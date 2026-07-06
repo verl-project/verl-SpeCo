@@ -19,6 +19,7 @@ from verl_speco.integration.vllm_runtime import (
     attach_update_draft_weights_to_rollout,
     build_vllm_speculative_config_from_drafter,
     configure_vllm_runtime_from_config,
+    patch_transformers_attention_layer_type_constants,
     speco_vllm_update_draft_weights,
 )
 
@@ -256,6 +257,19 @@ def test_vllm_runtime_injects_dspark_as_dflash_and_worker_extension(monkeypatch,
     assert engine_kwargs["speculative_config"]["method"] == "dflash"
     assert engine_kwargs["speculative_config"]["num_speculative_tokens"] == 16
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
+
+
+def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None:
+    transformers_module = types.ModuleType("transformers")
+    configuration_utils_module = types.ModuleType("transformers.configuration_utils")
+    transformers_module.configuration_utils = configuration_utils_module
+    monkeypatch.setitem(sys.modules, "transformers", transformers_module)
+    monkeypatch.setitem(sys.modules, "transformers.configuration_utils", configuration_utils_module)
+
+    assert patch_transformers_attention_layer_type_constants() is True
+    assert configuration_utils_module.ALLOWED_LAYER_TYPES
+    assert configuration_utils_module.ALLOWED_LAYER_TYPES == configuration_utils_module.ALLOWED_ATTENTION_LAYER_TYPES
+    assert patch_transformers_attention_layer_type_constants() is False
 
 
 def test_vllm_acceptance_stats_keep_stable_transport_keys() -> None:

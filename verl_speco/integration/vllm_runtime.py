@@ -31,6 +31,13 @@ _VLLM_DSPARK_RUNTIME_PATCHED = False
 _VLLM_DSPARK_REGISTRY_ALIAS_PATCHED = False
 
 _DSPARK_VLLM_ARCHITECTURES = {"DSparkDraftModel", "Qwen3DSparkModel", "DeepSeekDSparkModel"}
+_TRANSFORMERS_ATTENTION_LAYER_TYPES_FALLBACK = (
+    "attention",
+    "full_attention",
+    "sliding_attention",
+    "chunked_attention",
+    "linear_attention",
+)
 
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
@@ -557,6 +564,7 @@ def _is_vllm_ascend_runtime_hint() -> bool:
 
 
 def _maybe_apply_vllm_ascend_global_patch() -> bool:
+    patch_transformers_attention_layer_type_constants()
     if not _is_vllm_ascend_runtime_hint():
         return False
     try:
@@ -570,6 +578,48 @@ def _maybe_apply_vllm_ascend_global_patch() -> bool:
     except Exception as exc:  # noqa: BLE001
         logger.debug("Unable to apply vLLM-Ascend global patch hook: %s", exc)
         return False
+    return True
+
+
+def patch_transformers_attention_layer_type_constants() -> bool:
+    """Provide the attention layer type aliases expected by mixed vLLM builds."""
+
+    try:
+        from transformers import configuration_utils
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install transformers attention layer type compat: %s", exc)
+        return False
+
+    has_v5_name = hasattr(configuration_utils, "ALLOWED_ATTENTION_LAYER_TYPES")
+    has_v4_name = hasattr(configuration_utils, "ALLOWED_LAYER_TYPES")
+    if has_v5_name and has_v4_name:
+        return False
+
+    existing = None
+    if has_v5_name:
+        existing = getattr(configuration_utils, "ALLOWED_ATTENTION_LAYER_TYPES", None)
+    elif has_v4_name:
+        existing = getattr(configuration_utils, "ALLOWED_LAYER_TYPES", None)
+
+    try:
+        allowed_layer_types = tuple(existing) if existing is not None else _TRANSFORMERS_ATTENTION_LAYER_TYPES_FALLBACK
+    except TypeError:
+        allowed_layer_types = _TRANSFORMERS_ATTENTION_LAYER_TYPES_FALLBACK
+    if not allowed_layer_types:
+        allowed_layer_types = _TRANSFORMERS_ATTENTION_LAYER_TYPES_FALLBACK
+
+    patched_names = []
+    if not has_v5_name:
+        configuration_utils.ALLOWED_ATTENTION_LAYER_TYPES = allowed_layer_types
+        patched_names.append("ALLOWED_ATTENTION_LAYER_TYPES")
+    if not has_v4_name:
+        configuration_utils.ALLOWED_LAYER_TYPES = allowed_layer_types
+        patched_names.append("ALLOWED_LAYER_TYPES")
+
+    logger.warning(
+        "[speco vllm compat] patched transformers.configuration_utils missing %s for vLLM import",
+        ", ".join(patched_names),
+    )
     return True
 
 
