@@ -11,6 +11,7 @@ from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
     SPECO_VLLM_WORKER_EXTENSION_CLS,
     SpecoVLLMColocateWorkerExtension,
+    _describe_vllm_draft_logits,
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
     _record_vllm_spec_decode_scheduler_stats,
@@ -54,6 +55,12 @@ def test_vllm_worker_extension_constructs_without_wake_up_fallback() -> None:
     extension = SpecoVLLMColocateWorkerExtension()
 
     assert isinstance(extension, SpecoVLLMColocateWorkerExtension)
+
+
+def test_vllm_draft_logits_diagnostic_handles_missing_and_non_tensor_values() -> None:
+    assert _describe_vllm_draft_logits(None, missing=True) == "missing"
+    assert _describe_vllm_draft_logits(None) == "None(greedy)"
+    assert _describe_vllm_draft_logits("MISSING") == "str"
 
 
 def test_vllm_speculative_config_maps_dflash_contract() -> None:

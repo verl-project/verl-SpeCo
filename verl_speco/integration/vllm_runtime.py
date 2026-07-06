@@ -154,6 +154,20 @@ def _bool_or_none(value: Any) -> bool | None:
     return bool(value)
 
 
+def _describe_vllm_draft_logits(draft_logits: Any, *, missing: bool = False) -> str:
+    if missing:
+        return "missing"
+    if draft_logits is None:
+        return "None(greedy)"
+    shape = getattr(draft_logits, "shape", None)
+    if shape is not None:
+        try:
+            return f"tensor{tuple(shape)}"
+        except TypeError:
+            return f"shape={shape}"
+    return type(draft_logits).__name__
+
+
 def _resolve_torch_rebuild_func(func: Any):
     if callable(func):
         return func
@@ -1845,13 +1859,14 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         proposer = self._speco_resolve_draft_proposer()
         if proposer is not None and not getattr(self, "_speco_logged_sampling_mode", False):
             self._speco_logged_sampling_mode = True
-            draft_logits = getattr(proposer, "draft_logits", "MISSING")
+            missing_draft_logits = not hasattr(proposer, "draft_logits")
+            draft_logits = getattr(proposer, "draft_logits", None)
             spec_cfg = getattr(getattr(getattr(self, "model_runner", None), "vllm_config", None), "speculative_config", None)
             dsm = getattr(spec_cfg, "draft_sample_method", "UNKNOWN") if spec_cfg else "NO_SPEC_CFG"
             logger.warning(
                 "[speco-diag:sampling_mode] draft_sample_method=%s draft_logits=%s proposer=%s",
                 dsm,
-                "None(greedy)" if draft_logits is None else f"tensor{tuple(draft_logits.shape)}",
+                _describe_vllm_draft_logits(draft_logits, missing=missing_draft_logits),
                 type(proposer).__name__,
             )
         return {"loaded_params": loaded_params, "has_draft_model": True}
