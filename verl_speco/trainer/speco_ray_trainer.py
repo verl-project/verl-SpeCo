@@ -615,17 +615,30 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             raise ValueError(f"Unsupported SPECO old-logprob hidden capture impl: {capture_impl!r}")
         return True
 
-    def _speco_oldlogprob_entropy_hook_enabled(self) -> bool:
-        return self.is_drafter_rollout_enabled(self.config) and not self._speco_oldlogprob_calculate_entropy()
-
-    def _speco_oldlogprob_calculate_entropy(self) -> bool:
+    def _speco_oldlogprob_entropy_config_value(self):
         training_cfg = self._speco_drafter_training_config()
         value = training_cfg.get("old_logprob_calculate_entropy", None)
         if value is None:
-            value = _get_nested(self.config, ("actor_rollout_ref", "actor", "calculate_entropy"), False)
+            value = _get_nested(self.config, ("actor_rollout_ref", "actor", "calculate_entropy"), None)
+        return value
+
+    @staticmethod
+    def _speco_bool_config(value: Any) -> bool:
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "y", "on"}
         return bool(value)
+
+    def _speco_oldlogprob_entropy_hook_enabled(self) -> bool:
+        value = self._speco_oldlogprob_entropy_config_value()
+        if value is None and not self.is_drafter_rollout_enabled(self.config):
+            return False
+        return not self._speco_oldlogprob_calculate_entropy()
+
+    def _speco_oldlogprob_calculate_entropy(self) -> bool:
+        value = self._speco_oldlogprob_entropy_config_value()
+        if value is None:
+            value = False
+        return self._speco_bool_config(value)
 
     def _speco_oldlogprob_hidden_capture_impl(self) -> str:
         training_cfg = self._speco_drafter_training_config()

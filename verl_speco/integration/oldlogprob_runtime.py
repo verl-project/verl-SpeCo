@@ -73,6 +73,10 @@ def _load_drafter_env(raw: str | None = None) -> dict[str, Any]:
 
 
 def _oldlogprob_enabled_from_drafter(drafter: Any) -> bool:
+    if not bool(_get_nested(drafter, ("enable",), False)):
+        return False
+    if not bool(_get_nested(drafter, ("enable_drafter_training",), False)):
+        return False
     training = _get_nested(drafter, ("training",), {}) or {}
     return bool(_get_nested(training, ("collect_hidden_states_from_old_logprob",), False))
 

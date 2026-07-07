@@ -27,6 +27,16 @@ def test_oldlogprob_collection_is_disabled_by_default() -> None:
     assert oldlogprob_hidden_runtime_enabled({"rollout": {"drafter": _drafter(False)}}) is False
 
 
+def test_oldlogprob_collection_requires_online_drafter_training() -> None:
+    rollout_disabled = _drafter(True)
+    rollout_disabled["enable"] = False
+    training_disabled = _drafter(True)
+    training_disabled["enable_drafter_training"] = False
+
+    assert oldlogprob_hidden_runtime_enabled({"rollout": {"drafter": rollout_disabled}}) is False
+    assert oldlogprob_hidden_runtime_enabled({"rollout": {"drafter": training_disabled}}) is False
+
+
 def test_oldlogprob_collection_accepts_both_config_shapes() -> None:
     assert oldlogprob_hidden_runtime_enabled({"rollout": {"drafter": _drafter(True)}})
     assert oldlogprob_hidden_runtime_enabled(

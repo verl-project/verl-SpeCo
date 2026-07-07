@@ -17,6 +17,7 @@ def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
     trainer.global_steps = step
     trainer.config = SimpleNamespace(
         actor_rollout_ref=SimpleNamespace(
+            actor=SimpleNamespace(calculate_entropy=False),
             rollout=SimpleNamespace(
                 drafter=SimpleNamespace(
                     enable=True,
@@ -29,6 +30,26 @@ def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
     trainer._pending_drafter_publish_refs = None
     trainer._speco_last_collected_samples = 0
     trainer._ray_get_if_needed = lambda value: value
+    return trainer
+
+
+def _no_drafter_trainer(*, calculate_entropy=Ellipsis) -> SpecoRayPPOTrainer:
+    trainer = SpecoRayPPOTrainer.__new__(SpecoRayPPOTrainer)
+    actor = SimpleNamespace()
+    if calculate_entropy is not Ellipsis:
+        actor.calculate_entropy = calculate_entropy
+    trainer.config = SimpleNamespace(
+        actor_rollout_ref=SimpleNamespace(
+            actor=actor,
+            rollout=SimpleNamespace(
+                drafter=SimpleNamespace(
+                    enable=False,
+                    enable_drafter_training=False,
+                    training={},
+                )
+            ),
+        )
+    )
     return trainer
 
 
@@ -65,6 +86,12 @@ def test_drafter_training_attempt_requires_interval_and_samples() -> None:
 
     trainer._speco_last_collected_samples = 1
     assert trainer._speco_should_attempt_drafter_train_this_step() is True
+
+
+def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None:
+    assert _no_drafter_trainer(calculate_entropy=False)._speco_oldlogprob_entropy_hook_enabled() is True
+    assert _no_drafter_trainer(calculate_entropy=True)._speco_oldlogprob_entropy_hook_enabled() is False
+    assert _no_drafter_trainer()._speco_oldlogprob_entropy_hook_enabled() is False
 
 
 def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:
