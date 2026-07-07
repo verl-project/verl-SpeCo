@@ -13,11 +13,12 @@ training, and hot-update logic through `verl_speco`.
 - **Drafter Co-Training in the RL loop**: collects hidden states during    rollout or
   old-logprob computation, trains a drafter periodically, and publishes updated
   drafter weights back to the rollout engine.
-- **Multiple drafter backends**: includes EAGLE3 and DFLASH trainer
+- **Multiple drafter backends**: includes EAGLE3, DFLASH, and DSpark trainer
   backends under `verl_speco.backends`.
-- **vLLM and SGLang integration**: supports EAGLE3 and DFLASH speculative
-  decoding paths, with drafter collection and hot-update logic integrated
-  through the rollout engine.
+- **vLLM and SGLang integration**: supports EAGLE3, DFLASH, and DSpark
+  speculative decoding on vLLM, plus EAGLE3 and DFLASH on SGLang, with
+  drafter collection and hot-update logic integrated through the rollout
+  engine.
 - **GPU and NPU examples**: provides example scripts for vLLM, SGLang, and
   vLLM-Ascend style graph settings.
 - **Step-level observability**: exposes drafter timing and vLLM speculative
@@ -54,7 +55,7 @@ faster end-to-end training without accuracy regression.
 | :---: | :---: | :---: | :---: |
 | EAGLE3 | vLLM, SGLang | FSDP | ✅ |
 | DFLASH | vLLM, SGLang | FSDP | ✅ |
-| DSpark | TBD | TBD | WIP |
+| DSpark | vLLM | FSDP | ✅ |
 
 ## Runtime Compatibility
 
@@ -66,9 +67,20 @@ drafter backend you use.
 | :---: | :---: | :---: | :---: |
 | EAGLE3 | &gt;= 0.18.0 | &gt;= 0.18.0 | &gt;= 0.5.10 |
 | DFLASH | &gt;= 0.20.2 | &gt;= 0.20.2 | &gt;= 0.5.12 |
+| DSpark | GPU: [main](https://github.com/vllm-project/vllm/tree/main)<br>NPU: [`dc68bd8`](https://github.com/vllm-project/vllm/tree/dc68bd8c4199b00631fe71eb37313f406cc66ac1) | NPU: [`8214d19`](https://github.com/vllm-project/vllm-ascend/tree/8214d19f8b505484b839469444887b404db2e3a8) | - |
 
 For vLLM DFLASH, the drafter checkpoint must use the DFlash draft model config
 expected by the runtime.
+
+For vLLM DSpark on GPU, use vLLM main. For vLLM DSpark on NPU, follow the
+version pairing documented by
+[vLLM-Ascend PR #11153](https://github.com/vllm-project/vllm-ascend/pull/11153):
+vLLM
+[`dc68bd8c4199b00631fe71eb37313f406cc66ac1`](https://github.com/vllm-project/vllm/tree/dc68bd8c4199b00631fe71eb37313f406cc66ac1)
+and vLLM-Ascend
+[`8214d19f8b505484b839469444887b404db2e3a8`](https://github.com/vllm-project/vllm-ascend/tree/8214d19f8b505484b839469444887b404db2e3a8).
+SpeCo keeps the user-facing algorithm as `DSPARK`; on vLLM-Ascend/NPU it
+follows that PR's DSpark path.
 
 ## Repository Layout
 
@@ -79,7 +91,7 @@ verl_speco/
   trainer/speco_ray_trainer.py    # RayPPOTrainer adapter
   workers/speco_worker.py         # drafter trainer worker
   integration/                    # vLLM, SGLang, old-logprob, publish adapters
-  backends/                       # EAGLE3/DFLASH trainer backends
+  backends/                       # EAGLE3/DFLASH/DSpark trainer backends
   models/                         # drafter model definitions
 
 examples/                         # end-to-end command examples
@@ -160,7 +172,7 @@ Important groups:
 - `drafter.enable_drafter_training`: enables online drafter trainer workers.
 - `drafter.rollout.*`: controls speculative steps, top-k, and verify tokens.
 - `drafter.training.*`: controls hidden-state collection, training interval,
-  publish interval, update mode, and DFLASH-specific training options.
+  publish interval, update mode, and DFLASH/DSpark-specific training options.
 - `drafter.vllm.*`: contains vLLM-specific drafter overrides.
 
 The full default overlay is in

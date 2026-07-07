@@ -94,14 +94,16 @@
 
   <!-- Drafter trainer. -->
   <rect class="card card-drafter" x="405" y="430" width="310" height="230" rx="14"/>
-  <circle class="icon-ring" cx="449" cy="490" r="24"/>
-  <text class="icon-text" x="449" y="497" text-anchor="middle">D</text>
-  <text class="card-title" x="489" y="484">Drafter Trainer</text>
-  <text class="card-subtitle" x="489" y="508">FSDP</text>
-  <rect class="submodule" x="437" y="540" width="246" height="28" rx="7"/>
-  <text class="submodule-text" x="560" y="559" text-anchor="middle">Eagle3 Trainer Backend</text>
-  <rect class="submodule" x="437" y="576" width="246" height="28" rx="7"/>
-  <text class="submodule-text" x="560" y="595" text-anchor="middle">DFlash Trainer Backend</text>
-  <text class="ellipsis-text" x="560" y="630" text-anchor="middle">...</text>
+  <circle class="icon-ring" cx="449" cy="472" r="24"/>
+  <text class="icon-text" x="449" y="479" text-anchor="middle">D</text>
+  <text class="card-title" x="489" y="466">Drafter Trainer</text>
+  <text class="card-subtitle" x="489" y="490">FSDP</text>
+  <rect class="submodule" x="437" y="522" width="246" height="28" rx="7"/>
+  <text class="submodule-text" x="560" y="541" text-anchor="middle">Eagle3 Trainer Backend</text>
+  <rect class="submodule" x="437" y="558" width="246" height="28" rx="7"/>
+  <text class="submodule-text" x="560" y="577" text-anchor="middle">DFlash Trainer Backend</text>
+  <rect class="submodule" x="437" y="594" width="246" height="28" rx="7"/>
+  <text class="submodule-text" x="560" y="613" text-anchor="middle">DSpark Trainer Backend</text>
+  <text class="ellipsis-text" x="560" y="639" text-anchor="middle">...</text>
 
 </svg>
