@@ -946,71 +946,6 @@ def _resolve_vllm_draft_update_use_shm(adapter: Any, training_cfg: dict[str, Any
     return bool(getattr(adapter, "use_shm", False)) or _is_vllm_ascend_runtime_hint()
 
 
-def _draft_param_name_candidates(name: str) -> list[str]:
-    prefixes = ("module.", "_orig_mod.", "draft_model.", "model.draft_model.")
-    bases = []
-    pending = [name]
-    while pending:
-        candidate = pending.pop(0)
-        if candidate in bases:
-            continue
-        bases.append(candidate)
-        for prefix in prefixes:
-            if candidate.startswith(prefix):
-                pending.append(candidate[len(prefix) :])
-
-    # DFlash name aliases: training-side name -> vLLM inference-side name
-    dflash_aliases = (
-        ("context_proj.", "fc."),
-        ("context_norm.", "hidden_norm."),
-        ("final_norm.", "norm."),
-    )
-
-    candidates = []
-    for candidate in bases:
-        candidates.append(candidate)
-        if "midlayer." in candidate:
-            candidates.append(candidate.replace("midlayer.", "model.layers.0."))
-        for src, dst in dflash_aliases:
-            if src in candidate:
-                candidates.append(candidate.replace(src, dst))
-    for candidate in list(candidates):
-        if not candidate.startswith("model."):
-            candidates.append(f"model.{candidate}")
-    return list(dict.fromkeys(candidates))
-
-
-def _draft_fused_param_candidates(name: str) -> list[tuple[str, Any]]:
-    mappings = (
-        (".qkv_proj.", ".q_proj.", "q"),
-        (".qkv_proj.", ".k_proj.", "k"),
-        (".qkv_proj.", ".v_proj.", "v"),
-        (".gate_up_proj.", ".gate_proj.", 0),
-        (".gate_up_proj.", ".up_proj.", 1),
-    )
-    candidates = []
-    for candidate in _draft_param_name_candidates(name):
-        for fused_name, shard_name, shard_id in mappings:
-            if shard_name in candidate:
-                candidates.append((candidate.replace(shard_name, fused_name), shard_id))
-    return list(dict.fromkeys(candidates))
-
-
-def _load_draft_param(param: Any, tensor: Any, shard_id: Any = None) -> None:
-    param_data = getattr(param, "data", None)
-    device = getattr(param, "device", getattr(param_data, "device", None))
-    dtype = getattr(param, "dtype", getattr(param_data, "dtype", None))
-    tensor = tensor.to(device=device, dtype=dtype)
-    weight_loader = getattr(param, "weight_loader", None)
-    if callable(weight_loader):
-        if shard_id is None:
-            weight_loader(param, tensor)
-        else:
-            weight_loader(param, tensor, shard_id)
-        return
-    param.data.copy_(tensor, non_blocking=True)
-
-
 def _ensure_vllm_server_handle(adapter: Any) -> None:
     if (
         getattr(adapter, "rollout_rank", None) != 0
@@ -1165,6 +1100,13 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
 
     def _speco_resolve_draft_model(self):
         proposer = self._speco_resolve_draft_proposer()
+        # Prefer vLLM's stable accessor (Worker.get_draft_model) so the draft is
+        # resolved exactly the way vLLM does (V1 drafter / V2 speculator, and
+        # get_model() vs .model) instead of duplicating that logic here.
+        get_draft_model = getattr(self, "get_draft_model", None)
+        if callable(get_draft_model):
+            return get_draft_model(), proposer
+        # Fallback for vLLM versions without Worker.get_draft_model().
         if proposer is None:
             return None, None
         get_model = getattr(proposer, "get_model", None)
@@ -1194,63 +1136,6 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
 
     def _speco_is_dflash_draft(self) -> bool:
         return self._speco_draft_method() == "dflash"
-
-    def _speco_update_draft_weights(self, weights: list[tuple[str, Any]]) -> int:
-        draft_model, proposer = self._speco_resolve_draft_model()
-        if draft_model is None:
-            return 0
-        del proposer
-        named_parameters = getattr(draft_model, "named_parameters", None)
-        if not callable(named_parameters):
-            raise RuntimeError("Resolved vLLM draft model does not expose named_parameters() for graph-safe update")
-
-        named_params = dict(named_parameters())
-        updated = 0
-        missing = []
-        incompatible = []
-        for name, tensor in weights:
-            param = None
-            matched_name = None
-            for candidate in _draft_param_name_candidates(str(name)):
-                param = named_params.get(candidate)
-                if param is not None:
-                    matched_name = candidate
-                    break
-            shard_id = None
-            if param is None:
-                for candidate, candidate_shard_id in _draft_fused_param_candidates(str(name)):
-                    param = named_params.get(candidate)
-                    if param is not None:
-                        matched_name = candidate
-                        shard_id = candidate_shard_id
-                        break
-                if param is None:
-                    missing.append(name)
-                    continue
-            if (
-                shard_id is None
-                and not callable(getattr(param, "weight_loader", None))
-                and tuple(param.shape) != tuple(tensor.shape)
-            ):
-                incompatible.append(f"{name}->{matched_name}: expected {tuple(param.shape)}, got {tuple(tensor.shape)}")
-                continue
-            try:
-                _load_draft_param(param, tensor, shard_id=shard_id)
-            except Exception as exc:  # noqa: BLE001
-                incompatible.append(
-                    f"{name}->{matched_name}: loader failed for shape {tuple(tensor.shape)}: {exc}"
-                )
-                continue
-            updated += 1
-
-        if missing or incompatible:
-            details = []
-            if missing:
-                details.append(f"missing={missing[:8]}")
-            if incompatible:
-                details.append(f"incompatible={incompatible[:8]}")
-            raise RuntimeError("SPECO vLLM graph-safe draft update could not load all weights: " + "; ".join(details))
-        return updated
 
     def update_draft_weights_from_ipc(self, use_shm: bool = False):
         """Receive and load draft-model weights through the verl bucketed IPC path.
@@ -1332,20 +1217,13 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             translated_weights.append((n, tensor))
 
         loaded_params = len(translated_weights)
-        if is_eagle3:
-            loaded_params = self._speco_update_draft_weights(translated_weights)
-        else:
-            inner_model = getattr(draft_model, "model", None)
-            if inner_model is None:
-                return {"loaded_params": 0, "has_draft_model": True}
-            inner_model.load_weights(iter(translated_weights))
-
-            # Rebuild fused KV buffers (torch.cat snapshot, not a view)
-            try:
-                inner_model._build_fused_kv_buffers()
-            except Exception as exc:
-                logger.warning("[speco draft update] _build_fused_kv_buffers failed: %s", exc)
-
+        # Both eagle3 and dflash load through their own wrapper's public
+        # load_weights (Eagle3LlamaForCausalLM / DFlashLagunaForCausalLM /
+        # DFlashQwen3ForCausalLM). Each wrapper idempotently maps checkpoint-style
+        # names into the nested draft module and, for dflash, rebuilds the fused-KV
+        # buffers at the end. This replaces the previous eagle3-only per-parameter
+        # copy_ path and the manual inner_model._build_fused_kv_buffers() call.
+        draft_model.load_weights(iter(translated_weights))
         return {"loaded_params": loaded_params, "has_draft_model": True}
 
     # ----------------------------------------------------------------
