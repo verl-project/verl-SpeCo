@@ -4,7 +4,8 @@
 # and feature-store settings for independent draft model training.
 
 defaults:
-  - speco_trainer
+  - ppo_trainer
+  - speco_base
   - _self_
 
 hydra:
