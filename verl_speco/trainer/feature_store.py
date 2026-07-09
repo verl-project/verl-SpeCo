@@ -214,6 +214,15 @@ class TorchShardFeatureStore:
         self._next_shard_index += 1
         return [f"{shard_name}:{idx}" for idx in range(entry["num_samples"])]
 
+    def flush_on_step(self, global_step: int | None, interval_steps: int) -> list[str]:
+        """Flush pending samples on configured training-step boundaries."""
+        interval_steps = int(interval_steps)
+        if interval_steps <= 0 or global_step is None:
+            return []
+        if int(global_step) % interval_steps != 0:
+            return []
+        return self.flush()
+
     def read(self, key: str) -> DraftFeatureSample:
         shard_name, sample_index = _parse_key(key)
         shard = self._load_shard(shard_name)

@@ -533,9 +533,13 @@ class SpecoWorker(Worker):
             metadata=metadata,
         )
         writer.write_many([sample])
-        flush_interval = int(self.config.rollout.drafter.training.get("feature_store", {}).get("flush_interval_steps", 1))
-        if flush_interval <= 1:
-            writer.flush()
+
+    def _flush_rollout_features_for_step(self) -> None:
+        if self._drafter_training_mode() != "collect_only" or self.feature_writer is None:
+            return
+        feature_store_cfg = self.config.rollout.drafter.training.get("feature_store", {})
+        flush_interval = int(feature_store_cfg.get("flush_interval_steps", 1))
+        self.feature_writer.flush_on_step(self.last_global_step, flush_interval)
 
     @register(dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH))
     def collect_rollout_features(self, samples: list[dict]):
@@ -594,6 +598,7 @@ class SpecoWorker(Worker):
                 hidden_states=hidden,
                 target_logprobs=target_logprobs,
             )
+        self._flush_rollout_features_for_step()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_global_step(self, global_step: int):

@@ -60,3 +60,36 @@ def test_draft_feature_dataloader_slices_keys_by_rank(tmp_path):
     rank1_ids = [int(sample.input_ids[0].item()) for batch in rank1 for sample in batch]
     assert rank0_ids == [1, 3]
     assert rank1_ids == [2, 4]
+
+
+def test_flush_interval_zero_relies_on_shard_capacity(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=4)
+    store.write_many([_sample(0), _sample(1)])
+
+    assert store.flush_on_step(global_step=1, interval_steps=0) == []
+    assert list(tmp_path.glob("shard_*.pt")) == []
+
+    store.write_many([_sample(2), _sample(3)])
+    assert len(list(tmp_path.glob("shard_*.pt"))) == 1
+    assert store.get_metadata()["num_samples"] == 4
+
+
+def test_flush_interval_one_flushes_once_per_step(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=32)
+    store.write_many([_sample(index) for index in range(16)])
+
+    keys = store.flush_on_step(global_step=1, interval_steps=1)
+
+    assert len(keys) == 16
+    assert len(list(tmp_path.glob("shard_*.pt"))) == 1
+    assert store.get_metadata()["num_samples"] == 16
+
+
+def test_flush_interval_n_only_flushes_matching_steps(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=32)
+    store.write_many([_sample(0)])
+
+    assert store.flush_on_step(global_step=1, interval_steps=2) == []
+    assert list(tmp_path.glob("shard_*.pt")) == []
+    assert len(store.flush_on_step(global_step=2, interval_steps=2)) == 1
+    assert len(list(tmp_path.glob("shard_*.pt"))) == 1
