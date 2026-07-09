@@ -7,6 +7,10 @@ defaults:
   - speco_trainer
   - _self_
 
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
 speco:
   draft_training:
     enable: true

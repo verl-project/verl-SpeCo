@@ -1,3 +1,4 @@
+set -euo pipefail
 set -x
 
 # GPU smoke example for separate EAGLE3 draft model training.

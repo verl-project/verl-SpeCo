@@ -53,6 +53,7 @@ actor_rollout_ref:
         speculative_config_overrides: {}
 
       training:
+        mode: online
         collect_hidden_states_from_sgl: false
         collect_hidden_states_from_old_logprob: false
         old_logprob_hidden_capture_impl: forward_hook
@@ -136,3 +137,12 @@ actor_rollout_ref:
         current_max_samples: 2048
         data_buffer_max_size: 1024
         hidden_state_clip_value: 1.0e4
+        feature_store:
+          type: torch_shard
+          path: null
+          max_samples_per_shard: 1024
+          flush_interval_steps: 1
+          shuffle: true
+          repeat: true
+          prefetch_depth: 2
+          strict_schema: true
