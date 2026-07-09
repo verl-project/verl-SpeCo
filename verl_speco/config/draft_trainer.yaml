@@ -1,0 +1,49 @@
+# SPECO standalone draft trainer overlay.
+#
+# This config keeps the existing drafter backend shape while adding launcher
+# and feature-store settings for independent draft model training.
+
+defaults:
+  - speco_trainer
+  - _self_
+
+speco:
+  draft_training:
+    enable: true
+    launcher: python
+    nproc_per_node: 1
+    nnodes: 1
+    node_rank: null
+    master_addr: null
+    master_port: null
+    standalone: true
+    mode: feature_store
+    use_ray_controller: false
+
+actor_rollout_ref:
+  rollout:
+    drafter:
+      enable: true
+      enable_drafter_training: true
+      training:
+        mode: offline
+        max_steps: 1000
+        save_interval_steps: 100
+        save_final_checkpoint: true
+        eval_interval_steps: 0
+        gradient_accumulation_steps: 1
+        seed: 0
+        nproc_per_node: ${speco.draft_training.nproc_per_node}
+        nnodes: ${speco.draft_training.nnodes}
+        node_rank: ${speco.draft_training.node_rank}
+        master_addr: ${speco.draft_training.master_addr}
+        master_port: ${speco.draft_training.master_port}
+        standalone: ${speco.draft_training.standalone}
+        feature_store:
+          type: torch_shard
+          path: null
+          max_samples_per_shard: 1024
+          shuffle: true
+          repeat: true
+          prefetch_depth: 2
+          strict_schema: true

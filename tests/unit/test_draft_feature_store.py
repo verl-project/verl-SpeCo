@@ -1,0 +1,62 @@
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from verl_speco.trainer.draft_dataset import DraftFeatureDataLoader, DraftFeatureDataLoaderConfig
+from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
+
+
+def _sample(index: int = 0) -> DraftFeatureSample:
+    input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.long) + index
+    loss_mask = torch.tensor([0, 1, 1, 0], dtype=torch.float32)
+    hidden_states = torch.randn(4, 8, dtype=torch.float32)
+    last_hidden_states = torch.randn(4, 4, dtype=torch.float32)
+    return DraftFeatureSample(
+        algorithm="EAGLE3",
+        input_ids=input_ids,
+        loss_mask=loss_mask,
+        hidden_states=hidden_states,
+        last_hidden_states=last_hidden_states,
+        metadata={
+            "source": "unit",
+            "global_step": index,
+            "hidden_states_layout": "eagle3_aux_plus_last",
+            "sequence_length": 4,
+            "loss_tokens": 2,
+        },
+    )
+
+
+def test_torch_shard_feature_store_roundtrip(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=2)
+    store.write_many([_sample(0), _sample(1)])
+    store.close()
+
+    reader = TorchShardFeatureStore(tmp_path, read_only=True)
+    keys = list(reader.iter_keys(shuffle=False))
+    assert len(keys) == 2
+    loaded = reader.read(keys[0])
+    assert loaded.algorithm == "EAGLE3"
+    assert torch.equal(loaded.input_ids, torch.tensor([1, 2, 3, 4]))
+    assert loaded.metadata["hidden_states_layout"] == "eagle3_aux_plus_last"
+    assert reader.get_metadata()["num_samples"] == 2
+
+
+def test_draft_feature_dataloader_slices_keys_by_rank(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=4)
+    store.write_many([_sample(i) for i in range(4)])
+    store.close()
+
+    rank0 = DraftFeatureDataLoader(
+        TorchShardFeatureStore(tmp_path, read_only=True),
+        DraftFeatureDataLoaderConfig(batch_size=8, rank=0, world_size=2, shuffle=False, repeat=False),
+    )
+    rank1 = DraftFeatureDataLoader(
+        TorchShardFeatureStore(tmp_path, read_only=True),
+        DraftFeatureDataLoaderConfig(batch_size=8, rank=1, world_size=2, shuffle=False, repeat=False),
+    )
+
+    rank0_ids = [int(sample.input_ids[0].item()) for batch in rank0 for sample in batch]
+    rank1_ids = [int(sample.input_ids[0].item()) for batch in rank1 for sample in batch]
+    assert rank0_ids == [1, 3]
+    assert rank1_ids == [2, 4]
