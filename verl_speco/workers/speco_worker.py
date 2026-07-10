@@ -490,8 +490,24 @@ class SpecoWorker(Worker):
                 self.rank,
             )
             return
-        input_ids = batch["input_ids"].detach().cpu().reshape(-1)
-        loss_mask = self._build_rollout_loss_mask(batch, input_ids)
+        full_input_ids = batch["input_ids"].detach().cpu().reshape(-1)
+        full_loss_mask = self._build_rollout_loss_mask(batch, full_input_ids)
+        hidden_states = hidden_states.detach().cpu()
+        hidden_rows = int(hidden_states.size(1) if hidden_states.dim() == 3 and hidden_states.size(0) == 1 else hidden_states.size(0))
+        hidden_positions = batch.get("hidden_positions")
+        if torch.is_tensor(hidden_positions):
+            hidden_positions = hidden_positions.detach().cpu().long().reshape(-1)
+        else:
+            hidden_positions = None
+        feature_start, feature_end, position_ids = self._resolve_rollout_feature_window(
+            full_input_ids,
+            hidden_rows,
+            hidden_positions=hidden_positions,
+            hidden_position_start=batch.get("hidden_position_start"),
+            hidden_position_end=batch.get("hidden_position_end"),
+        )
+        input_ids = full_input_ids[feature_start:feature_end]
+        loss_mask = full_loss_mask[feature_start:feature_end]
         metadata = {
             "source": batch.get("hidden_target_logprobs_source", "rl_rollout"),
             "global_step": batch.get("global_step", self.last_global_step),
@@ -506,6 +522,9 @@ class SpecoWorker(Worker):
             "use_logits": bool(self.config.rollout.drafter.training.get("use_logits", False)),
             "sequence_length": int(input_ids.numel()),
             "loss_tokens": int(loss_mask.sum().item()),
+            "full_sequence_length": int(full_input_ids.numel()),
+            "feature_start": int(feature_start),
+            "feature_end": int(feature_end),
         }
         for key in (
             "hidden_position_start",
@@ -528,11 +547,51 @@ class SpecoWorker(Worker):
             algorithm=str(self.config.rollout.drafter.speculative_algorithm).upper(),
             input_ids=input_ids,
             loss_mask=loss_mask,
-            hidden_states=hidden_states.detach().cpu(),
+            hidden_states=hidden_states,
             target_logprobs=target_logprobs.detach().cpu() if torch.is_tensor(target_logprobs) else None,
+            position_ids=position_ids,
             metadata=metadata,
         )
         writer.write_many([sample])
+
+    @staticmethod
+    def _resolve_rollout_feature_window(
+        input_ids: torch.Tensor,
+        hidden_rows: int,
+        *,
+        hidden_positions: Optional[torch.Tensor],
+        hidden_position_start,
+        hidden_position_end,
+    ) -> tuple[int, int, torch.Tensor]:
+        input_len = int(input_ids.numel())
+        hidden_rows = max(int(hidden_rows), 0)
+        if hidden_positions is not None and int(hidden_positions.numel()) > 0:
+            positions = hidden_positions[:hidden_rows].long()
+            start = int(positions[0].item())
+            if int(positions.numel()) == hidden_rows and bool(torch.all(positions[1:] == positions[:-1] + 1).item()):
+                end = int(positions[-1].item()) + 1
+                if 0 <= start < end <= input_len:
+                    return start, end, positions + 1
+        else:
+            positions = None
+
+        try:
+            start = int(hidden_position_start)
+        except (TypeError, ValueError):
+            start = 0
+        try:
+            end = int(hidden_position_end)
+        except (TypeError, ValueError):
+            end = start + hidden_rows
+        start = min(max(start, 0), input_len)
+        end = min(max(end, start), input_len)
+        if end - start != hidden_rows:
+            end = min(start + hidden_rows, input_len)
+        if end <= start:
+            start = 0
+            end = min(hidden_rows, input_len)
+        position_ids = torch.arange(start + 1, end + 1, dtype=torch.long)
+        return start, end, position_ids
 
     def _flush_rollout_features_for_step(self) -> None:
         if self._drafter_training_mode() != "collect_only" or self.feature_writer is None:

@@ -265,10 +265,21 @@ class TorchShardFeatureStore:
             self.flush()
 
     def _write_metadata(self) -> None:
-        tmp_path = self.metadata_path.with_suffix(".json.tmp")
-        with tmp_path.open("w", encoding="utf-8") as metadata_file:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=self.metadata_path.name,
+            suffix=".tmp",
+            dir=self.metadata_path.parent,
+            delete=False,
+        ) as metadata_file:
+            tmp_name = metadata_file.name
             json.dump(self.metadata, metadata_file, ensure_ascii=True, indent=2, sort_keys=True)
-        os.replace(tmp_path, self.metadata_path)
+        try:
+            os.replace(tmp_name, self.metadata_path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.remove(tmp_name)
 
     def _load_manifest(self) -> list[dict[str, Any]]:
         if not self.manifest_path.exists():
