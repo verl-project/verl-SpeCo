@@ -42,6 +42,31 @@ def test_torch_shard_feature_store_roundtrip(tmp_path):
     assert reader.get_metadata()["num_samples"] == 2
 
 
+def test_feature_sample_normalizes_singleton_position_ids():
+    sample = DraftFeatureSample(
+        input_ids=torch.tensor([1, 2, 3, 4], dtype=torch.long),
+        loss_mask=torch.tensor([0, 1, 1, 0], dtype=torch.float32),
+        hidden_states=torch.randn(4, 8, dtype=torch.float32),
+        position_ids=torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+    )
+
+    sample.validate(strict=True)
+
+    assert sample.position_ids.shape == (4,)
+
+
+def test_feature_sample_rejects_position_id_length_mismatch():
+    sample = DraftFeatureSample(
+        input_ids=torch.tensor([1, 2, 3, 4], dtype=torch.long),
+        loss_mask=torch.tensor([0, 1, 1, 0], dtype=torch.float32),
+        hidden_states=torch.randn(4, 8, dtype=torch.float32),
+        position_ids=torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.long),
+    )
+
+    with pytest.raises(ValueError, match="input_ids/position_ids length mismatch"):
+        sample.validate(strict=True)
+
+
 def test_draft_feature_dataloader_slices_keys_by_rank(tmp_path):
     store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=4)
     store.write_many([_sample(i) for i in range(4)])

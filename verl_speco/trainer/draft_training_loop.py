@@ -9,7 +9,8 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from omegaconf import OmegaConf
+from torch.distributed.device_mesh import DeviceMesh
+from omegaconf import OmegaConf, open_dict
 from verl.utils.device import get_device_name, get_torch_device
 
 from verl_speco.backends.dflash_trainer_backend import DFlashTrainerBackend
@@ -34,34 +35,23 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     feature_store_cfg = training_cfg.feature_store
     if not feature_store_cfg.get("path"):
         raise ValueError("actor_rollout_ref.rollout.drafter.training.feature_store.path is required")
+    _disable_standalone_sequence_parallel(draft_config)
 
     _configure_device(local_rank)
     backend = _build_backend(draft_config)
+    training_device_mesh = _build_training_device_mesh(draft_config, world_size)
     trainer = DrafterBaseTrainer(
         config=draft_config,
         world_size=world_size,
         rollout_dp_rank=rank,
-        training_device_mesh=None,
-        training_process_group=dist.group.WORLD if dist.is_initialized() and world_size > 1 else None,
+        training_device_mesh=training_device_mesh,
+        training_process_group=(
+            None
+            if training_device_mesh is not None
+            else dist.group.WORLD if dist.is_initialized() and world_size > 1 else None
+        ),
         data_parallel_process_group=None,
         backend=backend,
-    )
-
-    activated = await trainer.activate_training_model()
-    if not activated:
-        raise RuntimeError(f"Failed to activate standalone drafter trainer on rank={rank}")
-
-    store = build_feature_store_from_config(feature_store_cfg, read_only=True)
-    loader = DraftFeatureDataLoader(
-        store,
-        DraftFeatureDataLoaderConfig(
-            batch_size=int(training_cfg.get("batch_size_per_gpu", 4)),
-            rank=rank,
-            world_size=world_size,
-            shuffle=bool(feature_store_cfg.get("shuffle", True)),
-            repeat=bool(feature_store_cfg.get("repeat", True)),
-            seed=int(training_cfg.get("seed", 0) or 0),
-        ),
     )
 
     max_steps = int(training_cfg.get("max_steps", training_cfg.get("step", 1000)) or 0)
@@ -69,7 +59,24 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     successful_steps = 0
     attempted_batches = 0
     last_save_result: dict[str, Any] | None = None
+    store = None
     try:
+        activated = await trainer.activate_training_model()
+        if not activated:
+            raise RuntimeError(f"Failed to activate standalone drafter trainer on rank={rank}")
+
+        store = build_feature_store_from_config(feature_store_cfg, read_only=True)
+        loader = DraftFeatureDataLoader(
+            store,
+            DraftFeatureDataLoaderConfig(
+                batch_size=int(training_cfg.get("batch_size_per_gpu", 4)),
+                rank=rank,
+                world_size=world_size,
+                shuffle=bool(feature_store_cfg.get("shuffle", True)),
+                repeat=bool(feature_store_cfg.get("repeat", True)),
+                seed=int(training_cfg.get("seed", 0) or 0),
+            ),
+        )
         for samples in loader:
             if max_steps > 0 and successful_steps >= max_steps:
                 break
@@ -94,7 +101,8 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             last_save_result = trainer.save_checkpoint(successful_steps, wait=True)
             _barrier()
     finally:
-        store.close()
+        if store is not None:
+            store.close()
         await trainer.cleanup_training(clear_data=True)
         if dist.is_initialized():
             dist.barrier()
@@ -120,6 +128,33 @@ def _build_backend(draft_config):
 
         return DSparkTrainerBackend(draft_config, draft_config.model)
     raise ValueError(f"Unsupported drafter algorithm {algo!r}; expected EAGLE3, DFLASH or DSPARK")
+
+
+def _disable_standalone_sequence_parallel(draft_config) -> None:
+    rollout_cfg = draft_config.rollout
+    rollout_tp_size = int(rollout_cfg.get("tensor_model_parallel_size", 1) or 1)
+    if rollout_tp_size <= 1:
+        return
+    logger.warning(
+        "Standalone draft training disables Ulysses sequence parallelism: "
+        "actor_rollout_ref.rollout.tensor_model_parallel_size=%s is treated as 1 for offline drafter training",
+        rollout_tp_size,
+    )
+    with open_dict(rollout_cfg):
+        rollout_cfg.tensor_model_parallel_size = 1
+
+
+def _build_training_device_mesh(draft_config, world_size: int) -> DeviceMesh | None:
+    if world_size <= 1 or not dist.is_initialized():
+        return None
+    strategy = str(draft_config.actor.get("strategy", "") if hasattr(draft_config, "actor") else "").lower()
+    if strategy != "fsdp2":
+        return None
+    return DeviceMesh(
+        device_type=get_device_name(),
+        mesh=torch.arange(world_size, dtype=torch.int64).reshape(1, world_size),
+        mesh_dim_names=("dp", "sp"),
+    )
 
 
 def _init_distributed() -> tuple[int, int, int]:

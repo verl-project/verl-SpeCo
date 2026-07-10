@@ -4,6 +4,7 @@ import pytest
 
 from verl_speco.draft_train_launcher import (
     build_torch_distributed_command,
+    normalize_training_args,
     resolve_launch_config,
 )
 
@@ -31,6 +32,22 @@ def test_launcher_resolves_python_friendly_gpu_count_override() -> None:
         "--standalone",
     ]
     assert command[-3:] == ["-m", "verl_speco.draft_train", "foo=bar"]
+
+
+def test_launcher_normalizes_gpu_count_alias_for_hydra() -> None:
+    overrides = [
+        "speco.draft_training.num_gpus_per_node=8",
+        "actor_rollout_ref.rollout.drafter.training.max_steps=10",
+    ]
+    config = resolve_launch_config(overrides)
+
+    normalized = normalize_training_args(overrides, config)
+
+    assert "speco.draft_training.num_gpus_per_node=8" not in normalized
+    assert "speco.draft_training.nproc_per_node=8" in normalized
+    assert "speco.draft_training.nnodes=1" in normalized
+    assert "speco.draft_training.standalone=true" in normalized
+    assert "actor_rollout_ref.rollout.drafter.training.max_steps=10" in normalized
 
 
 def test_launcher_resolves_multinode_settings() -> None:

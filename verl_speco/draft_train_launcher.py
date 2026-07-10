@@ -45,6 +45,15 @@ _STANDALONE_KEYS = (
     "actor_rollout_ref.rollout.drafter.training.standalone",
 )
 
+_LAUNCH_OVERRIDE_KEYS = frozenset(
+    _NPROC_KEYS
+    + _NNODES_KEYS
+    + _NODE_RANK_KEYS
+    + _MASTER_ADDR_KEYS
+    + _MASTER_PORT_KEYS
+    + _STANDALONE_KEYS
+)
+
 
 @dataclass(frozen=True)
 class DraftTrainLaunchConfig:
@@ -116,6 +125,30 @@ def resolve_launch_config(
     )
 
 
+def normalize_training_args(overrides: list[str], config: DraftTrainLaunchConfig) -> list[str]:
+    """Replace launcher aliases with canonical Hydra configuration fields."""
+
+    normalized = []
+    for item in overrides:
+        parsed = _split_override(item)
+        if parsed is None or parsed[0] not in _LAUNCH_OVERRIDE_KEYS:
+            normalized.append(item)
+    normalized.extend(
+        [
+            f"speco.draft_training.nproc_per_node={config.nproc_per_node}",
+            f"speco.draft_training.nnodes={config.nnodes}",
+            f"speco.draft_training.standalone={str(config.standalone).lower()}",
+        ]
+    )
+    if config.node_rank is not None:
+        normalized.append(f"speco.draft_training.node_rank={config.node_rank}")
+    if config.master_addr is not None:
+        normalized.append(f"speco.draft_training.master_addr={config.master_addr}")
+    if config.master_port is not None:
+        normalized.append(f"speco.draft_training.master_port={config.master_port}")
+    return normalized
+
+
 def build_torch_distributed_command(
     config: DraftTrainLaunchConfig,
     training_args: list[str],
@@ -165,9 +198,10 @@ def main(argv: list[str] | None = None) -> int:
     args, training_args = parser.parse_known_args(argv)
 
     launch_config = resolve_launch_config(training_args, module=args.module)
+    normalized_training_args = normalize_training_args(training_args, launch_config)
     command = build_torch_distributed_command(
         launch_config,
-        training_args,
+        normalized_training_args,
         python_executable=args.python_executable,
     )
     if args.dry_run:

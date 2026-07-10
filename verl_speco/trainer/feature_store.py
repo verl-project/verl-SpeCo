@@ -69,10 +69,17 @@ class DraftFeatureSample:
             self.input_ids = self.input_ids.reshape(-1)
         if self.loss_mask.dim() > 1:
             self.loss_mask = self.loss_mask.reshape(-1)
+        if torch.is_tensor(self.position_ids) and self.position_ids.dim() > 1:
+            self.position_ids = self.position_ids.reshape(-1)
         if self.input_ids.size(0) != self.loss_mask.size(0) and strict:
             raise ValueError(
                 "DraftFeatureSample input_ids/loss_mask length mismatch: "
                 f"{self.input_ids.size(0)} vs {self.loss_mask.size(0)}"
+            )
+        if torch.is_tensor(self.position_ids) and self.position_ids.size(0) != self.input_ids.size(0) and strict:
+            raise ValueError(
+                "DraftFeatureSample input_ids/position_ids length mismatch: "
+                f"{self.input_ids.size(0)} vs {self.position_ids.size(0)}"
             )
         if torch.is_tensor(self.hidden_states) and self.hidden_states.dim() == 3 and self.hidden_states.size(0) == 1:
             self.hidden_states = self.hidden_states.squeeze(0)
