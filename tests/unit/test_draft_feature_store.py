@@ -67,6 +67,40 @@ def test_feature_sample_rejects_position_id_length_mismatch():
         sample.validate(strict=True)
 
 
+def test_feature_sample_restores_online_alignment_metadata():
+    sample = DraftFeatureSample(
+        input_ids=torch.arange(127, dtype=torch.long),
+        loss_mask=torch.ones(127, dtype=torch.float32),
+        hidden_states=torch.randn(127, 12288, dtype=torch.float32),
+        target_logprobs=torch.zeros(126, 128, 2, dtype=torch.float32),
+        position_ids=torch.arange(140, 267, dtype=torch.long),
+        metadata={
+            "global_step": 1,
+            "hidden_states_layout": "eagle3_aux_plus_last",
+            "full_sequence_length": 1164,
+            "feature_start": 139,
+            "feature_end": 266,
+            "hidden_position_start": 139,
+            "hidden_position_end": 266,
+            "hidden_positions": torch.arange(139, 266, dtype=torch.long),
+            "target_logprobs_position_start": 140,
+            "target_logprobs_position_end": 266,
+        },
+    )
+
+    item = sample.to_training_item()
+
+    assert item["_verl_feature_start"] == 139
+    assert item["_verl_feature_end"] == 266
+    assert item["_verl_target_position_start"] == 140
+    assert item["_verl_target_position_end"] == 266
+    assert item["_verl_target_tensor_position_start"] == 140
+    assert item["_verl_target_tensor_position_end"] == 266
+    assert item["_verl_target_start"] == 0
+    assert item["_verl_target_end"] == 126
+    assert torch.equal(item["_verl_hidden_positions"], torch.arange(139, 266, dtype=torch.long))
+
+
 def test_draft_feature_dataloader_slices_keys_by_rank(tmp_path):
     store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=4)
     store.write_many([_sample(i) for i in range(4)])

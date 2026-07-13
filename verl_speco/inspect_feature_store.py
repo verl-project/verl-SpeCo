@@ -109,6 +109,7 @@ def _sample_issues(sample: dict[str, Any]) -> list[str]:
     loss_mask = _tensor(sample.get("loss_mask"), "loss_mask", issues)
     hidden_states = sample.get("hidden_states")
     position_ids = sample.get("position_ids")
+    target_logprobs = sample.get("target_logprobs")
 
     seq_len = None
     if input_ids is not None:
@@ -144,6 +145,21 @@ def _sample_issues(sample: dict[str, Any]) -> list[str]:
             issues.append(f"position_ids length {position_ids.numel()} does not match input_ids length {seq_len}")
         elif position_ids.dim() > 1:
             issues.append(f"position_ids is normalizable but not stored as 1D: {_shape(position_ids)}")
+    if target_logprobs is not None:
+        if not torch.is_tensor(target_logprobs):
+            issues.append(f"target_logprobs is not a tensor: {type(target_logprobs).__name__}")
+        else:
+            normalized = target_logprobs
+            while normalized.dim() > 3 and normalized.size(0) == 1:
+                normalized = normalized.squeeze(0)
+            if normalized.dim() != 3 or normalized.size(-1) < 2:
+                issues.append(f"target_logprobs should be [rows, topk, 2], got {_shape(target_logprobs)}")
+            elif target_logprobs.dim() > 3:
+                issues.append(f"target_logprobs is normalizable but not stored as 3D: {_shape(target_logprobs)}")
+            elif seq_len is not None and int(normalized.size(0)) < max(seq_len - 2, 1):
+                issues.append(
+                    f"target_logprobs rows {int(normalized.size(0))} may be too short for input_ids length {seq_len}"
+                )
 
     return issues
 

@@ -71,6 +71,9 @@ class DraftFeatureSample:
             self.loss_mask = self.loss_mask.reshape(-1)
         if torch.is_tensor(self.position_ids) and self.position_ids.dim() > 1:
             self.position_ids = self.position_ids.reshape(-1)
+        if torch.is_tensor(self.target_logprobs):
+            while self.target_logprobs.dim() > 3 and self.target_logprobs.size(0) == 1:
+                self.target_logprobs = self.target_logprobs.squeeze(0)
         if self.input_ids.size(0) != self.loss_mask.size(0) and strict:
             raise ValueError(
                 "DraftFeatureSample input_ids/loss_mask length mismatch: "
@@ -87,6 +90,11 @@ class DraftFeatureSample:
             self.last_hidden_states = self.last_hidden_states.squeeze(0)
         if self.target_logprobs is not None and not torch.is_tensor(self.target_logprobs):
             raise TypeError("DraftFeatureSample.target_logprobs must be a tensor when provided")
+        if torch.is_tensor(self.target_logprobs) and self.target_logprobs.dim() != 3 and strict:
+            raise ValueError(
+                "DraftFeatureSample.target_logprobs must have shape [rows, topk, 2], "
+                f"got {tuple(self.target_logprobs.shape)}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         self.validate(strict=False)
@@ -129,6 +137,7 @@ class DraftFeatureSample:
             item["position_ids"] = payload["position_ids"]
         for key, value in metadata.items():
             item.setdefault(key, value)
+        _populate_verl_alignment_fields(item, metadata)
         return item
 
 
@@ -142,6 +151,37 @@ class DraftFeatureStore(Protocol):
     def get_metadata(self) -> dict[str, Any]: ...
 
     def close(self) -> None: ...
+
+
+def _populate_verl_alignment_fields(item: dict[str, Any], metadata: dict[str, Any]) -> None:
+    """Restore online drafter alignment metadata for feature-store samples."""
+
+    direct_fields = {
+        "_verl_feature_start": "feature_start",
+        "_verl_feature_end": "feature_end",
+        "_verl_hidden_position_start": "hidden_position_start",
+        "_verl_hidden_position_end": "hidden_position_end",
+        "_verl_target_position_start": "target_logprobs_position_start",
+        "_verl_target_position_end": "target_logprobs_position_end",
+        "_verl_target_tensor_position_start": "target_logprobs_position_start",
+        "_verl_target_tensor_position_end": "target_logprobs_position_end",
+        "_verl_hidden_raw_target_position_start": "hidden_raw_target_logprobs_position_start",
+        "_verl_hidden_raw_target_position_end": "hidden_raw_target_logprobs_position_end",
+        "_verl_input_seq_length": "full_sequence_length",
+    }
+    for target_key, source_key in direct_fields.items():
+        if target_key not in item and source_key in metadata:
+            item[target_key] = metadata[source_key]
+
+    if "_verl_hidden_positions" not in item and "hidden_positions" in metadata:
+        item["_verl_hidden_positions"] = metadata["hidden_positions"]
+    if "_verl_uses_hidden_positions" not in item:
+        item["_verl_uses_hidden_positions"] = "hidden_positions" in metadata
+
+    if "_verl_target_start" not in item and "target_logprobs" in item:
+        item["_verl_target_start"] = 0
+    if "_verl_target_end" not in item and torch.is_tensor(item.get("target_logprobs")):
+        item["_verl_target_end"] = int(item["target_logprobs"].size(0))
 
 
 class TorchShardFeatureStore:

@@ -508,6 +508,13 @@ class SpecoWorker(Worker):
         )
         input_ids = full_input_ids[feature_start:feature_end]
         loss_mask = full_loss_mask[feature_start:feature_end]
+        target_logprobs = self._align_rollout_target_logprobs(
+            target_logprobs,
+            feature_start=feature_start,
+            train_rows=max(int(input_ids.numel()) - 1, 0),
+            target_position_start=batch.get("target_logprobs_position_start"),
+            target_position_end=batch.get("target_logprobs_position_end"),
+        )
         metadata = {
             "source": batch.get("hidden_target_logprobs_source", "rl_rollout"),
             "global_step": batch.get("global_step", self.last_global_step),
@@ -548,11 +555,44 @@ class SpecoWorker(Worker):
             input_ids=input_ids,
             loss_mask=loss_mask,
             hidden_states=hidden_states,
-            target_logprobs=target_logprobs.detach().cpu() if torch.is_tensor(target_logprobs) else None,
+            target_logprobs=target_logprobs,
             position_ids=position_ids,
             metadata=metadata,
         )
         writer.write_many([sample])
+
+    @staticmethod
+    def _align_rollout_target_logprobs(
+        target_logprobs: Optional[torch.Tensor],
+        *,
+        feature_start: int,
+        train_rows: int,
+        target_position_start,
+        target_position_end,
+    ) -> Optional[torch.Tensor]:
+        if not torch.is_tensor(target_logprobs):
+            return None
+        target = target_logprobs.detach().cpu()
+        while target.dim() > 3 and target.size(0) == 1:
+            target = target.squeeze(0)
+        if target.dim() != 3:
+            return target.contiguous()
+
+        try:
+            position_start = int(target_position_start)
+        except (TypeError, ValueError):
+            position_start = int(feature_start) + 1
+        try:
+            position_end = int(target_position_end)
+        except (TypeError, ValueError):
+            position_end = position_start + int(target.size(0))
+        position_end = min(max(position_end, position_start), position_start + int(target.size(0)))
+
+        desired_start = int(feature_start) + 1
+        desired_end = desired_start + max(int(train_rows), 0)
+        slice_start = min(max(desired_start - position_start, 0), int(target.size(0)))
+        slice_end = min(max(desired_end - position_start, slice_start), int(position_end - position_start))
+        return target[slice_start:slice_end].contiguous()
 
     @staticmethod
     def _resolve_rollout_feature_window(
