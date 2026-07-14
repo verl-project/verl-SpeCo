@@ -444,13 +444,15 @@ class SpecoWorker(Worker):
             return None
         if self.feature_writer is not None and self.feature_writer_path == path:
             return self.feature_writer
+        model_cfg = self.config.get("model", None)
+        target_model_path = _config_str(model_cfg.get("path", None)) if model_cfg is not None else ""
         self.feature_writer = TorchShardFeatureStore(
             path,
             max_samples_per_shard=int(feature_store_cfg.get("max_samples_per_shard", 1024)),
             strict_schema=bool(feature_store_cfg.get("strict_schema", True)),
             metadata={
                 "algorithm": str(self.config.rollout.drafter.speculative_algorithm).upper(),
-                "target_model_path": _config_str(getattr(self.config.model, "path", None)),
+                "target_model_path": target_model_path,
                 "drafter_model_path": _config_str(self.config.rollout.drafter.get("model_path", None)),
                 "source": "rl_collect_only",
             },
@@ -469,7 +471,8 @@ class SpecoWorker(Worker):
         if torch.is_tensor(prompts) and torch.is_tensor(responses):
             prompt_len = int(prompts.reshape(-1).numel())
             response_ids = responses.detach().cpu().reshape(-1)
-            pad_token_id = int(getattr(self.config.model, "pad_token_id", 0) or 0)
+            model_cfg = self.config.get("model", None)
+            pad_token_id = int(model_cfg.get("pad_token_id", 0) or 0) if model_cfg is not None else 0
             max_response = max(0, min(int(response_ids.numel()), int(ids.numel()) - prompt_len))
             if max_response > 0:
                 loss_mask[prompt_len : prompt_len + max_response] = (response_ids[:max_response] != pad_token_id).float()
@@ -515,10 +518,12 @@ class SpecoWorker(Worker):
             target_position_start=batch.get("target_logprobs_position_start"),
             target_position_end=batch.get("target_logprobs_position_end"),
         )
+        model_cfg = self.config.get("model", None)
+        target_model_path = _config_str(model_cfg.get("path", None)) if model_cfg is not None else ""
         metadata = {
             "source": batch.get("hidden_target_logprobs_source", "rl_rollout"),
             "global_step": batch.get("global_step", self.last_global_step),
-            "target_model_path": _config_str(getattr(self.config.model, "path", None)),
+            "target_model_path": target_model_path,
             "drafter_model_path": _config_str(self.config.rollout.drafter.get("model_path", None)),
             "hidden_states_layout": batch.get("hidden_states_layout") or (
                 "dflash_aux"

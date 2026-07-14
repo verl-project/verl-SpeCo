@@ -121,6 +121,26 @@ def test_draft_feature_dataloader_slices_keys_by_rank(tmp_path):
     assert rank1_ids == [2, 4]
 
 
+def test_draft_feature_dataloader_rejects_rank_out_of_range(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=4)
+
+    with pytest.raises(ValueError, match="Invalid rank/world_size configuration"):
+        DraftFeatureDataLoader(
+            store,
+            DraftFeatureDataLoaderConfig(batch_size=1, rank=2, world_size=2),
+        )
+
+
+def test_draft_feature_dataloader_rejects_non_positive_world_size(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=4)
+
+    with pytest.raises(ValueError, match="Invalid world_size"):
+        DraftFeatureDataLoader(
+            store,
+            DraftFeatureDataLoaderConfig(batch_size=1, rank=0, world_size=0),
+        )
+
+
 def test_flush_interval_zero_relies_on_shard_capacity(tmp_path):
     store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=4)
     store.write_many([_sample(0), _sample(1)])

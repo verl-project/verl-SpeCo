@@ -96,11 +96,12 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             successful_steps += 1
             if save_interval > 0 and successful_steps % save_interval == 0:
                 last_save_result = _save_standalone_checkpoint(trainer, successful_steps)
-                last_saved_step = successful_steps
+                if last_save_result.get("saved"):
+                    last_saved_step = successful_steps
                 _barrier()
         final_save = bool(training_cfg.get("save_final_checkpoint", True))
         if final_save and successful_steps > 0 and successful_steps != last_saved_step:
-            last_save_result = _save_standalone_checkpoint(trainer, successful_steps)
+            last_save_result = _save_standalone_checkpoint(trainer, successful_steps, wait=True)
             _barrier()
     finally:
         if store is not None:
@@ -132,7 +133,7 @@ def _build_backend(draft_config):
     raise ValueError(f"Unsupported drafter algorithm {algo!r}; expected EAGLE3, DFLASH or DSPARK")
 
 
-def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int) -> dict[str, Any]:
+def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int, *, wait: bool = False) -> dict[str, Any]:
     if not trainer.checkpoint_dir:
         return {"saved": False, "reason": "missing_checkpoint_dir"}
 
@@ -147,14 +148,14 @@ def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int) -> dict[
         }
 
     future = trainer._save_checkpoint_async(int(step))
-    if future is not None:
+    if future is not None and wait:
         future.result()
         trainer._pending_full_checkpoint_future = None
 
     return {
         "saved": future is not None,
         "path": checkpoint_path,
-        "reason": "saved" if future is not None else "not_checkpoint_leader",
+        "reason": "saved" if future is not None and wait else "scheduled" if future is not None else "not_checkpoint_leader",
     }
 
 

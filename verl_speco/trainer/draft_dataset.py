@@ -29,6 +29,14 @@ class DraftFeatureDataLoader:
     def __init__(self, store: DraftFeatureStore, config: DraftFeatureDataLoaderConfig):
         self.store = store
         self.config = config
+        rank = int(config.rank)
+        world_size = int(config.world_size)
+        if world_size <= 0:
+            raise ValueError(f"Invalid world_size: {world_size}")
+        if not (0 <= rank < world_size):
+            raise ValueError(
+                f"Invalid rank/world_size configuration: rank={rank}, world_size={world_size}"
+            )
 
     def __iter__(self) -> Iterator[list[DraftFeatureSample]]:
         epoch = 0
@@ -41,7 +49,7 @@ class DraftFeatureDataLoader:
             )
             if not keys:
                 return
-            rank_keys = keys[int(self.config.rank) :: max(int(self.config.world_size), 1)]
+            rank_keys = keys[int(self.config.rank) :: int(self.config.world_size)]
             batch: list[DraftFeatureSample] = []
             for key in rank_keys:
                 batch.append(self.store.read(key))
