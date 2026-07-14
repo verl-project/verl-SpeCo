@@ -158,6 +158,39 @@ actor_rollout_ref.rollout.drafter.model_path=/path/to/drafter
 actor_rollout_ref.rollout.drafter.speculative_algorithm=EAGLE3
 ```
 
+## Separate Draft Model Training
+
+verl-SpeCo also supports a separate draft model training workflow. In this
+mode, rollout workers collect drafter training features into a feature store,
+and the draft model can be trained separately after feature collection.
+
+Quickstart:
+
+```bash
+bash examples/run_qwen3-8b_drafter_separate_training.sh
+```
+
+Replace the model, drafter, dataset, feature-store, and checkpoint paths in
+the script before running it. The script uses `collect_only` mode for rollout
+feature collection and `offline` mode for standalone drafter training.
+
+The main mode values are:
+
+| Mode | Meaning |
+| --- | --- |
+| `online` | Default. Collects rollout features, trains the drafter inside the online PPO/Ray workflow, and can publish updated drafter weights back to the rollout engine. |
+| `collect_only` | Collects rollout features into `feature_store.path` without running drafter training in the PPO/Ray workflow. |
+| `offline` | Reads collected features from `feature_store.path` and trains the drafter with the standalone multi-GPU workflow. |
+
+Collected feature stores can be inspected before offline training:
+
+```bash
+python -m verl_speco.inspect_feature_store /path/to/features \
+  --max-samples 200 \
+  --show-ok \
+  --strict-exit
+```
+
 ## Configuration
 
 SPECO-specific options live under:
