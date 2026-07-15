@@ -32,18 +32,25 @@ from verl_speco.models.peagle.peagle_mask import create_peagle_mask_mod
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
-_flex_attention_compiled = torch.compile(flex_attention, mode="max-autotune-no-cudagraphs", dynamic=True)
+# flex_attention is run eagerly for correctness: the COD block mask captures
+# per-element index tensors, and compiling the attention (max-autotune, dynamic)
+# has an unstable backward on that mask (illegal memory access). Eager
+# flex_attention is correct; opt-in compilation can be added later once the
+# compiled backward is verified. ``VERL_PEAGLE_COMPILE_FLEX=1`` enables it.
+_flex_attention_compiled = None
 
 
-def _flex_supported(q: torch.Tensor) -> bool:
-    # Inductor's flex lowering needs CUDA and head_dim >= 16; eager fallback keeps
-    # CPU / small-head unit tests runnable.
-    return q.is_cuda and q.shape[-1] >= 16
+def _get_flex(q: torch.Tensor):
+    global _flex_attention_compiled
+    if os.getenv("VERL_PEAGLE_COMPILE_FLEX", "0") == "1" and q.is_cuda and q.shape[-1] >= 16:
+        if _flex_attention_compiled is None:
+            _flex_attention_compiled = torch.compile(flex_attention, mode="max-autotune-no-cudagraphs", dynamic=True)
+        return _flex_attention_compiled
+    return flex_attention
 
 
 def _run_flex_attention(q, k, v, *, block_mask, scale):
-    flex = _flex_attention_compiled if _flex_supported(q) else flex_attention
-    return flex(q, k, v, block_mask=block_mask, scale=scale)
+    return _get_flex(q)(q, k, v, block_mask=block_mask, scale=scale)
 
 
 class PeagleAttention(nn.Module):
