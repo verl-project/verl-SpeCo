@@ -187,7 +187,8 @@ class Eagle1TrainerBackend(Eagle3TrainerBackend):
         token_per_token = torch.where(valid_mask, per_token_ploss, torch.zeros_like(per_token_ploss))
         total_local_ploss = token_per_token.sum()
 
-        if num_tokens.detach().item() > 0:
+        # Gate on DEBUG so the .item() host-device syncs are skipped at INFO+.
+        if logger.isEnabledFor(logging.DEBUG) and num_tokens.detach().item() > 0:
             with torch.no_grad():
                 draft_top1 = predicted_logits.argmax(dim=-1)
                 target_top1 = target_probs.argmax(dim=-1)

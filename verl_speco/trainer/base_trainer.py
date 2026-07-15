@@ -481,7 +481,7 @@ class DrafterBaseTrainer:
                     "[Rank %s] Disable Ulysses SP for %s drafter training: "
                     "rollout_tp=%s training_group_world_size=%s",
                     self.rank,
-                    self.backend.model_type,
+                    self.config.rollout.drafter.get("speculative_algorithm", self.backend.model_type),
                     rollout_tp_size,
                     self.training_group_world_size,
                 )
