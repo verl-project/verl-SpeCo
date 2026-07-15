@@ -199,3 +199,28 @@ def test_disabled_or_untrained_drafter_does_not_publish() -> None:
         "drafter/publish_attempted": 0,
         "drafter/published": 0,
     }
+
+
+def test_drafter_checkpoint_results_require_a_successful_training_replica() -> None:
+    SpecoRayPPOTrainer._speco_validate_drafter_checkpoint_results(
+        [
+            {"saved": True, "reason": "saved"},
+            {"saved": False, "reason": "not_checkpoint_replica"},
+            {"saved": False, "reason": "not_in_training_group"},
+        ],
+        require_saved=True,
+    )
+
+    with pytest.raises(RuntimeError, match="produced no saved state"):
+        SpecoRayPPOTrainer._speco_validate_drafter_checkpoint_results(
+            [{"saved": False, "reason": "not_checkpoint_replica"}],
+            require_saved=True,
+        )
+
+
+def test_drafter_checkpoint_results_propagate_save_failure() -> None:
+    with pytest.raises(RuntimeError, match="missing_checkpoint_dir"):
+        SpecoRayPPOTrainer._speco_validate_drafter_checkpoint_results(
+            [{"saved": False, "reason": "missing_checkpoint_dir"}],
+            require_saved=True,
+        )

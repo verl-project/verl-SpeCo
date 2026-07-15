@@ -10,6 +10,21 @@ from verl.utils.torch_functional import (
 )
 
 
+_RESUME_OPTIMIZER_STEPS_KEY = "_resume_optimizer_steps"
+
+
+def _scheduler_last_epoch(optimizer: Optimizer, train_cfg: Any) -> int:
+    optimizer_steps = int(train_cfg.get(_RESUME_OPTIMIZER_STEPS_KEY, 0) or 0)
+    if optimizer_steps <= 0:
+        return -1
+
+    # LRScheduler performs one initial step in __init__. Passing step - 1
+    # initializes the newly-created optimizer at the LR for completed `step`.
+    for param_group in optimizer.param_groups:
+        param_group.setdefault("initial_lr", param_group["lr"])
+    return optimizer_steps - 1
+
+
 class ClampedGlobalCosineLR(LRScheduler):
     """Cosine decay over global successful optimizer steps with a fixed floor."""
 
@@ -63,11 +78,13 @@ def build_drafter_lr_scheduler(optimizer: Optimizer, train_cfg: Any) -> LRSchedu
     default_warmup_steps = 0 if configured_scheduler_type is not None else 1000
     configured_warmup_steps = train_cfg.get("lr_warmup_steps", default_warmup_steps)
     warmup_steps = int(default_warmup_steps if configured_warmup_steps is None else configured_warmup_steps)
+    last_epoch = _scheduler_last_epoch(optimizer, train_cfg)
 
     if scheduler_type == "constant":
         return get_constant_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=warmup_steps,
+            last_epoch=last_epoch,
         )
     if scheduler_type == "cosine":
         min_lr_ratio = train_cfg.get("min_lr_ratio", 0.0)
@@ -78,6 +95,7 @@ def build_drafter_lr_scheduler(optimizer: Optimizer, train_cfg: Any) -> LRSchedu
             num_training_steps=int(train_cfg.get("step", 0) or 0),
             min_lr_ratio=float(min_lr_ratio or 0.0),
             num_cycles=float(0.5 if num_cycles is None else num_cycles),
+            last_epoch=last_epoch,
         )
     if scheduler_type in {"global_cosine", "clamped_global_cosine"}:
         decay_steps = train_cfg.get("lr_decay_steps", 100)
@@ -87,5 +105,6 @@ def build_drafter_lr_scheduler(optimizer: Optimizer, train_cfg: Any) -> LRSchedu
             decay_steps=int(100 if decay_steps is None else decay_steps),
             min_lr_ratio=float(0.1 if min_lr_ratio is None else min_lr_ratio),
             warmup_steps=warmup_steps,
+            last_epoch=last_epoch,
         )
     raise NotImplementedError(f"LR scheduler type {scheduler_type!r} is not supported")

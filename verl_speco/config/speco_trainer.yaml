@@ -90,6 +90,7 @@ actor_rollout_ref:
         lr_decay_steps: 100
         min_lr_ratio: 0.1
         warmup_style: null
+        resume_trainer_state_from_checkpoint: true
         use_logits: false
         target_lm_head_row_restricted_sync: true
         logits_topk: 128

@@ -123,6 +123,35 @@ def alignment_debug_rank_selected(rank: int | None) -> bool:
     return False
 
 
+class _DrafterOptimizerState:
+    """DCP Stateful adapter for FSDP1/FSDP2 optimizer state dicts."""
+
+    def __init__(self, model, optimizer):
+        self.model = model
+        self.optimizer = optimizer
+
+    @staticmethod
+    def _options():
+        from torch.distributed.checkpoint.state_dict import StateDictOptions
+
+        return StateDictOptions(full_state_dict=False, cpu_offload=True)
+
+    def state_dict(self):
+        from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+        return get_optimizer_state_dict(self.model, self.optimizer, options=self._options())
+
+    def load_state_dict(self, state_dict):
+        from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
+
+        set_optimizer_state_dict(
+            self.model,
+            self.optimizer,
+            state_dict,
+            options=self._options(),
+        )
+
+
 def should_log_alignment(
     step: int | None,
     rank: int | None,
@@ -768,12 +797,84 @@ class DrafterBaseTrainer:
         drafter_train_config = self._prepare_training_config(self.config.rollout)
         setattr(self.backend, "train_config", drafter_train_config)
 
+        resume_metadata = {}
+        resume_state = {}
+        resume_setting = drafter_train_config.get("resume_trainer_state_from_checkpoint", None)
+        if resume_setting is None:
+            resume_setting = drafter_train_config.get("resume_lr_scheduler_from_checkpoint", True)
+        resume_enabled = bool(resume_setting)
+        spec_model_path = self.config.rollout.drafter.get("model_path")
+        if resume_enabled:
+            from verl_speco.trainer.checkpoint import (
+                get_drafter_checkpoint_step,
+                get_drafter_checkpoint_metadata,
+                get_drafter_trainer_state,
+            )
+
+            resume_metadata = get_drafter_checkpoint_metadata(spec_model_path)
+            resume_state = get_drafter_trainer_state(spec_model_path)
+            if not resume_state and get_drafter_checkpoint_step(spec_model_path) is not None:
+                logger.warning(
+                    "[drafter resume] checkpoint=%s has no trainer_state; optimizer and LR scheduler start fresh",
+                    spec_model_path,
+                )
+
+        resume_optimizer_steps = max(int(resume_state.get("optimizer_steps_total", 0) or 0), 0)
+        resume_training_steps = max(int(resume_state.get("training_steps", resume_optimizer_steps) or 0), 0)
+        with open_dict(drafter_train_config):
+            drafter_train_config["_resume_optimizer_steps"] = resume_optimizer_steps
+
         self.optimizer = self.backend.setup_optimizer(self.model, drafter_train_config)
+        restored_trainer_state = None
+        restored_optimizer_lrs = None
+        if resume_enabled and resume_metadata.get("optimizer") is not None:
+            restored_trainer_state = self._load_optimizer_checkpoint(spec_model_path, resume_metadata)
+            restored_optimizer_lrs = [float(param_group["lr"]) for param_group in self.optimizer.param_groups]
         self.lr_scheduler = self.backend.setup_scheduler(self.optimizer, drafter_train_config)
+        if restored_trainer_state is not None:
+            scheduler_state = restored_trainer_state.get("lr_scheduler")
+            if self.lr_scheduler is not None and isinstance(scheduler_state, dict):
+                self.lr_scheduler.load_state_dict(scheduler_state)
+                restored_optimizer_lrs = [float(lr) for lr in self.lr_scheduler.get_last_lr()]
+            if restored_optimizer_lrs is not None:
+                if len(restored_optimizer_lrs) != len(self.optimizer.param_groups):
+                    raise RuntimeError(
+                        "Drafter optimizer checkpoint parameter-group count does not match the current optimizer"
+                    )
+                for param_group, restored_lr in zip(
+                    self.optimizer.param_groups,
+                    restored_optimizer_lrs,
+                    strict=True,
+                ):
+                    param_group["lr"] = restored_lr
+            for key, expected in (
+                ("optimizer_steps_total", resume_optimizer_steps),
+                ("training_steps", resume_training_steps),
+            ):
+                restored_value = int(restored_trainer_state.get(key, expected) or 0)
+                if restored_value != expected:
+                    raise RuntimeError(
+                        f"Drafter checkpoint trainer state mismatch for {key}: "
+                        f"metadata={expected} optimizer_checkpoint={restored_value}"
+                    )
+        self.optimizer_steps_total = resume_optimizer_steps
+        self.training_steps = resume_training_steps
         self.drafter_train_config = drafter_train_config
         self.model_config = drafter_model_config
         self.pad_token_id = int(getattr(drafter_model_config, "pad_token_id", self.pad_token_id) or self.pad_token_id)
         self._apply_pending_target_lm_head_weight()
+        if resume_optimizer_steps > 0 or restored_trainer_state is not None:
+            current_lr = float(self.optimizer.param_groups[0]["lr"])
+            logger.info(
+                "[drafter resume] checkpoint=%s optimizer_steps_total=%s training_steps=%s "
+                "scheduler_last_epoch=%s lr=%.3e optimizer_state=%s",
+                spec_model_path,
+                self.optimizer_steps_total,
+                self.training_steps,
+                getattr(self.lr_scheduler, "last_epoch", None),
+                current_lr,
+                "restored" if restored_trainer_state is not None else "fresh",
+            )
         
     def _prepare_training_config(self, rollout_config):
         """
@@ -943,7 +1044,162 @@ class DrafterBaseTrainer:
                 except OSError as exc:
                     logger.warning("Failed to remove stale drafter checkpoint file %s: %s", path, exc)
 
-    def _save_pretrained_checkpoint_async(self, checkpoint_path: str, step: int):
+    @staticmethod
+    def _atomic_torch_save(payload: Any, output_path: str) -> None:
+        temporary_path = f"{output_path}.tmp-{os.getpid()}"
+        try:
+            torch.save(payload, temporary_path)
+            os.replace(temporary_path, output_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+
+    @staticmethod
+    def _atomic_json_dump(payload: dict[str, Any], output_path: str) -> None:
+        temporary_path = f"{output_path}.tmp-{os.getpid()}"
+        try:
+            with open(temporary_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_path, output_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+
+    def _checkpoint_process_group(self):
+        if not dist.is_initialized():
+            return None
+        group = self._get_sp_group()
+        if group is None:
+            raise RuntimeError("Drafter checkpoint requires an explicit SP process group")
+        return group
+
+    def _sync_checkpoint_phase_error(self, error: Optional[BaseException], phase: str) -> None:
+        group = self._checkpoint_process_group()
+        if group is None:
+            if error is not None:
+                raise RuntimeError(f"Drafter checkpoint {phase} failed: {error}") from error
+            return
+
+        failure = torch.tensor([1 if error is not None else 0], dtype=torch.int32, device=self.runtime_device)
+        dist.all_reduce(failure, op=dist.ReduceOp.MAX, group=group)
+        if int(failure.item()) != 0:
+            if error is not None:
+                raise RuntimeError(f"Drafter checkpoint {phase} failed: {error}") from error
+            raise RuntimeError(f"Drafter checkpoint {phase} failed on another SP rank")
+
+    def _save_optimizer_checkpoint(self, checkpoint_path: str) -> dict[str, Any]:
+        if self.optimizer is None:
+            raise RuntimeError("Cannot save drafter optimizer before it is initialized")
+
+        optimizer_path = os.path.join(checkpoint_path, "optimizer")
+        temporary_path = os.path.join(checkpoint_path, "optimizer.incomplete")
+        metadata_path = os.path.join(checkpoint_path, "metadata.json")
+        trainer_state_file = "trainer_state.pt"
+        is_leader = self._is_checkpoint_leader()
+
+        prepare_error = None
+        if is_leader:
+            try:
+                os.makedirs(checkpoint_path, exist_ok=True)
+                if os.path.exists(metadata_path):
+                    os.remove(metadata_path)
+                shutil.rmtree(temporary_path, ignore_errors=True)
+                shutil.rmtree(optimizer_path, ignore_errors=True)
+            except Exception as exc:  # noqa: BLE001
+                prepare_error = exc
+        self._sync_checkpoint_phase_error(prepare_error, "prepare")
+
+        save_error = None
+        try:
+            import torch.distributed.checkpoint as dcp
+
+            dcp.save(
+                {"optimizer": _DrafterOptimizerState(self.model, self.optimizer)},
+                checkpoint_id=temporary_path,
+                process_group=self._checkpoint_process_group(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            save_error = exc
+        self._sync_checkpoint_phase_error(save_error, "optimizer save")
+
+        finalize_error = None
+        if is_leader:
+            try:
+                self._atomic_torch_save(
+                    {
+                        "version": 1,
+                        "optimizer_steps_total": int(self.optimizer_steps_total),
+                        "training_steps": int(self.training_steps),
+                        "lr_scheduler": self.lr_scheduler.state_dict() if self.lr_scheduler is not None else None,
+                    },
+                    os.path.join(temporary_path, trainer_state_file),
+                )
+                os.replace(temporary_path, optimizer_path)
+            except Exception as exc:  # noqa: BLE001
+                finalize_error = exc
+        self._sync_checkpoint_phase_error(finalize_error, "optimizer finalize")
+
+        manifest = {
+            "format": "torch_distributed_checkpoint",
+            "path": "optimizer",
+            "trainer_state_file": trainer_state_file,
+            "save_sp_world_size": int(self._get_sp_world_size()),
+            "save_dp_world_size": int(self._get_dp_world_size()),
+        }
+        if is_leader:
+            try:
+                total_bytes = sum(
+                    os.path.getsize(os.path.join(root, filename))
+                    for root, _, filenames in os.walk(optimizer_path)
+                    for filename in filenames
+                )
+                logger.info(
+                    "[drafter checkpoint] optimizer saved path=%s size_gib=%.2f sp=%s dp=%s",
+                    optimizer_path,
+                    total_bytes / (1024**3),
+                    self._get_sp_world_size(),
+                    self._get_dp_world_size(),
+                )
+            except OSError as exc:
+                logger.warning("Unable to measure drafter optimizer checkpoint size at %s: %s", optimizer_path, exc)
+        return manifest
+
+    def _load_optimizer_checkpoint(self, checkpoint_path: str, metadata: dict[str, Any]) -> dict[str, Any]:
+        from verl_speco.trainer.checkpoint import get_drafter_optimizer_checkpoint_path
+
+        optimizer_path = get_drafter_optimizer_checkpoint_path(checkpoint_path)
+        if optimizer_path is None:
+            raise RuntimeError(f"Drafter checkpoint metadata declares no optimizer state: {checkpoint_path}")
+
+        try:
+            import torch.distributed.checkpoint as dcp
+
+            dcp.load(
+                {"optimizer": _DrafterOptimizerState(self.model, self.optimizer)},
+                checkpoint_id=optimizer_path,
+                process_group=self._checkpoint_process_group(),
+            )
+            trainer_state_file = metadata["optimizer"]["trainer_state_file"]
+            trainer_state_path = os.path.join(optimizer_path, trainer_state_file)
+            try:
+                trainer_state = torch.load(trainer_state_path, map_location="cpu", weights_only=False)
+            except TypeError:
+                trainer_state = torch.load(trainer_state_path, map_location="cpu")
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Failed to restore drafter optimizer checkpoint from {optimizer_path}: {exc}") from exc
+
+        if not isinstance(trainer_state, dict) or int(trainer_state.get("version", 0) or 0) != 1:
+            raise RuntimeError(f"Invalid drafter trainer state in {trainer_state_path}")
+        return trainer_state
+
+    def _save_pretrained_checkpoint_async(
+        self,
+        checkpoint_path: str,
+        step: int,
+        optimizer_manifest: dict[str, Any],
+    ):
         if self._pending_full_checkpoint_future is not None:
             if not self._pending_full_checkpoint_future.done():
                 logger.warning(
@@ -955,7 +1211,7 @@ class DrafterBaseTrainer:
             try:
                 self._pending_full_checkpoint_future.result()
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Previous full drafter checkpoint save failed: %s", exc)
+                raise RuntimeError("Previous full drafter checkpoint save failed") from exc
             self._pending_full_checkpoint_future = None
 
         export_model, _ = self._get_pretrained_export_model()
@@ -967,22 +1223,36 @@ class DrafterBaseTrainer:
 
         save_kwargs = self._infer_pretrained_save_kwargs()
         metadata_path = os.path.join(checkpoint_path, "metadata.json")
+        trainer_state = {
+            "version": 2,
+            "optimizer_steps_total": int(self.optimizer_steps_total),
+            "training_steps": int(self.training_steps),
+            "lr_scheduler_last_epoch": (
+                int(self.lr_scheduler.last_epoch) if self.lr_scheduler is not None else None
+            ),
+            "current_lr": (
+                float(self.optimizer.param_groups[0]["lr"])
+                if self.optimizer is not None and self.optimizer.param_groups
+                else None
+            ),
+        }
 
         def _write_full_checkpoint():
             os.makedirs(checkpoint_path, exist_ok=True)
             self._clear_existing_pretrained_weight_files(checkpoint_path)
             export_model.save_pretrained(checkpoint_path, state_dict=model_state_dict, **save_kwargs)
-            with open(metadata_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "step": step,
-                        "format": "pretrained_drafter_checkpoint",
-                        "serialization": "pytorch",
-                    },
-                    f,
-                    indent=2,
-                )
             self._copy_drafter_auxiliary_files(checkpoint_path)
+            self._atomic_json_dump(
+                {
+                    "step": step,
+                    "format": "pretrained_drafter_checkpoint",
+                    "serialization": "pytorch",
+                    "complete": True,
+                    "trainer_state": trainer_state,
+                    "optimizer": optimizer_manifest,
+                },
+                metadata_path,
+            )
 
         if self._full_checkpoint_executor is None:
             self._full_checkpoint_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="drafter-full-ckpt")
@@ -992,7 +1262,12 @@ class DrafterBaseTrainer:
         return future
 
     
-    def _save_checkpoint_async(self, step: int, is_final: bool = False):
+    def _save_checkpoint_async(
+        self,
+        step: int,
+        optimizer_manifest: dict[str, Any],
+        is_final: bool = False,
+    ):
         """Asynchronously save a directly loadable drafter checkpoint.
 
         Args:
@@ -1006,7 +1281,7 @@ class DrafterBaseTrainer:
             return None
 
         checkpoint_path = os.path.join(self.checkpoint_dir, f"draft_step_{step}")
-        return self._save_pretrained_checkpoint_async(checkpoint_path, step)
+        return self._save_pretrained_checkpoint_async(checkpoint_path, step, optimizer_manifest)
 
     def save_checkpoint(self, step: int, wait: bool = True) -> dict[str, Any]:
         if not self.checkpoint_dir:
@@ -1017,16 +1292,18 @@ class DrafterBaseTrainer:
             return {
                 "saved": False,
                 "path": checkpoint_path,
-                "reason": "not_checkpoint_leader",
+                "reason": "not_checkpoint_replica",
             }
         pending_full_checkpoint = getattr(self, "_pending_full_checkpoint_future", None)
-        pending_done = getattr(pending_full_checkpoint, "done", None)
-        if callable(pending_done) and not pending_done():
-            return {
-                "saved": False,
-                "path": checkpoint_path,
-                "reason": "previous_save_running",
-            }
+        previous_error = None
+        if self._is_checkpoint_leader() and pending_full_checkpoint is not None:
+            try:
+                pending_full_checkpoint.result()
+            except Exception as exc:  # noqa: BLE001
+                previous_error = exc
+            finally:
+                self._pending_full_checkpoint_future = None
+        self._sync_checkpoint_phase_error(previous_error, "previous save wait")
 
         if self.model is None:
             self._build_draft_model()
@@ -1038,8 +1315,10 @@ class DrafterBaseTrainer:
             load_fsdp_model_to_gpu(self.model)
 
         future = None
+        optimizer_manifest = None
         try:
-            future = self._save_checkpoint_async(int(step))
+            optimizer_manifest = self._save_optimizer_checkpoint(checkpoint_path)
+            future = self._save_checkpoint_async(int(step), optimizer_manifest)
             if wait and future is not None:
                 future.result()
                 self._pending_full_checkpoint_future = None
@@ -1048,13 +1327,13 @@ class DrafterBaseTrainer:
                 offload_fsdp_model_to_cpu(self.model)
 
         if future is None:
-            reason = "not_checkpoint_leader"
+            reason = "optimizer_shard_saved"
         elif wait:
             reason = "saved"
         else:
             reason = "scheduled"
         return {
-            "saved": future is not None,
+            "saved": optimizer_manifest is not None,
             "path": checkpoint_path,
             "reason": reason,
         }

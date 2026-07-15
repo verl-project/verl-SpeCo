@@ -33,6 +33,7 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.training.lr_decay_steps == 100
     assert drafter.training.min_lr_ratio == pytest.approx(0.1)
     assert drafter.training.warmup_style is None
+    assert drafter.training.resume_trainer_state_from_checkpoint is True
 
 
 def test_overlay_composes_with_pinned_upstream_verl(tmp_path: Path) -> None:
