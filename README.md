@@ -121,6 +121,69 @@ cd /path/to/verl-SpeCo
 export PYTHONPATH="$PWD:$PYTHONPATH"
 ```
 
+### Docker Images
+
+You can also build GPU runtime images from the official `verlai/verl`
+development images and then pin the importable upstream `verl` checkout to the
+required v0.8.0 commit. The Dockerfiles below target GPU deployments; use the
+matching accelerator image for NPU or other accelerator runtimes.
+
+For GPU vLLM-based examples, use this Dockerfile:
+
+```dockerfile
+# GPU vLLM runtime image.
+FROM verlai/verl:vllm023.dev1
+
+ARG VERL_COMMIT=7aed6b230776f963fa09509c10d9c3a767d1102c
+ARG VERL_REPO=https://github.com/verl-project/verl.git
+
+WORKDIR /workspace
+
+RUN git clone ${VERL_REPO} /workspace/verl \
+    && cd /workspace/verl \
+    && git checkout ${VERL_COMMIT} \
+    && pip install -e .
+
+COPY . /workspace/verl-SpeCo
+
+ENV PYTHONPATH=/workspace/verl-SpeCo:${PYTHONPATH}
+WORKDIR /workspace/verl-SpeCo
+```
+
+Build it from the `verl-SpeCo` repository root:
+
+```bash
+docker build -f Dockerfile.vllm -t verl-speco:vllm023-verl080 .
+```
+
+For GPU SGLang-based examples, use the same layout with the SGLang base image:
+
+```dockerfile
+# GPU SGLang runtime image.
+FROM verlai/verl:sgl0512.dev1
+
+ARG VERL_COMMIT=7aed6b230776f963fa09509c10d9c3a767d1102c
+ARG VERL_REPO=https://github.com/verl-project/verl.git
+
+WORKDIR /workspace
+
+RUN git clone ${VERL_REPO} /workspace/verl \
+    && cd /workspace/verl \
+    && git checkout ${VERL_COMMIT} \
+    && pip install -e .
+
+COPY . /workspace/verl-SpeCo
+
+ENV PYTHONPATH=/workspace/verl-SpeCo:${PYTHONPATH}
+WORKDIR /workspace/verl-SpeCo
+```
+
+Build it from the `verl-SpeCo` repository root:
+
+```bash
+docker build -f Dockerfile.sglang -t verl-speco:sgl0512-verl080 .
+```
+
 Install the rollout engine and accelerator runtime that match the script you
 intend to run, for example vLLM on GPU, SGLang on GPU, or vLLM-Ascend on NPU.
 Those runtime packages are intentionally not pinned by this repository.
@@ -156,6 +219,39 @@ actor_rollout_ref.rollout.drafter.enable=True
 actor_rollout_ref.rollout.drafter.enable_drafter_training=True
 actor_rollout_ref.rollout.drafter.model_path=/path/to/drafter
 actor_rollout_ref.rollout.drafter.speculative_algorithm=EAGLE3
+```
+
+## Separate Draft Model Training
+
+verl-SpeCo also supports a separate draft model training workflow. In this
+mode, rollout workers collect drafter training features into a feature store,
+and the draft model can be trained separately after feature collection.
+
+Quickstart:
+
+```bash
+bash examples/run_qwen3-8b_drafter_separate_training.sh
+```
+
+Replace the model, drafter, dataset, feature-store, and checkpoint paths in
+the script before running it. The script uses `collect_only` mode for rollout
+feature collection and `offline` mode for standalone drafter training.
+
+The main mode values are:
+
+| Mode | Meaning |
+| --- | --- |
+| `online` | Default. Collects rollout features, trains the drafter inside the online PPO/Ray workflow, and can publish updated drafter weights back to the rollout engine. |
+| `collect_only` | Collects rollout features into `feature_store.path` without running drafter training in the PPO/Ray workflow. |
+| `offline` | Reads collected features from `feature_store.path` and trains the drafter with the standalone multi-GPU workflow. |
+
+Collected feature stores can be inspected before offline training:
+
+```bash
+python -m verl_speco.inspect_feature_store /path/to/features \
+  --max-samples 200 \
+  --show-ok \
+  --strict-exit
 ```
 
 ## Configuration
