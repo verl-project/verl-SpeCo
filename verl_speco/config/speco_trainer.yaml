@@ -55,6 +55,11 @@ actor_rollout_ref:
       training:
         collect_hidden_states_from_sgl: false
         collect_hidden_states_from_old_logprob: false
+        # SGLang aux/context capture skips the target's final norm, so a target_layer_id
+        # equal to the last layer (or -1) diverges from the offline / old-logprob (post-norm
+        # / embedding) semantics. SPECO fails closed on that combination; set true only for a
+        # self-consistent SGLang-only train+serve setup (pre-norm on both sides).
+        allow_sglang_prenorm_last_layer: false
         old_logprob_hidden_capture_impl: forward_hook
         use_data_buffer: false
         collect_interval_steps: 5

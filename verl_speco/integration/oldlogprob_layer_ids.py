@@ -149,6 +149,41 @@ def _default_eagle3_aux_layer_ids(num_hidden_layers: int) -> list[int]:
     return [2, num_hidden_layers // 2, num_hidden_layers - 3]
 
 
+def assert_sglang_aux_last_layer_norm_safe(
+    layer_ids: Any,
+    num_hidden_layers: int | None,
+    *,
+    collect_from_sgl: bool,
+    allow_prenorm_last: bool,
+) -> None:
+    """Fail closed when SGLang aux collection would capture the last layer pre-norm.
+
+    SGLang's aux/context capture never applies the target's final norm, so a
+    ``target_layer_id`` equal to the last layer (``num_hidden_layers - 1``) or the
+    embedding id ``-1`` is captured with different semantics than the offline /
+    old-logprob paths (post-norm for the last layer, embedding for ``-1``). Training
+    a drafter offline (or via old-logprob) and then collecting/serving via SGLang
+    would then feed the ``fc`` an inconsistent feature for that slot. This refuses
+    the combination unless the user opts in (e.g. a self-consistent SGLang-only
+    train+serve setup, where pre-norm on both sides is fine).
+    """
+    if not collect_from_sgl or allow_prenorm_last or not layer_ids or num_hidden_layers is None:
+        return
+    last = int(num_hidden_layers) - 1
+    offenders = sorted({int(lid) for lid in layer_ids if int(lid) == last or int(lid) == -1})
+    if offenders:
+        raise ValueError(
+            "SGLang hidden-state collection (collect_hidden_states_from_sgl=true) captures aux/context "
+            f"features WITHOUT the target's final norm, but the resolved target_layer_ids {list(layer_ids)} "
+            f"include layer(s) {offenders} whose semantics differ from the offline / old-logprob paths "
+            f"(the last layer {last} is post-norm there, and -1 is the embedding). A drafter trained "
+            "off-policy of this convention would see a mismatched feature for that slot. Either set "
+            "collect_hidden_states_from_old_logprob=true, drop the last layer / -1 from target_layer_ids, "
+            "or set actor_rollout_ref.rollout.drafter.training.allow_sglang_prenorm_last_layer=true if you "
+            "train and serve entirely on SGLang (self-consistent pre-norm)."
+        )
+
+
 def resolve_oldlogprob_aux_layer_ids(
     drafter_cfg: Any,
     *,
