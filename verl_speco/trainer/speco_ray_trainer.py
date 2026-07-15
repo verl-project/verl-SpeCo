@@ -529,6 +529,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_should_save_drafter_checkpoint(self) -> bool:
         if not self.is_drafter_training_enabled(self.config):
             return False
+        if self._speco_drafter_training_mode() == "collect_only":
+            return False
         if self.drafter_wg is None:
             return False
         if not self._speco_drafter_checkpoint_save_config_enabled():
@@ -564,10 +566,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         training_cfg = self._speco_drafter_training_config()
         return speco_step_matches_interval(self.global_steps, training_cfg.get("training_interval_steps", 1))
 
+    def _speco_drafter_training_mode(self) -> str:
+        training_cfg = self._speco_drafter_training_config()
+        return str(training_cfg.get("mode", "online") or "online").strip().lower()
+
     def _speco_has_collected_drafter_samples_this_step(self) -> bool:
         return int(getattr(self, "_speco_last_collected_samples", 0) or 0) > 0
 
     def _speco_should_attempt_drafter_train_this_step(self) -> bool:
+        if self._speco_drafter_training_mode() == "collect_only":
+            return False
         if not self._speco_should_train_drafter_this_step():
             return False
         if self._speco_has_collected_drafter_samples_this_step():

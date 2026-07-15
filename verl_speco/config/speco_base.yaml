@@ -1,0 +1,153 @@
+# Shared SPECO configuration without Hydra primary-config metadata.
+
+speco:
+  enable: true
+
+  verl_base:
+    version: "0.8.0"
+    commit: "7aed6b230776f963fa09509c10d9c3a767d1102c"
+    source_modifications_allowed: false
+
+  compatibility:
+    policy: warn
+    strict_env: VERL_SPECO_STRICT_VERL
+    require_verl_base_tag: v0.8.0
+    require_verl_base_commit: 7aed6b230776f963fa09509c10d9c3a767d1102c
+
+  trainer:
+    task_runner: verl_speco.integration.task_runner.SpecoTaskRunner
+    ray_trainer: verl_speco.trainer.speco_ray_trainer.SpecoRayPPOTrainer
+
+actor_rollout_ref:
+  rollout:
+    drafter:
+      enable: false
+      enable_drafter_training: false
+      speculative_algorithm: EAGLE3
+      model_path: /path/to/drafter/model
+      checkpoint_path: null
+      world_size: 16
+
+      rollout:
+        spec_steps: 3
+        spec_topk: 1
+        spec_verify_tokens: 3
+        cuda_graph_max_bs: null
+
+      vllm:
+        draft_tensor_parallel_size: null
+        max_model_len: null
+        enforce_eager: null
+        speculative_config_overrides: {}
+
+      training:
+        mode: online
+        collect_hidden_states_from_sgl: false
+        collect_hidden_states_from_old_logprob: false
+        old_logprob_hidden_capture_impl: forward_hook
+        use_data_buffer: false
+        collect_interval_steps: 5
+        collection_sample_rate: 1.0
+        max_collect_samples_per_step_per_replica: 16
+        max_collect_tokens_per_step_per_replica: 2048
+        hidden_state_window_mode: front
+        hidden_state_window_tokens_per_sample: 128
+        hidden_state_window_min_rows: 512
+        hidden_state_random_max_offset: null
+        hidden_state_random_seed_by_step: true
+        hidden_state_max_tokens_per_sample: null
+        max_seq_len: 8192
+        step: 10
+        batch_size_per_gpu: 4
+        training_interval_steps: 5
+        publish_interval_steps: 0
+        publish_async: false
+        publish_dtype: null
+        publish_param_name_patterns: null
+        draft_update_use_shm: null
+        draft_update_weights_bucket_megabytes: null
+        draft_update_pause_generation: true
+        draft_update_flush_before: true
+        draft_update_flush_after: true
+        skip_heavy_cleanup_after_drafter_training: false
+        save_full_drafter_checkpoint: true
+        sample_last_n_steps: 20
+        train_batches_per_cycle: 4
+        lr: 1e-6
+        lr_warmup_steps: 0
+        min_lr_ratio: null
+        warmup_style: constant
+        use_logits: false
+        target_lm_head_row_restricted_sync: true
+        logits_topk: 128
+        logits_sparse_min_intersection: 1
+        logits_sparse_min_mass: null
+        logits_coverage_mask_min_ratio: 0.1
+        logits_coverage_mask_require_top1: false
+        ttt_length: 1
+        vocab_mapping_path: null
+        dflash_block_size: 16
+        dflash_num_anchors: 512
+        dflash_loss_decay_gamma: 7.0
+        dflash_front_position_weight: 1.0
+        dflash_front_position_count: 0
+        dflash_hard_sample_ratio: 0.0
+        dflash_hidden_size: null
+        dflash_num_target_layers: 5
+        dflash_num_hidden_layers: 1
+        dflash_mask_token_id: null
+        dflash_target_layer_ids: null
+        dflash_max_window: 512
+        dflash_loss_mode: full_vocab
+        dflash_sampled_ce_negatives: 0
+        dspark_block_size: 7
+        dspark_num_anchors: 512
+        dspark_loss_decay_gamma: 7.0
+        dspark_hard_sample_ratio: 0.0
+        dspark_hidden_size: null
+        dspark_num_target_layers: 5
+        dspark_num_hidden_layers: 5
+        dspark_mask_token_id: null
+        dspark_target_layer_ids: null
+        dspark_max_window: 512
+        dspark_loss_mode: full_vocab
+        dspark_sampled_ce_negatives: 0
+        dspark_markov_rank: 256
+        dspark_markov_head_type: vanilla
+        dspark_confidence_head_alpha: 0.0
+        dspark_confidence_loss_alpha: 0.0
+        dspark_confidence_head_with_markov: true
+        dspark_ce_loss_alpha: 1.0
+        dspark_l1_loss_alpha: 0.0
+        dspark_debug_log: false
+        dspark_debug_log_first_n: 2
+        dspark_debug_log_interval: 100
+        # Domino (DFlash variant: causal GRU correction head + dual-logit curriculum).
+        # Unset keys fall back to the matching dflash_* value.
+        domino_block_size: 16
+        domino_num_anchors: 512
+        domino_loss_decay_gamma: 7.0
+        domino_hidden_size: null
+        domino_num_target_layers: 5
+        domino_num_hidden_layers: 5
+        domino_mask_token_id: null
+        domino_target_layer_ids: null
+        domino_max_window: 512
+        domino_emb_dim: 256
+        domino_gru_hidden_dim: 1024
+        domino_pure_draft_prefix_len: 1
+        domino_shift_label: true
+        domino_lambda_base_start: 1.0
+        domino_lambda_base_decay_steps: 2000
+        current_max_samples: 2048
+        data_buffer_max_size: 1024
+        hidden_state_clip_value: 1.0e4
+        feature_store:
+          type: torch_shard
+          path: null
+          max_samples_per_shard: 1024
+          flush_interval_steps: 1
+          shuffle: true
+          repeat: true
+          prefetch_depth: 2
+          strict_schema: true
