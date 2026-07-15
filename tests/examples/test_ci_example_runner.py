@@ -36,14 +36,14 @@ def _require_working_bash() -> str:
 def test_ci_layers_match_required_shape() -> None:
     expected = {
         "cpu_unit_tests.yml",
-        "gpu_example_tests.yml",
-        "npu_example_tests.yml",
+        "gpu_unit_tests.yml",
+        "npu_unit_tests.yml",
     }
 
     assert expected <= {path.name for path in WORKFLOWS.glob("*.yml")}
     assert "pull_request" in _workflow("cpu_unit_tests.yml")["on"]
-    assert "pull_request" not in _workflow("gpu_example_tests.yml")["on"]
-    assert "pull_request" not in _workflow("npu_example_tests.yml")["on"]
+    assert "pull_request" not in _workflow("gpu_unit_tests.yml")["on"]
+    assert "pull_request" in _workflow("npu_unit_tests.yml")["on"]
 
 
 def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
@@ -65,8 +65,8 @@ def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
 
 def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
     for workflow_name, label in (
-        ("gpu_example_tests.yml", "gpu"),
-        ("npu_example_tests.yml", "npu"),
+        ("gpu_unit_tests.yml", "gpu"),
+        ("npu_unit_tests.yml", "npu"),
     ):
         source = _workflow_source(workflow_name)
         workflow = _workflow(workflow_name)
