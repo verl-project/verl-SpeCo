@@ -208,26 +208,30 @@ class DominoTrainingModel(DFlashTrainingModel):
         suffix_mask = active_pos >= self._suffix_start
 
         loss_per_token = torch.zeros_like(flat_weights)
-        base_loss_per_token_full = torch.zeros_like(flat_weights)
         sanitized_rows = torch.zeros((), dtype=torch.float32, device=device)
+        active_final_pred = None
+        active_base_pred = None
         active_final_logits = None
-        active_base_logits = None
         if active_targets.numel() == 0:
             loss = flat_weights.sum() * 0.0
             final_loss = base_loss = loss.detach()
         else:
-            base_logits = F.linear(active_hidden, lm_head_weight)  # [num_active, vocab]
-            final_logits = base_logits
+            # Base logits (backbone-only) over every active row. The Domino head only
+            # perturbs suffix positions, so we compute the correction and the final
+            # CE on the suffix rows and reuse the base CE elsewhere -- this avoids
+            # materializing a second full [num_active, vocab] logits tensor.
+            base_logits = F.linear(active_hidden, lm_head_weight).float()  # [num_active, vocab]
+            base_ce = F.cross_entropy(base_logits, active_targets, reduction="none")
+            final_ce = base_ce.clone()
             if bool(suffix_mask.any()):
                 suffix_delta = self.draft_model.embed_proj(
                     torch.cat([active_hidden[suffix_mask], active_gru[suffix_mask]], dim=-1)
                 )
-                suffix_final = base_logits[suffix_mask] + suffix_delta
-                final_logits = base_logits.clone()
-                final_logits[suffix_mask] = suffix_final
+                active_final_logits = base_logits[suffix_mask] + suffix_delta.float()
+                final_ce[suffix_mask] = F.cross_entropy(
+                    active_final_logits, active_targets[suffix_mask], reduction="none"
+                )
 
-            final_ce = F.cross_entropy(final_logits, active_targets, reduction="none")
-            base_ce = F.cross_entropy(base_logits, active_targets, reduction="none")
             finite = torch.isfinite(final_ce) & torch.isfinite(base_ce)
             sanitized_rows = (~finite).sum().to(dtype=torch.float32)
             final_ce = torch.where(finite, final_ce, torch.zeros_like(final_ce))
@@ -238,9 +242,11 @@ class DominoTrainingModel(DFlashTrainingModel):
             base_loss = (base_ce * active_loss_weights).sum() / den
             loss = (1.0 - lambda_base) * final_loss + lambda_base * base_loss
             loss_per_token[active_mask] = final_ce
-            base_loss_per_token_full[active_mask] = base_ce
-            active_final_logits = final_logits
-            active_base_logits = base_logits
+            with torch.no_grad():
+                active_base_pred = base_logits.argmax(dim=-1)
+                active_final_pred = active_base_pred.clone()
+                if active_final_logits is not None:
+                    active_final_pred[suffix_mask] = active_final_logits.argmax(dim=-1)
 
         with torch.no_grad():
             flat_eval_mask = eval_mask.reshape(-1)
@@ -250,17 +256,11 @@ class DominoTrainingModel(DFlashTrainingModel):
             top1_correct = torch.zeros((), dtype=torch.float32, device=device)
             top5_correct = torch.zeros((), dtype=torch.float32, device=device)
             quality_token_count = torch.zeros((), dtype=torch.float32, device=device)
-            if active_final_logits is not None and active_targets.numel() > 0:
-                pred_tokens = active_final_logits.argmax(dim=-1)
-                base_pred_tokens = active_base_logits.argmax(dim=-1)
-                active_correct = pred_tokens.eq(active_targets)
+            if active_final_pred is not None and active_targets.numel() > 0:
+                active_correct = active_final_pred.eq(active_targets)
                 correct[active_mask] = active_correct
-                base_correct[active_mask] = base_pred_tokens.eq(active_targets)
+                base_correct[active_mask] = active_base_pred.eq(active_targets)
                 top1_correct = active_correct.float().sum()
-                topk = min(5, active_final_logits.shape[-1])
-                top5_correct = (
-                    active_final_logits.topk(topk, dim=-1).indices.eq(active_targets.unsqueeze(-1)).any(dim=-1).float().sum()
-                )
                 quality_token_count = active_targets.new_tensor(float(active_targets.numel()), dtype=torch.float32)
 
             binary_weights = binary_eval_mask.view(bsz, n_blocks, self.block_size).float()
