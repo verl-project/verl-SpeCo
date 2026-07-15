@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import torch
 import torch.nn as nn
 
 from verl_speco.models.dflash import DFlashDraftModel
