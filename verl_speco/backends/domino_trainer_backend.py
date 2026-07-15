@@ -364,7 +364,7 @@ class DominoTrainerBackend(DFlashTrainerBackend):
     def build_model(self):
         target_model_path = self.config.model.path
         spec_model_path = self.config.rollout.drafter.model_path
-        config_path = os.path.join(spec_model_path, "config.json")
+        config_path = os.path.join(spec_model_path, "config.json") if spec_model_path else None
         target_hf_config = self._get_target_hf_config()
         normalized_state = None
 
