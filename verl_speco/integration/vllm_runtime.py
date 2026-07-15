@@ -431,11 +431,11 @@ def _should_force_eager(drafter_cfg: dict[str, Any]) -> bool:
 # it fails closed on the known silent-degradation paths (config overrides via
 # drafter.vllm.speculative_config_overrides or engine_kwargs.vllm.speculative_config).
 _LOSSY_VLLM_ACCEPTANCE_CHECKS = (
-    ("acceptance_method", lambda v: str(v).lower() == "typical_acceptance_sampler",
+    ("acceptance_method", lambda v: str(v).strip().lower() == "typical_acceptance_sampler",
      "typical_acceptance_sampler trades exactness for speed"),
-    ("spec_decoding_acceptance_method", lambda v: str(v).lower() == "typical_acceptance_sampler",
+    ("spec_decoding_acceptance_method", lambda v: str(v).strip().lower() == "typical_acceptance_sampler",
      "typical_acceptance_sampler trades exactness for speed"),
-    ("rejection_sample_method", lambda v: str(v).lower() == "synthetic",
+    ("rejection_sample_method", lambda v: str(v).strip().lower() == "synthetic",
      "synthetic acceptance does not sample from the corrected residual distribution"),
     ("posterior_threshold", lambda v: v is not None and float(v) > 0.0,
      "a nonzero posterior_threshold enables typical/Medusa relaxed acceptance"),
@@ -555,7 +555,8 @@ def build_vllm_speculative_config_from_drafter(
         raise TypeError("drafter.vllm.speculative_config_overrides must be a mapping when provided")
     speculative_config.update(_plain_container(overrides))
     assert_lossless_vllm_speculative_config(
-        speculative_config, allow_lossy=bool(vllm_cfg.get("allow_lossy_speculative_sampling", False))
+        speculative_config,
+        allow_lossy=bool(_bool_or_none(vllm_cfg.get("allow_lossy_speculative_sampling", False))),
     )
     return speculative_config
 
@@ -1311,7 +1312,7 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
     # priority in the merge, so a lossy acceptance mode injected there must be caught here.
     assert_lossless_vllm_speculative_config(
         merged_speculative_config,
-        allow_lossy=bool(_get_nested(drafter_cfg, ("vllm", "allow_lossy_speculative_sampling"), False)),
+        allow_lossy=bool(_bool_or_none(_get_nested(drafter_cfg, ("vllm", "allow_lossy_speculative_sampling"), False))),
     )
     _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
     if bool(merged_speculative_config.get("enforce_eager")):
@@ -1442,7 +1443,7 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     merged_speculative_config = _merge_speculative_config(existing_spec, speculative_config)
     assert_lossless_vllm_speculative_config(
         merged_speculative_config,
-        allow_lossy=bool(_get_nested(drafter_cfg, ("vllm", "allow_lossy_speculative_sampling"), False)),
+        allow_lossy=bool(_bool_or_none(_get_nested(drafter_cfg, ("vllm", "allow_lossy_speculative_sampling"), False))),
     )
     _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
     if bool(drafter_cfg.get("enable")):

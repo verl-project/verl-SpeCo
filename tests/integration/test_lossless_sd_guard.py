@@ -76,3 +76,21 @@ def test_build_default_is_lossless_and_passes() -> None:
     out = build_vllm_speculative_config_from_drafter(_drafter_cfg())
     assert out["draft_sample_method"] == "greedy"
     assert "acceptance_method" not in out
+
+
+def test_string_false_opt_out_does_not_bypass_guard() -> None:
+    # A YAML/CLI override can deliver the flag as the string "false"; bool("false")
+    # is True and would silently disable this fail-closed guard, so the opt-out must
+    # be parsed as a real boolean.
+    cfg = _drafter_cfg(
+        speculative_config_overrides={"rejection_sample_method": "synthetic"},
+        allow_lossy_speculative_sampling="false",
+    )
+    with pytest.raises(ValueError, match="lossy speculative-decoding config"):
+        build_vllm_speculative_config_from_drafter(cfg)
+
+
+def test_whitespace_padded_lossy_value_is_rejected() -> None:
+    config = {"method": "eagle3", "acceptance_method": " typical_acceptance_sampler "}
+    with pytest.raises(ValueError, match="lossy speculative-decoding config"):
+        assert_lossless_vllm_speculative_config(config, allow_lossy=False)
