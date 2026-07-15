@@ -12,13 +12,14 @@ The draft is cold-started (no pretrained checkpoint), so the useful signals are:
   * draft-vs-target top-1 agreement trending up.
 
 Run:
-    python ci/eagle1_gpu_smoke.py --target /llm-align/open_models/Qwen3/Qwen3-4B \
+    python ci/eagle1_gpu_smoke.py --target /path/to/target-model \
         --algorithm EAGLE1 --steps 100
 """
 
 from __future__ import annotations
 
 import argparse
+import tempfile
 
 import torch
 from omegaconf import OmegaConf
@@ -72,7 +73,7 @@ def _build_shifted_batch(target, tokenizer, device):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target", default="/llm-align/open_models/Qwen3/Qwen3-4B")
+    parser.add_argument("--target", required=True, help="path or HF id of the target causal LM")
     parser.add_argument("--algorithm", default="EAGLE1", choices=["EAGLE1", "EAGLE2"])
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -94,7 +95,7 @@ def main() -> None:
             "rollout": {
                 "drafter": {
                     "speculative_algorithm": args.algorithm,
-                    "model_path": "/llm-align/liuchonghan/runs/eagle1_smoke_cold_start",
+                    "model_path": tempfile.mkdtemp(prefix="eagle1_smoke_cold_start_"),
                     "training": {
                         "use_logits": False,
                         "eagle1_num_hidden_layers": 1,
