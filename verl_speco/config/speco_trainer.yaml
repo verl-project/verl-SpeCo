@@ -133,6 +133,15 @@ actor_rollout_ref:
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
         dspark_debug_log_interval: 100
+        # P-EAGLE (parallel drafting: COD-subsampled multi-depth forward + KL loss).
+        peagle_num_draft_layers: 4
+        peagle_num_aux_hidden_states: 3
+        peagle_draft_vocab_size: null
+        peagle_num_depths: 8
+        peagle_down_sample_ratio: 0.7
+        peagle_down_sample_ratio_min: 0.2
+        peagle_mask_token_id: null
+        peagle_fc_norm: false
         current_max_samples: 2048
         data_buffer_max_size: 1024
         hidden_state_clip_value: 1.0e4

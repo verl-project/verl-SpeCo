@@ -400,6 +400,14 @@ def _rollout_config_from_config(config: Any) -> Any:
 
 def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
     algorithm = _drafter_algorithm(drafter_cfg)
+    if algorithm == "PEAGLE":
+        # P-EAGLE trains against vLLM's parallel-drafting runtime (speculators
+        # PR #480). This overlay wires the training path; enabling vLLM rollout
+        # requires that runtime, which is not asserted here yet.
+        raise ValueError(
+            "P-EAGLE vLLM rollout requires the parallel-drafting runtime and is not wired in this overlay yet; "
+            "keep actor_rollout_ref.rollout.drafter.enable=false (train the drafter, serve separately)."
+        )
     if algorithm == "DSPARK":
         return "dflash" if _is_vllm_ascend_runtime_hint() else "dspark"
 
