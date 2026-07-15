@@ -127,9 +127,9 @@ def test_eagle1_compute_loss_matches_reference_formula() -> None:
 
     assert out["v_weight"] == pytest.approx(1.0)
     assert out["p_weight"] == pytest.approx(0.1)
-    assert float(out["local_num_tokens"]) == pytest.approx(float(num_tokens))
-    assert float(out["total_local_vloss"]) == pytest.approx(float(ref_vloss), rel=1e-5, abs=1e-6)
-    assert float(out["total_local_ploss"]) == pytest.approx(float(ref_ploss), rel=1e-5, abs=1e-6)
+    assert float(out["local_num_tokens"].detach()) == pytest.approx(float(num_tokens))
+    assert float(out["total_local_vloss"].detach()) == pytest.approx(float(ref_vloss), rel=1e-5, abs=1e-6)
+    assert float(out["total_local_ploss"].detach()) == pytest.approx(float(ref_ploss), rel=1e-5, abs=1e-6)
 
 
 def test_eagle1_compute_loss_requires_last_hidden_states() -> None:
