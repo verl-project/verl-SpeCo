@@ -1,8 +1,12 @@
-name: npu_example_tests
+name: npu_unit_tests
 
 run-name: NPU example tests (${{ github.ref_name }})
 
 on:
+  pull_request:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       run_training:
