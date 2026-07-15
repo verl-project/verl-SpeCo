@@ -174,15 +174,20 @@ def resolve_oldlogprob_aux_layer_ids(
             int(target_num_hidden_layers),
         )
 
+    # EAGLE-1/2 fuse a single (last) target hidden layer, unlike EAGLE-3's
+    # low/mid/high triple. The last-layer feature is also what the frozen target
+    # head distills from, so collect only the final layer as the single aux. This
+    # is resolved before the generic multi-layer config lookup so a stray
+    # eagle3-style eagle_aux_hidden_state_layer_ids cannot silently select the
+    # wrong (multi-layer) set while the draft fixes num_aux_hidden_states=1.
+    if _drafter_algorithm(drafter_cfg) in {"EAGLE1", "EAGLE2"}:
+        if target_num_hidden_layers is None:
+            return None
+        return [int(target_num_hidden_layers) - 1]
     for config in (drafter_cfg, *model_configs):
         layer_ids = _generic_aux_layer_ids_from_config(config)
         if layer_ids is not None:
             return layer_ids
     if target_num_hidden_layers is None:
         return None
-    # EAGLE-1/2 fuse a single (last) target hidden layer, unlike EAGLE-3's
-    # low/mid/high triple. The last-layer feature is also what the frozen target
-    # head distills from, so collect only the final layer as the single aux.
-    if _drafter_algorithm(drafter_cfg) in {"EAGLE1", "EAGLE2"}:
-        return [int(target_num_hidden_layers) - 1]
     return _default_eagle3_aux_layer_ids(target_num_hidden_layers)

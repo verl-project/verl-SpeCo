@@ -76,6 +76,20 @@ def test_eagle1_backend_reports_eagle3_data_plumbing() -> None:
     assert _make_backend().model_type == "eagle3"
 
 
+def test_eagle1_backend_opts_out_of_ulysses_sp() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    assert _make_backend().supports_ulysses_sp is False
+
+
+def test_eagle1_build_model_rejects_use_logits() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    backend = _make_backend({"use_logits": True})
+    with pytest.raises(ValueError, match="use_logits=False"):
+        backend.build_model()
+
+
 def test_eagle1_compute_loss_matches_reference_formula() -> None:
     torch = pytest.importorskip("torch")
     pytest.importorskip("transformers")
@@ -168,6 +182,23 @@ def test_eagle1_eagle2_collect_final_aux_layer(algorithm) -> None:
 
     layer_ids = resolve_oldlogprob_aux_layer_ids(
         {"speculative_algorithm": algorithm, "training": {}},
+        target_num_hidden_layers=32,
+    )
+    assert layer_ids == [31]
+
+
+@pytest.mark.parametrize("algorithm", ["EAGLE1", "EAGLE2"])
+def test_eagle1_eagle2_ignore_stray_multilayer_config(algorithm) -> None:
+    # A stray eagle3-style multi-layer id set must not override the single final
+    # layer, since the draft fixes num_aux_hidden_states=1.
+    from verl_speco.integration.oldlogprob_layer_ids import resolve_oldlogprob_aux_layer_ids
+
+    layer_ids = resolve_oldlogprob_aux_layer_ids(
+        {
+            "speculative_algorithm": algorithm,
+            "training": {},
+            "eagle_aux_hidden_state_layer_ids": [2, 16, 29],
+        },
         target_num_hidden_layers=32,
     )
     assert layer_ids == [31]

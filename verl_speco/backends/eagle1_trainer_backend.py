@@ -21,7 +21,7 @@ from copy import deepcopy
 
 import torch
 
-from verl_speco.backends.eagle3_trainer_backend import Eagle3TrainerBackend
+from verl_speco.backends.eagle3_trainer_backend import Eagle3TrainerBackend, _masked_soft_cross_entropy
 from verl_speco.models.eagle1 import Eagle1Config, LlamaForCausalLMEagle1
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 from verl.utils.device import get_device_name
@@ -52,6 +52,11 @@ class Eagle1TrainerBackend(Eagle3TrainerBackend):
         # Reuse the EAGLE-3 shifted-input / last_hidden_states data plumbing.
         return "eagle3"
 
+    # EAGLE-1/2 trains on full local sequences and does not implement the
+    # Ulysses sequence-parallel loss path yet; base_trainer honours this flag and
+    # forces ulysses_sequence_parallel_size = 1 instead of aborting mid-run.
+    supports_ulysses_sp = False
+
     def _build_draft_config(self, spec_model_path, target_hf_config):
         config_path = os.path.join(spec_model_path, "config.json") if spec_model_path else None
         if config_path and os.path.exists(config_path):
@@ -68,6 +73,9 @@ class Eagle1TrainerBackend(Eagle3TrainerBackend):
             num_aux_hidden_states=1,
             **cfg_dict,
         )
+        # The draft is a shallow model; advertise its real depth (not the target's)
+        # so the exported config.json matches the single-layer checkpoint.
+        draft_config.num_hidden_layers = draft_layers
         draft_config.torch_dtype = torch.bfloat16
         draft_config.tie_word_embeddings = False
         draft_config.architectures = ["LlamaForCausalLMEagle1"]
@@ -79,6 +87,11 @@ class Eagle1TrainerBackend(Eagle3TrainerBackend):
             "Initializing EAGLE-1/2 draft with target model_type: %s",
             getattr(self.target_model_config, "model_type", None),
         )
+        if bool(self.config.rollout.drafter.training.get("use_logits", False)):
+            raise ValueError(
+                "EAGLE-1/2 only supports hidden-state distillation against the frozen target head; "
+                "set actor_rollout_ref.rollout.drafter.training.use_logits=False"
+            )
         spec_model_path = self.config.rollout.drafter.model_path
         target_hf_config = self._get_target_hf_config()
 
@@ -151,23 +164,27 @@ class Eagle1TrainerBackend(Eagle3TrainerBackend):
             target_logits = self.target_model(last_hidden_states).float()
             target_probs = torch.softmax(target_logits, dim=-1)
 
-        valid_mask = loss_mask.bool()
-        finite_pred_logits = torch.isfinite(predicted_logits).all(dim=-1)
-        finite_target = torch.isfinite(target_probs).all(dim=-1) & (target_probs.sum(dim=-1) > 0)
+        # Full-vocabulary soft cross-entropy distillation. Reuse the EAGLE-3
+        # helper, which sanitizes non-finite logits/targets BEFORE log_softmax so
+        # masked positions cannot leak 0*NaN gradients into the draft.
+        per_token_ploss, valid_position = _masked_soft_cross_entropy(predicted_logits, target_probs, loss_mask)
         finite_hidden = torch.isfinite(predicted_hidden).all(dim=-1) & torch.isfinite(last_hidden_states).all(dim=-1)
-        valid_mask = valid_mask & finite_pred_logits & finite_target & finite_hidden
-
+        valid_mask = valid_position & finite_hidden
         num_tokens = valid_mask.float().sum()
 
         # SmoothL1 hidden regression against the (shifted) target last hidden.
-        hidden_per_token = self.criterion(predicted_hidden.float(), last_hidden_states.float()).mean(dim=-1)
+        # Sanitize before SmoothL1 for the same NaN-gradient reason.
+        safe_pred_hidden = torch.where(
+            torch.isfinite(predicted_hidden), predicted_hidden, torch.zeros_like(predicted_hidden)
+        ).float()
+        safe_target_hidden = torch.where(
+            torch.isfinite(last_hidden_states), last_hidden_states, torch.zeros_like(last_hidden_states)
+        ).float()
+        hidden_per_token = self.criterion(safe_pred_hidden, safe_target_hidden).mean(dim=-1)
         hidden_per_token = torch.where(valid_mask, hidden_per_token, torch.zeros_like(hidden_per_token))
         total_local_vloss = hidden_per_token.sum()
 
-        # Full-vocabulary soft cross-entropy distillation.
-        log_probs = torch.log_softmax(predicted_logits, dim=-1)
-        token_per_token = -(target_probs * log_probs).sum(dim=-1)
-        token_per_token = torch.where(valid_mask, token_per_token, torch.zeros_like(token_per_token))
+        token_per_token = torch.where(valid_mask, per_token_ploss, torch.zeros_like(per_token_ploss))
         total_local_ploss = token_per_token.sum()
 
         if num_tokens.detach().item() > 0:
