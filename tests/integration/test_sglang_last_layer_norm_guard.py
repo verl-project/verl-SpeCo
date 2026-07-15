@@ -54,3 +54,12 @@ def test_unresolvable_inputs_skip() -> None:
     # Best-effort: no raise when layer ids or target depth are unavailable.
     assert_sglang_aux_last_layer_norm_safe(None, 43, collect_from_sgl=True, allow_prenorm_last=False)
     assert_sglang_aux_last_layer_norm_safe([40, 41, 42], None, collect_from_sgl=True, allow_prenorm_last=False)
+
+
+def test_embedding_id_rejected_even_without_target_depth() -> None:
+    # -1 (the embedding) is divergent regardless of depth, so it must still be
+    # rejected when num_hidden_layers cannot be resolved.
+    with pytest.raises(ValueError, match="WITHOUT the target's final norm"):
+        assert_sglang_aux_last_layer_norm_safe(
+            [-1, 10], num_hidden_layers=None, collect_from_sgl=True, allow_prenorm_last=False
+        )

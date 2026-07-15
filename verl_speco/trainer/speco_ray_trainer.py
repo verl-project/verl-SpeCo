@@ -380,6 +380,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if online_drafter_enabled:
             self._speco_prepare_drafter_checkpoint_for_worker_init()
             self._init_speco_drafter_workers()
+            # Fail closed on the divergent SGLang last-layer-norm combination at
+            # init, before any (expensive) rollout generation runs.
+            self._speco_validate_sglang_aux_last_layer_norm()
 
     @contextmanager
     def _use_speco_agent_loop_manager(self, enabled: bool):
@@ -1129,9 +1132,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_collect_interval_matched = int(self._speco_should_collect_drafter_this_step())
         if not self._speco_online_enabled():
             return 0
-        if not getattr(self, "_speco_sglang_norm_validated", False):
-            self._speco_validate_sglang_aux_last_layer_norm()
-            self._speco_sglang_norm_validated = True
         samples = pop_drafter_samples(gen_batch_output)
         self._speco_last_raw_drafter_samples = len(samples)
         if not samples:
