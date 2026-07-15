@@ -97,6 +97,12 @@ actor_rollout_ref:
         logits_coverage_mask_require_top1: false
         ttt_length: 1
         vocab_mapping_path: null
+        # EAGLE-1 / EAGLE-2 draft training (single-step feature regression +
+        # full-vocab soft-CE distillation against the frozen target head).
+        eagle1_num_hidden_layers: 1
+        eagle1_hidden_loss_weight: 1.0
+        eagle1_token_loss_weight: 0.1
+        eagle1_feature_noise: 0.0
         dflash_block_size: 16
         dflash_num_anchors: 512
         dflash_loss_decay_gamma: 7.0

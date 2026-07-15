@@ -180,4 +180,9 @@ def resolve_oldlogprob_aux_layer_ids(
             return layer_ids
     if target_num_hidden_layers is None:
         return None
+    # EAGLE-1/2 fuse a single (last) target hidden layer, unlike EAGLE-3's
+    # low/mid/high triple. The last-layer feature is also what the frozen target
+    # head distills from, so collect only the final layer as the single aux.
+    if _drafter_algorithm(drafter_cfg) in {"EAGLE1", "EAGLE2"}:
+        return [int(target_num_hidden_layers) - 1]
     return _default_eagle3_aux_layer_ids(target_num_hidden_layers)

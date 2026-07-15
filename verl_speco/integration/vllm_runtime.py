@@ -404,6 +404,10 @@ def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
         return "dflash" if _is_vllm_ascend_runtime_hint() else "dspark"
 
     method_map = {
+        # EAGLE-1 and EAGLE-2 share vLLM's native EAGLE draft (method="eagle");
+        # EAGLE-2 is a dynamic-tree decoding policy over the same draft head.
+        "EAGLE1": "eagle",
+        "EAGLE2": "eagle",
         "EAGLE3": "eagle3",
         "DFLASH": "dflash",
         "DRAFT": "draft_model",
