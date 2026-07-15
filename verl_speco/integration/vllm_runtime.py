@@ -400,6 +400,15 @@ def _rollout_config_from_config(config: Any) -> Any:
 
 def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
     algorithm = _drafter_algorithm(drafter_cfg)
+    if algorithm == "DOMINO":
+        # Domino's GRU-conditioned correction head has no stock vLLM proposer; it
+        # trains a stronger DFlash backbone. Serve via DFLASH (the Domino head is
+        # inert for the DFlash serving path).
+        raise ValueError(
+            "Domino is a training-only drafter and cannot be served on vLLM directly; "
+            "set actor_rollout_ref.rollout.drafter.speculative_algorithm=DFLASH for the rollout/serve path "
+            "(the trained DFlash backbone), keeping DOMINO only for drafter training."
+        )
     if algorithm == "DSPARK":
         return "dflash" if _is_vllm_ascend_runtime_hint() else "dspark"
 
