@@ -58,6 +58,11 @@ def test_domino_model_builds_projector_head() -> None:
 
 
 def test_domino_lambda_base_schedule() -> None:
+    # get_lambda_base is pure-python, but its module (domino_trainer_backend)
+    # subclasses the torch-based DFlash backend at import time, so it cannot be
+    # imported without torch. Skip under the torch-free CPU CI like the siblings.
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
     from verl_speco.backends.domino_trainer_backend import get_lambda_base
 
     assert get_lambda_base(0, decay_steps=100, lambda_start=1.0) == pytest.approx(1.0)
