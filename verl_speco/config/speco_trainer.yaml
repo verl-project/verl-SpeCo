@@ -51,6 +51,12 @@ actor_rollout_ref:
         max_model_len: null
         enforce_eager: null
         speculative_config_overrides: {}
+        # Fail closed on known-lossy acceptance settings (typical_acceptance_sampler,
+        # synthetic rejection, nonzero posterior thresholds). RL rollout is only
+        # unbiased under exact target-distribution verification; SPECO recomputes
+        # old_log_probs as the target logprob with no importance-sampling correction,
+        # so a relaxed verifier would silently bias PPO. Set true to opt in knowingly.
+        allow_lossy_speculative_sampling: false
 
       training:
         collect_hidden_states_from_sgl: false
