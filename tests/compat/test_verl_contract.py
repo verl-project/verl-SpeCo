@@ -7,7 +7,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 REQUIRED_VERL = ROOT / "REQUIRED_VERL.txt"
-OVERLAY_CONFIG = ROOT / "verl_speco" / "config" / "speco_trainer.yaml"
+OVERLAY_CONFIG = ROOT / "verl_speco" / "config" / "speco_base.yaml"
 
 
 def _required_verl_values() -> dict[str, str]:

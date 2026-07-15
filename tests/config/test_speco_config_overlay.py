@@ -19,7 +19,7 @@ CONFIG_DIR = ROOT / "verl_speco" / "config"
 
 
 def test_overlay_has_expected_default_drafter_shape() -> None:
-    raw = OmegaConf.load(CONFIG_DIR / "speco_trainer.yaml")
+    raw = OmegaConf.load(CONFIG_DIR / "speco_base.yaml")
     drafter = raw.actor_rollout_ref.rollout.drafter
 
     assert raw.speco.verl_base.version == "0.8.0"
@@ -42,17 +42,44 @@ def test_overlay_composes_with_pinned_upstream_verl(tmp_path: Path) -> None:
     # checked-out config directory so this contract remains CPU-light.
     composed_config_dir = tmp_path / "config"
     shutil.copytree(upstream_config, composed_config_dir)
-    overlay_source = (CONFIG_DIR / "speco_trainer.yaml").read_text(encoding="utf-8")
-    overlay_source = overlay_source.replace(
-        "pkg://verl.trainer.config",
-        composed_config_dir.resolve().as_uri(),
-    )
-    (composed_config_dir / "speco_trainer.yaml").write_text(overlay_source, encoding="utf-8")
+    for config_name in ("speco_base.yaml", "speco_trainer.yaml"):
+        config_source = (CONFIG_DIR / config_name).read_text(encoding="utf-8")
+        config_source = config_source.replace(
+            "pkg://verl.trainer.config",
+            composed_config_dir.resolve().as_uri(),
+        )
+        (composed_config_dir / config_name).write_text(config_source, encoding="utf-8")
 
     with initialize_config_dir(config_dir=str(composed_config_dir), version_base=None):
         config = compose(config_name="speco_trainer")
 
     assert config.speco.verl_base.version == "0.8.0"
     assert config.actor_rollout_ref.rollout.drafter.enable is False
+    assert "trainer" in config
+    assert "algorithm" in config
+
+
+def test_draft_trainer_composes_as_primary_config(tmp_path: Path) -> None:
+    upstream_root = os.getenv("VERL_SPECO_UPSTREAM_ROOT")
+    if not upstream_root:
+        pytest.skip("set VERL_SPECO_UPSTREAM_ROOT to check compose against pinned upstream verl")
+    upstream_config = Path(upstream_root) / "verl" / "trainer" / "config"
+    assert upstream_config.is_dir()
+
+    composed_config_dir = tmp_path / "config"
+    shutil.copytree(upstream_config, composed_config_dir)
+    for config_name in ("speco_base.yaml", "draft_trainer.yaml"):
+        config_source = (CONFIG_DIR / config_name).read_text(encoding="utf-8")
+        config_source = config_source.replace(
+            "pkg://verl.trainer.config",
+            composed_config_dir.resolve().as_uri(),
+        )
+        (composed_config_dir / config_name).write_text(config_source, encoding="utf-8")
+
+    with initialize_config_dir(config_dir=str(composed_config_dir), version_base=None):
+        config = compose(config_name="draft_trainer")
+
+    assert config.actor_rollout_ref.rollout.drafter.training.mode == "offline"
+    assert config.speco.draft_training.enable is True
     assert "trainer" in config
     assert "algorithm" in config
