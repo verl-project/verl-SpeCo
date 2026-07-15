@@ -29,7 +29,7 @@ def generate_cod_sample_indices(
     Returns ``(anchor_pos, depth)`` flat tensors of shape ``[total_sampled]``.
     The reference (target) position of each element is ``anchor_pos + depth``.
     """
-    loss_mask = loss_mask.squeeze(0)
+    loss_mask = loss_mask.flatten()
     device = loss_mask.device
     all_valid_indices = torch.where(loss_mask == 1)[0]
 

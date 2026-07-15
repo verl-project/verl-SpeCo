@@ -28,7 +28,7 @@ def create_peagle_mask_mod(
     document_ids = torch.cat(
         [
             document_ids,
-            -1 * torch.ones(total_seq_len - document_ids.shape[0], device=lengths.device, dtype=torch.long),
+            torch.full((total_seq_len - document_ids.shape[0],), -1, device=lengths.device, dtype=torch.long),
         ]
     ).contiguous()
 

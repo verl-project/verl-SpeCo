@@ -17,7 +17,6 @@ differ from the EAGLE-3 backend; preprocess/optimizer/target-head are inherited.
 
 import logging
 import os
-from copy import deepcopy
 
 import torch
 
@@ -62,7 +61,7 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
             return PeagleConfig.from_pretrained(spec_model_path)
 
         training_cfg = self._training_cfg()
-        cfg_dict = deepcopy(target_hf_config).to_dict()
+        cfg_dict = target_hf_config.to_dict()
         for key in _TARGET_CONFIG_DROP_KEYS:
             cfg_dict.pop(key, None)
         draft_vocab_size = training_cfg.get("peagle_draft_vocab_size", None)
@@ -132,6 +131,11 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
         )
         mask_token_id = int(getattr(draft.config, "mask_token_id", draft.vocab_size - 1))
         selected_token_ids = draft.selected_token_ids().to(input_ids.device)
+        # Per-document chunk lengths for COD document isolation. base_trainer
+        # concatenates every document into one flat batch-1 sequence, so the
+        # all-ones attention_mask no longer marks document boundaries; fall back
+        # to a single document only when the lengths are unavailable.
+        seq_lengths = batch.get("seq_lengths", None)
 
         with torch.no_grad():
             target_logits = self.target_model(last_hidden_states).float()  # [B, S, vocab]
@@ -152,7 +156,10 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
                 down_sample_ratio_min=down_sample_ratio_min,
             )
             orig_positions = anchor_pos + depth
-            row_length = attention_mask[b].sum().clamp_min(1).reshape(1).to(device)
+            if seq_lengths is not None:
+                row_length = seq_lengths.to(device)
+            else:
+                row_length = attention_mask[b].sum().clamp_min(1).reshape(1).to(device)
             loss_positions = row_loss_mask[0, orig_positions].bool()
 
             is_depth0 = depth == 0

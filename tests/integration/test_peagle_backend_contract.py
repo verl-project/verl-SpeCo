@@ -70,6 +70,29 @@ def test_peagle_mask_predicate() -> None:
     assert bool(mod(z, z, torch.tensor(4), torch.tensor(1)))
 
 
+def test_peagle_mask_isolates_documents() -> None:
+    # Regression guard: with per-document lengths, a depth-0 query in one document
+    # must NOT attend to a depth-0 key in another, even though the flat sequence
+    # is causal. A single all-ones length (the old attention_mask.sum() behaviour)
+    # would merge both documents and leak across them.
+    torch = pytest.importorskip("torch")
+    from verl_speco.models.peagle.peagle_mask import create_peagle_mask_mod
+
+    # Two documents of length 2 concatenated: positions [0,1] and [2,3], all depth 0.
+    anchor_pos = torch.tensor([0, 1, 2, 3])
+    depth = torch.tensor([0, 0, 0, 0])
+    mod = create_peagle_mask_mod(anchor_pos, depth, torch.tensor([2, 2]), total_seq_len=4)
+    z = torch.tensor(0)
+
+    # Same document: causal depth-0 attention allowed (query 3 -> key 2).
+    assert bool(mod(z, z, torch.tensor(3), torch.tensor(2)))
+    # Cross document: query 2 (doc B) must NOT attend to key 1 (doc A), despite 2 >= 1.
+    assert not bool(mod(z, z, torch.tensor(2), torch.tensor(1)))
+    # Merging both into one document (the bug) would have leaked here.
+    merged = create_peagle_mask_mod(anchor_pos, depth, torch.tensor([4]), total_seq_len=4)
+    assert bool(merged(z, z, torch.tensor(2), torch.tensor(1)))
+
+
 def test_peagle_model_modules() -> None:
     torch = pytest.importorskip("torch")
     pytest.importorskip("transformers")

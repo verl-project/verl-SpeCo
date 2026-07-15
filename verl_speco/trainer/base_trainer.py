@@ -2675,6 +2675,13 @@ class DrafterBaseTrainer:
                 batch["last_hidden_states"] = last_hidden_states
         elif self.backend.model_type == "peagle":
             batch["last_hidden_states"] = last_hidden_states
+            # Preserve the per-document chunk lengths so the P-EAGLE COD mask can
+            # isolate documents. The flat batch concatenates every chunk into one
+            # length-`sum` sequence with an all-ones attention_mask, so the mask
+            # cannot recover document boundaries from attention_mask alone.
+            batch["seq_lengths"] = torch.tensor(
+                [chunk.size(0) for chunk in input_id_chunks], dtype=torch.long, device=dev
+            )
 
         batch = self._sanitize_training_batch(batch)
         input_ids = batch["input_ids"]
