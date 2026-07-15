@@ -35,6 +35,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
 )
 from verl.utils.ulysses import get_ulysses_sequence_parallel_group, set_ulysses_sequence_parallel_group
+from verl_speco.trainer.feature_store import DraftFeatureSample
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -2826,6 +2827,55 @@ class DrafterBaseTrainer:
         with self._ulysses_group_context():
             return self._prepare_training_batch()
 
+    def add_feature_sample(self, sample: DraftFeatureSample | dict[str, Any]) -> None:
+        """Append a normalized standalone sample to the in-memory training buffer."""
+        if isinstance(sample, DraftFeatureSample):
+            item = sample.to_training_item()
+        elif isinstance(sample, dict):
+            item = DraftFeatureSample.from_dict(sample, strict=False).to_training_item()
+        else:
+            raise TypeError(f"Unsupported draft feature sample type: {type(sample)!r}")
+        item["step"] = int(item.get("step", self.current_rl_step) or self.current_rl_step)
+        self.collected_data.append(item)
+
+    def prepare_training_batch_from_samples(
+        self,
+        samples: list[DraftFeatureSample | dict[str, Any]],
+        *,
+        step: Optional[int] = None,
+    ) -> Optional[dict[str, torch.Tensor]]:
+        """Prepare a training batch directly from standalone feature samples."""
+        current_step = int(self.current_rl_step if step is None else step)
+        previous_collected_data = self.collected_data
+        previous_current_step = self.current_rl_step
+        maxlen = max(len(samples), int(self.config.rollout.drafter.training.get("current_max_samples", 2000)))
+        self.collected_data = deque(maxlen=maxlen)
+        self.current_rl_step = current_step
+        try:
+            for sample in samples:
+                if isinstance(sample, DraftFeatureSample):
+                    item = sample.to_training_item()
+                elif isinstance(sample, dict):
+                    item = DraftFeatureSample.from_dict(sample, strict=False).to_training_item()
+                else:
+                    raise TypeError(f"Unsupported draft feature sample type: {type(sample)!r}")
+                item["step"] = current_step
+                self.collected_data.append(item)
+            with self._ulysses_group_context():
+                return self._prepare_training_batch()
+        finally:
+            self.collected_data = previous_collected_data
+            self.current_rl_step = previous_current_step
+
+    async def training_step_from_batch(self, batch: dict[str, torch.Tensor], step: int) -> bool:
+        """Execute one optimizer step from a pre-built standalone batch."""
+        try:
+            with torch.enable_grad():
+                return await self._training_step_on_batch(batch, step)
+        except Exception as e:  # noqa: BLE001
+            logger.exception(f"Standalone training step {step} failed with error: {e}")
+            return False
+
     async def training_step(self, step: int) -> bool:
         try:
             with torch.enable_grad():
@@ -2881,6 +2931,9 @@ class DrafterBaseTrainer:
             )
             return False
         
+        return await self._training_step_on_batch(batch, step)
+
+    async def _training_step_on_batch(self, batch: dict[str, torch.Tensor], step: int) -> bool:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
