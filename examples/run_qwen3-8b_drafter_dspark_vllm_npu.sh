@@ -1,5 +1,5 @@
 set -x
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 # NPU example for DSpark on vLLM-Ascend. SPECO keeps the user-facing
 # algorithm as DSPARK and maps it to vLLM's dflash speculative method.
@@ -8,6 +8,7 @@ exp_name='qwen3_8b_dspark_drafter_vllm_npu'
 
 gen_tp=2
 train_sp=4
+ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint
@@ -104,7 +105,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     trainer.logger='["console"]' \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${exp_name} \
-    trainer.n_gpus_per_node=16 \
+    trainer.n_gpus_per_node=${ppo_gpus_per_node} \
     trainer.nnodes=1 \
     trainer.resume_mode=disable \
     trainer.default_local_dir=${CKPTS_DIR} \
