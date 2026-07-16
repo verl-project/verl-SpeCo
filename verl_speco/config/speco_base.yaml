@@ -122,6 +122,12 @@ actor_rollout_ref:
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
         dspark_debug_log_interval: 100
+        # EAGLE-1 / EAGLE-2 draft training (single-step feature regression +
+        # full-vocab soft-CE distillation against the frozen target head).
+        eagle1_num_hidden_layers: 1
+        eagle1_hidden_loss_weight: 1.0
+        eagle1_token_loss_weight: 0.1
+        eagle1_feature_noise: 0.0
         current_max_samples: 2048
         data_buffer_max_size: 1024
         hidden_state_clip_value: 1.0e4
