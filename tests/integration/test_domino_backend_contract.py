@@ -57,6 +57,47 @@ def test_domino_model_builds_projector_head() -> None:
     assert model.embed_tokens.num_embeddings == config.vocab_size
 
 
+def test_domino_forward_computes_top5_accuracy() -> None:
+    """top5_correct_count must actually be reduced, not left at its zero init.
+
+    DFlash and DSpark both compute it; a Domino regression here silently reports
+    top5_acc=0 forever (base_trainer derives top5_acc from this counter).
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    import torch
+
+    from verl_speco.backends.domino_trainer_backend import DominoTrainingModel
+    from verl_speco.models.domino import DominoDraftModel
+
+    torch.manual_seed(0)
+    config = _tiny_domino_config()
+    model = DominoTrainingModel(
+        draft_model=DominoDraftModel(config),
+        block_size=config.block_size,
+        num_anchors=config.num_anchors,
+        pure_draft_prefix_len=config.pure_draft_prefix_len,
+    )
+
+    bsz, seq_len = 2, 16
+    input_ids = torch.randint(0, config.vocab_size, (bsz, seq_len))
+    hidden_states_list = [torch.randn(bsz, seq_len, config.target_hidden_size) for _ in config.target_layer_ids]
+    loss_mask = torch.ones(bsz, seq_len, dtype=torch.long)
+    lm_head_weight = torch.randn(config.vocab_size, config.hidden_size)
+
+    _, _, _, _, _, diagnostics = model(input_ids, hidden_states_list, loss_mask, lm_head_weight)
+
+    top1 = float(diagnostics["top1_correct_count"])
+    top5 = float(diagnostics["top5_correct_count"])
+    quality = float(diagnostics["quality_token_count"])
+
+    assert quality > 0
+    # top-5 is a superset of top-1, and with vocab_size=32 sampling 5 candidates
+    # over that many tokens must hit at least one target.
+    assert top5 >= top1
+    assert top5 > 0
+
+
 def test_domino_lambda_base_schedule() -> None:
     # get_lambda_base is pure-python, but its module (domino_trainer_backend)
     # subclasses the torch-based DFlash backend at import time, so it cannot be

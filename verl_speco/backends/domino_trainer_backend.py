@@ -212,6 +212,7 @@ class DominoTrainingModel(DFlashTrainingModel):
         active_final_pred = None
         active_base_pred = None
         active_final_logits = None
+        active_top5 = None
         if active_targets.numel() == 0:
             loss = flat_weights.sum() * 0.0
             final_loss = base_loss = loss.detach()
@@ -243,10 +244,13 @@ class DominoTrainingModel(DFlashTrainingModel):
             loss = (1.0 - lambda_base) * final_loss + lambda_base * base_loss
             loss_per_token[active_mask] = final_ce
             with torch.no_grad():
+                topk = min(5, base_logits.shape[-1])
                 active_base_pred = base_logits.argmax(dim=-1)
                 active_final_pred = active_base_pred.clone()
+                active_top5 = base_logits.topk(topk, dim=-1).indices
                 if active_final_logits is not None:
                     active_final_pred[suffix_mask] = active_final_logits.argmax(dim=-1)
+                    active_top5[suffix_mask] = active_final_logits.topk(topk, dim=-1).indices
 
         with torch.no_grad():
             flat_eval_mask = eval_mask.reshape(-1)
@@ -261,6 +265,7 @@ class DominoTrainingModel(DFlashTrainingModel):
                 correct[active_mask] = active_correct
                 base_correct[active_mask] = active_base_pred.eq(active_targets)
                 top1_correct = active_correct.float().sum()
+                top5_correct = active_top5.eq(active_targets.unsqueeze(-1)).any(dim=-1).float().sum()
                 quality_token_count = active_targets.new_tensor(float(active_targets.numel()), dtype=torch.float32)
 
             binary_weights = binary_eval_mask.view(bsz, n_blocks, self.block_size).float()
