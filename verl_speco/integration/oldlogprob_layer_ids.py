@@ -150,6 +150,45 @@ def _default_eagle3_aux_layer_ids(num_hidden_layers: int) -> list[int]:
     return [2, num_hidden_layers // 2, num_hidden_layers - 3]
 
 
+def assert_sglang_aux_last_layer_norm_safe(
+    layer_ids: Any,
+    num_hidden_layers: int | None,
+    *,
+    collect_from_sgl: bool,
+    allow_prenorm_last: bool,
+) -> None:
+    """Fail closed when SGLang aux collection would capture the last layer pre-norm.
+
+    SGLang's aux/context capture never applies the target's final norm, so a
+    ``target_layer_id`` equal to the last layer (``num_hidden_layers - 1``) or the
+    embedding id ``-1`` is captured with different semantics than the offline /
+    old-logprob paths (post-norm for the last layer, embedding for ``-1``). Training
+    a drafter offline (or via old-logprob) and then collecting/serving via SGLang
+    would then feed the ``fc`` an inconsistent feature for that slot. This refuses
+    the combination unless the user opts in (e.g. a self-consistent SGLang-only
+    train+serve setup, where pre-norm on both sides is fine).
+    """
+    if not collect_from_sgl or allow_prenorm_last or not layer_ids:
+        return
+    # ``-1`` (the embedding) is divergent regardless of target depth, so it is
+    # rejected even when ``num_hidden_layers`` is unresolved; the last layer can
+    # only be flagged once the depth is known.
+    last = int(num_hidden_layers) - 1 if num_hidden_layers is not None else None
+    offenders = sorted({int(lid) for lid in layer_ids if int(lid) == -1 or (last is not None and int(lid) == last)})
+    if offenders:
+        last_desc = f"the last layer {last}" if last is not None else "the last layer"
+        raise ValueError(
+            "SGLang hidden-state collection (collect_hidden_states_from_sgl=true) captures aux/context "
+            f"features WITHOUT the target's final norm, but the resolved target_layer_ids {list(layer_ids)} "
+            f"include layer(s) {offenders} whose semantics differ from the offline / old-logprob paths "
+            f"({last_desc} is post-norm there, and -1 is the embedding). A drafter trained "
+            "off-policy of this convention would see a mismatched feature for that slot. Either set "
+            "collect_hidden_states_from_old_logprob=true, drop the last layer / -1 from target_layer_ids, "
+            "or set actor_rollout_ref.rollout.drafter.training.allow_sglang_prenorm_last_layer=true if you "
+            "train and serve entirely on SGLang (self-consistent pre-norm)."
+        )
+
+
 def resolve_oldlogprob_aux_layer_ids(
     drafter_cfg: Any,
     *,
@@ -175,6 +214,16 @@ def resolve_oldlogprob_aux_layer_ids(
             int(target_num_hidden_layers),
         )
 
+    # EAGLE-1/2 fuse a single (last) target hidden layer, unlike EAGLE-3's
+    # low/mid/high triple. The last-layer feature is also what the frozen target
+    # head distills from, so collect only the final layer as the single aux. This
+    # is resolved before the generic multi-layer config lookup so a stray
+    # eagle3-style eagle_aux_hidden_state_layer_ids cannot silently select the
+    # wrong (multi-layer) set while the draft fixes num_aux_hidden_states=1.
+    if _drafter_algorithm(drafter_cfg) in {"EAGLE1", "EAGLE2"}:
+        if target_num_hidden_layers is None:
+            return None
+        return [int(target_num_hidden_layers) - 1]
     for config in (drafter_cfg, *model_configs):
         layer_ids = _generic_aux_layer_ids_from_config(config)
         if layer_ids is not None:

@@ -1,8 +1,12 @@
-name: npu_example_tests
+name: npu_unit_tests
 
 run-name: NPU example tests (${{ github.ref_name }})
 
 on:
+  pull_request:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       run_training:
@@ -74,7 +78,7 @@ env:
 jobs:
   example:
     name: NPU ${{ matrix.backend }} ${{ matrix.drafter }} example
-    runs-on: [self-hosted, linux, x64, npu]
+    runs-on: [linux-aarch64-a2-8, linux-aarch64-a2-4]
     timeout-minutes: 180
     environment: speco-npu-ci
     strategy:

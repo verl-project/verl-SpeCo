@@ -472,6 +472,20 @@ class DrafterBaseTrainer:
                     rollout_tp_size,
                     self.training_group_world_size,
                 )
+        elif not getattr(self.backend, "supports_ulysses_sp", True):
+            # Backends that do not implement the SP loss path (e.g. EAGLE-1/2)
+            # opt out here so SP is never enabled under them, rather than aborting
+            # in compute_loss when rollout_tp > 1 on a multi-rank training group.
+            self.ulysses_sequence_parallel_size = 1
+            if rollout_tp_size > 1 and self.training_group_world_size > 1:
+                logger.debug(
+                    "[Rank %s] Disable Ulysses SP for %s drafter training: "
+                    "rollout_tp=%s training_group_world_size=%s",
+                    self.rank,
+                    self.config.rollout.drafter.get("speculative_algorithm", self.backend.model_type),
+                    rollout_tp_size,
+                    self.training_group_world_size,
+                )
         else:
             self.ulysses_sequence_parallel_size = min(
                 rollout_tp_size,
