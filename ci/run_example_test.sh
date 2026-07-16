@@ -107,7 +107,8 @@ PY
   else
     visible_count=1
     if [[ -n "${ASCEND_RT_VISIBLE_DEVICES}" ]]; then
-      visible_count="$(awk -F, '{print NF}' <<< "${ASCEND_RT_VISIBLE_DEVICES}")"
+      visible_commas="${ASCEND_RT_VISIBLE_DEVICES//[^,]/}"
+      visible_count=$(( ${#visible_commas} + 1 ))
     fi
     if (( accelerator_count > visible_count )); then
       echo "SPECO_ACCELERATOR_COUNT=${accelerator_count} exceeds visible NPU count ${visible_count} from ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES}" >&2

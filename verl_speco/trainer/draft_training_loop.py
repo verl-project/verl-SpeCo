@@ -353,13 +353,7 @@ def _barrier() -> None:
 def _sync_any_rank_saved_checkpoint(saved: Any) -> bool:
     if not dist.is_initialized():
         return bool(saved)
-    device_name = get_device_name()
-    if device_name == "cpu":
-        device = torch.device("cpu")
-    else:
-        current_device = getattr(get_torch_device(), "current_device", None)
-        device_index = current_device() if callable(current_device) else 0
-        device = torch.device(f"{device_name}:{int(device_index)}")
+    device = torch.device(get_device_name())
     flag = torch.tensor([1 if saved else 0], dtype=torch.int32, device=device)
     dist.all_reduce(flag, op=dist.ReduceOp.MAX)
     return bool(flag.item())
