@@ -17,9 +17,11 @@ training forward differ. The shifted-label alignment (target ``x[a+1:a+1+block]`
 prev ``[x[a], labels[:-1]]``, every position supervised) is the DSpark alignment,
 which equals AutoModel's ``shift_label=True`` Domino path.
 
-Domino is a training-only drafter: its GRU-conditioned correction has no stock
-vLLM proposer, so what is served is the trained DFlash backbone. See
-``vllm_runtime`` for the serve-time guardrail.
+Domino is not an engine-level speculative algorithm: engines expose it as a
+``projector_type`` sub-mode of DFlash, so the serve method stays ``dflash`` and the
+correction head is enabled from the checkpoint's ``dflash_config.projector_type``.
+``DOMINO`` is therefore never a valid engine algorithm string; see ``vllm_runtime``
+and ``sglang_runtime`` for the serve-time guardrails that point at ``DFLASH``.
 """
 
 from __future__ import annotations
