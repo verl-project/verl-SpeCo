@@ -3,8 +3,8 @@
 The repository uses three workflow layers:
 
 - `cpu_unit_tests.yml`: required PR checks without installing this repository or using accelerator runtimes.
-- `gpu_example_tests.yml`: scheduled/manual vLLM and SGLang example-script runs on GPU.
-- `npu_example_tests.yml`: trusted PR, scheduled, and manual vLLM/SGLang example-script runs on NPU.
+- `gpu_unit_tests.yml`: scheduled/manual vLLM and SGLang example-script runs on GPU.
+- `npu_unit_tests.yml`: trusted PR, scheduled, and manual vLLM/SGLang example-script runs on NPU.
 
 The hardware workflows require self-hosted runner labels:
 
@@ -126,6 +126,6 @@ bash ci/run_example_test.sh npu vllm dspark
 ```
 
 To test the hardware workflows on GitHub, open Actions, choose
-`gpu_example_tests` or `npu_example_tests`, and run the workflow without inputs
+`gpu_unit_tests` or `npu_unit_tests`, and run the workflow without inputs
 after preparing the default paths above. Fill the manual inputs only when you
 want to override the defaults for one run.

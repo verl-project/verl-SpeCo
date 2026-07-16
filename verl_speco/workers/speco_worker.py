@@ -398,6 +398,10 @@ class SpecoWorker(Worker):
         algo = str(self.config.rollout.drafter.speculative_algorithm).upper()
         if algo == "EAGLE3":
             trainer_backend = Eagle3TrainerBackend(self.config, self.config.model)
+        elif algo in ("EAGLE1", "EAGLE2"):
+            from verl_speco.backends.eagle1_trainer_backend import Eagle1TrainerBackend
+
+            trainer_backend = Eagle1TrainerBackend(self.config, self.config.model)
         elif algo == "DFLASH":
             trainer_backend = DFlashTrainerBackend(self.config, self.config.model)
         elif algo == "DSPARK":
@@ -408,7 +412,7 @@ class SpecoWorker(Worker):
             raise ValueError(
                 "Unsupported drafter algorithm "
                 f"{self.config.rollout.drafter.speculative_algorithm!r}; "
-                "supported algorithms are EAGLE3, DFLASH and DSPARK"
+                "supported algorithms are EAGLE1, EAGLE2, EAGLE3, DFLASH and DSPARK"
             )
 
         self.trainer = DrafterBaseTrainer(

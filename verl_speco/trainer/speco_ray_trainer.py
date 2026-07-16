@@ -39,7 +39,10 @@ from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_OWNER_RANK_KEY,
     OLD_LOGPROB_TIMING_KEY,
 )
-from verl_speco.integration.oldlogprob_layer_ids import resolve_oldlogprob_aux_layer_ids
+from verl_speco.integration.oldlogprob_layer_ids import (
+    assert_sglang_aux_last_layer_norm_safe,
+    resolve_oldlogprob_aux_layer_ids,
+)
 from verl_speco.integration.sglang_adapter import (
     bucket_drafter_samples_by_replica,
     pop_drafter_samples,
@@ -377,6 +380,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if online_drafter_enabled:
             self._speco_prepare_drafter_checkpoint_for_worker_init()
             self._init_speco_drafter_workers()
+            # Fail closed on the divergent SGLang last-layer-norm combination at
+            # init, before any (expensive) rollout generation runs.
+            self._speco_validate_sglang_aux_last_layer_norm()
 
     @contextmanager
     def _use_speco_agent_loop_manager(self, enabled: bool):
@@ -746,6 +752,39 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if num_hidden_layers <= 0:
             raise RuntimeError(f"SPECO cannot derive EAGLE3 aux hidden layers from num_hidden_layers={num_hidden_layers}")
         return [2, num_hidden_layers // 2, num_hidden_layers - 3]
+
+    def _speco_validate_sglang_aux_last_layer_norm(self) -> None:
+        """Fail closed if SGLang collection would capture the last aux layer pre-norm.
+
+        SGLang's aux/context capture skips the target's final norm, so a last-layer
+        (or ``-1``) ``target_layer_id`` diverges from the offline / old-logprob
+        (post-norm / embedding) semantics; see ``assert_sglang_aux_last_layer_norm_safe``.
+        Best-effort: skips silently when the layer ids or target depth cannot be resolved.
+        """
+        training_cfg = self._speco_drafter_training_config()
+        if not bool(training_cfg.get("collect_hidden_states_from_sgl", False)):
+            return
+        drafter_cfg = self._speco_drafter_config()
+        model_configs = []
+        for path_key in ("model_path", "checkpoint_path"):
+            model_config = self._speco_load_model_config(_get_nested(drafter_cfg, (path_key,), None))
+            if model_config is not None:
+                model_configs.append(model_config)
+        num_hidden_layers = self._speco_target_num_hidden_layers()
+        try:
+            layer_ids = resolve_oldlogprob_aux_layer_ids(
+                drafter_cfg,
+                target_num_hidden_layers=num_hidden_layers,
+                model_configs=model_configs,
+            )
+        except Exception:  # noqa: BLE001 -- best-effort guard, never masks the real resolve path
+            return
+        assert_sglang_aux_last_layer_norm_safe(
+            layer_ids,
+            num_hidden_layers,
+            collect_from_sgl=True,
+            allow_prenorm_last=bool(training_cfg.get("allow_sglang_prenorm_last_layer", False)),
+        )
 
     def _speco_oldlogprob_aux_layer_ids(self) -> list[int]:
         drafter_cfg = self._speco_drafter_config()

@@ -52,14 +52,14 @@ def _runner_script() -> str:
 def test_ci_layers_match_required_shape() -> None:
     expected = {
         "cpu_unit_tests.yml",
-        "gpu_example_tests.yml",
-        "npu_example_tests.yml",
+        "gpu_unit_tests.yml",
+        "npu_unit_tests.yml",
     }
 
     assert expected <= {path.name for path in WORKFLOWS.glob("*.yml")}
     assert "pull_request" in _workflow("cpu_unit_tests.yml")["on"]
-    assert "pull_request" not in _workflow("gpu_example_tests.yml")["on"]
-    assert "pull_request" in _workflow("npu_example_tests.yml")["on"]
+    assert "pull_request" not in _workflow("gpu_unit_tests.yml")["on"]
+    assert "pull_request" in _workflow("npu_unit_tests.yml")["on"]
 
 
 def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
@@ -81,8 +81,8 @@ def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
 
 def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
     for workflow_name, label in (
-        ("gpu_example_tests.yml", "gpu"),
-        ("npu_example_tests.yml", "npu"),
+        ("gpu_unit_tests.yml", "gpu"),
+        ("npu_unit_tests.yml", "npu"),
     ):
         source = _workflow_source(workflow_name)
         workflow = _workflow(workflow_name)
@@ -94,14 +94,14 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
         assert "SPECO_TARGET_MODEL" in source
         assert "SPECO_EAGLE3_DRAFT_MODEL" in source
         assert "SPECO_DFLASH_DRAFT_MODEL" in source
-        if workflow_name == "npu_example_tests.yml":
+        if workflow_name == "npu_unit_tests.yml":
             assert "SPECO_DSPARK_DRAFT_MODEL" in source
         assert "SPECO_ACCELERATOR_COUNT" in source
         assert "SPECO_TENSOR_PARALLEL_SIZE" in source
         assert "SPECO_SEQUENCE_PARALLEL_SIZE" in source
         assert "SPECO_ENABLE_TRAINING" in source
         assert "SPECO_EXTRA_HYDRA_ARGS" in source
-        if workflow_name == "npu_example_tests.yml":
+        if workflow_name == "npu_unit_tests.yml":
             assert "github.event.pull_request.head.repo.full_name == github.repository" in source
             assert "linux-aarch64-a2-8" in source
             assert "linux-aarch64-a2-4" not in source
@@ -120,7 +120,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 ("sglang", "dflash"),
             } <= matrix_entries
         for job in workflow["jobs"].values():
-            if workflow_name == "npu_example_tests.yml":
+            if workflow_name == "npu_unit_tests.yml":
                 assert set(job["runs-on"]) == {"self-hosted", "linux-aarch64-a2-8"}
             else:
                 assert {"self-hosted", label} <= set(job["runs-on"])

@@ -39,11 +39,22 @@ actor_rollout_ref:
         max_model_len: null
         enforce_eager: null
         speculative_config_overrides: {}
+        # Fail closed on known-lossy acceptance settings (typical_acceptance_sampler,
+        # synthetic rejection, nonzero posterior thresholds). RL rollout is only
+        # unbiased under exact target-distribution verification; SPECO recomputes
+        # old_log_probs as the target logprob with no importance-sampling correction,
+        # so a relaxed verifier would silently bias PPO. Set true to opt in knowingly.
+        allow_lossy_speculative_sampling: false
 
       training:
         mode: online
         collect_hidden_states_from_sgl: false
         collect_hidden_states_from_old_logprob: false
+        # SGLang aux/context capture skips the target's final norm, so a target_layer_id
+        # equal to the last layer (or -1) diverges from the offline / old-logprob (post-norm
+        # / embedding) semantics. SPECO fails closed on that combination; set true only for a
+        # self-consistent SGLang-only train+serve setup (pre-norm on both sides).
+        allow_sglang_prenorm_last_layer: false
         old_logprob_hidden_capture_impl: forward_hook
         use_data_buffer: false
         collect_interval_steps: 5
@@ -122,6 +133,12 @@ actor_rollout_ref:
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
         dspark_debug_log_interval: 100
+        # EAGLE-1 / EAGLE-2 draft training (single-step feature regression +
+        # full-vocab soft-CE distillation against the frozen target head).
+        eagle1_num_hidden_layers: 1
+        eagle1_hidden_loss_weight: 1.0
+        eagle1_token_loss_weight: 0.1
+        eagle1_feature_noise: 0.0
         current_max_samples: 2048
         data_buffer_max_size: 1024
         hidden_state_clip_value: 1.0e4

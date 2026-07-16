@@ -110,6 +110,7 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             store.close()
         await trainer.cleanup_training(clear_data=True)
         if dist.is_initialized():
+            dist.barrier()
             dist.destroy_process_group()
 
     return {
