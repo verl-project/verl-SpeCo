@@ -118,5 +118,15 @@ def test_domino_uses_dflash_aux_layers() -> None:
 def test_domino_rejected_by_vllm_config_builder() -> None:
     from verl_speco.integration.vllm_runtime import _speculative_method_from_drafter
 
-    with pytest.raises(ValueError, match="training-only"):
+    with pytest.raises(ValueError, match="projector sub-mode"):
         _speculative_method_from_drafter({"speculative_algorithm": "DOMINO"})
+
+
+def test_domino_rejected_by_sglang_config_builder() -> None:
+    from verl_speco.integration.sglang_runtime import _server_args_overrides_from_drafter
+
+    with pytest.raises(ValueError, match="projector sub-mode"):
+        _server_args_overrides_from_drafter(
+            {"enable": True, "speculative_algorithm": "DOMINO"},
+            supported_fields={"speculative_algorithm"},
+        )
