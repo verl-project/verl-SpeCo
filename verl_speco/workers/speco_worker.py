@@ -26,12 +26,20 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import get_torch_device
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
+from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DRAFTER_OWNER_ROUTE_MESH = "drafter_owner_route"
 DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
+
+
+def _config_str(value, default: str = "") -> str:
+    if value is None:
+        return default
+    text = str(value)
+    return default if text in {"", "None", "null"} else text
 
 
 def _is_ray_object_ref(value) -> bool:
@@ -264,6 +272,8 @@ class SpecoWorker(Worker):
             raise ValueError("SpecoWorker requires an explicit device_name from the trainer initialization path")
         self.device_name = str(device_name).lower()
         self.trainer = None
+        self.feature_writer = None
+        self.feature_writer_path = None
         self.last_global_step = None
         self.last_trained_step = None
         self.training_process_group = None
@@ -417,7 +427,231 @@ class SpecoWorker(Worker):
     ):
         if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
             return
+        if self._drafter_training_mode() == "collect_only":
+            self._write_rollout_feature_sample(batch, hidden_states, target_logprobs)
+            return
         self.trainer.collect_online_data(batch, hidden_states, target_logprobs)
+
+    def _drafter_training_mode(self) -> str:
+        return str(self.config.rollout.drafter.training.get("mode", "online") or "online").strip().lower()
+
+    def _get_feature_writer(self) -> Optional[TorchShardFeatureStore]:
+        feature_store_cfg = self.config.rollout.drafter.training.get("feature_store", None)
+        if feature_store_cfg is None:
+            return None
+        path = _config_str(feature_store_cfg.get("path", None))
+        if not path:
+            return None
+        if self.feature_writer is not None and self.feature_writer_path == path:
+            return self.feature_writer
+        model_cfg = self.config.get("model", None)
+        target_model_path = _config_str(model_cfg.get("path", None)) if model_cfg is not None else ""
+        self.feature_writer = TorchShardFeatureStore(
+            path,
+            max_samples_per_shard=int(feature_store_cfg.get("max_samples_per_shard", 1024)),
+            strict_schema=bool(feature_store_cfg.get("strict_schema", True)),
+            metadata={
+                "algorithm": str(self.config.rollout.drafter.speculative_algorithm).upper(),
+                "target_model_path": target_model_path,
+                "drafter_model_path": _config_str(self.config.rollout.drafter.get("model_path", None)),
+                "source": "rl_collect_only",
+            },
+            shard_prefix=f"rank{int(self.rank):05d}_pid{int(os.getpid())}",
+        )
+        self.feature_writer_path = path
+        return self.feature_writer
+
+    def _build_rollout_loss_mask(self, batch: dict, input_ids: torch.Tensor) -> torch.Tensor:
+        if torch.is_tensor(batch.get("loss_mask")):
+            return batch["loss_mask"].detach().cpu().float().reshape(-1)
+        ids = input_ids.detach().cpu().reshape(-1)
+        loss_mask = torch.zeros_like(ids, dtype=torch.float32)
+        prompts = batch.get("prompts")
+        responses = batch.get("responses")
+        if torch.is_tensor(prompts) and torch.is_tensor(responses):
+            prompt_len = int(prompts.reshape(-1).numel())
+            response_ids = responses.detach().cpu().reshape(-1)
+            model_cfg = self.config.get("model", None)
+            pad_token_id = int(model_cfg.get("pad_token_id", 0) or 0) if model_cfg is not None else 0
+            max_response = max(0, min(int(response_ids.numel()), int(ids.numel()) - prompt_len))
+            if max_response > 0:
+                loss_mask[prompt_len : prompt_len + max_response] = (response_ids[:max_response] != pad_token_id).float()
+        else:
+            loss_mask[:] = 1.0
+        return loss_mask
+
+    def _write_rollout_feature_sample(
+        self,
+        batch: dict,
+        hidden_states: torch.Tensor,
+        target_logprobs: Optional[torch.Tensor],
+    ) -> None:
+        writer = self._get_feature_writer()
+        if writer is None:
+            logger.warning(
+                "[SpecoWorker rank=%s] training.mode=collect_only but feature_store.path is empty; drop sample",
+                self.rank,
+            )
+            return
+        full_input_ids = batch["input_ids"].detach().cpu().reshape(-1)
+        full_loss_mask = self._build_rollout_loss_mask(batch, full_input_ids)
+        hidden_states = hidden_states.detach().cpu()
+        hidden_rows = int(hidden_states.size(1) if hidden_states.dim() == 3 and hidden_states.size(0) == 1 else hidden_states.size(0))
+        hidden_positions = batch.get("hidden_positions")
+        if torch.is_tensor(hidden_positions):
+            hidden_positions = hidden_positions.detach().cpu().long().reshape(-1)
+        else:
+            hidden_positions = None
+        feature_start, feature_end, position_ids = self._resolve_rollout_feature_window(
+            full_input_ids,
+            hidden_rows,
+            hidden_positions=hidden_positions,
+            hidden_position_start=batch.get("hidden_position_start"),
+            hidden_position_end=batch.get("hidden_position_end"),
+        )
+        input_ids = full_input_ids[feature_start:feature_end]
+        loss_mask = full_loss_mask[feature_start:feature_end]
+        target_logprobs = self._align_rollout_target_logprobs(
+            target_logprobs,
+            feature_start=feature_start,
+            train_rows=max(int(input_ids.numel()) - 1, 0),
+            target_position_start=batch.get("target_logprobs_position_start"),
+            target_position_end=batch.get("target_logprobs_position_end"),
+        )
+        model_cfg = self.config.get("model", None)
+        target_model_path = _config_str(model_cfg.get("path", None)) if model_cfg is not None else ""
+        algorithm = str(self.config.rollout.drafter.speculative_algorithm).upper()
+        dspark_l1_enabled = (
+            algorithm == "DSPARK"
+            and float(self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
+        )
+        default_hidden_layout = (
+            "dflash_aux_plus_last"
+            if dspark_l1_enabled
+            else "dflash_aux"
+            if algorithm in {"DFLASH", "DSPARK"}
+            else "eagle3_aux_plus_last"
+        )
+        metadata = {
+            "source": batch.get("hidden_target_logprobs_source", "rl_rollout"),
+            "global_step": batch.get("global_step", self.last_global_step),
+            "target_model_path": target_model_path,
+            "drafter_model_path": _config_str(self.config.rollout.drafter.get("model_path", None)),
+            "hidden_states_layout": batch.get("hidden_states_layout") or default_hidden_layout,
+            "target_layer_ids": batch.get("target_layer_ids"),
+            "use_logits": bool(self.config.rollout.drafter.training.get("use_logits", False)),
+            "sequence_length": int(input_ids.numel()),
+            "loss_tokens": int(loss_mask.sum().item()),
+            "full_sequence_length": int(full_input_ids.numel()),
+            "feature_start": int(feature_start),
+            "feature_end": int(feature_end),
+        }
+        for key in (
+            "hidden_position_start",
+            "hidden_position_end",
+            "hidden_positions",
+            "hidden_prefix_cache_rows",
+            "hidden_window_start",
+            "hidden_window_end",
+            "hidden_lm_head_fingerprint",
+            "hidden_last_hidden_logprob_check",
+            "hidden_raw_topk_logprob_check",
+            "hidden_last_hidden_filter",
+            "hidden_last_hidden_select",
+            "target_logprobs_position_start",
+            "target_logprobs_position_end",
+        ):
+            if key in batch:
+                metadata[key] = batch[key]
+        sample = DraftFeatureSample(
+            algorithm=str(self.config.rollout.drafter.speculative_algorithm).upper(),
+            input_ids=input_ids,
+            loss_mask=loss_mask,
+            hidden_states=hidden_states,
+            target_logprobs=target_logprobs,
+            position_ids=position_ids,
+            metadata=metadata,
+        )
+        writer.write_many([sample])
+
+    @staticmethod
+    def _align_rollout_target_logprobs(
+        target_logprobs: Optional[torch.Tensor],
+        *,
+        feature_start: int,
+        train_rows: int,
+        target_position_start,
+        target_position_end,
+    ) -> Optional[torch.Tensor]:
+        if not torch.is_tensor(target_logprobs):
+            return None
+        target = target_logprobs.detach().cpu()
+        while target.dim() > 3 and target.size(0) == 1:
+            target = target.squeeze(0)
+        if target.dim() != 3:
+            return target.contiguous()
+
+        try:
+            position_start = int(target_position_start)
+        except (TypeError, ValueError):
+            position_start = int(feature_start) + 1
+        try:
+            position_end = int(target_position_end)
+        except (TypeError, ValueError):
+            position_end = position_start + int(target.size(0))
+        position_end = min(max(position_end, position_start), position_start + int(target.size(0)))
+
+        desired_start = int(feature_start) + 1
+        desired_end = desired_start + max(int(train_rows), 0)
+        slice_start = min(max(desired_start - position_start, 0), int(target.size(0)))
+        slice_end = min(max(desired_end - position_start, slice_start), int(position_end - position_start))
+        return target[slice_start:slice_end].contiguous()
+
+    @staticmethod
+    def _resolve_rollout_feature_window(
+        input_ids: torch.Tensor,
+        hidden_rows: int,
+        *,
+        hidden_positions: Optional[torch.Tensor],
+        hidden_position_start,
+        hidden_position_end,
+    ) -> tuple[int, int, torch.Tensor]:
+        input_len = int(input_ids.numel())
+        hidden_rows = max(int(hidden_rows), 0)
+        if hidden_positions is not None and int(hidden_positions.numel()) > 0:
+            positions = hidden_positions[:hidden_rows].long()
+            start = int(positions[0].item())
+            if int(positions.numel()) == hidden_rows and bool(torch.all(positions[1:] == positions[:-1] + 1).item()):
+                end = int(positions[-1].item()) + 1
+                if 0 <= start < end <= input_len:
+                    return start, end, positions + 1
+        else:
+            positions = None
+
+        try:
+            start = int(hidden_position_start)
+        except (TypeError, ValueError):
+            start = 0
+        try:
+            end = int(hidden_position_end)
+        except (TypeError, ValueError):
+            end = start + hidden_rows
+        start = min(max(start, 0), input_len)
+        end = min(max(end, start), input_len)
+        if end - start != hidden_rows:
+            end = min(start + hidden_rows, input_len)
+        if end <= start:
+            start = 0
+            end = min(hidden_rows, input_len)
+        position_ids = torch.arange(start + 1, end + 1, dtype=torch.long)
+        return start, end, position_ids
+
+    def _flush_rollout_features_for_step(self) -> None:
+        if self._drafter_training_mode() != "collect_only" or self.feature_writer is None:
+            return
+        feature_store_cfg = self.config.rollout.drafter.training.get("feature_store", {})
+        flush_interval = int(feature_store_cfg.get("flush_interval_steps", 1))
+        self.feature_writer.flush_on_step(self.last_global_step, flush_interval)
 
     @register(dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH))
     def collect_rollout_features(self, samples: list[dict]):
@@ -476,6 +710,7 @@ class SpecoWorker(Worker):
                 hidden_states=hidden,
                 target_logprobs=target_logprobs,
             )
+        self._flush_rollout_features_for_step()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_global_step(self, global_step: int):
