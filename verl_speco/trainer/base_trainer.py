@@ -2698,6 +2698,13 @@ class DrafterBaseTrainer:
                 target_logprobs = batch["target_logprobs"]
             else:
                 last_hidden_states = batch["last_hidden_states"]
+        elif self.backend.model_type == "peagle":
+            # Carry the sanitized P-EAGLE tensors across the batch rebuild below.
+            # They are not padded/sliced here: the backend rejects Ulysses SP in
+            # compute_loss (supports_ulysses_sp=False), so peagle batches must
+            # reach it unsliced.
+            peagle_last_hidden_states = batch["last_hidden_states"]
+            peagle_seq_lengths = batch["seq_lengths"]
 
         # Use Ulysses SP to pad and slice if needed.
         pad_size_for_batch = 0
@@ -2759,6 +2766,9 @@ class DrafterBaseTrainer:
                 batch["target_logprobs"] = target_logprobs
             else:
                 batch["last_hidden_states"] = last_hidden_states
+        elif self.backend.model_type == "peagle":
+            batch["last_hidden_states"] = peagle_last_hidden_states
+            batch["seq_lengths"] = peagle_seq_lengths
         batch["_speco_pad_size"] = pad_size_for_batch
 
         if alignment_debug_enabled():
