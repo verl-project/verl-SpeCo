@@ -61,4 +61,4 @@ jobs:
           tests/config
           tests/examples
           tests/integration
-          -q
+          -q -s

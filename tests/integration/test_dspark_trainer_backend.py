@@ -48,7 +48,7 @@ def test_dspark_label_and_prev_token_alignment():
         anchor_positions=anchor_positions,
         block_keep_mask=block_keep_mask,
     )
-
+    print('dspark label and prev token alignment test')
     assert label_indices.tolist() == [[[3, 4, 5, 6]]]
     assert target_ids.tolist() == [[[13, 14, 15, 16]]]
     assert prev_token_ids.tolist() == [[[12, 13, 14, 15]]]
