@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
+import json
 import logging
 import os
 from typing import Any
@@ -43,7 +45,10 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     trainer = DrafterBaseTrainer(
         config=draft_config,
         world_size=world_size,
-        rollout_dp_rank=rank,
+        # Standalone ranks form one training replica. Keep rollout_dp_rank at
+        # zero on every rank so all ranks participate in optimizer DCP while
+        # _is_checkpoint_leader still selects SP rank zero for metadata/model IO.
+        rollout_dp_rank=0,
         training_device_mesh=training_device_mesh,
         training_process_group=(
             None
@@ -57,6 +62,8 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     max_steps = int(training_cfg.get("max_steps", training_cfg.get("step", 1000)) or 0)
     save_interval = int(training_cfg.get("save_interval_steps", 0) or 0)
     successful_steps = 0
+    initial_optimizer_step = 0
+    optimizer_step = 0
     attempted_batches = 0
     last_save_result: dict[str, Any] | None = None
     last_saved_step = 0
@@ -65,6 +72,9 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         activated = await trainer.activate_training_model()
         if not activated:
             raise RuntimeError(f"Failed to activate standalone drafter trainer on rank={rank}")
+        initial_optimizer_step = int(trainer.optimizer_steps_total)
+        optimizer_step = initial_optimizer_step
+        last_saved_step = optimizer_step
 
         store = build_feature_store_from_config(feature_store_cfg, read_only=True)
         loader = DraftFeatureDataLoader(
@@ -82,26 +92,29 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             if max_steps > 0 and successful_steps >= max_steps:
                 break
             attempted_batches += 1
-            batch = trainer.prepare_training_batch_from_samples(samples, step=successful_steps)
+            batch = trainer.prepare_training_batch_from_samples(samples, step=optimizer_step)
             has_batch = batch is not None
-            if not trainer._sync_batch_readiness(has_batch):
+            if not _all_ranks_true(has_batch, trainer.runtime_device):
                 if rank == 0:
-                    logger.warning("Stopping standalone drafter training: at least one rank has no batch")
-                break
+                    logger.warning("Skipping standalone drafter batch: at least one rank has no valid batch")
+                continue
             if batch is None:
                 continue
-            ok = await trainer.training_step_from_batch(batch, successful_steps)
-            if not ok:
+            ok = await trainer.training_step_from_batch(batch, optimizer_step)
+            if not _all_ranks_true(ok, trainer.runtime_device):
                 continue
             successful_steps += 1
-            if save_interval > 0 and successful_steps % save_interval == 0:
-                last_save_result = _save_standalone_checkpoint(trainer, successful_steps)
-                if last_save_result.get("saved"):
-                    last_saved_step = successful_steps
+            optimizer_step = int(trainer.optimizer_steps_total)
+            if optimizer_step <= initial_optimizer_step:
+                optimizer_step = initial_optimizer_step + successful_steps
+            if save_interval > 0 and optimizer_step % save_interval == 0:
+                last_save_result = _save_standalone_checkpoint(trainer, optimizer_step)
+                if _sync_any_rank_saved_checkpoint(last_save_result.get("saved")):
+                    last_saved_step = optimizer_step
                 _barrier()
         final_save = bool(training_cfg.get("save_final_checkpoint", True))
-        if final_save and successful_steps > 0 and successful_steps != last_saved_step:
-            last_save_result = _save_standalone_checkpoint(trainer, successful_steps, wait=True)
+        if final_save and successful_steps > 0 and optimizer_step != last_saved_step:
+            last_save_result = _save_standalone_checkpoint(trainer, optimizer_step, wait=True)
             _barrier()
     finally:
         if store is not None:
@@ -116,6 +129,8 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         "world_size": world_size,
         "attempted_batches": attempted_batches,
         "successful_steps": successful_steps,
+        "initial_optimizer_step": initial_optimizer_step,
+        "optimizer_steps_total": optimizer_step,
         "last_save": last_save_result,
     }
 
@@ -134,29 +149,191 @@ def _build_backend(draft_config):
 
 
 def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int, *, wait: bool = False) -> dict[str, Any]:
-    if not trainer.checkpoint_dir:
-        return {"saved": False, "reason": "missing_checkpoint_dir"}
+    save_checkpoint = getattr(trainer, "save_checkpoint", None)
+    if callable(save_checkpoint):
+        result = save_checkpoint(int(step), wait=wait)
+        checkpoint_path = result.get("path")
+        is_export_leader = result.get("reason") in {"saved", "scheduled"}
+        if result.get("saved") and checkpoint_path and is_export_leader:
+            if wait:
+                _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
+            else:
+                future = getattr(trainer, "_pending_full_checkpoint_future", None)
+                if future is not None:
+                    future.add_done_callback(
+                        lambda completed: _rewrite_standalone_block_runtime_config(
+                            trainer,
+                            checkpoint_path,
+                            completed,
+                        )
+                    )
+        return result
 
-    checkpoint_path = os.path.join(trainer.checkpoint_dir, f"draft_step_{int(step)}")
+    # Keep the small PR #13 test double and older trainer adapters usable.
+    checkpoint_dir = getattr(trainer, "checkpoint_dir", None)
+    if not checkpoint_dir:
+        return {"saved": False, "reason": "missing_checkpoint_dir"}
+    checkpoint_path = os.path.join(checkpoint_dir, f"draft_step_{int(step)}")
     pending_full_checkpoint = getattr(trainer, "_pending_full_checkpoint_future", None)
     pending_done = getattr(pending_full_checkpoint, "done", None)
     if callable(pending_done) and not pending_done():
-        return {
-            "saved": False,
-            "path": checkpoint_path,
-            "reason": "previous_save_running",
-        }
+        return {"saved": False, "path": checkpoint_path, "reason": "previous_save_running"}
 
-    future = trainer._save_checkpoint_async(int(step))
+    save_async = getattr(trainer, "_save_checkpoint_async", None)
+    if not callable(save_async):
+        return {"saved": False, "path": checkpoint_path, "reason": "unsupported_trainer"}
+    future = save_async(int(step))
     if future is not None and wait:
         future.result()
         trainer._pending_full_checkpoint_future = None
-
+        _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
+    elif future is not None:
+        future.add_done_callback(
+            lambda completed: _rewrite_standalone_block_runtime_config(
+                trainer,
+                checkpoint_path,
+                completed,
+            )
+        )
     return {
         "saved": future is not None,
         "path": checkpoint_path,
         "reason": "saved" if future is not None and wait else "scheduled" if future is not None else "not_checkpoint_leader",
     }
+
+
+def _ensure_dict_child(config: dict[str, Any], key: str) -> dict[str, Any]:
+    value = config.get(key)
+    if isinstance(value, dict):
+        return value
+    value = {}
+    config[key] = value
+    return value
+
+
+def _load_source_drafter_config(trainer: DrafterBaseTrainer) -> dict[str, Any] | None:
+    model_path = getattr(getattr(getattr(trainer, "config", None), "rollout", None), "drafter", None)
+    model_path = getattr(model_path, "model_path", None)
+    if not model_path:
+        return None
+    config_path = os.path.join(os.fspath(model_path), "config.json")
+    if not os.path.exists(config_path):
+        return None
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to load source drafter config %s: %s", config_path, exc)
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _fill_if_missing(dst: dict[str, Any], src: dict[str, Any], keys: tuple[str, ...]) -> None:
+    for key in keys:
+        if key in src and key not in dst:
+            dst[key] = deepcopy(src[key])
+
+
+def _rewrite_standalone_block_runtime_config(
+    trainer: DrafterBaseTrainer,
+    checkpoint_path: str,
+    completed_future=None,
+) -> None:
+    """Export standalone DFlash/DSpark checkpoints with runtime-facing config.
+
+    The training wrapper saves an internal SpeCo config.  For standalone
+    checkpoints we keep the original drafter ``config.json`` as the runtime
+    contract and only merge the alias fields needed by vLLM/SGLang.
+    """
+    backend_type = getattr(getattr(trainer, "backend", None), "model_type", None)
+    if backend_type not in {"dflash", "dspark"}:
+        return
+
+    if completed_future is not None:
+        try:
+            completed_future.result()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Skip standalone runtime config rewrite because checkpoint save failed: %s", exc)
+            return
+
+    config_path = os.path.join(checkpoint_path, "config.json")
+    if not os.path.exists(config_path):
+        logger.warning("Cannot rewrite standalone runtime config: missing %s", config_path)
+        return
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            training_config = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Cannot rewrite standalone runtime config %s: %s", config_path, exc)
+        return
+    if not isinstance(training_config, dict):
+        logger.warning("Cannot rewrite standalone runtime config %s: expected object", config_path)
+        return
+
+    training_config_path = os.path.join(checkpoint_path, "speco_training_config.json")
+    try:
+        with open(training_config_path, "w", encoding="utf-8") as f:
+            json.dump(training_config, f, indent=2, sort_keys=True)
+    except OSError as exc:
+        logger.warning("Failed to write standalone training config copy %s: %s", training_config_path, exc)
+
+    runtime_config = _load_source_drafter_config(trainer)
+    if runtime_config is None:
+        runtime_config = deepcopy(training_config)
+        logger.warning(
+            "Source drafter config is unavailable; standalone checkpoint keeps SpeCo training config as runtime config"
+        )
+
+    runtime_config["speco_training_model_type"] = backend_type
+    common_alias_keys = ("target_layer_ids", "mask_token_id", "num_context_layers")
+    _fill_if_missing(runtime_config, training_config, common_alias_keys)
+
+    dflash_config = _ensure_dict_child(runtime_config, "dflash_config")
+    _fill_if_missing(dflash_config, training_config, common_alias_keys)
+
+    if backend_type == "dspark":
+        dspark_config = _ensure_dict_child(runtime_config, "dspark_config")
+        _fill_if_missing(
+            dspark_config,
+            training_config,
+            (
+                "block_size",
+                "num_anchors",
+                "markov_rank",
+                "markov_head_type",
+                "confidence_head_alpha",
+                "confidence_head_with_markov",
+                "ce_loss_alpha",
+                "l1_loss_alpha",
+                "loss_decay_gamma",
+                "target_layer_ids",
+                "num_context_layers",
+                "num_target_layers",
+                "target_num_hidden_layers",
+                "mask_token_id",
+            ),
+        )
+    else:
+        dspark_config = {}
+
+    target_layer_ids = (
+        runtime_config.get("target_layer_ids")
+        or dflash_config.get("target_layer_ids")
+        or dspark_config.get("target_layer_ids")
+    )
+    if target_layer_ids is not None and "eagle_aux_hidden_state_layer_ids" not in runtime_config:
+        try:
+            runtime_config["eagle_aux_hidden_state_layer_ids"] = [int(layer_id) + 1 for layer_id in target_layer_ids]
+        except (TypeError, ValueError):
+            logger.warning("Invalid target_layer_ids in standalone exported config: %r", target_layer_ids)
+
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(runtime_config, f, indent=2, sort_keys=True)
+            f.write("\n")
+    except OSError as exc:
+        logger.warning("Failed to write standalone runtime config %s: %s", config_path, exc)
 
 
 def _disable_standalone_sequence_parallel(draft_config) -> None:
@@ -191,7 +368,16 @@ def _init_distributed() -> tuple[int, int, int]:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size > 1 and not dist.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        _configure_device(local_rank)
+        device_name = str(get_device_name()).lower()
+        if device_name == "npu":
+            backend = "hccl"
+        elif device_name == "cuda":
+            backend = "nccl"
+        elif device_name == "cpu":
+            backend = "gloo"
+        else:
+            raise ValueError(f"Unsupported standalone drafter device_name={device_name!r}")
         dist.init_process_group(backend=backend)
     return rank, local_rank, world_size
 
@@ -209,6 +395,23 @@ def _configure_device(local_rank: int) -> None:
 def _barrier() -> None:
     if dist.is_initialized():
         dist.barrier()
+
+
+def _all_ranks_true(value: bool, device: torch.device) -> bool:
+    if not dist.is_initialized() or dist.get_world_size() <= 1:
+        return bool(value)
+    ready = torch.tensor(1 if value else 0, dtype=torch.int32, device=device)
+    dist.all_reduce(ready, op=dist.ReduceOp.MIN)
+    return bool(ready.item())
+
+
+def _sync_any_rank_saved_checkpoint(saved: Any) -> bool:
+    if not dist.is_initialized():
+        return bool(saved)
+    device = torch.device(get_device_name())
+    flag = torch.tensor([1 if saved else 0], dtype=torch.int32, device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item())
 
 
 def log_resolved_config(config) -> None:

@@ -87,7 +87,9 @@ follows that PR's DSpark path.
 ```text
 verl_speco/
   main.py                         # Hydra entrypoint
-  config/speco_trainer.yaml       # verl v0.8.0 config overlay
+  config/speco_base.yaml          # shared SPECO/drafter defaults
+  config/speco_trainer.yaml       # online PPO primary config
+  config/draft_trainer.yaml       # standalone drafter primary config
   trainer/speco_ray_trainer.py    # RayPPOTrainer adapter
   workers/speco_worker.py         # drafter trainer worker
   integration/                    # vLLM, SGLang, old-logprob, publish adapters
@@ -104,7 +106,7 @@ ci/                               # smoke-test helpers and CI notes
 This repository does not currently define its own Python package metadata. Use
 it with the upstream `verl` commit pinned in
 [`REQUIRED_VERL.txt`](./REQUIRED_VERL.txt), which is mirrored in
-[`verl_speco/config/speco_trainer.yaml`](./verl_speco/config/speco_trainer.yaml).
+[`verl_speco/config/speco_base.yaml`](./verl_speco/config/speco_base.yaml).
 By default, unsupported `verl` versions produce a warning. Set
 `VERL_SPECO_STRICT_VERL=1` to fail closed when the importable `verl` does not
 match the pinned version or commit.
@@ -271,8 +273,12 @@ Important groups:
   publish interval, update mode, and DFLASH/DSpark-specific training options.
 - `drafter.vllm.*`: contains vLLM-specific drafter overrides.
 
-The full default overlay is in
-[`verl_speco/config/speco_trainer.yaml`](./verl_speco/config/speco_trainer.yaml).
+Shared SPECO and drafter defaults are in
+[`verl_speco/config/speco_base.yaml`](./verl_speco/config/speco_base.yaml).
+The online PPO entrypoint composes them through
+[`speco_trainer.yaml`](./verl_speco/config/speco_trainer.yaml), while standalone
+feature-store training uses
+[`draft_trainer.yaml`](./verl_speco/config/draft_trainer.yaml).
 
 ## Testing
 

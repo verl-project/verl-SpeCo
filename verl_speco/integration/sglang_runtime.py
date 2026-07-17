@@ -513,6 +513,22 @@ def _server_args_overrides_from_drafter(drafter_cfg: dict[str, Any], supported_f
     if not bool(drafter_cfg.get("enable")):
         return {}
 
+    algorithm = str(drafter_cfg.get("speculative_algorithm", "") or "").strip().upper()
+    if algorithm == "DOMINO":
+        # Domino is a DFlash variant, not an engine-level method: engines expose it as
+        # "dflash" and enable the causal correction head (prefix_gru + embed_proj) from
+        # the checkpoint's dflash_config.projector_type="domino" (vllm-project/vllm#48241,
+        # sgl-project/sglang#31328). DOMINO is never a valid SGLang ServerArgs algorithm,
+        # so fail loud and point at DFLASH, mirroring
+        # vllm_runtime._speculative_method_from_drafter.
+        raise ValueError(
+            "DOMINO is not an engine-level speculative algorithm; Domino is served as a DFlash "
+            "projector sub-mode. Set actor_rollout_ref.rollout.drafter.speculative_algorithm=DFLASH "
+            "for the rollout/serve path; the trained checkpoint's dflash_config.projector_type=domino "
+            "enables the Domino correction head on engines that support it, keeping DOMINO for "
+            "drafter training."
+        )
+
     rollout_cfg = drafter_cfg.get("rollout") or {}
     training_cfg = drafter_cfg.get("training") or {}
     overrides = {

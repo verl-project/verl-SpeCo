@@ -1,5 +1,5 @@
 set -x
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 # NPU example for the native DFlash proposer in vLLM.
 project_name='verl_grpo_example_dflash_drafter'
@@ -7,6 +7,7 @@ exp_name='qwen3_8b_dflash_drafter_vllm_npu'
 
 gen_tp=2
 train_sp=4
+ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint
@@ -25,7 +26,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=256 \
     data.truncation='error' \
-    actor_rollout_ref.rollout.temperature=0.6 \
+    actor_rollout_ref.rollout.temperature=1 \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -50,7 +51,6 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode="FULL_DECODE_ONLY" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_capture_sizes="[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.max_cudagraph_capture_size=512 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode="FULL_DECODE_ONLY" \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
@@ -95,7 +95,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     trainer.logger='["console"]' \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${exp_name} \
-    trainer.n_gpus_per_node=16 \
+    trainer.n_gpus_per_node=${ppo_gpus_per_node} \
     trainer.nnodes=1 \
     trainer.resume_mode=disable \
     trainer.default_local_dir=${CKPTS_DIR} \

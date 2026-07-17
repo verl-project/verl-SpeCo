@@ -408,10 +408,27 @@ def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
             "P-EAGLE vLLM rollout requires the parallel-drafting runtime and is not wired in this overlay yet; "
             "keep actor_rollout_ref.rollout.drafter.enable=false (train the drafter, serve separately)."
         )
+    if algorithm == "DOMINO":
+        # Domino is a DFlash variant, not an engine-level method: engines expose it as
+        # "dflash" and enable the causal correction head (prefix_gru + embed_proj) from
+        # the checkpoint's dflash_config.projector_type="domino" (vllm-project/vllm#48241,
+        # sgl-project/sglang#31328). DOMINO is never a valid engine algorithm string, so
+        # fail loud and point at DFLASH.
+        raise ValueError(
+            "DOMINO is not an engine-level speculative algorithm; Domino is served as a DFlash "
+            "projector sub-mode. Set actor_rollout_ref.rollout.drafter.speculative_algorithm=DFLASH "
+            "for the rollout/serve path; the trained checkpoint's dflash_config.projector_type=domino "
+            "enables the Domino correction head on engines that support it, keeping DOMINO for "
+            "drafter training."
+        )
     if algorithm == "DSPARK":
         return "dflash" if _is_vllm_ascend_runtime_hint() else "dspark"
 
     method_map = {
+        # EAGLE-1 and EAGLE-2 share vLLM's native EAGLE draft (method="eagle");
+        # EAGLE-2 is a dynamic-tree decoding policy over the same draft head.
+        "EAGLE1": "eagle",
+        "EAGLE2": "eagle",
         "EAGLE3": "eagle3",
         "DFLASH": "dflash",
         "DRAFT": "draft_model",
@@ -432,6 +449,59 @@ def _should_force_eager(drafter_cfg: dict[str, Any]) -> bool:
     return explicit is not None and bool(_bool_or_none(explicit))
 
 
+# Acceptance settings that break the exact target-distribution guarantee RL relies
+# on. greedy DRAFT sampling is lossless (a one-hot proposal fed into rejection
+# sampling); only ACCEPTANCE-relaxing knobs are listed here. This is a best-effort
+# denylist of the lossy modes we can name confidently, NOT a proof of losslessness --
+# it fails closed on the known silent-degradation paths (config overrides via
+# drafter.vllm.speculative_config_overrides or engine_kwargs.vllm.speculative_config).
+_LOSSY_VLLM_ACCEPTANCE_CHECKS = (
+    ("acceptance_method", lambda v: str(v).strip().lower() == "typical_acceptance_sampler",
+     "typical_acceptance_sampler trades exactness for speed"),
+    ("spec_decoding_acceptance_method", lambda v: str(v).strip().lower() == "typical_acceptance_sampler",
+     "typical_acceptance_sampler trades exactness for speed"),
+    ("rejection_sample_method", lambda v: str(v).strip().lower() == "synthetic",
+     "synthetic acceptance does not sample from the corrected residual distribution"),
+    ("posterior_threshold", lambda v: v is not None and float(v) > 0.0,
+     "a nonzero posterior_threshold enables typical/Medusa relaxed acceptance"),
+    ("posterior_alpha", lambda v: v is not None and float(v) > 0.0,
+     "a nonzero posterior_alpha enables typical/Medusa relaxed acceptance"),
+)
+
+
+def assert_lossless_vllm_speculative_config(config: Any, *, allow_lossy: bool) -> None:
+    """Fail closed on known-lossy vLLM speculative acceptance settings.
+
+    RL rollout under speculative decoding is only unbiased when the verifier samples
+    exactly from the target policy. SPECO recomputes PPO's ``old_log_probs`` as the
+    target logprob with no importance-sampling correction, so a relaxed acceptance
+    method silently miscalibrates the PPO ratio (uncorrected off-policy bias). This
+    turns that implicit assumption into an enforced contract for the acceptance modes
+    we can name; set ``allow_lossy`` to opt in knowingly.
+    """
+    if allow_lossy or not isinstance(config, dict):
+        return
+    offenders = []
+    for key, is_lossy, why in _LOSSY_VLLM_ACCEPTANCE_CHECKS:
+        if key not in config:
+            continue
+        try:
+            lossy = bool(is_lossy(config[key]))
+        except (TypeError, ValueError):
+            lossy = False
+        if lossy:
+            offenders.append(f"{key}={config[key]!r} ({why})")
+    if offenders:
+        raise ValueError(
+            "SPECO refuses a lossy speculative-decoding config that would break the "
+            "target-distribution guarantee RL relies on: " + "; ".join(offenders) + ". "
+            "The generated tokens would no longer be exactly sampled from the target policy, so "
+            "PPO's old_log_probs (recomputed as the target logprob, with no importance-sampling "
+            "correction) would be miscalibrated. Set "
+            "actor_rollout_ref.rollout.drafter.vllm.allow_lossy_speculative_sampling=true to opt in knowingly."
+        )
+
+
 def build_vllm_speculative_config_from_drafter(
     drafter_cfg: dict[str, Any],
     rollout_cfg: Any = None,
@@ -444,8 +514,8 @@ def build_vllm_speculative_config_from_drafter(
     algorithm = _drafter_algorithm(drafter_cfg)
     method = _speculative_method_from_drafter(drafter_cfg)
     spec_model_path = _first_present(
-        drafter_cfg.get("checkpoint_path"),
         drafter_cfg.get("model_path"),
+        drafter_cfg.get("checkpoint_path"),
         _get_nested(drafter_cfg, ("spec_model", "path"), None),
         _get_nested(drafter_cfg, ("model", "path"), None),
         drafter_cfg.get("spec_model_path"),
@@ -509,6 +579,10 @@ def build_vllm_speculative_config_from_drafter(
     if not isinstance(overrides, dict):
         raise TypeError("drafter.vllm.speculative_config_overrides must be a mapping when provided")
     speculative_config.update(_plain_container(overrides))
+    assert_lossless_vllm_speculative_config(
+        speculative_config,
+        allow_lossy=bool(_bool_or_none(vllm_cfg.get("allow_lossy_speculative_sampling", False))),
+    )
     return speculative_config
 
 
@@ -1259,6 +1333,12 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
     engine_kwargs = _ensure_child_mapping(engine_kwargs_root, "vllm")
     existing_spec = _get_nested(engine_kwargs, ("speculative_config",), None)
     merged_speculative_config = _merge_speculative_config(existing_spec, speculative_config)
+    # Authoritative check: engine_kwargs.vllm.speculative_config (existing_spec) takes
+    # priority in the merge, so a lossy acceptance mode injected there must be caught here.
+    assert_lossless_vllm_speculative_config(
+        merged_speculative_config,
+        allow_lossy=bool(_bool_or_none(_get_nested(drafter_cfg, ("vllm", "allow_lossy_speculative_sampling"), False))),
+    )
     _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
     if bool(merged_speculative_config.get("enforce_eager")):
         _set_child(engine_kwargs, "enforce_eager", True)
@@ -1386,6 +1466,10 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     engine_kwargs = _ensure_nested_mapping(config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm"))
     existing_spec = _get_nested(engine_kwargs, ("speculative_config",), None)
     merged_speculative_config = _merge_speculative_config(existing_spec, speculative_config)
+    assert_lossless_vllm_speculative_config(
+        merged_speculative_config,
+        allow_lossy=bool(_bool_or_none(_get_nested(drafter_cfg, ("vllm", "allow_lossy_speculative_sampling"), False))),
+    )
     _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
     if bool(drafter_cfg.get("enable")):
         _set_child(engine_kwargs, "worker_extension_cls", SPECO_VLLM_WORKER_EXTENSION_CLS)
@@ -1446,21 +1530,11 @@ def _draft_param_name_candidates(name: str) -> list[str]:
             if candidate.startswith(prefix):
                 pending.append(candidate[len(prefix) :])
 
-    # DFlash name aliases: training-side name -> vLLM inference-side name
-    dflash_aliases = (
-        ("context_proj.", "fc."),
-        ("context_norm.", "hidden_norm."),
-        ("final_norm.", "norm."),
-    )
-
     candidates = []
     for candidate in bases:
         candidates.append(candidate)
         if "midlayer." in candidate:
             candidates.append(candidate.replace("midlayer.", "model.layers.0."))
-        for src, dst in dflash_aliases:
-            if src in candidate:
-                candidates.append(candidate.replace(src, dst))
     for candidate in list(candidates):
         if not candidate.startswith("model."):
             candidates.append(f"model.{candidate}")
@@ -1819,11 +1893,6 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         _strip_prefixes = ("module.", "_orig_mod.", "draft_model.", "model.draft_model.")
         if is_dflash or is_dspark:
             _strip_prefixes = (*_strip_prefixes, "model.")
-        _alias_map = (
-            ("context_proj.", "fc."),
-            ("context_norm.", "hidden_norm."),
-            ("final_norm.", "norm."),
-        )
         translated_weights: list[tuple[str, torch.Tensor]] = []
         for name, tensor in all_weights:
             n = name
@@ -1838,10 +1907,6 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 n = n.replace("midlayer.", "layers.0.")
             if is_eagle3 and n != "lm_head.weight" and "." in n and not n.startswith("model."):
                 n = f"model.{n}"
-            if is_dflash or is_dspark:
-                for src, dst in _alias_map:
-                    if src in n:
-                        n = n.replace(src, dst)
             translated_weights.append((n, tensor))
 
         loaded_params = len(translated_weights)

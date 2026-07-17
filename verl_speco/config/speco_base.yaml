@@ -1,4 +1,7 @@
 # Shared SPECO configuration without Hydra primary-config metadata.
+#
+# Keep online rollout/training defaults here so both the PPO trainer and the
+# standalone draft trainer inherit the same drafter model contract.
 
 speco:
   enable: true
@@ -39,19 +42,25 @@ actor_rollout_ref:
         max_model_len: null
         enforce_eager: null
         speculative_config_overrides: {}
+        # RL rollout assumes exact target-distribution verification. Set this
+        # only when intentionally opting into a lossy acceptance method.
+        allow_lossy_speculative_sampling: false
 
       training:
         mode: online
         collect_hidden_states_from_sgl: false
         collect_hidden_states_from_old_logprob: false
+        # SGLang does not apply the target final norm to captured aux states.
+        # Keep this false unless training and serving consistently use pre-norm.
+        allow_sglang_prenorm_last_layer: false
         old_logprob_hidden_capture_impl: forward_hook
         use_data_buffer: false
         collect_interval_steps: 5
         collection_sample_rate: 1.0
         max_collect_samples_per_step_per_replica: 16
-        max_collect_tokens_per_step_per_replica: 2048
+        max_collect_tokens_per_step_per_replica: 16384
         hidden_state_window_mode: front
-        hidden_state_window_tokens_per_sample: 128
+        hidden_state_window_tokens_per_sample: 512
         hidden_state_window_min_rows: 512
         hidden_state_random_max_offset: null
         hidden_state_random_seed_by_step: true
@@ -73,10 +82,13 @@ actor_rollout_ref:
         save_full_drafter_checkpoint: true
         sample_last_n_steps: 20
         train_batches_per_cycle: 4
-        lr: 1e-6
+        lr: 1e-5
         lr_warmup_steps: 0
-        min_lr_ratio: null
-        warmup_style: constant
+        lr_scheduler_type: global_cosine
+        lr_decay_steps: 100
+        min_lr_ratio: 0.1
+        warmup_style: null
+        resume_trainer_state_from_checkpoint: true
         use_logits: false
         target_lm_head_row_restricted_sync: true
         logits_topk: 128
@@ -101,7 +113,7 @@ actor_rollout_ref:
         dflash_loss_mode: full_vocab
         dflash_sampled_ce_negatives: 0
         dspark_block_size: 7
-        dspark_num_anchors: 512
+        dspark_num_anchors: 32
         dspark_loss_decay_gamma: 7.0
         dspark_hard_sample_ratio: 0.0
         dspark_hidden_size: null
@@ -117,8 +129,9 @@ actor_rollout_ref:
         dspark_confidence_head_alpha: 0.0
         dspark_confidence_loss_alpha: 0.0
         dspark_confidence_head_with_markov: true
-        dspark_ce_loss_alpha: 1.0
-        dspark_l1_loss_alpha: 0.0
+        dspark_ce_loss_alpha: 0.1
+        dspark_l1_loss_alpha: 0.9
+        dspark_l1_chunk_size: 0
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
         dspark_debug_log_interval: 100
@@ -131,6 +144,29 @@ actor_rollout_ref:
         peagle_down_sample_ratio_min: 0.2
         peagle_mask_token_id: null
         peagle_fc_norm: false
+        # Domino (DFlash variant: causal GRU correction head + dual-logit curriculum).
+        # Unset keys fall back to the matching dflash_* value.
+        domino_block_size: 16
+        domino_num_anchors: 512
+        domino_loss_decay_gamma: 7.0
+        domino_hidden_size: null
+        domino_num_target_layers: 5
+        domino_num_hidden_layers: 5
+        domino_mask_token_id: null
+        domino_target_layer_ids: null
+        domino_max_window: 512
+        domino_emb_dim: 256
+        domino_gru_hidden_dim: 1024
+        domino_pure_draft_prefix_len: 1
+        domino_shift_label: true
+        domino_lambda_base_start: 1.0
+        domino_lambda_base_decay_steps: 2000
+        # EAGLE-1 / EAGLE-2 draft training (single-step feature regression +
+        # full-vocab soft-CE distillation against the frozen target head).
+        eagle1_num_hidden_layers: 1
+        eagle1_hidden_loss_weight: 1.0
+        eagle1_token_loss_weight: 0.1
+        eagle1_feature_noise: 0.0
         current_max_samples: 2048
         data_buffer_max_size: 1024
         hidden_state_clip_value: 1.0e4

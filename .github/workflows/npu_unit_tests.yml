@@ -1,8 +1,14 @@
-name: npu_example_tests
+name: npu_unit_tests
 
 run-name: NPU example tests (${{ github.ref_name }})
 
 on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       run_training:
@@ -20,6 +26,10 @@ on:
         type: string
       dflash_draft_model:
         description: DFlash drafter path; falls back to SPECO_DFLASH_DRAFT_MODEL
+        required: false
+        type: string
+      dspark_draft_model:
+        description: DSpark drafter path; falls back to SPECO_DSPARK_DRAFT_MODEL
         required: false
         type: string
       train_file:
@@ -57,7 +67,7 @@ permissions:
 
 concurrency:
   group: npu-example-tests-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   SPECO_DEFAULT_MODEL_ROOT: ${{ vars.SPECO_MODEL_ROOT || '/home/runner/models' }}
@@ -65,6 +75,7 @@ env:
   SPECO_DEFAULT_TARGET_MODEL: ${{ vars.SPECO_TARGET_MODEL || '/home/runner/models/Qwen/Qwen2.5-0.5B-Instruct' }}
   SPECO_DEFAULT_EAGLE3_DRAFT_MODEL: ${{ vars.SPECO_EAGLE3_DRAFT_MODEL || '/home/runner/models/speco/eagle3-drafter' }}
   SPECO_DEFAULT_DFLASH_DRAFT_MODEL: ${{ vars.SPECO_DFLASH_DRAFT_MODEL || '/home/runner/models/speco/dflash-drafter' }}
+  SPECO_DEFAULT_DSPARK_DRAFT_MODEL: ${{ vars.SPECO_DSPARK_DRAFT_MODEL || '/home/runner/models/speco/dspark-drafter' }}
   SPECO_DEFAULT_TRAIN_FILE: ${{ vars.SPECO_TRAIN_FILE || '/home/runner/models/hf_data/gsm8k/train.parquet' }}
   SPECO_DEFAULT_TEST_FILE: ${{ vars.SPECO_TEST_FILE || '/home/runner/models/hf_data/gsm8k/test.parquet' }}
   SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '1' }}
@@ -74,21 +85,13 @@ env:
 jobs:
   example:
     name: NPU ${{ matrix.backend }} ${{ matrix.drafter }} example
-    runs-on: [self-hosted, linux, x64, npu]
+    # if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: [self-hosted, linux-aarch64-a2-8]
     timeout-minutes: 180
     environment: speco-npu-ci
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - backend: vllm
-            drafter: eagle3
-          - backend: vllm
-            drafter: dflash
-          - backend: sglang
-            drafter: eagle3
-          - backend: sglang
-            drafter: dflash
+      matrix: ${{ fromJSON(github.event_name == 'pull_request' && '{"include":[{"backend":"vllm","drafter":"dspark"},{"backend":"sglang","drafter":"eagle3"},{"backend":"sglang","drafter":"dflash"}]}' || '{"include":[{"backend":"vllm","drafter":"eagle3"},{"backend":"vllm","drafter":"dflash"},{"backend":"vllm","drafter":"dspark"},{"backend":"sglang","drafter":"eagle3"},{"backend":"sglang","drafter":"dflash"}]}') }}
 
     steps:
       - name: Check out verl-SpeCo
@@ -97,7 +100,12 @@ jobs:
       - name: Verify NPU runtime
         run: |
           npu-smi info
-          python -c "import torch, torch_npu; assert torch.npu.is_available()"
+          python - <<'PY'
+          import torch
+          import torch_npu
+          assert torch.npu.is_available()
+          print("torch.npu.device_count =", torch.npu.device_count())
+          PY
           if [[ "${{ matrix.backend }}" == "vllm" ]]; then
             python -c "import vllm; print(vllm.__version__)"
           else
@@ -110,12 +118,17 @@ jobs:
           SPECO_TARGET_MODEL: ${{ inputs.target_model || env.SPECO_DEFAULT_TARGET_MODEL }}
           SPECO_EAGLE3_DRAFT_MODEL: ${{ inputs.eagle3_draft_model || env.SPECO_DEFAULT_EAGLE3_DRAFT_MODEL }}
           SPECO_DFLASH_DRAFT_MODEL: ${{ inputs.dflash_draft_model || env.SPECO_DEFAULT_DFLASH_DRAFT_MODEL }}
+          SPECO_DSPARK_DRAFT_MODEL: ${{ inputs.dspark_draft_model || env.SPECO_DEFAULT_DSPARK_DRAFT_MODEL }}
           SPECO_TRAIN_FILE: ${{ inputs.train_file || env.SPECO_DEFAULT_TRAIN_FILE }}
           SPECO_TEST_FILE: ${{ inputs.test_file || env.SPECO_DEFAULT_TEST_FILE }}
           SPECO_CKPT_DIR: ${{ vars.SPECO_CKPT_DIR || runner.temp }}
           SPECO_ACCELERATOR_COUNT: ${{ inputs.accelerator_count || env.SPECO_DEFAULT_ACCELERATOR_COUNT }}
           SPECO_TENSOR_PARALLEL_SIZE: ${{ inputs.tensor_parallel_size || env.SPECO_DEFAULT_TENSOR_PARALLEL_SIZE }}
           SPECO_SEQUENCE_PARALLEL_SIZE: ${{ inputs.sequence_parallel_size || env.SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE }}
-          SPECO_ENABLE_TRAINING: ${{ github.event_name == 'schedule' && 'true' || inputs.run_training }}
+          SPECO_ENABLE_TRAINING: ${{ (github.event_name == 'schedule' || github.event_name == 'pull_request') && 'true' || inputs.run_training }}
+          SPECO_TOTAL_TRAINING_STEPS: ${{ github.event_name == 'pull_request' && '1' || vars.SPECO_TOTAL_TRAINING_STEPS }}
+          SPECO_TRAIN_MAX_SAMPLES: ${{ github.event_name == 'pull_request' && '1' || vars.SPECO_TRAIN_MAX_SAMPLES }}
+          SPECO_VAL_MAX_SAMPLES: ${{ github.event_name == 'pull_request' && '1' || vars.SPECO_VAL_MAX_SAMPLES }}
+          SPECO_DATALOADER_NUM_WORKERS: ${{ github.event_name == 'pull_request' && '0' || vars.SPECO_DATALOADER_NUM_WORKERS }}
           SPECO_EXTRA_HYDRA_ARGS: ${{ inputs.extra_hydra_args || vars.SPECO_EXTRA_HYDRA_ARGS }}
         run: bash ci/run_example_test.sh npu "${{ matrix.backend }}" "${{ matrix.drafter }}"

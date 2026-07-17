@@ -1,4 +1,4 @@
-name: gpu_example_tests
+name: gpu_unit_tests
 
 run-name: GPU example tests (${{ github.ref_name }})
 

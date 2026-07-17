@@ -1,5 +1,5 @@
 set -x
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 # NPU example for DSpark on vLLM-Ascend. SPECO keeps the user-facing
 # algorithm as DSPARK and maps it to vLLM's dflash speculative method.
@@ -8,6 +8,7 @@ exp_name='qwen3_8b_dspark_drafter_vllm_npu'
 
 gen_tp=2
 train_sp=4
+ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint
@@ -26,7 +27,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=256 \
     data.truncation='error' \
-    actor_rollout_ref.rollout.temperature=0.6 \
+    actor_rollout_ref.rollout.temperature=1 \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -67,27 +68,25 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True \
     actor_rollout_ref.rollout.drafter.training.old_logprob_hidden_capture_impl=forward_hook \
     actor_rollout_ref.rollout.drafter.training.dspark_block_size=7 \
-    actor_rollout_ref.rollout.drafter.training.dspark_num_anchors=64 \
+    actor_rollout_ref.rollout.drafter.training.dspark_num_anchors=32 \
     actor_rollout_ref.rollout.drafter.training.dspark_max_window=512 \
     actor_rollout_ref.rollout.drafter.training.dspark_loss_mode=restricted_ce \
     actor_rollout_ref.rollout.drafter.training.dspark_loss_decay_gamma=7 \
-    actor_rollout_ref.rollout.drafter.training.dspark_hard_sample_ratio=0.3 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_target_layers=5 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_hidden_layers=5 \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_rank=256 \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_head_type=vanilla \
-    actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=1.0 \
-    actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=0.0 \
+    actor_rollout_ref.rollout.drafter.training.target_lm_head_row_restricted_sync=False \
+    actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=0.1 \
+    actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=0.9 \
     actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=0.0 \
-    actor_rollout_ref.rollout.drafter.training.dspark_debug_log=True \
-    actor_rollout_ref.rollout.drafter.training.dspark_debug_log_first_n=2 \
-    actor_rollout_ref.rollout.drafter.training.dspark_debug_log_interval=100 \
     actor_rollout_ref.rollout.drafter.rollout.spec_steps=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=7 \
     actor_rollout_ref.rollout.drafter.training.step=20 \
     actor_rollout_ref.rollout.drafter.training.max_collect_samples_per_step_per_replica=16 \
     actor_rollout_ref.rollout.drafter.training.hidden_state_window_tokens_per_sample=512 \
+    actor_rollout_ref.rollout.drafter.training.max_collect_tokens_per_step_per_replica=16384 \
     actor_rollout_ref.rollout.drafter.training.collect_interval_steps=5 \
     actor_rollout_ref.rollout.drafter.training.training_interval_steps=5 \
     actor_rollout_ref.rollout.drafter.training.publish_async=True \
@@ -104,7 +103,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     trainer.logger='["console"]' \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${exp_name} \
-    trainer.n_gpus_per_node=16 \
+    trainer.n_gpus_per_node=${ppo_gpus_per_node} \
     trainer.nnodes=1 \
     trainer.resume_mode=disable \
     trainer.default_local_dir=${CKPTS_DIR} \
