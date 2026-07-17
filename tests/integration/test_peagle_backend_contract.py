@@ -145,3 +145,56 @@ def test_peagle_vllm_guardrail() -> None:
 
     with pytest.raises(ValueError, match="parallel-drafting runtime"):
         _speculative_method_from_drafter({"speculative_algorithm": "PEAGLE"})
+
+
+def test_peagle_batch_assembly_matches_reference_shift() -> None:
+    """base_trainer must apply the reference target-wrapper shift for P-EAGLE:
+    row p pairs unshifted aux[p] with token x[p+1], supervised by the
+    distribution from last_hidden[p+1] and gated by loss_mask[p+1]."""
+    pytest.importorskip("torch")
+    import torch
+    from omegaconf import OmegaConf
+
+    base_trainer_mod = pytest.importorskip("verl_speco.trainer.base_trainer")
+
+    seq_len, hidden = 10, 4
+    ids = torch.arange(seq_len, dtype=torch.long)
+    aux = torch.randn(seq_len, hidden)
+    last_h = torch.randn(seq_len, hidden)
+    loss_mask = torch.tensor([0, 0, 0, 1, 1, 1, 1, 1, 1, 1], dtype=torch.float32)
+    position_ids = torch.arange(seq_len, dtype=torch.long)
+
+    class _FakeBackend:
+        model_type = "peagle"
+
+        def preprocess_individual_items(self, items, dev, model_config):
+            return {
+                "ids": [ids],
+                "h_states": [aux],
+                "masks": [loss_mask],
+                "position_ids": [position_ids],
+                "last_h_states": [last_h],
+            }
+
+    trainer = object.__new__(base_trainer_mod.DrafterBaseTrainer)
+    trainer.backend = _FakeBackend()
+    trainer.batch_size = 2
+    trainer.current_rl_step = 0
+    trainer.training_steps = 0
+    trainer.use_data_buffer = False
+    trainer.collected_data = [{"step": 0, "hidden_states": aux}]
+    trainer.config = OmegaConf.create({"rollout": {"drafter": {"training": {}}}})
+    trainer.use_ulysses_sp = False
+    trainer.rank = 0
+    trainer.model_config = None
+    trainer.model = torch.nn.Linear(2, 2)
+
+    batch = trainer._prepare_training_batch()
+
+    assert batch is not None
+    train_len = seq_len - 1
+    assert torch.equal(batch["input_ids"][0], ids[1 : 1 + train_len])
+    assert torch.equal(batch["hidden_states"][0], aux[:train_len])
+    assert torch.equal(batch["last_hidden_states"][0], last_h[1 : 1 + train_len])
+    assert torch.equal(batch["loss_mask"][0], loss_mask[1 : 1 + train_len])
+    assert batch["seq_lengths"].tolist() == [train_len]

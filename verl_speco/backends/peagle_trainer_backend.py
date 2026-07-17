@@ -6,13 +6,16 @@ COD-subsampled sequence, supervised by a count-normalized ``KL(target || draft)`
 over the draft vocabulary. There is no EAGLE-3 test-time-training recurrence and
 no per-depth loss decay.
 
-Integration: P-EAGLE reuses the EAGLE-3 aux + last-hidden collection but needs the
-UNSHIFTED per-position data (aux feature ``f[p]``, token ``x[p]``, target
-distribution for ``x[p+1]``), so it reports ``model_type == "peagle"`` and
-``base_trainer`` assembles the unshifted batch (no eagle3 +1 shift). The frozen
-target head turns ``last_hidden_states`` into the full-vocab target logits, which
-are then restricted to the draft vocab. Only ``build_model`` and ``compute_loss``
-differ from the EAGLE-3 backend; preprocess/optimizer/target-head are inherited.
+Integration: P-EAGLE reuses the EAGLE-3 aux + last-hidden collection with the
+reference target-wrapper shift (AutoModel ``target.py`` ``_shift_left_with_zero``):
+row ``p`` pairs the unshifted aux feature ``f[p]`` with the NEXT token ``x[p+1]``,
+supervised against the distribution of ``x[p+2]`` from ``last_hidden[p+1]`` and
+gated by ``loss_mask[p+1]``. ``base_trainer`` applies that shift during batch
+assembly (ids/last_hidden/loss_mask by +1, aux unshifted), so this trainer stays a
+verbatim port of the reference ``_peagle_position_loss``. The frozen target head
+turns ``last_hidden_states`` into the full-vocab target logits, which are then
+restricted to the draft vocab. Only ``build_model`` and ``compute_loss`` differ
+from the EAGLE-3 backend; preprocess/optimizer/target-head are inherited.
 """
 
 import logging

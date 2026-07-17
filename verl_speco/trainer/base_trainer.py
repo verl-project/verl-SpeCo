@@ -2388,15 +2388,17 @@ class DrafterBaseTrainer:
                 ]
                 train_seq_len = min(train_seq_len_limits)
             elif self.backend.model_type == "peagle":
-                # P-EAGLE uses UNSHIFTED per-position data (aux f[p], token x[p],
-                # target distribution for x[p+1] from last_hidden[p]).
+                # P-EAGLE mirrors the reference target-wrapper shift: row p pairs
+                # aux f[p] with the NEXT token x[p+1], supervised against the
+                # distribution of x[p+2] from last_hidden[p+1] and gated by
+                # loss_mask[p+1]. Only aux stays unshifted.
                 last_h_states = preprocessed_lists["last_h_states"][item_idx]
                 train_seq_len = min(
-                    ids.size(0),
+                    max(ids.size(0) - 1, 0),
                     h_states.size(0),
-                    item_loss_mask.size(0),
+                    max(item_loss_mask.size(0) - 1, 0),
                     item_position_ids.size(0),
-                    last_h_states.size(0),
+                    max(last_h_states.size(0) - 1, 0),
                 )
             elif self._is_block_drafter_backend():
                 train_seq_len = seq_len
@@ -2587,7 +2589,7 @@ class DrafterBaseTrainer:
                             },
                         )
 
-            if uses_shifted_eagle_inputs:
+            if uses_shifted_eagle_inputs or self.backend.model_type == "peagle":
                 input_id_chunks.append(ids[1 : 1 + train_seq_len])
                 hidden_state_chunks.append(h_states[:train_seq_len])
                 position_id_chunks.append(item_position_ids[:train_seq_len])
@@ -2595,7 +2597,7 @@ class DrafterBaseTrainer:
                 input_id_chunks.append(ids[:train_seq_len])
                 hidden_state_chunks.append(h_states[:train_seq_len])
                 position_id_chunks.append(item_position_ids[:train_seq_len])
-            if self._is_block_drafter_backend() or self.backend.model_type == "peagle":
+            if self._is_block_drafter_backend():
                 loss_mask_chunks.append(item_loss_mask[:train_seq_len])
             elif uses_shifted_eagle_inputs:
                 loss_mask_chunks.append(item_loss_mask[2 : 2 + train_seq_len])
@@ -2612,8 +2614,9 @@ class DrafterBaseTrainer:
                 else:
                     last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
             elif self.backend.model_type == "peagle":
-                # UNSHIFTED: last_hidden[p] pairs with aux[p] / token x[p].
-                last_hidden_state_chunks.append(last_h_states[:train_seq_len])
+                # Reference-shifted: last_hidden[p+1] scores x[p+2], the token
+                # after the drafted input token x[p+1] at row p.
+                last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
 
         if not input_id_chunks:
             return None
