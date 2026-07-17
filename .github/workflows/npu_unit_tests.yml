@@ -86,7 +86,7 @@ jobs:
   example:
     name: NPU ${{ matrix.backend }} ${{ matrix.drafter }} example
     # if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: [self-hosted, linux-aarch64-a2-8]
+    runs-on: [linux-aarch64-a2-8]
     timeout-minutes: 180
     environment: speco-npu-ci
     strategy:
