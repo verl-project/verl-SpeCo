@@ -25,6 +25,7 @@ def _require_working_bash() -> str:
 def test_example_shell_syntax_is_valid(script: Path) -> None:
     bash = _require_working_bash()
     subprocess.run([bash, "-n", str(script)], check=True)
+    print("tests/examples/test_example_scripts.py::test_example_shell_syntax_is_valid", flush=True)
 
 
 @pytest.mark.parametrize("script", EXAMPLES, ids=lambda path: path.name)
@@ -39,6 +40,7 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(script: Pa
     assert "actor_rollout_ref.rollout.drafter.training.collect_interval_steps=" in source
     assert "actor_rollout_ref.rollout.drafter.training.training_interval_steps=" in source
     assert "actor_rollout_ref.rollout.drafter.training.publish_async=" in source
+    print("tests/examples/test_example_scripts.py::test_example_keeps_speco_entrypoint_and_required_drafter_switches", flush=True)
 
 
 def test_vllm_eagle3_example_keeps_runtime_agnostic_training_switches() -> None:
@@ -48,12 +50,14 @@ def test_vllm_eagle3_example_keeps_runtime_agnostic_training_switches() -> None:
     assert "actor_rollout_ref.rollout.drafter.speculative_algorithm=\"EAGLE3\"" in source
     assert "actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True" in source
     assert "actor_rollout_ref.rollout.drafter.training.use_logits=False" in source
+    print("tests/examples/test_example_scripts.py::test_vllm_eagle3_example_keeps_runtime_agnostic_training_switches", flush=True)
 
 
 def test_sglang_examples_request_sglang_rollout() -> None:
     for script in (ROOT / "examples").glob("*sglang*.sh"):
         source = script.read_text(encoding="utf-8")
         assert "actor_rollout_ref.rollout.name=sglang" in source
+    print("tests/examples/test_example_scripts.py::test_sglang_examples_request_sglang_rollout", flush=True)
 
 
 def test_npu_vllm_example_keeps_explicit_graph_settings() -> None:
@@ -64,3 +68,4 @@ def test_npu_vllm_example_keeps_explicit_graph_settings() -> None:
     assert 'cudagraph_mode="FULL_DECODE_ONLY"' in source
     assert "cudagraph_capture_sizes=" in source
     assert "max_cudagraph_capture_size=" in source
+    print("tests/examples/test_example_scripts.py::test_npu_vllm_example_keeps_explicit_graph_settings", flush=True)

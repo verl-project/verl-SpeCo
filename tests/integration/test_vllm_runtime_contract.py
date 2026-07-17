@@ -49,18 +49,21 @@ def test_vllm_speculative_config_maps_eagle3_contract() -> None:
         "model": "/models/drafter",
         "num_speculative_tokens": 3,
     }
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_speculative_config_maps_eagle3_contract", flush=True)
 
 
 def test_vllm_worker_extension_constructs_without_wake_up_fallback() -> None:
     extension = SpecoVLLMColocateWorkerExtension()
 
     assert isinstance(extension, SpecoVLLMColocateWorkerExtension)
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_worker_extension_constructs_without_wake_up_fallback", flush=True)
 
 
 def test_vllm_draft_logits_diagnostic_handles_missing_and_non_tensor_values() -> None:
     assert _describe_vllm_draft_logits(None, missing=True) == "missing"
     assert _describe_vllm_draft_logits(None) == "None(greedy)"
     assert _describe_vllm_draft_logits("MISSING") == "str"
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_draft_logits_diagnostic_handles_missing_and_non_tensor_values", flush=True)
 
 
 def test_vllm_speculative_config_maps_dflash_contract() -> None:
@@ -77,6 +80,7 @@ def test_vllm_speculative_config_maps_dflash_contract() -> None:
         "model": "/models/drafter",
         "num_speculative_tokens": 16,
     }
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_speculative_config_maps_dflash_contract", flush=True)
 
 
 def test_vllm_speculative_config_maps_dspark_to_native_gpu_contract(tmp_path, monkeypatch) -> None:
@@ -109,6 +113,7 @@ def test_vllm_speculative_config_maps_dspark_to_native_gpu_contract(tmp_path, mo
         "model": str(model_path),
         "num_speculative_tokens": 16,
     }
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_speculative_config_maps_dspark_to_native_gpu_contract", flush=True)
 
 
 def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(tmp_path, monkeypatch) -> None:
@@ -140,6 +145,7 @@ def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(tmp_path,
         "model": str(model_path),
         "num_speculative_tokens": 16,
     }
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract", flush=True)
 
 
 def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(tmp_path, monkeypatch) -> None:
@@ -162,6 +168,7 @@ def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(tmp_path, monk
 
     assert config["method"] == "dspark"
     assert config["draft_sample_method"] == "probabilistic"
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_dspark_gpu_probabilistic_sampling_requires_override", flush=True)
 
 
 def test_vllm_dflash_validator_rejects_dspark_when_algorithm_is_dflash(tmp_path) -> None:
@@ -174,6 +181,7 @@ def test_vllm_dflash_validator_rejects_dspark_when_algorithm_is_dflash(tmp_path)
 
     with pytest.raises(ValueError, match="vLLM DFlash requires"):
         _validate_vllm_dflash_drafter_config(model_path, algorithm="DFLASH")
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_dflash_validator_rejects_dspark_when_algorithm_is_dflash", flush=True)
 
 
 def test_vllm_dspark_validator_accepts_markov_head_config(tmp_path) -> None:
@@ -185,6 +193,7 @@ def test_vllm_dspark_validator_accepts_markov_head_config(tmp_path) -> None:
     )
 
     _validate_vllm_dflash_drafter_config(model_path, algorithm="DSPARK")
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_dspark_validator_accepts_markov_head_config", flush=True)
 
 
 def test_vllm_dspark_config_aliases_are_dflash_compatible() -> None:
@@ -202,6 +211,7 @@ def test_vllm_dspark_config_aliases_are_dflash_compatible() -> None:
         "mask_token_id": 151669,
     }
     assert config["eagle_aux_hidden_state_layer_ids"] == [2, 10, 18, 26, 34]
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_dspark_config_aliases_are_dflash_compatible", flush=True)
 
 
 def _install_fake_vllm_ascend_modules(monkeypatch, dflash_cls, proposer_cls) -> None:
@@ -261,6 +271,7 @@ def test_vllm_ascend_dspark_runtime_detector_accepts_pr11153_k_query(monkeypatch
     )
 
     assert _vllm_ascend_has_dspark_pr11153_k_query_runtime() is True
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_ascend_dspark_runtime_detector_accepts_pr11153_k_query", flush=True)
 
 
 def test_vllm_ascend_dspark_runtime_detector_rejects_old_full_block_layout(monkeypatch) -> None:
@@ -271,6 +282,7 @@ def test_vllm_ascend_dspark_runtime_detector_rejects_old_full_block_layout(monke
     )
 
     assert _vllm_ascend_has_dspark_pr11153_k_query_runtime() is False
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_ascend_dspark_runtime_detector_rejects_old_full_block_layout", flush=True)
 
 
 def test_vllm_runtime_injects_native_config_and_worker_extension(monkeypatch) -> None:
@@ -293,6 +305,7 @@ def test_vllm_runtime_injects_native_config_and_worker_extension(monkeypatch) ->
     engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
     assert engine_kwargs["speculative_config"]["method"] == "eagle3"
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_runtime_injects_native_config_and_worker_extension", flush=True)
 
 
 def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(monkeypatch, tmp_path) -> None:
@@ -327,6 +340,7 @@ def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(monke
     assert engine_kwargs["speculative_config"]["method"] == "dflash"
     assert engine_kwargs["speculative_config"]["num_speculative_tokens"] == 16
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension", flush=True)
 
 
 def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None:
@@ -340,6 +354,7 @@ def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None
     assert configuration_utils_module.ALLOWED_LAYER_TYPES
     assert configuration_utils_module.ALLOWED_LAYER_TYPES == configuration_utils_module.ALLOWED_ATTENTION_LAYER_TYPES
     assert patch_transformers_attention_layer_type_constants() is False
+    print("tests/integration/test_vllm_runtime_contract.py::test_transformers_attention_layer_type_constants_compat", flush=True)
 
 
 def test_transformers_attention_layer_type_patch_runs_before_vllm_worker_extension_import() -> None:
@@ -350,6 +365,7 @@ def test_transformers_attention_layer_type_patch_runs_before_vllm_worker_extensi
     assert source.index("\npatch_transformers_attention_layer_type_constants()\n") < source.index(
         "from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension"
     )
+    print("tests/integration/test_vllm_runtime_contract.py::test_transformers_attention_layer_type_patch_runs_before_vllm_worker_extension_import", flush=True)
 
 
 def test_vllm_acceptance_stats_keep_stable_transport_keys() -> None:
@@ -364,6 +380,7 @@ def test_vllm_acceptance_stats_keep_stable_transport_keys() -> None:
         f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_drafts": 4.0,
         f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_accepted_tokens": 7.0,
     }
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_acceptance_stats_keep_stable_transport_keys", flush=True)
 
 
 def test_trainer_keeps_public_acceptance_metric_name() -> None:
@@ -372,6 +389,7 @@ def test_trainer_keeps_public_acceptance_metric_name() -> None:
     ).read_text(encoding="utf-8")
 
     assert '"drafter/spec_decode/mean_acceptance_length"' in trainer_source
+    print("tests/integration/test_vllm_runtime_contract.py::test_trainer_keeps_public_acceptance_metric_name", flush=True)
 
 
 def test_vllm_draft_update_attachment_is_idempotent() -> None:
@@ -381,3 +399,4 @@ def test_vllm_draft_update_attachment_is_idempotent() -> None:
     first = rollout.update_draft_weights
     assert first.__func__ is speco_vllm_update_draft_weights
     assert attach_update_draft_weights_to_rollout(rollout).update_draft_weights == first
+    print("tests/integration/test_vllm_runtime_contract.py::test_vllm_draft_update_attachment_is_idempotent", flush=True)

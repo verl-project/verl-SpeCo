@@ -47,6 +47,7 @@ def test_qwen3_eagle3_config_alias_preserves_five_target_layers(tmp_path) -> Non
     assert loaded.eagle_aux_hidden_state_layer_ids == [1, 9, 17, 25, 33]
     assert loaded.eagle_config["eagle_aux_hidden_state_layer_ids"] == [1, 9, 17, 25, 33]
     assert loaded.num_aux_hidden_states == 5
+    print("tests/integration/test_eagle3_aux_hidden_contract.py::test_qwen3_eagle3_config_alias_preserves_five_target_layers", flush=True)
 
 
 def test_eagle3_model_uses_dynamic_aux_hidden_count() -> None:
@@ -71,3 +72,4 @@ def test_eagle3_model_uses_dynamic_aux_hidden_count() -> None:
 
     with pytest.raises(ValueError, match="num_aux_hidden_states=5"):
         model.project_hidden_states(torch.randn(2, 3, 12))
+    print("tests/integration/test_eagle3_aux_hidden_contract.py::test_eagle3_model_uses_dynamic_aux_hidden_count", flush=True)

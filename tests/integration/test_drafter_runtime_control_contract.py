@@ -72,6 +72,7 @@ def test_drafter_collect_train_and_publish_intervals() -> None:
     assert trainer._speco_should_train_drafter_this_step() is False
     assert trainer._speco_should_publish_drafter_weights(True) is True
     assert trainer._speco_should_publish_drafter_weights(False) is False
+    print("tests/integration/test_drafter_runtime_control_contract.py::test_drafter_collect_train_and_publish_intervals", flush=True)
 
 
 def test_drafter_training_attempt_requires_interval_and_samples() -> None:
@@ -86,12 +87,14 @@ def test_drafter_training_attempt_requires_interval_and_samples() -> None:
 
     trainer._speco_last_collected_samples = 1
     assert trainer._speco_should_attempt_drafter_train_this_step() is True
+    print("tests/integration/test_drafter_runtime_control_contract.py::test_drafter_training_attempt_requires_interval_and_samples", flush=True)
 
 
 def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None:
     assert _no_drafter_trainer(calculate_entropy=False)._speco_oldlogprob_entropy_hook_enabled() is True
     assert _no_drafter_trainer(calculate_entropy=True)._speco_oldlogprob_entropy_hook_enabled() is False
     assert _no_drafter_trainer()._speco_oldlogprob_entropy_hook_enabled() is False
+    print("tests/integration/test_drafter_runtime_control_contract.py::test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config", flush=True)
 
 
 def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:
@@ -111,6 +114,7 @@ def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:
     assert calls == [("update_draft_weights_async", {"weights": 1}, 10)]
     assert trainer._pending_drafter_publish_refs == ["new-ref"]
     assert metrics == {"drafter/publish_attempted": 1, "drafter/published": 1}
+    print("tests/integration/test_drafter_runtime_control_contract.py::test_async_publish_sets_pending_ref_and_waits_before_next_publish", flush=True)
 
 
 def test_disabled_or_untrained_drafter_does_not_publish() -> None:
@@ -119,3 +123,4 @@ def test_disabled_or_untrained_drafter_does_not_publish() -> None:
         "drafter/publish_attempted": 0,
         "drafter/published": 0,
     }
+    print("tests/integration/test_drafter_runtime_control_contract.py::test_disabled_or_untrained_drafter_does_not_publish", flush=True)

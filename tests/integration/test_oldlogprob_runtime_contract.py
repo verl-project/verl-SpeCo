@@ -25,6 +25,7 @@ def _drafter(enabled: bool) -> dict:
 def test_oldlogprob_collection_is_disabled_by_default() -> None:
     assert oldlogprob_hidden_runtime_enabled({}) is False
     assert oldlogprob_hidden_runtime_enabled({"rollout": {"drafter": _drafter(False)}}) is False
+    print("tests/integration/test_oldlogprob_runtime_contract.py::test_oldlogprob_collection_is_disabled_by_default", flush=True)
 
 
 def test_oldlogprob_collection_requires_online_drafter_training() -> None:
@@ -35,6 +36,7 @@ def test_oldlogprob_collection_requires_online_drafter_training() -> None:
 
     assert oldlogprob_hidden_runtime_enabled({"rollout": {"drafter": rollout_disabled}}) is False
     assert oldlogprob_hidden_runtime_enabled({"rollout": {"drafter": training_disabled}}) is False
+    print("tests/integration/test_oldlogprob_runtime_contract.py::test_oldlogprob_collection_requires_online_drafter_training", flush=True)
 
 
 def test_oldlogprob_collection_accepts_both_config_shapes() -> None:
@@ -42,6 +44,7 @@ def test_oldlogprob_collection_accepts_both_config_shapes() -> None:
     assert oldlogprob_hidden_runtime_enabled(
         {"actor_rollout_ref": {"rollout": {"drafter": _drafter(True)}}}
     )
+    print("tests/integration/test_oldlogprob_runtime_contract.py::test_oldlogprob_collection_accepts_both_config_shapes", flush=True)
 
 
 def test_oldlogprob_collection_can_be_enabled_from_worker_environment() -> None:
@@ -49,6 +52,7 @@ def test_oldlogprob_collection_can_be_enabled_from_worker_environment() -> None:
 
     assert oldlogprob_hidden_runtime_enabled({}, drafter_env=payload)
     assert oldlogprob_hidden_runtime_enabled({}, drafter_env="{invalid") is False
+    print("tests/integration/test_oldlogprob_runtime_contract.py::test_oldlogprob_collection_can_be_enabled_from_worker_environment", flush=True)
 
 
 def test_eagle3_oldlogprob_accepts_three_explicit_aux_layers() -> None:
@@ -63,6 +67,7 @@ def test_eagle3_oldlogprob_accepts_three_explicit_aux_layers() -> None:
         model_configs=[],
     ) == [2, 18, 33]
     assert eagle3_num_aux_hidden_states_from_config(drafter_cfg) == 3
+    print("tests/integration/test_oldlogprob_runtime_contract.py::test_eagle3_oldlogprob_accepts_three_explicit_aux_layers", flush=True)
 
 
 def test_eagle3_oldlogprob_falls_back_to_default_three_layers() -> None:
@@ -72,6 +77,7 @@ def test_eagle3_oldlogprob_falls_back_to_default_three_layers() -> None:
         model_configs=[],
     ) == [2, 18, 33]
     assert eagle3_num_aux_hidden_states_from_config({"speculative_algorithm": "EAGLE3"}) is None
+    print("tests/integration/test_oldlogprob_runtime_contract.py::test_eagle3_oldlogprob_falls_back_to_default_three_layers", flush=True)
 
 
 def test_eagle3_oldlogprob_accepts_top_level_target_layer_ids() -> None:
@@ -86,6 +92,7 @@ def test_eagle3_oldlogprob_accepts_top_level_target_layer_ids() -> None:
         model_configs=[],
     ) == [1, 9, 17, 25, 33]
     assert eagle3_num_aux_hidden_states_from_config(drafter_cfg) == 5
+    print("tests/integration/test_oldlogprob_runtime_contract.py::test_eagle3_oldlogprob_accepts_top_level_target_layer_ids", flush=True)
 
 
 def test_dflash_oldlogprob_ignores_dspark_training_defaults() -> None:
@@ -102,6 +109,7 @@ def test_dflash_oldlogprob_ignores_dspark_training_defaults() -> None:
         target_num_hidden_layers=36,
         model_configs=[],
     ) == [1, 17, 33]
+    print("tests/integration/test_oldlogprob_runtime_contract.py::test_dflash_oldlogprob_ignores_dspark_training_defaults", flush=True)
 
 
 def test_dspark_oldlogprob_uses_dspark_training_defaults() -> None:
@@ -117,6 +125,7 @@ def test_dspark_oldlogprob_uses_dspark_training_defaults() -> None:
         target_num_hidden_layers=36,
         model_configs=[],
     ) == [1, 9, 17, 25, 33]
+    print("tests/integration/test_oldlogprob_runtime_contract.py::test_dspark_oldlogprob_uses_dspark_training_defaults", flush=True)
 
 
 def _selection_context(*, batch_size: int, hidden_rows: int) -> dict:
@@ -150,6 +159,7 @@ def test_forward_hook_merges_already_selected_batch_hidden_without_reselection()
     torch.testing.assert_close(selected[..., :8], aux_hidden)
     torch.testing.assert_close(selected[..., 8:], final_hidden)
     assert owner_mask.shape == (4, 129)
+    print("tests/integration/test_oldlogprob_runtime_contract.py::test_forward_hook_merges_already_selected_batch_hidden_without_reselection", flush=True)
 
 
 def test_unselected_flat_hidden_keeps_original_row_selection() -> None:
@@ -162,6 +172,7 @@ def test_unselected_flat_hidden_keeps_original_row_selection() -> None:
     assert selected.shape == (2, 2, 2)
     torch.testing.assert_close(selected[0, 0], hidden[0])
     torch.testing.assert_close(selected[1, 0], hidden[2])
+    print("tests/integration/test_oldlogprob_runtime_contract.py::test_unselected_flat_hidden_keeps_original_row_selection", flush=True)
 
 
 def test_forward_hook_rejects_malformed_selected_hidden() -> None:
@@ -174,3 +185,4 @@ def test_forward_hook_rejects_malformed_selected_hidden() -> None:
             [torch.randn(4, 128, 8)],
             already_selected=True,
         )
+    print("tests/integration/test_oldlogprob_runtime_contract.py::test_forward_hook_rejects_malformed_selected_hidden", flush=True)

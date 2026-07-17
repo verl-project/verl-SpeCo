@@ -48,11 +48,11 @@ def test_dspark_label_and_prev_token_alignment():
         anchor_positions=anchor_positions,
         block_keep_mask=block_keep_mask,
     )
-    print('dspark label and prev token alignment test')
     assert label_indices.tolist() == [[[3, 4, 5, 6]]]
     assert target_ids.tolist() == [[[13, 14, 15, 16]]]
     assert prev_token_ids.tolist() == [[[12, 13, 14, 15]]]
     assert eval_mask.tolist() == [[[True, True, True, True]]]
+    print("tests/integration/test_dspark_trainer_backend.py::test_dspark_label_and_prev_token_alignment", flush=True)
 
 
 def test_dspark_first_position_is_masked_when_first_target_invalid():
@@ -71,6 +71,7 @@ def test_dspark_first_position_is_masked_when_first_target_invalid():
     )
 
     assert eval_mask.tolist() == [[[False, False, False, False]]]
+    print("tests/integration/test_dspark_trainer_backend.py::test_dspark_first_position_is_masked_when_first_target_invalid", flush=True)
 
 
 def test_dspark_markov_rank_zero_keeps_base_logits():
@@ -103,6 +104,7 @@ def test_dspark_markov_rank_zero_keeps_base_logits():
     )
 
     assert torch.equal(corrected, base_logits)
+    print("tests/integration/test_dspark_trainer_backend.py::test_dspark_markov_rank_zero_keeps_base_logits", flush=True)
 
 
 def test_dspark_markov_bias_changes_logits():
@@ -124,3 +126,4 @@ def test_dspark_markov_bias_changes_logits():
 
     assert corrected.abs().sum().item() > 0
     assert not torch.equal(corrected, base_logits)
+    print("tests/integration/test_dspark_trainer_backend.py::test_dspark_markov_bias_changes_logits", flush=True)

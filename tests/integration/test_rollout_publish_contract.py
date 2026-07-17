@@ -30,6 +30,7 @@ def test_materialize_direct_and_object_ref_payloads(monkeypatch) -> None:
         {"resolved": ref},
         True,
     )
+    print("tests/integration/test_rollout_publish_contract.py::test_materialize_direct_and_object_ref_payloads", flush=True)
 
 
 def test_rollout_backend_and_drafter_gates_support_both_config_shapes() -> None:
@@ -46,6 +47,7 @@ def test_rollout_backend_and_drafter_gates_support_both_config_shapes() -> None:
     assert not rollout_publish.drafter_rollout_enabled(
         {"actor_rollout_ref": {"rollout": {"drafter": {"enable": False}}}}
     )
+    print("tests/integration/test_rollout_publish_contract.py::test_rollout_backend_and_drafter_gates_support_both_config_shapes", flush=True)
 
 
 def test_publish_state_filter_keeps_eagle3_trainable_lm_head() -> None:
@@ -71,6 +73,7 @@ def test_publish_state_filter_keeps_eagle3_trainable_lm_head() -> None:
     )
 
     assert set(trainer._get_trainable_state_dict()) == {"lm_head.weight", "midlayer.fc.weight"}
+    print("tests/integration/test_rollout_publish_contract.py::test_publish_state_filter_keeps_eagle3_trainable_lm_head", flush=True)
 
 
 def test_publish_state_filter_skips_non_eagle_lm_head() -> None:
@@ -93,3 +96,4 @@ def test_publish_state_filter_skips_non_eagle_lm_head() -> None:
     )
 
     assert set(trainer._get_trainable_state_dict()) == {"context_proj.weight"}
+    print("tests/integration/test_rollout_publish_contract.py::test_publish_state_filter_skips_non_eagle_lm_head", flush=True)

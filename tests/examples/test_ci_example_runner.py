@@ -44,6 +44,7 @@ def test_ci_layers_match_required_shape() -> None:
     assert "pull_request" in _workflow("cpu_unit_tests.yml")["on"]
     assert "pull_request" not in _workflow("gpu_unit_tests.yml")["on"]
     assert "pull_request" in _workflow("npu_unit_tests.yml")["on"]
+    print("tests/examples/test_ci_example_runner.py::test_ci_layers_match_required_shape", flush=True)
 
 
 def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
@@ -61,6 +62,7 @@ def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
     assert "tests/examples" in source
     assert "tests/integration" in source
     assert "tests/ci" not in source
+    print("tests/examples/test_ci_example_runner.py::test_cpu_unit_workflow_is_lightweight_pr_gate", flush=True)
 
 
 def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
@@ -95,11 +97,13 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
         } <= matrix_entries
         for job in workflow["jobs"].values():
             assert {"self-hosted", label} <= set(job["runs-on"])
+    print("tests/examples/test_ci_example_runner.py::test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners", flush=True)
 
 
 def test_example_runner_shell_syntax_is_valid() -> None:
     bash = _require_working_bash()
     subprocess.run([bash, "-n", str(RUNNER)], check=True)
+    print("tests/examples/test_ci_example_runner.py::test_example_runner_shell_syntax_is_valid", flush=True)
 
 
 def test_example_runner_covers_gpu_and_npu_backend_matrix() -> None:
@@ -120,6 +124,7 @@ def test_example_runner_covers_gpu_and_npu_backend_matrix() -> None:
     assert "examples/run_qwen3-8b_drafter_dflash_vllm.sh" in source
     assert "examples/run_qwen3-8b_drafter_dflash_vllm_npu.sh" in source
     assert "examples/run_qwen3-8b_drafter_dflash_sglang.sh" in source
+    print("tests/examples/test_ci_example_runner.py::test_example_runner_covers_gpu_and_npu_backend_matrix", flush=True)
 
 
 def test_example_runner_exposes_required_hydra_overrides() -> None:
@@ -138,3 +143,4 @@ def test_example_runner_exposes_required_hydra_overrides() -> None:
     assert "SPECO_DFLASH_NUM_ANCHORS" in source
     assert "SPECO_DFLASH_MAX_WINDOW" in source
     assert "SPECO_EXTRA_HYDRA_ARGS" in source
+    print("tests/examples/test_ci_example_runner.py::test_example_runner_exposes_required_hydra_overrides", flush=True)

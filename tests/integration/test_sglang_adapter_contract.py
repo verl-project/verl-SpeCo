@@ -28,6 +28,7 @@ from verl_speco.integration.sglang_runtime import (
 )
 def test_interval_gate(step, interval, expected) -> None:
     assert speco_step_matches_interval(step, interval) is expected
+    print("tests/integration/test_sglang_adapter_contract.py::test_interval_gate", flush=True)
 
 
 def test_hidden_state_request_flags_are_independent() -> None:
@@ -40,6 +41,7 @@ def test_hidden_state_request_flags_are_independent() -> None:
         DFLASH_RETURN_AUX_HIDDEN_PARAM: True,
         DRAFTER_RAW_TOP_LOGPROBS_PARAM: True,
     }
+    print("tests/integration/test_sglang_adapter_contract.py::test_hidden_state_request_flags_are_independent", flush=True)
 
 
 def test_samples_are_routed_to_replica_owner() -> None:
@@ -49,6 +51,7 @@ def test_samples_are_routed_to_replica_owner() -> None:
 
     with pytest.raises(ValueError, match="out of range"):
         bucket_drafter_samples_by_replica([{"replica_rank": 2}], 2)
+    print("tests/integration/test_sglang_adapter_contract.py::test_samples_are_routed_to_replica_owner", flush=True)
 
 
 def test_sglang_draft_update_attachment_is_idempotent() -> None:
@@ -58,6 +61,7 @@ def test_sglang_draft_update_attachment_is_idempotent() -> None:
     first = rollout.update_draft_weights
     assert first.__func__ is speco_update_draft_weights
     assert attach_update_draft_weights_to_rollout(rollout).update_draft_weights == first
+    print("tests/integration/test_sglang_adapter_contract.py::test_sglang_draft_update_attachment_is_idempotent", flush=True)
 
 
 def test_sglang_patch_install_forwards_config_and_is_repeatable(monkeypatch) -> None:
@@ -84,6 +88,7 @@ def test_sglang_patch_install_forwards_config_and_is_repeatable(monkeypatch) -> 
     assert install_calls[0]["target_weight_loader"] == "target.loader"
     assert install_calls[0]["draft_weight_loader"] == "draft.loader"
     assert install_calls[0]["patches"] == {"hidden_states_tensor_output"}
+    print("tests/integration/test_sglang_adapter_contract.py::test_sglang_patch_install_forwards_config_and_is_repeatable", flush=True)
 
 
 def test_dflash_hidden_collection_requests_aux_hidden_without_raw_topk(monkeypatch) -> None:
@@ -120,6 +125,7 @@ def test_dflash_hidden_collection_requests_aux_hidden_without_raw_topk(monkeypat
     assert DRAFTER_RETURN_LAST_HIDDEN_PARAM not in custom_params
     assert DRAFTER_RAW_TOP_LOGPROBS_PARAM not in custom_params
     assert sampling_params["custom_params"] == custom_params
+    print("tests/integration/test_sglang_adapter_contract.py::test_dflash_hidden_collection_requests_aux_hidden_without_raw_topk", flush=True)
 
 
 def test_eagle3_last_hidden_collection_does_not_request_raw_topk_without_logits(monkeypatch) -> None:
@@ -155,3 +161,4 @@ def test_eagle3_last_hidden_collection_does_not_request_raw_topk_without_logits(
     assert DFLASH_RETURN_AUX_HIDDEN_PARAM not in custom_params
     assert DRAFTER_RAW_TOP_LOGPROBS_PARAM not in custom_params
     assert sampling_params["custom_params"] == custom_params
+    print("tests/integration/test_sglang_adapter_contract.py::test_eagle3_last_hidden_collection_does_not_request_raw_topk_without_logits", flush=True)

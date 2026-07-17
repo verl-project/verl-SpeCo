@@ -49,6 +49,7 @@ def test_eagle1_draft_forward_shape() -> None:
     attention_mask = torch.ones(batch, seq, dtype=torch.long)
     out = model(input_ids=input_ids, hidden_states=hidden_states, attention_mask=attention_mask)
     assert out.shape == (batch, seq, config.hidden_size)
+    print("tests/integration/test_eagle1_backend_contract.py::test_eagle1_draft_forward_shape", flush=True)
 
 
 def _make_backend(training_overrides=None):
@@ -74,12 +75,14 @@ def test_eagle1_backend_reports_eagle3_data_plumbing() -> None:
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
     assert _make_backend().model_type == "eagle3"
+    print("tests/integration/test_eagle1_backend_contract.py::test_eagle1_backend_reports_eagle3_data_plumbing", flush=True)
 
 
 def test_eagle1_backend_opts_out_of_ulysses_sp() -> None:
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
     assert _make_backend().supports_ulysses_sp is False
+    print("tests/integration/test_eagle1_backend_contract.py::test_eagle1_backend_opts_out_of_ulysses_sp", flush=True)
 
 
 def test_eagle1_build_model_rejects_use_logits() -> None:
@@ -88,6 +91,7 @@ def test_eagle1_build_model_rejects_use_logits() -> None:
     backend = _make_backend({"use_logits": True})
     with pytest.raises(ValueError, match="use_logits=False"):
         backend.build_model()
+    print("tests/integration/test_eagle1_backend_contract.py::test_eagle1_build_model_rejects_use_logits", flush=True)
 
 
 def test_eagle1_compute_loss_matches_reference_formula() -> None:
@@ -144,6 +148,7 @@ def test_eagle1_compute_loss_matches_reference_formula() -> None:
     assert float(out["local_num_tokens"].detach()) == pytest.approx(float(num_tokens))
     assert float(out["total_local_vloss"].detach()) == pytest.approx(float(ref_vloss), rel=1e-5, abs=1e-6)
     assert float(out["total_local_ploss"].detach()) == pytest.approx(float(ref_ploss), rel=1e-5, abs=1e-6)
+    print("tests/integration/test_eagle1_backend_contract.py::test_eagle1_compute_loss_matches_reference_formula", flush=True)
 
 
 def test_eagle1_compute_loss_requires_last_hidden_states() -> None:
@@ -167,6 +172,7 @@ def test_eagle1_compute_loss_requires_last_hidden_states() -> None:
     }
     with pytest.raises(ValueError, match="last_hidden_states"):
         backend.compute_loss(model, batch, 0)
+    print("tests/integration/test_eagle1_backend_contract.py::test_eagle1_compute_loss_requires_last_hidden_states", flush=True)
 
 
 @pytest.mark.parametrize("algorithm", ["EAGLE1", "EAGLE2"])
@@ -174,6 +180,7 @@ def test_eagle1_eagle2_vllm_method_is_eagle(algorithm) -> None:
     from verl_speco.integration.vllm_runtime import _speculative_method_from_drafter
 
     assert _speculative_method_from_drafter({"speculative_algorithm": algorithm}) == "eagle"
+    print("tests/integration/test_eagle1_backend_contract.py::test_eagle1_eagle2_vllm_method_is_eagle", flush=True)
 
 
 @pytest.mark.parametrize("algorithm", ["EAGLE1", "EAGLE2"])
@@ -185,6 +192,7 @@ def test_eagle1_eagle2_collect_final_aux_layer(algorithm) -> None:
         target_num_hidden_layers=32,
     )
     assert layer_ids == [31]
+    print("tests/integration/test_eagle1_backend_contract.py::test_eagle1_eagle2_collect_final_aux_layer", flush=True)
 
 
 @pytest.mark.parametrize("algorithm", ["EAGLE1", "EAGLE2"])
@@ -202,3 +210,4 @@ def test_eagle1_eagle2_ignore_stray_multilayer_config(algorithm) -> None:
         target_num_hidden_layers=32,
     )
     assert layer_ids == [31]
+    print("tests/integration/test_eagle1_backend_contract.py::test_eagle1_eagle2_ignore_stray_multilayer_config", flush=True)

@@ -28,6 +28,7 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.enable_drafter_training is False
     assert drafter.training.collect_hidden_states_from_sgl is False
     assert drafter.training.collect_hidden_states_from_old_logprob is False
+    print("tests/config/test_speco_config_overlay.py::test_overlay_has_expected_default_drafter_shape", flush=True)
 
 
 def test_overlay_composes_with_pinned_upstream_verl(tmp_path: Path) -> None:
@@ -57,6 +58,7 @@ def test_overlay_composes_with_pinned_upstream_verl(tmp_path: Path) -> None:
     assert config.actor_rollout_ref.rollout.drafter.enable is False
     assert "trainer" in config
     assert "algorithm" in config
+    print("tests/config/test_speco_config_overlay.py::test_overlay_composes_with_pinned_upstream_verl", flush=True)
 
 
 def test_draft_trainer_composes_as_primary_config(tmp_path: Path) -> None:
@@ -83,3 +85,4 @@ def test_draft_trainer_composes_as_primary_config(tmp_path: Path) -> None:
     assert config.speco.draft_training.enable is True
     assert "trainer" in config
     assert "algorithm" in config
+    print("tests/config/test_speco_config_overlay.py::test_draft_trainer_composes_as_primary_config", flush=True)

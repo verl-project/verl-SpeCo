@@ -32,7 +32,7 @@ def test_required_verl_contract_matches_overlay() -> None:
         base["source_modifications_allowed"]
     ).lower()
     assert required["ENTRYPOINT"] == "python -m verl_speco.main"
-    print('test required verl contract matches overlay test')
+    print("tests/compat/test_verl_contract.py::test_required_verl_contract_matches_overlay", flush=True)
 
 
 def test_overlay_keeps_speco_changes_external_to_verl() -> None:
@@ -40,3 +40,4 @@ def test_overlay_keeps_speco_changes_external_to_verl() -> None:
 
     assert required["VERL_SOURCE_MODIFICATIONS_ALLOWED"] == "false"
     assert required["REQUIRES"] == "import verl only"
+    print("tests/compat/test_verl_contract.py::test_overlay_keeps_speco_changes_external_to_verl", flush=True)
