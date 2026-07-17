@@ -131,6 +131,40 @@ def test_dspark_default_loss_weights_match_deepspec():
     assert model.l1_chunk_size == 0
 
 
+def test_dspark_untrained_confidence_head_is_kept_but_excluded_from_optimizer():
+    config = DSparkConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vocab_size=32,
+        num_target_layers=4,
+        num_context_layers=2,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1, 3],
+        mask_token_id=31,
+        markov_rank=4,
+        enable_confidence_head=True,
+    )
+    model = DSparkTrainingModel(
+        draft_model=DSparkDraftModel(config),
+        confidence_head_alpha=0.0,
+    )
+
+    confidence_head = model.draft_model.confidence_head
+    assert confidence_head is not None
+    assert "draft_model.confidence_head.proj.weight" in model.state_dict()
+    assert all(not parameter.requires_grad for parameter in confidence_head.parameters())
+    optimizer_parameter_ids = {
+        id(parameter) for parameter in model.parameters() if parameter.requires_grad
+    }
+    assert optimizer_parameter_ids.isdisjoint(
+        id(parameter) for parameter in confidence_head.parameters()
+    )
+
+
 def test_dspark_label_and_prev_token_alignment():
     model = _small_dspark_training_model(block_size=4)
     input_ids = torch.tensor([[10, 11, 12, 13, 14, 15, 16]], dtype=torch.long)

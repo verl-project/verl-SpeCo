@@ -71,6 +71,12 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 "DSpark confidence loss needs target acceptance targets from target logits; "
                 "set dspark_confidence_loss_alpha=0 for the current CE-only trainer path."
             )
+        confidence_head = getattr(self.draft_model, "confidence_head", None)
+        if confidence_head is not None:
+            confidence_head.requires_grad_(False)
+            logger.info(
+                "[dspark-trainer] confidence head is loaded but frozen because confidence loss is disabled"
+            )
         self.debug_log = bool(debug_log)
         self.debug_log_first_n = max(int(debug_log_first_n), 0)
         self.debug_log_interval = max(int(debug_log_interval), 1)
