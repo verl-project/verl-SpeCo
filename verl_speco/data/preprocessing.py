@@ -427,7 +427,7 @@ def build_eagle3_dataset(
         cache_file_name = os.path.join(cache_dir, f"{cache_key}.pkl")
         print(f"dataset is cached at {cache_file_name}")
     else:
-        if not (cache_dir is None and cache_key is None):
+        if cache_dir is not None or cache_key is not None:
             warnings.warn(
                 "cache_dir and cache_key must be provided together to make caching work; proceeding without caching"
             )
