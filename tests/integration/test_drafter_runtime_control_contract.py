@@ -12,6 +12,32 @@ _speco_ray_trainer = pytest.importorskip(
 SpecoRayPPOTrainer = _speco_ray_trainer.SpecoRayPPOTrainer
 
 
+class _FakeOldLogProbBatch:
+    non_tensor_batch = {}
+
+    def __init__(self) -> None:
+        self.selected_non_tensor_keys = None
+
+    def select(self, *, non_tensor_batch_keys=None, **kwargs):
+        self.selected_non_tensor_keys = non_tensor_batch_keys
+        return self
+
+    def to_tensordict(self):
+        raise AssertionError("non-collect old-logprob steps should not enter the collection compute path")
+
+
+class _FakeRolloutWorkerGroup:
+    def __init__(self) -> None:
+        self.compute_log_prob_calls = 0
+
+    def generate_sequences(self, *args, **kwargs):
+        return SimpleNamespace(meta_info={"metrics": {}})
+
+    def compute_log_prob(self, batch):
+        self.compute_log_prob_calls += 1
+        raise AssertionError("non-collect old-logprob steps should use the original compute path")
+
+
 def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
     trainer = SpecoRayPPOTrainer.__new__(SpecoRayPPOTrainer)
     trainer.global_steps = step
@@ -94,6 +120,60 @@ def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None
     assert _no_drafter_trainer()._speco_oldlogprob_entropy_hook_enabled() is False
 
 
+def test_oldlogprob_non_collect_step_uses_original_compute_path() -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_interval_steps": 2,
+            "training_interval_steps": 1,
+        },
+        step=1,
+    )
+    trainer.config.actor_rollout_ref.actor.calculate_entropy = True
+    trainer.config.actor_rollout_ref.actor.strategy = "fsdp"
+    trainer.actor_rollout_wg = _FakeRolloutWorkerGroup()
+    trainer._update_actor = lambda *args, **kwargs: SimpleNamespace(meta_info={"metrics": {}})
+    original_calls = []
+
+    def original_compute_old_log_prob(batch):
+        original_calls.append(batch)
+        return "old-log-prob", 0.5
+
+    trainer._compute_old_log_prob = original_compute_old_log_prob
+    batch = _FakeOldLogProbBatch()
+
+    with trainer._speco_online_fit_hooks():
+        result = trainer._compute_old_log_prob(batch)
+
+    assert result == ("old-log-prob", 0.5)
+    assert original_calls == [batch]
+    assert batch.selected_non_tensor_keys is None
+    assert trainer.actor_rollout_wg.compute_log_prob_calls == 0
+    assert trainer._speco_last_collect_interval_matched == 0
+
+
+def test_dspark_l1_oldlogprob_layout_collects_final_hidden() -> None:
+    trainer = _trainer({"dspark_l1_loss_alpha": 0.9}, step=1)
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DSPARK"
+
+    assert trainer._speco_oldlogprob_hidden_layout() == "dflash_aux_plus_last"
+
+
+def test_dspark_default_oldlogprob_layout_collects_final_hidden() -> None:
+    trainer = _trainer({}, step=1)
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DSPARK"
+
+    assert trainer._speco_oldlogprob_hidden_layout() == "dflash_aux_plus_last"
+    assert trainer._speco_get_drafter_target_lm_head_row_selection() is None
+
+
+def test_dspark_ce_only_oldlogprob_layout_keeps_aux_only_hidden() -> None:
+    trainer = _trainer({"dspark_l1_loss_alpha": 0.0}, step=1)
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DSPARK"
+
+    assert trainer._speco_oldlogprob_hidden_layout() == "dflash_aux"
+
+
 def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:
     calls: list[tuple[str, object, int]] = []
     waited: list[object] = []
@@ -119,3 +199,28 @@ def test_disabled_or_untrained_drafter_does_not_publish() -> None:
         "drafter/publish_attempted": 0,
         "drafter/published": 0,
     }
+
+
+def test_drafter_checkpoint_results_require_a_successful_training_replica() -> None:
+    SpecoRayPPOTrainer._speco_validate_drafter_checkpoint_results(
+        [
+            {"saved": True, "reason": "saved"},
+            {"saved": False, "reason": "not_checkpoint_replica"},
+            {"saved": False, "reason": "not_in_training_group"},
+        ],
+        require_saved=True,
+    )
+
+    with pytest.raises(RuntimeError, match="produced no saved state"):
+        SpecoRayPPOTrainer._speco_validate_drafter_checkpoint_results(
+            [{"saved": False, "reason": "not_checkpoint_replica"}],
+            require_saved=True,
+        )
+
+
+def test_drafter_checkpoint_results_propagate_save_failure() -> None:
+    with pytest.raises(RuntimeError, match="missing_checkpoint_dir"):
+        SpecoRayPPOTrainer._speco_validate_drafter_checkpoint_results(
+            [{"saved": False, "reason": "missing_checkpoint_dir"}],
+            require_saved=True,
+        )

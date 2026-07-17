@@ -10,16 +10,13 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from transformers import AutoConfig
 
-from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
+from verl.utils.device import get_device_name
+from verl.utils.fsdp_utils import get_device_id
+from verl_speco.backends.lr_scheduler import build_drafter_lr_scheduler
 from verl_speco.models.dflash import DFlashConfig, DFlashDraftModel, build_target_layer_ids
 from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
 from verl_speco.models.target.target_head import TargetHead
-from verl.utils.torch_functional import (
-    get_constant_schedule_with_warmup,
-    get_cosine_schedule_with_warmup,
-)
-from verl.utils.device import get_device_name
-from verl.utils.fsdp_utils import get_device_id
+from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 
 
 logger = logging.getLogger(__name__)
@@ -56,6 +53,49 @@ def _create_dflash_mask_mod(anchor_positions: torch.Tensor, block_keep_mask: tor
 
     dflash_mask_mod.__name__ = f"dflash_mask_A{anchor_positions.shape[1]}_B{block_size}_C{ctx_len}"
     return dflash_mask_mod
+
+
+def _create_dflash_dense_attention_mask(
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    ctx_len: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Build the dense equivalent of the DFlash/DSpark training block mask.
+
+    PyTorch FlexAttention is currently used only on CUDA. Other devices use
+    SDPA and therefore need an explicit boolean mask with ``True`` entries for
+    keys that are visible to each draft query.
+    """
+
+    bsz, num_blocks = anchor_positions.shape
+    device = anchor_positions.device
+    draft_len = num_blocks * block_size
+
+    query_indices = torch.arange(draft_len, device=device)
+    query_block_ids = query_indices // block_size
+    query_anchors = anchor_positions.index_select(1, query_block_ids)
+    query_valid = block_keep_mask.index_select(1, query_block_ids)
+
+    context_indices = torch.arange(ctx_len, device=device)
+    context_allowed = context_indices.view(1, 1, ctx_len) < query_anchors.unsqueeze(-1)
+
+    draft_block_ids = torch.arange(draft_len, device=device) // block_size
+    draft_allowed = (
+        query_block_ids.view(1, draft_len, 1)
+        == draft_block_ids.view(1, 1, draft_len)
+    ).expand(bsz, -1, -1)
+    allowed = torch.cat([context_allowed, draft_allowed], dim=-1)
+
+    # Some SDPA kernels do not define fully masked rows safely. Dummy anchor
+    # rows are excluded from every loss, so let each one attend only to itself.
+    total_len = ctx_len + draft_len
+    key_indices = torch.arange(total_len, device=device)
+    safe_self = key_indices.view(1, 1, total_len) == (
+        ctx_len + query_indices
+    ).view(1, draft_len, 1)
+    allowed = torch.where(query_valid.unsqueeze(-1), allowed, safe_self)
+    return allowed.unsqueeze(1)
 
 
 class DFlashTrainingModel(nn.Module):
@@ -199,6 +239,7 @@ class DFlashTrainingModel(nn.Module):
         draft_len = n_blocks * self.block_size
 
         block_mask = None
+        dense_attention_mask = None
         if device.type == "cuda":
             block_mask = compile_friendly_create_block_mask(
                 mask_mod=_create_dflash_mask_mod(anchor_positions, block_keep_mask, seq_len, self.block_size),
@@ -208,6 +249,13 @@ class DFlashTrainingModel(nn.Module):
                 KV_LEN=seq_len + draft_len,
                 device=device,
             )
+        else:
+            dense_attention_mask = _create_dflash_dense_attention_mask(
+                anchor_positions,
+                block_keep_mask,
+                seq_len,
+                self.block_size,
+            )
 
         draft_hidden = self.draft_model(
             draft_input_ids=None,
@@ -215,6 +263,7 @@ class DFlashTrainingModel(nn.Module):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             block_mask=block_mask,
+            dense_attention_mask=dense_attention_mask,
             noise_embedding=noise_embedding,
         )
         label_offsets = self._cached_arange("label_offsets", self.block_size, device, view_shape=(1, 1, -1))
@@ -414,24 +463,7 @@ class DFlashTrainerBackend:
         )
 
     def setup_scheduler(self, optimizer, train_cfg):
-        total_steps = train_cfg.get("step", 0)
-        num_warmup_steps = int(train_cfg.get("lr_warmup_steps", 1000))
-        warmup_style = train_cfg.get("warmup_style", "constant")
-
-        if warmup_style == "constant":
-            return get_constant_schedule_with_warmup(
-                optimizer=optimizer,
-                num_warmup_steps=num_warmup_steps,
-            )
-        if warmup_style == "cosine":
-            return get_cosine_schedule_with_warmup(
-                optimizer=optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=total_steps,
-                min_lr_ratio=train_cfg.get("min_lr_ratio", 0.0),
-                num_cycles=train_cfg.get("num_cycles", 0.5),
-            )
-        raise NotImplementedError(f"Warmup style {warmup_style} is not supported")
+        return build_drafter_lr_scheduler(optimizer, train_cfg)
 
     def _get_target_hf_config(self):
         target_hf_config = getattr(self.target_model_config, "hf_config", None)
@@ -510,11 +542,6 @@ class DFlashTrainerBackend:
         return state_dict
 
     def _normalize_draft_state_dict(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        key_remap = {
-            "fc.weight": "context_proj.weight",
-            "hidden_norm.weight": "context_norm.weight",
-            "norm.weight": "final_norm.weight",
-        }
         normalized_state: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             normalized_key = key
@@ -522,20 +549,19 @@ class DFlashTrainerBackend:
                 if normalized_key.startswith(prefix):
                     normalized_key = normalized_key[len(prefix) :]
                     break
-            normalized_key = key_remap.get(normalized_key, normalized_key)
             normalized_state[normalized_key] = value
         return normalized_state
 
     def _infer_num_context_layers_from_state(self, normalized_state: dict[str, torch.Tensor], target_hidden_size: int) -> int | None:
-        context_proj = normalized_state.get("context_proj.weight")
-        if context_proj is None:
+        fc_weight = normalized_state.get("fc.weight")
+        if fc_weight is None:
             return None
-        if context_proj.ndim != 2:
-            raise ValueError(f"DFlash context_proj.weight must be rank-2, got shape {tuple(context_proj.shape)}")
-        input_dim = int(context_proj.shape[1])
+        if fc_weight.ndim != 2:
+            raise ValueError(f"DFlash fc.weight must be rank-2, got shape {tuple(fc_weight.shape)}")
+        input_dim = int(fc_weight.shape[1])
         if input_dim % int(target_hidden_size) != 0:
             raise ValueError(
-                f"DFlash context_proj.weight input dim {input_dim} is not divisible by "
+                f"DFlash fc.weight input dim {input_dim} is not divisible by "
                 f"target_hidden_size={target_hidden_size}"
             )
         return input_dim // int(target_hidden_size)
@@ -580,7 +606,7 @@ class DFlashTrainerBackend:
 
         if state_num_context_layers is not None and ids_num_context_layers is not None and state_num_context_layers != ids_num_context_layers:
             raise ValueError(
-                f"DFlash checkpoint/config mismatch in {spec_model_path}: context_proj.weight implies "
+                f"DFlash checkpoint/config mismatch in {spec_model_path}: fc.weight implies "
                 f"{state_num_context_layers} context layers, but target_layer_ids has {ids_num_context_layers} entries"
             )
 
@@ -628,6 +654,13 @@ class DFlashTrainerBackend:
     ) -> None:
         if normalized_state is None:
             normalized_state = self._normalize_draft_state_dict(self._load_draft_state_dict(model_path))
+        required_backbone_keys = {"fc.weight", "hidden_norm.weight", "norm.weight"}
+        missing_backbone_keys = sorted(required_backbone_keys.difference(normalized_state))
+        if missing_backbone_keys:
+            raise ValueError(
+                "DFlash/DSpark checkpoint does not use the canonical vLLM parameter names; "
+                f"missing={missing_backbone_keys} model_path={model_path}"
+            )
 
         model_state = draft_model.state_dict()
         filtered_state: dict[str, torch.Tensor] = {}
@@ -639,9 +672,9 @@ class DFlashTrainerBackend:
                 continue
             if tuple(model_state[key].shape) != tuple(value.shape):
                 mismatched.append((key, tuple(value.shape), tuple(model_state[key].shape)))
-                if key == "context_proj.weight":
+                if key == "fc.weight":
                     raise ValueError(
-                        "DFlash context_proj.weight shape mismatch after config normalization: "
+                        "DFlash fc.weight shape mismatch after config normalization: "
                         f"checkpoint={tuple(value.shape)} model={tuple(model_state[key].shape)}"
                     )
                 continue

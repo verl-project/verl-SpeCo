@@ -199,11 +199,7 @@ class AutoDraftModelConfig:
         elif architecture in _DSPARK_ARCHITECTURE_ALIASES:
             from .dspark import DSparkConfig
 
-            config_class = DSparkConfig
-            config["model_type"] = DSparkConfig.model_type
-            config["architectures"] = ["DSparkDraftModel"]
-            if "enable_confidence_head" not in config:
-                config["enable_confidence_head"] = float(config.get("confidence_head_alpha", 0.0)) > 0.0
+            return DSparkConfig.from_dspark_dict(config)
         elif architecture in _DOMINO_ARCHITECTURE_ALIASES:
             from .domino import DominoConfig
 

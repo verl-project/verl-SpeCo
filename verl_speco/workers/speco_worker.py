@@ -528,16 +528,24 @@ class SpecoWorker(Worker):
         )
         model_cfg = self.config.get("model", None)
         target_model_path = _config_str(model_cfg.get("path", None)) if model_cfg is not None else ""
+        algorithm = str(self.config.rollout.drafter.speculative_algorithm).upper()
+        dspark_l1_enabled = (
+            algorithm == "DSPARK"
+            and float(self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
+        )
+        default_hidden_layout = (
+            "dflash_aux_plus_last"
+            if dspark_l1_enabled
+            else "dflash_aux"
+            if algorithm in {"DFLASH", "DSPARK"}
+            else "eagle3_aux_plus_last"
+        )
         metadata = {
             "source": batch.get("hidden_target_logprobs_source", "rl_rollout"),
             "global_step": batch.get("global_step", self.last_global_step),
             "target_model_path": target_model_path,
             "drafter_model_path": _config_str(self.config.rollout.drafter.get("model_path", None)),
-            "hidden_states_layout": batch.get("hidden_states_layout") or (
-                "dflash_aux"
-                if str(self.config.rollout.drafter.speculative_algorithm).upper() in {"DFLASH", "DSPARK"}
-                else "eagle3_aux_plus_last"
-            ),
+            "hidden_states_layout": batch.get("hidden_states_layout") or default_hidden_layout,
             "target_layer_ids": batch.get("target_layer_ids"),
             "use_logits": bool(self.config.rollout.drafter.training.get("use_logits", False)),
             "sequence_length": int(input_ids.numel()),

@@ -88,8 +88,61 @@ def test_publish_state_filter_skips_non_eagle_lm_head() -> None:
     trainer.model = SimpleNamespace(
         state_dict=lambda: {
             "lm_head.weight": torch.ones(2, 2),
-            "context_proj.weight": torch.ones(2, 2),
+            "draft_model.fc.weight": torch.ones(2, 2),
         }
     )
 
-    assert set(trainer._get_trainable_state_dict()) == {"context_proj.weight"}
+    assert set(trainer._get_trainable_state_dict()) == {"draft_model.fc.weight"}
+
+
+def test_publish_state_filter_excludes_block_drafter_embedding() -> None:
+    torch = pytest.importorskip("torch")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="publish state filtering needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(model_type="dspark")
+    trainer.training_device_mesh = None
+    trainer._frozen_param_names = []
+    trainer.model = SimpleNamespace(
+        state_dict=lambda: {
+            "draft_model.embed_tokens.weight": torch.ones(2, 2),
+            "draft_model.fc.weight": torch.ones(2, 2),
+        }
+    )
+
+    assert set(trainer._get_trainable_state_dict()) == {"draft_model.fc.weight"}
+
+
+def test_dspark_pretrained_export_strips_only_training_wrapper_prefix() -> None:
+    torch = pytest.importorskip("torch")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="checkpoint export needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(model_type="dspark")
+    trainer.training_device_mesh = None
+    trainer.model = SimpleNamespace(
+        draft_model=SimpleNamespace(),
+        state_dict=lambda: {
+            "draft_model.fc.weight": torch.ones(2, 4),
+            "draft_model.hidden_norm.weight": torch.ones(2),
+            "draft_model.norm.weight": torch.ones(2),
+            "draft_model.markov_head.markov_w1.weight": torch.ones(2, 2),
+        },
+    )
+
+    exported_state = trainer._get_pretrained_export_state_dict()
+
+    assert set(exported_state) == {
+        "fc.weight",
+        "hidden_norm.weight",
+        "norm.weight",
+        "markov_head.markov_w1.weight",
+    }

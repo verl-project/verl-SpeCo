@@ -506,8 +506,8 @@ def build_vllm_speculative_config_from_drafter(
     algorithm = _drafter_algorithm(drafter_cfg)
     method = _speculative_method_from_drafter(drafter_cfg)
     spec_model_path = _first_present(
-        drafter_cfg.get("checkpoint_path"),
         drafter_cfg.get("model_path"),
+        drafter_cfg.get("checkpoint_path"),
         _get_nested(drafter_cfg, ("spec_model", "path"), None),
         _get_nested(drafter_cfg, ("model", "path"), None),
         drafter_cfg.get("spec_model_path"),
@@ -1522,21 +1522,11 @@ def _draft_param_name_candidates(name: str) -> list[str]:
             if candidate.startswith(prefix):
                 pending.append(candidate[len(prefix) :])
 
-    # DFlash name aliases: training-side name -> vLLM inference-side name
-    dflash_aliases = (
-        ("context_proj.", "fc."),
-        ("context_norm.", "hidden_norm."),
-        ("final_norm.", "norm."),
-    )
-
     candidates = []
     for candidate in bases:
         candidates.append(candidate)
         if "midlayer." in candidate:
             candidates.append(candidate.replace("midlayer.", "model.layers.0."))
-        for src, dst in dflash_aliases:
-            if src in candidate:
-                candidates.append(candidate.replace(src, dst))
     for candidate in list(candidates):
         if not candidate.startswith("model."):
             candidates.append(f"model.{candidate}")
@@ -1895,11 +1885,6 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         _strip_prefixes = ("module.", "_orig_mod.", "draft_model.", "model.draft_model.")
         if is_dflash or is_dspark:
             _strip_prefixes = (*_strip_prefixes, "model.")
-        _alias_map = (
-            ("context_proj.", "fc."),
-            ("context_norm.", "hidden_norm."),
-            ("final_norm.", "norm."),
-        )
         translated_weights: list[tuple[str, torch.Tensor]] = []
         for name, tensor in all_weights:
             n = name
@@ -1914,10 +1899,6 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 n = n.replace("midlayer.", "layers.0.")
             if is_eagle3 and n != "lm_head.weight" and "." in n and not n.startswith("model."):
                 n = f"model.{n}"
-            if is_dflash or is_dspark:
-                for src, dst in _alias_map:
-                    if src in n:
-                        n = n.replace(src, dst)
             translated_weights.append((n, tensor))
 
         loaded_params = len(translated_weights)

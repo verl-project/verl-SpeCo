@@ -154,7 +154,7 @@ def _oldlogprob_hidden_layout(micro_batch: Any) -> str:
             value = micro_batch[OLD_LOGPROB_HIDDEN_LAYOUT_KEY]
     value = getattr(value, "data", value)
     layout = str(value or "eagle3_aux_plus_last")
-    if layout not in {"eagle3_aux_plus_last", "dflash_aux"}:
+    if layout not in {"eagle3_aux_plus_last", "dflash_aux", "dflash_aux_plus_last"}:
         raise ValueError(f"Unsupported SPECO old-logprob hidden layout: {layout!r}")
     return layout
 
@@ -1235,7 +1235,7 @@ def _install_oldlogprob_hidden_hooks(engine: Any, output_args: dict[str, Any], m
             required_modules[key] = layers[layer_index]
 
     final_key = None
-    if hidden_layout == "eagle3_aux_plus_last":
+    if hidden_layout in {"eagle3_aux_plus_last", "dflash_aux_plus_last"}:
         if final_norm is None:
             raise RuntimeError("SPECO old-logprob forward-hook capture could not find final norm module")
         final_key = "final"
@@ -1321,7 +1321,7 @@ def _select_oldlogprob_hidden_states(engine: Any, output: Any, output_args: dict
 
     aux_hidden_list = [_resolve_hidden_state(hidden_states, layer_id) for layer_id in aux_layer_ids]
     selected_hidden_list = list(aux_hidden_list)
-    if hidden_layout == "eagle3_aux_plus_last":
+    if hidden_layout in {"eagle3_aux_plus_last", "dflash_aux_plus_last"}:
         final_hidden = hidden_states[-1]
         final_hidden = final_hidden.squeeze(0) if final_hidden.dim() == 3 and final_hidden.size(0) == 1 else final_hidden
         selected_hidden_list.append(final_hidden)

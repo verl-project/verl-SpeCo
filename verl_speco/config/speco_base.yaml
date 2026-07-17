@@ -1,4 +1,7 @@
 # Shared SPECO configuration without Hydra primary-config metadata.
+#
+# Keep online rollout/training defaults here so both the PPO trainer and the
+# standalone draft trainer inherit the same drafter model contract.
 
 speco:
   enable: true
@@ -39,30 +42,25 @@ actor_rollout_ref:
         max_model_len: null
         enforce_eager: null
         speculative_config_overrides: {}
-        # Fail closed on known-lossy acceptance settings (typical_acceptance_sampler,
-        # synthetic rejection, nonzero posterior thresholds). RL rollout is only
-        # unbiased under exact target-distribution verification; SPECO recomputes
-        # old_log_probs as the target logprob with no importance-sampling correction,
-        # so a relaxed verifier would silently bias PPO. Set true to opt in knowingly.
+        # RL rollout assumes exact target-distribution verification. Set this
+        # only when intentionally opting into a lossy acceptance method.
         allow_lossy_speculative_sampling: false
 
       training:
         mode: online
         collect_hidden_states_from_sgl: false
         collect_hidden_states_from_old_logprob: false
-        # SGLang aux/context capture skips the target's final norm, so a target_layer_id
-        # equal to the last layer (or -1) diverges from the offline / old-logprob (post-norm
-        # / embedding) semantics. SPECO fails closed on that combination; set true only for a
-        # self-consistent SGLang-only train+serve setup (pre-norm on both sides).
+        # SGLang does not apply the target final norm to captured aux states.
+        # Keep this false unless training and serving consistently use pre-norm.
         allow_sglang_prenorm_last_layer: false
         old_logprob_hidden_capture_impl: forward_hook
         use_data_buffer: false
         collect_interval_steps: 5
         collection_sample_rate: 1.0
         max_collect_samples_per_step_per_replica: 16
-        max_collect_tokens_per_step_per_replica: 2048
+        max_collect_tokens_per_step_per_replica: 16384
         hidden_state_window_mode: front
-        hidden_state_window_tokens_per_sample: 128
+        hidden_state_window_tokens_per_sample: 512
         hidden_state_window_min_rows: 512
         hidden_state_random_max_offset: null
         hidden_state_random_seed_by_step: true
@@ -84,10 +82,13 @@ actor_rollout_ref:
         save_full_drafter_checkpoint: true
         sample_last_n_steps: 20
         train_batches_per_cycle: 4
-        lr: 1e-6
+        lr: 1e-5
         lr_warmup_steps: 0
-        min_lr_ratio: null
-        warmup_style: constant
+        lr_scheduler_type: global_cosine
+        lr_decay_steps: 100
+        min_lr_ratio: 0.1
+        warmup_style: null
+        resume_trainer_state_from_checkpoint: true
         use_logits: false
         target_lm_head_row_restricted_sync: true
         logits_topk: 128
@@ -112,7 +113,7 @@ actor_rollout_ref:
         dflash_loss_mode: full_vocab
         dflash_sampled_ce_negatives: 0
         dspark_block_size: 7
-        dspark_num_anchors: 512
+        dspark_num_anchors: 32
         dspark_loss_decay_gamma: 7.0
         dspark_hard_sample_ratio: 0.0
         dspark_hidden_size: null
@@ -128,8 +129,9 @@ actor_rollout_ref:
         dspark_confidence_head_alpha: 0.0
         dspark_confidence_loss_alpha: 0.0
         dspark_confidence_head_with_markov: true
-        dspark_ce_loss_alpha: 1.0
-        dspark_l1_loss_alpha: 0.0
+        dspark_ce_loss_alpha: 0.1
+        dspark_l1_loss_alpha: 0.9
+        dspark_l1_chunk_size: 0
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
         dspark_debug_log_interval: 100
