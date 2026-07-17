@@ -58,10 +58,10 @@ def _is_dspark_config(config: Any) -> bool:
 
 def _is_dflash_config(drafter_cfg: Any, model_configs: tuple[Any, ...]) -> bool:
     algorithm = _drafter_algorithm(drafter_cfg)
-    if algorithm in {"DFLASH", "DSPARK"}:
+    if algorithm in {"DFLASH", "DSPARK", "DOMINO"}:
         return True
     return any(
-        architecture in {"DFlashDraftModel", "DSparkDraftModel", "Qwen3DSparkModel"}
+        architecture in {"DFlashDraftModel", "DSparkDraftModel", "Qwen3DSparkModel", "DominoDraftModel", "Qwen3DominoModel"}
         for config in model_configs
         for architecture in _config_architectures(config)
     )
@@ -120,6 +120,7 @@ def _dflash_num_context_layers(drafter_cfg: Any, model_configs: tuple[Any, ...],
     candidates = []
     if is_dspark:
         candidates.append(_get_nested(training_cfg, ("dspark_num_target_layers",), None))
+    candidates.append(_get_nested(training_cfg, ("domino_num_target_layers",), None))
     candidates.extend(
         (
             _get_nested(training_cfg, ("dflash_num_target_layers",), None),

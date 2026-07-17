@@ -135,6 +135,25 @@ actor_rollout_ref:
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
         dspark_debug_log_interval: 100
+        # Domino (DFlash variant: causal GRU correction head + dual-logit curriculum).
+        # Unset keys fall back to the matching dflash_* value.
+        domino_block_size: 16
+        domino_num_anchors: 512
+        domino_loss_decay_gamma: 7.0
+        domino_hidden_size: null
+        domino_num_target_layers: 5
+        domino_num_hidden_layers: 5
+        domino_mask_token_id: null
+        domino_target_layer_ids: null
+        domino_max_window: 512
+        domino_emb_dim: 256
+        domino_gru_hidden_dim: 1024
+        domino_pure_draft_prefix_len: 1
+        domino_shift_label: true
+        domino_lambda_base_start: 1.0
+        domino_lambda_base_decay_steps: 2000
+        # EAGLE-1 / EAGLE-2 draft training (single-step feature regression +
+        # full-vocab soft-CE distillation against the frozen target head).
         eagle1_num_hidden_layers: 1
         eagle1_hidden_loss_weight: 1.0
         eagle1_token_loss_weight: 0.1

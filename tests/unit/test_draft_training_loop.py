@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -7,7 +8,7 @@ import pytest
 
 pytest.importorskip("torch")
 
-from verl_speco.trainer.draft_training_loop import _save_standalone_checkpoint
+from verl_speco.trainer.draft_training_loop import _rewrite_standalone_block_runtime_config, _save_standalone_checkpoint
 
 
 class _FakeTrainer:
@@ -53,3 +54,125 @@ def test_standalone_checkpoint_skips_when_previous_save_is_running():
 
     assert result["saved"] is False
     assert result["reason"] == "previous_save_running"
+
+
+def test_public_checkpoint_path_rewrites_dspark_runtime_config(tmp_path):
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    source_dir = tmp_path / "source_dspark"
+    source_dir.mkdir()
+    (source_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v3",
+                "architectures": ["DeepSeekDSparkModel"],
+                "target_layer_ids": [1, 9, 17],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "dspark",
+                "architectures": ["DSparkDraftModel"],
+                "target_layer_ids": [1, 9, 17],
+                "markov_head_type": "vanilla",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class _PublicCheckpointTrainer:
+        backend = SimpleNamespace(model_type="dspark")
+        config = SimpleNamespace(
+            rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))
+        )
+
+        @staticmethod
+        def save_checkpoint(step: int, wait: bool):
+            assert step == 5
+            assert wait is True
+            return {"saved": True, "reason": "saved", "path": str(checkpoint_dir)}
+
+    result = _save_standalone_checkpoint(_PublicCheckpointTrainer(), 5, wait=True)
+
+    runtime_config = json.loads((checkpoint_dir / "config.json").read_text(encoding="utf-8"))
+    assert result["saved"] is True
+    assert runtime_config["model_type"] == "deepseek_v3"
+    assert runtime_config["architectures"] == ["DeepSeekDSparkModel"]
+    assert runtime_config["dspark_config"]["markov_head_type"] == "vanilla"
+    assert (checkpoint_dir / "speco_training_config.json").exists()
+
+
+def test_standalone_dspark_checkpoint_preserves_source_runtime_config(tmp_path):
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    source_dir = tmp_path / "source_dspark"
+    source_dir.mkdir()
+    source_config = {
+        "model_type": "deepseek_v3",
+        "architectures": ["DeepSeekDSparkModel"],
+        "target_layer_ids": [1, 9, 17],
+    }
+    (source_dir / "config.json").write_text(json.dumps(source_config), encoding="utf-8")
+    training_config = {
+        "model_type": "dspark",
+        "architectures": ["DSparkDraftModel"],
+        "target_layer_ids": [1, 9, 17],
+        "mask_token_id": 151669,
+        "markov_head_type": "vanilla",
+        "markov_rank": 256,
+        "block_size": 7,
+        "num_context_layers": 3,
+    }
+    (checkpoint_dir / "config.json").write_text(json.dumps(training_config), encoding="utf-8")
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="dspark"),
+        config=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))),
+    )
+
+    _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    runtime_config = json.loads((checkpoint_dir / "config.json").read_text(encoding="utf-8"))
+    saved_training_config = json.loads((checkpoint_dir / "speco_training_config.json").read_text(encoding="utf-8"))
+    assert runtime_config["model_type"] == "deepseek_v3"
+    assert runtime_config["architectures"] == ["DeepSeekDSparkModel"]
+    assert runtime_config["dspark_config"]["markov_head_type"] == "vanilla"
+    assert runtime_config["dflash_config"]["target_layer_ids"] == [1, 9, 17]
+    assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [2, 10, 18]
+    assert saved_training_config == training_config
+
+
+def test_standalone_dflash_checkpoint_preserves_source_runtime_config(tmp_path):
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    source_dir = tmp_path / "source_dflash"
+    source_dir.mkdir()
+    source_config = {
+        "model_type": "qwen3",
+        "architectures": ["DFlashForCausalLM"],
+    }
+    (source_dir / "config.json").write_text(json.dumps(source_config), encoding="utf-8")
+    training_config = {
+        "model_type": "dflash",
+        "architectures": ["DFlashDraftModel"],
+        "target_layer_ids": [2, 10, 18],
+        "mask_token_id": 151669,
+        "num_context_layers": 3,
+    }
+    (checkpoint_dir / "config.json").write_text(json.dumps(training_config), encoding="utf-8")
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="dflash"),
+        config=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))),
+    )
+
+    _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    runtime_config = json.loads((checkpoint_dir / "config.json").read_text(encoding="utf-8"))
+    saved_training_config = json.loads((checkpoint_dir / "speco_training_config.json").read_text(encoding="utf-8"))
+    assert runtime_config["model_type"] == "qwen3"
+    assert runtime_config["architectures"] == ["DFlashForCausalLM"]
+    assert runtime_config["dflash_config"]["target_layer_ids"] == [2, 10, 18]
+    assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [3, 11, 19]
+    assert saved_training_config == training_config
