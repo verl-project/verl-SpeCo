@@ -99,7 +99,7 @@ jobs:
 
       - name: Verify NPU runtime
         run: |
-          npu-smi info
+          # npu-smi info
           python - <<'PY'
           import torch
           import torch_npu
