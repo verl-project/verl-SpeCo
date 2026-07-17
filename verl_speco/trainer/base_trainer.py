@@ -529,11 +529,13 @@ class DrafterBaseTrainer:
         )
 
     def _is_block_drafter_backend(self) -> bool:
-        return getattr(self.backend, "model_type", None) in {"dflash", "dspark"}
+        return getattr(self.backend, "model_type", None) in {"dflash", "dspark", "domino"}
 
     def _block_drafter_metric_prefix(self) -> str:
         model_type = str(getattr(self.backend, "model_type", "dflash") or "dflash")
-        return "dspark" if model_type == "dspark" else "dflash"
+        if model_type in {"dspark", "domino"}:
+            return model_type
+        return "dflash"
 
     def _block_drafter_config_value(self, suffix: str, default: Any) -> Any:
         training_cfg = self.config.rollout.drafter.training
@@ -698,7 +700,7 @@ class DrafterBaseTrainer:
         # A. 实例化模型（委托给backend）
         pending_target_weight = self._pending_target_lm_head_weight
         if (
-            getattr(self.backend, "model_type", None) in {"eagle3", "dflash", "dspark"}
+            getattr(self.backend, "model_type", None) in {"eagle3", "dflash", "dspark", "domino"}
             and torch.is_tensor(pending_target_weight)
             and pending_target_weight.dim() == 2
         ):

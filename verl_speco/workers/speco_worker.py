@@ -408,11 +408,15 @@ class SpecoWorker(Worker):
             from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend
 
             trainer_backend = DSparkTrainerBackend(self.config, self.config.model)
+        elif algo == "DOMINO":
+            from verl_speco.backends.domino_trainer_backend import DominoTrainerBackend
+
+            trainer_backend = DominoTrainerBackend(self.config, self.config.model)
         else:
             raise ValueError(
                 "Unsupported drafter algorithm "
                 f"{self.config.rollout.drafter.speculative_algorithm!r}; "
-                "supported algorithms are EAGLE1, EAGLE2, EAGLE3, DFLASH and DSPARK"
+                "supported algorithms are EAGLE1, EAGLE2, EAGLE3, DFLASH, DSPARK and DOMINO"
             )
 
         self.trainer = DrafterBaseTrainer(

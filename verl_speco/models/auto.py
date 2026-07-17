@@ -23,6 +23,11 @@ _DSPARK_ARCHITECTURE_ALIASES = {
     "Qwen3DSparkModel",
 }
 
+_DOMINO_ARCHITECTURE_ALIASES = {
+    "DominoDraftModel",
+    "Qwen3DominoModel",
+}
+
 
 def _normalize_int_list(value):
     if value is None:
@@ -180,7 +185,11 @@ class AutoDraftModelConfig:
 
         architecture = architectures[0]
 
-        if architecture not in cls._config_mapping and architecture not in _DSPARK_ARCHITECTURE_ALIASES:
+        if (
+            architecture not in cls._config_mapping
+            and architecture not in _DSPARK_ARCHITECTURE_ALIASES
+            and architecture not in _DOMINO_ARCHITECTURE_ALIASES
+        ):
             raise ValueError(f"Architecture {architecture} not supported")
 
         config_class = cls._config_mapping.get(architecture)
@@ -195,6 +204,13 @@ class AutoDraftModelConfig:
             config["architectures"] = ["DSparkDraftModel"]
             if "enable_confidence_head" not in config:
                 config["enable_confidence_head"] = float(config.get("confidence_head_alpha", 0.0)) > 0.0
+        elif architecture in _DOMINO_ARCHITECTURE_ALIASES:
+            from .domino import DominoConfig
+
+            config_class = DominoConfig
+            config["model_type"] = DominoConfig.model_type
+            config["architectures"] = ["DominoDraftModel"]
+            config.setdefault("projector_type", "domino")
         elif architecture in _EAGLE3_ARCHITECTURE_ALIASES:
             config = _normalize_eagle3_config_dict(config)
 
