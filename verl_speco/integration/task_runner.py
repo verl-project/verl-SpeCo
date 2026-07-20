@@ -47,6 +47,13 @@ def _drafter_rollout_enabled(config) -> bool:
     return bool(getattr(drafter, "enable", False))
 
 
+def _rollout_name(config):
+    try:
+        return config.actor_rollout_ref.rollout.get("name")
+    except (AttributeError, TypeError):
+        return None
+
+
 def _open_config_mapping(mapping):
     return open_dict(mapping) if OmegaConf.is_config(mapping) else nullcontext()
 
@@ -97,6 +104,31 @@ class SpecoTaskRunner(TaskRunner):
     Adapted from verl v0.8.0
     ``verl/trainer/main_ppo.py::TaskRunner.run``.
     """
+
+    def add_actor_rollout_worker(self, config):
+        worker_cls, ray_worker_group_cls = super().add_actor_rollout_worker(config)
+        if _drafter_rollout_enabled(config) or _rollout_name(config) != "vllm":
+            return worker_cls, ray_worker_group_cls
+
+        from verl_speco.integration.verl_npu_vllm_compat import VerlNPUVLLMImportCompatMixin
+
+        raw_worker_cls = _unwrap_ray_remote_actor_class(worker_cls)
+        if issubclass(raw_worker_cls, VerlNPUVLLMImportCompatMixin):
+            return worker_cls, ray_worker_group_cls
+
+        wrapped_cls = type(
+            f"SpecoNoDrafter{raw_worker_cls.__name__}",
+            (VerlNPUVLLMImportCompatMixin, raw_worker_cls),
+            {
+                "__module__": __name__,
+                "__doc__": raw_worker_cls.__doc__,
+            },
+        )
+        for role, role_worker_cls in list(self.role_worker_mapping.items()):
+            raw_role_worker_cls = _unwrap_ray_remote_actor_class(role_worker_cls)
+            if role_worker_cls is worker_cls or raw_role_worker_cls is raw_worker_cls:
+                self.role_worker_mapping[role] = _remotify_like_worker_mapping_value(role_worker_cls, wrapped_cls)
+        return _remotify_like_worker_mapping_value(worker_cls, wrapped_cls), ray_worker_group_cls
 
     def add_speco_drafter_worker(self, config):
         """Return the external SPECO drafter worker class when online training is enabled."""
