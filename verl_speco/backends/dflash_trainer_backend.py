@@ -13,7 +13,11 @@ from transformers import AutoConfig
 from verl.utils.device import get_device_name
 from verl.utils.fsdp_utils import get_device_id
 from verl_speco.backends.lr_scheduler import build_drafter_lr_scheduler
-from verl_speco.models.dflash import DFlashConfig, DFlashDraftModel, build_target_layer_ids
+from verl_speco.models.dflash import (
+    DFlashConfig,
+    DFlashDraftModel,
+    build_target_layer_ids,
+)
 from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
 from verl_speco.models.target.target_head import TargetHead
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
@@ -34,7 +38,12 @@ class _SyncedTargetHead(nn.Module):
         return self.fc(hidden_states)
 
 
-def _create_dflash_mask_mod(anchor_positions: torch.Tensor, block_keep_mask: torch.Tensor, ctx_len: int, block_size: int):
+def _create_dflash_mask_mod(
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    ctx_len: int,
+    block_size: int,
+):
     """Create DFlash block attention mask.
 
     A query block can attend to context tokens before its anchor and draft
@@ -51,7 +60,9 @@ def _create_dflash_mask_mod(anchor_positions: torch.Tensor, block_keep_mask: tor
         mask_draft = is_draft & (q_block_id == kv_block_id)
         return (mask_context | mask_draft) & block_keep_mask[b, q_block_id]
 
-    dflash_mask_mod.__name__ = f"dflash_mask_A{anchor_positions.shape[1]}_B{block_size}_C{ctx_len}"
+    dflash_mask_mod.__name__ = (
+        f"dflash_mask_A{anchor_positions.shape[1]}_B{block_size}_C{ctx_len}"
+    )
     return dflash_mask_mod
 
 
@@ -82,8 +93,7 @@ def _create_dflash_dense_attention_mask(
 
     draft_block_ids = torch.arange(draft_len, device=device) // block_size
     draft_allowed = (
-        query_block_ids.view(1, draft_len, 1)
-        == draft_block_ids.view(1, 1, draft_len)
+        query_block_ids.view(1, draft_len, 1) == draft_block_ids.view(1, 1, draft_len)
     ).expand(bsz, -1, -1)
     allowed = torch.cat([context_allowed, draft_allowed], dim=-1)
 
@@ -91,9 +101,9 @@ def _create_dflash_dense_attention_mask(
     # rows are excluded from every loss, so let each one attend only to itself.
     total_len = ctx_len + draft_len
     key_indices = torch.arange(total_len, device=device)
-    safe_self = key_indices.view(1, 1, total_len) == (
-        ctx_len + query_indices
-    ).view(1, draft_len, 1)
+    safe_self = key_indices.view(1, 1, total_len) == (ctx_len + query_indices).view(
+        1, draft_len, 1
+    )
     allowed = torch.where(query_valid.unsqueeze(-1), allowed, safe_self)
     return allowed.unsqueeze(1)
 
@@ -131,7 +141,14 @@ class DFlashTrainingModel(nn.Module):
         self.sampled_ce_negatives = max(int(sampled_ce_negatives), 0)
         self._tensor_template_cache: dict[tuple, torch.Tensor] = {}
 
-    def _cached_arange(self, name: str, length: int, device: torch.device, *, view_shape: tuple[int, ...] | None = None):
+    def _cached_arange(
+        self,
+        name: str,
+        length: int,
+        device: torch.device,
+        *,
+        view_shape: tuple[int, ...] | None = None,
+    ):
         key = (name, int(length), device.type, device.index, view_shape)
         cached = self._tensor_template_cache.get(key)
         if cached is None or cached.device != device:
@@ -146,22 +163,34 @@ class DFlashTrainingModel(nn.Module):
         key = ("decay_weights", self.block_size, gamma, device.type, device.index)
         cached = self._tensor_template_cache.get(key)
         if cached is None or cached.device != device:
-            k = self._cached_arange("decay_positions", self.block_size, device, view_shape=(1, 1, -1))
+            k = self._cached_arange(
+                "decay_positions", self.block_size, device, view_shape=(1, 1, -1)
+            )
             cached = torch.exp(-(k - 1).clamp(min=0).float() / gamma)
             self._tensor_template_cache[key] = cached
         return cached
 
-    def _sample_anchor_positions(self, seq_len: int, loss_mask: torch.Tensor, device: torch.device):
+    def _sample_anchor_positions(
+        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
+    ):
         bsz = loss_mask.shape[0]
         max_anchor = max(seq_len - self.block_size, 0)
         if max_anchor == 0:
-            anchors = torch.zeros(bsz, self.num_anchors, dtype=torch.long, device=device)
-            keep_mask = torch.zeros(bsz, self.num_anchors, dtype=torch.bool, device=device)
+            anchors = torch.zeros(
+                bsz, self.num_anchors, dtype=torch.long, device=device
+            )
+            keep_mask = torch.zeros(
+                bsz, self.num_anchors, dtype=torch.bool, device=device
+            )
             return anchors, keep_mask
 
         valid = loss_mask[:, : max_anchor + 1] > 0.5
         valid_counts = valid.sum(dim=1)
-        indices = self._cached_arange("anchor_indices", max_anchor + 1, device).unsqueeze(0).expand(bsz, -1)
+        indices = (
+            self._cached_arange("anchor_indices", max_anchor + 1, device)
+            .unsqueeze(0)
+            .expand(bsz, -1)
+        )
         masked_indices = torch.where(valid, indices, seq_len + 1)
         random_vals = torch.rand(bsz, max_anchor + 1, device=device)
         random_vals = torch.where(valid, random_vals, 2.0)
@@ -170,25 +199,45 @@ class DFlashTrainingModel(nn.Module):
         # hot path; selecting the smallest random values with topk keeps the
         # same uniform-without-replacement sampling semantics for valid anchors.
         take_n = min(self.num_anchors, masked_indices.shape[1])
-        _, top_idx = torch.topk(random_vals, k=take_n, dim=1, largest=False, sorted=False)
+        _, top_idx = torch.topk(
+            random_vals, k=take_n, dim=1, largest=False, sorted=False
+        )
         selected = torch.gather(masked_indices, 1, top_idx).sort(dim=1).values
         if take_n < self.num_anchors:
             selected = torch.cat(
-                [selected, torch.zeros(bsz, self.num_anchors - take_n, dtype=torch.long, device=device)],
+                [
+                    selected,
+                    torch.zeros(
+                        bsz, self.num_anchors - take_n, dtype=torch.long, device=device
+                    ),
+                ],
                 dim=1,
             )
-        keep_mask = self._cached_arange("anchor_keep", self.num_anchors, device).unsqueeze(0) < valid_counts.unsqueeze(1).clamp(max=self.num_anchors)
+        keep_mask = self._cached_arange(
+            "anchor_keep", self.num_anchors, device
+        ).unsqueeze(0) < valid_counts.unsqueeze(1).clamp(max=self.num_anchors)
         return torch.where(keep_mask, selected, 0), keep_mask
 
     def _create_position_ids(self, anchor_positions: torch.Tensor, seq_len: int):
         bsz = anchor_positions.shape[0]
         device = anchor_positions.device
-        context_position_ids = self._cached_arange("context_positions", seq_len, device).unsqueeze(0).expand(bsz, -1)
-        offsets = self._cached_arange("block_offsets", self.block_size, device, view_shape=(1, 1, -1))
+        context_position_ids = (
+            self._cached_arange("context_positions", seq_len, device)
+            .unsqueeze(0)
+            .expand(bsz, -1)
+        )
+        offsets = self._cached_arange(
+            "block_offsets", self.block_size, device, view_shape=(1, 1, -1)
+        )
         draft_position_ids = anchor_positions.unsqueeze(-1) + offsets
         return context_position_ids, draft_position_ids.view(bsz, -1)
 
-    def _create_noise_embed(self, input_ids: torch.Tensor, anchor_positions: torch.Tensor, block_keep_mask: torch.Tensor):
+    def _create_noise_embed(
+        self,
+        input_ids: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+    ):
         bsz, seq_len = input_ids.shape
         n_blocks = anchor_positions.shape[1]
         device = input_ids.device
@@ -199,21 +248,35 @@ class DFlashTrainingModel(nn.Module):
             device=device,
         )
         block_starts = (
-            self._cached_arange("block_starts", n_blocks, device) * self.block_size
-        ).unsqueeze(0).expand(bsz, -1)
-        anchor_tokens = torch.gather(input_ids, 1, anchor_positions.clamp(0, seq_len - 1))
-        batch_idx = self._cached_arange("batch_indices", bsz, device).unsqueeze(1).expand(bsz, n_blocks)
+            (self._cached_arange("block_starts", n_blocks, device) * self.block_size)
+            .unsqueeze(0)
+            .expand(bsz, -1)
+        )
+        anchor_tokens = torch.gather(
+            input_ids, 1, anchor_positions.clamp(0, seq_len - 1)
+        )
+        batch_idx = (
+            self._cached_arange("batch_indices", bsz, device)
+            .unsqueeze(1)
+            .expand(bsz, n_blocks)
+        )
         noise_ids[batch_idx, block_starts] = torch.where(
             block_keep_mask,
             anchor_tokens,
-            torch.tensor(self.draft_model.mask_token_id, dtype=torch.long, device=device),
+            torch.tensor(
+                self.draft_model.mask_token_id, dtype=torch.long, device=device
+            ),
         )
         return self.draft_model.embed_tokens(noise_ids)
 
-    def _build_restricted_vocab(self, input_ids: torch.Tensor, active_targets: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    def _build_restricted_vocab(
+        self, input_ids: torch.Tensor, active_targets: torch.Tensor, vocab_size: int
+    ) -> torch.Tensor:
         candidates = [active_targets]
         flat_input_ids = input_ids.reshape(-1)
-        flat_input_ids = flat_input_ids[(flat_input_ids >= 0) & (flat_input_ids < vocab_size)]
+        flat_input_ids = flat_input_ids[
+            (flat_input_ids >= 0) & (flat_input_ids < vocab_size)
+        ]
         if flat_input_ids.numel() > 0:
             candidates.append(flat_input_ids)
         if self.loss_mode == "sampled_ce" and self.sampled_ce_negatives > 0:
@@ -228,21 +291,35 @@ class DFlashTrainingModel(nn.Module):
             )
         return torch.unique(torch.cat(candidates), sorted=True)
 
-    def forward(self, input_ids: torch.Tensor, hidden_states_list: list[torch.Tensor], loss_mask: torch.Tensor, lm_head_weight: torch.Tensor):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states_list: list[torch.Tensor],
+        loss_mask: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+    ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(seq_len, loss_mask, device)
+        anchor_positions, block_keep_mask = self._sample_anchor_positions(
+            seq_len, loss_mask, device
+        )
         n_blocks = anchor_positions.shape[1]
-        noise_embedding = self._create_noise_embed(input_ids, anchor_positions, block_keep_mask)
-        context_position_ids, draft_position_ids = self._create_position_ids(anchor_positions, seq_len)
+        noise_embedding = self._create_noise_embed(
+            input_ids, anchor_positions, block_keep_mask
+        )
+        context_position_ids, draft_position_ids = self._create_position_ids(
+            anchor_positions, seq_len
+        )
         draft_len = n_blocks * self.block_size
 
         block_mask = None
         dense_attention_mask = None
         if device.type == "cuda":
             block_mask = compile_friendly_create_block_mask(
-                mask_mod=_create_dflash_mask_mod(anchor_positions, block_keep_mask, seq_len, self.block_size),
+                mask_mod=_create_dflash_mask_mod(
+                    anchor_positions, block_keep_mask, seq_len, self.block_size
+                ),
                 B=bsz,
                 H=None,
                 Q_LEN=draft_len,
@@ -266,17 +343,27 @@ class DFlashTrainingModel(nn.Module):
             dense_attention_mask=dense_attention_mask,
             noise_embedding=noise_embedding,
         )
-        label_offsets = self._cached_arange("label_offsets", self.block_size, device, view_shape=(1, 1, -1))
+        label_offsets = self._cached_arange(
+            "label_offsets", self.block_size, device, view_shape=(1, 1, -1)
+        )
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
         valid_label_mask = label_indices < seq_len
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
-        target_ids = torch.gather(input_ids.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices)
+        target_ids = torch.gather(
+            input_ids.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
+        )
 
-        weight_mask = block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
+        weight_mask = (
+            block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
+        )
         weight_mask = weight_mask * valid_label_mask.float()
-        pos_in_block = self._cached_arange("pos_in_block", self.block_size, device, view_shape=(1, 1, -1))
+        pos_in_block = self._cached_arange(
+            "pos_in_block", self.block_size, device, view_shape=(1, 1, -1)
+        )
         weight_mask = weight_mask * (pos_in_block > 0).float()
-        original_loss_mask = torch.gather(loss_mask.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices)
+        original_loss_mask = torch.gather(
+            loss_mask.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
+        )
         weight_mask = weight_mask * original_loss_mask
         binary_eval_mask = weight_mask.view(-1)
 
@@ -288,7 +375,12 @@ class DFlashTrainingModel(nn.Module):
             front_mask = (pos_in_block > 0) & (pos_in_block <= front_count)
             front_weights = torch.where(
                 front_mask,
-                torch.full((), self.front_position_weight, dtype=weight_mask.dtype, device=device),
+                torch.full(
+                    (),
+                    self.front_position_weight,
+                    dtype=weight_mask.dtype,
+                    device=device,
+                ),
                 torch.ones((), dtype=weight_mask.dtype, device=device),
             )
             weight_mask = weight_mask * front_weights
@@ -308,26 +400,40 @@ class DFlashTrainingModel(nn.Module):
             loss = flat_weights.sum() * 0.0
         elif self.loss_mode in {"restricted_ce", "sampled_ce"}:
             vocab_size = int(lm_head_weight.shape[0])
-            restricted_vocab = self._build_restricted_vocab(input_ids, active_targets, vocab_size)
+            restricted_vocab = self._build_restricted_vocab(
+                input_ids, active_targets, vocab_size
+            )
             restricted_weight = lm_head_weight.index_select(0, restricted_vocab)
             active_logits = F.linear(active_hidden, restricted_weight)
             active_ce_targets = torch.searchsorted(restricted_vocab, active_targets)
-            active_loss = F.cross_entropy(active_logits, active_ce_targets, reduction="none")
+            active_loss = F.cross_entropy(
+                active_logits, active_ce_targets, reduction="none"
+            )
             finite_loss = torch.isfinite(active_loss)
             sanitized_rows = (~finite_loss).sum().to(dtype=torch.float32)
-            active_loss = torch.where(finite_loss, active_loss, torch.zeros_like(active_loss))
-            active_loss_weights = active_weights * finite_loss.to(dtype=active_weights.dtype)
+            active_loss = torch.where(
+                finite_loss, active_loss, torch.zeros_like(active_loss)
+            )
+            active_loss_weights = active_weights * finite_loss.to(
+                dtype=active_weights.dtype
+            )
             loss_per_token[active_mask] = active_loss
             valid_token_count = active_loss_weights.sum().clamp(min=1e-6)
             local_ploss_sum = (active_loss * active_loss_weights).sum()
             loss = local_ploss_sum / valid_token_count
         else:
             active_logits = F.linear(active_hidden, lm_head_weight)
-            active_loss = F.cross_entropy(active_logits, active_targets, reduction="none")
+            active_loss = F.cross_entropy(
+                active_logits, active_targets, reduction="none"
+            )
             finite_loss = torch.isfinite(active_loss)
             sanitized_rows = (~finite_loss).sum().to(dtype=torch.float32)
-            active_loss = torch.where(finite_loss, active_loss, torch.zeros_like(active_loss))
-            active_loss_weights = active_weights * finite_loss.to(dtype=active_weights.dtype)
+            active_loss = torch.where(
+                finite_loss, active_loss, torch.zeros_like(active_loss)
+            )
+            active_loss_weights = active_weights * finite_loss.to(
+                dtype=active_weights.dtype
+            )
             loss_per_token[active_mask] = active_loss
             valid_token_count = active_loss_weights.sum().clamp(min=1e-6)
             local_ploss_sum = (active_loss * active_loss_weights).sum()
@@ -344,32 +450,47 @@ class DFlashTrainingModel(nn.Module):
                 quality_mask = finite_loss
                 quality_token_count = quality_mask.float().sum()
                 if self.loss_mode in {"restricted_ce", "sampled_ce"}:
-                    active_top1_ids = restricted_vocab[torch.argmax(active_logits, dim=-1)]
+                    active_top1_ids = restricted_vocab[
+                        torch.argmax(active_logits, dim=-1)
+                    ]
                 else:
                     active_top1_ids = torch.argmax(active_logits, dim=-1)
                 active_pred_ids = active_top1_ids
                 correct[active_mask] = active_pred_ids == active_targets
                 if quality_mask.any():
                     top1_correct_count = (
-                        active_top1_ids[quality_mask] == active_targets[quality_mask]
-                    ).float().sum()
+                        (active_top1_ids[quality_mask] == active_targets[quality_mask])
+                        .float()
+                        .sum()
+                    )
                     quality_topk = min(5, int(active_logits.size(-1)))
                     if quality_topk > 1:
                         active_topk = active_logits.topk(quality_topk, dim=-1).indices
                         if self.loss_mode in {"restricted_ce", "sampled_ce"}:
                             active_topk = restricted_vocab[active_topk]
                         top5_correct_count = (
-                            active_topk[quality_mask] == active_targets[quality_mask].unsqueeze(-1)
-                        ).any(dim=-1).float().sum()
+                            (
+                                active_topk[quality_mask]
+                                == active_targets[quality_mask].unsqueeze(-1)
+                            )
+                            .any(dim=-1)
+                            .float()
+                            .sum()
+                        )
                     else:
                         top5_correct_count = top1_correct_count
-                    flat_position_ids = pos_in_block.expand(bsz, n_blocks, -1).reshape(-1)
+                    flat_position_ids = pos_in_block.expand(bsz, n_blocks, -1).reshape(
+                        -1
+                    )
                     active_position_ids = flat_position_ids[active_mask]
                     quality_position_ids = active_position_ids[quality_mask]
-                    quality_top1_hits = active_top1_ids[quality_mask] == active_targets[quality_mask]
+                    quality_top1_hits = (
+                        active_top1_ids[quality_mask] == active_targets[quality_mask]
+                    )
                     if quality_topk > 1:
                         quality_topk_hits = (
-                            active_topk[quality_mask] == active_targets[quality_mask].unsqueeze(-1)
+                            active_topk[quality_mask]
+                            == active_targets[quality_mask].unsqueeze(-1)
                         ).any(dim=-1)
                     else:
                         quality_topk_hits = quality_top1_hits
@@ -378,18 +499,32 @@ class DFlashTrainingModel(nn.Module):
                         if not position_mask.any():
                             continue
                         step_tokens = position_mask.float().sum()
-                        step_top1_correct = quality_top1_hits[position_mask].float().sum()
-                        step_topk_correct = quality_topk_hits[position_mask].float().sum()
+                        step_top1_correct = (
+                            quality_top1_hits[position_mask].float().sum()
+                        )
+                        step_topk_correct = (
+                            quality_topk_hits[position_mask].float().sum()
+                        )
                         quality_step_stats.append(
                             {
                                 "step": pos - 1,
                                 "tokens": int(step_tokens.detach().cpu().item()),
                                 "top1": round(
-                                    float((step_top1_correct / step_tokens.clamp_min(1)).detach().cpu().item()),
+                                    float(
+                                        (step_top1_correct / step_tokens.clamp_min(1))
+                                        .detach()
+                                        .cpu()
+                                        .item()
+                                    ),
                                     6,
                                 ),
                                 f"top{quality_topk}": round(
-                                    float((step_topk_correct / step_tokens.clamp_min(1)).detach().cpu().item()),
+                                    float(
+                                        (step_topk_correct / step_tokens.clamp_min(1))
+                                        .detach()
+                                        .cpu()
+                                        .item()
+                                    ),
                                     6,
                                 ),
                             }
@@ -398,9 +533,19 @@ class DFlashTrainingModel(nn.Module):
                         "[drafter logits quality] valid_tokens=%s top1_acc=%.6f top%s_acc=%.6f "
                         "local_ploss_sum=%.6f local_tokens=%s per_step=%s",
                         int(quality_token_count.detach().cpu().item()),
-                        float((top1_correct_count / quality_token_count.clamp_min(1)).detach().cpu().item()),
+                        float(
+                            (top1_correct_count / quality_token_count.clamp_min(1))
+                            .detach()
+                            .cpu()
+                            .item()
+                        ),
                         quality_topk,
-                        float((top5_correct_count / quality_token_count.clamp_min(1)).detach().cpu().item()),
+                        float(
+                            (top5_correct_count / quality_token_count.clamp_min(1))
+                            .detach()
+                            .cpu()
+                            .item()
+                        ),
                         float(local_ploss_sum.detach().float().cpu().item()),
                         int(quality_token_count.detach().cpu().item()),
                         quality_step_stats,
@@ -410,8 +555,12 @@ class DFlashTrainingModel(nn.Module):
             binary_weights = binary_eval_mask.view(bsz, n_blocks, self.block_size)
             count_per_position = binary_weights.sum(dim=(0, 1))
             count_per_pos = count_per_position.clamp(min=1.0)
-            loss_sum_per_position = (loss_per_token.view(bsz, n_blocks, self.block_size) * binary_weights).sum(dim=(0, 1))
-            correct_per_position = correct.view(bsz, n_blocks, self.block_size).float().sum(dim=(0, 1))
+            loss_sum_per_position = (
+                loss_per_token.view(bsz, n_blocks, self.block_size) * binary_weights
+            ).sum(dim=(0, 1))
+            correct_per_position = (
+                correct.view(bsz, n_blocks, self.block_size).float().sum(dim=(0, 1))
+            )
             loss_per_position = loss_sum_per_position / count_per_pos
             acc_per_position = correct_per_position / count_per_pos
             masked_rows = (binary_eval_mask <= 0.5).sum().to(dtype=torch.float32)
@@ -429,18 +578,30 @@ class DFlashTrainingModel(nn.Module):
                 "correct_per_position": correct_per_position,
                 "count_per_position": count_per_position,
                 "sampled_vocab_size": torch.tensor(
-                    float(restricted_vocab.numel()) if self.loss_mode in {"restricted_ce", "sampled_ce"} and active_targets.numel() > 0 else float(lm_head_weight.shape[0]),
+                    float(restricted_vocab.numel())
+                    if self.loss_mode in {"restricted_ce", "sampled_ce"}
+                    and active_targets.numel() > 0
+                    else float(lm_head_weight.shape[0]),
                     dtype=torch.float32,
                     device=device,
                 ),
                 "loss_mode_id": torch.tensor(
-                    {"full_vocab": 0.0, "restricted_ce": 1.0, "sampled_ce": 2.0}.get(self.loss_mode, 0.0),
+                    {"full_vocab": 0.0, "restricted_ce": 1.0, "sampled_ce": 2.0}.get(
+                        self.loss_mode, 0.0
+                    ),
                     dtype=torch.float32,
                     device=device,
                 ),
             }
 
-        return loss, accuracy, loss_per_position, acc_per_position, count_per_position, diagnostics
+        return (
+            loss,
+            accuracy,
+            loss_per_position,
+            acc_per_position,
+            count_per_position,
+            diagnostics,
+        )
 
 
 class DFlashTrainerBackend:
@@ -469,7 +630,9 @@ class DFlashTrainerBackend:
         target_hf_config = getattr(self.target_model_config, "hf_config", None)
         if target_hf_config is not None:
             return target_hf_config
-        if hasattr(self.target_model_config, "hidden_size") and hasattr(self.target_model_config, "vocab_size"):
+        if hasattr(self.target_model_config, "hidden_size") and hasattr(
+            self.target_model_config, "vocab_size"
+        ):
             return self.target_model_config
         config_path = (
             getattr(self.target_model_config, "local_hf_config_path", None)
@@ -480,30 +643,54 @@ class DFlashTrainerBackend:
             raise ValueError("Cannot resolve target HF config for DFlash drafter")
         return AutoConfig.from_pretrained(
             config_path,
-            trust_remote_code=bool(getattr(self.target_model_config, "trust_remote_code", False)),
+            trust_remote_code=bool(
+                getattr(self.target_model_config, "trust_remote_code", False)
+            ),
         )
 
     def _build_fallback_config(self, target_hf_config):
         training_cfg = self.config.rollout.drafter.training
         target_text_config = getattr(target_hf_config, "text_config", target_hf_config)
         hidden_size_cfg = training_cfg.get("dflash_hidden_size", None)
-        hidden_size = int(hidden_size_cfg if hidden_size_cfg is not None else target_text_config.hidden_size)
+        hidden_size = int(
+            hidden_size_cfg
+            if hidden_size_cfg is not None
+            else target_text_config.hidden_size
+        )
         num_context_layers = int(training_cfg.get("dflash_num_target_layers", 5))
-        target_num_hidden_layers = int(getattr(target_text_config, "num_hidden_layers", 36))
+        target_num_hidden_layers = int(
+            getattr(target_text_config, "num_hidden_layers", 36)
+        )
         mask_token_id_cfg = training_cfg.get("dflash_mask_token_id", None)
-        mask_token_id = int(mask_token_id_cfg if mask_token_id_cfg is not None else target_text_config.vocab_size - 1)
+        mask_token_id = int(
+            mask_token_id_cfg
+            if mask_token_id_cfg is not None
+            else target_text_config.vocab_size - 1
+        )
         target_layer_ids = training_cfg.get("dflash_target_layer_ids", None)
         if target_layer_ids is None:
-            target_layer_ids = build_target_layer_ids(num_context_layers, target_num_hidden_layers)
+            target_layer_ids = build_target_layer_ids(
+                num_context_layers, target_num_hidden_layers
+            )
         return DFlashConfig(
             hidden_size=hidden_size,
-            intermediate_size=int(getattr(target_text_config, "intermediate_size", hidden_size * 4)),
+            intermediate_size=int(
+                getattr(target_text_config, "intermediate_size", hidden_size * 4)
+            ),
             num_hidden_layers=int(training_cfg.get("dflash_num_hidden_layers", 1)),
             num_attention_heads=int(getattr(target_text_config, "num_attention_heads")),
-            num_key_value_heads=int(getattr(target_text_config, "num_key_value_heads", getattr(target_text_config, "num_attention_heads"))),
+            num_key_value_heads=int(
+                getattr(
+                    target_text_config,
+                    "num_key_value_heads",
+                    getattr(target_text_config, "num_attention_heads"),
+                )
+            ),
             vocab_size=int(target_text_config.vocab_size),
             rms_norm_eps=float(getattr(target_text_config, "rms_norm_eps", 1e-6)),
-            max_position_embeddings=int(getattr(target_text_config, "max_position_embeddings", 32768)),
+            max_position_embeddings=int(
+                getattr(target_text_config, "max_position_embeddings", 32768)
+            ),
             rope_theta=float(getattr(target_text_config, "rope_theta", 10000.0)),
             num_target_layers=target_num_hidden_layers,
             num_context_layers=num_context_layers,
@@ -525,11 +712,15 @@ class DFlashTrainerBackend:
         index_paths = glob.glob(os.path.join(model_path, "*.index.json"))
         if index_paths:
             if len(index_paths) > 1:
-                raise FileNotFoundError(f"Multiple index.json files found in {model_path}")
+                raise FileNotFoundError(
+                    f"Multiple index.json files found in {model_path}"
+                )
             with open(index_paths[0], "r", encoding="utf-8") as f:
                 index_json = json.load(f)
             for shard_file in sorted(set(index_json.get("weight_map", {}).values())):
-                state_dict.update(self._load_state_file(os.path.join(model_path, shard_file)))
+                state_dict.update(
+                    self._load_state_file(os.path.join(model_path, shard_file))
+                )
         else:
             safetensors_path = os.path.join(model_path, "model.safetensors")
             pytorch_path = os.path.join(model_path, "pytorch_model.bin")
@@ -538,26 +729,39 @@ class DFlashTrainerBackend:
             elif os.path.exists(pytorch_path):
                 state_dict = self._load_state_file(pytorch_path)
             else:
-                raise FileNotFoundError(f"No model index, model.safetensors or pytorch_model.bin found in {model_path}")
+                raise FileNotFoundError(
+                    f"No model index, model.safetensors or pytorch_model.bin found in {model_path}"
+                )
         return state_dict
 
-    def _normalize_draft_state_dict(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def _normalize_draft_state_dict(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
         normalized_state: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             normalized_key = key
-            for prefix in ("_orig_mod.draft_model.", "module.draft_model.", "draft_model.", "module."):
+            for prefix in (
+                "_orig_mod.draft_model.",
+                "module.draft_model.",
+                "draft_model.",
+                "module.",
+            ):
                 if normalized_key.startswith(prefix):
                     normalized_key = normalized_key[len(prefix) :]
                     break
             normalized_state[normalized_key] = value
         return normalized_state
 
-    def _infer_num_context_layers_from_state(self, normalized_state: dict[str, torch.Tensor], target_hidden_size: int) -> int | None:
+    def _infer_num_context_layers_from_state(
+        self, normalized_state: dict[str, torch.Tensor], target_hidden_size: int
+    ) -> int | None:
         fc_weight = normalized_state.get("fc.weight")
         if fc_weight is None:
             return None
         if fc_weight.ndim != 2:
-            raise ValueError(f"DFlash fc.weight must be rank-2, got shape {tuple(fc_weight.shape)}")
+            raise ValueError(
+                f"DFlash fc.weight must be rank-2, got shape {tuple(fc_weight.shape)}"
+            )
         input_dim = int(fc_weight.shape[1])
         if input_dim % int(target_hidden_size) != 0:
             raise ValueError(
@@ -596,37 +800,62 @@ class DFlashTrainerBackend:
 
         state_num_context_layers = None
         if normalized_state is not None:
-            state_num_context_layers = self._infer_num_context_layers_from_state(normalized_state, target_hidden_size)
+            state_num_context_layers = self._infer_num_context_layers_from_state(
+                normalized_state, target_hidden_size
+            )
 
-        ids_num_context_layers = len(target_layer_ids) if target_layer_ids is not None else None
-        configured_num_target_layers = int(getattr(drafter_config, "num_target_layers", target_num_hidden_layers))
-        configured_num_context_layers = getattr(drafter_config, "num_context_layers", None)
+        ids_num_context_layers = (
+            len(target_layer_ids) if target_layer_ids is not None else None
+        )
+        configured_num_target_layers = int(
+            getattr(drafter_config, "num_target_layers", target_num_hidden_layers)
+        )
+        configured_num_context_layers = getattr(
+            drafter_config, "num_context_layers", None
+        )
         if configured_num_context_layers is not None:
             configured_num_context_layers = int(configured_num_context_layers)
 
-        if state_num_context_layers is not None and ids_num_context_layers is not None and state_num_context_layers != ids_num_context_layers:
+        if (
+            state_num_context_layers is not None
+            and ids_num_context_layers is not None
+            and state_num_context_layers != ids_num_context_layers
+        ):
             raise ValueError(
                 f"DFlash checkpoint/config mismatch in {spec_model_path}: fc.weight implies "
                 f"{state_num_context_layers} context layers, but target_layer_ids has {ids_num_context_layers} entries"
             )
 
-        num_context_layers = state_num_context_layers or ids_num_context_layers or configured_num_context_layers
+        num_context_layers = (
+            state_num_context_layers
+            or ids_num_context_layers
+            or configured_num_context_layers
+        )
         if num_context_layers is None:
             if configured_num_target_layers == target_num_hidden_layers:
-                num_context_layers = int(self.config.rollout.drafter.training.get("dflash_num_target_layers", 5))
+                num_context_layers = int(
+                    self.config.rollout.drafter.training.get(
+                        "dflash_num_target_layers", 5
+                    )
+                )
             else:
                 # Backward compatibility for older local configs that used
                 # num_target_layers as the concatenated hidden-state count.
                 num_context_layers = configured_num_target_layers
         if target_layer_ids is None:
-            target_layer_ids = build_target_layer_ids(int(num_context_layers), target_num_hidden_layers)
+            target_layer_ids = build_target_layer_ids(
+                int(num_context_layers), target_num_hidden_layers
+            )
         if len(target_layer_ids) != int(num_context_layers):
             raise ValueError(
                 f"DFlash expected {num_context_layers} target layer ids, got {len(target_layer_ids)} "
                 f"in {spec_model_path}"
             )
 
-        if configured_num_target_layers != target_num_hidden_layers or configured_num_context_layers != int(num_context_layers):
+        if (
+            configured_num_target_layers != target_num_hidden_layers
+            or configured_num_context_layers != int(num_context_layers)
+        ):
             logger.debug(
                 "Normalizing DFlash training config: num_target_layers=%s->%s "
                 "num_context_layers=%s->%s (state_context_layers=%s target_layer_ids=%s model_path=%s)",
@@ -653,9 +882,13 @@ class DFlashTrainerBackend:
         normalized_state: dict[str, torch.Tensor] | None = None,
     ) -> None:
         if normalized_state is None:
-            normalized_state = self._normalize_draft_state_dict(self._load_draft_state_dict(model_path))
+            normalized_state = self._normalize_draft_state_dict(
+                self._load_draft_state_dict(model_path)
+            )
         required_backbone_keys = {"fc.weight", "hidden_norm.weight", "norm.weight"}
-        missing_backbone_keys = sorted(required_backbone_keys.difference(normalized_state))
+        missing_backbone_keys = sorted(
+            required_backbone_keys.difference(normalized_state)
+        )
         if missing_backbone_keys:
             raise ValueError(
                 "DFlash/DSpark checkpoint does not use the canonical vLLM parameter names; "
@@ -671,7 +904,9 @@ class DFlashTrainerBackend:
                 unexpected.append(key)
                 continue
             if tuple(model_state[key].shape) != tuple(value.shape):
-                mismatched.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+                mismatched.append(
+                    (key, tuple(value.shape), tuple(model_state[key].shape))
+                )
                 if key == "fc.weight":
                     raise ValueError(
                         "DFlash fc.weight shape mismatch after config normalization: "
@@ -701,50 +936,82 @@ class DFlashTrainerBackend:
         if config_path and os.path.exists(config_path):
             drafter_config = DFlashConfig.from_dflash_pretrained(spec_model_path)
             if spec_model_path and os.path.exists(spec_model_path):
-                log_drafter_checkpoint_step(logger, spec_model_path, action="Loading DFlash drafter weights")
-                normalized_state = self._normalize_draft_state_dict(self._load_draft_state_dict(spec_model_path))
+                log_drafter_checkpoint_step(
+                    logger, spec_model_path, action="Loading DFlash drafter weights"
+                )
+                normalized_state = self._normalize_draft_state_dict(
+                    self._load_draft_state_dict(spec_model_path)
+                )
         else:
             drafter_config = self._build_fallback_config(target_hf_config)
 
         if not isinstance(drafter_config, DFlashConfig):
-            raise TypeError(f"DFlash config is not a DFlashConfig: {type(drafter_config)}")
-        drafter_config = self._normalize_dflash_config(drafter_config, target_hf_config, normalized_state, spec_model_path)
+            raise TypeError(
+                f"DFlash config is not a DFlashConfig: {type(drafter_config)}"
+            )
+        drafter_config = self._normalize_dflash_config(
+            drafter_config, target_hf_config, normalized_state, spec_model_path
+        )
 
-        if spec_model_path and os.path.exists(spec_model_path) and os.path.exists(config_path):
+        if (
+            spec_model_path
+            and os.path.exists(spec_model_path)
+            and os.path.exists(config_path)
+        ):
             draft_model = DFlashDraftModel(deepcopy(drafter_config))
-            self._load_draft_checkpoint(draft_model, spec_model_path, normalized_state=normalized_state)
+            self._load_draft_checkpoint(
+                draft_model, spec_model_path, normalized_state=normalized_state
+            )
         else:
             draft_model = DFlashDraftModel(deepcopy(drafter_config))
         draft_model.load_embedding(target_model_path)
         draft_model.freeze_embedding()
 
-        self.target_lm_head = self._build_target_lm_head(target_model_path, target_hf_config)
+        self.target_lm_head = self._build_target_lm_head(
+            target_model_path, target_hf_config
+        )
         training_cfg = self.config.rollout.drafter.training
         return DFlashTrainingModel(
             draft_model=draft_model,
             block_size=int(training_cfg.get("dflash_block_size", 16)),
             num_anchors=int(training_cfg.get("dflash_num_anchors", 512)),
             loss_decay_gamma=float(training_cfg.get("dflash_loss_decay_gamma", 7.0)),
-            front_position_weight=float(training_cfg.get("dflash_front_position_weight", 1.0)),
-            front_position_count=int(training_cfg.get("dflash_front_position_count", 0)),
+            front_position_weight=float(
+                training_cfg.get("dflash_front_position_weight", 1.0)
+            ),
+            front_position_count=int(
+                training_cfg.get("dflash_front_position_count", 0)
+            ),
             loss_mode=str(training_cfg.get("dflash_loss_mode", "full_vocab")),
-            sampled_ce_negatives=int(training_cfg.get("dflash_sampled_ce_negatives", 0)),
+            sampled_ce_negatives=int(
+                training_cfg.get("dflash_sampled_ce_negatives", 0)
+            ),
         ), drafter_config
 
     def _build_target_lm_head(self, target_model_path: str, target_hf_config=None):
-        target_device = torch.device(f"{device_name}:{get_device_id()}") if device_name != "cpu" else torch.device("cpu")
+        target_device = (
+            torch.device(f"{device_name}:{get_device_id()}")
+            if device_name != "cpu"
+            else torch.device("cpu")
+        )
         synced_shape = getattr(self, "_initial_target_lm_head_shape", None)
         if synced_shape is not None and len(synced_shape) == 2:
             vocab_size, hidden_size = int(synced_shape[0]), int(synced_shape[1])
-            target_text_config = getattr(target_hf_config, "text_config", target_hf_config)
+            target_text_config = getattr(
+                target_hf_config, "text_config", target_hf_config
+            )
             expected_hidden = getattr(target_text_config, "hidden_size", hidden_size)
             if int(expected_hidden) != hidden_size:
                 raise ValueError(
                     "Synced DFlash target lm_head hidden size mismatch: "
                     f"synced={hidden_size}, target_config={expected_hidden}"
                 )
-            target_lm_head = _SyncedTargetHead(hidden_size=hidden_size, vocab_size=vocab_size)
-            target_lm_head = target_lm_head.to(target_device, dtype=torch.bfloat16).eval()
+            target_lm_head = _SyncedTargetHead(
+                hidden_size=hidden_size, vocab_size=vocab_size
+            )
+            target_lm_head = target_lm_head.to(
+                target_device, dtype=torch.bfloat16
+            ).eval()
             for param in target_lm_head.parameters():
                 param.requires_grad_(False)
             logger.debug(
@@ -754,17 +1021,31 @@ class DFlashTrainerBackend:
             )
             return target_lm_head
 
-        target_lm_head = TargetHead.from_pretrained(model_path=target_model_path).to(target_device).eval()
+        target_lm_head = (
+            TargetHead.from_pretrained(model_path=target_model_path)
+            .to(target_device)
+            .eval()
+        )
         for param in target_lm_head.parameters():
             param.requires_grad_(False)
         return target_lm_head
 
     def preprocess_individual_items(self, items, device, model_config):
         res = {"ids": [], "h_states": [], "masks": []}
-        max_window = int(self.config.rollout.drafter.training.get("dflash_max_window", 512))
+        max_window = int(
+            self.config.rollout.drafter.training.get("dflash_max_window", 512)
+        )
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
-        h_dim = int(getattr(model_config, "target_hidden_size", model_config.hidden_size))
-        num_context_layers = int(getattr(model_config, "num_context_layers", getattr(model_config, "num_target_layers", 5)))
+        h_dim = int(
+            getattr(model_config, "target_hidden_size", model_config.hidden_size)
+        )
+        num_context_layers = int(
+            getattr(
+                model_config,
+                "num_context_layers",
+                getattr(model_config, "num_target_layers", 5),
+            )
+        )
         expected_hidden_dim = h_dim * num_context_layers
 
         for item in items:
@@ -776,7 +1057,9 @@ class DFlashTrainerBackend:
                 )
             ids = item["input_ids"].to(device, non_blocking=True)
             raw_h = item["hidden_states"]
-            full_h = torch.cat(raw_h, dim=-1) if isinstance(raw_h, (list, tuple)) else raw_h
+            full_h = (
+                torch.cat(raw_h, dim=-1) if isinstance(raw_h, (list, tuple)) else raw_h
+            )
             full_h = full_h.to(device, dtype=torch.bfloat16)
             if full_h.size(-1) < expected_hidden_dim:
                 raise ValueError(
@@ -788,17 +1071,21 @@ class DFlashTrainerBackend:
                     f"DFlash hidden_states_layout='dflash_aux' expected exactly {expected_hidden_dim} hidden dims "
                     f"({num_context_layers} context layers of size {h_dim}), got {full_h.size(-1)}"
                 )
-            
+
             if item.get("loss_mask") is not None:
-                item_loss_mask = item["loss_mask"].to(device, dtype=torch.float32, non_blocking=True)
+                item_loss_mask = item["loss_mask"].to(
+                    device, dtype=torch.float32, non_blocking=True
+                )
             elif "prompts" in item and "responses" in item:
-                item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)    
+                item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 prompt_len = item["prompts"].size(0)
                 responses = item["responses"]
-                item_loss_mask[prompt_len : prompt_len + responses.size(0)] = (responses != pad_id).float()[: max(0, ids.size(0) - prompt_len)]
-               
+                item_loss_mask[prompt_len : prompt_len + responses.size(0)] = (
+                    responses != pad_id
+                ).float()[: max(0, ids.size(0) - prompt_len)]
+
             else:
-                item_loss_mask = torch.zeros_like(ids, dtype=torch.float32) 
+                item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 item_loss_mask[:] = 1.0
             valid_len = min(ids.size(0), full_h.size(0), item_loss_mask.size(0))
             ids = ids[:valid_len]
@@ -807,7 +1094,11 @@ class DFlashTrainerBackend:
             nonzero = torch.nonzero(item_loss_mask)
             if nonzero.numel() > 0:
                 r_start = nonzero[0, 0]
-                start = torch.clamp(r_start - (max_window // 2), min=0, max=max(0, ids.size(0) - max_window)).item()
+                start = torch.clamp(
+                    r_start - (max_window // 2),
+                    min=0,
+                    max=max(0, ids.size(0) - max_window),
+                ).item()
                 end = min(start + max_window, ids.size(0))
             else:
                 start, end = max(0, ids.size(0) - max_window), ids.size(0)
@@ -819,7 +1110,9 @@ class DFlashTrainerBackend:
 
     def compute_loss(self, model, batch, _current_pad_size):
         if getattr(self, "use_ulysses_sp", False):
-            raise NotImplementedError("DFlash drafter training does not support Ulysses sequence parallel yet")
+            raise NotImplementedError(
+                "DFlash drafter training does not support Ulysses sequence parallel yet"
+            )
         if self.target_lm_head is None:
             raise ValueError("DFlash target_lm_head is not initialized")
 
@@ -847,5 +1140,8 @@ class DFlashTrainerBackend:
             "loss_per_position": loss_pp.detach(),
             "acc_per_position": acc_pp.detach(),
             "count_per_position": count_pp.detach(),
-            "diagnostics": {key: value.detach() if torch.is_tensor(value) else value for key, value in diagnostics.items()},
+            "diagnostics": {
+                key: value.detach() if torch.is_tensor(value) else value
+                for key, value in diagnostics.items()
+            },
         }

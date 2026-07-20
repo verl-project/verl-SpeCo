@@ -82,7 +82,11 @@ def resolve_drafter_publish_payload(published_payload: Any) -> Any:
 def drafter_rollout_enabled(config: Any) -> bool:
     if bool(_get_nested(config, ("rollout", "drafter", "enable"), False)):
         return True
-    if bool(_get_nested(config, ("actor_rollout_ref", "rollout", "drafter", "enable"), False)):
+    if bool(
+        _get_nested(
+            config, ("actor_rollout_ref", "rollout", "drafter", "enable"), False
+        )
+    ):
         return True
     try:
         from verl_speco.integration.sglang_runtime import _load_env_drafter_config
@@ -95,7 +99,11 @@ def drafter_rollout_enabled(config: Any) -> bool:
 def drafter_speculative_algorithm(config: Any) -> str:
     value = _get_nested(config, ("rollout", "drafter", "speculative_algorithm"), None)
     if value is None:
-        value = _get_nested(config, ("actor_rollout_ref", "rollout", "drafter", "speculative_algorithm"), None)
+        value = _get_nested(
+            config,
+            ("actor_rollout_ref", "rollout", "drafter", "speculative_algorithm"),
+            None,
+        )
     return str(value or "").upper()
 
 
@@ -121,7 +129,9 @@ def install_vllm_runtime_for_worker(worker: Any) -> None:
     """Install SPECO vLLM runtime hooks inside an actor-rollout worker process."""
 
     try:
-        from verl_speco.integration.vllm_runtime import install_vllm_runtime_for_worker as _install
+        from verl_speco.integration.vllm_runtime import (
+            install_vllm_runtime_for_worker as _install,
+        )
     except Exception:  # noqa: BLE001
         return
 
@@ -147,8 +157,12 @@ def install_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
     except Exception:  # noqa: BLE001
         return
 
-    drafter_env = getattr(type(worker), "_speco_sglang_drafter_config_env", None) or None
-    if not oldlogprob_hidden_runtime_enabled(getattr(worker, "config", None), drafter_env=drafter_env):
+    drafter_env = (
+        getattr(type(worker), "_speco_sglang_drafter_config_env", None) or None
+    )
+    if not oldlogprob_hidden_runtime_enabled(
+        getattr(worker, "config", None), drafter_env=drafter_env
+    ):
         return
     install_oldlogprob_hidden_runtime_patch()
 
@@ -259,7 +273,9 @@ def _select_lm_head_named_tensor(module: Any):
             if not torch.is_tensor(tensor) or tensor.dim() != 2:
                 continue
             name = str(name)
-            if name == "model.embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
+            if name == "model.embed_tokens.weight" or name.endswith(
+                ".embed_tokens.weight"
+            ):
                 fallback = (name, tensor)
             if name == "lm_head.weight" or name.endswith(".lm_head.weight"):
                 return name, tensor
@@ -287,9 +303,14 @@ def _export_actor_lm_head_rows_direct(worker: Any, row_indices: Any) -> Optional
             continue
         try:
             source_vocab_size = int(selected_weight.shape[0])
-            if int(row_indices_cpu.max().item()) >= source_vocab_size or int(row_indices_cpu.min().item()) < 0:
+            if (
+                int(row_indices_cpu.max().item()) >= source_vocab_size
+                or int(row_indices_cpu.min().item()) < 0
+            ):
                 continue
-            rows_on_device = row_indices_cpu.to(device=selected_weight.device, dtype=torch.long)
+            rows_on_device = row_indices_cpu.to(
+                device=selected_weight.device, dtype=torch.long
+            )
             selected_rows = selected_weight.detach().index_select(0, rows_on_device)
             if getattr(worker, "rank", None) != 0:
                 return {"_speco_non_owner_direct_sparse": True}
@@ -304,13 +325,17 @@ def _export_actor_lm_head_rows_direct(worker: Any, row_indices: Any) -> Optional
             return {
                 "name": selected_name,
                 "weight": weight,
-                "row_indices": row_indices_cpu.to(device="cpu", dtype=torch.long).contiguous(),
+                "row_indices": row_indices_cpu.to(
+                    device="cpu", dtype=torch.long
+                ).contiguous(),
                 "source_vocab_size": source_vocab_size,
                 "selected_rows": int(row_indices_cpu.numel()),
                 "export_strategy": "direct_sparse",
             }
         except Exception as exc:  # noqa: BLE001
-            logger.debug("Direct sparse lm_head export failed for %s: %s", selected_name, exc)
+            logger.debug(
+                "Direct sparse lm_head export failed for %s: %s", selected_name, exc
+            )
             continue
     return None
 
@@ -320,14 +345,28 @@ def export_actor_lm_head_weight(worker: Any, row_indices: Any = None) -> Optiona
 
     torch = _torch_module()
 
-    if not getattr(worker, "_is_actor", False) or getattr(worker, "actor", None) is None:
+    if (
+        not getattr(worker, "_is_actor", False)
+        or getattr(worker, "actor", None) is None
+    ):
         return None
 
     normalized_row_indices = _normalize_lm_head_row_indices(row_indices)
-    is_dflash = drafter_speculative_algorithm(getattr(worker, "config", None)) in {"DFLASH", "DSPARK"}
-    if is_dflash and normalized_row_indices is not None and int(normalized_row_indices.numel()) > 0:
-        direct_payload = _export_actor_lm_head_rows_direct(worker, normalized_row_indices)
-        if isinstance(direct_payload, dict) and direct_payload.get("_speco_non_owner_direct_sparse"):
+    is_dflash = drafter_speculative_algorithm(getattr(worker, "config", None)) in {
+        "DFLASH",
+        "DSPARK",
+    }
+    if (
+        is_dflash
+        and normalized_row_indices is not None
+        and int(normalized_row_indices.numel()) > 0
+    ):
+        direct_payload = _export_actor_lm_head_rows_direct(
+            worker, normalized_row_indices
+        )
+        if isinstance(direct_payload, dict) and direct_payload.get(
+            "_speco_non_owner_direct_sparse"
+        ):
             return None
         if direct_payload is not None:
             return direct_payload
@@ -360,7 +399,9 @@ def export_actor_lm_head_weight(worker: Any, row_indices: Any = None) -> Optiona
     if getattr(worker, "rank", None) != 0:
         return None
     if selected_weight is None:
-        logger.warning("Unable to find actor lm_head.weight or tied model.embed_tokens.weight for SPECO sync")
+        logger.warning(
+            "Unable to find actor lm_head.weight or tied model.embed_tokens.weight for SPECO sync"
+        )
         return None
 
     selected_rows = None
@@ -371,12 +412,18 @@ def export_actor_lm_head_weight(worker: Any, row_indices: Any = None) -> Optiona
         row_indices = row_indices.to(device=selected_weight.device, dtype=torch.long)
         if row_indices.numel() > 0 and row_indices.numel() < source_vocab_size:
             selected_weight = selected_weight.index_select(0, row_indices)
-            exported_row_indices = row_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
+            exported_row_indices = (
+                row_indices.detach().to(device="cpu", dtype=torch.long).contiguous()
+            )
             selected_rows = int(row_indices.numel())
         elif row_indices.numel() == 0:
-            logger.warning("Received empty lm_head row_indices for SPECO sync; falling back to full lm_head export")
+            logger.warning(
+                "Received empty lm_head row_indices for SPECO sync; falling back to full lm_head export"
+            )
 
-    weight = selected_weight.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+    weight = (
+        selected_weight.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+    )
     logger.warning(
         "[actor lm_head export] name=%s shape=%s dtype=%s source_vocab=%s selected_rows=%s",
         selected_name,
@@ -449,8 +496,12 @@ class DraftWeightPublishMixin:
     def _attach_update_draft_weights_to_rollout(self):
         backend = rollout_backend_name(getattr(self, "config", None))
         if backend == "vllm":
-            from verl_speco.integration.vllm_runtime import attach_update_draft_weights_to_rollout
+            from verl_speco.integration.vllm_runtime import (
+                attach_update_draft_weights_to_rollout,
+            )
         else:
-            from verl_speco.integration.sglang_runtime import attach_update_draft_weights_to_rollout
+            from verl_speco.integration.sglang_runtime import (
+                attach_update_draft_weights_to_rollout,
+            )
 
         attach_update_draft_weights_to_rollout(getattr(self, "rollout", None))

@@ -32,7 +32,9 @@ def compile_friendly_flex_attention(
     value: torch.Tensor,
     **kwargs,
 ) -> torch.Tensor:
-    flex_attention_compiled = WrappedFlexAttention()() if not is_torchdynamo_compiling() else flex_attention
+    flex_attention_compiled = (
+        WrappedFlexAttention()() if not is_torchdynamo_compiling() else flex_attention
+    )
     return flex_attention_compiled(
         query,
         key,
@@ -69,7 +71,11 @@ def compile_friendly_create_block_mask(
     KV_LEN,
     device,
 ):
-    create_block_mask_compiled = WrappedCreateBlockMask()() if not is_torchdynamo_compiling() else create_block_mask
+    create_block_mask_compiled = (
+        WrappedCreateBlockMask()()
+        if not is_torchdynamo_compiling()
+        else create_block_mask
+    )
     return create_block_mask_compiled(
         mask_mod,
         B,

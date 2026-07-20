@@ -40,7 +40,9 @@ class DominoDraftModel(DFlashDraftModel):
             bias=False,
         )
         self.embed_proj = nn.Sequential(
-            nn.Linear(config.hidden_size + self.gru_hidden_dim, self.emb_dim, bias=False),
+            nn.Linear(
+                config.hidden_size + self.gru_hidden_dim, self.emb_dim, bias=False
+            ),
             nn.SiLU(),
             nn.Linear(self.emb_dim, config.vocab_size, bias=False),
         )

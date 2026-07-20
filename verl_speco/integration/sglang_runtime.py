@@ -39,9 +39,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 SPECO_SGLANG_DRAFTER_CONFIG_ENV = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
 SPECO_SGLANG_RUNTIME_PATCHED_ENV = "VERL_SPECO_SGLANG_RUNTIME_PATCHED"
-SPECO_TARGET_WEIGHT_LOADER = "verl_speco.integration.sglang_runtime.speco_sglang_target_weight_loader"
-SPECO_DRAFT_WEIGHT_LOADER = "verl_speco.integration.sglang_runtime.speco_sglang_draft_weight_loader"
-SPECO_DISABLE_SPECULATIVE_WEIGHT_SYNC_GUARD_ENV = "VERL_SPECO_DISABLE_SPECULATIVE_WEIGHT_SYNC_GUARD"
+SPECO_TARGET_WEIGHT_LOADER = (
+    "verl_speco.integration.sglang_runtime.speco_sglang_target_weight_loader"
+)
+SPECO_DRAFT_WEIGHT_LOADER = (
+    "verl_speco.integration.sglang_runtime.speco_sglang_draft_weight_loader"
+)
+SPECO_DISABLE_SPECULATIVE_WEIGHT_SYNC_GUARD_ENV = (
+    "VERL_SPECO_DISABLE_SPECULATIVE_WEIGHT_SYNC_GUARD"
+)
 _DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
 _HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
 _HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
@@ -118,7 +124,12 @@ def _load_env_drafter_config() -> dict[str, Any]:
 def configure_sglang_runtime_from_config(config: Any) -> dict[str, Any]:
     """Serialize enabled SPECO drafter config for SGLang Ray actors."""
 
-    drafter = _plain_container(_get_nested(config, ("actor_rollout_ref", "rollout", "drafter"), {})) or {}
+    drafter = (
+        _plain_container(
+            _get_nested(config, ("actor_rollout_ref", "rollout", "drafter"), {})
+        )
+        or {}
+    )
     enabled = bool(drafter.get("enable"))
     if not enabled:
         os.environ.pop(SPECO_SGLANG_DRAFTER_CONFIG_ENV, None)
@@ -194,7 +205,11 @@ def _expected_collected_hidden_rows(
 
 
 def _hidden_state_window_mode(training_cfg: dict[str, Any]) -> str:
-    mode = str(training_cfg.get("hidden_state_window_mode", "random") or "random").strip().lower()
+    mode = (
+        str(training_cfg.get("hidden_state_window_mode", "random") or "random")
+        .strip()
+        .lower()
+    )
     return mode if mode in {"front", "random"} else "front"
 
 
@@ -214,7 +229,9 @@ def _deterministic_random_window_offset(
     seed_material = (
         f"{step_key}:{replica_rank}:{request_id}:{prompt_len}:{max_new_tokens}:{max_start_offset}"
     ).encode()
-    seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "little", signed=False)
+    seed = int.from_bytes(
+        hashlib.sha256(seed_material).digest()[:8], "little", signed=False
+    )
     return seed % (max_start_offset + 1)
 
 
@@ -231,7 +248,9 @@ def _build_drafter_hidden_window_plan(
 ) -> dict[str, Any]:
     mode = _hidden_state_window_mode(training_cfg)
     if mode == "random":
-        window_size = _positive_int_or_none(training_cfg.get("hidden_state_window_tokens_per_sample"))
+        window_size = _positive_int_or_none(
+            training_cfg.get("hidden_state_window_tokens_per_sample")
+        )
         if window_size is None:
             window_size = front_tokens
         if window_size is None:
@@ -239,13 +258,22 @@ def _build_drafter_hidden_window_plan(
         if window_size is None:
             window_size = max(int(max_new_tokens), 0)
 
-        min_rows = max(_nonnegative_int(training_cfg.get("hidden_state_window_min_rows", 64), default=64), 1)
-        max_offset_limit = _positive_int_or_none(training_cfg.get("hidden_state_random_max_offset"))
+        min_rows = max(
+            _nonnegative_int(
+                training_cfg.get("hidden_state_window_min_rows", 64), default=64
+            ),
+            1,
+        )
+        max_offset_limit = _positive_int_or_none(
+            training_cfg.get("hidden_state_random_max_offset")
+        )
         if max_offset_limit is None:
             max_offset_limit = max(int(max_new_tokens), 0)
         max_offset_limit = min(max(max_offset_limit, 0), max(int(max_new_tokens), 0))
 
-        target_window_rows = min(int(window_size), max_offset_limit, max(int(max_new_tokens), 0))
+        target_window_rows = min(
+            int(window_size), max_offset_limit, max(int(max_new_tokens), 0)
+        )
         if max_new_tokens <= 0 or target_window_rows < min_rows:
             return {"mode": mode, "estimated_rows": 0, "min_rows": min_rows}
 
@@ -257,7 +285,9 @@ def _build_drafter_hidden_window_plan(
             prompt_len=prompt_len,
             max_new_tokens=max_new_tokens,
             max_start_offset=max_start_offset,
-            seed_by_step=bool(training_cfg.get("hidden_state_random_seed_by_step", True)),
+            seed_by_step=bool(
+                training_cfg.get("hidden_state_random_seed_by_step", True)
+            ),
         )
         train_base = max(int(prompt_len) - 1, 0)
         window_start = train_base + random_offset
@@ -278,7 +308,9 @@ def _build_drafter_hidden_window_plan(
 
     return {
         "mode": "front",
-        "estimated_rows": _expected_collected_hidden_rows(prompt_len, max_new_tokens, front_tokens, tail_tokens),
+        "estimated_rows": _expected_collected_hidden_rows(
+            prompt_len, max_new_tokens, front_tokens, tail_tokens
+        ),
         "min_rows": 0,
     }
 
@@ -344,11 +376,17 @@ def _hidden_state_metadata_from_chunk(hidden_state_chunk: Any) -> dict[str, Any]
     if positions is not None:
         try:
             if torch.is_tensor(positions):
-                metadata["positions"] = positions.detach().to(device="cpu", dtype=torch.long).reshape(-1)
+                metadata["positions"] = (
+                    positions.detach().to(device="cpu", dtype=torch.long).reshape(-1)
+                )
             else:
-                metadata["positions"] = torch.tensor(list(positions), dtype=torch.long).reshape(-1)
+                metadata["positions"] = torch.tensor(
+                    list(positions), dtype=torch.long
+                ).reshape(-1)
         except Exception:  # noqa: BLE001
-            logger.warning("Failed to normalize SGLang hidden positions metadata; ignoring positions")
+            logger.warning(
+                "Failed to normalize SGLang hidden positions metadata; ignoring positions"
+            )
 
     for key in (
         "lm_head_fingerprint",
@@ -376,20 +414,30 @@ def _hidden_state_metadata_from_chunk(hidden_state_chunk: Any) -> dict[str, Any]
             if raw_tensor.dim() == 3 and raw_tensor.size(-1) >= 2:
                 metadata["raw_target_logprobs"] = raw_tensor.contiguous()
         except Exception:  # noqa: BLE001
-            logger.warning("Failed to normalize SGLang raw top-k metadata; ignoring raw target logprobs")
+            logger.warning(
+                "Failed to normalize SGLang raw top-k metadata; ignoring raw target logprobs"
+            )
 
     raw_positions = hidden_state_chunk.get("raw_target_logprobs_positions")
-    if raw_positions is not None and torch.is_tensor(metadata.get("raw_target_logprobs")):
+    if raw_positions is not None and torch.is_tensor(
+        metadata.get("raw_target_logprobs")
+    ):
         try:
             raw_positions_tensor = (
                 raw_positions.detach().to(device="cpu", dtype=torch.long).reshape(-1)
                 if torch.is_tensor(raw_positions)
                 else torch.tensor(list(raw_positions), dtype=torch.long).reshape(-1)
             )
-            if int(raw_positions_tensor.numel()) == int(metadata["raw_target_logprobs"].size(0)):
-                metadata["raw_target_logprobs_positions"] = raw_positions_tensor.contiguous()
+            if int(raw_positions_tensor.numel()) == int(
+                metadata["raw_target_logprobs"].size(0)
+            ):
+                metadata["raw_target_logprobs_positions"] = (
+                    raw_positions_tensor.contiguous()
+                )
         except Exception:  # noqa: BLE001
-            logger.warning("Failed to normalize SGLang raw top-k positions metadata; ignoring positions")
+            logger.warning(
+                "Failed to normalize SGLang raw top-k positions metadata; ignoring positions"
+            )
 
     return metadata
 
@@ -431,9 +479,13 @@ def _hidden_state_chunk_to_tensor_and_metadata(
 
             deserialized = MultiprocessingSerializer.deserialize(serialized_chunk)
         except Exception:  # noqa: BLE001
-            logger.warning("Failed to deserialize SGLang hidden-state chunk; skipping chunk")
+            logger.warning(
+                "Failed to deserialize SGLang hidden-state chunk; skipping chunk"
+            )
             return None, metadata
-        tensor, nested_metadata = _hidden_state_chunk_to_tensor_and_metadata(deserialized)
+        tensor, nested_metadata = _hidden_state_chunk_to_tensor_and_metadata(
+            deserialized
+        )
         return tensor, {**metadata, **nested_metadata}
     else:
         h_states = torch.tensor(hidden_state_chunk, dtype=torch.bfloat16)
@@ -459,7 +511,9 @@ def _iter_hidden_state_chunks(hidden_states_data: Any):
     return hidden_states_data
 
 
-def _target_logprobs_invalid_rows_like(target_logprobs: torch.Tensor, rows: int) -> torch.Tensor:
+def _target_logprobs_invalid_rows_like(
+    target_logprobs: torch.Tensor, rows: int
+) -> torch.Tensor:
     shape = (int(rows),) + tuple(target_logprobs.shape[1:])
     invalid = target_logprobs.new_empty(shape)
     invalid.zero_()
@@ -483,7 +537,9 @@ def _select_target_logprobs_by_raw_positions(
     if row_count <= 0 or desired_rows <= 0 or not torch.is_tensor(raw_positions):
         return None, None, None, row_count
 
-    raw_positions = raw_positions.reshape(-1).to(device=target_logprobs.device, dtype=torch.long)
+    raw_positions = raw_positions.reshape(-1).to(
+        device=target_logprobs.device, dtype=torch.long
+    )
     if int(raw_positions.numel()) < row_count:
         return None, None, None, row_count
     raw_positions = raw_positions[:row_count]
@@ -497,7 +553,9 @@ def _select_target_logprobs_by_raw_positions(
 
     selected = _target_logprobs_invalid_rows_like(target_logprobs, desired_rows)
     source_indices = torch.nonzero(keep_mask, as_tuple=False).reshape(-1)
-    dest_indices = (raw_positions[source_indices] - int(desired_position_start)).to(dtype=torch.long)
+    dest_indices = (raw_positions[source_indices] - int(desired_position_start)).to(
+        dtype=torch.long
+    )
     selected[dest_indices] = target_logprobs[source_indices]
     return (
         selected.contiguous(),
@@ -507,7 +565,9 @@ def _select_target_logprobs_by_raw_positions(
     )
 
 
-def _server_args_overrides_from_drafter(drafter_cfg: dict[str, Any], supported_fields: set[str]) -> dict[str, Any]:
+def _server_args_overrides_from_drafter(
+    drafter_cfg: dict[str, Any], supported_fields: set[str]
+) -> dict[str, Any]:
     """Build SGLang ``ServerArgs`` overrides from SPECO drafter config."""
 
     if not bool(drafter_cfg.get("enable")):
@@ -538,7 +598,8 @@ def _server_args_overrides_from_drafter(drafter_cfg: dict[str, Any], supported_f
         "speculative_eagle_topk": rollout_cfg.get("spec_topk"),
         "speculative_num_draft_tokens": rollout_cfg.get("spec_verify_tokens"),
         "enable_return_hidden_states": bool(
-            drafter_cfg.get("enable_drafter_training") and training_cfg.get("collect_hidden_states_from_sgl")
+            drafter_cfg.get("enable_drafter_training")
+            and training_cfg.get("collect_hidden_states_from_sgl")
         ),
         "enable_weights_cpu_backup": True,
         "enable_draft_weights_cpu_backup": True,
@@ -549,23 +610,36 @@ def _server_args_overrides_from_drafter(drafter_cfg: dict[str, Any], supported_f
         overrides["cuda_graph_max_bs"] = cuda_graph_max_bs
 
     if "custom_weight_loader" in supported_fields:
-        overrides["custom_weight_loader"] = [SPECO_TARGET_WEIGHT_LOADER, SPECO_DRAFT_WEIGHT_LOADER]
+        overrides["custom_weight_loader"] = [
+            SPECO_TARGET_WEIGHT_LOADER,
+            SPECO_DRAFT_WEIGHT_LOADER,
+        ]
 
-    return {key: value for key, value in overrides.items() if key in supported_fields and value is not None}
+    return {
+        key: value
+        for key, value in overrides.items()
+        if key in supported_fields and value is not None
+    }
 
 
 def _set_sglang_patch_envs(drafter_cfg: dict[str, Any]) -> None:
     training_cfg = drafter_cfg.get("training") or {}
-    os.environ["VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"] = "1" if _drafter_uses_eagle_last_hidden(drafter_cfg) else "0"
+    os.environ["VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"] = (
+        "1" if _drafter_uses_eagle_last_hidden(drafter_cfg) else "0"
+    )
     raw_top_logprobs_enabled = bool(
         drafter_cfg.get("enable")
         and drafter_cfg.get("enable_drafter_training")
         and training_cfg.get("collect_hidden_states_from_sgl")
         and training_cfg.get("use_logits")
     )
-    os.environ["VERL_DRAFTER_RAW_TOP_LOGPROBS"] = "1" if raw_top_logprobs_enabled else "0"
+    os.environ["VERL_DRAFTER_RAW_TOP_LOGPROBS"] = (
+        "1" if raw_top_logprobs_enabled else "0"
+    )
     if raw_top_logprobs_enabled:
-        os.environ["VERL_DRAFTER_RAW_TOP_LOGPROBS_TOPK"] = str(max(int(training_cfg.get("logits_topk", 1)), 1))
+        os.environ["VERL_DRAFTER_RAW_TOP_LOGPROBS_TOPK"] = str(
+            max(int(training_cfg.get("logits_topk", 1)), 1)
+        )
 
 
 def _default_sglang_verl_patches(drafter_cfg: dict[str, Any]) -> set[str]:
@@ -600,7 +674,9 @@ def _install_server_args_patch(drafter_cfg: dict[str, Any] | None = None) -> Non
         cfg = drafter_cfg or _load_env_drafter_config()
         if cfg:
             custom_loaders = list(kwargs.get("custom_weight_loader") or [])
-            for key, value in _server_args_overrides_from_drafter(cfg, supported_fields).items():
+            for key, value in _server_args_overrides_from_drafter(
+                cfg, supported_fields
+            ).items():
                 if key == "custom_weight_loader":
                     for loader in value:
                         if loader not in custom_loaders:
@@ -615,13 +691,18 @@ def _install_server_args_patch(drafter_cfg: dict[str, Any] | None = None) -> Non
 
 
 def _install_sglang_hidden_state_patch(drafter_cfg: dict[str, Any]) -> None:
-    from verl_speco.integration.sglang_adapter import SGLangSpecoPatchConfig, install_sglang_speco_patches
+    from verl_speco.integration.sglang_adapter import (
+        SGLangSpecoPatchConfig,
+        install_sglang_speco_patches,
+    )
 
     training_cfg = drafter_cfg.get("training") or {}
     _set_sglang_patch_envs(drafter_cfg)
     default_patches = _default_sglang_verl_patches(drafter_cfg)
     if default_patches:
-        logger.info("Installing SPECO SGLang patches: %s", ", ".join(sorted(default_patches)))
+        logger.info(
+            "Installing SPECO SGLang patches: %s", ", ".join(sorted(default_patches))
+        )
     install_sglang_speco_patches(
         SGLangSpecoPatchConfig(
             target_weight_loader=SPECO_TARGET_WEIGHT_LOADER,
@@ -638,11 +719,15 @@ def install_sglang_server_actor_runtime() -> dict[str, Any]:
     drafter_cfg = _load_env_drafter_config()
     if not drafter_cfg:
         if sglang_needs_qwen3_rope_compat_patch():
-            from verl_speco.integration.sglang_adapter import install_sglang_qwen3_rope_compat_patch
+            from verl_speco.integration.sglang_adapter import (
+                install_sglang_qwen3_rope_compat_patch,
+            )
 
             install_sglang_qwen3_rope_compat_patch()
             os.environ[SPECO_SGLANG_RUNTIME_PATCHED_ENV] = "1"
-            logger.warning("Installed SPECO SGLang Qwen3 rope compatibility runtime patch.")
+            logger.warning(
+                "Installed SPECO SGLang Qwen3 rope compatibility runtime patch."
+            )
         return {}
 
     _install_server_args_patch(drafter_cfg)
@@ -714,7 +799,11 @@ async def _sgl_update_weights_with_route(
 
     def _prepare_update_tensor(tensor):
         tensor = tensor.detach()
-        if stage_cpu_tensors_to_device and tensor.device.type == "cpu" and device_name != "cpu":
+        if (
+            stage_cpu_tensors_to_device
+            and tensor.device.type == "cpu"
+            and device_name != "cpu"
+        ):
             device_module = get_torch_device()
             tensor = tensor.to(
                 torch.device(f"{device_name}:{device_module.current_device()}"),
@@ -723,9 +812,12 @@ async def _sgl_update_weights_with_route(
         return _preprocess_tensor_for_update_weights(tensor)
 
     named_tensors_batch = [
-        (name, MultiprocessingSerializer.serialize(_prepare_update_tensor(tensor))) for name, tensor in params_batch
+        (name, MultiprocessingSerializer.serialize(_prepare_update_tensor(tensor)))
+        for name, tensor in params_batch
     ]
-    gathered_serialized_batches = [None for _ in range(infer_tp_size)] if infer_tp_rank == 0 else None
+    gathered_serialized_batches = (
+        [None for _ in range(infer_tp_size)] if infer_tp_rank == 0 else None
+    )
     dist.gather_object(
         obj=named_tensors_batch,
         object_gather_list=gathered_serialized_batches,
@@ -737,11 +829,17 @@ async def _sgl_update_weights_with_route(
 
     logical_tensors = zip(*gathered_serialized_batches, strict=True)
     named_tensors = [
-        (tensor_group[0][0], LocalSerializedTensor(values=[rank_part[1] for rank_part in tensor_group]))
+        (
+            tensor_group[0][0],
+            LocalSerializedTensor(values=[rank_part[1] for rank_part in tensor_group]),
+        )
         for tensor_group in logical_tensors
     ]
     update_weights_request = UpdateWeightsFromTensorReqInput(
-        serialized_named_tensors=[MultiprocessingSerializer.serialize(named_tensors) for _ in range(infer_tp_size)],
+        serialized_named_tensors=[
+            MultiprocessingSerializer.serialize(named_tensors)
+            for _ in range(infer_tp_size)
+        ],
         load_format=load_format,
         flush_cache=flush_cache,
     )
@@ -754,9 +852,21 @@ async def _sgl_update_weights_with_route(
     if isinstance(result, dict):
         success = result.get("success")
         status = str(result.get("status", "")).lower()
-        if success is False or status in {"error", "failed", "failure"} or bool(result.get("error")):
-            route = "target" if disable_draft_model else "draft" if disable_target_model else "target/draft"
-            raise RuntimeError(f"SGLang {route} weight update failed: {result.get('message') or result.get('error')}")
+        if (
+            success is False
+            or status in {"error", "failed", "failure"}
+            or bool(result.get("error"))
+        ):
+            route = (
+                "target"
+                if disable_draft_model
+                else "draft"
+                if disable_target_model
+                else "target/draft"
+            )
+            raise RuntimeError(
+                f"SGLang {route} weight update failed: {result.get('message') or result.get('error')}"
+            )
     return result
 
 
@@ -770,7 +880,9 @@ def _supports_sglang_custom_weight_loader() -> bool:
 
 
 def _speculative_weight_sync_guard_disabled() -> bool:
-    return _env_flag_enabled(SPECO_DISABLE_SPECULATIVE_WEIGHT_SYNC_GUARD_ENV, default=False)
+    return _env_flag_enabled(
+        SPECO_DISABLE_SPECULATIVE_WEIGHT_SYNC_GUARD_ENV, default=False
+    )
 
 
 def _server_adapter_original_update_weights(adapter: Any):
@@ -781,10 +893,14 @@ def _sglang_engine_has_method(engine: Any, method_name: str) -> bool:
     return callable(getattr(engine, method_name, None))
 
 
-async def _maybe_call_sglang_engine_method(engine: Any, method_name: str, *args, **kwargs) -> bool:
+async def _maybe_call_sglang_engine_method(
+    engine: Any, method_name: str, *args, **kwargs
+) -> bool:
     method = getattr(engine, method_name, None)
     if not callable(method):
-        logger.debug("SGLang engine %s has no %s(); skip", type(engine).__name__, method_name)
+        logger.debug(
+            "SGLang engine %s has no %s(); skip", type(engine).__name__, method_name
+        )
         return False
     try:
         result = method(*args, **kwargs)
@@ -797,7 +913,9 @@ async def _maybe_call_sglang_engine_method(engine: Any, method_name: str, *args,
     return True
 
 
-async def speco_update_target_weights(self, weights, *args, global_steps: int = None, **kwargs):
+async def speco_update_target_weights(
+    self, weights, *args, global_steps: int = None, **kwargs
+):
     """Update only SGLang target weights when speculative drafter is enabled."""
 
     original_update_weights = _server_adapter_original_update_weights(self)
@@ -805,22 +923,31 @@ async def speco_update_target_weights(self, weights, *args, global_steps: int = 
     if not bool(drafter_cfg.get("enable")):
         if original_update_weights is None:
             return None
-        return await original_update_weights(self, weights, *args, global_steps=global_steps, **kwargs)
+        return await original_update_weights(
+            self, weights, *args, global_steps=global_steps, **kwargs
+        )
 
     peft_config = getattr(self, "peft_config", None)
     base_sync_done = getattr(self, "base_sync_done", False)
     if peft_config is not None and base_sync_done:
         if original_update_weights is None:
             return None
-        return await original_update_weights(self, weights, *args, global_steps=global_steps, **kwargs)
+        return await original_update_weights(
+            self, weights, *args, global_steps=global_steps, **kwargs
+        )
 
     await self._init_server_adapter()
-    update_weights_bucket_bytes = int(self.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
+    update_weights_bucket_bytes = (
+        int(self.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
+    )
     generation_paused = False
 
     from verl.workers.rollout.sglang_rollout.utils import get_named_tensor_buckets
 
-    if getattr(self.config, "get", None) is not None and self.config.get("quantization") == "fp8":
+    if (
+        getattr(self.config, "get", None) is not None
+        and self.config.get("quantization") == "fp8"
+    ):
         from verl.workers.rollout.sglang_rollout.utils import SGLangFP8QuantizerHelper
 
         weights = SGLangFP8QuantizerHelper.modify_model_weight_for_fp8(weights)
@@ -828,7 +955,10 @@ async def speco_update_target_weights(self, weights, *args, global_steps: int = 
     total_ts = time.perf_counter()
     try:
         engine_has_flush_cache = _sglang_engine_has_method(self._engine, "flush_cache")
-        if self.device_mesh["infer_tp"].get_local_rank() == 0 and not _speculative_weight_sync_guard_disabled():
+        if (
+            self.device_mesh["infer_tp"].get_local_rank() == 0
+            and not _speculative_weight_sync_guard_disabled()
+        ):
             generation_paused = await _maybe_call_sglang_engine_method(
                 self._engine,
                 "pause_generation",
@@ -838,7 +968,9 @@ async def speco_update_target_weights(self, weights, *args, global_steps: int = 
                 await _maybe_call_sglang_engine_method(self._engine, "flush_cache")
 
         bucket_idx = 0
-        async for params_batch in get_named_tensor_buckets(weights, update_weights_bucket_bytes):
+        async for params_batch in get_named_tensor_buckets(
+            weights, update_weights_bucket_bytes
+        ):
             bucket_idx += 1
             await _sgl_update_weights_with_route(
                 engine=self._engine,
@@ -847,7 +979,9 @@ async def speco_update_target_weights(self, weights, *args, global_steps: int = 
                 device_mesh=self.device_mesh,
                 disable_draft_model=True,
                 disable_target_model=False,
-                load_format=SPECO_TARGET_WEIGHT_LOADER if _supports_sglang_custom_weight_loader() else None,
+                load_format=SPECO_TARGET_WEIGHT_LOADER
+                if _supports_sglang_custom_weight_loader()
+                else None,
                 stage_cpu_tensors_to_device=False,
                 flush_cache=not engine_has_flush_cache,
                 abort_all_requests=False,
@@ -869,7 +1003,9 @@ async def speco_update_target_weights(self, weights, *args, global_steps: int = 
             await _maybe_call_sglang_engine_method(self._engine, "continue_generation")
 
 
-async def speco_update_draft_weights(self, weights: dict[str, Any], *args, global_steps: int = None, **kwargs):
+async def speco_update_draft_weights(
+    self, weights: dict[str, Any], *args, global_steps: int = None, **kwargs
+):
     """Update only SGLang draft weights from an upstream ServerAdapter instance."""
 
     del args, kwargs
@@ -906,7 +1042,9 @@ async def speco_update_draft_weights(self, weights: dict[str, Any], *args, globa
                 await _maybe_call_sglang_engine_method(self._engine, "flush_cache")
 
         bucket_idx = 0
-        async for params_batch in get_named_tensor_buckets(weights.items(), update_weights_bucket_bytes):
+        async for params_batch in get_named_tensor_buckets(
+            weights.items(), update_weights_bucket_bytes
+        ):
             bucket_idx += 1
             await _sgl_update_weights_with_route(
                 engine=self._engine,
@@ -915,7 +1053,9 @@ async def speco_update_draft_weights(self, weights: dict[str, Any], *args, globa
                 device_mesh=self.device_mesh,
                 disable_draft_model=False,
                 disable_target_model=True,
-                load_format=SPECO_DRAFT_WEIGHT_LOADER if _supports_sglang_custom_weight_loader() else None,
+                load_format=SPECO_DRAFT_WEIGHT_LOADER
+                if _supports_sglang_custom_weight_loader()
+                else None,
                 stage_cpu_tensors_to_device=True,
                 flush_cache=bool(flush_after and not engine_has_flush_cache),
                 abort_all_requests=False,
@@ -941,8 +1081,12 @@ async def speco_update_draft_weights(self, weights: dict[str, Any], *args, globa
 def attach_update_draft_weights_to_rollout(rollout: Any) -> Any:
     """Attach ``update_draft_weights`` to an upstream SGLang ServerAdapter."""
 
-    if rollout is not None and not callable(getattr(rollout, "update_draft_weights", None)):
-        rollout.update_draft_weights = speco_update_draft_weights.__get__(rollout, type(rollout))
+    if rollout is not None and not callable(
+        getattr(rollout, "update_draft_weights", None)
+    ):
+        rollout.update_draft_weights = speco_update_draft_weights.__get__(
+            rollout, type(rollout)
+        )
     return rollout
 
 
@@ -983,7 +1127,9 @@ class _SpecoSGLangHttpServerMixin:
         return _load_env_drafter_config()
 
     @staticmethod
-    def _speco_strip_internal_sampling_params(sampling_params: dict[str, Any]) -> dict[str, Any]:
+    def _speco_strip_internal_sampling_params(
+        sampling_params: dict[str, Any],
+    ) -> dict[str, Any]:
         clean_params = dict(sampling_params)
         clean_params.pop("_verl_global_steps", None)
         clean_params.pop("_verl_skip_drafter_collection", None)
@@ -992,7 +1138,9 @@ class _SpecoSGLangHttpServerMixin:
     async def set_global_steps(self, global_steps: int):
         self.global_steps = global_steps
 
-    def _reset_drafter_collection_budget_if_needed(self, collection_global_steps: Optional[int]) -> None:
+    def _reset_drafter_collection_budget_if_needed(
+        self, collection_global_steps: Optional[int]
+    ) -> None:
         if getattr(self, "_drafter_collection_step", None) == collection_global_steps:
             return
         self._drafter_collection_step = collection_global_steps
@@ -1070,18 +1218,31 @@ class _SpecoSGLangHttpServerMixin:
             drafter_cfg.get("speculative_algorithm"),
         )
 
-    def _speco_should_collect_drafter(self, request_global_steps: Optional[int], request_id: str, estimated_hidden_rows: int) -> bool:
+    def _speco_should_collect_drafter(
+        self,
+        request_global_steps: Optional[int],
+        request_id: str,
+        estimated_hidden_rows: int,
+    ) -> bool:
         self._speco_last_collection_skip_reason = None
         drafter_cfg = self._speco_drafter_cfg()
-        if not bool(drafter_cfg.get("enable") and drafter_cfg.get("enable_drafter_training")):
+        if not bool(
+            drafter_cfg.get("enable") and drafter_cfg.get("enable_drafter_training")
+        ):
             return self._speco_mark_collection_skip("drafter_disabled")
         training_cfg = drafter_cfg.get("training") or {}
         if not bool(training_cfg.get("collect_hidden_states_from_sgl")):
             return self._speco_mark_collection_skip("hidden_collection_disabled")
-        skip_drafter_collection = bool(getattr(self, "_verl_skip_drafter_collection", False))
+        skip_drafter_collection = bool(
+            getattr(self, "_verl_skip_drafter_collection", False)
+        )
         if skip_drafter_collection:
             return self._speco_mark_collection_skip("request_skip_flag")
-        collection_global_steps = request_global_steps if request_global_steps is not None else self.global_steps
+        collection_global_steps = (
+            request_global_steps
+            if request_global_steps is not None
+            else self.global_steps
+        )
         self._reset_drafter_collection_budget_if_needed(collection_global_steps)
         if collection_global_steps is not None and not speco_step_matches_interval(
             collection_global_steps, training_cfg.get("collect_interval_steps", 1)
@@ -1105,13 +1266,21 @@ class _SpecoSGLangHttpServerMixin:
         if sample_rate <= 0:
             return self._speco_mark_collection_skip("sample_rate_zero")
         if sample_rate < 1.0:
-            sampling_key = f"{collection_global_steps}:{self.replica_rank}:{request_id}".encode()
+            sampling_key = (
+                f"{collection_global_steps}:{self.replica_rank}:{request_id}".encode()
+            )
             digest = hashlib.blake2b(sampling_key, digest_size=8).digest()
-            sample_value = int.from_bytes(digest, byteorder="big", signed=False) / float(1 << 64)
+            sample_value = int.from_bytes(
+                digest, byteorder="big", signed=False
+            ) / float(1 << 64)
             if sample_value >= sample_rate:
                 return self._speco_mark_collection_skip("sample_rate_rejected")
-        self._drafter_collection_samples = int(getattr(self, "_drafter_collection_samples", 0)) + 1
-        self._drafter_collection_tokens = int(getattr(self, "_drafter_collection_tokens", 0)) + int(estimated_hidden_rows)
+        self._drafter_collection_samples = (
+            int(getattr(self, "_drafter_collection_samples", 0)) + 1
+        )
+        self._drafter_collection_tokens = int(
+            getattr(self, "_drafter_collection_tokens", 0)
+        ) + int(estimated_hidden_rows)
         self._speco_last_collection_skip_reason = None
         return True
 
@@ -1126,11 +1295,19 @@ class _SpecoSGLangHttpServerMixin:
     ) -> tuple[bool, dict[str, Any], dict[str, Any]]:
         drafter_cfg = self._speco_drafter_cfg()
         training_cfg = drafter_cfg.get("training") or {}
-        front_hidden_tokens = _positive_int_or_none(training_cfg.get("hidden_state_window_tokens_per_sample", 512))
-        max_hidden_tokens = _positive_int_or_none(training_cfg.get("hidden_state_max_tokens_per_sample"))
+        front_hidden_tokens = _positive_int_or_none(
+            training_cfg.get("hidden_state_window_tokens_per_sample", 512)
+        )
+        max_hidden_tokens = _positive_int_or_none(
+            training_cfg.get("hidden_state_max_tokens_per_sample")
+        )
         if _drafter_uses_dflash_aux_hidden(drafter_cfg):
-            algorithm = str(drafter_cfg.get("speculative_algorithm", "") or "").strip().upper()
-            max_window_key = "dspark_max_window" if algorithm == "DSPARK" else "dflash_max_window"
+            algorithm = (
+                str(drafter_cfg.get("speculative_algorithm", "") or "").strip().upper()
+            )
+            max_window_key = (
+                "dspark_max_window" if algorithm == "DSPARK" else "dflash_max_window"
+            )
             dflash_max_window = _positive_int_or_none(
                 training_cfg.get(max_window_key, training_cfg.get("dflash_max_window"))
             )
@@ -1151,7 +1328,9 @@ class _SpecoSGLangHttpServerMixin:
             tail_tokens=max_hidden_tokens,
         )
         estimated_hidden_rows = int(hidden_window_plan.get("estimated_rows", 0) or 0)
-        should_collect = self._speco_should_collect_drafter(collection_global_steps, request_id, estimated_hidden_rows)
+        should_collect = self._speco_should_collect_drafter(
+            collection_global_steps, request_id, estimated_hidden_rows
+        )
         if not should_collect:
             return False, hidden_window_plan, {}
 
@@ -1164,10 +1343,18 @@ class _SpecoSGLangHttpServerMixin:
             }
         )
         if hidden_window_plan.get("mode") == "random":
-            custom_params[_HIDDEN_STATE_WINDOW_START_PARAM] = int(hidden_window_plan["window_start"])
-            custom_params[_HIDDEN_STATE_WINDOW_END_PARAM] = int(hidden_window_plan["window_end"])
-            custom_params[_HIDDEN_STATE_WINDOW_START_OFFSET_PARAM] = int(hidden_window_plan["window_start_offset"])
-            custom_params[_HIDDEN_STATE_WINDOW_MIN_ROWS_PARAM] = int(hidden_window_plan["min_rows"])
+            custom_params[_HIDDEN_STATE_WINDOW_START_PARAM] = int(
+                hidden_window_plan["window_start"]
+            )
+            custom_params[_HIDDEN_STATE_WINDOW_END_PARAM] = int(
+                hidden_window_plan["window_end"]
+            )
+            custom_params[_HIDDEN_STATE_WINDOW_START_OFFSET_PARAM] = int(
+                hidden_window_plan["window_start_offset"]
+            )
+            custom_params[_HIDDEN_STATE_WINDOW_MIN_ROWS_PARAM] = int(
+                hidden_window_plan["min_rows"]
+            )
         elif front_hidden_tokens is not None:
             custom_params[_HIDDEN_STATE_FRONT_TOKENS_PARAM] = int(front_hidden_tokens)
         if (
@@ -1216,11 +1403,19 @@ class _SpecoSGLangHttpServerMixin:
         request_global_steps = original_sampling_params.get("_verl_global_steps")
         if request_global_steps is not None:
             request_global_steps = int(request_global_steps)
-        skip_drafter_collection = bool(original_sampling_params.get("_verl_skip_drafter_collection", False))
-        collection_global_steps = request_global_steps if request_global_steps is not None else self.global_steps
+        skip_drafter_collection = bool(
+            original_sampling_params.get("_verl_skip_drafter_collection", False)
+        )
+        collection_global_steps = (
+            request_global_steps
+            if request_global_steps is not None
+            else self.global_steps
+        )
         if skip_drafter_collection or (
             collection_global_steps is not None
-            and not speco_step_matches_interval(collection_global_steps, training_cfg.get("collect_interval_steps", 1))
+            and not speco_step_matches_interval(
+                collection_global_steps, training_cfg.get("collect_interval_steps", 1)
+            )
         ):
             self._speco_log_collection_skip_once(
                 "request_skip_flag" if skip_drafter_collection else "interval_mismatch",
@@ -1238,7 +1433,9 @@ class _SpecoSGLangHttpServerMixin:
                 video_data=video_data,
             )
 
-        sampling_params = self._speco_strip_internal_sampling_params(original_sampling_params)
+        sampling_params = self._speco_strip_internal_sampling_params(
+            original_sampling_params
+        )
 
         max_possible_tokens = self.config.max_model_len - len(prompt_ids) - 1
         if max_possible_tokens < 0:
@@ -1252,7 +1449,12 @@ class _SpecoSGLangHttpServerMixin:
         elif "max_tokens" in sampling_params:
             max_new_tokens = sampling_params.pop("max_tokens")
         else:
-            max_new_tokens = min(self.config.response_length, self.config.prompt_length + self.config.response_length - len(prompt_ids))
+            max_new_tokens = min(
+                self.config.response_length,
+                self.config.prompt_length
+                + self.config.response_length
+                - len(prompt_ids),
+            )
         max_new_tokens = max(0, min(int(max_new_tokens), max_possible_tokens))
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
@@ -1298,7 +1500,9 @@ class _SpecoSGLangHttpServerMixin:
         if self.model_config.lora_rank > 0:
             generate_request.lora_path = SGLANG_LORA_NAME
 
-        output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
+        output = await self.tokenizer_manager.generate_request(
+            generate_request, None
+        ).__anext__()
         meta_info = output.get("meta_info", {})
         finish_reason = meta_info.get("finish_reason")
         finish_reason = finish_reason["type"] if finish_reason else None
@@ -1307,7 +1511,9 @@ class _SpecoSGLangHttpServerMixin:
         if return_logprob:
             output_token_logprobs = meta_info.get("output_token_logprobs") or []
             if output_token_logprobs and len(output_token_logprobs) == len(token_ids):
-                log_probs = [float(log_prob) for log_prob, _, _ in output_token_logprobs]
+                log_probs = [
+                    float(log_prob) for log_prob, _, _ in output_token_logprobs
+                ]
             else:
                 assert not token_ids, (
                     f"output_token_logprobs length ({len(output_token_logprobs)}) != "
@@ -1322,10 +1528,14 @@ class _SpecoSGLangHttpServerMixin:
             if self.config.skip_tokenizer_init:
                 routed_experts = output.get("meta_info", {}).get("routed_experts", None)
             else:
-                from sglang.srt.layers.moe.routed_experts_capturer import extract_routed_experts_from_meta_info
+                from sglang.srt.layers.moe.routed_experts_capturer import (
+                    extract_routed_experts_from_meta_info,
+                )
 
                 hf_config = self.model_config.hf_config
-                if not hasattr(hf_config, "num_hidden_layers") or not hasattr(hf_config, "num_experts_per_tok"):
+                if not hasattr(hf_config, "num_hidden_layers") or not hasattr(
+                    hf_config, "num_experts_per_tok"
+                ):
                     raise AttributeError(
                         "enable_rollout_routing_replay is set, but hf_config is missing "
                         "'num_hidden_layers' or 'num_experts_per_tok'. This feature requires an MoE model "
@@ -1337,7 +1547,10 @@ class _SpecoSGLangHttpServerMixin:
 
         drafter_sample = None
         if should_collect:
-            collect_target_logprobs = bool(training_cfg.get("use_logits", False)) and not uses_dflash_aux_hidden
+            collect_target_logprobs = (
+                bool(training_cfg.get("use_logits", False))
+                and not uses_dflash_aux_hidden
+            )
             hidden_states_data = meta_info.pop("hidden_states", [])
             hidden_states_raw_type = type(hidden_states_data).__name__
             try:
@@ -1379,7 +1592,9 @@ class _SpecoSGLangHttpServerMixin:
             hidden_last_hidden_select = None
 
             if has_hidden_states:
-                prompt_tensor = torch.as_tensor(prompt_ids, dtype=torch.long).detach().cpu()
+                prompt_tensor = (
+                    torch.as_tensor(prompt_ids, dtype=torch.long).detach().cpu()
+                )
                 response_tensor = torch.tensor(token_ids, dtype=torch.long)
                 hidden_states = torch.cat(hidden_states_list, dim=0)
                 hidden_raw_len = int(hidden_states.size(0))
@@ -1392,17 +1607,32 @@ class _SpecoSGLangHttpServerMixin:
                         if torch.is_tensor(metadata.get("positions"))
                     ]
                     if position_chunks:
-                        hidden_positions = torch.cat(position_chunks, dim=0).to(dtype=torch.long)
+                        hidden_positions = torch.cat(position_chunks, dim=0).to(
+                            dtype=torch.long
+                        )
                         if int(hidden_positions.numel()) != hidden_raw_len:
                             hidden_positions = None
                     hidden_position_start = int(first_metadata.get("position_start", 0))
-                    hidden_position_end = int(last_metadata.get("position_end", hidden_position_start + hidden_raw_len))
-                    if hidden_positions is not None and int(hidden_positions.numel()) > 0:
+                    hidden_position_end = int(
+                        last_metadata.get(
+                            "position_end", hidden_position_start + hidden_raw_len
+                        )
+                    )
+                    if (
+                        hidden_positions is not None
+                        and int(hidden_positions.numel()) > 0
+                    ):
                         hidden_position_start = int(hidden_positions[0].item())
                         hidden_position_end = int(hidden_positions[-1].item()) + 1
-                    hidden_prefix_cache_rows = int(first_metadata.get("prefix_cache_rows", 0))
-                    hidden_window_start = first_metadata.get("window_start", hidden_window_start)
-                    hidden_window_end = first_metadata.get("window_end", hidden_window_end)
+                    hidden_prefix_cache_rows = int(
+                        first_metadata.get("prefix_cache_rows", 0)
+                    )
+                    hidden_window_start = first_metadata.get(
+                        "window_start", hidden_window_start
+                    )
+                    hidden_window_end = first_metadata.get(
+                        "window_end", hidden_window_end
+                    )
                     hidden_last_hidden_logprob_check = next(
                         (
                             metadata.get("last_hidden_logprob_check")
@@ -1433,33 +1663,78 @@ class _SpecoSGLangHttpServerMixin:
                         if torch.is_tensor(metadata.get("raw_target_logprobs"))
                     ]
                     if raw_target_logprob_chunks:
-                        hidden_raw_target_logprobs = torch.cat(raw_target_logprob_chunks, dim=0).contiguous()
+                        hidden_raw_target_logprobs = torch.cat(
+                            raw_target_logprob_chunks, dim=0
+                        ).contiguous()
                         raw_target_rows = int(hidden_raw_target_logprobs.size(0))
                         raw_target_position_chunks = []
-                        if any(torch.is_tensor(metadata.get("raw_target_logprobs_positions")) for metadata in hidden_states_metadata):
+                        if any(
+                            torch.is_tensor(
+                                metadata.get("raw_target_logprobs_positions")
+                            )
+                            for metadata in hidden_states_metadata
+                        ):
                             for metadata in hidden_states_metadata:
                                 raw_chunk = metadata.get("raw_target_logprobs")
                                 if not torch.is_tensor(raw_chunk):
                                     continue
-                                raw_position_chunk = metadata.get("raw_target_logprobs_positions")
-                                if torch.is_tensor(raw_position_chunk) and int(raw_position_chunk.numel()) == int(raw_chunk.size(0)):
-                                    raw_target_position_chunks.append(raw_position_chunk.reshape(-1).to(dtype=torch.long))
+                                raw_position_chunk = metadata.get(
+                                    "raw_target_logprobs_positions"
+                                )
+                                if torch.is_tensor(raw_position_chunk) and int(
+                                    raw_position_chunk.numel()
+                                ) == int(raw_chunk.size(0)):
+                                    raw_target_position_chunks.append(
+                                        raw_position_chunk.reshape(-1).to(
+                                            dtype=torch.long
+                                        )
+                                    )
                                 else:
-                                    raw_target_position_chunks.append(torch.full((int(raw_chunk.size(0)),), -1, dtype=torch.long))
+                                    raw_target_position_chunks.append(
+                                        torch.full(
+                                            (int(raw_chunk.size(0)),),
+                                            -1,
+                                            dtype=torch.long,
+                                        )
+                                    )
                         if raw_target_position_chunks:
-                            hidden_raw_target_logprobs_positions = torch.cat(raw_target_position_chunks, dim=0).contiguous()
+                            hidden_raw_target_logprobs_positions = torch.cat(
+                                raw_target_position_chunks, dim=0
+                            ).contiguous()
                         if torch.is_tensor(hidden_raw_target_logprobs_positions):
-                            valid_raw_positions = hidden_raw_target_logprobs_positions[hidden_raw_target_logprobs_positions >= 0]
+                            valid_raw_positions = hidden_raw_target_logprobs_positions[
+                                hidden_raw_target_logprobs_positions >= 0
+                            ]
                             if int(valid_raw_positions.numel()) > 0:
-                                hidden_raw_target_logprobs_position_start = int(valid_raw_positions[0].item())
-                                hidden_raw_target_logprobs_position_end = int(valid_raw_positions[-1].item()) + 1
-                        if hidden_raw_target_logprobs_position_start is None and not collect_target_logprobs:
-                            hidden_raw_target_logprobs_position_start = int(hidden_position_start)
-                            hidden_raw_target_logprobs_position_end = hidden_raw_target_logprobs_position_start + raw_target_rows
+                                hidden_raw_target_logprobs_position_start = int(
+                                    valid_raw_positions[0].item()
+                                )
+                                hidden_raw_target_logprobs_position_end = (
+                                    int(valid_raw_positions[-1].item()) + 1
+                                )
+                        if (
+                            hidden_raw_target_logprobs_position_start is None
+                            and not collect_target_logprobs
+                        ):
+                            hidden_raw_target_logprobs_position_start = int(
+                                hidden_position_start
+                            )
+                            hidden_raw_target_logprobs_position_end = (
+                                hidden_raw_target_logprobs_position_start
+                                + raw_target_rows
+                            )
                         if torch.is_tensor(hidden_raw_target_logprobs_positions):
                             target_window_start = int(hidden_position_start) + 1
-                            target_window_end = min(int(hidden_position_end), max(len(prompt_ids) - 1, 0) + len(token_ids))
-                            target_logprobs, target_logprobs_position_start, target_logprobs_position_end, _ = _select_target_logprobs_by_raw_positions(
+                            target_window_end = min(
+                                int(hidden_position_end),
+                                max(len(prompt_ids) - 1, 0) + len(token_ids),
+                            )
+                            (
+                                target_logprobs,
+                                target_logprobs_position_start,
+                                target_logprobs_position_end,
+                                _,
+                            ) = _select_target_logprobs_by_raw_positions(
                                 hidden_raw_target_logprobs,
                                 hidden_raw_target_logprobs_positions,
                                 desired_position_start=target_window_start,
@@ -1482,35 +1757,69 @@ class _SpecoSGLangHttpServerMixin:
                         None,
                     )
                 else:
-                    hidden_states, hidden_position_start, hidden_position_end, _, hidden_prefix_cache_rows = _select_drafter_hidden_state_window(
+                    (
                         hidden_states,
-                        expected_hidden_rows=_expected_full_hidden_rows(len(prompt_ids), len(token_ids)),
+                        hidden_position_start,
+                        hidden_position_end,
+                        _,
+                        hidden_prefix_cache_rows,
+                    ) = _select_drafter_hidden_state_window(
+                        hidden_states,
+                        expected_hidden_rows=_expected_full_hidden_rows(
+                            len(prompt_ids), len(token_ids)
+                        ),
                         prompt_len=len(prompt_ids),
-                        front_tokens=_positive_int_or_none(training_cfg.get("hidden_state_window_tokens_per_sample", 512)),
-                        tail_tokens=_positive_int_or_none(training_cfg.get("hidden_state_max_tokens_per_sample")),
-                )
+                        front_tokens=_positive_int_or_none(
+                            training_cfg.get(
+                                "hidden_state_window_tokens_per_sample", 512
+                            )
+                        ),
+                        tail_tokens=_positive_int_or_none(
+                            training_cfg.get("hidden_state_max_tokens_per_sample")
+                        ),
+                    )
                 hidden_kept_len = int(hidden_states.size(0))
                 fail_closed_alignment_reason = None
                 if not uses_dflash_aux_hidden:
-                    if hidden_positions is None or int(hidden_positions.numel()) != hidden_kept_len:
-                        fail_closed_alignment_reason = "hidden_positions_missing_or_mismatched"
+                    if (
+                        hidden_positions is None
+                        or int(hidden_positions.numel()) != hidden_kept_len
+                    ):
+                        fail_closed_alignment_reason = (
+                            "hidden_positions_missing_or_mismatched"
+                        )
                     else:
                         aligned_prefix_rows = hidden_kept_len
-                        hidden_contiguous = hidden_positions[1:] == hidden_positions[:-1] + 1
-                        if hidden_contiguous.numel() > 0 and not bool(hidden_contiguous.all()):
-                            first_break = int(
-                                torch.nonzero(~hidden_contiguous, as_tuple=False).reshape(-1)[0].item()
-                            ) + 1
+                        hidden_contiguous = (
+                            hidden_positions[1:] == hidden_positions[:-1] + 1
+                        )
+                        if hidden_contiguous.numel() > 0 and not bool(
+                            hidden_contiguous.all()
+                        ):
+                            first_break = (
+                                int(
+                                    torch.nonzero(~hidden_contiguous, as_tuple=False)
+                                    .reshape(-1)[0]
+                                    .item()
+                                )
+                                + 1
+                            )
                             aligned_prefix_rows = min(aligned_prefix_rows, first_break)
 
                         if collect_target_logprobs:
                             if not (
                                 torch.is_tensor(hidden_raw_target_logprobs)
-                                and torch.is_tensor(hidden_raw_target_logprobs_positions)
+                                and torch.is_tensor(
+                                    hidden_raw_target_logprobs_positions
+                                )
                             ):
                                 aligned_prefix_rows = 0
                             else:
-                                raw_positions = hidden_raw_target_logprobs_positions.reshape(-1).to(dtype=torch.long)
+                                raw_positions = (
+                                    hidden_raw_target_logprobs_positions.reshape(-1).to(
+                                        dtype=torch.long
+                                    )
+                                )
                                 aligned_prefix_rows = min(
                                     aligned_prefix_rows,
                                     int(hidden_raw_target_logprobs.size(0)),
@@ -1518,26 +1827,46 @@ class _SpecoSGLangHttpServerMixin:
                                 )
                                 raw_contiguous = (
                                     raw_positions[1:aligned_prefix_rows]
-                                    == raw_positions[: max(aligned_prefix_rows - 1, 0)] + 1
+                                    == raw_positions[: max(aligned_prefix_rows - 1, 0)]
+                                    + 1
                                 )
-                                if raw_contiguous.numel() > 0 and not bool(raw_contiguous.all()):
-                                    first_raw_break = int(
-                                        torch.nonzero(~raw_contiguous, as_tuple=False).reshape(-1)[0].item()
-                                    ) + 1
-                                    aligned_prefix_rows = min(aligned_prefix_rows, first_raw_break)
+                                if raw_contiguous.numel() > 0 and not bool(
+                                    raw_contiguous.all()
+                                ):
+                                    first_raw_break = (
+                                        int(
+                                            torch.nonzero(
+                                                ~raw_contiguous, as_tuple=False
+                                            )
+                                            .reshape(-1)[0]
+                                            .item()
+                                        )
+                                        + 1
+                                    )
+                                    aligned_prefix_rows = min(
+                                        aligned_prefix_rows, first_raw_break
+                                    )
                                 # hidden position p produces the teacher row for token p + 1.
                                 positions_match = (
                                     raw_positions[:aligned_prefix_rows]
                                     == hidden_positions[:aligned_prefix_rows] + 1
                                 )
-                                if positions_match.numel() > 0 and not bool(positions_match.all()):
+                                if positions_match.numel() > 0 and not bool(
+                                    positions_match.all()
+                                ):
                                     first_mismatch = int(
-                                        torch.nonzero(~positions_match, as_tuple=False).reshape(-1)[0].item()
+                                        torch.nonzero(~positions_match, as_tuple=False)
+                                        .reshape(-1)[0]
+                                        .item()
                                     )
-                                    aligned_prefix_rows = min(aligned_prefix_rows, first_mismatch)
+                                    aligned_prefix_rows = min(
+                                        aligned_prefix_rows, first_mismatch
+                                    )
 
                         if aligned_prefix_rows <= 0:
-                            fail_closed_alignment_reason = "no_aligned_continuous_prefix"
+                            fail_closed_alignment_reason = (
+                                "no_aligned_continuous_prefix"
+                            )
                         elif aligned_prefix_rows < hidden_kept_len:
                             logger.warning(
                                 "[SpeCo SGLang] Truncate drafter sample to aligned prefix: kept=%s/%s",
@@ -1550,11 +1879,15 @@ class _SpecoSGLangHttpServerMixin:
                             hidden_position_start = int(hidden_positions[0].item())
                             hidden_position_end = int(hidden_positions[-1].item()) + 1
                             if torch.is_tensor(hidden_raw_target_logprobs):
-                                hidden_raw_target_logprobs = hidden_raw_target_logprobs[:aligned_prefix_rows]
-                            if torch.is_tensor(hidden_raw_target_logprobs_positions):
-                                hidden_raw_target_logprobs_positions = hidden_raw_target_logprobs_positions[
+                                hidden_raw_target_logprobs = hidden_raw_target_logprobs[
                                     :aligned_prefix_rows
                                 ]
+                            if torch.is_tensor(hidden_raw_target_logprobs_positions):
+                                hidden_raw_target_logprobs_positions = (
+                                    hidden_raw_target_logprobs_positions[
+                                        :aligned_prefix_rows
+                                    ]
+                                )
 
                 if fail_closed_alignment_reason is not None:
                     logger.warning(
@@ -1562,7 +1895,9 @@ class _SpecoSGLangHttpServerMixin:
                         "hidden_positions=%s raw_rows=%s raw_positions=%s",
                         fail_closed_alignment_reason,
                         hidden_kept_len,
-                        int(hidden_positions.numel()) if torch.is_tensor(hidden_positions) else None,
+                        int(hidden_positions.numel())
+                        if torch.is_tensor(hidden_positions)
+                        else None,
                         (
                             int(hidden_raw_target_logprobs.size(0))
                             if torch.is_tensor(hidden_raw_target_logprobs)
@@ -1576,9 +1911,17 @@ class _SpecoSGLangHttpServerMixin:
                     )
                 if collect_target_logprobs and hidden_raw_target_logprobs is not None:
                     target_window_start = int(hidden_position_start) + 1
-                    target_window_end = min(int(hidden_position_end), max(len(prompt_ids) - 1, 0) + len(token_ids))
+                    target_window_end = min(
+                        int(hidden_position_end),
+                        max(len(prompt_ids) - 1, 0) + len(token_ids),
+                    )
                     if torch.is_tensor(hidden_raw_target_logprobs_positions):
-                        target_logprobs, target_logprobs_position_start, target_logprobs_position_end, _ = _select_target_logprobs_by_raw_positions(
+                        (
+                            target_logprobs,
+                            target_logprobs_position_start,
+                            target_logprobs_position_end,
+                            _,
+                        ) = _select_target_logprobs_by_raw_positions(
                             hidden_raw_target_logprobs,
                             hidden_raw_target_logprobs_positions,
                             desired_position_start=target_window_start,
@@ -1586,15 +1929,22 @@ class _SpecoSGLangHttpServerMixin:
                         )
                 if fail_closed_alignment_reason is not None:
                     drafter_sample = None
-                elif hidden_window_mode == "random" and hidden_kept_len < hidden_window_min_rows:
+                elif (
+                    hidden_window_mode == "random"
+                    and hidden_kept_len < hidden_window_min_rows
+                ):
                     drafter_sample = None
                 else:
                     drafter_sample = {
-                        "input_ids": torch.cat([prompt_tensor, response_tensor], dim=0).unsqueeze(0),
+                        "input_ids": torch.cat(
+                            [prompt_tensor, response_tensor], dim=0
+                        ).unsqueeze(0),
                         "prompts": prompt_tensor.unsqueeze(0),
                         "responses": response_tensor.unsqueeze(0),
                         "hidden_states": hidden_states.unsqueeze(0).cpu(),
-                        "hidden_positions": hidden_positions.unsqueeze(0).cpu() if hidden_positions is not None else None,
+                        "hidden_positions": hidden_positions.unsqueeze(0).cpu()
+                        if hidden_positions is not None
+                        else None,
                         "hidden_position_start": hidden_position_start,
                         "hidden_position_end": hidden_position_end,
                         "hidden_prefix_cache_rows": hidden_prefix_cache_rows,
@@ -1616,7 +1966,9 @@ class _SpecoSGLangHttpServerMixin:
                         "hidden_target_logprobs_source": hidden_target_logprobs_source,
                         "hidden_raw_topk_logprob_check": hidden_raw_topk_logprob_check,
                         "hidden_raw_target_logprobs": (
-                            hidden_raw_target_logprobs.unsqueeze(0).cpu() if torch.is_tensor(hidden_raw_target_logprobs) else None
+                            hidden_raw_target_logprobs.unsqueeze(0).cpu()
+                            if torch.is_tensor(hidden_raw_target_logprobs)
+                            else None
                         ),
                         "hidden_raw_target_logprobs_positions": (
                             hidden_raw_target_logprobs_positions.unsqueeze(0).cpu()
@@ -1627,7 +1979,9 @@ class _SpecoSGLangHttpServerMixin:
                         "hidden_raw_target_logprobs_position_end": hidden_raw_target_logprobs_position_end,
                         "hidden_last_hidden_filter": hidden_last_hidden_filter,
                         "hidden_last_hidden_select": hidden_last_hidden_select,
-                        "target_logprobs": target_logprobs.unsqueeze(0).cpu() if target_logprobs is not None else None,
+                        "target_logprobs": target_logprobs.unsqueeze(0).cpu()
+                        if target_logprobs is not None
+                        else None,
                         "target_logprobs_position_start": target_logprobs_position_start,
                         "target_logprobs_position_end": target_logprobs_position_end,
                         "global_step": collection_global_steps,
@@ -1666,7 +2020,11 @@ def _build_speco_http_server_class(upstream_module):
     upstream_cls = upstream_module.SGLangHttpServer
     if issubclass(upstream_cls, _SpecoSGLangHttpServerMixin):
         return upstream_cls
-    return type("SpecoSGLangHttpServer", (_SpecoSGLangHttpServerMixin, upstream_cls), {"__module__": __name__})
+    return type(
+        "SpecoSGLangHttpServer",
+        (_SpecoSGLangHttpServerMixin, upstream_cls),
+        {"__module__": __name__},
+    )
 
 
 def _build_speco_replica_class(upstream_module):
@@ -1690,23 +2048,35 @@ def _build_speco_replica_class(upstream_module):
             worker_infos = await asyncio.gather(
                 *[
                     worker.__ray_call__.remote(
-                        lambda self: (ray.get_runtime_context().get_node_id(), os.environ[visible_devices_keyword])
+                        lambda self: (
+                            ray.get_runtime_context().get_node_id(),
+                            os.environ[visible_devices_keyword],
+                        )
                     )
                     for worker in self.workers
                 ]
             )
-            worker_cuda_visible_devices = [worker_info[1] for worker_info in worker_infos]
+            worker_cuda_visible_devices = [
+                worker_info[1] for worker_info in worker_infos
+            ]
             worker_node_ids = [worker_info[0] for worker_info in worker_infos]
             base_gpu_id = 0
-            infer_tp = self.config.tensor_model_parallel_size * self.config.data_parallel_size
+            infer_tp = (
+                self.config.tensor_model_parallel_size * self.config.data_parallel_size
+            )
             replica_world_size = infer_tp * self.config.pipeline_model_parallel_size
-            if os.environ.get(f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}", None):
-                base_gpu_id = (0 + self.replica_rank * replica_world_size) % self.gpus_per_node
+            if os.environ.get(
+                f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}", None
+            ):
+                base_gpu_id = (
+                    0 + self.replica_rank * replica_world_size
+                ) % self.gpus_per_node
 
             drafter_env = os.getenv(SPECO_SGLANG_DRAFTER_CONFIG_ENV, "")
             for node_rank in range(self.nnodes):
                 node_cuda_visible_devices_set = worker_cuda_visible_devices[
-                    node_rank * self.gpus_per_replica_node : (node_rank + 1) * self.gpus_per_replica_node
+                    node_rank * self.gpus_per_replica_node : (node_rank + 1)
+                    * self.gpus_per_replica_node
                 ]
                 node_cuda_visible_devices = ",".join(
                     map(
@@ -1745,7 +2115,8 @@ def _build_speco_replica_class(upstream_module):
                     model_config=self.model_config,
                     rollout_mode=self.rollout_mode,
                     workers=self.workers[
-                        node_rank * self.gpus_per_replica_node : (node_rank + 1) * self.gpus_per_replica_node
+                        node_rank * self.gpus_per_replica_node : (node_rank + 1)
+                        * self.gpus_per_replica_node
                     ],
                     replica_rank=self.replica_rank,
                     node_rank=node_rank,
@@ -1757,14 +2128,20 @@ def _build_speco_replica_class(upstream_module):
 
             master_address, master_port = None, None
             if self.nnodes > 1:
-                master_address, master_port = await self.servers[0].get_master_address.remote()
+                master_address, master_port = await self.servers[
+                    0
+                ].get_master_address.remote()
             await asyncio.gather(
                 *[
-                    server.launch_server.remote(master_address=master_address, master_port=master_port)
+                    server.launch_server.remote(
+                        master_address=master_address, master_port=master_port
+                    )
                     for server in self.servers
                 ]
             )
-            server_address, server_port = await self.servers[0].get_server_address.remote()
+            server_address, server_port = await self.servers[
+                0
+            ].get_server_address.remote()
             self._server_handle = self.servers[0]
             self._server_address = (
                 f"[{server_address}]:{server_port}"

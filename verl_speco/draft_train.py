@@ -11,7 +11,10 @@ import logging
 
 import hydra
 
-from verl_speco.trainer.draft_training_loop import log_resolved_config, run_standalone_draft_training
+from verl_speco.trainer.draft_training_loop import (
+    log_resolved_config,
+    run_standalone_draft_training,
+)
 
 
 logger = logging.getLogger(__name__)

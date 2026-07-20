@@ -20,7 +20,9 @@ SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCH = "hidden_states_tensor_output"
 SGLANG_NPU_EAGLE_TARGET_SAMPLING_PATCH = "npu_eagle_target_sampling"
 
 
-def speco_step_matches_interval(global_step: Any, interval_steps: Any, *, default_interval: int = 1) -> bool:
+def speco_step_matches_interval(
+    global_step: Any, interval_steps: Any, *, default_interval: int = 1
+) -> bool:
     """Return whether a positive trainer step should run an interval-gated action."""
 
     try:
@@ -47,7 +49,9 @@ class SGLangSpecoPatchConfig:
     patches: Optional[Iterable[str]] = None
 
 
-def install_sglang_speco_patches(config: Optional[SGLangSpecoPatchConfig] = None) -> None:
+def install_sglang_speco_patches(
+    config: Optional[SGLangSpecoPatchConfig] = None,
+) -> None:
     """Install SPECO's SGLang patches.
 
     The imported patch module touches third-party SGLang runtime objects, so it
@@ -89,10 +93,14 @@ def sglang_needs_qwen3_rope_compat_patch(sglang_version: Optional[str] = None) -
     return version.parse("0.5.10") <= current_version < version.parse("0.5.12")
 
 
-def install_sglang_qwen3_rope_compat_patch(set_envs_and_config: Optional[Callable] = None) -> None:
+def install_sglang_qwen3_rope_compat_patch(
+    set_envs_and_config: Optional[Callable] = None,
+) -> None:
     """Install only the SGLang Qwen3 rope compatibility patch."""
 
-    from verl_speco.integration.sglang_patch import install_sglang_qwen3_rope_compat_patch as _install
+    from verl_speco.integration.sglang_patch import (
+        install_sglang_qwen3_rope_compat_patch as _install,
+    )
 
     _install(set_envs_and_config=set_envs_and_config)
 
@@ -139,7 +147,9 @@ def pop_drafter_samples(gen_batch_output: Any) -> list[dict]:
     return normalize_drafter_samples(samples_array)
 
 
-def bucket_drafter_samples_by_replica(samples: list[dict], num_replicas: int) -> list[list[dict]]:
+def bucket_drafter_samples_by_replica(
+    samples: list[dict], num_replicas: int
+) -> list[list[dict]]:
     """Bucket normalized samples by rollout replica rank."""
 
     buckets = [[] for _ in range(num_replicas)]

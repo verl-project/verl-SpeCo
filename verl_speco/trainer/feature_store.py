@@ -40,10 +40,16 @@ class DraftFeatureSample:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any], *, strict: bool = True) -> "DraftFeatureSample":
+    def from_dict(
+        cls, payload: dict[str, Any], *, strict: bool = True
+    ) -> "DraftFeatureSample":
         sample = cls(
             schema_version=int(payload.get("schema_version", SCHEMA_VERSION)),
-            algorithm=str(payload.get("algorithm", payload.get("metadata", {}).get("algorithm", "EAGLE3"))),
+            algorithm=str(
+                payload.get(
+                    "algorithm", payload.get("metadata", {}).get("algorithm", "EAGLE3")
+                )
+            ),
             input_ids=payload["input_ids"],
             loss_mask=payload["loss_mask"],
             hidden_states=payload["hidden_states"],
@@ -58,13 +64,20 @@ class DraftFeatureSample:
 
     def validate(self, *, strict: bool = True) -> None:
         if self.schema_version != SCHEMA_VERSION and strict:
-            raise ValueError(f"Unsupported DraftFeatureSample schema_version={self.schema_version}")
+            raise ValueError(
+                f"Unsupported DraftFeatureSample schema_version={self.schema_version}"
+            )
         if not torch.is_tensor(self.input_ids):
             raise TypeError("DraftFeatureSample.input_ids must be a torch.Tensor")
         if not torch.is_tensor(self.loss_mask):
             raise TypeError("DraftFeatureSample.loss_mask must be a torch.Tensor")
-        if not (torch.is_tensor(self.hidden_states) or isinstance(self.hidden_states, (list, tuple))):
-            raise TypeError("DraftFeatureSample.hidden_states must be a tensor or tensor list")
+        if not (
+            torch.is_tensor(self.hidden_states)
+            or isinstance(self.hidden_states, (list, tuple))
+        ):
+            raise TypeError(
+                "DraftFeatureSample.hidden_states must be a tensor or tensor list"
+            )
         if self.input_ids.dim() > 1:
             self.input_ids = self.input_ids.reshape(-1)
         if self.loss_mask.dim() > 1:
@@ -79,18 +92,38 @@ class DraftFeatureSample:
                 "DraftFeatureSample input_ids/loss_mask length mismatch: "
                 f"{self.input_ids.size(0)} vs {self.loss_mask.size(0)}"
             )
-        if torch.is_tensor(self.position_ids) and self.position_ids.size(0) != self.input_ids.size(0) and strict:
+        if (
+            torch.is_tensor(self.position_ids)
+            and self.position_ids.size(0) != self.input_ids.size(0)
+            and strict
+        ):
             raise ValueError(
                 "DraftFeatureSample input_ids/position_ids length mismatch: "
                 f"{self.input_ids.size(0)} vs {self.position_ids.size(0)}"
             )
-        if torch.is_tensor(self.hidden_states) and self.hidden_states.dim() == 3 and self.hidden_states.size(0) == 1:
+        if (
+            torch.is_tensor(self.hidden_states)
+            and self.hidden_states.dim() == 3
+            and self.hidden_states.size(0) == 1
+        ):
             self.hidden_states = self.hidden_states.squeeze(0)
-        if torch.is_tensor(self.last_hidden_states) and self.last_hidden_states.dim() == 3 and self.last_hidden_states.size(0) == 1:
+        if (
+            torch.is_tensor(self.last_hidden_states)
+            and self.last_hidden_states.dim() == 3
+            and self.last_hidden_states.size(0) == 1
+        ):
             self.last_hidden_states = self.last_hidden_states.squeeze(0)
-        if self.target_logprobs is not None and not torch.is_tensor(self.target_logprobs):
-            raise TypeError("DraftFeatureSample.target_logprobs must be a tensor when provided")
-        if torch.is_tensor(self.target_logprobs) and self.target_logprobs.dim() != 3 and strict:
+        if self.target_logprobs is not None and not torch.is_tensor(
+            self.target_logprobs
+        ):
+            raise TypeError(
+                "DraftFeatureSample.target_logprobs must be a tensor when provided"
+            )
+        if (
+            torch.is_tensor(self.target_logprobs)
+            and self.target_logprobs.dim() != 3
+            and strict
+        ):
             raise ValueError(
                 "DraftFeatureSample.target_logprobs must have shape [rows, topk, 2], "
                 f"got {tuple(self.target_logprobs.shape)}"
@@ -107,13 +140,19 @@ class DraftFeatureSample:
             "metadata": dict(self.metadata),
         }
         if self.last_hidden_states is not None:
-            payload["last_hidden_states"] = self.last_hidden_states.detach().cpu().contiguous()
+            payload["last_hidden_states"] = (
+                self.last_hidden_states.detach().cpu().contiguous()
+            )
         if self.target is not None:
             payload["target"] = self.target.detach().cpu().contiguous()
         if self.target_logprobs is not None:
-            payload["target_logprobs"] = self.target_logprobs.detach().cpu().contiguous()
+            payload["target_logprobs"] = (
+                self.target_logprobs.detach().cpu().contiguous()
+            )
         if self.position_ids is not None:
-            payload["position_ids"] = self.position_ids.detach().cpu().long().contiguous()
+            payload["position_ids"] = (
+                self.position_ids.detach().cpu().long().contiguous()
+            )
         return payload
 
     def to_training_item(self) -> dict[str, Any]:
@@ -142,7 +181,9 @@ class DraftFeatureSample:
 
 
 class DraftFeatureStore(Protocol):
-    def write_many(self, samples: list[DraftFeatureSample | dict[str, Any]]) -> list[str]: ...
+    def write_many(
+        self, samples: list[DraftFeatureSample | dict[str, Any]]
+    ) -> list[str]: ...
 
     def read(self, key: str) -> DraftFeatureSample: ...
 
@@ -153,7 +194,9 @@ class DraftFeatureStore(Protocol):
     def close(self) -> None: ...
 
 
-def _populate_verl_alignment_fields(item: dict[str, Any], metadata: dict[str, Any]) -> None:
+def _populate_verl_alignment_fields(
+    item: dict[str, Any], metadata: dict[str, Any]
+) -> None:
     """Restore online drafter alignment metadata for feature-store samples."""
 
     direct_fields = {
@@ -225,7 +268,9 @@ class TorchShardFeatureStore:
         if not self.read_only:
             self._write_metadata()
 
-    def write_many(self, samples: list[DraftFeatureSample | dict[str, Any]]) -> list[str]:
+    def write_many(
+        self, samples: list[DraftFeatureSample | dict[str, Any]]
+    ) -> list[str]:
         if self.read_only:
             raise RuntimeError("Cannot write to a read-only TorchShardFeatureStore")
         keys: list[str] = []
@@ -250,12 +295,16 @@ class TorchShardFeatureStore:
         entry = {
             "path": shard_name,
             "num_samples": len(self._pending),
-            "num_tokens": int(sum(_sample_token_count(sample) for sample in self._pending)),
+            "num_tokens": int(
+                sum(_sample_token_count(sample) for sample in self._pending)
+            ),
             "min_global_step": _min_metadata_int(self._pending, "global_step"),
             "max_global_step": _max_metadata_int(self._pending, "global_step"),
         }
         with self.manifest_path.open("a", encoding="utf-8") as manifest_file:
-            manifest_file.write(json.dumps(entry, ensure_ascii=True, sort_keys=True) + "\n")
+            manifest_file.write(
+                json.dumps(entry, ensure_ascii=True, sort_keys=True) + "\n"
+            )
         self._manifest.append(entry)
         self._pending = []
         self._next_shard_index += 1
@@ -297,7 +346,9 @@ class TorchShardFeatureStore:
             except (OSError, json.JSONDecodeError):
                 pass
         metadata["num_shards"] = len(self._load_manifest())
-        metadata["num_samples"] = sum(int(entry.get("num_samples", 0)) for entry in self._load_manifest())
+        metadata["num_samples"] = sum(
+            int(entry.get("num_samples", 0)) for entry in self._load_manifest()
+        )
         return metadata
 
     def close(self) -> None:
@@ -314,7 +365,13 @@ class TorchShardFeatureStore:
             delete=False,
         ) as metadata_file:
             tmp_name = metadata_file.name
-            json.dump(self.metadata, metadata_file, ensure_ascii=True, indent=2, sort_keys=True)
+            json.dump(
+                self.metadata,
+                metadata_file,
+                ensure_ascii=True,
+                indent=2,
+                sort_keys=True,
+            )
         try:
             os.replace(tmp_name, self.metadata_path)
         finally:
@@ -352,7 +409,9 @@ class TorchShardFeatureStore:
             return torch.load(path, map_location="cpu")
 
 
-def build_feature_store_from_config(feature_store_cfg, *, read_only: bool = False) -> TorchShardFeatureStore:
+def build_feature_store_from_config(
+    feature_store_cfg, *, read_only: bool = False
+) -> TorchShardFeatureStore:
     store_type = str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
     if store_type != "torch_shard":
         raise NotImplementedError(f"Unsupported draft feature store type: {store_type}")
@@ -364,7 +423,9 @@ def build_feature_store_from_config(feature_store_cfg, *, read_only: bool = Fals
     )
 
 
-def _coerce_sample(sample_like: DraftFeatureSample | dict[str, Any], *, strict: bool) -> DraftFeatureSample:
+def _coerce_sample(
+    sample_like: DraftFeatureSample | dict[str, Any], *, strict: bool
+) -> DraftFeatureSample:
     if isinstance(sample_like, DraftFeatureSample):
         sample_like.validate(strict=strict)
         return sample_like
@@ -422,7 +483,9 @@ def _parse_key(key: str) -> tuple[str, int]:
 
 
 def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
-    with tempfile.NamedTemporaryFile(prefix=path.name, suffix=".tmp", dir=path.parent, delete=False) as tmp_file:
+    with tempfile.NamedTemporaryFile(
+        prefix=path.name, suffix=".tmp", dir=path.parent, delete=False
+    ) as tmp_file:
         tmp_name = tmp_file.name
     try:
         torch.save(payload, tmp_name)

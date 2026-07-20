@@ -13,7 +13,6 @@ __all__ = ["GeneralParser", "HarmonyParser", "ThinkingParser"]
 
 
 class Parser(ABC):
-
     def __init__(
         self,
         tokenizer: PreTrainedTokenizer,
@@ -56,7 +55,7 @@ class Parser(ABC):
                     tool_calls = json.loads(tool_calls)
                 except json.JSONDecodeError:
                     warnings.warn(
-                        f"Failed to parse tool_calls JSON string, removing tool_calls"
+                        "Failed to parse tool_calls JSON string, removing tool_calls"
                     )
                     cleaned.pop("tool_calls", None)
                     return cleaned
@@ -107,7 +106,6 @@ _harmony_encoding = None
 
 
 class GeneralParser(Parser):
-
     def __init__(
         self,
         tokenizer: PreTrainedTokenizer,
@@ -161,7 +159,7 @@ class GeneralParser(Parser):
 
             if conversation[0]["role"] == "system":
                 warnings.warn(
-                    f"The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
+                    "The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
                 )
                 messages.append(
                     {"role": "system", "content": conversation[0]["content"]}

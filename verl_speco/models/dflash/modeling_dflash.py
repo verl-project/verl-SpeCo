@@ -28,22 +28,36 @@ class DFlashRMSNorm(nn.Module):
 
 
 class DFlashRotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_position_embeddings: int = 32768, base: float = 10000.0):
+    def __init__(
+        self, dim: int, max_position_embeddings: int = 32768, base: float = 10000.0
+    ):
         super().__init__()
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.dim, 2).float() / self.dim)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._set_cos_sin_cache(max_position_embeddings + 20, self.inv_freq.device, torch.float32)
+        self._set_cos_sin_cache(
+            max_position_embeddings + 20, self.inv_freq.device, torch.float32
+        )
 
-    def _set_cos_sin_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+    def _set_cos_sin_cache(
+        self, seq_len: int, device: torch.device, dtype: torch.dtype
+    ):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        t = torch.arange(
+            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
+        )
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
+        self.register_buffer(
+            "cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False
+        )
+        self.register_buffer(
+            "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
+        )
 
     def forward(self, x: torch.Tensor, seq_len: int):
         if seq_len > self.max_seq_len_cached:
@@ -64,7 +78,9 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return hidden_states
     batch, num_kv_heads, slen, head_dim = hidden_states.shape
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, slen, head_dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_kv_heads, n_rep, slen, head_dim
+    )
     return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
 
 
@@ -75,7 +91,10 @@ def build_target_layer_ids(num_target_layers: int, num_hidden_layers: int) -> li
     start = 1
     end = num_hidden_layers - 3
     span = end - start
-    return [int(round(start + (i * span) / (num_target_layers - 1))) for i in range(num_target_layers)]
+    return [
+        int(round(start + (i * span) / (num_target_layers - 1)))
+        for i in range(num_target_layers)
+    ]
 
 
 class DFlashAttention(nn.Module):
@@ -94,10 +113,18 @@ class DFlashAttention(nn.Module):
         self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
         self.num_kv_heads = config.num_key_value_heads
         self.num_kv_groups = self.num_heads // self.num_kv_heads
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.num_kv_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.num_kv_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
         self.q_norm = DFlashRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = DFlashRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.rotary_emb = DFlashRotaryEmbedding(
@@ -118,7 +145,9 @@ class DFlashAttention(nn.Module):
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
 
-        q = self.q_proj(draft_hidden).view(bsz, draft_len, self.num_heads, self.head_dim)
+        q = self.q_proj(draft_hidden).view(
+            bsz, draft_len, self.num_heads, self.head_dim
+        )
         q = self.q_norm(q).transpose(1, 2)
 
         k_ctx = self.k_proj(context_hidden)
@@ -148,7 +177,9 @@ class DFlashAttention(nn.Module):
 
         if block_mask is not None:
             if dense_attention_mask is not None:
-                raise ValueError("DFlash attention received both block_mask and dense_attention_mask")
+                raise ValueError(
+                    "DFlash attention received both block_mask and dense_attention_mask"
+                )
             attn_output = compile_friendly_flex_attention(
                 q,
                 k.contiguous(),
@@ -169,16 +200,24 @@ class DFlashAttention(nn.Module):
             )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, draft_len, self.num_heads * self.head_dim)
+        attn_output = attn_output.reshape(
+            bsz, draft_len, self.num_heads * self.head_dim
+        )
         return self.o_proj(attn_output)
 
 
 class DFlashMLP(nn.Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -189,8 +228,12 @@ class DFlashDecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = DFlashAttention(config)
         self.mlp = DFlashMLP(config)
-        self.input_layernorm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = DFlashRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = DFlashRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -232,34 +275,62 @@ class DFlashDraftModel(PreTrainedModel):
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_layers = config.num_hidden_layers
-        target_num_hidden = int(getattr(config, "target_num_hidden_layers", getattr(config, "num_target_layers", 36)))
-        self.num_target_layers = int(getattr(config, "num_target_layers", target_num_hidden))
-        self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
+        target_num_hidden = int(
+            getattr(
+                config,
+                "target_num_hidden_layers",
+                getattr(config, "num_target_layers", 36),
+            )
+        )
+        self.num_target_layers = int(
+            getattr(config, "num_target_layers", target_num_hidden)
+        )
+        self.target_hidden_size = getattr(
+            config, "target_hidden_size", config.hidden_size
+        )
         self.mask_token_id = getattr(config, "mask_token_id", config.vocab_size - 1)
         self.target_layer_ids = getattr(config, "target_layer_ids", None)
         self.num_context_layers = getattr(config, "num_context_layers", None)
         if self.target_layer_ids is not None:
-            self.target_layer_ids = [int(layer_id) for layer_id in self.target_layer_ids]
+            self.target_layer_ids = [
+                int(layer_id) for layer_id in self.target_layer_ids
+            ]
             if self.num_context_layers is None:
                 self.num_context_layers = len(self.target_layer_ids)
         else:
             if self.num_context_layers is None:
-                self.num_context_layers = self.num_target_layers if self.num_target_layers != target_num_hidden else 5
-            self.target_layer_ids = build_target_layer_ids(int(self.num_context_layers), target_num_hidden)
+                self.num_context_layers = (
+                    self.num_target_layers
+                    if self.num_target_layers != target_num_hidden
+                    else 5
+                )
+            self.target_layer_ids = build_target_layer_ids(
+                int(self.num_context_layers), target_num_hidden
+            )
         self.num_context_layers = int(self.num_context_layers)
         if len(self.target_layer_ids) != self.num_context_layers:
             raise ValueError(
                 f"DFlash expected {self.num_context_layers} target layer ids, got {len(self.target_layer_ids)}"
             )
-        self.fc = nn.Linear(self.num_context_layers * self.target_hidden_size, self.hidden_size, bias=False)
+        self.fc = nn.Linear(
+            self.num_context_layers * self.target_hidden_size,
+            self.hidden_size,
+            bias=False,
+        )
         self.hidden_norm = DFlashRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([DFlashDecoderLayer(config) for _ in range(self.num_layers)])
+        self.layers = nn.ModuleList(
+            [DFlashDecoderLayer(config) for _ in range(self.num_layers)]
+        )
         self.norm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def extract_context_feature(self, all_hidden_states: list[torch.Tensor]) -> torch.Tensor:
+    def extract_context_feature(
+        self, all_hidden_states: list[torch.Tensor]
+    ) -> torch.Tensor:
         if len(all_hidden_states) != self.num_context_layers:
-            raise ValueError(f"DFlash expected {self.num_context_layers} hidden-state tensors, got {len(all_hidden_states)}")
+            raise ValueError(
+                f"DFlash expected {self.num_context_layers} hidden-state tensors, got {len(all_hidden_states)}"
+            )
         concatenated = torch.cat(all_hidden_states, dim=-1).to(self.fc.weight.dtype)
         return self.hidden_norm(self.fc(concatenated))
 
@@ -293,7 +364,9 @@ class DFlashDraftModel(PreTrainedModel):
         self.embed_tokens.weight.requires_grad = False
 
     @torch.no_grad()
-    def load_embedding(self, model_path: str, embedding_key: str = "model.embed_tokens.weight") -> None:
+    def load_embedding(
+        self, model_path: str, embedding_key: str = "model.embed_tokens.weight"
+    ) -> None:
         if not os.path.exists(model_path):
             model_path = snapshot_download(repo_id=model_path)
 
@@ -308,10 +381,14 @@ class DFlashDraftModel(PreTrainedModel):
                 return
             pytorch_model_path = os.path.join(model_path, "pytorch_model.bin")
             if os.path.exists(pytorch_model_path):
-                state_dict = torch.load(pytorch_model_path, map_location="cpu", weights_only=True)
+                state_dict = torch.load(
+                    pytorch_model_path, map_location="cpu", weights_only=True
+                )
                 self.embed_tokens.weight.copy_(state_dict[embedding_key])
                 return
-            raise FileNotFoundError(f"No index.json, model.safetensors or pytorch_model.bin found in {model_path}")
+            raise FileNotFoundError(
+                f"No index.json, model.safetensors or pytorch_model.bin found in {model_path}"
+            )
         if len(index_json_path) > 1:
             raise FileNotFoundError(f"Multiple index.json files found in {model_path}")
 
@@ -322,5 +399,9 @@ class DFlashDraftModel(PreTrainedModel):
             with safe_open(os.path.join(model_path, ckpt_file), framework="pt") as f:
                 self.embed_tokens.weight.copy_(f.get_tensor(embedding_key))
         else:
-            state_dict = torch.load(os.path.join(model_path, ckpt_file), map_location="cpu", weights_only=True)
+            state_dict = torch.load(
+                os.path.join(model_path, ckpt_file),
+                map_location="cpu",
+                weights_only=True,
+            )
             self.embed_tokens.weight.copy_(state_dict[embedding_key])

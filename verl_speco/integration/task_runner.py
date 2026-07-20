@@ -18,7 +18,9 @@ from verl_speco.workers import SpecoWorker
 
 def _serialize_drafter_config(config):
     try:
-        drafter = OmegaConf.to_container(config.actor_rollout_ref.rollout.drafter, resolve=True)
+        drafter = OmegaConf.to_container(
+            config.actor_rollout_ref.rollout.drafter, resolve=True
+        )
     except Exception:  # noqa: BLE001
         return ""
     return json.dumps(drafter, sort_keys=True) if isinstance(drafter, dict) else ""
@@ -52,9 +54,7 @@ class SpecoTaskRunner(TaskRunner):
         return ray.remote(SpecoWorker)
 
     def _with_speco_rollout_publish_mixin(self, worker_cls, config):
-        enable_drafter = bool(
-            config.actor_rollout_ref.rollout.drafter.enable
-        )
+        enable_drafter = bool(config.actor_rollout_ref.rollout.drafter.enable)
         raw_worker_cls = _unwrap_ray_remote_actor_class(worker_cls)
         if not enable_drafter or issubclass(raw_worker_cls, DraftWeightPublishMixin):
             return worker_cls
@@ -71,7 +71,9 @@ class SpecoTaskRunner(TaskRunner):
         for role, role_worker_cls in list(self.role_worker_mapping.items()):
             raw_role_worker_cls = _unwrap_ray_remote_actor_class(role_worker_cls)
             if role_worker_cls is worker_cls or raw_role_worker_cls is raw_worker_cls:
-                self.role_worker_mapping[role] = _remotify_like_worker_mapping_value(role_worker_cls, wrapped_cls)
+                self.role_worker_mapping[role] = _remotify_like_worker_mapping_value(
+                    role_worker_cls, wrapped_cls
+                )
         return _remotify_like_worker_mapping_value(worker_cls, wrapped_cls)
 
     def run(self, config):
@@ -84,7 +86,9 @@ class SpecoTaskRunner(TaskRunner):
         OmegaConf.resolve(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
-        actor_rollout_cls = self._with_speco_rollout_publish_mixin(actor_rollout_cls, config)
+        actor_rollout_cls = self._with_speco_rollout_publish_mixin(
+            actor_rollout_cls, config
+        )
         self.add_critic_worker(config)
         speco_worker_cls = self.add_speco_drafter_worker(config)
         self.add_reward_model_resource_pool(config)
@@ -103,7 +107,9 @@ class SpecoTaskRunner(TaskRunner):
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        processor = hf_processor(
+            local_path, trust_remote_code=trust_remote_code, use_fast=True
+        )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 

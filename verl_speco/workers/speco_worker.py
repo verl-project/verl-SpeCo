@@ -25,7 +25,10 @@ from omegaconf import DictConfig
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import get_torch_device
-from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
+from verl.utils.distributed import (
+    initialize_global_process_group_ray,
+    set_numa_affinity,
+)
 from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
 
 logger = logging.getLogger(__file__)
@@ -82,7 +85,9 @@ def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
         if torch.is_tensor(row_indices):
             row_indices = row_indices.detach().cpu().long().reshape(-1)
         elif isinstance(row_indices, (list, tuple)):
-            row_indices = torch.tensor([int(idx) for idx in row_indices], dtype=torch.long)
+            row_indices = torch.tensor(
+                [int(idx) for idx in row_indices], dtype=torch.long
+            )
         else:
             row_indices = torch.arange(length, dtype=torch.long)
         if int(row_indices.numel()) != int(part.shape[0]):
@@ -93,7 +98,10 @@ def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
             )
             continue
         pieces.append((row_indices, part))
-        full_rows = max(full_rows, int(row_indices.max().item()) + 1 if int(row_indices.numel()) > 0 else 0)
+        full_rows = max(
+            full_rows,
+            int(row_indices.max().item()) + 1 if int(row_indices.numel()) > 0 else 0,
+        )
         hidden_size = int(part.shape[-1])
         dtype = part.dtype
     if not pieces or hidden_size is None:
@@ -137,7 +145,9 @@ def build_rollout_parallel_layout(
     replica_training_ranks = []
     for replica_rank in range(num_replicas):
         replica_base = replica_rank * rollout_world_size
-        replica_training_ranks.append([replica_base + tp_rank * infer_pp for tp_rank in range(int(rollout_tp))])
+        replica_training_ranks.append(
+            [replica_base + tp_rank * infer_pp for tp_rank in range(int(rollout_tp))]
+        )
 
     return RolloutParallelLayout(
         infer_tp=infer_tp,
@@ -148,7 +158,9 @@ def build_rollout_parallel_layout(
     )
 
 
-def build_drafter_training_device_mesh(device_type: str, layout: RolloutParallelLayout) -> DeviceMesh:
+def build_drafter_training_device_mesh(
+    device_type: str, layout: RolloutParallelLayout
+) -> DeviceMesh:
     return DeviceMesh(
         device_type=device_type,
         mesh=torch.tensor(layout.replica_training_ranks, dtype=torch.int64),
@@ -156,7 +168,9 @@ def build_drafter_training_device_mesh(device_type: str, layout: RolloutParallel
     )
 
 
-def _dispatch_nd_compute(dp_rank_mapping: list[int], dp_size, worker_group, *args, **kwargs):
+def _dispatch_nd_compute(
+    dp_rank_mapping: list[int], dp_size, worker_group, *args, **kwargs
+):
     from verl.single_controller.base.worker_group import WorkerGroup
     from verl.utils.ray_utils import parallel_put
 
@@ -181,7 +195,11 @@ def _collect_nd_compute(collect_mask: list[bool], worker_group, output):
 
     assert isinstance(worker_group, WorkerGroup)
     assert len(output) == worker_group.world_size
-    return [output[global_rank] for global_rank in range(worker_group.world_size) if collect_mask[global_rank]]
+    return [
+        output[global_rank]
+        for global_rank in range(worker_group.world_size)
+        if collect_mask[global_rank]
+    ]
 
 
 def _dispatch_lazy_compute(mesh_name, worker_group, *args, **kwargs):
@@ -190,7 +208,9 @@ def _dispatch_lazy_compute(mesh_name, worker_group, *args, **kwargs):
     assert isinstance(worker_group, WorkerGroup)
 
     if mesh_name not in worker_group._dispatch_info:
-        worker_group._dispatch_info[mesh_name] = worker_group._query_dispatch_info(mesh_name)
+        worker_group._dispatch_info[mesh_name] = worker_group._query_dispatch_info(
+            mesh_name
+        )
         assert len(worker_group._dispatch_info[mesh_name]) == worker_group.world_size
 
     dp_rank_mapping = worker_group._dispatch_info[mesh_name]
@@ -205,10 +225,14 @@ def _collect_lazy_compute(mesh_name, worker_group, *args, **kwargs):
     assert mesh_name in worker_group._dispatch_info
 
     if mesh_name not in worker_group._collect_info:
-        worker_group._collect_info[mesh_name] = worker_group._query_collect_info(mesh_name)
+        worker_group._collect_info[mesh_name] = worker_group._query_collect_info(
+            mesh_name
+        )
         assert len(worker_group._collect_info[mesh_name]) == worker_group.world_size
 
-    return _collect_nd_compute(worker_group._collect_info[mesh_name], worker_group, *args, **kwargs)
+    return _collect_nd_compute(
+        worker_group._collect_info[mesh_name], worker_group, *args, **kwargs
+    )
 
 
 def make_nd_compute_dispatch_fn(mesh_name):
@@ -254,7 +278,9 @@ def _preserve_process_rng_state(device_name: str):
             try:
                 torch_device.set_rng_state(torch_device_rng_state)
             except (AttributeError, RuntimeError):
-                logger.warning("Failed to restore %s RNG state after SPECO training.", device_name)
+                logger.warning(
+                    "Failed to restore %s RNG state after SPECO training.", device_name
+                )
 
 
 class SpecoWorker(Worker):
@@ -264,12 +290,20 @@ class SpecoWorker(Worker):
     drafter model periodically according to global RL steps.
     """
 
-    def __init__(self, config: DictConfig, role: str = "speco", device_name: Optional[str] = None, **kwargs):
+    def __init__(
+        self,
+        config: DictConfig,
+        role: str = "speco",
+        device_name: Optional[str] = None,
+        **kwargs,
+    ):
         Worker.__init__(self)
         self.config = config
         self.role = role
         if device_name is None:
-            raise ValueError("SpecoWorker requires an explicit device_name from the trainer initialization path")
+            raise ValueError(
+                "SpecoWorker requires an explicit device_name from the trainer initialization path"
+            )
         self.device_name = str(device_name).lower()
         self.trainer = None
         self.feature_writer = None
@@ -303,11 +337,18 @@ class SpecoWorker(Worker):
         self.is_global_publish_leader = False
 
         self.enable_drafter = bool(
-            self.config.rollout.drafter.enable and self.config.rollout.drafter.enable_drafter_training
+            self.config.rollout.drafter.enable
+            and self.config.rollout.drafter.enable_drafter_training
         )
-        self.training_interval_steps = int(self.config.rollout.drafter.training.get("training_interval_steps", 1))
-        self.publish_interval_steps = int(self.config.rollout.drafter.training.get("publish_interval_steps", 0))
-        self.train_steps_per_trigger = int(self.config.rollout.drafter.training.get("step", 100))
+        self.training_interval_steps = int(
+            self.config.rollout.drafter.training.get("training_interval_steps", 1)
+        )
+        self.publish_interval_steps = int(
+            self.config.rollout.drafter.training.get("publish_interval_steps", 0)
+        )
+        self.train_steps_per_trigger = int(
+            self.config.rollout.drafter.training.get("step", 100)
+        )
 
     def _ensure_process_group_initialized(self):
         if not dist.is_initialized():
@@ -319,7 +360,9 @@ class SpecoWorker(Worker):
             set_numa_affinity()
             self._process_group_initialized = True
         if dist.is_initialized() and dist.get_rank() != self.rank:
-            raise RuntimeError(f"SpecoWorker rank mismatch: worker_rank={self.rank}, dist_rank={dist.get_rank()}")
+            raise RuntimeError(
+                f"SpecoWorker rank mismatch: worker_rank={self.rank}, dist_rank={dist.get_rank()}"
+            )
 
     def _ensure_training_group_initialized(self):
         if self._training_group_initialized:
@@ -339,10 +382,14 @@ class SpecoWorker(Worker):
         self.num_rollout_replicas = rollout_layout.num_replicas
 
         self.global_publish_leader_rank = (
-            rollout_layout.replica_training_ranks[0][0] if rollout_layout.replica_training_ranks else None
+            rollout_layout.replica_training_ranks[0][0]
+            if rollout_layout.replica_training_ranks
+            else None
         )
         self.is_global_publish_leader = self.rank == self.global_publish_leader_rank
-        self.training_device_mesh = build_drafter_training_device_mesh(self.device_name, rollout_layout)
+        self.training_device_mesh = build_drafter_training_device_mesh(
+            self.device_name, rollout_layout
+        )
         owner_route_rank = self.num_rollout_replicas
         owner_route_collect = False
 
@@ -358,7 +405,9 @@ class SpecoWorker(Worker):
                 )
             self.training_process_group = self.training_device_mesh["sp"].get_group()
             self.dp_process_group = self.training_device_mesh["dp"].get_group()
-            self.training_group_ranks = list(rollout_layout.replica_training_ranks[mesh_dp_rank])
+            self.training_group_ranks = list(
+                rollout_layout.replica_training_ranks[mesh_dp_rank]
+            )
             self.dp_group_ranks = [
                 rollout_layout.replica_training_ranks[replica_rank][mesh_sp_rank]
                 for replica_rank in range(rollout_layout.num_replicas)
@@ -433,7 +482,11 @@ class SpecoWorker(Worker):
         hidden_states: torch.Tensor,
         target_logprobs: Optional[torch.Tensor] = None,
     ):
-        if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
+        if (
+            not self.enable_drafter
+            or not self.in_drafter_train_group
+            or self.trainer is None
+        ):
             return
         if self._drafter_training_mode() == "collect_only":
             self._write_rollout_feature_sample(batch, hidden_states, target_logprobs)
@@ -441,10 +494,16 @@ class SpecoWorker(Worker):
         self.trainer.collect_online_data(batch, hidden_states, target_logprobs)
 
     def _drafter_training_mode(self) -> str:
-        return str(self.config.rollout.drafter.training.get("mode", "online") or "online").strip().lower()
+        return (
+            str(self.config.rollout.drafter.training.get("mode", "online") or "online")
+            .strip()
+            .lower()
+        )
 
     def _get_feature_writer(self) -> Optional[TorchShardFeatureStore]:
-        feature_store_cfg = self.config.rollout.drafter.training.get("feature_store", None)
+        feature_store_cfg = self.config.rollout.drafter.training.get(
+            "feature_store", None
+        )
         if feature_store_cfg is None:
             return None
         path = _config_str(feature_store_cfg.get("path", None))
@@ -453,15 +512,23 @@ class SpecoWorker(Worker):
         if self.feature_writer is not None and self.feature_writer_path == path:
             return self.feature_writer
         model_cfg = self.config.get("model", None)
-        target_model_path = _config_str(model_cfg.get("path", None)) if model_cfg is not None else ""
+        target_model_path = (
+            _config_str(model_cfg.get("path", None)) if model_cfg is not None else ""
+        )
         self.feature_writer = TorchShardFeatureStore(
             path,
-            max_samples_per_shard=int(feature_store_cfg.get("max_samples_per_shard", 1024)),
+            max_samples_per_shard=int(
+                feature_store_cfg.get("max_samples_per_shard", 1024)
+            ),
             strict_schema=bool(feature_store_cfg.get("strict_schema", True)),
             metadata={
-                "algorithm": str(self.config.rollout.drafter.speculative_algorithm).upper(),
+                "algorithm": str(
+                    self.config.rollout.drafter.speculative_algorithm
+                ).upper(),
                 "target_model_path": target_model_path,
-                "drafter_model_path": _config_str(self.config.rollout.drafter.get("model_path", None)),
+                "drafter_model_path": _config_str(
+                    self.config.rollout.drafter.get("model_path", None)
+                ),
                 "source": "rl_collect_only",
             },
             shard_prefix=f"rank{int(self.rank):05d}_pid{int(os.getpid())}",
@@ -469,7 +536,9 @@ class SpecoWorker(Worker):
         self.feature_writer_path = path
         return self.feature_writer
 
-    def _build_rollout_loss_mask(self, batch: dict, input_ids: torch.Tensor) -> torch.Tensor:
+    def _build_rollout_loss_mask(
+        self, batch: dict, input_ids: torch.Tensor
+    ) -> torch.Tensor:
         if torch.is_tensor(batch.get("loss_mask")):
             return batch["loss_mask"].detach().cpu().float().reshape(-1)
         ids = input_ids.detach().cpu().reshape(-1)
@@ -480,10 +549,18 @@ class SpecoWorker(Worker):
             prompt_len = int(prompts.reshape(-1).numel())
             response_ids = responses.detach().cpu().reshape(-1)
             model_cfg = self.config.get("model", None)
-            pad_token_id = int(model_cfg.get("pad_token_id", 0) or 0) if model_cfg is not None else 0
-            max_response = max(0, min(int(response_ids.numel()), int(ids.numel()) - prompt_len))
+            pad_token_id = (
+                int(model_cfg.get("pad_token_id", 0) or 0)
+                if model_cfg is not None
+                else 0
+            )
+            max_response = max(
+                0, min(int(response_ids.numel()), int(ids.numel()) - prompt_len)
+            )
             if max_response > 0:
-                loss_mask[prompt_len : prompt_len + max_response] = (response_ids[:max_response] != pad_token_id).float()
+                loss_mask[prompt_len : prompt_len + max_response] = (
+                    response_ids[:max_response] != pad_token_id
+                ).float()
         else:
             loss_mask[:] = 1.0
         return loss_mask
@@ -504,7 +581,11 @@ class SpecoWorker(Worker):
         full_input_ids = batch["input_ids"].detach().cpu().reshape(-1)
         full_loss_mask = self._build_rollout_loss_mask(batch, full_input_ids)
         hidden_states = hidden_states.detach().cpu()
-        hidden_rows = int(hidden_states.size(1) if hidden_states.dim() == 3 and hidden_states.size(0) == 1 else hidden_states.size(0))
+        hidden_rows = int(
+            hidden_states.size(1)
+            if hidden_states.dim() == 3 and hidden_states.size(0) == 1
+            else hidden_states.size(0)
+        )
         hidden_positions = batch.get("hidden_positions")
         if torch.is_tensor(hidden_positions):
             hidden_positions = hidden_positions.detach().cpu().long().reshape(-1)
@@ -527,11 +608,17 @@ class SpecoWorker(Worker):
             target_position_end=batch.get("target_logprobs_position_end"),
         )
         model_cfg = self.config.get("model", None)
-        target_model_path = _config_str(model_cfg.get("path", None)) if model_cfg is not None else ""
+        target_model_path = (
+            _config_str(model_cfg.get("path", None)) if model_cfg is not None else ""
+        )
         algorithm = str(self.config.rollout.drafter.speculative_algorithm).upper()
         dspark_l1_enabled = (
             algorithm == "DSPARK"
-            and float(self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
+            and float(
+                self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.9)
+                or 0.0
+            )
+            > 0
         )
         default_hidden_layout = (
             "dflash_aux_plus_last"
@@ -544,10 +631,15 @@ class SpecoWorker(Worker):
             "source": batch.get("hidden_target_logprobs_source", "rl_rollout"),
             "global_step": batch.get("global_step", self.last_global_step),
             "target_model_path": target_model_path,
-            "drafter_model_path": _config_str(self.config.rollout.drafter.get("model_path", None)),
-            "hidden_states_layout": batch.get("hidden_states_layout") or default_hidden_layout,
+            "drafter_model_path": _config_str(
+                self.config.rollout.drafter.get("model_path", None)
+            ),
+            "hidden_states_layout": batch.get("hidden_states_layout")
+            or default_hidden_layout,
             "target_layer_ids": batch.get("target_layer_ids"),
-            "use_logits": bool(self.config.rollout.drafter.training.get("use_logits", False)),
+            "use_logits": bool(
+                self.config.rollout.drafter.training.get("use_logits", False)
+            ),
             "sequence_length": int(input_ids.numel()),
             "loss_tokens": int(loss_mask.sum().item()),
             "full_sequence_length": int(full_input_ids.numel()),
@@ -607,12 +699,17 @@ class SpecoWorker(Worker):
             position_end = int(target_position_end)
         except (TypeError, ValueError):
             position_end = position_start + int(target.size(0))
-        position_end = min(max(position_end, position_start), position_start + int(target.size(0)))
+        position_end = min(
+            max(position_end, position_start), position_start + int(target.size(0))
+        )
 
         desired_start = int(feature_start) + 1
         desired_end = desired_start + max(int(train_rows), 0)
         slice_start = min(max(desired_start - position_start, 0), int(target.size(0)))
-        slice_end = min(max(desired_end - position_start, slice_start), int(position_end - position_start))
+        slice_end = min(
+            max(desired_end - position_start, slice_start),
+            int(position_end - position_start),
+        )
         return target[slice_start:slice_end].contiguous()
 
     @staticmethod
@@ -629,7 +726,9 @@ class SpecoWorker(Worker):
         if hidden_positions is not None and int(hidden_positions.numel()) > 0:
             positions = hidden_positions[:hidden_rows].long()
             start = int(positions[0].item())
-            if int(positions.numel()) == hidden_rows and bool(torch.all(positions[1:] == positions[:-1] + 1).item()):
+            if int(positions.numel()) == hidden_rows and bool(
+                torch.all(positions[1:] == positions[:-1] + 1).item()
+            ):
                 end = int(positions[-1].item()) + 1
                 if 0 <= start < end <= input_len:
                     return start, end, positions + 1
@@ -655,13 +754,20 @@ class SpecoWorker(Worker):
         return start, end, position_ids
 
     def _flush_rollout_features_for_step(self) -> None:
-        if self._drafter_training_mode() != "collect_only" or self.feature_writer is None:
+        if (
+            self._drafter_training_mode() != "collect_only"
+            or self.feature_writer is None
+        ):
             return
-        feature_store_cfg = self.config.rollout.drafter.training.get("feature_store", {})
+        feature_store_cfg = self.config.rollout.drafter.training.get(
+            "feature_store", {}
+        )
         flush_interval = int(feature_store_cfg.get("flush_interval_steps", 1))
         self.feature_writer.flush_on_step(self.last_global_step, flush_interval)
 
-    @register(dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH))
+    @register(
+        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
+    )
     def collect_rollout_features(self, samples: list[dict]):
         if not samples:
             return
@@ -705,12 +811,16 @@ class SpecoWorker(Worker):
                     hidden_positions = batch.get("hidden_positions")
                     if torch.is_tensor(hidden_positions):
                         expected_rows = int(hidden_positions.numel())
-                    hidden = _resolve_hidden_state_chunks(hidden_chunks, expected_rows=expected_rows)
+                    hidden = _resolve_hidden_state_chunks(
+                        hidden_chunks, expected_rows=expected_rows
+                    )
                 else:
                     hidden = _resolve_ray_object_ref(sample.get("hidden_states_ref"))
             target_logprobs = sample.get("target_logprobs")
             if target_logprobs is None:
-                target_logprobs = _resolve_ray_object_ref(sample.get("target_logprobs_ref"))
+                target_logprobs = _resolve_ray_object_ref(
+                    sample.get("target_logprobs_ref")
+                )
             if hidden is None:
                 continue
             self._store_rollout_sample(
@@ -722,7 +832,11 @@ class SpecoWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_global_step(self, global_step: int):
-        if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
+        if (
+            not self.enable_drafter
+            or not self.in_drafter_train_group
+            or self.trainer is None
+        ):
             return
         if global_step is None:
             return
@@ -755,18 +869,34 @@ class SpecoWorker(Worker):
         if not self.enable_drafter:
             return {"waited": False, "completed": True, "reason": "disabled"}
         if not self.in_drafter_train_group or self.trainer is None:
-            return {"waited": False, "completed": True, "reason": "not_in_training_group"}
+            return {
+                "waited": False,
+                "completed": True,
+                "reason": "not_in_training_group",
+            }
         result = self.trainer.wait_checkpoint()
         if self.is_drafter_group_leader:
-            logger.debug("[speco checkpoint wait] replica=%s result=%s", self.replica_rank, result)
+            logger.debug(
+                "[speco checkpoint wait] replica=%s result=%s",
+                self.replica_rank,
+                result,
+            )
         return result
 
-    @register(dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_TARGET_SYNC_MESH))
-    def sync_target_lm_head_weight(self, payload: Optional[dict], global_step: Optional[int] = None):
+    @register(
+        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_TARGET_SYNC_MESH)
+    )
+    def sync_target_lm_head_weight(
+        self, payload: Optional[dict], global_step: Optional[int] = None
+    ):
         if not self.enable_drafter:
             return {"accepted": False, "applied": False, "reason": "disabled"}
         if not self.in_drafter_train_group or self.trainer is None:
-            return {"accepted": False, "applied": False, "reason": "not_in_training_group"}
+            return {
+                "accepted": False,
+                "applied": False,
+                "reason": "not_in_training_group",
+            }
         if not payload:
             return {"accepted": False, "applied": False, "reason": "missing_payload"}
 
@@ -792,7 +922,11 @@ class SpecoWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_drafter_target_lm_head_row_indices(self):
-        if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
+        if (
+            not self.enable_drafter
+            or not self.in_drafter_train_group
+            or self.trainer is None
+        ):
             return None
         result = self.trainer.get_target_lm_head_row_indices()
         if result is not None and self.is_drafter_group_leader:
@@ -827,7 +961,9 @@ class SpecoWorker(Worker):
             await self.trainer.release_training_memory_after_activation()
             result["release_elapsed_sec"] = time.time() - release_ts
             result["elapsed_sec"] = time.time() - start_ts
-            result["reason"] = "activated" if result["activated"] else "activation_failed"
+            result["reason"] = (
+                "activated" if result["activated"] else "activation_failed"
+            )
             return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
@@ -889,13 +1025,18 @@ class SpecoWorker(Worker):
                 result.update(self.trainer.get_training_metrics())
                 if result["successful_steps"] > 0:
                     should_prepare_publish = (
-                        self.publish_interval_steps <= 0 or self.last_global_step % self.publish_interval_steps == 0
+                        self.publish_interval_steps <= 0
+                        or self.last_global_step % self.publish_interval_steps == 0
                     )
                     if should_prepare_publish:
                         snapshot_ts = time.time()
-                        cached = self.trainer.prepare_model_state_dict_for_publish(self.last_global_step)
+                        cached = self.trainer.prepare_model_state_dict_for_publish(
+                            self.last_global_step
+                        )
                         result["publish_snapshot_cached"] = int(cached)
-                        result["publish_snapshot_elapsed_sec"] = time.time() - snapshot_ts
+                        result["publish_snapshot_elapsed_sec"] = (
+                            time.time() - snapshot_ts
+                        )
                         if hasattr(self.trainer, "record_training_timing"):
                             self.trainer.record_training_timing(
                                 "timing_s/drafter_publish_snapshot",
@@ -908,7 +1049,9 @@ class SpecoWorker(Worker):
                 result.update(self.trainer.get_training_metrics())
             finally:
                 cleanup_ts = time.time()
-                await self.trainer.cleanup_training(clear_data=result["successful_steps"] > 0)
+                await self.trainer.cleanup_training(
+                    clear_data=result["successful_steps"] > 0
+                )
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
 
             result["trained"] = result["successful_steps"] > 0
@@ -920,15 +1063,24 @@ class SpecoWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def maybe_publish(self):
-        if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
+        if (
+            not self.enable_drafter
+            or not self.in_drafter_train_group
+            or self.trainer is None
+        ):
             return None
         if self.last_global_step is None:
             return None
-        if self.training_interval_steps <= 0 or self.last_global_step % self.training_interval_steps != 0:
+        if (
+            self.training_interval_steps <= 0
+            or self.last_global_step % self.training_interval_steps != 0
+        ):
             return None
         if self.last_trained_step != self.last_global_step:
             return None
-        has_snapshot, weights = self.trainer.pop_model_state_dict_for_publish(self.last_global_step)
+        has_snapshot, weights = self.trainer.pop_model_state_dict_for_publish(
+            self.last_global_step
+        )
         if not has_snapshot:
             logger.debug(
                 "[SpecoWorker replica=%s rank=%s] missing cached publish snapshot at step %s; skip publish.",
