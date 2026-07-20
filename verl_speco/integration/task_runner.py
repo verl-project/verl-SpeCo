@@ -128,6 +128,7 @@ class SpecoTaskRunner(TaskRunner):
             raw_role_worker_cls = _unwrap_ray_remote_actor_class(role_worker_cls)
             if role_worker_cls is worker_cls or raw_role_worker_cls is raw_worker_cls:
                 self.role_worker_mapping[role] = _remotify_like_worker_mapping_value(role_worker_cls, wrapped_cls)
+        logger.warning("SPECO no-drafter vLLM worker import compatibility enabled: %s", wrapped_cls.__name__)
         return _remotify_like_worker_mapping_value(worker_cls, wrapped_cls), ray_worker_group_cls
 
     def add_speco_drafter_worker(self, config):

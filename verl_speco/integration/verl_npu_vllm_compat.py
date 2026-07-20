@@ -45,7 +45,9 @@ def install_verl_npu_vllm_import_compat(
     global _IMPORT_COMPAT_APPLIED
     if _IMPORT_COMPAT_APPLIED or _VERL_NPU_VLLM_PATCH_MODULE in sys.modules:
         return False
-    if not (_module_available("torch_npu") and _module_available("vllm_ascend")):
+    # Match verl's own guard: its failing import path is enabled by torch_npu,
+    # even before vllm_ascend itself has necessarily been imported.
+    if not _module_available("torch_npu"):
         return False
 
     vllm = module_importer("vllm")
@@ -71,24 +73,9 @@ def install_verl_npu_vllm_import_compat(
     return True
 
 
-try:
-    from verl.single_controller.base.decorator import Dispatch, register
-except Exception:  # noqa: BLE001
-    Dispatch = None
-
-    def register(*args, **kwargs):
-        del args, kwargs
-
-        def decorator(func):
-            return func
-
-        return decorator
-
-
 class VerlNPUVLLMImportCompatMixin:
-    """Install the import compatibility before verl loads its vLLM adapter."""
+    """Install import compatibility when WorkerDict constructs the worker."""
 
-    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
-    def init_model(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         install_verl_npu_vllm_import_compat()
-        return super().init_model(*args, **kwargs)
+        super().__init__(*args, **kwargs)

@@ -39,3 +39,18 @@ def test_factory_fused_moe_survives_verl_npu_patch_import(monkeypatch) -> None:
     assert compat.install_verl_npu_vllm_import_compat(module_importer) is True
     assert not hasattr(fused_moe_factory, "weight_loader")
     assert compat._IMPORT_COMPAT_APPLIED is True
+
+
+def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
+    events = []
+    monkeypatch.setattr(compat, "install_verl_npu_vllm_import_compat", lambda: events.append("compat"))
+
+    class BaseWorker:
+        def __init__(self):
+            events.append("base")
+
+    class WrappedWorker(compat.VerlNPUVLLMImportCompatMixin, BaseWorker):
+        pass
+
+    WrappedWorker()
+    assert events == ["compat", "base"]
