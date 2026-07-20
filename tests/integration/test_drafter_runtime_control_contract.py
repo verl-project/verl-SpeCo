@@ -140,11 +140,18 @@ def test_no_drafter_vllm_path_disables_async_scheduling_without_hiding_config() 
     )
 
     with task_runner._prepare_no_drafter_runtime_config(config):
+        from verl_speco.integration.vllm_runtime import SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS
+
         assert config.actor_rollout_ref.rollout.drafter.enable is False
         assert config.actor_rollout_ref.rollout.engine_kwargs.vllm["no-async-scheduling"] is True
+        assert (
+            config.actor_rollout_ref.rollout.engine_kwargs.vllm["worker_extension_cls"]
+            == SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS
+        )
 
     assert "drafter" in config.actor_rollout_ref.rollout
     assert "no-async-scheduling" not in config.actor_rollout_ref.rollout.engine_kwargs.vllm
+    assert "worker_extension_cls" not in config.actor_rollout_ref.rollout.engine_kwargs.vllm
 
 
 def test_no_drafter_run_keeps_speco_entropy_control(monkeypatch) -> None:
@@ -174,13 +181,23 @@ def test_no_drafter_run_keeps_speco_entropy_control(monkeypatch) -> None:
         observed["no_async"] = active_config.actor_rollout_ref.rollout.engine_kwargs.vllm[
             "no-async-scheduling"
         ]
+        observed["worker_extension_cls"] = active_config.actor_rollout_ref.rollout.engine_kwargs.vllm[
+            "worker_extension_cls"
+        ]
         return "ran"
 
     monkeypatch.setattr(task_runner.SpecoTaskRunner, "_run_with_speco_trainer", fake_run_with_speco_trainer)
 
     assert runner.run(config) == "ran"
-    assert observed == {"drafter_present": True, "no_async": True}
+    from verl_speco.integration.vllm_runtime import SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS
+
+    assert observed == {
+        "drafter_present": True,
+        "no_async": True,
+        "worker_extension_cls": SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS,
+    }
     assert "no-async-scheduling" not in config.actor_rollout_ref.rollout.engine_kwargs.vllm
+    assert "worker_extension_cls" not in config.actor_rollout_ref.rollout.engine_kwargs.vllm
 
 
 def test_oldlogprob_non_collect_step_uses_original_compute_path() -> None:

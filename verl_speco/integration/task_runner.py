@@ -60,9 +60,12 @@ def _open_config_mapping(mapping):
 
 @contextmanager
 def _prepare_no_drafter_runtime_config(config):
+    from verl_speco.integration.vllm_runtime import SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS
+
     rollout_config = getattr(getattr(config, "actor_rollout_ref", None), "rollout", None)
     missing = object()
     no_async_scheduling = missing
+    worker_extension_cls = missing
     vllm_engine_kwargs = None
     if rollout_config is not None and rollout_config.get("name") == "vllm":
         with _open_config_mapping(rollout_config):
@@ -78,7 +81,10 @@ def _prepare_no_drafter_runtime_config(config):
                 with _open_config_mapping(vllm_engine_kwargs):
                     no_async_scheduling = vllm_engine_kwargs.get("no-async-scheduling", missing)
                     vllm_engine_kwargs["no-async-scheduling"] = True
-        logger.info("SPECO no-drafter baseline: forcing vLLM async scheduling off")
+                    worker_extension_cls = vllm_engine_kwargs.get("worker_extension_cls", missing)
+                    if worker_extension_cls is missing or worker_extension_cls is None:
+                        vllm_engine_kwargs["worker_extension_cls"] = SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS
+        logger.info("SPECO no-drafter baseline: forcing vLLM async scheduling off with IPC weight-sync compatibility")
     try:
         yield
     finally:
@@ -88,6 +94,10 @@ def _prepare_no_drafter_runtime_config(config):
                     del vllm_engine_kwargs["no-async-scheduling"]
                 else:
                     vllm_engine_kwargs["no-async-scheduling"] = no_async_scheduling
+                if worker_extension_cls is missing:
+                    del vllm_engine_kwargs["worker_extension_cls"]
+                else:
+                    vllm_engine_kwargs["worker_extension_cls"] = worker_extension_cls
 
 
 class SpecoTaskRunner(TaskRunner):

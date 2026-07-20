@@ -21,6 +21,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 SPECO_DRAFTER_CONFIG_ENV = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
 SPECO_VLLM_DRAFT_UPDATE_USE_SHM_ENV = "VERL_SPECO_VLLM_DRAFT_UPDATE_USE_SHM"
+SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS = (
+    "verl_speco.integration.vllm_runtime.SpecoVLLMWeightSyncCompatExtension"
+)
 SPECO_VLLM_WORKER_EXTENSION_CLS = "verl_speco.integration.vllm_runtime.SpecoVLLMColocateWorkerExtension"
 SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_ENV = "VERL_SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_SECONDS"
 SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
@@ -1694,6 +1697,20 @@ try:
     from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension as _VLLMWorkerExtensionBase
 except Exception:  # noqa: BLE001
     _VLLMWorkerExtensionBase = object
+
+
+class SpecoVLLMWeightSyncCompatExtension(_VLLMWorkerExtensionBase):
+    """Install the serialized NPU IPC-handle compatibility before target weight sync."""
+
+    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+        patched = patch_verl_bucketed_weight_transfer_rebuild_ipc()
+        if patched and int(getattr(self, "local_rank", 0) or 0) == 0:
+            logger.warning("[speco vllm weight sync] installed IPC rebuild compatibility")
+        return super().update_weights_from_ipc(
+            peft_config=peft_config,
+            base_sync_done=base_sync_done,
+            use_shm=use_shm,
+        )
 
 
 class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):

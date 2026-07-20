@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import types
+from inspect import getsource
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,8 +10,10 @@ import pytest
 
 from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
+    SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS,
     SPECO_VLLM_WORKER_EXTENSION_CLS,
     SpecoVLLMColocateWorkerExtension,
+    SpecoVLLMWeightSyncCompatExtension,
     _describe_vllm_draft_logits,
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
@@ -71,6 +74,14 @@ def test_vllm_worker_extension_constructs_without_wake_up_fallback() -> None:
     extension = SpecoVLLMColocateWorkerExtension()
 
     assert isinstance(extension, SpecoVLLMColocateWorkerExtension)
+
+
+def test_vllm_weight_sync_extension_has_stable_runtime_path() -> None:
+    assert SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS.endswith(".SpecoVLLMWeightSyncCompatExtension")
+    source = getsource(SpecoVLLMWeightSyncCompatExtension.update_weights_from_ipc)
+    assert source.index("patch_verl_bucketed_weight_transfer_rebuild_ipc()") < source.index(
+        "super().update_weights_from_ipc("
+    )
 
 
 def test_vllm_draft_logits_diagnostic_handles_missing_and_non_tensor_values() -> None:
