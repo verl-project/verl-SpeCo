@@ -22,8 +22,9 @@ class DraftFeatureDataLoader:
     """Small iterable loader over a DraftFeatureStore.
 
     The first implementation deliberately keeps sharding simple:
-    ``rank_keys = keys[rank::world_size]``. That matches the design doc's P2
-    phase-1 recommendation and works for torchrun DP/FSDP ranks.
+    ``rank_keys = keys[rank::world_size]``. Distributed ranks are truncated to
+    the same sample count so every rank executes the same number of FSDP
+    collectives when the store size is not divisible by ``world_size``.
     """
 
     def __init__(self, store: DraftFeatureStore, config: DraftFeatureDataLoaderConfig):
@@ -49,7 +50,11 @@ class DraftFeatureDataLoader:
             )
             if not keys:
                 return
-            rank_keys = keys[int(self.config.rank) :: int(self.config.world_size)]
+            rank = int(self.config.rank)
+            world_size = int(self.config.world_size)
+            rank_keys = keys[rank::world_size]
+            if world_size > 1:
+                rank_keys = rank_keys[: len(keys) // world_size]
             batch: list[DraftFeatureSample] = []
             for key in rank_keys:
                 batch.append(self.store.read(key))

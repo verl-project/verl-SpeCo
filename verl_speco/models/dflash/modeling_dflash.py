@@ -113,6 +113,7 @@ class DFlashAttention(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        dense_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
@@ -146,6 +147,8 @@ class DFlashAttention(nn.Module):
         k = (k * cos_k) + (rotate_half(k) * sin_k)
 
         if block_mask is not None:
+            if dense_attention_mask is not None:
+                raise ValueError("DFlash attention received both block_mask and dense_attention_mask")
             attn_output = compile_friendly_flex_attention(
                 q,
                 k.contiguous(),
@@ -156,7 +159,14 @@ class DFlashAttention(nn.Module):
         else:
             k = repeat_kv(k, self.num_kv_groups)
             v = repeat_kv(v, self.num_kv_groups)
-            attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=False, dropout_p=0.0)
+            attn_output = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=dense_attention_mask,
+                is_causal=False,
+                dropout_p=0.0,
+            )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, draft_len, self.num_heads * self.head_dim)
@@ -189,6 +199,7 @@ class DFlashDecoderLayer(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        dense_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         residual = draft_hidden
         draft_hidden = self.input_layernorm(draft_hidden)
@@ -198,6 +209,7 @@ class DFlashDecoderLayer(nn.Module):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             block_mask=block_mask,
+            dense_attention_mask=dense_attention_mask,
         )
         draft_hidden = residual + draft_hidden
 
@@ -239,17 +251,17 @@ class DFlashDraftModel(PreTrainedModel):
             raise ValueError(
                 f"DFlash expected {self.num_context_layers} target layer ids, got {len(self.target_layer_ids)}"
             )
-        self.context_proj = nn.Linear(self.num_context_layers * self.target_hidden_size, self.hidden_size, bias=False)
-        self.context_norm = DFlashRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.fc = nn.Linear(self.num_context_layers * self.target_hidden_size, self.hidden_size, bias=False)
+        self.hidden_norm = DFlashRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([DFlashDecoderLayer(config) for _ in range(self.num_layers)])
-        self.final_norm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def extract_context_feature(self, all_hidden_states: list[torch.Tensor]) -> torch.Tensor:
         if len(all_hidden_states) != self.num_context_layers:
             raise ValueError(f"DFlash expected {self.num_context_layers} hidden-state tensors, got {len(all_hidden_states)}")
-        concatenated = torch.cat(all_hidden_states, dim=-1).to(self.context_proj.weight.dtype)
-        return self.context_norm(self.context_proj(concatenated))
+        concatenated = torch.cat(all_hidden_states, dim=-1).to(self.fc.weight.dtype)
+        return self.hidden_norm(self.fc(concatenated))
 
     def forward(
         self,
@@ -258,6 +270,7 @@ class DFlashDraftModel(PreTrainedModel):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        dense_attention_mask: Optional[torch.Tensor] = None,
         noise_embedding: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if noise_embedding is not None:
@@ -272,8 +285,9 @@ class DFlashDraftModel(PreTrainedModel):
                 draft_position_ids=draft_position_ids,
                 context_position_ids=context_position_ids,
                 block_mask=block_mask,
+                dense_attention_mask=dense_attention_mask,
             )
-        return self.final_norm(draft_hidden)
+        return self.norm(draft_hidden)
 
     def freeze_embedding(self) -> None:
         self.embed_tokens.weight.requires_grad = False

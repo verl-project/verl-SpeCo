@@ -121,6 +121,22 @@ def test_draft_feature_dataloader_slices_keys_by_rank(tmp_path):
     assert rank1_ids == [2, 4]
 
 
+def test_draft_feature_dataloader_balances_uneven_distributed_shards(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=5)
+    store.write_many([_sample(i) for i in range(5)])
+    store.close()
+
+    rank_batches = []
+    for rank in range(2):
+        loader = DraftFeatureDataLoader(
+            TorchShardFeatureStore(tmp_path, read_only=True),
+            DraftFeatureDataLoaderConfig(batch_size=1, rank=rank, world_size=2, shuffle=False, repeat=False),
+        )
+        rank_batches.append(list(loader))
+
+    assert [len(batches) for batches in rank_batches] == [2, 2]
+
+
 def test_draft_feature_dataloader_rejects_rank_out_of_range(tmp_path):
     store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=4)
 

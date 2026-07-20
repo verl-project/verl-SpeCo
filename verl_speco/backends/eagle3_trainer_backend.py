@@ -7,16 +7,13 @@ from torch.nn import SmoothL1Loss
 from torch.nn import functional as F
 from transformers import AutoConfig
 
+from verl.utils.device import get_device_name
+from verl.utils.fsdp_utils import get_device_id
+from verl_speco.backends.lr_scheduler import build_drafter_lr_scheduler
 from verl_speco.models.auto import AutoDraftModelConfig, AutoEagle3DraftModel
 from verl_speco.models.eagle.llama_eagle import resolve_eagle3_num_aux_hidden_states
-from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 from verl_speco.models.target.target_head import TargetHead
-from verl.utils.fsdp_utils import get_device_id
-from verl.utils.device import get_device_name
-from verl.utils.torch_functional import (
-    get_constant_schedule_with_warmup,
-    get_cosine_schedule_with_warmup,
-)
+from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 
 
 logger = logging.getLogger(__name__)
@@ -573,24 +570,7 @@ class Eagle3TrainerBackend:
         )
 
     def setup_scheduler(self, optimizer, train_cfg):
-        total_steps = train_cfg.get("step", 0)
-        num_warmup_steps = int(train_cfg.get("lr_warmup_steps", 1000))
-        warmup_style = train_cfg.get("warmup_style", "constant")
-
-        if warmup_style == "constant":
-            return get_constant_schedule_with_warmup(
-                optimizer=optimizer,
-                num_warmup_steps=num_warmup_steps,
-            )
-        if warmup_style == "cosine":
-            return get_cosine_schedule_with_warmup(
-                optimizer=optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=total_steps,
-                min_lr_ratio=train_cfg.get("min_lr_ratio", 0.0),
-                num_cycles=train_cfg.get("num_cycles", 0.5),
-            )
-        raise NotImplementedError(f"Warmup style {warmup_style} is not supported")
+        return build_drafter_lr_scheduler(optimizer, train_cfg)
 
     def _get_target_hf_config(self):
         target_hf_config = getattr(self.target_model_config, "hf_config", None)

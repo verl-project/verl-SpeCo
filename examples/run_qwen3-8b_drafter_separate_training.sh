@@ -9,9 +9,9 @@ set -x
 # starts torch.distributed.run.
 #
 # Usage:
-#   bash examples/run_qwen3-8b_drafter_eagle3_vllm_separate_multigpu.sh
-#   RUN_STAGE=collect bash examples/run_qwen3-8b_drafter_eagle3_vllm_separate_multigpu.sh
-#   RUN_STAGE=train bash examples/run_qwen3-8b_drafter_eagle3_vllm_separate_multigpu.sh
+#   bash examples/run_qwen3-8b_drafter_separate_training.sh
+#   RUN_STAGE=collect bash examples/run_qwen3-8b_drafter_separate_training.sh
+#   RUN_STAGE=train bash examples/run_qwen3-8b_drafter_separate_training.sh
 
 project_name='verl_grpo_example_eagle3_drafter'
 exp_name='qwen3_8b_eagle3_separate_drafter_vllm_gpu'

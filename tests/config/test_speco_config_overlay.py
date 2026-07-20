@@ -18,6 +18,17 @@ ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = ROOT / "verl_speco" / "config"
 
 
+def _copy_overlay_configs(upstream_config: Path, composed_config_dir: Path, names: tuple[str, ...]) -> None:
+    shutil.copytree(upstream_config, composed_config_dir)
+    for config_name in names:
+        config_source = (CONFIG_DIR / config_name).read_text(encoding="utf-8")
+        config_source = config_source.replace(
+            "pkg://verl.trainer.config",
+            composed_config_dir.resolve().as_uri(),
+        )
+        (composed_config_dir / config_name).write_text(config_source, encoding="utf-8")
+
+
 def test_overlay_has_expected_default_drafter_shape() -> None:
     raw = OmegaConf.load(CONFIG_DIR / "speco_base.yaml")
     drafter = raw.actor_rollout_ref.rollout.drafter
@@ -28,6 +39,15 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.enable_drafter_training is False
     assert drafter.training.collect_hidden_states_from_sgl is False
     assert drafter.training.collect_hidden_states_from_old_logprob is False
+    assert drafter.vllm.allow_lossy_speculative_sampling is False
+    assert drafter.training.allow_sglang_prenorm_last_layer is False
+    assert drafter.training.lr == pytest.approx(1e-5)
+    assert drafter.training.lr_scheduler_type == "global_cosine"
+    assert drafter.training.lr_decay_steps == 100
+    assert drafter.training.min_lr_ratio == pytest.approx(0.1)
+    assert drafter.training.warmup_style is None
+    assert drafter.training.resume_trainer_state_from_checkpoint is True
+    assert drafter.training.eagle1_num_hidden_layers == 1
 
 
 def test_overlay_composes_with_pinned_upstream_verl(tmp_path: Path) -> None:
@@ -37,18 +57,8 @@ def test_overlay_composes_with_pinned_upstream_verl(tmp_path: Path) -> None:
     upstream_config = Path(upstream_root) / "verl" / "trainer" / "config"
     assert upstream_config.is_dir()
 
-    # Hydra's pkg:// provider imports verl.__init__, which pulls the full
-    # training dependency stack. Point the unchanged overlay at the exact
-    # checked-out config directory so this contract remains CPU-light.
     composed_config_dir = tmp_path / "config"
-    shutil.copytree(upstream_config, composed_config_dir)
-    for config_name in ("speco_base.yaml", "speco_trainer.yaml"):
-        config_source = (CONFIG_DIR / config_name).read_text(encoding="utf-8")
-        config_source = config_source.replace(
-            "pkg://verl.trainer.config",
-            composed_config_dir.resolve().as_uri(),
-        )
-        (composed_config_dir / config_name).write_text(config_source, encoding="utf-8")
+    _copy_overlay_configs(upstream_config, composed_config_dir, ("speco_base.yaml", "speco_trainer.yaml"))
 
     with initialize_config_dir(config_dir=str(composed_config_dir), version_base=None):
         config = compose(config_name="speco_trainer")
@@ -67,14 +77,7 @@ def test_draft_trainer_composes_as_primary_config(tmp_path: Path) -> None:
     assert upstream_config.is_dir()
 
     composed_config_dir = tmp_path / "config"
-    shutil.copytree(upstream_config, composed_config_dir)
-    for config_name in ("speco_base.yaml", "draft_trainer.yaml"):
-        config_source = (CONFIG_DIR / config_name).read_text(encoding="utf-8")
-        config_source = config_source.replace(
-            "pkg://verl.trainer.config",
-            composed_config_dir.resolve().as_uri(),
-        )
-        (composed_config_dir / config_name).write_text(config_source, encoding="utf-8")
+    _copy_overlay_configs(upstream_config, composed_config_dir, ("speco_base.yaml", "draft_trainer.yaml"))
 
     with initialize_config_dir(config_dir=str(composed_config_dir), version_base=None):
         config = compose(config_name="draft_trainer")

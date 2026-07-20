@@ -363,6 +363,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def init_workers(self):
         drafter_rollout_enabled = self.is_drafter_rollout_enabled(self.config)
         online_drafter_enabled = self.is_drafter_training_enabled(self.config)
+        if online_drafter_enabled:
+            self._speco_prepare_drafter_checkpoint_for_worker_init()
         if drafter_rollout_enabled:
             configure_sglang_runtime_from_config(self.config)
             configure_vllm_runtime_from_config(self.config)
@@ -378,7 +380,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             with self._use_speco_agent_loop_manager(online_drafter_enabled):
                 super().init_workers()
         if online_drafter_enabled:
-            self._speco_prepare_drafter_checkpoint_for_worker_init()
             self._init_speco_drafter_workers()
             # Fail closed on the divergent SGLang last-layer-norm combination at
             # init, before any (expensive) rollout generation runs.
@@ -528,9 +529,82 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return bool(training_cfg.get("save_full_drafter_checkpoint", True))
         return True
 
+    def _speco_resume_global_step_hint(self) -> int | None:
+        trainer_cfg = _get_nested(self.config, ("trainer",), None)
+        resume_mode = str(_get_nested(trainer_cfg, ("resume_mode",), "disable") or "disable")
+        if resume_mode == "disable":
+            return None
+
+        global_step_folder = None
+        if resume_mode == "resume_path":
+            global_step_folder = _get_nested(trainer_cfg, ("resume_from_path",), None)
+        elif resume_mode == "auto":
+            checkpoint_folder = _get_nested(trainer_cfg, ("default_local_dir",), None)
+            if checkpoint_folder:
+                checkpoint_folder = os.path.abspath(os.fspath(checkpoint_folder))
+                try:
+                    from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+
+                    global_step_folder = find_latest_ckpt_path(checkpoint_folder)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Unable to resolve latest actor checkpoint for drafter resume: %s", exc)
+
+        if not global_step_folder:
+            return None
+        folder_name = os.path.basename(os.path.normpath(os.fspath(global_step_folder)))
+        if not folder_name.startswith("global_step_"):
+            return None
+        try:
+            return int(folder_name.removeprefix("global_step_"))
+        except ValueError:
+            return None
+
     def _speco_prepare_drafter_checkpoint_for_worker_init(self):
-        if self._speco_drafter_checkpoint_save_config_enabled():
+        drafter_cfg = self._speco_drafter_config()
+        if drafter_cfg is None:
+            return
+
+        checkpoint_save_enabled = self._speco_drafter_checkpoint_save_config_enabled()
+        if checkpoint_save_enabled:
             self._speco_ensure_drafter_checkpoint_path()
+
+        training_cfg = self._speco_drafter_training_config()
+        resume_setting = training_cfg.get("resume_trainer_state_from_checkpoint", None)
+        if resume_setting is None:
+            resume_setting = training_cfg.get("resume_lr_scheduler_from_checkpoint", True)
+        if not bool(resume_setting):
+            return
+
+        resume_step = self._speco_resume_global_step_hint()
+        if resume_step is None:
+            return
+
+        from verl_speco.trainer.checkpoint import (
+            get_drafter_checkpoint_step,
+            resolve_drafter_checkpoint_path,
+        )
+
+        model_path = _get_nested(drafter_cfg, ("model_path",), None)
+        checkpoint_path = _get_nested(drafter_cfg, ("checkpoint_path",), None)
+        resolved_path = resolve_drafter_checkpoint_path(model_path, checkpoint_path, resume_step)
+        if resolved_path is None:
+            return
+        if os.path.normpath(resolved_path) == os.path.normpath(os.fspath(model_path or "")):
+            if get_drafter_checkpoint_step(resolved_path) != resume_step:
+                message = (
+                    f"[drafter resume] no complete draft_step_{resume_step} checkpoint under "
+                    f"{checkpoint_path}; model_path={model_path}"
+                )
+                if checkpoint_save_enabled:
+                    raise RuntimeError(message)
+                logger.warning("%s; starting drafter state from model_path", message)
+            return
+        self._speco_set_config_value(drafter_cfg, "model_path", resolved_path)
+        logger.info(
+            "[drafter resume] resolved global_step=%s checkpoint=%s",
+            resume_step,
+            resolved_path,
+        )
 
     def _speco_should_save_drafter_checkpoint(self) -> bool:
         if not self.is_drafter_training_enabled(self.config):
@@ -543,12 +617,41 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return False
         return True
 
-    def _speco_save_drafter_checkpoint(self):
+    @staticmethod
+    def _speco_flatten_checkpoint_results(value: Any) -> list[dict[str, Any]]:
+        if isinstance(value, dict):
+            return [value]
+        if isinstance(value, (list, tuple)):
+            flattened = []
+            for item in value:
+                flattened.extend(SpecoRayPPOTrainer._speco_flatten_checkpoint_results(item))
+            return flattened
+        return []
+
+    @classmethod
+    def _speco_validate_drafter_checkpoint_results(cls, value: Any, *, require_saved: bool) -> None:
+        results = cls._speco_flatten_checkpoint_results(value)
+        allowed_skips = {"not_checkpoint_replica", "not_in_training_group"}
+        failures = [
+            result
+            for result in results
+            if not bool(result.get("saved", False)) and result.get("reason") not in allowed_skips
+        ]
+        if failures:
+            raise RuntimeError(f"Drafter checkpoint failed: {failures}")
+        if require_saved and not any(bool(result.get("saved", False)) for result in results):
+            raise RuntimeError(f"Drafter checkpoint produced no saved state: {results}")
+
+    def _speco_save_drafter_checkpoint(self, *, wait: bool = True):
         if not self._speco_should_save_drafter_checkpoint():
             return None
         if self._speco_ensure_drafter_checkpoint_path() is None:
             return None
-        checkpoint_refs = self.speco_save_checkpoint(self.global_steps, wait=False)
+        checkpoint_refs = self.speco_save_checkpoint(self.global_steps, wait=wait)
+        if wait:
+            results = self._ray_get_if_needed(checkpoint_refs)
+            self._speco_validate_drafter_checkpoint_results(results, require_saved=True)
+            return results
         if not hasattr(self, "_pending_drafter_checkpoint_refs"):
             self._pending_drafter_checkpoint_refs = []
         self._pending_drafter_checkpoint_refs.append(checkpoint_refs)
@@ -560,8 +663,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return 0
         self._pending_drafter_checkpoint_refs = []
         for refs in pending_refs:
-            self._ray_get_if_needed(refs)
-        self._ray_get_if_needed(self.speco_wait_checkpoint())
+            results = self._ray_get_if_needed(refs)
+            self._speco_validate_drafter_checkpoint_results(results, require_saved=True)
+        wait_results = self._ray_get_if_needed(self.speco_wait_checkpoint())
+        incomplete = [
+            result
+            for result in self._speco_flatten_checkpoint_results(wait_results)
+            if result.get("completed") is False
+        ]
+        if incomplete:
+            raise RuntimeError(f"Drafter checkpoint wait failed: {incomplete}")
         return len(pending_refs)
 
     def _speco_should_collect_drafter_this_step(self) -> bool:
@@ -661,6 +772,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_oldlogprob_hidden_layout(self) -> str:
         drafter_cfg = self._speco_drafter_config()
         algorithm = str(_get_nested(drafter_cfg, ("speculative_algorithm",), "") or "").upper()
+        training_cfg = self._speco_drafter_training_config()
+        if algorithm == "DSPARK" and float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0:
+            return "dflash_aux_plus_last"
         return "dflash_aux" if algorithm in {"DFLASH", "DSPARK"} else "eagle3_aux_plus_last"
 
     @staticmethod
@@ -1218,6 +1332,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         training_cfg = self._speco_drafter_training_config()
         if bool(training_cfg.get("use_logits", False)):
             return None
+        drafter_cfg = self._speco_drafter_config()
+        algorithm = str(_get_nested(drafter_cfg, ("speculative_algorithm",), "") or "").upper()
+        if algorithm == "DSPARK" and float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0:
+            return None
         if not bool(training_cfg.get("target_lm_head_row_restricted_sync", True)):
             return None
 
@@ -1678,35 +1796,56 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_last_oldlogprob_collect_elapsed_sec = 0.0
             self._speco_last_oldlogprob_collect_rpc_elapsed_sec = 0.0
             self._speco_last_oldlogprob_total_elapsed_sec = 0.0
-            self._speco_last_collect_interval_matched = int(self._speco_should_collect_drafter_this_step())
+            collect_interval_matched = self._speco_should_collect_drafter_this_step()
+            train_interval_matched = self._speco_should_train_drafter_this_step()
+            self._speco_last_collect_interval_matched = int(collect_interval_matched)
             prepare_started = time.perf_counter()
+            original_batch = batch
+
+            def compute_old_log_prob_without_collection():
+                self._speco_last_oldlogprob_prepare_elapsed_sec = time.perf_counter() - prepare_started
+                compute_started = time.perf_counter()
+                if self._speco_oldlogprob_entropy_hook_enabled():
+                    old_log_prob, old_log_prob_mfu = self._speco_compute_old_log_prob_without_forced_entropy(
+                        original_batch
+                    )
+                else:
+                    old_log_prob, old_log_prob_mfu = original_compute_old_log_prob(original_batch)
+                self._speco_last_oldlogprob_compute_elapsed_sec = time.perf_counter() - compute_started
+                self._speco_last_oldlogprob_total_elapsed_sec = time.perf_counter() - oldlogprob_started
+                return old_log_prob, old_log_prob_mfu
+
+            if not collect_interval_matched or not train_interval_matched:
+                return compute_old_log_prob_without_collection()
+
             batch = _select_policy_model_batch(batch)
             collect_plan = self._speco_build_oldlogprob_collect_plan(batch)
+            if collect_plan is None:
+                return compute_old_log_prob_without_collection()
             batch_td = batch.to_tensordict()
             batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self._speco_oldlogprob_calculate_entropy()
             tu.assign_non_tensor(batch_td, calculate_entropy=calculate_entropy, compute_loss=False)
-            if collect_plan is not None:
-                batch_td[OLD_LOGPROB_COLLECT_MASK_KEY] = collect_plan["collect_mask"]
-                batch_td[OLD_LOGPROB_HIDDEN_POSITIONS_KEY] = collect_plan["hidden_positions"]
-                batch_td[OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY] = collect_plan["hidden_position_mask"]
-                batch_td[OLD_LOGPROB_OWNER_RANK_KEY] = collect_plan["owner_rank"]
-                tu.assign_non_tensor_data(
-                    batch_td,
-                    OLD_LOGPROB_AUX_LAYER_IDS_KEY,
-                    self._speco_oldlogprob_aux_layer_ids(),
-                )
-                tu.assign_non_tensor_data(
-                    batch_td,
-                    OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
-                    self._speco_oldlogprob_hidden_capture_impl(),
-                )
-                tu.assign_non_tensor_data(
-                    batch_td,
-                    OLD_LOGPROB_HIDDEN_LAYOUT_KEY,
-                    self._speco_oldlogprob_hidden_layout(),
-                )
-                tu.assign_non_tensor_data(batch_td, OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY, True)
+            batch_td[OLD_LOGPROB_COLLECT_MASK_KEY] = collect_plan["collect_mask"]
+            batch_td[OLD_LOGPROB_HIDDEN_POSITIONS_KEY] = collect_plan["hidden_positions"]
+            batch_td[OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY] = collect_plan["hidden_position_mask"]
+            batch_td[OLD_LOGPROB_OWNER_RANK_KEY] = collect_plan["owner_rank"]
+            tu.assign_non_tensor_data(
+                batch_td,
+                OLD_LOGPROB_AUX_LAYER_IDS_KEY,
+                self._speco_oldlogprob_aux_layer_ids(),
+            )
+            tu.assign_non_tensor_data(
+                batch_td,
+                OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
+                self._speco_oldlogprob_hidden_capture_impl(),
+            )
+            tu.assign_non_tensor_data(
+                batch_td,
+                OLD_LOGPROB_HIDDEN_LAYOUT_KEY,
+                self._speco_oldlogprob_hidden_layout(),
+            )
+            tu.assign_non_tensor_data(batch_td, OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY, True)
 
             self._speco_last_oldlogprob_prepare_elapsed_sec = time.perf_counter() - prepare_started
             compute_started = time.perf_counter()
@@ -1859,5 +1998,5 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_wait_pending_drafter_checkpoint()
 
     def _save_checkpoint(self):
-        self._speco_save_drafter_checkpoint()
+        self._speco_save_drafter_checkpoint(wait=True)
         return super()._save_checkpoint()
