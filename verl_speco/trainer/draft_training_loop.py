@@ -211,12 +211,19 @@ def _ensure_dict_child(config: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
-def _load_source_drafter_config(trainer: DrafterBaseTrainer) -> dict[str, Any] | None:
+def _source_drafter_model_path(trainer: DrafterBaseTrainer) -> str | None:
     model_path = getattr(getattr(getattr(trainer, "config", None), "rollout", None), "drafter", None)
     model_path = getattr(model_path, "model_path", None)
     if not model_path:
         return None
-    config_path = os.path.join(os.fspath(model_path), "config.json")
+    return os.fspath(model_path)
+
+
+def _load_source_drafter_config(trainer: DrafterBaseTrainer) -> dict[str, Any] | None:
+    model_path = _source_drafter_model_path(trainer)
+    if not model_path:
+        return None
+    config_path = os.path.join(model_path, "config.json")
     if not os.path.exists(config_path):
         return None
     try:
@@ -226,6 +233,105 @@ def _load_source_drafter_config(trainer: DrafterBaseTrainer) -> dict[str, Any] |
         logger.warning("Failed to load source drafter config %s: %s", config_path, exc)
         return None
     return loaded if isinstance(loaded, dict) else None
+
+
+def _load_tensor_from_safetensors(path: str, key: str) -> torch.Tensor | None:
+    try:
+        from safetensors import safe_open
+
+        with safe_open(path, framework="pt", device="cpu") as f:
+            if key in f.keys():
+                return f.get_tensor(key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to load %s from %s: %s", key, path, exc)
+    return None
+
+
+def _load_tensor_from_torch(path: str, key: str) -> torch.Tensor | None:
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to load %s from %s: %s", key, path, exc)
+        return None
+    if isinstance(state, dict):
+        value = state.get(key)
+        if isinstance(value, torch.Tensor):
+            return value
+    return None
+
+
+def _load_source_lm_head_weight(model_path: str | None) -> torch.Tensor | None:
+    if not model_path:
+        return None
+
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index_path = os.path.join(model_path, index_name)
+        if not os.path.exists(index_path):
+            continue
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                weight_map = json.load(f).get("weight_map", {})
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to read source weight index %s: %s", index_path, exc)
+            continue
+        shard_name = weight_map.get("lm_head.weight") if isinstance(weight_map, dict) else None
+        if not shard_name:
+            continue
+        shard_path = os.path.join(model_path, os.fspath(shard_name))
+        if index_name.endswith(".safetensors.index.json"):
+            return _load_tensor_from_safetensors(shard_path, "lm_head.weight")
+        return _load_tensor_from_torch(shard_path, "lm_head.weight")
+
+    safetensors_path = os.path.join(model_path, "model.safetensors")
+    if os.path.exists(safetensors_path):
+        return _load_tensor_from_safetensors(safetensors_path, "lm_head.weight")
+
+    torch_path = os.path.join(model_path, "pytorch_model.bin")
+    if os.path.exists(torch_path):
+        return _load_tensor_from_torch(torch_path, "lm_head.weight")
+
+    return None
+
+
+def _append_lm_head_weight_if_missing(checkpoint_path: str, source_model_path: str | None) -> None:
+    lm_head_weight = _load_source_lm_head_weight(source_model_path)
+    if lm_head_weight is None:
+        logger.warning("Standalone checkpoint export could not find source lm_head.weight in %s", source_model_path)
+        return
+    lm_head_weight = lm_head_weight.detach().cpu()
+
+    safetensors_path = os.path.join(checkpoint_path, "model.safetensors")
+    if os.path.exists(safetensors_path):
+        try:
+            from safetensors.torch import load_file, save_file
+
+            state = load_file(safetensors_path, device="cpu")
+            if "lm_head.weight" in state:
+                return
+            state["lm_head.weight"] = lm_head_weight
+            save_file(state, safetensors_path)
+            logger.info("Added lm_head.weight to standalone checkpoint %s", safetensors_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to append lm_head.weight to %s: %s", safetensors_path, exc)
+        return
+
+    torch_path = os.path.join(checkpoint_path, "pytorch_model.bin")
+    if os.path.exists(torch_path):
+        try:
+            state = torch.load(torch_path, map_location="cpu", weights_only=True)
+            if not isinstance(state, dict):
+                logger.warning("Cannot append lm_head.weight to %s: expected dict state", torch_path)
+                return
+            if "lm_head.weight" in state:
+                return
+            state["lm_head.weight"] = lm_head_weight
+            torch.save(state, torch_path)
+            logger.info("Added lm_head.weight to standalone checkpoint %s", torch_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to append lm_head.weight to %s: %s", torch_path, exc)
+        return
+
+    logger.warning("Standalone checkpoint export found no model.safetensors or pytorch_model.bin under %s", checkpoint_path)
 
 
 def _fill_if_missing(dst: dict[str, Any], src: dict[str, Any], keys: tuple[str, ...]) -> None:
@@ -278,6 +384,7 @@ def _rewrite_standalone_block_runtime_config(
     except OSError as exc:
         logger.warning("Failed to write standalone training config copy %s: %s", training_config_path, exc)
 
+    source_model_path = _source_drafter_model_path(trainer)
     runtime_config = _load_source_drafter_config(trainer)
     if runtime_config is None:
         runtime_config = deepcopy(training_config)
@@ -334,6 +441,8 @@ def _rewrite_standalone_block_runtime_config(
             f.write("\n")
     except OSError as exc:
         logger.warning("Failed to write standalone runtime config %s: %s", config_path, exc)
+
+    _append_lm_head_weight_if_missing(checkpoint_path, source_model_path)
 
 
 def _disable_standalone_sequence_parallel(draft_config) -> None:

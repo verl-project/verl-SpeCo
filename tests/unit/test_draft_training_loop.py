@@ -6,9 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
-from verl_speco.trainer.draft_training_loop import _rewrite_standalone_block_runtime_config, _save_standalone_checkpoint
+from verl_speco.trainer.draft_training_loop import (  # noqa: E402
+    _rewrite_standalone_block_runtime_config,
+    _save_standalone_checkpoint,
+)
 
 
 class _FakeTrainer:
@@ -176,3 +179,32 @@ def test_standalone_dflash_checkpoint_preserves_source_runtime_config(tmp_path):
     assert runtime_config["dflash_config"]["target_layer_ids"] == [2, 10, 18]
     assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [3, 11, 19]
     assert saved_training_config == training_config
+
+
+def test_standalone_block_checkpoint_appends_source_lm_head_weight(tmp_path):
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    source_dir = tmp_path / "source_dspark"
+    source_dir.mkdir()
+    (source_dir / "config.json").write_text(
+        json.dumps({"model_type": "qwen3", "architectures": ["DSparkForCausalLM"]}),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps({"model_type": "dspark", "architectures": ["DSparkDraftModel"]}),
+        encoding="utf-8",
+    )
+    lm_head = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    safetensors_torch.save_file({"lm_head.weight": lm_head}, str(source_dir / "model.safetensors"))
+    safetensors_torch.save_file({"fc.weight": torch.ones(2, 2)}, str(checkpoint_dir / "model.safetensors"))
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="dspark"),
+        config=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))),
+    )
+
+    _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    exported_state = safetensors_torch.load_file(str(checkpoint_dir / "model.safetensors"), device="cpu")
+    assert torch.equal(exported_state["lm_head.weight"], lm_head)
+    assert torch.equal(exported_state["fc.weight"], torch.ones(2, 2))
