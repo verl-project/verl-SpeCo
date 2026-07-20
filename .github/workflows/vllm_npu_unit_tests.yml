@@ -1,14 +1,14 @@
-name: npu_unit_tests
+name: vllm_npu_unit_tests
 
-run-name: NPU example tests (${{ github.ref_name }})
+run-name: NPU vllm example tests (${{ github.ref_name }})
 
 on:
-  pull_request:
-    branches:
-      - main
-  push:
-    branches:
-      - main
+  # pull_request:
+  #   branches:
+  #     - main
+  # push:
+  #   branches:
+  #     - main
   workflow_dispatch:
     inputs:
       run_training:
@@ -66,7 +66,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: npu-example-tests-${{ github.ref }}
+  group: npu-vllm-example-tests-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -88,10 +88,14 @@ jobs:
     # if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: [linux-aarch64-a2-8]
     timeout-minutes: 180
+    # container:
+    #   image: quay.io/ascend/verl:verl-sglang-8.5.0-910b-ubuntu22.04-py3.11-latest
+    #   options: >-
+    #     --shm-size 16g
     environment: speco-npu-ci
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(github.event_name == 'pull_request' && '{"include":[{"backend":"vllm","drafter":"dspark"},{"backend":"sglang","drafter":"eagle3"},{"backend":"sglang","drafter":"dflash"}]}' || '{"include":[{"backend":"vllm","drafter":"eagle3"},{"backend":"vllm","drafter":"dflash"},{"backend":"vllm","drafter":"dspark"},{"backend":"sglang","drafter":"eagle3"},{"backend":"sglang","drafter":"dflash"}]}') }}
+      matrix: ${{ fromJSON(github.event_name == 'pull_request' && '{"include":[{"backend":"vllm","drafter":"dspark"}]}' || '{"include":[{"backend":"vllm","drafter":"eagle3"},{"backend":"vllm","drafter":"dflash"},{"backend":"vllm","drafter":"dspark"}]}') }}
 
     steps:
       - name: Check out verl-SpeCo
@@ -106,11 +110,7 @@ jobs:
           assert torch.npu.is_available()
           print("torch.npu.device_count =", torch.npu.device_count())
           PY
-          if [[ "${{ matrix.backend }}" == "vllm" ]]; then
-            python -c "import vllm; print(vllm.__version__)"
-          else
-            python -c "import sglang; print(sglang.__version__)"
-          fi
+          python -c "import vllm; print(vllm.__version__)"
 
       - name: Run example script
         env:
