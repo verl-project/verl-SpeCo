@@ -59,16 +59,11 @@ def _open_config_mapping(mapping):
 
 
 @contextmanager
-def _prepare_no_drafter_upstream_config(config):
+def _prepare_no_drafter_runtime_config(config):
     rollout_config = getattr(getattr(config, "actor_rollout_ref", None), "rollout", None)
     missing = object()
-    drafter_config = missing
     no_async_scheduling = missing
     vllm_engine_kwargs = None
-    if rollout_config is not None and hasattr(rollout_config, "__contains__") and "drafter" in rollout_config:
-        drafter_config = rollout_config["drafter"]
-        with _open_config_mapping(rollout_config):
-            del rollout_config["drafter"]
     if rollout_config is not None and rollout_config.get("name") == "vllm":
         with _open_config_mapping(rollout_config):
             engine_kwargs = rollout_config.get("engine_kwargs")
@@ -87,9 +82,6 @@ def _prepare_no_drafter_upstream_config(config):
     try:
         yield
     finally:
-        if drafter_config is not missing:
-            with _open_config_mapping(rollout_config):
-                rollout_config["drafter"] = drafter_config
         if vllm_engine_kwargs is not None:
             with _open_config_mapping(vllm_engine_kwargs):
                 if no_async_scheduling is missing:
@@ -169,12 +161,18 @@ class SpecoTaskRunner(TaskRunner):
         return _remotify_like_worker_mapping_value(worker_cls, wrapped_cls)
 
     def run(self, config):
-        # Preserve the upstream release/v0.8.0 execution path when SPECO is
-        # disabled. This keeps the no-drafter baseline independent from the
-        # custom TaskRunner and trainer integration.
         if not _drafter_rollout_enabled(config):
-            with _prepare_no_drafter_upstream_config(config):
+            if _rollout_name(config) != "vllm":
                 return super().run(config)
+            # Keep the SPECO trainer's calculate_entropy=False old-logprob path.
+            # Upstream release/v0.8.0 forces entropy on here, which triggers a
+            # costly torch.compile on NPU during the first training step.
+            with _prepare_no_drafter_runtime_config(config):
+                return self._run_with_speco_trainer(config)
+
+        return self._run_with_speco_trainer(config)
+
+    def _run_with_speco_trainer(self, config):
 
         from verl.utils import hf_processor, hf_tokenizer
         from verl.utils.dataset.rl_dataset import collate_fn

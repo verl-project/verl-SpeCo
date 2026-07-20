@@ -120,7 +120,7 @@ def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None
     assert _no_drafter_trainer()._speco_oldlogprob_entropy_hook_enabled() is False
 
 
-def test_no_drafter_vllm_path_disables_async_scheduling() -> None:
+def test_no_drafter_vllm_path_disables_async_scheduling_without_hiding_config() -> None:
     task_runner = pytest.importorskip(
         "verl_speco.integration.task_runner",
         reason="no-drafter scheduler contract needs verl and Ray",
@@ -139,11 +139,47 @@ def test_no_drafter_vllm_path_disables_async_scheduling() -> None:
         }
     )
 
-    with task_runner._prepare_no_drafter_upstream_config(config):
-        assert "drafter" not in config.actor_rollout_ref.rollout
+    with task_runner._prepare_no_drafter_runtime_config(config):
+        assert config.actor_rollout_ref.rollout.drafter.enable is False
         assert config.actor_rollout_ref.rollout.engine_kwargs.vllm["no-async-scheduling"] is True
 
     assert "drafter" in config.actor_rollout_ref.rollout
+    assert "no-async-scheduling" not in config.actor_rollout_ref.rollout.engine_kwargs.vllm
+
+
+def test_no_drafter_run_keeps_speco_entropy_control(monkeypatch) -> None:
+    task_runner = pytest.importorskip(
+        "verl_speco.integration.task_runner",
+        reason="no-drafter trainer contract needs verl and Ray",
+    )
+    from omegaconf import OmegaConf
+
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {
+                    "name": "vllm",
+                    "drafter": {"enable": False},
+                    "engine_kwargs": {"vllm": {}},
+                }
+            }
+        }
+    )
+    runner = task_runner.SpecoTaskRunner.__new__(task_runner.SpecoTaskRunner)
+    observed = {}
+
+    def fake_run_with_speco_trainer(self, active_config):
+        del self
+        observed["drafter_present"] = "drafter" in active_config.actor_rollout_ref.rollout
+        observed["no_async"] = active_config.actor_rollout_ref.rollout.engine_kwargs.vllm[
+            "no-async-scheduling"
+        ]
+        return "ran"
+
+    monkeypatch.setattr(task_runner.SpecoTaskRunner, "_run_with_speco_trainer", fake_run_with_speco_trainer)
+
+    assert runner.run(config) == "ran"
+    assert observed == {"drafter_present": True, "no_async": True}
     assert "no-async-scheduling" not in config.actor_rollout_ref.rollout.engine_kwargs.vllm
 
 
