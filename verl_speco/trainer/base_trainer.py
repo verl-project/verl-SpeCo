@@ -3328,6 +3328,34 @@ class DrafterBaseTrainer:
         
         return await self._training_step_on_batch(batch, step)
 
+    def _reduce_loss_metrics(
+        self, l_v: torch.Tensor, l_p: torch.Tensor, l_n: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """All-reduce detached loss/token sums across the SP/DP groups.
+
+        Returns the global sums plus the number of ranks that participated in
+        the reduction. The all-reduce is detached, so the caller must scale its
+        local loss by that world size to cancel FSDP's gradient averaging over
+        the same ranks.
+        """
+        metrics = torch.stack([l_v.detach(), l_p.detach(), l_n.detach()])
+        reduce_world_size = 1
+        sp_group = self._get_sp_group()
+        dp_group = self._get_dp_group()
+        if sp_group is not None and self._get_sp_world_size() > 1:
+            dist.all_reduce(metrics, group=sp_group)
+            reduce_world_size *= self._get_sp_world_size()
+            if dp_group is not None and self._get_dp_world_size() > 1:
+                dist.all_reduce(metrics, group=dp_group)
+                reduce_world_size *= self._get_dp_world_size()
+        elif dp_group is not None and self._get_dp_world_size() > 1:
+            dist.all_reduce(metrics, group=dp_group)
+            reduce_world_size *= self._get_dp_world_size()
+        elif self.training_device_mesh is not None and self.training_device_mesh.size() > 1:
+            dist.all_reduce(metrics, group=self.training_device_mesh.get_group())
+            reduce_world_size *= self.training_device_mesh.size()
+        return metrics[0], metrics[1], metrics[2], reduce_world_size
+
     async def _training_step_on_batch(self, batch: dict[str, torch.Tensor], step: int) -> bool:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
@@ -3348,27 +3376,9 @@ class DrafterBaseTrainer:
 
         # Reduce scalar loss statistics once across SP/DP groups.
         reduce_ts = time.time()
-        sp_group = self._get_sp_group()
-        dp_group = self._get_dp_group()
-        if sp_group is not None and self._get_sp_world_size() > 1:
-            metrics = torch.stack([l_v, l_p, l_n])
-            dist.all_reduce(metrics, group=sp_group)
-            if dp_group is not None and self._get_dp_world_size() > 1:
-                dist.all_reduce(metrics, group=dp_group)
-            global_vloss, global_ploss, global_tokens = metrics[0], metrics[1], metrics[2]
-        elif dp_group is not None and self._get_dp_world_size() > 1:
-            metrics = torch.stack([l_v, l_p, l_n])
-            dist.all_reduce(metrics, group=dp_group)
-            global_vloss, global_ploss, global_tokens = metrics[0], metrics[1], metrics[2]
-        elif self.training_device_mesh is not None and self.training_device_mesh.size() > 1:
-            metrics = torch.stack([l_v, l_p, l_n])
-            dist.all_reduce(metrics, group=self.training_device_mesh.get_group())
-            global_vloss, global_ploss, global_tokens = metrics[0], metrics[1], metrics[2]
-        else:
-            global_vloss, global_ploss, global_tokens = l_v, l_p, l_n
+        global_vloss, global_ploss, global_tokens, reduce_world_size = self._reduce_loss_metrics(l_v, l_p, l_n)
         self.record_training_timing("timing_s/drafter_reduce_loss", time.time() - reduce_ts)
-        
-        # 最终 Loss 平滑处理
+
         if float(global_tokens.detach().float().item()) <= 0:
             logger.debug(
                 f"Step {self.training_steps + 1}: no finite drafter target tokens, skipping optimizer step"
@@ -3379,7 +3389,7 @@ class DrafterBaseTrainer:
         vloss = global_vloss / denom
         ploss = global_ploss / denom
 
-        # 使用 backend 传回的权重合成最终 Loss
+        # Global token-mean loss, identical on every rank; used for guards and logging.
         loss = loss_dict["v_weight"] * vloss + loss_dict["p_weight"] * ploss
         if not torch.isfinite(loss):
             logger.error(
@@ -3391,9 +3401,17 @@ class DrafterBaseTrainer:
             )
             return False
 
-        # 反向传播
+        # Backward on this rank's local loss sums: the metric all-reduce above is
+        # outside the autograd graph, so each rank's backward carries only its own
+        # contribution, and FSDP then averages gradients across the same
+        # `reduce_world_size` ranks. Scaling by `reduce_world_size` cancels that
+        # mean, making the synchronized gradient the exact global token-mean
+        # gradient regardless of world size.
+        local_loss = (loss_dict["v_weight"] * l_v + loss_dict["p_weight"] * l_p) * (
+            float(reduce_world_size) / denom
+        )
         backward_ts = time.time()
-        loss.backward()
+        local_loss.backward()
         self.record_training_timing("timing_s/drafter_backward", time.time() - backward_ts)
 
         # 更新权重
