@@ -202,8 +202,7 @@ def test_peagle_batch_assembly_matches_reference_shift() -> None:
 
 def test_peagle_layers_are_callable_fsdp_wrap_targets() -> None:
     """The draft layers are the FSDP wrap targets, so their entry point must be
-    ``forward``: FSDP2 unshards a wrapped module in its pre-forward hook, which
-    only runs through ``__call__``."""
+    ``forward``; see ``PEagleTrainingModel`` for why."""
     pytest.importorskip("torch")
     from verl_speco.backends.peagle_trainer_backend import PEagleTrainingModel
     from verl_speco.models.peagle.modeling_peagle import PeagleFusedLayer, PeagleVanillaLayer

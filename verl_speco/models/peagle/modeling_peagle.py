@@ -110,9 +110,8 @@ class PeagleMLP(nn.Module):
 class PeagleFusedLayer(nn.Module):
     """Layer 0: fuses ``[input_layernorm(embed), hidden_norm(hidden)]`` (2H).
 
-    The draft layers are the FSDP wrap targets (``_no_split_modules``), so this
-    entry point has to be ``forward``: FSDP2 unshards a wrapped module's
-    parameters in its pre-forward hook, which only runs through ``__call__``.
+    The entry point is ``forward`` because the draft layers are FSDP wrap
+    targets; see ``PEagleTrainingModel`` for why.
     """
 
     def __init__(self, config: PeagleConfig):
@@ -222,9 +221,8 @@ class LlamaForCausalLMPeagle(DraftModel):
 
     def forward_peagle(self, sampled_input_ids, sampled_projected_hidden, position_ids, block_mask) -> torch.Tensor:
         draft_input_embeds = self.embed_tokens(sampled_input_ids).to(sampled_projected_hidden.dtype)
-        # Call the layers through ``__call__`` so FSDP2's pre-forward unshard hook
-        # runs; the layers are the wrap targets, so a direct method call would use
-        # sharded DTensor parameters.
+        # Layers are called through ``__call__``, never a method, because they are
+        # the FSDP wrap targets; see ``PEagleTrainingModel`` for why.
         hidden_states = self.layers[0](
             input_embeds=draft_input_embeds,
             hidden_states=sampled_projected_hidden,
