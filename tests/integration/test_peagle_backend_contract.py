@@ -198,3 +198,90 @@ def test_peagle_batch_assembly_matches_reference_shift() -> None:
     assert torch.equal(batch["last_hidden_states"][0], last_h[1 : 1 + train_len])
     assert torch.equal(batch["loss_mask"][0], loss_mask[1 : 1 + train_len])
     assert batch["seq_lengths"].tolist() == [train_len]
+
+
+def test_peagle_layers_are_callable_fsdp_wrap_targets() -> None:
+    """The draft layers are the FSDP wrap targets, so their entry point must be
+    ``forward``; see ``PEagleTrainingModel`` for why."""
+    pytest.importorskip("torch")
+    from verl_speco.backends.peagle_trainer_backend import PEagleTrainingModel
+    from verl_speco.models.peagle.modeling_peagle import PeagleFusedLayer, PeagleVanillaLayer
+
+    wrap_targets = set(PEagleTrainingModel._no_split_modules)
+    assert wrap_targets == {"PeagleFusedLayer", "PeagleVanillaLayer"}
+    for layer_cls in (PeagleFusedLayer, PeagleVanillaLayer):
+        assert layer_cls.__name__ in wrap_targets
+        assert "forward" in vars(layer_cls), f"{layer_cls.__name__} must define forward for FSDP wrapping"
+        assert not hasattr(layer_cls, "forward_peagle")
+
+
+def test_peagle_training_model_wraps_the_draft() -> None:
+    pytest.importorskip("torch")
+    from verl_speco.backends.peagle_trainer_backend import PEagleTrainingModel
+    from verl_speco.models.peagle import LlamaForCausalLMPeagle
+
+    config = _tiny_peagle_config()
+    draft = LlamaForCausalLMPeagle(config)
+    training_model = PEagleTrainingModel(draft, num_depths=4, down_sample_ratio=0.5, down_sample_ratio_min=0.1)
+
+    assert training_model.draft_model is draft
+    assert training_model.config is draft.config
+    assert training_model.num_depths == 4
+    # The wrapper owns no parameters of its own, so the exported draft is complete.
+    assert {name for name, _ in training_model.named_parameters()} == {
+        f"draft_model.{name}" for name, _ in draft.named_parameters()
+    }
+
+
+def test_peagle_compute_loss_calls_the_module_forward() -> None:
+    """compute_loss must drive the draft through ``model(...)`` so FSDP2 unshards."""
+    torch = pytest.importorskip("torch")
+    from omegaconf import OmegaConf
+
+    from verl_speco.backends.peagle_trainer_backend import PEagleTrainerBackend
+
+    backend = PEagleTrainerBackend(
+        OmegaConf.create({"rollout": {"drafter": {"training": {}}}, "model": {"path": "/tmp/none"}}),
+        OmegaConf.create({}),
+    )
+    backend.target_model = lambda last_hidden: torch.zeros(*last_hidden.shape[:-1], 6)
+
+    calls = []
+
+    def _model(**kwargs):
+        calls.append(kwargs)
+        return torch.tensor(8.0), torch.tensor(4.0), torch.tensor(3.0)
+
+    batch = {
+        "input_ids": torch.zeros(1, 5, dtype=torch.long),
+        "hidden_states": torch.zeros(1, 5, 8),
+        "loss_mask": torch.ones(1, 5),
+        "attention_mask": torch.ones(1, 5, dtype=torch.long),
+        "last_hidden_states": torch.zeros(1, 5, 4),
+        "seq_lengths": torch.tensor([5]),
+    }
+
+    out = backend.compute_loss(_model, batch, 0)
+
+    assert len(calls) == 1
+    assert set(calls[0]) == {"input_ids", "aux_hidden", "loss_mask", "attention_mask", "target_logits", "seq_lengths"}
+    assert calls[0]["target_logits"].shape == (1, 5, 6)
+    assert float(out["total_local_ploss"]) == 8.0
+    assert float(out["local_num_tokens"]) == 4.0
+    assert float(out["accuracy"]) == pytest.approx(0.75)
+
+
+def test_peagle_checkpoint_export_unwraps_the_training_model() -> None:
+    pytest.importorskip("torch")
+    from types import SimpleNamespace
+
+    base_trainer_mod = pytest.importorskip("verl_speco.trainer.base_trainer")
+
+    draft = SimpleNamespace(name="draft")
+    trainer = object.__new__(base_trainer_mod.DrafterBaseTrainer)
+    trainer.model = SimpleNamespace(draft_model=draft)
+
+    export_model, strip_prefixes = trainer._get_pretrained_export_model()
+
+    assert export_model is draft
+    assert "draft_model." in strip_prefixes

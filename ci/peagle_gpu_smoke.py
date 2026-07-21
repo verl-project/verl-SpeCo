@@ -107,9 +107,10 @@ def main() -> None:
     backend.target_model = backend.target_model.to(device).to(torch.bfloat16)
     optimizer = backend.setup_optimizer(model, cfg.rollout.drafter.training)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    draft = model.draft_model
     print(
-        f"[smoke] draft_layers={len(model.layers)} num_depths={model.config.num_depths} "
-        f"fc={model.fc.in_features}->{model.fc.out_features} trainable_params={n_params:,}"
+        f"[smoke] draft_layers={len(draft.layers)} num_depths={model.num_depths} "
+        f"fc={draft.fc.in_features}->{draft.fc.out_features} trainable_params={n_params:,}"
     )
 
     first = None

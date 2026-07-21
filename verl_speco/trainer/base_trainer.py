@@ -975,8 +975,12 @@ class DrafterBaseTrainer:
 
     def _get_pretrained_export_model(self):
         model = self.model.module if hasattr(self.model, "module") else self.model
-        if self._is_block_drafter_backend() and hasattr(model, "draft_model"):
-            return model.draft_model, ("draft_model.", "module.draft_model.", "_orig_mod.draft_model.")
+        # Trainer wrappers (the DFlash family and P-EAGLE) keep the exportable
+        # draft as ``draft_model``; the checkpoint must hold the draft itself, so
+        # unwrap whenever a wrapper is present rather than per backend type.
+        draft_model = getattr(model, "draft_model", None)
+        if draft_model is not None:
+            return draft_model, ("draft_model.", "module.draft_model.", "_orig_mod.draft_model.")
         return model, ()
 
     def _get_pretrained_export_state_dict(self) -> dict[str, torch.Tensor]:
