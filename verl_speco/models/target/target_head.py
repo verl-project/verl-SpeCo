@@ -23,7 +23,9 @@ def _load_checkpoint_tensor(model_path: str, key: str) -> torch.Tensor:
             index_json = json.load(f)
         weight_map = index_json.get("weight_map", {})
         if key not in weight_map:
-            raise KeyError(f"Tensor {key!r} is not present in checkpoint index for {model_path}")
+            raise KeyError(
+                f"Tensor {key!r} is not present in checkpoint index for {model_path}"
+            )
         ckpt_file = os.path.join(model_path, weight_map[key])
         if ckpt_file.endswith(".safetensors"):
             with safe_open(ckpt_file, framework="pt", device="cpu") as f:
@@ -39,7 +41,9 @@ def _load_checkpoint_tensor(model_path: str, key: str) -> torch.Tensor:
     if os.path.exists(pytorch_path):
         return torch.load(pytorch_path, map_location="cpu", weights_only=True)[key]
 
-    raise FileNotFoundError(f"No index.json, model.safetensors or pytorch_model.bin found in {model_path}")
+    raise FileNotFoundError(
+        f"No index.json, model.safetensors or pytorch_model.bin found in {model_path}"
+    )
 
 
 class TargetHead(nn.Module):
@@ -48,7 +52,9 @@ class TargetHead(nn.Module):
     def __init__(self, weight: torch.Tensor):
         super().__init__()
         if weight.dim() != 2:
-            raise ValueError(f"TargetHead weight must be rank-2, got shape={tuple(weight.shape)}")
+            raise ValueError(
+                f"TargetHead weight must be rank-2, got shape={tuple(weight.shape)}"
+            )
         vocab_size, hidden_size = weight.shape
         self.fc = nn.Linear(hidden_size, vocab_size, bias=False)
         with torch.no_grad():

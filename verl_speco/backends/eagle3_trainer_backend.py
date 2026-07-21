@@ -21,7 +21,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 device_name = get_device_name()
 _LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
-_LAST_HIDDEN_LOGPROB_CHECK_MAX_LOGS_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_MAX_LOGS"
+_LAST_HIDDEN_LOGPROB_CHECK_MAX_LOGS_ENV = (
+    "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_MAX_LOGS"
+)
 _HIDDEN_BLOCK_DEBUG_LOG_COUNT = 0
 _RAW_TOPK_DEBUG_LOG_COUNT = 0
 _RAW_HIDDEN_METADATA_SOURCE = "raw_hidden_metadata"
@@ -62,7 +64,9 @@ def _last_hidden_logprob_check_max_logs() -> int:
         return 8
 
 
-def _log_eagle3_hidden_block_check(full_h: torch.Tensor, h_dim: int, item_idx: int, item: dict) -> None:
+def _log_eagle3_hidden_block_check(
+    full_h: torch.Tensor, h_dim: int, item_idx: int, item: dict
+) -> None:
     global _HIDDEN_BLOCK_DEBUG_LOG_COUNT
     if not _last_hidden_logprob_check_enabled():
         return
@@ -74,12 +78,18 @@ def _log_eagle3_hidden_block_check(full_h: torch.Tensor, h_dim: int, item_idx: i
             blocks = int(full_h.size(-1)) // int(h_dim)
             block_stats = []
             for block_idx in range(min(blocks, 6)):
-                block = full_h[:rows, block_idx * h_dim : (block_idx + 1) * h_dim].float()
+                block = full_h[
+                    :rows, block_idx * h_dim : (block_idx + 1) * h_dim
+                ].float()
                 block_stats.append(
                     {
                         "block": block_idx,
-                        "mean_row_norm": round(float(block.norm(dim=-1).mean().detach().cpu().item()), 6),
-                        "mean_abs": round(float(block.abs().mean().detach().cpu().item()), 6),
+                        "mean_row_norm": round(
+                            float(block.norm(dim=-1).mean().detach().cpu().item()), 6
+                        ),
+                        "mean_abs": round(
+                            float(block.abs().mean().detach().cpu().item()), 6
+                        ),
                     }
                 )
             logger.debug(
@@ -122,13 +132,22 @@ def _log_eagle3_raw_topk_check(
     if item.get("hidden_target_logprobs_source") != _RAW_HIDDEN_METADATA_SOURCE:
         return
     raw_target_logprobs = item.get("hidden_raw_target_logprobs")
-    if not torch.is_tensor(raw_target_logprobs) or raw_target_logprobs.dim() != 3 or raw_target_logprobs.size(-1) < 2:
+    if (
+        not torch.is_tensor(raw_target_logprobs)
+        or raw_target_logprobs.dim() != 3
+        or raw_target_logprobs.size(-1) < 2
+    ):
         return
     if target_model is None:
-        logger.debug("[drafter raw topk check] skip item_idx=%s: missing synced target_model", item_idx)
+        logger.debug(
+            "[drafter raw topk check] skip item_idx=%s: missing synced target_model",
+            item_idx,
+        )
         return
     if last_h_states.device.type == "cpu":
-        logger.debug("[drafter raw topk check] skip item_idx=%s: CPU-prepared batch", item_idx)
+        logger.debug(
+            "[drafter raw topk check] skip item_idx=%s: CPU-prepared batch", item_idx
+        )
         return
     try:
         with torch.no_grad():
@@ -149,20 +168,30 @@ def _log_eagle3_raw_topk_check(
                 if rows <= 0:
                     return None
 
-                check_hidden = last_h_states[hidden_start : hidden_start + rows].to(device=target_device)
+                check_hidden = last_h_states[hidden_start : hidden_start + rows].to(
+                    device=target_device
+                )
                 target_scores = target_model(check_hidden).float()
                 raw_slice = raw_target_logprobs[raw_start : raw_start + rows]
-                raw_top1_ids = raw_slice[:, 0, 1].to(device=target_scores.device, dtype=torch.long)
-                raw_top1_logprobs = raw_slice[:, 0, 0].to(device=target_scores.device, dtype=torch.float32)
+                raw_top1_ids = raw_slice[:, 0, 1].to(
+                    device=target_scores.device, dtype=torch.long
+                )
+                raw_top1_logprobs = raw_slice[:, 0, 0].to(
+                    device=target_scores.device, dtype=torch.float32
+                )
 
                 local_raw_top1_ids = raw_top1_ids
                 mapped_vocab = False
-                if target_token_to_local_device is not None and int(target_scores.size(-1)) < int(
-                    target_token_to_local_device.numel()
-                ):
-                    in_vocab = (raw_top1_ids >= 0) & (raw_top1_ids < int(target_token_to_local_device.numel()))
+                if target_token_to_local_device is not None and int(
+                    target_scores.size(-1)
+                ) < int(target_token_to_local_device.numel()):
+                    in_vocab = (raw_top1_ids >= 0) & (
+                        raw_top1_ids < int(target_token_to_local_device.numel())
+                    )
                     local_raw_top1_ids = torch.full_like(raw_top1_ids, -1)
-                    local_raw_top1_ids[in_vocab] = target_token_to_local_device[raw_top1_ids[in_vocab]]
+                    local_raw_top1_ids[in_vocab] = target_token_to_local_device[
+                        raw_top1_ids[in_vocab]
+                    ]
                     mapped_vocab = True
 
                 valid = (
@@ -185,13 +214,19 @@ def _log_eagle3_raw_topk_check(
                 target_logprobs = F.log_softmax(target_scores, dim=-1)
                 target_top1_ids = target_logprobs.argmax(dim=-1)
                 row_ids = torch.arange(rows, device=target_scores.device)
-                target_at_raw_top1 = target_logprobs[row_ids[valid], local_raw_top1_ids[valid]]
+                target_at_raw_top1 = target_logprobs[
+                    row_ids[valid], local_raw_top1_ids[valid]
+                ]
                 diff = (target_at_raw_top1 - raw_top1_logprobs[valid]).abs()
-                top1_match = (target_top1_ids[valid] == local_raw_top1_ids[valid]).float().mean()
+                top1_match = (
+                    (target_top1_ids[valid] == local_raw_top1_ids[valid]).float().mean()
+                )
                 result.update(
                     {
                         "top1_match": float(top1_match.detach().cpu().item()),
-                        "logprob_abs_diff_mean": float(diff.mean().detach().cpu().item()),
+                        "logprob_abs_diff_mean": float(
+                            diff.mean().detach().cpu().item()
+                        ),
                     }
                 )
                 return result
@@ -269,16 +304,24 @@ def _masked_soft_cross_entropy(
     valid_position = (position_mask > 0) & finite_logits & finite_target
 
     safe_logits = torch.where(torch.isfinite(logits), logits, torch.zeros_like(logits))
-    safe_target = torch.where(torch.isfinite(target_p), target_p, torch.zeros_like(target_p))
-    safe_target = torch.where(valid_position.unsqueeze(-1), safe_target, torch.zeros_like(safe_target))
+    safe_target = torch.where(
+        torch.isfinite(target_p), target_p, torch.zeros_like(target_p)
+    )
+    safe_target = torch.where(
+        valid_position.unsqueeze(-1), safe_target, torch.zeros_like(safe_target)
+    )
 
     log_probs = F.log_softmax(safe_logits, dim=-1)
     per_token_ploss = -(safe_target * log_probs).sum(dim=-1)
-    per_token_ploss = torch.where(valid_position, per_token_ploss, torch.zeros_like(per_token_ploss))
+    per_token_ploss = torch.where(
+        valid_position, per_token_ploss, torch.zeros_like(per_token_ploss)
+    )
     return per_token_ploss, valid_position
 
 
-def _pad_topk_logprobs_for_future_shift(target_topk_logprobs: torch.Tensor, length: int) -> torch.Tensor:
+def _pad_topk_logprobs_for_future_shift(
+    target_topk_logprobs: torch.Tensor, length: int
+) -> torch.Tensor:
     if length <= 0:
         return target_topk_logprobs
 
@@ -343,17 +386,24 @@ def _sparse_restricted_topk_cross_entropy(
         logprobs.exp(),
         torch.zeros_like(logprobs, dtype=torch.float32),
     ).sum(dim=-1)
-    valid_position = (position_mask > 0) & finite_logits & (intersection_count >= int(min_intersection))
+    valid_position = (
+        (position_mask > 0)
+        & finite_logits
+        & (intersection_count >= int(min_intersection))
+    )
     if min_hit_mass is not None:
         valid_position = valid_position & (hit_mass >= float(min_hit_mass))
 
     safe_logits = torch.where(torch.isfinite(logits), logits, torch.zeros_like(logits))
     student_log_probs = F.log_softmax(safe_logits, dim=-1)
-    gathered_student_log_probs = torch.gather(student_log_probs, dim=-1, index=draft_ids.clamp_min(0))
+    gathered_student_log_probs = torch.gather(
+        student_log_probs, dim=-1, index=draft_ids.clamp_min(0)
+    )
 
     teacher_weights = torch.where(
         in_draft_vocab,
-        logprobs.exp() / hit_mass.clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(-1),
+        logprobs.exp()
+        / hit_mass.clamp_min(torch.finfo(torch.float32).tiny).unsqueeze(-1),
         torch.zeros_like(logprobs, dtype=torch.float32),
     )
     teacher_weights = torch.where(
@@ -362,7 +412,9 @@ def _sparse_restricted_topk_cross_entropy(
         torch.zeros_like(teacher_weights),
     )
     per_token_ploss = -(teacher_weights * gathered_student_log_probs).sum(dim=-1)
-    per_token_ploss = torch.where(valid_position, per_token_ploss, torch.zeros_like(per_token_ploss))
+    per_token_ploss = torch.where(
+        valid_position, per_token_ploss, torch.zeros_like(per_token_ploss)
+    )
 
     masked_teacher_logprobs = torch.where(
         in_draft_vocab,
@@ -418,8 +470,12 @@ def _log_topk_draft_vocab_coverage(
 
         valid_count = valid.sum(dim=-1)
         hit_count = in_draft_vocab.sum(dim=-1)
-        topk_mass = torch.where(valid, logprobs.exp(), torch.zeros_like(logprobs)).sum(dim=-1)
-        hit_mass = torch.where(in_draft_vocab, logprobs.exp(), torch.zeros_like(logprobs)).sum(dim=-1)
+        topk_mass = torch.where(valid, logprobs.exp(), torch.zeros_like(logprobs)).sum(
+            dim=-1
+        )
+        hit_mass = torch.where(
+            in_draft_vocab, logprobs.exp(), torch.zeros_like(logprobs)
+        ).sum(dim=-1)
         active_rows = valid_count > 0
 
         if loss_mask is not None:
@@ -443,7 +499,9 @@ def _log_topk_draft_vocab_coverage(
         active_topk_mass = topk_mass[active_rows].float()
         active_hit_mass = hit_mass[active_rows].float()
         hit_ratio = active_hit_count / active_valid_count.clamp_min(1)
-        hit_mass_ratio = active_hit_mass / active_topk_mass.clamp_min(torch.finfo(torch.float32).tiny)
+        hit_mass_ratio = active_hit_mass / active_topk_mass.clamp_min(
+            torch.finfo(torch.float32).tiny
+        )
         top1_in_draft = in_draft_vocab[:, 0] & valid[:, 0]
         top1_valid_rows = active_rows & valid[:, 0]
         top1_in_draft_ratio = (
@@ -504,12 +562,18 @@ def _build_topk_draft_vocab_coverage_mask(
         in_draft_vocab = valid & t2d[safe_token_ids]
 
         valid_count = valid.sum(dim=-1)
-        topk_mass = torch.where(valid, logprobs.exp(), torch.zeros_like(logprobs)).sum(dim=-1)
-        hit_mass = torch.where(in_draft_vocab, logprobs.exp(), torch.zeros_like(logprobs)).sum(dim=-1)
+        topk_mass = torch.where(valid, logprobs.exp(), torch.zeros_like(logprobs)).sum(
+            dim=-1
+        )
+        hit_mass = torch.where(
+            in_draft_vocab, logprobs.exp(), torch.zeros_like(logprobs)
+        ).sum(dim=-1)
         keep_mask = valid_count > 0
 
         if min_hit_mass_ratio is not None:
-            hit_mass_ratio = hit_mass / topk_mass.clamp_min(torch.finfo(torch.float32).tiny)
+            hit_mass_ratio = hit_mass / topk_mass.clamp_min(
+                torch.finfo(torch.float32).tiny
+            )
             keep_mask = keep_mask & (hit_mass_ratio >= float(min_hit_mass_ratio))
         if require_top1:
             keep_mask = keep_mask & in_draft_vocab[:, 0]
@@ -527,7 +591,9 @@ def _build_topk_draft_vocab_coverage_mask(
         return keep_mask.to(dtype=torch.float32).unsqueeze(0)
 
 
-def _apply_coverage_mask_to_loss_mask(loss_mask: torch.Tensor, coverage_mask: torch.Tensor | None) -> torch.Tensor:
+def _apply_coverage_mask_to_loss_mask(
+    loss_mask: torch.Tensor, coverage_mask: torch.Tensor | None
+) -> torch.Tensor:
     if coverage_mask is None:
         return loss_mask
 
@@ -537,17 +603,14 @@ def _apply_coverage_mask_to_loss_mask(loss_mask: torch.Tensor, coverage_mask: to
         return loss_mask
 
     masked_loss_mask = loss_mask.clone()
-    masked_loss_mask[..., :common_rows] = masked_loss_mask[..., :common_rows] * coverage_mask[..., :common_rows]
+    masked_loss_mask[..., :common_rows] = (
+        masked_loss_mask[..., :common_rows] * coverage_mask[..., :common_rows]
+    )
     return masked_loss_mask
 
 
 class Eagle3TrainerBackend:
-
-    def __init__(
-        self,
-        config,
-        target_model_config
-    ):
+    def __init__(self, config, target_model_config):
         self.config = config
         self.target_model_config = target_model_config
         self.criterion = SmoothL1Loss(reduction="none")
@@ -576,7 +639,9 @@ class Eagle3TrainerBackend:
         target_hf_config = getattr(self.target_model_config, "hf_config", None)
         if target_hf_config is not None:
             return target_hf_config
-        if hasattr(self.target_model_config, "hidden_size") and hasattr(self.target_model_config, "vocab_size"):
+        if hasattr(self.target_model_config, "hidden_size") and hasattr(
+            self.target_model_config, "vocab_size"
+        ):
             return self.target_model_config
 
         config_path = (
@@ -588,12 +653,16 @@ class Eagle3TrainerBackend:
             raise ValueError("Cannot resolve target HF config for EAGLE3 drafter")
         return AutoConfig.from_pretrained(
             config_path,
-            trust_remote_code=bool(getattr(self.target_model_config, "trust_remote_code", False)),
+            trust_remote_code=bool(
+                getattr(self.target_model_config, "trust_remote_code", False)
+            ),
         )
 
     def build_model(self):
         """build eagle3 draft model"""
-        logger.debug(f"Initializing Eagle3 model with type: {getattr(self.target_model_config, 'model_type', None)}")
+        logger.debug(
+            f"Initializing Eagle3 model with type: {getattr(self.target_model_config, 'model_type', None)}"
+        )
         spec_model_path = self.config.rollout.drafter.model_path
         config_path = os.path.join(spec_model_path, "config.json")
         target_hf_config = self._get_target_hf_config()
@@ -616,13 +685,15 @@ class Eagle3TrainerBackend:
         self.vocab_size = drafter_config.vocab_size
 
         factory_cls = AutoEagle3DraftModel
-        
+
         drafter_module = factory_cls.from_config(drafter_config)
         checkpoint_has_vocab_mapping = False
 
         # Initialize model
         if spec_model_path and os.path.exists(spec_model_path):
-            log_drafter_checkpoint_step(logger, spec_model_path, action="Loading EAGLE3 drafter weights")
+            log_drafter_checkpoint_step(
+                logger, spec_model_path, action="Loading EAGLE3 drafter weights"
+            )
             loaded = factory_cls.from_pretrained(
                 spec_model_path,
                 config=drafter_config,
@@ -631,27 +702,35 @@ class Eagle3TrainerBackend:
             if isinstance(loaded, tuple):
                 drafter_module, loading_info = loaded
                 missing_keys = set(loading_info.get("missing_keys", []))
-                checkpoint_has_vocab_mapping = not {"t2d", "d2t"}.intersection(missing_keys)
+                checkpoint_has_vocab_mapping = not {"t2d", "d2t"}.intersection(
+                    missing_keys
+                )
             else:
                 drafter_module = loaded
-                checkpoint_has_vocab_mapping = self._has_valid_vocab_mapping(drafter_module)
+                checkpoint_has_vocab_mapping = self._has_valid_vocab_mapping(
+                    drafter_module
+                )
 
-        
         # Reuse the target model embedding and lm_head
         reset_rope_buffers = getattr(drafter_module, "reset_rope_buffers", None)
         if callable(reset_rope_buffers):
             reset_count = reset_rope_buffers(dtype=torch.float32)
             if reset_count:
-                logger.debug("Reset %s EAGLE3 rotary embedding buffers after checkpoint load", reset_count)
+                logger.debug(
+                    "Reset %s EAGLE3 rotary embedding buffers after checkpoint load",
+                    reset_count,
+                )
 
         target_model_path = self.config.model.path
-            
+
         drafter_module.load_embedding(target_model_path)
         drafter_module.freeze_embedding()
-        
+
         training_cfg = self.config.rollout.drafter.training
         if drafter_module.draft_vocab_size != drafter_module.vocab_size:
-            if checkpoint_has_vocab_mapping and self._has_valid_vocab_mapping(drafter_module):
+            if checkpoint_has_vocab_mapping and self._has_valid_vocab_mapping(
+                drafter_module
+            ):
                 logger.debug("Using EAGLE3 vocab mapping loaded from draft checkpoint")
             else:
                 raise ValueError(
@@ -666,12 +745,22 @@ class Eagle3TrainerBackend:
             target_token_to_draft_index,
             torch.full_like(target_token_to_draft_index, -1),
         )
-        self._target_token_to_draft_index = target_token_to_draft_index.detach().to("cpu")
+        self._target_token_to_draft_index = target_token_to_draft_index.detach().to(
+            "cpu"
+        )
 
         use_logits = training_cfg.get("use_logits", False)
         if not use_logits:
-            target_device = torch.device(f"{device_name}:{get_device_id()}") if device_name != "cpu" else torch.device("cpu")
-            self.target_model = self._build_target_model(target_model_path, target_hf_config).to(target_device).eval()
+            target_device = (
+                torch.device(f"{device_name}:{get_device_id()}")
+                if device_name != "cpu"
+                else torch.device("cpu")
+            )
+            self.target_model = (
+                self._build_target_model(target_model_path, target_hf_config)
+                .to(target_device)
+                .eval()
+            )
             for param in self.target_model.parameters():
                 param.requires_grad_(False)
 
@@ -686,7 +775,9 @@ class Eagle3TrainerBackend:
 
     def _validate_vocab_mapping(self, drafter_module) -> None:
         if not hasattr(drafter_module, "t2d") or not hasattr(drafter_module, "d2t"):
-            raise AttributeError("EAGLE3 draft model does not have t2d/d2t vocab mapping buffers")
+            raise AttributeError(
+                "EAGLE3 draft model does not have t2d/d2t vocab mapping buffers"
+            )
 
         if drafter_module.t2d.numel() != drafter_module.vocab_size:
             raise ValueError(
@@ -732,19 +823,19 @@ class Eagle3TrainerBackend:
         )
 
         return target_head
-    
+
     def preprocess_individual_items(self, items, device, model_config):
         """
         Process one sample: crop the window, build masks, and keep dimensions aligned.
         """
         res = {
-            'ids': [],
-            'h_states': [],
-            'masks': [],
-            'hidden_positions': [],
-            'position_ids': [],
-            'last_h_states': [],
-            'target_logprobs': [],
+            "ids": [],
+            "h_states": [],
+            "masks": [],
+            "hidden_positions": [],
+            "position_ids": [],
+            "last_h_states": [],
+            "target_logprobs": [],
         }
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
         h_dim = getattr(model_config, "target_hidden_size", model_config.hidden_size)
@@ -789,7 +880,9 @@ class Eagle3TrainerBackend:
                     getattr(self, "target_model", None),
                     item_idx,
                     item,
-                    target_token_to_local=getattr(self, "_target_token_to_draft_index", None),
+                    target_token_to_local=getattr(
+                        self, "_target_token_to_draft_index", None
+                    ),
                 )
 
             # Compute loss_mask if not present (for DataBuffer items)
@@ -811,36 +904,48 @@ class Eagle3TrainerBackend:
                     # If no response info, assume all tokens are valid
                     item_loss_mask[:] = 1.0
             else:
-                item_loss_mask = item["loss_mask"].to(device, dtype=torch.float32, non_blocking=True)
+                item_loss_mask = item["loss_mask"].to(
+                    device, dtype=torch.float32, non_blocking=True
+                )
             item_hidden_positions = item.get("hidden_positions")
             if item_hidden_positions is not None:
-                item_hidden_positions = item_hidden_positions.to(device, dtype=torch.long, non_blocking=True)
+                item_hidden_positions = item_hidden_positions.to(
+                    device, dtype=torch.long, non_blocking=True
+                )
             item_position_ids = item.get("position_ids")
             if item_position_ids is None:
                 if item_hidden_positions is not None:
                     item_position_ids = item_hidden_positions + 1
                 else:
-                    item_position_ids = torch.arange(full_len, device=device, dtype=torch.long)
+                    item_position_ids = torch.arange(
+                        full_len, device=device, dtype=torch.long
+                    )
             else:
-                item_position_ids = item_position_ids.to(device, dtype=torch.long, non_blocking=True)
-            
+                item_position_ids = item_position_ids.to(
+                    device, dtype=torch.long, non_blocking=True
+                )
+
             start = 0
             end = full_len
-            res['ids'].append(ids[start:end])
-            res['h_states'].append(h_states[start:end])
-            res['hidden_positions'].append(
-                item_hidden_positions[start:end] if item_hidden_positions is not None else None
+            res["ids"].append(ids[start:end])
+            res["h_states"].append(h_states[start:end])
+            res["hidden_positions"].append(
+                item_hidden_positions[start:end]
+                if item_hidden_positions is not None
+                else None
             )
-            res['position_ids'].append(item_position_ids[start:end])
+            res["position_ids"].append(item_position_ids[start:end])
             if not use_logits:
-                res['last_h_states'].append(last_h_states[start:end])
-            res['masks'].append(item_loss_mask[start:end])
+                res["last_h_states"].append(last_h_states[start:end])
+            res["masks"].append(item_loss_mask[start:end])
             target_logprobs_item = None
             if use_logits and item.get("target_logprobs") is not None:
                 target_end = max(start, end - 1)
-                target_logprobs_item = item["target_logprobs"].to(device, dtype=torch.float32)[start:target_end]
+                target_logprobs_item = item["target_logprobs"].to(
+                    device, dtype=torch.float32
+                )[start:target_end]
             res["target_logprobs"].append(target_logprobs_item)
-        
+
         return res
 
     def compute_loss(self, model, batch, _current_pad_size):
@@ -856,14 +961,20 @@ class Eagle3TrainerBackend:
         use_logits = self.config.rollout.drafter.training.use_logits
         use_sparse_restricted_ce = bool(use_logits)
         logits_sparse_min_intersection = int(
-            self.config.rollout.drafter.training.get("logits_sparse_min_intersection", 1)
+            self.config.rollout.drafter.training.get(
+                "logits_sparse_min_intersection", 1
+            )
         )
-        logits_sparse_min_mass = self.config.rollout.drafter.training.get("logits_sparse_min_mass", None)
+        logits_sparse_min_mass = self.config.rollout.drafter.training.get(
+            "logits_sparse_min_mass", None
+        )
         logits_coverage_mask_min_ratio = self.config.rollout.drafter.training.get(
             "logits_coverage_mask_min_ratio", None
         )
         logits_coverage_mask_require_top1 = bool(
-            self.config.rollout.drafter.training.get("logits_coverage_mask_require_top1", False)
+            self.config.rollout.drafter.training.get(
+                "logits_coverage_mask_require_top1", False
+            )
         )
         ttt_length = int(self.config.rollout.drafter.training.get("ttt_length", 1))
         if ttt_length < 1:
@@ -895,13 +1006,18 @@ class Eagle3TrainerBackend:
                     gather_dim=0,
                     unpad_dim=0,
                     padding_size=_current_pad_size,
-                ).unsqueeze(0) for l in all_step_logits
+                ).unsqueeze(0)
+                for l in all_step_logits
             ]
 
             all_step_position_mask = [
                 gather_outputs_and_unpad(
-                    m.squeeze(0), gather_dim=0, unpad_dim=0, padding_size=_current_pad_size
-                ).unsqueeze(0) for m in all_step_position_mask
+                    m.squeeze(0),
+                    gather_dim=0,
+                    unpad_dim=0,
+                    padding_size=_current_pad_size,
+                ).unsqueeze(0)
+                for m in all_step_position_mask
             ]
 
             loss_mask = gather_outputs_and_unpad(
@@ -933,7 +1049,9 @@ class Eagle3TrainerBackend:
                 target_topk_logprobs_for_loss = target_topk_logprobs
             else:
                 if last_hidden_states is None:
-                    raise ValueError("last_hidden_states is required when use_logits=False")
+                    raise ValueError(
+                        "last_hidden_states is required when use_logits=False"
+                    )
                 last_hidden_states = gather_outputs_and_unpad(
                     last_hidden_states.squeeze(0),
                     gather_dim=0,
@@ -963,10 +1081,12 @@ class Eagle3TrainerBackend:
                 target_topk_logprobs_for_loss = target_topk_logprobs
             else:
                 if last_hidden_states is None:
-                    raise ValueError("last_hidden_states is required when use_logits=False")
+                    raise ValueError(
+                        "last_hidden_states is required when use_logits=False"
+                    )
                 with torch.no_grad():
                     target_scores = self.target_model(last_hidden_states)
-        
+
         length = len(all_step_logits)
         if length == 0:
             return {
@@ -992,39 +1112,61 @@ class Eagle3TrainerBackend:
             if target_topk_logprobs_for_loss is None:
                 raise ValueError("target_logprobs is required when use_logits=True")
             if target_topk_logprobs_for_loss.device != target_device:
-                target_topk_logprobs_for_loss = target_topk_logprobs_for_loss.to(target_device)
+                target_topk_logprobs_for_loss = target_topk_logprobs_for_loss.to(
+                    target_device
+                )
             target_topk_logprobs_padded = _pad_topk_logprobs_for_future_shift(
                 target_topk_logprobs_for_loss,
                 length=length,
             )
-            sparse_loss_mask_padded = F.pad(loss_mask.float(), pad=(0, length), mode="constant", value=0.0)
+            sparse_loss_mask_padded = F.pad(
+                loss_mask.float(), pad=(0, length), mode="constant", value=0.0
+            )
         else:
             if target_scores is None:
                 raise ValueError("target_scores is required when use_logits=False")
             if target_scores.device != target_device:
                 target_scores = target_scores.to(target_device)
-            target_p_padded, target_position_mask_padded = self._compute_target_p_padded(
-                target_scores=target_scores,
-                t2d=draft_model.t2d,
-                loss_mask=loss_mask,
-                length=length,
+            target_p_padded, target_position_mask_padded = (
+                self._compute_target_p_padded(
+                    target_scores=target_scores,
+                    t2d=draft_model.t2d,
+                    loss_mask=loss_mask,
+                    length=length,
+                )
             )
             # Clean up large tensors to free memory
             del target_scores
 
-        total_local_ploss = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
-        total_local_tokens = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
-        quality_top1_correct = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
-        quality_topk_correct = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
+        total_local_ploss = torch.tensor(
+            0.0, device=input_ids.device, dtype=torch.float32
+        )
+        total_local_tokens = torch.tensor(
+            0.0, device=input_ids.device, dtype=torch.float32
+        )
+        quality_top1_correct = torch.tensor(
+            0.0, device=input_ids.device, dtype=torch.float32
+        )
+        quality_topk_correct = torch.tensor(
+            0.0, device=input_ids.device, dtype=torch.float32
+        )
         quality_tokens = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
         quality_topk = min(5, int(all_step_logits[0].size(-1)))
         quality_step_stats = []
-        sparse_base_tokens = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
-        sparse_valid_tokens = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
-        sparse_intersection_sum = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
-        sparse_hit_mass_sum = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
+        sparse_base_tokens = torch.tensor(
+            0.0, device=input_ids.device, dtype=torch.float32
+        )
+        sparse_valid_tokens = torch.tensor(
+            0.0, device=input_ids.device, dtype=torch.float32
+        )
+        sparse_intersection_sum = torch.tensor(
+            0.0, device=input_ids.device, dtype=torch.float32
+        )
+        sparse_hit_mass_sum = torch.tensor(
+            0.0, device=input_ids.device, dtype=torch.float32
+        )
         gamma = 0.8
-        
+
         # Preprocess shifted targets
         for idx in range(length):
             # Slice-align each step with its corresponding future target.
@@ -1034,28 +1176,44 @@ class Eagle3TrainerBackend:
             if step_position_mask.dim() == 3:
                 step_position_mask = step_position_mask.squeeze(-1)
             if use_sparse_restricted_ce:
-                target_position_mask = sparse_loss_mask_padded[:, idx : idx + seq_length]
+                target_position_mask = sparse_loss_mask_padded[
+                    :, idx : idx + seq_length
+                ]
             else:
-                target_position_mask = target_position_mask_padded[:, idx : idx + seq_length]
+                target_position_mask = target_position_mask_padded[
+                    :, idx : idx + seq_length
+                ]
             if target_position_mask.dim() == 3:
                 target_position_mask = target_position_mask.squeeze(-1)
             position_mask = step_position_mask * target_position_mask
 
             base_valid_position = position_mask > 0
             if use_sparse_restricted_ce:
-                target_topk = target_topk_logprobs_padded[:, idx : idx + seq_length, :, :].contiguous()
-                per_token_ploss, valid_position, target_top1, sparse_stats = _sparse_restricted_topk_cross_entropy(
-                    logits=logits,
-                    target_topk_logprobs=target_topk,
-                    t2d=draft_model.t2d,
-                    position_mask=position_mask,
-                    min_intersection=logits_sparse_min_intersection,
-                    min_hit_mass=logits_sparse_min_mass,
+                target_topk = target_topk_logprobs_padded[
+                    :, idx : idx + seq_length, :, :
+                ].contiguous()
+                per_token_ploss, valid_position, target_top1, sparse_stats = (
+                    _sparse_restricted_topk_cross_entropy(
+                        logits=logits,
+                        target_topk_logprobs=target_topk,
+                        t2d=draft_model.t2d,
+                        position_mask=position_mask,
+                        min_intersection=logits_sparse_min_intersection,
+                        min_hit_mass=logits_sparse_min_mass,
+                    )
                 )
-                sparse_base_tokens += sparse_stats["base_tokens"].to(device=input_ids.device)
-                sparse_valid_tokens += sparse_stats["valid_tokens"].to(device=input_ids.device)
-                sparse_intersection_sum += sparse_stats["intersection_sum"].to(device=input_ids.device)
-                sparse_hit_mass_sum += sparse_stats["hit_mass_sum"].to(device=input_ids.device)
+                sparse_base_tokens += sparse_stats["base_tokens"].to(
+                    device=input_ids.device
+                )
+                sparse_valid_tokens += sparse_stats["valid_tokens"].to(
+                    device=input_ids.device
+                )
+                sparse_intersection_sum += sparse_stats["intersection_sum"].to(
+                    device=input_ids.device
+                )
+                sparse_hit_mass_sum += sparse_stats["hit_mass_sum"].to(
+                    device=input_ids.device
+                )
             else:
                 target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
                 per_token_ploss, valid_position = _masked_soft_cross_entropy(
@@ -1064,7 +1222,10 @@ class Eagle3TrainerBackend:
                     position_mask=position_mask,
                 )
                 target_top1 = target_p.argmax(dim=-1)
-            if base_valid_position.any() and not valid_position[base_valid_position].all():
+            if (
+                base_valid_position.any()
+                and not valid_position[base_valid_position].all()
+            ):
                 dropped_tokens = (base_valid_position & ~valid_position).sum()
                 logger.debug(
                     "Dropping %s EAGLE3 target positions with non-finite logits or targets",
@@ -1073,18 +1234,30 @@ class Eagle3TrainerBackend:
             with torch.no_grad():
                 if valid_position.any():
                     draft_top1 = logits.argmax(dim=-1)
-                    step_top1_correct = (draft_top1[valid_position] == target_top1[valid_position]).float().sum()
+                    step_top1_correct = (
+                        (draft_top1[valid_position] == target_top1[valid_position])
+                        .float()
+                        .sum()
+                    )
                     quality_top1_correct += step_top1_correct
                     if quality_topk > 1:
                         draft_topk = logits.topk(quality_topk, dim=-1).indices
                         step_topk_correct = (
-                            draft_topk[valid_position] == target_top1[valid_position].unsqueeze(-1)
-                        ).any(dim=-1).float().sum()
+                            (
+                                draft_topk[valid_position]
+                                == target_top1[valid_position].unsqueeze(-1)
+                            )
+                            .any(dim=-1)
+                            .float()
+                            .sum()
+                        )
                         quality_topk_correct += step_topk_correct
                     else:
                         step_topk_correct = (
-                            draft_top1[valid_position] == target_top1[valid_position]
-                        ).float().sum()
+                            (draft_top1[valid_position] == target_top1[valid_position])
+                            .float()
+                            .sum()
+                        )
                         quality_topk_correct += step_topk_correct
                     step_tokens = valid_position.float().sum()
                     quality_tokens += step_tokens
@@ -1093,19 +1266,29 @@ class Eagle3TrainerBackend:
                             "step": idx,
                             "tokens": int(step_tokens.detach().cpu().item()),
                             "top1": round(
-                                float((step_top1_correct / step_tokens.clamp_min(1)).detach().cpu().item()),
+                                float(
+                                    (step_top1_correct / step_tokens.clamp_min(1))
+                                    .detach()
+                                    .cpu()
+                                    .item()
+                                ),
                                 6,
                             ),
                             f"top{quality_topk}": round(
-                                float((step_topk_correct / step_tokens.clamp_min(1)).detach().cpu().item()),
+                                float(
+                                    (step_topk_correct / step_tokens.clamp_min(1))
+                                    .detach()
+                                    .cpu()
+                                    .item()
+                                ),
                                 6,
                             ),
                         }
                     )
             step_loss_sum = per_token_ploss.sum()
-            
+
             # Apply EAGLE3 step-wise temporal decay
-            total_local_ploss += (gamma ** idx) * step_loss_sum
+            total_local_ploss += (gamma**idx) * step_loss_sum
             total_local_tokens += valid_position.float().sum()
 
         if use_sparse_restricted_ce and sparse_base_tokens.detach().float().item() > 0:
@@ -1115,8 +1298,18 @@ class Eagle3TrainerBackend:
                 int(sparse_base_tokens.detach().cpu().item()),
                 int(sparse_valid_tokens.detach().cpu().item()),
                 int((sparse_base_tokens - sparse_valid_tokens).detach().cpu().item()),
-                float((sparse_intersection_sum / sparse_base_tokens.clamp_min(1)).detach().cpu().item()),
-                float((sparse_hit_mass_sum / sparse_base_tokens.clamp_min(1)).detach().cpu().item()),
+                float(
+                    (sparse_intersection_sum / sparse_base_tokens.clamp_min(1))
+                    .detach()
+                    .cpu()
+                    .item()
+                ),
+                float(
+                    (sparse_hit_mass_sum / sparse_base_tokens.clamp_min(1))
+                    .detach()
+                    .cpu()
+                    .item()
+                ),
                 logits_sparse_min_intersection,
                 logits_sparse_min_mass,
             )
@@ -1139,9 +1332,9 @@ class Eagle3TrainerBackend:
             "total_local_ploss": total_local_ploss,
             "local_num_tokens": total_local_tokens,
             "v_weight": 0.0,
-            "p_weight": 1.0
+            "p_weight": 1.0,
         }
-    
+
     def _compute_target_p_padded(self, target_scores, t2d, loss_mask, length):
         with torch.no_grad():
             target_p, position_mask = self._compute_target_p(
@@ -1166,7 +1359,6 @@ class Eagle3TrainerBackend:
             )
 
             return target_p_padded, position_mask_padded
-
 
     def _compute_target_p(self, target_scores, t2d, loss_mask):
         loss_mask = loss_mask.to(device=target_scores.device)
@@ -1205,6 +1397,3 @@ class Eagle3TrainerBackend:
         )
         target_p = target_p.detach()
         return target_p, position_mask
-        
-
-        

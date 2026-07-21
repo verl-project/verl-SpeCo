@@ -18,7 +18,10 @@ from verl.utils.device import get_device_name, get_torch_device
 from verl_speco.backends.dflash_trainer_backend import DFlashTrainerBackend
 from verl_speco.backends.eagle3_trainer_backend import Eagle3TrainerBackend
 from verl_speco.trainer.base_trainer import DrafterBaseTrainer
-from verl_speco.trainer.draft_dataset import DraftFeatureDataLoader, DraftFeatureDataLoaderConfig
+from verl_speco.trainer.draft_dataset import (
+    DraftFeatureDataLoader,
+    DraftFeatureDataLoaderConfig,
+)
 from verl_speco.trainer.feature_store import build_feature_store_from_config
 
 logger = logging.getLogger(__name__)
@@ -36,7 +39,9 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     training_cfg = drafter_cfg.training
     feature_store_cfg = training_cfg.feature_store
     if not feature_store_cfg.get("path"):
-        raise ValueError("actor_rollout_ref.rollout.drafter.training.feature_store.path is required")
+        raise ValueError(
+            "actor_rollout_ref.rollout.drafter.training.feature_store.path is required"
+        )
     _disable_standalone_sequence_parallel(draft_config)
 
     _configure_device(local_rank)
@@ -53,7 +58,9 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         training_process_group=(
             None
             if training_device_mesh is not None
-            else dist.group.WORLD if dist.is_initialized() and world_size > 1 else None
+            else dist.group.WORLD
+            if dist.is_initialized() and world_size > 1
+            else None
         ),
         data_parallel_process_group=None,
         backend=backend,
@@ -71,7 +78,9 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     try:
         activated = await trainer.activate_training_model()
         if not activated:
-            raise RuntimeError(f"Failed to activate standalone drafter trainer on rank={rank}")
+            raise RuntimeError(
+                f"Failed to activate standalone drafter trainer on rank={rank}"
+            )
         initial_optimizer_step = int(trainer.optimizer_steps_total)
         optimizer_step = initial_optimizer_step
         last_saved_step = optimizer_step
@@ -92,11 +101,15 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             if max_steps > 0 and successful_steps >= max_steps:
                 break
             attempted_batches += 1
-            batch = trainer.prepare_training_batch_from_samples(samples, step=optimizer_step)
+            batch = trainer.prepare_training_batch_from_samples(
+                samples, step=optimizer_step
+            )
             has_batch = batch is not None
             if not _all_ranks_true(has_batch, trainer.runtime_device):
                 if rank == 0:
-                    logger.warning("Skipping standalone drafter batch: at least one rank has no valid batch")
+                    logger.warning(
+                        "Skipping standalone drafter batch: at least one rank has no valid batch"
+                    )
                 continue
             if batch is None:
                 continue
@@ -114,7 +127,9 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 _barrier()
         final_save = bool(training_cfg.get("save_final_checkpoint", True))
         if final_save and successful_steps > 0 and optimizer_step != last_saved_step:
-            last_save_result = _save_standalone_checkpoint(trainer, optimizer_step, wait=True)
+            last_save_result = _save_standalone_checkpoint(
+                trainer, optimizer_step, wait=True
+            )
             _barrier()
     finally:
         if store is not None:
@@ -145,10 +160,14 @@ def _build_backend(draft_config):
         from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend
 
         return DSparkTrainerBackend(draft_config, draft_config.model)
-    raise ValueError(f"Unsupported drafter algorithm {algo!r}; expected EAGLE3, DFLASH or DSPARK")
+    raise ValueError(
+        f"Unsupported drafter algorithm {algo!r}; expected EAGLE3, DFLASH or DSPARK"
+    )
 
 
-def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int, *, wait: bool = False) -> dict[str, Any]:
+def _save_standalone_checkpoint(
+    trainer: DrafterBaseTrainer, step: int, *, wait: bool = False
+) -> dict[str, Any]:
     save_checkpoint = getattr(trainer, "save_checkpoint", None)
     if callable(save_checkpoint):
         result = save_checkpoint(int(step), wait=wait)
@@ -177,11 +196,19 @@ def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int, *, wait:
     pending_full_checkpoint = getattr(trainer, "_pending_full_checkpoint_future", None)
     pending_done = getattr(pending_full_checkpoint, "done", None)
     if callable(pending_done) and not pending_done():
-        return {"saved": False, "path": checkpoint_path, "reason": "previous_save_running"}
+        return {
+            "saved": False,
+            "path": checkpoint_path,
+            "reason": "previous_save_running",
+        }
 
     save_async = getattr(trainer, "_save_checkpoint_async", None)
     if not callable(save_async):
-        return {"saved": False, "path": checkpoint_path, "reason": "unsupported_trainer"}
+        return {
+            "saved": False,
+            "path": checkpoint_path,
+            "reason": "unsupported_trainer",
+        }
     future = save_async(int(step))
     if future is not None and wait:
         future.result()
@@ -198,7 +225,11 @@ def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int, *, wait:
     return {
         "saved": future is not None,
         "path": checkpoint_path,
-        "reason": "saved" if future is not None and wait else "scheduled" if future is not None else "not_checkpoint_leader",
+        "reason": "saved"
+        if future is not None and wait
+        else "scheduled"
+        if future is not None
+        else "not_checkpoint_leader",
     }
 
 
@@ -212,7 +243,9 @@ def _ensure_dict_child(config: dict[str, Any], key: str) -> dict[str, Any]:
 
 
 def _load_source_drafter_config(trainer: DrafterBaseTrainer) -> dict[str, Any] | None:
-    model_path = getattr(getattr(getattr(trainer, "config", None), "rollout", None), "drafter", None)
+    model_path = getattr(
+        getattr(getattr(trainer, "config", None), "rollout", None), "drafter", None
+    )
     model_path = getattr(model_path, "model_path", None)
     if not model_path:
         return None
@@ -228,7 +261,9 @@ def _load_source_drafter_config(trainer: DrafterBaseTrainer) -> dict[str, Any] |
     return loaded if isinstance(loaded, dict) else None
 
 
-def _fill_if_missing(dst: dict[str, Any], src: dict[str, Any], keys: tuple[str, ...]) -> None:
+def _fill_if_missing(
+    dst: dict[str, Any], src: dict[str, Any], keys: tuple[str, ...]
+) -> None:
     for key in keys:
         if key in src and key not in dst:
             dst[key] = deepcopy(src[key])
@@ -253,22 +288,31 @@ def _rewrite_standalone_block_runtime_config(
         try:
             completed_future.result()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Skip standalone runtime config rewrite because checkpoint save failed: %s", exc)
+            logger.warning(
+                "Skip standalone runtime config rewrite because checkpoint save failed: %s",
+                exc,
+            )
             return
 
     config_path = os.path.join(checkpoint_path, "config.json")
     if not os.path.exists(config_path):
-        logger.warning("Cannot rewrite standalone runtime config: missing %s", config_path)
+        logger.warning(
+            "Cannot rewrite standalone runtime config: missing %s", config_path
+        )
         return
 
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             training_config = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Cannot rewrite standalone runtime config %s: %s", config_path, exc)
+        logger.warning(
+            "Cannot rewrite standalone runtime config %s: %s", config_path, exc
+        )
         return
     if not isinstance(training_config, dict):
-        logger.warning("Cannot rewrite standalone runtime config %s: expected object", config_path)
+        logger.warning(
+            "Cannot rewrite standalone runtime config %s: expected object", config_path
+        )
         return
 
     training_config_path = os.path.join(checkpoint_path, "speco_training_config.json")
@@ -276,7 +320,11 @@ def _rewrite_standalone_block_runtime_config(
         with open(training_config_path, "w", encoding="utf-8") as f:
             json.dump(training_config, f, indent=2, sort_keys=True)
     except OSError as exc:
-        logger.warning("Failed to write standalone training config copy %s: %s", training_config_path, exc)
+        logger.warning(
+            "Failed to write standalone training config copy %s: %s",
+            training_config_path,
+            exc,
+        )
 
     runtime_config = _load_source_drafter_config(trainer)
     if runtime_config is None:
@@ -322,18 +370,28 @@ def _rewrite_standalone_block_runtime_config(
         or dflash_config.get("target_layer_ids")
         or dspark_config.get("target_layer_ids")
     )
-    if target_layer_ids is not None and "eagle_aux_hidden_state_layer_ids" not in runtime_config:
+    if (
+        target_layer_ids is not None
+        and "eagle_aux_hidden_state_layer_ids" not in runtime_config
+    ):
         try:
-            runtime_config["eagle_aux_hidden_state_layer_ids"] = [int(layer_id) + 1 for layer_id in target_layer_ids]
+            runtime_config["eagle_aux_hidden_state_layer_ids"] = [
+                int(layer_id) + 1 for layer_id in target_layer_ids
+            ]
         except (TypeError, ValueError):
-            logger.warning("Invalid target_layer_ids in standalone exported config: %r", target_layer_ids)
+            logger.warning(
+                "Invalid target_layer_ids in standalone exported config: %r",
+                target_layer_ids,
+            )
 
     try:
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(runtime_config, f, indent=2, sort_keys=True)
             f.write("\n")
     except OSError as exc:
-        logger.warning("Failed to write standalone runtime config %s: %s", config_path, exc)
+        logger.warning(
+            "Failed to write standalone runtime config %s: %s", config_path, exc
+        )
 
 
 def _disable_standalone_sequence_parallel(draft_config) -> None:
@@ -353,7 +411,9 @@ def _disable_standalone_sequence_parallel(draft_config) -> None:
 def _build_training_device_mesh(draft_config, world_size: int) -> DeviceMesh | None:
     if world_size <= 1 or not dist.is_initialized():
         return None
-    strategy = str(draft_config.actor.get("strategy", "") if hasattr(draft_config, "actor") else "").lower()
+    strategy = str(
+        draft_config.actor.get("strategy", "") if hasattr(draft_config, "actor") else ""
+    ).lower()
     if strategy != "fsdp2":
         return None
     return DeviceMesh(
@@ -377,7 +437,9 @@ def _init_distributed() -> tuple[int, int, int]:
         elif device_name == "cpu":
             backend = "gloo"
         else:
-            raise ValueError(f"Unsupported standalone drafter device_name={device_name!r}")
+            raise ValueError(
+                f"Unsupported standalone drafter device_name={device_name!r}"
+            )
         dist.init_process_group(backend=backend)
     return rank, local_rank, world_size
 
@@ -417,4 +479,7 @@ def _sync_any_rank_saved_checkpoint(saved: Any) -> bool:
 def log_resolved_config(config) -> None:
     rank = int(os.environ.get("RANK", "0"))
     if rank == 0:
-        logger.warning("Resolved SPECO standalone draft trainer config:\n%s", OmegaConf.to_yaml(config))
+        logger.warning(
+            "Resolved SPECO standalone draft trainer config:\n%s",
+            OmegaConf.to_yaml(config),
+        )

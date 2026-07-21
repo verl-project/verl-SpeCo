@@ -9,12 +9,13 @@ from safetensors import safe_open
 from transformers.cache_utils import Cache
 from transformers.modeling_utils import PreTrainedModel
 
+
 def load_checkpoint(model_path: str, key: str) -> torch.Tensor:
     if not os.path.exists(model_path):
         # this is the case where model_path is a huggingface repository
         # we first need to locate its local cache
         model_path = snapshot_download(repo_id=model_path)
-    
+
     # check if there is file ending with index.json
     glob_path = os.path.join(model_path, "*.index.json")
     index_json_path = glob.glob(glob_path)
@@ -35,9 +36,7 @@ def load_checkpoint(model_path: str, key: str) -> torch.Tensor:
             f"No index.json, model.safetensors or pytorch_model.bin found in {model_path}"
         )
     if len(index_json_path) > 1:
-        raise FileNotFoundError(
-            f"Multiple index.json files found in {model_path}"
-        )
+        raise FileNotFoundError(f"Multiple index.json files found in {model_path}")
     index_json_path = index_json_path[0]
 
     with open(index_json_path, "r") as f:
@@ -45,16 +44,14 @@ def load_checkpoint(model_path: str, key: str) -> torch.Tensor:
     ckpt_file = index_json["weight_map"][key]
 
     if ckpt_file.endswith(".safetensors"):
-        with safe_open(
-            os.path.join(model_path, ckpt_file), framework="pt"
-        ) as f:
+        with safe_open(os.path.join(model_path, ckpt_file), framework="pt") as f:
             return f.get_tensor(key)
     else:
         state_dict = torch.load(os.path.join(model_path, ckpt_file))
         return state_dict[key]
 
+
 class DraftModel(PreTrainedModel):
-    
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
         Embed the input ids.
@@ -120,6 +117,7 @@ class Eagle3DraftModel(DraftModel):
     This is the base class for the Eagle3 draft model implementation. The child class needs to implement
     the abstract methods to support training with TTT.
     """
+
     drafter_model_type = "LlamaForCausalLMEagle3"
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -127,7 +125,7 @@ class Eagle3DraftModel(DraftModel):
         Project the concatenated hidden states from the high, medium and low layers to the target hidden size.
         """
         raise NotImplementedError("Subclasses must implement project_hidden_states")
-    
+
     def load_vocab_mapping(self, file_path: str) -> None:
         """
         Load the vocab buffers of the draft model.
@@ -135,16 +133,20 @@ class Eagle3DraftModel(DraftModel):
         Args:
             file_path (str): The path to the vocab mapping file.
         """
-        assert hasattr(self, "t2d") and hasattr(
-            self, "d2t"
-        ), "t2d and d2t buffersare not found in the draft model, please check your draft model implementation"
+        assert hasattr(self, "t2d") and hasattr(self, "d2t"), (
+            "t2d and d2t buffersare not found in the draft model, please check your draft model implementation"
+        )
         vocab_mapping = torch.load(file_path, map_location=self.t2d.device)
         t2d = vocab_mapping["t2d"].to(device=self.t2d.device, dtype=self.t2d.dtype)
         d2t = vocab_mapping["d2t"].to(device=self.d2t.device, dtype=self.d2t.dtype)
         if t2d.shape != self.t2d.shape:
-            raise ValueError(f"Expected t2d shape {tuple(self.t2d.shape)}, got {tuple(t2d.shape)}")
+            raise ValueError(
+                f"Expected t2d shape {tuple(self.t2d.shape)}, got {tuple(t2d.shape)}"
+            )
         if d2t.shape != self.d2t.shape:
-            raise ValueError(f"Expected d2t shape {tuple(self.d2t.shape)}, got {tuple(d2t.shape)}")
+            raise ValueError(
+                f"Expected d2t shape {tuple(self.d2t.shape)}, got {tuple(d2t.shape)}"
+            )
         self.t2d.copy_(t2d)
         self.d2t.copy_(d2t)
         self.vocab_mapping_loaded = True

@@ -4,7 +4,6 @@ import warnings
 from typing import List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
@@ -83,7 +82,9 @@ def resolve_eagle3_num_aux_hidden_states(config) -> int:
         num_aux_hidden_states = len(layer_ids) if layer_ids else 3
     num_aux_hidden_states = int(num_aux_hidden_states)
     if num_aux_hidden_states <= 0:
-        raise ValueError(f"EAGLE3 num_aux_hidden_states must be positive, got {num_aux_hidden_states}")
+        raise ValueError(
+            f"EAGLE3 num_aux_hidden_states must be positive, got {num_aux_hidden_states}"
+        )
     return num_aux_hidden_states
 
 
@@ -168,7 +169,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-def _rotary_seq_len_for_position_ids(seq_len: int, position_ids: Optional[torch.Tensor]) -> int:
+def _rotary_seq_len_for_position_ids(
+    seq_len: int, position_ids: Optional[torch.Tensor]
+) -> int:
     if position_ids is None or position_ids.numel() == 0:
         return int(seq_len)
     return max(int(seq_len), int(position_ids.detach().max().item()) + 1)
@@ -319,12 +322,21 @@ class LlamaRotaryEmbedding(torch.nn.Module):
     def reset_inv_freq(self, device=None, dtype=torch.float32):
         device = device if device is not None else self.inv_freq.device
         inv_freq = 1.0 / (
-            self.base ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim)
+            self.base
+            ** (
+                torch.arange(0, self.dim, 2, device=device, dtype=torch.float32)
+                / self.dim
+            )
         )
 
         if all(
             getattr(self, attr, None) is not None
-            for attr in ("scaling_factor", "low_freq_factor", "high_freq_factor", "orig_max_position")
+            for attr in (
+                "scaling_factor",
+                "low_freq_factor",
+                "high_freq_factor",
+                "orig_max_position",
+            )
         ):
             low_freq_wavelen = self.orig_max_position / self.low_freq_factor
             high_freq_wavelen = self.orig_max_position / self.high_freq_factor
@@ -346,7 +358,9 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             )
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        seq_len = int(getattr(self, "max_seq_len_cached", self.max_position_embeddings + 20))
+        seq_len = int(
+            getattr(self, "max_seq_len_cached", self.max_position_embeddings + 20)
+        )
         self._set_cos_sin_cache(seq_len=seq_len, device=device, dtype=dtype)
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
@@ -530,7 +544,6 @@ def yarn_linear_ramp_mask(min_val, max_val, dim):
 
 
 class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
-
     def __init__(
         self,
         dim,
@@ -787,7 +800,9 @@ class LlamaAttention(nn.Module):
                 )
             else:
                 shifted_position_ids = position_ids + lck
-                rotary_seq_len = _rotary_seq_len_for_position_ids(q_len + lck, shifted_position_ids)
+                rotary_seq_len = _rotary_seq_len_for_position_ids(
+                    q_len + lck, shifted_position_ids
+                )
                 cos, sin = self.rotary_emb(query_states, seq_len=rotary_seq_len)
                 cos, sin = cos.to(query_states.device), sin.to(query_states.device)
                 query_states, key_states = apply_rotary_pos_emb(
@@ -899,7 +914,9 @@ class LlamaFlexAttention(LlamaAttention):
             )
         else:
             shifted_position_ids = position_ids + lck
-            rotary_seq_len = _rotary_seq_len_for_position_ids(q_len + lck, shifted_position_ids)
+            rotary_seq_len = _rotary_seq_len_for_position_ids(
+                q_len + lck, shifted_position_ids
+            )
             cos, sin = self.rotary_emb(query_states, seq_len=rotary_seq_len)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
             # Keep positions ids aligned when padding so the KV cache is unaffected.
@@ -1005,11 +1022,18 @@ class LlamaFlashAttention(LlamaAttention):
             )
         else:
             shifted_position_ids = position_ids + lck
-            rotary_seq_len = _rotary_seq_len_for_position_ids(q_len + lck, shifted_position_ids)
+            rotary_seq_len = _rotary_seq_len_for_position_ids(
+                q_len + lck, shifted_position_ids
+            )
             cos, sin = self.rotary_emb(query_states, seq_len=rotary_seq_len)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
             query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, shifted_position_ids, unsqueeze_dim=2
+                query_states,
+                key_states,
+                cos,
+                sin,
+                shifted_position_ids,
+                unsqueeze_dim=2,
             )
 
         if cache_hidden is not None:
@@ -1025,9 +1049,9 @@ class LlamaFlashAttention(LlamaAttention):
         k0 = cache_k[0]
         v0 = cache_v[0]
 
-        assert (
-            flash_attn_func is not None
-        ), "flash_attn is not installed, please install flash_attn if you want to use the flash attention backend"
+        assert flash_attn_func is not None, (
+            "flash_attn is not installed, please install flash_attn if you want to use the flash attention backend"
+        )
         attn_output, lse, _ = flash_attn_func(
             query_states,
             k0,
@@ -1411,19 +1435,20 @@ class LlamaDecoderLayer(nn.Module):
 
 
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
-
     config_class = LlamaConfig
     _no_split_modules = ["LlamaDecoderLayer"]
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
         super().__init__(config)
-        
+
         self.config = config
         self.quant_config = quant_config
 
         self.vocab_size = config.vocab_size
         self.draft_vocab_size = getattr(config, "draft_vocab_size", config.vocab_size)
-        self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
+        self.target_hidden_size = getattr(
+            config, "target_hidden_size", config.hidden_size
+        )
         self.num_aux_hidden_states = resolve_eagle3_num_aux_hidden_states(config)
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
@@ -1431,7 +1456,9 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
         self.fc = torch.nn.Linear(
-            self.target_hidden_size * self.num_aux_hidden_states, config.hidden_size, bias=False
+            self.target_hidden_size * self.num_aux_hidden_states,
+            config.hidden_size,
+            bias=False,
         )
         if getattr(config, "fc_norm", False):
             self.fc_norm = nn.ModuleList(
@@ -1444,9 +1471,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             self.fc_norm = None
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = nn.Linear(
-            config.hidden_size, self.draft_vocab_size, bias=False
-        )
+        self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
 
         self.post_init()
 
@@ -1506,7 +1531,9 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
                 past_length = past_key_value.get_usable_length(seq_length)
             else:
                 past_length = 0
-            position_ids = torch.arange(past_length, seq_length + past_length, dtype=torch.long, device=device)
+            position_ids = torch.arange(
+                past_length, seq_length + past_length, dtype=torch.long, device=device
+            )
             position_ids = position_ids.unsqueeze(0)
 
         # make attention mask
@@ -1531,7 +1558,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
         # TTT多步循环
         for idx in range(ttt_length):
-            is_last = (idx == ttt_length - 1)
+            is_last = idx == ttt_length - 1
 
             inputs_embeds = self.embed_input_ids(current_input_ids)
 
@@ -1567,7 +1594,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             "logits": all_step_logits,
             "loss_masks": all_step_loss_masks,
             "position_masks": all_step_position_masks,
-            "last_hidden_states": current_hidden_states
+            "last_hidden_states": current_hidden_states,
         }
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1584,7 +1611,9 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             )
         if self.fc_norm is not None:
             chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
-            hidden_states = torch.cat([norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)], dim=-1)
+            hidden_states = torch.cat(
+                [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)], dim=-1
+            )
         return self.fc(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1612,7 +1641,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
-    
+
     def _shift_right(self, x: torch.Tensor):
         """实现 Teacher Forcing 下的右移填充：舍弃首位，末位补0"""
         # x: (batch, seq) -> (batch, seq)

@@ -19,9 +19,13 @@ _DEFAULT_EXTRA_KEYS = {
     "extras",
     "drafter_sample",
 }
-_CURRENT_GLOBAL_STEPS = contextvars.ContextVar("speco_current_global_steps", default=None)
+_CURRENT_GLOBAL_STEPS = contextvars.ContextVar(
+    "speco_current_global_steps", default=None
+)
 _CURRENT_VALIDATE = contextvars.ContextVar("speco_current_validate", default=False)
-SPECO_AGENT_LOOP_MANAGER_CLASS = "verl_speco.integration.agent_loop_runtime.SpecoAgentLoopManager"
+SPECO_AGENT_LOOP_MANAGER_CLASS = (
+    "verl_speco.integration.agent_loop_runtime.SpecoAgentLoopManager"
+)
 _SPECO_WORKER_WRAPPER_METHOD_NAMES = {
     "_speco_worker_init",
     "_speco_worker_generate_sequences",
@@ -36,7 +40,11 @@ def _is_sglang_rollout_config(config: Any) -> bool:
     rollout_config = getattr(rollout_config, "rollout", None)
     if rollout_config is None and hasattr(config, "get"):
         actor_rollout_ref = config.get("actor_rollout_ref", {})
-        rollout_config = actor_rollout_ref.get("rollout") if hasattr(actor_rollout_ref, "get") else None
+        rollout_config = (
+            actor_rollout_ref.get("rollout")
+            if hasattr(actor_rollout_ref, "get")
+            else None
+        )
     if rollout_config is None:
         return False
     if hasattr(rollout_config, "get"):
@@ -85,7 +93,9 @@ def _sampling_params_with_speco_context(sampling_params: Any) -> Any:
     return patched
 
 
-def _sampling_params_with_speco_step(sampling_params: Any, *, global_steps: Any, validate: bool) -> Any:
+def _sampling_params_with_speco_step(
+    sampling_params: Any, *, global_steps: Any, validate: bool
+) -> Any:
     if not isinstance(sampling_params, dict):
         return sampling_params
     patched = dict(sampling_params)
@@ -101,7 +111,11 @@ def _speco_parent_method(instance: Any, method_name: str) -> Any:
         if getattr(cls, "_speco_explicit_worker_runtime", False):
             continue
         method = cls.__dict__.get(method_name)
-        if method is not None and getattr(method, "__name__", None) not in _SPECO_WORKER_WRAPPER_METHOD_NAMES:
+        if (
+            method is not None
+            and getattr(method, "__name__", None)
+            not in _SPECO_WORKER_WRAPPER_METHOD_NAMES
+        ):
             return method
     return None
 
@@ -145,7 +159,9 @@ async def _speco_worker_generate_sequences(self, batch):
     try:
         generate_sequences = _speco_parent_method(self, "generate_sequences")
         if not callable(generate_sequences):
-            raise AttributeError("SPECO AgentLoop worker parent has no generate_sequences method")
+            raise AttributeError(
+                "SPECO AgentLoop worker parent has no generate_sequences method"
+            )
         result = generate_sequences(self, batch)
         if inspect.isawaitable(result):
             result = await result
@@ -154,7 +170,9 @@ async def _speco_worker_generate_sequences(self, batch):
         _speco_reset_context(global_steps_token, validate_token)
 
 
-async def _speco_worker_run_agent_loop(self, sampling_params, trajectory, *args, **kwargs):
+async def _speco_worker_run_agent_loop(
+    self, sampling_params, trajectory, *args, **kwargs
+):
     trajectory = trajectory if isinstance(trajectory, dict) else {}
     sampling_params = _sampling_params_with_speco_step(
         sampling_params,
@@ -163,7 +181,9 @@ async def _speco_worker_run_agent_loop(self, sampling_params, trajectory, *args,
     )
     run_agent_loop = _speco_parent_method(self, "_run_agent_loop")
     if not callable(run_agent_loop):
-        raise AttributeError("SPECO AgentLoop worker parent has no _run_agent_loop method")
+        raise AttributeError(
+            "SPECO AgentLoop worker parent has no _run_agent_loop method"
+        )
     result = run_agent_loop(self, sampling_params, trajectory, *args, **kwargs)
     if inspect.isawaitable(result):
         result = await result
@@ -174,14 +194,18 @@ async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs)
     _speco_default_agent_loop_extra_fields(output)
     agent_loop_postprocess = _speco_parent_method(self, "_agent_loop_postprocess")
     if not callable(agent_loop_postprocess):
-        raise AttributeError("SPECO AgentLoop worker parent has no _agent_loop_postprocess method")
+        raise AttributeError(
+            "SPECO AgentLoop worker parent has no _agent_loop_postprocess method"
+        )
     result = agent_loop_postprocess(self, output, validate, **kwargs)
     if inspect.isawaitable(result):
         result = await result
     return _speco_default_agent_loop_extra_fields(result)
 
 
-def _speco_worker_postprocess(self, inputs, input_non_tensor_batch=None, validate=False):
+def _speco_worker_postprocess(
+    self, inputs, input_non_tensor_batch=None, validate=False
+):
     _speco_default_agent_loop_inputs(inputs)
     postprocess = _speco_parent_method(self, "_postprocess")
     if not callable(postprocess):
@@ -222,7 +246,9 @@ except Exception:  # noqa: BLE001
 
 def _build_speco_agent_loop_worker_class(worker_cls):
     speco_worker_cls = getattr(worker_cls, "_speco_remote_worker_cls", None)
-    if speco_worker_cls is not None and getattr(speco_worker_cls, "_speco_explicit_worker_runtime", False):
+    if speco_worker_cls is not None and getattr(
+        speco_worker_cls, "_speco_explicit_worker_runtime", False
+    ):
         return speco_worker_cls
 
     generate_sequences = getattr(worker_cls, "generate_sequences", None)
@@ -259,7 +285,9 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
 
     import ray
 
-    manager.agent_loop_workers_class = ray.remote(_build_speco_agent_loop_worker_class(worker_cls))
+    manager.agent_loop_workers_class = ray.remote(
+        _build_speco_agent_loop_worker_class(worker_cls)
+    )
 
     try:
         from verl.workers.rollout.sglang_rollout import async_sglang_server
@@ -271,11 +299,17 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
         manager.rollout_replica_class = _build_speco_replica_class(async_sglang_server)
         patch_sglang_server_adapter_update()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Unable to bind SPECO SGLang replica bridge to AgentLoopManager: %s", exc)
+        logger.warning(
+            "Unable to bind SPECO SGLang replica bridge to AgentLoopManager: %s", exc
+        )
 
     logger.warning(
         "SPECO AgentLoopManager bridge active for SGLang rollout: worker_class=%s rollout_replica_class=%s",
-        getattr(_build_speco_agent_loop_worker_class(worker_cls), "__name__", type(worker_cls).__name__),
+        getattr(
+            _build_speco_agent_loop_worker_class(worker_cls),
+            "__name__",
+            type(worker_cls).__name__,
+        ),
         getattr(getattr(manager, "rollout_replica_class", None), "__name__", None),
     )
     manager._speco_agent_loop_manager_configured = True
@@ -309,7 +343,9 @@ def install_agent_loop_runtime_patch() -> bool:
     manager_cls = getattr(agent_loop_module, "AgentLoopManager", None)
     llm_server_manager_cls = getattr(agent_loop_module, "AsyncLLMServerManager", None)
     if worker_cls is None or manager_cls is None or llm_server_manager_cls is None:
-        logger.warning("Unable to install SPECO agent-loop runtime patch: missing upstream classes")
+        logger.warning(
+            "Unable to install SPECO agent-loop runtime patch: missing upstream classes"
+        )
         return False
 
     generate_sequences = getattr(worker_cls, "generate_sequences", None)
@@ -327,7 +363,9 @@ def install_agent_loop_runtime_patch() -> bool:
         or not callable(manager_generate_sequences)
         or not callable(llm_server_generate)
     ):
-        logger.warning("Unable to install SPECO agent-loop runtime patch: missing upstream methods")
+        logger.warning(
+            "Unable to install SPECO agent-loop runtime patch: missing upstream methods"
+        )
         return False
 
     if not getattr(llm_server_manager_cls, "_speco_patched_generate", False):
@@ -335,7 +373,9 @@ def install_agent_loop_runtime_patch() -> bool:
         @wraps(llm_server_generate)
         async def speco_llm_server_generate(self, *args, **kwargs):
             if "sampling_params" in kwargs:
-                kwargs["sampling_params"] = _sampling_params_with_speco_context(kwargs["sampling_params"])
+                kwargs["sampling_params"] = _sampling_params_with_speco_context(
+                    kwargs["sampling_params"]
+                )
             result = llm_server_generate(self, *args, **kwargs)
             if inspect.isawaitable(result):
                 result = await result
@@ -350,8 +390,12 @@ def install_agent_loop_runtime_patch() -> bool:
         async def speco_generate_sequences(self, batch):
             meta_info = getattr(batch, "meta_info", None)
             meta_info = meta_info if isinstance(meta_info, dict) else {}
-            global_steps_token = _CURRENT_GLOBAL_STEPS.set(meta_info.get("global_steps"))
-            validate_token = _CURRENT_VALIDATE.set(bool(meta_info.get("validate", False)))
+            global_steps_token = _CURRENT_GLOBAL_STEPS.set(
+                meta_info.get("global_steps")
+            )
+            validate_token = _CURRENT_VALIDATE.set(
+                bool(meta_info.get("validate", False))
+            )
             try:
                 result = generate_sequences(self, batch)
                 if inspect.isawaitable(result):
@@ -367,7 +411,9 @@ def install_agent_loop_runtime_patch() -> bool:
     if not getattr(worker_cls, "_speco_patched_run_agent_loop", False):
 
         @wraps(run_agent_loop)
-        async def speco_run_agent_loop(self, sampling_params, trajectory, *args, **kwargs):
+        async def speco_run_agent_loop(
+            self, sampling_params, trajectory, *args, **kwargs
+        ):
             trajectory = trajectory if isinstance(trajectory, dict) else {}
             sampling_params = _sampling_params_with_speco_step(
                 sampling_params,
@@ -382,7 +428,9 @@ def install_agent_loop_runtime_patch() -> bool:
         worker_cls._run_agent_loop = speco_run_agent_loop
         worker_cls._speco_patched_run_agent_loop = True
 
-    if callable(agent_loop_postprocess) and not getattr(worker_cls, "_speco_patched_agent_loop_postprocess", False):
+    if callable(agent_loop_postprocess) and not getattr(
+        worker_cls, "_speco_patched_agent_loop_postprocess", False
+    ):
 
         @wraps(agent_loop_postprocess)
         async def speco_agent_loop_postprocess(self, output, validate, **kwargs):
@@ -405,7 +453,9 @@ def install_agent_loop_runtime_patch() -> bool:
     if not getattr(worker_cls, "_speco_patched_postprocess", False):
 
         @wraps(postprocess)
-        def speco_postprocess(self, inputs, input_non_tensor_batch=None, validate=False):
+        def speco_postprocess(
+            self, inputs, input_non_tensor_batch=None, validate=False
+        ):
             for input_item in inputs:
                 extra_fields = getattr(input_item, "extra_fields", None)
                 if isinstance(extra_fields, dict):
@@ -444,7 +494,11 @@ def install_agent_loop_runtime_patch() -> bool:
             if _is_sglang_rollout_config(getattr(self, "config", None)):
                 meta_info = getattr(prompts, "meta_info", None)
                 if isinstance(meta_info, dict) and "global_steps" in meta_info:
-                    global_steps = None if meta_info.get("validate", False) else meta_info.get("global_steps")
+                    global_steps = (
+                        None
+                        if meta_info.get("validate", False)
+                        else meta_info.get("global_steps")
+                    )
                     server_handles = getattr(self, "server_handles", None)
                     if server_handles:
                         import asyncio
@@ -463,7 +517,9 @@ def install_agent_loop_runtime_patch() -> bool:
             return _ensure_extra_field_defaults(result)
 
         manager_cls.generate_sequences = (
-            auto_await(speco_manager_generate_sequences) if callable(auto_await) else speco_manager_generate_sequences
+            auto_await(speco_manager_generate_sequences)
+            if callable(auto_await)
+            else speco_manager_generate_sequences
         )
         manager_cls._speco_patched_generate_sequences = True
 

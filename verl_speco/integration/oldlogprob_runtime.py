@@ -67,7 +67,10 @@ def _load_drafter_env(raw: str | None = None) -> dict[str, Any]:
     try:
         value = json.loads(raw)
     except json.JSONDecodeError:
-        logger.warning("Invalid %s while checking old-logprob hidden runtime", SPECO_SGLANG_DRAFTER_CONFIG_ENV)
+        logger.warning(
+            "Invalid %s while checking old-logprob hidden runtime",
+            SPECO_SGLANG_DRAFTER_CONFIG_ENV,
+        )
         return {}
     return value if isinstance(value, dict) else {}
 
@@ -78,10 +81,14 @@ def _oldlogprob_enabled_from_drafter(drafter: Any) -> bool:
     if not bool(_get_nested(drafter, ("enable_drafter_training",), False)):
         return False
     training = _get_nested(drafter, ("training",), {}) or {}
-    return bool(_get_nested(training, ("collect_hidden_states_from_old_logprob",), False))
+    return bool(
+        _get_nested(training, ("collect_hidden_states_from_old_logprob",), False)
+    )
 
 
-def oldlogprob_hidden_runtime_enabled(config: Any = None, *, drafter_env: str | None = None) -> bool:
+def oldlogprob_hidden_runtime_enabled(
+    config: Any = None, *, drafter_env: str | None = None
+) -> bool:
     """Return whether an actor worker should install the old-logprob runtime patch."""
 
     if _oldlogprob_enabled_from_drafter(_load_drafter_env(drafter_env)):
@@ -125,7 +132,9 @@ def _resolve_hidden_state(hidden_states: Any, layer_id: int):
     return hidden.squeeze(0) if hidden.dim() == 3 and hidden.size(0) == 1 else hidden
 
 
-def _flat_local_range(total_tokens: int, pad_size: int, sp_size: int, sp_rank: int) -> tuple[int, int]:
+def _flat_local_range(
+    total_tokens: int, pad_size: int, sp_size: int, sp_rank: int
+) -> tuple[int, int]:
     if sp_size <= 1:
         return 0, int(total_tokens)
     total_padded = int(total_tokens) + int(pad_size)
@@ -167,7 +176,9 @@ def _oldlogprob_hidden_object_ref_enabled(micro_batch: Any) -> bool:
     try:
         from verl.utils import tensordict_utils as tu
 
-        value = tu.get_non_tensor_data(data=micro_batch, key=OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY, default=False)
+        value = tu.get_non_tensor_data(
+            data=micro_batch, key=OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY, default=False
+        )
     except Exception:  # noqa: BLE001
         try:
             value = micro_batch.get(OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY, False)
@@ -181,11 +192,18 @@ def _oldlogprob_hidden_object_ref_enabled(micro_batch: Any) -> bool:
 
 
 def _is_sparse_sp_non_source_context(context: dict[str, Any]) -> bool:
-    return bool(context.get("sparse_sp_merge")) and int(context.get("sp_rank", 0) or 0) != 0
+    return (
+        bool(context.get("sparse_sp_merge"))
+        and int(context.get("sp_rank", 0) or 0) != 0
+    )
 
 
 def _is_sparse_selected(value: Any) -> bool:
-    return isinstance(value, dict) and {"rows", "batch_indices", "row_indices"}.issubset(value)
+    return isinstance(value, dict) and {
+        "rows",
+        "batch_indices",
+        "row_indices",
+    }.issubset(value)
 
 
 def _selected_device(selected: Any):
@@ -210,10 +228,14 @@ def _row_indices_payload(row_indices: Any):
 
 
 def _sparse_rows_cover_full_window(row_indices: list[int], valid_rows: int) -> bool:
-    return len(row_indices) == int(valid_rows) and row_indices == list(range(int(valid_rows)))
+    return len(row_indices) == int(valid_rows) and row_indices == list(
+        range(int(valid_rows))
+    )
 
 
-def _put_oldlogprob_hidden_refs(hidden_output: dict[str, Any], micro_batch: Any) -> dict[str, Any]:
+def _put_oldlogprob_hidden_refs(
+    hidden_output: dict[str, Any], micro_batch: Any
+) -> dict[str, Any]:
     if not _oldlogprob_hidden_object_ref_enabled(micro_batch):
         return hidden_output
 
@@ -240,23 +262,40 @@ def _put_oldlogprob_hidden_refs(hidden_output: dict[str, Any], micro_batch: Any)
     ray_put_us = 0.0
     try:
         collect_mask = micro_batch[OLD_LOGPROB_COLLECT_MASK_KEY].bool().detach().cpu()
-        position_mask = micro_batch[OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY].bool().detach().cpu()
+        position_mask = (
+            micro_batch[OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY].bool().detach().cpu()
+        )
         owner_rank = micro_batch[OLD_LOGPROB_OWNER_RANK_KEY].long().detach().cpu()
-        selected_batch_indices = hidden_output.get(OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY)
+        selected_batch_indices = hidden_output.get(
+            OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY
+        )
         if torch.is_tensor(selected_batch_indices):
-            selected_batch_indices = [int(idx) for idx in selected_batch_indices.detach().cpu().reshape(-1).tolist()]
+            selected_batch_indices = [
+                int(idx)
+                for idx in selected_batch_indices.detach().cpu().reshape(-1).tolist()
+            ]
         elif isinstance(selected_batch_indices, (list, tuple)):
             selected_batch_indices = [int(idx) for idx in selected_batch_indices]
         else:
             selected_batch_indices = None
-        rows = [] if selected_is_sparse else (list(selected.unbind(0)) if selected.dim() >= 3 else [selected])
-        if not selected_is_sparse and selected_batch_indices is not None and len(selected_batch_indices) != len(rows):
+        rows = (
+            []
+            if selected_is_sparse
+            else (list(selected.unbind(0)) if selected.dim() >= 3 else [selected])
+        )
+        if (
+            not selected_is_sparse
+            and selected_batch_indices is not None
+            and len(selected_batch_indices) != len(rows)
+        ):
             raise RuntimeError(
                 "SPECO old-logprob compact hidden refs got mismatched selected batch indices: "
                 f"indices={len(selected_batch_indices)} rows={len(rows)}"
             )
         owner_mask = hidden_output.get("speco_oldlogprob_owner_mask")
-        owner_mask_cpu = owner_mask.detach().bool().cpu() if torch.is_tensor(owner_mask) else None
+        owner_mask_cpu = (
+            owner_mask.detach().bool().cpu() if torch.is_tensor(owner_mask) else None
+        )
         sample_count = int(collect_mask.numel())
         refs = [None for _ in range(sample_count)]
         metas = [None for _ in range(sample_count)]
@@ -264,11 +303,19 @@ def _put_oldlogprob_hidden_refs(hidden_output: dict[str, Any], micro_batch: Any)
         if selected_is_sparse:
             sparse_rows = selected["rows"]
             copy_started = time.perf_counter()
-            sparse_rows_cpu = sparse_rows.detach().to(device="cpu", copy=True).contiguous()
+            sparse_rows_cpu = (
+                sparse_rows.detach().to(device="cpu", copy=True).contiguous()
+            )
             copy_us += (time.perf_counter() - copy_started) * 1_000_000.0
-            sparse_batch_indices = selected["batch_indices"].detach().cpu().reshape(-1).tolist()
-            sparse_row_indices = selected["row_indices"].detach().cpu().reshape(-1).tolist()
-            hidden_dim = int(sparse_rows_cpu.shape[-1]) if sparse_rows_cpu.dim() > 1 else 0
+            sparse_batch_indices = (
+                selected["batch_indices"].detach().cpu().reshape(-1).tolist()
+            )
+            sparse_row_indices = (
+                selected["row_indices"].detach().cpu().reshape(-1).tolist()
+            )
+            hidden_dim = (
+                int(sparse_rows_cpu.shape[-1]) if sparse_rows_cpu.dim() > 1 else 0
+            )
             element_size = int(sparse_rows_cpu.element_size())
             owner_sample_chunks: dict[int, dict[int, dict[str, Any]]] = {}
             for source_idx, (batch_idx, row_idx) in enumerate(
@@ -276,12 +323,22 @@ def _put_oldlogprob_hidden_refs(hidden_output: dict[str, Any], micro_batch: Any)
             ):
                 batch_idx = int(batch_idx)
                 row_idx = int(row_idx)
-                if batch_idx >= sample_count or not bool(collect_mask[batch_idx].item()):
+                if batch_idx >= sample_count or not bool(
+                    collect_mask[batch_idx].item()
+                ):
                     continue
-                valid_rows = int(position_mask[batch_idx].sum().item()) if batch_idx < int(position_mask.size(0)) else 0
+                valid_rows = (
+                    int(position_mask[batch_idx].sum().item())
+                    if batch_idx < int(position_mask.size(0))
+                    else 0
+                )
                 if valid_rows <= 0 or row_idx < 0 or row_idx >= valid_rows:
                     continue
-                owner = int(owner_rank[batch_idx].item()) if batch_idx < int(owner_rank.numel()) else 0
+                owner = (
+                    int(owner_rank[batch_idx].item())
+                    if batch_idx < int(owner_rank.numel())
+                    else 0
+                )
                 sample_chunks = owner_sample_chunks.setdefault(owner, {})
                 chunk = sample_chunks.setdefault(
                     batch_idx,
@@ -304,21 +361,41 @@ def _put_oldlogprob_hidden_refs(hidden_output: dict[str, Any], micro_batch: Any)
                 for chunk in sample_chunks.values():
                     if not chunk["source_indices"]:
                         continue
-                    sorted_pairs = sorted(zip(chunk["row_indices"], chunk.pop("source_indices"), strict=False))
-                    chunk["row_indices"] = [row_idx for row_idx, _source_idx in sorted_pairs]
+                    sorted_pairs = sorted(
+                        zip(
+                            chunk["row_indices"],
+                            chunk.pop("source_indices"),
+                            strict=False,
+                        )
+                    )
+                    chunk["row_indices"] = [
+                        row_idx for row_idx, _source_idx in sorted_pairs
+                    ]
                     source_indices = torch.tensor(
                         [source_idx for _row_idx, source_idx in sorted_pairs],
                         dtype=torch.long,
                     )
-                    chunk["hidden"] = sparse_rows_cpu.index_select(0, source_indices).contiguous()
+                    chunk["hidden"] = sparse_rows_cpu.index_select(
+                        0, source_indices
+                    ).contiguous()
                     owner_chunks.setdefault(owner, []).append(chunk)
         else:
             for row_idx, hidden in enumerate(rows):
-                batch_idx = selected_batch_indices[row_idx] if selected_batch_indices is not None else row_idx
-                if batch_idx >= sample_count or not bool(collect_mask[batch_idx].item()):
+                batch_idx = (
+                    selected_batch_indices[row_idx]
+                    if selected_batch_indices is not None
+                    else row_idx
+                )
+                if batch_idx >= sample_count or not bool(
+                    collect_mask[batch_idx].item()
+                ):
                     continue
 
-                valid_rows = int(position_mask[batch_idx].sum().item()) if batch_idx < int(position_mask.size(0)) else 0
+                valid_rows = (
+                    int(position_mask[batch_idx].sum().item())
+                    if batch_idx < int(position_mask.size(0))
+                    else 0
+                )
                 if valid_rows <= 0:
                     continue
 
@@ -330,13 +407,19 @@ def _put_oldlogprob_hidden_refs(hidden_output: dict[str, Any], micro_batch: Any)
                         row_indices = owner_mask_row.nonzero(as_tuple=False).reshape(-1)
                         if int(row_indices.numel()) <= 0:
                             continue
-                        hidden = hidden.index_select(0, row_indices.to(device=hidden.device))
+                        hidden = hidden.index_select(
+                            0, row_indices.to(device=hidden.device)
+                        )
                         row_indices = row_indices.to(dtype=torch.long)
 
                 copy_started = time.perf_counter()
                 hidden_cpu = hidden.detach().to(device="cpu", copy=True).contiguous()
                 copy_us += (time.perf_counter() - copy_started) * 1_000_000.0
-                owner = int(owner_rank[batch_idx].item()) if batch_idx < int(owner_rank.numel()) else 0
+                owner = (
+                    int(owner_rank[batch_idx].item())
+                    if batch_idx < int(owner_rank.numel())
+                    else 0
+                )
                 owner_chunks.setdefault(owner, []).append(
                     {
                         "batch_idx": int(batch_idx),
@@ -345,14 +428,14 @@ def _put_oldlogprob_hidden_refs(hidden_output: dict[str, Any], micro_batch: Any)
                         "row_indices": row_indices,
                     }
                 )
-                metas[batch_idx] = (
-                    {
-                        "shape": (1, int(valid_rows), int(hidden_cpu.shape[-1])),
-                        "dtype": str(hidden_cpu.dtype),
-                        "nbytes": int(valid_rows) * int(hidden_cpu.shape[-1]) * int(hidden_cpu.element_size()),
-                        "rows": int(valid_rows),
-                    }
-                )
+                metas[batch_idx] = {
+                    "shape": (1, int(valid_rows), int(hidden_cpu.shape[-1])),
+                    "dtype": str(hidden_cpu.dtype),
+                    "nbytes": int(valid_rows)
+                    * int(hidden_cpu.shape[-1])
+                    * int(hidden_cpu.element_size()),
+                    "rows": int(valid_rows),
+                }
 
         chunk_refs = []
         chunk_meta = []
@@ -371,12 +454,18 @@ def _put_oldlogprob_hidden_refs(hidden_output: dict[str, Any], micro_batch: Any)
                 lengths.append(length)
                 sample_indices.append(int(chunk["batch_idx"]))
                 row_indices = chunk.get("row_indices")
-                if isinstance(row_indices, list) and _sparse_rows_cover_full_window(row_indices, chunk["valid_rows"]):
+                if isinstance(row_indices, list) and _sparse_rows_cover_full_window(
+                    row_indices, chunk["valid_rows"]
+                ):
                     row_indices_payload.append(None)
                 else:
                     row_indices_payload.append(_row_indices_payload(row_indices))
                 offset += length
-            hidden_chunk = torch.cat(tensors, dim=0).contiguous() if len(tensors) > 1 else tensors[0].contiguous()
+            hidden_chunk = (
+                torch.cat(tensors, dim=0).contiguous()
+                if len(tensors) > 1
+                else tensors[0].contiguous()
+            )
             ray_put_started = time.perf_counter()
             chunk_ref = ray.put(hidden_chunk)
             ray_put_us += (time.perf_counter() - ray_put_started) * 1_000_000.0
@@ -387,7 +476,8 @@ def _put_oldlogprob_hidden_refs(hidden_output: dict[str, Any], micro_batch: Any)
                     "owner": int(owner),
                     "shape": tuple(hidden_chunk.shape),
                     "dtype": str(hidden_chunk.dtype),
-                    "nbytes": int(hidden_chunk.numel()) * int(hidden_chunk.element_size()),
+                    "nbytes": int(hidden_chunk.numel())
+                    * int(hidden_chunk.element_size()),
                     "sample_indices": sample_indices,
                     "starts": starts,
                     "lengths": lengths,
@@ -404,8 +494,13 @@ def _put_oldlogprob_hidden_refs(hidden_output: dict[str, Any], micro_batch: Any)
                     metas[batch_idx]["chunk_row_indices"] = row_indices
     except Exception as exc:  # noqa: BLE001
         logger.warning("Unable to export SPECO old-logprob hidden ObjectRefs: %s", exc)
-        if selected_is_sparse or hidden_output.get(OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY) is not None:
-            raise RuntimeError("SPECO old-logprob compact hidden ObjectRef export failed") from exc
+        if (
+            selected_is_sparse
+            or hidden_output.get(OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY) is not None
+        ):
+            raise RuntimeError(
+                "SPECO old-logprob compact hidden ObjectRef export failed"
+            ) from exc
         return hidden_output
 
     updated = dict(hidden_output)
@@ -436,7 +531,11 @@ def _install_oldlogprob_training_worker_postprocess_patch() -> bool:
         return False
 
     worker_cls = getattr(module, "TrainingWorker", None)
-    postprocess_output = getattr(worker_cls, "_postprocess_output", None) if worker_cls is not None else None
+    postprocess_output = (
+        getattr(worker_cls, "_postprocess_output", None)
+        if worker_cls is not None
+        else None
+    )
     if not callable(postprocess_output):
         logger.warning(
             "Unable to install SPECO old-logprob postprocess patch: missing TrainingWorker._postprocess_output"
@@ -489,7 +588,9 @@ def _restore_non_tensor_dynamic_batch(values: list[Any], indices: Any) -> list[A
     return [values[idx] for idx in reverse_indices]
 
 
-def _micro_batch_index_map(indices: Any, micro_batch_idx: int, fallback_start: int, sample_count: int) -> list[int]:
+def _micro_batch_index_map(
+    indices: Any, micro_batch_idx: int, fallback_start: int, sample_count: int
+) -> list[int]:
     if indices is not None and micro_batch_idx < len(indices):
         values = indices[micro_batch_idx]
         try:
@@ -504,7 +605,9 @@ def _micro_batch_index_map(indices: Any, micro_batch_idx: int, fallback_start: i
     return list(range(int(fallback_start), int(fallback_start) + int(sample_count)))
 
 
-def _remap_chunk_meta_sample_indices(chunk_meta: Any, index_map: list[int]) -> list[Any]:
+def _remap_chunk_meta_sample_indices(
+    chunk_meta: Any, index_map: list[int]
+) -> list[Any]:
     remapped = []
     for meta in chunk_meta if isinstance(chunk_meta, (list, tuple)) else [chunk_meta]:
         if not isinstance(meta, dict):
@@ -544,7 +647,9 @@ def _extract_oldlogprob_non_tensor_model_output(
             continue
         hidden_refs = model_output.get(OLD_LOGPROB_HIDDEN_REFS_KEY)
         sample_count = len(hidden_refs) if isinstance(hidden_refs, (list, tuple)) else 0
-        index_map = _micro_batch_index_map(indices, micro_batch_idx, batch_offset, sample_count)
+        index_map = _micro_batch_index_map(
+            indices, micro_batch_idx, batch_offset, sample_count
+        )
         for key in tuple(extracted):
             if key not in model_output:
                 continue
@@ -567,24 +672,35 @@ def _install_oldlogprob_fsdp_batch_postprocess_patch(transformer_module: Any) ->
 
     postprocess_batch_func = getattr(transformer_module, "postprocess_batch_func", None)
     if not callable(postprocess_batch_func):
-        logger.warning("Unable to install SPECO old-logprob batch postprocess patch: missing postprocess_batch_func")
+        logger.warning(
+            "Unable to install SPECO old-logprob batch postprocess patch: missing postprocess_batch_func"
+        )
         return False
-    if getattr(transformer_module, "_speco_oldlogprob_patched_batch_postprocess", False):
+    if getattr(
+        transformer_module, "_speco_oldlogprob_patched_batch_postprocess", False
+    ):
         _BATCH_POSTPROCESS_PATCHED = True
         return True
 
     @wraps(postprocess_batch_func)
     def speco_postprocess_batch_func(output_lst, indices, data):
-        speco_non_tensor = _extract_oldlogprob_non_tensor_model_output(output_lst, indices)
+        speco_non_tensor = _extract_oldlogprob_non_tensor_model_output(
+            output_lst, indices
+        )
         output = postprocess_batch_func(output_lst, indices, data)
         if speco_non_tensor and isinstance(output, dict):
             model_output = output.setdefault("model_output", {})
             if isinstance(model_output, dict):
                 for key, value in speco_non_tensor.items():
-                    if key in (OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY, OLD_LOGPROB_HIDDEN_CHUNK_META_KEY):
+                    if key in (
+                        OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
+                        OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
+                    ):
                         model_output[key] = value
                     else:
-                        model_output[key] = _restore_non_tensor_dynamic_batch(value, indices)
+                        model_output[key] = _restore_non_tensor_dynamic_batch(
+                            value, indices
+                        )
         return output
 
     transformer_module.postprocess_batch_func = speco_postprocess_batch_func
@@ -594,14 +710,20 @@ def _install_oldlogprob_fsdp_batch_postprocess_patch(transformer_module: Any) ->
     return True
 
 
-def _build_selection_context(engine: Any, output_args: dict[str, Any], micro_batch: Any) -> dict[str, Any]:
+def _build_selection_context(
+    engine: Any, output_args: dict[str, Any], micro_batch: Any
+) -> dict[str, Any]:
     import torch
     from verl.utils import tensordict_utils as tu
     from verl.utils.dataset.dataset_utils import DatasetPadMode
     from verl.utils.ulysses import get_ulysses_sequence_parallel_group
 
-    use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
-    pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+    use_remove_padding = tu.get_non_tensor_data(
+        data=micro_batch, key="use_remove_padding", default=True
+    )
+    pad_mode = tu.get_non_tensor_data(
+        data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING
+    )
     if not use_remove_padding or pad_mode != DatasetPadMode.NO_PADDING:
         raise NotImplementedError(
             "SPECO old-logprob hidden collection currently requires use_remove_padding=True "
@@ -634,9 +756,12 @@ def _build_selection_context(engine: Any, output_args: dict[str, Any], micro_bat
         and bool(hidden_position_mask[batch_idx].detach().any().item())
     ]
     selected_index_by_batch = {
-        batch_idx: selected_idx for selected_idx, batch_idx in enumerate(selected_batch_indices)
+        batch_idx: selected_idx
+        for selected_idx, batch_idx in enumerate(selected_batch_indices)
     }
-    output_batch_size = len(selected_batch_indices) if compact_selected else int(batch_size)
+    output_batch_size = (
+        len(selected_batch_indices) if compact_selected else int(batch_size)
+    )
     rank_start, rank_end = _flat_local_range(total_tokens, pad_size, sp_size, sp_rank)
 
     local_positions = []
@@ -649,7 +774,9 @@ def _build_selection_context(engine: Any, output_args: dict[str, Any], micro_bat
         if not bool(collect_mask[batch_idx].item()):
             continue
         if compact_selected:
-            output_batch_idx = selected_index_by_batch.get(int(batch_idx), int(batch_idx))
+            output_batch_idx = selected_index_by_batch.get(
+                int(batch_idx), int(batch_idx)
+            )
         else:
             output_batch_idx = int(batch_idx)
         seq_start = int(offsets[batch_idx].item())
@@ -698,14 +825,20 @@ def _build_selection_context(engine: Any, output_args: dict[str, Any], micro_bat
     }
 
 
-def _add_timing_us(hidden_output: dict[str, Any], timing_idx: int, value_us: float) -> None:
+def _add_timing_us(
+    hidden_output: dict[str, Any], timing_idx: int, value_us: float
+) -> None:
     timing = hidden_output.get(OLD_LOGPROB_TIMING_KEY)
     if value_us <= 0 or timing is None:
         return
     try:
         import torch
 
-        if not torch.is_tensor(timing) or timing.numel() <= 0 or timing.shape[-1] <= timing_idx:
+        if (
+            not torch.is_tensor(timing)
+            or timing.numel() <= 0
+            or timing.shape[-1] <= timing_idx
+        ):
             return
         timing.reshape(-1, timing.shape[-1])[0, timing_idx] += float(value_us)
     except Exception:  # noqa: BLE001
@@ -722,9 +855,15 @@ def _timing_tensor_from_context(context: dict[str, Any], device: Any):
         device=device,
     )
     if context["batch_size"] > 0:
-        timing[0, _TIMING_SELECT_US] = float(context.get("timing_us", {}).get("select", 0.0))
-        timing[0, _TIMING_SP_MERGE_US] = float(context.get("timing_us", {}).get("sp_merge", 0.0))
-        timing[0, _TIMING_CONCAT_US] = float(context.get("timing_us", {}).get("concat", 0.0))
+        timing[0, _TIMING_SELECT_US] = float(
+            context.get("timing_us", {}).get("select", 0.0)
+        )
+        timing[0, _TIMING_SP_MERGE_US] = float(
+            context.get("timing_us", {}).get("sp_merge", 0.0)
+        )
+        timing[0, _TIMING_CONCAT_US] = float(
+            context.get("timing_us", {}).get("concat", 0.0)
+        )
     return timing
 
 
@@ -737,7 +876,9 @@ def _owner_mask_for_context(context: dict[str, Any], device: Any):
         dtype=torch.int32,
         device=device,
     )
-    local_positions, batch_indices, row_indices = _selection_index_tensors_for_device(context, device)
+    local_positions, batch_indices, row_indices = _selection_index_tensors_for_device(
+        context, device
+    )
     if int(local_positions.numel()) > 0:
         owner_mask[batch_indices, row_indices] = 1
     return owner_mask
@@ -753,9 +894,15 @@ def _selection_index_tensors_for_device(context: dict[str, Any], device: Any):
         return cached
 
     if context["local_positions"]:
-        local_positions = torch.tensor(context["local_positions"], dtype=torch.long, device=device)
-        batch_indices = torch.tensor(context["local_batch_indices"], dtype=torch.long, device=device)
-        row_indices = torch.tensor(context["local_row_indices"], dtype=torch.long, device=device)
+        local_positions = torch.tensor(
+            context["local_positions"], dtype=torch.long, device=device
+        )
+        batch_indices = torch.tensor(
+            context["local_batch_indices"], dtype=torch.long, device=device
+        )
+        row_indices = torch.tensor(
+            context["local_row_indices"], dtype=torch.long, device=device
+        )
     else:
         local_positions = torch.empty(0, dtype=torch.long, device=device)
         batch_indices = torch.empty(0, dtype=torch.long, device=device)
@@ -776,23 +923,38 @@ def _selection_3d_index_tensors_for_device(context: dict[str, Any], device: Any)
         return cached
 
     if context.get("local_3d_batch_indices"):
-        hidden_batch_indices = torch.tensor(context["local_3d_batch_indices"], dtype=torch.long, device=device)
-        hidden_seq_positions = torch.tensor(context["local_3d_seq_positions"], dtype=torch.long, device=device)
-        output_batch_indices = torch.tensor(context["local_batch_indices"], dtype=torch.long, device=device)
-        row_indices = torch.tensor(context["local_row_indices"], dtype=torch.long, device=device)
+        hidden_batch_indices = torch.tensor(
+            context["local_3d_batch_indices"], dtype=torch.long, device=device
+        )
+        hidden_seq_positions = torch.tensor(
+            context["local_3d_seq_positions"], dtype=torch.long, device=device
+        )
+        output_batch_indices = torch.tensor(
+            context["local_batch_indices"], dtype=torch.long, device=device
+        )
+        row_indices = torch.tensor(
+            context["local_row_indices"], dtype=torch.long, device=device
+        )
     else:
         hidden_batch_indices = torch.empty(0, dtype=torch.long, device=device)
         hidden_seq_positions = torch.empty(0, dtype=torch.long, device=device)
         output_batch_indices = torch.empty(0, dtype=torch.long, device=device)
         row_indices = torch.empty(0, dtype=torch.long, device=device)
 
-    cached = (hidden_batch_indices, hidden_seq_positions, output_batch_indices, row_indices)
+    cached = (
+        hidden_batch_indices,
+        hidden_seq_positions,
+        output_batch_indices,
+        row_indices,
+    )
     cache[key] = cached
     return cached
 
 
 def _filter_selection_indices_for_hidden(context: dict[str, Any], hidden: Any):
-    local_positions, batch_indices, row_indices = _selection_index_tensors_for_device(context, hidden.device)
+    local_positions, batch_indices, row_indices = _selection_index_tensors_for_device(
+        context, hidden.device
+    )
     if int(local_positions.numel()) <= 0:
         return local_positions, batch_indices, row_indices
 
@@ -804,21 +966,35 @@ def _filter_selection_indices_for_hidden(context: dict[str, Any], hidden: Any):
 
 
 def _filter_3d_selection_indices_for_hidden(context: dict[str, Any], hidden: Any):
-    hidden_batch_indices, hidden_seq_positions, output_batch_indices, row_indices = _selection_3d_index_tensors_for_device(
-        context, hidden.device
+    hidden_batch_indices, hidden_seq_positions, output_batch_indices, row_indices = (
+        _selection_3d_index_tensors_for_device(context, hidden.device)
     )
     if int(hidden_batch_indices.numel()) <= 0:
-        return hidden_batch_indices, hidden_seq_positions, output_batch_indices, row_indices
+        return (
+            hidden_batch_indices,
+            hidden_seq_positions,
+            output_batch_indices,
+            row_indices,
+        )
 
-    valid = (hidden_batch_indices < int(hidden.size(0))) & (hidden_seq_positions < int(hidden.size(1)))
-    return hidden_batch_indices[valid], hidden_seq_positions[valid], output_batch_indices[valid], row_indices[valid]
+    valid = (hidden_batch_indices < int(hidden.size(0))) & (
+        hidden_seq_positions < int(hidden.size(1))
+    )
+    return (
+        hidden_batch_indices[valid],
+        hidden_seq_positions[valid],
+        output_batch_indices[valid],
+        row_indices[valid],
+    )
 
 
 def _extract_hidden_tensor(module_output: Any):
     if isinstance(module_output, tuple):
         module_output = module_output[0]
     elif isinstance(module_output, dict):
-        module_output = module_output.get("last_hidden_state", next(iter(module_output.values()), None))
+        module_output = module_output.get(
+            "last_hidden_state", next(iter(module_output.values()), None)
+        )
     if module_output is None:
         return None
     if module_output.dim() == 3 and module_output.size(0) == 1:
@@ -837,9 +1013,12 @@ def _select_rows_from_local_hidden(context: dict[str, Any], hidden: Any):
         if hidden.dim() == 3:
             if context.get("sparse_sp_merge"):
                 empty_indices = torch.empty(0, dtype=torch.long, device=hidden.device)
-                hidden_batch_indices, hidden_seq_positions, batch_indices, row_indices = _filter_3d_selection_indices_for_hidden(
-                    context, hidden
-                )
+                (
+                    hidden_batch_indices,
+                    hidden_seq_positions,
+                    batch_indices,
+                    row_indices,
+                ) = _filter_3d_selection_indices_for_hidden(context, hidden)
                 if int(hidden_batch_indices.numel()) <= 0:
                     return {
                         "rows": hidden.new_empty((0, int(hidden.size(-1)))),
@@ -860,11 +1039,13 @@ def _select_rows_from_local_hidden(context: dict[str, Any], hidden: Any):
                 dtype=hidden.dtype,
                 device=hidden.device,
             )
-            hidden_batch_indices, hidden_seq_positions, batch_indices, row_indices = _filter_3d_selection_indices_for_hidden(
-                context, hidden
+            hidden_batch_indices, hidden_seq_positions, batch_indices, row_indices = (
+                _filter_3d_selection_indices_for_hidden(context, hidden)
             )
             if int(hidden_batch_indices.numel()) > 0:
-                selected[batch_indices, row_indices] = hidden[hidden_batch_indices, hidden_seq_positions].detach()
+                selected[batch_indices, row_indices] = hidden[
+                    hidden_batch_indices, hidden_seq_positions
+                ].detach()
             return selected
         if hidden.dim() != 2:
             raise RuntimeError(
@@ -874,7 +1055,9 @@ def _select_rows_from_local_hidden(context: dict[str, Any], hidden: Any):
 
         if context.get("sparse_sp_merge"):
             empty_indices = torch.empty(0, dtype=torch.long, device=hidden.device)
-            local_positions, batch_indices, row_indices = _filter_selection_indices_for_hidden(context, hidden)
+            local_positions, batch_indices, row_indices = (
+                _filter_selection_indices_for_hidden(context, hidden)
+            )
             if int(local_positions.numel()) <= 0:
                 return {
                     "rows": hidden.new_empty((0, int(hidden.size(-1)))),
@@ -895,16 +1078,22 @@ def _select_rows_from_local_hidden(context: dict[str, Any], hidden: Any):
             dtype=hidden.dtype,
             device=hidden.device,
         )
-        local_positions, batch_indices, row_indices = _filter_selection_indices_for_hidden(context, hidden)
+        local_positions, batch_indices, row_indices = (
+            _filter_selection_indices_for_hidden(context, hidden)
+        )
         if int(local_positions.numel()) > 0:
-            selected[batch_indices, row_indices] = hidden.index_select(0, local_positions).detach()
+            selected[batch_indices, row_indices] = hidden.index_select(
+                0, local_positions
+            ).detach()
         return selected
     finally:
         context.setdefault("timing_us", {}).setdefault("select", 0.0)
         context["timing_us"]["select"] += (time.perf_counter() - started) * 1_000_000.0
 
 
-def _dense_selected_from_sparse(context: dict[str, Any], sparse_selected: dict[str, Any]):
+def _dense_selected_from_sparse(
+    context: dict[str, Any], sparse_selected: dict[str, Any]
+):
     import torch
 
     rows = sparse_selected["rows"]
@@ -916,11 +1105,15 @@ def _dense_selected_from_sparse(context: dict[str, Any], sparse_selected: dict[s
         device=rows.device,
     )
     if int(rows.size(0)) > 0:
-        selected[sparse_selected["batch_indices"], sparse_selected["row_indices"]] = rows
+        selected[sparse_selected["batch_indices"], sparse_selected["row_indices"]] = (
+            rows
+        )
     return selected
 
 
-def _owner_mask_from_sparse_selected(context: dict[str, Any], sparse_selected: dict[str, Any]):
+def _owner_mask_from_sparse_selected(
+    context: dict[str, Any], sparse_selected: dict[str, Any]
+):
     import torch
 
     rows = sparse_selected["rows"]
@@ -942,7 +1135,9 @@ def _owner_mask_from_sparse_selected(context: dict[str, Any], sparse_selected: d
     return owner_mask
 
 
-def _gather_sparse_sp_selected_to_source(context: dict[str, Any], sparse_selected: dict[str, Any]):
+def _gather_sparse_sp_selected_to_source(
+    context: dict[str, Any], sparse_selected: dict[str, Any]
+):
     import torch
     import torch.distributed as dist
 
@@ -953,7 +1148,9 @@ def _gather_sparse_sp_selected_to_source(context: dict[str, Any], sparse_selecte
     sp_rank = int(context.get("sp_rank", 0) or 0)
     source_sp_rank = 0
     source_global_rank = (
-        dist.get_global_rank(sp_group, source_sp_rank) if hasattr(dist, "get_global_rank") else source_sp_rank
+        dist.get_global_rank(sp_group, source_sp_rank)
+        if hasattr(dist, "get_global_rank")
+        else source_sp_rank
     )
     is_source = sp_rank == source_sp_rank
     local_count = torch.tensor([int(rows.size(0))], dtype=torch.long, device=device)
@@ -976,14 +1173,40 @@ def _gather_sparse_sp_selected_to_source(context: dict[str, Any], sparse_selecte
         padded_batch_indices[:count] = sparse_selected["batch_indices"]
         padded_row_indices[:count] = sparse_selected["row_indices"]
 
-    gathered_counts = [torch.empty_like(local_count) for _ in range(sp_size)] if is_source else None
-    gathered_rows = [torch.empty_like(padded_rows) for _ in range(sp_size)] if is_source else None
-    gathered_batch_indices = [torch.empty_like(padded_batch_indices) for _ in range(sp_size)] if is_source else None
-    gathered_row_indices = [torch.empty_like(padded_row_indices) for _ in range(sp_size)] if is_source else None
-    dist.gather(local_count, gather_list=gathered_counts, dst=source_global_rank, group=sp_group)
-    dist.gather(padded_rows, gather_list=gathered_rows, dst=source_global_rank, group=sp_group)
-    dist.gather(padded_batch_indices, gather_list=gathered_batch_indices, dst=source_global_rank, group=sp_group)
-    dist.gather(padded_row_indices, gather_list=gathered_row_indices, dst=source_global_rank, group=sp_group)
+    gathered_counts = (
+        [torch.empty_like(local_count) for _ in range(sp_size)] if is_source else None
+    )
+    gathered_rows = (
+        [torch.empty_like(padded_rows) for _ in range(sp_size)] if is_source else None
+    )
+    gathered_batch_indices = (
+        [torch.empty_like(padded_batch_indices) for _ in range(sp_size)]
+        if is_source
+        else None
+    )
+    gathered_row_indices = (
+        [torch.empty_like(padded_row_indices) for _ in range(sp_size)]
+        if is_source
+        else None
+    )
+    dist.gather(
+        local_count, gather_list=gathered_counts, dst=source_global_rank, group=sp_group
+    )
+    dist.gather(
+        padded_rows, gather_list=gathered_rows, dst=source_global_rank, group=sp_group
+    )
+    dist.gather(
+        padded_batch_indices,
+        gather_list=gathered_batch_indices,
+        dst=source_global_rank,
+        group=sp_group,
+    )
+    dist.gather(
+        padded_row_indices,
+        gather_list=gathered_row_indices,
+        dst=source_global_rank,
+        group=sp_group,
+    )
     if not is_source:
         return None
 
@@ -992,7 +1215,11 @@ def _gather_sparse_sp_selected_to_source(context: dict[str, Any], sparse_selecte
     row_parts = []
     counts = [int(count.item()) for count in gathered_counts or []]
     for count, row_part, batch_part, row_idx_part in zip(
-        counts, gathered_rows, gathered_batch_indices, gathered_row_indices, strict=False
+        counts,
+        gathered_rows,
+        gathered_batch_indices,
+        gathered_row_indices,
+        strict=False,
     ):
         if count <= 0:
             continue
@@ -1000,8 +1227,16 @@ def _gather_sparse_sp_selected_to_source(context: dict[str, Any], sparse_selecte
         batch_parts.append(batch_part[:count])
         row_parts.append(row_idx_part[:count])
     if not rows_parts:
-        return rows.new_empty((0, hidden_dim)), rows.new_empty((0,), dtype=torch.long), rows.new_empty((0,), dtype=torch.long)
-    return torch.cat(rows_parts, dim=0), torch.cat(batch_parts, dim=0), torch.cat(row_parts, dim=0)
+        return (
+            rows.new_empty((0, hidden_dim)),
+            rows.new_empty((0,), dtype=torch.long),
+            rows.new_empty((0,), dtype=torch.long),
+        )
+    return (
+        torch.cat(rows_parts, dim=0),
+        torch.cat(batch_parts, dim=0),
+        torch.cat(row_parts, dim=0),
+    )
 
 
 def _merge_sp_selected(context: dict[str, Any], selected: Any):
@@ -1012,7 +1247,9 @@ def _merge_sp_selected(context: dict[str, Any], selected: Any):
             started = time.perf_counter()
             gathered = _gather_sparse_sp_selected_to_source(context, selected)
             context.setdefault("timing_us", {}).setdefault("sp_merge", 0.0)
-            context["timing_us"]["sp_merge"] += (time.perf_counter() - started) * 1_000_000.0
+            context["timing_us"]["sp_merge"] += (
+                time.perf_counter() - started
+            ) * 1_000_000.0
             if gathered is None:
                 return None, None
             rows, batch_indices, row_indices = gathered
@@ -1036,7 +1273,9 @@ def _merge_sp_selected(context: dict[str, Any], selected: Any):
         dist.all_reduce(owner_mask, op=dist.ReduceOp.SUM, group=sp_group)
         owner_mask = owner_mask.to(dtype=torch.bool)
         context.setdefault("timing_us", {}).setdefault("sp_merge", 0.0)
-        context["timing_us"]["sp_merge"] += (time.perf_counter() - started) * 1_000_000.0
+        context["timing_us"]["sp_merge"] += (
+            time.perf_counter() - started
+        ) * 1_000_000.0
     return selected, owner_mask
 
 
@@ -1057,8 +1296,16 @@ def _select_and_merge_concatenated_hidden(
                 int(context.get("output_batch_size", context["batch_size"])),
                 int(context["hidden_rows"]),
             )
-            if not torch.is_tensor(hidden) or hidden.dim() != 3 or tuple(hidden.shape[:2]) != expected_shape:
-                shape = tuple(hidden.shape) if torch.is_tensor(hidden) else type(hidden).__name__
+            if (
+                not torch.is_tensor(hidden)
+                or hidden.dim() != 3
+                or tuple(hidden.shape[:2]) != expected_shape
+            ):
+                shape = (
+                    tuple(hidden.shape)
+                    if torch.is_tensor(hidden)
+                    else type(hidden).__name__
+                )
                 raise RuntimeError(
                     "SPECO old-logprob forward-hook capture produced an invalid selected hidden tensor: "
                     f"expected [batch, rows, hidden] with prefix={expected_shape}, got {shape}"
@@ -1068,19 +1315,29 @@ def _select_and_merge_concatenated_hidden(
             selected_items.append(_select_rows_from_local_hidden(context, hidden))
 
     if not selected_items or any(selected is None for selected in selected_items):
-        raise RuntimeError("SPECO old-logprob hidden collection failed to resolve required hidden layers")
+        raise RuntimeError(
+            "SPECO old-logprob hidden collection failed to resolve required hidden layers"
+        )
 
-    dict_selected = [selected for selected in selected_items if isinstance(selected, dict)]
+    dict_selected = [
+        selected for selected in selected_items if isinstance(selected, dict)
+    ]
     if dict_selected and len(dict_selected) != len(selected_items):
-        raise RuntimeError("SPECO old-logprob hidden collection mixed sparse and dense selected rows")
+        raise RuntimeError(
+            "SPECO old-logprob hidden collection mixed sparse and dense selected rows"
+        )
 
     concat_started = time.perf_counter()
     if dict_selected:
-        selected_rows = torch.cat([selected["rows"] for selected in dict_selected], dim=-1)
+        selected_rows = torch.cat(
+            [selected["rows"] for selected in dict_selected], dim=-1
+        )
     else:
         selected_rows = torch.cat(selected_items, dim=-1)
     context.setdefault("timing_us", {}).setdefault("concat", 0.0)
-    context["timing_us"]["concat"] += (time.perf_counter() - concat_started) * 1_000_000.0
+    context["timing_us"]["concat"] += (
+        time.perf_counter() - concat_started
+    ) * 1_000_000.0
 
     if dict_selected:
         selected_template = dict_selected[0]
@@ -1097,7 +1354,9 @@ def _select_and_merge_concatenated_hidden(
 def _unwrap_module(module: Any):
     current = module
     seen = set()
-    while current is not None and hasattr(current, "module") and id(current) not in seen:
+    while (
+        current is not None and hasattr(current, "module") and id(current) not in seen
+    ):
         seen.add(id(current))
         child = getattr(current, "module", None)
         if child is None or child is current:
@@ -1158,7 +1417,9 @@ def _find_layers_and_final_norm(engine: Any):
     return None, None
 
 
-def _hidden_state_capture_target(layer_id: int, num_layers: int) -> tuple[str, int | None]:
+def _hidden_state_capture_target(
+    layer_id: int, num_layers: int
+) -> tuple[str, int | None]:
     num_states = num_layers + 1
     index = int(layer_id)
     hidden_state_index = index + 1 if index >= 0 else num_states + index
@@ -1175,7 +1436,9 @@ def _hidden_state_capture_target(layer_id: int, num_layers: int) -> tuple[str, i
 def _oldlogprob_aux_layer_ids_from_batch(micro_batch: Any) -> list[int]:
     from verl.utils import tensordict_utils as tu
 
-    aux_layer_ids = tu.get_non_tensor_data(data=micro_batch, key=OLD_LOGPROB_AUX_LAYER_IDS_KEY, default=None)
+    aux_layer_ids = tu.get_non_tensor_data(
+        data=micro_batch, key=OLD_LOGPROB_AUX_LAYER_IDS_KEY, default=None
+    )
     if aux_layer_ids is None:
         raise RuntimeError(
             "SPECO old-logprob hidden collection is missing aux layer ids. "
@@ -1210,13 +1473,17 @@ def _cleanup_oldlogprob_hidden_capture(engine: Any) -> None:
         pass
 
 
-def _install_oldlogprob_hidden_hooks(engine: Any, output_args: dict[str, Any], micro_batch: Any) -> None:
+def _install_oldlogprob_hidden_hooks(
+    engine: Any, output_args: dict[str, Any], micro_batch: Any
+) -> None:
     if not _tensor_key_present(micro_batch, OLD_LOGPROB_COLLECT_MASK_KEY):
         return
 
     layers, final_norm = _find_layers_and_final_norm(engine)
     if not layers:
-        raise RuntimeError("SPECO old-logprob forward-hook capture could not find transformer layers")
+        raise RuntimeError(
+            "SPECO old-logprob forward-hook capture could not find transformer layers"
+        )
 
     selection_context = _build_selection_context(engine, output_args, micro_batch)
     aux_layer_ids = _oldlogprob_aux_layer_ids_from_batch(micro_batch)
@@ -1229,7 +1496,9 @@ def _install_oldlogprob_hidden_hooks(engine: Any, output_args: dict[str, Any], m
         aux_keys.append(key)
         if kind == "final":
             if final_norm is None:
-                raise RuntimeError("SPECO old-logprob forward-hook capture could not find final norm module")
+                raise RuntimeError(
+                    "SPECO old-logprob forward-hook capture could not find final norm module"
+                )
             required_modules[key] = final_norm
         else:
             required_modules[key] = layers[layer_index]
@@ -1237,7 +1506,9 @@ def _install_oldlogprob_hidden_hooks(engine: Any, output_args: dict[str, Any], m
     final_key = None
     if hidden_layout in {"eagle3_aux_plus_last", "dflash_aux_plus_last"}:
         if final_norm is None:
-            raise RuntimeError("SPECO old-logprob forward-hook capture could not find final norm module")
+            raise RuntimeError(
+                "SPECO old-logprob forward-hook capture could not find final norm module"
+            )
         final_key = "final"
         required_modules[final_key] = final_norm
 
@@ -1251,7 +1522,9 @@ def _install_oldlogprob_hidden_hooks(engine: Any, output_args: dict[str, Any], m
         "handles": [],
     }
     for key, module in required_modules.items():
-        context["handles"].append(module.register_forward_hook(_make_capture_hook(context, key)))
+        context["handles"].append(
+            module.register_forward_hook(_make_capture_hook(context, key))
+        )
     engine._speco_oldlogprob_hidden_context = context
 
 
@@ -1261,7 +1534,6 @@ def _consume_oldlogprob_hidden_capture(engine: Any):
     context = getattr(engine, "_speco_oldlogprob_hidden_context", None)
     if not context:
         return {}
-    import torch
 
     try:
         captures = context.get("captures", {})
@@ -1270,7 +1542,9 @@ def _consume_oldlogprob_hidden_capture(engine: Any):
             required_keys.append(context["final_key"])
         missing = [key for key in required_keys if key not in captures]
         if missing:
-            raise RuntimeError(f"SPECO old-logprob forward-hook capture missed hidden tensors: {missing}")
+            raise RuntimeError(
+                f"SPECO old-logprob forward-hook capture missed hidden tensors: {missing}"
+            )
 
         hidden_parts = [captures[key] for key in context["aux_keys"]]
         if context.get("final_key") is not None:
@@ -1286,7 +1560,9 @@ def _consume_oldlogprob_hidden_capture(engine: Any):
             return {}
         output = {
             OLD_LOGPROB_HIDDEN_STATES_KEY: selected,
-            OLD_LOGPROB_TIMING_KEY: _timing_tensor_from_context(context, _selected_device(selected)),
+            OLD_LOGPROB_TIMING_KEY: _timing_tensor_from_context(
+                context, _selected_device(selected)
+            ),
             "speco_oldlogprob_owner_mask": owner_mask,
             "speco_oldlogprob_sp_group": context.get("sp_group"),
             "speco_oldlogprob_sp_size": int(context.get("sp_size", 1) or 1),
@@ -1303,7 +1579,9 @@ def _consume_oldlogprob_hidden_capture(engine: Any):
         _cleanup_oldlogprob_hidden_capture(engine)
 
 
-def _select_oldlogprob_hidden_states(engine: Any, output: Any, output_args: dict[str, Any], micro_batch: Any):
+def _select_oldlogprob_hidden_states(
+    engine: Any, output: Any, output_args: dict[str, Any], micro_batch: Any
+):
     if not _tensor_key_present(micro_batch, OLD_LOGPROB_COLLECT_MASK_KEY):
         return {}
 
@@ -1319,20 +1597,30 @@ def _select_oldlogprob_hidden_states(engine: Any, output: Any, output_args: dict
     aux_layer_ids = _oldlogprob_aux_layer_ids_from_batch(micro_batch)
     hidden_layout = _oldlogprob_hidden_layout(micro_batch)
 
-    aux_hidden_list = [_resolve_hidden_state(hidden_states, layer_id) for layer_id in aux_layer_ids]
+    aux_hidden_list = [
+        _resolve_hidden_state(hidden_states, layer_id) for layer_id in aux_layer_ids
+    ]
     selected_hidden_list = list(aux_hidden_list)
     if hidden_layout in {"eagle3_aux_plus_last", "dflash_aux_plus_last"}:
         final_hidden = hidden_states[-1]
-        final_hidden = final_hidden.squeeze(0) if final_hidden.dim() == 3 and final_hidden.size(0) == 1 else final_hidden
+        final_hidden = (
+            final_hidden.squeeze(0)
+            if final_hidden.dim() == 3 and final_hidden.size(0) == 1
+            else final_hidden
+        )
         selected_hidden_list.append(final_hidden)
-    selected, owner_mask = _select_and_merge_concatenated_hidden(context, selected_hidden_list)
+    selected, owner_mask = _select_and_merge_concatenated_hidden(
+        context, selected_hidden_list
+    )
     if _is_sparse_sp_non_source_context(context):
         return {}
     if selected is None:
         return {}
     output = {
         OLD_LOGPROB_HIDDEN_STATES_KEY: selected,
-        OLD_LOGPROB_TIMING_KEY: _timing_tensor_from_context(context, _selected_device(selected)),
+        OLD_LOGPROB_TIMING_KEY: _timing_tensor_from_context(
+            context, _selected_device(selected)
+        ),
         "speco_oldlogprob_owner_mask": owner_mask,
         "speco_oldlogprob_sp_group": context.get("sp_group"),
         "speco_oldlogprob_sp_size": int(context.get("sp_size", 1) or 1),
@@ -1360,19 +1648,25 @@ def install_oldlogprob_hidden_runtime_patch() -> bool:
     try:
         module = importlib.import_module("verl.workers.engine.fsdp.transformer_impl")
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Unable to install SPECO old-logprob hidden runtime patch: %s", exc)
+        logger.warning(
+            "Unable to install SPECO old-logprob hidden runtime patch: %s", exc
+        )
         return False
 
     engine_cls = getattr(module, "FSDPEngineWithLMHead", None)
     if engine_cls is None:
-        logger.warning("Unable to install SPECO old-logprob hidden runtime patch: missing FSDPEngineWithLMHead")
+        logger.warning(
+            "Unable to install SPECO old-logprob hidden runtime patch: missing FSDPEngineWithLMHead"
+        )
         return False
 
     prepare_model_inputs = getattr(engine_cls, "prepare_model_inputs", None)
     prepare_model_outputs = getattr(engine_cls, "prepare_model_outputs", None)
     forward_step = getattr(engine_cls, "forward_step", None)
     if not callable(prepare_model_inputs) or not callable(prepare_model_outputs):
-        logger.warning("Unable to install SPECO old-logprob hidden runtime patch: missing engine methods")
+        logger.warning(
+            "Unable to install SPECO old-logprob hidden runtime patch: missing engine methods"
+        )
         return False
 
     _install_oldlogprob_fsdp_batch_postprocess_patch(module)
@@ -1381,7 +1675,9 @@ def install_oldlogprob_hidden_runtime_patch() -> bool:
 
         @wraps(prepare_model_inputs)
         def speco_prepare_model_inputs(self, micro_batch, *args, **kwargs):
-            model_inputs, output_args = prepare_model_inputs(self, micro_batch, *args, **kwargs)
+            model_inputs, output_args = prepare_model_inputs(
+                self, micro_batch, *args, **kwargs
+            )
             if _tensor_key_present(micro_batch, OLD_LOGPROB_COLLECT_MASK_KEY):
                 capture_impl = _oldlogprob_capture_impl(micro_batch)
                 model_inputs["return_dict"] = True
@@ -1390,7 +1686,9 @@ def install_oldlogprob_hidden_runtime_patch() -> bool:
                 elif capture_impl == "forward_hook":
                     _install_oldlogprob_hidden_hooks(self, output_args, micro_batch)
                 else:
-                    raise ValueError(f"Unsupported SPECO old-logprob hidden capture impl: {capture_impl!r}")
+                    raise ValueError(
+                        f"Unsupported SPECO old-logprob hidden capture impl: {capture_impl!r}"
+                    )
             return model_inputs, output_args
 
         engine_cls.prepare_model_inputs = speco_prepare_model_inputs
@@ -1399,7 +1697,15 @@ def install_oldlogprob_hidden_runtime_patch() -> bool:
     if not getattr(engine_cls, "_speco_oldlogprob_patched_outputs", False):
 
         @wraps(prepare_model_outputs)
-        def speco_prepare_model_outputs(self, output, output_args, micro_batch, logits_processor_func, *args, **kwargs):
+        def speco_prepare_model_outputs(
+            self,
+            output,
+            output_args,
+            micro_batch,
+            logits_processor_func,
+            *args,
+            **kwargs,
+        ):
             try:
                 model_output = prepare_model_outputs(
                     self,
@@ -1415,14 +1721,22 @@ def install_oldlogprob_hidden_runtime_patch() -> bool:
                     if capture_impl == "forward_hook":
                         hidden_output = _consume_oldlogprob_hidden_capture(self)
                     elif capture_impl == "output_hidden_states":
-                        hidden_output = _select_oldlogprob_hidden_states(self, output, output_args, micro_batch)
+                        hidden_output = _select_oldlogprob_hidden_states(
+                            self, output, output_args, micro_batch
+                        )
                     else:
-                        raise ValueError(f"Unsupported SPECO old-logprob hidden capture impl: {capture_impl!r}")
+                        raise ValueError(
+                            f"Unsupported SPECO old-logprob hidden capture impl: {capture_impl!r}"
+                        )
                     if not hidden_output:
                         if _oldlogprob_hidden_object_ref_enabled(micro_batch):
                             return model_output
-                        raise RuntimeError("SPECO old-logprob hidden collection did not produce selected hidden states")
-                    hidden_output = _put_oldlogprob_hidden_refs(hidden_output, micro_batch)
+                        raise RuntimeError(
+                            "SPECO old-logprob hidden collection did not produce selected hidden states"
+                        )
+                    hidden_output = _put_oldlogprob_hidden_refs(
+                        hidden_output, micro_batch
+                    )
                     model_output.update(hidden_output)
                 return model_output
             except Exception:
@@ -1432,7 +1746,9 @@ def install_oldlogprob_hidden_runtime_patch() -> bool:
         engine_cls.prepare_model_outputs = speco_prepare_model_outputs
         engine_cls._speco_oldlogprob_patched_outputs = True
 
-    if callable(forward_step) and not getattr(engine_cls, "_speco_oldlogprob_patched_forward_step", False):
+    if callable(forward_step) and not getattr(
+        engine_cls, "_speco_oldlogprob_patched_forward_step", False
+    ):
 
         @wraps(forward_step)
         def speco_forward_step(self, *args, **kwargs):
@@ -1447,5 +1763,7 @@ def install_oldlogprob_hidden_runtime_patch() -> bool:
     _install_oldlogprob_training_worker_postprocess_patch()
 
     _PATCHED = True
-    logger.warning("SPECO old-logprob hidden runtime patch active for upstream FSDP LM-head engine")
+    logger.warning(
+        "SPECO old-logprob hidden runtime patch active for upstream FSDP LM-head engine"
+    )
     return True

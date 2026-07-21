@@ -108,7 +108,6 @@ def compile_friendly_create_block_mask(
 def generate_eagle3_mask(
     seq_lengths: torch.Tensor, Q_LEN: int, KV_LEN: int, lck: int = 0
 ):
-
     def causal_mask(b, h, q_idx, kv_idx):
         # Causal attention shrinks by one diagonal because of the appended suffix.
         causal_mask = q_idx >= kv_idx

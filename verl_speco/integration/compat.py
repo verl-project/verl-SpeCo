@@ -70,13 +70,25 @@ def resolve_verl_compatibility(
     commit_id = _read_distribution_commit()
 
     if version in set(allowed_versions):
-        return VerlCompatibility(version=version, commit_id=commit_id, supported=True, reason="matched version")
+        return VerlCompatibility(
+            version=version,
+            commit_id=commit_id,
+            supported=True,
+            reason="matched version",
+        )
 
     if commit_id in set(allowed_commits):
-        return VerlCompatibility(version=version, commit_id=commit_id, supported=True, reason="matched commit")
+        return VerlCompatibility(
+            version=version,
+            commit_id=commit_id,
+            supported=True,
+            reason="matched commit",
+        )
 
     if os.getenv(ALLOW_UNSUPPORTED_ENV, "").lower() in {"1", "true", "yes"}:
-        return VerlCompatibility(version=version, commit_id=commit_id, supported=True, reason="env override")
+        return VerlCompatibility(
+            version=version, commit_id=commit_id, supported=True, reason="env override"
+        )
 
     return VerlCompatibility(
         version=version,

@@ -110,7 +110,9 @@ def resolve_launch_config(
     master_port = _find_override(overrides, _MASTER_PORT_KEYS)
 
     standalone_default = nnodes == "1" and master_addr is None and master_port is None
-    standalone = _parse_bool(_find_override(overrides, _STANDALONE_KEYS), default=standalone_default)
+    standalone = _parse_bool(
+        _find_override(overrides, _STANDALONE_KEYS), default=standalone_default
+    )
     if standalone and nnodes != "1":
         raise ValueError("standalone=true requires nnodes=1")
 
@@ -125,7 +127,9 @@ def resolve_launch_config(
     )
 
 
-def normalize_training_args(overrides: list[str], config: DraftTrainLaunchConfig) -> list[str]:
+def normalize_training_args(
+    overrides: list[str], config: DraftTrainLaunchConfig
+) -> list[str]:
     """Replace launcher aliases with canonical Hydra configuration fields."""
 
     normalized = []
@@ -183,8 +187,14 @@ def _format_command(command: list[str]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Launch standalone SPECO draft training.")
-    parser.add_argument("--dry-run", action="store_true", help="Print the resolved launch command and exit.")
+    parser = argparse.ArgumentParser(
+        description="Launch standalone SPECO draft training."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the resolved launch command and exit.",
+    )
     parser.add_argument(
         "--module",
         default="verl_speco.draft_train",

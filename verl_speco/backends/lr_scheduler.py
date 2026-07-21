@@ -43,7 +43,9 @@ class ClampedGlobalCosineLR(LRScheduler):
         if self.decay_steps <= 0:
             raise ValueError(f"lr_decay_steps must be positive, got {self.decay_steps}")
         if self.warmup_steps < 0:
-            raise ValueError(f"lr_warmup_steps must be non-negative, got {self.warmup_steps}")
+            raise ValueError(
+                f"lr_warmup_steps must be non-negative, got {self.warmup_steps}"
+            )
         if self.warmup_steps >= self.decay_steps:
             raise ValueError(
                 "lr_warmup_steps must be smaller than lr_decay_steps, "
@@ -77,7 +79,11 @@ def build_drafter_lr_scheduler(optimizer: Optimizer, train_cfg: Any) -> LRSchedu
     scheduler_type = str(scheduler_type).strip().lower()
     default_warmup_steps = 0 if configured_scheduler_type is not None else 1000
     configured_warmup_steps = train_cfg.get("lr_warmup_steps", default_warmup_steps)
-    warmup_steps = int(default_warmup_steps if configured_warmup_steps is None else configured_warmup_steps)
+    warmup_steps = int(
+        default_warmup_steps
+        if configured_warmup_steps is None
+        else configured_warmup_steps
+    )
     last_epoch = _scheduler_last_epoch(optimizer, train_cfg)
 
     if scheduler_type == "constant":

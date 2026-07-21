@@ -36,5 +36,9 @@ class Eagle1Config(LlamaConfig):
     ):
         super().__init__(**kwargs)
         self.draft_num_hidden_layers = int(draft_num_hidden_layers)
-        self.target_hidden_size = int(target_hidden_size) if target_hidden_size is not None else self.hidden_size
+        self.target_hidden_size = (
+            int(target_hidden_size)
+            if target_hidden_size is not None
+            else self.hidden_size
+        )
         self.num_aux_hidden_states = int(num_aux_hidden_states)

@@ -9,7 +9,7 @@ from transformers import (
     modeling_utils,
 )
 
-from .dflash import DFlashConfig, DFlashDraftModel
+from .dflash import DFlashConfig
 from .eagle.llama_eagle import LlamaForCausalLMEagle3
 
 
@@ -94,7 +94,6 @@ def _normalize_eagle3_config_dict(config: dict) -> dict:
 
 
 class AutoDraftModel(AutoModelForCausalLMBase):
-
     @classmethod
     def from_config(cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs):
         """
@@ -118,10 +117,10 @@ class AutoDraftModel(AutoModelForCausalLMBase):
 
     @classmethod
     def from_pretrained(
-            cls,
-            pretrained_model_name_or_path: Union[str, os.PathLike[str]],
-            *model_args,
-            **kwargs,
+        cls,
+        pretrained_model_name_or_path: Union[str, os.PathLike[str]],
+        *model_args,
+        **kwargs,
     ):
         original_warn = modeling_utils.logger.warning
 
