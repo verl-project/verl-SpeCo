@@ -31,6 +31,14 @@ class _FakeTrainer:
         return self.future
 
 
+def _export_trainer(model_type: str, model_path=None):
+    """Minimal trainer stand-in for the standalone checkpoint export helpers."""
+    return SimpleNamespace(
+        backend=SimpleNamespace(model_type=model_type),
+        config=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=model_path))),
+    )
+
+
 def _standalone_config(algorithm: str):
     return OmegaConf.create(
         {
@@ -166,10 +174,7 @@ def test_standalone_dspark_checkpoint_preserves_source_runtime_config(tmp_path):
         "num_context_layers": 3,
     }
     (checkpoint_dir / "config.json").write_text(json.dumps(training_config), encoding="utf-8")
-    trainer = SimpleNamespace(
-        backend=SimpleNamespace(model_type="dspark"),
-        config=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))),
-    )
+    trainer = _export_trainer("dspark", str(source_dir))
 
     _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
 
@@ -207,10 +212,7 @@ def test_standalone_domino_checkpoint_exports_dflash_projector_config(tmp_path):
         "pure_draft_prefix_len": 1,
     }
     (checkpoint_dir / "config.json").write_text(json.dumps(training_config), encoding="utf-8")
-    trainer = SimpleNamespace(
-        backend=SimpleNamespace(model_type="domino"),
-        config=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))),
-    )
+    trainer = _export_trainer("domino", str(source_dir))
 
     _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
 
@@ -237,10 +239,7 @@ def test_standalone_domino_checkpoint_defaults_projector_type(tmp_path):
         json.dumps({"model_type": "domino", "architectures": ["DominoDraftModel"]}),
         encoding="utf-8",
     )
-    trainer = SimpleNamespace(
-        backend=SimpleNamespace(model_type="domino"),
-        config=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=None))),
-    )
+    trainer = _export_trainer("domino", None)
 
     _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
 
@@ -266,10 +265,7 @@ def test_standalone_dflash_checkpoint_preserves_source_runtime_config(tmp_path):
         "num_context_layers": 3,
     }
     (checkpoint_dir / "config.json").write_text(json.dumps(training_config), encoding="utf-8")
-    trainer = SimpleNamespace(
-        backend=SimpleNamespace(model_type="dflash"),
-        config=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))),
-    )
+    trainer = _export_trainer("dflash", str(source_dir))
 
     _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
 

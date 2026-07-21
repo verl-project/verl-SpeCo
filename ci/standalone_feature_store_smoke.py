@@ -21,7 +21,10 @@ import argparse
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from verl_speco.integration.oldlogprob_layer_ids import resolve_drafter_hidden_states_layout
+from verl_speco.integration.oldlogprob_layer_ids import (
+    DFLASH_FAMILY_ALGORITHMS,
+    resolve_drafter_hidden_states_layout,
+)
 from verl_speco.models.dflash.modeling_dflash import build_target_layer_ids
 from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
 
@@ -35,13 +38,6 @@ PROMPTS = [
     "What is speculative decoding, and why does it speed up inference?",
     "Outline the steps of a code review for a performance-sensitive change.",
 ]
-
-
-def _resolve_target_layer_ids(algorithm: str, num_layers: int, num_context_layers: int, num_aux: int) -> list[int]:
-    if algorithm in {"DFLASH", "DSPARK", "DOMINO"}:
-        return build_target_layer_ids(num_context_layers, num_layers)
-    # EAGLE-family aux layers, matching the per-backend GPU smokes.
-    return [2, num_layers // 2, num_layers - 3][:num_aux]
 
 
 def main() -> None:
@@ -65,7 +61,11 @@ def main() -> None:
     target_cfg = AutoConfig.from_pretrained(args.target)
     num_layers = int(getattr(target_cfg, "num_hidden_layers"))
 
-    target_layer_ids = _resolve_target_layer_ids(algorithm, num_layers, args.num_context_layers, args.num_aux)
+    if algorithm in DFLASH_FAMILY_ALGORITHMS:
+        target_layer_ids = build_target_layer_ids(args.num_context_layers, num_layers)
+    else:
+        # EAGLE-family aux layers, matching the per-backend GPU smokes.
+        target_layer_ids = [2, num_layers // 2, num_layers - 3][: args.num_aux]
     print(f"[features] algorithm={algorithm} layout={layout} target_layer_ids={target_layer_ids} (of {num_layers})")
 
     store = TorchShardFeatureStore(

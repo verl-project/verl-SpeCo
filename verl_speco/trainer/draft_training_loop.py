@@ -224,6 +224,46 @@ def _fill_if_missing(dst: dict[str, Any], src: dict[str, Any], keys: tuple[str, 
             dst[key] = deepcopy(src[key])
 
 
+# Extra runtime-facing config a DFlash variant needs on top of the shared DFlash
+# aliases, as (config child, keys copied from the training config). Domino writes
+# into dflash_config because engines serve it as a DFlash projector sub-mode
+# (dflash_config.projector_type="domino"), while DSpark is its own serve method.
+_VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "domino": (
+        "dflash_config",
+        (
+            "block_size",
+            "num_anchors",
+            "loss_decay_gamma",
+            "emb_dim",
+            "gru_hidden_dim",
+            "pure_draft_prefix_len",
+            "num_target_layers",
+            "target_num_hidden_layers",
+        ),
+    ),
+    "dspark": (
+        "dspark_config",
+        (
+            "block_size",
+            "num_anchors",
+            "markov_rank",
+            "markov_head_type",
+            "confidence_head_alpha",
+            "confidence_head_with_markov",
+            "ce_loss_alpha",
+            "l1_loss_alpha",
+            "loss_decay_gamma",
+            "target_layer_ids",
+            "num_context_layers",
+            "num_target_layers",
+            "target_num_hidden_layers",
+            "mask_token_id",
+        ),
+    ),
+}
+
+
 def _rewrite_standalone_block_runtime_config(
     trainer: DrafterBaseTrainer,
     checkpoint_path: str,
@@ -282,54 +322,16 @@ def _rewrite_standalone_block_runtime_config(
     dflash_config = _ensure_dict_child(runtime_config, "dflash_config")
     _fill_if_missing(dflash_config, training_config, common_alias_keys)
 
+    variant_child_key, variant_alias_keys = _VARIANT_RUNTIME_ALIASES.get(backend_type, (None, ()))
+    variant_config = _ensure_dict_child(runtime_config, variant_child_key) if variant_child_key else {}
+    _fill_if_missing(variant_config, training_config, variant_alias_keys)
     if backend_type == "domino":
-        # Engines serve Domino as a DFlash projector sub-mode, so the correction
-        # head is described inside dflash_config rather than by the method name.
-        _fill_if_missing(
-            dflash_config,
-            training_config,
-            (
-                "block_size",
-                "num_anchors",
-                "loss_decay_gamma",
-                "emb_dim",
-                "gru_hidden_dim",
-                "pure_draft_prefix_len",
-                "num_target_layers",
-                "target_num_hidden_layers",
-            ),
-        )
-        dflash_config["projector_type"] = str(training_config.get("projector_type", "domino") or "domino")
-
-    if backend_type == "dspark":
-        dspark_config = _ensure_dict_child(runtime_config, "dspark_config")
-        _fill_if_missing(
-            dspark_config,
-            training_config,
-            (
-                "block_size",
-                "num_anchors",
-                "markov_rank",
-                "markov_head_type",
-                "confidence_head_alpha",
-                "confidence_head_with_markov",
-                "ce_loss_alpha",
-                "l1_loss_alpha",
-                "loss_decay_gamma",
-                "target_layer_ids",
-                "num_context_layers",
-                "num_target_layers",
-                "target_num_hidden_layers",
-                "mask_token_id",
-            ),
-        )
-    else:
-        dspark_config = {}
+        variant_config["projector_type"] = str(training_config.get("projector_type", "domino") or "domino")
 
     target_layer_ids = (
         runtime_config.get("target_layer_ids")
         or dflash_config.get("target_layer_ids")
-        or dspark_config.get("target_layer_ids")
+        or variant_config.get("target_layer_ids")
     )
     if target_layer_ids is not None and "eagle_aux_hidden_state_layer_ids" not in runtime_config:
         try:
