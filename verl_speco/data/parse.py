@@ -2,7 +2,7 @@ import json
 import re
 import warnings
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from transformers import PreTrainedTokenizer
@@ -31,7 +31,7 @@ class Parser(ABC):
         max_length: int,
         preformatted: bool = False,
         train_only_last_turn: bool = False,
-        tool: List[Dict] = [],
+        tool: Optional[List[Dict]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -162,9 +162,10 @@ class GeneralParser(Parser):
         max_length: int,
         preformatted: bool = False,
         train_only_last_turn: bool = False,
-        tool: List[Dict] = [],
+        tool: Optional[List[Dict]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        tool = [] if tool is None else tool
         if not preformatted:
             messages = []
 
@@ -353,8 +354,10 @@ class HarmonyParser(Parser):
         max_length: int,
         preformatted: bool = False,
         train_only_last_turn: bool = False,
-        tool: List[Dict] = [],
+        tool: Optional[List[Dict]] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        tool = [] if tool is None else tool
         # conversation = process_harmony_conversations(conversation)
         if not preformatted:
             prompt_text = ""
@@ -451,7 +454,7 @@ class ThinkingParser(GeneralParser):
         max_length: int,
         preformatted: bool = False,
         train_only_last_turn: bool = False,
-        tool: List[Dict] = [],
+        tool: Optional[List[Dict]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Parse conversation, processing all assistant turns for loss mask."""
