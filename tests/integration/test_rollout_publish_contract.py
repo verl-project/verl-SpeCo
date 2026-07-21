@@ -48,6 +48,27 @@ def test_rollout_backend_and_drafter_gates_support_both_config_shapes() -> None:
     )
 
 
+def test_vllm_worker_runtime_installs_import_compat_first(monkeypatch) -> None:
+    from verl_speco.integration import verl_npu_vllm_compat, vllm_runtime
+
+    events = []
+    monkeypatch.setattr(
+        verl_npu_vllm_compat,
+        "install_verl_npu_vllm_import_compat",
+        lambda: events.append("compat"),
+    )
+    monkeypatch.setattr(
+        vllm_runtime,
+        "install_vllm_runtime_for_worker",
+        lambda worker: events.append(("runtime", worker)),
+    )
+    worker = SimpleNamespace()
+
+    rollout_publish.install_vllm_runtime_for_worker(worker)
+
+    assert events == ["compat", ("runtime", worker)]
+
+
 def test_publish_state_filter_keeps_eagle3_trainable_lm_head() -> None:
     torch = pytest.importorskip("torch")
     base_trainer = pytest.importorskip(

@@ -120,6 +120,12 @@ def install_sglang_runtime_for_worker(worker: Any) -> None:
 def install_vllm_runtime_for_worker(worker: Any) -> None:
     """Install SPECO vLLM runtime hooks inside an actor-rollout worker process."""
 
+    from verl_speco.integration.verl_npu_vllm_compat import install_verl_npu_vllm_import_compat
+
+    # This must run before importing verl's vLLM rollout modules. verl
+    # release/v0.8.0 still treats vLLM >= 0.18 FusedMoE as a class on NPU.
+    install_verl_npu_vllm_import_compat()
+
     try:
         from verl_speco.integration.vllm_runtime import install_vllm_runtime_for_worker as _install
     except Exception:  # noqa: BLE001
