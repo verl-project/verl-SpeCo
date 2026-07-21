@@ -135,6 +135,15 @@ actor_rollout_ref:
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
         dspark_debug_log_interval: 100
+        # P-EAGLE (parallel drafting: COD-subsampled multi-depth forward + KL loss).
+        peagle_num_draft_layers: 4
+        peagle_num_aux_hidden_states: 3
+        peagle_draft_vocab_size: null
+        peagle_num_depths: 8
+        peagle_down_sample_ratio: 0.7
+        peagle_down_sample_ratio_min: 0.2
+        peagle_mask_token_id: null
+        peagle_fc_norm: false
         # Domino (DFlash variant: causal GRU correction head + dual-logit curriculum).
         # Unset keys fall back to the matching dflash_* value.
         domino_block_size: 16

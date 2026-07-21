@@ -2722,6 +2722,19 @@ class DrafterBaseTrainer:
                     max(last_h_states.size(0) - 1, 0),
                 ]
                 train_seq_len = min(train_seq_len_limits)
+            elif self.backend.model_type == "peagle":
+                # P-EAGLE mirrors the reference target-wrapper shift: row p pairs
+                # aux f[p] with the NEXT token x[p+1], supervised against the
+                # distribution of x[p+2] from last_hidden[p+1] and gated by
+                # loss_mask[p+1]. Only aux stays unshifted.
+                last_h_states = preprocessed_lists["last_h_states"][item_idx]
+                train_seq_len = min(
+                    max(ids.size(0) - 1, 0),
+                    h_states.size(0),
+                    max(item_loss_mask.size(0) - 1, 0),
+                    item_position_ids.size(0),
+                    max(last_h_states.size(0) - 1, 0),
+                )
             elif self._is_block_drafter_backend():
                 train_seq_len = seq_len
             else:
@@ -2911,7 +2924,7 @@ class DrafterBaseTrainer:
                             },
                         )
 
-            if uses_shifted_eagle_inputs:
+            if uses_shifted_eagle_inputs or self.backend.model_type == "peagle":
                 input_id_chunks.append(ids[1 : 1 + train_seq_len])
                 hidden_state_chunks.append(h_states[:train_seq_len])
                 position_id_chunks.append(item_position_ids[:train_seq_len])
@@ -2935,6 +2948,10 @@ class DrafterBaseTrainer:
                     )
                 else:
                     last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
+            elif self.backend.model_type == "peagle":
+                # Reference-shifted: last_hidden[p+1] scores x[p+2], the token
+                # after the drafted input token x[p+1] at row p.
+                last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
             elif dspark_l1_enabled and torch.is_tensor(target_last_h_states):
                 target_last_hidden_state_chunks.append(target_last_h_states[:train_seq_len])
 
@@ -3000,6 +3017,10 @@ class DrafterBaseTrainer:
                 if not last_hidden_state_chunks:
                     return None
                 last_hidden_states = torch.cat(last_hidden_state_chunks, dim=0).unsqueeze(0).contiguous()
+        elif self.backend.model_type == "peagle":
+            if not last_hidden_state_chunks:
+                return None
+            last_hidden_states = torch.cat(last_hidden_state_chunks, dim=0).unsqueeze(0).contiguous()
 
         batch = {
             "input_ids": input_ids,
@@ -3013,6 +3034,15 @@ class DrafterBaseTrainer:
                 batch["target_logprobs"] = target_logprobs
             else:
                 batch["last_hidden_states"] = last_hidden_states
+        elif self.backend.model_type == "peagle":
+            batch["last_hidden_states"] = last_hidden_states
+            # Preserve the per-document chunk lengths so the P-EAGLE COD mask can
+            # isolate documents. The flat batch concatenates every chunk into one
+            # length-`sum` sequence with an all-ones attention_mask, so the mask
+            # cannot recover document boundaries from attention_mask alone.
+            batch["seq_lengths"] = torch.tensor(
+                [chunk.size(0) for chunk in input_id_chunks], dtype=torch.long, device=dev
+            )
         elif self.backend.model_type == "dspark" and target_last_hidden_state_chunks:
             batch["target_last_hidden_states"] = target_last_hidden_states
 
@@ -3027,6 +3057,13 @@ class DrafterBaseTrainer:
                 target_logprobs = batch["target_logprobs"]
             else:
                 last_hidden_states = batch["last_hidden_states"]
+        elif self.backend.model_type == "peagle":
+            # Carry the sanitized P-EAGLE tensors across the batch rebuild below.
+            # They are not padded/sliced here: the backend rejects Ulysses SP in
+            # compute_loss (supports_ulysses_sp=False), so peagle batches must
+            # reach it unsliced.
+            peagle_last_hidden_states = batch["last_hidden_states"]
+            peagle_seq_lengths = batch["seq_lengths"]
         elif self.backend.model_type == "dspark" and "target_last_hidden_states" in batch:
             target_last_hidden_states = batch["target_last_hidden_states"]
 
@@ -3096,6 +3133,9 @@ class DrafterBaseTrainer:
                 batch["target_logprobs"] = target_logprobs
             else:
                 batch["last_hidden_states"] = last_hidden_states
+        elif self.backend.model_type == "peagle":
+            batch["last_hidden_states"] = peagle_last_hidden_states
+            batch["seq_lengths"] = peagle_seq_lengths
         elif self.backend.model_type == "dspark" and target_last_hidden_state_chunks:
             batch["target_last_hidden_states"] = target_last_hidden_states
         batch["_speco_pad_size"] = pad_size_for_batch
