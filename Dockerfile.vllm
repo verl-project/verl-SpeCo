@@ -13,5 +13,5 @@ RUN git clone ${VERL_REPO} /workspace/verl \
 
 COPY . /workspace/verl-SpeCo
 
-ENV PYTHONPATH=/workspace/verl-SpeCo:${PYTHONPATH}
 WORKDIR /workspace/verl-SpeCo
+RUN pip install -e .

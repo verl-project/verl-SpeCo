@@ -1,8 +1,12 @@
+import ctypes
+import gc
 import json
 import logging
 import os
 import re
 import shutil
+import sys
+import time
 from glob import glob
 from typing import Any, Optional, Union
 
@@ -222,6 +226,96 @@ def format_checkpoint_memory_snapshot() -> str:
         f"{name}={value / (1024**2):.2f}" if value is not None else f"{name}=n/a"
         for name, value in counters.items()
     )
+
+
+def _trim_process_heap() -> bool:
+    """Return free glibc heap arenas to the operating system when available."""
+
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        libc = ctypes.CDLL(None)
+        malloc_trim = libc.malloc_trim
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+        return bool(malloc_trim(0))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _flush_and_drop_checkpoint_file_cache(checkpoint_path: str) -> tuple[int, int]:
+    """Flush completed checkpoint files and advise Linux to evict their cache."""
+
+    if not sys.platform.startswith("linux") or not hasattr(os, "posix_fadvise"):
+        return 0, 0
+    try:
+        if not checkpoint_path or not os.path.exists(checkpoint_path):
+            return 0, 0
+    except OSError:
+        return 0, 1
+
+    advised = 0
+    failed = 0
+    paths = []
+    if os.path.isfile(checkpoint_path):
+        paths.append(checkpoint_path)
+    else:
+        for root, _, filenames in os.walk(checkpoint_path):
+            paths.extend(os.path.join(root, filename) for filename in filenames)
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    advice = getattr(os, "POSIX_FADV_DONTNEED", 4)
+    for path in paths:
+        try:
+            fd = os.open(path, flags)
+        except OSError:
+            failed += 1
+            continue
+        try:
+            os.fsync(fd)
+            os.posix_fadvise(fd, 0, 0, advice)
+            advised += 1
+        except OSError:
+            failed += 1
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                failed += 1
+    return advised, failed
+
+
+def release_checkpoint_host_memory(
+    checkpoint_path: Optional[Union[str, os.PathLike]] = None,
+    *,
+    drop_file_cache: bool = False,
+) -> dict[str, Any]:
+    """Best-effort release of checkpoint staging and file-cache memory."""
+
+    started = time.perf_counter()
+    try:
+        gc.collect()
+    except Exception:  # noqa: BLE001
+        pass
+    trimmed_before = _trim_process_heap()
+    advised = 0
+    failed = 0
+    if drop_file_cache and checkpoint_path:
+        try:
+            advised, failed = _flush_and_drop_checkpoint_file_cache(os.fspath(checkpoint_path))
+        except Exception:  # noqa: BLE001
+            failed = 1
+    try:
+        gc.collect()
+    except Exception:  # noqa: BLE001
+        pass
+    trimmed_after = _trim_process_heap()
+    return {
+        "elapsed_sec": time.perf_counter() - started,
+        "heap_trimmed": bool(trimmed_before or trimmed_after),
+        "files_advised": advised,
+        "files_failed": failed,
+    }
 
 
 def resolve_drafter_checkpoint_path(

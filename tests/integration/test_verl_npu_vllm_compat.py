@@ -4,6 +4,8 @@ import importlib
 import sys
 import types
 
+import pytest
+
 from verl_speco.integration import verl_npu_vllm_compat as compat
 
 
@@ -46,8 +48,8 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     monkeypatch.setattr(compat, "install_verl_npu_vllm_import_compat", lambda: events.append("compat"))
     monkeypatch.setattr(
         compat,
-        "install_verl_npu_fsdp2_checkpoint_compat",
-        lambda: events.append("checkpoint"),
+        "install_verl_npu_checkpoint_reclaim",
+        lambda: events.append("reclaim"),
     )
 
     class BaseWorker:
@@ -58,67 +60,72 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
         pass
 
     WrappedWorker()
-    assert events == ["compat", "checkpoint", "base"]
+    assert events == ["compat", "reclaim", "base"]
 
 
-def test_npu_fsdp2_checkpoint_saves_existing_cpu_shards(monkeypatch) -> None:
+def test_npu_checkpoint_reclaim_preserves_native_save(monkeypatch) -> None:
     events = []
     engine_module = types.ModuleType(compat._VERL_FSDP_ENGINE_MODULE)
 
     class FSDPEngine:
         def save_checkpoint(self, *args, **kwargs):
             events.append(("original", args, kwargs))
+            return "saved"
 
     engine_module.FSDPEngine = FSDPEngine
     device_module = types.SimpleNamespace(get_device_name=lambda: "npu")
-    fsdp_utils = types.SimpleNamespace(fsdp_version=lambda module: module.fsdp_version)
-    torch_module = types.SimpleNamespace(
-        distributed=types.SimpleNamespace(barrier=lambda: events.append(("barrier",)))
-    )
     modules = {
         compat._VERL_FSDP_ENGINE_MODULE: engine_module,
         "verl.utils.device": device_module,
-        "verl.utils.fsdp_utils": fsdp_utils,
-        "torch": torch_module,
     }
     monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
-    monkeypatch.setattr(compat, "_NPU_FSDP2_CHECKPOINT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_NPU_CHECKPOINT_RECLAIM_APPLIED", False)
+    monkeypatch.setattr(
+        compat,
+        "release_checkpoint_host_memory",
+        lambda path, drop_file_cache: events.append(("reclaim", path, drop_file_cache))
+        or {"elapsed_sec": 0.1, "files_advised": 3, "files_failed": 0},
+    )
+    monkeypatch.setattr(compat, "format_checkpoint_memory_snapshot", lambda: "memory")
 
-    assert compat.install_verl_npu_fsdp2_checkpoint_compat(modules.__getitem__) is True
-
-    class Model:
-        fsdp_version = 2
-
-        @staticmethod
-        def parameters():
-            parameter = types.SimpleNamespace(device=types.SimpleNamespace(type="cpu"))
-            return iter([parameter])
-
-    class CheckpointManager:
-        should_save_optimizer = True
-
-        @staticmethod
-        def save_checkpoint(**kwargs):
-            events.append(("manager", kwargs))
-            return "saved"
+    assert compat.install_verl_npu_checkpoint_reclaim(modules.__getitem__) is True
 
     engine = FSDPEngine()
-    engine.rank = 1
-    engine.module = Model()
-    engine.checkpoint_manager = CheckpointManager()
-    engine.optimizer = types.SimpleNamespace(state={})
-    engine._is_offload_param = True
-    engine._is_offload_optimizer = True
-    engine._uses_fsdp2_cpu_offload_policy = False
+    engine.rank = 0
 
     assert engine.save_checkpoint("/tmp/actor", global_step=20, max_ckpt_to_keep=1) == "saved"
-    assert [event[0] for event in events] == ["manager", "barrier"]
+    assert events == [
+        ("original", ("/tmp/actor",), {"global_step": 20, "max_ckpt_to_keep": 1}),
+        ("reclaim", "/tmp/actor", True),
+    ]
 
-    engine.module.fsdp_version = 1
-    engine.save_checkpoint("/tmp/actor", global_step=40)
-    assert events[-1][0] == "original"
 
-    engine.module.fsdp_version = 2
-    engine._is_offload_optimizer = False
-    engine.save_checkpoint("/tmp/actor", global_step=60)
-    assert events[-1][0] == "original"
+def test_npu_checkpoint_reclaim_runs_after_native_save_failure(monkeypatch) -> None:
+    events = []
+    engine_module = types.ModuleType(compat._VERL_FSDP_ENGINE_MODULE)
+
+    class FSDPEngine:
+        rank = 1
+
+        def save_checkpoint(self, *args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("save failed")
+
+    engine_module.FSDPEngine = FSDPEngine
+    modules = {
+        compat._VERL_FSDP_ENGINE_MODULE: engine_module,
+        "verl.utils.device": types.SimpleNamespace(get_device_name=lambda: "npu"),
+    }
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_NPU_CHECKPOINT_RECLAIM_APPLIED", False)
+    monkeypatch.setattr(
+        compat,
+        "release_checkpoint_host_memory",
+        lambda path, drop_file_cache: events.append((path, drop_file_cache))
+        or {"elapsed_sec": 0.1, "files_advised": 0, "files_failed": 0},
+    )
+
+    assert compat.install_verl_npu_checkpoint_reclaim(modules.__getitem__) is True
+    with pytest.raises(RuntimeError, match="save failed"):
+        FSDPEngine().save_checkpoint("/tmp/actor")
+    assert events == [(None, False)]

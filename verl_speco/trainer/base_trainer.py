@@ -35,6 +35,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
 )
 from verl.utils.ulysses import get_ulysses_sequence_parallel_group, set_ulysses_sequence_parallel_group
+from verl_speco.trainer.checkpoint import release_checkpoint_host_memory
 from verl_speco.trainer.feature_store import DraftFeatureSample
 
 logger = logging.getLogger(__name__)
@@ -1216,6 +1217,9 @@ class DrafterBaseTrainer:
 
         if not isinstance(trainer_state, dict) or int(trainer_state.get("version", 0) or 0) != 1:
             raise RuntimeError(f"Invalid drafter trainer state in {trainer_state_path}")
+        # Other DP replicas may still be reading the shared DCP files. Trim
+        # only process-local staging here; file-cache eviction is save-only.
+        release_checkpoint_host_memory()
         return trainer_state
 
     def _save_pretrained_checkpoint_async(
@@ -1279,6 +1283,7 @@ class DrafterBaseTrainer:
 
             write_started = time.perf_counter()
             removed = []
+            checkpoint_complete = False
             try:
                 os.makedirs(checkpoint_path, exist_ok=True)
                 self._clear_existing_pretrained_weight_files(checkpoint_path)
@@ -1300,6 +1305,7 @@ class DrafterBaseTrainer:
                         self.checkpoint_dir,
                         self.max_drafter_ckpt_to_keep,
                     )
+                checkpoint_complete = True
                 write_elapsed = time.perf_counter() - write_started
                 logger.warning(
                     "[drafter checkpoint] step=%s phase=write elapsed=%.2fs pruned=%s %s",
@@ -1315,7 +1321,18 @@ class DrafterBaseTrainer:
                 }
             finally:
                 model_state_dict.clear()
-                gc.collect()
+                reclaim = release_checkpoint_host_memory(
+                    checkpoint_path if checkpoint_complete else None,
+                    drop_file_cache=checkpoint_complete,
+                )
+                logger.warning(
+                    "[drafter checkpoint] step=%s phase=reclaim elapsed=%.2fs files=%s failed=%s %s",
+                    step,
+                    reclaim["elapsed_sec"],
+                    reclaim["files_advised"],
+                    reclaim["files_failed"],
+                    format_checkpoint_memory_snapshot(),
+                )
 
         if self._full_checkpoint_executor is None:
             self._full_checkpoint_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="drafter-full-ckpt")
@@ -1410,6 +1427,7 @@ class DrafterBaseTrainer:
         write_elapsed = 0.0
         pruned = 0
         offload_elapsed = 0.0
+        reclaim_elapsed = 0.0
         try:
             optimizer_started = time.perf_counter()
             optimizer_manifest = self._save_optimizer_checkpoint(checkpoint_path)
@@ -1443,14 +1461,15 @@ class DrafterBaseTrainer:
                 offload_started = time.perf_counter()
                 offload_fsdp_model_to_cpu(self.model)
                 offload_elapsed = time.perf_counter() - offload_started
-            gc.collect()
+            reclaim = release_checkpoint_host_memory()
+            reclaim_elapsed = reclaim["elapsed_sec"]
 
         if self._is_checkpoint_leader():
             from verl_speco.trainer.checkpoint import format_checkpoint_memory_snapshot
 
             logger.warning(
                 "[drafter checkpoint] step=%s phase=complete total=%.2fs load=%.2fs "
-                "optimizer=%.2fs export=%.2fs write=%.2fs offload=%.2fs pruned=%s %s",
+                "optimizer=%.2fs export=%.2fs write=%.2fs offload=%.2fs reclaim=%.2fs pruned=%s %s",
                 step,
                 time.perf_counter() - checkpoint_started,
                 load_elapsed,
@@ -1458,6 +1477,7 @@ class DrafterBaseTrainer:
                 export_elapsed,
                 write_elapsed,
                 offload_elapsed,
+                reclaim_elapsed,
                 pruned,
                 format_checkpoint_memory_snapshot(),
             )
@@ -1490,10 +1510,11 @@ class DrafterBaseTrainer:
             self.checkpoint_dir,
             self.max_drafter_ckpt_to_keep,
         )
-        gc.collect()
+        reclaim = release_checkpoint_host_memory()
         logger.warning(
-            "[drafter checkpoint] phase=prune elapsed=%.2fs removed=%s %s",
+            "[drafter checkpoint] phase=prune elapsed=%.2fs reclaim=%.2fs removed=%s %s",
             time.perf_counter() - started,
+            reclaim["elapsed_sec"],
             len(removed),
             format_checkpoint_memory_snapshot(),
         )

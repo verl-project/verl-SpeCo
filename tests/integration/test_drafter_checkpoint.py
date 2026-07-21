@@ -13,6 +13,7 @@ from verl_speco.trainer.checkpoint import (
     get_drafter_trainer_state,
     is_pretrained_drafter_checkpoint,
     prune_drafter_checkpoints,
+    release_checkpoint_host_memory,
     resolve_drafter_checkpoint_path,
 )
 
@@ -154,3 +155,25 @@ def test_prune_drafter_checkpoints_keeps_latest_complete_checkpoint(tmp_path) ->
 def test_prune_drafter_checkpoints_rejects_zero_retention(tmp_path) -> None:
     with pytest.raises(ValueError, match="at least 1"):
         prune_drafter_checkpoints(tmp_path, max_to_keep=0)
+
+
+def test_checkpoint_host_memory_reclaim_is_best_effort(monkeypatch, tmp_path) -> None:
+    checkpoint = tmp_path / "actor"
+    checkpoint.mkdir()
+    (checkpoint / "model.bin").write_bytes(b"weights")
+    events = []
+    monkeypatch.setattr(
+        "verl_speco.trainer.checkpoint._trim_process_heap",
+        lambda: events.append("trim") or True,
+    )
+    monkeypatch.setattr(
+        "verl_speco.trainer.checkpoint._flush_and_drop_checkpoint_file_cache",
+        lambda path: events.append(("drop", path)) or (1, 0),
+    )
+
+    result = release_checkpoint_host_memory(checkpoint, drop_file_cache=True)
+
+    assert events == ["trim", ("drop", str(checkpoint)), "trim"]
+    assert result["heap_trimmed"] is True
+    assert result["files_advised"] == 1
+    assert result["files_failed"] == 0

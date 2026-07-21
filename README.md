@@ -103,8 +103,7 @@ ci/                               # smoke-test helpers and CI notes
 
 ## Installation
 
-This repository does not currently define its own Python package metadata. Use
-it with the upstream `verl` release branch specified in
+Install the upstream `verl` release branch specified in
 [`REQUIRED_VERL.txt`](./REQUIRED_VERL.txt), which is mirrored in
 [`verl_speco/config/speco_base.yaml`](./verl_speco/config/speco_base.yaml).
 By default, unsupported `verl` versions produce a warning. Set
@@ -119,9 +118,17 @@ cd verl
 git checkout release/v0.8.0
 pip install -e .
 
-cd /path/to/verl-SpeCo
-export PYTHONPATH="$PWD:$PYTHONPATH"
+cd ..
+git clone https://github.com/verl-project/verl-SpeCo.git
+cd verl-SpeCo
+pip install -e .
 ```
+
+The editable install exposes the `verl_speco` package without modifying
+`PYTHONPATH`. It also installs the `verl-speco`, `verl-speco-draft-train`, and
+`verl-speco-inspect-features` command-line entry points. Install the matching
+GPU or NPU rollout runtime separately; `verl-SpeCo` intentionally does not let
+pip replace accelerator-specific PyTorch, vLLM, SGLang, or vLLM-Ascend builds.
 
 ### Docker Images
 
@@ -148,8 +155,8 @@ RUN git clone ${VERL_REPO} /workspace/verl \
 
 COPY . /workspace/verl-SpeCo
 
-ENV PYTHONPATH=/workspace/verl-SpeCo:${PYTHONPATH}
 WORKDIR /workspace/verl-SpeCo
+RUN pip install -e .
 ```
 
 Build it from the `verl-SpeCo` repository root:
@@ -176,8 +183,8 @@ RUN git clone ${VERL_REPO} /workspace/verl \
 
 COPY . /workspace/verl-SpeCo
 
-ENV PYTHONPATH=/workspace/verl-SpeCo:${PYTHONPATH}
 WORKDIR /workspace/verl-SpeCo
+RUN pip install -e .
 ```
 
 Build it from the `verl-SpeCo` repository root:
