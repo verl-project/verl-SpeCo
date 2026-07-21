@@ -267,8 +267,8 @@ class DFlashDraftModel(PreTrainedModel):
 
     config_class = DFlashConfig
     _no_split_modules = ["DFlashDecoderLayer"]
-    _tied_weights_keys = []
-    all_tied_weights_keys = []
+    _tied_weights_keys: list[str] = []
+    all_tied_weights_keys: list[str] = []
 
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)

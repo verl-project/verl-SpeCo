@@ -3558,8 +3558,8 @@ def _filter_sglang_drafter_last_hidden_output(
                     int(index_cpu.max().item()) if int(index_cpu.numel()) > 0 else None
                 )
             except Exception as exc:  # noqa: BLE001
-                index_head = [f"error:{exc}"]
-                index_tail = index_head
+                accept_head = [f"error:{exc}"]
+                accept_tail = accept_head
                 identity_prefix = None
                 index_min = None
                 index_max = None

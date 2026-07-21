@@ -2,7 +2,7 @@ import json
 import re
 import warnings
 from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 from transformers import PreTrainedTokenizer
@@ -10,6 +10,8 @@ from transformers import PreTrainedTokenizer
 from .template import ChatTemplate
 
 __all__ = ["GeneralParser", "HarmonyParser", "ThinkingParser"]
+
+Conversation = List[Dict[str, Any]]
 
 
 class Parser(ABC):
@@ -24,7 +26,13 @@ class Parser(ABC):
 
     @abstractmethod
     def parse(
-        self, conversation: "Conversation", max_length: int
+        self,
+        conversation: "Conversation",
+        max_length: int,
+        preformatted: bool = False,
+        train_only_last_turn: bool = False,
+        tool: List[Dict] = [],
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Parse the conversation into a list of tensors.
@@ -138,10 +146,13 @@ class GeneralParser(Parser):
                 + "|$))"
             )
         else:
+            end_of_turn_token = self.chat_template.end_of_turn_token
+            if end_of_turn_token is None:
+                raise ValueError("chat_template.end_of_turn_token must be set")
             self.assistant_pattern = (
                 re.escape(self.assistant_message_separator)
                 + r"([\s\S]*?(?:"
-                + re.escape(self.chat_template.end_of_turn_token)
+                + re.escape(end_of_turn_token)
                 + "|$))"
             )
 
@@ -153,7 +164,7 @@ class GeneralParser(Parser):
         train_only_last_turn: bool = False,
         tool: List[Dict] = [],
         **kwargs,
-    ) -> Dict[str, List[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not preformatted:
             messages = []
 
@@ -343,7 +354,7 @@ class HarmonyParser(Parser):
         preformatted: bool = False,
         train_only_last_turn: bool = False,
         tool: List[Dict] = [],
-    ) -> List[torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # conversation = process_harmony_conversations(conversation)
         if not preformatted:
             prompt_text = ""
@@ -442,7 +453,7 @@ class ThinkingParser(GeneralParser):
         train_only_last_turn: bool = False,
         tool: List[Dict] = [],
         **kwargs,
-    ) -> Dict[str, List[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Parse conversation, processing all assistant turns for loss mask."""
         if self.chat_template.enable_thinking:
             kwargs["enable_thinking"] = True

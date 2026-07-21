@@ -37,9 +37,9 @@ def load_checkpoint(model_path: str, key: str) -> torch.Tensor:
         )
     if len(index_json_path) > 1:
         raise FileNotFoundError(f"Multiple index.json files found in {model_path}")
-    index_json_path = index_json_path[0]
+    resolved_index_json_path = index_json_path[0]
 
-    with open(index_json_path, "r") as f:
+    with open(resolved_index_json_path, "r") as f:
         index_json = json.load(f)
     ckpt_file = index_json["weight_map"][key]
 
