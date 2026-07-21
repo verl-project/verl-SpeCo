@@ -108,7 +108,12 @@ class PeagleMLP(nn.Module):
 
 
 class PeagleFusedLayer(nn.Module):
-    """Layer 0: fuses ``[input_layernorm(embed), hidden_norm(hidden)]`` (2H)."""
+    """Layer 0: fuses ``[input_layernorm(embed), hidden_norm(hidden)]`` (2H).
+
+    The draft layers are the FSDP wrap targets (``_no_split_modules``), so this
+    entry point has to be ``forward``: FSDP2 unshards a wrapped module's
+    parameters in its pre-forward hook, which only runs through ``__call__``.
+    """
 
     def __init__(self, config: PeagleConfig):
         super().__init__()
@@ -118,7 +123,7 @@ class PeagleFusedLayer(nn.Module):
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward_peagle(self, input_embeds, hidden_states, position_ids, block_mask) -> torch.Tensor:
+    def forward(self, input_embeds, hidden_states, position_ids, block_mask) -> torch.Tensor:
         residual = hidden_states
         combined = torch.cat((self.input_layernorm(input_embeds), self.hidden_norm(hidden_states)), dim=-1)
         hidden_states = residual + self.self_attn.forward_peagle(combined, position_ids, block_mask)
@@ -137,7 +142,7 @@ class PeagleVanillaLayer(nn.Module):
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward_peagle(self, hidden_states, position_ids, block_mask) -> torch.Tensor:
+    def forward(self, hidden_states, position_ids, block_mask) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = residual + self.self_attn.forward_peagle(hidden_states, position_ids, block_mask)
@@ -217,14 +222,17 @@ class LlamaForCausalLMPeagle(DraftModel):
 
     def forward_peagle(self, sampled_input_ids, sampled_projected_hidden, position_ids, block_mask) -> torch.Tensor:
         draft_input_embeds = self.embed_tokens(sampled_input_ids).to(sampled_projected_hidden.dtype)
-        hidden_states = self.layers[0].forward_peagle(
+        # Call the layers through ``__call__`` so FSDP2's pre-forward unshard hook
+        # runs; the layers are the wrap targets, so a direct method call would use
+        # sharded DTensor parameters.
+        hidden_states = self.layers[0](
             input_embeds=draft_input_embeds,
             hidden_states=sampled_projected_hidden,
             position_ids=position_ids,
             block_mask=block_mask,
         )
         for layer in self.layers[1:]:
-            hidden_states = layer.forward_peagle(hidden_states, position_ids, block_mask)
+            hidden_states = layer(hidden_states, position_ids, block_mask)
         # The final norm is applied in compute_logits (lm_head(norm(h))), matching
         # the EAGLE-3 draft; forward_peagle returns the pre-norm hidden states.
         return hidden_states
