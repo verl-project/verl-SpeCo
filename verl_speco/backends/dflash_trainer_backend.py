@@ -1080,9 +1080,8 @@ class DFlashTrainerBackend:
                 item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 prompt_len = item["prompts"].size(0)
                 responses = item["responses"]
-                item_loss_mask[prompt_len : prompt_len + responses.size(0)] = (
-                    responses != pad_id
-                ).float()[: max(0, ids.size(0) - prompt_len)]
+                rhs = (responses != pad_id).float()[: max(0, ids.size(0) - prompt_len)]
+                item_loss_mask[prompt_len : prompt_len + rhs.size(0)] = rhs
 
             else:
                 item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
