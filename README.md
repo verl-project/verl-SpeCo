@@ -247,6 +247,25 @@ The main mode values are:
 | `collect_only` | Collects rollout features into `feature_store.path` without running drafter training in the PPO/Ray workflow. |
 | `offline` | Reads collected features from `feature_store.path` and trains the drafter with the standalone multi-GPU workflow. |
 
+Offline training supports every drafter family the online workers support:
+EAGLE-1, EAGLE-2, EAGLE-3, DFlash, DSpark, Domino and P-EAGLE.
+
+Domino and P-EAGLE are training-time families with no engine-level speculative
+method of their own (engines serve Domino as a DFlash projector sub-mode, and
+P-EAGLE needs the parallel-drafting runtime), so the rollout stage collects
+features with the engine algorithm whose hidden-state layout they consume, and
+the offline stage trains them from that same feature store:
+
+| Drafter to train | Stage 1 `speculative_algorithm` | Feature layout | Stage 2 `speculative_algorithm` |
+| --- | --- | --- | --- |
+| Domino | `DFLASH` | `dflash_aux` | `DOMINO` |
+| P-EAGLE | `EAGLE3` | `eagle3_aux_plus_last` | `PEAGLE` |
+
+```bash
+DRAFT_ALGO=domino bash examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh
+DRAFT_ALGO=peagle bash examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh
+```
+
 Collected feature stores can be inspected before offline training:
 
 ```bash

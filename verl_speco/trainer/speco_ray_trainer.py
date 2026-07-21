@@ -41,6 +41,7 @@ from verl_speco.integration.oldlogprob_runtime import (
 )
 from verl_speco.integration.oldlogprob_layer_ids import (
     assert_sglang_aux_last_layer_norm_safe,
+    resolve_drafter_hidden_states_layout,
     resolve_oldlogprob_aux_layer_ids,
 )
 from verl_speco.integration.sglang_adapter import (
@@ -771,11 +772,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_oldlogprob_hidden_layout(self) -> str:
         drafter_cfg = self._speco_drafter_config()
-        algorithm = str(_get_nested(drafter_cfg, ("speculative_algorithm",), "") or "").upper()
-        training_cfg = self._speco_drafter_training_config()
-        if algorithm == "DSPARK" and float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0:
-            return "dflash_aux_plus_last"
-        return "dflash_aux" if algorithm in {"DFLASH", "DSPARK"} else "eagle3_aux_plus_last"
+        algorithm = _get_nested(drafter_cfg, ("speculative_algorithm",), "")
+        return resolve_drafter_hidden_states_layout(algorithm, self._speco_drafter_training_config())
 
     @staticmethod
     def _speco_oldlogprob_window_train_rows(training_cfg) -> int:
