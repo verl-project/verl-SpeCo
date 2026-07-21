@@ -1402,9 +1402,7 @@ class DrafterBaseTrainer:
                 load_fsdp_optimizer(optimizer=self.optimizer, device_id=current_dev_id)
                 logger.debug("Loaded drafter optimizer to GPU for training")
 
-            target_model = getattr(self.backend, "target_model", None)
-            if target_model is not None:
-                target_model.to(self.runtime_device)
+            self._move_target_lm_head(self.runtime_device)
             self._apply_pending_target_lm_head_weight()
 
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
@@ -1690,6 +1688,22 @@ class DrafterBaseTrainer:
         if target_lm_head is not None and getattr(target_lm_head, "fc", None) is not None:
             return target_lm_head.fc
         return None
+
+    def _move_target_lm_head(self, device: torch.device | str) -> bool:
+        """Move the backend's frozen target head to the requested device."""
+        for attribute in ("target_model", "target_lm_head"):
+            target_head = getattr(self.backend, attribute, None)
+            if target_head is None:
+                continue
+            target_head.to(device)
+            logger.debug(
+                "[Rank %s] Moved %s to %s",
+                getattr(self, "rank", -1),
+                attribute,
+                device,
+            )
+            return True
+        return False
 
     @torch.no_grad()
     def _apply_pending_target_lm_head_weight(self) -> bool:
@@ -3610,12 +3624,10 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
 
-        target_model = getattr(self.backend, "target_model", None)
-        if target_model is not None:
-            try:
-                target_model.to("cpu")
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"Failed to offload drafter target model during cleanup: {e}")
+        try:
+            self._move_target_lm_head("cpu")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Failed to offload drafter target lm_head during cleanup: {e}")
         
         if clear_data:
             self.collected_data.clear()
@@ -3657,12 +3669,10 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter optimizer after activation warmup: {e}")
 
-        target_model = getattr(self.backend, "target_model", None)
-        if target_model is not None:
-            try:
-                target_model.to("cpu")
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"Failed to offload drafter target model after activation warmup: {e}")
+        try:
+            self._move_target_lm_head("cpu")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Failed to offload drafter target lm_head after activation warmup: {e}")
 
         if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
             if hasattr(self.device_module, "synchronize"):

@@ -120,12 +120,20 @@ def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None
     assert _no_drafter_trainer()._speco_oldlogprob_entropy_hook_enabled() is False
 
 
-def test_no_drafter_vllm_path_disables_async_scheduling_without_hiding_config() -> None:
+def test_no_drafter_vllm_path_disables_async_scheduling_without_hiding_config(monkeypatch) -> None:
     task_runner = pytest.importorskip(
         "verl_speco.integration.task_runner",
         reason="no-drafter scheduler contract needs verl and Ray",
     )
     from omegaconf import OmegaConf
+    from verl_speco.integration import vllm_runtime
+
+    bridge_calls = []
+    monkeypatch.setattr(
+        vllm_runtime,
+        "install_upstream_vllm_runtime_bridge",
+        lambda: bridge_calls.append("installed") or True,
+    )
 
     config = OmegaConf.create(
         {
@@ -148,6 +156,7 @@ def test_no_drafter_vllm_path_disables_async_scheduling_without_hiding_config() 
             config.actor_rollout_ref.rollout.engine_kwargs.vllm["worker_extension_cls"]
             == SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS
         )
+    assert bridge_calls == ["installed"]
 
     assert "drafter" in config.actor_rollout_ref.rollout
     assert "no-async-scheduling" not in config.actor_rollout_ref.rollout.engine_kwargs.vllm

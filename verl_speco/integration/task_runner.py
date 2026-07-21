@@ -68,7 +68,10 @@ def _open_config_mapping(mapping):
 
 @contextmanager
 def _prepare_no_drafter_runtime_config(config):
-    from verl_speco.integration.vllm_runtime import SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS
+    from verl_speco.integration.vllm_runtime import (
+        SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS,
+        install_upstream_vllm_runtime_bridge,
+    )
 
     rollout_config = getattr(getattr(config, "actor_rollout_ref", None), "rollout", None)
     missing = object()
@@ -76,6 +79,11 @@ def _prepare_no_drafter_runtime_config(config):
     worker_extension_cls = missing
     vllm_engine_kwargs = None
     if rollout_config is not None and rollout_config.get("name") == "vllm":
+        # Keep the no-drafter HTTP server on the same import-safe Ray actor
+        # path as speculative rollout. This avoids hiding child-process import
+        # failures behind Ray's TemporaryActor coroutine error.
+        if not install_upstream_vllm_runtime_bridge():
+            logger.warning("SPECO no-drafter baseline could not install the vLLM server runtime bridge")
         with _open_config_mapping(rollout_config):
             engine_kwargs = rollout_config.get("engine_kwargs")
             if engine_kwargs is None:
