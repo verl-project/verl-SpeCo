@@ -9,6 +9,10 @@ The layout written here is the one the trainer resolves for the algorithm:
 DFlash-family drafters (DFlash, DSpark, Domino) get ``dflash_aux`` context
 layers, EAGLE-family drafters (EAGLE-1/2/3, P-EAGLE) get ``eagle3_aux_plus_last``.
 
+The samples supervise every token, unlike a real rollout where the loss mask
+covers the response only, so this store is a plumbing and convergence smoke and
+not a substitute for RL-collected features.
+
 Run:
     python ci/standalone_feature_store_smoke.py --target /path/to/target-model \
         --algorithm DOMINO --out /path/to/features --num-samples 32
@@ -79,6 +83,7 @@ def main() -> None:
         shard_prefix="smoke",
     )
 
+    hidden_dim = 0
     for index in range(int(args.num_samples)):
         text = PROMPTS[index % len(PROMPTS)]
         messages = [{"role": "user", "content": text}]
@@ -92,6 +97,7 @@ def main() -> None:
         if layout.endswith("_plus_last"):
             blocks.append(out.hidden_states[-1][0])
         hidden_states = torch.cat(blocks, dim=-1).to(torch.bfloat16).cpu()
+        hidden_dim = int(hidden_states.size(-1))
 
         input_ids = enc["input_ids"][0].cpu()
         seq_len = int(input_ids.numel())
@@ -121,7 +127,7 @@ def main() -> None:
     metadata = store.get_metadata()
     print(
         f"[features] wrote num_samples={metadata['num_samples']} num_shards={metadata['num_shards']} "
-        f"hidden_dim={hidden_states.size(-1)} to {args.out}"
+        f"hidden_dim={hidden_dim} to {args.out}"
     )
 
 

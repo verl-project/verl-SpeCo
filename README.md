@@ -266,6 +266,11 @@ DRAFT_ALGO=domino bash examples/run_qwen3-8b_drafter_domino_peagle_separate_trai
 DRAFT_ALGO=peagle bash examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh
 ```
 
+Feature stores collected with `speculative_algorithm=DOMINO` before Domino was
+mapped to the DFlash layout carry `hidden_states_layout=eagle3_aux_plus_last`
+in their sample metadata. DFlash preprocessing fails closed on that layout, so
+those stores have to be collected again with `DFLASH`.
+
 Collected feature stores can be inspected before offline training:
 
 ```bash
