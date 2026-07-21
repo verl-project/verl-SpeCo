@@ -11,6 +11,7 @@ torch = pytest.importorskip("torch")
 from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _rewrite_standalone_block_runtime_config,
     _save_standalone_checkpoint,
+    _torch_load_cpu,
 )
 
 
@@ -208,3 +209,67 @@ def test_standalone_block_checkpoint_appends_source_lm_head_weight(tmp_path):
     exported_state = safetensors_torch.load_file(str(checkpoint_dir / "model.safetensors"), device="cpu")
     assert torch.equal(exported_state["lm_head.weight"], lm_head)
     assert torch.equal(exported_state["fc.weight"], torch.ones(2, 2))
+
+
+def test_standalone_block_checkpoint_appends_lm_head_to_sharded_safetensors_index(tmp_path):
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    source_dir = tmp_path / "source_dspark"
+    source_dir.mkdir()
+    (source_dir / "config.json").write_text(
+        json.dumps({"model_type": "qwen3", "architectures": ["DSparkForCausalLM"]}),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps({"model_type": "dspark", "architectures": ["DSparkDraftModel"]}),
+        encoding="utf-8",
+    )
+    lm_head = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    fc_weight = torch.ones(2, 2)
+    safetensors_torch.save_file({"lm_head.weight": lm_head}, str(source_dir / "model.safetensors"))
+    safetensors_torch.save_file({"fc.weight": fc_weight}, str(checkpoint_dir / "model-00001-of-00001.safetensors"))
+    (checkpoint_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": fc_weight.numel() * fc_weight.element_size()},
+                "weight_map": {"fc.weight": "model-00001-of-00001.safetensors"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="dspark"),
+        config=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))),
+    )
+
+    _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    index_data = json.loads((checkpoint_dir / "model.safetensors.index.json").read_text(encoding="utf-8"))
+    assert index_data["weight_map"]["lm_head.weight"] == "model-lm-head.safetensors"
+    assert index_data["metadata"]["total_size"] == (
+        fc_weight.numel() * fc_weight.element_size() + lm_head.numel() * lm_head.element_size()
+    )
+    added_state = safetensors_torch.load_file(str(checkpoint_dir / "model-lm-head.safetensors"), device="cpu")
+    assert torch.equal(added_state["lm_head.weight"], lm_head)
+
+
+def test_torch_load_cpu_falls_back_without_weights_only(monkeypatch, tmp_path):
+    checkpoint_path = tmp_path / "pytorch_model.bin"
+    expected = {"lm_head.weight": torch.ones(2, 2)}
+    calls = []
+
+    def fake_load(path, **kwargs):
+        calls.append(kwargs)
+        if "weights_only" in kwargs:
+            raise TypeError("weights_only is unsupported")
+        assert path == str(checkpoint_path)
+        return expected
+
+    monkeypatch.setattr(torch, "load", fake_load)
+
+    assert _torch_load_cpu(str(checkpoint_path)) is expected
+    assert calls == [
+        {"map_location": "cpu", "weights_only": True},
+        {"map_location": "cpu"},
+    ]

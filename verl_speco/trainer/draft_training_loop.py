@@ -247,9 +247,16 @@ def _load_tensor_from_safetensors(path: str, key: str) -> torch.Tensor | None:
     return None
 
 
+def _torch_load_cpu(path: str) -> Any:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
 def _load_tensor_from_torch(path: str, key: str) -> torch.Tensor | None:
     try:
-        state = torch.load(path, map_location="cpu", weights_only=True)
+        state = _torch_load_cpu(path)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to load %s from %s: %s", key, path, exc)
         return None
@@ -293,12 +300,77 @@ def _load_source_lm_head_weight(model_path: str | None) -> torch.Tensor | None:
     return None
 
 
+def _append_lm_head_to_safetensors_index(checkpoint_path: str, lm_head_weight: torch.Tensor) -> bool:
+    index_path = os.path.join(checkpoint_path, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        return False
+    try:
+        from safetensors.torch import save_file
+
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+        weight_map = index_data.setdefault("weight_map", {})
+        if not isinstance(weight_map, dict):
+            logger.warning("Cannot append lm_head.weight to %s: expected weight_map object", index_path)
+            return True
+        if "lm_head.weight" in weight_map:
+            return True
+
+        shard_name = "model-lm-head.safetensors"
+        save_file({"lm_head.weight": lm_head_weight}, os.path.join(checkpoint_path, shard_name))
+        weight_map["lm_head.weight"] = shard_name
+        metadata = index_data.setdefault("metadata", {})
+        if isinstance(metadata, dict) and "total_size" in metadata:
+            metadata["total_size"] = int(metadata["total_size"]) + lm_head_weight.numel() * lm_head_weight.element_size()
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump(index_data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        logger.info("Added lm_head.weight to standalone sharded checkpoint %s", index_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to append lm_head.weight to sharded checkpoint %s: %s", index_path, exc)
+    return True
+
+
+def _append_lm_head_to_torch_index(checkpoint_path: str, lm_head_weight: torch.Tensor) -> bool:
+    index_path = os.path.join(checkpoint_path, "pytorch_model.bin.index.json")
+    if not os.path.exists(index_path):
+        return False
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+        weight_map = index_data.setdefault("weight_map", {})
+        if not isinstance(weight_map, dict):
+            logger.warning("Cannot append lm_head.weight to %s: expected weight_map object", index_path)
+            return True
+        if "lm_head.weight" in weight_map:
+            return True
+
+        shard_name = "pytorch_model-lm-head.bin"
+        torch.save({"lm_head.weight": lm_head_weight}, os.path.join(checkpoint_path, shard_name))
+        weight_map["lm_head.weight"] = shard_name
+        metadata = index_data.setdefault("metadata", {})
+        if isinstance(metadata, dict) and "total_size" in metadata:
+            metadata["total_size"] = int(metadata["total_size"]) + lm_head_weight.numel() * lm_head_weight.element_size()
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump(index_data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        logger.info("Added lm_head.weight to standalone sharded checkpoint %s", index_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to append lm_head.weight to sharded checkpoint %s: %s", index_path, exc)
+    return True
+
+
 def _append_lm_head_weight_if_missing(checkpoint_path: str, source_model_path: str | None) -> None:
     lm_head_weight = _load_source_lm_head_weight(source_model_path)
     if lm_head_weight is None:
         logger.warning("Standalone checkpoint export could not find source lm_head.weight in %s", source_model_path)
         return
     lm_head_weight = lm_head_weight.detach().cpu()
+
+    if _append_lm_head_to_safetensors_index(checkpoint_path, lm_head_weight):
+        return
+    if _append_lm_head_to_torch_index(checkpoint_path, lm_head_weight):
+        return
 
     safetensors_path = os.path.join(checkpoint_path, "model.safetensors")
     if os.path.exists(safetensors_path):
@@ -318,7 +390,7 @@ def _append_lm_head_weight_if_missing(checkpoint_path: str, source_model_path: s
     torch_path = os.path.join(checkpoint_path, "pytorch_model.bin")
     if os.path.exists(torch_path):
         try:
-            state = torch.load(torch_path, map_location="cpu", weights_only=True)
+            state = _torch_load_cpu(torch_path)
             if not isinstance(state, dict):
                 logger.warning("Cannot append lm_head.weight to %s: expected dict state", torch_path)
                 return
