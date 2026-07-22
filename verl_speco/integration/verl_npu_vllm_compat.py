@@ -35,9 +35,9 @@ _NPU_CHECKPOINT_RECLAIM_APPLIED = False
 _NPU_FSDP2_WEIGHT_EXPORT_APPLIED = False
 _FSDP_TRAIN_OUTPUT_RELEASE_APPLIED = False
 _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED = False
-_NPU_FSDP_DIAGNOSTIC_METHOD = contextvars.ContextVar(
-    "speco_npu_fsdp_diagnostic_method",
-    default="forward_backward_batch",
+_NPU_FSDP_DIAGNOSTIC_CONTEXT = contextvars.ContextVar(
+    "speco_npu_fsdp_diagnostic_context",
+    default=None,
 )
 
 try:
@@ -305,13 +305,27 @@ def install_verl_npu_fsdp_host_memory_reclaim(
     @functools.wraps(original_forward_backward_batch)
     def forward_backward_batch_with_entry_reclaim(self, *args, **kwargs):
         if int(getattr(self, "rank", 0) or 0) == 0:
-            diagnostic_method = _NPU_FSDP_DIAGNOSTIC_METHOD.get()
-            trim_process_host_memory_with_diagnostics(
-                self,
-                f"fsdp:{diagnostic_method}:trim",
-                role="worker_dict",
-                method=diagnostic_method,
-            )
+            diagnostic_context = _NPU_FSDP_DIAGNOSTIC_CONTEXT.get()
+            if isinstance(diagnostic_context, dict):
+                if not diagnostic_context["trim_logged"]:
+                    diagnostic_context["trim_logged"] = True
+                    diagnostic_method = str(diagnostic_context["method"])
+                    trim_process_host_memory_with_diagnostics(
+                        self,
+                        f"fsdp:{diagnostic_method}:outer_trim",
+                        role="worker_dict",
+                        method=diagnostic_method,
+                        call_index=int(diagnostic_context["call_index"]),
+                    )
+                else:
+                    trim_process_host_memory()
+            else:
+                trim_process_host_memory_with_diagnostics(
+                    self,
+                    "fsdp:forward_backward_batch:trim",
+                    role="worker_dict",
+                    method="forward_backward_batch",
+                )
         else:
             trim_process_host_memory()
         return original_forward_backward_batch(self, *args, **kwargs)
@@ -452,13 +466,19 @@ def _install_npu_worker_memory_diagnostics(worker: Any) -> bool:
                 method=_method_name,
             )
             succeeded = False
-            diagnostic_token = _NPU_FSDP_DIAGNOSTIC_METHOD.set(_method_name)
+            diagnostic_token = _NPU_FSDP_DIAGNOSTIC_CONTEXT.set(
+                {
+                    "method": _method_name,
+                    "call_index": call_index,
+                    "trim_logged": False,
+                }
+            )
             try:
                 result = _original(*args, **kwargs)
                 succeeded = True
                 return result
             finally:
-                _NPU_FSDP_DIAGNOSTIC_METHOD.reset(diagnostic_token)
+                _NPU_FSDP_DIAGNOSTIC_CONTEXT.reset(diagnostic_token)
                 log_process_memory_after_call(
                     bound_worker,
                     f"worker_dict:{_method_name}",

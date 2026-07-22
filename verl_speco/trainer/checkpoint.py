@@ -191,6 +191,7 @@ def collect_checkpoint_memory_snapshot() -> dict[str, Optional[int]]:
             "Dirty",
             "Writeback",
             "AnonPages",
+            "Slab",
             "SReclaimable",
             "SUnreclaim",
             "PageTables",
@@ -221,6 +222,7 @@ def collect_checkpoint_memory_snapshot() -> dict[str, Optional[int]]:
         "dirty_gib": system.get("Dirty"),
         "writeback_gib": system.get("Writeback"),
         "anon_pages_gib": system.get("AnonPages"),
+        "slab_gib": system.get("Slab"),
         "sreclaimable_gib": system.get("SReclaimable"),
         "sunreclaim_gib": system.get("SUnreclaim"),
         "pagetables_gib": system.get("PageTables"),
@@ -398,12 +400,36 @@ def format_node_memory_delta_summary(
     unavailable_delta = _memory_counter_delta(memory, previous_memory, "node_unavailable_gib")
     anon_pages_delta = _memory_counter_delta(memory, previous_memory, "anon_pages_gib")
     anon_residual = anon_pages_delta - process_anon_delta if anon_pages_delta is not None else None
+    non_anon_unavailable_delta = (
+        unavailable_delta - anon_pages_delta
+        if unavailable_delta is not None and anon_pages_delta is not None
+        else None
+    )
 
     fields = {
         "node_unavailable_delta_gib": unavailable_delta,
         "node_anon_pages_delta_gib": anon_pages_delta,
         "proc_anon_delta_gib": process_anon_delta,
         "anon_pages_minus_proc_anon_delta_gib": anon_residual,
+        "node_non_anon_unavailable_delta_gib": non_anon_unavailable_delta,
+        "cached_delta_gib": _memory_counter_delta(memory, previous_memory, "cached_gib"),
+        "sreclaimable_delta_gib": _memory_counter_delta(
+            memory,
+            previous_memory,
+            "sreclaimable_gib",
+        ),
+        "slab_delta_gib": _memory_counter_delta(memory, previous_memory, "slab_gib"),
+        "pagetables_delta_gib": _memory_counter_delta(
+            memory,
+            previous_memory,
+            "pagetables_gib",
+        ),
+        "kernel_stack_delta_gib": _memory_counter_delta(
+            memory,
+            previous_memory,
+            "kernel_stack_gib",
+        ),
+        "mlocked_delta_gib": _memory_counter_delta(memory, previous_memory, "mlocked_gib"),
     }
     return " ".join(
         [f"memory_delta_scope={delta_scope}"]
@@ -496,12 +522,13 @@ def collect_host_allocator_stats() -> dict[str, Any]:
     stats = {
         "allocator": allocator,
         "allocated": None,
+        "active": None,
         "resident": None,
         "retained": None,
     }
     if allocator != "jemalloc" or not _jemalloc_refresh_stats():
         return stats
-    for key in ("allocated", "resident", "retained"):
+    for key in ("allocated", "active", "resident", "retained"):
         stats[key] = _jemalloc_read_size(f"stats.{key}")
     return stats
 
@@ -619,7 +646,7 @@ def _log_process_memory_diagnostics(
             name,
             include_absolute=include_allocator_absolute,
         )
-        for name in ("allocated", "resident", "retained")
+        for name in ("allocated", "active", "resident", "retained")
     )
     print(
         f"[speco process memory] role={role} method={method} call={call_index} "
@@ -772,6 +799,7 @@ def trim_process_host_memory_with_diagnostics(
     *,
     role: str,
     method: str,
+    call_index: Optional[int] = None,
 ) -> dict[str, Any]:
     """Measure memory accumulated before trim and pages released by this trim."""
 
@@ -780,7 +808,10 @@ def trim_process_host_memory_with_diagnostics(
         states = {}
         setattr(owner, "_speco_host_memory_reclaim_states", states)
     state = states.setdefault(key, {})
-    call_index = int(state.get("call", 0)) + 1
+    if call_index is None:
+        call_index = int(state.get("call", 0)) + 1
+    else:
+        call_index = int(call_index)
     state["call"] = call_index
 
     if not _should_log_memory_diagnostic(call_index):

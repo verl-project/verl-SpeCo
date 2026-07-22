@@ -191,6 +191,7 @@ def test_trim_process_host_memory_reports_allocator(monkeypatch) -> None:
 def test_collect_host_allocator_stats_reads_jemalloc_counters(monkeypatch) -> None:
     values = {
         "stats.allocated": 1,
+        "stats.active": 2,
         "stats.resident": 3,
         "stats.retained": 4,
     }
@@ -201,6 +202,7 @@ def test_collect_host_allocator_stats_reads_jemalloc_counters(monkeypatch) -> No
     assert checkpoint_utils.collect_host_allocator_stats() == {
         "allocator": "jemalloc",
         "allocated": 1,
+        "active": 2,
         "resident": 3,
         "retained": 4,
     }
@@ -212,6 +214,7 @@ def test_process_memory_diagnostics_compare_call_boundaries(monkeypatch, capsys)
         {
             "allocator": "jemalloc",
             "allocated": value * gib,
+            "active": value * gib,
             "resident": value * gib,
             "retained": value * gib,
         }
