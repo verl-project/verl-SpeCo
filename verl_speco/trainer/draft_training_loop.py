@@ -15,8 +15,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from omegaconf import OmegaConf, open_dict
 from verl.utils.device import get_device_name, get_torch_device
 
-from verl_speco.backends.dflash_trainer_backend import DFlashTrainerBackend
-from verl_speco.backends.eagle3_trainer_backend import Eagle3TrainerBackend
+from verl_speco.backends.factory import build_trainer_backend
 from verl_speco.trainer.base_trainer import DrafterBaseTrainer
 from verl_speco.trainer.draft_dataset import DraftFeatureDataLoader, DraftFeatureDataLoaderConfig
 from verl_speco.trainer.feature_store import build_feature_store_from_config
@@ -136,16 +135,7 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
 
 
 def _build_backend(draft_config):
-    algo = str(draft_config.rollout.drafter.speculative_algorithm).upper()
-    if algo == "EAGLE3":
-        return Eagle3TrainerBackend(draft_config, draft_config.model)
-    if algo == "DFLASH":
-        return DFlashTrainerBackend(draft_config, draft_config.model)
-    if algo == "DSPARK":
-        from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend
-
-        return DSparkTrainerBackend(draft_config, draft_config.model)
-    raise ValueError(f"Unsupported drafter algorithm {algo!r}; expected EAGLE3, DFLASH or DSPARK")
+    return build_trainer_backend(draft_config, draft_config.model)
 
 
 def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int, *, wait: bool = False) -> dict[str, Any]:
@@ -234,19 +224,59 @@ def _fill_if_missing(dst: dict[str, Any], src: dict[str, Any], keys: tuple[str, 
             dst[key] = deepcopy(src[key])
 
 
+# Extra runtime-facing config a DFlash variant needs on top of the shared DFlash
+# aliases, as (config child, keys copied from the training config). Domino writes
+# into dflash_config because engines serve it as a DFlash projector sub-mode
+# (dflash_config.projector_type="domino"), while DSpark is its own serve method.
+_VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "domino": (
+        "dflash_config",
+        (
+            "block_size",
+            "num_anchors",
+            "loss_decay_gamma",
+            "emb_dim",
+            "gru_hidden_dim",
+            "pure_draft_prefix_len",
+            "num_target_layers",
+            "target_num_hidden_layers",
+        ),
+    ),
+    "dspark": (
+        "dspark_config",
+        (
+            "block_size",
+            "num_anchors",
+            "markov_rank",
+            "markov_head_type",
+            "confidence_head_alpha",
+            "confidence_head_with_markov",
+            "ce_loss_alpha",
+            "l1_loss_alpha",
+            "loss_decay_gamma",
+            "target_layer_ids",
+            "num_context_layers",
+            "num_target_layers",
+            "target_num_hidden_layers",
+            "mask_token_id",
+        ),
+    ),
+}
+
+
 def _rewrite_standalone_block_runtime_config(
     trainer: DrafterBaseTrainer,
     checkpoint_path: str,
     completed_future=None,
 ) -> None:
-    """Export standalone DFlash/DSpark checkpoints with runtime-facing config.
+    """Export standalone DFlash/DSpark/Domino checkpoints with runtime-facing config.
 
     The training wrapper saves an internal SpeCo config.  For standalone
     checkpoints we keep the original drafter ``config.json`` as the runtime
     contract and only merge the alias fields needed by vLLM/SGLang.
     """
     backend_type = getattr(getattr(trainer, "backend", None), "model_type", None)
-    if backend_type not in {"dflash", "dspark"}:
+    if backend_type not in {"dflash", "dspark", "domino"}:
         return
 
     if completed_future is not None:
@@ -292,35 +322,16 @@ def _rewrite_standalone_block_runtime_config(
     dflash_config = _ensure_dict_child(runtime_config, "dflash_config")
     _fill_if_missing(dflash_config, training_config, common_alias_keys)
 
-    if backend_type == "dspark":
-        dspark_config = _ensure_dict_child(runtime_config, "dspark_config")
-        _fill_if_missing(
-            dspark_config,
-            training_config,
-            (
-                "block_size",
-                "num_anchors",
-                "markov_rank",
-                "markov_head_type",
-                "confidence_head_alpha",
-                "confidence_head_with_markov",
-                "ce_loss_alpha",
-                "l1_loss_alpha",
-                "loss_decay_gamma",
-                "target_layer_ids",
-                "num_context_layers",
-                "num_target_layers",
-                "target_num_hidden_layers",
-                "mask_token_id",
-            ),
-        )
-    else:
-        dspark_config = {}
+    variant_child_key, variant_alias_keys = _VARIANT_RUNTIME_ALIASES.get(backend_type, (None, ()))
+    variant_config = _ensure_dict_child(runtime_config, variant_child_key) if variant_child_key else {}
+    _fill_if_missing(variant_config, training_config, variant_alias_keys)
+    if backend_type == "domino":
+        variant_config["projector_type"] = str(training_config.get("projector_type", "domino") or "domino")
 
     target_layer_ids = (
         runtime_config.get("target_layer_ids")
         or dflash_config.get("target_layer_ids")
-        or dspark_config.get("target_layer_ids")
+        or variant_config.get("target_layer_ids")
     )
     if target_layer_ids is not None and "eagle_aux_hidden_state_layer_ids" not in runtime_config:
         try:

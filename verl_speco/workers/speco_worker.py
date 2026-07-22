@@ -26,6 +26,7 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import get_torch_device
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
+from verl_speco.integration.oldlogprob_layer_ids import resolve_drafter_hidden_states_layout
 from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
 
 logger = logging.getLogger(__file__)
@@ -391,37 +392,10 @@ class SpecoWorker(Worker):
         if not self.in_drafter_train_group:
             return
 
-        from verl_speco.backends.dflash_trainer_backend import DFlashTrainerBackend
-        from verl_speco.backends.eagle3_trainer_backend import Eagle3TrainerBackend
+        from verl_speco.backends.factory import build_trainer_backend
         from verl_speco.trainer.base_trainer import DrafterBaseTrainer
 
-        algo = str(self.config.rollout.drafter.speculative_algorithm).upper()
-        if algo == "EAGLE3":
-            trainer_backend = Eagle3TrainerBackend(self.config, self.config.model)
-        elif algo in ("EAGLE1", "EAGLE2"):
-            from verl_speco.backends.eagle1_trainer_backend import Eagle1TrainerBackend
-
-            trainer_backend = Eagle1TrainerBackend(self.config, self.config.model)
-        elif algo == "DFLASH":
-            trainer_backend = DFlashTrainerBackend(self.config, self.config.model)
-        elif algo == "DSPARK":
-            from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend
-
-            trainer_backend = DSparkTrainerBackend(self.config, self.config.model)
-        elif algo == "DOMINO":
-            from verl_speco.backends.domino_trainer_backend import DominoTrainerBackend
-
-            trainer_backend = DominoTrainerBackend(self.config, self.config.model)
-        elif algo == "PEAGLE":
-            from verl_speco.backends.peagle_trainer_backend import PEagleTrainerBackend
-
-            trainer_backend = PEagleTrainerBackend(self.config, self.config.model)
-        else:
-            raise ValueError(
-                "Unsupported drafter algorithm "
-                f"{self.config.rollout.drafter.speculative_algorithm!r}; "
-                "supported algorithms are EAGLE1, EAGLE2, EAGLE3, DFLASH, DSPARK, DOMINO and PEAGLE"
-            )
+        trainer_backend = build_trainer_backend(self.config, self.config.model)
 
         self.trainer = DrafterBaseTrainer(
             config=self.config,
@@ -533,16 +507,9 @@ class SpecoWorker(Worker):
         model_cfg = self.config.get("model", None)
         target_model_path = _config_str(model_cfg.get("path", None)) if model_cfg is not None else ""
         algorithm = str(self.config.rollout.drafter.speculative_algorithm).upper()
-        dspark_l1_enabled = (
-            algorithm == "DSPARK"
-            and float(self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
-        )
-        default_hidden_layout = (
-            "dflash_aux_plus_last"
-            if dspark_l1_enabled
-            else "dflash_aux"
-            if algorithm in {"DFLASH", "DSPARK"}
-            else "eagle3_aux_plus_last"
+        default_hidden_layout = resolve_drafter_hidden_states_layout(
+            algorithm,
+            self.config.rollout.drafter.training,
         )
         metadata = {
             "source": batch.get("hidden_target_logprobs_source", "rl_rollout"),
@@ -576,7 +543,7 @@ class SpecoWorker(Worker):
             if key in batch:
                 metadata[key] = batch[key]
         sample = DraftFeatureSample(
-            algorithm=str(self.config.rollout.drafter.speculative_algorithm).upper(),
+            algorithm=algorithm,
             input_ids=input_ids,
             loss_mask=loss_mask,
             hidden_states=hidden_states,

@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+# Drafters that consume the DFlash aux context layers instead of the EAGLE
+# aux-plus-final layout. Domino is a DFlash variant, so it shares the layout.
+DFLASH_FAMILY_ALGORITHMS = frozenset({"DFLASH", "DSPARK", "DOMINO"})
+
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
     current = config
@@ -56,9 +60,26 @@ def _is_dspark_config(config: Any) -> bool:
     )
 
 
+def resolve_drafter_hidden_states_layout(algorithm: Any, training_cfg: Any) -> str:
+    """Return the hidden-state layout a drafter algorithm expects at training time.
+
+    DFlash-family drafters (DFlash, DSpark, Domino) consume the raw aux context
+    layers, while EAGLE-family drafters also need the final hidden state to
+    rebuild the target distribution. DSpark additionally needs the final hidden
+    for its L1 loss.
+    """
+
+    algorithm = str(algorithm or "").strip().upper()
+    if algorithm not in DFLASH_FAMILY_ALGORITHMS:
+        return "eagle3_aux_plus_last"
+    if algorithm == "DSPARK" and float(_get_nested(training_cfg, ("dspark_l1_loss_alpha",), 0.9) or 0.0) > 0:
+        return "dflash_aux_plus_last"
+    return "dflash_aux"
+
+
 def _is_dflash_config(drafter_cfg: Any, model_configs: tuple[Any, ...]) -> bool:
     algorithm = _drafter_algorithm(drafter_cfg)
-    if algorithm in {"DFLASH", "DSPARK", "DOMINO"}:
+    if algorithm in DFLASH_FAMILY_ALGORITHMS:
         return True
     return any(
         architecture in {"DFlashDraftModel", "DSparkDraftModel", "Qwen3DSparkModel", "DominoDraftModel", "Qwen3DominoModel"}
