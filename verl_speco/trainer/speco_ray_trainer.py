@@ -56,6 +56,7 @@ from verl_speco.integration.sglang_runtime import (
 )
 from verl_speco.integration.vllm_runtime import SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX, configure_vllm_runtime_from_config
 from verl_speco.trainer.checkpoint import (
+    collect_node_process_memory_snapshot,
     format_checkpoint_memory_snapshot,
     format_node_process_memory_summary,
 )
@@ -1759,12 +1760,42 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_log_stage_memory(self, stage: str, phase: str, call_index: int) -> None:
         if call_index > 8 and call_index % 10 != 0:
             return
-        process_summary = f" {format_node_process_memory_summary()}" if stage == "rollout" else ""
+        processes, scan_ms = collect_node_process_memory_snapshot()
+        stage_snapshots = getattr(self, "_speco_stage_process_snapshots", None)
+        prior_before = getattr(self, "_speco_stage_prior_before", None)
+        if stage_snapshots is None:
+            stage_snapshots = {}
+            self._speco_stage_process_snapshots = stage_snapshots
+        if prior_before is None:
+            prior_before = {}
+            self._speco_stage_prior_before = prior_before
+
+        previous_processes = None
+        delta_scope = "none"
+        snapshot_key = (stage, call_index)
+        if phase == "before":
+            previous_entry = prior_before.get(stage)
+            if previous_entry is not None:
+                previous_call, previous_processes = previous_entry
+                delta_scope = f"prior_before_call_{previous_call}"
+            stage_snapshots[snapshot_key] = processes
+            prior_before[stage] = (call_index, processes)
+        else:
+            previous_processes = stage_snapshots.pop(snapshot_key, None)
+            if previous_processes is not None:
+                delta_scope = "stage_before"
+
+        process_summary = format_node_process_memory_summary(
+            processes,
+            previous_processes=previous_processes,
+            delta_scope=delta_scope,
+            scan_ms=scan_ms,
+        )
         print(
             f"[speco stage memory] stage={stage} phase={phase} "
             f"call_tag={_speco_alpha_counter(call_index)} call={call_index} "
             f"step={self.global_steps} pid={os.getpid()} "
-            f"{format_checkpoint_memory_snapshot()}{process_summary}",
+            f"{format_checkpoint_memory_snapshot()} {process_summary}",
             flush=True,
         )
 
@@ -1821,6 +1852,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         finally:
             for owner, method_name, original in reversed(installed):
                 setattr(owner, method_name, original)
+            self.__dict__.pop("_speco_stage_process_snapshots", None)
+            self.__dict__.pop("_speco_stage_prior_before", None)
 
     @contextmanager
     def _speco_oldlogprob_entropy_fit_hook(self):

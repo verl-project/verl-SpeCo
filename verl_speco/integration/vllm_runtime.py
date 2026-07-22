@@ -21,7 +21,7 @@ from contextlib import nullcontext
 from typing import Any, Iterable
 
 from verl_speco.integration.verl_npu_vllm_compat import install_verl_npu_vllm_import_compat
-from verl_speco.trainer.checkpoint import format_checkpoint_memory_snapshot, trim_process_host_memory
+from verl_speco.trainer.checkpoint import trim_process_host_memory
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -59,57 +59,6 @@ def _speco_is_npu_vllm_worker(worker: Any) -> bool:
     except Exception:  # noqa: BLE001
         device = getattr(worker, "device", None)
         return str(getattr(device, "type", "")).lower() == "npu"
-
-
-def _speco_next_worker_sync_index(worker: Any, counter_name: str) -> int:
-    sync_index = int(getattr(worker, counter_name, 0) or 0) + 1
-    setattr(worker, counter_name, sync_index)
-    return sync_index
-
-
-def _speco_should_log_weight_sync(sync_index: int) -> bool:
-    return sync_index <= 8 or sync_index % 10 == 0
-
-
-def _speco_log_vllm_weight_memory(
-    worker: Any,
-    *,
-    role: str,
-    phase: str,
-    sync_index: int,
-    extra: str = "",
-) -> None:
-    if int(getattr(worker, "local_rank", 0) or 0) != 0 or not _speco_should_log_weight_sync(sync_index):
-        return
-    suffix = f" {extra}" if extra else ""
-    logger.warning(
-        "[speco weight memory] role=%s phase=%s sync=%s pid=%s %s%s",
-        role,
-        phase,
-        sync_index,
-        os.getpid(),
-        format_checkpoint_memory_snapshot(),
-        suffix,
-    )
-
-
-def _speco_trim_vllm_weight_memory(
-    worker: Any,
-    *,
-    role: str,
-    sync_index: int,
-) -> None:
-    reclaim = trim_process_host_memory()
-    _speco_log_vllm_weight_memory(
-        worker,
-        role=role,
-        phase="after_trim",
-        sync_index=sync_index,
-        extra=(
-            f"trimmed={int(reclaim['heap_trimmed'])} "
-            f"trim_sec={reclaim['elapsed_sec']:.3f}"
-        ),
-    )
 
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
@@ -1981,32 +1930,14 @@ class SpecoVLLMWeightSyncCompatExtension(_VLLMWorkerExtensionBase):
                 use_shm=use_shm,
             )
 
-        sync_index = _speco_next_worker_sync_index(self, "_speco_target_weight_sync_index")
-        role = "vllm_target_receiver"
-        _speco_log_vllm_weight_memory(
-            self,
-            role=role,
-            phase="before_receive",
-            sync_index=sync_index,
-            extra=f"use_shm={int(bool(use_shm))}",
-        )
-        succeeded = False
         try:
-            result = super().update_weights_from_ipc(
+            return super().update_weights_from_ipc(
                 peft_config=peft_config,
                 base_sync_done=base_sync_done,
                 use_shm=use_shm,
             )
-            succeeded = True
-            return result
         finally:
-            _speco_log_vllm_weight_memory(
-                self,
-                role=role,
-                phase="after_target_load" if succeeded else "after_target_load_error",
-                sync_index=sync_index,
-            )
-            _speco_trim_vllm_weight_memory(self, role=role, sync_index=sync_index)
+            trim_process_host_memory()
 
 
 class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
@@ -2160,13 +2091,6 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
 
         is_npu = str(getattr(current_platform, "device_type", "")).lower() == "npu"
         use_shm = bool(use_shm)
-        sync_index = (
-            _speco_next_worker_sync_index(self, "_speco_draft_weight_sync_index")
-            if is_npu
-            else 0
-        )
-        role = "vllm_draft_receiver"
-
         if is_npu and not use_shm:
             raise RuntimeError("SPECO vLLM draft weight update on NPU requires shared-memory transfer")
 
@@ -2174,31 +2098,15 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             self.device = torch.device(f"npu:{self.local_rank}")
         assert self.device is not None
 
-        if is_npu:
-            _speco_log_vllm_weight_memory(
-                self,
-                role=role,
-                phase="before_receive",
-                sync_index=sync_index,
-                extra=f"use_shm={int(use_shm)}",
-            )
-
         all_weights: list[tuple[str, torch.Tensor]] = []
 
         def finish_update(result, translated_weights=None):
             if not is_npu:
                 return result
-            _speco_log_vllm_weight_memory(
-                self,
-                role=role,
-                phase="after_draft_load",
-                sync_index=sync_index,
-                extra=f"received={len(all_weights)}",
-            )
             if translated_weights is not None:
                 translated_weights.clear()
             all_weights.clear()
-            _speco_trim_vllm_weight_memory(self, role=role, sync_index=sync_index)
+            trim_process_host_memory()
             return result
 
         def on_bucket_received(bucket_weights):
@@ -2213,14 +2121,6 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             use_shm=use_shm,
         )
         receiver.receive_weights(on_bucket_received=on_bucket_received)
-        if is_npu:
-            _speco_log_vllm_weight_memory(
-                self,
-                role=role,
-                phase="after_receive",
-                sync_index=sync_index,
-                extra=f"received={len(all_weights)}",
-            )
 
         draft_model, _ = self._speco_resolve_draft_model()
         if draft_model is None or not all_weights:
@@ -2370,61 +2270,23 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         patch_verl_bucketed_weight_transfer_rebuild_ipc()
         patch_verl_bucketed_weight_transfer_shm_reuse()
         is_npu = _speco_is_npu_vllm_worker(self)
-        sync_index = (
-            _speco_next_worker_sync_index(self, "_speco_target_weight_sync_index")
-            if is_npu
-            else 0
-        )
-        role = "vllm_spec_target_receiver"
-        if is_npu:
-            _speco_log_vllm_weight_memory(
-                self,
-                role=role,
-                phase="before_receive",
-                sync_index=sync_index,
-                extra=f"use_shm={int(bool(use_shm))}",
-            )
         # Diagnostic: check draft state BEFORE target sync
         self._speco_diag_draft_state("before_target_sync")
-        target_loaded = False
         try:
             result = super().update_weights_from_ipc(
                 peft_config=peft_config, base_sync_done=base_sync_done, use_shm=use_shm
             )
-            target_loaded = True
-            if is_npu:
-                _speco_log_vllm_weight_memory(
-                    self,
-                    role=role,
-                    phase="after_target_load",
-                    sync_index=sync_index,
-                )
             # Diagnostic: check draft state AFTER target sync (may be zeroed by wake_up)
             self._speco_diag_draft_state("after_target_sync")
             reloaded = self._speco_reload_draft_from_checkpoint()
             if reloaded > 0:
                 logger.warning("[speco draft reload] drafter weights restored after target sync (%d tensors)", reloaded)
-            if is_npu:
-                _speco_log_vllm_weight_memory(
-                    self,
-                    role=role,
-                    phase="after_draft_reload",
-                    sync_index=sync_index,
-                    extra=f"reloaded={reloaded}",
-                )
             # Diagnostic: check draft state AFTER reload
             self._speco_diag_draft_state("after_draft_reload")
             return result
         finally:
             if is_npu:
-                if not target_loaded:
-                    _speco_log_vllm_weight_memory(
-                        self,
-                        role=role,
-                        phase="after_target_load_error",
-                        sync_index=sync_index,
-                    )
-                _speco_trim_vllm_weight_memory(self, role=role, sync_index=sync_index)
+                trim_process_host_memory()
 
     def _speco_diag_draft_state(self, phase: str):
         """Log norms of key draft model parameters for debugging."""

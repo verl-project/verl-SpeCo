@@ -241,15 +241,21 @@ def _classify_process_memory_group(process_text: str) -> str | None:
     return None
 
 
-def format_node_process_memory_summary() -> str:
-    """Aggregate RSS/anonymous memory for the Ray and vLLM process roles."""
+def _process_memory_title(comm: str, cmdline: str) -> str:
+    ray_title = re.search(r"ray::[^\s]+", f"{comm} {cmdline}", flags=re.IGNORECASE)
+    title = ray_title.group(0) if ray_title is not None else comm
+    return re.sub(r"[^A-Za-z0-9_.:+-]+", "_", title)[:64] or "unknown"
+
+
+def collect_node_process_memory_snapshot() -> tuple[dict[int, dict[str, Any]], float]:
+    """Collect compact per-process memory data for relevant Ray and vLLM roles."""
 
     started = time.perf_counter()
-    groups: dict[str, list[int]] = {}
+    processes: dict[int, dict[str, Any]] = {}
     try:
         process_entries = os.scandir("/proc")
     except OSError:
-        return "proc_groups=unavailable proc_scan_ms=0.0"
+        return processes, 0.0
 
     with process_entries:
         for entry in process_entries:
@@ -268,10 +274,86 @@ def format_node_process_memory_summary() -> str:
             if group is None:
                 continue
             memory = _read_kib(os.path.join(process_root, "status"), {"VmRSS", "RssAnon"})
-            values = groups.setdefault(group, [0, 0, 0])
-            values[0] += 1
-            values[1] += int(memory.get("VmRSS", 0))
-            values[2] += int(memory.get("RssAnon", 0))
+            processes[int(entry.name)] = {
+                "group": group,
+                "title": _process_memory_title(comm, cmdline),
+                "rss_kib": int(memory.get("VmRSS", 0)),
+                "anon_kib": int(memory.get("RssAnon", 0)),
+            }
+    return processes, (time.perf_counter() - started) * 1000.0
+
+
+def _aggregate_process_memory_groups(processes: dict[int, dict[str, Any]]) -> dict[str, list[int]]:
+    groups: dict[str, list[int]] = {}
+    for process in processes.values():
+        values = groups.setdefault(str(process["group"]), [0, 0, 0])
+        values[0] += 1
+        values[1] += int(process["rss_kib"])
+        values[2] += int(process["anon_kib"])
+    return groups
+
+
+def _format_process_memory_deltas(
+    processes: dict[int, dict[str, Any]],
+    previous_processes: dict[int, dict[str, Any]],
+    scope: str,
+) -> str:
+    groups = _aggregate_process_memory_groups(processes)
+    previous_groups = _aggregate_process_memory_groups(previous_processes)
+    ordered_groups = [group for group, _ in _PROCESS_MEMORY_GROUPS] + ["ray_other"]
+    group_deltas = []
+    for group in ordered_groups:
+        current = groups.get(group, [0, 0, 0])
+        previous = previous_groups.get(group, [0, 0, 0])
+        delta = [current[index] - previous[index] for index in range(3)]
+        if any(delta):
+            group_deltas.append(
+                f"{group}:{delta[0]:+d}/{delta[1] / (1024**2):+.2f}/{delta[2] / (1024**2):+.2f}"
+            )
+
+    top_deltas = []
+    for group in ("ray_other", "worker_tp"):
+        candidates = []
+        for pid, process in processes.items():
+            if process["group"] != group:
+                continue
+            previous = previous_processes.get(pid)
+            previous_anon_kib = (
+                int(previous["anon_kib"])
+                if previous is not None and previous.get("group") == group
+                else 0
+            )
+            delta_kib = int(process["anon_kib"]) - previous_anon_kib
+            if delta_kib > 0:
+                candidates.append((delta_kib, pid, str(process["title"])))
+        candidates.sort(reverse=True)
+        if candidates:
+            top_deltas.append(
+                f"{group}["
+                + ",".join(
+                    f"{pid}@{title}:{delta_kib / (1024**2):+.3f}"
+                    for delta_kib, pid, title in candidates[:8]
+                )
+                + "]"
+            )
+    return (
+        f"proc_delta_scope={scope} proc_group_delta={','.join(group_deltas) or 'none'} "
+        f"proc_top_anon_delta={';'.join(top_deltas) or 'none'}"
+    )
+
+
+def format_node_process_memory_summary(
+    processes: Optional[dict[int, dict[str, Any]]] = None,
+    *,
+    previous_processes: Optional[dict[int, dict[str, Any]]] = None,
+    delta_scope: str = "none",
+    scan_ms: Optional[float] = None,
+) -> str:
+    """Aggregate process memory and optionally report PID-level anonymous deltas."""
+
+    if processes is None:
+        processes, scan_ms = collect_node_process_memory_snapshot()
+    groups = _aggregate_process_memory_groups(processes)
 
     ordered_groups = [group for group, _ in _PROCESS_MEMORY_GROUPS] + ["ray_other"]
     formatted = []
@@ -283,8 +365,17 @@ def format_node_process_memory_summary() -> str:
         formatted.append(
             f"{group}:{count}/{rss_kib / (1024**2):.2f}/{anon_kib / (1024**2):.2f}"
         )
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
-    return f"proc_groups={','.join(formatted) or 'none'} proc_scan_ms={elapsed_ms:.1f}"
+    delta_summary = ""
+    if previous_processes is not None:
+        delta_summary = " " + _format_process_memory_deltas(
+            processes,
+            previous_processes,
+            delta_scope,
+        )
+    return (
+        f"proc_groups={','.join(formatted) or 'none'}{delta_summary} "
+        f"proc_scan_ms={(scan_ms or 0.0):.1f}"
+    )
 
 
 def _trim_process_heap() -> bool:

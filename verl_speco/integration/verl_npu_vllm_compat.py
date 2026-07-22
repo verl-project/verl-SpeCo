@@ -367,38 +367,6 @@ def _is_npu_worker() -> bool:
         return False
 
 
-def _next_weight_sync_index(worker: Any) -> int:
-    sync_index = int(getattr(worker, "_speco_actor_weight_sync_index", 0) or 0) + 1
-    worker._speco_actor_weight_sync_index = sync_index
-    return sync_index
-
-
-def _should_log_weight_sync(sync_index: int) -> bool:
-    return sync_index <= 8 or sync_index % 10 == 0
-
-
-def _log_actor_weight_sync_memory(
-    worker: Any,
-    *,
-    phase: str,
-    sync_index: int,
-    global_steps: int | None,
-    extra: str = "",
-) -> None:
-    if int(getattr(worker, "rank", 0) or 0) != 0 or not _should_log_weight_sync(sync_index):
-        return
-    suffix = f" {extra}" if extra else ""
-    logger.warning(
-        "[speco weight memory] role=actor_sender phase=%s sync=%s step=%s pid=%s %s%s",
-        phase,
-        sync_index,
-        global_steps,
-        os.getpid(),
-        format_checkpoint_memory_snapshot(),
-        suffix,
-    )
-
-
 class VerlNPUVLLMImportCompatMixin:
     """Install import compatibility when WorkerDict constructs the worker."""
 
@@ -418,33 +386,7 @@ class VerlNPUVLLMImportCompatMixin:
         if not _is_npu_worker():
             return await super().update_weights(global_steps=global_steps, mode=mode)
 
-        sync_index = _next_weight_sync_index(self)
-        _log_actor_weight_sync_memory(
-            self,
-            phase="before_sync",
-            sync_index=sync_index,
-            global_steps=global_steps,
-        )
-        succeeded = False
         try:
-            result = await super().update_weights(global_steps=global_steps, mode=mode)
-            succeeded = True
-            return result
+            return await super().update_weights(global_steps=global_steps, mode=mode)
         finally:
-            _log_actor_weight_sync_memory(
-                self,
-                phase="after_sync" if succeeded else "after_sync_error",
-                sync_index=sync_index,
-                global_steps=global_steps,
-            )
-            reclaim = trim_process_host_memory()
-            _log_actor_weight_sync_memory(
-                self,
-                phase="after_trim",
-                sync_index=sync_index,
-                global_steps=global_steps,
-                extra=(
-                    f"trimmed={int(reclaim['heap_trimmed'])} "
-                    f"trim_sec={reclaim['elapsed_sec']:.3f}"
-                ),
-            )
+            trim_process_host_memory()
