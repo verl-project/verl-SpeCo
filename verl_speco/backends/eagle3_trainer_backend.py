@@ -1002,12 +1002,12 @@ class Eagle3TrainerBackend:
 
             all_step_logits = [
                 gather_outputs_and_unpad(
-                    l.squeeze(0),
+                    logits.squeeze(0),
                     gather_dim=0,
                     unpad_dim=0,
                     padding_size=_current_pad_size,
                 ).unsqueeze(0)
-                for l in all_step_logits
+                for logits in all_step_logits
             ]
 
             all_step_position_mask = [

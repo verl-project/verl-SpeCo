@@ -1774,7 +1774,6 @@ class DrafterBaseTrainer:
         samples preserves the original loss semantics while avoiding a full
         lm_head transfer.
         """
-        training_cfg = self.config.rollout.drafter.training
         loss_mode = str(self._block_drafter_config_value("loss_mode", "full_vocab"))
         if loss_mode != "restricted_ce":
             return None

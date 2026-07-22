@@ -1115,7 +1115,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if any(key not in batch_tensors for key in required_keys):
             return None
         prompts = batch_tensors["prompts"]
-        responses = batch_tensors["responses"]
         attention_mask = batch_tensors["attention_mask"]
         response_mask = batch_tensors.get("response_mask", None)
         batch_size = int(prompts.size(0))
