@@ -7,7 +7,7 @@ from copy import deepcopy
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -102,7 +102,8 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 break
             attempted_batches += 1
             batch = trainer.prepare_training_batch_from_samples(
-                samples, step=optimizer_step
+                cast(list[Any], samples),
+                step=optimizer_step,
             )
             has_batch = batch is not None
             if not _all_ranks_true(has_batch, trainer.runtime_device):

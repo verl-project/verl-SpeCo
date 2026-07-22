@@ -2413,7 +2413,8 @@ def _attach_sglang_raw_top_logprobs(
             computed_subset = _is_torch_tensor(row_indices)
             if computed_subset:
                 row_indices = row_indices.to(
-                    device=next_token_logits.device, dtype=torch.long
+                    device=next_token_logits.device,
+                    dtype=torch.long,
                 )
                 compute_logits = compute_logits[row_indices]
 
@@ -2865,10 +2866,13 @@ def _build_sglang_last_hidden_logprob_check_summary(
             }
             if _is_torch_tensor(raw_topk_ids) and _is_torch_tensor(raw_topk_logprobs):
                 raw_rows = min(
-                    int(raw_topk_ids.shape[0]), int(raw_topk_logprobs.shape[0]), rows
+                    int(raw_topk_ids.shape[0]),
+                    int(raw_topk_logprobs.shape[0]),
+                    rows,
                 )
                 raw_topk = min(
-                    int(raw_topk_ids.shape[-1]), int(raw_topk_logprobs.shape[-1])
+                    int(raw_topk_ids.shape[-1]),
+                    int(raw_topk_logprobs.shape[-1]),
                 )
                 if raw_rows > 0 and raw_topk > 0:
                     summary.update(
@@ -3356,11 +3360,13 @@ def _filter_sglang_drafter_last_hidden_output(
     ):
         try:
             base_index = index_tensor.to(
-                device=base_hidden_states.device, dtype=torch.long
+                device=base_hidden_states.device,
+                dtype=torch.long,
             )
             if base_hidden_states.dim() == 3:
                 base_hidden_states = base_hidden_states.reshape(
-                    -1, base_hidden_states.shape[-1]
+                    -1,
+                    base_hidden_states.shape[-1],
                 )
             if index_len > 0 and int(base_hidden_states.shape[0]) > int(
                 base_index.max().item()
@@ -3634,7 +3640,8 @@ def _filter_sglang_drafter_last_hidden_output(
     if _is_torch_tensor(last_hidden_positions):
         try:
             position_index = index_tensor.to(
-                device=last_hidden_positions.device, dtype=torch.long
+                device=last_hidden_positions.device,
+                dtype=torch.long,
             )
             filtered_positions = last_hidden_positions[position_index].detach()
             setattr(

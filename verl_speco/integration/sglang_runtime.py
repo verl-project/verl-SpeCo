@@ -914,7 +914,11 @@ async def _maybe_call_sglang_engine_method(
 
 
 async def speco_update_target_weights(
-    self, weights, *args, global_steps: int = None, **kwargs
+    self,
+    weights,
+    *args,
+    global_steps: int = None,
+    **kwargs,
 ):
     """Update only SGLang target weights when speculative drafter is enabled."""
 
@@ -1004,7 +1008,11 @@ async def speco_update_target_weights(
 
 
 async def speco_update_draft_weights(
-    self, weights: dict[str, Any], *args, global_steps: int = None, **kwargs
+    self,
+    weights: dict[str, Any],
+    *args,
+    global_steps: int = None,
+    **kwargs,
 ):
     """Update only SGLang draft weights from an upstream ServerAdapter instance."""
 
@@ -1883,11 +1891,9 @@ class _SpecoSGLangHttpServerMixin:
                                     :aligned_prefix_rows
                                 ]
                             if torch.is_tensor(hidden_raw_target_logprobs_positions):
-                                hidden_raw_target_logprobs_positions = (
-                                    hidden_raw_target_logprobs_positions[
-                                        :aligned_prefix_rows
-                                    ]
-                                )
+                                hidden_raw_target_logprobs_positions = hidden_raw_target_logprobs_positions[
+                                    :aligned_prefix_rows
+                                ]
 
                 if fail_closed_alignment_reason is not None:
                     logger.warning(

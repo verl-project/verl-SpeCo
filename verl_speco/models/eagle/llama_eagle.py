@@ -739,6 +739,7 @@ class LlamaAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        assert position_ids is not None, "position_ids must be provided"
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -881,6 +882,9 @@ class LlamaFlexAttention(LlamaAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        assert position_ids is not None, "position_ids must be provided"
+        assert attention_mask is not None, "attention_mask must be provided"
+        assert past_key_values is not None, "past_key_values must be provided"
         bsz, q_len, _ = hidden_states.size()
 
         past_seen_tokens = (
@@ -994,6 +998,7 @@ class LlamaFlashAttention(LlamaAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        assert position_ids is not None, "position_ids must be provided"
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -1383,7 +1388,7 @@ class LlamaDecoderLayer(nn.Module):
         self,
         input_emb: torch.Tensor,
         hidden_states: torch.Tensor,
-        cache_hidden: List[List[torch.Tensor]] = None,
+        cache_hidden: Optional[List[List[torch.Tensor]]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,

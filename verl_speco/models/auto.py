@@ -209,4 +209,6 @@ class AutoDraftModelConfig:
         elif architecture in _EAGLE3_ARCHITECTURE_ALIASES:
             config = _normalize_eagle3_config_dict(config)
 
+        if config_class is None:
+            raise ValueError(f"Architecture {architecture} not supported")
         return config_class.from_dict(config)

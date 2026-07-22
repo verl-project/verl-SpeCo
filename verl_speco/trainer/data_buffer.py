@@ -14,6 +14,7 @@
 
 import logging
 from collections import deque
+from typing import Any, Optional
 
 import torch
 
@@ -35,8 +36,8 @@ class DataBuffer:
     def __init__(self, max_size: int = 10000, store_hidden_states: bool = True):
         self.max_size = max_size
         self.store_hidden_states = store_hidden_states
-        self.buffer = deque(maxlen=max_size)
-        self._current_step = 0
+        self.buffer: deque[dict[str, Any]] = deque(maxlen=max_size)
+        self._current_step: Optional[int] = 0
 
     def add_batch(self, batch: dict[str, torch.Tensor]):
         """Add a batch of data to the buffer.
@@ -51,7 +52,7 @@ class DataBuffer:
         batch["step"] = self._current_step
         self.buffer.append(batch)
 
-    def update_rl_step(self, step: int = None):
+    def update_rl_step(self, step: Optional[int] = None):
         """Increment the current RL step counter."""
         self._current_step = step
 
@@ -72,7 +73,8 @@ class DataBuffer:
         Returns:
             List of dictionaries containing data from last n steps
         """
-        min_step = max(0, self._current_step - n)
+        current_step = self._current_step or 0
+        min_step = max(0, current_step - n)
         return [sample for sample in self.buffer if sample["step"] >= min_step]
 
     def get_data_count(self) -> int:
@@ -90,7 +92,7 @@ class DataBuffer:
 
     def get_current_step(self) -> int:
         """Get the current RL step number."""
-        return self._current_step
+        return self._current_step or 0
 
     def __len__(self) -> int:
         """Return the number of samples in buffer."""

@@ -782,10 +782,12 @@ class DFlashTrainerBackend:
             getattr(target_text_config, "hidden_size", None)
             or getattr(drafter_config, "target_hidden_size")
         )
-        target_num_hidden_layers = int(
-            getattr(target_text_config, "num_hidden_layers", None)
-            or getattr(drafter_config, "target_num_hidden_layers", 36)
-        )
+        target_num_hidden_layers_value = getattr(
+            target_text_config, "num_hidden_layers", None
+        ) or getattr(drafter_config, "target_num_hidden_layers", 36)
+        if target_num_hidden_layers_value is None:
+            raise ValueError("target_num_hidden_layers must be set for DFlash")
+        target_num_hidden_layers = int(target_num_hidden_layers_value)
 
         nested_dflash_config = getattr(drafter_config, "dflash_config", None)
         nested_target_layer_ids = None

@@ -206,9 +206,12 @@ class LlamaForCausalLMEagle1(DraftModel):
         self.fc = nn.Linear(
             config.hidden_size + self.target_hidden_size, config.hidden_size, bias=False
         )
-        num_layers = max(
-            1, int(getattr(config, "draft_num_hidden_layers", config.num_hidden_layers))
+        draft_num_hidden_layers = getattr(
+            config, "draft_num_hidden_layers", config.num_hidden_layers
         )
+        if draft_num_hidden_layers is None:
+            raise ValueError("draft_num_hidden_layers must be set")
+        num_layers = max(1, int(draft_num_hidden_layers))
         self.layers = nn.ModuleList(
             [EagleLlamaDecoderLayer(config) for _ in range(num_layers)]
         )

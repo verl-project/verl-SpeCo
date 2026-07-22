@@ -2194,7 +2194,10 @@ class DrafterBaseTrainer:
         return lm_head
 
     def collect_online_data(
-        self, batch: dict, hidden_states: torch.Tensor, target_logprobs: List = None
+        self,
+        batch: dict,
+        hidden_states: torch.Tensor,
+        target_logprobs: List = None,
     ) -> None:
         """Collect online data from inference for drafter training.
 
@@ -4181,7 +4184,8 @@ class DrafterBaseTrainer:
         # 更新权重
         optimizer_ts = time.time()
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), max_norm=1.0
+            self.model.parameters(),
+            max_norm=1.0,
         )
         if not torch.isfinite(grad_norm):
             logger.error(

@@ -84,6 +84,7 @@ class DraftModel(PreTrainedModel):
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         past_key_values: Optional[Cache] = None,
+        output_attentions: bool = False,
         use_cache: bool = True,
     ) -> torch.Tensor:
         """

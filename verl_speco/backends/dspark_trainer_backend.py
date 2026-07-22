@@ -508,6 +508,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     # Full-vocab CE already normalizes the complete LM head and Markov bias.
                     # Restricted CE must build separate full-vocab probabilities for L1.
                     if restricted_vocab is None:
+                        if active_log_probs is None:
+                            raise ValueError("DSpark L1 loss requires active_log_probs")
                         reusable_draft_log_probs = (
                             active_log_probs
                             if l1_mask.all()

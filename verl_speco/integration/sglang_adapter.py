@@ -67,7 +67,7 @@ def install_sglang_speco_patches(
     if config.enable_original_logprobs:
         enable_sglang_original_logprob_return()
 
-    install_kwargs = {
+    install_kwargs: dict[str, Any] = {
         "set_envs_and_config": config.set_envs_and_config,
         "target_weight_loader": config.target_weight_loader,
         "draft_weight_loader": config.draft_weight_loader,
@@ -152,7 +152,7 @@ def bucket_drafter_samples_by_replica(
 ) -> list[list[dict]]:
     """Bucket normalized samples by rollout replica rank."""
 
-    buckets = [[] for _ in range(num_replicas)]
+    buckets: list[list[dict]] = [[] for _ in range(num_replicas)]
     for sample in samples:
         replica_rank = sample.get("replica_rank")
         if replica_rank is None:
