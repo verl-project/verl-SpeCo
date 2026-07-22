@@ -148,7 +148,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     trainer.default_local_dir=${CKPTS_DIR} \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
-    trainer.total_epochs=1 $@
+    trainer.total_epochs=1 "$@"
 fi
 
 if [ "${RUN_STAGE}" = "both" ] || [ "${RUN_STAGE}" = "train" ]; then
@@ -179,5 +179,5 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.draft_train_launcher \
     actor_rollout_ref.rollout.drafter.training.feature_store.path=${FEATURE_STORE_DIR} \
     actor_rollout_ref.rollout.drafter.training.feature_store.shuffle=True \
     actor_rollout_ref.rollout.drafter.training.feature_store.repeat=True \
-    actor_rollout_ref.rollout.drafter.training.feature_store.strict_schema=True $@
+    actor_rollout_ref.rollout.drafter.training.feature_store.strict_schema=True "$@"
 fi

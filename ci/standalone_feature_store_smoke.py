@@ -106,7 +106,7 @@ def main() -> None:
             input_ids=input_ids,
             loss_mask=torch.ones(seq_len, dtype=torch.float32),
             hidden_states=hidden_states,
-            position_ids=torch.arange(seq_len, dtype=torch.long),
+            position_ids=torch.arange(1, seq_len + 1, dtype=torch.long),
             metadata={
                 "source": "ci_standalone_feature_store_smoke",
                 "global_step": 0,
