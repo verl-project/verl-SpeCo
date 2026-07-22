@@ -59,18 +59,8 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         compat,
-        "install_verl_npu_fsdp_host_memory_reclaim",
-        lambda: events.append("host_memory_reclaim"),
-    )
-    monkeypatch.setattr(
-        compat,
         "install_verl_npu_fsdp2_weight_export_compat",
         lambda: events.append("fsdp2_export"),
-    )
-    monkeypatch.setattr(
-        compat,
-        "_install_npu_worker_memory_diagnostics",
-        lambda worker: events.append(("memory_diagnostics", worker)),
     )
 
     class BaseWorker:
@@ -80,57 +70,13 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     class WrappedWorker(compat.VerlNPUVLLMImportCompatMixin, BaseWorker):
         pass
 
-    worker = WrappedWorker()
-    assert events[:-1] == [
+    WrappedWorker()
+    assert events == [
         "compat",
         "training_output_release",
-        "host_memory_reclaim",
         "reclaim",
         "fsdp2_export",
         "base",
-    ]
-    assert events[-1] == ("memory_diagnostics", worker)
-
-
-def test_npu_worker_memory_diagnostics_wrap_worker_calls(monkeypatch) -> None:
-    events = []
-
-    class Worker:
-        rank = 0
-
-        def compute_log_prob(self, value):
-            events.append(("compute", value))
-            return f"output:{value}"
-
-    worker = Worker()
-    monkeypatch.setattr(compat, "_is_npu_worker", lambda: True)
-    monkeypatch.setattr(
-        compat,
-        "log_process_memory_before_call",
-        lambda owner, key, role, method: events.append(("log", owner, key, role, method)) or 7,
-    )
-    monkeypatch.setattr(
-        compat,
-        "log_process_memory_after_call",
-        lambda owner, key, call, role, method, phase: events.append(
-            ("after", owner, key, call, role, method, phase)
-        ),
-    )
-
-    assert compat._install_npu_worker_memory_diagnostics(worker) is True
-    assert worker.compute_log_prob("batch") == "output:batch"
-    assert events == [
-        ("log", worker, "worker_dict:compute_log_prob", "worker_dict", "compute_log_prob"),
-        ("compute", "batch"),
-        (
-            "after",
-            worker,
-            "worker_dict:compute_log_prob",
-            7,
-            "worker_dict",
-            "compute_log_prob",
-            "after",
-        ),
     ]
 
 
@@ -225,42 +171,6 @@ def test_npu_checkpoint_reclaim_preserves_native_save(monkeypatch) -> None:
             },
         ),
         ("reclaim", "/tmp/actor", True),
-    ]
-
-
-def test_npu_fsdp_host_memory_reclaim_runs_at_each_call_entry(monkeypatch) -> None:
-    events = []
-    engine_module = types.ModuleType(compat._VERL_FSDP_ENGINE_MODULE)
-
-    class FSDPEngine:
-        rank = 0
-
-        def forward_backward_batch(self, value):
-            events.append(("forward_backward_batch", value))
-            return value
-
-    engine_module.FSDPEngine = FSDPEngine
-    modules = {
-        compat._VERL_FSDP_ENGINE_MODULE: engine_module,
-        "verl.utils.device": types.SimpleNamespace(get_device_name=lambda: "npu"),
-    }
-    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
-    monkeypatch.setattr(compat, "_NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED", False)
-    monkeypatch.setattr(
-        compat,
-        "trim_process_host_memory",
-        lambda: events.append(("trim",)) or {"heap_trimmed": True, "elapsed_sec": 0.0},
-    )
-
-    assert compat.install_verl_npu_fsdp_host_memory_reclaim(modules.__getitem__) is True
-    engine = FSDPEngine()
-    assert engine.forward_backward_batch(1) == 1
-    assert engine.forward_backward_batch(2) == 2
-    assert events == [
-        ("trim",),
-        ("forward_backward_batch", 1),
-        ("trim",),
-        ("forward_backward_batch", 2),
     ]
 
 

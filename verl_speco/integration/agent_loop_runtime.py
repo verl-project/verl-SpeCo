@@ -8,12 +8,6 @@ import logging
 from functools import wraps
 from typing import Any
 
-from verl_speco.trainer.checkpoint import (
-    log_process_memory_after_call,
-    log_process_memory_before_call,
-    trim_process_host_memory_with_diagnostics,
-)
-
 logger = logging.getLogger(__file__)
 
 _PATCHED = False
@@ -28,13 +22,9 @@ _DEFAULT_EXTRA_KEYS = {
 _CURRENT_GLOBAL_STEPS = contextvars.ContextVar("speco_current_global_steps", default=None)
 _CURRENT_VALIDATE = contextvars.ContextVar("speco_current_validate", default=False)
 SPECO_AGENT_LOOP_MANAGER_CLASS = "verl_speco.integration.agent_loop_runtime.SpecoAgentLoopManager"
-SPECO_HOST_MEMORY_AGENT_LOOP_MANAGER_CLASS = (
-    "verl_speco.integration.agent_loop_runtime.SpecoHostMemoryAgentLoopManager"
-)
 _SPECO_WORKER_WRAPPER_METHOD_NAMES = {
     "_speco_worker_init",
     "_speco_worker_generate_sequences",
-    "_speco_host_memory_worker_generate_sequences",
     "_speco_worker_run_agent_loop",
     "_speco_worker_agent_loop_postprocess",
     "_speco_worker_postprocess",
@@ -52,30 +42,6 @@ def _is_sglang_rollout_config(config: Any) -> bool:
     if hasattr(rollout_config, "get"):
         return rollout_config.get("name") == "sglang"
     return getattr(rollout_config, "name", None) == "sglang"
-
-
-def _is_npu_config(config: Any) -> bool:
-    trainer_config = getattr(config, "trainer", None)
-    if trainer_config is None and hasattr(config, "get"):
-        trainer_config = config.get("trainer")
-    if trainer_config is None:
-        return False
-    if hasattr(trainer_config, "get"):
-        device = trainer_config.get("device")
-    else:
-        device = getattr(trainer_config, "device", None)
-    return str(device).lower() == "npu"
-
-
-def _trim_agent_loop_host_memory(worker: Any) -> None:
-    if not _is_npu_config(getattr(worker, "config", None)):
-        return
-    trim_process_host_memory_with_diagnostics(
-        worker,
-        "agent_loop:generate_sequences:trim",
-        role="agent_loop",
-        method="generate_sequences",
-    )
 
 
 def _ensure_extra_field_defaults(result: Any) -> Any:
@@ -175,20 +141,7 @@ def _speco_worker_init(self, *args, **kwargs):
 
 
 async def _speco_worker_generate_sequences(self, batch):
-    _trim_agent_loop_host_memory(self)
-    diagnose_host_memory = _is_npu_config(getattr(self, "config", None))
-    call_index = (
-        log_process_memory_before_call(
-            self,
-            "agent_loop:generate_sequences",
-            role="agent_loop",
-            method="generate_sequences",
-        )
-        if diagnose_host_memory
-        else 0
-    )
     global_steps_token, validate_token = _speco_context_from_batch(batch)
-    succeeded = False
     try:
         generate_sequences = _speco_parent_method(self, "generate_sequences")
         if not callable(generate_sequences):
@@ -197,54 +150,9 @@ async def _speco_worker_generate_sequences(self, batch):
         if inspect.isawaitable(result):
             result = await result
         result = _ensure_extra_field_defaults(result)
-        succeeded = True
         return result
     finally:
-        if diagnose_host_memory:
-            log_process_memory_after_call(
-                self,
-                "agent_loop:generate_sequences",
-                call_index,
-                role="agent_loop",
-                method="generate_sequences",
-                phase="after" if succeeded else "after_error",
-            )
         _speco_reset_context(global_steps_token, validate_token)
-
-
-async def _speco_host_memory_worker_generate_sequences(self, batch):
-    _trim_agent_loop_host_memory(self)
-    diagnose_host_memory = _is_npu_config(getattr(self, "config", None))
-    call_index = (
-        log_process_memory_before_call(
-            self,
-            "agent_loop:generate_sequences",
-            role="agent_loop",
-            method="generate_sequences",
-        )
-        if diagnose_host_memory
-        else 0
-    )
-    succeeded = False
-    try:
-        generate_sequences = _speco_parent_method(self, "generate_sequences")
-        if not callable(generate_sequences):
-            raise AttributeError("SPECO AgentLoop worker parent has no generate_sequences method")
-        result = generate_sequences(self, batch)
-        if inspect.isawaitable(result):
-            result = await result
-        succeeded = True
-        return result
-    finally:
-        if diagnose_host_memory:
-            log_process_memory_after_call(
-                self,
-                "agent_loop:generate_sequences",
-                call_index,
-                role="agent_loop",
-                method="generate_sequences",
-                phase="after" if succeeded else "after_error",
-            )
 
 
 async def _speco_worker_run_agent_loop(self, sampling_params, trajectory, *args, **kwargs):
@@ -362,33 +270,6 @@ def _build_speco_agent_loop_worker_class(worker_cls):
     return speco_worker_cls
 
 
-def _build_host_memory_agent_loop_worker_class(worker_cls):
-    host_memory_worker_cls = getattr(worker_cls, "_speco_host_memory_remote_worker_cls", None)
-    if host_memory_worker_cls is not None:
-        return host_memory_worker_cls
-
-    attrs = {
-        "__module__": __name__,
-        "__doc__": "Ray-serializable AgentLoopWorker subclass with NPU host-memory reclaim.",
-        "generate_sequences": _speco_host_memory_worker_generate_sequences,
-    }
-    host_memory_worker_cls = type("SpecoHostMemoryAgentLoopWorker", (worker_cls,), attrs)
-    host_memory_worker_cls.__qualname__ = "SpecoHostMemoryAgentLoopWorker"
-    worker_cls._speco_host_memory_remote_worker_cls = host_memory_worker_cls
-    return host_memory_worker_cls
-
-
-def _configure_host_memory_agent_loop_manager_instance(manager: Any, worker_cls: Any) -> bool:
-    if not _is_npu_config(getattr(manager, "config", None)):
-        return False
-
-    import ray
-
-    host_memory_worker_cls = _build_host_memory_agent_loop_worker_class(worker_cls)
-    manager.agent_loop_workers_class = ray.remote(host_memory_worker_cls)
-    return True
-
-
 def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) -> None:
     if not _is_sglang_rollout_config(getattr(manager, "config", None)):
         return
@@ -428,18 +309,6 @@ class SpecoAgentLoopManager(_UpstreamAgentLoopManager):
         agent_loop_module = _AgentLoopModule or _load_agent_loop_module()
         worker_cls = getattr(agent_loop_module, "AgentLoopWorker")
         _configure_speco_agent_loop_manager_instance(self, worker_cls)
-        if not _is_sglang_rollout_config(getattr(self, "config", None)):
-            _configure_host_memory_agent_loop_manager_instance(self, worker_cls)
-
-
-class SpecoHostMemoryAgentLoopManager(_UpstreamAgentLoopManager):
-    """Use upstream agent-loop behavior with NPU cross-call heap reclaim."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        agent_loop_module = _AgentLoopModule or _load_agent_loop_module()
-        worker_cls = getattr(agent_loop_module, "AgentLoopWorker")
-        _configure_host_memory_agent_loop_manager_instance(self, worker_cls)
 
 
 def install_agent_loop_runtime_patch() -> bool:

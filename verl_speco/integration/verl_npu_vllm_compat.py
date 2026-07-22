@@ -2,27 +2,21 @@
 
 from __future__ import annotations
 
-import contextvars
 import functools
 import importlib
 import importlib.util
 import inspect
 import logging
-import os
 import sys
 import time
-from types import MethodType
 from typing import Any, Callable
 
 from packaging import version
 
 from verl_speco.trainer.checkpoint import (
     format_checkpoint_memory_snapshot,
-    log_process_memory_after_call,
-    log_process_memory_before_call,
     release_checkpoint_host_memory,
     trim_process_host_memory,
-    trim_process_host_memory_with_diagnostics,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,11 +28,6 @@ _IMPORT_COMPAT_APPLIED = False
 _NPU_CHECKPOINT_RECLAIM_APPLIED = False
 _NPU_FSDP2_WEIGHT_EXPORT_APPLIED = False
 _FSDP_TRAIN_OUTPUT_RELEASE_APPLIED = False
-_NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED = False
-_NPU_FSDP_DIAGNOSTIC_CONTEXT = contextvars.ContextVar(
-    "speco_npu_fsdp_diagnostic_context",
-    default=None,
-)
 
 try:
     from verl.single_controller.base.decorator import Dispatch, register
@@ -274,68 +263,6 @@ def install_verl_fsdp_training_output_release_compat(
     return True
 
 
-def install_verl_npu_fsdp_host_memory_reclaim(
-    module_importer: Callable[[str], Any] = importlib.import_module,
-) -> bool:
-    """Trim completed Ray-call allocations at the next NPU FSDP call entry.
-
-    Ray may still be serializing the previous ``forward_backward_batch`` result
-    when that call returns. Trimming at the next entry avoids retaining glibc's
-    previous high-water mark without touching live return values or forcing a
-    Python GC cycle.
-    """
-
-    global _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED
-    if _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED or not _module_available("torch_npu"):
-        return False
-
-    device_module = module_importer("verl.utils.device")
-    if device_module.get_device_name() != "npu":
-        return False
-
-    engine_module = module_importer(_VERL_FSDP_ENGINE_MODULE)
-    engine_cls = getattr(engine_module, "FSDPEngine", None)
-    original_forward_backward_batch = getattr(engine_cls, "forward_backward_batch", None)
-    if engine_cls is None or not callable(original_forward_backward_batch):
-        return False
-    if getattr(original_forward_backward_batch, "_speco_npu_entry_host_memory_reclaim", False):
-        _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED = True
-        return False
-
-    @functools.wraps(original_forward_backward_batch)
-    def forward_backward_batch_with_entry_reclaim(self, *args, **kwargs):
-        if int(getattr(self, "rank", 0) or 0) == 0:
-            diagnostic_context = _NPU_FSDP_DIAGNOSTIC_CONTEXT.get()
-            if isinstance(diagnostic_context, dict):
-                if not diagnostic_context["trim_logged"]:
-                    diagnostic_context["trim_logged"] = True
-                    diagnostic_method = str(diagnostic_context["method"])
-                    trim_process_host_memory_with_diagnostics(
-                        self,
-                        f"fsdp:{diagnostic_method}:outer_trim",
-                        role="worker_dict",
-                        method=diagnostic_method,
-                        call_index=int(diagnostic_context["call_index"]),
-                    )
-                else:
-                    trim_process_host_memory()
-            else:
-                trim_process_host_memory_with_diagnostics(
-                    self,
-                    "fsdp:forward_backward_batch:trim",
-                    role="worker_dict",
-                    method="forward_backward_batch",
-                )
-        else:
-            trim_process_host_memory()
-        return original_forward_backward_batch(self, *args, **kwargs)
-
-    forward_backward_batch_with_entry_reclaim._speco_npu_entry_host_memory_reclaim = True
-    engine_cls.forward_backward_batch = forward_backward_batch_with_entry_reclaim
-    _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED = True
-    return True
-
-
 def install_verl_npu_fsdp2_weight_export_compat(
     module_importer: Callable[[str], Any] = importlib.import_module,
 ) -> bool:
@@ -439,81 +366,15 @@ def _is_npu_worker() -> bool:
         return False
 
 
-def _install_npu_worker_memory_diagnostics(worker: Any) -> bool:
-    if not _is_npu_worker() or int(getattr(worker, "rank", 0) or 0) != 0:
-        return False
-    if getattr(worker, "_speco_memory_diagnostics_installed", False):
-        return False
-
-    installed = []
-    for method_name in ("compute_log_prob", "compute_ref_log_prob", "update_actor"):
-        original = getattr(worker, method_name, None)
-        if not callable(original) or inspect.iscoroutinefunction(original):
-            continue
-
-        @functools.wraps(original)
-        def process_memory_wrapper(
-            bound_worker,
-            *args,
-            _original=original,
-            _method_name=method_name,
-            **kwargs,
-        ):
-            call_index = log_process_memory_before_call(
-                bound_worker,
-                f"worker_dict:{_method_name}",
-                role="worker_dict",
-                method=_method_name,
-            )
-            succeeded = False
-            diagnostic_token = _NPU_FSDP_DIAGNOSTIC_CONTEXT.set(
-                {
-                    "method": _method_name,
-                    "call_index": call_index,
-                    "trim_logged": False,
-                }
-            )
-            try:
-                result = _original(*args, **kwargs)
-                succeeded = True
-                return result
-            finally:
-                _NPU_FSDP_DIAGNOSTIC_CONTEXT.reset(diagnostic_token)
-                log_process_memory_after_call(
-                    bound_worker,
-                    f"worker_dict:{_method_name}",
-                    call_index,
-                    role="worker_dict",
-                    method=_method_name,
-                    phase="after" if succeeded else "after_error",
-                )
-
-        setattr(worker, method_name, MethodType(process_memory_wrapper, worker))
-        installed.append(method_name)
-
-    if not installed:
-        return False
-    worker._speco_memory_diagnostics_installed = True
-    print(
-        "[speco process memory] WorkerDict diagnostics installed "
-        f"pid={os.getpid()} rank={getattr(worker, 'rank', None)} "
-        f"methods={','.join(installed)}",
-        flush=True,
-    )
-    return True
-
-
 class VerlNPUVLLMImportCompatMixin:
     """Install import compatibility when WorkerDict constructs the worker."""
 
     def __init__(self, *args, **kwargs):
         install_verl_npu_vllm_import_compat()
         install_verl_fsdp_training_output_release_compat()
-        install_verl_npu_fsdp_host_memory_reclaim()
         install_verl_npu_checkpoint_reclaim()
         install_verl_npu_fsdp2_weight_export_compat()
         super().__init__(*args, **kwargs)
-        _install_npu_worker_memory_diagnostics(self)
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
