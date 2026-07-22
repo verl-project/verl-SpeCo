@@ -17,7 +17,9 @@ from packaging import version
 
 from verl_speco.trainer.checkpoint import (
     format_checkpoint_memory_snapshot,
+    log_process_memory_after_call,
     log_previous_output_lifetime,
+    remember_input_lifetime,
     remember_output_lifetime,
     release_checkpoint_host_memory,
     trim_process_host_memory,
@@ -436,14 +438,33 @@ def _install_npu_worker_output_lifetime_diagnostics(worker: Any) -> bool:
                 role="worker_dict",
                 method=_method_name,
             )
-            result = _original(*args, **kwargs)
-            remember_output_lifetime(
+            primary_input = args[0] if args else kwargs
+            remember_input_lifetime(
                 bound_worker,
                 f"worker_dict:{_method_name}",
                 call_index,
-                result,
+                primary_input,
             )
-            return result
+            succeeded = False
+            try:
+                result = _original(*args, **kwargs)
+                remember_output_lifetime(
+                    bound_worker,
+                    f"worker_dict:{_method_name}",
+                    call_index,
+                    result,
+                )
+                succeeded = True
+                return result
+            finally:
+                log_process_memory_after_call(
+                    bound_worker,
+                    f"worker_dict:{_method_name}",
+                    call_index,
+                    role="worker_dict",
+                    method=_method_name,
+                    phase="after" if succeeded else "after_error",
+                )
 
         setattr(worker, method_name, MethodType(output_lifetime_wrapper, worker))
         installed.append(method_name)

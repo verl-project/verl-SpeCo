@@ -9,7 +9,9 @@ from functools import wraps
 from typing import Any
 
 from verl_speco.trainer.checkpoint import (
+    log_process_memory_after_call,
     log_previous_output_lifetime,
+    remember_input_lifetime,
     remember_output_lifetime,
     trim_process_host_memory,
 )
@@ -182,7 +184,15 @@ async def _speco_worker_generate_sequences(self, batch):
         if diagnose_host_memory
         else 0
     )
+    if diagnose_host_memory:
+        remember_input_lifetime(
+            self,
+            "agent_loop:generate_sequences",
+            call_index,
+            batch,
+        )
     global_steps_token, validate_token = _speco_context_from_batch(batch)
+    succeeded = False
     try:
         generate_sequences = _speco_parent_method(self, "generate_sequences")
         if not callable(generate_sequences):
@@ -198,8 +208,18 @@ async def _speco_worker_generate_sequences(self, batch):
                 call_index,
                 result,
             )
+        succeeded = True
         return result
     finally:
+        if diagnose_host_memory:
+            log_process_memory_after_call(
+                self,
+                "agent_loop:generate_sequences",
+                call_index,
+                role="agent_loop",
+                method="generate_sequences",
+                phase="after" if succeeded else "after_error",
+            )
         _speco_reset_context(global_steps_token, validate_token)
 
 
@@ -216,20 +236,40 @@ async def _speco_host_memory_worker_generate_sequences(self, batch):
         if diagnose_host_memory
         else 0
     )
-    generate_sequences = _speco_parent_method(self, "generate_sequences")
-    if not callable(generate_sequences):
-        raise AttributeError("SPECO AgentLoop worker parent has no generate_sequences method")
-    result = generate_sequences(self, batch)
-    if inspect.isawaitable(result):
-        result = await result
     if diagnose_host_memory:
-        remember_output_lifetime(
+        remember_input_lifetime(
             self,
             "agent_loop:generate_sequences",
             call_index,
-            result,
+            batch,
         )
-    return result
+    succeeded = False
+    try:
+        generate_sequences = _speco_parent_method(self, "generate_sequences")
+        if not callable(generate_sequences):
+            raise AttributeError("SPECO AgentLoop worker parent has no generate_sequences method")
+        result = generate_sequences(self, batch)
+        if inspect.isawaitable(result):
+            result = await result
+        if diagnose_host_memory:
+            remember_output_lifetime(
+                self,
+                "agent_loop:generate_sequences",
+                call_index,
+                result,
+            )
+        succeeded = True
+        return result
+    finally:
+        if diagnose_host_memory:
+            log_process_memory_after_call(
+                self,
+                "agent_loop:generate_sequences",
+                call_index,
+                role="agent_loop",
+                method="generate_sequences",
+                phase="after" if succeeded else "after_error",
+            )
 
 
 async def _speco_worker_run_agent_loop(self, sampling_params, trajectory, *args, **kwargs):
