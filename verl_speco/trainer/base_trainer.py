@@ -9,7 +9,7 @@ import fnmatch
 import shutil
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, List, Any
+from typing import Optional, Any, cast
 from omegaconf import open_dict
 from contextlib import contextmanager, nullcontext
 
@@ -224,6 +224,7 @@ def log_alignment_event(
 
 def _tensor_shape(tensor: Optional[torch.Tensor]) -> list[int] | None:
     if torch.is_tensor(tensor):
+        tensor = cast(torch.Tensor, tensor)
         return list(tensor.shape)
     return None
 
@@ -232,6 +233,7 @@ def _batch_item_int(value: Any, index: int = 0) -> int | None:
     if value is None:
         return None
     if torch.is_tensor(value):
+        value = cast(torch.Tensor, value)
         if value.numel() == 0:
             return None
         flat = value.detach().view(-1).cpu()
@@ -252,6 +254,7 @@ def _batch_item_float(value: Any, index: int = 0) -> float | None:
     if value is None:
         return None
     if torch.is_tensor(value):
+        value = cast(torch.Tensor, value)
         if value.numel() == 0:
             return None
         flat = value.detach().view(-1).float().cpu()
@@ -309,11 +312,12 @@ def _target_top_ids(target_logprobs: torch.Tensor, row: int, limit: int) -> list
 
 def _eagle_target_logprobs_train_start(source_item: dict) -> int:
     hidden_positions = source_item.get("hidden_positions")
+    feature_start: Any
     if isinstance(hidden_positions, torch.Tensor) and int(hidden_positions.numel()) > 0:
         feature_start = int(hidden_positions.reshape(-1)[0].item())
     else:
         feature_start = source_item.get("_verl_feature_start")
-    target_position_start = source_item.get("_verl_target_position_start")
+    target_position_start: Any = source_item.get("_verl_target_position_start")
     try:
         return max(int(feature_start) + 1 - int(target_position_start), 0)
     except (TypeError, ValueError):
@@ -489,15 +493,15 @@ class DrafterBaseTrainer:
         self._training_active = False
         self.training_steps = 0
         self.optimizer_steps_total = 0
-        self._alignment_debug_step = None
-        self._alignment_debug_counts = {}
+        self._alignment_debug_step: Optional[int] = None
+        self._alignment_debug_counts: dict[Any, Any] = {}
 
-        self.collected_data = deque(
+        self.collected_data: deque[Any] = deque(
             maxlen=int(
                 self.config.rollout.drafter.training.get("current_max_samples", 2000)
             )
         )
-        self.shared_data_buffer = None
+        self.shared_data_buffer: Any = None
         self.batch_size = int(
             self.config.rollout.drafter.training.get("batch_size_per_gpu", 4)
         )
@@ -527,24 +531,24 @@ class DrafterBaseTrainer:
         )
 
         # Track the last pending async checkpoint save future
-        self._pending_checkpoint_future = None
-        self._pending_full_checkpoint_future = None
-        self._full_checkpoint_executor = None
-        self._pending_publish_state_dict = None
-        self._pending_publish_step = None
+        self._pending_checkpoint_future: Any = None
+        self._pending_full_checkpoint_future: Any = None
+        self._full_checkpoint_executor: Optional[ThreadPoolExecutor] = None
+        self._pending_publish_state_dict: Optional[dict[str, Any]] = None
+        self._pending_publish_step: Optional[int] = None
         self._pending_publish_ready = False
-        self.model = None
-        self.optimizer = None
-        self.lr_scheduler = None
-        self.drafter_train_config = None
-        self._pending_target_lm_head_weight = None
-        self._pending_target_lm_head_row_indices = None
-        self._pending_target_lm_head_source_vocab_size = None
-        self._target_lm_head_weight_step = None
-        self._cached_target_lm_head_row_indices = None
-        self._training_timing_accumulator = {}
+        self.model: Any = None
+        self.optimizer: Any = None
+        self.lr_scheduler: Any = None
+        self.drafter_train_config: Any = None
+        self._pending_target_lm_head_weight: Any = None
+        self._pending_target_lm_head_row_indices: Any = None
+        self._pending_target_lm_head_source_vocab_size: Optional[int] = None
+        self._target_lm_head_weight_step: Optional[int] = None
+        self._cached_target_lm_head_row_indices: Any = None
+        self._training_timing_accumulator: dict[str, float] = {}
         self._training_timing_steps = 0
-        self._training_metric_sums = {}
+        self._training_metric_sums: dict[str, float] = {}
         self._training_metric_steps = 0
         self._frozen_param_names = {"model.embed_tokens.weight"}
 
@@ -772,6 +776,7 @@ class DrafterBaseTrainer:
             value = diagnostics.get(source_key)
             if not torch.is_tensor(value):
                 continue
+            value = cast(torch.Tensor, value)
             reduced = self._reduce_training_metric(value.reshape(()))
             self._training_metric_sums[metric_key] = self._training_metric_sums.get(
                 metric_key, 0.0
@@ -786,6 +791,7 @@ class DrafterBaseTrainer:
             value = diagnostics.get(source_key)
             if not torch.is_tensor(value):
                 continue
+            value = cast(torch.Tensor, value)
             reduced = self._reduce_training_metric(value)
             for idx, item in enumerate(reduced.detach().cpu().tolist()):
                 metric_key = f"{metric_prefix}/{idx}"
@@ -795,32 +801,44 @@ class DrafterBaseTrainer:
 
     def _get_sp_group(self):
         if self._has_mesh_dim("sp"):
-            return self.training_device_mesh["sp"].get_group()
+            training_device_mesh = self.training_device_mesh
+            assert training_device_mesh is not None
+            return training_device_mesh["sp"].get_group()
         return self.training_process_group
 
     def _get_dp_group(self):
         if self._has_mesh_dim("dp"):
-            return self.training_device_mesh["dp"].get_group()
+            training_device_mesh = self.training_device_mesh
+            assert training_device_mesh is not None
+            return training_device_mesh["dp"].get_group()
         return self.data_parallel_process_group
 
     def _get_sp_world_size(self) -> int:
         if self._has_mesh_dim("sp"):
-            return self.training_device_mesh["sp"].size()
+            training_device_mesh = self.training_device_mesh
+            assert training_device_mesh is not None
+            return training_device_mesh["sp"].size()
         return self.training_group_world_size
 
     def _get_dp_world_size(self) -> int:
         if self._has_mesh_dim("dp"):
-            return self.training_device_mesh["dp"].size()
+            training_device_mesh = self.training_device_mesh
+            assert training_device_mesh is not None
+            return training_device_mesh["dp"].size()
         return self.dp_group_world_size
 
     def _get_sp_local_rank(self) -> int:
         if self._has_mesh_dim("sp"):
-            return self.training_device_mesh["sp"].get_local_rank()
+            training_device_mesh = self.training_device_mesh
+            assert training_device_mesh is not None
+            return training_device_mesh["sp"].get_local_rank()
         return self.rank
 
     def _get_dp_local_rank(self) -> int:
         if self._has_mesh_dim("dp"):
-            return self.training_device_mesh["dp"].get_local_rank()
+            training_device_mesh = self.training_device_mesh
+            assert training_device_mesh is not None
+            return training_device_mesh["dp"].get_local_rank()
         return self.dp_rank
 
     def _resolve_fsdp_config(self):
@@ -1787,6 +1805,7 @@ class DrafterBaseTrainer:
             input_ids = item.get("input_ids")
             if not torch.is_tensor(input_ids):
                 continue
+            input_ids = cast(torch.Tensor, input_ids)
             flat_ids = input_ids.detach().reshape(-1).to(dtype=torch.long, device="cpu")
             valid = flat_ids[(flat_ids >= 0) & (flat_ids < int(source_vocab_size))]
             if int(valid.numel()) > 0:
@@ -2197,7 +2216,7 @@ class DrafterBaseTrainer:
         self,
         batch: dict,
         hidden_states: torch.Tensor,
-        target_logprobs: List = None,
+        target_logprobs: Optional[torch.Tensor] = None,
     ) -> None:
         """Collect online data from inference for drafter training.
 
@@ -2208,6 +2227,7 @@ class DrafterBaseTrainer:
         if input_ids is None:
             logger.debug(f"[Rank {self.rank}] Non-batched data in input_ids")
             return
+        input_ids = cast(torch.Tensor, input_ids)
 
         # 1、异步拷贝，GPU在后台进行数据搬运，避免阻塞Rollout Stream
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
@@ -2237,12 +2257,14 @@ class DrafterBaseTrainer:
             source_tensors.append(hidden_positions)
         else:
             hidden_positions = None
-        hidden_raw_target_logprobs = batch.get("hidden_raw_target_logprobs")
+        hidden_raw_target_logprobs: Optional[torch.Tensor] = batch.get(
+            "hidden_raw_target_logprobs"
+        )
         if isinstance(hidden_raw_target_logprobs, torch.Tensor):
             source_tensors.append(hidden_raw_target_logprobs)
         else:
             hidden_raw_target_logprobs = None
-        hidden_raw_target_logprobs_positions = batch.get(
+        hidden_raw_target_logprobs_positions: Optional[torch.Tensor] = batch.get(
             "hidden_raw_target_logprobs_positions"
         )
         if isinstance(hidden_raw_target_logprobs_positions, torch.Tensor):
@@ -2286,12 +2308,16 @@ class DrafterBaseTrainer:
                     else None
                 )
                 cpu_responses = (
-                    batch.get("responses").to("cpu", non_blocking=True)
+                    cast(torch.Tensor, batch.get("responses")).to(
+                        "cpu", non_blocking=True
+                    )
                     if "responses" in batch
                     else None
                 )
                 cpu_prompts = (
-                    batch.get("prompts").to("cpu", non_blocking=True)
+                    cast(torch.Tensor, batch.get("prompts")).to(
+                        "cpu", non_blocking=True
+                    )
                     if "prompts" in batch
                     else None
                 )
@@ -2317,9 +2343,15 @@ class DrafterBaseTrainer:
                 else None
             )
             cpu_responses = (
-                batch.get("responses").to("cpu") if "responses" in batch else None
+                cast(torch.Tensor, batch.get("responses")).to("cpu")
+                if "responses" in batch
+                else None
             )
-            cpu_prompts = batch.get("prompts").to("cpu") if "prompts" in batch else None
+            cpu_prompts = (
+                cast(torch.Tensor, batch.get("prompts")).to("cpu")
+                if "prompts" in batch
+                else None
+            )
 
         batch_size = cpu_input_ids.size(0)
 
@@ -3043,6 +3075,7 @@ class DrafterBaseTrainer:
         for key in keys:
             value = item.get(key)
             if torch.is_tensor(value):
+                value = cast(torch.Tensor, value)
                 if value.numel() != 1:
                     continue
                 value = value.detach().float().cpu().item()
@@ -3213,6 +3246,10 @@ class DrafterBaseTrainer:
             )
             return None
 
+        if self.model is None:
+            raise RuntimeError(
+                "Cannot prepare drafter training batch before model is initialized"
+            )
         dev = next(self.model.parameters()).device
         if self._is_block_drafter_backend() and self.use_ulysses_sp:
             raise NotImplementedError(
@@ -3275,6 +3312,7 @@ class DrafterBaseTrainer:
                 item_position_ids.size(0),
             ]
             if torch.is_tensor(target_last_h_states):
+                target_last_h_states = cast(torch.Tensor, target_last_h_states)
                 seq_len_limits.append(target_last_h_states.size(0))
             seq_len = min(seq_len_limits)
             if seq_len < 1:
@@ -3284,7 +3322,7 @@ class DrafterBaseTrainer:
                 items_dropped_missing_target += 1
                 continue
 
-            target_logprobs_item = None
+            target_logprobs_item: Any = None
             target_logprobs_train_start = 0
             if self.backend.model_type == "eagle3" and use_logits:
                 target_logprobs_item = preprocessed_lists["target_logprobs"][item_idx]
@@ -3617,6 +3655,7 @@ class DrafterBaseTrainer:
                         last_h_states[1 : 1 + train_seq_len]
                     )
             elif dspark_l1_enabled and torch.is_tensor(target_last_h_states):
+                target_last_h_states = cast(torch.Tensor, target_last_h_states)
                 target_last_hidden_state_chunks.append(
                     target_last_h_states[:train_seq_len]
                 )
@@ -3841,22 +3880,27 @@ class DrafterBaseTrainer:
                 final_target = batch.get("last_hidden_states")
 
             final_loss_mask = batch["loss_mask"]
+            final_target_tensor = (
+                cast(torch.Tensor, final_target)
+                if torch.is_tensor(final_target)
+                else None
+            )
             final_target_rows = (
-                int(final_target.size(1))
-                if torch.is_tensor(final_target) and final_target.dim() >= 2
+                int(final_target_tensor.size(1))
+                if final_target_tensor is not None and final_target_tensor.dim() >= 2
                 else None
             )
             final_row_valid = None
             final_active_rows = None
             final_active_valid = None
             if (
-                torch.is_tensor(final_target)
-                and final_target.dim() >= 3
+                final_target_tensor is not None
+                and final_target_tensor.dim() >= 3
                 and final_target_rows is not None
             ):
                 if self.backend.model_type == "eagle3" and use_logits:
                     final_row_valid_mask = _target_row_valid_mask(
-                        final_target.squeeze(0)
+                        final_target_tensor.squeeze(0)
                     )
                     if (
                         final_row_valid_mask is not None
@@ -4087,6 +4131,10 @@ class DrafterBaseTrainer:
     async def _training_step_on_batch(
         self, batch: dict[str, torch.Tensor], step: int
     ) -> bool:
+        if self.model is None or self.optimizer is None:
+            raise RuntimeError(
+                "Cannot run drafter training before model and optimizer are initialized"
+            )
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -4421,10 +4469,11 @@ class DrafterBaseTrainer:
             except Exception as e:
                 logger.debug(f"DP-group cleanup error (expected): {e}")
         elif self.training_device_mesh is not None:
+            training_device_mesh = self.training_device_mesh
             try:
                 # Give a moment for any pending operations to complete
                 await asyncio.sleep(0.1)
-                if self.training_device_mesh.size() > 1:
+                if training_device_mesh.size() > 1:
                     # Try to destroy the process group if possible
                     try:
                         # Run barrier with timeout to avoid hanging
@@ -4432,7 +4481,7 @@ class DrafterBaseTrainer:
                             asyncio.get_event_loop().run_in_executor(
                                 None,
                                 lambda: torch.distributed.barrier(
-                                    self.training_device_mesh.get_group()
+                                    training_device_mesh.get_group()
                                 ),
                             ),
                             timeout=5.0,
