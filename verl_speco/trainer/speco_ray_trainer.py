@@ -419,13 +419,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             yield
             return
 
-        print(
-            "[speco host memory] AgentLoop manager selected "
-            f"pid={os.getpid()} trainer_device={_get_nested(self.config, ('trainer', 'device'), None)} "
-            f"online_drafter={int(enabled)} manager_class={manager_class}",
-            flush=True,
-        )
-
         rollout_config = _get_nested(self.config, ("actor_rollout_ref", "rollout"), None)
         if rollout_config is None:
             yield
@@ -1814,13 +1807,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     @contextmanager
     def _speco_npu_stage_memory_fit_hook(self):
         """Measure node memory around the common PPO stages."""
-
-        print(
-            f"[speco stage memory] hook=enabled device_name={getattr(self, 'device_name', None)} "
-            f"trainer_device={_get_nested(self.config, ('trainer', 'device'), None)} "
-            f"pid={os.getpid()} proc_group_fmt=count/rss_gib/anon_gib",
-            flush=True,
-        )
 
         rollout_target = self._speco_rollout_generation_target()
         checkpoint_manager = getattr(self, "checkpoint_manager", None)

@@ -59,11 +59,6 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         compat,
-        "install_verl_npu_fsdp_unit_temperature_compat",
-        lambda: events.append("unit_temperature"),
-    )
-    monkeypatch.setattr(
-        compat,
         "install_verl_npu_fsdp_host_memory_reclaim",
         lambda: events.append("host_memory_reclaim"),
     )
@@ -71,6 +66,11 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
         compat,
         "install_verl_npu_fsdp2_weight_export_compat",
         lambda: events.append("fsdp2_export"),
+    )
+    monkeypatch.setattr(
+        compat,
+        "_install_npu_worker_output_lifetime_diagnostics",
+        lambda worker: events.append(("output_lifetime", worker)),
     )
 
     class BaseWorker:
@@ -80,15 +80,47 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     class WrappedWorker(compat.VerlNPUVLLMImportCompatMixin, BaseWorker):
         pass
 
-    WrappedWorker()
-    assert events == [
+    worker = WrappedWorker()
+    assert events[:-1] == [
         "compat",
         "training_output_release",
-        "unit_temperature",
         "host_memory_reclaim",
         "reclaim",
         "fsdp2_export",
         "base",
+    ]
+    assert events[-1] == ("output_lifetime", worker)
+
+
+def test_npu_worker_output_lifetime_diagnostics_wrap_worker_results(monkeypatch) -> None:
+    events = []
+
+    class Worker:
+        rank = 0
+
+        def compute_log_prob(self, value):
+            events.append(("compute", value))
+            return f"output:{value}"
+
+    worker = Worker()
+    monkeypatch.setattr(compat, "_is_npu_worker", lambda: True)
+    monkeypatch.setattr(
+        compat,
+        "log_previous_output_lifetime",
+        lambda owner, key, role, method: events.append(("log", owner, key, role, method)) or 7,
+    )
+    monkeypatch.setattr(
+        compat,
+        "remember_output_lifetime",
+        lambda owner, key, call, output: events.append(("remember", owner, key, call, output)),
+    )
+
+    assert compat._install_npu_worker_output_lifetime_diagnostics(worker) is True
+    assert worker.compute_log_prob("batch") == "output:batch"
+    assert events == [
+        ("log", worker, "worker_dict:compute_log_prob", "worker_dict", "compute_log_prob"),
+        ("compute", "batch"),
+        ("remember", worker, "worker_dict:compute_log_prob", 7, "output:batch"),
     ]
 
 
@@ -328,84 +360,3 @@ def test_fsdp_training_output_release_preserves_forward_only(monkeypatch) -> Non
     _, inference_output = engine.forward_step(None, None, True)
     assert "model_output" not in training_output
     assert inference_output["model_output"] == {"log_probs": "tensor"}
-
-
-def test_npu_fsdp_unit_temperature_skips_only_scalar_identity_scaling(monkeypatch) -> None:
-    events = []
-    engine_module = types.ModuleType(compat._VERL_FSDP_ENGINE_MODULE)
-
-    class FakeTemperature:
-        def clamp(self, **kwargs):
-            events.append(("clamp", kwargs))
-            return self
-
-        def unsqueeze(self, dim):
-            events.append(("unsqueeze", dim))
-            return self
-
-        def to(self, dtype):
-            events.append(("to", dtype))
-            return self
-
-    class FakeLogits:
-        dtype = "bfloat16"
-
-        def __truediv__(self, other):
-            events.append(("divide", other))
-            return "scaled"
-
-    class FSDPEngineWithLMHead:
-        def prepare_model_outputs(self, output, output_args, micro_batch, logits_processor_func):
-            del logits_processor_func
-            if output_args["use_remove_padding"]:
-                logits_rmpad = output.logits
-                temperature_rmpad = output_args["temperature_rmpad"]
-                logits_rmpad = logits_rmpad / temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype)
-                return logits_rmpad
-            logits = output.logits
-            temperature = output_args["temperature"]
-            logits = logits / temperature.clamp(min=1e-8).to(logits.dtype)
-            return logits
-
-    engine_module.FSDPEngineWithLMHead = FSDPEngineWithLMHead
-    modules = {
-        compat._VERL_FSDP_ENGINE_MODULE: engine_module,
-        "verl.utils.device": types.SimpleNamespace(get_device_name=lambda: "npu"),
-    }
-    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
-    monkeypatch.setattr(compat, "_NPU_FSDP_UNIT_TEMPERATURE_APPLIED", False)
-    monkeypatch.setattr(compat, "_NPU_FSDP_UNIT_TEMPERATURE_USED", False)
-
-    assert compat.install_verl_npu_fsdp_unit_temperature_compat(modules.__getitem__) is True
-
-    engine = FSDPEngineWithLMHead()
-    logits = FakeLogits()
-    temperature = FakeTemperature()
-    output = types.SimpleNamespace(logits=logits)
-
-    assert (
-        engine.prepare_model_outputs(
-            output,
-            {"use_remove_padding": True, "temperature_rmpad": temperature},
-            {"temperature": 1.0},
-            None,
-        )
-        is logits
-    )
-    assert events == []
-    assert compat._NPU_FSDP_UNIT_TEMPERATURE_USED is True
-
-    assert (
-        engine.prepare_model_outputs(
-            output,
-            {"use_remove_padding": False, "temperature": temperature},
-            {"temperature": 0.5},
-            None,
-        )
-        == "scaled"
-    )
-    assert events == [
-        ("clamp", {"min": 1e-8}),
-        ("to", "bfloat16"),
-        ("divide", temperature),
-    ]

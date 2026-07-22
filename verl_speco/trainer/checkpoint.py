@@ -6,6 +6,8 @@ import os
 import re
 import sys
 import time
+import weakref
+from collections.abc import Mapping
 from functools import lru_cache
 from glob import glob
 from typing import Any, Optional, Union
@@ -430,6 +432,186 @@ def _jemalloc_mallctl(name: str) -> bool:
         return mallctl(name.encode("ascii"), None, None, None, 0) == 0
     except Exception:  # noqa: BLE001
         return False
+
+
+def _jemalloc_refresh_stats() -> bool:
+    try:
+        mallctl = _jemalloc_mallctl_function()
+        if mallctl is None:
+            return False
+        epoch = ctypes.c_uint64(1)
+        epoch_size = ctypes.c_size_t(ctypes.sizeof(epoch))
+        return (
+            mallctl(
+                b"epoch",
+                ctypes.byref(epoch),
+                ctypes.byref(epoch_size),
+                ctypes.byref(epoch),
+                ctypes.sizeof(epoch),
+            )
+            == 0
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _jemalloc_read_size(name: str) -> Optional[int]:
+    try:
+        mallctl = _jemalloc_mallctl_function()
+        if mallctl is None:
+            return None
+        value = ctypes.c_size_t()
+        value_size = ctypes.c_size_t(ctypes.sizeof(value))
+        if mallctl(name.encode("ascii"), ctypes.byref(value), ctypes.byref(value_size), None, 0) != 0:
+            return None
+        return int(value.value)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def collect_host_allocator_stats() -> dict[str, Any]:
+    """Read allocator counters without allocating or reclaiming model buffers."""
+
+    allocator = _host_allocator_name()
+    stats = {
+        "allocator": allocator,
+        "allocated": None,
+        "active": None,
+        "resident": None,
+        "retained": None,
+    }
+    if allocator != "jemalloc" or not _jemalloc_refresh_stats():
+        return stats
+    for key in ("allocated", "active", "resident", "retained"):
+        stats[key] = _jemalloc_read_size(f"stats.{key}")
+    return stats
+
+
+def _iter_output_memory_buffers(value: Any, seen: set[int]):
+    if value is None:
+        return
+    identifier = id(value)
+    if identifier in seen:
+        return
+    seen.add(identifier)
+
+    numel = getattr(value, "numel", None)
+    element_size = getattr(value, "element_size", None)
+    if callable(numel) and callable(element_size):
+        try:
+            yield value, int(numel()) * int(element_size())
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    nbytes = getattr(value, "nbytes", None)
+    if nbytes is not None:
+        try:
+            yield value, int(nbytes)
+        except (TypeError, ValueError):
+            pass
+        return
+
+    if isinstance(value, Mapping):
+        children = value.values()
+    elif isinstance(value, (list, tuple, set)):
+        children = value
+    elif type(value).__module__.startswith("tensordict") and callable(getattr(value, "values", None)):
+        try:
+            children = value.values()
+        except Exception:  # noqa: BLE001
+            children = ()
+    else:
+        children = (
+            child
+            for child in (
+                getattr(value, "batch", None),
+                getattr(value, "non_tensor_batch", None),
+            )
+            if child is not None and child is not value
+        )
+    for child in children:
+        yield from _iter_output_memory_buffers(child, seen)
+
+
+def _weakref_or_none(value: Any):
+    try:
+        return weakref.ref(value)
+    except TypeError:
+        return None
+
+
+def _format_allocator_stat(stats: dict[str, Any], previous: dict[str, Any], key: str) -> str:
+    value = stats.get(key)
+    previous_value = previous.get(key)
+    if value is None:
+        return f"jemalloc_{key}_gib=n/a jemalloc_{key}_delta_gib=n/a"
+    delta = value - previous_value if previous_value is not None else None
+    delta_text = f"{delta / (1024**3):+.3f}" if delta is not None else "n/a"
+    return (
+        f"jemalloc_{key}_gib={value / (1024**3):.3f} "
+        f"jemalloc_{key}_delta_gib={delta_text}"
+    )
+
+
+def log_previous_output_lifetime(owner: Any, key: str, *, role: str, method: str) -> int:
+    """Log whether a prior Ray-call output remains live without retaining it."""
+
+    states = getattr(owner, "_speco_output_lifetime_states", None)
+    if not isinstance(states, dict):
+        states = {}
+        setattr(owner, "_speco_output_lifetime_states", states)
+    state = states.setdefault(key, {})
+    call_index = int(state.get("call", 0)) + 1
+    state["call"] = call_index
+
+    output_ref = state.get("output_ref")
+    output_alive = int(output_ref() is not None) if callable(output_ref) else -1
+    buffer_refs = state.get("buffer_refs", ())
+    tracked_bytes = sum(size for _, size in buffer_refs)
+    alive_buffers = [(reference, size) for reference, size in buffer_refs if reference() is not None]
+    alive_bytes = sum(size for _, size in alive_buffers)
+
+    allocator_stats = collect_host_allocator_stats()
+    previous_allocator_stats = state.get("allocator_stats", {})
+    process = _read_kib("/proc/self/status", {"VmRSS", "RssAnon"})
+    allocator_text = " ".join(
+        _format_allocator_stat(allocator_stats, previous_allocator_stats, name)
+        for name in ("allocated", "active", "resident", "retained")
+    )
+    print(
+        f"[speco output lifetime] role={role} method={method} call={call_index} "
+        f"pid={os.getpid()} previous_call={state.get('tracked_call', 'none')} "
+        f"previous_output_alive={output_alive} tracked_buffers={len(buffer_refs)} "
+        f"alive_buffers={len(alive_buffers)} tracked_mib={tracked_bytes / (1024**2):.2f} "
+        f"alive_mib={alive_bytes / (1024**2):.2f} "
+        f"rss_gib={process.get('VmRSS', 0) / (1024**2):.2f} "
+        f"anon_gib={process.get('RssAnon', 0) / (1024**2):.2f} "
+        f"allocator={allocator_stats['allocator']} {allocator_text}",
+        flush=True,
+    )
+    state["allocator_stats"] = allocator_stats
+    return call_index
+
+
+def remember_output_lifetime(owner: Any, key: str, call_index: int, output: Any) -> None:
+    """Store only weak references for the next output-lifetime check."""
+
+    states = getattr(owner, "_speco_output_lifetime_states", None)
+    if not isinstance(states, dict):
+        return
+    state = states.get(key)
+    if not isinstance(state, dict) or call_index < int(state.get("tracked_call", 0)):
+        return
+
+    buffer_refs = []
+    for buffer, size in _iter_output_memory_buffers(output, set()):
+        reference = _weakref_or_none(buffer)
+        if reference is not None:
+            buffer_refs.append((reference, max(0, int(size))))
+    state["tracked_call"] = call_index
+    state["output_ref"] = _weakref_or_none(output)
+    state["buffer_refs"] = tuple(buffer_refs)
 
 
 def _jemalloc_reclaim_mode() -> str:

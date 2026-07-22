@@ -5,11 +5,14 @@ from __future__ import annotations
 import contextvars
 import inspect
 import logging
-import os
 from functools import wraps
 from typing import Any
 
-from verl_speco.trainer.checkpoint import trim_process_host_memory
+from verl_speco.trainer.checkpoint import (
+    log_previous_output_lifetime,
+    remember_output_lifetime,
+    trim_process_host_memory,
+)
 
 logger = logging.getLogger(__file__)
 
@@ -67,18 +70,7 @@ def _is_npu_config(config: Any) -> bool:
 def _trim_agent_loop_host_memory(worker: Any) -> None:
     if not _is_npu_config(getattr(worker, "config", None)):
         return
-    reclaim = trim_process_host_memory()
-    if getattr(worker, "_speco_agent_loop_host_memory_reclaim_logged", False):
-        return
-    print(
-        "[speco host memory] AgentLoop entry reclaim active "
-        f"allocator={reclaim.get('allocator', 'unknown')} "
-        f"action={reclaim.get('reclaim_action', 'unknown')} "
-        f"heap_trimmed={int(bool(reclaim['heap_trimmed']))} "
-        f"elapsed_sec={reclaim['elapsed_sec']:.4f}",
-        flush=True,
-    )
-    worker._speco_agent_loop_host_memory_reclaim_logged = True
+    trim_process_host_memory()
 
 
 def _ensure_extra_field_defaults(result: Any) -> Any:
@@ -179,6 +171,17 @@ def _speco_worker_init(self, *args, **kwargs):
 
 async def _speco_worker_generate_sequences(self, batch):
     _trim_agent_loop_host_memory(self)
+    diagnose_host_memory = _is_npu_config(getattr(self, "config", None))
+    call_index = (
+        log_previous_output_lifetime(
+            self,
+            "agent_loop:generate_sequences",
+            role="agent_loop",
+            method="generate_sequences",
+        )
+        if diagnose_host_memory
+        else 0
+    )
     global_steps_token, validate_token = _speco_context_from_batch(batch)
     try:
         generate_sequences = _speco_parent_method(self, "generate_sequences")
@@ -187,19 +190,45 @@ async def _speco_worker_generate_sequences(self, batch):
         result = generate_sequences(self, batch)
         if inspect.isawaitable(result):
             result = await result
-        return _ensure_extra_field_defaults(result)
+        result = _ensure_extra_field_defaults(result)
+        if diagnose_host_memory:
+            remember_output_lifetime(
+                self,
+                "agent_loop:generate_sequences",
+                call_index,
+                result,
+            )
+        return result
     finally:
         _speco_reset_context(global_steps_token, validate_token)
 
 
 async def _speco_host_memory_worker_generate_sequences(self, batch):
     _trim_agent_loop_host_memory(self)
+    diagnose_host_memory = _is_npu_config(getattr(self, "config", None))
+    call_index = (
+        log_previous_output_lifetime(
+            self,
+            "agent_loop:generate_sequences",
+            role="agent_loop",
+            method="generate_sequences",
+        )
+        if diagnose_host_memory
+        else 0
+    )
     generate_sequences = _speco_parent_method(self, "generate_sequences")
     if not callable(generate_sequences):
         raise AttributeError("SPECO AgentLoop worker parent has no generate_sequences method")
     result = generate_sequences(self, batch)
     if inspect.isawaitable(result):
         result = await result
+    if diagnose_host_memory:
+        remember_output_lifetime(
+            self,
+            "agent_loop:generate_sequences",
+            call_index,
+            result,
+        )
     return result
 
 
@@ -342,12 +371,6 @@ def _configure_host_memory_agent_loop_manager_instance(manager: Any, worker_cls:
 
     host_memory_worker_cls = _build_host_memory_agent_loop_worker_class(worker_cls)
     manager.agent_loop_workers_class = ray.remote(host_memory_worker_cls)
-    print(
-        "[speco host memory] AgentLoop manager active "
-        f"pid={os.getpid()} manager={type(manager).__name__} "
-        f"worker_class={host_memory_worker_cls.__name__}",
-        flush=True,
-    )
     return True
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import gc
 import json
+
 import pytest
 
 from verl_speco.trainer import checkpoint as checkpoint_utils
@@ -185,3 +187,92 @@ def test_trim_process_host_memory_reports_allocator(monkeypatch) -> None:
     assert result["heap_trimmed"] is True
     assert result["allocator"] == "jemalloc"
     assert result["reclaim_action"] == "decay"
+
+
+def test_collect_host_allocator_stats_reads_jemalloc_counters(monkeypatch) -> None:
+    values = {
+        "stats.allocated": 1,
+        "stats.active": 2,
+        "stats.resident": 3,
+        "stats.retained": 4,
+    }
+    monkeypatch.setattr(checkpoint_utils, "_host_allocator_name", lambda: "jemalloc")
+    monkeypatch.setattr(checkpoint_utils, "_jemalloc_refresh_stats", lambda: True)
+    monkeypatch.setattr(checkpoint_utils, "_jemalloc_read_size", values.__getitem__)
+
+    assert checkpoint_utils.collect_host_allocator_stats() == {
+        "allocator": "jemalloc",
+        "allocated": 1,
+        "active": 2,
+        "resident": 3,
+        "retained": 4,
+    }
+
+
+def test_output_lifetime_diagnostics_use_only_weak_references(monkeypatch, capsys) -> None:
+    gib = 1024**3
+    stats = iter(
+        {
+            "allocator": "jemalloc",
+            "allocated": value * gib,
+            "active": value * gib,
+            "resident": value * gib,
+            "retained": value * gib,
+        }
+        for value in (1, 2, 3)
+    )
+    monkeypatch.setattr(checkpoint_utils, "collect_host_allocator_stats", lambda: next(stats))
+    monkeypatch.setattr(
+        checkpoint_utils,
+        "_read_kib",
+        lambda path, keys: {"VmRSS": 2 * 1024**2, "RssAnon": 1 * 1024**2},
+    )
+
+    class Owner:
+        pass
+
+    class Buffer:
+        def numel(self):
+            return 1024
+
+        def element_size(self):
+            return 2
+
+    class Output:
+        def __init__(self, buffer):
+            self.batch = {"tensor": buffer}
+
+    owner = Owner()
+    buffer = Buffer()
+    output = Output(buffer)
+
+    first_call = checkpoint_utils.log_previous_output_lifetime(
+        owner,
+        "worker:method",
+        role="worker",
+        method="method",
+    )
+    checkpoint_utils.remember_output_lifetime(owner, "worker:method", first_call, output)
+    checkpoint_utils.log_previous_output_lifetime(
+        owner,
+        "worker:method",
+        role="worker",
+        method="method",
+    )
+    live_log = capsys.readouterr().out
+    assert "previous_output_alive=1" in live_log
+    assert "alive_buffers=1" in live_log
+    assert "jemalloc_allocated_delta_gib=+1.000" in live_log
+
+    del output
+    del buffer
+    gc.collect()
+    checkpoint_utils.log_previous_output_lifetime(
+        owner,
+        "worker:method",
+        role="worker",
+        method="method",
+    )
+    released_log = capsys.readouterr().out
+    assert "previous_output_alive=0" in released_log
+    assert "alive_buffers=0" in released_log

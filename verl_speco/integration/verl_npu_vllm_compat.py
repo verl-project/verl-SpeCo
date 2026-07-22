@@ -7,17 +7,18 @@ import importlib
 import importlib.util
 import inspect
 import logging
-import numbers
 import os
 import sys
-import textwrap
 import time
+from types import MethodType
 from typing import Any, Callable
 
 from packaging import version
 
 from verl_speco.trainer.checkpoint import (
     format_checkpoint_memory_snapshot,
+    log_previous_output_lifetime,
+    remember_output_lifetime,
     release_checkpoint_host_memory,
     trim_process_host_memory,
 )
@@ -32,13 +33,6 @@ _NPU_CHECKPOINT_RECLAIM_APPLIED = False
 _NPU_FSDP2_WEIGHT_EXPORT_APPLIED = False
 _FSDP_TRAIN_OUTPUT_RELEASE_APPLIED = False
 _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED = False
-_NPU_FSDP_UNIT_TEMPERATURE_APPLIED = False
-_NPU_FSDP_UNIT_TEMPERATURE_USED = False
-
-_RMPAD_TEMPERATURE_SCALE_EXPR = (
-    "logits_rmpad / temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype)"
-)
-_PADDED_TEMPERATURE_SCALE_EXPR = "logits / temperature.clamp(min=1e-8).to(logits.dtype)"
 
 try:
     from verl.single_controller.base.decorator import Dispatch, register
@@ -274,99 +268,6 @@ def install_verl_fsdp_training_output_release_compat(
     return True
 
 
-def _scale_logits_for_temperature(logits, temperature, micro_batch, *, tokenwise: bool = False):
-    """Preserve logits when the configured temperature is scalar one."""
-
-    global _NPU_FSDP_UNIT_TEMPERATURE_USED
-    configured_temperature = micro_batch["temperature"]
-    if isinstance(configured_temperature, numbers.Real) and float(configured_temperature) == 1.0:
-        if not _NPU_FSDP_UNIT_TEMPERATURE_USED:
-            logger.warning("[speco host memory] NPU FSDP scalar temperature=1 fast path active")
-            _NPU_FSDP_UNIT_TEMPERATURE_USED = True
-        return logits
-    if tokenwise:
-        temperature = temperature.unsqueeze(-1)
-    return logits / temperature.clamp(min=1e-8).to(logits.dtype)
-
-
-def install_verl_npu_fsdp_unit_temperature_compat(
-    module_importer: Callable[[str], Any] = importlib.import_module,
-) -> bool:
-    """Avoid allocating a full-vocabulary scaled-logits tensor for temperature one.
-
-    verl release/v0.8.0 changed FSDP temperature scaling from an in-place
-    operation to an out-of-place division so DTensor views remain valid. For
-    the default scalar temperature of one, that division is an identity but
-    still allocates another ``[tokens, vocab_size]`` tensor. Keep release
-    semantics for per-sample and non-unit temperatures while skipping only
-    the scalar identity operation on NPU.
-    """
-
-    global _NPU_FSDP_UNIT_TEMPERATURE_APPLIED
-    if _NPU_FSDP_UNIT_TEMPERATURE_APPLIED or not _module_available("torch_npu"):
-        return False
-
-    device_module = module_importer("verl.utils.device")
-    if device_module.get_device_name() != "npu":
-        return False
-
-    engine_module = module_importer(_VERL_FSDP_ENGINE_MODULE)
-    lm_head_cls = getattr(engine_module, "FSDPEngineWithLMHead", None)
-    original_prepare_model_outputs = getattr(lm_head_cls, "prepare_model_outputs", None)
-    if lm_head_cls is None or not callable(original_prepare_model_outputs):
-        return False
-    if getattr(
-        original_prepare_model_outputs,
-        "_speco_npu_unit_temperature_compat",
-        False,
-    ):
-        _NPU_FSDP_UNIT_TEMPERATURE_APPLIED = True
-        return False
-
-    try:
-        source = textwrap.dedent(inspect.getsource(original_prepare_model_outputs))
-    except (OSError, TypeError):
-        return False
-
-    replacements = {
-        _RMPAD_TEMPERATURE_SCALE_EXPR: (
-            "_scale_logits_for_temperature(logits_rmpad, temperature_rmpad, "
-            "micro_batch, tokenwise=True)"
-        ),
-        _PADDED_TEMPERATURE_SCALE_EXPR: (
-            "_scale_logits_for_temperature(logits, temperature, micro_batch)"
-        ),
-    }
-    replacement_count = 0
-    for original_expr, replacement_expr in replacements.items():
-        count = source.count(original_expr)
-        if count:
-            source = source.replace(original_expr, replacement_expr)
-            replacement_count += count
-    if replacement_count == 0:
-        return False
-
-    patched_globals = dict(original_prepare_model_outputs.__globals__)
-    patched_globals["_scale_logits_for_temperature"] = _scale_logits_for_temperature
-    patched_namespace: dict[str, Any] = {}
-    exec(  # noqa: S102
-        compile(source, original_prepare_model_outputs.__code__.co_filename, "exec"),
-        patched_globals,
-        patched_namespace,
-    )
-    patched_prepare_model_outputs = patched_namespace[original_prepare_model_outputs.__name__]
-    functools.update_wrapper(patched_prepare_model_outputs, original_prepare_model_outputs)
-    patched_prepare_model_outputs._speco_npu_unit_temperature_compat = True
-    lm_head_cls.prepare_model_outputs = patched_prepare_model_outputs
-
-    _NPU_FSDP_UNIT_TEMPERATURE_APPLIED = True
-    logger.warning(
-        "Enabled NPU FSDP scalar unit-temperature allocation fast path (%s branches)",
-        replacement_count,
-    )
-    return True
-
-
 def install_verl_npu_fsdp_host_memory_reclaim(
     module_importer: Callable[[str], Any] = importlib.import_module,
 ) -> bool:
@@ -383,64 +284,26 @@ def install_verl_npu_fsdp_host_memory_reclaim(
         return False
 
     device_module = module_importer("verl.utils.device")
-    device_name = device_module.get_device_name()
-    if device_name != "npu":
-        print(
-            "[speco host memory] NPU FSDP reclaim unavailable "
-            f"pid={os.getpid()} reason=device:{device_name}",
-            flush=True,
-        )
+    if device_module.get_device_name() != "npu":
         return False
 
     engine_module = module_importer(_VERL_FSDP_ENGINE_MODULE)
     engine_cls = getattr(engine_module, "FSDPEngine", None)
     original_forward_backward_batch = getattr(engine_cls, "forward_backward_batch", None)
     if engine_cls is None or not callable(original_forward_backward_batch):
-        print(
-            "[speco host memory] NPU FSDP reclaim unavailable "
-            f"pid={os.getpid()} reason=missing_forward_backward_batch",
-            flush=True,
-        )
         return False
     if getattr(original_forward_backward_batch, "_speco_npu_entry_host_memory_reclaim", False):
         _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED = True
-        print(
-            "[speco host memory] NPU FSDP reclaim installed "
-            f"pid={os.getpid()} engine={engine_cls.__module__}.{engine_cls.__name__} already_active=1",
-            flush=True,
-        )
         return False
 
     @functools.wraps(original_forward_backward_batch)
     def forward_backward_batch_with_entry_reclaim(self, *args, **kwargs):
-        reclaim = trim_process_host_memory()
-        if int(getattr(self, "rank", 0) or 0) == 0 and not getattr(
-            self,
-            "_speco_npu_entry_host_memory_reclaim_logged",
-            False,
-        ):
-            print(
-                "[speco host memory] NPU FSDP entry reclaim active "
-                f"pid={os.getpid()} rank={getattr(self, 'rank', None)} "
-                f"engine={type(self).__module__}.{type(self).__name__} "
-                f"allocator={reclaim.get('allocator', 'unknown')} "
-                f"action={reclaim.get('reclaim_action', 'unknown')} "
-                f"heap_trimmed={int(bool(reclaim['heap_trimmed']))} "
-                f"elapsed_sec={reclaim['elapsed_sec']:.4f}",
-                flush=True,
-            )
-            self._speco_npu_entry_host_memory_reclaim_logged = True
+        trim_process_host_memory()
         return original_forward_backward_batch(self, *args, **kwargs)
 
     forward_backward_batch_with_entry_reclaim._speco_npu_entry_host_memory_reclaim = True
     engine_cls.forward_backward_batch = forward_backward_batch_with_entry_reclaim
     _NPU_FSDP_HOST_MEMORY_RECLAIM_APPLIED = True
-    print(
-        "[speco host memory] NPU FSDP reclaim installed "
-        f"pid={os.getpid()} engine={engine_cls.__module__}.{engine_cls.__name__} already_active=0",
-        flush=True,
-    )
-    logger.warning("Enabled NPU FSDP cross-call host-memory reclaim")
     return True
 
 
@@ -547,17 +410,67 @@ def _is_npu_worker() -> bool:
         return False
 
 
+def _install_npu_worker_output_lifetime_diagnostics(worker: Any) -> bool:
+    if not _is_npu_worker() or int(getattr(worker, "rank", 0) or 0) != 0:
+        return False
+    if getattr(worker, "_speco_output_lifetime_diagnostics_installed", False):
+        return False
+
+    installed = []
+    for method_name in ("compute_log_prob", "compute_ref_log_prob", "update_actor"):
+        original = getattr(worker, method_name, None)
+        if not callable(original) or inspect.iscoroutinefunction(original):
+            continue
+
+        @functools.wraps(original)
+        def output_lifetime_wrapper(
+            bound_worker,
+            *args,
+            _original=original,
+            _method_name=method_name,
+            **kwargs,
+        ):
+            call_index = log_previous_output_lifetime(
+                bound_worker,
+                f"worker_dict:{_method_name}",
+                role="worker_dict",
+                method=_method_name,
+            )
+            result = _original(*args, **kwargs)
+            remember_output_lifetime(
+                bound_worker,
+                f"worker_dict:{_method_name}",
+                call_index,
+                result,
+            )
+            return result
+
+        setattr(worker, method_name, MethodType(output_lifetime_wrapper, worker))
+        installed.append(method_name)
+
+    if not installed:
+        return False
+    worker._speco_output_lifetime_diagnostics_installed = True
+    print(
+        "[speco output lifetime] WorkerDict diagnostics installed "
+        f"pid={os.getpid()} rank={getattr(worker, 'rank', None)} "
+        f"methods={','.join(installed)}",
+        flush=True,
+    )
+    return True
+
+
 class VerlNPUVLLMImportCompatMixin:
     """Install import compatibility when WorkerDict constructs the worker."""
 
     def __init__(self, *args, **kwargs):
         install_verl_npu_vllm_import_compat()
         install_verl_fsdp_training_output_release_compat()
-        install_verl_npu_fsdp_unit_temperature_compat()
         install_verl_npu_fsdp_host_memory_reclaim()
         install_verl_npu_checkpoint_reclaim()
         install_verl_npu_fsdp2_weight_export_compat()
         super().__init__(*args, **kwargs)
+        _install_npu_worker_output_lifetime_diagnostics(self)
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
