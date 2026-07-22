@@ -18,7 +18,9 @@ from verl_speco.integration.vllm_runtime import (
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
     _record_vllm_spec_decode_scheduler_stats,
+    _speco_can_use_npu_target_layerwise_reload,
     _speco_persistent_weight_shm_name,
+    _speco_update_target_weights_from_ipc,
     _validate_vllm_dflash_drafter_config,
     _vllm_ascend_has_dspark_pr11153_k_query_runtime,
     _vllm_spec_decode_stats_to_metrics,
@@ -82,11 +84,27 @@ def test_vllm_weight_sync_extension_has_stable_runtime_path() -> None:
     assert SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS.endswith(".SpecoVLLMWeightSyncCompatExtension")
     source = getsource(SpecoVLLMWeightSyncCompatExtension.update_weights_from_ipc)
     assert source.index("patch_verl_bucketed_weight_transfer_rebuild_ipc()") < source.index(
-        "super().update_weights_from_ipc("
+        "_speco_update_target_weights_from_ipc("
     )
     assert source.index("patch_verl_bucketed_weight_transfer_shm_reuse()") < source.index(
-        "super().update_weights_from_ipc("
+        "_speco_update_target_weights_from_ipc("
     )
+
+
+def test_vllm_npu_layerwise_reload_is_guarded_and_has_fallback() -> None:
+    guard_source = getsource(_speco_can_use_npu_target_layerwise_reload)
+    update_source = getsource(_speco_update_target_weights_from_ipc)
+    draft_update_source = getsource(SpecoVLLMColocateWorkerExtension.update_weights_from_ipc)
+
+    assert "not use_shm" in guard_source
+    assert "not _speco_is_npu_vllm_worker(worker)" in guard_source
+    assert "peft_config is not None" in guard_source
+    assert 'getattr(vllm_config, "quant_config", None)' in guard_source
+    assert "return fallback(" in update_source
+    assert "runner.reload_weights(" in update_source
+    assert "is_checkpoint_format=True" in update_source
+    assert "_speco_update_target_weights_from_ipc(" in draft_update_source
+    assert "trim_after=False" in draft_update_source
 
 
 def test_vllm_weight_shm_name_is_stable_and_channel_scoped() -> None:

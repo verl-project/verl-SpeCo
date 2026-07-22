@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from contextlib import nullcontext
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from verl_speco.integration.verl_npu_vllm_compat import install_verl_npu_vllm_import_compat
 from verl_speco.trainer.checkpoint import trim_process_host_memory
@@ -35,6 +35,7 @@ SPECO_VLLM_WORKER_EXTENSION_CLS = "verl_speco.integration.vllm_runtime.SpecoVLLM
 SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_ENV = "VERL_SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_SECONDS"
 SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
 SPECO_VLLM_DRAFT_DIAG_ENV = "VERL_SPECO_VLLM_DRAFT_DIAG"
+SPECO_VLLM_NPU_LAYERWISE_RELOAD_ENV = "VERL_SPECO_VLLM_NPU_LAYERWISE_RELOAD"
 
 _VLLM_REPLICA_PATCHED = False
 _VLLM_DFLASH_CONFIG_ALIASES_PATCHED = False
@@ -1909,6 +1910,148 @@ def install_vllm_runtime_for_worker(worker: Any) -> None:
     patch_vllm_server_adapter_update()
 
 
+def _speco_can_use_npu_target_layerwise_reload(
+    worker: Any,
+    *,
+    peft_config: dict | None,
+    use_shm: bool,
+) -> bool:
+    """Return whether target weights can use vLLM's bounded reload path."""
+
+    if _bool_or_none(os.getenv(SPECO_VLLM_NPU_LAYERWISE_RELOAD_ENV)) is False:
+        return False
+    if not use_shm or not _speco_is_npu_vllm_worker(worker) or peft_config is not None:
+        return False
+    if bool(getattr(worker, "_is_qat_model", False)) or bool(getattr(worker, "_is_modelopt_qat", False)):
+        return False
+
+    use_mtp_sync = getattr(worker, "_use_mtp_drafter_weight_sync", None)
+    if callable(use_mtp_sync) and use_mtp_sync():
+        return False
+
+    runner = getattr(worker, "model_runner", None)
+    reload_weights = getattr(runner, "reload_weights", None)
+    vllm_config = getattr(runner, "vllm_config", None)
+    if not callable(reload_weights) or vllm_config is None:
+        return False
+
+    # Keep quantized and adapter updates on verl's established path. Their
+    # post-load transforms have additional state that layerwise reload must
+    # handle together with the matching upstream version.
+    if getattr(vllm_config, "quant_config", None) is not None:
+        return False
+    return True
+
+
+def _speco_iter_npu_shm_weights(receiver: Any):
+    """Stream independent NPU tensors from a reusable verl SHM bucket."""
+
+    from verl.utils.device import get_torch_device
+    from verl.workers.rollout.vllm_rollout import bucketed_weight_transfer
+
+    try:
+        receiver._init_socket()
+        receiver._init_buffer()
+
+        while True:
+            metadata = receiver.socket.recv_pyobj()
+            is_last = bool(metadata["is_last"])
+            tensor = None
+            for name, meta in metadata["bucket_meta"].items():
+                shape = meta["shape"]
+                dtype = meta["dtype"]
+                offset = meta["offset"]
+                handle = meta["handle"]
+                if handle is not None:
+                    tensor = bucketed_weight_transfer.rebuild_ipc(handle, receiver.device.index)
+                else:
+                    size = dtype.itemsize * shape.numel()
+                    tensor = receiver.buffer[offset : offset + size].view(dtype=dtype).view(shape)
+                    if receiver.use_shm:
+                        # This copy gives reload_weights independent device
+                        # storage. A second clone would only double the
+                        # transient allocation for the NPU SHM path.
+                        tensor = tensor.to(receiver.device)
+                yield name, tensor
+
+            get_torch_device().synchronize()
+            receiver.socket.send(b"")
+            tensor = None
+            metadata = None
+            if is_last:
+                break
+    finally:
+        receiver._cleanup()
+
+
+def _speco_update_target_weights_from_ipc(
+    worker: Any,
+    *,
+    peft_config: dict | None,
+    base_sync_done: bool,
+    use_shm: bool,
+    fallback: Callable[..., Any],
+    trim_after: bool = True,
+):
+    """Use vLLM layerwise reload for eligible NPU target-model updates."""
+
+    if not _speco_can_use_npu_target_layerwise_reload(
+        worker,
+        peft_config=peft_config,
+        use_shm=use_shm,
+    ):
+        try:
+            return fallback(
+                peft_config=peft_config,
+                base_sync_done=base_sync_done,
+                use_shm=use_shm,
+            )
+        finally:
+            if trim_after and _speco_is_npu_vllm_worker(worker):
+                trim_process_host_memory()
+
+    import torch
+    from vllm.config import set_current_vllm_config
+
+    from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+
+    if getattr(worker, "device", None) is None:
+        worker.device = torch.device(f"npu:{worker.local_rank}")
+
+    iter_models = getattr(worker, "_iter_all_models", None)
+    if callable(iter_models):
+        for model in iter_models():
+            patch_vllm_moe_model_weight_loader(model)
+
+    receiver = BucketedWeightReceiver(
+        zmq_handle=worker._get_zmq_handle(),
+        device=worker.device,
+        use_shm=True,
+    )
+    runner = worker.model_runner
+    if not getattr(worker, "_speco_logged_npu_layerwise_reload", False):
+        worker._speco_logged_npu_layerwise_reload = True
+        logger.warning(
+            "[speco vllm weight sync] using NPU layerwise target reload with reusable SHM pid=%s local_rank=%s",
+            os.getpid(),
+            getattr(worker, "local_rank", None),
+        )
+
+    try:
+        with set_current_vllm_config(runner.vllm_config):
+            runner.reload_weights(
+                weights_iterator=_speco_iter_npu_shm_weights(receiver),
+                is_checkpoint_format=True,
+            )
+    finally:
+        # The receiver owns no model tensors after reload. This only returns
+        # genuinely free libc arenas; live NPU/ACL allocations remain intact.
+        if trim_after:
+            trim_process_host_memory()
+    return None
+
+
 try:
     from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension as _VLLMWorkerExtensionBase
 except Exception:  # noqa: BLE001
@@ -1923,21 +2066,13 @@ class SpecoVLLMWeightSyncCompatExtension(_VLLMWorkerExtensionBase):
         patch_verl_bucketed_weight_transfer_shm_reuse()
         if patched and int(getattr(self, "local_rank", 0) or 0) == 0:
             logger.warning("[speco vllm weight sync] installed IPC rebuild compatibility")
-        if not _speco_is_npu_vllm_worker(self):
-            return super().update_weights_from_ipc(
-                peft_config=peft_config,
-                base_sync_done=base_sync_done,
-                use_shm=use_shm,
-            )
-
-        try:
-            return super().update_weights_from_ipc(
-                peft_config=peft_config,
-                base_sync_done=base_sync_done,
-                use_shm=use_shm,
-            )
-        finally:
-            trim_process_host_memory()
+        return _speco_update_target_weights_from_ipc(
+            self,
+            peft_config=peft_config,
+            base_sync_done=base_sync_done,
+            use_shm=use_shm,
+            fallback=super().update_weights_from_ipc,
+        )
 
 
 class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
@@ -2273,8 +2408,13 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         # Diagnostic: check draft state BEFORE target sync
         self._speco_diag_draft_state("before_target_sync")
         try:
-            result = super().update_weights_from_ipc(
-                peft_config=peft_config, base_sync_done=base_sync_done, use_shm=use_shm
+            result = _speco_update_target_weights_from_ipc(
+                self,
+                peft_config=peft_config,
+                base_sync_done=base_sync_done,
+                use_shm=use_shm,
+                fallback=super().update_weights_from_ipc,
+                trim_after=False,
             )
             # Diagnostic: check draft state AFTER target sync (may be zeroed by wake_up)
             self._speco_diag_draft_state("after_target_sync")
