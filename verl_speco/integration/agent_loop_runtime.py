@@ -6,7 +6,7 @@ import contextvars
 import inspect
 import logging
 from functools import wraps
-from typing import Any
+from typing import Any, cast
 
 logger = logging.getLogger(__file__)
 
@@ -315,15 +315,26 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
     manager._speco_agent_loop_manager_configured = True
 
 
-class SpecoAgentLoopManager(_UpstreamAgentLoopManager):
-    """Explicit AgentLoopManager bridge used by upstream config loading."""
+_upstream_agent_loop_manager_base = cast(type[Any], _UpstreamAgentLoopManager)
 
-    def __init__(self, *args, **kwargs):
-        install_agent_loop_runtime_patch()
-        super().__init__(*args, **kwargs)
-        agent_loop_module = _AgentLoopModule or _load_agent_loop_module()
-        worker_cls = getattr(agent_loop_module, "AgentLoopWorker")
-        _configure_speco_agent_loop_manager_instance(self, worker_cls)
+
+def _speco_agent_loop_manager_init(self: Any, *args: Any, **kwargs: Any) -> None:
+    install_agent_loop_runtime_patch()
+    _upstream_agent_loop_manager_base.__init__(self, *args, **kwargs)
+    agent_loop_module = _AgentLoopModule or _load_agent_loop_module()
+    worker_cls = getattr(agent_loop_module, "AgentLoopWorker")
+    _configure_speco_agent_loop_manager_instance(self, worker_cls)
+
+
+SpecoAgentLoopManager = type(
+    "SpecoAgentLoopManager",
+    (_upstream_agent_loop_manager_base,),
+    {
+        "__doc__": "Explicit AgentLoopManager bridge used by upstream config loading.",
+        "__init__": _speco_agent_loop_manager_init,
+        "__module__": __name__,
+    },
+)
 
 
 def install_agent_loop_runtime_patch() -> bool:

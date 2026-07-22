@@ -1,6 +1,7 @@
 import logging
 import os
 from copy import deepcopy
+from typing import Any, Optional, cast
 
 import torch
 from torch.nn import SmoothL1Loss
@@ -132,11 +133,10 @@ def _log_eagle3_raw_topk_check(
     if item.get("hidden_target_logprobs_source") != _RAW_HIDDEN_METADATA_SOURCE:
         return
     raw_target_logprobs = item.get("hidden_raw_target_logprobs")
-    if (
-        not torch.is_tensor(raw_target_logprobs)
-        or raw_target_logprobs.dim() != 3
-        or raw_target_logprobs.size(-1) < 2
-    ):
+    if not torch.is_tensor(raw_target_logprobs):
+        return
+    raw_target_logprobs = cast(torch.Tensor, raw_target_logprobs)
+    if raw_target_logprobs.dim() != 3 or raw_target_logprobs.size(-1) < 2:
         return
     if target_model is None:
         logger.debug(
@@ -614,9 +614,9 @@ class Eagle3TrainerBackend:
         self.config = config
         self.target_model_config = target_model_config
         self.criterion = SmoothL1Loss(reduction="none")
-        self.target_model = None
-        self.vocab_size = None
-        self._target_token_to_draft_index = None
+        self.target_model: Any = None
+        self.vocab_size: Optional[int] = None
+        self._target_token_to_draft_index: Optional[torch.Tensor] = None
 
     @property
     def model_type(self):

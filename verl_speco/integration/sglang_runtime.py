@@ -16,7 +16,7 @@ import logging
 import os
 import time
 from dataclasses import fields
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 try:
     import torch
@@ -815,7 +815,7 @@ async def _sgl_update_weights_with_route(
         (name, MultiprocessingSerializer.serialize(_prepare_update_tensor(tensor)))
         for name, tensor in params_batch
     ]
-    gathered_serialized_batches = (
+    gathered_serialized_batches: list[Any] | None = (
         [None for _ in range(infer_tp_size)] if infer_tp_rank == 0 else None
     )
     dist.gather_object(
@@ -826,6 +826,7 @@ async def _sgl_update_weights_with_route(
     )
     if infer_tp_rank != 0:
         return None
+    assert gathered_serialized_batches is not None
 
     logical_tensors = zip(*gathered_serialized_batches, strict=True)
     named_tensors = [
@@ -917,7 +918,7 @@ async def speco_update_target_weights(
     self,
     weights,
     *args,
-    global_steps: int = None,
+    global_steps: int | None = None,
     **kwargs,
 ):
     """Update only SGLang target weights when speculative drafter is enabled."""
@@ -1011,7 +1012,7 @@ async def speco_update_draft_weights(
     self,
     weights: dict[str, Any],
     *args,
-    global_steps: int = None,
+    global_steps: int | None = None,
     **kwargs,
 ):
     """Update only SGLang draft weights from an upstream ServerAdapter instance."""
@@ -1118,6 +1119,16 @@ def patch_sglang_server_adapter_update() -> None:
 
 
 class _SpecoSGLangHttpServerMixin:
+    config: Any
+    global_steps: Optional[int]
+    model_config: Any
+    replica_rank: int
+    tokenizer_manager: Any
+    _speco_last_collection_skip_reason: Optional[str]
+
+    def _speco_upstream_generate(self) -> Any:
+        return getattr(super(_SpecoSGLangHttpServerMixin, self), "generate")
+
     async def launch_server(self, *args, **kwargs):
         self._speco_drafter_config = install_sglang_server_actor_runtime()
         self.global_steps = getattr(self, "global_steps", None)
@@ -1399,7 +1410,7 @@ class _SpecoSGLangHttpServerMixin:
             and drafter_cfg.get("enable_drafter_training")
             and training_cfg.get("collect_hidden_states_from_sgl")
         ):
-            return await super().generate(
+            return await self._speco_upstream_generate()(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(sampling_params),
                 request_id,
@@ -1433,7 +1444,7 @@ class _SpecoSGLangHttpServerMixin:
                 max_new_tokens=None,
                 hidden_window_plan=None,
             )
-            return await super().generate(
+            return await self._speco_upstream_generate()(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(original_sampling_params),
                 request_id,
@@ -1495,7 +1506,7 @@ class _SpecoSGLangHttpServerMixin:
                 max_new_tokens=max_new_tokens,
                 hidden_window_plan=hidden_window_plan,
             )
-            return await super().generate(
+            return await self._speco_upstream_generate()(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(original_sampling_params),
                 request_id,
@@ -1565,8 +1576,8 @@ class _SpecoSGLangHttpServerMixin:
                 hidden_states_raw_len = len(hidden_states_data)
             except TypeError:
                 hidden_states_raw_len = None
-            hidden_states_list = []
-            hidden_states_metadata = []
+            hidden_states_list: list[Any] = []
+            hidden_states_metadata: list[dict[str, Any]] = []
             for hs in _iter_hidden_state_chunks(hidden_states_data):
                 h_states, metadata = _hidden_state_chunk_to_tensor_and_metadata(hs)
                 if h_states is not None:
@@ -1578,24 +1589,26 @@ class _SpecoSGLangHttpServerMixin:
             hidden_window_start = hidden_window_plan.get("window_start")
             hidden_window_end = hidden_window_plan.get("window_end")
             hidden_window_start_offset = hidden_window_plan.get("window_start_offset")
-            hidden_window_min_rows = int(hidden_window_plan.get("min_rows", 0) or 0)
+            hidden_window_min_rows = int(
+                cast(Any, hidden_window_plan.get("min_rows", 0)) or 0
+            )
             hidden_window_target_rows = hidden_window_plan.get("target_window_rows")
             hidden_raw_len = 0
             hidden_kept_len = 0
             hidden_position_start = 0
             hidden_position_end = 0
             hidden_prefix_cache_rows = 0
-            hidden_positions = None
-            target_logprobs = None
-            target_logprobs_position_start = None
-            target_logprobs_position_end = None
+            hidden_positions: Any = None
+            target_logprobs: Any = None
+            target_logprobs_position_start: Optional[int] = None
+            target_logprobs_position_end: Optional[int] = None
             hidden_last_hidden_logprob_check = None
             hidden_target_logprobs_source = None
             hidden_raw_topk_logprob_check = None
-            hidden_raw_target_logprobs = None
-            hidden_raw_target_logprobs_positions = None
-            hidden_raw_target_logprobs_position_start = None
-            hidden_raw_target_logprobs_position_end = None
+            hidden_raw_target_logprobs: Any = None
+            hidden_raw_target_logprobs_positions: Any = None
+            hidden_raw_target_logprobs_position_start: Optional[int] = None
+            hidden_raw_target_logprobs_position_end: Optional[int] = None
             hidden_last_hidden_filter = None
             hidden_last_hidden_select = None
 
@@ -1675,7 +1688,7 @@ class _SpecoSGLangHttpServerMixin:
                             raw_target_logprob_chunks, dim=0
                         ).contiguous()
                         raw_target_rows = int(hidden_raw_target_logprobs.size(0))
-                        raw_target_position_chunks = []
+                        raw_target_position_chunks: list[Any] = []
                         if any(
                             torch.is_tensor(
                                 metadata.get("raw_target_logprobs_positions")
@@ -1686,14 +1699,21 @@ class _SpecoSGLangHttpServerMixin:
                                 raw_chunk = metadata.get("raw_target_logprobs")
                                 if not torch.is_tensor(raw_chunk):
                                     continue
+                                raw_chunk = cast(Any, raw_chunk)
                                 raw_position_chunk = metadata.get(
                                     "raw_target_logprobs_positions"
                                 )
-                                if torch.is_tensor(raw_position_chunk) and int(
-                                    raw_position_chunk.numel()
-                                ) == int(raw_chunk.size(0)):
+                                raw_position_tensor: Any = None
+                                if torch.is_tensor(raw_position_chunk):
+                                    raw_position_tensor = cast(Any, raw_position_chunk)
+                                    raw_position_matches = int(
+                                        raw_position_tensor.numel()
+                                    ) == int(raw_chunk.size(0))
+                                else:
+                                    raw_position_matches = False
+                                if raw_position_matches:
                                     raw_target_position_chunks.append(
-                                        raw_position_chunk.reshape(-1).to(
+                                        raw_position_tensor.reshape(-1).to(
                                             dtype=torch.long
                                         )
                                     )
@@ -1891,9 +1911,11 @@ class _SpecoSGLangHttpServerMixin:
                                     :aligned_prefix_rows
                                 ]
                             if torch.is_tensor(hidden_raw_target_logprobs_positions):
-                                hidden_raw_target_logprobs_positions = hidden_raw_target_logprobs_positions[
-                                    :aligned_prefix_rows
-                                ]
+                                hidden_raw_target_logprobs_positions = (
+                                    hidden_raw_target_logprobs_positions[
+                                        :aligned_prefix_rows
+                                    ]
+                                )
 
                 if fail_closed_alignment_reason is not None:
                     logger.warning(

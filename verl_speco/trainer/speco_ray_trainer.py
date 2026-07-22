@@ -7,7 +7,7 @@ import os
 import time
 from contextlib import contextmanager
 from types import MethodType
-from typing import Any
+from typing import Any, cast
 
 import ray
 import torch
@@ -125,6 +125,7 @@ def _speco_ref_meta_row_count(meta: Any, default: int = 0) -> int:
         return int(default)
     row_indices = meta.get("chunk_row_indices")
     if torch.is_tensor(row_indices):
+        row_indices = cast(torch.Tensor, row_indices)
         return int(row_indices.numel())
     if isinstance(row_indices, (list, tuple)):
         return len(row_indices)
@@ -1322,7 +1323,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         owner_rank = collect_plan["owner_rank"]
         prompt_lens = collect_plan["prompt_lens"]
         response_lens = collect_plan["response_lens"]
-        buckets = [[] for _ in range(int(collect_plan["owner_count"]))]
+        buckets: list[list[dict[str, Any]]] = [
+            [] for _ in range(int(collect_plan["owner_count"]))
+        ]
         collected_rows = 0
         payload_bytes = 0
         sample_ref_chunks: dict[int, list[dict[str, Any]]] = {}
@@ -1419,7 +1422,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             prompt_ids = prompt_ids[:prompt_len]
             response_ids = response_ids[:response_len]
             sample_input_ids = torch.cat([prompt_ids, response_ids], dim=0)
-            sample = {
+            sample: dict[str, Any] = {
                 "input_ids": sample_input_ids.unsqueeze(0),
                 "prompts": prompt_ids.unsqueeze(0),
                 "responses": response_ids.unsqueeze(0),
@@ -1433,6 +1436,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if ref_chunks:
                 sample["hidden_states_ref_chunks"] = ref_chunks
             elif hidden_ref is None:
+                assert hidden is not None
                 sample["hidden_states"] = hidden.detach().cpu().unsqueeze(0)
             else:
                 sample["hidden_states_ref"] = hidden_ref
@@ -1747,7 +1751,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             default=0,
         )
 
-        metrics = {
+        metrics: dict[str, Any] = {
             "drafter/trained": int(trained),
             "drafter/train_successful_steps_max": successful_steps_max,
             "drafter/train_no_trainable_batch": int(
