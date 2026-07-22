@@ -1756,26 +1756,23 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_log_stage_memory(self, stage: str, phase: str, call_index: int) -> None:
         if call_index > 8 and call_index % 10 != 0:
             return
-        logger.warning(
-            "[speco stage memory] stage=%s phase=%s call_tag=%s call=%s step=%s pid=%s %s",
-            stage,
-            phase,
-            _speco_alpha_counter(call_index),
-            call_index,
-            self.global_steps,
-            os.getpid(),
-            format_checkpoint_memory_snapshot(),
+        print(
+            f"[speco stage memory] stage={stage} phase={phase} "
+            f"call_tag={_speco_alpha_counter(call_index)} call={call_index} "
+            f"step={self.global_steps} pid={os.getpid()} "
+            f"{format_checkpoint_memory_snapshot()}",
+            flush=True,
         )
 
     @contextmanager
     def _speco_npu_stage_memory_fit_hook(self):
         """Measure node memory around the common PPO stages."""
 
-        logger.warning(
-            "[speco stage memory] hook=enabled device_name=%s trainer_device=%s pid=%s",
-            getattr(self, "device_name", None),
-            _get_nested(self.config, ("trainer", "device"), None),
-            os.getpid(),
+        print(
+            f"[speco stage memory] hook=enabled device_name={getattr(self, 'device_name', None)} "
+            f"trainer_device={_get_nested(self.config, ('trainer', 'device'), None)} "
+            f"pid={os.getpid()}",
+            flush=True,
         )
 
         rollout_target = self._speco_rollout_generation_target()
