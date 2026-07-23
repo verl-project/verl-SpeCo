@@ -38,7 +38,9 @@ def _build_batch(target, tokenizer, target_layer_ids, device):
     id_chunks, mask_chunks, hidden_chunks = [], [], []
     for text in PROMPTS:
         messages = [{"role": "user", "content": text}]
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
         enc = tokenizer(prompt, return_tensors="pt").to(device)
         with torch.no_grad():
             out = target(input_ids=enc["input_ids"], output_hidden_states=True)
@@ -51,12 +53,19 @@ def _build_batch(target, tokenizer, target_layer_ids, device):
     input_ids = torch.cat(id_chunks).unsqueeze(0)
     loss_mask = torch.cat(mask_chunks).unsqueeze(0)
     hidden = torch.cat(hidden_chunks).unsqueeze(0).to(torch.bfloat16)
-    return {"input_ids": input_ids, "loss_mask": loss_mask, "hidden_states": hidden, "attention_mask": torch.ones_like(input_ids)}
+    return {
+        "input_ids": input_ids,
+        "loss_mask": loss_mask,
+        "hidden_states": hidden,
+        "attention_mask": torch.ones_like(input_ids),
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target", required=True, help="path or HF id of the target causal LM")
+    parser.add_argument(
+        "--target", required=True, help="path or HF id of the target causal LM"
+    )
     parser.add_argument("--steps", type=int, default=120)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-context-layers", type=int, default=5)
@@ -68,7 +77,11 @@ def main() -> None:
 
     print(f"[smoke] loading target {args.target}")
     tokenizer = AutoTokenizer.from_pretrained(args.target)
-    target = AutoModelForCausalLM.from_pretrained(args.target, torch_dtype=torch.bfloat16).to(device).eval()
+    target = (
+        AutoModelForCausalLM.from_pretrained(args.target, torch_dtype=torch.bfloat16)
+        .to(device)
+        .eval()
+    )
     target_cfg = AutoConfig.from_pretrained(args.target)
 
     from verl_speco.models.dflash import build_target_layer_ids
@@ -78,7 +91,9 @@ def main() -> None:
     print(f"[smoke] context layers={target_layer_ids} (of {target_layers})")
 
     batch = _build_batch(target, tokenizer, target_layer_ids, device)
-    print(f"[smoke] batch seq_len={batch['input_ids'].size(1)} hidden={batch['hidden_states'].size(-1)}")
+    print(
+        f"[smoke] batch seq_len={batch['input_ids'].size(1)} hidden={batch['hidden_states'].size(-1)}"
+    )
 
     cfg = OmegaConf.create(
         {

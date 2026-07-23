@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import logging
 import glob
 import json
@@ -782,10 +795,12 @@ class DFlashTrainerBackend:
             getattr(target_text_config, "hidden_size", None)
             or getattr(drafter_config, "target_hidden_size")
         )
-        target_num_hidden_layers = int(
-            getattr(target_text_config, "num_hidden_layers", None)
-            or getattr(drafter_config, "target_num_hidden_layers", 36)
-        )
+        target_num_hidden_layers_value = getattr(
+            target_text_config, "num_hidden_layers", None
+        ) or getattr(drafter_config, "target_num_hidden_layers", 36)
+        if target_num_hidden_layers_value is None:
+            raise ValueError("target_num_hidden_layers must be set for DFlash")
+        target_num_hidden_layers = int(target_num_hidden_layers_value)
 
         nested_dflash_config = getattr(drafter_config, "dflash_config", None)
         nested_target_layer_ids = None

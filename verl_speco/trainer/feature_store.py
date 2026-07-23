@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Feature store primitives for standalone SPECO draft training."""
 
 from __future__ import annotations
@@ -9,7 +22,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Protocol
+from typing import Any, Iterator, Protocol, cast
 
 import torch
 
@@ -82,11 +95,19 @@ class DraftFeatureSample:
             self.input_ids = self.input_ids.reshape(-1)
         if self.loss_mask.dim() > 1:
             self.loss_mask = self.loss_mask.reshape(-1)
-        if torch.is_tensor(self.position_ids) and self.position_ids.dim() > 1:
-            self.position_ids = self.position_ids.reshape(-1)
-        if torch.is_tensor(self.target_logprobs):
-            while self.target_logprobs.dim() > 3 and self.target_logprobs.size(0) == 1:
-                self.target_logprobs = self.target_logprobs.squeeze(0)
+        position_ids = self.position_ids
+        if torch.is_tensor(position_ids):
+            position_ids_tensor = cast(Any, position_ids)
+            if position_ids_tensor.dim() > 1:
+                self.position_ids = position_ids_tensor.reshape(-1)
+        target_logprobs = self.target_logprobs
+        if torch.is_tensor(target_logprobs):
+            target_logprobs_tensor = cast(Any, target_logprobs)
+            while (
+                target_logprobs_tensor.dim() > 3 and target_logprobs_tensor.size(0) == 1
+            ):
+                target_logprobs_tensor = target_logprobs_tensor.squeeze(0)
+            self.target_logprobs = target_logprobs_tensor
         if self.input_ids.size(0) != self.loss_mask.size(0) and strict:
             raise ValueError(
                 "DraftFeatureSample input_ids/loss_mask length mismatch: "
@@ -94,25 +115,26 @@ class DraftFeatureSample:
             )
         if (
             torch.is_tensor(self.position_ids)
-            and self.position_ids.size(0) != self.input_ids.size(0)
+            and cast(Any, self.position_ids).size(0) != self.input_ids.size(0)
             and strict
         ):
             raise ValueError(
                 "DraftFeatureSample input_ids/position_ids length mismatch: "
-                f"{self.input_ids.size(0)} vs {self.position_ids.size(0)}"
+                f"{self.input_ids.size(0)} vs {cast(Any, self.position_ids).size(0)}"
             )
-        if (
-            torch.is_tensor(self.hidden_states)
-            and self.hidden_states.dim() == 3
-            and self.hidden_states.size(0) == 1
-        ):
-            self.hidden_states = self.hidden_states.squeeze(0)
-        if (
-            torch.is_tensor(self.last_hidden_states)
-            and self.last_hidden_states.dim() == 3
-            and self.last_hidden_states.size(0) == 1
-        ):
-            self.last_hidden_states = self.last_hidden_states.squeeze(0)
+        hidden_states = self.hidden_states
+        if torch.is_tensor(hidden_states):
+            hidden_states_tensor = cast(Any, hidden_states)
+            if hidden_states_tensor.dim() == 3 and hidden_states_tensor.size(0) == 1:
+                self.hidden_states = hidden_states_tensor.squeeze(0)
+        last_hidden_states = self.last_hidden_states
+        if torch.is_tensor(last_hidden_states):
+            last_hidden_states_tensor = cast(Any, last_hidden_states)
+            if (
+                last_hidden_states_tensor.dim() == 3
+                and last_hidden_states_tensor.size(0) == 1
+            ):
+                self.last_hidden_states = last_hidden_states_tensor.squeeze(0)
         if self.target_logprobs is not None and not torch.is_tensor(
             self.target_logprobs
         ):
@@ -121,12 +143,12 @@ class DraftFeatureSample:
             )
         if (
             torch.is_tensor(self.target_logprobs)
-            and self.target_logprobs.dim() != 3
+            and cast(Any, self.target_logprobs).dim() != 3
             and strict
         ):
             raise ValueError(
                 "DraftFeatureSample.target_logprobs must have shape [rows, topk, 2], "
-                f"got {tuple(self.target_logprobs.shape)}"
+                f"got {tuple(cast(Any, self.target_logprobs).shape)}"
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -308,7 +330,8 @@ class TorchShardFeatureStore:
         self._manifest.append(entry)
         self._pending = []
         self._next_shard_index += 1
-        return [f"{shard_name}:{idx}" for idx in range(entry["num_samples"])]
+        num_samples = int(cast(Any, entry["num_samples"]))
+        return [f"{shard_name}:{idx}" for idx in range(num_samples)]
 
     def flush_on_step(self, global_step: int | None, interval_steps: int) -> list[str]:
         """Flush pending samples on configured training-step boundaries."""
@@ -445,10 +468,10 @@ def _cpu_tensor_tree(value: Any) -> Any:
 def _sample_token_count(sample: dict[str, Any]) -> int:
     loss_mask = sample.get("loss_mask")
     if torch.is_tensor(loss_mask):
-        return int(loss_mask.detach().float().sum().item())
+        return int(cast(Any, loss_mask).detach().float().sum().item())
     input_ids = sample.get("input_ids")
     if torch.is_tensor(input_ids):
-        return int(input_ids.numel())
+        return int(cast(Any, input_ids).numel())
     return 0
 
 
@@ -457,6 +480,8 @@ def _metadata_int(sample: dict[str, Any], name: str) -> int | None:
     if not isinstance(metadata, dict):
         return None
     value = metadata.get(name)
+    if value is None:
+        return None
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -464,15 +489,15 @@ def _metadata_int(sample: dict[str, Any], name: str) -> int | None:
 
 
 def _min_metadata_int(samples: list[dict[str, Any]], name: str) -> int | None:
-    values = [_metadata_int(sample, name) for sample in samples]
-    values = [value for value in values if value is not None]
-    return min(values) if values else None
+    values: list[int | None] = [_metadata_int(sample, name) for sample in samples]
+    int_values = [value for value in values if value is not None]
+    return min(int_values) if int_values else None
 
 
 def _max_metadata_int(samples: list[dict[str, Any]], name: str) -> int | None:
-    values = [_metadata_int(sample, name) for sample in samples]
-    values = [value for value in values if value is not None]
-    return max(values) if values else None
+    values: list[int | None] = [_metadata_int(sample, name) for sample in samples]
+    int_values = [value for value in values if value is not None]
+    return max(int_values) if int_values else None
 
 
 def _parse_key(key: str) -> tuple[str, int]:

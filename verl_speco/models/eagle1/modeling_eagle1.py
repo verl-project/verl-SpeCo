@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Llama-style dense draft model for EAGLE-1 / EAGLE-2 training.
 
 Logic ported from NeMo AutoModel's EAGLE-1/2 ``LlamaEagleDraftModel``
@@ -206,9 +219,12 @@ class LlamaForCausalLMEagle1(DraftModel):
         self.fc = nn.Linear(
             config.hidden_size + self.target_hidden_size, config.hidden_size, bias=False
         )
-        num_layers = max(
-            1, int(getattr(config, "draft_num_hidden_layers", config.num_hidden_layers))
+        draft_num_hidden_layers = getattr(
+            config, "draft_num_hidden_layers", config.num_hidden_layers
         )
+        if draft_num_hidden_layers is None:
+            raise ValueError("draft_num_hidden_layers must be set")
+        num_layers = max(1, int(draft_num_hidden_layers))
         self.layers = nn.ModuleList(
             [EagleLlamaDecoderLayer(config) for _ in range(num_layers)]
         )

@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """External SPECO worker.
 
 Adapted from the current in-tree
@@ -13,7 +26,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional
+from typing import Any, Optional, cast
 
 import numpy as np
 import ray
@@ -76,6 +89,7 @@ def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
         tensor = resolved_cache[cache_key]
         if not torch.is_tensor(tensor):
             continue
+        tensor = cast(torch.Tensor, tensor)
         start = int(chunk.get("chunk_start", 0) or 0)
         length = int(chunk.get("chunk_length", 0) or 0)
         if length <= 0:
@@ -83,6 +97,7 @@ def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
         part = tensor[start : start + length]
         row_indices = chunk.get("chunk_row_indices")
         if torch.is_tensor(row_indices):
+            row_indices = cast(torch.Tensor, row_indices)
             row_indices = row_indices.detach().cpu().long().reshape(-1)
         elif isinstance(row_indices, (list, tuple)):
             row_indices = torch.tensor(
@@ -305,16 +320,16 @@ class SpecoWorker(Worker):
                 "SpecoWorker requires an explicit device_name from the trainer initialization path"
             )
         self.device_name = str(device_name).lower()
-        self.trainer = None
-        self.feature_writer = None
-        self.feature_writer_path = None
-        self.last_global_step = None
-        self.last_trained_step = None
+        self.trainer: Any = None
+        self.feature_writer: Optional[TorchShardFeatureStore] = None
+        self.feature_writer_path: Optional[str] = None
+        self.last_global_step: Optional[int] = None
+        self.last_trained_step: Optional[int] = None
         self.training_process_group = None
         self.dp_process_group = None
-        self.training_group_ranks = []
+        self.training_group_ranks: list[int] = []
         self.training_group_world_size = 1
-        self.dp_group_ranks = []
+        self.dp_group_ranks: list[int] = []
         self.dp_group_world_size = 1
         self.num_rollout_replicas = 1
         self.training_device_mesh = None
@@ -539,13 +554,17 @@ class SpecoWorker(Worker):
     def _build_rollout_loss_mask(
         self, batch: dict, input_ids: torch.Tensor
     ) -> torch.Tensor:
-        if torch.is_tensor(batch.get("loss_mask")):
-            return batch["loss_mask"].detach().cpu().float().reshape(-1)
+        loss_mask_value = batch.get("loss_mask")
+        if torch.is_tensor(loss_mask_value):
+            loss_mask_value = cast(torch.Tensor, loss_mask_value)
+            return loss_mask_value.detach().cpu().float().reshape(-1)
         ids = input_ids.detach().cpu().reshape(-1)
         loss_mask = torch.zeros_like(ids, dtype=torch.float32)
         prompts = batch.get("prompts")
         responses = batch.get("responses")
         if torch.is_tensor(prompts) and torch.is_tensor(responses):
+            prompts = cast(torch.Tensor, prompts)
+            responses = cast(torch.Tensor, responses)
             prompt_len = int(prompts.reshape(-1).numel())
             response_ids = responses.detach().cpu().reshape(-1)
             model_cfg = self.config.get("model", None)
@@ -588,6 +607,7 @@ class SpecoWorker(Worker):
         )
         hidden_positions = batch.get("hidden_positions")
         if torch.is_tensor(hidden_positions):
+            hidden_positions = cast(torch.Tensor, hidden_positions)
             hidden_positions = hidden_positions.detach().cpu().long().reshape(-1)
         else:
             hidden_positions = None
@@ -685,6 +705,7 @@ class SpecoWorker(Worker):
     ) -> Optional[torch.Tensor]:
         if not torch.is_tensor(target_logprobs):
             return None
+        target_logprobs = cast(torch.Tensor, target_logprobs)
         target = target_logprobs.detach().cpu()
         while target.dim() > 3 and target.size(0) == 1:
             target = target.squeeze(0)
@@ -810,6 +831,7 @@ class SpecoWorker(Worker):
                     expected_rows = None
                     hidden_positions = batch.get("hidden_positions")
                     if torch.is_tensor(hidden_positions):
+                        hidden_positions = cast(torch.Tensor, hidden_positions)
                         expected_rows = int(hidden_positions.numel())
                     hidden = _resolve_hidden_state_chunks(
                         hidden_chunks, expected_rows=expected_rows

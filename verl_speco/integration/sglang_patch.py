@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import inspect
 import logging
 import os
@@ -21,7 +22,7 @@ import re
 import sys
 import textwrap
 from functools import wraps
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, TypeGuard, cast
 
 import torch
 import sglang.srt.entrypoints.engine
@@ -165,7 +166,7 @@ def _sglang_version_tuple() -> tuple[int, int, int] | None:
         return None
     values = [int(part) for part in version_parts[:3]]
     values.extend([0] * (3 - len(values)))
-    return tuple(values[:3])
+    return cast(tuple[int, int, int], tuple(values[:3]))
 
 
 def _sglang_version_in_range(
@@ -234,7 +235,7 @@ def _make_sglang_eagle_legacy_draft_forward_alignment_patch(original_method):
     )
     patched_method = namespace[original_method.__name__]
     patched_method = wraps(original_method)(patched_method)
-    patched_method._verl_patched_eagle_legacy_alignment = True
+    setattr(patched_method, "_verl_patched_eagle_legacy_alignment", True)
     return patched_method
 
 
@@ -431,7 +432,7 @@ def _make_sglang_qwen3_decoder_layer_init_patch(original_init):
     )
     patched_init = namespace[original_init.__name__]
     patched_init = wraps(original_init)(patched_init)
-    patched_init._verl_patched_qwen3_rope_compat = True
+    setattr(patched_init, "_verl_patched_qwen3_rope_compat", True)
     return patched_init
 
 
@@ -459,7 +460,7 @@ def patch_sglang_qwen3_rope_compat() -> None:
     if patched_init is None:
         return
 
-    qwen3_decoder_layer.__init__ = patched_init
+    setattr(qwen3_decoder_layer, "__init__", patched_init)
     _SGLANG_QWEN3_ROPE_COMPAT_PATCHED = True
     logger.warning("SGLang Qwen3 rope-parameters compatibility patch active.")
 
@@ -545,7 +546,11 @@ def _make_verl_eagle_update_weights_patch(original_update_weights):
 
         return True, "Routed EAGLE weight update succeeded."
 
-    patched_update_weights_from_tensor._verl_patched_eagle_update_weights = True
+    setattr(
+        patched_update_weights_from_tensor,
+        "_verl_patched_eagle_update_weights",
+        True,
+    )
     return patched_update_weights_from_tensor
 
 
@@ -575,8 +580,10 @@ def patch_sglang_eagle_update_weights_from_tensor() -> None:
             ):
                 continue
 
-            cls.update_weights_from_tensor = _make_verl_eagle_update_weights_patch(
-                original_update_weights
+            setattr(
+                cls,
+                "update_weights_from_tensor",
+                _make_verl_eagle_update_weights_patch(original_update_weights),
             )
             patched_classes.append(f"{module_name}.{class_name}")
 
@@ -928,7 +935,8 @@ def _sglang_patch_enabled(
 ) -> bool:
     if selected is _SGLANG_PATCH_SELECTION_FROM_ENV:
         selected = _selected_sglang_patches()
-    return selected is None or patch_name in selected
+    selected_patches = cast(set[str] | None, selected)
+    return selected_patches is None or patch_name in selected_patches
 
 
 def _normalize_sglang_npu_eagle_verify_mode(mode: str | None) -> str | None:
@@ -1839,23 +1847,22 @@ def _patch_sglang_npu_eagle_triton_bool_compat() -> None:
             count=1,
         )
         if replacement_count <= 0:
+            kernel_code = getattr(kernel_fn, "__code__", None)
             logger.warning(
                 "Skip SGLang NPU EAGLE Triton bool compatibility patch: "
                 "chained condition not found in %s.",
-                getattr(kernel_fn, "__code__", None).co_filename
-                if getattr(kernel_fn, "__code__", None)
-                else kernel_fn,
+                kernel_code.co_filename if kernel_code is not None else kernel_fn,
             )
             return
-        namespace = {}
+        namespace: dict[str, Any] = {}
         exec(  # noqa: S102
             "from __future__ import annotations\n" + patched_source,
             kernel_fn.__globals__,
             namespace,
         )
         patched_kernel = namespace[kernel_fn.__name__]
-        patched_kernel._verl_patched_triton_bool_compat = True
-        spec_utils.assign_draft_cache_locs = patched_kernel
+        setattr(patched_kernel, "_verl_patched_triton_bool_compat", True)
+        setattr(spec_utils, "assign_draft_cache_locs", patched_kernel)
         for module_name in (
             "sglang.srt.speculative.eagle_worker",
             "sglang.srt.speculative.eagle_worker_v2",
@@ -1865,7 +1872,7 @@ def _patch_sglang_npu_eagle_triton_bool_compat() -> None:
         ):
             module = sys.modules.get(module_name)
             if module is not None and hasattr(module, "assign_draft_cache_locs"):
-                module.assign_draft_cache_locs = patched_kernel
+                setattr(module, "assign_draft_cache_locs", patched_kernel)
         logger.warning("SGLang NPU EAGLE Triton bool compatibility patch active.")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Skip SGLang NPU EAGLE Triton bool compatibility patch: %s", exc)
@@ -1885,12 +1892,14 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
     if v1_verify_mode != "greedy":
         try:
             eagle_info = importlib.import_module("sglang.srt.speculative.eagle_info")
-            eagle_info.top_k_renorm_prob = _top_k_renorm_prob_torch
-            eagle_info.top_p_renorm_prob = _top_p_renorm_prob_torch
-            eagle_info.tree_speculative_sampling_target_only = (
-                _tree_speculative_sampling_target_only_torch
+            setattr(eagle_info, "top_k_renorm_prob", _top_k_renorm_prob_torch)
+            setattr(eagle_info, "top_p_renorm_prob", _top_p_renorm_prob_torch)
+            setattr(
+                eagle_info,
+                "tree_speculative_sampling_target_only",
+                _tree_speculative_sampling_target_only_torch,
             )
-            eagle_info.TREE_SPEC_KERNEL_AVAILABLE = True
+            setattr(eagle_info, "TREE_SPEC_KERNEL_AVAILABLE", True)
             patched_targets.append("sglang.srt.speculative.eagle_info(target_only)")
         except Exception as exc:  # noqa: BLE001
             logger.debug("Skip SGLang EAGLE v1 target sampling patch: %s", exc)
@@ -1907,7 +1916,7 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
         )
 
 
-def _is_torch_tensor(value: Any) -> bool:
+def _is_torch_tensor(value: Any) -> TypeGuard[torch.Tensor]:
     is_tensor = getattr(torch, "is_tensor", None)
     return bool(callable(is_tensor) and is_tensor(value))
 
@@ -2413,7 +2422,8 @@ def _attach_sglang_raw_top_logprobs(
             computed_subset = _is_torch_tensor(row_indices)
             if computed_subset:
                 row_indices = row_indices.to(
-                    device=next_token_logits.device, dtype=torch.long
+                    device=next_token_logits.device,
+                    dtype=torch.long,
                 )
                 compute_logits = compute_logits[row_indices]
 
@@ -2810,6 +2820,11 @@ def _build_sglang_last_hidden_logprob_check_summary(
         )
     ):
         return None
+    recomputed_top_ids = cast(torch.Tensor, recomputed_top_ids)
+    recomputed_top_logprobs = cast(torch.Tensor, recomputed_top_logprobs)
+    recomputed_at_sglang_top = cast(torch.Tensor, recomputed_at_sglang_top)
+    sglang_top_ids = cast(torch.Tensor, sglang_top_ids)
+    sglang_top_logprobs = cast(torch.Tensor, sglang_top_logprobs)
 
     try:
         with torch.no_grad():
@@ -2865,10 +2880,13 @@ def _build_sglang_last_hidden_logprob_check_summary(
             }
             if _is_torch_tensor(raw_topk_ids) and _is_torch_tensor(raw_topk_logprobs):
                 raw_rows = min(
-                    int(raw_topk_ids.shape[0]), int(raw_topk_logprobs.shape[0]), rows
+                    int(raw_topk_ids.shape[0]),
+                    int(raw_topk_logprobs.shape[0]),
+                    rows,
                 )
                 raw_topk = min(
-                    int(raw_topk_ids.shape[-1]), int(raw_topk_logprobs.shape[-1])
+                    int(raw_topk_ids.shape[-1]),
+                    int(raw_topk_logprobs.shape[-1]),
                 )
                 if raw_rows > 0 and raw_topk > 0:
                     summary.update(
@@ -2935,7 +2953,7 @@ def _log_sglang_last_hidden_logprob_check(
 
 def _sglang_tensor_head_tail(
     value, limit: int = 8
-) -> tuple[list[int] | None, list[int] | None]:
+) -> tuple[list[Any] | None, list[Any] | None]:
     if value is None:
         return None, None
     try:
@@ -3356,11 +3374,13 @@ def _filter_sglang_drafter_last_hidden_output(
     ):
         try:
             base_index = index_tensor.to(
-                device=base_hidden_states.device, dtype=torch.long
+                device=base_hidden_states.device,
+                dtype=torch.long,
             )
             if base_hidden_states.dim() == 3:
                 base_hidden_states = base_hidden_states.reshape(
-                    -1, base_hidden_states.shape[-1]
+                    -1,
+                    base_hidden_states.shape[-1],
                 )
             if index_len > 0 and int(base_hidden_states.shape[0]) > int(
                 base_index.max().item()
@@ -3530,7 +3550,7 @@ def _filter_sglang_drafter_last_hidden_output(
     # reindex, and SGLang only filters logits_output.hidden_states itself.
     if _is_torch_tensor(last_hidden_states) and last_hidden_states.dim() > 0:
         hidden_rows = int(last_hidden_states.shape[0])
-        filter_summary = {
+        filter_summary: dict[str, Any] = {
             "stage": "before_filter",
             "hidden_rows_before": hidden_rows,
             "index_len": index_len,
@@ -3634,7 +3654,8 @@ def _filter_sglang_drafter_last_hidden_output(
     if _is_torch_tensor(last_hidden_positions):
         try:
             position_index = index_tensor.to(
-                device=last_hidden_positions.device, dtype=torch.long
+                device=last_hidden_positions.device,
+                dtype=torch.long,
             )
             filtered_positions = last_hidden_positions[position_index].detach()
             setattr(
@@ -3662,13 +3683,13 @@ def _filter_sglang_drafter_last_hidden_output(
             *_sglang_tensor_head_tail(filtered_positions),
         )
     setattr(logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, True)
-    filter_summary = getattr(
+    stored_filter_summary = getattr(
         logits_output, _VERL_DRAFTER_LAST_HIDDEN_FILTER_SUMMARY_ATTR, None
     )
-    if isinstance(filter_summary, dict):
+    if isinstance(stored_filter_summary, dict):
         pos_head, pos_tail = _sglang_tensor_head_tail(filtered_positions)
         filter_summary = {
-            **filter_summary,
+            **stored_filter_summary,
             "stage": "filtered",
             "hidden_rows_after": int(filtered_last_hidden_states.shape[0]),
             "positions_len": int(filtered_positions.numel())
@@ -4054,7 +4075,7 @@ def _slice_sglang_row_aligned_metadata(
 def _sglang_hidden_debug_metadata(
     logits_output, row_slice=None, raw_positions=None
 ) -> dict:
-    metadata = {}
+    metadata: dict[str, Any] = {}
     fingerprint = getattr(
         logits_output, "_verl_drafter_lh_check_lm_head_fingerprint", None
     )
@@ -4236,7 +4257,7 @@ def _append_sglang_hidden_state_chunk_with_budget(
                     local_end,
                     keep_mask=local_keep_mask,
                 )
-            metadata = {
+            metadata: dict[str, Any] = {
                 "position_start": int(clipped_positions[0].item()),
                 "position_end": int(clipped_positions[-1].item()) + 1,
                 "positions": clipped_positions,
@@ -4317,19 +4338,20 @@ def _append_sglang_hidden_state_chunk_with_budget(
             except TypeError:
                 pass
 
-    metadata = _slice_sglang_row_aligned_metadata(
+    metadata_payload = _slice_sglang_row_aligned_metadata(
         extra_metadata,
         0,
         _sglang_hidden_chunk_rows(chunk),
     )
-    if positions is not None and int(positions.numel()) > 0:
-        metadata = {
-            "position_start": int(positions[0].item()),
-            "position_end": int(positions[-1].item()) + 1,
+    positions_for_metadata = cast(Any, positions)
+    if positions is not None and int(positions_for_metadata.numel()) > 0:
+        metadata_payload = {
+            "position_start": int(positions_for_metadata[0].item()),
+            "position_end": int(positions_for_metadata[-1].item()) + 1,
             "positions": positions,
-            **(metadata or {}),
+            **(metadata_payload or {}),
         }
-    appended_rows = _append_sglang_hidden_chunk_payload(req, chunk, metadata)
+    appended_rows = _append_sglang_hidden_chunk_payload(req, chunk, metadata_payload)
     collected_rows += appended_rows
     setattr(req, "_verl_hidden_state_rows", collected_rows)
     if max_rows is not None and max_rows > 0 and collected_rows >= max_rows:
@@ -4746,7 +4768,7 @@ def _validate_sglang_eagle_verify_hidden_states(
     ):
         return
     hidden_states = getattr(logits_output, "hidden_states", None)
-    shape = tuple(hidden_states.shape) if torch.is_tensor(hidden_states) else None
+    shape = tuple(hidden_states.shape) if _is_torch_tensor(hidden_states) else None
     expected_rows = _sglang_eagle_verify_expected_hidden_rows(batch, spec_info)
     actual_rows = _sglang_hidden_state_rows(hidden_states)
     raise RuntimeError(
@@ -4763,7 +4785,9 @@ def _validate_sglang_eagle_verify_last_hidden(batch, spec_info, logits_output) -
         logits_output, _VERL_DRAFTER_LAST_HIDDEN_STATES_ATTR, None
     )
     shape = (
-        tuple(last_hidden_states.shape) if torch.is_tensor(last_hidden_states) else None
+        tuple(last_hidden_states.shape)
+        if _is_torch_tensor(last_hidden_states)
+        else None
     )
     expected_rows = _sglang_eagle_verify_expected_hidden_rows(batch, spec_info)
     actual_rows = _sglang_hidden_state_rows(last_hidden_states)
@@ -5261,7 +5285,7 @@ def _render_sglang_prefill_hidden_states_append(match: re.Match) -> str:
     )
 
 
-def _render_sglang_stream_hidden_states(match: re.Match) -> str:
+def _render_sglang_stream_hidden_states(match: re.Match[str]) -> str:
     indent = match.group("indent")
     return (
         f"{indent}if _sglang_req_should_stream_hidden_states(req):\n"
@@ -5283,7 +5307,7 @@ def _insert_sglang_decode_hidden_state_offset(source: str) -> str | None:
 
     patched_source, function_count = re.subn(
         r"(?ms)^(?P<header>def\s+process_batch_result_decode\s*\(.*?\)\s*(?:->\s*[^:]+)?\s*:\r?\n)",
-        lambda match: f"{match.group('header')}    hidden_state_offset = 0\n",
+        lambda match: f"{match.group('header')!s}    hidden_state_offset = 0\n",
         source,
         count=1,
     )
@@ -5487,12 +5511,16 @@ def _make_sglang_drafter_output_forward_patch(
             setattr(output, _VERL_DRAFTER_LAST_HIDDEN_FILTERED_ATTR, False)
         return output
 
-    patched_logits_processor_forward._verl_patched_drafter_output = True
-    patched_logits_processor_forward._verl_patched_drafter_raw_top_logprobs = (
-        enable_raw_top_logprobs
+    setattr(patched_logits_processor_forward, "_verl_patched_drafter_output", True)
+    setattr(
+        patched_logits_processor_forward,
+        "_verl_patched_drafter_raw_top_logprobs",
+        enable_raw_top_logprobs,
     )
-    patched_logits_processor_forward._verl_patched_drafter_last_hidden_output = (
-        enable_last_hidden
+    setattr(
+        patched_logits_processor_forward,
+        "_verl_patched_drafter_last_hidden_output",
+        enable_last_hidden,
     )
     return patched_logits_processor_forward
 
@@ -5589,6 +5617,10 @@ def _raw_top_logprobs_metadata_complete(logits_output) -> bool:
         for value in (next_token_logits, raw_topk_ids, raw_topk_logprobs, raw_positions)
     ):
         return False
+    next_token_logits = cast(torch.Tensor, next_token_logits)
+    raw_topk_ids = cast(torch.Tensor, raw_topk_ids)
+    raw_topk_logprobs = cast(torch.Tensor, raw_topk_logprobs)
+    raw_positions = cast(torch.Tensor, raw_positions)
     rows = int(next_token_logits.shape[0])
     return (
         next_token_logits.dim() >= 2
@@ -5709,11 +5741,17 @@ def _make_sglang_drafter_graph_replay_patch(
             )
         return result
 
-    patched_graph_replay._verl_patched_drafter_output = True
-    patched_graph_replay._verl_patched_drafter_raw_top_logprobs = (
-        enable_raw_top_logprobs
+    setattr(patched_graph_replay, "_verl_patched_drafter_output", True)
+    setattr(
+        patched_graph_replay,
+        "_verl_patched_drafter_raw_top_logprobs",
+        enable_raw_top_logprobs,
     )
-    patched_graph_replay._verl_patched_drafter_last_hidden_output = enable_last_hidden
+    setattr(
+        patched_graph_replay,
+        "_verl_patched_drafter_last_hidden_output",
+        enable_last_hidden,
+    )
     return patched_graph_replay
 
 
@@ -5787,12 +5825,20 @@ def _make_sglang_drafter_inline_graph_replay_patch(
     globals_dict["_sglang_forward_batch_requests_last_hidden_for_drafter"] = (
         _sglang_forward_batch_requests_last_hidden_for_drafter
     )
-    namespace = {}
+    namespace: dict[str, Any] = {}
     exec("from __future__ import annotations\n" + source, globals_dict, namespace)  # noqa: S102
     patched_method = wraps(original_method)(namespace[original_method.__name__])
-    patched_method._verl_patched_drafter_output = True
-    patched_method._verl_patched_drafter_raw_top_logprobs = enable_raw_top_logprobs
-    patched_method._verl_patched_drafter_last_hidden_output = enable_last_hidden
+    setattr(patched_method, "_verl_patched_drafter_output", True)
+    setattr(
+        patched_method,
+        "_verl_patched_drafter_raw_top_logprobs",
+        enable_raw_top_logprobs,
+    )
+    setattr(
+        patched_method,
+        "_verl_patched_drafter_last_hidden_output",
+        enable_last_hidden,
+    )
     return patched_method
 
 
@@ -6151,11 +6197,12 @@ def patch_sglang_hidden_states_tensor_output() -> None:
 def _apply_selected_sglang_patches(
     patches: Iterable[str] | str | None | object = _SGLANG_PATCH_SELECTION_FROM_ENV,
 ) -> bool:
-    selected_patches = (
-        _selected_sglang_patches()
-        if patches is _SGLANG_PATCH_SELECTION_FROM_ENV
-        else _normalize_sglang_patch_names(patches)
-    )
+    if patches is _SGLANG_PATCH_SELECTION_FROM_ENV:
+        selected_patches = _selected_sglang_patches()
+    else:
+        selected_patches = _normalize_sglang_patch_names(
+            cast(Iterable[str] | str | None, patches)
+        )
 
     patchers = (
         (_SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME, patch_sglang_qwen3_rope_compat),
@@ -6219,7 +6266,11 @@ def _run_scheduler_process_with_verl_patches(*args, **kwargs):
     return _ORIGINAL_SGLANG_RUN_SCHEDULER_PROCESS(*args, **kwargs)
 
 
-_run_scheduler_process_with_verl_patches._verl_patched_eagle_update_weights = True
+setattr(
+    _run_scheduler_process_with_verl_patches,
+    "_verl_patched_eagle_update_weights",
+    True,
+)
 setattr(_run_scheduler_process_with_verl_patches, _SCHEDULER_PROCESS_PATCH_ATTR, True)
 
 
@@ -6235,8 +6286,10 @@ def _run_direct_scheduler_process_with_verl_patches(*args, **kwargs):
     return _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS(*args, **kwargs)
 
 
-_run_direct_scheduler_process_with_verl_patches._verl_patched_eagle_update_weights = (
-    True
+setattr(
+    _run_direct_scheduler_process_with_verl_patches,
+    "_verl_patched_eagle_update_weights",
+    True,
 )
 setattr(
     _run_direct_scheduler_process_with_verl_patches, _SCHEDULER_PROCESS_PATCH_ATTR, True
@@ -6314,11 +6367,12 @@ def install_sglang_verl_patches(
         )
         return
 
-    selected_patches = (
-        _selected_sglang_patches()
-        if patches is _SGLANG_PATCH_SELECTION_FROM_ENV
-        else _normalize_sglang_patch_names(patches)
-    )
+    if patches is _SGLANG_PATCH_SELECTION_FROM_ENV:
+        selected_patches = _selected_sglang_patches()
+    else:
+        selected_patches = _normalize_sglang_patch_names(
+            cast(Iterable[str] | str | None, patches)
+        )
     if patches is not _SGLANG_PATCH_SELECTION_FROM_ENV:
         os.environ.pop(_SGLANG_BASE_COMPAT_PATCHES_ENV, None)
         _set_sglang_patch_selection_env(selected_patches)

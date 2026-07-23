@@ -1,9 +1,22 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Draft-weight publishing helpers for SPECO rollout adapters."""
 
 import logging
 import os
 import time
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -244,23 +257,27 @@ def _actor_module_candidates(worker: Any) -> list[Any]:
     return deduped
 
 
-def _select_lm_head_named_tensor(module: Any):
+def _select_lm_head_named_tensor(module: Any) -> tuple[str | None, Any | None]:
     torch = _torch_module()
     direct_weight = getattr(module, "weight", None)
-    if torch.is_tensor(direct_weight) and direct_weight.dim() == 2:
-        return "lm_head.weight", direct_weight
+    if torch.is_tensor(direct_weight):
+        direct_weight = cast(Any, direct_weight)
+        if direct_weight.dim() == 2:
+            return "lm_head.weight", direct_weight
 
     for attr_name in ("lm_head", "embed_tokens"):
         child = getattr(module, attr_name, None)
         child_weight = getattr(child, "weight", None)
-        if torch.is_tensor(child_weight) and child_weight.dim() == 2:
-            return f"{attr_name}.weight", child_weight
+        if torch.is_tensor(child_weight):
+            child_weight = cast(Any, child_weight)
+            if child_weight.dim() == 2:
+                return f"{attr_name}.weight", child_weight
 
     named_parameters = getattr(module, "named_parameters", None)
     if not callable(named_parameters):
         return None, None
 
-    fallback = (None, None)
+    fallback: tuple[str | None, Any | None] = (None, None)
     try:
         iterator = named_parameters(recurse=True)
     except TypeError:
@@ -445,6 +462,9 @@ def export_actor_lm_head_weight(worker: Any, row_indices: Any = None) -> Optiona
 class DraftWeightPublishMixin:
     """Mixin for external actor-rollout workers that publish SPECO draft weights."""
 
+    config: Any
+    rollout: Any
+
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
     def init_model(self, *args, **kwargs):
         install_rollout_runtime_for_worker(self)
@@ -460,7 +480,9 @@ class DraftWeightPublishMixin:
         return materialize_draft_weights_payload(weights)
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
-    async def update_draft_weights(self, weights: dict, global_steps: int = None):
+    async def update_draft_weights(
+        self, weights: dict, global_steps: int | None = None
+    ):
         if not drafter_rollout_enabled(self.config):
             return
 
@@ -477,7 +499,9 @@ class DraftWeightPublishMixin:
         await self.rollout.update_draft_weights(weights, global_steps=global_steps)
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
-    async def update_draft_weights_async(self, weights: dict, global_steps: int = None):
+    async def update_draft_weights_async(
+        self, weights: dict, global_steps: int | None = None
+    ):
         if not drafter_rollout_enabled(self.config):
             return
 

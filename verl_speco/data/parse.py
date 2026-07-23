@@ -1,8 +1,21 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import json
 import re
 import warnings
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import torch
 from transformers import PreTrainedTokenizer
@@ -12,6 +25,7 @@ from .template import ChatTemplate
 __all__ = ["GeneralParser", "HarmonyParser", "ThinkingParser"]
 
 Conversation = List[Dict[str, Any]]
+ConversationInput = Union[Conversation, str]
 
 
 class Parser(ABC):
@@ -27,7 +41,7 @@ class Parser(ABC):
     @abstractmethod
     def parse(
         self,
-        conversation: "Conversation",
+        conversation: "ConversationInput",
         max_length: int,
         preformatted: bool = False,
         train_only_last_turn: bool = False,
@@ -47,9 +61,9 @@ class Parser(ABC):
     def _sanitize_message(self, message: dict) -> dict:
         """
         Clean up individual messages, handling the following issues:
-        1. `tool_calls` is a string → Parse as a list
-        2. `tool_calls[].function.arguments` is a string → Parse as a dictionary
-        3. Non-standard fields (extra, etc.) in `tool_calls[]` → Remove
+        1. `tool_calls` is a string 鈫?Parse as a list
+        2. `tool_calls[].function.arguments` is a string 鈫?Parse as a dictionary
+        3. Non-standard fields (extra, etc.) in `tool_calls[]` 鈫?Remove
         """
         cleaned = {k: v for k, v in message.items() if k in self.standard_keys}
 
@@ -57,7 +71,7 @@ class Parser(ABC):
         if "tool_calls" in cleaned:
             tool_calls = cleaned["tool_calls"]
 
-            # tool_calls is a string → Parsing
+            # tool_calls is a string 鈫?Parsing
             if isinstance(tool_calls, str):
                 try:
                     tool_calls = json.loads(tool_calls)
@@ -158,7 +172,7 @@ class GeneralParser(Parser):
 
     def parse(
         self,
-        conversation: "Conversation",
+        conversation: "ConversationInput",
         max_length: int,
         preformatted: bool = False,
         train_only_last_turn: bool = False,
@@ -167,21 +181,22 @@ class GeneralParser(Parser):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         tool = [] if tool is None else tool
         if not preformatted:
+            source_conversation = cast(Conversation, conversation)
             messages = []
 
-            if conversation[0]["role"] == "system":
+            if source_conversation[0]["role"] == "system":
                 warnings.warn(
                     "The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
                 )
                 messages.append(
-                    {"role": "system", "content": conversation[0]["content"]}
+                    {"role": "system", "content": source_conversation[0]["content"]}
                 )
-                conversation = conversation[1:]
+                source_conversation = source_conversation[1:]
             else:
                 if self.system_prompt:
                     messages.append({"role": "system", "content": self.system_prompt})
 
-            for j, sentence in enumerate(conversation):
+            for j, sentence in enumerate(source_conversation):
                 role = sentence["role"]
                 if j == 0:
                     if role != "user":
@@ -190,7 +205,7 @@ class GeneralParser(Parser):
                         )
                         break
                 else:
-                    prev_role = conversation[j - 1]["role"]
+                    prev_role = source_conversation[j - 1]["role"]
                     if role == "tool" and prev_role not in ["assistant", "tool"]:
                         warnings.warn(
                             f"A 'tool' message must follow an 'assistant' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
@@ -204,7 +219,9 @@ class GeneralParser(Parser):
                 sentence = self._sanitize_message(sentence)
                 messages.append(sentence)
             try:
-                conversation = self.apply_chat_template(messages, tool=tool, **kwargs)
+                rendered_conversation = self.apply_chat_template(
+                    messages, tool=tool, **kwargs
+                )
             except (ValueError, TypeError):
                 # Fallback rendering for tokenizers without built-in chat_template
                 warnings.warn(
@@ -227,14 +244,16 @@ class GeneralParser(Parser):
                         parts.append(f"{user_header}{msg['content']}")
                     elif msg["role"] == "assistant":
                         parts.append(f"{assistant_header}{msg['content']}{end_of_turn}")
-                conversation = "".join(parts)
+                rendered_conversation = "".join(parts)
+        else:
+            rendered_conversation = cast(str, conversation)
 
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
         # get input_ids
         encoding = self.tokenizer(
-            conversation,
+            rendered_conversation,
             max_length=max_length,
             truncation=True,
             return_tensors="pt",
@@ -243,7 +262,9 @@ class GeneralParser(Parser):
         input_ids = encoding.input_ids[0]
         loss_mask = torch.zeros(len(input_ids), dtype=torch.long)
 
-        matches = list(re.finditer(self.assistant_pattern, conversation, re.DOTALL))
+        matches = list(
+            re.finditer(self.assistant_pattern, rendered_conversation, re.DOTALL)
+        )
         if train_only_last_turn and matches:
             matches = [matches[-1]]  # Only keep the last match
 
@@ -254,14 +275,14 @@ class GeneralParser(Parser):
             # --- Core Alternative Operation: Calculate Token Index Based on Prefix String Length ---
             # Encode the text "assistant start", the length of which is the position of the starting token.
             prefix_ids = self.tokenizer.encode(
-                conversation[:content_start_char],
+                rendered_conversation[:content_start_char],
                 add_special_tokens=False,
                 truncation=True,
                 max_length=max_length,
             )
             # Encodes the text "assistant end", the length of which is the position of the end token.
             full_ids = self.tokenizer.encode(
-                conversation[:content_end_char],
+                rendered_conversation[:content_end_char],
                 add_special_tokens=False,
                 truncation=True,
                 max_length=max_length,
@@ -283,20 +304,20 @@ class GeneralParser(Parser):
             for token_str in ignore_tokens:
                 start = 0
                 while True:
-                    idx = conversation.find(token_str, start)
+                    idx = rendered_conversation.find(token_str, start)
                     if idx == -1:
                         break
                     ignore_start_char = idx
                     ignore_end_char = idx + len(token_str)
 
                     prefix_ids = self.tokenizer.encode(
-                        conversation[:ignore_start_char],
+                        rendered_conversation[:ignore_start_char],
                         add_special_tokens=False,
                         truncation=True,
                         max_length=max_length,
                     )
                     full_ids = self.tokenizer.encode(
-                        conversation[:ignore_end_char],
+                        rendered_conversation[:ignore_end_char],
                         add_special_tokens=False,
                         truncation=True,
                         max_length=max_length,
@@ -350,7 +371,7 @@ class HarmonyParser(Parser):
 
     def parse(
         self,
-        conversation: "Conversation",
+        conversation: "ConversationInput",
         max_length: int,
         preformatted: bool = False,
         train_only_last_turn: bool = False,
@@ -360,8 +381,9 @@ class HarmonyParser(Parser):
         tool = [] if tool is None else tool
         # conversation = process_harmony_conversations(conversation)
         if not preformatted:
+            source_conversation = cast(Conversation, conversation)
             prompt_text = ""
-            for j, message in enumerate(conversation):
+            for j, message in enumerate(source_conversation):
                 if j == 0 and (
                     message["role"] != "system"
                     or message["role"] != "assistant_reasoning_effort"
@@ -374,13 +396,15 @@ class HarmonyParser(Parser):
                 prompt_text = self.build_single_turn_prompt(
                     prompt_text, message["role"], message["content"]
                 )
-            conversation = prompt_text
+            rendered_conversation = prompt_text
+        else:
+            rendered_conversation = cast(str, conversation)
 
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
         encoding = self.tokenizer(
-            conversation,
+            rendered_conversation,
             return_offsets_mapping=True,
             max_length=max_length,
             truncation=True,
@@ -399,7 +423,7 @@ class HarmonyParser(Parser):
         )
 
         # Find all matching segments
-        matches = list(pattern.finditer(conversation))
+        matches = list(pattern.finditer(rendered_conversation))
         if train_only_last_turn and matches:
             matches = [matches[-1]]  # Only keep the last match
 
@@ -450,7 +474,7 @@ class ThinkingParser(GeneralParser):
 
     def parse(
         self,
-        conversation: "Conversation",
+        conversation: "ConversationInput",
         max_length: int,
         preformatted: bool = False,
         train_only_last_turn: bool = False,

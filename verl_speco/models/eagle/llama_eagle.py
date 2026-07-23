@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import os
 import math
 import warnings
@@ -739,6 +752,7 @@ class LlamaAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        assert position_ids is not None, "position_ids must be provided"
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -881,6 +895,9 @@ class LlamaFlexAttention(LlamaAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        assert position_ids is not None, "position_ids must be provided"
+        assert attention_mask is not None, "attention_mask must be provided"
+        assert past_key_values is not None, "past_key_values must be provided"
         bsz, q_len, _ = hidden_states.size()
 
         past_seen_tokens = (
@@ -994,6 +1011,7 @@ class LlamaFlashAttention(LlamaAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        assert position_ids is not None, "position_ids must be provided"
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -1383,7 +1401,7 @@ class LlamaDecoderLayer(nn.Module):
         self,
         input_emb: torch.Tensor,
         hidden_states: torch.Tensor,
-        cache_hidden: List[List[torch.Tensor]] = None,
+        cache_hidden: Optional[List[List[torch.Tensor]]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -1510,7 +1528,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask (`torch.FloatTensor`): attention mask of size
                 `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
             position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
-            ttt_length (`int`): 预测长度
+            ttt_length (`int`): 棰勬祴闀垮害
         """
         if ttt_length == 1:
             logger.info("using ttt_length 1, no need to cache hidden states")
@@ -1556,7 +1574,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         all_step_loss_masks = []
         all_step_position_masks = []
 
-        # TTT多步循环
+        # TTT澶氭寰幆
         for idx in range(ttt_length):
             is_last = idx == ttt_length - 1
 
@@ -1574,18 +1592,18 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
                 use_cache=False,
             )
 
-            # 计算logits
+            # 璁＄畻logits
             logits = self.compute_logits(current_hidden_states)
 
-            # 保存当前状态供外层Loss使用
+            # 淇濆瓨褰撳墠鐘舵€佷緵澶栧眰Loss浣跨敤
             all_step_logits.append(logits)
             all_step_loss_masks.append(current_loss_mask)
             all_step_position_masks.append(current_position_mask)
 
-            # 更新 Mask 和 Input
+            # 鏇存柊 Mask 鍜?Input
             if not is_last:
-                # 原因：为了模拟“预测下一个词”的过程，我们需要将输入序列向右平移。
-                # 这样在 idx+1 步时，模型实际上是在基于 Token[n+idx] 预测 Token[n+idx+1]
+                # 鍘熷洜锛氫负浜嗘ā鎷熲€滈娴嬩笅涓€涓瘝鈥濈殑杩囩▼锛屾垜浠渶瑕佸皢杈撳叆搴忓垪鍚戝彸骞崇Щ銆?
+                # 杩欐牱鍦?idx+1 姝ユ椂锛屾ā鍨嬪疄闄呬笂鏄湪鍩轰簬 Token[n+idx] 棰勬祴 Token[n+idx+1]
                 current_input_ids = self._shift_right(current_input_ids)
                 current_loss_mask = self._shift_right(current_loss_mask)
                 current_position_mask = self._shift_right(current_position_mask)
@@ -1643,7 +1661,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         )
 
     def _shift_right(self, x: torch.Tensor):
-        """实现 Teacher Forcing 下的右移填充：舍弃首位，末位补0"""
+        """瀹炵幇 Teacher Forcing 涓嬬殑鍙崇Щ濉厖锛氳垗寮冮浣嶏紝鏈綅琛?"""
         # x: (batch, seq) -> (batch, seq)
-        # 逻辑：将序列整体向左推一格，模拟序列的步进
+        # 閫昏緫锛氬皢搴忓垪鏁翠綋鍚戝乏鎺ㄤ竴鏍硷紝妯℃嫙搴忓垪鐨勬杩?
         return torch.cat([x[:, 1:], torch.zeros_like(x[:, :1])], dim=1)

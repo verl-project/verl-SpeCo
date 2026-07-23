@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import json
@@ -8,7 +21,10 @@ import pytest
 
 pytest.importorskip("torch")
 
-from verl_speco.trainer.draft_training_loop import _rewrite_standalone_block_runtime_config, _save_standalone_checkpoint
+from verl_speco.trainer.draft_training_loop import (
+    _rewrite_standalone_block_runtime_config,
+    _save_standalone_checkpoint,
+)
 
 
 class _FakeTrainer:
@@ -48,7 +64,9 @@ def test_standalone_checkpoint_waits_when_requested():
 
 
 def test_standalone_checkpoint_skips_when_previous_save_is_running():
-    trainer = SimpleNamespace(checkpoint_dir="/tmp/draft", _pending_full_checkpoint_future=Future())
+    trainer = SimpleNamespace(
+        checkpoint_dir="/tmp/draft", _pending_full_checkpoint_future=Future()
+    )
 
     result = _save_standalone_checkpoint(trainer, 5)
 
@@ -97,7 +115,9 @@ def test_public_checkpoint_path_rewrites_dspark_runtime_config(tmp_path):
 
     result = _save_standalone_checkpoint(_PublicCheckpointTrainer(), 5, wait=True)
 
-    runtime_config = json.loads((checkpoint_dir / "config.json").read_text(encoding="utf-8"))
+    runtime_config = json.loads(
+        (checkpoint_dir / "config.json").read_text(encoding="utf-8")
+    )
     assert result["saved"] is True
     assert runtime_config["model_type"] == "deepseek_v3"
     assert runtime_config["architectures"] == ["DeepSeekDSparkModel"]
@@ -126,16 +146,24 @@ def test_standalone_dspark_checkpoint_preserves_source_runtime_config(tmp_path):
         "block_size": 7,
         "num_context_layers": 3,
     }
-    (checkpoint_dir / "config.json").write_text(json.dumps(training_config), encoding="utf-8")
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps(training_config), encoding="utf-8"
+    )
     trainer = SimpleNamespace(
         backend=SimpleNamespace(model_type="dspark"),
-        config=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))),
+        config=SimpleNamespace(
+            rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))
+        ),
     )
 
     _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
 
-    runtime_config = json.loads((checkpoint_dir / "config.json").read_text(encoding="utf-8"))
-    saved_training_config = json.loads((checkpoint_dir / "speco_training_config.json").read_text(encoding="utf-8"))
+    runtime_config = json.loads(
+        (checkpoint_dir / "config.json").read_text(encoding="utf-8")
+    )
+    saved_training_config = json.loads(
+        (checkpoint_dir / "speco_training_config.json").read_text(encoding="utf-8")
+    )
     assert runtime_config["model_type"] == "deepseek_v3"
     assert runtime_config["architectures"] == ["DeepSeekDSparkModel"]
     assert runtime_config["dspark_config"]["markov_head_type"] == "vanilla"
@@ -161,16 +189,24 @@ def test_standalone_dflash_checkpoint_preserves_source_runtime_config(tmp_path):
         "mask_token_id": 151669,
         "num_context_layers": 3,
     }
-    (checkpoint_dir / "config.json").write_text(json.dumps(training_config), encoding="utf-8")
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps(training_config), encoding="utf-8"
+    )
     trainer = SimpleNamespace(
         backend=SimpleNamespace(model_type="dflash"),
-        config=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))),
+        config=SimpleNamespace(
+            rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))
+        ),
     )
 
     _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
 
-    runtime_config = json.loads((checkpoint_dir / "config.json").read_text(encoding="utf-8"))
-    saved_training_config = json.loads((checkpoint_dir / "speco_training_config.json").read_text(encoding="utf-8"))
+    runtime_config = json.loads(
+        (checkpoint_dir / "config.json").read_text(encoding="utf-8")
+    )
+    saved_training_config = json.loads(
+        (checkpoint_dir / "speco_training_config.json").read_text(encoding="utf-8")
+    )
     assert runtime_config["model_type"] == "qwen3"
     assert runtime_config["architectures"] == ["DFlashForCausalLM"]
     assert runtime_config["dflash_config"]["target_layer_ids"] == [2, 10, 18]

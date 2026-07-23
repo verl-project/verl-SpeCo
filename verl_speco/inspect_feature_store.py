@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Inspect SPECO standalone draft feature stores."""
 
 from __future__ import annotations
@@ -6,7 +19,7 @@ import argparse
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -149,6 +162,7 @@ def _sample_issues(sample: dict[str, Any]) -> list[str]:
                 f"loss_mask length {loss_mask.numel()} does not match input_ids length {seq_len}"
             )
     if torch.is_tensor(hidden_states):
+        hidden_states = cast(torch.Tensor, hidden_states)
         if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
             hidden_len = int(hidden_states.size(1))
         elif hidden_states.dim() == 2:
@@ -182,20 +196,23 @@ def _sample_issues(sample: dict[str, Any]) -> list[str]:
             issues.append(
                 f"position_ids is not a tensor: {type(position_ids).__name__}"
             )
-        elif position_ids.numel() != seq_len:
-            issues.append(
-                f"position_ids length {position_ids.numel()} does not match input_ids length {seq_len}"
-            )
-        elif position_ids.dim() > 1:
-            issues.append(
-                f"position_ids is normalizable but not stored as 1D: {_shape(position_ids)}"
-            )
+        else:
+            position_ids = cast(torch.Tensor, position_ids)
+            if position_ids.numel() != seq_len:
+                issues.append(
+                    f"position_ids length {position_ids.numel()} does not match input_ids length {seq_len}"
+                )
+            elif position_ids.dim() > 1:
+                issues.append(
+                    f"position_ids is normalizable but not stored as 1D: {_shape(position_ids)}"
+                )
     if target_logprobs is not None:
         if not torch.is_tensor(target_logprobs):
             issues.append(
                 f"target_logprobs is not a tensor: {type(target_logprobs).__name__}"
             )
         else:
+            target_logprobs = cast(torch.Tensor, target_logprobs)
             normalized = target_logprobs
             while normalized.dim() > 3 and normalized.size(0) == 1:
                 normalized = normalized.squeeze(0)

@@ -16,18 +16,20 @@ repos:
 
   - repo: local
     hooks:
-      # TODO: these hooks need scripts under tests/special_sanity/ that don't exist yet
+      # Upstream verl also defines local special_sanity hooks here. In
+      # verl-SpeCo, only enable checks that match this repository layout and do
+      # not require full upstream verl trainer/docs infrastructure.
       # - id: autogen-trainer-cfg
       #   name: Generate and verify verl/trainer/config/_generated_*.yaml
       #   entry: scripts/generate_trainer_config.sh
       #   language: script
       #   pass_filenames: false
 
-      # - id: check-docs-time-info
-      #   name: Check docs Last updated info
-      #   entry: python3 tests/special_sanity/check_docs_time_info.py
-      #   language: python
-      #   pass_filenames: false
+      - id: check-docs-time-info
+        name: Check docs Last updated info
+        entry: python tests/special_sanity/check_docs_time_info.py
+        language: python
+        pass_filenames: false
 
       # - id: check-docstrings
       #   name: Check doc string coverage
@@ -35,44 +37,44 @@ repos:
       #   language: python
       #   pass_filenames: false
 
-      # - id: check-license
-      #   name: Check license
-      #   entry: python3 tests/special_sanity/check_license.py --directories .
-      #   language: python
-      #   pass_filenames: false
+      - id: check-license
+        name: Check license
+        entry: python tests/special_sanity/check_license.py --directories verl_speco tests
+        language: python
+        pass_filenames: false
 
-      # - id: check-device-api-usage
-      #   name: Check device API usage
-      #   entry: python3 tests/special_sanity/check_device_api_usage.py --directory ./verl
-      #   language: python
-      #   pass_filenames: false
+      - id: check-device-api-usage
+        name: Check device API usage
+        entry: python tests/special_sanity/check_device_api_usage.py --directory ./verl_speco
+        language: python
+        pass_filenames: false
 
-      # - id: check-dataproto-usage
-      #   name: Check DataProto usage
-      #   entry: python3 tests/special_sanity/check_dataproto_usage.py -d ./verl/workers/engine
-      #   language: python
-      #   pass_filenames: false
+      - id: check-dataproto-usage
+        name: Check DataProto usage
+        entry: python tests/special_sanity/check_dataproto_usage.py -d ./verl_speco
+        language: python
+        pass_filenames: false
 
-      # - id: validate-structure
-      #   name: Validate test structure
-      #   entry: python3 tests/special_sanity/validate_structure.py
-      #   language: python
-      #   pass_filenames: false
+      - id: validate-structure
+        name: Validate test structure
+        entry: python tests/special_sanity/validate_structure.py --impl-root verl_speco --tests-root tests --allow-dirs compat config examples heavy integration unit special_sanity
+        language: python
+        pass_filenames: false
 
       - id: check-naming-conventions
         name: Check naming conventions
-        entry: sh -c 'fail=0; if grep -rIn --exclude-dir=.git --exclude-dir=.github --exclude-dir=venv --exclude-dir=__pycache__ --exclude=.pre-commit-config.yaml "veRL" .; then echo "Please use verl instead of veRL"; fail=1; fi; if grep -rIn --exclude-dir=.git --exclude-dir=.github --exclude-dir=venv --exclude-dir=__pycache__ --exclude=ascend_sglang_best_practices.rst --exclude=.pre-commit-config.yaml -E "Sglang|sgLang|sglAng|sglaNg|sglanG" .; then echo "Please use SGLang or sglang"; fail=1; fi; exit $fail'
-        language: system
+        entry: python tests/special_sanity/check_naming_conventions.py
+        language: python
         pass_filenames: false
 
-      # - id: check-example-naming
-      #   name: Check example script naming convention
-      #   entry: python3 tests/special_sanity/check_example_naming.py --root examples
-      #   language: python
-      #   pass_filenames: false
+      - id: check-example-naming
+        name: Check example script naming convention
+        entry: python tests/special_sanity/check_example_naming.py --root examples --repo-root .
+        language: python
+        pass_filenames: false
 
       - id: compileall
         name: Compile all python files
-        entry: sh -c 'PYTHONWARNINGS=error python3 -m compileall -q . -x "(^|[\\/])(\.venv|venv|\.git|verl[\\/]experimental[\\/]vla)([\\/]|$)"'
-        language: system
+        entry: python tests/special_sanity/compile_all.py
+        language: python
         pass_filenames: false

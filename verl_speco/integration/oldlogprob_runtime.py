@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Runtime patch for SPECO old-logprob hidden-state collection.
 
 The SPECO package must not edit the upstream ``verl`` source tree. This module
@@ -13,7 +26,7 @@ import logging
 import os
 import time
 from functools import wraps
-from typing import Any
+from typing import Any, cast
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -257,6 +270,12 @@ def _put_oldlogprob_hidden_refs(
     selected_is_sparse = _is_sparse_selected(selected)
     if not torch.is_tensor(selected) and not selected_is_sparse:
         return hidden_output
+    if selected_is_sparse:
+        selected_sparse = cast(dict[str, Any], selected)
+        selected_tensor: Any = None
+    else:
+        selected_sparse = {}
+        selected_tensor = cast(Any, selected)
 
     copy_us = 0.0
     ray_put_us = 0.0
@@ -270,6 +289,7 @@ def _put_oldlogprob_hidden_refs(
             OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY
         )
         if torch.is_tensor(selected_batch_indices):
+            selected_batch_indices = cast(Any, selected_batch_indices)
             selected_batch_indices = [
                 int(idx)
                 for idx in selected_batch_indices.detach().cpu().reshape(-1).tolist()
@@ -281,7 +301,11 @@ def _put_oldlogprob_hidden_refs(
         rows = (
             []
             if selected_is_sparse
-            else (list(selected.unbind(0)) if selected.dim() >= 3 else [selected])
+            else (
+                list(selected_tensor.unbind(0))
+                if selected_tensor.dim() >= 3
+                else [selected_tensor]
+            )
         )
         if (
             not selected_is_sparse
@@ -294,24 +318,26 @@ def _put_oldlogprob_hidden_refs(
             )
         owner_mask = hidden_output.get("speco_oldlogprob_owner_mask")
         owner_mask_cpu = (
-            owner_mask.detach().bool().cpu() if torch.is_tensor(owner_mask) else None
+            cast(Any, owner_mask).detach().bool().cpu()
+            if torch.is_tensor(owner_mask)
+            else None
         )
         sample_count = int(collect_mask.numel())
-        refs = [None for _ in range(sample_count)]
-        metas = [None for _ in range(sample_count)]
+        refs: list[Any] = [None for _ in range(sample_count)]
+        metas: list[Any] = [None for _ in range(sample_count)]
         owner_chunks: dict[int, list[dict[str, Any]]] = {}
         if selected_is_sparse:
-            sparse_rows = selected["rows"]
+            sparse_rows = selected_sparse["rows"]
             copy_started = time.perf_counter()
             sparse_rows_cpu = (
                 sparse_rows.detach().to(device="cpu", copy=True).contiguous()
             )
             copy_us += (time.perf_counter() - copy_started) * 1_000_000.0
             sparse_batch_indices = (
-                selected["batch_indices"].detach().cpu().reshape(-1).tolist()
+                selected_sparse["batch_indices"].detach().cpu().reshape(-1).tolist()
             )
             sparse_row_indices = (
-                selected["row_indices"].detach().cpu().reshape(-1).tolist()
+                selected_sparse["row_indices"].detach().cpu().reshape(-1).tolist()
             )
             hidden_dim = (
                 int(sparse_rows_cpu.shape[-1]) if sparse_rows_cpu.dim() > 1 else 0
@@ -340,15 +366,13 @@ def _put_oldlogprob_hidden_refs(
                     else 0
                 )
                 sample_chunks = owner_sample_chunks.setdefault(owner, {})
-                chunk = sample_chunks.setdefault(
-                    batch_idx,
-                    {
-                        "batch_idx": batch_idx,
-                        "source_indices": [],
-                        "valid_rows": int(valid_rows),
-                        "row_indices": [],
-                    },
-                )
+                default_chunk: dict[str, Any] = {
+                    "batch_idx": batch_idx,
+                    "source_indices": [],
+                    "valid_rows": int(valid_rows),
+                    "row_indices": [],
+                }
+                chunk = sample_chunks.setdefault(batch_idx, default_chunk)
                 chunk["source_indices"].append(int(source_idx))
                 chunk["row_indices"].append(row_idx)
                 metas[batch_idx] = {
@@ -437,16 +461,16 @@ def _put_oldlogprob_hidden_refs(
                     "rows": int(valid_rows),
                 }
 
-        chunk_refs = []
-        chunk_meta = []
+        chunk_refs: list[Any] = []
+        chunk_meta: list[dict[str, Any]] = []
         for owner, chunks in sorted(owner_chunks.items()):
             if not chunks:
                 continue
             tensors = [chunk["hidden"] for chunk in chunks]
-            starts = []
-            lengths = []
-            sample_indices = []
-            row_indices_payload = []
+            starts: list[int] = []
+            lengths: list[int] = []
+            sample_indices: list[int] = []
+            row_indices_payload: list[Any] = []
             offset = 0
             for chunk in chunks:
                 length = int(chunk["hidden"].shape[0])
@@ -544,6 +568,7 @@ def _install_oldlogprob_training_worker_postprocess_patch() -> bool:
     if getattr(worker_cls, "_speco_oldlogprob_patched_postprocess", False):
         _POSTPROCESS_PATCHED = True
         return True
+    assert worker_cls is not None
 
     @wraps(postprocess_output)
     def speco_postprocess_output(self, output, *args, **kwargs):
@@ -633,7 +658,7 @@ def _extract_oldlogprob_non_tensor_model_output(
     output_lst: list[dict[str, Any]],
     indices: Any = None,
 ) -> dict[str, list[Any]]:
-    extracted = {
+    extracted: dict[str, list[Any]] = {
         OLD_LOGPROB_HIDDEN_REFS_KEY: [],
         OLD_LOGPROB_HIDDEN_REF_META_KEY: [],
         OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY: [],
@@ -1209,11 +1234,15 @@ def _gather_sparse_sp_selected_to_source(
     )
     if not is_source:
         return None
+    assert gathered_counts is not None
+    assert gathered_rows is not None
+    assert gathered_batch_indices is not None
+    assert gathered_row_indices is not None
 
-    rows_parts = []
-    batch_parts = []
-    row_parts = []
-    counts = [int(count.item()) for count in gathered_counts or []]
+    rows_parts: list[Any] = []
+    batch_parts: list[Any] = []
+    row_parts: list[Any] = []
+    counts = [int(count.item()) for count in gathered_counts]
     for count, row_part, batch_part, row_idx_part in zip(
         counts,
         gathered_rows,
@@ -1382,7 +1411,7 @@ def _find_layers_and_final_norm(engine: Any):
     import torch.nn as nn
 
     module = getattr(engine, "module", None)
-    roots = []
+    roots: list[Any] = []
     for root in (module, _unwrap_module(module)):
         if root is not None and all(root is not existing for existing in roots):
             roots.append(root)

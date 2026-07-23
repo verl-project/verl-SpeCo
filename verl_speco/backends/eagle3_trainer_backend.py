@@ -1,6 +1,20 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import logging
 import os
 from copy import deepcopy
+from typing import Any, Optional, cast
 
 import torch
 from torch.nn import SmoothL1Loss
@@ -132,11 +146,10 @@ def _log_eagle3_raw_topk_check(
     if item.get("hidden_target_logprobs_source") != _RAW_HIDDEN_METADATA_SOURCE:
         return
     raw_target_logprobs = item.get("hidden_raw_target_logprobs")
-    if (
-        not torch.is_tensor(raw_target_logprobs)
-        or raw_target_logprobs.dim() != 3
-        or raw_target_logprobs.size(-1) < 2
-    ):
+    if not torch.is_tensor(raw_target_logprobs):
+        return
+    raw_target_logprobs = cast(torch.Tensor, raw_target_logprobs)
+    if raw_target_logprobs.dim() != 3 or raw_target_logprobs.size(-1) < 2:
         return
     if target_model is None:
         logger.debug(
@@ -614,9 +627,9 @@ class Eagle3TrainerBackend:
         self.config = config
         self.target_model_config = target_model_config
         self.criterion = SmoothL1Loss(reduction="none")
-        self.target_model = None
-        self.vocab_size = None
-        self._target_token_to_draft_index = None
+        self.target_model: Any = None
+        self.vocab_size: Optional[int] = None
+        self._target_token_to_draft_index: Optional[torch.Tensor] = None
 
     @property
     def model_type(self):
@@ -850,7 +863,7 @@ class Eagle3TrainerBackend:
                     "EAGLE3 received hidden_states_layout='dflash_aux'. "
                     "DFlash aux hidden states must not be routed into EAGLE3 training."
                 )
-            # 1. 搬运到GPU
+            # 1. 鎼繍鍒癎PU
             # 1. Move tensors to the target device
             ids = item["input_ids"].to(device, non_blocking=True)
 

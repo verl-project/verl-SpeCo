@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # coding=utf-8
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
@@ -27,7 +40,7 @@ import os
 import re
 import warnings
 from collections import Counter
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import torch
 import torch.nn.functional as F
@@ -45,11 +58,11 @@ except ImportError:
     process_vision_info = None
 
 
-from .parse import GeneralParser, HarmonyParser, ThinkingParser
+from .parse import GeneralParser, HarmonyParser, Parser, ThinkingParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
 # define a type called conversation
-Conversation = List[Dict[str, str]]
+Conversation = List[Dict[str, Any]]
 
 
 # ==============================
@@ -121,7 +134,7 @@ def preprocess_conversations(
     max_length: int = 2048,
     is_preformatted: bool = False,
     train_only_last_turn: bool = False,
-    tools: Optional[List[List[Dict]]] = [[]],
+    tools: Optional[List[List[Dict]]] = None,
     **kwargs,
 ) -> Dict[str, List[torch.Tensor]]:
     """
@@ -144,16 +157,22 @@ def preprocess_conversations(
             - attention_mask: List of attention masks.
     """
     # prepare result
-    results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
+    results: Dict[str, List[torch.Tensor]] = {
+        "input_ids": [],
+        "loss_mask": [],
+        "attention_mask": [],
+    }
+    if tools is None:
+        tools = [[] for _ in range(len(conversations))]
     if chat_template.parser_type == "general":
-        parser = GeneralParser(tokenizer, chat_template)
+        parser: Parser = GeneralParser(tokenizer, chat_template)
     elif chat_template.parser_type == "thinking":
         parser = ThinkingParser(tokenizer, chat_template)
     elif chat_template.parser_type == "openai-harmony":
         parser = HarmonyParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
-    kwargs_list = [{} for _ in range(len(conversations))]
+    kwargs_list: List[Dict[str, Any]] = [{} for _ in range(len(conversations))]
     for key, value_list in kwargs.items():
         for i, value in enumerate(value_list):
             kwargs_list[i][key] = value
@@ -161,8 +180,9 @@ def preprocess_conversations(
         if not source:
             # if the source is None, skip it
             continue
+        parser_input = cast(Union[Conversation, str], source)
         input_ids, loss_mask = parser.parse(
-            source,
+            parser_input,
             max_length,
             preformatted=is_preformatted,
             train_only_last_turn=train_only_last_turn,
@@ -177,7 +197,7 @@ def preprocess_conversations(
 
 def preprocess_vlm_conversations(
     processor: ImageProcessingMixin,
-    examples: List[Conversation],
+    examples: Dict[str, List[Any]],
     chat_template: ChatTemplate,
     max_length: int = 2048,
 ) -> Dict[str, List[torch.Tensor]]:
@@ -203,7 +223,7 @@ def preprocess_vlm_conversations(
     system_prompt = chat_template.system_prompt
 
     # prepare result
-    results = {
+    results: Dict[str, List[torch.Tensor]] = {
         "input_ids": [],
         "loss_mask": [],
         "attention_mask": [],
@@ -214,7 +234,7 @@ def preprocess_vlm_conversations(
     # Note: currently, we assume that each example has only one image
     for i, image in enumerate(examples["image"]):
         source = examples["conversations"][i]
-        messages = [{"role": "system", "content": system_prompt}]
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         if not source:
             # if the source is None, skip it
             continue
@@ -237,12 +257,12 @@ def preprocess_vlm_conversations(
                                 "type": "image",
                                 "image": image,
                             },
-                            {"type": "text", "text": sentence["content"]},
+                            {"type": "text", "text": str(sentence["content"])},
                         ],
                     }
                 )
             else:
-                messages.append({"role": role, "content": sentence["content"]})
+                messages.append({"role": role, "content": str(sentence["content"])})
 
         conversation = processor.apply_chat_template(
             messages,
@@ -703,7 +723,7 @@ def generate_vocab_mapping_file(
         return vocab_mapping_path
 
     # we first count the frequency of effective tokens in the dataset
-    token_dict = Counter()
+    token_dict: Counter[int] = Counter()
     for input_ids, loss_mask in tqdm(
         zip(dataset["input_ids"], dataset["loss_mask"]),
         total=len(dataset),

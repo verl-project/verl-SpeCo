@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import subprocess
@@ -28,25 +41,38 @@ def test_example_shell_syntax_is_valid(script: Path) -> None:
 
 
 @pytest.mark.parametrize("script", EXAMPLES, ids=lambda path: path.name)
-def test_example_keeps_speco_entrypoint_and_required_drafter_switches(script: Path) -> None:
+def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
+    script: Path,
+) -> None:
     source = script.read_text(encoding="utf-8")
 
-    assert "python3 -m verl_speco.main" in source or "python -m verl_speco.main" in source
+    assert (
+        "python3 -m verl_speco.main" in source or "python -m verl_speco.main" in source
+    )
     assert "actor_rollout_ref.rollout.drafter.enable=" in source
     assert "actor_rollout_ref.rollout.drafter.enable_drafter_training=" in source
     assert "actor_rollout_ref.rollout.drafter.model_path=" in source
     assert "actor_rollout_ref.rollout.drafter.speculative_algorithm=" in source
-    assert "actor_rollout_ref.rollout.drafter.training.collect_interval_steps=" in source
-    assert "actor_rollout_ref.rollout.drafter.training.training_interval_steps=" in source
+    assert (
+        "actor_rollout_ref.rollout.drafter.training.collect_interval_steps=" in source
+    )
+    assert (
+        "actor_rollout_ref.rollout.drafter.training.training_interval_steps=" in source
+    )
     assert "actor_rollout_ref.rollout.drafter.training.publish_async=" in source
 
 
 def test_vllm_eagle3_example_keeps_runtime_agnostic_training_switches() -> None:
-    source = (ROOT / "examples" / "run_qwen3-8b_drafter_eagle3_vllm.sh").read_text(encoding="utf-8")
+    source = (ROOT / "examples" / "run_qwen3-8b_drafter_eagle3_vllm.sh").read_text(
+        encoding="utf-8"
+    )
 
     assert "actor_rollout_ref.rollout.name=vllm" in source
-    assert "actor_rollout_ref.rollout.drafter.speculative_algorithm=\"EAGLE3\"" in source
-    assert "actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True" in source
+    assert 'actor_rollout_ref.rollout.drafter.speculative_algorithm="EAGLE3"' in source
+    assert (
+        "actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True"
+        in source
+    )
     assert "actor_rollout_ref.rollout.drafter.training.use_logits=False" in source
 
 
