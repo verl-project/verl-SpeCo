@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import json
 import re
 import warnings
@@ -48,9 +61,9 @@ class Parser(ABC):
     def _sanitize_message(self, message: dict) -> dict:
         """
         Clean up individual messages, handling the following issues:
-        1. `tool_calls` is a string → Parse as a list
-        2. `tool_calls[].function.arguments` is a string → Parse as a dictionary
-        3. Non-standard fields (extra, etc.) in `tool_calls[]` → Remove
+        1. `tool_calls` is a string 鈫?Parse as a list
+        2. `tool_calls[].function.arguments` is a string 鈫?Parse as a dictionary
+        3. Non-standard fields (extra, etc.) in `tool_calls[]` 鈫?Remove
         """
         cleaned = {k: v for k, v in message.items() if k in self.standard_keys}
 
@@ -58,7 +71,7 @@ class Parser(ABC):
         if "tool_calls" in cleaned:
             tool_calls = cleaned["tool_calls"]
 
-            # tool_calls is a string → Parsing
+            # tool_calls is a string 鈫?Parsing
             if isinstance(tool_calls, str):
                 try:
                     tool_calls = json.loads(tool_calls)

@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import json
@@ -16,7 +29,9 @@ DSparkDraftModel = dspark_models.DSparkDraftModel
 create_dense_attention_mask = dflash_backend._create_dflash_dense_attention_mask
 
 
-def test_dspark_checkpoint_preserves_source_config_and_vllm_weight_names(tmp_path) -> None:
+def test_dspark_checkpoint_preserves_source_config_and_vllm_weight_names(
+    tmp_path,
+) -> None:
     initial_config = DSparkConfig(
         hidden_size=8,
         intermediate_size=16,
@@ -60,7 +75,9 @@ def test_dspark_checkpoint_preserves_source_config_and_vllm_weight_names(tmp_pat
     assert config.model_type == "dspark"
     model.save_pretrained(output_dir, safe_serialization=False)
     saved_config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
-    saved_state = torch.load(output_dir / "pytorch_model.bin", map_location="cpu", weights_only=True)
+    saved_state = torch.load(
+        output_dir / "pytorch_model.bin", map_location="cpu", weights_only=True
+    )
     for key, value in source_config.items():
         assert saved_config[key] == value
     assert saved_config["enable_confidence_head"] is False
@@ -156,7 +173,9 @@ def test_dspark_untrained_confidence_head_is_kept_but_excluded_from_optimizer():
     confidence_head = model.draft_model.confidence_head
     assert confidence_head is not None
     assert "draft_model.confidence_head.proj.weight" in model.state_dict()
-    assert all(not parameter.requires_grad for parameter in confidence_head.parameters())
+    assert all(
+        not parameter.requires_grad for parameter in confidence_head.parameters()
+    )
     optimizer_parameter_ids = {
         id(parameter) for parameter in model.parameters() if parameter.requires_grad
     }
@@ -198,10 +217,34 @@ def test_dspark_dense_attention_mask_matches_deepspec_block_contract():
 
     assert mask.dtype == torch.bool
     assert mask.shape == (1, 1, 4, 10)
-    assert torch.nonzero(mask[0, 0, 0], as_tuple=False).flatten().tolist() == [0, 1, 6, 7]
-    assert torch.nonzero(mask[0, 0, 1], as_tuple=False).flatten().tolist() == [0, 1, 6, 7]
-    assert torch.nonzero(mask[0, 0, 2], as_tuple=False).flatten().tolist() == [0, 1, 2, 3, 8, 9]
-    assert torch.nonzero(mask[0, 0, 3], as_tuple=False).flatten().tolist() == [0, 1, 2, 3, 8, 9]
+    assert torch.nonzero(mask[0, 0, 0], as_tuple=False).flatten().tolist() == [
+        0,
+        1,
+        6,
+        7,
+    ]
+    assert torch.nonzero(mask[0, 0, 1], as_tuple=False).flatten().tolist() == [
+        0,
+        1,
+        6,
+        7,
+    ]
+    assert torch.nonzero(mask[0, 0, 2], as_tuple=False).flatten().tolist() == [
+        0,
+        1,
+        2,
+        3,
+        8,
+        9,
+    ]
+    assert torch.nonzero(mask[0, 0, 3], as_tuple=False).flatten().tolist() == [
+        0,
+        1,
+        2,
+        3,
+        8,
+        9,
+    ]
 
 
 def test_dspark_dense_attention_mask_keeps_dummy_rows_finite_safe():
@@ -317,7 +360,9 @@ def test_dspark_l1_loss_uses_target_last_hidden_states():
     ("loss_mode", "expects_reused_log_probs"),
     [("full_vocab", True), ("restricted_ce", False)],
 )
-def test_dspark_l1_reuses_only_full_vocab_ce_log_probs(monkeypatch, loss_mode, expects_reused_log_probs):
+def test_dspark_l1_reuses_only_full_vocab_ce_log_probs(
+    monkeypatch, loss_mode, expects_reused_log_probs
+):
     model = _small_dspark_training_model(
         block_size=2,
         l1_loss_alpha=0.5,
@@ -351,7 +396,9 @@ def test_dspark_l1_reuses_only_full_vocab_ce_log_probs(monkeypatch, loss_mode, e
     assert (captured_log_probs[0] is not None) is expects_reused_log_probs
     if captured_log_probs[0] is not None:
         probability_mass = captured_log_probs[0].exp().sum(dim=-1)
-        assert torch.allclose(probability_mass, torch.ones_like(probability_mass), atol=1e-5, rtol=1e-5)
+        assert torch.allclose(
+            probability_mass, torch.ones_like(probability_mass), atol=1e-5, rtol=1e-5
+        )
     assert any(
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
         for parameter in model.parameters()

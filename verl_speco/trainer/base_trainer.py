@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import logging
 import json
 import os
@@ -858,7 +871,7 @@ class DrafterBaseTrainer:
     def _build_draft_model(self):
         """build draft model"""
         logger.debug(f"[Rank {self.rollout_dp_rank}] Building drafter model...")
-        # A. 实例化模型（委托给backend）
+        # A. 瀹炰緥鍖栨ā鍨嬶紙濮旀墭缁檅ackend锛?
         pending_target_weight = self._pending_target_lm_head_weight
         if (
             getattr(self.backend, "model_type", None)
@@ -876,9 +889,9 @@ class DrafterBaseTrainer:
         raw_model, drafter_model_config = self.backend.build_model()
         raw_model.to(self.runtime_device)
 
-        # B. 获取全量状态用于 FSDP 初始化
+        # B. 鑾峰彇鍏ㄩ噺鐘舵€佺敤浜?FSDP 鍒濆鍖?
 
-        # C. FSDP包装
+        # C. FSDP鍖呰
         if self.training_device_mesh is not None and dist.is_initialized():
             fsdp_config = self._resolve_fsdp_config()
             mp_policy = MixedPrecisionPolicy(
@@ -948,7 +961,7 @@ class DrafterBaseTrainer:
             )
             self.model = raw_model
 
-        # D. 构建优化器和调度器
+        # D. 鏋勫缓浼樺寲鍣ㄥ拰璋冨害鍣?
         drafter_train_config = self._prepare_training_config(self.config.rollout)
         setattr(self.backend, "train_config", drafter_train_config)
 
@@ -1615,7 +1628,7 @@ class DrafterBaseTrainer:
         return {"waited": True, "completed": True, "reason": "completed"}
 
     async def activate_training_model(self) -> bool:
-        # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态
+        # 灏嗘ā鍨嬪拰浼樺寲鍣ㄧ姸鎬佷粠CPU鍔犺浇鍒癎PU锛屾縺娲昏崏绋挎ā鍨嬭繘鍏ヨ缁冪姸鎬?
         start_ts = time.time()
         try:
             logger.debug(
@@ -1636,14 +1649,14 @@ class DrafterBaseTrainer:
                 )
                 self._build_draft_model()
 
-            # 只有当配置了 offload 或者当前模型不在 CUDA 上时执行加载
+            # 鍙湁褰撻厤缃簡 offload 鎴栬€呭綋鍓嶆ā鍨嬩笉鍦?CUDA 涓婃椂鎵ц鍔犺浇
             first_param = next(self.model.parameters(), None)
             is_on_cuda = (
                 first_param is not None and first_param.device.type == device_name
             )
 
             if self.is_offload_param or not is_on_cuda:
-                # 调用工具将 FSDP 分片移动到 GPU
+                # 璋冪敤宸ュ叿灏?FSDP 鍒嗙墖绉诲姩鍒?GPU
                 load_fsdp_model_to_gpu(self.model)
                 logger.debug("Loaded drafter model to GPU for training")
 
@@ -1651,7 +1664,7 @@ class DrafterBaseTrainer:
                 self.is_offload_optimizer
                 or not self._optimizer_state_on_runtime_device()
             ):
-                # 获取 device_id,否则在多卡环境优化器状态可能全部挤在 cuda:0 导致 OOM
+                # 鑾峰彇 device_id,鍚﹀垯鍦ㄥ鍗＄幆澧冧紭鍖栧櫒鐘舵€佸彲鑳藉叏閮ㄦ尋鍦?cuda:0 瀵艰嚧 OOM
                 current_dev_id = get_device_id()
                 load_fsdp_optimizer(optimizer=self.optimizer, device_id=current_dev_id)
                 logger.debug("Loaded drafter optimizer to GPU for training")
@@ -1661,7 +1674,7 @@ class DrafterBaseTrainer:
                 target_model.to(self.runtime_device)
             self._apply_pending_target_lm_head_weight()
 
-            # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
+            # 鍏堟爣璁板垵濮嬪寲瀹屾垚锛岀劧鍚庡紑鍚?active 寮€鍏筹紝纭繚璁粌寰幆涓嶄細璇诲埌涓棿鐘舵€?
             self._training_initialized = True
             self._training_active = True
 
@@ -2229,7 +2242,7 @@ class DrafterBaseTrainer:
             return
         input_ids = cast(torch.Tensor, input_ids)
 
-        # 1、异步拷贝，GPU在后台进行数据搬运，避免阻塞Rollout Stream
+        # 1銆佸紓姝ユ嫹璐濓紝GPU鍦ㄥ悗鍙拌繘琛屾暟鎹惉杩愶紝閬垮厤闃诲Rollout Stream
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
         if not use_logits:
             # Phase 4: use_logits=False reconstructs supervision from the
@@ -2943,11 +2956,11 @@ class DrafterBaseTrainer:
                             },
                         )
 
-            # 同步 DataBuffer
+            # 鍚屾 DataBuffer
             if self.use_data_buffer:
                 self.data_buffer.add_batch(data_item)
 
-            # 同步 collect_data (当前步训练直接使用)
+            # 鍚屾 collect_data (褰撳墠姝ヨ缁冪洿鎺ヤ娇鐢?
             else:
                 data_item["step"] = self.current_rl_step
                 self.collected_data.append(data_item)
@@ -4199,7 +4212,7 @@ class DrafterBaseTrainer:
             "timing_s/drafter_reduce_loss", time.time() - reduce_ts
         )
 
-        # 最终 Loss 平滑处理
+        # 鏈€缁?Loss 骞虫粦澶勭悊
         if float(global_tokens.detach().float().item()) <= 0:
             logger.debug(
                 f"Step {self.training_steps + 1}: no finite drafter target tokens, skipping optimizer step"
@@ -4210,7 +4223,7 @@ class DrafterBaseTrainer:
         vloss = global_vloss / denom
         ploss = global_ploss / denom
 
-        # 使用 backend 传回的权重合成最终 Loss
+        # 浣跨敤 backend 浼犲洖鐨勬潈閲嶅悎鎴愭渶缁?Loss
         loss = loss_dict["v_weight"] * vloss + loss_dict["p_weight"] * ploss
         if not torch.isfinite(loss):
             logger.error(
@@ -4222,14 +4235,14 @@ class DrafterBaseTrainer:
             )
             return False
 
-        # 反向传播
+        # 鍙嶅悜浼犳挱
         backward_ts = time.time()
         loss.backward()
         self.record_training_timing(
             "timing_s/drafter_backward", time.time() - backward_ts
         )
 
-        # 更新权重
+        # 鏇存柊鏉冮噸
         optimizer_ts = time.time()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.model.parameters(),

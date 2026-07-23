@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -23,7 +36,9 @@ class _FakeOldLogProbBatch:
         return self
 
     def to_tensordict(self):
-        raise AssertionError("non-collect old-logprob steps should not enter the collection compute path")
+        raise AssertionError(
+            "non-collect old-logprob steps should not enter the collection compute path"
+        )
 
 
 class _FakeRolloutWorkerGroup:
@@ -35,7 +50,9 @@ class _FakeRolloutWorkerGroup:
 
     def compute_log_prob(self, batch):
         self.compute_log_prob_calls += 1
-        raise AssertionError("non-collect old-logprob steps should use the original compute path")
+        raise AssertionError(
+            "non-collect old-logprob steps should use the original compute path"
+        )
 
 
 def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
@@ -50,7 +67,7 @@ def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
                     enable_drafter_training=True,
                     training=training_cfg,
                 )
-            )
+            ),
         )
     )
     trainer._pending_drafter_publish_refs = None
@@ -115,8 +132,18 @@ def test_drafter_training_attempt_requires_interval_and_samples() -> None:
 
 
 def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None:
-    assert _no_drafter_trainer(calculate_entropy=False)._speco_oldlogprob_entropy_hook_enabled() is True
-    assert _no_drafter_trainer(calculate_entropy=True)._speco_oldlogprob_entropy_hook_enabled() is False
+    assert (
+        _no_drafter_trainer(
+            calculate_entropy=False
+        )._speco_oldlogprob_entropy_hook_enabled()
+        is True
+    )
+    assert (
+        _no_drafter_trainer(
+            calculate_entropy=True
+        )._speco_oldlogprob_entropy_hook_enabled()
+        is False
+    )
     assert _no_drafter_trainer()._speco_oldlogprob_entropy_hook_enabled() is False
 
 
@@ -132,7 +159,9 @@ def test_oldlogprob_non_collect_step_uses_original_compute_path() -> None:
     trainer.config.actor_rollout_ref.actor.calculate_entropy = True
     trainer.config.actor_rollout_ref.actor.strategy = "fsdp"
     trainer.actor_rollout_wg = _FakeRolloutWorkerGroup()
-    trainer._update_actor = lambda *args, **kwargs: SimpleNamespace(meta_info={"metrics": {}})
+    trainer._update_actor = lambda *args, **kwargs: SimpleNamespace(
+        meta_info={"metrics": {}}
+    )
     original_calls = []
 
     def original_compute_old_log_prob(batch):
@@ -182,7 +211,8 @@ def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:
     trainer._ray_get_if_needed = lambda value: waited.append(value) or value
     trainer._speco_get_published_drafter_weights = lambda: {"weights": 1}
     trainer._speco_actor_rollout_method = lambda name: (
-        lambda payload, global_steps=None: calls.append((name, payload, global_steps)) or ["new-ref"]
+        lambda payload, global_steps=None: calls.append((name, payload, global_steps))
+        or ["new-ref"]
     )
 
     metrics = trainer._speco_publish_drafter_weights(True)

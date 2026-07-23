@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Contract tests for the Domino drafter backend.
 
 CPU-light: they exercise the Domino projector modules, the lambda-base
@@ -81,11 +94,16 @@ def test_domino_forward_computes_top5_accuracy() -> None:
 
     bsz, seq_len = 2, 16
     input_ids = torch.randint(0, config.vocab_size, (bsz, seq_len))
-    hidden_states_list = [torch.randn(bsz, seq_len, config.target_hidden_size) for _ in config.target_layer_ids]
+    hidden_states_list = [
+        torch.randn(bsz, seq_len, config.target_hidden_size)
+        for _ in config.target_layer_ids
+    ]
     loss_mask = torch.ones(bsz, seq_len, dtype=torch.long)
     lm_head_weight = torch.randn(config.vocab_size, config.hidden_size)
 
-    _, _, _, _, _, diagnostics = model(input_ids, hidden_states_list, loss_mask, lm_head_weight)
+    _, _, _, _, _, diagnostics = model(
+        input_ids, hidden_states_list, loss_mask, lm_head_weight
+    )
 
     top1 = float(diagnostics["top1_correct_count"])
     top5 = float(diagnostics["top5_correct_count"])
@@ -121,7 +139,9 @@ def test_domino_backend_is_block_drafter_metadata() -> None:
     from verl_speco.backends.domino_trainer_backend import DominoTrainerBackend
 
     backend = DominoTrainerBackend(
-        OmegaConf.create({"rollout": {"drafter": {"training": {}}}, "model": {"path": "/tmp/none"}}),
+        OmegaConf.create(
+            {"rollout": {"drafter": {"training": {}}}, "model": {"path": "/tmp/none"}}
+        ),
         OmegaConf.create({}),
     )
     assert backend.model_type == "domino"
@@ -145,10 +165,15 @@ def test_domino_config_from_file_routes_to_domino(tmp_path) -> None:
 
 
 def test_domino_uses_dflash_aux_layers() -> None:
-    from verl_speco.integration.oldlogprob_layer_ids import resolve_oldlogprob_aux_layer_ids
+    from verl_speco.integration.oldlogprob_layer_ids import (
+        resolve_oldlogprob_aux_layer_ids,
+    )
 
     layer_ids = resolve_oldlogprob_aux_layer_ids(
-        {"speculative_algorithm": "DOMINO", "training": {"domino_num_target_layers": 5}},
+        {
+            "speculative_algorithm": "DOMINO",
+            "training": {"domino_num_target_layers": 5},
+        },
         target_num_hidden_layers=36,
     )
     # Routes down the DFlash multi-context-layer branch (not the EAGLE default triple).
@@ -164,7 +189,9 @@ def test_domino_rejected_by_vllm_config_builder() -> None:
 
 
 def test_domino_rejected_by_sglang_config_builder() -> None:
-    from verl_speco.integration.sglang_runtime import _server_args_overrides_from_drafter
+    from verl_speco.integration.sglang_runtime import (
+        _server_args_overrides_from_drafter,
+    )
 
     with pytest.raises(ValueError, match="projector sub-mode"):
         _server_args_overrides_from_drafter(

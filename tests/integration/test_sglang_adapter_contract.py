@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import sys
@@ -24,7 +37,14 @@ from verl_speco.integration.sglang_runtime import (
 
 @pytest.mark.parametrize(
     ("step", "interval", "expected"),
-    [(None, 5, False), (0, 5, False), (4, 5, False), (5, 5, True), (10, 5, True), (5, 0, False)],
+    [
+        (None, 5, False),
+        (0, 5, False),
+        (4, 5, False),
+        (5, 5, True),
+        (10, 5, True),
+        (5, 0, False),
+    ],
 )
 def test_interval_gate(step, interval, expected) -> None:
     assert speco_step_matches_interval(step, interval) is expected
@@ -64,10 +84,14 @@ def test_sglang_patch_install_forwards_config_and_is_repeatable(monkeypatch) -> 
     calls = []
 
     fake_patch_module = SimpleNamespace(
-        enable_sglang_original_logprob_return=lambda: calls.append(("enable_original", None)),
+        enable_sglang_original_logprob_return=lambda: calls.append(
+            ("enable_original", None)
+        ),
         install_sglang_verl_patches=lambda **kwargs: calls.append(("install", kwargs)),
     )
-    monkeypatch.setitem(sys.modules, "verl_speco.integration.sglang_patch", fake_patch_module)
+    monkeypatch.setitem(
+        sys.modules, "verl_speco.integration.sglang_patch", fake_patch_module
+    )
 
     config = SGLangSpecoPatchConfig(
         set_envs_and_config=lambda: None,
@@ -86,7 +110,9 @@ def test_sglang_patch_install_forwards_config_and_is_repeatable(monkeypatch) -> 
     assert install_calls[0]["patches"] == {"hidden_states_tensor_output"}
 
 
-def test_dflash_hidden_collection_requests_aux_hidden_without_raw_topk(monkeypatch) -> None:
+def test_dflash_hidden_collection_requests_aux_hidden_without_raw_topk(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("VERL_DRAFTER_RAW_TOP_LOGPROBS", "1")
     server = _SpecoSGLangHttpServerMixin()
     server.replica_rank = 0
@@ -122,7 +148,9 @@ def test_dflash_hidden_collection_requests_aux_hidden_without_raw_topk(monkeypat
     assert sampling_params["custom_params"] == custom_params
 
 
-def test_eagle3_last_hidden_collection_does_not_request_raw_topk_without_logits(monkeypatch) -> None:
+def test_eagle3_last_hidden_collection_does_not_request_raw_topk_without_logits(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("VERL_DRAFTER_RAW_TOP_LOGPROBS", "1")
     server = _SpecoSGLangHttpServerMixin()
     server.replica_rank = 0

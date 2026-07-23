@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import json
@@ -39,7 +52,9 @@ def test_drafter_checkpoint_reads_nested_trainer_state(tmp_path) -> None:
 def test_drafter_checkpoint_keeps_old_metadata_compatible(tmp_path) -> None:
     checkpoint = tmp_path / "draft_step_12"
     checkpoint.mkdir()
-    (checkpoint / "metadata.json").write_text(json.dumps({"step": 12}), encoding="utf-8")
+    (checkpoint / "metadata.json").write_text(
+        json.dumps({"step": 12}), encoding="utf-8"
+    )
 
     assert get_drafter_checkpoint_step(checkpoint) == 12
     assert get_drafter_trainer_state(checkpoint) == {}
@@ -53,9 +68,13 @@ def test_resolve_drafter_checkpoint_path_matches_resumed_global_step(tmp_path) -
     checkpoint.mkdir(parents=True)
     (checkpoint / "config.json").write_text("{}", encoding="utf-8")
     (checkpoint / "pytorch_model.bin").write_bytes(b"weights")
-    (checkpoint / "metadata.json").write_text(json.dumps({"step": 20}), encoding="utf-8")
+    (checkpoint / "metadata.json").write_text(
+        json.dumps({"step": 20}), encoding="utf-8"
+    )
 
-    assert resolve_drafter_checkpoint_path(original_model, checkpoint_root, 20) == str(checkpoint)
+    assert resolve_drafter_checkpoint_path(original_model, checkpoint_root, 20) == str(
+        checkpoint
+    )
 
 
 def test_corrupt_metadata_fails_closed(tmp_path) -> None:
@@ -65,9 +84,13 @@ def test_corrupt_metadata_fails_closed(tmp_path) -> None:
     (checkpoint / "pytorch_model.bin").write_bytes(b"weights")
     (checkpoint / "metadata.json").write_text("{not-json", encoding="utf-8")
 
-    with pytest.raises(DrafterCheckpointMetadataError, match="Invalid drafter checkpoint metadata"):
+    with pytest.raises(
+        DrafterCheckpointMetadataError, match="Invalid drafter checkpoint metadata"
+    ):
         get_drafter_checkpoint_step(checkpoint)
-    with pytest.raises(DrafterCheckpointMetadataError, match="Invalid drafter checkpoint metadata"):
+    with pytest.raises(
+        DrafterCheckpointMetadataError, match="Invalid drafter checkpoint metadata"
+    ):
         is_pretrained_drafter_checkpoint(checkpoint)
 
 
@@ -115,6 +138,10 @@ def test_resolve_rejects_checkpoint_with_mismatched_metadata_step(tmp_path) -> N
     checkpoint.mkdir(parents=True)
     (checkpoint / "config.json").write_text("{}", encoding="utf-8")
     (checkpoint / "pytorch_model.bin").write_bytes(b"weights")
-    (checkpoint / "metadata.json").write_text(json.dumps({"step": 19}), encoding="utf-8")
+    (checkpoint / "metadata.json").write_text(
+        json.dumps({"step": 19}), encoding="utf-8"
+    )
 
-    assert resolve_drafter_checkpoint_path(original_model, checkpoint_root, 20) == str(original_model)
+    assert resolve_drafter_checkpoint_path(original_model, checkpoint_root, 20) == str(
+        original_model
+    )
