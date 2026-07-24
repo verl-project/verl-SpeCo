@@ -55,6 +55,7 @@ from verl_speco.integration.sglang_runtime import (
     should_install_sglang_base_compat_runtime,
 )
 from verl_speco.integration.vllm_runtime import SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX, configure_vllm_runtime_from_config
+from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
 from verl_speco.workers import SpecoWorker
 
 
@@ -1681,6 +1682,24 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         finally:
             rollout_generation_target.generate_sequences = original_generate_sequences
 
+    def _speco_bubble_profiler_enabled(self) -> bool:
+        return bool(
+            _get_nested(self.config, ("actor_rollout_ref", "rollout", "drafter", "profile_bubble"), False)
+        )
+
+    def _speco_augment_log_data(self, data: Any, latest_rollout_metrics: dict[str, float]) -> Any:
+        if (
+            isinstance(data, dict)
+            and isinstance(latest_rollout_metrics, dict)
+            and data.get("training/global_step") == self.global_steps
+        ):
+            data = dict(data)
+            data.update(latest_rollout_metrics)
+        data = _speco_move_drafter_timing_next_to_update_actor(data)
+        if self._speco_bubble_profiler_enabled():
+            data = inject_bubble_metrics(data)
+        return data
+
     @contextmanager
     def _speco_tracking_metrics_hook(self):
         try:
@@ -1698,26 +1717,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             latest_rollout_metrics = self._speco_current_step_rollout_metrics()
             if "data" in kwargs:
                 kwargs = dict(kwargs)
-                data = kwargs["data"]
-                if (
-                    isinstance(data, dict)
-                    and isinstance(latest_rollout_metrics, dict)
-                    and data.get("training/global_step") == self.global_steps
-                ):
-                    data = dict(data)
-                    data.update(latest_rollout_metrics)
-                kwargs["data"] = _speco_move_drafter_timing_next_to_update_actor(data)
+                kwargs["data"] = self._speco_augment_log_data(kwargs["data"], latest_rollout_metrics)
                 return original_log(tracking_self, *args, **kwargs)
             if args:
-                data = args[0]
-                if (
-                    isinstance(data, dict)
-                    and isinstance(latest_rollout_metrics, dict)
-                    and data.get("training/global_step") == self.global_steps
-                ):
-                    data = dict(data)
-                    data.update(latest_rollout_metrics)
-                args = (_speco_move_drafter_timing_next_to_update_actor(data), *args[1:])
+                args = (self._speco_augment_log_data(args[0], latest_rollout_metrics), *args[1:])
             return original_log(tracking_self, *args, **kwargs)
 
         log_with_speco_metrics._speco_drafter_timing_hook = True
