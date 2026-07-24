@@ -8,28 +8,41 @@ keeps draft-only weight publishing as a runtime method on the rollout adapter.
 
 from __future__ import annotations
 
+import atexit
+import gc
+import hashlib
 import json
 import logging
 import os
 import sys
+import threading
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Iterable
+
+from verl_speco.integration.verl_npu_vllm_compat import install_verl_npu_vllm_import_compat
+from verl_speco.trainer.checkpoint import trim_process_host_memory
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 SPECO_DRAFTER_CONFIG_ENV = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
 SPECO_VLLM_DRAFT_UPDATE_USE_SHM_ENV = "VERL_SPECO_VLLM_DRAFT_UPDATE_USE_SHM"
+SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS = (
+    "verl_speco.integration.vllm_runtime.SpecoVLLMWeightSyncCompatExtension"
+)
 SPECO_VLLM_WORKER_EXTENSION_CLS = "verl_speco.integration.vllm_runtime.SpecoVLLMColocateWorkerExtension"
 SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_ENV = "VERL_SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_SECONDS"
 SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
 SPECO_VLLM_DRAFT_DIAG_ENV = "VERL_SPECO_VLLM_DRAFT_DIAG"
+SPECO_VLLM_NPU_STAGING_ENV = "VERL_SPECO_VLLM_NPU_STAGING"
+SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES = 64 << 20
 
 _VLLM_REPLICA_PATCHED = False
 _VLLM_DFLASH_CONFIG_ALIASES_PATCHED = False
 _VLLM_DSPARK_RUNTIME_PATCHED = False
 _VLLM_DSPARK_REGISTRY_ALIAS_PATCHED = False
+_NPU_TARGET_STAGING_STATE = threading.local()
 
 _DSPARK_VLLM_ARCHITECTURES = {"DSparkDraftModel", "Qwen3DSparkModel", "DeepSeekDSparkModel"}
 _TRANSFORMERS_ATTENTION_LAYER_TYPES_FALLBACK = (
@@ -39,6 +52,16 @@ _TRANSFORMERS_ATTENTION_LAYER_TYPES_FALLBACK = (
     "chunked_attention",
     "linear_attention",
 )
+
+
+def _speco_is_npu_vllm_worker(worker: Any) -> bool:
+    try:
+        from vllm.platforms import current_platform
+
+        return str(getattr(current_platform, "device_type", "")).lower() == "npu"
+    except Exception:  # noqa: BLE001
+        device = getattr(worker, "device", None)
+        return str(getattr(device, "type", "")).lower() == "npu"
 
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
@@ -212,6 +235,364 @@ def patch_verl_bucketed_weight_transfer_rebuild_ipc(bucketed_weight_transfer: An
         return False
     bucketed_weight_transfer.rebuild_ipc = _speco_rebuild_ipc_compat
     return True
+
+
+def _speco_persistent_weight_shm_name(zmq_handle: str, bucket_size: int) -> str:
+    """Return a job/rank/bucket-scoped shared-memory name.
+
+    ``zmq_handle`` contains the Ray job id, replica id, and local rank in verl.
+    Including the bucket size keeps target and draft transfers isolated when
+    they use different bucket sizes.
+    """
+
+    identity = f"{zmq_handle}\0{int(bucket_size)}".encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()[:24]
+    return f"verl_weights_speco_{digest}"
+
+
+def patch_verl_bucketed_weight_transfer_shm_reuse(bucketed_weight_transfer: Any = None) -> bool:
+    """Reuse one stable SHM mapping per verl weight-transfer channel.
+
+    NPU cannot use torch device IPC, so verl falls back to POSIX shared memory.
+    Upstream creates a new UUID-named bucket for every actor update. If an NPU
+    runtime keeps the old mmap/pinned registration alive after ``close()``, the
+    node can retain one full bucket per rank and update. Keeping the mapping
+    open and reusing it bounds host memory to one bucket per channel.
+
+    CUDA/device IPC is delegated to the untouched upstream implementation.
+    """
+
+    if bucketed_weight_transfer is None:
+        try:
+            from verl.workers.rollout.vllm_rollout import bucketed_weight_transfer
+        except Exception:  # noqa: BLE001
+            return False
+
+    sender_cls = getattr(bucketed_weight_transfer, "BucketedWeightSender", None)
+    receiver_cls = getattr(bucketed_weight_transfer, "BucketedWeightReceiver", None)
+    if sender_cls is None or receiver_cls is None:
+        return False
+
+    sender_init = getattr(sender_cls, "_init_buffer", None)
+    receiver_init = getattr(receiver_cls, "_init_buffer", None)
+    sender_cleanup = getattr(sender_cls, "_cleanup", None)
+    receiver_cleanup = getattr(receiver_cls, "_cleanup", None)
+    methods = (sender_init, receiver_init, sender_cleanup, receiver_cleanup)
+    if not all(callable(method) for method in methods):
+        return False
+    if all(getattr(method, "_speco_shm_reuse", False) for method in methods):
+        return False
+
+    cache = getattr(bucketed_weight_transfer, "_speco_persistent_weight_shm_cache", None)
+    if cache is None:
+        cache = {}
+        bucketed_weight_transfer._speco_persistent_weight_shm_cache = cache
+    owner_names = getattr(bucketed_weight_transfer, "_speco_persistent_weight_shm_owner_names", None)
+    if owner_names is None:
+        owner_names = set()
+        bucketed_weight_transfer._speco_persistent_weight_shm_owner_names = owner_names
+    reuse_logged = getattr(bucketed_weight_transfer, "_speco_persistent_weight_shm_reuse_logged", None)
+    if reuse_logged is None:
+        reuse_logged = set()
+        bucketed_weight_transfer._speco_persistent_weight_shm_reuse_logged = reuse_logged
+    cache_lock = getattr(bucketed_weight_transfer, "_speco_persistent_weight_shm_lock", None)
+    if cache_lock is None:
+        cache_lock = threading.Lock()
+        bucketed_weight_transfer._speco_persistent_weight_shm_lock = cache_lock
+
+    if not getattr(bucketed_weight_transfer, "_speco_persistent_weight_shm_cleanup_registered", False):
+
+        def _cleanup_persistent_weight_shm() -> None:
+            with cache_lock:
+                entries = list(cache.items())
+                cache.clear()
+                owned = set(owner_names)
+                owner_names.clear()
+
+            # Drop torch.frombuffer views before closing their mmap objects.
+            shm_entries = [(name, entry[1]) for name, entry in entries]
+            entries.clear()
+            gc.collect()
+            for name, shm in shm_entries:
+                try:
+                    shm.close()
+                except (BufferError, OSError) as exc:
+                    logger.warning("[speco weight shm] close failed name=%s: %s", name, exc)
+                if name in owned:
+                    try:
+                        shm.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        logger.warning("[speco weight shm] unlink failed name=%s: %s", name, exc)
+
+        bucketed_weight_transfer._speco_cleanup_persistent_weight_shm = _cleanup_persistent_weight_shm
+        bucketed_weight_transfer._speco_persistent_weight_shm_cleanup_registered = True
+        atexit.register(_cleanup_persistent_weight_shm)
+
+    def _get_cached_buffer(shm_name: str, shm_size: int, *, owner: bool):
+        with cache_lock:
+            cached = cache.get(shm_name)
+            if cached is not None:
+                buffer, shm = cached
+                if int(getattr(shm, "size", shm_size)) < shm_size:
+                    raise RuntimeError(
+                        f"Persistent weight SHM {shm_name!r} is smaller than requested: "
+                        f"{getattr(shm, 'size', None)} < {shm_size}"
+                    )
+                if owner:
+                    owner_names.add(shm_name)
+                reuse_key = ("sender" if owner else "receiver", shm_name)
+                if reuse_key not in reuse_logged:
+                    reuse_logged.add(reuse_key)
+                    logger.warning(
+                        "[speco weight shm] persistent mapping reused role=%s name=%s "
+                        "size_mb=%.1f pid=%s cache_entries=%s",
+                        reuse_key[0],
+                        shm_name,
+                        shm_size / (1 << 20),
+                        os.getpid(),
+                        len(cache),
+                    )
+                return buffer, shm
+
+            if owner:
+                shm = bucketed_weight_transfer.create_shared_memory(shm_size, shm_name)
+                buffer = bucketed_weight_transfer.torch.frombuffer(
+                    shm.buf,
+                    dtype=bucketed_weight_transfer.torch.uint8,
+                )
+                owner_names.add(shm_name)
+                role = "sender"
+            else:
+                buffer, shm = bucketed_weight_transfer.rebuild_shared_memory(
+                    shm_name,
+                    shm_size,
+                    dtype=bucketed_weight_transfer.torch.uint8,
+                )
+                role = "receiver"
+            cache[shm_name] = (buffer, shm)
+            logger.warning(
+                "[speco weight shm] persistent mapping ready role=%s name=%s size_mb=%.1f",
+                role,
+                shm_name,
+                shm_size / (1 << 20),
+            )
+            return buffer, shm
+
+    def _sender_init_buffer_with_shm_reuse(self):
+        if not bool(getattr(self, "use_shm", False)):
+            return sender_init(self)
+        shm_name = _speco_persistent_weight_shm_name(self.zmq_handle, self.bucket_size)
+        buffer, shm = _get_cached_buffer(shm_name, self.bucket_size, owner=True)
+        self.socket.send_pyobj({"name": shm_name, "size": self.bucket_size})
+        self.socket.recv()
+        self.buffer = buffer
+        self.shm = shm
+
+    def _receiver_init_buffer_with_shm_reuse(self):
+        if not bool(getattr(self, "use_shm", False)):
+            return receiver_init(self)
+        comm_metadata = self.socket.recv_pyobj()
+        shm_name = comm_metadata["name"]
+        shm_size = int(comm_metadata["size"])
+        buffer, shm = _get_cached_buffer(shm_name, shm_size, owner=False)
+        self.socket.send(b"")
+        self.buffer = buffer
+        self.shm = shm
+
+    def _sender_cleanup_with_shm_reuse(self):
+        if not bool(getattr(self, "use_shm", False)):
+            return sender_cleanup(self)
+        # The module-level cache owns the mapping. Let upstream clean sockets
+        # and device caches without closing or unlinking the persistent SHM.
+        self.buffer = None
+        self.shm = None
+        return sender_cleanup(self)
+
+    def _receiver_cleanup_with_shm_reuse(self):
+        if not bool(getattr(self, "use_shm", False)):
+            return receiver_cleanup(self)
+        self.buffer = None
+        self.shm = None
+        return receiver_cleanup(self)
+
+    for method in (
+        _sender_init_buffer_with_shm_reuse,
+        _receiver_init_buffer_with_shm_reuse,
+        _sender_cleanup_with_shm_reuse,
+        _receiver_cleanup_with_shm_reuse,
+    ):
+        method._speco_shm_reuse = True
+
+    sender_cls._init_buffer = _sender_init_buffer_with_shm_reuse
+    receiver_cls._init_buffer = _receiver_init_buffer_with_shm_reuse
+    sender_cls._cleanup = _sender_cleanup_with_shm_reuse
+    receiver_cls._cleanup = _receiver_cleanup_with_shm_reuse
+    return True
+
+
+def patch_verl_bucketed_weight_transfer_npu_staging(bucketed_weight_transfer: Any = None) -> bool:
+    """Use one reusable NPU allocation for all SHM buckets in a target reload."""
+
+    if bucketed_weight_transfer is None:
+        try:
+            from verl.workers.rollout.vllm_rollout import bucketed_weight_transfer
+        except Exception:  # noqa: BLE001
+            return False
+
+    receiver_cls = getattr(bucketed_weight_transfer, "BucketedWeightReceiver", None)
+    if receiver_cls is None:
+        return False
+    original_receive = getattr(receiver_cls, "receive_weights", None)
+    if not callable(original_receive) or getattr(original_receive, "_speco_npu_staging", False):
+        return False
+
+    logged_pids = getattr(bucketed_weight_transfer, "_speco_npu_staging_logged_pids", None)
+    if logged_pids is None:
+        logged_pids = set()
+        bucketed_weight_transfer._speco_npu_staging_logged_pids = logged_pids
+
+    def _receive_weights_with_npu_staging(self, on_bucket_received):
+        enabled = bool(getattr(_NPU_TARGET_STAGING_STATE, "enabled", False))
+        device_type = str(getattr(getattr(self, "device", None), "type", "")).lower()
+        if not enabled or not bool(getattr(self, "use_shm", False)) or device_type != "npu":
+            return original_receive(self, on_bucket_received)
+
+        staging_buffer = None
+        weights = None
+        tensor = None
+        metadata = None
+        bucket_meta = None
+        try:
+            self._init_socket()
+            self._init_buffer()
+            capacity = int(self.buffer.numel())
+            staging_buffer = bucketed_weight_transfer.torch.empty(
+                capacity,
+                dtype=bucketed_weight_transfer.torch.uint8,
+                device=self.device,
+            )
+            if os.getpid() not in logged_pids:
+                logged_pids.add(os.getpid())
+                logger.warning(
+                    "[speco vllm weight sync] using one reusable NPU staging allocation for SHM target reload "
+                    "pid=%s capacity_mb=%.1f copy_chunk_mb=%.1f",
+                    os.getpid(),
+                    capacity / (1 << 20),
+                    SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES / (1 << 20),
+                )
+
+            while True:
+                metadata = self.socket.recv_pyobj()
+                bucket_meta = metadata["bucket_meta"]
+                used_bytes = max(
+                    (
+                        int(meta["offset"]) + int(meta["dtype"].itemsize * meta["shape"].numel())
+                        for meta in bucket_meta.values()
+                        if meta["handle"] is None
+                    ),
+                    default=0,
+                )
+                if used_bytes > capacity:
+                    raise RuntimeError(f"NPU staging bucket overflow: {used_bytes} > {capacity}")
+                if used_bytes:
+                    for start in range(0, used_bytes, SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES):
+                        end = min(start + SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES, used_bytes)
+                        staging_buffer[start:end].copy_(self.buffer[start:end], non_blocking=False)
+
+                weights = []
+                for name, meta in bucket_meta.items():
+                    shape = meta["shape"]
+                    dtype = meta["dtype"]
+                    offset = int(meta["offset"])
+                    handle = meta["handle"]
+                    if handle is not None:
+                        tensor = bucketed_weight_transfer.rebuild_ipc(handle, self.device.index)
+                    else:
+                        size = int(dtype.itemsize * shape.numel())
+                        tensor = staging_buffer[offset : offset + size].view(dtype=dtype).view(shape)
+                    weights.append((name, tensor))
+
+                on_bucket_received(weights)
+                bucketed_weight_transfer.get_torch_device().synchronize()
+                self.socket.send(b"")
+                weights = None
+                tensor = None
+                if metadata["is_last"]:
+                    break
+        finally:
+            weights = None
+            tensor = None
+            bucket_meta = None
+            metadata = None
+            staging_buffer = None
+            self._cleanup()
+
+    _receive_weights_with_npu_staging._speco_npu_staging = True
+    receiver_cls.receive_weights = _receive_weights_with_npu_staging
+    return True
+
+
+def _speco_npu_target_staging_decision(
+    worker: Any,
+    *,
+    peft_config: dict | None,
+    use_shm: bool,
+) -> tuple[bool, str]:
+    if _bool_or_none(os.getenv(SPECO_VLLM_NPU_STAGING_ENV)) is False:
+        return False, "disabled_by_env"
+    if not use_shm:
+        return False, "not_shm"
+    if peft_config is not None:
+        return False, "peft"
+    if not _speco_is_npu_vllm_worker(worker):
+        return False, "not_npu"
+    if bool(getattr(worker, "_is_qat_model", False)) or bool(getattr(worker, "_is_modelopt_qat", False)):
+        return False, "qat"
+    use_mtp_sync = getattr(worker, "_use_mtp_drafter_weight_sync", None)
+    if callable(use_mtp_sync) and use_mtp_sync():
+        return False, "mtp"
+    runner = getattr(worker, "model_runner", None)
+    vllm_config = getattr(runner, "vllm_config", None)
+    if vllm_config is None:
+        return False, "missing_vllm_config"
+    quant_config = getattr(vllm_config, "quant_config", None)
+    if quant_config is not None:
+        return False, f"quantized:{type(quant_config).__name__}"
+    return True, "eligible"
+
+
+def _speco_can_use_npu_target_staging(worker: Any, *, peft_config: dict | None, use_shm: bool) -> bool:
+    enabled, _ = _speco_npu_target_staging_decision(
+        worker,
+        peft_config=peft_config,
+        use_shm=use_shm,
+    )
+    return enabled
+
+
+@contextmanager
+def _speco_npu_target_staging(worker: Any, *, peft_config: dict | None, use_shm: bool):
+    previous = bool(getattr(_NPU_TARGET_STAGING_STATE, "enabled", False))
+    enabled, reason = _speco_npu_target_staging_decision(
+        worker,
+        peft_config=peft_config,
+        use_shm=use_shm,
+    )
+    _NPU_TARGET_STAGING_STATE.enabled = enabled
+    if not bool(getattr(worker, "_speco_npu_staging_decision_logged", False)):
+        worker._speco_npu_staging_decision_logged = True
+        print(
+            "[speco vllm weight sync] NPU staging decision "
+            f"enabled={int(enabled)} reason={reason} pid={os.getpid()} "
+            f"local_rank={getattr(worker, 'local_rank', None)} use_shm={int(bool(use_shm))}",
+            flush=True,
+        )
+    try:
+        yield
+    finally:
+        _NPU_TARGET_STAGING_STATE.enabled = previous
 
 
 def _int_list_or_none(value: Any, field_name: str) -> list[int] | None:
@@ -729,9 +1110,10 @@ def patch_transformers_attention_layer_type_constants() -> bool:
 
 
 # Ray imports this module to deserialize SpecoVLLMHttpServer before the normal
-# worker runtime hooks run. Patch transformers before any top-level verl/vLLM
-# imports below can transitively import vLLM.
+# worker runtime hooks run. Install both import guards before any top-level
+# verl/vLLM import below, including Worker_TP extension class resolution.
 patch_transformers_attention_layer_type_constants()
+install_verl_npu_vllm_import_compat()
 
 
 def _is_dspark_hf_config(hf_config: Any) -> bool:
@@ -1622,6 +2004,7 @@ async def speco_vllm_update_draft_weights(self, weights: Any, *args, global_step
             getattr(self, "use_shm", None),
         )
 
+    patch_verl_bucketed_weight_transfer_shm_reuse()
     from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
 
     start_time = time.time()
@@ -1677,6 +2060,7 @@ def attach_update_draft_weights_to_rollout(rollout: Any) -> Any:
 
 def patch_vllm_server_adapter_update() -> None:
     patch_verl_bucketed_weight_transfer_rebuild_ipc()
+    patch_verl_bucketed_weight_transfer_shm_reuse()
     try:
         from verl.workers.rollout.vllm_rollout import vllm_rollout
     except Exception:  # noqa: BLE001
@@ -1695,6 +2079,8 @@ def install_vllm_runtime_for_worker(worker: Any) -> None:
         os.environ[SPECO_DRAFTER_CONFIG_ENV] = drafter_env
     install_vllm_runtime_observability()
     patch_verl_bucketed_weight_transfer_rebuild_ipc()
+    patch_verl_bucketed_weight_transfer_shm_reuse()
+    patch_verl_bucketed_weight_transfer_npu_staging()
     patch_vllm_server_adapter_update()
 
 
@@ -1702,6 +2088,33 @@ try:
     from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension as _VLLMWorkerExtensionBase
 except Exception:  # noqa: BLE001
     _VLLMWorkerExtensionBase = object
+
+
+class SpecoVLLMWeightSyncCompatExtension(_VLLMWorkerExtensionBase):
+    """Install the serialized NPU IPC-handle compatibility before target weight sync."""
+
+    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+        patched = patch_verl_bucketed_weight_transfer_rebuild_ipc()
+        patch_verl_bucketed_weight_transfer_shm_reuse()
+        patch_verl_bucketed_weight_transfer_npu_staging()
+        if patched and int(getattr(self, "local_rank", 0) or 0) == 0:
+            logger.warning("[speco vllm weight sync] installed IPC rebuild compatibility")
+        if not _speco_is_npu_vllm_worker(self):
+            return super().update_weights_from_ipc(
+                peft_config=peft_config,
+                base_sync_done=base_sync_done,
+                use_shm=use_shm,
+            )
+
+        try:
+            with _speco_npu_target_staging(self, peft_config=peft_config, use_shm=use_shm):
+                return super().update_weights_from_ipc(
+                    peft_config=peft_config,
+                    base_sync_done=base_sync_done,
+                    use_shm=use_shm,
+                )
+        finally:
+            trim_process_host_memory()
 
 
 class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
@@ -1850,11 +2263,11 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         from vllm.platforms import current_platform
 
         patch_verl_bucketed_weight_transfer_rebuild_ipc()
+        patch_verl_bucketed_weight_transfer_shm_reuse()
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
 
         is_npu = str(getattr(current_platform, "device_type", "")).lower() == "npu"
         use_shm = bool(use_shm)
-
         if is_npu and not use_shm:
             raise RuntimeError("SPECO vLLM draft weight update on NPU requires shared-memory transfer")
 
@@ -1864,10 +2277,19 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
 
         all_weights: list[tuple[str, torch.Tensor]] = []
 
+        def finish_update(result, translated_weights=None):
+            if not is_npu:
+                return result
+            if translated_weights is not None:
+                translated_weights.clear()
+            all_weights.clear()
+            trim_process_host_memory()
+            return result
+
         def on_bucket_received(bucket_weights):
-            # Clone immediately: IPC buffer views become invalid after receive_weights()
-            # returns (the buffer is freed in _cleanup()). Cloning while the buffer is
-            # still valid gives each tensor its own GPU storage that outlives the buffer.
+            # Clone immediately: bucket views may be freed (IPC) or overwritten
+            # by the next update (persistent SHM). Give each tensor independent
+            # device storage before receive_weights() returns.
             all_weights.extend([(name, t.detach().clone()) for name, t in bucket_weights])
 
         receiver = BucketedWeightReceiver(
@@ -1879,7 +2301,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
 
         draft_model, _ = self._speco_resolve_draft_model()
         if draft_model is None or not all_weights:
-            return {"loaded_params": 0, "has_draft_model": draft_model is not None}
+            return finish_update({"loaded_params": 0, "has_draft_model": draft_model is not None})
 
         draft_method = self._speco_draft_method()
         is_dflash = draft_method == "dflash"
@@ -1915,7 +2337,10 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         else:
             inner_model = getattr(draft_model, "model", None)
             if inner_model is None:
-                return {"loaded_params": 0, "has_draft_model": True}
+                return finish_update(
+                    {"loaded_params": 0, "has_draft_model": True},
+                    translated_weights,
+                )
             logger.warning("[speco draft ipc] loading %d translated weights into %s (method=%s), first 5 keys: %s",
                           len(translated_weights), type(inner_model).__name__, draft_method,
                           [n for n, _ in translated_weights[:5]])
@@ -1942,7 +2367,10 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 _describe_vllm_draft_logits(draft_logits, missing=missing_draft_logits),
                 type(proposer).__name__,
             )
-        return {"loaded_params": loaded_params, "has_draft_model": True}
+        return finish_update(
+            {"loaded_params": loaded_params, "has_draft_model": True},
+            translated_weights,
+        )
 
     # ----------------------------------------------------------------
     # Fix: reload DFlash drafter weights from checkpoint after wake_up
@@ -2017,19 +2445,27 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Override target weight sync to also reload drafter from checkpoint."""
         patch_verl_bucketed_weight_transfer_rebuild_ipc()
+        patch_verl_bucketed_weight_transfer_shm_reuse()
+        patch_verl_bucketed_weight_transfer_npu_staging()
+        is_npu = _speco_is_npu_vllm_worker(self)
         # Diagnostic: check draft state BEFORE target sync
         self._speco_diag_draft_state("before_target_sync")
-        result = super().update_weights_from_ipc(
-            peft_config=peft_config, base_sync_done=base_sync_done, use_shm=use_shm
-        )
-        # Diagnostic: check draft state AFTER target sync (may be zeroed by wake_up)
-        self._speco_diag_draft_state("after_target_sync")
-        reloaded = self._speco_reload_draft_from_checkpoint()
-        if reloaded > 0:
-            logger.warning("[speco draft reload] drafter weights restored after target sync (%d tensors)", reloaded)
-        # Diagnostic: check draft state AFTER reload
-        self._speco_diag_draft_state("after_draft_reload")
-        return result
+        try:
+            with _speco_npu_target_staging(self, peft_config=peft_config, use_shm=use_shm):
+                result = super().update_weights_from_ipc(
+                    peft_config=peft_config, base_sync_done=base_sync_done, use_shm=use_shm
+                )
+            # Diagnostic: check draft state AFTER target sync (may be zeroed by wake_up)
+            self._speco_diag_draft_state("after_target_sync")
+            reloaded = self._speco_reload_draft_from_checkpoint()
+            if reloaded > 0:
+                logger.warning("[speco draft reload] drafter weights restored after target sync (%d tensors)", reloaded)
+            # Diagnostic: check draft state AFTER reload
+            self._speco_diag_draft_state("after_draft_reload")
+            return result
+        finally:
+            if is_npu:
+                trim_process_host_memory()
 
     def _speco_diag_draft_state(self, phase: str):
         """Log norms of key draft model parameters for debugging."""

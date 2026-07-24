@@ -1,17 +1,17 @@
 # GPU SGLang runtime image.
 FROM verlai/verl:sgl0512.dev1
 
-ARG VERL_COMMIT=7aed6b230776f963fa09509c10d9c3a767d1102c
+ARG VERL_REF=release/v0.8.0
 ARG VERL_REPO=https://github.com/verl-project/verl.git
 
 WORKDIR /workspace
 
 RUN git clone ${VERL_REPO} /workspace/verl \
     && cd /workspace/verl \
-    && git checkout ${VERL_COMMIT} \
+    && git checkout ${VERL_REF} \
     && pip install -e .
 
 COPY . /workspace/verl-SpeCo
 
-ENV PYTHONPATH=/workspace/verl-SpeCo:${PYTHONPATH}
 WORKDIR /workspace/verl-SpeCo
+RUN pip install -e .

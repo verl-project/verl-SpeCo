@@ -821,9 +821,11 @@ async def speco_update_target_weights(self, weights, *args, global_steps: int = 
     from verl.workers.rollout.sglang_rollout.utils import get_named_tensor_buckets
 
     if getattr(self.config, "get", None) is not None and self.config.get("quantization") == "fp8":
-        from verl.workers.rollout.sglang_rollout.utils import SGLangFP8QuantizerHelper
+        from verl.utils.sglang.sglang_fp8_utils import SGLangFP8QuantizerHelper
 
-        weights = SGLangFP8QuantizerHelper.modify_model_weight_for_fp8(weights)
+        hf_config = self.model_config.hf_config
+        fp8_quantizer = SGLangFP8QuantizerHelper(hf_config.quantization_config)
+        weights = fp8_quantizer.quant_weights_by_name(weights, dtype=hf_config.dtype)
 
     total_ts = time.perf_counter()
     try:

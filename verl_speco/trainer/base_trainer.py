@@ -20,12 +20,11 @@ from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy
 from torch.nn import SmoothL1Loss
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-from verl.utils.device import get_device_name, get_torch_device
+from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl_speco.trainer.data_buffer import DataBuffer
 from verl.utils.fsdp_utils import (
     get_fsdp_full_state_dict,
     get_fsdp_wrap_policy,
-    get_device_id,
     apply_fsdp2,
     fsdp2_load_full_state_dict,
     load_fsdp_model_to_gpu,
@@ -35,6 +34,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
 )
 from verl.utils.ulysses import get_ulysses_sequence_parallel_group, set_ulysses_sequence_parallel_group
+from verl_speco.trainer.checkpoint import release_checkpoint_host_memory
 from verl_speco.trainer.feature_store import DraftFeatureSample
 
 logger = logging.getLogger(__name__)
@@ -1209,6 +1209,9 @@ class DrafterBaseTrainer:
 
         if not isinstance(trainer_state, dict) or int(trainer_state.get("version", 0) or 0) != 1:
             raise RuntimeError(f"Invalid drafter trainer state in {trainer_state_path}")
+        # Other DP replicas may still be reading the shared DCP files. Trim
+        # only process-local staging here; file-cache eviction is save-only.
+        release_checkpoint_host_memory()
         return trainer_state
 
     def _save_pretrained_checkpoint_async(
@@ -1231,12 +1234,24 @@ class DrafterBaseTrainer:
                 raise RuntimeError("Previous full drafter checkpoint save failed") from exc
             self._pending_full_checkpoint_future = None
 
+        export_started = time.perf_counter()
         export_model, _ = self._get_pretrained_export_model()
         model_state_dict = self._get_pretrained_export_state_dict()
+        export_elapsed = time.perf_counter() - export_started
         if not self._is_checkpoint_leader() or not model_state_dict:
             return None
         if not hasattr(export_model, "save_pretrained"):
             raise TypeError(f"Drafter export model does not support save_pretrained: {type(export_model)}")
+
+        from verl_speco.trainer.checkpoint import format_checkpoint_memory_snapshot
+
+        logger.warning(
+            "[drafter checkpoint] step=%s phase=export elapsed=%.2fs tensors=%s %s",
+            step,
+            export_elapsed,
+            len(model_state_dict),
+            format_checkpoint_memory_snapshot(),
+        )
 
         save_kwargs = self._infer_pretrained_save_kwargs()
         metadata_path = os.path.join(checkpoint_path, "metadata.json")
@@ -1255,21 +1270,54 @@ class DrafterBaseTrainer:
         }
 
         def _write_full_checkpoint():
-            os.makedirs(checkpoint_path, exist_ok=True)
-            self._clear_existing_pretrained_weight_files(checkpoint_path)
-            export_model.save_pretrained(checkpoint_path, state_dict=model_state_dict, **save_kwargs)
-            self._copy_drafter_auxiliary_files(checkpoint_path)
-            self._atomic_json_dump(
-                {
-                    "step": step,
-                    "format": "pretrained_drafter_checkpoint",
-                    "serialization": "pytorch",
-                    "complete": True,
-                    "trainer_state": trainer_state,
-                    "optimizer": optimizer_manifest,
-                },
-                metadata_path,
-            )
+            write_started = time.perf_counter()
+            checkpoint_complete = False
+            write_result = None
+            try:
+                os.makedirs(checkpoint_path, exist_ok=True)
+                self._clear_existing_pretrained_weight_files(checkpoint_path)
+                export_model.save_pretrained(checkpoint_path, state_dict=model_state_dict, **save_kwargs)
+                self._copy_drafter_auxiliary_files(checkpoint_path)
+                self._atomic_json_dump(
+                    {
+                        "step": step,
+                        "format": "pretrained_drafter_checkpoint",
+                        "serialization": "pytorch",
+                        "complete": True,
+                        "trainer_state": trainer_state,
+                        "optimizer": optimizer_manifest,
+                    },
+                    metadata_path,
+                )
+                checkpoint_complete = True
+                write_elapsed = time.perf_counter() - write_started
+                logger.warning(
+                    "[drafter checkpoint] step=%s phase=write elapsed=%.2fs %s",
+                    step,
+                    write_elapsed,
+                    format_checkpoint_memory_snapshot(),
+                )
+                write_result = {
+                    "export_elapsed": export_elapsed,
+                    "write_elapsed": write_elapsed,
+                }
+            finally:
+                model_state_dict.clear()
+                reclaim = release_checkpoint_host_memory(
+                    checkpoint_path if checkpoint_complete else None,
+                    drop_file_cache=checkpoint_complete,
+                )
+                logger.warning(
+                    "[drafter checkpoint] step=%s phase=reclaim elapsed=%.2fs files=%s failed=%s %s",
+                    step,
+                    reclaim["elapsed_sec"],
+                    reclaim["files_advised"],
+                    reclaim["files_failed"],
+                    format_checkpoint_memory_snapshot(),
+                )
+                if write_result is not None:
+                    write_result["reclaim_elapsed"] = reclaim["elapsed_sec"]
+            return write_result
 
         if self._full_checkpoint_executor is None:
             self._full_checkpoint_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="drafter-full-ckpt")
@@ -1298,12 +1346,21 @@ class DrafterBaseTrainer:
             return None
 
         checkpoint_path = os.path.join(self.checkpoint_dir, f"draft_step_{step}")
-        return self._save_pretrained_checkpoint_async(checkpoint_path, step, optimizer_manifest)
+        return self._save_pretrained_checkpoint_async(
+            checkpoint_path,
+            step,
+            optimizer_manifest,
+        )
 
-    def save_checkpoint(self, step: int, wait: bool = True) -> dict[str, Any]:
+    def save_checkpoint(
+        self,
+        step: int,
+        wait: bool = True,
+    ) -> dict[str, Any]:
         if not self.checkpoint_dir:
             return {"saved": False, "reason": "missing_checkpoint_dir"}
 
+        checkpoint_started = time.perf_counter()
         checkpoint_path = os.path.join(self.checkpoint_dir, f"draft_step_{int(step)}")
         if self.rollout_dp_rank != 0:
             return {
@@ -1311,6 +1368,15 @@ class DrafterBaseTrainer:
                 "path": checkpoint_path,
                 "reason": "not_checkpoint_replica",
             }
+        if self._is_checkpoint_leader():
+            from verl_speco.trainer.checkpoint import format_checkpoint_memory_snapshot
+
+            logger.warning(
+                "[drafter checkpoint] step=%s phase=start path=%s %s",
+                step,
+                checkpoint_path,
+                format_checkpoint_memory_snapshot(),
+            )
         pending_full_checkpoint = getattr(self, "_pending_full_checkpoint_future", None)
         previous_error = None
         if self._is_checkpoint_leader() and pending_full_checkpoint is not None:
@@ -1328,20 +1394,73 @@ class DrafterBaseTrainer:
         first_param = next(self.model.parameters(), None)
         was_on_device = first_param is not None and first_param.device.type == device_name
         is_fsdp_wrapped = isinstance(self.model, FSDP) or self.training_device_mesh is not None
+        load_elapsed = 0.0
         if is_fsdp_wrapped and not was_on_device:
+            load_started = time.perf_counter()
             load_fsdp_model_to_gpu(self.model)
+            load_elapsed = time.perf_counter() - load_started
 
         future = None
         optimizer_manifest = None
+        optimizer_elapsed = 0.0
+        export_elapsed = 0.0
+        write_elapsed = 0.0
+        offload_elapsed = 0.0
+        reclaim_elapsed = 0.0
         try:
+            optimizer_started = time.perf_counter()
             optimizer_manifest = self._save_optimizer_checkpoint(checkpoint_path)
-            future = self._save_checkpoint_async(int(step), optimizer_manifest)
+            optimizer_elapsed = time.perf_counter() - optimizer_started
+            if self._is_checkpoint_leader():
+                from verl_speco.trainer.checkpoint import format_checkpoint_memory_snapshot
+
+                logger.warning(
+                    "[drafter checkpoint] step=%s phase=optimizer elapsed=%.2fs %s",
+                    step,
+                    optimizer_elapsed,
+                    format_checkpoint_memory_snapshot(),
+                )
+            future = self._save_checkpoint_async(
+                int(step),
+                optimizer_manifest,
+            )
             if wait and future is not None:
-                future.result()
-                self._pending_full_checkpoint_future = None
+                try:
+                    write_result = future.result()
+                finally:
+                    self._pending_full_checkpoint_future = None
+                if isinstance(write_result, dict):
+                    export_elapsed = float(write_result.get("export_elapsed", 0.0) or 0.0)
+                    write_elapsed = float(write_result.get("write_elapsed", 0.0) or 0.0)
+                    reclaim_elapsed = float(write_result.get("reclaim_elapsed", 0.0) or 0.0)
         finally:
             if is_fsdp_wrapped and not was_on_device:
+                offload_started = time.perf_counter()
                 offload_fsdp_model_to_cpu(self.model)
+                offload_elapsed = time.perf_counter() - offload_started
+            # The full-checkpoint writer already clears its state dict and
+            # reclaims once. Ranks without a full-weight write still need one
+            # local cleanup for optimizer/export staging.
+            if future is None:
+                reclaim = release_checkpoint_host_memory()
+                reclaim_elapsed = reclaim["elapsed_sec"]
+
+        if self._is_checkpoint_leader():
+            from verl_speco.trainer.checkpoint import format_checkpoint_memory_snapshot
+
+            logger.warning(
+                "[drafter checkpoint] step=%s phase=complete total=%.2fs load=%.2fs "
+                "optimizer=%.2fs export=%.2fs write=%.2fs offload=%.2fs reclaim=%.2fs %s",
+                step,
+                time.perf_counter() - checkpoint_started,
+                load_elapsed,
+                optimizer_elapsed,
+                export_elapsed,
+                write_elapsed,
+                offload_elapsed,
+                reclaim_elapsed,
+                format_checkpoint_memory_snapshot(),
+            )
 
         if future is None:
             reason = "optimizer_shard_saved"
@@ -1403,9 +1522,7 @@ class DrafterBaseTrainer:
                 load_fsdp_optimizer(optimizer=self.optimizer, device_id=current_dev_id)
                 logger.debug("Loaded drafter optimizer to GPU for training")
 
-            target_model = getattr(self.backend, "target_model", None)
-            if target_model is not None:
-                target_model.to(self.runtime_device)
+            self._move_target_lm_head(self.runtime_device)
             self._apply_pending_target_lm_head_weight()
 
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
@@ -1691,6 +1808,22 @@ class DrafterBaseTrainer:
         if target_lm_head is not None and getattr(target_lm_head, "fc", None) is not None:
             return target_lm_head.fc
         return None
+
+    def _move_target_lm_head(self, device: torch.device | str) -> bool:
+        """Move the backend's frozen target head to the requested device."""
+        for attribute in ("target_model", "target_lm_head"):
+            target_head = getattr(self.backend, attribute, None)
+            if target_head is None:
+                continue
+            target_head.to(device)
+            logger.debug(
+                "[Rank %s] Moved %s to %s",
+                getattr(self, "rank", -1),
+                attribute,
+                device,
+            )
+            return True
+        return False
 
     @torch.no_grad()
     def _apply_pending_target_lm_head_weight(self) -> bool:
@@ -3554,7 +3687,7 @@ class DrafterBaseTrainer:
         state_dict = self._pending_publish_state_dict
         self.clear_pending_publish_state_dict()
         return True, state_dict
-    
+
     async def cleanup_training(self, clear_data: bool = True):
         # First set training as inactive to prevent further steps
         self._training_active = False
@@ -3669,6 +3802,8 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
 
+        # Keep block-drafter target_lm_head on device; Eagle target_model keeps
+        # its legacy offload behavior.
         target_model = getattr(self.backend, "target_model", None)
         if target_model is not None:
             try:
@@ -3716,6 +3851,8 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter optimizer after activation warmup: {e}")
 
+        # Keep block-drafter target_lm_head on device; Eagle target_model keeps
+        # its legacy offload behavior.
         target_model = getattr(self.backend, "target_model", None)
         if target_model is not None:
             try:
