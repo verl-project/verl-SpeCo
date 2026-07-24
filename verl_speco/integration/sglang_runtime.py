@@ -31,10 +31,6 @@ import time
 from dataclasses import fields
 from typing import Any, Optional, cast
 
-try:
-    import torch
-except Exception:  # noqa: BLE001
-    torch = None
 from verl_speco.integration.sglang_adapter import (
     DFLASH_RETURN_AUX_HIDDEN_PARAM,
     DRAFTER_RAW_TOP_LOGPROBS_PARAM,
@@ -46,6 +42,12 @@ from verl_speco.integration.sglang_adapter import (
     sglang_needs_qwen3_rope_compat_patch,
     speco_step_matches_interval,
 )
+
+try:
+    import torch as _torch
+except Exception:  # noqa: BLE001
+    _torch = None
+torch: Any = _torch
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -828,7 +830,7 @@ async def _sgl_update_weights_with_route(
         (name, MultiprocessingSerializer.serialize(_prepare_update_tensor(tensor)))
         for name, tensor in params_batch
     ]
-    gathered_serialized_batches: list[Any] | None = (
+    gathered_serialized_batches = (
         [None for _ in range(infer_tp_size)] if infer_tp_rank == 0 else None
     )
     dist.gather_object(
@@ -839,9 +841,9 @@ async def _sgl_update_weights_with_route(
     )
     if infer_tp_rank != 0:
         return None
-    assert gathered_serialized_batches is not None
 
-    logical_tensors = zip(*gathered_serialized_batches, strict=True)
+    gathered_batches = cast(list[Any], gathered_serialized_batches)
+    logical_tensors = zip(*gathered_batches, strict=True)
     named_tensors = [
         (
             tensor_group[0][0],
@@ -928,11 +930,7 @@ async def _maybe_call_sglang_engine_method(
 
 
 async def speco_update_target_weights(
-    self,
-    weights,
-    *args,
-    global_steps: int | None = None,
-    **kwargs,
+    self, weights, *args, global_steps: int | None = None, **kwargs
 ):
     """Update only SGLang target weights when speculative drafter is enabled."""
 
@@ -966,9 +964,11 @@ async def speco_update_target_weights(
         getattr(self.config, "get", None) is not None
         and self.config.get("quantization") == "fp8"
     ):
-        from verl.workers.rollout.sglang_rollout.utils import SGLangFP8QuantizerHelper
+        from verl.utils.sglang.sglang_fp8_utils import SGLangFP8QuantizerHelper
 
-        weights = SGLangFP8QuantizerHelper.modify_model_weight_for_fp8(weights)
+        hf_config = self.model_config.hf_config
+        fp8_quantizer = SGLangFP8QuantizerHelper(hf_config.quantization_config)
+        weights = fp8_quantizer.quant_weights_by_name(weights, dtype=hf_config.dtype)
 
     total_ts = time.perf_counter()
     try:
@@ -1022,11 +1022,7 @@ async def speco_update_target_weights(
 
 
 async def speco_update_draft_weights(
-    self,
-    weights: dict[str, Any],
-    *args,
-    global_steps: int | None = None,
-    **kwargs,
+    self, weights: dict[str, Any], *args, global_steps: int | None = None, **kwargs
 ):
     """Update only SGLang draft weights from an upstream ServerAdapter instance."""
 
@@ -1133,14 +1129,11 @@ def patch_sglang_server_adapter_update() -> None:
 
 class _SpecoSGLangHttpServerMixin:
     config: Any
-    global_steps: Optional[int]
+    global_steps: int | None
     model_config: Any
     replica_rank: int
     tokenizer_manager: Any
-    _speco_last_collection_skip_reason: Optional[str]
-
-    def _speco_upstream_generate(self) -> Any:
-        return getattr(super(_SpecoSGLangHttpServerMixin, self), "generate")
+    _speco_last_collection_skip_reason: str | None
 
     async def launch_server(self, *args, **kwargs):
         self._speco_drafter_config = install_sglang_server_actor_runtime()
@@ -1150,7 +1143,7 @@ class _SpecoSGLangHttpServerMixin:
         self._drafter_collection_tokens = 0
         self._speco_collection_skip_log_keys = set()
         self._speco_hidden_missing_log_keys = set()
-        return await super().launch_server(*args, **kwargs)
+        return await cast(Any, super()).launch_server(*args, **kwargs)
 
     def _speco_drafter_cfg(self) -> dict[str, Any]:
         cached_cfg = getattr(self, "_speco_drafter_config", None)
@@ -1423,7 +1416,7 @@ class _SpecoSGLangHttpServerMixin:
             and drafter_cfg.get("enable_drafter_training")
             and training_cfg.get("collect_hidden_states_from_sgl")
         ):
-            return await self._speco_upstream_generate()(
+            return await cast(Any, super()).generate(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(sampling_params),
                 request_id,
@@ -1457,7 +1450,7 @@ class _SpecoSGLangHttpServerMixin:
                 max_new_tokens=None,
                 hidden_window_plan=None,
             )
-            return await self._speco_upstream_generate()(
+            return await cast(Any, super()).generate(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(original_sampling_params),
                 request_id,
@@ -1519,7 +1512,7 @@ class _SpecoSGLangHttpServerMixin:
                 max_new_tokens=max_new_tokens,
                 hidden_window_plan=hidden_window_plan,
             )
-            return await self._speco_upstream_generate()(
+            return await cast(Any, super()).generate(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(original_sampling_params),
                 request_id,
@@ -1589,8 +1582,8 @@ class _SpecoSGLangHttpServerMixin:
                 hidden_states_raw_len = len(hidden_states_data)
             except TypeError:
                 hidden_states_raw_len = None
-            hidden_states_list: list[Any] = []
-            hidden_states_metadata: list[dict[str, Any]] = []
+            hidden_states_list = []
+            hidden_states_metadata = []
             for hs in _iter_hidden_state_chunks(hidden_states_data):
                 h_states, metadata = _hidden_state_chunk_to_tensor_and_metadata(hs)
                 if h_states is not None:
@@ -1599,8 +1592,12 @@ class _SpecoSGLangHttpServerMixin:
                         hidden_states_metadata.append(metadata)
             has_hidden_states = bool(hidden_states_list)
             hidden_window_mode = str(hidden_window_plan.get("mode", "front") or "front")
-            hidden_window_start = hidden_window_plan.get("window_start")
-            hidden_window_end = hidden_window_plan.get("window_end")
+            hidden_window_start: int | None = cast(
+                Optional[int], hidden_window_plan.get("window_start")
+            )
+            hidden_window_end: int | None = cast(
+                Optional[int], hidden_window_plan.get("window_end")
+            )
             hidden_window_start_offset = hidden_window_plan.get("window_start_offset")
             hidden_window_min_rows = int(
                 cast(Any, hidden_window_plan.get("min_rows", 0)) or 0
@@ -1613,17 +1610,17 @@ class _SpecoSGLangHttpServerMixin:
             hidden_prefix_cache_rows = 0
             hidden_positions: Any = None
             target_logprobs: Any = None
-            target_logprobs_position_start: Optional[int] = None
-            target_logprobs_position_end: Optional[int] = None
-            hidden_last_hidden_logprob_check = None
-            hidden_target_logprobs_source = None
-            hidden_raw_topk_logprob_check = None
+            target_logprobs_position_start: int | None = None
+            target_logprobs_position_end: int | None = None
+            hidden_last_hidden_logprob_check: Any = None
+            hidden_target_logprobs_source: str | None = None
+            hidden_raw_topk_logprob_check: Any = None
             hidden_raw_target_logprobs: Any = None
             hidden_raw_target_logprobs_positions: Any = None
-            hidden_raw_target_logprobs_position_start: Optional[int] = None
-            hidden_raw_target_logprobs_position_end: Optional[int] = None
-            hidden_last_hidden_filter = None
-            hidden_last_hidden_select = None
+            hidden_raw_target_logprobs_position_start: int | None = None
+            hidden_raw_target_logprobs_position_end: int | None = None
+            hidden_last_hidden_filter: Any = None
+            hidden_last_hidden_select: Any = None
 
             if has_hidden_states:
                 prompt_tensor = (
@@ -1701,7 +1698,7 @@ class _SpecoSGLangHttpServerMixin:
                             raw_target_logprob_chunks, dim=0
                         ).contiguous()
                         raw_target_rows = int(hidden_raw_target_logprobs.size(0))
-                        raw_target_position_chunks: list[Any] = []
+                        raw_target_position_chunks = []
                         if any(
                             torch.is_tensor(
                                 metadata.get("raw_target_logprobs_positions")
@@ -1716,17 +1713,12 @@ class _SpecoSGLangHttpServerMixin:
                                 raw_position_chunk = metadata.get(
                                     "raw_target_logprobs_positions"
                                 )
-                                raw_position_tensor: Any = None
-                                if torch.is_tensor(raw_position_chunk):
-                                    raw_position_tensor = cast(Any, raw_position_chunk)
-                                    raw_position_matches = int(
-                                        raw_position_tensor.numel()
-                                    ) == int(raw_chunk.size(0))
-                                else:
-                                    raw_position_matches = False
-                                if raw_position_matches:
+                                if torch.is_tensor(raw_position_chunk) and int(
+                                    cast(Any, raw_position_chunk).numel()
+                                ) == int(raw_chunk.size(0)):
+                                    raw_position_chunk = cast(Any, raw_position_chunk)
                                     raw_target_position_chunks.append(
-                                        raw_position_tensor.reshape(-1).to(
+                                        raw_position_chunk.reshape(-1).to(
                                             dtype=torch.long
                                         )
                                     )

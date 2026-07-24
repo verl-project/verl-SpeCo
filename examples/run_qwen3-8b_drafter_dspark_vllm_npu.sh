@@ -1,5 +1,19 @@
 set -x
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+case "${LD_PRELOAD:-}" in
+    *libjemalloc*) ;;
+    *)
+        if [ -f /usr/lib/aarch64-linux-gnu/libjemalloc.so.2 ]; then
+            export LD_PRELOAD="/usr/lib/aarch64-linux-gnu/libjemalloc.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
+        elif [ -f /usr/lib64/libjemalloc.so.2 ]; then
+            export LD_PRELOAD="/usr/lib64/libjemalloc.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
+        fi
+        ;;
+esac
+export MALLOC_CONF="${MALLOC_CONF:-narenas:8,thp:never,metadata_thp:disabled,dirty_decay_ms:0,muzzy_decay_ms:0}"
+export SPECO_JEMALLOC_RECLAIM_MODE="${SPECO_JEMALLOC_RECLAIM_MODE:-purge}"
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
 
 # NPU example for DSpark on vLLM-Ascend. SPECO keeps the user-facing
 # algorithm as DSPARK and maps it to vLLM's dflash speculative method.
@@ -9,6 +23,8 @@ exp_name='qwen3_8b_dspark_drafter_vllm_npu'
 gen_tp=2
 train_sp=4
 ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
+ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
+ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint
@@ -19,6 +35,10 @@ DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter
 
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \
+    transfer_queue.enable=False \
+    ray_kwargs.ray_init.num_cpus=${ray_num_cpus} \
+    +ray_kwargs.ray_init._system_config.prestart_worker_first_driver=false \
+    +ray_kwargs.ray_init._system_config.num_workers_soft_limit=${ray_worker_soft_limit} \
     data.train_files=${TRAIN_FILE} \
     data.val_files=${TEST_FILE} \
     data.train_batch_size=64 \
@@ -39,8 +59,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.calculate_entropy=False \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${train_sp} \
@@ -60,7 +80,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n=5 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=10 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.rollout.drafter.enable=True \
     actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
     actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH} \
@@ -105,7 +125,6 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     trainer.experiment_name=${exp_name} \
     trainer.n_gpus_per_node=${ppo_gpus_per_node} \
     trainer.nnodes=1 \
-    trainer.resume_mode=disable \
     trainer.default_local_dir=${CKPTS_DIR} \
     trainer.total_training_steps=200 \
     trainer.save_freq=20 \

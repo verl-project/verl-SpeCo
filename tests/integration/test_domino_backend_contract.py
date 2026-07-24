@@ -116,6 +116,54 @@ def test_domino_forward_computes_top5_accuracy() -> None:
     assert top5 > 0
 
 
+def test_domino_forward_passes_dense_mask_off_cuda(monkeypatch) -> None:
+    """Off CUDA there is no flex block mask, so the backend must hand the
+    draft model the dense equivalent; without it SDPA runs unmasked and every
+    draft query sees the target tokens it is supposed to predict."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    import torch
+
+    from verl_speco.backends.domino_trainer_backend import DominoTrainingModel
+    from verl_speco.models.domino import DominoDraftModel
+
+    torch.manual_seed(0)
+    config = _tiny_domino_config()
+    model = DominoTrainingModel(
+        draft_model=DominoDraftModel(config),
+        block_size=config.block_size,
+        num_anchors=config.num_anchors,
+        pure_draft_prefix_len=config.pure_draft_prefix_len,
+    )
+
+    captured = {}
+    original_forward = model.draft_model.forward
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(model.draft_model, "forward", spy)
+
+    bsz, seq_len = 2, 16
+    input_ids = torch.randint(0, config.vocab_size, (bsz, seq_len))
+    hidden_states_list = [
+        torch.randn(bsz, seq_len, config.target_hidden_size)
+        for _ in config.target_layer_ids
+    ]
+    loss_mask = torch.ones(bsz, seq_len, dtype=torch.long)
+    lm_head_weight = torch.randn(config.vocab_size, config.hidden_size)
+
+    model(input_ids, hidden_states_list, loss_mask, lm_head_weight)
+
+    assert captured["block_mask"] is None
+    dense_mask = captured["dense_attention_mask"]
+    assert dense_mask is not None
+    draft_len = config.num_anchors * config.block_size
+    assert dense_mask.shape == (bsz, 1, draft_len, seq_len + draft_len)
+    assert dense_mask.dtype == torch.bool
+
+
 def test_domino_lambda_base_schedule() -> None:
     # get_lambda_base is pure-python, but its module (domino_trainer_backend)
     # subclasses the torch-based DFlash backend at import time, so it cannot be

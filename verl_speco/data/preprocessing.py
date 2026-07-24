@@ -58,7 +58,7 @@ except ImportError:
     process_vision_info = None
 
 
-from .parse import GeneralParser, HarmonyParser, Parser, ThinkingParser
+from .parse import GeneralParser, HarmonyParser, ThinkingParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
 
 # define a type called conversation
@@ -134,7 +134,7 @@ def preprocess_conversations(
     max_length: int = 2048,
     is_preformatted: bool = False,
     train_only_last_turn: bool = False,
-    tools: Optional[List[List[Dict]]] = None,
+    tools: Optional[List[List[Dict]]] = [[]],
     **kwargs,
 ) -> Dict[str, List[torch.Tensor]]:
     """
@@ -162,27 +162,28 @@ def preprocess_conversations(
         "loss_mask": [],
         "attention_mask": [],
     }
-    if tools is None:
-        tools = [[] for _ in range(len(conversations))]
     if chat_template.parser_type == "general":
-        parser: Parser = GeneralParser(tokenizer, chat_template)
+        parser: GeneralParser | ThinkingParser | HarmonyParser = GeneralParser(
+            tokenizer, chat_template
+        )
     elif chat_template.parser_type == "thinking":
         parser = ThinkingParser(tokenizer, chat_template)
     elif chat_template.parser_type == "openai-harmony":
         parser = HarmonyParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
-    kwargs_list: List[Dict[str, Any]] = [{} for _ in range(len(conversations))]
+    kwargs_list: list[dict[str, Any]] = [{} for _ in range(len(conversations))]
     for key, value_list in kwargs.items():
         for i, value in enumerate(value_list):
             kwargs_list[i][key] = value
+    if tools is None:
+        tools = [[] for _ in range(len(conversations))]
     for source, tool, kwargs_item in zip(conversations, tools, kwargs_list):
         if not source:
             # if the source is None, skip it
             continue
-        parser_input = cast(Union[Conversation, str], source)
         input_ids, loss_mask = parser.parse(
-            parser_input,
+            cast(Conversation | str, source),
             max_length,
             preformatted=is_preformatted,
             train_only_last_turn=train_only_last_turn,
@@ -197,7 +198,7 @@ def preprocess_conversations(
 
 def preprocess_vlm_conversations(
     processor: ImageProcessingMixin,
-    examples: Dict[str, List[Any]],
+    examples: Any,
     chat_template: ChatTemplate,
     max_length: int = 2048,
 ) -> Dict[str, List[torch.Tensor]]:
@@ -234,7 +235,9 @@ def preprocess_vlm_conversations(
     # Note: currently, we assume that each example has only one image
     for i, image in enumerate(examples["image"]):
         source = examples["conversations"][i]
-        messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt or ""}
+        ]
         if not source:
             # if the source is None, skip it
             continue
@@ -257,12 +260,12 @@ def preprocess_vlm_conversations(
                                 "type": "image",
                                 "image": image,
                             },
-                            {"type": "text", "text": str(sentence["content"])},
+                            {"type": "text", "text": sentence["content"]},
                         ],
                     }
                 )
             else:
-                messages.append({"role": role, "content": str(sentence["content"])})
+                messages.append({"role": role, "content": sentence["content"]})
 
         conversation = processor.apply_chat_template(
             messages,
@@ -446,14 +449,14 @@ def build_eagle3_dataset(
         os.makedirs(cache_dir, exist_ok=True)
         cache_file_name = os.path.join(cache_dir, f"{cache_key}.pkl")
         print(f"dataset is cached at {cache_file_name}")
-    elif cache_dir is None and cache_key is None:
+    else:
+        if cache_dir is not None or cache_key is not None:
+            warnings.warn(
+                "cache_dir and cache_key must be provided together to make caching work; proceeding without caching"
+            )
         load_from_cache_file = False
         cache_file_name = None
         print("dataset is not cached")
-    else:
-        warnings.warn(
-            "cache_dir and cache_key must be provided together to make caching work"
-        )
 
     # Disable tokenizers internal parallelism when using multiprocessing to avoid
     # deadlocks caused by forked Rust threads (see huggingface/tokenizers#1391).

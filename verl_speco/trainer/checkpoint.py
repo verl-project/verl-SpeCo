@@ -11,10 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ctypes
+import gc
 import json
 import logging
 import os
 import re
+import sys
+import time
+from functools import lru_cache
 from glob import glob
 from typing import Any, Optional, Union
 
@@ -26,6 +31,11 @@ _WEIGHT_PATTERNS = (
     "*.index.json",
 )
 _OPTIMIZER_DCP_METADATA = ".metadata"
+
+logger = logging.getLogger(__name__)
+
+_JEMALLOC_ARENAS_ALL = 4096
+_JEMALLOC_RECLAIM_MODE_ENV = "SPECO_JEMALLOC_RECLAIM_MODE"
 
 
 class DrafterCheckpointMetadataError(ValueError):
@@ -176,6 +186,248 @@ def is_pretrained_drafter_checkpoint(
         if metadata.get("optimizer") is not None:
             get_drafter_optimizer_checkpoint_path(path)
     return True
+
+
+def _read_kib(path: str, keys: set[str]) -> dict[str, int]:
+    values = {}
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            for line in stream:
+                name, separator, raw_value = line.partition(":")
+                if not separator or name not in keys:
+                    continue
+                fields = raw_value.strip().split()
+                if fields:
+                    values[name] = int(fields[0])
+    except (OSError, ValueError):
+        return {}
+    return values
+
+
+def collect_checkpoint_memory_snapshot() -> dict[str, Optional[int]]:
+    """Collect Linux process/system memory counters in KiB."""
+
+    process = _read_kib("/proc/self/status", {"VmRSS", "RssAnon", "RssShmem"})
+    system = _read_kib(
+        "/proc/meminfo",
+        {
+            "MemTotal",
+            "MemAvailable",
+            "Cached",
+            "Shmem",
+            "Dirty",
+            "Writeback",
+        },
+    )
+    dev_shm_used_kib = None
+    statvfs = getattr(os, "statvfs", None)
+    try:
+        if statvfs is not None:
+            stat = statvfs("/dev/shm")
+            dev_shm_used_kib = ((stat.f_blocks - stat.f_bfree) * stat.f_frsize) // 1024
+    except OSError:
+        pass
+    return {
+        "rss_gib": process.get("VmRSS"),
+        "anon_gib": process.get("RssAnon"),
+        "rss_shmem_gib": process.get("RssShmem"),
+        "node_unavailable_gib": (
+            system["MemTotal"] - system["MemAvailable"]
+            if "MemTotal" in system and "MemAvailable" in system
+            else None
+        ),
+        "available_gib": system.get("MemAvailable"),
+        "cached_gib": system.get("Cached"),
+        "node_shmem_gib": system.get("Shmem"),
+        "dev_shm_used_gib": dev_shm_used_kib,
+        "dirty_gib": system.get("Dirty"),
+        "writeback_gib": system.get("Writeback"),
+    }
+
+
+def format_checkpoint_memory_snapshot(
+    counters: Optional[dict[str, Optional[int]]] = None,
+) -> str:
+    """Return concise Linux process/system memory counters without extra dependencies."""
+
+    counters = (
+        counters if counters is not None else collect_checkpoint_memory_snapshot()
+    )
+    return " ".join(
+        f"{name}={value / (1024**2):.2f}" if value is not None else f"{name}=n/a"
+        for name, value in counters.items()
+    )
+
+
+@lru_cache(maxsize=1)
+def _jemalloc_is_active() -> bool:
+    if not sys.platform.startswith("linux"):
+        return False
+    if "jemalloc" in os.getenv("LD_PRELOAD", "").lower():
+        return True
+    try:
+        with open("/proc/self/maps", encoding="utf-8") as stream:
+            return any("jemalloc" in line.lower() for line in stream)
+    except OSError:
+        return False
+
+
+@lru_cache(maxsize=1)
+def _jemalloc_mallctl_function() -> Any:
+    try:
+        runtime = ctypes.CDLL(None)
+        mallctl = getattr(runtime, "mallctl", None) or getattr(
+            runtime, "je_mallctl", None
+        )
+        if mallctl is None:
+            return None
+        mallctl.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        mallctl.restype = ctypes.c_int
+        return mallctl
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _jemalloc_mallctl(name: str) -> bool:
+    try:
+        mallctl = _jemalloc_mallctl_function()
+        if mallctl is None:
+            return False
+        return mallctl(name.encode("ascii"), None, None, None, 0) == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _jemalloc_reclaim_mode() -> str:
+    mode = os.getenv(_JEMALLOC_RECLAIM_MODE_ENV, "decay").strip().lower()
+    return mode if mode in {"decay", "purge"} else "decay"
+
+
+def _reclaim_jemalloc_heap() -> bool:
+    _jemalloc_mallctl("thread.tcache.flush")
+    return _jemalloc_mallctl(f"arena.{_JEMALLOC_ARENAS_ALL}.{_jemalloc_reclaim_mode()}")
+
+
+def _host_allocator_name() -> str:
+    if not sys.platform.startswith("linux"):
+        return "unsupported"
+    return "jemalloc" if _jemalloc_is_active() else "glibc"
+
+
+def _trim_process_heap() -> bool:
+    """Return unused allocator pages to the operating system when available."""
+
+    if not sys.platform.startswith("linux"):
+        return False
+    if _jemalloc_is_active():
+        return _reclaim_jemalloc_heap()
+    try:
+        libc = ctypes.CDLL(None)
+        malloc_trim = libc.malloc_trim
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+        return bool(malloc_trim(0))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def trim_process_host_memory() -> dict[str, Any]:
+    """Return unused jemalloc/glibc pages without forcing a Python GC cycle."""
+
+    started = time.perf_counter()
+    allocator = _host_allocator_name()
+    heap_trimmed = _trim_process_heap()
+    return {
+        "elapsed_sec": time.perf_counter() - started,
+        "heap_trimmed": heap_trimmed,
+        "allocator": allocator,
+        "reclaim_action": (
+            _jemalloc_reclaim_mode() if allocator == "jemalloc" else "malloc_trim"
+        ),
+    }
+
+
+def _flush_and_drop_checkpoint_file_cache(checkpoint_path: str) -> tuple[int, int]:
+    """Flush completed checkpoint files and advise Linux to evict their cache."""
+
+    if not sys.platform.startswith("linux") or not hasattr(os, "posix_fadvise"):
+        return 0, 0
+    try:
+        if not checkpoint_path or not os.path.exists(checkpoint_path):
+            return 0, 0
+    except OSError:
+        return 0, 1
+
+    advised = 0
+    failed = 0
+    paths = []
+    if os.path.isfile(checkpoint_path):
+        paths.append(checkpoint_path)
+    else:
+        for root, _, filenames in os.walk(checkpoint_path):
+            paths.extend(os.path.join(root, filename) for filename in filenames)
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    advice = getattr(os, "POSIX_FADV_DONTNEED", 4)
+    for path in paths:
+        try:
+            fd = os.open(path, flags)
+        except OSError:
+            failed += 1
+            continue
+        try:
+            os.fsync(fd)
+            os.posix_fadvise(fd, 0, 0, advice)
+            advised += 1
+        except OSError:
+            failed += 1
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                failed += 1
+    return advised, failed
+
+
+def release_checkpoint_host_memory(
+    checkpoint_path: Optional[Union[str, os.PathLike]] = None,
+    *,
+    drop_file_cache: bool = False,
+) -> dict[str, Any]:
+    """Best-effort release of checkpoint staging and file-cache memory."""
+
+    started = time.perf_counter()
+    try:
+        gc.collect()
+    except Exception:  # noqa: BLE001
+        pass
+    allocator = _host_allocator_name()
+    trimmed_before = _trim_process_heap()
+    advised = 0
+    failed = 0
+    if drop_file_cache and checkpoint_path:
+        try:
+            advised, failed = _flush_and_drop_checkpoint_file_cache(
+                os.fspath(checkpoint_path)
+            )
+        except Exception:  # noqa: BLE001
+            failed = 1
+    return {
+        "elapsed_sec": time.perf_counter() - started,
+        "heap_trimmed": trimmed_before,
+        "allocator": allocator,
+        "reclaim_action": (
+            _jemalloc_reclaim_mode() if allocator == "jemalloc" else "malloc_trim"
+        ),
+        "files_advised": advised,
+        "files_failed": failed,
+    }
 
 
 def resolve_drafter_checkpoint_path(

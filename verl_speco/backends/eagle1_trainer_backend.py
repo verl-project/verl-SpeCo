@@ -40,8 +40,7 @@ from verl_speco.backends.eagle3_trainer_backend import (
 )
 from verl_speco.models.eagle1 import Eagle1Config, LlamaForCausalLMEagle1
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
-from verl.utils.device import get_device_name
-from verl.utils.fsdp_utils import get_device_id
+from verl.utils.device import get_device_id, get_device_name
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))

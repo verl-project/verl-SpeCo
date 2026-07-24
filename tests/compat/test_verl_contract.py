@@ -37,10 +37,10 @@ def test_required_verl_contract_matches_overlay() -> None:
     base = overlay["speco"]["verl_base"]
     compatibility = overlay["speco"]["compatibility"]
 
-    assert required["VERL_BASE_TAG"] == f"v{base['version']}"
-    assert required["VERL_BASE_COMMIT"] == base["commit"]
-    assert required["VERL_BASE_TAG"] == compatibility["require_verl_base_tag"]
-    assert required["VERL_BASE_COMMIT"] == compatibility["require_verl_base_commit"]
+    assert required["VERL_BASE_BRANCH"] == base["branch"]
+    assert required["VERL_BASE_VERSION"] == base["version"]
+    assert required["VERL_BASE_BRANCH"] == compatibility["require_verl_base_branch"]
+    assert required["VERL_BASE_VERSION"] == compatibility["require_verl_base_version"]
     assert (
         required["VERL_SOURCE_MODIFICATIONS_ALLOWED"]
         == str(base["source_modifications_allowed"]).lower()
