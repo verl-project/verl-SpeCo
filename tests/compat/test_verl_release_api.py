@@ -109,6 +109,17 @@ def _module_file(root: Path, module_name: str) -> Path:
     raise AssertionError(f"missing release/v0.8.0 module: {module_name}")
 
 
+def _upstream_repo_root(upstream_root: str) -> Path:
+    base = Path(upstream_root)
+    for candidate in (base, base / "verl"):
+        if (candidate / "verl").is_dir():
+            return candidate
+    raise AssertionError(
+        "VERL_SPECO_UPSTREAM_ROOT must point to the upstream verl checkout "
+        "or to a directory containing it"
+    )
+
+
 def _defined_names(source: str) -> set[str]:
     tree = ast.parse(source)
     names: set[str] = set()
@@ -133,7 +144,7 @@ def test_release_v080_modules_and_symbols_are_present() -> None:
     if not upstream_root:
         pytest.skip("set VERL_SPECO_UPSTREAM_ROOT to check the release/v0.8.0 API")
 
-    root = Path(upstream_root) / "verl"
+    root = _upstream_repo_root(upstream_root)
     missing: list[str] = []
     for module_name, symbols in REQUIRED_MODULES.items():
         try:

@@ -22,7 +22,7 @@ import inspect
 import logging
 import sys
 import time
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from packaging import version
 
@@ -210,7 +210,7 @@ def install_verl_npu_checkpoint_reclaim(
                     format_checkpoint_memory_snapshot(),
                 )
 
-    save_checkpoint_with_reclaim._speco_npu_checkpoint_reclaim = True
+    setattr(save_checkpoint_with_reclaim, "_speco_npu_checkpoint_reclaim", True)
     engine_cls.save_checkpoint = save_checkpoint_with_reclaim
     _NPU_CHECKPOINT_RECLAIM_APPLIED = True
     logger.warning("Enabled post-save NPU actor checkpoint host-memory reclaim")
@@ -241,7 +241,11 @@ def install_verl_fsdp_training_output_release_compat(
 
     forward_backward_batch = getattr(engine_cls, "forward_backward_batch", None)
     try:
-        forward_backward_source = inspect.getsource(forward_backward_batch)
+        forward_backward_source = (
+            inspect.getsource(forward_backward_batch)
+            if forward_backward_batch is not None
+            else ""
+        )
     except (OSError, TypeError):
         forward_backward_source = ""
     upstream_releases_training_output = "meta_info.pop" in forward_backward_source and (
@@ -272,7 +276,11 @@ def install_verl_fsdp_training_output_release_compat(
                 meta_info.pop("model_output", None)
         return result
 
-    forward_step_without_retained_training_output._speco_training_output_release_compat = True
+    setattr(
+        forward_step_without_retained_training_output,
+        "_speco_training_output_release_compat",
+        True,
+    )
     lm_head_cls.forward_step = forward_step_without_retained_training_output
     _FSDP_TRAIN_OUTPUT_RELEASE_APPLIED = True
     logger.warning("Enabled FSDP actor training output-release compatibility")
@@ -359,8 +367,10 @@ def install_verl_npu_fsdp2_weight_export_compat(
             self._uses_fsdp2_cpu_offload_policy = uses_cpu_offload_policy
             self._is_offload_param = is_offload_param
 
-    get_per_tensor_param_without_fsdp2_staging._speco_npu_fsdp2_weight_export_compat = (
-        True
+    setattr(
+        get_per_tensor_param_without_fsdp2_staging,
+        "_speco_npu_fsdp2_weight_export_compat",
+        True,
     )
     engine_cls.get_per_tensor_param = get_per_tensor_param_without_fsdp2_staging
     _NPU_FSDP2_WEIGHT_EXPORT_APPLIED = True
@@ -401,15 +411,19 @@ class VerlNPUVLLMImportCompatMixin:
         super().__init__(*args, **kwargs)
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
-    async def update_weights(self, global_steps: int = None, mode: str = "auto"):
+    async def update_weights(self, global_steps: int | None = None, mode: str = "auto"):
         # Both baseline and speculative runs send actor weights from this
         # WorkerDict process. Install immediately before the upstream sender is
         # constructed so no-drafter runs receive the same NPU SHM protection.
         _install_weight_transfer_shm_reuse()
         if not _is_npu_worker():
-            return await super().update_weights(global_steps=global_steps, mode=mode)
+            return await cast(Any, super()).update_weights(
+                global_steps=global_steps, mode=mode
+            )
 
         try:
-            return await super().update_weights(global_steps=global_steps, mode=mode)
+            return await cast(Any, super()).update_weights(
+                global_steps=global_steps, mode=mode
+            )
         finally:
             trim_process_host_memory()

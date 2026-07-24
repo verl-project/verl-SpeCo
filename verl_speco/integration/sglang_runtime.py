@@ -29,12 +29,8 @@ import logging
 import os
 import time
 from dataclasses import fields
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
-try:
-    import torch
-except Exception:  # noqa: BLE001
-    torch = None
 from verl_speco.integration.sglang_adapter import (
     DFLASH_RETURN_AUX_HIDDEN_PARAM,
     DRAFTER_RAW_TOP_LOGPROBS_PARAM,
@@ -46,6 +42,12 @@ from verl_speco.integration.sglang_adapter import (
     sglang_needs_qwen3_rope_compat_patch,
     speco_step_matches_interval,
 )
+
+try:
+    import torch as _torch
+except Exception:  # noqa: BLE001
+    _torch = None
+torch: Any = _torch
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -840,7 +842,8 @@ async def _sgl_update_weights_with_route(
     if infer_tp_rank != 0:
         return None
 
-    logical_tensors = zip(*gathered_serialized_batches, strict=True)
+    gathered_batches = cast(list[Any], gathered_serialized_batches)
+    logical_tensors = zip(*gathered_batches, strict=True)
     named_tensors = [
         (
             tensor_group[0][0],
@@ -927,7 +930,7 @@ async def _maybe_call_sglang_engine_method(
 
 
 async def speco_update_target_weights(
-    self, weights, *args, global_steps: int = None, **kwargs
+    self, weights, *args, global_steps: int | None = None, **kwargs
 ):
     """Update only SGLang target weights when speculative drafter is enabled."""
 
@@ -1019,7 +1022,7 @@ async def speco_update_target_weights(
 
 
 async def speco_update_draft_weights(
-    self, weights: dict[str, Any], *args, global_steps: int = None, **kwargs
+    self, weights: dict[str, Any], *args, global_steps: int | None = None, **kwargs
 ):
     """Update only SGLang draft weights from an upstream ServerAdapter instance."""
 
@@ -1125,6 +1128,13 @@ def patch_sglang_server_adapter_update() -> None:
 
 
 class _SpecoSGLangHttpServerMixin:
+    config: Any
+    global_steps: int | None
+    model_config: Any
+    replica_rank: int
+    tokenizer_manager: Any
+    _speco_last_collection_skip_reason: str | None
+
     async def launch_server(self, *args, **kwargs):
         self._speco_drafter_config = install_sglang_server_actor_runtime()
         self.global_steps = getattr(self, "global_steps", None)
@@ -1133,7 +1143,7 @@ class _SpecoSGLangHttpServerMixin:
         self._drafter_collection_tokens = 0
         self._speco_collection_skip_log_keys = set()
         self._speco_hidden_missing_log_keys = set()
-        return await super().launch_server(*args, **kwargs)
+        return await cast(Any, super()).launch_server(*args, **kwargs)
 
     def _speco_drafter_cfg(self) -> dict[str, Any]:
         cached_cfg = getattr(self, "_speco_drafter_config", None)
@@ -1406,7 +1416,7 @@ class _SpecoSGLangHttpServerMixin:
             and drafter_cfg.get("enable_drafter_training")
             and training_cfg.get("collect_hidden_states_from_sgl")
         ):
-            return await super().generate(
+            return await cast(Any, super()).generate(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(sampling_params),
                 request_id,
@@ -1440,7 +1450,7 @@ class _SpecoSGLangHttpServerMixin:
                 max_new_tokens=None,
                 hidden_window_plan=None,
             )
-            return await super().generate(
+            return await cast(Any, super()).generate(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(original_sampling_params),
                 request_id,
@@ -1502,7 +1512,7 @@ class _SpecoSGLangHttpServerMixin:
                 max_new_tokens=max_new_tokens,
                 hidden_window_plan=hidden_window_plan,
             )
-            return await super().generate(
+            return await cast(Any, super()).generate(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(original_sampling_params),
                 request_id,
@@ -1582,29 +1592,35 @@ class _SpecoSGLangHttpServerMixin:
                         hidden_states_metadata.append(metadata)
             has_hidden_states = bool(hidden_states_list)
             hidden_window_mode = str(hidden_window_plan.get("mode", "front") or "front")
-            hidden_window_start = hidden_window_plan.get("window_start")
-            hidden_window_end = hidden_window_plan.get("window_end")
+            hidden_window_start: int | None = cast(
+                Optional[int], hidden_window_plan.get("window_start")
+            )
+            hidden_window_end: int | None = cast(
+                Optional[int], hidden_window_plan.get("window_end")
+            )
             hidden_window_start_offset = hidden_window_plan.get("window_start_offset")
-            hidden_window_min_rows = int(hidden_window_plan.get("min_rows", 0) or 0)
+            hidden_window_min_rows = int(
+                cast(Any, hidden_window_plan.get("min_rows", 0)) or 0
+            )
             hidden_window_target_rows = hidden_window_plan.get("target_window_rows")
             hidden_raw_len = 0
             hidden_kept_len = 0
             hidden_position_start = 0
             hidden_position_end = 0
             hidden_prefix_cache_rows = 0
-            hidden_positions = None
-            target_logprobs = None
-            target_logprobs_position_start = None
-            target_logprobs_position_end = None
-            hidden_last_hidden_logprob_check = None
-            hidden_target_logprobs_source = None
-            hidden_raw_topk_logprob_check = None
-            hidden_raw_target_logprobs = None
-            hidden_raw_target_logprobs_positions = None
-            hidden_raw_target_logprobs_position_start = None
-            hidden_raw_target_logprobs_position_end = None
-            hidden_last_hidden_filter = None
-            hidden_last_hidden_select = None
+            hidden_positions: Any = None
+            target_logprobs: Any = None
+            target_logprobs_position_start: int | None = None
+            target_logprobs_position_end: int | None = None
+            hidden_last_hidden_logprob_check: Any = None
+            hidden_target_logprobs_source: str | None = None
+            hidden_raw_topk_logprob_check: Any = None
+            hidden_raw_target_logprobs: Any = None
+            hidden_raw_target_logprobs_positions: Any = None
+            hidden_raw_target_logprobs_position_start: int | None = None
+            hidden_raw_target_logprobs_position_end: int | None = None
+            hidden_last_hidden_filter: Any = None
+            hidden_last_hidden_select: Any = None
 
             if has_hidden_states:
                 prompt_tensor = (
@@ -1693,12 +1709,14 @@ class _SpecoSGLangHttpServerMixin:
                                 raw_chunk = metadata.get("raw_target_logprobs")
                                 if not torch.is_tensor(raw_chunk):
                                     continue
+                                raw_chunk = cast(Any, raw_chunk)
                                 raw_position_chunk = metadata.get(
                                     "raw_target_logprobs_positions"
                                 )
                                 if torch.is_tensor(raw_position_chunk) and int(
-                                    raw_position_chunk.numel()
+                                    cast(Any, raw_position_chunk).numel()
                                 ) == int(raw_chunk.size(0)):
+                                    raw_position_chunk = cast(Any, raw_position_chunk)
                                     raw_target_position_chunks.append(
                                         raw_position_chunk.reshape(-1).to(
                                             dtype=torch.long

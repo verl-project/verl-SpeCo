@@ -220,10 +220,12 @@ def collect_checkpoint_memory_snapshot() -> dict[str, Optional[int]]:
         },
     )
     dev_shm_used_kib = None
+    statvfs = getattr(os, "statvfs", None)
     try:
-        stat = os.statvfs("/dev/shm")
-        dev_shm_used_kib = ((stat.f_blocks - stat.f_bfree) * stat.f_frsize) // 1024
-    except (AttributeError, OSError):
+        if statvfs is not None:
+            stat = statvfs("/dev/shm")
+            dev_shm_used_kib = ((stat.f_blocks - stat.f_bfree) * stat.f_frsize) // 1024
+    except OSError:
         pass
     return {
         "rss_gib": process.get("VmRSS"),

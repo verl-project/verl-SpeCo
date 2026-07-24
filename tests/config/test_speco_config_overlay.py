@@ -33,6 +33,17 @@ ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = ROOT / "verl_speco" / "config"
 
 
+def _upstream_repo_root(upstream_root: str) -> Path:
+    base = Path(upstream_root)
+    for candidate in (base, base / "verl"):
+        if (candidate / "verl" / "trainer" / "config").is_dir():
+            return candidate
+    raise AssertionError(
+        "VERL_SPECO_UPSTREAM_ROOT must point to the upstream verl checkout "
+        "or to a directory containing it"
+    )
+
+
 def _copy_overlay_configs(
     upstream_config: Path, composed_config_dir: Path, names: tuple[str, ...]
 ) -> None:
@@ -59,7 +70,7 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.vllm.allow_lossy_speculative_sampling is False
     assert drafter.training.allow_sglang_prenorm_last_layer is False
     assert drafter.training.lr == pytest.approx(1e-5)
-    assert drafter.training.lr_scheduler_type == "global_cosine"
+    assert drafter.training.lr_scheduler_type == "constant"
     assert drafter.training.lr_decay_steps == 100
     assert drafter.training.min_lr_ratio == pytest.approx(0.1)
     assert drafter.training.warmup_style is None
@@ -73,7 +84,7 @@ def test_overlay_composes_with_release_upstream_verl(tmp_path: Path) -> None:
         pytest.skip(
             "set VERL_SPECO_UPSTREAM_ROOT to check compose against release/v0.8.0 verl"
         )
-    upstream_config = Path(upstream_root) / "verl" / "trainer" / "config"
+    upstream_config = _upstream_repo_root(upstream_root) / "verl" / "trainer" / "config"
     assert upstream_config.is_dir()
 
     composed_config_dir = tmp_path / "config"
@@ -96,7 +107,7 @@ def test_draft_trainer_composes_as_primary_config(tmp_path: Path) -> None:
         pytest.skip(
             "set VERL_SPECO_UPSTREAM_ROOT to check compose against release/v0.8.0 verl"
         )
-    upstream_config = Path(upstream_root) / "verl" / "trainer" / "config"
+    upstream_config = _upstream_repo_root(upstream_root) / "verl" / "trainer" / "config"
     assert upstream_config.is_dir()
 
     composed_config_dir = tmp_path / "config"

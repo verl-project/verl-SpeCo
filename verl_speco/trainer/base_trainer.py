@@ -22,7 +22,7 @@ import fnmatch
 import shutil
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, List, Any
+from typing import Optional, Any, cast
 from omegaconf import open_dict
 from contextlib import contextmanager, nullcontext
 
@@ -237,6 +237,7 @@ def log_alignment_event(
 
 def _tensor_shape(tensor: Optional[torch.Tensor]) -> list[int] | None:
     if torch.is_tensor(tensor):
+        tensor = cast(torch.Tensor, tensor)
         return list(tensor.shape)
     return None
 
@@ -325,8 +326,8 @@ def _eagle_target_logprobs_train_start(source_item: dict) -> int:
     if isinstance(hidden_positions, torch.Tensor) and int(hidden_positions.numel()) > 0:
         feature_start = int(hidden_positions.reshape(-1)[0].item())
     else:
-        feature_start = source_item.get("_verl_feature_start")
-    target_position_start = source_item.get("_verl_target_position_start")
+        feature_start = cast(Any, source_item.get("_verl_feature_start"))
+    target_position_start = cast(Any, source_item.get("_verl_target_position_start"))
     try:
         return max(int(feature_start) + 1 - int(target_position_start), 0)
     except (TypeError, ValueError):
@@ -443,7 +444,7 @@ class DrafterBaseTrainer:
                 configured_pad_id = getattr(model_cfg, "pad_token_id", None)
             if configured_pad_id is not None:
                 self.pad_token_id = int(configured_pad_id)
-        self.training_device_mesh = training_device_mesh
+        self.training_device_mesh: Any = training_device_mesh
         if self.training_device_mesh is not None:
             self.training_process_group = self.training_device_mesh["sp"].get_group()
             self.data_parallel_process_group = self.training_device_mesh[
@@ -502,10 +503,10 @@ class DrafterBaseTrainer:
         self._training_active = False
         self.training_steps = 0
         self.optimizer_steps_total = 0
-        self._alignment_debug_step = None
-        self._alignment_debug_counts = {}
+        self._alignment_debug_step: int | None = None
+        self._alignment_debug_counts: dict[str, int] = {}
 
-        self.collected_data = deque(
+        self.collected_data: deque[dict[str, Any]] = deque(
             maxlen=int(
                 self.config.rollout.drafter.training.get("current_max_samples", 2000)
             )
@@ -540,24 +541,24 @@ class DrafterBaseTrainer:
         )
 
         # Track the last pending async checkpoint save future
-        self._pending_checkpoint_future = None
-        self._pending_full_checkpoint_future = None
-        self._full_checkpoint_executor = None
-        self._pending_publish_state_dict = None
-        self._pending_publish_step = None
+        self._pending_checkpoint_future: Any = None
+        self._pending_full_checkpoint_future: Any = None
+        self._full_checkpoint_executor: ThreadPoolExecutor | None = None
+        self._pending_publish_state_dict: dict[str, Any] | None = None
+        self._pending_publish_step: int | None = None
         self._pending_publish_ready = False
-        self.model = None
-        self.optimizer = None
-        self.lr_scheduler = None
+        self.model: Any = None
+        self.optimizer: Any = None
+        self.lr_scheduler: Any = None
         self.drafter_train_config = None
-        self._pending_target_lm_head_weight = None
-        self._pending_target_lm_head_row_indices = None
-        self._pending_target_lm_head_source_vocab_size = None
-        self._target_lm_head_weight_step = None
-        self._cached_target_lm_head_row_indices = None
-        self._training_timing_accumulator = {}
+        self._pending_target_lm_head_weight: Any = None
+        self._pending_target_lm_head_row_indices: Any = None
+        self._pending_target_lm_head_source_vocab_size: int | None = None
+        self._target_lm_head_weight_step: int | None = None
+        self._cached_target_lm_head_row_indices: dict[str, Any] | None = None
+        self._training_timing_accumulator: dict[str, float] = {}
         self._training_timing_steps = 0
-        self._training_metric_sums = {}
+        self._training_metric_sums: dict[str, float] = {}
         self._training_metric_steps = 0
         self._frozen_param_names = {"model.embed_tokens.weight"}
 
@@ -785,6 +786,7 @@ class DrafterBaseTrainer:
             value = diagnostics.get(source_key)
             if not torch.is_tensor(value):
                 continue
+            value = cast(torch.Tensor, value)
             reduced = self._reduce_training_metric(value.reshape(()))
             self._training_metric_sums[metric_key] = self._training_metric_sums.get(
                 metric_key, 0.0
@@ -799,6 +801,7 @@ class DrafterBaseTrainer:
             value = diagnostics.get(source_key)
             if not torch.is_tensor(value):
                 continue
+            value = cast(torch.Tensor, value)
             reduced = self._reduce_training_metric(value)
             for idx, item in enumerate(reduced.detach().cpu().tolist()):
                 metric_key = f"{metric_prefix}/{idx}"
@@ -1921,6 +1924,7 @@ class DrafterBaseTrainer:
             input_ids = item.get("input_ids")
             if not torch.is_tensor(input_ids):
                 continue
+            input_ids = cast(torch.Tensor, input_ids)
             flat_ids = input_ids.detach().reshape(-1).to(dtype=torch.long, device="cpu")
             valid = flat_ids[(flat_ids >= 0) & (flat_ids < int(source_vocab_size))]
             if int(valid.numel()) > 0:
@@ -2344,7 +2348,10 @@ class DrafterBaseTrainer:
         return lm_head
 
     def collect_online_data(
-        self, batch: dict, hidden_states: torch.Tensor, target_logprobs: List = None
+        self,
+        batch: dict,
+        hidden_states: torch.Tensor,
+        target_logprobs: torch.Tensor | None = None,
     ) -> None:
         """Collect online data from inference for drafter training.
 
@@ -2433,13 +2440,13 @@ class DrafterBaseTrainer:
                     else None
                 )
                 cpu_responses = (
-                    batch.get("responses").to("cpu", non_blocking=True)
-                    if "responses" in batch
+                    batch["responses"].to("cpu", non_blocking=True)
+                    if batch.get("responses") is not None
                     else None
                 )
                 cpu_prompts = (
-                    batch.get("prompts").to("cpu", non_blocking=True)
-                    if "prompts" in batch
+                    batch["prompts"].to("cpu", non_blocking=True)
+                    if batch.get("prompts") is not None
                     else None
                 )
 
@@ -2464,9 +2471,13 @@ class DrafterBaseTrainer:
                 else None
             )
             cpu_responses = (
-                batch.get("responses").to("cpu") if "responses" in batch else None
+                batch["responses"].to("cpu")
+                if batch.get("responses") is not None
+                else None
             )
-            cpu_prompts = batch.get("prompts").to("cpu") if "prompts" in batch else None
+            cpu_prompts = (
+                batch["prompts"].to("cpu") if batch.get("prompts") is not None else None
+            )
 
         batch_size = cpu_input_ids.size(0)
 
@@ -3190,6 +3201,7 @@ class DrafterBaseTrainer:
         for key in keys:
             value = item.get(key)
             if torch.is_tensor(value):
+                value = cast(torch.Tensor, value)
                 if value.numel() != 1:
                     continue
                 value = value.detach().float().cpu().item()
@@ -3422,6 +3434,7 @@ class DrafterBaseTrainer:
                 item_position_ids.size(0),
             ]
             if torch.is_tensor(target_last_h_states):
+                target_last_h_states = cast(torch.Tensor, target_last_h_states)
                 seq_len_limits.append(target_last_h_states.size(0))
             seq_len = min(seq_len_limits)
             if seq_len < 1:
@@ -3431,7 +3444,7 @@ class DrafterBaseTrainer:
                 items_dropped_missing_target += 1
                 continue
 
-            target_logprobs_item = None
+            target_logprobs_item: Any = None
             target_logprobs_train_start = 0
             if self.backend.model_type == "eagle3" and use_logits:
                 target_logprobs_item = preprocessed_lists["target_logprobs"][item_idx]
@@ -3448,7 +3461,7 @@ class DrafterBaseTrainer:
                     max(target_logprobs_item.size(0) - target_logprobs_train_start, 0),
                 )
             elif self.backend.model_type == "eagle3":
-                last_h_states = preprocessed_lists["last_h_states"][item_idx]
+                last_h_states: Any = preprocessed_lists["last_h_states"][item_idx]
                 train_seq_len_limits = [
                     max(ids.size(0) - 2, 0),
                     h_states.size(0),
@@ -3781,6 +3794,7 @@ class DrafterBaseTrainer:
                 # after the drafted input token x[p+1] at row p.
                 last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
             elif dspark_l1_enabled and torch.is_tensor(target_last_h_states):
+                target_last_h_states = cast(torch.Tensor, target_last_h_states)
                 target_last_hidden_state_chunks.append(
                     target_last_h_states[:train_seq_len]
                 )
@@ -4032,22 +4046,27 @@ class DrafterBaseTrainer:
                 final_target = batch.get("last_hidden_states")
 
             final_loss_mask = batch["loss_mask"]
+            final_target_tensor = (
+                cast(torch.Tensor, final_target)
+                if torch.is_tensor(final_target)
+                else None
+            )
             final_target_rows = (
-                int(final_target.size(1))
-                if torch.is_tensor(final_target) and final_target.dim() >= 2
+                int(final_target_tensor.size(1))
+                if final_target_tensor is not None and final_target_tensor.dim() >= 2
                 else None
             )
             final_row_valid = None
             final_active_rows = None
             final_active_valid = None
             if (
-                torch.is_tensor(final_target)
-                and final_target.dim() >= 3
+                final_target_tensor is not None
+                and final_target_tensor.dim() >= 3
                 and final_target_rows is not None
             ):
                 if self.backend.model_type == "eagle3" and use_logits:
                     final_row_valid_mask = _target_row_valid_mask(
-                        final_target.squeeze(0)
+                        final_target_tensor.squeeze(0)
                     )
                     if (
                         final_row_valid_mask is not None

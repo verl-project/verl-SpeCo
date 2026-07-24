@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -221,14 +222,14 @@ class LlamaForCausalLMPeagle(DraftModel):
     def __init__(self, config: PeagleConfig):
         super().__init__(config)
         self.config = config
-        self.vocab_size = config.vocab_size
-        self.hidden_size = config.hidden_size
-        self.target_hidden_size = getattr(
-            config, "target_hidden_size", config.hidden_size
+        self.vocab_size = cast(int, config.vocab_size)
+        self.hidden_size = cast(int, config.hidden_size)
+        self.target_hidden_size = cast(
+            int, getattr(config, "target_hidden_size", config.hidden_size)
         )
         self.num_aux_hidden_states = int(getattr(config, "num_aux_hidden_states", 3))
         self.draft_vocab_size = int(
-            getattr(config, "draft_vocab_size", config.vocab_size)
+            getattr(config, "draft_vocab_size", self.vocab_size)
         )
 
         self.embed_tokens = nn.Embedding(

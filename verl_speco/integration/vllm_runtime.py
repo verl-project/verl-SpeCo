@@ -30,8 +30,9 @@ import os
 import sys
 import threading
 import time
+import types
 from contextlib import contextmanager, nullcontext
-from typing import Any, Iterable
+from typing import Any, Iterable, cast
 
 from verl_speco.integration.verl_npu_vllm_compat import (
     install_verl_npu_vllm_import_compat,
@@ -238,7 +239,7 @@ def _speco_rebuild_ipc_compat(handle: tuple[Any, tuple], device_id: int | None =
     return _resolve_torch_rebuild_func(func)(*list_args)
 
 
-_speco_rebuild_ipc_compat._speco_compat = True
+setattr(_speco_rebuild_ipc_compat, "_speco_compat", True)
 
 
 def patch_verl_bucketed_weight_transfer_rebuild_ipc(
@@ -253,9 +254,12 @@ def patch_verl_bucketed_weight_transfer_rebuild_ipc(
 
     if bucketed_weight_transfer is None:
         try:
-            from verl.workers.rollout.vllm_rollout import bucketed_weight_transfer
+            from verl.workers.rollout.vllm_rollout import (
+                bucketed_weight_transfer as bucketed_weight_transfer_module,
+            )
         except Exception:  # noqa: BLE001
             return False
+        bucketed_weight_transfer = bucketed_weight_transfer_module
 
     current = getattr(bucketed_weight_transfer, "rebuild_ipc", None)
     if getattr(current, "_speco_compat", False):
@@ -293,9 +297,12 @@ def patch_verl_bucketed_weight_transfer_shm_reuse(
 
     if bucketed_weight_transfer is None:
         try:
-            from verl.workers.rollout.vllm_rollout import bucketed_weight_transfer
+            from verl.workers.rollout.vllm_rollout import (
+                bucketed_weight_transfer as bucketed_weight_transfer_module,
+            )
         except Exception:  # noqa: BLE001
             return False
+        bucketed_weight_transfer = bucketed_weight_transfer_module
 
     sender_cls = getattr(bucketed_weight_transfer, "BucketedWeightSender", None)
     receiver_cls = getattr(bucketed_weight_transfer, "BucketedWeightReceiver", None)
@@ -472,7 +479,7 @@ def patch_verl_bucketed_weight_transfer_shm_reuse(
         _sender_cleanup_with_shm_reuse,
         _receiver_cleanup_with_shm_reuse,
     ):
-        method._speco_shm_reuse = True
+        setattr(method, "_speco_shm_reuse", True)
 
     sender_cls._init_buffer = _sender_init_buffer_with_shm_reuse
     receiver_cls._init_buffer = _receiver_init_buffer_with_shm_reuse
@@ -488,9 +495,12 @@ def patch_verl_bucketed_weight_transfer_npu_staging(
 
     if bucketed_weight_transfer is None:
         try:
-            from verl.workers.rollout.vllm_rollout import bucketed_weight_transfer
+            from verl.workers.rollout.vllm_rollout import (
+                bucketed_weight_transfer as bucketed_weight_transfer_module,
+            )
         except Exception:  # noqa: BLE001
             return False
+        bucketed_weight_transfer = bucketed_weight_transfer_module
 
     receiver_cls = getattr(bucketed_weight_transfer, "BucketedWeightReceiver", None)
     if receiver_cls is None:
@@ -603,7 +613,7 @@ def patch_verl_bucketed_weight_transfer_npu_staging(
             staging_buffer = None
             self._cleanup()
 
-    _receive_weights_with_npu_staging._speco_npu_staging = True
+    setattr(_receive_weights_with_npu_staging, "_speco_npu_staging", True)
     receiver_cls.receive_weights = _receive_weights_with_npu_staging
     return True
 
@@ -1355,8 +1365,12 @@ def _patch_vllm_dspark_parallel_token() -> bool:
                 return
         current(self)
 
-    patched_init_parallel_drafting_params._speco_dspark_parallel_token = True
-    patched_init_parallel_drafting_params._speco_original_init_parallel_drafting_params = current
+    setattr(patched_init_parallel_drafting_params, "_speco_dspark_parallel_token", True)
+    setattr(
+        patched_init_parallel_drafting_params,
+        "_speco_original_init_parallel_drafting_params",
+        current,
+    )
     SpecDecodeBaseProposer._init_parallel_drafting_params = (
         patched_init_parallel_drafting_params
     )
@@ -1460,8 +1474,8 @@ def _patch_vllm_dspark_qwen3_heads() -> bool:
                     vllm_config, prefix=f"{prefix}.confidence_head"
                 )
 
-    patched_dflash_qwen3_init._speco_dspark_qwen3_heads = True
-    patched_dflash_qwen3_init._speco_original_dflash_qwen3_init = current
+    setattr(patched_dflash_qwen3_init, "_speco_dspark_qwen3_heads", True)
+    setattr(patched_dflash_qwen3_init, "_speco_original_dflash_qwen3_init", current)
     DFlashQwen3Model.__init__ = patched_dflash_qwen3_init
     return True
 
@@ -1649,8 +1663,16 @@ def patch_vllm_spec_decode_acceptance_logging() -> bool:
             logger.debug("Failed to log vLLM spec decode acceptance stats: %s", exc)
         return result
 
-    patched_make_spec_decoding_stats._speco_spec_decode_acceptance_logging = True
-    patched_make_spec_decoding_stats._speco_original_make_spec_decoding_stats = original
+    setattr(
+        patched_make_spec_decoding_stats,
+        "_speco_spec_decode_acceptance_logging",
+        True,
+    )
+    setattr(
+        patched_make_spec_decoding_stats,
+        "_speco_original_make_spec_decoding_stats",
+        original,
+    )
     Scheduler.make_spec_decoding_stats = patched_make_spec_decoding_stats
     return True
 
@@ -1684,8 +1706,8 @@ def patch_vllm_dflash_config_aliases() -> bool:
             if _is_dspark_hf_config(self):
                 _set_child(self, "architectures", ["DFlashDraftModel"])
 
-    patched_eagle_config_init._speco_dflash_config_aliases = True
-    patched_eagle_config_init._speco_original_eagle_config_init = current
+    setattr(patched_eagle_config_init, "_speco_dflash_config_aliases", True)
+    setattr(patched_eagle_config_init, "_speco_original_eagle_config_init", current)
     EAGLEConfig.__init__ = patched_eagle_config_init
     _VLLM_DFLASH_CONFIG_ALIASES_PATCHED = True
     return True
@@ -1754,7 +1776,11 @@ def patch_vllm_engine_core_entrypoint() -> bool:
         return True
 
     EngineCoreProc._speco_original_run_engine_core = current
-    _speco_vllm_run_engine_core_with_acceptance_logging._speco_engine_core_acceptance_logging = True
+    setattr(
+        _speco_vllm_run_engine_core_with_acceptance_logging,
+        "_speco_engine_core_acceptance_logging",
+        True,
+    )
     EngineCoreProc.run_engine_core = staticmethod(
         _speco_vllm_run_engine_core_with_acceptance_logging
     )
@@ -1801,9 +1827,15 @@ def patch_vllm_worker_proc_entrypoint() -> bool:
         return True
 
     WorkerProc._speco_original_worker_main = current
-    _speco_vllm_worker_main_with_runtime_observability._speco_worker_proc_runtime_observability = True
-    _speco_vllm_worker_main_with_runtime_observability._speco_original_worker_main = (
-        current
+    setattr(
+        _speco_vllm_worker_main_with_runtime_observability,
+        "_speco_worker_proc_runtime_observability",
+        True,
+    )
+    setattr(
+        _speco_vllm_worker_main_with_runtime_observability,
+        "_speco_original_worker_main",
+        current,
     )
     WorkerProc.worker_main = staticmethod(
         _speco_vllm_worker_main_with_runtime_observability
@@ -2025,10 +2057,19 @@ def install_upstream_vllm_runtime_bridge() -> bool:
 
     speco_http_server_cls = _build_speco_vllm_http_server_class(vllm_async_server)
 
-    class SpecoVLLMReplica(upstream_replica):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.server_class = ray.remote(speco_http_server_cls)
+    upstream_replica_base = cast(type[Any], upstream_replica)
+
+    def _speco_vllm_replica_init(self, *args, **kwargs):
+        upstream_replica_base.__init__(self, *args, **kwargs)
+        self.server_class = ray.remote(speco_http_server_cls)
+
+    SpecoVLLMReplica = types.new_class(
+        "SpecoVLLMReplica",
+        (upstream_replica_base,),
+        exec_body=lambda namespace: namespace.update(
+            {"__init__": _speco_vllm_replica_init}
+        ),
+    )
 
     SpecoVLLMReplica.__module__ = __name__
     vllm_async_server.vLLMReplica = SpecoVLLMReplica
@@ -2220,7 +2261,7 @@ async def _maybe_call_vllm_server_method(
 
 
 async def speco_vllm_update_draft_weights(
-    self, weights: Any, *args, global_steps: int = None, **kwargs
+    self, weights: Any, *args, global_steps: int | None = None, **kwargs
 ):
     """Update only vLLM draft/speculative model weights from a ServerAdapter."""
 
@@ -2361,7 +2402,10 @@ class SpecoVLLMWeightSyncCompatExtension(_VLLMWorkerExtensionBase):
     """Install the serialized NPU IPC-handle compatibility before target weight sync."""
 
     def update_weights_from_ipc(
-        self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False
+        self,
+        peft_config: dict | None = None,
+        base_sync_done=False,
+        use_shm: bool = False,
     ):
         patched = patch_verl_bucketed_weight_transfer_rebuild_ipc()
         patch_verl_bucketed_weight_transfer_shm_reuse()
@@ -2609,7 +2653,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         # DFlashQwen3Model/Qwen3DSparkModel, while EAGLE3 publishes into the
         # outer Eagle3LlamaForCausalLM because lm_head.weight lives outside
         # ``draft_model.model`` in vLLM.
-        _strip_prefixes = (
+        _strip_prefixes: tuple[str, ...] = (
             "module.",
             "_orig_mod.",
             "draft_model.",
@@ -2771,7 +2815,10 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         return loaded_count
 
     def update_weights_from_ipc(
-        self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False
+        self,
+        peft_config: dict | None = None,
+        base_sync_done=False,
+        use_shm: bool = False,
     ):
         """Override target weight sync to also reload drafter from checkpoint."""
         patch_verl_bucketed_weight_transfer_rebuild_ipc()
