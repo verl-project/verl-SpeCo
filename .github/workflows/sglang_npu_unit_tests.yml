@@ -1,0 +1,134 @@
+name: npu_unit_tests
+
+run-name: NPU example tests (${{ github.ref_name }})
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      run_training:
+        description: Enable drafter collect/train/publish inside the example run
+        required: true
+        default: true
+        type: boolean
+      target_model:
+        description: Target model path or HF id; falls back to SPECO_TARGET_MODEL
+        required: false
+        type: string
+      eagle3_draft_model:
+        description: EAGLE3 drafter path; falls back to SPECO_EAGLE3_DRAFT_MODEL
+        required: false
+        type: string
+      dflash_draft_model:
+        description: DFlash drafter path; falls back to SPECO_DFLASH_DRAFT_MODEL
+        required: false
+        type: string
+      dspark_draft_model:
+        description: DSpark drafter path; falls back to SPECO_DSPARK_DRAFT_MODEL
+        required: false
+        type: string
+      train_file:
+        description: Training dataset path; falls back to SPECO_TRAIN_FILE
+        required: false
+        type: string
+      test_file:
+        description: Validation dataset path; falls back to SPECO_TEST_FILE
+        required: false
+        type: string
+      accelerator_count:
+        description: Number of NPU devices
+        required: false
+        default: "1"
+        type: string
+      tensor_parallel_size:
+        description: Rollout tensor parallel size
+        required: false
+        default: "1"
+        type: string
+      sequence_parallel_size:
+        description: Actor/ref sequence parallel size
+        required: false
+        default: "1"
+        type: string
+      extra_hydra_args:
+        description: Optional newline-separated Hydra overrides
+        required: false
+        type: string
+  schedule:
+    - cron: "23 19 * * 3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npu-example-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SPECO_DEFAULT_MODEL_ROOT: ${{ vars.SPECO_MODEL_ROOT || '/home/runner/models' }}
+  SPECO_DEFAULT_DATA_ROOT: ${{ vars.SPECO_DATA_ROOT || '/home/runner/models/hf_data' }}
+  SPECO_DEFAULT_TARGET_MODEL: ${{ vars.SPECO_TARGET_MODEL || '/home/runner/models/Qwen/Qwen2.5-0.5B-Instruct' }}
+  SPECO_DEFAULT_EAGLE3_DRAFT_MODEL: ${{ vars.SPECO_EAGLE3_DRAFT_MODEL || '/home/runner/models/speco/eagle3-drafter' }}
+  SPECO_DEFAULT_DFLASH_DRAFT_MODEL: ${{ vars.SPECO_DFLASH_DRAFT_MODEL || '/home/runner/models/speco/dflash-drafter' }}
+  SPECO_DEFAULT_DSPARK_DRAFT_MODEL: ${{ vars.SPECO_DSPARK_DRAFT_MODEL || '/home/runner/models/speco/dspark-drafter' }}
+  SPECO_DEFAULT_TRAIN_FILE: ${{ vars.SPECO_TRAIN_FILE || '/home/runner/models/hf_data/gsm8k/train.parquet' }}
+  SPECO_DEFAULT_TEST_FILE: ${{ vars.SPECO_TEST_FILE || '/home/runner/models/hf_data/gsm8k/test.parquet' }}
+  SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '1' }}
+  SPECO_DEFAULT_TENSOR_PARALLEL_SIZE: ${{ vars.SPECO_TENSOR_PARALLEL_SIZE || '1' }}
+  SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE: ${{ vars.SPECO_SEQUENCE_PARALLEL_SIZE || '1' }}
+
+jobs:
+  example:
+    name: NPU ${{ matrix.backend }} ${{ matrix.drafter }} example
+    # if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: [linux-aarch64-a2-8]
+    timeout-minutes: 180
+    container:
+      image: quay.io/ascend/verl:verl-sglang-8.5.0-910b-ubuntu22.04-py3.11-latest
+      options: >-
+        --shm-size 16g
+    environment: speco-npu-ci
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(github.event_name == 'pull_request' && '{"include":[{"backend":"sglang","drafter":"eagle3"},{"backend":"sglang","drafter":"dflash"}]}' || '{"include":[{"backend":"sglang","drafter":"eagle3"},{"backend":"sglang","drafter":"dflash"}]}') }}
+
+    steps:
+      - name: Check out verl-SpeCo
+        uses: actions/checkout@v4
+
+      - name: Verify NPU runtime
+        run: |
+          # npu-smi info
+          python - <<'PY'
+          import torch
+          import torch_npu
+          assert torch.npu.is_available()
+          print("torch.npu.device_count =", torch.npu.device_count())
+          PY
+          python -c "import sglang; print(sglang.__version__)"
+
+      - name: Run example script
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          SPECO_TARGET_MODEL: ${{ inputs.target_model || env.SPECO_DEFAULT_TARGET_MODEL }}
+          SPECO_EAGLE3_DRAFT_MODEL: ${{ inputs.eagle3_draft_model || env.SPECO_DEFAULT_EAGLE3_DRAFT_MODEL }}
+          SPECO_DFLASH_DRAFT_MODEL: ${{ inputs.dflash_draft_model || env.SPECO_DEFAULT_DFLASH_DRAFT_MODEL }}
+          SPECO_DSPARK_DRAFT_MODEL: ${{ inputs.dspark_draft_model || env.SPECO_DEFAULT_DSPARK_DRAFT_MODEL }}
+          SPECO_TRAIN_FILE: ${{ inputs.train_file || env.SPECO_DEFAULT_TRAIN_FILE }}
+          SPECO_TEST_FILE: ${{ inputs.test_file || env.SPECO_DEFAULT_TEST_FILE }}
+          SPECO_CKPT_DIR: ${{ vars.SPECO_CKPT_DIR || runner.temp }}
+          SPECO_ACCELERATOR_COUNT: ${{ inputs.accelerator_count || env.SPECO_DEFAULT_ACCELERATOR_COUNT }}
+          SPECO_TENSOR_PARALLEL_SIZE: ${{ inputs.tensor_parallel_size || env.SPECO_DEFAULT_TENSOR_PARALLEL_SIZE }}
+          SPECO_SEQUENCE_PARALLEL_SIZE: ${{ inputs.sequence_parallel_size || env.SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE }}
+          SPECO_ENABLE_TRAINING: ${{ (github.event_name == 'schedule' || github.event_name == 'pull_request') && 'true' || inputs.run_training }}
+          SPECO_TOTAL_TRAINING_STEPS: ${{ github.event_name == 'pull_request' && '1' || vars.SPECO_TOTAL_TRAINING_STEPS }}
+          SPECO_TRAIN_MAX_SAMPLES: ${{ github.event_name == 'pull_request' && '1' || vars.SPECO_TRAIN_MAX_SAMPLES }}
+          SPECO_VAL_MAX_SAMPLES: ${{ github.event_name == 'pull_request' && '1' || vars.SPECO_VAL_MAX_SAMPLES }}
+          SPECO_DATALOADER_NUM_WORKERS: ${{ github.event_name == 'pull_request' && '0' || vars.SPECO_DATALOADER_NUM_WORKERS }}
+          SPECO_EXTRA_HYDRA_ARGS: ${{ inputs.extra_hydra_args || vars.SPECO_EXTRA_HYDRA_ARGS }}
+        run: bash ci/run_example_test.sh npu "${{ matrix.backend }}" "${{ matrix.drafter }}"
