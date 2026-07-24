@@ -130,7 +130,7 @@ actor_rollout_ref:
         dspark_confidence_loss_alpha: 0.0
         dspark_confidence_head_with_markov: true
         dspark_ce_loss_alpha: 0.1
-        dspark_l1_loss_alpha: 0.9
+        dspark_l1_loss_alpha: 0.45
         dspark_l1_chunk_size: 0
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
