@@ -19,7 +19,7 @@ import contextvars
 import inspect
 import logging
 from functools import wraps
-from typing import Any, cast
+from typing import Any
 
 logger = logging.getLogger(__file__)
 
@@ -178,7 +178,8 @@ async def _speco_worker_generate_sequences(self, batch):
         result = generate_sequences(self, batch)
         if inspect.isawaitable(result):
             result = await result
-        return _ensure_extra_field_defaults(result)
+        result = _ensure_extra_field_defaults(result)
+        return result
     finally:
         _speco_reset_context(global_steps_token, validate_token)
 
@@ -247,6 +248,24 @@ def _load_agent_loop_module():
         return agent_loop_module
     except Exception:
         raise
+
+
+def _resolve_llm_server_client_class(agent_loop_module: Any) -> Any:
+    """Resolve the request client used by legacy and release/v0.8.0 agent loops."""
+
+    client_cls = getattr(agent_loop_module, "LLMServerClient", None)
+    if client_cls is not None:
+        return client_cls
+
+    legacy_cls = getattr(agent_loop_module, "AsyncLLMServerManager", None)
+    if legacy_cls is not None:
+        return legacy_cls
+
+    try:
+        from verl.workers.rollout.llm_server import LLMServerClient
+    except Exception:  # noqa: BLE001
+        return None
+    return LLMServerClient
 
 
 try:
@@ -328,26 +347,15 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
     manager._speco_agent_loop_manager_configured = True
 
 
-_upstream_agent_loop_manager_base = cast(type[Any], _UpstreamAgentLoopManager)
+class SpecoAgentLoopManager(_UpstreamAgentLoopManager):
+    """Explicit AgentLoopManager bridge used by upstream config loading."""
 
-
-def _speco_agent_loop_manager_init(self: Any, *args: Any, **kwargs: Any) -> None:
-    install_agent_loop_runtime_patch()
-    _upstream_agent_loop_manager_base.__init__(self, *args, **kwargs)
-    agent_loop_module = _AgentLoopModule or _load_agent_loop_module()
-    worker_cls = getattr(agent_loop_module, "AgentLoopWorker")
-    _configure_speco_agent_loop_manager_instance(self, worker_cls)
-
-
-SpecoAgentLoopManager = type(
-    "SpecoAgentLoopManager",
-    (_upstream_agent_loop_manager_base,),
-    {
-        "__doc__": "Explicit AgentLoopManager bridge used by upstream config loading.",
-        "__init__": _speco_agent_loop_manager_init,
-        "__module__": __name__,
-    },
-)
+    def __init__(self, *args, **kwargs):
+        install_agent_loop_runtime_patch()
+        super().__init__(*args, **kwargs)
+        agent_loop_module = _AgentLoopModule or _load_agent_loop_module()
+        worker_cls = getattr(agent_loop_module, "AgentLoopWorker")
+        _configure_speco_agent_loop_manager_instance(self, worker_cls)
 
 
 def install_agent_loop_runtime_patch() -> bool:
@@ -365,8 +373,8 @@ def install_agent_loop_runtime_patch() -> bool:
 
     worker_cls = getattr(agent_loop_module, "AgentLoopWorker", None)
     manager_cls = getattr(agent_loop_module, "AgentLoopManager", None)
-    llm_server_manager_cls = getattr(agent_loop_module, "AsyncLLMServerManager", None)
-    if worker_cls is None or manager_cls is None or llm_server_manager_cls is None:
+    llm_server_client_cls = _resolve_llm_server_client_class(agent_loop_module)
+    if worker_cls is None or manager_cls is None or llm_server_client_cls is None:
         logger.warning(
             "Unable to install SPECO agent-loop runtime patch: missing upstream classes"
         )
@@ -378,7 +386,7 @@ def install_agent_loop_runtime_patch() -> bool:
     postprocess = getattr(worker_cls, "_postprocess", None)
     manager_init = getattr(manager_cls, "__init__", None)
     manager_generate_sequences = getattr(manager_cls, "generate_sequences", None)
-    llm_server_generate = getattr(llm_server_manager_cls, "generate", None)
+    llm_server_generate = getattr(llm_server_client_cls, "generate", None)
     if (
         not callable(generate_sequences)
         or not callable(run_agent_loop)
@@ -392,7 +400,7 @@ def install_agent_loop_runtime_patch() -> bool:
         )
         return False
 
-    if not getattr(llm_server_manager_cls, "_speco_patched_generate", False):
+    if not getattr(llm_server_client_cls, "_speco_patched_generate", False):
 
         @wraps(llm_server_generate)
         async def speco_llm_server_generate(self, *args, **kwargs):
@@ -405,8 +413,8 @@ def install_agent_loop_runtime_patch() -> bool:
                 result = await result
             return result
 
-        llm_server_manager_cls.generate = speco_llm_server_generate
-        llm_server_manager_cls._speco_patched_generate = True
+        llm_server_client_cls.generate = speco_llm_server_generate
+        llm_server_client_cls._speco_patched_generate = True
 
     if not getattr(worker_cls, "_speco_patched_generate_sequences", False):
 

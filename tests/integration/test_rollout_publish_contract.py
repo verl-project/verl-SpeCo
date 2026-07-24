@@ -136,6 +136,52 @@ def test_publish_state_filter_excludes_block_drafter_embedding() -> None:
     assert set(trainer._get_trainable_state_dict()) == {"draft_model.fc.weight"}
 
 
+def test_target_lm_head_device_helper_handles_dflash_style_backend() -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="target lm_head device contract needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    class _FakeHead:
+        def __init__(self):
+            self.devices = []
+
+        def to(self, device):
+            self.devices.append(device)
+            return self
+
+    head = _FakeHead()
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(target_lm_head=head)
+
+    assert trainer._move_target_lm_head("cpu") is True
+    assert head.devices == ["cpu"]
+
+
+def test_target_lm_head_device_helper_preserves_eagle_backend() -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="target model device contract needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    class _FakeHead:
+        def __init__(self):
+            self.devices = []
+
+        def to(self, device):
+            self.devices.append(device)
+            return self
+
+    head = _FakeHead()
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(target_model=head, target_lm_head=None)
+
+    assert trainer._move_target_lm_head("npu:0") is True
+    assert head.devices == ["npu:0"]
+
+
 def test_dspark_pretrained_export_strips_only_training_wrapper_prefix() -> None:
     torch = pytest.importorskip("torch")
     base_trainer = pytest.importorskip(

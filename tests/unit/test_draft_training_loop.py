@@ -125,6 +125,42 @@ def test_public_checkpoint_path_rewrites_dspark_runtime_config(tmp_path):
     assert (checkpoint_dir / "speco_training_config.json").exists()
 
 
+def test_standalone_checkpoint_rewrites_runtime_config_after_save(tmp_path):
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    source_dir = tmp_path / "source_dspark"
+    source_dir.mkdir()
+    (source_dir / "config.json").write_text(
+        json.dumps(
+            {"model_type": "deepseek_v3", "architectures": ["DeepSeekDSparkModel"]}
+        ),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps({"model_type": "dspark", "architectures": ["DSparkDraftModel"]}),
+        encoding="utf-8",
+    )
+    events = []
+
+    class _CheckpointTrainer:
+        backend = SimpleNamespace(model_type="dspark")
+        config = SimpleNamespace(
+            rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))
+        )
+
+        @staticmethod
+        def save_checkpoint(step: int, wait: bool):
+            assert step == 5
+            assert wait is True
+            events.append("save")
+            return {"saved": True, "reason": "saved", "path": str(checkpoint_dir)}
+
+    result = _save_standalone_checkpoint(_CheckpointTrainer(), 5, wait=True)
+
+    assert result["saved"] is True
+    assert events == ["save"]
+
+
 def test_standalone_dspark_checkpoint_preserves_source_runtime_config(tmp_path):
     checkpoint_dir = tmp_path / "draft_step_5"
     checkpoint_dir.mkdir()

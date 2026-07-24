@@ -8,14 +8,14 @@ speco:
 
   verl_base:
     version: "0.8.0"
-    commit: "7aed6b230776f963fa09509c10d9c3a767d1102c"
+    branch: release/v0.8.0
     source_modifications_allowed: false
 
   compatibility:
     policy: warn
     strict_env: VERL_SPECO_STRICT_VERL
-    require_verl_base_tag: v0.8.0
-    require_verl_base_commit: 7aed6b230776f963fa09509c10d9c3a767d1102c
+    require_verl_base_branch: release/v0.8.0
+    require_verl_base_version: 0.8.0
 
   trainer:
     task_runner: verl_speco.integration.task_runner.SpecoTaskRunner
@@ -84,7 +84,7 @@ actor_rollout_ref:
         train_batches_per_cycle: 4
         lr: 1e-5
         lr_warmup_steps: 0
-        lr_scheduler_type: global_cosine
+        lr_scheduler_type: constant
         lr_decay_steps: 100
         min_lr_ratio: 0.1
         warmup_style: null
@@ -130,11 +130,20 @@ actor_rollout_ref:
         dspark_confidence_loss_alpha: 0.0
         dspark_confidence_head_with_markov: true
         dspark_ce_loss_alpha: 0.1
-        dspark_l1_loss_alpha: 0.9
+        dspark_l1_loss_alpha: 0.45
         dspark_l1_chunk_size: 0
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
         dspark_debug_log_interval: 100
+        # P-EAGLE (parallel drafting: COD-subsampled multi-depth forward + KL loss).
+        peagle_num_draft_layers: 4
+        peagle_num_aux_hidden_states: 3
+        peagle_draft_vocab_size: null
+        peagle_num_depths: 8
+        peagle_down_sample_ratio: 0.7
+        peagle_down_sample_ratio_min: 0.2
+        peagle_mask_token_id: null
+        peagle_fc_norm: false
         # Domino (DFlash variant: causal GRU correction head + dual-logit curriculum).
         # Unset keys fall back to the matching dflash_* value.
         domino_block_size: 16

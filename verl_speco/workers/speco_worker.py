@@ -476,11 +476,15 @@ class SpecoWorker(Worker):
             from verl_speco.backends.domino_trainer_backend import DominoTrainerBackend
 
             trainer_backend = DominoTrainerBackend(self.config, self.config.model)
+        elif algo == "PEAGLE":
+            from verl_speco.backends.peagle_trainer_backend import PEagleTrainerBackend
+
+            trainer_backend = PEagleTrainerBackend(self.config, self.config.model)
         else:
             raise ValueError(
                 "Unsupported drafter algorithm "
                 f"{self.config.rollout.drafter.speculative_algorithm!r}; "
-                "supported algorithms are EAGLE1, EAGLE2, EAGLE3, DFLASH, DSPARK and DOMINO"
+                "supported algorithms are EAGLE1, EAGLE2, EAGLE3, DFLASH, DSPARK, DOMINO and PEAGLE"
             )
 
         self.trainer = DrafterBaseTrainer(
@@ -869,14 +873,21 @@ class SpecoWorker(Worker):
         self.trainer.increment_rl_step(global_step)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def save_checkpoint(self, global_step: int, wait: bool = True):
+    def save_checkpoint(
+        self,
+        global_step: int,
+        wait: bool = True,
+    ):
         if not self.enable_drafter:
             return {"saved": False, "reason": "disabled"}
         if not self.in_drafter_train_group or self.trainer is None:
             return {"saved": False, "reason": "not_in_training_group"}
         if global_step is None:
             return {"saved": False, "reason": "missing_global_step"}
-        result = self.trainer.save_checkpoint(int(global_step), wait=wait)
+        result = self.trainer.save_checkpoint(
+            int(global_step),
+            wait=wait,
+        )
         if self.is_drafter_group_leader:
             logger.debug(
                 "[speco checkpoint] replica=%s global_step=%s result=%s",
