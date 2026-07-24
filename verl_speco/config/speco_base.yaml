@@ -84,7 +84,7 @@ actor_rollout_ref:
         train_batches_per_cycle: 4
         lr: 1e-5
         lr_warmup_steps: 0
-        lr_scheduler_type: constant
+        lr_scheduler_type: global_cosine
         lr_decay_steps: 100
         min_lr_ratio: 0.1
         warmup_style: null
