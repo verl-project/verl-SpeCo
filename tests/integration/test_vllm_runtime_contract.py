@@ -105,7 +105,8 @@ def test_vllm_npu_staging_is_guarded_and_preserves_upstream_fallback() -> None:
     assert "not use_shm" in guard_source
     assert "peft_config is not None" in guard_source
     assert "not _speco_is_npu_vllm_worker(worker)" in guard_source
-    assert 'getattr(vllm_config, "quant_config", None) is None' in guard_source
+    assert 'getattr(vllm_config, "quant_config", None)' in guard_source
+    assert "quant_config is not None" in guard_source
     assert "return original_receive(self, on_bucket_received)" in patch_source
     assert "SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES" in patch_source
     assert "staging_buffer[start:end].copy_(self.buffer[start:end], non_blocking=False)" in patch_source

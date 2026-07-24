@@ -30,6 +30,11 @@ actor_rollout_ref:
       model_path: /path/to/drafter/model
       checkpoint_path: null
       world_size: 16
+      # Emit bubble/* metrics derived from the per-step timing breakdown to
+      # measure pipeline gaps and the overlap headroom between the serial
+      # draft-training stage and the generation window. Measurement only; adds
+      # no work to a step when false.
+      profile_bubble: false
 
       rollout:
         spec_steps: 3
@@ -84,7 +89,7 @@ actor_rollout_ref:
         train_batches_per_cycle: 4
         lr: 1e-5
         lr_warmup_steps: 0
-        lr_scheduler_type: constant
+        lr_scheduler_type: global_cosine
         lr_decay_steps: 100
         min_lr_ratio: 0.1
         warmup_style: null

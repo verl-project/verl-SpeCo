@@ -106,7 +106,11 @@ def test_release_v080_modules_and_symbols_are_present() -> None:
     if not upstream_root:
         pytest.skip("set VERL_SPECO_UPSTREAM_ROOT to check the release/v0.8.0 API")
 
-    root = Path(upstream_root) / "verl"
+    # REQUIRED_MODULES keys already start with the ``verl`` package segment
+    # (e.g. ``verl.trainer.main_ppo``), so resolve them from the checkout root,
+    # not from ``<root>/verl`` which would double the segment into
+    # ``<root>/verl/verl/...`` and report every module as missing.
+    root = Path(upstream_root)
     missing: list[str] = []
     for module_name, symbols in REQUIRED_MODULES.items():
         try:
