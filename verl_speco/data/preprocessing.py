@@ -426,14 +426,14 @@ def build_eagle3_dataset(
         os.makedirs(cache_dir, exist_ok=True)
         cache_file_name = os.path.join(cache_dir, f"{cache_key}.pkl")
         print(f"dataset is cached at {cache_file_name}")
-    elif cache_dir is None and cache_key is None:
+    else:
+        if cache_dir is not None or cache_key is not None:
+            warnings.warn(
+                "cache_dir and cache_key must be provided together to make caching work; proceeding without caching"
+            )
         load_from_cache_file = False
         cache_file_name = None
-        print(f"dataset is not cached")
-    else:
-        warnings.warn(
-            f"cache_dir and cache_key must be provided together to make caching work"
-        )
+        print("dataset is not cached")
 
     # Disable tokenizers internal parallelism when using multiprocessing to avoid
     # deadlocks caused by forked Rust threads (see huggingface/tokenizers#1391).

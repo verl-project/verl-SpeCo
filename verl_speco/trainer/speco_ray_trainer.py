@@ -89,6 +89,17 @@ def _get_nested(config, path, default=None):
     return current
 
 
+def _speco_alpha_counter(value: int) -> str:
+    """Encode a positive counter with letters so Ray log dedup keeps each sample."""
+
+    value = max(int(value), 1)
+    chars = []
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        chars.append(chr(ord("a") + remainder))
+    return "".join(reversed(chars))
+
+
 def _speco_ref_meta_rows(meta: Any) -> int:
     if not isinstance(meta, dict):
         return 0
@@ -354,8 +365,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def speco_maybe_publish(self):
         return self._require_speco_worker_group().maybe_publish()
 
-    def speco_save_checkpoint(self, global_step: int, wait: bool = True):
-        return self._require_speco_worker_group().save_checkpoint(global_step, wait=wait)
+    def speco_save_checkpoint(
+        self,
+        global_step: int,
+        wait: bool = True,
+    ):
+        return self._require_speco_worker_group().save_checkpoint(
+            global_step,
+            wait=wait,
+        )
 
     def speco_wait_checkpoint(self):
         return self._require_speco_worker_group().wait_checkpoint()
@@ -390,6 +408,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not enabled:
             yield
             return
+        manager_class = SPECO_AGENT_LOOP_MANAGER_CLASS
 
         rollout_config = _get_nested(self.config, ("actor_rollout_ref", "rollout"), None)
         if rollout_config is None:
@@ -405,7 +424,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         with open_dict(rollout_config):
             if "agent" not in rollout_config or rollout_config["agent"] is None:
                 rollout_config["agent"] = {}
-            rollout_config["agent"]["agent_loop_manager_class"] = SPECO_AGENT_LOOP_MANAGER_CLASS
+            rollout_config["agent"]["agent_loop_manager_class"] = manager_class
         try:
             yield
         finally:
@@ -647,7 +666,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return None
         if self._speco_ensure_drafter_checkpoint_path() is None:
             return None
-        checkpoint_refs = self.speco_save_checkpoint(self.global_steps, wait=wait)
+        checkpoint_refs = self.speco_save_checkpoint(
+            self.global_steps,
+            wait=wait,
+        )
         if wait:
             results = self._ray_get_if_needed(checkpoint_refs)
             self._speco_validate_drafter_checkpoint_results(results, require_saved=True)

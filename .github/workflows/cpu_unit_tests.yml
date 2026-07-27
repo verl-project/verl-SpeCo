@@ -31,10 +31,10 @@ jobs:
           cache: pip
           cache-dependency-path: ci/requirements-ci.txt
 
-      - name: Check out pinned upstream verl
+      - name: Check out release/v0.8.0 upstream verl
         run: |
           set -euo pipefail
-          verl_ref="$(awk -F= '/^VERL_BASE_COMMIT=/{print $2}' REQUIRED_VERL.txt)"
+          verl_ref="$(awk -F= '/^VERL_BASE_BRANCH=/{print $2}' REQUIRED_VERL.txt)"
           mkdir -p .ci
           git clone --filter=blob:none https://github.com/verl-project/verl .ci/upstream-verl
           git -C .ci/upstream-verl checkout "${verl_ref}"

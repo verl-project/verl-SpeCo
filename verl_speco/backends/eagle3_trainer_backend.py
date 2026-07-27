@@ -7,8 +7,7 @@ from torch.nn import SmoothL1Loss
 from torch.nn import functional as F
 from transformers import AutoConfig
 
-from verl.utils.device import get_device_name
-from verl.utils.fsdp_utils import get_device_id
+from verl.utils.device import get_device_id, get_device_name
 from verl_speco.backends.lr_scheduler import build_drafter_lr_scheduler
 from verl_speco.models.auto import AutoDraftModelConfig, AutoEagle3DraftModel
 from verl_speco.models.eagle.llama_eagle import resolve_eagle3_num_aux_hidden_states

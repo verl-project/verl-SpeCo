@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from verl_speco.backends.dflash_trainer_backend import (
     DFlashTrainerBackend,
     DFlashTrainingModel,
+    _create_dflash_dense_attention_mask,
     _create_dflash_mask_mod,
 )
 from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
@@ -158,6 +159,7 @@ class DominoTrainingModel(DFlashTrainingModel):
         draft_len = n_blocks * self.block_size
 
         block_mask = None
+        dense_attention_mask = None
         if device.type == "cuda":
             block_mask = compile_friendly_create_block_mask(
                 mask_mod=_create_dflash_mask_mod(anchor_positions, block_keep_mask, seq_len, self.block_size),
@@ -167,6 +169,13 @@ class DominoTrainingModel(DFlashTrainingModel):
                 KV_LEN=seq_len + draft_len,
                 device=device,
             )
+        else:
+            dense_attention_mask = _create_dflash_dense_attention_mask(
+                anchor_positions,
+                block_keep_mask,
+                seq_len,
+                self.block_size,
+            )
 
         draft_hidden = self.draft_model(
             draft_input_ids=None,
@@ -174,6 +183,7 @@ class DominoTrainingModel(DFlashTrainingModel):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             block_mask=block_mask,
+            dense_attention_mask=dense_attention_mask,
             noise_embedding=noise_embedding,
         ).view(bsz, n_blocks, self.block_size, -1)
 

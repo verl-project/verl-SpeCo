@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import types
+from inspect import getsource
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,12 +10,18 @@ import pytest
 
 from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
+    SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS,
     SPECO_VLLM_WORKER_EXTENSION_CLS,
     SpecoVLLMColocateWorkerExtension,
+    SpecoVLLMWeightSyncCompatExtension,
     _describe_vllm_draft_logits,
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
     _record_vllm_spec_decode_scheduler_stats,
+    _speco_can_use_npu_target_staging,
+    _speco_npu_target_staging,
+    _speco_npu_target_staging_decision,
+    _speco_persistent_weight_shm_name,
     _validate_vllm_dflash_drafter_config,
     _vllm_ascend_has_dspark_pr11153_k_query_runtime,
     _vllm_spec_decode_stats_to_metrics,
@@ -22,6 +29,8 @@ from verl_speco.integration.vllm_runtime import (
     build_vllm_speculative_config_from_drafter,
     configure_vllm_runtime_from_config,
     patch_transformers_attention_layer_type_constants,
+    patch_verl_bucketed_weight_transfer_npu_staging,
+    patch_verl_bucketed_weight_transfer_shm_reuse,
     speco_vllm_update_draft_weights,
 )
 
@@ -71,6 +80,174 @@ def test_vllm_worker_extension_constructs_without_wake_up_fallback() -> None:
     extension = SpecoVLLMColocateWorkerExtension()
 
     assert isinstance(extension, SpecoVLLMColocateWorkerExtension)
+
+
+def test_vllm_weight_sync_extension_has_stable_runtime_path() -> None:
+    assert SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS.endswith(".SpecoVLLMWeightSyncCompatExtension")
+    source = getsource(SpecoVLLMWeightSyncCompatExtension.update_weights_from_ipc)
+    assert source.index("patch_verl_bucketed_weight_transfer_rebuild_ipc()") < source.index(
+        "super().update_weights_from_ipc("
+    )
+    assert source.index("patch_verl_bucketed_weight_transfer_shm_reuse()") < source.index(
+        "super().update_weights_from_ipc("
+    )
+    assert source.index("patch_verl_bucketed_weight_transfer_npu_staging()") < source.index(
+        "super().update_weights_from_ipc("
+    )
+    assert "with _speco_npu_target_staging(" in source
+
+
+def test_vllm_npu_staging_is_guarded_and_preserves_upstream_fallback() -> None:
+    guard_source = getsource(_speco_npu_target_staging_decision)
+    context_source = getsource(_speco_npu_target_staging)
+    patch_source = getsource(patch_verl_bucketed_weight_transfer_npu_staging)
+
+    assert "not use_shm" in guard_source
+    assert "peft_config is not None" in guard_source
+    assert "not _speco_is_npu_vllm_worker(worker)" in guard_source
+    assert 'getattr(vllm_config, "quant_config", None) is None' in guard_source
+    assert "return original_receive(self, on_bucket_received)" in patch_source
+    assert "SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES" in patch_source
+    assert "staging_buffer[start:end].copy_(self.buffer[start:end], non_blocking=False)" in patch_source
+    assert "get_torch_device().synchronize()" in patch_source
+    assert "NPU staging decision" in context_source
+    assert "flush=True" in context_source
+    assert "return enabled" in getsource(_speco_can_use_npu_target_staging)
+
+
+def test_vllm_weight_shm_name_is_stable_and_channel_scoped() -> None:
+    handle = "ipc:///tmp/rl-colocate-zmq-job-replica-0-rank-0.sock"
+
+    assert _speco_persistent_weight_shm_name(handle, 2048 << 20) == _speco_persistent_weight_shm_name(
+        handle, 2048 << 20
+    )
+    assert _speco_persistent_weight_shm_name(handle, 2048 << 20) != _speco_persistent_weight_shm_name(
+        handle, 512 << 20
+    )
+    assert _speco_persistent_weight_shm_name(handle, 2048 << 20) != _speco_persistent_weight_shm_name(
+        handle.replace("rank-0", "rank-1"), 2048 << 20
+    )
+
+
+def test_vllm_weight_shm_patch_reuses_mapping_and_preserves_ipc_path() -> None:
+    created = []
+
+    class FakeShm:
+        def __init__(self, size: int):
+            self.size = size
+            self.buf = bytearray(size)
+            self.close_count = 0
+            self.unlink_count = 0
+
+        def close(self):
+            self.close_count += 1
+
+        def unlink(self):
+            self.unlink_count += 1
+
+    class FakeTorch:
+        uint8 = "uint8"
+
+        @staticmethod
+        def frombuffer(buffer, dtype):
+            assert dtype == FakeTorch.uint8
+            return buffer
+
+    class FakeSocket:
+        def __init__(self, incoming=None):
+            self.metadata = []
+            self.incoming = incoming
+
+        def send_pyobj(self, value):
+            self.metadata.append(value)
+
+        def recv(self):
+            return b""
+
+        def recv_pyobj(self):
+            return self.incoming
+
+        def send(self, value):
+            self.metadata.append(value)
+
+    class FakeSender:
+        def __init__(self, *, use_shm: bool):
+            self.use_shm = use_shm
+            self.zmq_handle = "ipc:///tmp/rl-colocate-zmq-job-replica-0-rank-0.sock"
+            self.bucket_size = 64
+            self.socket = FakeSocket()
+            self.buffer = None
+            self.shm = None
+            self.upstream_init_called = False
+            self.upstream_cleanup_called = False
+
+        def _init_buffer(self):
+            self.upstream_init_called = True
+
+        def _cleanup(self):
+            self.upstream_cleanup_called = True
+            self.buffer = None
+            self.shm = None
+
+    class FakeReceiver:
+        def __init__(self, *, use_shm: bool, metadata):
+            self.use_shm = use_shm
+            self.socket = FakeSocket(metadata)
+            self.buffer = None
+            self.shm = None
+            self.upstream_init_called = False
+            self.upstream_cleanup_called = False
+
+        def _init_buffer(self):
+            self.upstream_init_called = True
+
+        def _cleanup(self):
+            self.upstream_cleanup_called = True
+            self.buffer = None
+            self.shm = None
+
+    def create_shared_memory(size, name):
+        shm = FakeShm(size)
+        created.append((name, shm))
+        return shm
+
+    module = SimpleNamespace(
+        BucketedWeightSender=FakeSender,
+        BucketedWeightReceiver=FakeReceiver,
+        create_shared_memory=create_shared_memory,
+        rebuild_shared_memory=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected attach")),
+        torch=FakeTorch,
+    )
+
+    assert patch_verl_bucketed_weight_transfer_shm_reuse(module) is True
+    assert patch_verl_bucketed_weight_transfer_shm_reuse(module) is False
+    first = FakeSender(use_shm=True)
+    first._init_buffer()
+    first_buffer = first.buffer
+    first._cleanup()
+    second = FakeSender(use_shm=True)
+    second._init_buffer()
+
+    assert len(created) == 1
+    assert second.buffer is first_buffer
+    assert created[0][1].close_count == 0
+    assert created[0][1].unlink_count == 0
+    assert first.upstream_cleanup_called is True
+
+    receiver = FakeReceiver(use_shm=True, metadata=second.socket.metadata[0])
+    receiver._init_buffer()
+    assert receiver.buffer is first_buffer
+    receiver._cleanup()
+    assert receiver.upstream_cleanup_called is True
+
+    ipc_sender = FakeSender(use_shm=False)
+    ipc_sender._init_buffer()
+    assert ipc_sender.upstream_init_called is True
+
+    second._cleanup()
+    module._speco_cleanup_persistent_weight_shm()
+    assert created[0][1].close_count == 1
+    assert created[0][1].unlink_count == 1
 
 
 def test_vllm_draft_logits_diagnostic_handles_missing_and_non_tensor_values() -> None:
@@ -358,14 +535,16 @@ def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None
     assert patch_transformers_attention_layer_type_constants() is False
 
 
-def test_transformers_attention_layer_type_patch_runs_before_vllm_worker_extension_import() -> None:
+def test_import_compat_runs_before_vllm_worker_extension_import() -> None:
     source = (
         Path(__file__).resolve().parents[2] / "verl_speco" / "integration" / "vllm_runtime.py"
     ).read_text(encoding="utf-8")
 
-    assert source.index("\npatch_transformers_attention_layer_type_constants()\n") < source.index(
+    extension_import = source.index(
         "from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension"
     )
+    assert source.index("\npatch_transformers_attention_layer_type_constants()\n") < extension_import
+    assert source.index("\ninstall_verl_npu_vllm_import_compat()\n") < extension_import
 
 
 def test_vllm_acceptance_stats_keep_stable_transport_keys() -> None:

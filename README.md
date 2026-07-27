@@ -103,31 +103,38 @@ ci/                               # smoke-test helpers and CI notes
 
 ## Installation
 
-This repository does not currently define its own Python package metadata. Use
-it with the upstream `verl` commit pinned in
+Install the upstream `verl` release branch specified in
 [`REQUIRED_VERL.txt`](./REQUIRED_VERL.txt), which is mirrored in
 [`verl_speco/config/speco_base.yaml`](./verl_speco/config/speco_base.yaml).
 By default, unsupported `verl` versions produce a warning. Set
 `VERL_SPECO_STRICT_VERL=1` to fail closed when the importable `verl` does not
-match the pinned version or commit.
+match the release/v0.8.0 version and API contract.
 
 One typical editable setup is:
 
 ```bash
 git clone https://github.com/verl-project/verl.git
 cd verl
-git checkout 7aed6b230776f963fa09509c10d9c3a767d1102c
+git checkout release/v0.8.0
 pip install -e .
 
-cd /path/to/verl-SpeCo
-export PYTHONPATH="$PWD:$PYTHONPATH"
+cd ..
+git clone https://github.com/verl-project/verl-SpeCo.git
+cd verl-SpeCo
+pip install -e .
 ```
+
+The editable install exposes the `verl_speco` package without modifying
+`PYTHONPATH`. It also installs the `verl-speco`, `verl-speco-draft-train`, and
+`verl-speco-inspect-features` command-line entry points. Install the matching
+GPU or NPU rollout runtime separately; `verl-SpeCo` intentionally does not let
+pip replace accelerator-specific PyTorch, vLLM, SGLang, or vLLM-Ascend builds.
 
 ### Docker Images
 
 You can also build GPU runtime images from the official `verlai/verl`
-development images and then pin the importable upstream `verl` checkout to the
-required v0.8.0 commit. The Dockerfiles below target GPU deployments; use the
+development images and then use the importable upstream `verl` checkout from
+the release/v0.8.0 branch. The Dockerfiles below target GPU deployments; use the
 matching accelerator image for NPU or other accelerator runtimes.
 
 For GPU vLLM-based examples, use this Dockerfile:
@@ -136,20 +143,20 @@ For GPU vLLM-based examples, use this Dockerfile:
 # GPU vLLM runtime image.
 FROM verlai/verl:vllm023.dev1
 
-ARG VERL_COMMIT=7aed6b230776f963fa09509c10d9c3a767d1102c
+ARG VERL_REF=release/v0.8.0
 ARG VERL_REPO=https://github.com/verl-project/verl.git
 
 WORKDIR /workspace
 
 RUN git clone ${VERL_REPO} /workspace/verl \
     && cd /workspace/verl \
-    && git checkout ${VERL_COMMIT} \
+    && git checkout ${VERL_REF} \
     && pip install -e .
 
 COPY . /workspace/verl-SpeCo
 
-ENV PYTHONPATH=/workspace/verl-SpeCo:${PYTHONPATH}
 WORKDIR /workspace/verl-SpeCo
+RUN pip install -e .
 ```
 
 Build it from the `verl-SpeCo` repository root:
@@ -164,20 +171,20 @@ For GPU SGLang-based examples, use the same layout with the SGLang base image:
 # GPU SGLang runtime image.
 FROM verlai/verl:sgl0512.dev1
 
-ARG VERL_COMMIT=7aed6b230776f963fa09509c10d9c3a767d1102c
+ARG VERL_REF=release/v0.8.0
 ARG VERL_REPO=https://github.com/verl-project/verl.git
 
 WORKDIR /workspace
 
 RUN git clone ${VERL_REPO} /workspace/verl \
     && cd /workspace/verl \
-    && git checkout ${VERL_COMMIT} \
+    && git checkout ${VERL_REF} \
     && pip install -e .
 
 COPY . /workspace/verl-SpeCo
 
-ENV PYTHONPATH=/workspace/verl-SpeCo:${PYTHONPATH}
 WORKDIR /workspace/verl-SpeCo
+RUN pip install -e .
 ```
 
 Build it from the `verl-SpeCo` repository root:
@@ -289,7 +296,7 @@ pip install -r ci/requirements-ci.txt
 pytest tests
 ```
 
-Some tests require a pinned upstream `verl` checkout. Set
+Some tests require an upstream `verl` checkout from `release/v0.8.0`. Set
 `VERL_SPECO_UPSTREAM_ROOT` to the root of that checkout when running the config
 composition contract:
 

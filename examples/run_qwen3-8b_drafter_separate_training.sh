@@ -20,6 +20,8 @@ gen_tp=2
 train_sp=1
 ppo_gpus_per_node=8
 draft_train_gpus_per_node=8
+ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
+ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint
@@ -34,6 +36,9 @@ RUN_STAGE=${RUN_STAGE:-both}
 if [ "${RUN_STAGE}" = "both" ] || [ "${RUN_STAGE}" = "collect" ]; then
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \
+    ray_kwargs.ray_init.num_cpus=${ray_num_cpus} \
+    +ray_kwargs.ray_init._system_config.prestart_worker_first_driver=false \
+    +ray_kwargs.ray_init._system_config.num_workers_soft_limit=${ray_worker_soft_limit} \
     data.train_files=${TRAIN_FILE} \
     data.val_files=${TEST_FILE} \
     data.train_batch_size=64 \

@@ -34,7 +34,7 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     drafter = raw.actor_rollout_ref.rollout.drafter
 
     assert raw.speco.verl_base.version == "0.8.0"
-    assert raw.speco.verl_base.commit == "7aed6b230776f963fa09509c10d9c3a767d1102c"
+    assert raw.speco.verl_base.branch == "release/v0.8.0"
     assert drafter.enable is False
     assert drafter.enable_drafter_training is False
     assert drafter.training.collect_hidden_states_from_sgl is False
@@ -50,10 +50,10 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.training.eagle1_num_hidden_layers == 1
 
 
-def test_overlay_composes_with_pinned_upstream_verl(tmp_path: Path) -> None:
+def test_overlay_composes_with_release_upstream_verl(tmp_path: Path) -> None:
     upstream_root = os.getenv("VERL_SPECO_UPSTREAM_ROOT")
     if not upstream_root:
-        pytest.skip("set VERL_SPECO_UPSTREAM_ROOT to check compose against pinned upstream verl")
+        pytest.skip("set VERL_SPECO_UPSTREAM_ROOT to check compose against release/v0.8.0 verl")
     upstream_config = Path(upstream_root) / "verl" / "trainer" / "config"
     assert upstream_config.is_dir()
 
@@ -72,7 +72,7 @@ def test_overlay_composes_with_pinned_upstream_verl(tmp_path: Path) -> None:
 def test_draft_trainer_composes_as_primary_config(tmp_path: Path) -> None:
     upstream_root = os.getenv("VERL_SPECO_UPSTREAM_ROOT")
     if not upstream_root:
-        pytest.skip("set VERL_SPECO_UPSTREAM_ROOT to check compose against pinned upstream verl")
+        pytest.skip("set VERL_SPECO_UPSTREAM_ROOT to check compose against release/v0.8.0 verl")
     upstream_config = Path(upstream_root) / "verl" / "trainer" / "config"
     assert upstream_config.is_dir()
 
