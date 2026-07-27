@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Contract tests for the P-EAGLE (parallel-drafting) drafter backend.
 
 CPU-light: they exercise the COD sampling, the flex-attention mask predicate, the
@@ -39,7 +52,9 @@ def test_cod_sampling_structure() -> None:
     torch.manual_seed(0)
     seq_len = 16
     loss_mask = torch.ones(1, seq_len)
-    anchor_pos, depth = generate_cod_sample_indices(seq_len, loss_mask, num_depths=4, down_sample_ratio=0.7)
+    anchor_pos, depth = generate_cod_sample_indices(
+        seq_len, loss_mask, num_depths=4, down_sample_ratio=0.7
+    )
 
     assert anchor_pos.shape == depth.shape
     # Depth 0 keeps every position; deeper depths shrink geometrically.
@@ -81,7 +96,9 @@ def test_peagle_mask_isolates_documents() -> None:
     # Two documents of length 2 concatenated: positions [0,1] and [2,3], all depth 0.
     anchor_pos = torch.tensor([0, 1, 2, 3])
     depth = torch.tensor([0, 0, 0, 0])
-    mod = create_peagle_mask_mod(anchor_pos, depth, torch.tensor([2, 2]), total_seq_len=4)
+    mod = create_peagle_mask_mod(
+        anchor_pos, depth, torch.tensor([2, 2]), total_seq_len=4
+    )
     z = torch.tensor(0)
 
     # Same document: causal depth-0 attention allowed (query 3 -> key 2).
@@ -89,12 +106,14 @@ def test_peagle_mask_isolates_documents() -> None:
     # Cross document: query 2 (doc B) must NOT attend to key 1 (doc A), despite 2 >= 1.
     assert not bool(mod(z, z, torch.tensor(2), torch.tensor(1)))
     # Merging both into one document (the bug) would have leaked here.
-    merged = create_peagle_mask_mod(anchor_pos, depth, torch.tensor([4]), total_seq_len=4)
+    merged = create_peagle_mask_mod(
+        anchor_pos, depth, torch.tensor([4]), total_seq_len=4
+    )
     assert bool(merged(z, z, torch.tensor(2), torch.tensor(1)))
 
 
 def test_peagle_model_modules() -> None:
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     pytest.importorskip("transformers")
     from verl_speco.models.peagle import LlamaForCausalLMPeagle
 
@@ -102,7 +121,9 @@ def test_peagle_model_modules() -> None:
     model = LlamaForCausalLMPeagle(config)
 
     # fc fuses num_aux * target_hidden -> hidden; mask_hidden lives at the pre-fc width.
-    assert model.fc.in_features == config.num_aux_hidden_states * config.target_hidden_size
+    assert (
+        model.fc.in_features == config.num_aux_hidden_states * config.target_hidden_size
+    )
     assert model.fc.out_features == config.hidden_size
     assert tuple(model.mask_hidden.shape) == (1, 1, model.fc.in_features)
     assert len(model.layers) == config.num_draft_layers
@@ -133,7 +154,9 @@ def test_peagle_backend_metadata() -> None:
     from verl_speco.backends.peagle_trainer_backend import PEagleTrainerBackend
 
     backend = PEagleTrainerBackend(
-        OmegaConf.create({"rollout": {"drafter": {"training": {}}}, "model": {"path": "/tmp/none"}}),
+        OmegaConf.create(
+            {"rollout": {"drafter": {"training": {}}}, "model": {"path": "/tmp/none"}}
+        ),
         OmegaConf.create({}),
     )
     assert backend.model_type == "peagle"

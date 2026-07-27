@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import asyncio
@@ -46,7 +59,9 @@ def test_factory_fused_moe_survives_verl_npu_patch_import(monkeypatch) -> None:
 
 def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     events = []
-    monkeypatch.setattr(compat, "install_verl_npu_vllm_import_compat", lambda: events.append("compat"))
+    monkeypatch.setattr(
+        compat, "install_verl_npu_vllm_import_compat", lambda: events.append("compat")
+    )
     monkeypatch.setattr(
         compat,
         "install_verl_fsdp_training_output_release_compat",
@@ -159,7 +174,10 @@ def test_npu_checkpoint_reclaim_preserves_native_save(monkeypatch) -> None:
     engine = FSDPEngine()
     engine.rank = 0
 
-    assert engine.save_checkpoint("/tmp/actor", global_step=20, max_ckpt_to_keep=1) == "saved"
+    assert (
+        engine.save_checkpoint("/tmp/actor", global_step=20, max_ckpt_to_keep=1)
+        == "saved"
+    )
     assert events == [
         (
             "original",
@@ -267,13 +285,19 @@ def test_fsdp_training_output_release_preserves_forward_only(monkeypatch) -> Non
     class FSDPEngineWithLMHead:
         def forward_step(self, micro_batch, loss_function, forward_only):
             del micro_batch, loss_function
-            return "loss", {"model_output": {"log_probs": "tensor"}, "forward_only": forward_only}
+            return "loss", {
+                "model_output": {"log_probs": "tensor"},
+                "forward_only": forward_only,
+            }
 
     engine_module.FSDPEngine = FSDPEngine
     engine_module.FSDPEngineWithLMHead = FSDPEngineWithLMHead
     monkeypatch.setattr(compat, "_FSDP_TRAIN_OUTPUT_RELEASE_APPLIED", False)
 
-    assert compat.install_verl_fsdp_training_output_release_compat(lambda _: engine_module) is True
+    assert (
+        compat.install_verl_fsdp_training_output_release_compat(lambda _: engine_module)
+        is True
+    )
     engine = FSDPEngineWithLMHead()
 
     _, training_output = engine.forward_step(None, None, False)

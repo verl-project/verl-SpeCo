@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """User-friendly launcher for standalone SPECO draft model training.
 
 This module lets examples keep the familiar ``python -m ...`` shape while still
@@ -110,7 +123,9 @@ def resolve_launch_config(
     master_port = _find_override(overrides, _MASTER_PORT_KEYS)
 
     standalone_default = nnodes == "1" and master_addr is None and master_port is None
-    standalone = _parse_bool(_find_override(overrides, _STANDALONE_KEYS), default=standalone_default)
+    standalone = _parse_bool(
+        _find_override(overrides, _STANDALONE_KEYS), default=standalone_default
+    )
     if standalone and nnodes != "1":
         raise ValueError("standalone=true requires nnodes=1")
 
@@ -125,7 +140,9 @@ def resolve_launch_config(
     )
 
 
-def normalize_training_args(overrides: list[str], config: DraftTrainLaunchConfig) -> list[str]:
+def normalize_training_args(
+    overrides: list[str], config: DraftTrainLaunchConfig
+) -> list[str]:
     """Replace launcher aliases with canonical Hydra configuration fields."""
 
     normalized = []
@@ -183,8 +200,14 @@ def _format_command(command: list[str]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Launch standalone SPECO draft training.")
-    parser.add_argument("--dry-run", action="store_true", help="Print the resolved launch command and exit.")
+    parser = argparse.ArgumentParser(
+        description="Launch standalone SPECO draft training."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the resolved launch command and exit.",
+    )
     parser.add_argument(
         "--module",
         default="verl_speco.draft_train",

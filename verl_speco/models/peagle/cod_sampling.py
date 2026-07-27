@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Conditional-On-Distribution (COD) sampling for P-EAGLE parallel drafting.
 
 P-EAGLE trains all ``K`` draft depths in a single parallel forward rather than
@@ -51,7 +64,9 @@ def generate_cod_sample_indices(
             break
 
         if prev_indices.shape[0] >= sample_size:
-            random_selection = torch.randperm(prev_indices.shape[0], device=device)[:sample_size]
+            random_selection = torch.randperm(prev_indices.shape[0], device=device)[
+                :sample_size
+            ]
             sampled_idx = prev_indices[random_selection]
             sampled_idx = torch.sort(sampled_idx)[0]  # restore causal order
         else:
@@ -68,5 +83,10 @@ def generate_cod_sample_indices(
         n_per_depth.append(sampled_idx.shape[0])
 
     anchor_pos = torch.cat(sample_indices)
-    depth = torch.cat([torch.full((n,), i, device=device, dtype=torch.long) for i, n in enumerate(n_per_depth)])
+    depth = torch.cat(
+        [
+            torch.full((n,), i, device=device, dtype=torch.long)
+            for i, n in enumerate(n_per_depth)
+        ]
+    )
     return anchor_pos, depth

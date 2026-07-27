@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import ctypes
 import gc
 import json
@@ -34,7 +47,9 @@ def _managed_checkpoint_step(path: str) -> Optional[int]:
     return int(match.group(1)) if match is not None else None
 
 
-def get_drafter_checkpoint_metadata(model_path: Optional[Union[str, os.PathLike]]) -> dict[str, Any]:
+def get_drafter_checkpoint_metadata(
+    model_path: Optional[Union[str, os.PathLike]],
+) -> dict[str, Any]:
     if not model_path:
         return {}
 
@@ -45,7 +60,9 @@ def get_drafter_checkpoint_metadata(model_path: Optional[Union[str, os.PathLike]
         with open(metadata_path, "r", encoding="utf-8") as f:
             metadata = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        raise DrafterCheckpointMetadataError(f"Invalid drafter checkpoint metadata {metadata_path}: {exc}") from exc
+        raise DrafterCheckpointMetadataError(
+            f"Invalid drafter checkpoint metadata {metadata_path}: {exc}"
+        ) from exc
     if not isinstance(metadata, dict):
         raise DrafterCheckpointMetadataError(
             f"Invalid drafter checkpoint metadata {metadata_path}: expected a JSON object"
@@ -53,17 +70,23 @@ def get_drafter_checkpoint_metadata(model_path: Optional[Union[str, os.PathLike]
     return metadata
 
 
-def get_drafter_trainer_state(model_path: Optional[Union[str, os.PathLike]]) -> dict[str, Any]:
+def get_drafter_trainer_state(
+    model_path: Optional[Union[str, os.PathLike]],
+) -> dict[str, Any]:
     metadata = get_drafter_checkpoint_metadata(model_path)
     trainer_state = metadata.get("trainer_state")
     if trainer_state is None:
         return {}
     if not isinstance(trainer_state, dict):
-        raise DrafterCheckpointMetadataError("Invalid drafter trainer state metadata: expected a JSON object")
+        raise DrafterCheckpointMetadataError(
+            "Invalid drafter trainer state metadata: expected a JSON object"
+        )
     return dict(trainer_state)
 
 
-def get_drafter_checkpoint_step(model_path: Optional[Union[str, os.PathLike]]) -> Optional[int]:
+def get_drafter_checkpoint_step(
+    model_path: Optional[Union[str, os.PathLike]],
+) -> Optional[int]:
     """Return the drafter training step recorded in a saved checkpoint directory."""
     if not model_path:
         return None
@@ -83,23 +106,35 @@ def get_drafter_checkpoint_step(model_path: Optional[Union[str, os.PathLike]]) -
     return None
 
 
-def get_drafter_optimizer_manifest(model_path: Optional[Union[str, os.PathLike]]) -> dict[str, Any]:
+def get_drafter_optimizer_manifest(
+    model_path: Optional[Union[str, os.PathLike]],
+) -> dict[str, Any]:
     metadata = get_drafter_checkpoint_metadata(model_path)
     manifest = metadata.get("optimizer")
     if manifest is None:
         return {}
     if not isinstance(manifest, dict):
-        raise DrafterCheckpointMetadataError("Invalid drafter optimizer manifest: expected a JSON object")
+        raise DrafterCheckpointMetadataError(
+            "Invalid drafter optimizer manifest: expected a JSON object"
+        )
 
     checkpoint_format = manifest.get("format")
     relative_path = manifest.get("path")
-    if checkpoint_format != "torch_distributed_checkpoint" or not isinstance(relative_path, str):
+    if checkpoint_format != "torch_distributed_checkpoint" or not isinstance(
+        relative_path, str
+    ):
         raise DrafterCheckpointMetadataError(
             "Invalid drafter optimizer manifest: expected torch_distributed_checkpoint format and path"
         )
     normalized_path = os.path.normpath(relative_path)
-    if os.path.isabs(normalized_path) or normalized_path == ".." or normalized_path.startswith(f"..{os.sep}"):
-        raise DrafterCheckpointMetadataError(f"Invalid drafter optimizer checkpoint path: {relative_path!r}")
+    if (
+        os.path.isabs(normalized_path)
+        or normalized_path == ".."
+        or normalized_path.startswith(f"..{os.sep}")
+    ):
+        raise DrafterCheckpointMetadataError(
+            f"Invalid drafter optimizer checkpoint path: {relative_path!r}"
+        )
     return dict(manifest)
 
 
@@ -128,7 +163,9 @@ def get_drafter_optimizer_checkpoint_path(
     return optimizer_path
 
 
-def is_pretrained_drafter_checkpoint(model_path: Optional[Union[str, os.PathLike]]) -> bool:
+def is_pretrained_drafter_checkpoint(
+    model_path: Optional[Union[str, os.PathLike]],
+) -> bool:
     if not model_path:
         return False
     path = os.fspath(model_path)
@@ -183,10 +220,12 @@ def collect_checkpoint_memory_snapshot() -> dict[str, Optional[int]]:
         },
     )
     dev_shm_used_kib = None
+    statvfs = getattr(os, "statvfs", None)
     try:
-        stat = os.statvfs("/dev/shm")
-        dev_shm_used_kib = ((stat.f_blocks - stat.f_bfree) * stat.f_frsize) // 1024
-    except (AttributeError, OSError):
+        if statvfs is not None:
+            stat = statvfs("/dev/shm")
+            dev_shm_used_kib = ((stat.f_blocks - stat.f_bfree) * stat.f_frsize) // 1024
+    except OSError:
         pass
     return {
         "rss_gib": process.get("VmRSS"),
@@ -211,7 +250,9 @@ def format_checkpoint_memory_snapshot(
 ) -> str:
     """Return concise Linux process/system memory counters without extra dependencies."""
 
-    counters = counters if counters is not None else collect_checkpoint_memory_snapshot()
+    counters = (
+        counters if counters is not None else collect_checkpoint_memory_snapshot()
+    )
     return " ".join(
         f"{name}={value / (1024**2):.2f}" if value is not None else f"{name}=n/a"
         for name, value in counters.items()
@@ -235,7 +276,9 @@ def _jemalloc_is_active() -> bool:
 def _jemalloc_mallctl_function() -> Any:
     try:
         runtime = ctypes.CDLL(None)
-        mallctl = getattr(runtime, "mallctl", None) or getattr(runtime, "je_mallctl", None)
+        mallctl = getattr(runtime, "mallctl", None) or getattr(
+            runtime, "je_mallctl", None
+        )
         if mallctl is None:
             return None
         mallctl.argtypes = [
@@ -370,7 +413,9 @@ def release_checkpoint_host_memory(
     failed = 0
     if drop_file_cache and checkpoint_path:
         try:
-            advised, failed = _flush_and_drop_checkpoint_file_cache(os.fspath(checkpoint_path))
+            advised, failed = _flush_and_drop_checkpoint_file_cache(
+                os.fspath(checkpoint_path)
+            )
         except Exception:  # noqa: BLE001
             failed = 1
     return {
@@ -417,7 +462,9 @@ def resolve_drafter_checkpoint_path(
         candidates.append(os.path.join(root, f"draft_step_{step}"))
 
     for candidate in candidates:
-        if get_drafter_checkpoint_step(candidate) == step and is_pretrained_drafter_checkpoint(candidate):
+        if get_drafter_checkpoint_step(
+            candidate
+        ) == step and is_pretrained_drafter_checkpoint(candidate):
             return candidate
     return original_model_path
 

@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import os
@@ -102,7 +115,10 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
         assert "SPECO_ENABLE_TRAINING" in source
         assert "SPECO_EXTRA_HYDRA_ARGS" in source
         if workflow_name == "npu_unit_tests.yml":
-            assert "github.event.pull_request.head.repo.full_name == github.repository" in source
+            assert (
+                "github.event.pull_request.head.repo.full_name == github.repository"
+                in source
+            )
             assert "linux-aarch64-a2-8" in source
             assert "linux-aarch64-a2-4" not in source
             assert '"backend":"vllm","drafter":"dspark"' in source
@@ -111,7 +127,9 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
         else:
             matrix_entries = {
                 (entry["backend"], entry["drafter"])
-                for entry in workflow["jobs"]["example"]["strategy"]["matrix"]["include"]
+                for entry in workflow["jobs"]["example"]["strategy"]["matrix"][
+                    "include"
+                ]
             }
             assert {
                 ("vllm", "eagle3"),
@@ -128,7 +146,9 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
 
 def test_example_runner_shell_syntax_is_valid() -> None:
     bash = _require_working_bash()
-    subprocess.run([bash, "-n", "-s"], input=_runner_script().encode("utf-8"), check=True)
+    subprocess.run(
+        [bash, "-n", "-s"], input=_runner_script().encode("utf-8"), check=True
+    )
 
 
 def test_example_runner_covers_gpu_and_npu_backend_matrix() -> None:
@@ -191,7 +211,9 @@ def test_example_runner_dry_run_covers_npu_dspark() -> None:
         "SPECO_CKPT_DIR": "/tmp/speco",
         "SPECO_ACCELERATOR_COUNT": "1",
     }
-    script = "".join(f"export {name}={shlex.quote(value)}\n" for name, value in env.items())
+    script = "".join(
+        f"export {name}={shlex.quote(value)}\n" for name, value in env.items()
+    )
     script += _runner_script()
     result = subprocess.run(
         [bash, "-s", "--", "npu", "vllm", "dspark"],

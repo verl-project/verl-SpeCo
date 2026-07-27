@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -25,7 +38,10 @@ def test_materialize_direct_and_object_ref_payloads(monkeypatch) -> None:
     ref = _FakeObjectRef()
 
     assert rollout_publish.materialize_draft_weights_payload(direct) == (direct, False)
-    assert rollout_publish.materialize_draft_weights_payload(ref) == ({"resolved": ref}, True)
+    assert rollout_publish.materialize_draft_weights_payload(ref) == (
+        {"resolved": ref},
+        True,
+    )
     assert rollout_publish.materialize_draft_weights_payload({"weights_ref": ref}) == (
         {"resolved": ref},
         True,
@@ -70,7 +86,10 @@ def test_publish_state_filter_keeps_eagle3_trainable_lm_head() -> None:
         }
     )
 
-    assert set(trainer._get_trainable_state_dict()) == {"lm_head.weight", "midlayer.fc.weight"}
+    assert set(trainer._get_trainable_state_dict()) == {
+        "lm_head.weight",
+        "midlayer.fc.weight",
+    }
 
 
 def test_publish_state_filter_skips_non_eagle_lm_head() -> None:

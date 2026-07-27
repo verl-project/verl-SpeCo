@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """P-EAGLE (parallel-drafting) draft model.
 
 Logic ported from NeMo AutoModel's P-EAGLE (``peagle_draft.py`` mixins on the
@@ -14,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -42,9 +56,15 @@ _flex_attention_compiled = None
 
 def _get_flex(q: torch.Tensor):
     global _flex_attention_compiled
-    if os.getenv("VERL_PEAGLE_COMPILE_FLEX", "0") == "1" and q.is_cuda and q.shape[-1] >= 16:
+    if (
+        os.getenv("VERL_PEAGLE_COMPILE_FLEX", "0") == "1"
+        and q.is_cuda
+        and q.shape[-1] >= 16
+    ):
         if _flex_attention_compiled is None:
-            _flex_attention_compiled = torch.compile(flex_attention, mode="max-autotune-no-cudagraphs", dynamic=True)
+            _flex_attention_compiled = torch.compile(
+                flex_attention, mode="max-autotune-no-cudagraphs", dynamic=True
+            )
         return _flex_attention_compiled
     return flex_attention
 
@@ -59,7 +79,9 @@ class PeagleAttention(nn.Module):
     def __init__(self, config: PeagleConfig, fuse_input: bool):
         super().__init__()
         self.config = config
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
@@ -67,10 +89,18 @@ class PeagleAttention(nn.Module):
         in_features = config.hidden_size * 2 if fuse_input else config.hidden_size
 
         attention_bias = getattr(config, "attention_bias", False)
-        self.q_proj = nn.Linear(in_features, self.num_heads * self.head_dim, bias=attention_bias)
-        self.k_proj = nn.Linear(in_features, self.num_key_value_heads * self.head_dim, bias=attention_bias)
-        self.v_proj = nn.Linear(in_features, self.num_key_value_heads * self.head_dim, bias=attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=attention_bias)
+        self.q_proj = nn.Linear(
+            in_features, self.num_heads * self.head_dim, bias=attention_bias
+        )
+        self.k_proj = nn.Linear(
+            in_features, self.num_key_value_heads * self.head_dim, bias=attention_bias
+        )
+        self.v_proj = nn.Linear(
+            in_features, self.num_key_value_heads * self.head_dim, bias=attention_bias
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, config.hidden_size, bias=attention_bias
+        )
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
 
     def _repeat_kv(self, k, v):
@@ -81,16 +111,34 @@ class PeagleAttention(nn.Module):
             v.repeat_interleave(self.num_key_value_groups, dim=1),
         )
 
-    def forward_peagle(self, combined_states: torch.Tensor, position_ids: torch.Tensor, block_mask) -> torch.Tensor:
+    def forward_peagle(
+        self, combined_states: torch.Tensor, position_ids: torch.Tensor, block_mask
+    ) -> torch.Tensor:
         batch_size, seq_len, _ = combined_states.shape
-        q = self.q_proj(combined_states).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(combined_states).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(combined_states).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.q_proj(combined_states)
+            .view(batch_size, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(combined_states)
+            .view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(combined_states)
+            .view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+            .transpose(1, 2)
+        )
         cos, sin = self.rotary_emb(combined_states, position_ids)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
         k, v = self._repeat_kv(k, v)
-        attn_output = _run_flex_attention(q, k, v, block_mask=block_mask, scale=self.scaling)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        attn_output = _run_flex_attention(
+            q, k, v, block_mask=block_mask, scale=self.scaling
+        )
+        attn_output = (
+            attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        )
         return self.o_proj(attn_output)
 
 
@@ -98,9 +146,15 @@ class PeagleMLP(nn.Module):
     def __init__(self, config: PeagleConfig):
         super().__init__()
         mlp_bias = getattr(config, "mlp_bias", False)
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=mlp_bias)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=mlp_bias)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=mlp_bias)
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=mlp_bias
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=mlp_bias
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=mlp_bias
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -116,12 +170,21 @@ class PeagleFusedLayer(nn.Module):
         self.mlp = PeagleMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
-    def forward_peagle(self, input_embeds, hidden_states, position_ids, block_mask) -> torch.Tensor:
+    def forward_peagle(
+        self, input_embeds, hidden_states, position_ids, block_mask
+    ) -> torch.Tensor:
         residual = hidden_states
-        combined = torch.cat((self.input_layernorm(input_embeds), self.hidden_norm(hidden_states)), dim=-1)
-        hidden_states = residual + self.self_attn.forward_peagle(combined, position_ids, block_mask)
+        combined = torch.cat(
+            (self.input_layernorm(input_embeds), self.hidden_norm(hidden_states)),
+            dim=-1,
+        )
+        hidden_states = residual + self.self_attn.forward_peagle(
+            combined, position_ids, block_mask
+        )
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         return residual + self.mlp(hidden_states)
@@ -135,12 +198,16 @@ class PeagleVanillaLayer(nn.Module):
         self.self_attn = PeagleAttention(config, fuse_input=False)
         self.mlp = PeagleMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward_peagle(self, hidden_states, position_ids, block_mask) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = residual + self.self_attn.forward_peagle(hidden_states, position_ids, block_mask)
+        hidden_states = residual + self.self_attn.forward_peagle(
+            hidden_states, position_ids, block_mask
+        )
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         return residual + self.mlp(hidden_states)
@@ -155,17 +222,30 @@ class LlamaForCausalLMPeagle(DraftModel):
     def __init__(self, config: PeagleConfig):
         super().__init__(config)
         self.config = config
-        self.vocab_size = config.vocab_size
-        self.hidden_size = config.hidden_size
-        self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
+        self.vocab_size = cast(int, config.vocab_size)
+        self.hidden_size = cast(int, config.hidden_size)
+        self.target_hidden_size = cast(
+            int, getattr(config, "target_hidden_size", config.hidden_size)
+        )
         self.num_aux_hidden_states = int(getattr(config, "num_aux_hidden_states", 3))
-        self.draft_vocab_size = int(getattr(config, "draft_vocab_size", config.vocab_size))
+        self.draft_vocab_size = int(
+            getattr(config, "draft_vocab_size", self.vocab_size)
+        )
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
-        self.fc = nn.Linear(self.target_hidden_size * self.num_aux_hidden_states, config.hidden_size, bias=False)
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, config.pad_token_id
+        )
+        self.fc = nn.Linear(
+            self.target_hidden_size * self.num_aux_hidden_states,
+            config.hidden_size,
+            bias=False,
+        )
         if getattr(config, "fc_norm", False):
             self.fc_norm = nn.ModuleList(
-                [LlamaRMSNorm(self.target_hidden_size, eps=config.rms_norm_eps) for _ in range(self.num_aux_hidden_states)]
+                [
+                    LlamaRMSNorm(self.target_hidden_size, eps=config.rms_norm_eps)
+                    for _ in range(self.num_aux_hidden_states)
+                ]
             )
         else:
             self.fc_norm = None
@@ -197,7 +277,9 @@ class LlamaForCausalLMPeagle(DraftModel):
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.fc_norm is not None:
             chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
-            hidden_states = torch.cat([norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)], dim=-1)
+            hidden_states = torch.cat(
+                [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)], dim=-1
+            )
         return self.fc(hidden_states)
 
     def masked_projected_hidden(self) -> torch.Tensor:
@@ -210,13 +292,27 @@ class LlamaForCausalLMPeagle(DraftModel):
         return torch.nonzero(self.t2d, as_tuple=False).flatten()
 
     def build_peagle_block_mask(self, anchor_pos, depth, lengths, total_seq_len):
-        mask_mod = create_peagle_mask_mod(anchor_pos=anchor_pos, depth=depth, lengths=lengths, total_seq_len=total_seq_len)
+        mask_mod = create_peagle_mask_mod(
+            anchor_pos=anchor_pos,
+            depth=depth,
+            lengths=lengths,
+            total_seq_len=total_seq_len,
+        )
         return create_block_mask(
-            mask_mod, B=None, H=None, Q_LEN=anchor_pos.shape[0], KV_LEN=anchor_pos.shape[0], device=anchor_pos.device
+            mask_mod,
+            B=None,
+            H=None,
+            Q_LEN=anchor_pos.shape[0],
+            KV_LEN=anchor_pos.shape[0],
+            device=anchor_pos.device,
         )
 
-    def forward_peagle(self, sampled_input_ids, sampled_projected_hidden, position_ids, block_mask) -> torch.Tensor:
-        draft_input_embeds = self.embed_tokens(sampled_input_ids).to(sampled_projected_hidden.dtype)
+    def forward_peagle(
+        self, sampled_input_ids, sampled_projected_hidden, position_ids, block_mask
+    ) -> torch.Tensor:
+        draft_input_embeds = self.embed_tokens(sampled_input_ids).to(
+            sampled_projected_hidden.dtype
+        )
         hidden_states = self.layers[0].forward_peagle(
             input_embeds=draft_input_embeds,
             hidden_states=sampled_projected_hidden,
@@ -224,7 +320,9 @@ class LlamaForCausalLMPeagle(DraftModel):
             block_mask=block_mask,
         )
         for layer in self.layers[1:]:
-            hidden_states = layer.forward_peagle(hidden_states, position_ids, block_mask)
+            hidden_states = layer.forward_peagle(
+                hidden_states, position_ids, block_mask
+            )
         # The final norm is applied in compute_logits (lm_head(norm(h))), matching
         # the EAGLE-3 draft; forward_peagle returns the pre-norm hidden states.
         return hidden_states

@@ -35,11 +35,15 @@ def _build_batch(target, tokenizer, aux_layer_ids, device):
     id_chunks, mask_chunks, aux_chunks, last_chunks = [], [], [], []
     for text in PROMPTS:
         messages = [{"role": "user", "content": text}]
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
         enc = tokenizer(prompt, return_tensors="pt").to(device)
         with torch.no_grad():
             out = target(input_ids=enc["input_ids"], output_hidden_states=True)
-        aux = torch.cat([out.hidden_states[i][0] for i in aux_layer_ids], dim=-1)  # [S, num_aux*H]
+        aux = torch.cat(
+            [out.hidden_states[i][0] for i in aux_layer_ids], dim=-1
+        )  # [S, num_aux*H]
         id_chunks.append(enc["input_ids"][0])
         mask_chunks.append(torch.ones(enc["input_ids"].size(1), device=device))
         aux_chunks.append(aux)
@@ -70,7 +74,11 @@ def main() -> None:
 
     print(f"[smoke] loading target {args.target}")
     tokenizer = AutoTokenizer.from_pretrained(args.target)
-    target = AutoModelForCausalLM.from_pretrained(args.target, torch_dtype=torch.bfloat16).to(device).eval()
+    target = (
+        AutoModelForCausalLM.from_pretrained(args.target, torch_dtype=torch.bfloat16)
+        .to(device)
+        .eval()
+    )
     target_cfg = AutoConfig.from_pretrained(args.target)
 
     num_layers = int(getattr(target_cfg, "num_hidden_layers"))
@@ -78,7 +86,9 @@ def main() -> None:
     print(f"[smoke] aux layers={aux_layer_ids} (of {num_layers})")
 
     batch = _build_batch(target, tokenizer, aux_layer_ids, device)
-    print(f"[smoke] batch seq_len={batch['input_ids'].size(1)} aux={batch['hidden_states'].size(-1)}")
+    print(
+        f"[smoke] batch seq_len={batch['input_ids'].size(1)} aux={batch['hidden_states'].size(-1)}"
+    )
 
     cfg = OmegaConf.create(
         {
@@ -127,9 +137,13 @@ def main() -> None:
             acc = float(out["accuracy"])
             if first is None:
                 first = (kl, acc)
-            print(f"[smoke] step {step:3d}  kl_loss={kl:.4f}  draft_vs_target_top1={acc:.4f}")
+            print(
+                f"[smoke] step {step:3d}  kl_loss={kl:.4f}  draft_vs_target_top1={acc:.4f}"
+            )
 
-    print(f"[smoke] DONE  kl_loss {first[0]:.4f}->{kl:.4f}  top1 {first[1]:.4f}->{acc:.4f}")
+    print(
+        f"[smoke] DONE  kl_loss {first[0]:.4f}->{kl:.4f}  top1 {first[1]:.4f}->{acc:.4f}"
+    )
 
 
 if __name__ == "__main__":

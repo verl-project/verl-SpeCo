@@ -42,10 +42,18 @@ def _build_shifted_batch(target, tokenizer, device):
       last_hidden_states[t] = final_hidden[t + 1]    (regression target)
       loss_mask[t]          = mask[t + 2]
     """
-    hidden_chunks, id_chunks, last_hidden_chunks, mask_chunks, pos_chunks = [], [], [], [], []
+    hidden_chunks, id_chunks, last_hidden_chunks, mask_chunks, pos_chunks = (
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
     for text in PROMPTS:
         messages = [{"role": "user", "content": text}]
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
         enc = tokenizer(prompt, return_tensors="pt").to(device)
         ids = enc["input_ids"][0]
         with torch.no_grad():
@@ -65,7 +73,9 @@ def _build_shifted_batch(target, tokenizer, device):
         "input_ids": torch.cat(id_chunks).unsqueeze(0),
         "hidden_states": torch.cat(hidden_chunks).unsqueeze(0),
         "last_hidden_states": torch.cat(last_hidden_chunks).unsqueeze(0),
-        "attention_mask": torch.ones(1, sum(c.size(0) for c in id_chunks), dtype=torch.long, device=device),
+        "attention_mask": torch.ones(
+            1, sum(c.size(0) for c in id_chunks), dtype=torch.long, device=device
+        ),
         "loss_mask": torch.cat(mask_chunks).unsqueeze(0),
         "position_ids": torch.cat(pos_chunks).unsqueeze(0),
     }
@@ -73,7 +83,9 @@ def _build_shifted_batch(target, tokenizer, device):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target", required=True, help="path or HF id of the target causal LM")
+    parser.add_argument(
+        "--target", required=True, help="path or HF id of the target causal LM"
+    )
     parser.add_argument("--algorithm", default="EAGLE1", choices=["EAGLE1", "EAGLE2"])
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -84,11 +96,17 @@ def main() -> None:
 
     print(f"[smoke] loading target {args.target}")
     tokenizer = AutoTokenizer.from_pretrained(args.target)
-    target = AutoModelForCausalLM.from_pretrained(args.target, torch_dtype=torch.bfloat16).to(device).eval()
+    target = (
+        AutoModelForCausalLM.from_pretrained(args.target, torch_dtype=torch.bfloat16)
+        .to(device)
+        .eval()
+    )
     target_cfg = AutoConfig.from_pretrained(args.target)
 
     batch = _build_shifted_batch(target, tokenizer, device)
-    print(f"[smoke] batch seq_len={batch['input_ids'].size(1)} hidden={batch['hidden_states'].size(-1)}")
+    print(
+        f"[smoke] batch seq_len={batch['input_ids'].size(1)} hidden={batch['hidden_states'].size(-1)}"
+    )
 
     cfg = OmegaConf.create(
         {
@@ -146,7 +164,9 @@ def main() -> None:
                 pred_logits = backend.target_model(predicted_hidden).float()
                 tgt_logits = backend.target_model(batch["last_hidden_states"]).float()
                 valid = batch["loss_mask"].bool()
-                acc = ((pred_logits.argmax(-1) == tgt_logits.argmax(-1)) & valid).float().sum() / valid.float().sum()
+                acc = (
+                    (pred_logits.argmax(-1) == tgt_logits.argmax(-1)) & valid
+                ).float().sum() / valid.float().sum()
             hv, pv, av = float(vloss), float(ploss), float(acc)
             if first_hidden is None:
                 first_hidden, first_token = hv, pv

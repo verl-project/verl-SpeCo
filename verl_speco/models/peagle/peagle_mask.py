@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Flex-attention mask for P-EAGLE parallel-group prediction.
 
 P-EAGLE flattens all COD-sampled depths into one sequence and runs a single
@@ -28,7 +41,12 @@ def create_peagle_mask_mod(
     document_ids = torch.cat(
         [
             document_ids,
-            torch.full((total_seq_len - document_ids.shape[0],), -1, device=lengths.device, dtype=torch.long),
+            torch.full(
+                (total_seq_len - document_ids.shape[0],),
+                -1,
+                device=lengths.device,
+                dtype=torch.long,
+            ),
         ]
     ).contiguous()
 
@@ -45,6 +63,10 @@ def create_peagle_mask_mod(
         in_depth_order = q_depth >= kv_depth
         is_anchor_causal = q_anchor_pos >= kv_anchor_pos
 
-        return is_not_padding & same_document & ((kv_depth0 & is_anchor_causal) | (same_rollout & in_depth_order))
+        return (
+            is_not_padding
+            & same_document
+            & ((kv_depth0 & is_anchor_causal) | (same_rollout & in_depth_order))
+        )
 
     return peagle_mask_mod

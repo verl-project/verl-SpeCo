@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """TaskRunner hook for the SPECO trainer."""
 
 import os
@@ -19,7 +32,9 @@ logger = logging.getLogger(__name__)
 
 def _serialize_drafter_config(config):
     try:
-        drafter = OmegaConf.to_container(config.actor_rollout_ref.rollout.drafter, resolve=True)
+        drafter = OmegaConf.to_container(
+            config.actor_rollout_ref.rollout.drafter, resolve=True
+        )
     except Exception:  # noqa: BLE001
         return ""
     return json.dumps(drafter, sort_keys=True) if isinstance(drafter, dict) else ""
@@ -57,7 +72,9 @@ def _rollout_name(config):
 def _install_vllm_import_compat_for_task_runner(config) -> bool:
     if _rollout_name(config) != "vllm":
         return False
-    from verl_speco.integration.verl_npu_vllm_compat import install_verl_npu_vllm_import_compat
+    from verl_speco.integration.verl_npu_vllm_compat import (
+        install_verl_npu_vllm_import_compat,
+    )
 
     return install_verl_npu_vllm_import_compat()
 
@@ -73,7 +90,9 @@ def _prepare_no_drafter_runtime_config(config):
         install_upstream_vllm_runtime_bridge,
     )
 
-    rollout_config = getattr(getattr(config, "actor_rollout_ref", None), "rollout", None)
+    rollout_config = getattr(
+        getattr(config, "actor_rollout_ref", None), "rollout", None
+    )
     missing = object()
     no_async_scheduling = missing
     worker_extension_cls = missing
@@ -83,7 +102,9 @@ def _prepare_no_drafter_runtime_config(config):
         # path as speculative rollout. This avoids hiding child-process import
         # failures behind Ray's TemporaryActor coroutine error.
         if not install_upstream_vllm_runtime_bridge():
-            logger.warning("SPECO no-drafter baseline could not install the vLLM server runtime bridge")
+            logger.warning(
+                "SPECO no-drafter baseline could not install the vLLM server runtime bridge"
+            )
         with _open_config_mapping(rollout_config):
             engine_kwargs = rollout_config.get("engine_kwargs")
             if engine_kwargs is None:
@@ -95,12 +116,20 @@ def _prepare_no_drafter_runtime_config(config):
                     vllm_engine_kwargs = {}
                     engine_kwargs["vllm"] = vllm_engine_kwargs
                 with _open_config_mapping(vllm_engine_kwargs):
-                    no_async_scheduling = vllm_engine_kwargs.get("no-async-scheduling", missing)
+                    no_async_scheduling = vllm_engine_kwargs.get(
+                        "no-async-scheduling", missing
+                    )
                     vllm_engine_kwargs["no-async-scheduling"] = True
-                    worker_extension_cls = vllm_engine_kwargs.get("worker_extension_cls", missing)
+                    worker_extension_cls = vllm_engine_kwargs.get(
+                        "worker_extension_cls", missing
+                    )
                     if worker_extension_cls is missing or worker_extension_cls is None:
-                        vllm_engine_kwargs["worker_extension_cls"] = SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS
-        logger.info("SPECO no-drafter baseline: forcing vLLM async scheduling off with IPC weight-sync compatibility")
+                        vllm_engine_kwargs["worker_extension_cls"] = (
+                            SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS
+                        )
+        logger.info(
+            "SPECO no-drafter baseline: forcing vLLM async scheduling off with IPC weight-sync compatibility"
+        )
     try:
         yield
     finally:
@@ -128,7 +157,9 @@ class SpecoTaskRunner(TaskRunner):
         if _rollout_name(config) != "vllm":
             return worker_cls, ray_worker_group_cls
 
-        from verl_speco.integration.verl_npu_vllm_compat import VerlNPUVLLMImportCompatMixin
+        from verl_speco.integration.verl_npu_vllm_compat import (
+            VerlNPUVLLMImportCompatMixin,
+        )
 
         raw_worker_cls = _unwrap_ray_remote_actor_class(worker_cls)
         if issubclass(raw_worker_cls, VerlNPUVLLMImportCompatMixin):
@@ -145,9 +176,15 @@ class SpecoTaskRunner(TaskRunner):
         for role, role_worker_cls in list(self.role_worker_mapping.items()):
             raw_role_worker_cls = _unwrap_ray_remote_actor_class(role_worker_cls)
             if role_worker_cls is worker_cls or raw_role_worker_cls is raw_worker_cls:
-                self.role_worker_mapping[role] = _remotify_like_worker_mapping_value(role_worker_cls, wrapped_cls)
-        logger.warning("SPECO vLLM worker import compatibility enabled: %s", wrapped_cls.__name__)
-        return _remotify_like_worker_mapping_value(worker_cls, wrapped_cls), ray_worker_group_cls
+                self.role_worker_mapping[role] = _remotify_like_worker_mapping_value(
+                    role_worker_cls, wrapped_cls
+                )
+        logger.warning(
+            "SPECO vLLM worker import compatibility enabled: %s", wrapped_cls.__name__
+        )
+        return _remotify_like_worker_mapping_value(
+            worker_cls, wrapped_cls
+        ), ray_worker_group_cls
 
     def add_speco_drafter_worker(self, config):
         """Return the external SPECO drafter worker class when online training is enabled."""
@@ -164,9 +201,7 @@ class SpecoTaskRunner(TaskRunner):
     def _with_speco_rollout_publish_mixin(self, worker_cls, config):
         from verl_speco.integration.rollout_publish import DraftWeightPublishMixin
 
-        enable_drafter = bool(
-            config.actor_rollout_ref.rollout.drafter.enable
-        )
+        enable_drafter = bool(config.actor_rollout_ref.rollout.drafter.enable)
         raw_worker_cls = _unwrap_ray_remote_actor_class(worker_cls)
         if not enable_drafter or issubclass(raw_worker_cls, DraftWeightPublishMixin):
             return worker_cls
@@ -183,7 +218,9 @@ class SpecoTaskRunner(TaskRunner):
         for role, role_worker_cls in list(self.role_worker_mapping.items()):
             raw_role_worker_cls = _unwrap_ray_remote_actor_class(role_worker_cls)
             if role_worker_cls is worker_cls or raw_role_worker_cls is raw_worker_cls:
-                self.role_worker_mapping[role] = _remotify_like_worker_mapping_value(role_worker_cls, wrapped_cls)
+                self.role_worker_mapping[role] = _remotify_like_worker_mapping_value(
+                    role_worker_cls, wrapped_cls
+                )
         return _remotify_like_worker_mapping_value(worker_cls, wrapped_cls)
 
     def run(self, config):
@@ -202,7 +239,6 @@ class SpecoTaskRunner(TaskRunner):
         return self._run_with_speco_trainer(config)
 
     def _run_with_speco_trainer(self, config):
-
         from verl.utils import hf_processor, hf_tokenizer
         from verl.utils.dataset.rl_dataset import collate_fn
         from verl.utils.fs import copy_to_local
@@ -213,7 +249,9 @@ class SpecoTaskRunner(TaskRunner):
         OmegaConf.resolve(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
-        actor_rollout_cls = self._with_speco_rollout_publish_mixin(actor_rollout_cls, config)
+        actor_rollout_cls = self._with_speco_rollout_publish_mixin(
+            actor_rollout_cls, config
+        )
         self.add_critic_worker(config)
         speco_worker_cls = self.add_speco_drafter_worker(config)
         self.add_reward_model_resource_pool(config)
@@ -233,7 +271,9 @@ class SpecoTaskRunner(TaskRunner):
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        processor = hf_processor(
+            local_path, trust_remote_code=trust_remote_code, use_fast=True
+        )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 

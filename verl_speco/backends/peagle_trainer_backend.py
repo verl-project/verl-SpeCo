@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """P-EAGLE (parallel-drafting EAGLE) drafter training backend.
 
 Logic follows NeMo AutoModel's P-EAGLE trainer (``peagle_trainer.py``): the draft
@@ -35,14 +48,23 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 device_name = get_device_name()
 
-_TARGET_CONFIG_DROP_KEYS = ("architectures", "model_type", "auto_map", "_name_or_path", "torch_dtype", "tie_word_embeddings")
+_TARGET_CONFIG_DROP_KEYS = (
+    "architectures",
+    "model_type",
+    "auto_map",
+    "_name_or_path",
+    "torch_dtype",
+    "tie_word_embeddings",
+)
 
 
 def _kl_div_loss(logits: torch.Tensor, target_logits: torch.Tensor) -> torch.Tensor:
     """Per-position KL(target || draft) over the draft vocab. Shapes [*, V] -> [*]."""
     log_p = torch.nn.functional.log_softmax(logits.float(), dim=-1)
     target_p = torch.nn.functional.softmax(target_logits.float(), dim=-1)
-    return torch.nn.functional.kl_div(log_p, target_p, reduction="none", log_target=False).sum(dim=-1)
+    return torch.nn.functional.kl_div(
+        log_p, target_p, reduction="none", log_target=False
+    ).sum(dim=-1)
 
 
 class PEagleTrainerBackend(Eagle3TrainerBackend):
@@ -59,7 +81,9 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
         return self.config.rollout.drafter.training
 
     def _build_draft_config(self, spec_model_path, target_hf_config):
-        config_path = os.path.join(spec_model_path, "config.json") if spec_model_path else None
+        config_path = (
+            os.path.join(spec_model_path, "config.json") if spec_model_path else None
+        )
         if config_path and os.path.exists(config_path):
             return PeagleConfig.from_pretrained(spec_model_path)
 
@@ -71,17 +95,25 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
         draft_config = PeagleConfig(
             num_draft_layers=int(training_cfg.get("peagle_num_draft_layers", 4)),
             target_hidden_size=int(target_hf_config.hidden_size),
-            num_aux_hidden_states=int(training_cfg.get("peagle_num_aux_hidden_states", 3)),
-            draft_vocab_size=int(draft_vocab_size) if draft_vocab_size is not None else int(target_hf_config.vocab_size),
+            num_aux_hidden_states=int(
+                training_cfg.get("peagle_num_aux_hidden_states", 3)
+            ),
+            draft_vocab_size=int(draft_vocab_size)
+            if draft_vocab_size is not None
+            else int(target_hf_config.vocab_size),
             num_depths=int(training_cfg.get("peagle_num_depths", 8)),
             down_sample_ratio=float(training_cfg.get("peagle_down_sample_ratio", 0.7)),
-            down_sample_ratio_min=float(training_cfg.get("peagle_down_sample_ratio_min", 0.2)),
+            down_sample_ratio_min=float(
+                training_cfg.get("peagle_down_sample_ratio_min", 0.2)
+            ),
             mask_token_id=training_cfg.get("peagle_mask_token_id", None),
             fc_norm=bool(training_cfg.get("peagle_fc_norm", False)),
             parallel_drafting=True,
             **cfg_dict,
         )
-        draft_config.num_hidden_layers = int(training_cfg.get("peagle_num_draft_layers", 4))
+        draft_config.num_hidden_layers = int(
+            training_cfg.get("peagle_num_draft_layers", 4)
+        )
         draft_config.torch_dtype = torch.bfloat16
         draft_config.tie_word_embeddings = False
         draft_config.architectures = ["LlamaForCausalLMPeagle"]
@@ -98,9 +130,15 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
         draft_config = self._build_draft_config(spec_model_path, target_hf_config)
         self.vocab_size = draft_config.vocab_size
 
-        if spec_model_path and os.path.exists(os.path.join(spec_model_path, "config.json")):
-            log_drafter_checkpoint_step(logger, spec_model_path, action="Loading P-EAGLE drafter weights")
-            drafter_module = LlamaForCausalLMPeagle.from_pretrained(spec_model_path, config=draft_config)
+        if spec_model_path and os.path.exists(
+            os.path.join(spec_model_path, "config.json")
+        ):
+            log_drafter_checkpoint_step(
+                logger, spec_model_path, action="Loading P-EAGLE drafter weights"
+            )
+            drafter_module = LlamaForCausalLMPeagle.from_pretrained(
+                spec_model_path, config=draft_config
+            )
         else:
             drafter_module = LlamaForCausalLMPeagle(draft_config)
 
@@ -108,18 +146,30 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
         # so seed them from the target but do NOT freeze.
         drafter_module.load_embedding(self.config.model.path)
 
-        target_device = torch.device(f"{device_name}:{get_device_id()}") if device_name != "cpu" else torch.device("cpu")
-        self.target_model = self._build_target_model(self.config.model.path, target_hf_config).to(target_device).eval()
+        target_device = (
+            torch.device(f"{device_name}:{get_device_id()}")
+            if device_name != "cpu"
+            else torch.device("cpu")
+        )
+        self.target_model = (
+            self._build_target_model(self.config.model.path, target_hf_config)
+            .to(target_device)
+            .eval()
+        )
         for param in self.target_model.parameters():
             param.requires_grad_(False)
         return drafter_module, draft_config
 
     def compute_loss(self, model, batch, _current_pad_size):
         if getattr(self, "use_ulysses_sp", False):
-            raise NotImplementedError("P-EAGLE drafter training does not support Ulysses sequence parallel yet")
+            raise NotImplementedError(
+                "P-EAGLE drafter training does not support Ulysses sequence parallel yet"
+            )
         last_hidden_states = batch.get("last_hidden_states", None)
         if last_hidden_states is None:
-            raise ValueError("P-EAGLE requires last_hidden_states; use_logits must be False")
+            raise ValueError(
+                "P-EAGLE requires last_hidden_states; use_logits must be False"
+            )
 
         draft = model.module if hasattr(model, "module") else model
         input_ids = batch["input_ids"]
@@ -127,12 +177,26 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
         attention_mask = batch["attention_mask"]
         loss_mask = batch["loss_mask"]
         training_cfg = self._training_cfg()
-        num_depths = int(training_cfg.get("peagle_num_depths", getattr(draft.config, "num_depths", 8)))
-        down_sample_ratio = float(training_cfg.get("peagle_down_sample_ratio", getattr(draft.config, "down_sample_ratio", 0.7)))
-        down_sample_ratio_min = float(
-            training_cfg.get("peagle_down_sample_ratio_min", getattr(draft.config, "down_sample_ratio_min", 0.2))
+        num_depths = int(
+            training_cfg.get(
+                "peagle_num_depths", getattr(draft.config, "num_depths", 8)
+            )
         )
-        mask_token_id = int(getattr(draft.config, "mask_token_id", draft.vocab_size - 1))
+        down_sample_ratio = float(
+            training_cfg.get(
+                "peagle_down_sample_ratio",
+                getattr(draft.config, "down_sample_ratio", 0.7),
+            )
+        )
+        down_sample_ratio_min = float(
+            training_cfg.get(
+                "peagle_down_sample_ratio_min",
+                getattr(draft.config, "down_sample_ratio_min", 0.2),
+            )
+        )
+        mask_token_id = int(
+            getattr(draft.config, "mask_token_id", draft.vocab_size - 1)
+        )
         selected_token_ids = draft.selected_token_ids().to(input_ids.device)
         # Per-document chunk lengths for COD document isolation. base_trainer
         # concatenates every document into one flat batch-1 sequence, so the
@@ -141,7 +205,9 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
         seq_lengths = batch.get("seq_lengths", None)
 
         with torch.no_grad():
-            target_logits = self.target_model(last_hidden_states).float()  # [B, S, vocab]
+            target_logits = self.target_model(
+                last_hidden_states
+            ).float()  # [B, S, vocab]
 
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
@@ -168,15 +234,24 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
             is_depth0 = depth == 0
             mask_hidden_proj = draft.masked_projected_hidden()  # [1, H]
             flat_ids = torch.where(
-                is_depth0, input_ids[b][orig_positions], torch.full_like(orig_positions, mask_token_id)
+                is_depth0,
+                input_ids[b][orig_positions],
+                torch.full_like(orig_positions, mask_token_id),
             ).unsqueeze(0)
-            real_proj = draft.project_hidden_states(aux_hidden[b : b + 1][:, orig_positions])[0]  # [n, H]
+            real_proj = draft.project_hidden_states(
+                aux_hidden[b : b + 1][:, orig_positions]
+            )[0]  # [n, H]
             flat_hidden = torch.where(
-                is_depth0.unsqueeze(-1), real_proj, mask_hidden_proj.expand(orig_positions.shape[0], -1)
+                is_depth0.unsqueeze(-1),
+                real_proj,
+                mask_hidden_proj.expand(orig_positions.shape[0], -1),
             ).unsqueeze(0)
 
             block_mask = draft.build_peagle_block_mask(
-                anchor_pos=anchor_pos, depth=depth, lengths=row_length, total_seq_len=seq_len
+                anchor_pos=anchor_pos,
+                depth=depth,
+                lengths=row_length,
+                total_seq_len=seq_len,
             )
             hidden = draft.forward_peagle(
                 sampled_input_ids=flat_ids,
@@ -185,16 +260,24 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
                 block_mask=block_mask,
             )
             logits = draft.compute_logits(hidden)[0]  # [n, draft_vocab]
-            draft_target_logits = target_logits[b][orig_positions].index_select(dim=-1, index=selected_token_ids)
+            draft_target_logits = target_logits[b][orig_positions].index_select(
+                dim=-1, index=selected_token_ids
+            )
 
             elementwise = _kl_div_loss(logits, draft_target_logits)
             mask_f = loss_positions.to(elementwise.dtype)
             loss_num = loss_num + (elementwise * mask_f).sum()
             loss_den = loss_den + mask_f.sum()
             with torch.no_grad():
-                correct = correct + (
-                    (logits.argmax(dim=-1) == draft_target_logits.argmax(dim=-1)) & loss_positions
-                ).float().sum()
+                correct = (
+                    correct
+                    + (
+                        (logits.argmax(dim=-1) == draft_target_logits.argmax(dim=-1))
+                        & loss_positions
+                    )
+                    .float()
+                    .sum()
+                )
 
         accuracy = (correct / loss_den.clamp_min(1.0)).detach()
         return {

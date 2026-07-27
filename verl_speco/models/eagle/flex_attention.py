@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import torch
 import torch._dynamo as dynamo
 from torch.nn.attention.flex_attention import (
@@ -108,7 +121,6 @@ def compile_friendly_create_block_mask(
 def generate_eagle3_mask(
     seq_lengths: torch.Tensor, Q_LEN: int, KV_LEN: int, lck: int = 0
 ):
-
     def causal_mask(b, h, q_idx, kv_idx):
         # Causal attention shrinks by one diagonal because of the appended suffix.
         causal_mask = q_idx >= kv_idx

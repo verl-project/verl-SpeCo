@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """EAGLE-1 / EAGLE-2 drafter training backend.
 
 Logic follows NeMo AutoModel's EAGLE-1/2 training path (``core_v12.py`` /
@@ -21,7 +34,10 @@ from copy import deepcopy
 
 import torch
 
-from verl_speco.backends.eagle3_trainer_backend import Eagle3TrainerBackend, _masked_soft_cross_entropy
+from verl_speco.backends.eagle3_trainer_backend import (
+    Eagle3TrainerBackend,
+    _masked_soft_cross_entropy,
+)
 from verl_speco.models.eagle1 import Eagle1Config, LlamaForCausalLMEagle1
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 from verl.utils.device import get_device_id, get_device_name
@@ -57,7 +73,9 @@ class Eagle1TrainerBackend(Eagle3TrainerBackend):
     supports_ulysses_sp = False
 
     def _build_draft_config(self, spec_model_path, target_hf_config):
-        config_path = os.path.join(spec_model_path, "config.json") if spec_model_path else None
+        config_path = (
+            os.path.join(spec_model_path, "config.json") if spec_model_path else None
+        )
         if config_path and os.path.exists(config_path):
             return Eagle1Config.from_pretrained(spec_model_path)
 
@@ -99,9 +117,15 @@ class Eagle1TrainerBackend(Eagle3TrainerBackend):
             draft_config.target_hidden_size = int(target_hf_config.hidden_size)
         self.vocab_size = draft_config.vocab_size
 
-        if spec_model_path and os.path.exists(os.path.join(spec_model_path, "config.json")):
-            log_drafter_checkpoint_step(logger, spec_model_path, action="Loading EAGLE-1/2 drafter weights")
-            drafter_module = LlamaForCausalLMEagle1.from_pretrained(spec_model_path, config=draft_config)
+        if spec_model_path and os.path.exists(
+            os.path.join(spec_model_path, "config.json")
+        ):
+            log_drafter_checkpoint_step(
+                logger, spec_model_path, action="Loading EAGLE-1/2 drafter weights"
+            )
+            drafter_module = LlamaForCausalLMEagle1.from_pretrained(
+                spec_model_path, config=draft_config
+            )
         else:
             drafter_module = LlamaForCausalLMEagle1(draft_config)
 
@@ -114,9 +138,15 @@ class Eagle1TrainerBackend(Eagle3TrainerBackend):
         # the draft carries no lm_head of its own, so token logits are produced by
         # the target head applied to the predicted hidden states.
         target_device = (
-            torch.device(f"{device_name}:{get_device_id()}") if device_name != "cpu" else torch.device("cpu")
+            torch.device(f"{device_name}:{get_device_id()}")
+            if device_name != "cpu"
+            else torch.device("cpu")
         )
-        self.target_model = self._build_target_model(target_model_path, target_hf_config).to(target_device).eval()
+        self.target_model = (
+            self._build_target_model(target_model_path, target_hf_config)
+            .to(target_device)
+            .eval()
+        )
         for param in self.target_model.parameters():
             param.requires_grad_(False)
 
@@ -125,7 +155,9 @@ class Eagle1TrainerBackend(Eagle3TrainerBackend):
     def compute_loss(self, model, batch, _current_pad_size):
         """SmoothL1 feature regression + soft-CE token distillation (EAGLE-1/2)."""
         if getattr(self, "use_ulysses_sp", False):
-            raise NotImplementedError("EAGLE-1/2 drafter training does not support Ulysses sequence parallel yet")
+            raise NotImplementedError(
+                "EAGLE-1/2 drafter training does not support Ulysses sequence parallel yet"
+            )
 
         input_ids = batch["input_ids"]
         hidden_states = batch["hidden_states"]
@@ -134,7 +166,9 @@ class Eagle1TrainerBackend(Eagle3TrainerBackend):
         loss_mask = batch["loss_mask"]
         position_ids = batch["position_ids"]
         if last_hidden_states is None:
-            raise ValueError("EAGLE-1/2 requires last_hidden_states; use_logits must be False")
+            raise ValueError(
+                "EAGLE-1/2 requires last_hidden_states; use_logits must be False"
+            )
 
         training_cfg = self.config.rollout.drafter.training
         hidden_loss_weight = float(training_cfg.get("eagle1_hidden_loss_weight", 1.0))
@@ -147,7 +181,9 @@ class Eagle1TrainerBackend(Eagle3TrainerBackend):
         # (U(-fn, fn); train mode only). The SmoothL1 target stays clean.
         fc_input = hidden_states
         if draft_model.training and feature_noise > 0:
-            fc_input = fc_input + (torch.rand_like(fc_input) - 0.5) * (2.0 * feature_noise)
+            fc_input = fc_input + (torch.rand_like(fc_input) - 0.5) * (
+                2.0 * feature_noise
+            )
 
         predicted_hidden = model(
             input_ids=input_ids,
@@ -166,24 +202,38 @@ class Eagle1TrainerBackend(Eagle3TrainerBackend):
         # Full-vocabulary soft cross-entropy distillation. Reuse the EAGLE-3
         # helper, which sanitizes non-finite logits/targets BEFORE log_softmax so
         # masked positions cannot leak 0*NaN gradients into the draft.
-        per_token_ploss, valid_position = _masked_soft_cross_entropy(predicted_logits, target_probs, loss_mask)
-        finite_hidden = torch.isfinite(predicted_hidden).all(dim=-1) & torch.isfinite(last_hidden_states).all(dim=-1)
+        per_token_ploss, valid_position = _masked_soft_cross_entropy(
+            predicted_logits, target_probs, loss_mask
+        )
+        finite_hidden = torch.isfinite(predicted_hidden).all(dim=-1) & torch.isfinite(
+            last_hidden_states
+        ).all(dim=-1)
         valid_mask = valid_position & finite_hidden
         num_tokens = valid_mask.float().sum()
 
         # SmoothL1 hidden regression against the (shifted) target last hidden.
         # Sanitize before SmoothL1 for the same NaN-gradient reason.
         safe_pred_hidden = torch.where(
-            torch.isfinite(predicted_hidden), predicted_hidden, torch.zeros_like(predicted_hidden)
+            torch.isfinite(predicted_hidden),
+            predicted_hidden,
+            torch.zeros_like(predicted_hidden),
         ).float()
         safe_target_hidden = torch.where(
-            torch.isfinite(last_hidden_states), last_hidden_states, torch.zeros_like(last_hidden_states)
+            torch.isfinite(last_hidden_states),
+            last_hidden_states,
+            torch.zeros_like(last_hidden_states),
         ).float()
-        hidden_per_token = self.criterion(safe_pred_hidden, safe_target_hidden).mean(dim=-1)
-        hidden_per_token = torch.where(valid_mask, hidden_per_token, torch.zeros_like(hidden_per_token))
+        hidden_per_token = self.criterion(safe_pred_hidden, safe_target_hidden).mean(
+            dim=-1
+        )
+        hidden_per_token = torch.where(
+            valid_mask, hidden_per_token, torch.zeros_like(hidden_per_token)
+        )
         total_local_vloss = hidden_per_token.sum()
 
-        token_per_token = torch.where(valid_mask, per_token_ploss, torch.zeros_like(per_token_ploss))
+        token_per_token = torch.where(
+            valid_mask, per_token_ploss, torch.zeros_like(per_token_ploss)
+        )
         total_local_ploss = token_per_token.sum()
 
         # Gate on DEBUG so the .item() host-device syncs are skipped at INFO+.
@@ -191,12 +241,18 @@ class Eagle1TrainerBackend(Eagle3TrainerBackend):
             with torch.no_grad():
                 draft_top1 = predicted_logits.argmax(dim=-1)
                 target_top1 = target_probs.argmax(dim=-1)
-                acc = ((draft_top1 == target_top1) & valid_mask).float().sum() / num_tokens.clamp_min(1)
+                acc = (
+                    (draft_top1 == target_top1) & valid_mask
+                ).float().sum() / num_tokens.clamp_min(1)
             logger.debug(
                 "[eagle1 loss] tokens=%s hidden_loss=%.6f token_loss=%.6f top1_acc=%.6f",
                 int(num_tokens.detach().cpu().item()),
-                float((total_local_vloss / num_tokens.clamp_min(1)).detach().cpu().item()),
-                float((total_local_ploss / num_tokens.clamp_min(1)).detach().cpu().item()),
+                float(
+                    (total_local_vloss / num_tokens.clamp_min(1)).detach().cpu().item()
+                ),
+                float(
+                    (total_local_ploss / num_tokens.clamp_min(1)).detach().cpu().item()
+                ),
                 float(acc.detach().cpu().item()),
             )
 

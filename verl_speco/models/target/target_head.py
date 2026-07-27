@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Minimal target lm-head loader for SPECO drafter training."""
 
 import glob
@@ -23,7 +36,9 @@ def _load_checkpoint_tensor(model_path: str, key: str) -> torch.Tensor:
             index_json = json.load(f)
         weight_map = index_json.get("weight_map", {})
         if key not in weight_map:
-            raise KeyError(f"Tensor {key!r} is not present in checkpoint index for {model_path}")
+            raise KeyError(
+                f"Tensor {key!r} is not present in checkpoint index for {model_path}"
+            )
         ckpt_file = os.path.join(model_path, weight_map[key])
         if ckpt_file.endswith(".safetensors"):
             with safe_open(ckpt_file, framework="pt", device="cpu") as f:
@@ -39,7 +54,9 @@ def _load_checkpoint_tensor(model_path: str, key: str) -> torch.Tensor:
     if os.path.exists(pytorch_path):
         return torch.load(pytorch_path, map_location="cpu", weights_only=True)[key]
 
-    raise FileNotFoundError(f"No index.json, model.safetensors or pytorch_model.bin found in {model_path}")
+    raise FileNotFoundError(
+        f"No index.json, model.safetensors or pytorch_model.bin found in {model_path}"
+    )
 
 
 class TargetHead(nn.Module):
@@ -48,7 +65,9 @@ class TargetHead(nn.Module):
     def __init__(self, weight: torch.Tensor):
         super().__init__()
         if weight.dim() != 2:
-            raise ValueError(f"TargetHead weight must be rank-2, got shape={tuple(weight.shape)}")
+            raise ValueError(
+                f"TargetHead weight must be rank-2, got shape={tuple(weight.shape)}"
+            )
         vocab_size, hidden_size = weight.shape
         self.fc = nn.Linear(hidden_size, vocab_size, bias=False)
         with torch.no_grad():

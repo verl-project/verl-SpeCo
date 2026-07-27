@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Compatibility checks for the import-only verl dependency.
 
 The supported upstream target is the ``release/v0.8.0`` API surface. A commit
@@ -27,12 +40,21 @@ logger = logging.getLogger(__file__)
 REQUIRED_VERL_API: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "verl.trainer.main_ppo",
-        ("TaskRunner", "create_rl_dataset", "create_rl_sampler", "run_ppo", "migrate_legacy_reward_impl"),
+        (
+            "TaskRunner",
+            "create_rl_dataset",
+            "create_rl_sampler",
+            "run_ppo",
+            "migrate_legacy_reward_impl",
+        ),
     ),
     ("verl.trainer.ppo.ray_trainer", ("RayPPOTrainer",)),
     ("verl.trainer.ppo.utils", ("Role", "need_critic", "need_reference_policy")),
     ("verl.utils.config", ("validate_config",)),
-    ("verl.utils.device", ("auto_set_device", "get_device_id", "get_device_name", "get_torch_device")),
+    (
+        "verl.utils.device",
+        ("auto_set_device", "get_device_id", "get_device_name", "get_torch_device"),
+    ),
     (
         "verl.utils.fsdp_utils",
         (
@@ -47,15 +69,24 @@ REQUIRED_VERL_API: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     ("verl.utils.dataset.rl_dataset", ("collate_fn",)),
-    ("verl.utils.ulysses", ("get_ulysses_sequence_parallel_group", "set_ulysses_sequence_parallel_group")),
-    ("verl.utils.tensordict_utils", ("assign_non_tensor", "assign_non_tensor_data", "get", "get_non_tensor_data")),
+    (
+        "verl.utils.ulysses",
+        ("get_ulysses_sequence_parallel_group", "set_ulysses_sequence_parallel_group"),
+    ),
+    (
+        "verl.utils.tensordict_utils",
+        ("assign_non_tensor", "assign_non_tensor_data", "get", "get_non_tensor_data"),
+    ),
     ("verl.workers.engine_workers", ("ActorRolloutRefWorker", "TrainingWorker")),
     ("verl.workers.rollout.replica", ("RolloutReplica", "TokenOutput")),
     ("verl.single_controller.base", ("Worker",)),
     ("verl.single_controller.base.decorator", ("Dispatch", "register")),
     ("verl.single_controller.ray", ("RayClassWithInitArgs",)),
     ("verl.utils.ray_utils", ("auto_await", "parallel_put")),
-    ("verl.utils.distributed", ("initialize_global_process_group_ray", "set_numa_affinity")),
+    (
+        "verl.utils.distributed",
+        ("initialize_global_process_group_ray", "set_numa_affinity"),
+    ),
     ("verl.workers.utils.padding", ("left_right_2_no_padding", "no_padding_2_padding")),
 )
 
@@ -72,7 +103,9 @@ class VerlCompatibility:
     missing_api: tuple[str, ...] = ()
 
 
-def _read_distribution_vcs_info(distribution_name: str = "verl") -> tuple[Optional[str], Optional[str]]:
+def _read_distribution_vcs_info(
+    distribution_name: str = "verl",
+) -> tuple[Optional[str], Optional[str]]:
     try:
         distribution = metadata.distribution(distribution_name)
     except metadata.PackageNotFoundError:
@@ -123,7 +156,9 @@ def _missing_required_api() -> tuple[str, ...]:
         try:
             module = importlib.import_module(module_name)
         except Exception as exc:  # noqa: BLE001
-            missing.append(f"{module_name} (import failed: {type(exc).__name__}: {exc})")
+            missing.append(
+                f"{module_name} (import failed: {type(exc).__name__}: {exc})"
+            )
             continue
         for symbol in symbols:
             if not hasattr(module, symbol):
@@ -160,7 +195,9 @@ def resolve_verl_compatibility(
 
     reasons = []
     if not version_matches and not branch_matches:
-        reasons.append(f"expected version {SUPPORTED_VERL_VERSION} or branch {SUPPORTED_VERL_BRANCH}")
+        reasons.append(
+            f"expected version {SUPPORTED_VERL_VERSION} or branch {SUPPORTED_VERL_BRANCH}"
+        )
     if missing_api:
         reasons.append("missing/incompatible API: " + ", ".join(missing_api[:8]))
     return VerlCompatibility(

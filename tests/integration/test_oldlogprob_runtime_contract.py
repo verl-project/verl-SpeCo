@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import json
@@ -24,7 +37,10 @@ def _drafter(enabled: bool) -> dict:
 
 def test_oldlogprob_collection_is_disabled_by_default() -> None:
     assert oldlogprob_hidden_runtime_enabled({}) is False
-    assert oldlogprob_hidden_runtime_enabled({"rollout": {"drafter": _drafter(False)}}) is False
+    assert (
+        oldlogprob_hidden_runtime_enabled({"rollout": {"drafter": _drafter(False)}})
+        is False
+    )
 
 
 def test_oldlogprob_collection_requires_online_drafter_training() -> None:
@@ -33,8 +49,14 @@ def test_oldlogprob_collection_requires_online_drafter_training() -> None:
     training_disabled = _drafter(True)
     training_disabled["enable_drafter_training"] = False
 
-    assert oldlogprob_hidden_runtime_enabled({"rollout": {"drafter": rollout_disabled}}) is False
-    assert oldlogprob_hidden_runtime_enabled({"rollout": {"drafter": training_disabled}}) is False
+    assert (
+        oldlogprob_hidden_runtime_enabled({"rollout": {"drafter": rollout_disabled}})
+        is False
+    )
+    assert (
+        oldlogprob_hidden_runtime_enabled({"rollout": {"drafter": training_disabled}})
+        is False
+    )
 
 
 def test_oldlogprob_collection_accepts_both_config_shapes() -> None:
@@ -71,7 +93,10 @@ def test_eagle3_oldlogprob_falls_back_to_default_three_layers() -> None:
         target_num_hidden_layers=36,
         model_configs=[],
     ) == [2, 18, 33]
-    assert eagle3_num_aux_hidden_states_from_config({"speculative_algorithm": "EAGLE3"}) is None
+    assert (
+        eagle3_num_aux_hidden_states_from_config({"speculative_algorithm": "EAGLE3"})
+        is None
+    )
 
 
 def test_eagle3_oldlogprob_accepts_top_level_target_layer_ids() -> None:
@@ -134,7 +159,9 @@ def _selection_context(*, batch_size: int, hidden_rows: int) -> dict:
     }
 
 
-def test_forward_hook_merges_already_selected_batch_hidden_without_reselection() -> None:
+def test_forward_hook_merges_already_selected_batch_hidden_without_reselection() -> (
+    None
+):
     torch = pytest.importorskip("torch")
     context = _selection_context(batch_size=4, hidden_rows=129)
     aux_hidden = torch.randn(4, 129, 8)

@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import math
 from typing import Any
 
@@ -43,7 +56,9 @@ class ClampedGlobalCosineLR(LRScheduler):
         if self.decay_steps <= 0:
             raise ValueError(f"lr_decay_steps must be positive, got {self.decay_steps}")
         if self.warmup_steps < 0:
-            raise ValueError(f"lr_warmup_steps must be non-negative, got {self.warmup_steps}")
+            raise ValueError(
+                f"lr_warmup_steps must be non-negative, got {self.warmup_steps}"
+            )
         if self.warmup_steps >= self.decay_steps:
             raise ValueError(
                 "lr_warmup_steps must be smaller than lr_decay_steps, "
@@ -77,7 +92,11 @@ def build_drafter_lr_scheduler(optimizer: Optimizer, train_cfg: Any) -> LRSchedu
     scheduler_type = str(scheduler_type).strip().lower()
     default_warmup_steps = 0 if configured_scheduler_type is not None else 1000
     configured_warmup_steps = train_cfg.get("lr_warmup_steps", default_warmup_steps)
-    warmup_steps = int(default_warmup_steps if configured_warmup_steps is None else configured_warmup_steps)
+    warmup_steps = int(
+        default_warmup_steps
+        if configured_warmup_steps is None
+        else configured_warmup_steps
+    )
     last_epoch = _scheduler_last_epoch(optimizer, train_cfg)
 
     if scheduler_type == "constant":

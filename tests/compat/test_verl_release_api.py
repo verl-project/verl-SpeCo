@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import ast
@@ -18,7 +31,12 @@ REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
     "verl.trainer.ppo.ray_trainer": ("RayPPOTrainer",),
     "verl.trainer.ppo.utils": ("Role", "need_critic", "need_reference_policy"),
     "verl.utils.config": ("validate_config",),
-    "verl.utils.device": ("auto_set_device", "get_device_id", "get_device_name", "get_torch_device"),
+    "verl.utils.device": (
+        "auto_set_device",
+        "get_device_id",
+        "get_device_name",
+        "get_torch_device",
+    ),
     "verl.utils.fsdp_utils": (
         "get_fsdp_full_state_dict",
         "get_fsdp_wrap_policy",
@@ -47,11 +65,17 @@ REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
     "verl.utils.checkpoint.checkpoint_manager": ("find_latest_ckpt_path",),
     "verl.utils.tracking": ("Tracking",),
     "verl.utils.ray_utils": ("auto_await", "parallel_put"),
-    "verl.utils.distributed": ("initialize_global_process_group_ray", "set_numa_affinity"),
+    "verl.utils.distributed": (
+        "initialize_global_process_group_ray",
+        "set_numa_affinity",
+    ),
     "verl.workers.engine_workers": ("ActorRolloutRefWorker", "TrainingWorker"),
     "verl.workers.rollout.replica": ("RolloutReplica", "TokenOutput"),
     "verl.workers.rollout.llm_server": ("LLMServerClient",),
-    "verl.workers.rollout.vllm_rollout.vllm_async_server": ("vLLMHttpServer", "vLLMReplica"),
+    "verl.workers.rollout.vllm_rollout.vllm_async_server": (
+        "vLLMHttpServer",
+        "vLLMReplica",
+    ),
     "verl.workers.rollout.vllm_rollout.utils": (
         "vLLMColocateWorkerExtension",
         "build_cli_args_from_config",
@@ -60,7 +84,10 @@ REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
         "BucketedWeightSender",
         "BucketedWeightReceiver",
     ),
-    "verl.workers.rollout.sglang_rollout.utils": ("get_named_tensor_buckets", "SGLANG_LORA_NAME"),
+    "verl.workers.rollout.sglang_rollout.utils": (
+        "get_named_tensor_buckets",
+        "SGLANG_LORA_NAME",
+    ),
     "verl.utils.sglang.sglang_fp8_utils": ("SGLangFP8QuantizerHelper",),
     "verl.workers.utils.padding": ("left_right_2_no_padding", "no_padding_2_padding"),
     "verl.single_controller.base": ("Worker",),
@@ -80,6 +107,17 @@ def _module_file(root: Path, module_name: str) -> Path:
     if package_init.is_file():
         return package_init
     raise AssertionError(f"missing release/v0.8.0 module: {module_name}")
+
+
+def _upstream_repo_root(upstream_root: str) -> Path:
+    base = Path(upstream_root)
+    for candidate in (base, base / "verl"):
+        if (candidate / "verl").is_dir():
+            return candidate
+    raise AssertionError(
+        "VERL_SPECO_UPSTREAM_ROOT must point to the upstream verl checkout "
+        "or to a directory containing it"
+    )
 
 
 def _defined_names(source: str) -> set[str]:
@@ -106,11 +144,13 @@ def test_release_v080_modules_and_symbols_are_present() -> None:
     if not upstream_root:
         pytest.skip("set VERL_SPECO_UPSTREAM_ROOT to check the release/v0.8.0 API")
 
-    root = Path(upstream_root) / "verl"
+    root = _upstream_repo_root(upstream_root)
     missing: list[str] = []
     for module_name, symbols in REQUIRED_MODULES.items():
         try:
-            names = _defined_names(_module_file(root, module_name).read_text(encoding="utf-8"))
+            names = _defined_names(
+                _module_file(root, module_name).read_text(encoding="utf-8")
+            )
         except (AssertionError, OSError, SyntaxError) as exc:
             missing.append(f"{module_name}: {exc}")
             continue

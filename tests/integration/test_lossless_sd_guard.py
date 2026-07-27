@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tests for the fail-closed lossless speculative-decoding guard.
 
 RL rollout under speculative decoding is only unbiased when the verifier samples
@@ -20,7 +33,11 @@ def test_default_greedy_config_passes() -> None:
     # The config SPECO builds by default: greedy DRAFT sampling is lossless
     # (one-hot proposal -> rejection sampling), so it must not be rejected.
     assert_lossless_vllm_speculative_config(
-        {"method": "eagle3", "num_speculative_tokens": 3, "draft_sample_method": "greedy"},
+        {
+            "method": "eagle3",
+            "num_speculative_tokens": 3,
+            "draft_sample_method": "greedy",
+        },
         allow_lossy=False,
     )
 
@@ -58,7 +75,9 @@ def _drafter_cfg(**vllm_overrides):
 
 
 def test_build_rejects_lossy_override() -> None:
-    cfg = _drafter_cfg(speculative_config_overrides={"rejection_sample_method": "synthetic"})
+    cfg = _drafter_cfg(
+        speculative_config_overrides={"rejection_sample_method": "synthetic"}
+    )
     with pytest.raises(ValueError, match="lossy speculative-decoding config"):
         build_vllm_speculative_config_from_drafter(cfg)
 

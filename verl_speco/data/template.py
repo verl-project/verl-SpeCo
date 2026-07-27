@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # Adapted from: https://github.com/sgl-project/sglang/blob/main/python/sglang/lang/chat_template.py#L13
 from typing import List, Optional
 
@@ -58,9 +71,9 @@ class TemplateRegistry:
             template(ChatTemplate): The chat template.
             override(bool): Whether to override the existing template, default to False
         """
-        assert (
-            not override and name not in self.templates
-        ), f"Chat template for the model type {name} has already been registered"
+        assert not override and name not in self.templates, (
+            f"Chat template for the model type {name} has already been registered"
+        )
         self.templates[name] = template
 
     def get(self, name: str) -> ChatTemplate:
@@ -184,8 +197,8 @@ TEMPLATE_REGISTRY.register(
 TEMPLATE_REGISTRY.register(
     name="deepseek-r1-distill",
     template=ChatTemplate(
-        assistant_header="<｜Assistant｜>",
-        user_header="<｜User｜>",
+        assistant_header="<锝淎ssistant锝?",
+        user_header="<锝淯ser锝?",
         end_of_turn_token=None,
         system_prompt=None,
     ),
@@ -252,10 +265,10 @@ TEMPLATE_REGISTRY.register(
 TEMPLATE_REGISTRY.register(
     name="deepseek-v3",
     template=ChatTemplate(
-        assistant_header="<｜Assistant｜>",
-        user_header="<｜User｜>",
+        assistant_header="<锝淎ssistant锝?",
+        user_header="<锝淯ser锝?",
         system_prompt="You are a helpful assistant.",
-        end_of_turn_token="<｜end▁of▁sentence｜>",
+        end_of_turn_token="<锝渆nd鈻乷f鈻乻entence锝?",
     ),
 )
 
@@ -272,10 +285,10 @@ TEMPLATE_REGISTRY.register(
 TEMPLATE_REGISTRY.register(
     name="deepseek-v32",
     template=ChatTemplate(
-        assistant_header="<｜Assistant｜>",
-        user_header="<｜User｜>",
+        assistant_header="<锝淎ssistant锝?",
+        user_header="<锝淯ser锝?",
         system_prompt="",
-        end_of_turn_token="<｜end▁of▁sentence｜>",
+        end_of_turn_token="<锝渆nd鈻乷f鈻乻entence锝?",
         parser_type="thinking",
         enable_thinking=True,
     ),

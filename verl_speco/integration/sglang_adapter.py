@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """SGLang integration helpers for SPECO.
 
 This module is intentionally explicit: importing it does not monkey patch
@@ -20,7 +33,9 @@ SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCH = "hidden_states_tensor_output"
 SGLANG_NPU_EAGLE_TARGET_SAMPLING_PATCH = "npu_eagle_target_sampling"
 
 
-def speco_step_matches_interval(global_step: Any, interval_steps: Any, *, default_interval: int = 1) -> bool:
+def speco_step_matches_interval(
+    global_step: Any, interval_steps: Any, *, default_interval: int = 1
+) -> bool:
     """Return whether a positive trainer step should run an interval-gated action."""
 
     try:
@@ -47,7 +62,9 @@ class SGLangSpecoPatchConfig:
     patches: Optional[Iterable[str]] = None
 
 
-def install_sglang_speco_patches(config: Optional[SGLangSpecoPatchConfig] = None) -> None:
+def install_sglang_speco_patches(
+    config: Optional[SGLangSpecoPatchConfig] = None,
+) -> None:
     """Install SPECO's SGLang patches.
 
     The imported patch module touches third-party SGLang runtime objects, so it
@@ -63,7 +80,7 @@ def install_sglang_speco_patches(config: Optional[SGLangSpecoPatchConfig] = None
     if config.enable_original_logprobs:
         enable_sglang_original_logprob_return()
 
-    install_kwargs = {
+    install_kwargs: dict[str, Any] = {
         "set_envs_and_config": config.set_envs_and_config,
         "target_weight_loader": config.target_weight_loader,
         "draft_weight_loader": config.draft_weight_loader,
@@ -89,10 +106,14 @@ def sglang_needs_qwen3_rope_compat_patch(sglang_version: Optional[str] = None) -
     return version.parse("0.5.10") <= current_version < version.parse("0.5.12")
 
 
-def install_sglang_qwen3_rope_compat_patch(set_envs_and_config: Optional[Callable] = None) -> None:
+def install_sglang_qwen3_rope_compat_patch(
+    set_envs_and_config: Optional[Callable] = None,
+) -> None:
     """Install only the SGLang Qwen3 rope compatibility patch."""
 
-    from verl_speco.integration.sglang_patch import install_sglang_qwen3_rope_compat_patch as _install
+    from verl_speco.integration.sglang_patch import (
+        install_sglang_qwen3_rope_compat_patch as _install,
+    )
 
     _install(set_envs_and_config=set_envs_and_config)
 
@@ -130,7 +151,7 @@ def normalize_drafter_samples(samples_array: Any) -> list[dict]:
 
 
 def pop_drafter_samples(gen_batch_output: Any) -> list[dict]:
-    """Pop SPECO rollout samples from a DataProto-like generation output."""
+    """Pop SPECO rollout samples from a generation output object."""
 
     non_tensor_batch = getattr(gen_batch_output, "non_tensor_batch", None)
     if non_tensor_batch is None:
@@ -139,10 +160,12 @@ def pop_drafter_samples(gen_batch_output: Any) -> list[dict]:
     return normalize_drafter_samples(samples_array)
 
 
-def bucket_drafter_samples_by_replica(samples: list[dict], num_replicas: int) -> list[list[dict]]:
+def bucket_drafter_samples_by_replica(
+    samples: list[dict], num_replicas: int
+) -> list[list[dict]]:
     """Bucket normalized samples by rollout replica rank."""
 
-    buckets = [[] for _ in range(num_replicas)]
+    buckets: list[list[dict]] = [[] for _ in range(num_replicas)]
     for sample in samples:
         replica_rank = sample.get("replica_rank")
         if replica_rank is None:

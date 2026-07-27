@@ -1,12 +1,31 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import importlib
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from verl_speco.trainer.draft_dataset import DraftFeatureDataLoader, DraftFeatureDataLoaderConfig
-from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
+draft_dataset = importlib.import_module("verl_speco.trainer.draft_dataset")
+feature_store = importlib.import_module("verl_speco.trainer.feature_store")
+DraftFeatureDataLoader = draft_dataset.DraftFeatureDataLoader
+DraftFeatureDataLoaderConfig = draft_dataset.DraftFeatureDataLoaderConfig
+DraftFeatureSample = feature_store.DraftFeatureSample
+TorchShardFeatureStore = feature_store.TorchShardFeatureStore
 
 
-def _sample(index: int = 0) -> DraftFeatureSample:
+def _sample(index: int = 0):
     input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.long) + index
     loss_mask = torch.tensor([0, 1, 1, 0], dtype=torch.float32)
     hidden_states = torch.randn(4, 8, dtype=torch.float32)
@@ -98,7 +117,9 @@ def test_feature_sample_restores_online_alignment_metadata():
     assert item["_verl_target_tensor_position_end"] == 266
     assert item["_verl_target_start"] == 0
     assert item["_verl_target_end"] == 126
-    assert torch.equal(item["_verl_hidden_positions"], torch.arange(139, 266, dtype=torch.long))
+    assert torch.equal(
+        item["_verl_hidden_positions"], torch.arange(139, 266, dtype=torch.long)
+    )
 
 
 def test_draft_feature_dataloader_slices_keys_by_rank(tmp_path):
@@ -108,11 +129,15 @@ def test_draft_feature_dataloader_slices_keys_by_rank(tmp_path):
 
     rank0 = DraftFeatureDataLoader(
         TorchShardFeatureStore(tmp_path, read_only=True),
-        DraftFeatureDataLoaderConfig(batch_size=8, rank=0, world_size=2, shuffle=False, repeat=False),
+        DraftFeatureDataLoaderConfig(
+            batch_size=8, rank=0, world_size=2, shuffle=False, repeat=False
+        ),
     )
     rank1 = DraftFeatureDataLoader(
         TorchShardFeatureStore(tmp_path, read_only=True),
-        DraftFeatureDataLoaderConfig(batch_size=8, rank=1, world_size=2, shuffle=False, repeat=False),
+        DraftFeatureDataLoaderConfig(
+            batch_size=8, rank=1, world_size=2, shuffle=False, repeat=False
+        ),
     )
 
     rank0_ids = [int(sample.input_ids[0].item()) for batch in rank0 for sample in batch]
@@ -130,7 +155,9 @@ def test_draft_feature_dataloader_balances_uneven_distributed_shards(tmp_path):
     for rank in range(2):
         loader = DraftFeatureDataLoader(
             TorchShardFeatureStore(tmp_path, read_only=True),
-            DraftFeatureDataLoaderConfig(batch_size=1, rank=rank, world_size=2, shuffle=False, repeat=False),
+            DraftFeatureDataLoaderConfig(
+                batch_size=1, rank=rank, world_size=2, shuffle=False, repeat=False
+            ),
         )
         rank_batches.append(list(loader))
 

@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """NPU compatibility for verl release/v0.8.0 vLLM imports and checkpoints."""
 
 from __future__ import annotations
@@ -9,7 +22,7 @@ import inspect
 import logging
 import sys
 import time
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from packaging import version
 
@@ -54,7 +67,9 @@ def _module_available(module_name: str) -> bool:
 
 def _unused_factory_weight_loader(*args, **kwargs):
     del args, kwargs
-    raise RuntimeError("FusedMoE factory compatibility weight_loader must never be called")
+    raise RuntimeError(
+        "FusedMoE factory compatibility weight_loader must never be called"
+    )
 
 
 def install_verl_npu_vllm_import_compat(
@@ -82,7 +97,11 @@ def install_verl_npu_vllm_import_compat(
 
     fused_moe_module = module_importer(_VLLM_FUSED_MOE_MODULE)
     fused_moe = getattr(fused_moe_module, "FusedMoE", None)
-    if fused_moe is None or isinstance(fused_moe, type) or hasattr(fused_moe, "weight_loader"):
+    if (
+        fused_moe is None
+        or isinstance(fused_moe, type)
+        or hasattr(fused_moe, "weight_loader")
+    ):
         return False
 
     fused_moe.weight_loader = _unused_factory_weight_loader
@@ -191,7 +210,7 @@ def install_verl_npu_checkpoint_reclaim(
                     format_checkpoint_memory_snapshot(),
                 )
 
-    save_checkpoint_with_reclaim._speco_npu_checkpoint_reclaim = True
+    setattr(save_checkpoint_with_reclaim, "_speco_npu_checkpoint_reclaim", True)
     engine_cls.save_checkpoint = save_checkpoint_with_reclaim
     _NPU_CHECKPOINT_RECLAIM_APPLIED = True
     logger.warning("Enabled post-save NPU actor checkpoint host-memory reclaim")
@@ -222,15 +241,16 @@ def install_verl_fsdp_training_output_release_compat(
 
     forward_backward_batch = getattr(engine_cls, "forward_backward_batch", None)
     try:
-        forward_backward_source = inspect.getsource(forward_backward_batch)
+        forward_backward_source = (
+            inspect.getsource(forward_backward_batch)
+            if forward_backward_batch is not None
+            else ""
+        )
     except (OSError, TypeError):
         forward_backward_source = ""
-    upstream_releases_training_output = (
-        "meta_info.pop" in forward_backward_source
-        and (
-            '"model_output"' in forward_backward_source
-            or "'model_output'" in forward_backward_source
-        )
+    upstream_releases_training_output = "meta_info.pop" in forward_backward_source and (
+        '"model_output"' in forward_backward_source
+        or "'model_output'" in forward_backward_source
     )
     if upstream_releases_training_output:
         _FSDP_TRAIN_OUTPUT_RELEASE_APPLIED = True
@@ -256,7 +276,11 @@ def install_verl_fsdp_training_output_release_compat(
                 meta_info.pop("model_output", None)
         return result
 
-    forward_step_without_retained_training_output._speco_training_output_release_compat = True
+    setattr(
+        forward_step_without_retained_training_output,
+        "_speco_training_output_release_compat",
+        True,
+    )
     lm_head_cls.forward_step = forward_step_without_retained_training_output
     _FSDP_TRAIN_OUTPUT_RELEASE_APPLIED = True
     logger.warning("Enabled FSDP actor training output-release compatibility")
@@ -310,9 +334,13 @@ def install_verl_npu_fsdp2_weight_export_compat(
         module = getattr(self, "module", None)
         peft_model = getattr(module, "_fsdp_wrapped_module", module)
         try:
-            skip_staging = module is not None and fsdp_version(module) == 2 and not hasattr(
-                peft_model,
-                "peft_config",
+            skip_staging = (
+                module is not None
+                and fsdp_version(module) == 2
+                and not hasattr(
+                    peft_model,
+                    "peft_config",
+                )
             )
         except Exception:  # noqa: BLE001
             skip_staging = False
@@ -339,7 +367,11 @@ def install_verl_npu_fsdp2_weight_export_compat(
             self._uses_fsdp2_cpu_offload_policy = uses_cpu_offload_policy
             self._is_offload_param = is_offload_param
 
-    get_per_tensor_param_without_fsdp2_staging._speco_npu_fsdp2_weight_export_compat = True
+    setattr(
+        get_per_tensor_param_without_fsdp2_staging,
+        "_speco_npu_fsdp2_weight_export_compat",
+        True,
+    )
     engine_cls.get_per_tensor_param = get_per_tensor_param_without_fsdp2_staging
     _NPU_FSDP2_WEIGHT_EXPORT_APPLIED = True
     logger.warning("Enabled NPU FSDP2 weight-export staging compatibility")
@@ -350,7 +382,9 @@ def _install_weight_transfer_shm_reuse() -> bool:
     """Install the sender-side SHM reuse patch in the WorkerDict process."""
 
     try:
-        from verl_speco.integration.vllm_runtime import patch_verl_bucketed_weight_transfer_shm_reuse
+        from verl_speco.integration.vllm_runtime import (
+            patch_verl_bucketed_weight_transfer_shm_reuse,
+        )
     except Exception:  # noqa: BLE001
         return False
     return patch_verl_bucketed_weight_transfer_shm_reuse()
@@ -377,15 +411,19 @@ class VerlNPUVLLMImportCompatMixin:
         super().__init__(*args, **kwargs)
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
-    async def update_weights(self, global_steps: int = None, mode: str = "auto"):
+    async def update_weights(self, global_steps: int | None = None, mode: str = "auto"):
         # Both baseline and speculative runs send actor weights from this
         # WorkerDict process. Install immediately before the upstream sender is
         # constructed so no-drafter runs receive the same NPU SHM protection.
         _install_weight_transfer_shm_reuse()
         if not _is_npu_worker():
-            return await super().update_weights(global_steps=global_steps, mode=mode)
+            return await cast(Any, super()).update_weights(
+                global_steps=global_steps, mode=mode
+            )
 
         try:
-            return await super().update_weights(global_steps=global_steps, mode=mode)
+            return await cast(Any, super()).update_weights(
+                global_steps=global_steps, mode=mode
+            )
         finally:
             trim_process_host_memory()

@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Contract tests for the EAGLE-1 / EAGLE-2 drafter backend.
 
 These are CPU-light: they exercise the draft model forward, the loss math
@@ -47,7 +60,9 @@ def test_eagle1_draft_forward_shape() -> None:
     input_ids = torch.randint(0, config.vocab_size, (batch, seq))
     hidden_states = torch.randn(batch, seq, config.target_hidden_size)
     attention_mask = torch.ones(batch, seq, dtype=torch.long)
-    out = model(input_ids=input_ids, hidden_states=hidden_states, attention_mask=attention_mask)
+    out = model(
+        input_ids=input_ids, hidden_states=hidden_states, attention_mask=attention_mask
+    )
     assert out.shape == (batch, seq, config.hidden_size)
 
 
@@ -65,7 +80,10 @@ def _make_backend(training_overrides=None):
     if training_overrides:
         training.update(training_overrides)
     config = OmegaConf.create(
-        {"rollout": {"drafter": {"model_path": "/tmp/none", "training": training}}, "model": {"path": "/tmp/none"}}
+        {
+            "rollout": {"drafter": {"model_path": "/tmp/none", "training": training}},
+            "model": {"path": "/tmp/none"},
+        }
     )
     return Eagle1TrainerBackend(config, OmegaConf.create({}))
 
@@ -98,7 +116,9 @@ def test_eagle1_compute_loss_matches_reference_formula() -> None:
     torch.manual_seed(0)
     config = _tiny_eagle1_config()
     model = LlamaForCausalLMEagle1(config).eval()
-    target_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False).eval()
+    target_head = torch.nn.Linear(
+        config.hidden_size, config.vocab_size, bias=False
+    ).eval()
 
     backend = _make_backend()
     backend.target_model = target_head
@@ -136,14 +156,20 @@ def test_eagle1_compute_loss_matches_reference_formula() -> None:
             predicted_hidden.float(), last_hidden_states.float(), reduction="none"
         ).mean(dim=-1)
         ref_vloss = torch.where(valid, hidden_pt, torch.zeros_like(hidden_pt)).sum()
-        token_pt = -(target_probs * torch.log_softmax(predicted_logits, dim=-1)).sum(dim=-1)
+        token_pt = -(target_probs * torch.log_softmax(predicted_logits, dim=-1)).sum(
+            dim=-1
+        )
         ref_ploss = torch.where(valid, token_pt, torch.zeros_like(token_pt)).sum()
 
     assert out["v_weight"] == pytest.approx(1.0)
     assert out["p_weight"] == pytest.approx(0.1)
     assert float(out["local_num_tokens"].detach()) == pytest.approx(float(num_tokens))
-    assert float(out["total_local_vloss"].detach()) == pytest.approx(float(ref_vloss), rel=1e-5, abs=1e-6)
-    assert float(out["total_local_ploss"].detach()) == pytest.approx(float(ref_ploss), rel=1e-5, abs=1e-6)
+    assert float(out["total_local_vloss"].detach()) == pytest.approx(
+        float(ref_vloss), rel=1e-5, abs=1e-6
+    )
+    assert float(out["total_local_ploss"].detach()) == pytest.approx(
+        float(ref_ploss), rel=1e-5, abs=1e-6
+    )
 
 
 def test_eagle1_compute_loss_requires_last_hidden_states() -> None:
@@ -154,7 +180,9 @@ def test_eagle1_compute_loss_requires_last_hidden_states() -> None:
     config = _tiny_eagle1_config()
     model = LlamaForCausalLMEagle1(config).eval()
     backend = _make_backend()
-    backend.target_model = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    backend.target_model = torch.nn.Linear(
+        config.hidden_size, config.vocab_size, bias=False
+    )
 
     seq = 4
     batch = {
@@ -173,12 +201,17 @@ def test_eagle1_compute_loss_requires_last_hidden_states() -> None:
 def test_eagle1_eagle2_vllm_method_is_eagle(algorithm) -> None:
     from verl_speco.integration.vllm_runtime import _speculative_method_from_drafter
 
-    assert _speculative_method_from_drafter({"speculative_algorithm": algorithm}) == "eagle"
+    assert (
+        _speculative_method_from_drafter({"speculative_algorithm": algorithm})
+        == "eagle"
+    )
 
 
 @pytest.mark.parametrize("algorithm", ["EAGLE1", "EAGLE2"])
 def test_eagle1_eagle2_collect_final_aux_layer(algorithm) -> None:
-    from verl_speco.integration.oldlogprob_layer_ids import resolve_oldlogprob_aux_layer_ids
+    from verl_speco.integration.oldlogprob_layer_ids import (
+        resolve_oldlogprob_aux_layer_ids,
+    )
 
     layer_ids = resolve_oldlogprob_aux_layer_ids(
         {"speculative_algorithm": algorithm, "training": {}},
@@ -191,7 +224,9 @@ def test_eagle1_eagle2_collect_final_aux_layer(algorithm) -> None:
 def test_eagle1_eagle2_ignore_stray_multilayer_config(algorithm) -> None:
     # A stray eagle3-style multi-layer id set must not override the single final
     # layer, since the draft fixes num_aux_hidden_states=1.
-    from verl_speco.integration.oldlogprob_layer_ids import resolve_oldlogprob_aux_layer_ids
+    from verl_speco.integration.oldlogprob_layer_ids import (
+        resolve_oldlogprob_aux_layer_ids,
+    )
 
     layer_ids = resolve_oldlogprob_aux_layer_ids(
         {

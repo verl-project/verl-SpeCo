@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Llama-style dense draft model for EAGLE-1 / EAGLE-2 training.
 
 Logic ported from NeMo AutoModel's EAGLE-1/2 ``LlamaEagleDraftModel``
@@ -29,11 +42,15 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
-def _build_causal_mask(attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+def _build_causal_mask(
+    attention_mask: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
     """Build an additive causal + padding mask for eager attention."""
     batch_size, seq_len = attention_mask.shape
     min_value = torch.finfo(dtype).min
-    causal = torch.full((seq_len, seq_len), min_value, device=attention_mask.device, dtype=dtype)
+    causal = torch.full(
+        (seq_len, seq_len), min_value, device=attention_mask.device, dtype=dtype
+    )
     causal = torch.triu(causal, diagonal=1)
     causal = causal.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len)
     expanded = (1.0 - attention_mask[:, None, None, :].to(dtype)) * min_value
@@ -46,17 +63,31 @@ class EagleLlamaAttention(nn.Module):
     def __init__(self, config: Eagle1Config):
         super().__init__()
         self.config = config
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
 
         attention_bias = getattr(config, "attention_bias", False)
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=attention_bias)
-        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=attention_bias)
-        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=attention_bias)
+        self.q_proj = nn.Linear(
+            config.hidden_size, self.num_heads * self.head_dim, bias=attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=attention_bias,
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=attention_bias,
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, config.hidden_size, bias=attention_bias
+        )
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
 
     def _repeat_kv(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -71,9 +102,21 @@ class EagleLlamaAttention(nn.Module):
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-        q = self.q_proj(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(hidden_states).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.q_proj(hidden_states)
+            .view(batch_size, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(hidden_states)
+            .view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(hidden_states)
+            .view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+            .transpose(1, 2)
+        )
 
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
@@ -84,7 +127,9 @@ class EagleLlamaAttention(nn.Module):
         attn_weights = attn_weights + attention_mask
         attn_probs = torch.softmax(attn_weights.float(), dim=-1).to(q.dtype)
         attn_output = torch.matmul(attn_probs, v)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        attn_output = (
+            attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        )
         return self.o_proj(attn_output)
 
 
@@ -94,13 +139,21 @@ class EagleLlamaMLP(nn.Module):
     def __init__(self, config: Eagle1Config):
         super().__init__()
         mlp_bias = getattr(config, "mlp_bias", False)
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=mlp_bias)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=mlp_bias)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=mlp_bias)
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=mlp_bias
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=mlp_bias
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=mlp_bias
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
+        return self.down_proj(
+            self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+        )
 
 
 class EagleLlamaDecoderLayer(nn.Module):
@@ -113,7 +166,9 @@ class EagleLlamaDecoderLayer(nn.Module):
         self.self_attn = EagleLlamaAttention(config)
         self.mlp = EagleLlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -123,7 +178,9 @@ class EagleLlamaDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, attention_mask=attention_mask, position_ids=position_ids)
+        hidden_states = self.self_attn(
+            hidden_states, attention_mask=attention_mask, position_ids=position_ids
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -152,12 +209,25 @@ class LlamaForCausalLMEagle1(DraftModel):
         self.config = config
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
-        self.target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
+        self.target_hidden_size = getattr(
+            config, "target_hidden_size", config.hidden_size
+        )
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
-        self.fc = nn.Linear(config.hidden_size + self.target_hidden_size, config.hidden_size, bias=False)
-        num_layers = max(1, int(getattr(config, "draft_num_hidden_layers", config.num_hidden_layers)))
-        self.layers = nn.ModuleList([EagleLlamaDecoderLayer(config) for _ in range(num_layers)])
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, config.pad_token_id
+        )
+        self.fc = nn.Linear(
+            config.hidden_size + self.target_hidden_size, config.hidden_size, bias=False
+        )
+        draft_num_hidden_layers = getattr(
+            config, "draft_num_hidden_layers", config.num_hidden_layers
+        )
+        if draft_num_hidden_layers is None:
+            raise ValueError("draft_num_hidden_layers must be set")
+        num_layers = max(1, int(draft_num_hidden_layers))
+        self.layers = nn.ModuleList(
+            [EagleLlamaDecoderLayer(config) for _ in range(num_layers)]
+        )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.post_init()
@@ -188,9 +258,15 @@ class LlamaForCausalLMEagle1(DraftModel):
 
         batch_size, seq_len, _ = fused.shape
         if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=fused.device)
+            attention_mask = torch.ones(
+                (batch_size, seq_len), dtype=torch.long, device=fused.device
+            )
         if position_ids is None:
-            position_ids = torch.arange(seq_len, device=fused.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+            position_ids = (
+                torch.arange(seq_len, device=fused.device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
         causal_mask = _build_causal_mask(attention_mask, fused.dtype)
 
         for layer in self.layers:

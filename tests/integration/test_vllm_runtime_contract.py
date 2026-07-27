@@ -1,5 +1,19 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
+import re
 import sys
 import types
 from inspect import getsource
@@ -83,17 +97,19 @@ def test_vllm_worker_extension_constructs_without_wake_up_fallback() -> None:
 
 
 def test_vllm_weight_sync_extension_has_stable_runtime_path() -> None:
-    assert SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS.endswith(".SpecoVLLMWeightSyncCompatExtension")
+    assert SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS.endswith(
+        ".SpecoVLLMWeightSyncCompatExtension"
+    )
     source = getsource(SpecoVLLMWeightSyncCompatExtension.update_weights_from_ipc)
-    assert source.index("patch_verl_bucketed_weight_transfer_rebuild_ipc()") < source.index(
-        "super().update_weights_from_ipc("
-    )
-    assert source.index("patch_verl_bucketed_weight_transfer_shm_reuse()") < source.index(
-        "super().update_weights_from_ipc("
-    )
-    assert source.index("patch_verl_bucketed_weight_transfer_npu_staging()") < source.index(
-        "super().update_weights_from_ipc("
-    )
+    assert source.index(
+        "patch_verl_bucketed_weight_transfer_rebuild_ipc()"
+    ) < source.index("super().update_weights_from_ipc(")
+    assert source.index(
+        "patch_verl_bucketed_weight_transfer_shm_reuse()"
+    ) < source.index("super().update_weights_from_ipc(")
+    assert source.index(
+        "patch_verl_bucketed_weight_transfer_npu_staging()"
+    ) < source.index("super().update_weights_from_ipc(")
     assert "with _speco_npu_target_staging(" in source
 
 
@@ -105,10 +121,12 @@ def test_vllm_npu_staging_is_guarded_and_preserves_upstream_fallback() -> None:
     assert "not use_shm" in guard_source
     assert "peft_config is not None" in guard_source
     assert "not _speco_is_npu_vllm_worker(worker)" in guard_source
-    assert 'getattr(vllm_config, "quant_config", None) is None' in guard_source
+    assert 'getattr(vllm_config, "quant_config", None)' in guard_source
+    assert "quant_config is not None" in guard_source
     assert "return original_receive(self, on_bucket_received)" in patch_source
     assert "SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES" in patch_source
-    assert "staging_buffer[start:end].copy_(self.buffer[start:end], non_blocking=False)" in patch_source
+    assert "staging_buffer[start:end].copy_(" in patch_source
+    assert "self.buffer[start:end], non_blocking=False" in patch_source
     assert "get_torch_device().synchronize()" in patch_source
     assert "NPU staging decision" in context_source
     assert "flush=True" in context_source
@@ -118,13 +136,15 @@ def test_vllm_npu_staging_is_guarded_and_preserves_upstream_fallback() -> None:
 def test_vllm_weight_shm_name_is_stable_and_channel_scoped() -> None:
     handle = "ipc:///tmp/rl-colocate-zmq-job-replica-0-rank-0.sock"
 
-    assert _speco_persistent_weight_shm_name(handle, 2048 << 20) == _speco_persistent_weight_shm_name(
+    assert _speco_persistent_weight_shm_name(
         handle, 2048 << 20
-    )
-    assert _speco_persistent_weight_shm_name(handle, 2048 << 20) != _speco_persistent_weight_shm_name(
-        handle, 512 << 20
-    )
-    assert _speco_persistent_weight_shm_name(handle, 2048 << 20) != _speco_persistent_weight_shm_name(
+    ) == _speco_persistent_weight_shm_name(handle, 2048 << 20)
+    assert _speco_persistent_weight_shm_name(
+        handle, 2048 << 20
+    ) != _speco_persistent_weight_shm_name(handle, 512 << 20)
+    assert _speco_persistent_weight_shm_name(
+        handle, 2048 << 20
+    ) != _speco_persistent_weight_shm_name(
         handle.replace("rank-0", "rank-1"), 2048 << 20
     )
 
@@ -215,7 +235,9 @@ def test_vllm_weight_shm_patch_reuses_mapping_and_preserves_ipc_path() -> None:
         BucketedWeightSender=FakeSender,
         BucketedWeightReceiver=FakeReceiver,
         create_shared_memory=create_shared_memory,
-        rebuild_shared_memory=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected attach")),
+        rebuild_shared_memory=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unexpected attach")
+        ),
         torch=FakeTorch,
     )
 
@@ -272,8 +294,13 @@ def test_vllm_speculative_config_maps_dflash_contract() -> None:
     }
 
 
-def test_vllm_speculative_config_maps_dspark_to_native_gpu_contract(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: False)
+def test_vllm_speculative_config_maps_dspark_to_native_gpu_contract(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint",
+        lambda: False,
+    )
 
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
@@ -304,8 +331,12 @@ def test_vllm_speculative_config_maps_dspark_to_native_gpu_contract(tmp_path, mo
     }
 
 
-def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True)
+def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
@@ -335,8 +366,13 @@ def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(tmp_path,
     }
 
 
-def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: False)
+def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint",
+        lambda: False,
+    )
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
@@ -349,7 +385,9 @@ def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(tmp_path, monk
             speculative_algorithm="DSPARK",
             model_path=str(model_path),
             rollout={"spec_steps": 3, "spec_verify_tokens": 16},
-            vllm={"speculative_config_overrides": {"draft_sample_method": "probabilistic"}},
+            vllm={
+                "speculative_config_overrides": {"draft_sample_method": "probabilistic"}
+            },
         )
     )
 
@@ -357,7 +395,9 @@ def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(tmp_path, monk
     assert config["draft_sample_method"] == "probabilistic"
 
 
-def test_vllm_dflash_validator_rejects_dspark_when_algorithm_is_dflash(tmp_path) -> None:
+def test_vllm_dflash_validator_rejects_dspark_when_algorithm_is_dflash(
+    tmp_path,
+) -> None:
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
@@ -411,13 +451,21 @@ def _install_fake_vllm_ascend_modules(monkeypatch, dflash_cls, proposer_cls) -> 
 
     monkeypatch.setitem(sys.modules, "vllm_ascend", root_module)
     monkeypatch.setitem(sys.modules, "vllm_ascend.spec_decode", spec_decode_module)
-    monkeypatch.setitem(sys.modules, "vllm_ascend.spec_decode.dflash_proposer", dflash_module)
-    monkeypatch.setitem(sys.modules, "vllm_ascend.spec_decode.llm_base_proposer", proposer_module)
+    monkeypatch.setitem(
+        sys.modules, "vllm_ascend.spec_decode.dflash_proposer", dflash_module
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm_ascend.spec_decode.llm_base_proposer", proposer_module
+    )
 
 
 class _FakePR11153DflashProposer:
     def _num_query_per_req(self):
-        return self.num_speculative_tokens if self._is_dspark else 1 + self.num_speculative_tokens
+        return (
+            self.num_speculative_tokens
+            if self._is_dspark
+            else 1 + self.num_speculative_tokens
+        )
 
     def set_inputs_first_pass(self):
         return self._num_query_per_req(), "IS_DSPARK"
@@ -425,7 +473,9 @@ class _FakePR11153DflashProposer:
 
 class _FakePR11153SpecDecodeBaseProposer:
     def _run_merged_draft(self):
-        if hasattr(self.speculative_config.draft_model_config.hf_config, "markov_head_type"):
+        if hasattr(
+            self.speculative_config.draft_model_config.hf_config, "markov_head_type"
+        ):
             blk = self.num_speculative_tokens
             draft_token_ids = self.model.model.markov_head
             return draft_token_ids[:, 1:] if blk else None
@@ -439,14 +489,18 @@ class _FakeOldDSparkDflashProposer:
 
 class _FakeOldDSparkSpecDecodeBaseProposer:
     def _run_merged_draft(self):
-        if hasattr(self.speculative_config.draft_model_config.hf_config, "markov_head_type"):
+        if hasattr(
+            self.speculative_config.draft_model_config.hf_config, "markov_head_type"
+        ):
             blk = self.num_speculative_tokens + 1
             draft_token_ids = self.model.model.markov_head
             return draft_token_ids[:, 1:] if blk else None
         return None
 
 
-def test_vllm_ascend_dspark_runtime_detector_accepts_pr11153_k_query(monkeypatch) -> None:
+def test_vllm_ascend_dspark_runtime_detector_accepts_pr11153_k_query(
+    monkeypatch,
+) -> None:
     _install_fake_vllm_ascend_modules(
         monkeypatch,
         _FakePR11153DflashProposer,
@@ -456,7 +510,9 @@ def test_vllm_ascend_dspark_runtime_detector_accepts_pr11153_k_query(monkeypatch
     assert _vllm_ascend_has_dspark_pr11153_k_query_runtime() is True
 
 
-def test_vllm_ascend_dspark_runtime_detector_rejects_old_full_block_layout(monkeypatch) -> None:
+def test_vllm_ascend_dspark_runtime_detector_rejects_old_full_block_layout(
+    monkeypatch,
+) -> None:
     _install_fake_vllm_ascend_modules(
         monkeypatch,
         _FakeOldDSparkDflashProposer,
@@ -488,12 +544,16 @@ def test_vllm_runtime_injects_native_config_and_worker_extension(monkeypatch) ->
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
 
 
-def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(monkeypatch, tmp_path) -> None:
+def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.setattr(
         "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
         lambda: True,
     )
-    monkeypatch.setattr("verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True)
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
@@ -527,23 +587,38 @@ def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None
     configuration_utils_module = types.ModuleType("transformers.configuration_utils")
     transformers_module.configuration_utils = configuration_utils_module
     monkeypatch.setitem(sys.modules, "transformers", transformers_module)
-    monkeypatch.setitem(sys.modules, "transformers.configuration_utils", configuration_utils_module)
+    monkeypatch.setitem(
+        sys.modules, "transformers.configuration_utils", configuration_utils_module
+    )
 
     assert patch_transformers_attention_layer_type_constants() is True
     assert configuration_utils_module.ALLOWED_LAYER_TYPES
-    assert configuration_utils_module.ALLOWED_LAYER_TYPES == configuration_utils_module.ALLOWED_ATTENTION_LAYER_TYPES
+    assert (
+        configuration_utils_module.ALLOWED_LAYER_TYPES
+        == configuration_utils_module.ALLOWED_ATTENTION_LAYER_TYPES
+    )
     assert patch_transformers_attention_layer_type_constants() is False
 
 
 def test_import_compat_runs_before_vllm_worker_extension_import() -> None:
     source = (
-        Path(__file__).resolve().parents[2] / "verl_speco" / "integration" / "vllm_runtime.py"
+        Path(__file__).resolve().parents[2]
+        / "verl_speco"
+        / "integration"
+        / "vllm_runtime.py"
     ).read_text(encoding="utf-8")
 
-    extension_import = source.index(
-        "from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension"
+    extension_import_match = re.search(
+        r"from\s+verl\.workers\.rollout\.vllm_rollout\.utils\s+import\s+"
+        r"\(?\s*vLLMColocateWorkerExtension",
+        source,
     )
-    assert source.index("\npatch_transformers_attention_layer_type_constants()\n") < extension_import
+    assert extension_import_match is not None
+    extension_import = extension_import_match.start()
+    assert (
+        source.index("\npatch_transformers_attention_layer_type_constants()\n")
+        < extension_import
+    )
     assert source.index("\ninstall_verl_npu_vllm_import_compat()\n") < extension_import
 
 
@@ -563,7 +638,10 @@ def test_vllm_acceptance_stats_keep_stable_transport_keys() -> None:
 
 def test_trainer_keeps_public_acceptance_metric_name() -> None:
     trainer_source = (
-        Path(__file__).resolve().parents[2] / "verl_speco" / "trainer" / "speco_ray_trainer.py"
+        Path(__file__).resolve().parents[2]
+        / "verl_speco"
+        / "trainer"
+        / "speco_ray_trainer.py"
     ).read_text(encoding="utf-8")
 
     assert '"drafter/spec_decode/mean_acceptance_length"' in trainer_source
