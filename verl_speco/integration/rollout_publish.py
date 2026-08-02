@@ -13,6 +13,8 @@
 # limitations under the License.
 """Draft-weight publishing helpers for SPECO rollout adapters."""
 
+from __future__ import annotations
+
 import logging
 import os
 import time
@@ -61,6 +63,63 @@ def rollout_backend_name(config: Any) -> Optional[str]:
     return _get_nested(config, ("rollout", "name"), None) or _get_nested(
         config, ("actor_rollout_ref", "rollout", "name"), None
     )
+
+
+def actor_training_backend_name(config: Any) -> str:
+    value = _get_nested(config, ("actor", "strategy"), None)
+    if value is None:
+        value = _get_nested(config, ("actor_rollout_ref", "actor", "strategy"), None)
+    if value is None:
+        value = _get_nested(config, ("model_engine",), None)
+    return str(value or "fsdp").strip().lower()
+
+
+def veomni_parallel_layout(config: Any) -> dict[str, Any]:
+    actor_config = _get_nested(config, ("actor",), None)
+    if actor_config is None:
+        actor_config = _get_nested(config, ("actor_rollout_ref", "actor"), {})
+    veomni_config = _get_nested(actor_config, ("veomni",), {}) or {}
+    rollout_config = _get_nested(config, ("rollout",), None)
+    if rollout_config is None:
+        rollout_config = _get_nested(config, ("actor_rollout_ref", "rollout"), {})
+    return {
+        "ulysses_parallel_size": int(
+            _get_nested(veomni_config, ("ulysses_parallel_size",), 1) or 1
+        ),
+        "expert_parallel_size": int(
+            _get_nested(veomni_config, ("expert_parallel_size",), 1) or 1
+        ),
+        "router_replay_mode": str(
+            _get_nested(veomni_config, ("router_replay", "mode"), "disabled")
+            or "disabled"
+        ).upper(),
+        "rollout_routing_replay": bool(
+            _get_nested(
+                rollout_config, ("enable_rollout_routing_replay",), False
+            )
+        ),
+    }
+
+
+def validate_veomni_parallel_layout(config: Any) -> dict[str, Any]:
+    layout = veomni_parallel_layout(config)
+    router_mode = layout["router_replay_mode"]
+    rollout_replay = layout["rollout_routing_replay"]
+    if router_mode not in {"DISABLED", "R2", "R3"}:
+        raise ValueError(
+            "VeOmni router_replay.mode must be disabled, R2, or R3, got "
+            f"{router_mode!r}"
+        )
+    if router_mode == "R3" and not rollout_replay:
+        raise RuntimeError(
+            "VeOmni router_replay.mode=R3 requires "
+            "actor_rollout_ref.rollout.enable_rollout_routing_replay=True"
+        )
+    if router_mode == "R2" and rollout_replay:
+        raise RuntimeError(
+            "VeOmni router_replay.mode=R2 must not enable rollout routing replay"
+        )
+    return layout
 
 
 def materialize_draft_weights_payload(weights: Any) -> tuple[Any, bool]:
@@ -162,6 +221,9 @@ def install_rollout_runtime_for_worker(worker: Any) -> None:
 def install_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
     """Install old-logprob hidden collection hooks inside an actor worker process."""
 
+    if getattr(worker, "_is_actor", True) is False:
+        return
+
     try:
         from verl_speco.integration.oldlogprob_runtime import (
             install_oldlogprob_hidden_runtime_patch,
@@ -177,7 +239,79 @@ def install_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
         getattr(worker, "config", None), drafter_env=drafter_env
     ):
         return
-    install_oldlogprob_hidden_runtime_patch()
+    actor_backend = actor_training_backend_name(getattr(worker, "config", None))
+    if actor_backend != "veomni":
+        install_oldlogprob_hidden_runtime_patch()
+        return
+
+    patched = install_oldlogprob_hidden_runtime_patch(actor_backend="veomni")
+    if not patched:
+        raise RuntimeError(
+            "SPECO could not install VeOmni old-logprob hidden collection. "
+            "Verify the installed verl and VeOmni versions before enabling drafter co-training."
+        )
+    validate_veomni_parallel_layout(getattr(worker, "config", None))
+
+
+def validate_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
+    """Validate VeOmni's initialized model contract before the first rollout."""
+
+    if getattr(worker, "_is_actor", True) is False:
+        return
+
+    config = getattr(worker, "config", None)
+    if actor_training_backend_name(config) != "veomni":
+        return
+
+    try:
+        from verl_speco.integration.oldlogprob_runtime import (
+            _find_layers_and_final_norm,
+            oldlogprob_hidden_runtime_enabled,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "SPECO could not import the VeOmni hidden-state validator"
+        ) from exc
+
+    drafter_env = (
+        getattr(type(worker), "_speco_sglang_drafter_config_env", None) or None
+    )
+    if not oldlogprob_hidden_runtime_enabled(config, drafter_env=drafter_env):
+        return
+
+    actor = getattr(worker, "actor", None)
+    engine = getattr(actor, "engine", None) if actor is not None else None
+    module = getattr(engine, "module", None) if engine is not None else None
+    if engine is None or module is None:
+        raise RuntimeError(
+            "SPECO VeOmni validation requires an initialized actor engine"
+        )
+
+    layers, final_norm = _find_layers_and_final_norm(engine)
+    if not layers or final_norm is None:
+        raise RuntimeError(
+            "SPECO could not locate VeOmni transformer layers and final norm; "
+            "the installed VeOmni model layout is not supported"
+        )
+    lm_head_name, lm_head_weight = _select_lm_head_named_tensor(module)
+    if lm_head_weight is None:
+        raise RuntimeError(
+            "SPECO could not locate VeOmni lm_head.weight or tied "
+            "embed_tokens.weight"
+        )
+
+    layout = veomni_parallel_layout(config)
+    if getattr(worker, "rank", None) == 0:
+        logger.warning(
+            "[speco actor backend] strategy=veomni hidden_capture=forward_hook "
+            "lm_head_export=veomni_lm_head_only drafter_backend=fsdp2 "
+            "layers=%s lm_head=%s sp=%s ep=%s router_replay=%s",
+            len(layers),
+            lm_head_name,
+            layout["ulysses_parallel_size"],
+            layout["expert_parallel_size"],
+            layout["router_replay_mode"],
+        )
 
 
 def _normalize_lm_head_row_indices(row_indices: Any, *, device: Any = None):
@@ -357,6 +491,202 @@ def _export_actor_lm_head_rows_direct(worker: Any, row_indices: Any) -> Optional
     return None
 
 
+def _is_veomni_actor_worker(worker: Any) -> bool:
+    return actor_training_backend_name(getattr(worker, "config", None)) == "veomni"
+
+
+def _materialize_veomni_lm_head_rows(selected_weight: Any, row_indices: Any):
+    """Collect selected vocab rows without replicating the full DTensor."""
+
+    torch = _torch_module()
+    if not callable(getattr(selected_weight, "to_local", None)):
+        rows_on_device = row_indices.to(
+            device=selected_weight.device, dtype=torch.long
+        )
+        return selected_weight.detach().index_select(0, rows_on_device)
+
+    try:
+        import torch.distributed as dist
+        from torch.distributed.tensor._utils import (
+            compute_local_shape_and_global_offset,
+        )
+    except (ImportError, AttributeError) as exc:
+        raise NotImplementedError(
+            "the installed PyTorch DTensor build does not expose shard offsets"
+        ) from exc
+
+    placements = tuple(getattr(selected_weight, "placements", ()))
+    device_mesh = getattr(selected_weight, "device_mesh", None)
+    if device_mesh is None or not placements:
+        raise NotImplementedError("missing DTensor placements or device mesh")
+
+    sharded_mesh_dims = []
+    for mesh_dim, placement in enumerate(placements):
+        placement_name = type(placement).__name__
+        if placement_name == "Shard":
+            if int(getattr(placement, "dim", -1)) != 0:
+                raise NotImplementedError(
+                    "lm_head DTensor is sharded on a non-vocab dimension"
+                )
+            sharded_mesh_dims.append(mesh_dim)
+        elif placement_name != "Replicate":
+            raise NotImplementedError(
+                f"unsupported lm_head DTensor placement {placement_name}"
+            )
+
+    local_weight = selected_weight.to_local().detach()
+    _local_shape, global_offset = compute_local_shape_and_global_offset(
+        tuple(selected_weight.shape), device_mesh, placements
+    )
+    row_start = int(global_offset[0])
+    row_end = row_start + int(local_weight.shape[0])
+    global_rows = row_indices.to(device=local_weight.device, dtype=torch.long)
+    local_mask = (global_rows >= row_start) & (global_rows < row_end)
+    selected_rows = local_weight.new_zeros(
+        (int(global_rows.numel()), int(local_weight.shape[1]))
+    )
+    if bool(local_mask.any().item()):
+        output_positions = torch.nonzero(local_mask, as_tuple=False).flatten()
+        local_rows = global_rows.index_select(0, output_positions) - row_start
+        selected_rows.index_copy_(
+            0,
+            output_positions,
+            local_weight.index_select(0, local_rows),
+        )
+
+    for mesh_dim in sharded_mesh_dims:
+        if int(device_mesh.size(mesh_dim)) > 1:
+            dist.all_reduce(selected_rows, group=device_mesh.get_group(mesh_dim))
+    return selected_rows
+
+
+def _export_veomni_actor_lm_head_weight(
+    worker: Any, row_indices: Any = None
+) -> Optional[dict]:
+    """Export only VeOmni's lm_head DTensor instead of its full state dict."""
+
+    torch = _torch_module()
+    actor = getattr(worker, "actor", None)
+    engine = getattr(actor, "engine", None) if actor is not None else None
+    module = getattr(engine, "module", None) if engine is not None else None
+    if engine is None or module is None:
+        raise RuntimeError(
+            "SPECO VeOmni lm_head export requires an initialized actor engine"
+        )
+
+    offload_model = None
+    restore_cpu_after_export = bool(getattr(engine, "_is_offload_param", False))
+    if restore_cpu_after_export:
+        try:
+            from verl.workers.engine.veomni.utils import (
+                load_veomni_model_to_gpu,
+                offload_veomni_model_to_cpu,
+            )
+
+            offload_model = offload_veomni_model_to_cpu
+            load_veomni_model_to_gpu(module)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "SPECO failed to activate the VeOmni actor for lm_head-only export"
+            ) from exc
+
+    try:
+        selected_name, selected_weight = _select_lm_head_named_tensor(module)
+        if selected_weight is None:
+            raise RuntimeError(
+                "SPECO could not find VeOmni lm_head.weight or tied embed_tokens.weight"
+            )
+
+        if not torch.is_tensor(selected_weight) or selected_weight.dim() != 2:
+            raise RuntimeError("SPECO VeOmni lm_head-only export expected a 2D tensor")
+
+        source_vocab_size = int(selected_weight.shape[0])
+        normalized_rows = _normalize_lm_head_row_indices(row_indices)
+        exported_rows = None
+        selected_rows = None
+        export_strategy = "veomni_lm_head_full"
+        materialized_weight = None
+        if normalized_rows is not None and int(normalized_rows.numel()) > 0:
+            min_row = int(normalized_rows.min().item())
+            max_row = int(normalized_rows.max().item())
+            if min_row < 0 or max_row >= source_vocab_size:
+                raise ValueError(
+                    "SPECO VeOmni lm_head row selection is outside the source vocabulary: "
+                    f"min={min_row}, max={max_row}, vocab={source_vocab_size}"
+                )
+            if int(normalized_rows.numel()) < source_vocab_size:
+                try:
+                    materialized_weight = _materialize_veomni_lm_head_rows(
+                        selected_weight,
+                        normalized_rows,
+                    )
+                    if int(materialized_weight.shape[0]) != int(
+                        normalized_rows.numel()
+                    ):
+                        raise RuntimeError(
+                            "VeOmni sparse lm_head export returned an unexpected row count"
+                        )
+                    export_strategy = "veomni_lm_head_sparse"
+                except (NotImplementedError, RuntimeError, TypeError) as exc:
+                    logger.warning(
+                        "VeOmni DTensor row-selective lm_head export is unavailable; "
+                        "falling back to full lm_head materialization: %s",
+                        exc,
+                    )
+                exported_rows = normalized_rows.to(
+                    device="cpu", dtype=torch.long
+                ).contiguous()
+                selected_rows = int(normalized_rows.numel())
+
+        if materialized_weight is None:
+            full_tensor = getattr(selected_weight, "full_tensor", None)
+            materialized_weight = (
+                full_tensor() if callable(full_tensor) else selected_weight.detach()
+            )
+            if exported_rows is not None:
+                rows_on_device = normalized_rows.to(
+                    device=materialized_weight.device, dtype=torch.long
+                )
+                materialized_weight = materialized_weight.index_select(
+                    0, rows_on_device
+                )
+
+        if not torch.is_tensor(materialized_weight) or materialized_weight.dim() != 2:
+            raise RuntimeError(
+                "SPECO VeOmni lm_head-only export expected a materialized 2D tensor, "
+                f"got {type(materialized_weight).__name__}"
+            )
+
+        # DTensor.full_tensor() is collective, so every rank must execute it.
+        # Only rank 0 retains the host payload consumed by the trainer.
+        if getattr(worker, "rank", None) != 0:
+            return None
+
+        weight = materialized_weight.detach().to(
+            device="cpu", dtype=torch.bfloat16
+        ).contiguous()
+        logger.warning(
+            "[actor lm_head export] veomni_lm_head_only name=%s shape=%s "
+            "source_vocab=%s selected_rows=%s",
+            selected_name,
+            tuple(weight.shape),
+            source_vocab_size,
+            selected_rows,
+        )
+        return {
+            "name": selected_name,
+            "weight": weight,
+            "row_indices": exported_rows,
+            "source_vocab_size": source_vocab_size,
+            "selected_rows": selected_rows,
+            "export_strategy": export_strategy,
+            "actor_backend": "veomni",
+        }
+    finally:
+        if restore_cpu_after_export and offload_model is not None:
+            offload_model(module)
+
+
 def export_actor_lm_head_weight(worker: Any, row_indices: Any = None) -> Optional[dict]:
     """Export actor lm_head or tied embedding rows from an actor-rollout worker."""
 
@@ -367,6 +697,9 @@ def export_actor_lm_head_weight(worker: Any, row_indices: Any = None) -> Optiona
         or getattr(worker, "actor", None) is None
     ):
         return None
+
+    if _is_veomni_actor_worker(worker):
+        return _export_veomni_actor_lm_head_weight(worker, row_indices=row_indices)
 
     normalized_row_indices = _normalize_lm_head_row_indices(row_indices)
     is_dflash = drafter_speculative_algorithm(getattr(worker, "config", None)) in {
@@ -469,7 +802,9 @@ class DraftWeightPublishMixin:
     def init_model(self, *args, **kwargs):
         install_rollout_runtime_for_worker(self)
         install_oldlogprob_hidden_runtime_for_worker(self)
-        return super().init_model(*args, **kwargs)
+        result = super().init_model(*args, **kwargs)
+        validate_oldlogprob_hidden_runtime_for_worker(self)
+        return result
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
     def get_actor_lm_head_weight(self, row_indices: Any = None):

@@ -50,6 +50,13 @@ def test_materialize_direct_and_object_ref_payloads(monkeypatch) -> None:
 
 def test_rollout_backend_and_drafter_gates_support_both_config_shapes() -> None:
     assert rollout_publish.rollout_backend_name({"rollout": {"name": "vllm"}}) == "vllm"
+    assert rollout_publish.actor_training_backend_name({}) == "fsdp"
+    assert (
+        rollout_publish.actor_training_backend_name(
+            {"actor_rollout_ref": {"actor": {"strategy": "fsdp2"}}}
+        )
+        == "fsdp2"
+    )
     assert (
         rollout_publish.rollout_backend_name(
             {"actor_rollout_ref": {"rollout": {"name": "sglang"}}}
@@ -62,6 +69,172 @@ def test_rollout_backend_and_drafter_gates_support_both_config_shapes() -> None:
     assert not rollout_publish.drafter_rollout_enabled(
         {"actor_rollout_ref": {"rollout": {"drafter": {"enable": False}}}}
     )
+
+
+def test_veomni_backend_and_parallel_layout_support_worker_config_shape() -> None:
+    config = {
+        "actor": {
+            "strategy": "veomni",
+            "veomni": {
+                "ulysses_parallel_size": 2,
+                "expert_parallel_size": 4,
+                "router_replay": {"mode": "R3"},
+            },
+        },
+        "rollout": {"enable_rollout_routing_replay": True},
+    }
+
+    assert rollout_publish.actor_training_backend_name(config) == "veomni"
+    assert rollout_publish.veomni_parallel_layout(config) == {
+        "ulysses_parallel_size": 2,
+        "expert_parallel_size": 4,
+        "router_replay_mode": "R3",
+        "rollout_routing_replay": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("router_mode", "rollout_replay", "error_match"),
+    [
+        ("invalid", False, "disabled, R2, or R3"),
+        ("R2", True, "R2 must not enable"),
+        ("R3", False, "R3 requires"),
+    ],
+)
+def test_veomni_router_replay_contract_fails_closed(
+    router_mode: str, rollout_replay: bool, error_match: str
+) -> None:
+    config = {
+        "actor": {
+            "strategy": "veomni",
+            "veomni": {"router_replay": {"mode": router_mode}},
+        },
+        "rollout": {"enable_rollout_routing_replay": rollout_replay},
+    }
+
+    with pytest.raises((ValueError, RuntimeError), match=error_match):
+        rollout_publish.validate_veomni_parallel_layout(config)
+
+
+def test_veomni_r3_contract_accepts_rollout_routing_replay() -> None:
+    config = {
+        "actor": {
+            "strategy": "veomni",
+            "veomni": {"router_replay": {"mode": "R3"}},
+        },
+        "rollout": {"enable_rollout_routing_replay": True},
+    }
+
+    layout = rollout_publish.validate_veomni_parallel_layout(config)
+
+    assert layout["router_replay_mode"] == "R3"
+
+
+def test_veomni_oldlogprob_runtime_skips_ref_only_worker(monkeypatch) -> None:
+    from verl_speco.integration import oldlogprob_runtime
+
+    install_called = False
+
+    def fake_install(*, actor_backend=None):
+        nonlocal install_called
+        install_called = True
+        return True
+
+    monkeypatch.setattr(
+        oldlogprob_runtime,
+        "install_oldlogprob_hidden_runtime_patch",
+        fake_install,
+    )
+    worker = SimpleNamespace(
+        _is_actor=False,
+        config={"actor": {"strategy": "veomni"}},
+    )
+
+    rollout_publish.install_oldlogprob_hidden_runtime_for_worker(worker)
+    rollout_publish.validate_oldlogprob_hidden_runtime_for_worker(worker)
+
+    assert install_called is False
+
+
+@pytest.mark.parametrize(
+    ("row_indices", "expected_strategy", "expected_rows"),
+    [
+        (None, "veomni_lm_head_full", 6),
+        ([1, 4], "veomni_lm_head_sparse", 2),
+    ],
+)
+def test_veomni_lm_head_export_avoids_full_engine_state_dict(
+    row_indices, expected_strategy: str, expected_rows: int
+) -> None:
+    torch = pytest.importorskip("torch")
+
+    class _Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = torch.nn.Linear(3, 6, bias=False)
+
+    class _Engine:
+        module = _Module()
+
+        @staticmethod
+        def get_per_tensor_param(**kwargs):
+            raise AssertionError("VeOmni export must not enumerate the full state dict")
+
+    worker = SimpleNamespace(
+        _is_actor=True,
+        rank=0,
+        config={"actor": {"strategy": "veomni"}},
+        actor=SimpleNamespace(engine=_Engine()),
+    )
+
+    payload = rollout_publish.export_actor_lm_head_weight(
+        worker, row_indices=row_indices
+    )
+
+    assert payload["export_strategy"] == expected_strategy
+    assert payload["actor_backend"] == "veomni"
+    assert tuple(payload["weight"].shape) == (expected_rows, 3)
+
+
+def test_veomni_runtime_validation_checks_initialized_model_contract() -> None:
+    torch = pytest.importorskip("torch")
+
+    class _TextModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([torch.nn.Linear(3, 3)])
+            self.norm = torch.nn.LayerNorm(3)
+
+    class _Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _TextModel()
+            self.lm_head = torch.nn.Linear(3, 6, bias=False)
+
+    config = {
+        "actor": {
+            "strategy": "veomni",
+            "veomni": {
+                "ulysses_parallel_size": 2,
+                "expert_parallel_size": 1,
+                "router_replay": {"mode": "R2"},
+            },
+        },
+        "rollout": {
+            "drafter": {
+                "enable": True,
+                "enable_drafter_training": True,
+                "training": {"collect_hidden_states_from_old_logprob": True},
+            }
+        },
+    }
+    worker = SimpleNamespace(
+        rank=0,
+        config=config,
+        actor=SimpleNamespace(engine=SimpleNamespace(module=_Module())),
+    )
+
+    rollout_publish.validate_oldlogprob_hidden_runtime_for_worker(worker)
 
 
 def test_publish_state_filter_keeps_eagle3_trainable_lm_head() -> None:

@@ -131,6 +131,35 @@ def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     assert trainer._speco_should_attempt_drafter_train_this_step() is True
 
 
+@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "veomni"])
+def test_oldlogprob_collection_accepts_supported_actor_backends(strategy: str) -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_hidden_states_from_sgl": False,
+            "use_logits": False,
+            "old_logprob_hidden_capture_impl": "forward_hook",
+        }
+    )
+    trainer.config.actor_rollout_ref.actor.strategy = strategy
+
+    assert trainer._speco_oldlogprob_collection_enabled() is True
+
+
+def test_oldlogprob_collection_rejects_unknown_actor_backend() -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_hidden_states_from_sgl": False,
+            "use_logits": False,
+        }
+    )
+    trainer.config.actor_rollout_ref.actor.strategy = "unknown"
+
+    with pytest.raises(ValueError, match="fsdp/fsdp2/veomni"):
+        trainer._speco_oldlogprob_collection_enabled()
+
+
 def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None:
     assert (
         _no_drafter_trainer(

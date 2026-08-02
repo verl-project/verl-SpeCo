@@ -14,10 +14,15 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from verl_speco.integration import oldlogprob_runtime
 from verl_speco.integration.oldlogprob_runtime import (
+    OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
+    _find_layers_and_final_norm,
+    _install_oldlogprob_fsdp_batch_postprocess_patch,
     _select_and_merge_concatenated_hidden,
     oldlogprob_hidden_runtime_enabled,
 )
@@ -25,6 +30,35 @@ from verl_speco.integration.oldlogprob_layer_ids import (
     eagle3_num_aux_hidden_states_from_config,
     resolve_oldlogprob_aux_layer_ids,
 )
+
+
+def test_fsdp2_runtime_install_does_not_import_veomni(monkeypatch) -> None:
+    imported_modules = []
+    fsdp_module = SimpleNamespace(__name__="verl.workers.engine.fsdp.transformer_impl")
+
+    def fake_import_module(name: str):
+        imported_modules.append(name)
+        if name == "verl.workers.engine.fsdp.transformer_impl":
+            return fsdp_module
+        raise AssertionError(f"unexpected backend import: {name}")
+
+    monkeypatch.setattr(oldlogprob_runtime, "_PATCHED", True)
+    monkeypatch.setattr(oldlogprob_runtime.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(
+        oldlogprob_runtime,
+        "_install_oldlogprob_fsdp_batch_postprocess_patch",
+        lambda module: module is fsdp_module,
+    )
+    monkeypatch.setattr(
+        oldlogprob_runtime,
+        "_install_oldlogprob_training_worker_postprocess_patch",
+        lambda: True,
+    )
+
+    assert oldlogprob_runtime.install_oldlogprob_hidden_runtime_patch(
+        actor_backend="fsdp2"
+    )
+    assert imported_modules == ["verl.workers.engine.fsdp.transformer_impl"]
 
 
 def _drafter(enabled: bool) -> dict:
@@ -201,3 +235,74 @@ def test_forward_hook_rejects_malformed_selected_hidden() -> None:
             [torch.randn(4, 128, 8)],
             already_selected=True,
         )
+
+
+@pytest.mark.parametrize("root_attr", ["model", "thinker"])
+def test_hidden_layer_discovery_supports_veomni_multimodal_wrappers(
+    root_attr: str,
+) -> None:
+    torch = pytest.importorskip("torch")
+    nn = torch.nn
+
+    text_model = SimpleNamespace(
+        layers=nn.ModuleList([nn.Linear(4, 4), nn.Linear(4, 4)]),
+        norm=nn.LayerNorm(4),
+    )
+    if root_attr == "model":
+        module = SimpleNamespace(model=SimpleNamespace(language_model=text_model))
+    else:
+        module = SimpleNamespace(thinker=SimpleNamespace(model=text_model))
+
+    layers, final_norm = _find_layers_and_final_norm(SimpleNamespace(module=module))
+
+    assert len(layers) == 2
+    assert layers[0] is text_model.layers[0]
+    assert final_norm is text_model.norm
+
+
+def test_batch_postprocess_patch_is_installed_per_engine_module() -> None:
+    module_a = SimpleNamespace(
+        __name__="fake.fsdp.transformer_impl",
+        postprocess_batch_func=lambda output_lst, indices, data: {"engine": "fsdp"},
+    )
+    module_b = SimpleNamespace(
+        __name__="fake.veomni.transformer_impl",
+        postprocess_batch_func=lambda output_lst, indices, data: {"engine": "veomni"},
+    )
+
+    assert _install_oldlogprob_fsdp_batch_postprocess_patch(module_a)
+    assert _install_oldlogprob_fsdp_batch_postprocess_patch(module_b)
+    assert module_a.postprocess_batch_func([], None, None) == {"engine": "fsdp"}
+    assert module_b.postprocess_batch_func([], None, None) == {"engine": "veomni"}
+
+
+def test_veomni_batch_postprocess_keeps_router_replay_output() -> None:
+    def native_postprocess(output_lst, indices, data):
+        model_output = output_lst[0]["model_output"]
+        assert model_output["routed_experts"] == "routes"
+        assert OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY not in model_output
+        return {"model_output": {"routed_experts": "routes"}}
+
+    module = SimpleNamespace(
+        __name__="fake.veomni.router_replay.transformer_impl",
+        postprocess_batch_func=native_postprocess,
+    )
+    assert _install_oldlogprob_fsdp_batch_postprocess_patch(module)
+
+    result = module.postprocess_batch_func(
+        [
+            {
+                "model_output": {
+                    "routed_experts": "routes",
+                    OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY: ["hidden-ref"],
+                }
+            }
+        ],
+        None,
+        None,
+    )
+
+    assert result["model_output"]["routed_experts"] == "routes"
+    assert result["model_output"][OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY] == [
+        "hidden-ref"
+    ]

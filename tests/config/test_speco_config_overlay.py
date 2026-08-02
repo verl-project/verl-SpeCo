@@ -122,3 +122,27 @@ def test_draft_trainer_composes_as_primary_config(tmp_path: Path) -> None:
     assert config.speco.draft_training.enable is True
     assert "trainer" in config
     assert "algorithm" in config
+
+
+def test_veomni_trainer_composes_with_release_upstream_verl(tmp_path: Path) -> None:
+    upstream_root = os.getenv("VERL_SPECO_UPSTREAM_ROOT")
+    if not upstream_root:
+        pytest.skip(
+            "set VERL_SPECO_UPSTREAM_ROOT to check compose against release/v0.8.0 verl"
+        )
+    upstream_config = _upstream_repo_root(upstream_root) / "verl" / "trainer" / "config"
+    assert upstream_config.is_dir()
+
+    composed_config_dir = tmp_path / "config"
+    _copy_overlay_configs(
+        upstream_config,
+        composed_config_dir,
+        ("speco_base.yaml", "speco_veomni_trainer.yaml"),
+    )
+
+    with initialize_config_dir(config_dir=str(composed_config_dir), version_base=None):
+        config = compose(config_name="speco_veomni_trainer")
+
+    assert config.model_engine == "veomni"
+    assert config.actor_rollout_ref.actor.strategy == "veomni"
+    assert "fsdp_config" in config.actor_rollout_ref.rollout.drafter.training

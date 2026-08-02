@@ -887,9 +887,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             _get_nested(self.config, ("actor_rollout_ref", "actor", "strategy"), "")
             or ""
         ).lower()
-        if strategy not in {"fsdp", "fsdp2"}:
+        if strategy not in {"fsdp", "fsdp2", "veomni"}:
             raise ValueError(
-                "SPECO old-logprob hidden collection currently supports actor.strategy=fsdp/fsdp2 only, "
+                "SPECO old-logprob hidden collection supports "
+                "actor.strategy=fsdp/fsdp2/veomni, "
                 f"got {strategy!r}"
             )
         capture_impl = str(
@@ -1744,7 +1745,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "drafter/target_lm_head_selected_rows": selected_rows,
             "drafter/target_lm_head_source_vocab_size": source_vocab_size,
             "drafter/target_lm_head_direct_sparse_export": int(
-                export_strategy == "direct_sparse"
+                export_strategy
+                in {"direct_sparse", "veomni_lm_head_sparse"}
             ),
             "timing_s/drafter_sync_target_lm_head": time.perf_counter() - sync_started,
             "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
