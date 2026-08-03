@@ -377,25 +377,26 @@ def test_dspark_ce_only_oldlogprob_layout_keeps_aux_only_hidden() -> None:
 
 
 @pytest.mark.parametrize(
-    ("algorithm", "actor_device_type", "export_strategy", "expected_deferred"),
+    ("algorithm", "actor_backend", "actor_device_type", "export_strategy"),
     [
-        ("DSPARK", "npu", "veomni_lm_head_full", 1),
-        ("DSPARK", "cuda", "veomni_lm_head_full", 0),
-        ("DFLASH", "npu", "veomni_lm_head_full", 0),
-        ("DSPARK", "npu", "veomni_lm_head_sparse", 0),
+        ("DSPARK", "veomni", "npu", "veomni_lm_head_full"),
+        ("DFLASH", "veomni", "npu", "veomni_lm_head_sparse"),
+        ("EAGLE3", "veomni", "cuda", "veomni_lm_head_full"),
+        ("EAGLE1", "fsdp", "npu", "engine_full_param"),
+        ("DOMINO", "fsdp2", "cuda", "engine_full_param"),
     ],
 )
-def test_veomni_target_head_sync_defers_only_npu_device_apply(
+def test_target_head_sync_defers_for_all_lm_head_drafters(
     algorithm: str,
+    actor_backend: str,
     actor_device_type: str,
     export_strategy: str,
-    expected_deferred: int,
 ) -> None:
     trainer = _trainer({"training_interval_steps": 1}, step=1)
     trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = algorithm
     payload = {
         "weight": "cpu-weight",
-        "actor_backend": "veomni",
+        "actor_backend": actor_backend,
         "actor_device_type": actor_device_type,
         "export_strategy": export_strategy,
     }
@@ -411,14 +412,12 @@ def test_veomni_target_head_sync_defers_only_npu_device_apply(
 
     metrics = trainer._speco_sync_target_lm_head_weight()
 
-    assert metrics["drafter/target_lm_head_apply_deferred"] == expected_deferred
-    assert received[0][0].get("defer_device_apply", False) == bool(
-        expected_deferred
-    )
+    assert metrics["drafter/target_lm_head_apply_deferred"] == 1
+    assert received[0][0].get("defer_device_apply", False) is True
     assert received[0][1] == 1
 
 
-def test_veomni_npu_target_head_transfer_waits_after_actor_update() -> None:
+def test_target_head_transfer_waits_after_actor_update() -> None:
     trainer = _trainer({"training_interval_steps": 1}, step=1)
     trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DSPARK"
     payload = {
@@ -449,6 +448,20 @@ def test_veomni_npu_target_head_transfer_waits_after_actor_update() -> None:
 
     assert resolved == [[payload], pending_refs]
     assert metrics["drafter/target_lm_head_synced"] == 1
+
+
+def test_target_head_sync_is_skipped_when_training_uses_logits() -> None:
+    trainer = _trainer({"training_interval_steps": 1, "use_logits": True}, step=1)
+
+    def unexpected_actor_method(name):
+        raise AssertionError(f"unexpected actor method lookup: {name}")
+
+    trainer._speco_actor_rollout_method = unexpected_actor_method
+
+    metrics, pending = trainer._speco_start_target_lm_head_weight_sync()
+
+    assert metrics["drafter/target_lm_head_synced"] == 0
+    assert pending is None
 
 
 def test_target_head_worker_dispatch_is_nonblocking() -> None:

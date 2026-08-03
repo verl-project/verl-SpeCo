@@ -1735,21 +1735,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if isinstance(payload, dict)
             else "unknown"
         )
-        drafter_algorithm = str(
-            _get_nested(
-                self._speco_drafter_config(),
-                ("speculative_algorithm",),
-                "",
-            )
-            or ""
-        ).upper()
-        defer_device_apply = bool(
-            isinstance(payload, dict)
-            and payload.get("actor_backend") == "veomni"
-            and payload.get("actor_device_type") == "npu"
-            and export_strategy == "veomni_lm_head_full"
-            and drafter_algorithm == "DSPARK"
-        )
+        # Reconstructing supervision from last hidden states requires a fresh
+        # target head for every drafter backend. Stage the payload on CPU while
+        # the actor updates, then apply it when the drafter activates.
+        defer_device_apply = isinstance(payload, dict)
         if defer_device_apply:
             payload = dict(payload)
             payload["defer_device_apply"] = True

@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+from inspect import getsource
 from types import SimpleNamespace
 
 import pytest
@@ -353,6 +354,21 @@ def test_target_lm_head_device_helper_preserves_eagle_backend() -> None:
 
     assert trainer._move_target_lm_head("npu:0") is True
     assert head.devices == ["npu:0"]
+
+
+def test_target_lm_head_is_offloaded_after_training_and_warmup() -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="target lm_head cleanup contract needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    assert '_move_target_lm_head("cpu")' in getsource(
+        DrafterBaseTrainer.cleanup_training
+    )
+    assert '_move_target_lm_head("cpu")' in getsource(
+        DrafterBaseTrainer.release_training_memory_after_activation
+    )
 
 
 def test_target_lm_head_sync_can_defer_device_apply() -> None:

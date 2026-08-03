@@ -577,7 +577,7 @@ def _export_veomni_actor_lm_head_weight(
     offload_model = None
     actor_device_type = None
     materialized_weight = None
-    dspark_npu_export = False
+    npu_lm_head_export = False
     reclaim_npu_staging = False
     restore_cpu_after_export = bool(getattr(engine, "_is_offload_param", False))
     if restore_cpu_after_export:
@@ -606,11 +606,7 @@ def _export_veomni_actor_lm_head_weight(
 
         source_vocab_size = int(selected_weight.shape[0])
         actor_device_type = str(selected_weight.device.type)
-        dspark_npu_export = bool(
-            actor_device_type == "npu"
-            and drafter_speculative_algorithm(getattr(worker, "config", None))
-            == "DSPARK"
-        )
+        npu_lm_head_export = actor_device_type == "npu"
         normalized_rows = _normalize_lm_head_row_indices(row_indices)
         exported_rows = None
         selected_rows = None
@@ -666,7 +662,7 @@ def _export_veomni_actor_lm_head_weight(
                 f"got {type(materialized_weight).__name__}"
             )
         reclaim_npu_staging = bool(
-            dspark_npu_export and export_strategy == "veomni_lm_head_full"
+            npu_lm_head_export and export_strategy == "veomni_lm_head_full"
         )
 
         # DTensor.full_tensor() is collective, so every rank must execute it.
