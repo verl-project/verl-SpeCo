@@ -1725,6 +1725,29 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
             }
 
+        export_strategy = (
+            str(payload.get("export_strategy", "unknown"))
+            if isinstance(payload, dict)
+            else "unknown"
+        )
+        drafter_algorithm = str(
+            _get_nested(
+                self._speco_drafter_config(),
+                ("speculative_algorithm",),
+                "",
+            )
+            or ""
+        ).upper()
+        defer_device_apply = bool(
+            isinstance(payload, dict)
+            and payload.get("actor_backend") == "veomni"
+            and payload.get("actor_device_type") == "npu"
+            and export_strategy == "veomni_lm_head_full"
+            and drafter_algorithm == "DSPARK"
+        )
+        if defer_device_apply:
+            payload = dict(payload)
+            payload["defer_device_apply"] = True
         payload_arg, global_step_arg, _ = (
             self._speco_build_drafter_target_lm_head_sync_args(payload)
         )
@@ -1735,13 +1758,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
         )
         apply_elapsed = time.perf_counter() - apply_started
-        export_strategy = (
-            str(payload.get("export_strategy", "unknown"))
-            if isinstance(payload, dict)
-            else "unknown"
-        )
         return {
             "drafter/target_lm_head_synced": 1,
+            "drafter/target_lm_head_apply_deferred": int(defer_device_apply),
             "drafter/target_lm_head_selected_rows": selected_rows,
             "drafter/target_lm_head_source_vocab_size": source_vocab_size,
             "drafter/target_lm_head_direct_sparse_export": int(

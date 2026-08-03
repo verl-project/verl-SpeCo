@@ -33,6 +33,7 @@ rollout_ep_size=${ROLLOUT_EP_SIZE:-1}
 router_replay_mode=${VEOMNI_ROUTER_REPLAY_MODE:-disabled}
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
+weight_sync_bucket_mb=${SPECO_WEIGHT_SYNC_BUCKET_MB:-2560}
 
 case "${router_replay_mode,,}" in
     disabled)
@@ -98,6 +99,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_veomni_trainer
     actor_rollout_ref.actor.veomni.rotary_pos_emb_implementation=npu \
     actor_rollout_ref.actor.veomni.swiglu_mlp_implementation=eager \
     actor_rollout_ref.actor.veomni.router_replay.mode=${router_replay_mode} \
+    actor_rollout_ref.actor.veomni.forward_prefetch=False \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
@@ -106,6 +108,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_veomni_trainer
     actor_rollout_ref.rollout.expert_parallel_size=${rollout_ep_size} \
     actor_rollout_ref.rollout.enable_rollout_routing_replay=${enable_rollout_routing_replay} \
     actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=${weight_sync_bucket_mb} \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_capture_sizes="[1, 2, 4, 8, 16, 32, 64, 128, 256, 512]" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.max_cudagraph_capture_size=512 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=FULL_DECODE_ONLY \
@@ -124,6 +127,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_veomni_trainer
     actor_rollout_ref.ref.veomni.rms_norm_implementation=npu \
     actor_rollout_ref.ref.veomni.rotary_pos_emb_implementation=npu \
     actor_rollout_ref.ref.veomni.swiglu_mlp_implementation=eager \
+    actor_rollout_ref.ref.veomni.forward_prefetch=False \
     actor_rollout_ref.rollout.drafter.enable=True \
     actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
     actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH} \

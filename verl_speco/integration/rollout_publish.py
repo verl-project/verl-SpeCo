@@ -575,6 +575,10 @@ def _export_veomni_actor_lm_head_weight(
         )
 
     offload_model = None
+    actor_device_type = None
+    materialized_weight = None
+    dspark_npu_export = False
+    reclaim_npu_staging = False
     restore_cpu_after_export = bool(getattr(engine, "_is_offload_param", False))
     if restore_cpu_after_export:
         try:
@@ -601,11 +605,16 @@ def _export_veomni_actor_lm_head_weight(
             raise RuntimeError("SPECO VeOmni lm_head-only export expected a 2D tensor")
 
         source_vocab_size = int(selected_weight.shape[0])
+        actor_device_type = str(selected_weight.device.type)
+        dspark_npu_export = bool(
+            actor_device_type == "npu"
+            and drafter_speculative_algorithm(getattr(worker, "config", None))
+            == "DSPARK"
+        )
         normalized_rows = _normalize_lm_head_row_indices(row_indices)
         exported_rows = None
         selected_rows = None
         export_strategy = "veomni_lm_head_full"
-        materialized_weight = None
         if normalized_rows is not None and int(normalized_rows.numel()) > 0:
             min_row = int(normalized_rows.min().item())
             max_row = int(normalized_rows.max().item())
@@ -656,6 +665,9 @@ def _export_veomni_actor_lm_head_weight(
                 "SPECO VeOmni lm_head-only export expected a materialized 2D tensor, "
                 f"got {type(materialized_weight).__name__}"
             )
+        reclaim_npu_staging = bool(
+            dspark_npu_export and export_strategy == "veomni_lm_head_full"
+        )
 
         # DTensor.full_tensor() is collective, so every rank must execute it.
         # Only rank 0 retains the host payload consumed by the trainer.
@@ -667,11 +679,13 @@ def _export_veomni_actor_lm_head_weight(
         ).contiguous()
         logger.warning(
             "[actor lm_head export] veomni_lm_head_only name=%s shape=%s "
-            "source_vocab=%s selected_rows=%s",
+            "source_vocab=%s selected_rows=%s device=%s reclaim_staging=%s",
             selected_name,
             tuple(weight.shape),
             source_vocab_size,
             selected_rows,
+            actor_device_type,
+            int(reclaim_npu_staging),
         )
         return {
             "name": selected_name,
@@ -681,10 +695,23 @@ def _export_veomni_actor_lm_head_weight(
             "selected_rows": selected_rows,
             "export_strategy": export_strategy,
             "actor_backend": "veomni",
+            "actor_device_type": actor_device_type,
         }
     finally:
+        device_module = None
+        if reclaim_npu_staging and materialized_weight is not None:
+            device_module = getattr(torch, "npu", None)
+            if device_module is not None:
+                synchronize = getattr(device_module, "synchronize", None)
+                if callable(synchronize):
+                    synchronize()
+        materialized_weight = None
         if restore_cpu_after_export and offload_model is not None:
             offload_model(module)
+        if device_module is not None:
+            empty_cache = getattr(device_module, "empty_cache", None)
+            if callable(empty_cache):
+                empty_cache()
 
 
 def export_actor_lm_head_weight(worker: Any, row_indices: Any = None) -> Optional[dict]:

@@ -355,6 +355,44 @@ def test_target_lm_head_device_helper_preserves_eagle_backend() -> None:
     assert head.devices == ["npu:0"]
 
 
+def test_target_lm_head_sync_can_defer_device_apply() -> None:
+    torch = pytest.importorskip("torch")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="target lm_head sync needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    head = torch.nn.Linear(3, 4, bias=False)
+    head.weight.data.zero_()
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(
+        model_type="dspark",
+        target_model=None,
+        target_lm_head=SimpleNamespace(fc=head),
+    )
+    trainer._pending_target_lm_head_weight = None
+    trainer._pending_target_lm_head_row_indices = None
+    trainer._pending_target_lm_head_source_vocab_size = None
+    trainer._target_lm_head_weight_step = None
+    source_weight = torch.ones_like(head.weight)
+
+    result = trainer.sync_target_lm_head_weight(
+        source_weight,
+        global_step=3,
+        defer_device_apply=True,
+    )
+
+    assert result["accepted"] is True
+    assert result["applied"] is False
+    assert result["pending"] is True
+    assert result["deferred"] is True
+    assert torch.count_nonzero(head.weight) == 0
+
+    assert trainer._apply_pending_target_lm_head_weight() is True
+    assert torch.equal(head.weight, source_weight)
+
+
 def test_dspark_pretrained_export_strips_only_training_wrapper_prefix() -> None:
     torch = pytest.importorskip("torch")
     base_trainer = pytest.importorskip(

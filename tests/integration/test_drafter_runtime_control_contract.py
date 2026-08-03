@@ -376,6 +376,48 @@ def test_dspark_ce_only_oldlogprob_layout_keeps_aux_only_hidden() -> None:
     assert trainer._speco_oldlogprob_hidden_layout() == "dflash_aux"
 
 
+@pytest.mark.parametrize(
+    ("algorithm", "actor_device_type", "export_strategy", "expected_deferred"),
+    [
+        ("DSPARK", "npu", "veomni_lm_head_full", 1),
+        ("DSPARK", "cuda", "veomni_lm_head_full", 0),
+        ("DFLASH", "npu", "veomni_lm_head_full", 0),
+        ("DSPARK", "npu", "veomni_lm_head_sparse", 0),
+    ],
+)
+def test_veomni_target_head_sync_defers_only_npu_device_apply(
+    algorithm: str,
+    actor_device_type: str,
+    export_strategy: str,
+    expected_deferred: int,
+) -> None:
+    trainer = _trainer({"training_interval_steps": 1}, step=1)
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = algorithm
+    payload = {
+        "weight": "cpu-weight",
+        "actor_backend": "veomni",
+        "actor_device_type": actor_device_type,
+        "export_strategy": export_strategy,
+    }
+    received = []
+    trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
+    trainer._speco_actor_rollout_method = lambda name: lambda rows: [payload]
+    trainer._speco_build_drafter_target_lm_head_sync_args = (
+        lambda value: (value, trainer.global_steps, 1)
+    )
+    trainer.speco_sync_target_lm_head_weight = (
+        lambda value, global_step=None: received.append((value, global_step))
+    )
+
+    metrics = trainer._speco_sync_target_lm_head_weight()
+
+    assert metrics["drafter/target_lm_head_apply_deferred"] == expected_deferred
+    assert received[0][0].get("defer_device_apply", False) == bool(
+        expected_deferred
+    )
+    assert received[0][1] == 1
+
+
 def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:
     calls: list[tuple[str, object, int]] = []
     waited: list[object] = []

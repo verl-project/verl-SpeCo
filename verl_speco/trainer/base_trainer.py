@@ -554,6 +554,7 @@ class DrafterBaseTrainer:
         self._pending_target_lm_head_weight: Any = None
         self._pending_target_lm_head_row_indices: Any = None
         self._pending_target_lm_head_source_vocab_size: int | None = None
+        self._pending_target_lm_head_chunked_apply = False
         self._target_lm_head_weight_step: int | None = None
         self._cached_target_lm_head_row_indices: dict[str, Any] | None = None
         self._training_timing_accumulator: dict[str, float] = {}
@@ -1751,6 +1752,11 @@ class DrafterBaseTrainer:
                 )
                 return True
 
+            # A VeOmni NPU sync is staged on CPU before actor update. Apply it
+            # before loading drafter model/optimizer state to minimize peak NPU
+            # memory during activation.
+            self._apply_pending_target_lm_head_weight()
+
             if self.model is None:
                 logger.debug(
                     "Draft Model not initialized, calling build_draft_model during activation..."
@@ -1803,6 +1809,7 @@ class DrafterBaseTrainer:
         global_step: Optional[int] = None,
         row_indices: Optional[torch.Tensor] = None,
         source_vocab_size: Optional[int] = None,
+        defer_device_apply: bool = False,
     ) -> dict[str, Any]:
         """Update the frozen target lm_head used by last-hidden drafter training."""
         if weight is None or not torch.is_tensor(weight):
@@ -1825,6 +1832,7 @@ class DrafterBaseTrainer:
         self._pending_target_lm_head_source_vocab_size = (
             int(source_vocab_size) if source_vocab_size is not None else None
         )
+        self._pending_target_lm_head_chunked_apply = bool(defer_device_apply)
         self._target_lm_head_weight_step = global_step
         selected_rows = (
             int(self._pending_target_lm_head_row_indices.numel())
@@ -1832,11 +1840,16 @@ class DrafterBaseTrainer:
             else None
         )
         pending_source_vocab_size = self._pending_target_lm_head_source_vocab_size
-        applied = self._apply_pending_target_lm_head_weight()
+        applied = (
+            False
+            if defer_device_apply
+            else self._apply_pending_target_lm_head_weight()
+        )
         return {
             "accepted": True,
             "applied": applied,
             "pending": not applied,
+            "deferred": bool(defer_device_apply),
             "global_step": global_step,
             "shape": weight_shape,
             "selected_rows": selected_rows,
@@ -2169,6 +2182,7 @@ class DrafterBaseTrainer:
                 self._pending_target_lm_head_weight = None
                 self._pending_target_lm_head_row_indices = None
                 self._pending_target_lm_head_source_vocab_size = None
+                self._pending_target_lm_head_chunked_apply = False
                 return True
             if (
                 int(source_row_indices.max().item()) >= int(target_weight.shape[0])
@@ -2200,6 +2214,7 @@ class DrafterBaseTrainer:
             self._pending_target_lm_head_weight = None
             self._pending_target_lm_head_row_indices = None
             self._pending_target_lm_head_source_vocab_size = None
+            self._pending_target_lm_head_chunked_apply = False
             return True
 
         if tuple(source_weight.shape) != tuple(target_weight.shape):
@@ -2211,13 +2226,41 @@ class DrafterBaseTrainer:
                     f"source={tuple(source_weight.shape)}, target={tuple(target_weight.shape)}"
                 )
 
-        target_weight.copy_(
-            source_weight.to(
-                device=target_weight.device,
-                dtype=target_weight.dtype,
-                non_blocking=True,
-            )
+        chunked_apply = bool(
+            getattr(self, "_pending_target_lm_head_chunked_apply", False)
+            and target_weight.device.type == "npu"
+            and source_weight.dim() == 2
         )
+        if chunked_apply:
+            chunk_bytes = 256 * 1024 * 1024
+            row_bytes = max(
+                int(target_weight.shape[1]) * int(target_weight.element_size()),
+                1,
+            )
+            chunk_rows = max(1, chunk_bytes // row_bytes)
+            copy_started = time.perf_counter()
+            for row_start in range(0, int(source_weight.shape[0]), chunk_rows):
+                row_end = min(row_start + chunk_rows, int(source_weight.shape[0]))
+                target_weight[row_start:row_end].copy_(
+                    source_weight[row_start:row_end],
+                    non_blocking=False,
+                )
+            if getattr(self, "rank", -1) == 0:
+                logger.info(
+                    "[drafter target lm_head sync] deferred_npu_apply shape=%s "
+                    "dtype=%s chunk_mib=256 elapsed=%.2fs",
+                    tuple(target_weight.shape),
+                    target_weight.dtype,
+                    time.perf_counter() - copy_started,
+                )
+        else:
+            target_weight.copy_(
+                source_weight.to(
+                    device=target_weight.device,
+                    dtype=target_weight.dtype,
+                    non_blocking=True,
+                )
+            )
         lm_head.requires_grad_(False)
         if logger.isEnabledFor(logging.DEBUG):
             block = (
@@ -2278,6 +2321,7 @@ class DrafterBaseTrainer:
         self._pending_target_lm_head_weight = None
         self._pending_target_lm_head_row_indices = None
         self._pending_target_lm_head_source_vocab_size = None
+        self._pending_target_lm_head_chunked_apply = False
         return True
 
     def _resize_target_lm_head_to_vocab_size(self, lm_head, vocab_size: int):

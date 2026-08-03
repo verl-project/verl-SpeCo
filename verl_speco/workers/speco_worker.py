@@ -936,12 +936,14 @@ class SpecoWorker(Worker):
         weight = payload.get("weight")
         row_indices = payload.get("row_indices")
         source_vocab_size = payload.get("source_vocab_size")
+        defer_device_apply = bool(payload.get("defer_device_apply", False))
         name = payload.get("name")
         result = self.trainer.sync_target_lm_head_weight(
             weight,
             global_step=global_step,
             row_indices=row_indices,
             source_vocab_size=source_vocab_size,
+            defer_device_apply=defer_device_apply,
         )
         if self.is_drafter_group_leader:
             logger.debug(
