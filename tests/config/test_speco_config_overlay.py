@@ -145,4 +145,11 @@ def test_veomni_trainer_composes_with_release_upstream_verl(tmp_path: Path) -> N
 
     assert config.model_engine == "veomni"
     assert config.actor_rollout_ref.actor.strategy == "veomni"
+    assert "veomni" in config.actor_rollout_ref.actor
+    assert "optim" in config.actor_rollout_ref.actor
+    assert config.actor_rollout_ref.actor.veomni.router_replay.mode == "disabled"
+    assert config.actor_rollout_ref.ref.strategy == "veomni"
+    assert "veomni" in config.actor_rollout_ref.ref
+    assert config.critic.strategy == "veomni"
+    assert "veomni" in config.critic
     assert "fsdp_config" in config.actor_rollout_ref.rollout.drafter.training

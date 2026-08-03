@@ -2,9 +2,12 @@
 
 defaults:
   - ppo_trainer
-  - override model_engine: veomni
   - speco_base
   - _self_
+  - override model_engine: veomni
+  - override actor@actor_rollout_ref.actor: veomni_actor
+  - override ref@actor_rollout_ref.ref: veomni_ref
+  - override critic@critic: veomni_critic
 
 hydra:
   searchpath:
