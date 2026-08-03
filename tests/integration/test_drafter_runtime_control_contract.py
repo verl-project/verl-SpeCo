@@ -418,6 +418,48 @@ def test_veomni_target_head_sync_defers_only_npu_device_apply(
     assert received[0][1] == 1
 
 
+def test_veomni_npu_target_head_transfer_waits_after_actor_update() -> None:
+    trainer = _trainer({"training_interval_steps": 1}, step=1)
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DSPARK"
+    payload = {
+        "weight": "cpu-weight",
+        "actor_backend": "veomni",
+        "actor_device_type": "npu",
+        "export_strategy": "veomni_lm_head_full",
+    }
+    pending_refs = ["pending-target-sync"]
+    resolved = []
+    trainer._ray_get_if_needed = lambda value: resolved.append(value) or value
+    trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
+    trainer._speco_actor_rollout_method = lambda name: lambda rows: [payload]
+    trainer._speco_build_drafter_target_lm_head_sync_args = (
+        lambda value: (value, trainer.global_steps, 1)
+    )
+    trainer.speco_sync_target_lm_head_weight = (
+        lambda value, global_step=None: pending_refs
+    )
+
+    metrics, pending = trainer._speco_start_target_lm_head_weight_sync()
+
+    assert pending is not None
+    assert metrics["drafter/target_lm_head_apply_deferred"] == 1
+    assert resolved == [[payload]]
+
+    metrics.update(trainer._speco_finish_target_lm_head_weight_sync(pending))
+
+    assert resolved == [[payload], pending_refs]
+    assert metrics["drafter/target_lm_head_synced"] == 1
+
+
+def test_target_head_worker_dispatch_is_nonblocking() -> None:
+    from verl.single_controller.base.decorator import MAGIC_ATTR
+    from verl_speco.workers.speco_worker import SpecoWorker
+
+    attrs = getattr(SpecoWorker.sync_target_lm_head_weight, MAGIC_ATTR)
+
+    assert attrs["blocking"] is False
+
+
 def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:
     calls: list[tuple[str, object, int]] = []
     waited: list[object] = []

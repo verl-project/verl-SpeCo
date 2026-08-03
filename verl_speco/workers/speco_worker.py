@@ -917,7 +917,8 @@ class SpecoWorker(Worker):
         return result
 
     @register(
-        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_TARGET_SYNC_MESH)
+        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_TARGET_SYNC_MESH),
+        blocking=False,
     )
     def sync_target_lm_head_weight(
         self, payload: Optional[dict], global_step: Optional[int] = None
