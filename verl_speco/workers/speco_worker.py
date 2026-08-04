@@ -993,6 +993,7 @@ class SpecoWorker(Worker):
             activation_ts = time.time()
             result["activated"] = bool(await self.trainer.activate_training_model())
             result["activation_elapsed_sec"] = time.time() - activation_ts
+            result.update(self.trainer.get_last_activation_timing_metrics())
             release_ts = time.time()
             await self.trainer.release_training_memory_after_activation()
             result["release_elapsed_sec"] = time.time() - release_ts
@@ -1035,6 +1036,7 @@ class SpecoWorker(Worker):
             activation_ts = time.time()
             success = await self.trainer.activate_training_model()
             result["activation_elapsed_sec"] = time.time() - activation_ts
+            result.update(self.trainer.get_last_activation_timing_metrics())
             if not success:
                 logger.error(
                     "[SpecoWorker replica=%s] failed to activate trainer at step %s",
@@ -1043,7 +1045,8 @@ class SpecoWorker(Worker):
                 )
                 self.trainer.clear_pending_publish_state_dict()
                 cleanup_ts = time.time()
-                await self.trainer.cleanup_training(clear_data=False)
+                cleanup_metrics = await self.trainer.cleanup_training(clear_data=False)
+                result.update(cleanup_metrics)
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
                 result["reason"] = "activation_failed"
                 result["elapsed_sec"] = time.time() - start_ts
@@ -1085,9 +1088,10 @@ class SpecoWorker(Worker):
                 result.update(self.trainer.get_training_metrics())
             finally:
                 cleanup_ts = time.time()
-                await self.trainer.cleanup_training(
+                cleanup_metrics = await self.trainer.cleanup_training(
                     clear_data=result["successful_steps"] > 0
                 )
+                result.update(cleanup_metrics)
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
 
             result["trained"] = result["successful_steps"] > 0

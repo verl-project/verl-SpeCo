@@ -1739,6 +1739,9 @@ class DrafterBaseTrainer:
     async def activate_training_model(self) -> bool:
         # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态
         start_ts = time.time()
+        activation_started = time.perf_counter()
+        activation_metrics: dict[str, float] = {}
+        self._last_activation_timing_metrics = activation_metrics
         activation_stage = "enter"
         try:
             logger.debug(
@@ -1746,7 +1749,14 @@ class DrafterBaseTrainer:
             )
 
             if self._training_active and self.model is not None:
+                stage_started = time.perf_counter()
                 self._apply_pending_target_lm_head_weight()
+                activation_metrics[
+                    "timing_s/drafter_activation_apply_target_head_active"
+                ] = time.perf_counter() - stage_started
+                activation_metrics["timing_s/drafter_activation_total"] = (
+                    time.perf_counter() - activation_started
+                )
                 logger.debug(
                     f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] activate_training_model reused active model "
                     f"elapsed={time.time() - start_ts:.2f}s"
@@ -1757,14 +1767,22 @@ class DrafterBaseTrainer:
             # Apply them before loading drafter model/optimizer state to keep
             # accelerator memory peaks low during activation.
             activation_stage = "apply_pending_target_head_on_host"
+            stage_started = time.perf_counter()
             self._apply_pending_target_lm_head_weight()
+            activation_metrics[
+                "timing_s/drafter_activation_apply_target_head_cpu"
+            ] = time.perf_counter() - stage_started
 
             if self.model is None:
                 logger.debug(
                     "Draft Model not initialized, calling build_draft_model during activation..."
                 )
                 activation_stage = "build_draft_model"
+                stage_started = time.perf_counter()
                 self._build_draft_model()
+                activation_metrics["timing_s/drafter_activation_build_model"] = (
+                    time.perf_counter() - stage_started
+                )
 
             # 只有当配置了 offload 或者当前模型不在 CUDA 上时执行加载
             first_param = next(self.model.parameters(), None)
@@ -1775,7 +1793,11 @@ class DrafterBaseTrainer:
             if self.is_offload_param or not is_on_cuda:
                 # 调用工具将 FSDP 分片移动到 GPU
                 activation_stage = "load_draft_model"
+                stage_started = time.perf_counter()
                 load_fsdp_model_to_gpu(self.model)
+                activation_metrics["timing_s/drafter_activation_load_model"] = (
+                    time.perf_counter() - stage_started
+                )
                 logger.debug("Loaded drafter model to GPU for training")
 
             if self.optimizer is not None and (
@@ -1785,17 +1807,32 @@ class DrafterBaseTrainer:
                 # 获取 device_id,否则在多卡环境优化器状态可能全部挤在 cuda:0 导致 OOM
                 current_dev_id = get_device_id()
                 activation_stage = "load_draft_optimizer"
+                stage_started = time.perf_counter()
                 load_fsdp_optimizer(optimizer=self.optimizer, device_id=current_dev_id)
+                activation_metrics[
+                    "timing_s/drafter_activation_load_optimizer"
+                ] = time.perf_counter() - stage_started
                 logger.debug("Loaded drafter optimizer to GPU for training")
 
             activation_stage = "load_target_lm_head"
+            stage_started = time.perf_counter()
             self._move_target_lm_head(self.runtime_device)
+            activation_metrics[
+                "timing_s/drafter_activation_load_target_lm_head"
+            ] = time.perf_counter() - stage_started
             activation_stage = "apply_pending_target_head_on_device"
+            stage_started = time.perf_counter()
             self._apply_pending_target_lm_head_weight()
+            activation_metrics[
+                "timing_s/drafter_activation_apply_target_head_device"
+            ] = time.perf_counter() - stage_started
 
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
             self._training_initialized = True
             self._training_active = True
+            activation_metrics["timing_s/drafter_activation_total"] = (
+                time.perf_counter() - activation_started
+            )
 
             logger.debug(
                 f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] activate_training_model success "
@@ -1804,12 +1841,18 @@ class DrafterBaseTrainer:
             return True
 
         except Exception as e:
+            activation_metrics["timing_s/drafter_activation_total"] = (
+                time.perf_counter() - activation_started
+            )
             logger.error(
                 f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] "
                 f"activate_training_model failed stage={activation_stage}: {e}"
             )
             self._training_active = False
             return False
+
+    def get_last_activation_timing_metrics(self) -> dict[str, float]:
+        return dict(getattr(self, "_last_activation_timing_metrics", {}))
 
     def sync_target_lm_head_weight(
         self,
@@ -4600,11 +4643,14 @@ class DrafterBaseTrainer:
         self.clear_pending_publish_state_dict()
         return True, state_dict
 
-    async def cleanup_training(self, clear_data: bool = True):
+    async def cleanup_training(self, clear_data: bool = True) -> dict[str, float]:
+        cleanup_started = time.perf_counter()
+        cleanup_metrics: dict[str, float] = {}
         # First set training as inactive to prevent further steps
         self._training_active = False
 
         # Wait for any pending async checkpoint save to complete
+        stage_started = time.perf_counter()
         if self._pending_checkpoint_future is not None:
             logger.debug(
                 f"[Rank {self.rank}] Waiting for pending checkpoint save to complete..."
@@ -4629,12 +4675,19 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Pending full drafter checkpoint save failed: {e}")
             self._pending_full_checkpoint_future = None
+        cleanup_metrics["timing_s/drafter_cleanup_checkpoint_wait"] = (
+            time.perf_counter() - stage_started
+        )
 
+        stage_started = time.perf_counter()
         if self.optimizer is not None:
             try:
                 self.optimizer.zero_grad(set_to_none=True)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to clear drafter gradients during cleanup: {e}")
+        cleanup_metrics["timing_s/drafter_cleanup_zero_grad"] = (
+            time.perf_counter() - stage_started
+        )
 
         if self.skip_heavy_cleanup_after_drafter_training:
             if clear_data:
@@ -4648,106 +4701,72 @@ class DrafterBaseTrainer:
                 "[Rank %s] Skipped heavy drafter cleanup; model/optimizer stay on runtime device",
                 self.rank,
             )
-            return
+            cleanup_metrics["timing_s/drafter_cleanup_total"] = (
+                time.perf_counter() - cleanup_started
+            )
+            return cleanup_metrics
 
-        # Clean up distributed resources gracefully
-        sp_group = self._get_sp_group()
-        dp_group = self._get_dp_group()
-        if sp_group is not None and self._get_sp_world_size() > 1:
-            try:
-                await asyncio.sleep(0.1)
-                try:
-                    await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(
-                            None, lambda: torch.distributed.barrier(sp_group)
-                        ),
-                        timeout=5.0,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"Rank {self.rank} subgroup barrier timeout during cleanup, continuing anyway"
-                    )
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.debug(f"Subgroup cleanup error (expected): {e}")
-        if dp_group is not None and self._get_dp_world_size() > 1:
-            try:
-                await asyncio.sleep(0.1)
-                try:
-                    await asyncio.wait_for(
-                        asyncio.get_event_loop().run_in_executor(
-                            None, lambda: torch.distributed.barrier(dp_group)
-                        ),
-                        timeout=5.0,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"Rank {self.rank} dp-group barrier timeout during cleanup, continuing anyway"
-                    )
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.debug(f"DP-group cleanup error (expected): {e}")
-        elif self.training_device_mesh is not None:
-            try:
-                # Give a moment for any pending operations to complete
-                await asyncio.sleep(0.1)
-                if self.training_device_mesh.size() > 1:
-                    # Try to destroy the process group if possible
-                    try:
-                        # Run barrier with timeout to avoid hanging
-                        await asyncio.wait_for(
-                            asyncio.get_event_loop().run_in_executor(
-                                None,
-                                lambda: torch.distributed.barrier(
-                                    self.training_device_mesh.get_group()
-                                ),
-                            ),
-                            timeout=5.0,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            f"Rank {self.rank} barrier timeout during cleanup, continuing anyway"
-                        )
-                    except Exception:
-                        pass  # Ignore barrier errors during cleanup
-            except Exception as e:
-                logger.debug(f"Process group cleanup error (expected): {e}")
+        # Training and publish collectives have completed before cleanup. These
+        # process groups stay alive across triggers, so barriers here only
+        # serialize ranks and can add timeout windows without releasing memory.
 
+        stage_started = time.perf_counter()
         if self.model is not None:
             try:
                 offload_fsdp_model_to_cpu(self.model)
                 logger.debug("Offloaded drafter model to CPU after training")
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter model during cleanup: {e}")
+        cleanup_metrics["timing_s/drafter_cleanup_offload_model"] = (
+            time.perf_counter() - stage_started
+        )
 
+        stage_started = time.perf_counter()
         if self.optimizer is not None:
             try:
                 offload_fsdp_optimizer(self.optimizer)
                 logger.debug("Offloaded drafter optimizer state to CPU after training")
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
+        cleanup_metrics["timing_s/drafter_cleanup_offload_optimizer"] = (
+            time.perf_counter() - stage_started
+        )
 
+        stage_started = time.perf_counter()
         try:
             self._move_target_lm_head("cpu")
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Failed to offload drafter target head during cleanup: {e}")
+        cleanup_metrics["timing_s/drafter_cleanup_offload_target_lm_head"] = (
+            time.perf_counter() - stage_started
+        )
 
+        stage_started = time.perf_counter()
         if clear_data:
             self.collected_data.clear()
             self.data_buffer.clear()  # Clear the cross-step data buffer
         if self._full_checkpoint_executor is not None:
             self._full_checkpoint_executor.shutdown(wait=False)
             self._full_checkpoint_executor = None
+        cleanup_metrics["timing_s/drafter_cleanup_release_host_state"] = (
+            time.perf_counter() - stage_started
+        )
+        stage_started = time.perf_counter()
         if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
             if hasattr(self.device_module, "synchronize"):
                 self.device_module.synchronize()
             self.device_module.empty_cache()
+        cleanup_metrics["timing_s/drafter_cleanup_device_reclaim"] = (
+            time.perf_counter() - stage_started
+        )
         self._training_initialized = False
         self._training_active = False
         self._last_ckpt_step = -1
         self.training_steps = 0
+        cleanup_metrics["timing_s/drafter_cleanup_total"] = (
+            time.perf_counter() - cleanup_started
+        )
+        return cleanup_metrics
 
     async def release_training_memory_after_activation(self):
         """Release runtime-device memory after a pre-fit activation warmup."""

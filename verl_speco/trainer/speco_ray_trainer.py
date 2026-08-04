@@ -1713,8 +1713,33 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         get_actor_lm_head_weight = self._speco_actor_rollout_method(
             "get_actor_lm_head_weight"
         )
+        actor_backend = str(
+            _get_nested(
+                self.config,
+                ("actor_rollout_ref", "actor", "strategy"),
+                "",
+            )
+            or ""
+        ).strip().lower()
+        actor_veomni_param_offload = bool(
+            _get_nested(
+                self.config,
+                ("actor_rollout_ref", "actor", "veomni", "param_offload"),
+                False,
+            )
+        )
+        keep_actor_model_on_device = bool(
+            actor_backend == "veomni"
+            and str(self.device_name).lower() == "npu"
+            and actor_veomni_param_offload
+        )
         fetch_started = time.perf_counter()
-        payloads = self._ray_get_if_needed(get_actor_lm_head_weight(row_indices)) or []
+        payloads = self._ray_get_if_needed(
+            get_actor_lm_head_weight(
+                row_indices,
+                keep_model_on_device=keep_actor_model_on_device,
+            )
+        ) or []
         fetch_elapsed = time.perf_counter() - fetch_started
         payload = self._first_non_null(payloads)
         if payload is None:
@@ -1757,6 +1782,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "drafter/target_lm_head_direct_sparse_export": int(
                 export_strategy
                 in {"direct_sparse", "veomni_lm_head_sparse"}
+            ),
+            "drafter/actor_model_kept_on_device": int(
+                isinstance(payload, dict)
+                and payload.get("actor_model_kept_on_device", False)
             ),
             "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
             "timing_s/drafter_sync_target_lm_head_dispatch": dispatch_elapsed,
@@ -1890,13 +1919,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
             ),
         }
+        timing_keys = sorted(
+            {
+                key
+                for result in normalized_results
+                for key in result
+                if key.startswith("timing_s/drafter_")
+            }
+        )
         for key in (
-            "timing_s/drafter_prepare_batch",
-            "timing_s/drafter_forward_loss",
-            "timing_s/drafter_reduce_loss",
-            "timing_s/drafter_backward",
-            "timing_s/drafter_optimizer",
-            "timing_s/drafter_publish_snapshot",
+            *timing_keys,
             "activation_elapsed_sec",
             "training_loop_elapsed_sec",
             "cleanup_elapsed_sec",
@@ -2409,6 +2441,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     },
                 )
             metrics.update(train_metrics)
+            metrics["timing_s/speco_actor_update_rpc_raw"] = actor_elapsed
+            metrics["timing_s/speco_drafter_pre_actor"] = max(
+                0.0, actor_started - update_actor_started
+            )
+            metrics["timing_s/speco_drafter_post_actor"] = max(
+                0.0,
+                time.perf_counter() - actor_started - actor_elapsed,
+            )
             if defer_publish_until_update_weights and drafter_trained:
                 pending_drafter_publish["ready"] = True
                 pending_drafter_publish["drafter_trained"] = drafter_trained

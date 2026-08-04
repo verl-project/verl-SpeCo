@@ -87,8 +87,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_veomni_trainer
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.calculate_entropy=False \
     actor_rollout_ref.actor.use_torch_compile=False \
-    actor_rollout_ref.actor.veomni.param_offload=False \
-    actor_rollout_ref.actor.veomni.optimizer_offload=False \
+    actor_rollout_ref.actor.veomni.param_offload=True \
+    actor_rollout_ref.actor.veomni.optimizer_offload=True \
     actor_rollout_ref.actor.veomni.enable_full_shard=True \
     actor_rollout_ref.actor.veomni.fsdp_size=-1 \
     actor_rollout_ref.actor.veomni.ulysses_parallel_size=${veomni_sp_size} \

@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from functools import wraps
 from typing import Any, Optional, cast
 
 logger = logging.getLogger(__file__)
@@ -45,6 +46,250 @@ def _torch_module():
     import torch
 
     return torch
+
+
+def _speco_output_metrics(output: Any) -> dict[str, Any] | None:
+    """Get the mutable metrics dictionary from a verl TensorDict result."""
+
+    try:
+        metrics = output["metrics"]
+    except (KeyError, TypeError, AttributeError, IndexError):
+        metrics = None
+    if isinstance(metrics, dict):
+        return metrics
+    meta_info = getattr(output, "meta_info", None)
+    if isinstance(meta_info, dict):
+        metrics = meta_info.get("metrics")
+        if isinstance(metrics, dict):
+            return metrics
+    return None
+
+
+def _speco_values_numel(value: Any) -> int:
+    """Count packed token values without materializing them on the host."""
+
+    try:
+        values = value.values() if callable(getattr(value, "values", None)) else value
+        return int(values.numel())
+    except (AttributeError, TypeError, RuntimeError, ValueError):
+        return 0
+
+
+def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
+    """Attach per-update VeOmni timing counters to the actor worker.
+
+    This stays on the actor's local ``TrainingWorker`` instance, so it does not
+    alter Ray dispatch or the FSDP/FSDP2 paths. The counters are returned in
+    the normal actor metrics and are reset for every ``train_mini_batch`` call.
+    """
+
+    if getattr(worker, "_is_actor", False) is False:
+        return False
+    actor = getattr(worker, "actor", None)
+    engine = getattr(actor, "engine", None) if actor is not None else None
+    if actor is None or engine is None:
+        return False
+    strategy = str(getattr(getattr(actor, "engine_config", None), "strategy", "") or "")
+    if strategy.lower() != "veomni":
+        return False
+    if getattr(actor, "_speco_veomni_actor_diag_installed", False):
+        return False
+
+    original_train_mini_batch = getattr(actor, "train_mini_batch", None)
+    original_forward_backward = getattr(engine, "forward_backward_batch", None)
+    original_optimizer_step = getattr(engine, "optimizer_step", None)
+    original_to = getattr(engine, "to", None)
+    if not all(
+        callable(method)
+        for method in (
+            original_train_mini_batch,
+            original_forward_backward,
+            original_optimizer_step,
+            original_to,
+        )
+    ):
+        return False
+
+    state: dict[str, Any] = {"active": False}
+
+    @wraps(original_forward_backward)
+    def forward_backward_with_diagnostics(*args, **kwargs):
+        if not state.get("active", False):
+            return original_forward_backward(*args, **kwargs)
+
+        forward_only = kwargs.get("forward_only")
+        if forward_only is None and len(args) >= 3:
+            forward_only = args[2]
+        if forward_only:
+            return original_forward_backward(*args, **kwargs)
+
+        data = args[0] if args else kwargs.get("data")
+        state["forward_backward_calls"] += 1
+        if data is not None:
+            try:
+                state["input_tokens"] += _speco_values_numel(data["input_ids"])
+            except (KeyError, TypeError, AttributeError, IndexError):
+                pass
+
+        original_function = getattr(
+            original_forward_backward, "__func__", original_forward_backward
+        )
+        function_globals = getattr(original_function, "__globals__", None)
+        original_prepare = (
+            function_globals.get("prepare_micro_batches")
+            if isinstance(function_globals, dict)
+            else None
+        )
+
+        def prepare_with_diagnostics(*prepare_args, **prepare_kwargs):
+            prepared = original_prepare(*prepare_args, **prepare_kwargs)
+            try:
+                micro_batches = prepared[0]
+                state["micro_batches"] += len(micro_batches)
+                state["micro_batch_tokens_max"] = max(
+                    state["micro_batch_tokens_max"],
+                    max(
+                        (
+                            _speco_values_numel(micro_batch["input_ids"])
+                            for micro_batch in micro_batches
+                        ),
+                        default=0,
+                    ),
+                )
+            except (KeyError, TypeError, AttributeError, IndexError, ValueError):
+                pass
+            return prepared
+
+        started = time.perf_counter()
+        if isinstance(function_globals, dict) and callable(original_prepare):
+            function_globals["prepare_micro_batches"] = prepare_with_diagnostics
+        try:
+            return original_forward_backward(*args, **kwargs)
+        finally:
+            if isinstance(function_globals, dict) and callable(original_prepare):
+                function_globals["prepare_micro_batches"] = original_prepare
+            state["forward_backward_elapsed_sec"] += time.perf_counter() - started
+
+    @wraps(original_optimizer_step)
+    def optimizer_step_with_diagnostics(*args, **kwargs):
+        if not state.get("active", False):
+            return original_optimizer_step(*args, **kwargs)
+        started = time.perf_counter()
+        try:
+            return original_optimizer_step(*args, **kwargs)
+        finally:
+            state["optimizer_step_calls"] += 1
+            state["optimizer_step_elapsed_sec"] += time.perf_counter() - started
+
+    @wraps(original_to)
+    def to_with_diagnostics(*args, **kwargs):
+        if not state.get("active", False):
+            return original_to(*args, **kwargs)
+        device = kwargs.get("device", args[0] if args else None)
+        started = time.perf_counter()
+        try:
+            return original_to(*args, **kwargs)
+        finally:
+            elapsed = time.perf_counter() - started
+            if str(device).lower() == "cpu":
+                state["to_cpu_elapsed_sec"] += elapsed
+            else:
+                state["to_device_elapsed_sec"] += elapsed
+
+    @wraps(original_train_mini_batch)
+    def train_mini_batch_with_diagnostics(*args, **kwargs):
+        state.clear()
+        state.update(
+            {
+                "active": True,
+                "forward_backward_calls": 0,
+                "micro_batches": 0,
+                "micro_batch_tokens_max": 0,
+                "input_tokens": 0,
+                "forward_backward_elapsed_sec": 0.0,
+                "optimizer_step_calls": 0,
+                "optimizer_step_elapsed_sec": 0.0,
+                "to_device_elapsed_sec": 0.0,
+                "to_cpu_elapsed_sec": 0.0,
+            }
+        )
+        started = time.perf_counter()
+        try:
+            output = original_train_mini_batch(*args, **kwargs)
+        finally:
+            state["active"] = False
+
+        metrics = _speco_output_metrics(output)
+        if metrics is None:
+            if not getattr(actor, "_speco_veomni_actor_diag_output_warned", False):
+                logger.warning(
+                    "[speco actor diagnostics] actor output has no mutable metrics mapping"
+                )
+                actor._speco_veomni_actor_diag_output_warned = True
+            return output
+
+        train_mini_batch_elapsed = time.perf_counter() - started
+        accounted_elapsed = sum(
+            float(state[key])
+            for key in (
+                "forward_backward_elapsed_sec",
+                "optimizer_step_elapsed_sec",
+                "to_device_elapsed_sec",
+                "to_cpu_elapsed_sec",
+            )
+        )
+        metrics.update(
+            {
+                "speco/veomni_actor_diag_version": 1,
+                "speco/veomni_actor_forward_backward_calls": state[
+                    "forward_backward_calls"
+                ],
+                "speco/veomni_actor_micro_batches": state["micro_batches"],
+                "speco/veomni_actor_input_tokens": state["input_tokens"],
+                "speco/veomni_actor_micro_batch_tokens_max": state[
+                    "micro_batch_tokens_max"
+                ],
+                "speco/veomni_actor_optimizer_step_calls": state[
+                    "optimizer_step_calls"
+                ],
+                "timing_s/speco_veomni_actor_train_mini_batch": (
+                    train_mini_batch_elapsed
+                ),
+                "timing_s/speco_veomni_actor_forward_backward": state[
+                    "forward_backward_elapsed_sec"
+                ],
+                "timing_s/speco_veomni_actor_optimizer_step": state[
+                    "optimizer_step_elapsed_sec"
+                ],
+                "timing_s/speco_veomni_actor_to_device": state[
+                    "to_device_elapsed_sec"
+                ],
+                "timing_s/speco_veomni_actor_to_cpu": state["to_cpu_elapsed_sec"],
+                "timing_s/speco_veomni_actor_other": max(
+                    0.0, train_mini_batch_elapsed - accounted_elapsed
+                ),
+                "speco/veomni_actor_param_offload": int(
+                    bool(getattr(engine, "_is_offload_param", False))
+                ),
+                "speco/veomni_actor_optimizer_offload": int(
+                    bool(getattr(engine, "_is_offload_optimizer", False))
+                ),
+                "speco/veomni_actor_dynamic_bsz": int(
+                    bool(getattr(engine.engine_config, "use_dynamic_bsz", False))
+                ),
+            }
+        )
+        return output
+
+    engine.forward_backward_batch = forward_backward_with_diagnostics
+    engine.optimizer_step = optimizer_step_with_diagnostics
+    engine.to = to_with_diagnostics
+    actor.train_mini_batch = train_mini_batch_with_diagnostics
+    actor._speco_veomni_actor_diag_installed = True
+    logger.warning(
+        "[speco actor diagnostics] installed backend=veomni counters=forward_backward,micro_batches,optimizer,to_device,to_cpu"
+    )
+    return True
 
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
@@ -561,7 +806,9 @@ def _materialize_veomni_lm_head_rows(selected_weight: Any, row_indices: Any):
 
 
 def _export_veomni_actor_lm_head_weight(
-    worker: Any, row_indices: Any = None
+    worker: Any,
+    row_indices: Any = None,
+    keep_model_on_device: bool = False,
 ) -> Optional[dict]:
     """Export only VeOmni's lm_head DTensor instead of its full state dict."""
 
@@ -580,6 +827,7 @@ def _export_veomni_actor_lm_head_weight(
     npu_lm_head_export = False
     reclaim_npu_staging = False
     restore_cpu_after_export = bool(getattr(engine, "_is_offload_param", False))
+    keep_model_on_device_after_export = False
     if restore_cpu_after_export:
         try:
             from verl.workers.engine.veomni.utils import (
@@ -665,6 +913,13 @@ def _export_veomni_actor_lm_head_weight(
             npu_lm_head_export and export_strategy == "veomni_lm_head_full"
         )
 
+        # The caller enters actor update immediately after this RPC. Keeping the
+        # already materialized actor on device avoids a full model offload/load
+        # pair when VeOmni parameter offload is enabled.
+        keep_model_on_device_after_export = bool(
+            keep_model_on_device and restore_cpu_after_export
+        )
+
         # DTensor.full_tensor() is collective, so every rank must execute it.
         # Only rank 0 retains the host payload consumed by the trainer.
         if getattr(worker, "rank", None) != 0:
@@ -692,6 +947,7 @@ def _export_veomni_actor_lm_head_weight(
             "export_strategy": export_strategy,
             "actor_backend": "veomni",
             "actor_device_type": actor_device_type,
+            "actor_model_kept_on_device": int(keep_model_on_device_after_export),
         }
     finally:
         device_module = None
@@ -702,7 +958,11 @@ def _export_veomni_actor_lm_head_weight(
                 if callable(synchronize):
                     synchronize()
         materialized_weight = None
-        if restore_cpu_after_export and offload_model is not None:
+        if (
+            restore_cpu_after_export
+            and offload_model is not None
+            and not keep_model_on_device_after_export
+        ):
             offload_model(module)
         if device_module is not None:
             empty_cache = getattr(device_module, "empty_cache", None)
@@ -710,7 +970,11 @@ def _export_veomni_actor_lm_head_weight(
                 empty_cache()
 
 
-def export_actor_lm_head_weight(worker: Any, row_indices: Any = None) -> Optional[dict]:
+def export_actor_lm_head_weight(
+    worker: Any,
+    row_indices: Any = None,
+    keep_model_on_device: bool = False,
+) -> Optional[dict]:
     """Export actor lm_head or tied embedding rows from an actor-rollout worker."""
 
     torch = _torch_module()
@@ -722,7 +986,11 @@ def export_actor_lm_head_weight(worker: Any, row_indices: Any = None) -> Optiona
         return None
 
     if _is_veomni_actor_worker(worker):
-        return _export_veomni_actor_lm_head_weight(worker, row_indices=row_indices)
+        return _export_veomni_actor_lm_head_weight(
+            worker,
+            row_indices=row_indices,
+            keep_model_on_device=keep_model_on_device,
+        )
 
     normalized_row_indices = _normalize_lm_head_row_indices(row_indices)
     is_dflash = drafter_speculative_algorithm(getattr(worker, "config", None)) in {
@@ -849,12 +1117,21 @@ class DraftWeightPublishMixin:
         install_rollout_runtime_for_worker(self)
         install_oldlogprob_hidden_runtime_for_worker(self)
         result = super().init_model(*args, **kwargs)
+        install_veomni_actor_update_diagnostics(self)
         validate_oldlogprob_hidden_runtime_for_worker(self)
         return result
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
-    def get_actor_lm_head_weight(self, row_indices: Any = None):
-        return export_actor_lm_head_weight(self, row_indices=row_indices)
+    def get_actor_lm_head_weight(
+        self,
+        row_indices: Any = None,
+        keep_model_on_device: bool = False,
+    ):
+        return export_actor_lm_head_weight(
+            self,
+            row_indices=row_indices,
+            keep_model_on_device=keep_model_on_device,
+        )
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
     def reclaim_actor_cache_for_drafter(self):
