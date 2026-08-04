@@ -94,6 +94,26 @@ def test_veomni_backend_and_parallel_layout_support_worker_config_shape() -> Non
     }
 
 
+def test_veomni_npu_actor_cache_is_reclaimed_before_drafter(monkeypatch) -> None:
+    events = []
+    fake_torch = SimpleNamespace(
+        npu=SimpleNamespace(
+            synchronize=lambda: events.append("synchronize"),
+            empty_cache=lambda: events.append("empty_cache"),
+        )
+    )
+    monkeypatch.setattr(rollout_publish, "_torch_module", lambda: fake_torch)
+    worker = SimpleNamespace(
+        _is_actor=True,
+        config={"actor": {"strategy": "veomni"}},
+    )
+
+    result = rollout_publish.reclaim_actor_cache_for_drafter(worker)
+
+    assert result["reclaimed"] is True
+    assert events == ["synchronize", "empty_cache"]
+
+
 @pytest.mark.parametrize(
     ("router_mode", "rollout_replay", "error_match"),
     [

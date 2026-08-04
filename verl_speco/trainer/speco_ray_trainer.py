@@ -1806,6 +1806,37 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             ),
         }
 
+    def _speco_reclaim_actor_cache_before_drafter(self) -> dict[str, Any]:
+        actor_backend = str(
+            _get_nested(
+                self.config,
+                ("actor_rollout_ref", "actor", "strategy"),
+                "",
+            )
+            or ""
+        ).strip().lower()
+        if actor_backend != "veomni" or str(self.device_name).lower() != "npu":
+            return {"drafter/actor_cache_reclaimed": 0}
+
+        reclaim_started = time.perf_counter()
+        reclaim_actor_cache = self._speco_actor_rollout_method(
+            "reclaim_actor_cache_for_drafter"
+        )
+        results = self._ray_get_if_needed(reclaim_actor_cache()) or []
+        if not isinstance(results, list):
+            results = [results]
+        reclaimed = any(
+            bool(result.get("reclaimed", False))
+            for result in results
+            if isinstance(result, dict)
+        )
+        return {
+            "drafter/actor_cache_reclaimed": int(reclaimed),
+            "timing_s/drafter_actor_cache_reclaim": (
+                time.perf_counter() - reclaim_started
+            ),
+        }
+
     def _speco_sync_target_lm_head_weight(self) -> dict[str, Any]:
         metrics, pending = self._speco_start_target_lm_head_weight_sync()
         if pending is not None:
@@ -2363,6 +2394,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     )
                 )
             if should_train_drafter:
+                metrics.update(self._speco_reclaim_actor_cache_before_drafter())
                 drafter_trained, train_metrics = self._speco_train_drafter()
             else:
                 drafter_trained, train_metrics = (
@@ -2389,6 +2421,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             known_drafter_timing = 0.0
             for key in (
                 "timing_s/drafter_sync_target_lm_head",
+                "timing_s/drafter_actor_cache_reclaim",
                 "timing_s/drafter_train_rpc",
                 "timing_s/drafter_publish_wait_pending",
                 "timing_s/drafter_publish_fetch_snapshot",

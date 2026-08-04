@@ -464,6 +464,22 @@ def test_target_head_sync_is_skipped_when_training_uses_logits() -> None:
     assert pending is None
 
 
+def test_veomni_npu_actor_cache_reclaim_uses_rollout_worker_method() -> None:
+    trainer = _trainer({"training_interval_steps": 1}, step=1)
+    trainer.config.actor_rollout_ref.actor.strategy = "veomni"
+    trainer.device_name = "npu"
+    calls = []
+    trainer.actor_rollout_wg = SimpleNamespace(
+        reclaim_actor_cache_for_drafter=lambda: calls.append("reclaim")
+        or [{"reclaimed": True}]
+    )
+
+    metrics = trainer._speco_reclaim_actor_cache_before_drafter()
+
+    assert calls == ["reclaim"]
+    assert metrics["drafter/actor_cache_reclaimed"] == 1
+
+
 def test_target_head_worker_dispatch_is_nonblocking() -> None:
     from verl.single_controller.base.decorator import MAGIC_ATTR
     from verl_speco.workers.speco_worker import SpecoWorker

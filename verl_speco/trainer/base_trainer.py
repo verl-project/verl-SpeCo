@@ -1739,6 +1739,7 @@ class DrafterBaseTrainer:
     async def activate_training_model(self) -> bool:
         # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态
         start_ts = time.time()
+        activation_stage = "enter"
         try:
             logger.debug(
                 f"[Trainer rank {getattr(self, 'rank', -1)}] activate_training_model enter "
@@ -1755,12 +1756,14 @@ class DrafterBaseTrainer:
             # Target-head syncs are staged on CPU while the actor updates.
             # Apply them before loading drafter model/optimizer state to keep
             # accelerator memory peaks low during activation.
+            activation_stage = "apply_pending_target_head_on_host"
             self._apply_pending_target_lm_head_weight()
 
             if self.model is None:
                 logger.debug(
                     "Draft Model not initialized, calling build_draft_model during activation..."
                 )
+                activation_stage = "build_draft_model"
                 self._build_draft_model()
 
             # 只有当配置了 offload 或者当前模型不在 CUDA 上时执行加载
@@ -1771,6 +1774,7 @@ class DrafterBaseTrainer:
 
             if self.is_offload_param or not is_on_cuda:
                 # 调用工具将 FSDP 分片移动到 GPU
+                activation_stage = "load_draft_model"
                 load_fsdp_model_to_gpu(self.model)
                 logger.debug("Loaded drafter model to GPU for training")
 
@@ -1780,10 +1784,13 @@ class DrafterBaseTrainer:
             ):
                 # 获取 device_id,否则在多卡环境优化器状态可能全部挤在 cuda:0 导致 OOM
                 current_dev_id = get_device_id()
+                activation_stage = "load_draft_optimizer"
                 load_fsdp_optimizer(optimizer=self.optimizer, device_id=current_dev_id)
                 logger.debug("Loaded drafter optimizer to GPU for training")
 
+            activation_stage = "load_target_lm_head"
             self._move_target_lm_head(self.runtime_device)
+            activation_stage = "apply_pending_target_head_on_device"
             self._apply_pending_target_lm_head_weight()
 
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
@@ -1798,7 +1805,8 @@ class DrafterBaseTrainer:
 
         except Exception as e:
             logger.error(
-                f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] activate_training_model failed: {e}"
+                f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] "
+                f"activate_training_model failed stage={activation_stage}: {e}"
             )
             self._training_active = False
             return False

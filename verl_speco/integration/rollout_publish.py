@@ -815,6 +815,29 @@ def export_actor_lm_head_weight(worker: Any, row_indices: Any = None) -> Optiona
     }
 
 
+def reclaim_actor_cache_for_drafter(worker: Any) -> dict[str, Any]:
+    """Release cached VeOmni NPU blocks before an external drafter activates."""
+
+    if not getattr(worker, "_is_actor", False):
+        return {"reclaimed": False, "reason": "not_actor"}
+    if not _is_veomni_actor_worker(worker):
+        return {"reclaimed": False, "reason": "not_veomni"}
+
+    torch = _torch_module()
+    device_module = getattr(torch, "npu", None)
+    if device_module is None:
+        return {"reclaimed": False, "reason": "not_npu"}
+
+    synchronize = getattr(device_module, "synchronize", None)
+    if callable(synchronize):
+        synchronize()
+    empty_cache = getattr(device_module, "empty_cache", None)
+    if not callable(empty_cache):
+        return {"reclaimed": False, "reason": "empty_cache_unavailable"}
+    empty_cache()
+    return {"reclaimed": True, "reason": "veomni_npu_cache_released"}
+
+
 class DraftWeightPublishMixin:
     """Mixin for external actor-rollout workers that publish SPECO draft weights."""
 
@@ -832,6 +855,10 @@ class DraftWeightPublishMixin:
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
     def get_actor_lm_head_weight(self, row_indices: Any = None):
         return export_actor_lm_head_weight(self, row_indices=row_indices)
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
+    def reclaim_actor_cache_for_drafter(self):
+        return reclaim_actor_cache_for_drafter(self)
 
     @staticmethod
     def _materialize_draft_weights_payload(weights):
