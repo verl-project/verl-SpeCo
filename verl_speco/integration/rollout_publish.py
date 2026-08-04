@@ -128,6 +128,20 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                 values.append(0.0)
         return values[0], values[1]
 
+    def device_memory_snapshot() -> tuple[float, float] | None:
+        """Return whole-device free/in-use memory, including other processes."""
+
+        mem_get_info = getattr(device_module, "mem_get_info", None)
+        if not callable(mem_get_info):
+            return None
+        try:
+            free_bytes, total_bytes = mem_get_info()
+        except Exception:  # noqa: BLE001
+            return None
+        gib = float(1024**3)
+        free_gib = float(free_bytes) / gib
+        return free_gib, float(int(total_bytes) - int(free_bytes)) / gib
+
     @wraps(original_forward_backward)
     def forward_backward_with_diagnostics(*args, **kwargs):
         if not state.get("active", False):
@@ -244,6 +258,8 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                 "optimizer_step_elapsed_sec": 0.0,
                 "to_device_elapsed_sec": 0.0,
                 "to_cpu_elapsed_sec": 0.0,
+                "allocator_memory_before": allocator_snapshot(),
+                "device_memory_before": device_memory_snapshot(),
             }
         )
         started = time.perf_counter()
@@ -262,6 +278,8 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
             return output
 
         train_mini_batch_elapsed = time.perf_counter() - started
+        allocator_memory_after = allocator_snapshot()
+        device_memory_after = device_memory_snapshot()
         accounted_elapsed = sum(
             float(state[key])
             for key in (
@@ -271,9 +289,11 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                 "to_cpu_elapsed_sec",
             )
         )
+        allocated_before, reserved_before = state["allocator_memory_before"]
+        allocated_after, reserved_after = allocator_memory_after
         metrics.update(
             {
-                "speco/veomni_actor_diag_version": 1,
+                "speco/veomni_actor_diag_version": 2,
                 "speco/veomni_actor_forward_backward_calls": state[
                     "forward_backward_calls"
                 ],
@@ -310,8 +330,33 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                 "speco/veomni_actor_dynamic_bsz": int(
                     bool(getattr(engine.engine_config, "use_dynamic_bsz", False))
                 ),
+                "speco/veomni_actor_allocated_before_gib": allocated_before,
+                "speco/veomni_actor_allocated_after_gib": allocated_after,
+                "speco/veomni_actor_reserved_before_gib": reserved_before,
+                "speco/veomni_actor_reserved_after_gib": reserved_after,
             }
         )
+        device_memory_before = state["device_memory_before"]
+        if device_memory_before is not None and device_memory_after is not None:
+            free_before, in_use_before = device_memory_before
+            free_after, in_use_after = device_memory_after
+            metrics.update(
+                {
+                    "speco/veomni_actor_device_free_before_gib": free_before,
+                    "speco/veomni_actor_device_free_after_gib": free_after,
+                    "speco/veomni_actor_device_in_use_before_gib": in_use_before,
+                    "speco/veomni_actor_device_in_use_after_gib": in_use_after,
+                    "speco/veomni_actor_device_in_use_delta_gib": (
+                        in_use_after - in_use_before
+                    ),
+                    "speco/veomni_actor_device_unattributed_before_gib": max(
+                        0.0, in_use_before - reserved_before
+                    ),
+                    "speco/veomni_actor_device_unattributed_after_gib": max(
+                        0.0, in_use_after - reserved_after
+                    ),
+                }
+            )
         for call_index, elapsed in enumerate(
             state["forward_backward_call_elapsed_sec"], start=1
         ):
@@ -335,7 +380,8 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
     actor.train_mini_batch = train_mini_batch_with_diagnostics
     actor._speco_veomni_actor_diag_installed = True
     logger.warning(
-        "[speco actor diagnostics] installed backend=veomni counters=forward_backward,micro_batches,optimizer,to_device,to_cpu"
+        "[speco actor diagnostics] installed backend=veomni "
+        "counters=forward_backward,micro_batches,optimizer,to_device,to_cpu,device_memory"
     )
     return True
 

@@ -403,6 +403,20 @@ def test_drafter_state_is_offloaded_after_training_and_warmup() -> None:
     )
 
 
+def test_drafter_full_shard_mesh_reuses_default_process_group() -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="drafter mesh contract needs the trainer dependency stack",
+    )
+    source = getsource(
+        base_trainer.DrafterBaseTrainer._resolve_drafter_fsdp_device_mesh
+    )
+
+    assert 'getattr(DeviceMesh, "from_group", None)' in source
+    assert "dist.group.WORLD" in source
+    assert 'mesh._flatten(mesh_dim_name="fsdp")' in source
+
+
 def test_target_lm_head_sync_can_defer_device_apply() -> None:
     torch = pytest.importorskip("torch")
     base_trainer = pytest.importorskip(

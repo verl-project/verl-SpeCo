@@ -607,6 +607,7 @@ class DrafterBaseTrainer:
         self.use_native_dp_sp = (
             self.training_group_world_size > 1 and self.dp_group_world_size > 1
         )
+        self._fsdp_mesh_reuses_default_group = False
         self.fsdp_device_mesh = self._resolve_drafter_fsdp_device_mesh()
 
         self.checkpoint_dir = self.config.rollout.drafter.get("checkpoint_path")
@@ -709,6 +710,9 @@ class DrafterBaseTrainer:
             ),
             "drafter/resource_fsdp_mesh_flattened": float(
                 self._use_flattened_drafter_fsdp_mesh()
+            ),
+            "drafter/resource_fsdp_reuses_default_world_group": float(
+                self._fsdp_mesh_reuses_default_group
             ),
         }
 
@@ -839,14 +843,34 @@ class DrafterBaseTrainer:
         # does not use Ulysses SP, so flatten all drafter ranks into one full-
         # shard dimension while retaining the original dp/sp mesh for data and
         # metric collectives.
-        flattened_mesh = mesh._flatten(mesh_dim_name="fsdp")
+        mesh_ranks = mesh.mesh.reshape(-1)
+        world_ranks = list(range(dist.get_world_size()))
+        covers_default_world = (
+            [int(rank) for rank in mesh_ranks.tolist()] == world_ranks
+        )
+        from_group = getattr(DeviceMesh, "from_group", None)
+        if covers_default_world and callable(from_group):
+            # The SpecoWorker default group already spans these exact ranks.
+            # Reusing it avoids creating one more HCCL communicator on every
+            # NPU while preserving a 1D full-shard mesh for drafter FSDP2.
+            flattened_mesh = from_group(
+                dist.group.WORLD,
+                device_type=device_name,
+                mesh=mesh_ranks,
+                mesh_dim_names=("fsdp",),
+            )
+            self._fsdp_mesh_reuses_default_group = True
+        else:
+            flattened_mesh = mesh._flatten(mesh_dim_name="fsdp")
         if dist.get_rank() == int(flattened_mesh.mesh.reshape(-1)[0].item()):
             logger.info(
                 "[drafter-fsdp] NPU VeOmni DSpark uses a 1D full-shard mesh "
-                "across %s ranks instead of dp=%s x sp=%s HSDP",
+                "across %s ranks instead of dp=%s x sp=%s HSDP "
+                "reuse_default_world_group=%s",
                 flattened_mesh.size(),
                 self.dp_group_world_size,
                 self.training_group_world_size,
+                int(self._fsdp_mesh_reuses_default_group),
             )
         return flattened_mesh
 
