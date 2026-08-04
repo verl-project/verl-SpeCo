@@ -382,7 +382,7 @@ def test_target_lm_head_device_helper_preserves_eagle_backend() -> None:
     assert head.devices == ["npu:0"]
 
 
-def test_target_lm_head_is_offloaded_after_training_and_warmup() -> None:
+def test_drafter_state_is_offloaded_after_training_and_warmup() -> None:
     base_trainer = pytest.importorskip(
         "verl_speco.trainer.base_trainer",
         reason="target lm_head cleanup contract needs the trainer dependency stack",
@@ -393,6 +393,12 @@ def test_target_lm_head_is_offloaded_after_training_and_warmup() -> None:
         DrafterBaseTrainer.cleanup_training
     )
     assert '_move_target_lm_head("cpu")' in getsource(
+        DrafterBaseTrainer.release_training_memory_after_activation
+    )
+    assert "self._offload_optimizer_state_to_cpu()" in getsource(
+        DrafterBaseTrainer.cleanup_training
+    )
+    assert "self._offload_optimizer_state_to_cpu()" in getsource(
         DrafterBaseTrainer.release_training_memory_after_activation
     )
 

@@ -797,6 +797,38 @@ class DrafterBaseTrainer:
             and self.dp_group_world_size > 1
         )
 
+    def _use_blocking_npu_optimizer_offload(self) -> bool:
+        actor_config = getattr(self.config, "actor", None)
+        actor_strategy = (
+            actor_config.get("strategy", "")
+            if hasattr(actor_config, "get")
+            else getattr(actor_config, "strategy", "")
+        )
+        return device_name == "npu" and str(actor_strategy).lower() == "veomni"
+
+    def _offload_optimizer_state_to_cpu(self) -> None:
+        if self.optimizer is None or not self.optimizer.state:
+            return
+        if not self._use_blocking_npu_optimizer_offload():
+            offload_fsdp_optimizer(self.optimizer)
+            return
+
+        # Ascend may surface asynchronous optimizer D2H failures only at the
+        # later device synchronize. Use blocking copies for this long-lived
+        # state so failures are attributed to the actual transfer and no AICPU
+        # work remains pending when activation cleanup reclaims the device.
+        for state in self.optimizer.state.values():
+            if not isinstance(state, dict):
+                continue
+            for key, value in state.items():
+                local_value = (
+                    self._tensor_local_shard(value)
+                    if torch.is_tensor(value)
+                    else None
+                )
+                if local_value is not None and local_value.device.type != "cpu":
+                    state[key] = value.to("cpu", non_blocking=False)
+
     def _resolve_drafter_fsdp_device_mesh(self):
         mesh = self.training_device_mesh
         if mesh is None or not self._use_flattened_drafter_fsdp_mesh():
@@ -4847,6 +4879,9 @@ class DrafterBaseTrainer:
         cleanup_started = time.perf_counter()
         cleanup_metrics: dict[str, float] = {}
         cleanup_metrics.update(self._runtime_resource_metrics("pre_cleanup"))
+        cleanup_metrics["drafter/resource_npu_blocking_optimizer_offload"] = float(
+            self._use_blocking_npu_optimizer_offload()
+        )
         # First set training as inactive to prevent further steps
         self._training_active = False
 
@@ -4925,9 +4960,13 @@ class DrafterBaseTrainer:
         stage_started = time.perf_counter()
         if self.optimizer is not None:
             try:
-                offload_fsdp_optimizer(self.optimizer)
+                self._offload_optimizer_state_to_cpu()
                 logger.debug("Offloaded drafter optimizer state to CPU after training")
             except Exception as e:  # noqa: BLE001
+                if self._use_blocking_npu_optimizer_offload():
+                    raise RuntimeError(
+                        "NPU VeOmni drafter optimizer blocking offload failed during cleanup"
+                    ) from e
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
         cleanup_metrics["timing_s/drafter_cleanup_offload_optimizer"] = (
             time.perf_counter() - stage_started
@@ -4994,11 +5033,16 @@ class DrafterBaseTrainer:
 
         if self.optimizer is not None:
             try:
-                offload_fsdp_optimizer(self.optimizer)
+                self._offload_optimizer_state_to_cpu()
                 logger.debug(
                     "Offloaded drafter optimizer state to CPU after activation warmup"
                 )
             except Exception as e:  # noqa: BLE001
+                if self._use_blocking_npu_optimizer_offload():
+                    raise RuntimeError(
+                        "NPU VeOmni drafter optimizer blocking offload failed "
+                        "after activation warmup"
+                    ) from e
                 logger.debug(
                     f"Failed to offload drafter optimizer after activation warmup: {e}"
                 )
