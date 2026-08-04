@@ -499,6 +499,9 @@ class DrafterBaseTrainer:
         self.skip_heavy_cleanup_after_drafter_training = bool(
             training_cfg.get("skip_heavy_cleanup_after_drafter_training", False)
         )
+        self.park_hccl_after_drafter_training = bool(
+            training_cfg.get("park_hccl_after_drafter_training", False)
+        )
         self._training_initialized = False
         self._training_active = False
         self.training_steps = 0
@@ -809,6 +812,115 @@ class DrafterBaseTrainer:
             else getattr(actor_config, "strategy", "")
         )
         return device_name == "npu" and str(actor_strategy).lower() == "veomni"
+
+    def _should_park_drafter_hccl(self) -> bool:
+        actor_config = getattr(self.config, "actor", None)
+        actor_strategy = (
+            actor_config.get("strategy", "")
+            if hasattr(actor_config, "get")
+            else getattr(actor_config, "strategy", "")
+        )
+        return (
+            self.park_hccl_after_drafter_training
+            and device_name == "npu"
+            and str(actor_strategy).lower() == "veomni"
+            and getattr(self.backend, "model_type", None) == "dspark"
+        )
+
+    def _park_idle_drafter_hccl(self) -> dict[str, float]:
+        """Release idle HCCL communicators without rebuilding the trainer."""
+
+        if not self._should_park_drafter_hccl() or not dist.is_initialized():
+            return {}
+        metrics = {
+            "drafter/resource_hccl_idle_release_enabled": 1.0,
+            "drafter/resource_hccl_idle_release_supported": 0.0,
+            "drafter/resource_hccl_idle_groups_parked": 0.0,
+            "drafter/resource_hccl_idle_released_gib": 0.0,
+            "timing_s/drafter_hccl_idle_release": 0.0,
+        }
+
+        groups = []
+        for group in (
+            self.fsdp_device_mesh.get_group()
+            if self.fsdp_device_mesh is not None
+            else None,
+            self.training_process_group,
+            self.data_parallel_process_group,
+        ):
+            if group is None or group is dist.GroupMember.NON_GROUP_MEMBER:
+                continue
+            if all(group is not existing for existing in groups):
+                groups.append(group)
+
+        npu_device = torch.device("npu")
+        group_backends = []
+        for group in groups:
+            get_backend = getattr(group, "_get_backend", None)
+            if not callable(get_backend):
+                return metrics
+            backend = get_backend(npu_device)
+            delete_store_key = getattr(backend, "_delete_tcpstore_key", None)
+            abort_hccl = getattr(backend, "abort_hccl_comm", None)
+            if not callable(delete_store_key) or not callable(abort_hccl):
+                return metrics
+            group_backends.append((delete_store_key, abort_hccl))
+        metrics["drafter/resource_hccl_idle_release_supported"] = 1.0
+
+        mem_get_info = getattr(self.device_module, "mem_get_info", None)
+
+        def free_memory_gib() -> float | None:
+            if not callable(mem_get_info):
+                return None
+            try:
+                free_bytes, _ = mem_get_info(self.device_id)
+            except TypeError:
+                try:
+                    free_bytes, _ = mem_get_info()
+                except Exception:  # noqa: BLE001
+                    return None
+            except Exception:  # noqa: BLE001
+                return None
+            return float(free_bytes) / float(1024**3)
+
+        started = time.perf_counter()
+        sync_group = groups[0] if groups else None
+        if sync_group is not None and dist.get_world_size(group=sync_group) > 1:
+            dist.barrier(group=sync_group)
+        if hasattr(self.device_module, "synchronize"):
+            self.device_module.synchronize()
+        free_before = free_memory_gib()
+
+        for delete_store_key, abort_hccl in group_backends:
+            delete_store_key()
+            abort_hccl("speco drafter idle")
+
+        if hasattr(self.device_module, "synchronize"):
+            self.device_module.synchronize()
+        if hasattr(self.device_module, "empty_cache"):
+            self.device_module.empty_cache()
+        free_after = free_memory_gib()
+
+        metrics["drafter/resource_hccl_idle_groups_parked"] = float(
+            len(group_backends)
+        )
+        if free_before is not None and free_after is not None:
+            metrics["drafter/resource_hccl_idle_free_before_gib"] = free_before
+            metrics["drafter/resource_hccl_idle_free_after_gib"] = free_after
+            metrics["drafter/resource_hccl_idle_released_gib"] = max(
+                free_after - free_before, 0.0
+            )
+        metrics["timing_s/drafter_hccl_idle_release"] = (
+            time.perf_counter() - started
+        )
+        if dist.get_rank() == 0:
+            logger.info(
+                "[drafter-hccl] parked %s idle process groups released_gib=%.3f elapsed_sec=%.3f",
+                len(group_backends),
+                metrics["drafter/resource_hccl_idle_released_gib"],
+                metrics["timing_s/drafter_hccl_idle_release"],
+            )
+        return metrics
 
     def _offload_optimizer_state_to_cpu(self) -> None:
         if self.optimizer is None or not self.optimizer.state:
@@ -5023,6 +5135,7 @@ class DrafterBaseTrainer:
         cleanup_metrics["timing_s/drafter_cleanup_device_reclaim"] = (
             time.perf_counter() - stage_started
         )
+        cleanup_metrics.update(self._park_idle_drafter_hccl())
         self._training_initialized = False
         self._training_active = False
         self._last_ckpt_step = -1
@@ -5033,7 +5146,7 @@ class DrafterBaseTrainer:
         )
         return cleanup_metrics
 
-    async def release_training_memory_after_activation(self):
+    async def release_training_memory_after_activation(self) -> dict[str, float]:
         """Release runtime-device memory after a pre-fit activation warmup."""
 
         self._training_active = False
@@ -5083,4 +5196,6 @@ class DrafterBaseTrainer:
                 self.device_module.synchronize()
             self.device_module.empty_cache()
 
+        release_metrics = self._park_idle_drafter_hccl()
         self._training_initialized = False
+        return release_metrics

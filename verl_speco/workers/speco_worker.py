@@ -995,7 +995,9 @@ class SpecoWorker(Worker):
             result["activation_elapsed_sec"] = time.time() - activation_ts
             result.update(self.trainer.get_last_activation_timing_metrics())
             release_ts = time.time()
-            await self.trainer.release_training_memory_after_activation()
+            result.update(
+                await self.trainer.release_training_memory_after_activation()
+            )
             result["release_elapsed_sec"] = time.time() - release_ts
             result["elapsed_sec"] = time.time() - start_ts
             result["reason"] = (
