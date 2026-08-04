@@ -217,6 +217,12 @@ def test_veomni_lm_head_export_avoids_full_engine_state_dict(
     assert tuple(payload["weight"].shape) == (expected_rows, 3)
 
 
+def test_veomni_lm_head_export_preserves_cache_for_resident_actor() -> None:
+    source = getsource(rollout_publish._export_veomni_actor_lm_head_weight)
+
+    assert "device_module is not None and not preserve_npu_cache_after_export" in source
+
+
 def test_veomni_runtime_validation_checks_initialized_model_contract() -> None:
     torch = pytest.importorskip("torch")
 

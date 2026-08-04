@@ -480,6 +480,27 @@ def test_veomni_npu_actor_cache_reclaim_uses_rollout_worker_method() -> None:
     assert metrics["drafter/actor_cache_reclaimed"] == 1
 
 
+def test_veomni_npu_dspark_skips_reclaim_after_actor_offload() -> None:
+    trainer = _trainer({"training_interval_steps": 1}, step=1)
+    trainer.config.actor_rollout_ref.actor.strategy = "veomni"
+    trainer.config.actor_rollout_ref.actor.veomni = SimpleNamespace(
+        param_offload=True
+    )
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DSPARK"
+    trainer.device_name = "npu"
+    trainer.actor_rollout_wg = SimpleNamespace(
+        reclaim_actor_cache_for_drafter=lambda: pytest.fail(
+            "DSpark must not repeat cache reclamation after VeOmni actor offload"
+        )
+    )
+
+    metrics = trainer._speco_reclaim_actor_cache_before_drafter()
+
+    assert metrics["drafter/actor_cache_reclaimed"] == 0
+    assert metrics["drafter/actor_cache_reclaim_skipped_after_offload"] == 1
+    assert metrics["timing_s/drafter_actor_cache_reclaim"] == 0.0
+
+
 def test_target_head_worker_dispatch_is_nonblocking() -> None:
     from verl.single_controller.base.decorator import MAGIC_ATTR
     from verl_speco.workers.speco_worker import SpecoWorker

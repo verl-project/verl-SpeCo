@@ -1787,6 +1787,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 isinstance(payload, dict)
                 and payload.get("actor_model_kept_on_device", False)
             ),
+            "drafter/actor_cache_preserved_after_lm_head_export": int(
+                isinstance(payload, dict)
+                and payload.get("actor_cache_preserved_after_export", False)
+            ),
             "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
             "timing_s/drafter_sync_target_lm_head_dispatch": dispatch_elapsed,
         }
@@ -1845,7 +1849,37 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             or ""
         ).strip().lower()
         if actor_backend != "veomni" or str(self.device_name).lower() != "npu":
-            return {"drafter/actor_cache_reclaimed": 0}
+            return {
+                "drafter/actor_cache_reclaimed": 0,
+                "drafter/actor_cache_reclaim_skipped_after_offload": 0,
+            }
+
+        drafter_cfg = self._speco_drafter_config()
+        algorithm = str(
+            _get_nested(drafter_cfg, ("speculative_algorithm",), "") or ""
+        ).upper()
+        actor_param_offload = self._speco_bool_config(
+            _get_nested(
+                self.config,
+                (
+                    "actor_rollout_ref",
+                    "actor",
+                    "veomni",
+                    "param_offload",
+                ),
+                False,
+            )
+        )
+        if algorithm == "DSPARK" and actor_param_offload:
+            # NPU VeOmni DSpark now full-shards model and optimizer state across
+            # rollout replicas. When actor parameter offload is enabled, VeOmni
+            # has already released its NPU allocations while leaving train mode,
+            # so another synchronize/empty_cache pair here is redundant.
+            return {
+                "drafter/actor_cache_reclaimed": 0,
+                "drafter/actor_cache_reclaim_skipped_after_offload": 1,
+                "timing_s/drafter_actor_cache_reclaim": 0.0,
+            }
 
         reclaim_started = time.perf_counter()
         reclaim_actor_cache = self._speco_actor_rollout_method(
@@ -1861,6 +1895,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         return {
             "drafter/actor_cache_reclaimed": int(reclaimed),
+            "drafter/actor_cache_reclaim_skipped_after_offload": 0,
             "timing_s/drafter_actor_cache_reclaim": (
                 time.perf_counter() - reclaim_started
             ),

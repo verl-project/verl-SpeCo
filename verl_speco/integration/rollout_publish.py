@@ -876,6 +876,7 @@ def _export_veomni_actor_lm_head_weight(
     reclaim_npu_staging = False
     restore_cpu_after_export = bool(getattr(engine, "_is_offload_param", False))
     keep_model_on_device_after_export = False
+    preserve_npu_cache_after_export = False
     if restore_cpu_after_export:
         try:
             from verl.workers.engine.veomni.utils import (
@@ -967,6 +968,13 @@ def _export_veomni_actor_lm_head_weight(
         keep_model_on_device_after_export = bool(
             keep_model_on_device and restore_cpu_after_export
         )
+        preserve_npu_cache_after_export = bool(
+            reclaim_npu_staging
+            and (
+                not restore_cpu_after_export
+                or keep_model_on_device_after_export
+            )
+        )
 
         # DTensor.full_tensor() is collective, so every rank must execute it.
         # Only rank 0 retains the host payload consumed by the trainer.
@@ -995,7 +1003,12 @@ def _export_veomni_actor_lm_head_weight(
             "export_strategy": export_strategy,
             "actor_backend": "veomni",
             "actor_device_type": actor_device_type,
-            "actor_model_kept_on_device": int(keep_model_on_device_after_export),
+            "actor_model_kept_on_device": int(
+                not restore_cpu_after_export or keep_model_on_device_after_export
+            ),
+            "actor_cache_preserved_after_export": int(
+                preserve_npu_cache_after_export
+            ),
         }
     finally:
         device_module = None
@@ -1012,7 +1025,7 @@ def _export_veomni_actor_lm_head_weight(
             and not keep_model_on_device_after_export
         ):
             offload_model(module)
-        if device_module is not None:
+        if device_module is not None and not preserve_npu_cache_after_export:
             empty_cache = getattr(device_module, "empty_cache", None)
             if callable(empty_cache):
                 empty_cache()
