@@ -607,6 +607,7 @@ class DrafterBaseTrainer:
         self.use_native_dp_sp = (
             self.training_group_world_size > 1 and self.dp_group_world_size > 1
         )
+        self.fsdp_device_mesh = self._resolve_drafter_fsdp_device_mesh()
 
         self.checkpoint_dir = self.config.rollout.drafter.get("checkpoint_path")
         self.step = self.config.rollout.drafter.training.step
@@ -693,7 +694,23 @@ class DrafterBaseTrainer:
 
     def _runtime_resource_metrics(self, phase: str) -> dict[str, float]:
         prefix = f"drafter/resource_{phase}"
-        metrics = {f"{prefix}_process_rss_gib": self._process_rss_gib()}
+        metrics = {
+            f"{prefix}_process_rss_gib": self._process_rss_gib(),
+            "drafter/resource_training_dp_world_size": float(
+                self.dp_group_world_size
+            ),
+            "drafter/resource_training_sp_world_size": float(
+                self.training_group_world_size
+            ),
+            "drafter/resource_fsdp_shard_world_size": float(
+                self.fsdp_device_mesh.size()
+                if self.fsdp_device_mesh is not None
+                else 1
+            ),
+            "drafter/resource_fsdp_mesh_flattened": float(
+                self._use_flattened_drafter_fsdp_mesh()
+            ),
+        }
 
         model_stats = self._tensor_collection_stats(
             self.model.parameters() if self.model is not None else ()
@@ -765,36 +782,41 @@ class DrafterBaseTrainer:
                     ) / float(1024**3)
         return metrics
 
-    def _use_blocking_npu_optimizer_offload(self) -> bool:
+    def _use_flattened_drafter_fsdp_mesh(self) -> bool:
         actor_config = getattr(self.config, "actor", None)
         actor_strategy = (
             actor_config.get("strategy", "")
             if hasattr(actor_config, "get")
             else getattr(actor_config, "strategy", "")
         )
-        return device_name == "npu" and str(actor_strategy).lower() == "veomni"
+        return (
+            device_name == "npu"
+            and str(actor_strategy).lower() == "veomni"
+            and getattr(self.backend, "model_type", None) == "dspark"
+            and self.training_device_mesh is not None
+            and self.dp_group_world_size > 1
+        )
 
-    def _offload_optimizer_state_to_cpu(self) -> None:
-        if self.optimizer is None or not self.optimizer.state:
-            return
-        if not self._use_blocking_npu_optimizer_offload():
-            offload_fsdp_optimizer(self.optimizer)
-            return
+    def _resolve_drafter_fsdp_device_mesh(self):
+        mesh = self.training_device_mesh
+        if mesh is None or not self._use_flattened_drafter_fsdp_mesh():
+            return mesh
 
-        # Ascend's asynchronous D2H path may keep transfer-backed host mappings
-        # alive with AdamW state between triggers. The state is long-lived, so a
-        # blocking copy avoids retaining that staging without changing its dtype.
-        for state in self.optimizer.state.values():
-            if not isinstance(state, dict):
-                continue
-            for key, value in state.items():
-                local_value = (
-                    self._tensor_local_shard(value)
-                    if torch.is_tensor(value)
-                    else None
-                )
-                if local_value is not None and local_value.device.type != "cpu":
-                    state[key] = value.to("cpu", non_blocking=False)
+        # A 2D mesh makes FSDP2 use HSDP: parameters and optimizer state are
+        # sharded over SP but replicated over every rollout DP replica. DSpark
+        # does not use Ulysses SP, so flatten all drafter ranks into one full-
+        # shard dimension while retaining the original dp/sp mesh for data and
+        # metric collectives.
+        flattened_mesh = mesh._flatten(mesh_dim_name="fsdp")
+        if dist.get_rank() == int(flattened_mesh.mesh.reshape(-1)[0].item()):
+            logger.info(
+                "[drafter-fsdp] NPU VeOmni DSpark uses a 1D full-shard mesh "
+                "across %s ranks instead of dp=%s x sp=%s HSDP",
+                flattened_mesh.size(),
+                self.dp_group_world_size,
+                self.training_group_world_size,
+            )
+        return flattened_mesh
 
     def _create_copy_stream(self):
         if device_name == "cpu":
@@ -1049,7 +1071,7 @@ class DrafterBaseTrainer:
         # B. 获取全量状态用于 FSDP 初始化
 
         # C. FSDP包装
-        if self.training_device_mesh is not None and dist.is_initialized():
+        if self.fsdp_device_mesh is not None and dist.is_initialized():
             fsdp_config = self._resolve_fsdp_config()
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
@@ -1058,18 +1080,18 @@ class DrafterBaseTrainer:
             )
 
             fsdp_kwargs = {
-                "mesh": self.training_device_mesh,
+                "mesh": self.fsdp_device_mesh,
                 "mp_policy": mp_policy,
                 "offload_policy": None,
             }
-            logger.debug("Building drafter model with mesh-centered dp x sp FSDP2")
+            logger.debug("Building drafter model with its configured FSDP2 mesh")
 
             full_state = raw_model.state_dict()
             apply_fsdp2(raw_model, fsdp_kwargs, fsdp_config)
 
             # Load full state dict using the same mesh as used by drafter FSDP wrapping
             fsdp2_load_full_state_dict(
-                raw_model, full_state, self.training_device_mesh, None
+                raw_model, full_state, self.fsdp_device_mesh, None
             )
             self.model = raw_model
             del full_state
@@ -1446,6 +1468,8 @@ class DrafterBaseTrainer:
     def _checkpoint_process_group(self):
         if not dist.is_initialized():
             return None
+        if self._use_flattened_drafter_fsdp_mesh():
+            return self.fsdp_device_mesh.get_group()
         group = self._get_sp_group()
         if group is None:
             raise RuntimeError(
@@ -1537,6 +1561,11 @@ class DrafterBaseTrainer:
             "trainer_state_file": trainer_state_file,
             "save_sp_world_size": int(self._get_sp_world_size()),
             "save_dp_world_size": int(self._get_dp_world_size()),
+            "save_fsdp_shard_world_size": int(
+                self.fsdp_device_mesh.size()
+                if self.fsdp_device_mesh is not None
+                else 1
+            ),
         }
         if is_leader:
             try:
@@ -1763,7 +1792,7 @@ class DrafterBaseTrainer:
 
         checkpoint_started = time.perf_counter()
         checkpoint_path = os.path.join(self.checkpoint_dir, f"draft_step_{int(step)}")
-        if self.rollout_dp_rank != 0:
+        if self.rollout_dp_rank != 0 and not self._use_flattened_drafter_fsdp_mesh():
             return {
                 "saved": False,
                 "path": checkpoint_path,
@@ -4818,9 +4847,6 @@ class DrafterBaseTrainer:
         cleanup_started = time.perf_counter()
         cleanup_metrics: dict[str, float] = {}
         cleanup_metrics.update(self._runtime_resource_metrics("pre_cleanup"))
-        cleanup_metrics["drafter/resource_npu_blocking_optimizer_offload"] = float(
-            self._use_blocking_npu_optimizer_offload()
-        )
         # First set training as inactive to prevent further steps
         self._training_active = False
 
@@ -4899,7 +4925,7 @@ class DrafterBaseTrainer:
         stage_started = time.perf_counter()
         if self.optimizer is not None:
             try:
-                self._offload_optimizer_state_to_cpu()
+                offload_fsdp_optimizer(self.optimizer)
                 logger.debug("Offloaded drafter optimizer state to CPU after training")
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
@@ -4968,7 +4994,7 @@ class DrafterBaseTrainer:
 
         if self.optimizer is not None:
             try:
-                self._offload_optimizer_state_to_cpu()
+                offload_fsdp_optimizer(self.optimizer)
                 logger.debug(
                     "Offloaded drafter optimizer state to CPU after activation warmup"
                 )

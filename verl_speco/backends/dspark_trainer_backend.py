@@ -659,6 +659,29 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             return value
         return training_cfg.get(dflash_key, default)
 
+    def _build_target_lm_head(self, target_model_path: str, target_hf_config=None):
+        target_lm_head = super()._build_target_lm_head(
+            target_model_path, target_hf_config
+        )
+        actor_config = getattr(self.config, "actor", None)
+        actor_strategy = (
+            actor_config.get("strategy", "")
+            if hasattr(actor_config, "get")
+            else getattr(actor_config, "strategy", "")
+        )
+        target_weight = getattr(getattr(target_lm_head, "fc", None), "weight", None)
+        if (
+            str(actor_strategy).lower() == "veomni"
+            and torch.is_tensor(target_weight)
+            and target_weight.device.type == "npu"
+            and target_weight.dtype != torch.bfloat16
+        ):
+            target_lm_head = target_lm_head.to(dtype=torch.bfloat16)
+            logger.debug(
+                "[dspark-trainer] keep the frozen NPU VeOmni target lm_head in bfloat16"
+            )
+        return target_lm_head
+
     def _normalize_dflash_config(
         self, drafter_config, target_hf_config, normalized_state, spec_model_path
     ):
