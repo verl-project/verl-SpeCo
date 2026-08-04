@@ -625,6 +625,177 @@ class DrafterBaseTrainer:
                     return False
         return True
 
+    @staticmethod
+    def _optimizer_state_tensors(value: Any):
+        if torch.is_tensor(value):
+            yield value
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                yield from DrafterBaseTrainer._optimizer_state_tensors(item)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                yield from DrafterBaseTrainer._optimizer_state_tensors(item)
+
+    @staticmethod
+    def _tensor_local_shard(tensor: torch.Tensor) -> torch.Tensor:
+        local_tensor = getattr(tensor, "_local_tensor", None)
+        return local_tensor if torch.is_tensor(local_tensor) else tensor
+
+    @classmethod
+    def _tensor_collection_stats(cls, tensors) -> dict[str, float]:
+        bytes_by_device: dict[str, int] = {}
+        pinned_cpu_bytes = 0
+        tensor_count = 0
+        seen: set[int] = set()
+        for tensor in tensors:
+            if not torch.is_tensor(tensor):
+                continue
+            local_tensor = cls._tensor_local_shard(tensor)
+            identity = id(local_tensor)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            tensor_count += 1
+            tensor_bytes = int(local_tensor.numel()) * int(local_tensor.element_size())
+            device_type = str(local_tensor.device.type)
+            bytes_by_device[device_type] = (
+                bytes_by_device.get(device_type, 0) + tensor_bytes
+            )
+            if device_type == "cpu":
+                try:
+                    if bool(local_tensor.is_pinned()):
+                        pinned_cpu_bytes += tensor_bytes
+                except (AttributeError, RuntimeError):
+                    pass
+        gib = float(1024**3)
+        return {
+            "cpu_gib": bytes_by_device.get("cpu", 0) / gib,
+            "runtime_gib": sum(
+                size for name, size in bytes_by_device.items() if name != "cpu"
+            )
+            / gib,
+            "pinned_cpu_gib": pinned_cpu_bytes / gib,
+            "tensor_count": float(tensor_count),
+        }
+
+    @staticmethod
+    def _process_rss_gib() -> float:
+        if not os.path.exists("/proc/self/statm"):
+            return 0.0
+        try:
+            with open("/proc/self/statm", encoding="utf-8") as stream:
+                resident_pages = int(stream.read().split()[1])
+            return resident_pages * os.sysconf("SC_PAGE_SIZE") / float(1024**3)
+        except (OSError, ValueError, IndexError):
+            return 0.0
+
+    def _runtime_resource_metrics(self, phase: str) -> dict[str, float]:
+        prefix = f"drafter/resource_{phase}"
+        metrics = {f"{prefix}_process_rss_gib": self._process_rss_gib()}
+
+        model_stats = self._tensor_collection_stats(
+            self.model.parameters() if self.model is not None else ()
+        )
+        optimizer_stats = self._tensor_collection_stats(
+            self._optimizer_state_tensors(self.optimizer.state)
+            if self.optimizer is not None
+            else ()
+        )
+        target_head = self._target_lm_head_module()
+        target_stats = self._tensor_collection_stats(
+            target_head.parameters() if target_head is not None else ()
+        )
+        metrics.update(
+            {
+                f"{prefix}_model_cpu_gib": model_stats["cpu_gib"],
+                f"{prefix}_model_runtime_gib": model_stats["runtime_gib"],
+                f"{prefix}_optimizer_cpu_gib": optimizer_stats["cpu_gib"],
+                f"{prefix}_optimizer_runtime_gib": optimizer_stats["runtime_gib"],
+                f"{prefix}_optimizer_pinned_cpu_gib": optimizer_stats[
+                    "pinned_cpu_gib"
+                ],
+                f"{prefix}_optimizer_tensor_count": optimizer_stats[
+                    "tensor_count"
+                ],
+                f"{prefix}_target_head_cpu_gib": target_stats["cpu_gib"],
+                f"{prefix}_target_head_runtime_gib": target_stats["runtime_gib"],
+            }
+        )
+
+        if device_name != "cpu":
+            for metric_name, method_name in (
+                ("npu_allocated_gib", "memory_allocated"),
+                ("npu_reserved_gib", "memory_reserved"),
+            ):
+                method = getattr(self.device_module, method_name, None)
+                if callable(method):
+                    try:
+                        value = method(self.device_id)
+                    except TypeError:
+                        try:
+                            value = method()
+                        except Exception:  # noqa: BLE001
+                            continue
+                    except Exception:  # noqa: BLE001
+                        continue
+                    metrics[f"{prefix}_{metric_name}"] = float(value) / float(
+                        1024**3
+                    )
+            mem_get_info = getattr(self.device_module, "mem_get_info", None)
+            if callable(mem_get_info):
+                try:
+                    free_bytes, total_bytes = mem_get_info(self.device_id)
+                except TypeError:
+                    try:
+                        free_bytes, total_bytes = mem_get_info()
+                    except Exception:  # noqa: BLE001
+                        free_bytes = None
+                        total_bytes = None
+                except Exception:  # noqa: BLE001
+                    free_bytes = None
+                    total_bytes = None
+                if free_bytes is not None and total_bytes is not None:
+                    metrics[f"{prefix}_npu_free_gib"] = float(free_bytes) / float(
+                        1024**3
+                    )
+                    metrics[f"{prefix}_npu_device_in_use_gib"] = float(
+                        int(total_bytes) - int(free_bytes)
+                    ) / float(1024**3)
+        return metrics
+
+    def _use_blocking_npu_optimizer_offload(self) -> bool:
+        actor_config = getattr(self.config, "actor", None)
+        actor_strategy = (
+            actor_config.get("strategy", "")
+            if hasattr(actor_config, "get")
+            else getattr(actor_config, "strategy", "")
+        )
+        return device_name == "npu" and str(actor_strategy).lower() == "veomni"
+
+    def _offload_optimizer_state_to_cpu(self) -> None:
+        if self.optimizer is None or not self.optimizer.state:
+            return
+        if not self._use_blocking_npu_optimizer_offload():
+            offload_fsdp_optimizer(self.optimizer)
+            return
+
+        # Ascend's asynchronous D2H path may keep transfer-backed host mappings
+        # alive with AdamW state between triggers. The state is long-lived, so a
+        # blocking copy avoids retaining that staging without changing its dtype.
+        for state in self.optimizer.state.values():
+            if not isinstance(state, dict):
+                continue
+            for key, value in state.items():
+                local_value = (
+                    self._tensor_local_shard(value)
+                    if torch.is_tensor(value)
+                    else None
+                )
+                if local_value is not None and local_value.device.type != "cpu":
+                    state[key] = value.to("cpu", non_blocking=False)
+
     def _create_copy_stream(self):
         if device_name == "cpu":
             return None
@@ -4646,6 +4817,10 @@ class DrafterBaseTrainer:
     async def cleanup_training(self, clear_data: bool = True) -> dict[str, float]:
         cleanup_started = time.perf_counter()
         cleanup_metrics: dict[str, float] = {}
+        cleanup_metrics.update(self._runtime_resource_metrics("pre_cleanup"))
+        cleanup_metrics["drafter/resource_npu_blocking_optimizer_offload"] = float(
+            self._use_blocking_npu_optimizer_offload()
+        )
         # First set training as inactive to prevent further steps
         self._training_active = False
 
@@ -4724,7 +4899,7 @@ class DrafterBaseTrainer:
         stage_started = time.perf_counter()
         if self.optimizer is not None:
             try:
-                offload_fsdp_optimizer(self.optimizer)
+                self._offload_optimizer_state_to_cpu()
                 logger.debug("Offloaded drafter optimizer state to CPU after training")
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
@@ -4763,6 +4938,7 @@ class DrafterBaseTrainer:
         self._training_active = False
         self._last_ckpt_step = -1
         self.training_steps = 0
+        cleanup_metrics.update(self._runtime_resource_metrics("post_cleanup"))
         cleanup_metrics["timing_s/drafter_cleanup_total"] = (
             time.perf_counter() - cleanup_started
         )
@@ -4792,7 +4968,7 @@ class DrafterBaseTrainer:
 
         if self.optimizer is not None:
             try:
-                offload_fsdp_optimizer(self.optimizer)
+                self._offload_optimizer_state_to_cpu()
                 logger.debug(
                     "Offloaded drafter optimizer state to CPU after activation warmup"
                 )

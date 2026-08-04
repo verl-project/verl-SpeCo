@@ -110,7 +110,23 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
     ):
         return False
 
+    from verl.utils.device import get_torch_device
+
+    device_module = get_torch_device()
     state: dict[str, Any] = {"active": False}
+
+    def allocator_snapshot() -> tuple[float, float]:
+        values = []
+        for method_name in ("memory_allocated", "memory_reserved"):
+            method = getattr(device_module, method_name, None)
+            if not callable(method):
+                values.append(0.0)
+                continue
+            try:
+                values.append(float(method()) / float(1024**3))
+            except Exception:  # noqa: BLE001
+                values.append(0.0)
+        return values[0], values[1]
 
     @wraps(original_forward_backward)
     def forward_backward_with_diagnostics(*args, **kwargs):
@@ -124,10 +140,12 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
             return original_forward_backward(*args, **kwargs)
 
         data = args[0] if args else kwargs.get("data")
+        call_tokens = 0
         state["forward_backward_calls"] += 1
         if data is not None:
             try:
-                state["input_tokens"] += _speco_values_numel(data["input_ids"])
+                call_tokens = _speco_values_numel(data["input_ids"])
+                state["input_tokens"] += call_tokens
             except (KeyError, TypeError, AttributeError, IndexError):
                 pass
 
@@ -160,6 +178,7 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                 pass
             return prepared
 
+        allocated_before, reserved_before = allocator_snapshot()
         started = time.perf_counter()
         if isinstance(function_globals, dict) and callable(original_prepare):
             function_globals["prepare_micro_batches"] = prepare_with_diagnostics
@@ -168,7 +187,17 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
         finally:
             if isinstance(function_globals, dict) and callable(original_prepare):
                 function_globals["prepare_micro_batches"] = original_prepare
-            state["forward_backward_elapsed_sec"] += time.perf_counter() - started
+            elapsed = time.perf_counter() - started
+            allocated_after, reserved_after = allocator_snapshot()
+            state["forward_backward_elapsed_sec"] += elapsed
+            state["forward_backward_call_elapsed_sec"].append(elapsed)
+            state["forward_backward_call_tokens"].append(call_tokens)
+            state["forward_backward_call_allocated_delta_gib"].append(
+                allocated_after - allocated_before
+            )
+            state["forward_backward_call_reserved_delta_gib"].append(
+                reserved_after - reserved_before
+            )
 
     @wraps(original_optimizer_step)
     def optimizer_step_with_diagnostics(*args, **kwargs):
@@ -207,6 +236,10 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                 "micro_batch_tokens_max": 0,
                 "input_tokens": 0,
                 "forward_backward_elapsed_sec": 0.0,
+                "forward_backward_call_elapsed_sec": [],
+                "forward_backward_call_tokens": [],
+                "forward_backward_call_allocated_delta_gib": [],
+                "forward_backward_call_reserved_delta_gib": [],
                 "optimizer_step_calls": 0,
                 "optimizer_step_elapsed_sec": 0.0,
                 "to_device_elapsed_sec": 0.0,
@@ -279,6 +312,21 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                 ),
             }
         )
+        for call_index, elapsed in enumerate(
+            state["forward_backward_call_elapsed_sec"], start=1
+        ):
+            metrics[
+                f"timing_s/speco_veomni_actor_forward_backward_call_{call_index}"
+            ] = elapsed
+            metrics[
+                f"speco/veomni_actor_forward_backward_call_{call_index}_tokens"
+            ] = state["forward_backward_call_tokens"][call_index - 1]
+            metrics[
+                f"speco/veomni_actor_forward_backward_call_{call_index}_allocated_delta_gib"
+            ] = state["forward_backward_call_allocated_delta_gib"][call_index - 1]
+            metrics[
+                f"speco/veomni_actor_forward_backward_call_{call_index}_reserved_delta_gib"
+            ] = state["forward_backward_call_reserved_delta_gib"][call_index - 1]
         return output
 
     engine.forward_backward_batch = forward_backward_with_diagnostics

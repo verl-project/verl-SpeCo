@@ -1947,6 +1947,38 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "elapsed_sec": "timing_s/drafter_worker_elapsed",
                 }.get(key, key)
                 metrics[metric_key] = max(values)
+        resource_keys = sorted(
+            {
+                key
+                for result in normalized_results
+                for key in result
+                if key.startswith("drafter/resource_")
+            }
+        )
+        for key in resource_keys:
+            values = [
+                value
+                for result in normalized_results
+                if (value := _speco_metric_float(result.get(key))) is not None
+            ]
+            if not values:
+                continue
+            metrics[key] = (
+                min(values) if key.endswith("_npu_free_gib") else max(values)
+            )
+            if key.endswith("_gib") and any(
+                part in key
+                for part in (
+                    "process_rss",
+                    "model_cpu",
+                    "optimizer_cpu",
+                    "optimizer_pinned_cpu",
+                    "target_head_cpu",
+                )
+            ):
+                metrics[f"{key[:-4]}_sum_gib"] = sum(values)
+            elif key.endswith("_tensor_count"):
+                metrics[f"{key}_sum"] = sum(values)
         metrics["timing_s/drafter_train_rpc"] = train_rpc_elapsed
         return trained, metrics
 
