@@ -114,6 +114,19 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
 
     device_module = get_torch_device()
     state: dict[str, Any] = {"active": False}
+    synchronized_diagnostics = str(
+        os.getenv("SPECO_VEOMNI_ACTOR_SYNC_DIAG", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    def synchronize_device() -> float:
+        if not synchronized_diagnostics:
+            return 0.0
+        synchronize = getattr(device_module, "synchronize", None)
+        if not callable(synchronize):
+            return 0.0
+        started = time.perf_counter()
+        synchronize()
+        return time.perf_counter() - started
 
     def allocator_snapshot() -> tuple[float, float]:
         values = []
@@ -192,6 +205,7 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                 pass
             return prepared
 
+        carry_sync_elapsed = synchronize_device()
         allocated_before, reserved_before = allocator_snapshot()
         started = time.perf_counter()
         if isinstance(function_globals, dict) and callable(original_prepare):
@@ -202,9 +216,19 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
             if isinstance(function_globals, dict) and callable(original_prepare):
                 function_globals["prepare_micro_batches"] = original_prepare
             elapsed = time.perf_counter() - started
+            drain_sync_elapsed = synchronize_device()
             allocated_after, reserved_after = allocator_snapshot()
             state["forward_backward_elapsed_sec"] += elapsed
+            state["forward_backward_sync_elapsed_sec"] += (
+                carry_sync_elapsed + drain_sync_elapsed
+            )
             state["forward_backward_call_elapsed_sec"].append(elapsed)
+            state["forward_backward_call_carry_sync_elapsed_sec"].append(
+                carry_sync_elapsed
+            )
+            state["forward_backward_call_drain_sync_elapsed_sec"].append(
+                drain_sync_elapsed
+            )
             state["forward_backward_call_tokens"].append(call_tokens)
             state["forward_backward_call_allocated_delta_gib"].append(
                 allocated_after - allocated_before
@@ -217,30 +241,41 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
     def optimizer_step_with_diagnostics(*args, **kwargs):
         if not state.get("active", False):
             return original_optimizer_step(*args, **kwargs)
+        carry_sync_elapsed = synchronize_device()
         started = time.perf_counter()
         try:
             return original_optimizer_step(*args, **kwargs)
         finally:
+            elapsed = time.perf_counter() - started
+            drain_sync_elapsed = synchronize_device()
             state["optimizer_step_calls"] += 1
-            state["optimizer_step_elapsed_sec"] += time.perf_counter() - started
+            state["optimizer_step_elapsed_sec"] += elapsed
+            state["optimizer_step_sync_elapsed_sec"] += (
+                carry_sync_elapsed + drain_sync_elapsed
+            )
 
     @wraps(original_to)
     def to_with_diagnostics(*args, **kwargs):
         if not state.get("active", False):
             return original_to(*args, **kwargs)
         device = kwargs.get("device", args[0] if args else None)
+        carry_sync_elapsed = synchronize_device()
         started = time.perf_counter()
         try:
             return original_to(*args, **kwargs)
         finally:
             elapsed = time.perf_counter() - started
+            sync_elapsed = carry_sync_elapsed + synchronize_device()
             if str(device).lower() == "cpu":
                 state["to_cpu_elapsed_sec"] += elapsed
+                state["to_cpu_sync_elapsed_sec"] += sync_elapsed
             else:
                 state["to_device_elapsed_sec"] += elapsed
+                state["to_device_sync_elapsed_sec"] += sync_elapsed
 
     @wraps(original_train_mini_batch)
     def train_mini_batch_with_diagnostics(*args, **kwargs):
+        entry_sync_elapsed = synchronize_device()
         state.clear()
         state.update(
             {
@@ -250,14 +285,22 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                 "micro_batch_tokens_max": 0,
                 "input_tokens": 0,
                 "forward_backward_elapsed_sec": 0.0,
+                "forward_backward_sync_elapsed_sec": 0.0,
                 "forward_backward_call_elapsed_sec": [],
+                "forward_backward_call_carry_sync_elapsed_sec": [],
+                "forward_backward_call_drain_sync_elapsed_sec": [],
                 "forward_backward_call_tokens": [],
                 "forward_backward_call_allocated_delta_gib": [],
                 "forward_backward_call_reserved_delta_gib": [],
                 "optimizer_step_calls": 0,
                 "optimizer_step_elapsed_sec": 0.0,
+                "optimizer_step_sync_elapsed_sec": 0.0,
                 "to_device_elapsed_sec": 0.0,
+                "to_device_sync_elapsed_sec": 0.0,
                 "to_cpu_elapsed_sec": 0.0,
+                "to_cpu_sync_elapsed_sec": 0.0,
+                "entry_sync_elapsed_sec": entry_sync_elapsed,
+                "exit_sync_elapsed_sec": 0.0,
                 "allocator_memory_before": allocator_snapshot(),
                 "device_memory_before": device_memory_snapshot(),
             }
@@ -267,6 +310,7 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
             output = original_train_mini_batch(*args, **kwargs)
         finally:
             state["active"] = False
+            state["exit_sync_elapsed_sec"] = synchronize_device()
 
         metrics = _speco_output_metrics(output)
         if metrics is None:
@@ -287,13 +331,21 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                 "optimizer_step_elapsed_sec",
                 "to_device_elapsed_sec",
                 "to_cpu_elapsed_sec",
+                "forward_backward_sync_elapsed_sec",
+                "optimizer_step_sync_elapsed_sec",
+                "to_device_sync_elapsed_sec",
+                "to_cpu_sync_elapsed_sec",
+                "exit_sync_elapsed_sec",
             )
         )
         allocated_before, reserved_before = state["allocator_memory_before"]
         allocated_after, reserved_after = allocator_memory_after
         metrics.update(
             {
-                "speco/veomni_actor_diag_version": 2,
+                "speco/veomni_actor_diag_version": 3,
+                "speco/veomni_actor_sync_diagnostics": int(
+                    synchronized_diagnostics
+                ),
                 "speco/veomni_actor_forward_backward_calls": state[
                     "forward_backward_calls"
                 ],
@@ -357,6 +409,29 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                     ),
                 }
             )
+        if synchronized_diagnostics:
+            metrics.update(
+                {
+                    "timing_s/speco_veomni_actor_forward_backward_sync": state[
+                        "forward_backward_sync_elapsed_sec"
+                    ],
+                    "timing_s/speco_veomni_actor_optimizer_step_sync": state[
+                        "optimizer_step_sync_elapsed_sec"
+                    ],
+                    "timing_s/speco_veomni_actor_to_device_sync": state[
+                        "to_device_sync_elapsed_sec"
+                    ],
+                    "timing_s/speco_veomni_actor_to_cpu_sync": state[
+                        "to_cpu_sync_elapsed_sec"
+                    ],
+                    "timing_s/speco_veomni_actor_entry_sync": state[
+                        "entry_sync_elapsed_sec"
+                    ],
+                    "timing_s/speco_veomni_actor_exit_sync": state[
+                        "exit_sync_elapsed_sec"
+                    ],
+                }
+            )
         for call_index, elapsed in enumerate(
             state["forward_backward_call_elapsed_sec"], start=1
         ):
@@ -366,6 +441,17 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
             metrics[
                 f"speco/veomni_actor_forward_backward_call_{call_index}_tokens"
             ] = state["forward_backward_call_tokens"][call_index - 1]
+            if synchronized_diagnostics:
+                metrics[
+                    f"timing_s/speco_veomni_actor_forward_backward_call_{call_index}_carry_sync"
+                ] = state["forward_backward_call_carry_sync_elapsed_sec"][
+                    call_index - 1
+                ]
+                metrics[
+                    f"timing_s/speco_veomni_actor_forward_backward_call_{call_index}_drain_sync"
+                ] = state["forward_backward_call_drain_sync_elapsed_sec"][
+                    call_index - 1
+                ]
             metrics[
                 f"speco/veomni_actor_forward_backward_call_{call_index}_allocated_delta_gib"
             ] = state["forward_backward_call_allocated_delta_gib"][call_index - 1]
@@ -381,7 +467,9 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
     actor._speco_veomni_actor_diag_installed = True
     logger.warning(
         "[speco actor diagnostics] installed backend=veomni "
-        "counters=forward_backward,micro_batches,optimizer,to_device,to_cpu,device_memory"
+        "counters=forward_backward,micro_batches,optimizer,to_device,to_cpu,device_memory "
+        "synchronized=%s",
+        int(synchronized_diagnostics),
     )
     return True
 
