@@ -164,6 +164,9 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
     synchronized_diagnostics = str(
         os.getenv("SPECO_VEOMNI_ACTOR_SYNC_DIAG", "")
     ).strip().lower() in {"1", "true", "yes", "on"}
+    entry_barrier_diagnostics = str(
+        os.getenv("SPECO_VEOMNI_ACTOR_ENTRY_BARRIER_DIAG", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
     def synchronize_device() -> float:
         if not synchronized_diagnostics:
@@ -173,6 +176,17 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
             return 0.0
         started = time.perf_counter()
         synchronize()
+        return time.perf_counter() - started
+
+    def synchronize_actor_entry() -> float:
+        if not entry_barrier_diagnostics:
+            return 0.0
+        import torch.distributed as dist
+
+        if not dist.is_initialized() or dist.get_world_size() <= 1:
+            return 0.0
+        started = time.perf_counter()
+        dist.barrier()
         return time.perf_counter() - started
 
     def allocator_snapshot() -> tuple[float, float]:
@@ -322,6 +336,7 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
 
     @wraps(original_train_mini_batch)
     def train_mini_batch_with_diagnostics(*args, **kwargs):
+        entry_barrier_elapsed = synchronize_actor_entry()
         entry_sync_elapsed = synchronize_device()
         state.clear()
         state.update(
@@ -392,6 +407,7 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
             0.0, train_mini_batch_elapsed - accounted_elapsed
         )
         local_rank_values = {
+            "entry_barrier": entry_barrier_elapsed,
             "train": train_mini_batch_elapsed,
             "forward_backward": float(state["forward_backward_elapsed_sec"]),
             "optimizer_step": float(state["optimizer_step_elapsed_sec"]),
@@ -426,9 +442,24 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
 
         metrics.update(
             {
-                "speco/veomni_actor_diag_version": 6,
+                "speco/veomni_actor_diag_version": 7,
                 "speco/veomni_actor_diag_world_size": diagnostic_world_size,
+                "speco/veomni_actor_entry_barrier_diagnostics": int(
+                    entry_barrier_diagnostics
+                ),
+                "speco/veomni_actor_entry_barrier_seconds_min": rank_value(
+                    "entry_barrier", "min"
+                ),
+                "speco/veomni_actor_entry_barrier_seconds_mean": rank_value(
+                    "entry_barrier", "mean"
+                ),
+                "speco/veomni_actor_entry_barrier_seconds_max": rank_value(
+                    "entry_barrier", "max"
+                ),
                 "speco/veomni_actor_slowest_rank": slowest_rank,
+                "speco/veomni_actor_slowest_rank_entry_barrier_seconds": (
+                    slowest_values["entry_barrier"]
+                ),
                 "speco/veomni_actor_slowest_rank_train_seconds": slowest_values[
                     "train"
                 ],
@@ -644,8 +675,9 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
     logger.warning(
         "[speco actor diagnostics] installed backend=veomni "
         "counters=forward_backward,micro_batches,optimizer,to_device,to_cpu,device_memory "
-        "synchronized=%s",
+        "synchronized=%s entry_barrier=%s",
         int(synchronized_diagnostics),
+        int(entry_barrier_diagnostics),
     )
     return True
 
