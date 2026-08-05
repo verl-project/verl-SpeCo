@@ -75,6 +75,45 @@ def _speco_values_numel(value: Any) -> int:
         return 0
 
 
+def _aggregate_veomni_actor_rank_values(
+    local_values: dict[str, float],
+) -> tuple[dict[str, dict[str, float]], int, int]:
+    """Aggregate small diagnostic scalars across the actor world group."""
+
+    import torch.distributed as dist
+
+    local_rank = dist.get_rank() if dist.is_initialized() else 0
+    gathered = [{"rank": local_rank, "values": local_values}]
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(
+            gathered,
+            {"rank": local_rank, "values": local_values},
+        )
+
+    valid = [item for item in gathered if isinstance(item, dict)]
+    stats: dict[str, dict[str, float]] = {}
+    for name in local_values:
+        values = [
+            float(item["values"][name])
+            for item in valid
+            if name in item.get("values", {})
+        ]
+        if values:
+            stats[name] = {
+                "min": min(values),
+                "mean": sum(values) / len(values),
+                "max": max(values),
+            }
+
+    train_values = [
+        (float(item["values"].get("train", float("-inf"))), int(item["rank"]))
+        for item in valid
+    ]
+    slowest_rank = max(train_values)[1] if train_values else local_rank
+    return stats, slowest_rank, len(valid)
+
+
 def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
     """Attach per-update VeOmni timing counters to the actor worker.
 
@@ -312,15 +351,6 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
             state["active"] = False
             state["exit_sync_elapsed_sec"] = synchronize_device()
 
-        metrics = _speco_output_metrics(output)
-        if metrics is None:
-            if not getattr(actor, "_speco_veomni_actor_diag_output_warned", False):
-                logger.warning(
-                    "[speco actor diagnostics] actor output has no mutable metrics mapping"
-                )
-                actor._speco_veomni_actor_diag_output_warned = True
-            return output
-
         train_mini_batch_elapsed = time.perf_counter() - started
         allocator_memory_after = allocator_snapshot()
         device_memory_after = device_memory_snapshot()
@@ -350,9 +380,50 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
         )
         allocated_before, reserved_before = state["allocator_memory_before"]
         allocated_after, reserved_after = allocator_memory_after
+        other_elapsed = max(
+            0.0, train_mini_batch_elapsed - accounted_elapsed
+        )
+        local_rank_values = {
+            "train": train_mini_batch_elapsed,
+            "forward_backward": float(state["forward_backward_elapsed_sec"]),
+            "optimizer_step": float(state["optimizer_step_elapsed_sec"]),
+            "to_device": float(state["to_device_elapsed_sec"]),
+            "to_cpu": float(state["to_cpu_elapsed_sec"]),
+            "sync": sync_elapsed,
+            "other": other_elapsed,
+            "device_free_before": 0.0,
+            "device_unattributed_before": 0.0,
+        }
+        device_memory_before = state["device_memory_before"]
+        if device_memory_before is not None and device_memory_after is not None:
+            free_before, in_use_before = device_memory_before
+            local_rank_values["device_free_before"] = free_before
+            local_rank_values["device_unattributed_before"] = max(
+                0.0, in_use_before - reserved_before
+            )
+        rank_aggregate_started = time.perf_counter()
+        rank_stats, slowest_rank, diagnostic_world_size = (
+            _aggregate_veomni_actor_rank_values(local_rank_values)
+        )
+        rank_aggregate_elapsed = time.perf_counter() - rank_aggregate_started
+
+        def rank_value(name: str, reduction: str) -> float:
+            return rank_stats.get(name, {}).get(
+                reduction, local_rank_values[name]
+            )
+
+        metrics = _speco_output_metrics(output)
+        if metrics is None:
+            return output
+
         metrics.update(
             {
-                "speco/veomni_actor_diag_version": 4,
+                "speco/veomni_actor_diag_version": 5,
+                "speco/veomni_actor_diag_world_size": diagnostic_world_size,
+                "speco/veomni_actor_slowest_rank": slowest_rank,
+                "timing_s/speco_veomni_actor_rank_aggregate": (
+                    rank_aggregate_elapsed
+                ),
                 "speco/veomni_actor_sync_diagnostics": int(
                     synchronized_diagnostics
                 ),
@@ -368,81 +439,77 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                     "optimizer_step_calls"
                 ],
                 "timing_s/speco_veomni_actor_train_mini_batch": (
-                    train_mini_batch_elapsed
+                    rank_value("train", "min")
                 ),
                 # verl's reduce_metrics() treats any key containing "min" as
                 # a minimum. That includes the "timing" and "mini" words, so
                 # use a non-timing namespace for unambiguous rank reduction.
                 "speco/veomni_actor_train_batch_seconds_min": (
-                    train_mini_batch_elapsed
+                    rank_value("train", "min")
                 ),
                 "speco/veomni_actor_train_batch_seconds_mean": (
-                    train_mini_batch_elapsed
+                    rank_value("train", "mean")
                 ),
                 "speco/veomni_actor_train_batch_seconds_max": (
-                    train_mini_batch_elapsed
+                    rank_value("train", "max")
                 ),
-                "timing_s/speco_veomni_actor_forward_backward": state[
-                    "forward_backward_elapsed_sec"
-                ],
-                "speco/veomni_actor_forward_backward_seconds_min": state[
-                    "forward_backward_elapsed_sec"
-                ],
-                "speco/veomni_actor_forward_backward_seconds_mean": state[
-                    "forward_backward_elapsed_sec"
-                ],
-                "speco/veomni_actor_forward_backward_seconds_max": state[
-                    "forward_backward_elapsed_sec"
-                ],
-                "timing_s/speco_veomni_actor_optimizer_step": state[
-                    "optimizer_step_elapsed_sec"
-                ],
-                "speco/veomni_actor_optimizer_step_seconds_min": state[
-                    "optimizer_step_elapsed_sec"
-                ],
-                "speco/veomni_actor_optimizer_step_seconds_mean": state[
-                    "optimizer_step_elapsed_sec"
-                ],
-                "speco/veomni_actor_optimizer_step_seconds_max": state[
-                    "optimizer_step_elapsed_sec"
-                ],
-                "timing_s/speco_veomni_actor_to_device": state[
-                    "to_device_elapsed_sec"
-                ],
-                "speco/veomni_actor_to_device_seconds_min": state[
-                    "to_device_elapsed_sec"
-                ],
-                "speco/veomni_actor_to_device_seconds_mean": state[
-                    "to_device_elapsed_sec"
-                ],
-                "speco/veomni_actor_to_device_seconds_max": state[
-                    "to_device_elapsed_sec"
-                ],
-                "timing_s/speco_veomni_actor_to_cpu": state["to_cpu_elapsed_sec"],
-                "speco/veomni_actor_to_cpu_seconds_min": state[
-                    "to_cpu_elapsed_sec"
-                ],
-                "speco/veomni_actor_to_cpu_seconds_mean": state[
-                    "to_cpu_elapsed_sec"
-                ],
-                "speco/veomni_actor_to_cpu_seconds_max": state[
-                    "to_cpu_elapsed_sec"
-                ],
-                "timing_s/speco_veomni_actor_other": max(
-                    0.0, train_mini_batch_elapsed - accounted_elapsed
+                "timing_s/speco_veomni_actor_forward_backward": rank_value(
+                    "forward_backward", "min"
                 ),
-                "speco/veomni_actor_sync_seconds_min": sync_elapsed,
-                "speco/veomni_actor_sync_seconds_mean": sync_elapsed,
-                "speco/veomni_actor_sync_seconds_max": sync_elapsed,
-                "speco/veomni_actor_other_seconds_min": max(
-                    0.0, train_mini_batch_elapsed - accounted_elapsed
+                "speco/veomni_actor_forward_backward_seconds_min": rank_value(
+                    "forward_backward", "min"
                 ),
-                "speco/veomni_actor_other_seconds_mean": max(
-                    0.0, train_mini_batch_elapsed - accounted_elapsed
+                "speco/veomni_actor_forward_backward_seconds_mean": rank_value(
+                    "forward_backward", "mean"
                 ),
-                "speco/veomni_actor_other_seconds_max": max(
-                    0.0, train_mini_batch_elapsed - accounted_elapsed
+                "speco/veomni_actor_forward_backward_seconds_max": rank_value(
+                    "forward_backward", "max"
                 ),
+                "timing_s/speco_veomni_actor_optimizer_step": rank_value(
+                    "optimizer_step", "min"
+                ),
+                "speco/veomni_actor_optimizer_step_seconds_min": rank_value(
+                    "optimizer_step", "min"
+                ),
+                "speco/veomni_actor_optimizer_step_seconds_mean": rank_value(
+                    "optimizer_step", "mean"
+                ),
+                "speco/veomni_actor_optimizer_step_seconds_max": rank_value(
+                    "optimizer_step", "max"
+                ),
+                "timing_s/speco_veomni_actor_to_device": rank_value(
+                    "to_device", "min"
+                ),
+                "speco/veomni_actor_to_device_seconds_min": rank_value(
+                    "to_device", "min"
+                ),
+                "speco/veomni_actor_to_device_seconds_mean": rank_value(
+                    "to_device", "mean"
+                ),
+                "speco/veomni_actor_to_device_seconds_max": rank_value(
+                    "to_device", "max"
+                ),
+                "timing_s/speco_veomni_actor_to_cpu": rank_value(
+                    "to_cpu", "min"
+                ),
+                "speco/veomni_actor_to_cpu_seconds_min": rank_value(
+                    "to_cpu", "min"
+                ),
+                "speco/veomni_actor_to_cpu_seconds_mean": rank_value(
+                    "to_cpu", "mean"
+                ),
+                "speco/veomni_actor_to_cpu_seconds_max": rank_value(
+                    "to_cpu", "max"
+                ),
+                "timing_s/speco_veomni_actor_other": rank_value("other", "min"),
+                "speco/veomni_actor_sync_seconds_min": rank_value("sync", "min"),
+                "speco/veomni_actor_sync_seconds_mean": rank_value("sync", "mean"),
+                "speco/veomni_actor_sync_seconds_max": rank_value("sync", "max"),
+                "speco/veomni_actor_other_seconds_min": rank_value("other", "min"),
+                "speco/veomni_actor_other_seconds_mean": rank_value(
+                    "other", "mean"
+                ),
+                "speco/veomni_actor_other_seconds_max": rank_value("other", "max"),
                 "speco/veomni_actor_param_offload": int(
                     bool(getattr(engine, "_is_offload_param", False))
                 ),
@@ -458,25 +525,28 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                 "speco/veomni_actor_reserved_after_gib": reserved_after,
             }
         )
-        device_memory_before = state["device_memory_before"]
         if device_memory_before is not None and device_memory_after is not None:
             free_before, in_use_before = device_memory_before
             free_after, in_use_after = device_memory_after
             metrics.update(
                 {
-                    "speco/veomni_actor_device_free_before_gib": free_before,
-                    "speco/veomni_actor_device_free_before_gib_min": free_before,
+                    "speco/veomni_actor_device_free_before_gib": rank_value(
+                        "device_free_before", "mean"
+                    ),
+                    "speco/veomni_actor_device_free_before_gib_min": rank_value(
+                        "device_free_before", "min"
+                    ),
                     "speco/veomni_actor_device_free_after_gib": free_after,
                     "speco/veomni_actor_device_in_use_before_gib": in_use_before,
                     "speco/veomni_actor_device_in_use_after_gib": in_use_after,
                     "speco/veomni_actor_device_in_use_delta_gib": (
                         in_use_after - in_use_before
                     ),
-                    "speco/veomni_actor_device_unattributed_before_gib": max(
-                        0.0, in_use_before - reserved_before
+                    "speco/veomni_actor_device_unattributed_before_gib": (
+                        rank_value("device_unattributed_before", "mean")
                     ),
-                    "speco/veomni_actor_device_unattributed_before_gib_max": max(
-                        0.0, in_use_before - reserved_before
+                    "speco/veomni_actor_device_unattributed_before_gib_max": (
+                        rank_value("device_unattributed_before", "max")
                     ),
                     "speco/veomni_actor_device_unattributed_after_gib": max(
                         0.0, in_use_after - reserved_after
