@@ -324,6 +324,16 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
         train_mini_batch_elapsed = time.perf_counter() - started
         allocator_memory_after = allocator_snapshot()
         device_memory_after = device_memory_snapshot()
+        sync_elapsed = sum(
+            float(state[key])
+            for key in (
+                "forward_backward_sync_elapsed_sec",
+                "optimizer_step_sync_elapsed_sec",
+                "to_device_sync_elapsed_sec",
+                "to_cpu_sync_elapsed_sec",
+                "exit_sync_elapsed_sec",
+            )
+        )
         accounted_elapsed = sum(
             float(state[key])
             for key in (
@@ -342,7 +352,7 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
         allocated_after, reserved_after = allocator_memory_after
         metrics.update(
             {
-                "speco/veomni_actor_diag_version": 3,
+                "speco/veomni_actor_diag_version": 4,
                 "speco/veomni_actor_sync_diagnostics": int(
                     synchronized_diagnostics
                 ),
@@ -360,17 +370,77 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                 "timing_s/speco_veomni_actor_train_mini_batch": (
                     train_mini_batch_elapsed
                 ),
+                # verl's reduce_metrics() treats any key containing "min" as
+                # a minimum. That includes the "timing" and "mini" words, so
+                # use a non-timing namespace for unambiguous rank reduction.
+                "speco/veomni_actor_train_batch_seconds_min": (
+                    train_mini_batch_elapsed
+                ),
+                "speco/veomni_actor_train_batch_seconds_mean": (
+                    train_mini_batch_elapsed
+                ),
+                "speco/veomni_actor_train_batch_seconds_max": (
+                    train_mini_batch_elapsed
+                ),
                 "timing_s/speco_veomni_actor_forward_backward": state[
+                    "forward_backward_elapsed_sec"
+                ],
+                "speco/veomni_actor_forward_backward_seconds_min": state[
+                    "forward_backward_elapsed_sec"
+                ],
+                "speco/veomni_actor_forward_backward_seconds_mean": state[
+                    "forward_backward_elapsed_sec"
+                ],
+                "speco/veomni_actor_forward_backward_seconds_max": state[
                     "forward_backward_elapsed_sec"
                 ],
                 "timing_s/speco_veomni_actor_optimizer_step": state[
                     "optimizer_step_elapsed_sec"
                 ],
+                "speco/veomni_actor_optimizer_step_seconds_min": state[
+                    "optimizer_step_elapsed_sec"
+                ],
+                "speco/veomni_actor_optimizer_step_seconds_mean": state[
+                    "optimizer_step_elapsed_sec"
+                ],
+                "speco/veomni_actor_optimizer_step_seconds_max": state[
+                    "optimizer_step_elapsed_sec"
+                ],
                 "timing_s/speco_veomni_actor_to_device": state[
                     "to_device_elapsed_sec"
                 ],
+                "speco/veomni_actor_to_device_seconds_min": state[
+                    "to_device_elapsed_sec"
+                ],
+                "speco/veomni_actor_to_device_seconds_mean": state[
+                    "to_device_elapsed_sec"
+                ],
+                "speco/veomni_actor_to_device_seconds_max": state[
+                    "to_device_elapsed_sec"
+                ],
                 "timing_s/speco_veomni_actor_to_cpu": state["to_cpu_elapsed_sec"],
+                "speco/veomni_actor_to_cpu_seconds_min": state[
+                    "to_cpu_elapsed_sec"
+                ],
+                "speco/veomni_actor_to_cpu_seconds_mean": state[
+                    "to_cpu_elapsed_sec"
+                ],
+                "speco/veomni_actor_to_cpu_seconds_max": state[
+                    "to_cpu_elapsed_sec"
+                ],
                 "timing_s/speco_veomni_actor_other": max(
+                    0.0, train_mini_batch_elapsed - accounted_elapsed
+                ),
+                "speco/veomni_actor_sync_seconds_min": sync_elapsed,
+                "speco/veomni_actor_sync_seconds_mean": sync_elapsed,
+                "speco/veomni_actor_sync_seconds_max": sync_elapsed,
+                "speco/veomni_actor_other_seconds_min": max(
+                    0.0, train_mini_batch_elapsed - accounted_elapsed
+                ),
+                "speco/veomni_actor_other_seconds_mean": max(
+                    0.0, train_mini_batch_elapsed - accounted_elapsed
+                ),
+                "speco/veomni_actor_other_seconds_max": max(
                     0.0, train_mini_batch_elapsed - accounted_elapsed
                 ),
                 "speco/veomni_actor_param_offload": int(
@@ -395,6 +465,7 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
             metrics.update(
                 {
                     "speco/veomni_actor_device_free_before_gib": free_before,
+                    "speco/veomni_actor_device_free_before_gib_min": free_before,
                     "speco/veomni_actor_device_free_after_gib": free_after,
                     "speco/veomni_actor_device_in_use_before_gib": in_use_before,
                     "speco/veomni_actor_device_in_use_after_gib": in_use_after,
@@ -402,6 +473,9 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                         in_use_after - in_use_before
                     ),
                     "speco/veomni_actor_device_unattributed_before_gib": max(
+                        0.0, in_use_before - reserved_before
+                    ),
+                    "speco/veomni_actor_device_unattributed_before_gib_max": max(
                         0.0, in_use_before - reserved_before
                     ),
                     "speco/veomni_actor_device_unattributed_after_gib": max(
