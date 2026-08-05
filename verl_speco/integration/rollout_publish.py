@@ -77,13 +77,13 @@ def _speco_values_numel(value: Any) -> int:
 
 def _aggregate_veomni_actor_rank_values(
     local_values: dict[str, float],
-) -> tuple[dict[str, dict[str, float]], int, int]:
+) -> tuple[dict[str, dict[str, float]], int, dict[str, float], int]:
     """Aggregate small diagnostic scalars across the actor world group."""
 
     import torch.distributed as dist
 
     local_rank = dist.get_rank() if dist.is_initialized() else 0
-    gathered = [{"rank": local_rank, "values": local_values}]
+    gathered: list[Any] = [{"rank": local_rank, "values": local_values}]
     if dist.is_initialized() and dist.get_world_size() > 1:
         gathered = [None] * dist.get_world_size()
         dist.all_gather_object(
@@ -111,7 +111,15 @@ def _aggregate_veomni_actor_rank_values(
         for item in valid
     ]
     slowest_rank = max(train_values)[1] if train_values else local_rank
-    return stats, slowest_rank, len(valid)
+    slowest_values = next(
+        (
+            {name: float(value) for name, value in item["values"].items()}
+            for item in valid
+            if int(item["rank"]) == slowest_rank
+        ),
+        local_values,
+    )
+    return stats, slowest_rank, slowest_values, len(valid)
 
 
 def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
@@ -402,7 +410,7 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
                 0.0, in_use_before - reserved_before
             )
         rank_aggregate_started = time.perf_counter()
-        rank_stats, slowest_rank, diagnostic_world_size = (
+        rank_stats, slowest_rank, slowest_values, diagnostic_world_size = (
             _aggregate_veomni_actor_rank_values(local_rank_values)
         )
         rank_aggregate_elapsed = time.perf_counter() - rank_aggregate_started
@@ -418,9 +426,33 @@ def install_veomni_actor_update_diagnostics(worker: Any) -> bool:
 
         metrics.update(
             {
-                "speco/veomni_actor_diag_version": 5,
+                "speco/veomni_actor_diag_version": 6,
                 "speco/veomni_actor_diag_world_size": diagnostic_world_size,
                 "speco/veomni_actor_slowest_rank": slowest_rank,
+                "speco/veomni_actor_slowest_rank_train_seconds": slowest_values[
+                    "train"
+                ],
+                "speco/veomni_actor_slowest_rank_forward_backward_seconds": (
+                    slowest_values["forward_backward"]
+                ),
+                "speco/veomni_actor_slowest_rank_optimizer_step_seconds": (
+                    slowest_values["optimizer_step"]
+                ),
+                "speco/veomni_actor_slowest_rank_to_device_seconds": slowest_values[
+                    "to_device"
+                ],
+                "speco/veomni_actor_slowest_rank_to_cpu_seconds": slowest_values[
+                    "to_cpu"
+                ],
+                "speco/veomni_actor_slowest_rank_sync_seconds": slowest_values[
+                    "sync"
+                ],
+                "speco/veomni_actor_slowest_rank_device_free_before_gib": (
+                    slowest_values["device_free_before"]
+                ),
+                "speco/veomni_actor_slowest_rank_device_unattributed_before_gib": (
+                    slowest_values["device_unattributed_before"]
+                ),
                 "timing_s/speco_veomni_actor_rank_aggregate": (
                     rank_aggregate_elapsed
                 ),
