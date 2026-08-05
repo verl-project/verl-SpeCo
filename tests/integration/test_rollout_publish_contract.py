@@ -94,26 +94,6 @@ def test_veomni_backend_and_parallel_layout_support_worker_config_shape() -> Non
     }
 
 
-def test_veomni_npu_actor_cache_is_reclaimed_before_drafter(monkeypatch) -> None:
-    events = []
-    fake_torch = SimpleNamespace(
-        npu=SimpleNamespace(
-            synchronize=lambda: events.append("synchronize"),
-            empty_cache=lambda: events.append("empty_cache"),
-        )
-    )
-    monkeypatch.setattr(rollout_publish, "_torch_module", lambda: fake_torch)
-    worker = SimpleNamespace(
-        _is_actor=True,
-        config={"actor": {"strategy": "veomni"}},
-    )
-
-    result = rollout_publish.reclaim_actor_cache_for_drafter(worker)
-
-    assert result["reclaimed"] is True
-    assert events == ["synchronize", "empty_cache"]
-
-
 @pytest.mark.parametrize(
     ("router_mode", "rollout_replay", "error_match"),
     [
@@ -215,12 +195,6 @@ def test_veomni_lm_head_export_avoids_full_engine_state_dict(
     assert payload["export_strategy"] == expected_strategy
     assert payload["actor_backend"] == "veomni"
     assert tuple(payload["weight"].shape) == (expected_rows, 3)
-
-
-def test_veomni_lm_head_export_preserves_cache_for_resident_actor() -> None:
-    source = getsource(rollout_publish._export_veomni_actor_lm_head_weight)
-
-    assert "device_module is not None and not preserve_npu_cache_after_export" in source
 
 
 def test_veomni_runtime_validation_checks_initialized_model_contract() -> None:

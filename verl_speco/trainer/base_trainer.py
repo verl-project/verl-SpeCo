@@ -631,163 +631,9 @@ class DrafterBaseTrainer:
         return True
 
     @staticmethod
-    def _optimizer_state_tensors(value: Any):
-        if torch.is_tensor(value):
-            yield value
-            return
-        if isinstance(value, dict):
-            for item in value.values():
-                yield from DrafterBaseTrainer._optimizer_state_tensors(item)
-            return
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                yield from DrafterBaseTrainer._optimizer_state_tensors(item)
-
-    @staticmethod
     def _tensor_local_shard(tensor: torch.Tensor) -> torch.Tensor:
         local_tensor = getattr(tensor, "_local_tensor", None)
         return local_tensor if torch.is_tensor(local_tensor) else tensor
-
-    @classmethod
-    def _tensor_collection_stats(cls, tensors) -> dict[str, float]:
-        bytes_by_device: dict[str, int] = {}
-        pinned_cpu_bytes = 0
-        tensor_count = 0
-        seen: set[int] = set()
-        for tensor in tensors:
-            if not torch.is_tensor(tensor):
-                continue
-            local_tensor = cls._tensor_local_shard(tensor)
-            identity = id(local_tensor)
-            if identity in seen:
-                continue
-            seen.add(identity)
-            tensor_count += 1
-            tensor_bytes = int(local_tensor.numel()) * int(local_tensor.element_size())
-            device_type = str(local_tensor.device.type)
-            bytes_by_device[device_type] = (
-                bytes_by_device.get(device_type, 0) + tensor_bytes
-            )
-            if device_type == "cpu":
-                try:
-                    if bool(local_tensor.is_pinned()):
-                        pinned_cpu_bytes += tensor_bytes
-                except (AttributeError, RuntimeError):
-                    pass
-        gib = float(1024**3)
-        return {
-            "cpu_gib": bytes_by_device.get("cpu", 0) / gib,
-            "runtime_gib": sum(
-                size for name, size in bytes_by_device.items() if name != "cpu"
-            )
-            / gib,
-            "pinned_cpu_gib": pinned_cpu_bytes / gib,
-            "tensor_count": float(tensor_count),
-        }
-
-    @staticmethod
-    def _process_rss_gib() -> float:
-        if not os.path.exists("/proc/self/statm"):
-            return 0.0
-        try:
-            with open("/proc/self/statm", encoding="utf-8") as stream:
-                resident_pages = int(stream.read().split()[1])
-            return resident_pages * os.sysconf("SC_PAGE_SIZE") / float(1024**3)
-        except (OSError, ValueError, IndexError):
-            return 0.0
-
-    def _runtime_resource_metrics(self, phase: str) -> dict[str, float]:
-        prefix = f"drafter/resource_{phase}"
-        metrics = {
-            f"{prefix}_process_rss_gib": self._process_rss_gib(),
-            "drafter/resource_training_dp_world_size": float(
-                self.dp_group_world_size
-            ),
-            "drafter/resource_training_sp_world_size": float(
-                self.training_group_world_size
-            ),
-            "drafter/resource_fsdp_shard_world_size": float(
-                self.fsdp_device_mesh.size()
-                if self.fsdp_device_mesh is not None
-                else 1
-            ),
-            "drafter/resource_fsdp_mesh_flattened": float(
-                self._use_flattened_drafter_fsdp_mesh()
-            ),
-            "drafter/resource_fsdp_reuses_default_world_group": float(
-                self._fsdp_mesh_reuses_default_group
-            ),
-        }
-
-        model_stats = self._tensor_collection_stats(
-            self.model.parameters() if self.model is not None else ()
-        )
-        optimizer_stats = self._tensor_collection_stats(
-            self._optimizer_state_tensors(self.optimizer.state)
-            if self.optimizer is not None
-            else ()
-        )
-        target_head = self._target_lm_head_module()
-        target_stats = self._tensor_collection_stats(
-            target_head.parameters() if target_head is not None else ()
-        )
-        metrics.update(
-            {
-                f"{prefix}_model_cpu_gib": model_stats["cpu_gib"],
-                f"{prefix}_model_runtime_gib": model_stats["runtime_gib"],
-                f"{prefix}_optimizer_cpu_gib": optimizer_stats["cpu_gib"],
-                f"{prefix}_optimizer_runtime_gib": optimizer_stats["runtime_gib"],
-                f"{prefix}_optimizer_pinned_cpu_gib": optimizer_stats[
-                    "pinned_cpu_gib"
-                ],
-                f"{prefix}_optimizer_tensor_count": optimizer_stats[
-                    "tensor_count"
-                ],
-                f"{prefix}_target_head_cpu_gib": target_stats["cpu_gib"],
-                f"{prefix}_target_head_runtime_gib": target_stats["runtime_gib"],
-            }
-        )
-
-        if device_name != "cpu":
-            for metric_name, method_name in (
-                ("npu_allocated_gib", "memory_allocated"),
-                ("npu_reserved_gib", "memory_reserved"),
-            ):
-                method = getattr(self.device_module, method_name, None)
-                if callable(method):
-                    try:
-                        value = method(self.device_id)
-                    except TypeError:
-                        try:
-                            value = method()
-                        except Exception:  # noqa: BLE001
-                            continue
-                    except Exception:  # noqa: BLE001
-                        continue
-                    metrics[f"{prefix}_{metric_name}"] = float(value) / float(
-                        1024**3
-                    )
-            mem_get_info = getattr(self.device_module, "mem_get_info", None)
-            if callable(mem_get_info):
-                try:
-                    free_bytes, total_bytes = mem_get_info(self.device_id)
-                except TypeError:
-                    try:
-                        free_bytes, total_bytes = mem_get_info()
-                    except Exception:  # noqa: BLE001
-                        free_bytes = None
-                        total_bytes = None
-                except Exception:  # noqa: BLE001
-                    free_bytes = None
-                    total_bytes = None
-                if free_bytes is not None and total_bytes is not None:
-                    metrics[f"{prefix}_npu_free_gib"] = float(free_bytes) / float(
-                        1024**3
-                    )
-                    metrics[f"{prefix}_npu_device_in_use_gib"] = float(
-                        int(total_bytes) - int(free_bytes)
-                    ) / float(1024**3)
-        return metrics
 
     def _use_flattened_drafter_fsdp_mesh(self) -> bool:
         actor_config = getattr(self.config, "actor", None)
@@ -827,18 +673,11 @@ class DrafterBaseTrainer:
             and getattr(self.backend, "model_type", None) == "dspark"
         )
 
-    def _park_idle_drafter_hccl(self) -> dict[str, float]:
+    def _park_idle_drafter_hccl(self) -> None:
         """Release idle HCCL communicators without rebuilding the trainer."""
 
         if not self._should_park_drafter_hccl() or not dist.is_initialized():
-            return {}
-        metrics = {
-            "drafter/resource_hccl_idle_release_enabled": 1.0,
-            "drafter/resource_hccl_idle_release_supported": 0.0,
-            "drafter/resource_hccl_idle_groups_parked": 0.0,
-            "drafter/resource_hccl_idle_released_gib": 0.0,
-            "timing_s/drafter_hccl_idle_release": 0.0,
-        }
+            return
 
         groups = []
         for group in (
@@ -858,38 +697,19 @@ class DrafterBaseTrainer:
         for group in groups:
             get_backend = getattr(group, "_get_backend", None)
             if not callable(get_backend):
-                return metrics
+                return
             backend = get_backend(npu_device)
             delete_store_key = getattr(backend, "_delete_tcpstore_key", None)
             abort_hccl = getattr(backend, "abort_hccl_comm", None)
             if not callable(delete_store_key) or not callable(abort_hccl):
-                return metrics
+                return
             group_backends.append((delete_store_key, abort_hccl))
-        metrics["drafter/resource_hccl_idle_release_supported"] = 1.0
 
-        mem_get_info = getattr(self.device_module, "mem_get_info", None)
-
-        def free_memory_gib() -> float | None:
-            if not callable(mem_get_info):
-                return None
-            try:
-                free_bytes, _ = mem_get_info(self.device_id)
-            except TypeError:
-                try:
-                    free_bytes, _ = mem_get_info()
-                except Exception:  # noqa: BLE001
-                    return None
-            except Exception:  # noqa: BLE001
-                return None
-            return float(free_bytes) / float(1024**3)
-
-        started = time.perf_counter()
         sync_group = groups[0] if groups else None
         if sync_group is not None and dist.get_world_size(group=sync_group) > 1:
             dist.barrier(group=sync_group)
         if hasattr(self.device_module, "synchronize"):
             self.device_module.synchronize()
-        free_before = free_memory_gib()
 
         for delete_store_key, abort_hccl in group_backends:
             delete_store_key()
@@ -899,28 +719,6 @@ class DrafterBaseTrainer:
             self.device_module.synchronize()
         if hasattr(self.device_module, "empty_cache"):
             self.device_module.empty_cache()
-        free_after = free_memory_gib()
-
-        metrics["drafter/resource_hccl_idle_groups_parked"] = float(
-            len(group_backends)
-        )
-        if free_before is not None and free_after is not None:
-            metrics["drafter/resource_hccl_idle_free_before_gib"] = free_before
-            metrics["drafter/resource_hccl_idle_free_after_gib"] = free_after
-            metrics["drafter/resource_hccl_idle_released_gib"] = max(
-                free_after - free_before, 0.0
-            )
-        metrics["timing_s/drafter_hccl_idle_release"] = (
-            time.perf_counter() - started
-        )
-        if dist.get_rank() == 0:
-            logger.info(
-                "[drafter-hccl] parked %s idle process groups released_gib=%.3f elapsed_sec=%.3f",
-                len(group_backends),
-                metrics["drafter/resource_hccl_idle_released_gib"],
-                metrics["timing_s/drafter_hccl_idle_release"],
-            )
-        return metrics
 
     def _offload_optimizer_state_to_cpu(self) -> None:
         if self.optimizer is None or not self.optimizer.state:
@@ -2107,9 +1905,6 @@ class DrafterBaseTrainer:
     async def activate_training_model(self) -> bool:
         # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态
         start_ts = time.time()
-        activation_started = time.perf_counter()
-        activation_metrics: dict[str, float] = {}
-        self._last_activation_timing_metrics = activation_metrics
         activation_stage = "enter"
         try:
             logger.debug(
@@ -2117,14 +1912,7 @@ class DrafterBaseTrainer:
             )
 
             if self._training_active and self.model is not None:
-                stage_started = time.perf_counter()
                 self._apply_pending_target_lm_head_weight()
-                activation_metrics[
-                    "timing_s/drafter_activation_apply_target_head_active"
-                ] = time.perf_counter() - stage_started
-                activation_metrics["timing_s/drafter_activation_total"] = (
-                    time.perf_counter() - activation_started
-                )
                 logger.debug(
                     f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] activate_training_model reused active model "
                     f"elapsed={time.time() - start_ts:.2f}s"
@@ -2135,22 +1923,14 @@ class DrafterBaseTrainer:
             # Apply them before loading drafter model/optimizer state to keep
             # accelerator memory peaks low during activation.
             activation_stage = "apply_pending_target_head_on_host"
-            stage_started = time.perf_counter()
             self._apply_pending_target_lm_head_weight()
-            activation_metrics[
-                "timing_s/drafter_activation_apply_target_head_cpu"
-            ] = time.perf_counter() - stage_started
 
             if self.model is None:
                 logger.debug(
                     "Draft Model not initialized, calling build_draft_model during activation..."
                 )
                 activation_stage = "build_draft_model"
-                stage_started = time.perf_counter()
                 self._build_draft_model()
-                activation_metrics["timing_s/drafter_activation_build_model"] = (
-                    time.perf_counter() - stage_started
-                )
 
             # 只有当配置了 offload 或者当前模型不在 CUDA 上时执行加载
             first_param = next(self.model.parameters(), None)
@@ -2161,11 +1941,7 @@ class DrafterBaseTrainer:
             if self.is_offload_param or not is_on_cuda:
                 # 调用工具将 FSDP 分片移动到 GPU
                 activation_stage = "load_draft_model"
-                stage_started = time.perf_counter()
                 load_fsdp_model_to_gpu(self.model)
-                activation_metrics["timing_s/drafter_activation_load_model"] = (
-                    time.perf_counter() - stage_started
-                )
                 logger.debug("Loaded drafter model to GPU for training")
 
             if self.optimizer is not None and (
@@ -2175,33 +1951,17 @@ class DrafterBaseTrainer:
                 # 获取 device_id,否则在多卡环境优化器状态可能全部挤在 cuda:0 导致 OOM
                 current_dev_id = get_device_id()
                 activation_stage = "load_draft_optimizer"
-                stage_started = time.perf_counter()
                 load_fsdp_optimizer(optimizer=self.optimizer, device_id=current_dev_id)
-                activation_metrics[
-                    "timing_s/drafter_activation_load_optimizer"
-                ] = time.perf_counter() - stage_started
                 logger.debug("Loaded drafter optimizer to GPU for training")
 
             activation_stage = "load_target_lm_head"
-            stage_started = time.perf_counter()
             self._move_target_lm_head(self.runtime_device)
-            activation_metrics[
-                "timing_s/drafter_activation_load_target_lm_head"
-            ] = time.perf_counter() - stage_started
             activation_stage = "apply_pending_target_head_on_device"
-            stage_started = time.perf_counter()
             self._apply_pending_target_lm_head_weight()
-            activation_metrics[
-                "timing_s/drafter_activation_apply_target_head_device"
-            ] = time.perf_counter() - stage_started
 
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
             self._training_initialized = True
             self._training_active = True
-            activation_metrics["timing_s/drafter_activation_total"] = (
-                time.perf_counter() - activation_started
-            )
-
             logger.debug(
                 f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] activate_training_model success "
                 f"elapsed={time.time() - start_ts:.2f}s"
@@ -2209,18 +1969,12 @@ class DrafterBaseTrainer:
             return True
 
         except Exception as e:
-            activation_metrics["timing_s/drafter_activation_total"] = (
-                time.perf_counter() - activation_started
-            )
             logger.error(
                 f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] "
                 f"activate_training_model failed stage={activation_stage}: {e}"
             )
             self._training_active = False
             return False
-
-    def get_last_activation_timing_metrics(self) -> dict[str, float]:
-        return dict(getattr(self, "_last_activation_timing_metrics", {}))
 
     def sync_target_lm_head_weight(
         self,
@@ -5011,18 +4765,11 @@ class DrafterBaseTrainer:
         self.clear_pending_publish_state_dict()
         return True, state_dict
 
-    async def cleanup_training(self, clear_data: bool = True) -> dict[str, float]:
-        cleanup_started = time.perf_counter()
-        cleanup_metrics: dict[str, float] = {}
-        cleanup_metrics.update(self._runtime_resource_metrics("pre_cleanup"))
-        cleanup_metrics["drafter/resource_npu_blocking_optimizer_offload"] = float(
-            self._use_blocking_npu_optimizer_offload()
-        )
+    async def cleanup_training(self, clear_data: bool = True):
         # First set training as inactive to prevent further steps
         self._training_active = False
 
         # Wait for any pending async checkpoint save to complete
-        stage_started = time.perf_counter()
         if self._pending_checkpoint_future is not None:
             logger.debug(
                 f"[Rank {self.rank}] Waiting for pending checkpoint save to complete..."
@@ -5047,20 +4794,11 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Pending full drafter checkpoint save failed: {e}")
             self._pending_full_checkpoint_future = None
-        cleanup_metrics["timing_s/drafter_cleanup_checkpoint_wait"] = (
-            time.perf_counter() - stage_started
-        )
-
-        stage_started = time.perf_counter()
         if self.optimizer is not None:
             try:
                 self.optimizer.zero_grad(set_to_none=True)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to clear drafter gradients during cleanup: {e}")
-        cleanup_metrics["timing_s/drafter_cleanup_zero_grad"] = (
-            time.perf_counter() - stage_started
-        )
-
         if self.skip_heavy_cleanup_after_drafter_training:
             if clear_data:
                 self.collected_data.clear()
@@ -5073,27 +4811,18 @@ class DrafterBaseTrainer:
                 "[Rank %s] Skipped heavy drafter cleanup; model/optimizer stay on runtime device",
                 self.rank,
             )
-            cleanup_metrics["timing_s/drafter_cleanup_total"] = (
-                time.perf_counter() - cleanup_started
-            )
-            return cleanup_metrics
+            return
 
         # Training and publish collectives have completed before cleanup. These
         # process groups stay alive across triggers, so barriers here only
         # serialize ranks and can add timeout windows without releasing memory.
 
-        stage_started = time.perf_counter()
         if self.model is not None:
             try:
                 offload_fsdp_model_to_cpu(self.model)
                 logger.debug("Offloaded drafter model to CPU after training")
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter model during cleanup: {e}")
-        cleanup_metrics["timing_s/drafter_cleanup_offload_model"] = (
-            time.perf_counter() - stage_started
-        )
-
-        stage_started = time.perf_counter()
         if self.optimizer is not None:
             try:
                 self._offload_optimizer_state_to_cpu()
@@ -5104,49 +4833,27 @@ class DrafterBaseTrainer:
                         "NPU VeOmni drafter optimizer blocking offload failed during cleanup"
                     ) from e
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
-        cleanup_metrics["timing_s/drafter_cleanup_offload_optimizer"] = (
-            time.perf_counter() - stage_started
-        )
-
-        stage_started = time.perf_counter()
         try:
             self._move_target_lm_head("cpu")
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Failed to offload drafter target head during cleanup: {e}")
-        cleanup_metrics["timing_s/drafter_cleanup_offload_target_lm_head"] = (
-            time.perf_counter() - stage_started
-        )
-
-        stage_started = time.perf_counter()
         if clear_data:
             self.collected_data.clear()
             self.data_buffer.clear()  # Clear the cross-step data buffer
         if self._full_checkpoint_executor is not None:
             self._full_checkpoint_executor.shutdown(wait=False)
             self._full_checkpoint_executor = None
-        cleanup_metrics["timing_s/drafter_cleanup_release_host_state"] = (
-            time.perf_counter() - stage_started
-        )
-        stage_started = time.perf_counter()
         if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
             if hasattr(self.device_module, "synchronize"):
                 self.device_module.synchronize()
             self.device_module.empty_cache()
-        cleanup_metrics["timing_s/drafter_cleanup_device_reclaim"] = (
-            time.perf_counter() - stage_started
-        )
-        cleanup_metrics.update(self._park_idle_drafter_hccl())
+        self._park_idle_drafter_hccl()
         self._training_initialized = False
         self._training_active = False
         self._last_ckpt_step = -1
         self.training_steps = 0
-        cleanup_metrics.update(self._runtime_resource_metrics("post_cleanup"))
-        cleanup_metrics["timing_s/drafter_cleanup_total"] = (
-            time.perf_counter() - cleanup_started
-        )
-        return cleanup_metrics
 
-    async def release_training_memory_after_activation(self) -> dict[str, float]:
+    async def release_training_memory_after_activation(self):
         """Release runtime-device memory after a pre-fit activation warmup."""
 
         self._training_active = False
@@ -5196,6 +4903,5 @@ class DrafterBaseTrainer:
                 self.device_module.synchronize()
             self.device_module.empty_cache()
 
-        release_metrics = self._park_idle_drafter_hccl()
+        self._park_idle_drafter_hccl()
         self._training_initialized = False
-        return release_metrics

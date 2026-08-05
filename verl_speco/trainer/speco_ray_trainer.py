@@ -115,173 +115,6 @@ def _get_nested(config, path, default=None):
     return current
 
 
-def _run_veomni_actor_update_with_outer_diagnostics(
-    trainer: Any,
-    original_update_actor: Any,
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> tuple[Any, dict[str, float | int]]:
-    """Time controller preprocessing, dispatch, future wait, and collection."""
-
-    actor_strategy = str(
-        _get_nested(
-            getattr(trainer, "config", None),
-            ("actor_rollout_ref", "actor", "strategy"),
-            "",
-        )
-        or ""
-    ).lower()
-    if actor_strategy != "veomni":
-        return original_update_actor(*args, **kwargs), {}
-
-    worker_group = getattr(trainer, "actor_rollout_wg", None)
-    original_worker_update = getattr(worker_group, "update_actor", None)
-    if worker_group is None or not callable(original_worker_update):
-        return original_update_actor(*args, **kwargs), {
-            "actor/speco/veomni_actor_outer_diag_version": 1,
-            "actor/speco/veomni_actor_outer_diag_available": 0,
-        }
-
-    try:
-        from verl.single_controller.base import decorator as dispatch_module
-    except (ImportError, AttributeError):
-        dispatch_module = None
-
-    original_dispatch = (
-        getattr(dispatch_module, "dispatch_nd_compute_dataproto", None)
-        if dispatch_module is not None
-        else None
-    )
-    original_collect = (
-        getattr(dispatch_module, "collect_nd_compute_dataproto", None)
-        if dispatch_module is not None
-        else None
-    )
-    state: dict[str, float | int | None] = {
-        "worker_group_calls": 0,
-        "worker_group_started": None,
-        "worker_group_finished": None,
-        "worker_group_elapsed": 0.0,
-        "dispatch_elapsed": 0.0,
-        "collect_elapsed": 0.0,
-        "materialize_calls": 0,
-        "materialize_elapsed": 0.0,
-    }
-
-    def timed_dispatch(*dispatch_args, **dispatch_kwargs):
-        started = time.perf_counter()
-        try:
-            return original_dispatch(*dispatch_args, **dispatch_kwargs)
-        finally:
-            state["dispatch_elapsed"] = float(state["dispatch_elapsed"]) + (
-                time.perf_counter() - started
-            )
-
-    def timed_collect(*collect_args, **collect_kwargs):
-        started = time.perf_counter()
-        try:
-            return original_collect(*collect_args, **collect_kwargs)
-        finally:
-            state["collect_elapsed"] = float(state["collect_elapsed"]) + (
-                time.perf_counter() - started
-            )
-
-    def timed_worker_update(*worker_args, **worker_kwargs):
-        started = time.perf_counter()
-        if state["worker_group_started"] is None:
-            state["worker_group_started"] = started
-        state["worker_group_calls"] = int(state["worker_group_calls"]) + 1
-        try:
-            return original_worker_update(*worker_args, **worker_kwargs)
-        finally:
-            finished = time.perf_counter()
-            state["worker_group_finished"] = finished
-            state["worker_group_elapsed"] = float(
-                state["worker_group_elapsed"]
-            ) + (finished - started)
-
-    original_tu_get = tu.get
-
-    def timed_tu_get(*get_args, **get_kwargs):
-        started = time.perf_counter()
-        state["materialize_calls"] = int(state["materialize_calls"]) + 1
-        try:
-            return original_tu_get(*get_args, **get_kwargs)
-        finally:
-            state["materialize_elapsed"] = float(
-                state["materialize_elapsed"]
-            ) + (time.perf_counter() - started)
-
-    outer_started = time.perf_counter()
-    worker_group.update_actor = timed_worker_update
-    if callable(original_dispatch):
-        dispatch_module.dispatch_nd_compute_dataproto = timed_dispatch
-    if callable(original_collect):
-        dispatch_module.collect_nd_compute_dataproto = timed_collect
-    tu.get = timed_tu_get
-    try:
-        output = original_update_actor(*args, **kwargs)
-    finally:
-        tu.get = original_tu_get
-        worker_group.update_actor = original_worker_update
-        if callable(original_dispatch):
-            dispatch_module.dispatch_nd_compute_dataproto = original_dispatch
-        if callable(original_collect):
-            dispatch_module.collect_nd_compute_dataproto = original_collect
-    outer_finished = time.perf_counter()
-
-    worker_group_started = state["worker_group_started"]
-    worker_group_finished = state["worker_group_finished"]
-    worker_group_elapsed = float(state["worker_group_elapsed"])
-    dispatch_elapsed = float(state["dispatch_elapsed"])
-    collect_elapsed = float(state["collect_elapsed"])
-    materialize_elapsed = float(state["materialize_elapsed"])
-    controller_pre_rpc = (
-        float(worker_group_started) - outer_started
-        if worker_group_started is not None
-        else outer_finished - outer_started
-    )
-    controller_post_rpc = (
-        max(
-            0.0,
-            outer_finished
-            - float(worker_group_finished)
-            - materialize_elapsed,
-        )
-        if worker_group_finished is not None
-        else 0.0
-    )
-    worker_submit = max(
-        0.0,
-        worker_group_elapsed - dispatch_elapsed - collect_elapsed,
-    )
-    return output, {
-        "actor/speco/veomni_actor_outer_diag_version": 1,
-        "actor/speco/veomni_actor_outer_diag_available": 1,
-        "actor/speco/veomni_actor_worker_group_calls": int(
-            state["worker_group_calls"]
-        ),
-        "actor/speco/veomni_actor_materialize_calls": int(
-            state["materialize_calls"]
-        ),
-        "actor/timing_s/speco_veomni_actor_controller_pre_rpc": max(
-            0.0, controller_pre_rpc
-        ),
-        "actor/timing_s/speco_veomni_actor_dispatch": dispatch_elapsed,
-        "actor/timing_s/speco_veomni_actor_worker_submit": worker_submit,
-        "actor/timing_s/speco_veomni_actor_collect": collect_elapsed,
-        "actor/timing_s/speco_veomni_actor_future_materialize": (
-            materialize_elapsed
-        ),
-        "actor/timing_s/speco_veomni_actor_controller_post_rpc": max(
-            0.0, controller_post_rpc
-        ),
-        "actor/timing_s/speco_veomni_actor_worker_group_total": (
-            worker_group_elapsed
-        ),
-    }
-
-
 def _speco_alpha_counter(value: int) -> str:
     """Encode a positive counter with letters so Ray log dedup keeps each sample."""
 
@@ -1950,14 +1783,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 export_strategy
                 in {"direct_sparse", "veomni_lm_head_sparse"}
             ),
-            "drafter/actor_model_kept_on_device": int(
-                isinstance(payload, dict)
-                and payload.get("actor_model_kept_on_device", False)
-            ),
-            "drafter/actor_cache_preserved_after_lm_head_export": int(
-                isinstance(payload, dict)
-                and payload.get("actor_cache_preserved_after_export", False)
-            ),
             "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
             "timing_s/drafter_sync_target_lm_head_dispatch": dispatch_elapsed,
         }
@@ -2003,68 +1828,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "timing_s/drafter_sync_target_lm_head_wait": wait_elapsed,
             "timing_s/drafter_sync_target_lm_head_overlap_window": (
                 overlap_window_elapsed
-            ),
-        }
-
-    def _speco_reclaim_actor_cache_before_drafter(self) -> dict[str, Any]:
-        actor_backend = str(
-            _get_nested(
-                self.config,
-                ("actor_rollout_ref", "actor", "strategy"),
-                "",
-            )
-            or ""
-        ).strip().lower()
-        if actor_backend != "veomni" or str(self.device_name).lower() != "npu":
-            return {
-                "drafter/actor_cache_reclaimed": 0,
-                "drafter/actor_cache_reclaim_skipped_after_offload": 0,
-            }
-
-        drafter_cfg = self._speco_drafter_config()
-        algorithm = str(
-            _get_nested(drafter_cfg, ("speculative_algorithm",), "") or ""
-        ).upper()
-        actor_param_offload = self._speco_bool_config(
-            _get_nested(
-                self.config,
-                (
-                    "actor_rollout_ref",
-                    "actor",
-                    "veomni",
-                    "param_offload",
-                ),
-                False,
-            )
-        )
-        if algorithm == "DSPARK" and actor_param_offload:
-            # NPU VeOmni DSpark now full-shards model and optimizer state across
-            # rollout replicas. When actor parameter offload is enabled, VeOmni
-            # has already released its NPU allocations while leaving train mode,
-            # so another synchronize/empty_cache pair here is redundant.
-            return {
-                "drafter/actor_cache_reclaimed": 0,
-                "drafter/actor_cache_reclaim_skipped_after_offload": 1,
-                "timing_s/drafter_actor_cache_reclaim": 0.0,
-            }
-
-        reclaim_started = time.perf_counter()
-        reclaim_actor_cache = self._speco_actor_rollout_method(
-            "reclaim_actor_cache_for_drafter"
-        )
-        results = self._ray_get_if_needed(reclaim_actor_cache()) or []
-        if not isinstance(results, list):
-            results = [results]
-        reclaimed = any(
-            bool(result.get("reclaimed", False))
-            for result in results
-            if isinstance(result, dict)
-        )
-        return {
-            "drafter/actor_cache_reclaimed": int(reclaimed),
-            "drafter/actor_cache_reclaim_skipped_after_offload": 0,
-            "timing_s/drafter_actor_cache_reclaim": (
-                time.perf_counter() - reclaim_started
             ),
         }
 
@@ -2121,16 +1884,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
             ),
         }
-        timing_keys = sorted(
-            {
-                key
-                for result in normalized_results
-                for key in result
-                if key.startswith("timing_s/drafter_")
-            }
-        )
         for key in (
-            *timing_keys,
+            "timing_s/drafter_prepare_batch",
+            "timing_s/drafter_forward_loss",
+            "timing_s/drafter_reduce_loss",
+            "timing_s/drafter_backward",
+            "timing_s/drafter_optimizer",
+            "timing_s/drafter_publish_snapshot",
             "activation_elapsed_sec",
             "training_loop_elapsed_sec",
             "cleanup_elapsed_sec",
@@ -2149,38 +1909,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "elapsed_sec": "timing_s/drafter_worker_elapsed",
                 }.get(key, key)
                 metrics[metric_key] = max(values)
-        resource_keys = sorted(
-            {
-                key
-                for result in normalized_results
-                for key in result
-                if key.startswith("drafter/resource_")
-            }
-        )
-        for key in resource_keys:
-            values = [
-                value
-                for result in normalized_results
-                if (value := _speco_metric_float(result.get(key))) is not None
-            ]
-            if not values:
-                continue
-            metrics[key] = (
-                min(values) if key.endswith("_npu_free_gib") else max(values)
-            )
-            if key.endswith("_gib") and any(
-                part in key
-                for part in (
-                    "process_rss",
-                    "model_cpu",
-                    "optimizer_cpu",
-                    "optimizer_pinned_cpu",
-                    "target_head_cpu",
-                )
-            ):
-                metrics[f"{key[:-4]}_sum_gib"] = sum(values)
-            elif key.endswith("_tensor_count"):
-                metrics[f"{key}_sum"] = sum(values)
         metrics["timing_s/drafter_train_rpc"] = train_rpc_elapsed
         return trained, metrics
 
@@ -2651,16 +2379,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             else:
                 metrics["drafter/target_lm_head_synced"] = 0
             actor_started = time.perf_counter()
-            actor_output, actor_outer_metrics = (
-                _run_veomni_actor_update_with_outer_diagnostics(
-                    self,
-                    original_update_actor,
-                    args,
-                    kwargs,
-                )
-            )
+            actor_output = original_update_actor(*args, **kwargs)
             actor_elapsed = time.perf_counter() - actor_started
-            metrics.update(actor_outer_metrics)
             if pending_target_lm_head_sync is not None:
                 metrics.update(
                     self._speco_finish_target_lm_head_weight_sync(
@@ -2668,7 +2388,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     )
                 )
             if should_train_drafter:
-                metrics.update(self._speco_reclaim_actor_cache_before_drafter())
                 drafter_trained, train_metrics = self._speco_train_drafter()
             else:
                 drafter_trained, train_metrics = (
@@ -2683,14 +2402,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     },
                 )
             metrics.update(train_metrics)
-            metrics["timing_s/speco_actor_update_rpc_raw"] = actor_elapsed
-            metrics["timing_s/speco_drafter_pre_actor"] = max(
-                0.0, actor_started - update_actor_started
-            )
-            metrics["timing_s/speco_drafter_post_actor"] = max(
-                0.0,
-                time.perf_counter() - actor_started - actor_elapsed,
-            )
             if defer_publish_until_update_weights and drafter_trained:
                 pending_drafter_publish["ready"] = True
                 pending_drafter_publish["drafter_trained"] = drafter_trained
@@ -2703,7 +2414,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             known_drafter_timing = 0.0
             for key in (
                 "timing_s/drafter_sync_target_lm_head",
-                "timing_s/drafter_actor_cache_reclaim",
                 "timing_s/drafter_train_rpc",
                 "timing_s/drafter_publish_wait_pending",
                 "timing_s/drafter_publish_fetch_snapshot",

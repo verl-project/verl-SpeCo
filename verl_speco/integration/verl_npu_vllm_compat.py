@@ -410,16 +410,6 @@ class VerlNPUVLLMImportCompatMixin:
         install_verl_npu_fsdp2_weight_export_compat()
         super().__init__(*args, **kwargs)
 
-    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
-    def init_model(self, *args, **kwargs):
-        result = super().init_model(*args, **kwargs)
-        from verl_speco.integration.rollout_publish import (
-            install_veomni_actor_update_diagnostics,
-        )
-
-        install_veomni_actor_update_diagnostics(self)
-        return result
-
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
     async def update_weights(self, global_steps: int | None = None, mode: str = "auto"):
         # Both baseline and speculative runs send actor weights from this
