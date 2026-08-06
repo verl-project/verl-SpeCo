@@ -8,13 +8,24 @@ from types import SimpleNamespace
 import pytest
 
 from verl_speco.integration.vllm_runtime import (
+    SPECO_VLLM_REQUEST_STATS_TRACE_HEADER,
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
     SPECO_VLLM_WORKER_EXTENSION_CLS,
     SpecoVLLMColocateWorkerExtension,
+    _attach_vllm_request_stats_to_trace_headers,
+    _decode_vllm_request_stats_trace_header,
     _describe_vllm_draft_logits,
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
+    _pop_vllm_request_stats_for_ids,
+    _pop_vllm_request_stats_for_rollout_output,
+    _record_vllm_request_acceptance_stats,
     _record_vllm_spec_decode_scheduler_stats,
+    _set_vllm_request_stats_on_output,
+    _stage_vllm_request_stats_for_rollout_output,
+    _vllm_generate_request_id,
+    _vllm_request_accept_stats_to_extra_fields,
+    _vllm_request_accept_stats_to_scalar_extra_fields,
     _validate_vllm_dflash_drafter_config,
     _vllm_ascend_has_dspark_pr11153_k_query_runtime,
     _vllm_spec_decode_stats_to_metrics,
@@ -380,6 +391,115 @@ def test_vllm_acceptance_stats_keep_stable_transport_keys() -> None:
         f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_drafts": 4.0,
         f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_accepted_tokens": 7.0,
     }
+
+
+def test_vllm_request_acceptance_stats_keep_stable_transport_keys() -> None:
+    scheduler = SimpleNamespace()
+    _record_vllm_request_acceptance_stats(
+        scheduler,
+        request_id="req-1",
+        num_draft_tokens=7,
+        num_accepted_tokens=3,
+        num_invalid_spec_tokens=1,
+    )
+    _record_vllm_request_acceptance_stats(
+        scheduler,
+        request_id="req-1",
+        num_draft_tokens=7,
+        num_accepted_tokens=4,
+        num_invalid_spec_tokens=0,
+    )
+    output = SimpleNamespace(
+        request_id="req-1",
+        _speco_vllm_request_accept_stats=scheduler._speco_vllm_request_accept_stats,
+    )
+
+    assert _vllm_request_accept_stats_to_extra_fields(output) == {
+        "_speco_vllm_request_id": ["req-1"],
+        "_speco_vllm_request_verify_rounds": [2],
+        "_speco_vllm_request_draft_tokens": [14],
+        "_speco_vllm_request_accepted_tokens": [7],
+        "_speco_vllm_request_invalid_spec_tokens": [1],
+        "_speco_vllm_request_completion_index": [0],
+        "_speco_vllm_request_elapsed_sec": [None],
+        "_verl_request_mean_accept_len": [4.5],
+    }
+
+
+def test_vllm_request_acceptance_stats_can_cross_engine_core_trace_headers() -> None:
+    scheduler = SimpleNamespace()
+    _record_vllm_request_acceptance_stats(
+        scheduler,
+        request_id="internal-req-1",
+        num_draft_tokens=7,
+        num_accepted_tokens=6,
+        num_invalid_spec_tokens=0,
+    )
+    summaries, completion_order = _pop_vllm_request_stats_for_ids(scheduler, ["internal-req-1"])
+
+    assert completion_order == ["internal-req-1"]
+    assert scheduler._speco_vllm_request_accept_stats == {}
+
+    engine_core_output = SimpleNamespace(request_id="internal-req-1", trace_headers={"trace": "keep"})
+    _attach_vllm_request_stats_to_trace_headers(engine_core_output, summaries["internal-req-1"])
+
+    assert engine_core_output.trace_headers["trace"] == "keep"
+    decoded = _decode_vllm_request_stats_trace_header(
+        engine_core_output.trace_headers[SPECO_VLLM_REQUEST_STATS_TRACE_HEADER]
+    )
+    assert decoded is not None
+    assert decoded["verify_rounds"] == 1
+    assert decoded["accepted_tokens"] == 6
+
+
+def test_vllm_request_acceptance_stats_extra_fields_use_request_output_id() -> None:
+    output = SimpleNamespace(request_id="external-req-1")
+    summary = {
+        "verify_rounds": 2,
+        "draft_tokens": 14,
+        "accepted_tokens": 8,
+        "invalid_spec_tokens": 1,
+        "completion_index": 3,
+        "elapsed_sec": 0.5,
+    }
+
+    assert _set_vllm_request_stats_on_output(output, {"external-req-1": summary}, ["external-req-1"])
+    assert _vllm_request_accept_stats_to_extra_fields(output) == {
+        "_speco_vllm_request_id": ["external-req-1"],
+        "_speco_vllm_request_verify_rounds": [2],
+        "_speco_vllm_request_draft_tokens": [14],
+        "_speco_vllm_request_accepted_tokens": [8],
+        "_speco_vllm_request_invalid_spec_tokens": [1],
+        "_speco_vllm_request_completion_index": [3],
+        "_speco_vllm_request_elapsed_sec": [0.5],
+        "_verl_request_mean_accept_len": [5.0],
+    }
+
+
+def test_vllm_request_acceptance_stats_can_stage_for_token_output() -> None:
+    summary = {
+        "verify_rounds": 4,
+        "draft_tokens": 28,
+        "accepted_tokens": 12,
+        "invalid_spec_tokens": 0,
+        "completion_index": 5,
+    }
+    _stage_vllm_request_stats_for_rollout_output("server-req-1", {"server-req-1": summary}, ["server-req-1"])
+
+    summaries, completion_order = _pop_vllm_request_stats_for_rollout_output(
+        _vllm_generate_request_id(([], {}, "server-req-1"), {})
+    )
+    output = SimpleNamespace(
+        request_id="server-req-1",
+        _speco_vllm_request_accept_stats=summaries,
+        _speco_vllm_request_completion_order=completion_order,
+    )
+
+    scalar_fields = _vllm_request_accept_stats_to_scalar_extra_fields(output)
+
+    assert scalar_fields["_verl_request_mean_accept_len"] == 4.0
+    assert scalar_fields["_speco_vllm_request_id"] == "server-req-1"
+    assert scalar_fields["_speco_vllm_request_verify_rounds"] == 4
 
 
 def test_trainer_keeps_public_acceptance_metric_name() -> None:
