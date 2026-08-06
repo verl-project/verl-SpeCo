@@ -21,6 +21,7 @@ from pathlib import Path
 from tests.special_sanity.check_example_naming import (
     DRAFTER_BACKENDS,
     ROLLOUT_BACKENDS,
+    STANDALONE_ONLY_BACKENDS,
     check_filename,
     main,
 )
@@ -47,6 +48,25 @@ def test_npu_suffix_passes():
 
 def test_separate_training_entrypoint_passes():
     assert _violations("run_qwen3-8b_drafter_separate_training.sh") == []
+
+
+def test_separate_training_may_name_its_drafter_backends():
+    """Standalone-only drafters identify themselves so several can coexist."""
+    for backend in DRAFTER_BACKENDS + STANDALONE_ONLY_BACKENDS:
+        assert _violations(f"run_qwen3-8b_drafter_{backend}_separate_training.sh") == []
+    assert _violations("run_qwen3-8b_drafter_domino_peagle_separate_training.sh") == []
+
+
+def test_separate_training_rejects_an_unknown_drafter_backend():
+    errs = _violations("run_qwen3-8b_drafter_unknown_separate_training.sh")
+    assert errs and "unknown drafter backend" in errs[0]
+
+
+def test_standalone_only_backends_cannot_pair_with_a_rollout_backend():
+    """Domino/P-EAGLE/EAGLE-1/2 have no engine-served form, so the matrix name is invalid."""
+    for backend in STANDALONE_ONLY_BACKENDS:
+        errs = _violations(f"run_qwen3-8b_drafter_{backend}_vllm.sh")
+        assert errs and "unknown drafter backend" in errs[0]
 
 
 def test_missing_drafter_marker_rejected():

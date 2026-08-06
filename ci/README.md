@@ -42,17 +42,18 @@ The default paths are intentionally tiny-runner friendly and can be overridden
 with GitHub environment variables or manual workflow inputs.
 
 The NPU vLLM workflow follows verl's Ascend CI layout. Its image provides the
-accelerator runtime plus pre-cached model and dataset assets under
-`/root/.cache/models`; the workflow links that cache to `~/models`. It checks
-out the pull-request revision and runs `pip install --no-deps -e .`, then verifies that
-`verl_speco` imports from the current GitHub workspace rather than the image's
-preinstalled copy.
+accelerator runtime plus pre-cached model assets under
+`/root/.cache/huggingface/hub`. It checks out the pull-request revision and runs
+`pip install --no-deps -e .`, then verifies that `verl_speco` imports from the
+current GitHub workspace rather than the image's preinstalled copy.
 
-The NPU vLLM workflow does not download models or datasets. Before launching the
-example script it checks that the selected target model directory, selected
-draft model directory, training parquet, and validation parquet exist. Override
-the defaults with GitHub environment variables or manual inputs when the image
-uses different paths.
+Before launching the example script, the NPU vLLM workflow checks that the
+selected target model directory and selected draft model directory exist. Its
+default datasets are Hugging Face dataset ids, allowing the datasets library to
+reuse the local cache or download them if needed. The workflow uses
+`HF_ENDPOINT=https://hf-mirror.com` and disables `hf_transfer` for more stable
+downloads on the NPU runner. Override the defaults with GitHub environment
+variables or manual inputs when the image uses different paths or dataset ids.
 
 The CPU layer uses `PYTHONPATH=$PWD` and checks out the upstream verl commit
 from `REQUIRED_VERL.txt`. It runs:
@@ -115,12 +116,20 @@ caller has not already set `ASCEND_RT_VISIBLE_DEVICES`. If the caller provides
 `ASCEND_RT_VISIBLE_DEVICES`, the script preserves it and checks that
 `SPECO_ACCELERATOR_COUNT` does not exceed the visible device count.
 
-PR smoke jobs force lightweight settings through environment variables:
+NPU vLLM smoke jobs use lightweight fallback settings for pull requests, pushes,
+and manual runs:
 
 - `SPECO_TOTAL_TRAINING_STEPS=1`
-- `SPECO_TRAIN_MAX_SAMPLES=1`
-- `SPECO_VAL_MAX_SAMPLES=1`
+- `SPECO_TRAIN_BATCH_SIZE=8`
+- `SPECO_TRAIN_MAX_SAMPLES=32`
+- `SPECO_VAL_MAX_SAMPLES=32`
+- `SPECO_PPO_MINI_BATCH_SIZE=8`
 - `SPECO_DATALOADER_NUM_WORKERS=0`
+
+The NPU vLLM smoke batch uses eight samples so the generation batch can be
+split evenly across the eight NPU agent-loop workers. The PPO mini-batch also
+uses eight samples so actor updates split evenly across the eight data-parallel
+workers.
 
 The runner image is responsible for providing the matching verl, vLLM/SGLang,
 PyTorch accelerator runtime, and model files. Hardware workflows deliberately
