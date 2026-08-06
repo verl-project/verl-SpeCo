@@ -32,6 +32,12 @@ TRAIN_FILE=/path/to/train_file
 TEST_FILE=/path/to/test_file
 DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter
 
+# Request-level speculative acceptance statistics.
+REQUEST_ACCEPT_LEN_LOG_PATH=${REQUEST_ACCEPT_LEN_LOG_PATH:-./logs/${exp_name}_request_accept_len_hist.jsonl}
+mkdir -p "$(dirname "${REQUEST_ACCEPT_LEN_LOG_PATH}")"
+export VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH="${REQUEST_ACCEPT_LEN_LOG_PATH}"
+export VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_PRINT=0
+
 
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \
@@ -90,16 +96,17 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.dspark_block_size=7 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_anchors=32 \
     actor_rollout_ref.rollout.drafter.training.dspark_max_window=512 \
-    actor_rollout_ref.rollout.drafter.training.dspark_loss_mode=restricted_ce \
-    actor_rollout_ref.rollout.drafter.training.dspark_loss_decay_gamma=7 \
+    actor_rollout_ref.rollout.drafter.training.dspark_loss_mode=full_vocab \
+    actor_rollout_ref.rollout.drafter.training.dspark_loss_decay_gamma=4 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_target_layers=5 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_hidden_layers=5 \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_rank=256 \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_head_type=vanilla \
     actor_rollout_ref.rollout.drafter.training.target_lm_head_row_restricted_sync=False \
-    actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=0.1 \
-    actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=0.9 \
     actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=0.0 \
+    actor_rollout_ref.rollout.drafter.training.dspark_hard_candidate_ratio=0.4 \
+    actor_rollout_ref.rollout.drafter.training.dspark_hard_sample_ratio=0.1 \
+    actor_rollout_ref.rollout.drafter.training.request_accept_len_variance_interval_steps=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_steps=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=7 \
