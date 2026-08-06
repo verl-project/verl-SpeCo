@@ -499,6 +499,9 @@ class DrafterBaseTrainer:
         self.skip_heavy_cleanup_after_drafter_training = bool(
             training_cfg.get("skip_heavy_cleanup_after_drafter_training", False)
         )
+        self.park_hccl_after_drafter_training = bool(
+            training_cfg.get("park_hccl_after_drafter_training", False)
+        )
         self._training_initialized = False
         self._training_active = False
         self.training_steps = 0
@@ -607,6 +610,7 @@ class DrafterBaseTrainer:
         self.use_native_dp_sp = (
             self.training_group_world_size > 1 and self.dp_group_world_size > 1
         )
+        self._fsdp_mesh_reuses_default_group = False
         self.fsdp_device_mesh = self._resolve_drafter_fsdp_device_mesh()
 
         self.checkpoint_dir = self.config.rollout.drafter.get("checkpoint_path")
@@ -655,6 +659,67 @@ class DrafterBaseTrainer:
         )
         return device_name == "npu" and str(actor_strategy).lower() == "veomni"
 
+    def _should_park_drafter_hccl(self) -> bool:
+        actor_config = getattr(self.config, "actor", None)
+        actor_strategy = (
+            actor_config.get("strategy", "")
+            if hasattr(actor_config, "get")
+            else getattr(actor_config, "strategy", "")
+        )
+        return (
+            self.park_hccl_after_drafter_training
+            and device_name == "npu"
+            and str(actor_strategy).lower() == "veomni"
+            and getattr(self.backend, "model_type", None) == "dspark"
+        )
+
+    def _park_idle_drafter_hccl(self) -> None:
+        """Release idle HCCL communicators without rebuilding the trainer."""
+
+        if not self._should_park_drafter_hccl() or not dist.is_initialized():
+            return
+
+        groups = []
+        for group in (
+            self.fsdp_device_mesh.get_group()
+            if self.fsdp_device_mesh is not None
+            else None,
+            self.training_process_group,
+            self.data_parallel_process_group,
+        ):
+            if group is None or group is dist.GroupMember.NON_GROUP_MEMBER:
+                continue
+            if all(group is not existing for existing in groups):
+                groups.append(group)
+
+        npu_device = torch.device("npu")
+        group_backends = []
+        for group in groups:
+            get_backend = getattr(group, "_get_backend", None)
+            if not callable(get_backend):
+                return
+            backend = get_backend(npu_device)
+            delete_store_key = getattr(backend, "_delete_tcpstore_key", None)
+            abort_hccl = getattr(backend, "abort_hccl_comm", None)
+            if not callable(delete_store_key) or not callable(abort_hccl):
+                return
+            group_backends.append((delete_store_key, abort_hccl))
+
+        sync_group = groups[0] if groups else None
+        if sync_group is not None and dist.get_world_size(group=sync_group) > 1:
+            dist.barrier(group=sync_group)
+        if hasattr(self.device_module, "synchronize"):
+            self.device_module.synchronize()
+
+        for delete_store_key, abort_hccl in group_backends:
+            delete_store_key()
+            abort_hccl("speco drafter idle")
+
+        if hasattr(self.device_module, "synchronize"):
+            self.device_module.synchronize()
+        if hasattr(self.device_module, "empty_cache"):
+            self.device_module.empty_cache()
+
     def _offload_optimizer_state_to_cpu(self) -> None:
         if self.optimizer is None or not self.optimizer.state:
             return
@@ -688,22 +753,34 @@ class DrafterBaseTrainer:
         # does not use Ulysses SP, so flatten all drafter ranks into one full-
         # shard dimension while retaining the original dp/sp mesh for data and
         # metric collectives.
-        # Keep the drafter FSDP communicator separate from the SpecoWorker
-        # default WORLD group. The default group is used to bootstrap the
-        # worker and dispatch metadata; reusing it for FSDP and later aborting
-        # it during idle cleanup can force communicator recovery on the next
-        # training trigger and can interfere with colocated VeOmni workers.
-        # This mesh is created once during SpecoWorker.init_model() and reused
-        # for all subsequent drafter activation/training cycles.
-        flattened_mesh = mesh._flatten(mesh_dim_name="fsdp")
+        mesh_ranks = mesh.mesh.reshape(-1)
+        world_ranks = list(range(dist.get_world_size()))
+        covers_default_world = (
+            [int(rank) for rank in mesh_ranks.tolist()] == world_ranks
+        )
+        from_group = getattr(DeviceMesh, "from_group", None)
+        if covers_default_world and callable(from_group):
+            # The SpecoWorker default group already spans these exact ranks.
+            # Reusing it avoids creating one more HCCL communicator on every
+            # NPU while preserving a 1D full-shard mesh for drafter FSDP2.
+            flattened_mesh = from_group(
+                dist.group.WORLD,
+                device_type=device_name,
+                mesh=mesh_ranks,
+                mesh_dim_names=("fsdp",),
+            )
+            self._fsdp_mesh_reuses_default_group = True
+        else:
+            flattened_mesh = mesh._flatten(mesh_dim_name="fsdp")
         if dist.get_rank() == int(flattened_mesh.mesh.reshape(-1)[0].item()):
             logger.info(
                 "[drafter-fsdp] NPU VeOmni DSpark uses a 1D full-shard mesh "
                 "across %s ranks instead of dp=%s x sp=%s HSDP "
-                "with a dedicated FSDP process group",
+                "reuse_default_world_group=%s",
                 flattened_mesh.size(),
                 self.dp_group_world_size,
                 self.training_group_world_size,
+                int(self._fsdp_mesh_reuses_default_group),
             )
         return flattened_mesh
 
@@ -4770,6 +4847,7 @@ class DrafterBaseTrainer:
             if hasattr(self.device_module, "synchronize"):
                 self.device_module.synchronize()
             self.device_module.empty_cache()
+        self._park_idle_drafter_hccl()
         self._training_initialized = False
         self._training_active = False
         self._last_ckpt_step = -1
@@ -4825,4 +4903,5 @@ class DrafterBaseTrainer:
                 self.device_module.synchronize()
             self.device_module.empty_cache()
 
+        self._park_idle_drafter_hccl()
         self._training_initialized = False

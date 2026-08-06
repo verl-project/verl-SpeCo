@@ -79,6 +79,8 @@ actor_rollout_ref:
         draft_update_flush_before: true
         draft_update_flush_after: true
         skip_heavy_cleanup_after_drafter_training: false
+        # Keep trainer objects resident while releasing idle NPU HCCL memory.
+        park_hccl_after_drafter_training: false
         save_full_drafter_checkpoint: true
         sample_last_n_steps: 20
         train_batches_per_cycle: 4

@@ -158,6 +158,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_veomni_trainer
     actor_rollout_ref.rollout.drafter.training.collect_interval_steps=5 \
     actor_rollout_ref.rollout.drafter.training.training_interval_steps=5 \
     actor_rollout_ref.rollout.drafter.training.publish_async=False \
+    actor_rollout_ref.rollout.drafter.training.park_hccl_after_drafter_training=True \
     actor_rollout_ref.rollout.drafter.training.publish_dtype=bf16 \
     actor_rollout_ref.rollout.drafter.training.draft_update_weights_bucket_megabytes=512 \
     actor_rollout_ref.rollout.load_format=auto \
