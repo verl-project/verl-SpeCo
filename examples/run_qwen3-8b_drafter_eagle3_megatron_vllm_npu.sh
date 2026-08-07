@@ -1,29 +1,3 @@
-#!/bin/bash
-# ─── Cleanup: kill all stale processes and wait for NPU memory release ───
-echo "=== Cleaning up stale processes ==="
-ray stop --force 2>/dev/null
-sleep 2
-kill -9 $(ps aux | grep -E "python3|ray|EngineCore|vllm" | grep -v grep | grep -v "$$" | awk '{print $2}') 2>/dev/null
-sleep 5
-rm -rf /tmp/ray/session_* /home/model/tmp/ray_tmpdir/ray /tmp/torchinductor_root /tmp/speco_precision_ckpt_* 2>/dev/null
-
-echo "=== Waiting for NPU memory release ==="
-for i in $(seq 1 12); do
-    _free=$(python3 -c "import torch_npu; print(int(torch_npu.npu.mem_get_info(0)[0]/1e9))" 2>/dev/null || echo 0)
-    if [ "$_free" -ge 60 ]; then
-        echo "NPU0: ${_free}G free — OK"
-        break
-    fi
-    echo "  NPU0: ${_free}G free — waiting... (${i}/12)"
-    sleep 10
-done
-
-echo "=== NPU status ==="
-python3 -c "import torch_npu; [print(f'  NPU{i}: {torch_npu.npu.mem_get_info(i)[0]/1e9:.1f}G free') for i in range(8)]" 2>/dev/null
-echo "=== Disk status ==="
-df -h / | tail -1
-echo "=== Starting training ==="
-
 set -x
 export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
 export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
@@ -62,14 +36,13 @@ ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
 
-MODEL_PATH=/home/model/Qwen3-8B
-CKPTS_DIR=/home/model/ckpts/qwen3_8b_eagle3_speco_megatron
-TRAIN_FILE=/home/dataset/DAPO-Math-17k/data/dapo-math-17k-train-10k.parquet
-TEST_FILE=/home/dataset/DAPO-Math-17k/data/dapo-math-17k-val.parquet
-DRAFTER_PATH=/home/model/Qwen3-8B_eagle3_AngelSlim
+MODEL_PATH=/path/to/model
+CKPTS_DIR=/path/to/checkpoint
+TRAIN_FILE=/path/to/train_file
+TEST_FILE=/path/to/test_file
+DRAFTER_PATH=/path/to/drafter
 
-mkdir -p /home/model/tmp/ray_tmpdir
-PYTHONUNBUFFERED=1 VERL_DRAFTER_ALIGNMENT_DEBUG=1 VERL_DRAFTER_ALIGNMENT_DEBUG_EVERY_N_STEPS=1 VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK=1 RAY_TMPDIR=/home/model/tmp/ray_tmpdir python3 -m verl_speco.main \
+PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \
     transfer_queue.enable=False \
     ray_kwargs.ray_init.num_cpus=${ray_num_cpus} \
@@ -80,7 +53,7 @@ PYTHONUNBUFFERED=1 VERL_DRAFTER_ALIGNMENT_DEBUG=1 VERL_DRAFTER_ALIGNMENT_DEBUG_E
     data.train_batch_size=64 \
     data.max_prompt_length=512 \
     data.max_response_length=8192 \
-    data.filter_overlong_prompts=False \
+    data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=256 \
     data.truncation='error' \
     actor_rollout_ref.model.path=${MODEL_PATH} \
@@ -120,8 +93,8 @@ PYTHONUNBUFFERED=1 VERL_DRAFTER_ALIGNMENT_DEBUG=1 VERL_DRAFTER_ALIGNMENT_DEBUG_E
     actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=4 \
     actor_rollout_ref.rollout.drafter.training.step=20 \
-    actor_rollout_ref.rollout.drafter.training.collect_interval_steps=1 \
-    actor_rollout_ref.rollout.drafter.training.training_interval_steps=1 \
+    actor_rollout_ref.rollout.drafter.training.collect_interval_steps=5 \
+    actor_rollout_ref.rollout.drafter.training.training_interval_steps=5 \
     actor_rollout_ref.rollout.drafter.training.publish_async=True \
     actor_rollout_ref.rollout.drafter.training.publish_dtype=bf16 \
     actor_rollout_ref.rollout.drafter.training.draft_update_weights_bucket_megabytes=512 \
@@ -147,49 +120,6 @@ PYTHONUNBUFFERED=1 VERL_DRAFTER_ALIGNMENT_DEBUG=1 VERL_DRAFTER_ALIGNMENT_DEBUG_E
     trainer.n_gpus_per_node=${ppo_gpus_per_node} \
     trainer.nnodes=1 \
     trainer.default_local_dir=${CKPTS_DIR} \
-    trainer.save_freq=10 \
+    trainer.save_freq=20 \
     trainer.test_freq=5 \
-    trainer.total_epochs=15 $@ 2>&1 | tee /verl-SpeCo/logs/${exp_name}.log &
-
-# --- Kill after step 1 completes ---
-TRAIN_LOG=/verl-SpeCo/logs/${exp_name}.log
-TRAIN_PID=$!
-echo "Training PID: $TRAIN_PID, log: $TRAIN_LOG"
-echo "Will kill after step 1..."
-
-for i in $(seq 1 180); do
-    sleep 30
-    if grep -q "step:1 " "$TRAIN_LOG" 2>/dev/null; then
-        echo "Step 1 found! Waiting 10s for logs to flush..."
-        sleep 10
-        echo "Killing training..."
-        kill -9 $TRAIN_PID 2>/dev/null
-        ray stop --force 2>/dev/null
-        sleep 5
-        kill -9 $(ps aux | grep -E "python3|ray" | grep -v grep | awk '{print $2}') 2>/dev/null
-        break
-    fi
-    echo "  [$((i*30))s] waiting... ($(grep -c 'step:' "$TRAIN_LOG" 2>/dev/null || echo 0) steps, $(ps aux | grep python3 | grep -v grep | wc -l) procs)"
-done
-
-echo ""
-echo "========================================"
-echo "STEP 1 ANALYSIS"
-echo "========================================"
-echo "--- TP ranks calling forward_step ---"
-grep "\[SPECO RANK\]" "$TRAIN_LOG" 2>/dev/null | grep -o "tp_rank=[0-9]*" | sort | uniq -c | sort -rn
-echo "--- sp_size in hooks ---"
-grep "megatron hooks installed" "$TRAIN_LOG" 2>/dev/null | grep -o "sp_size=[0-9]*" | sort | uniq -c | sort -rn
-echo "--- local_positions ---"
-grep "megatron hooks installed" "$TRAIN_LOG" 2>/dev/null | grep -o "local_positions=[0-9]*" | sort | uniq -c | sort -rn | head -5
-echo "--- collected_samples ---"
-grep -o "drafter/collected_samples:[0-9.]*" "$TRAIN_LOG" 2>/dev/null | head -3
-echo "--- trained ---"
-grep -o "drafter/trained:[0-9.]*" "$TRAIN_LOG" 2>/dev/null | head -3
-echo "--- eval probe ---"
-grep "eval probe" "$TRAIN_LOG" 2>/dev/null | head -5
-echo "--- acceptance_length ---"
-grep -o "mean_acceptance_length:[0-9.]*" "$TRAIN_LOG" 2>/dev/null | head -5
-echo "--- sequence_parallel in config ---"
-grep "sequence_parallel" "$TRAIN_LOG" 2>/dev/null | head -5 | cut -c1-150
-echo "========================================"
+    trainer.total_epochs=15 $@
