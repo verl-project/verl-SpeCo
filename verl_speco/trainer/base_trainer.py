@@ -848,6 +848,24 @@ class DrafterBaseTrainer:
         if fsdp_config is None:
             fsdp_config = self.config.rollout.drafter.training.get("fsdp_config")
         if fsdp_config is None:
+            # When the main model uses Megatron, the actor config has no
+            # fsdp_config (it uses megatron.* instead).  The drafter is
+            # always trained with FSDP, so provide a default config.
+            actor_strategy = ""
+            if hasattr(self.config, "actor"):
+                actor_strategy = str(
+                    getattr(self.config.actor, "strategy", "") or ""
+                ).lower()
+            if actor_strategy in {"megatron", "mindspeed_megatron"}:
+                from verl.workers.config import FSDPEngineConfig
+
+                fsdp_config = FSDPEngineConfig()
+                logger.warning(
+                    "SPECO drafter: actor strategy=%s has no fsdp_config; "
+                    "using default FSDPEngineConfig for drafter training",
+                    actor_strategy,
+                )
+        if fsdp_config is None:
             raise ValueError(
                 "FSDP config is missing: expect actor_rollout_ref.actor.fsdp_config or drafter override"
             )
@@ -1146,12 +1164,8 @@ class DrafterBaseTrainer:
 
     def _get_pretrained_export_model(self):
         model = self.model.module if hasattr(self.model, "module") else self.model
-        # Trainer wrappers (the DFlash family and P-EAGLE) keep the exportable
-        # draft as ``draft_model``; the checkpoint must hold the draft itself, so
-        # unwrap whenever a wrapper is present rather than per backend type.
-        draft_model = getattr(model, "draft_model", None)
-        if draft_model is not None:
-            return draft_model, (
+        if self._is_block_drafter_backend() and hasattr(model, "draft_model"):
+            return model.draft_model, (
                 "draft_model.",
                 "module.draft_model.",
                 "_orig_mod.draft_model.",
@@ -4284,16 +4298,33 @@ class DrafterBaseTrainer:
         self.record_training_timing(
             "timing_s/drafter_prepare_batch", time.time() - prepare_ts
         )
+        if batch is None:
+            logger.debug(
+                f"[DrafterTrainer rank {self.rank}] Not enough data at step {step} "
+                f"(have={len(self.collected_data)} need>={self.batch_size})"
+            )
+            try:
+                eval_metrics = self.evaluate_drafter_quality()
+                if eval_metrics:
+                    self._training_metric_sums.update(
+                        {f"eval_{k}": v for k, v in eval_metrics.items()}
+                    )
+                    logger.warning(
+                        "[drafter eval probe] step=%s top1=%.4f entropy=%.4f kl=%.4f tokens=%s",
+                        step,
+                        eval_metrics.get("drafter/eval_top1_match", 0.0),
+                        eval_metrics.get("drafter/eval_actor_entropy", 0.0),
+                        eval_metrics.get("drafter/eval_kl_actor_drafter", 0.0),
+                        eval_metrics.get("drafter/eval_token_count", 0),
+                    )
+            except Exception as exc:
+                logger.debug("[drafter eval probe] failed: %s", exc)
         if not self._sync_batch_readiness(batch is not None):
             logger.debug(
                 f"[DrafterTrainer rank {self.rank}] Skipping step {step} due to missing drafter batch"
             )
             return False
         if batch is None:
-            logger.debug(
-                f"[DrafterTrainer rank {self.rank}] Not enough data at step {step} "
-                f"(have={len(self.collected_data)} need>={self.batch_size})"
-            )
             return False
 
         return await self._training_step_on_batch(batch, step)
@@ -4436,6 +4467,223 @@ class DrafterBaseTrainer:
             float(ploss.item()),
         )
         return True
+
+    @torch.no_grad()
+    def evaluate_drafter_quality(self) -> dict[str, float]:
+        """Evaluate drafter prediction quality without training.
+
+        Directly compares actor vs drafter output distributions on collected
+        rollout data.  Runs even when prepare_training_batch returns None
+        (i.e. no_trainable_batch), so quality can be tracked every step.
+
+        Produces:
+          drafter/eval_top1_match      P(drafter_argmax == actor_argmax)
+          drafter/eval_top5_match      P(actor_argmax in drafter top-5)
+          drafter/eval_actor_entropy   mean Shannon entropy of actor dist
+          drafter/eval_drafter_entropy mean Shannon entropy of drafter dist
+          drafter/eval_kl_actor_drafter  KL(actor || drafter)
+          drafter/eval_exp_acceptance    expected spec-decode acceptance prob
+          drafter/eval_token_count     number of evaluated tokens
+        """
+        if not self.model or not self.collected_data:
+            return {}
+        items = list(self.collected_data)[: min(4, len(self.collected_data))]
+        items = [it for it in items if "hidden_states" in it]
+        if not items:
+            return {}
+
+        try:
+            dev = next(self.model.parameters()).device
+        except StopIteration:
+            return {}
+
+        use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
+        try:
+            pre = self.backend.preprocess_individual_items(
+                items, dev, self.model_config
+            )
+        except Exception:
+            logger.debug(
+                "[drafter eval probe] preprocess failed for %s items", len(items)
+            )
+            return {}
+
+        ids_list = pre["ids"]
+        hidden_list = pre["h_states"]
+        mask_list = pre["masks"]
+        pos_list = pre.get("position_ids")
+        last_h_list = pre.get("last_h_states")
+        target_lp_list = pre.get("target_logprobs")
+
+        if not ids_list:
+            return {}
+
+        def _pad(tensors, dim=0, value=0):
+            tensors = [
+                t.squeeze(0) if t.dim() == 3 and t.size(0) == 1 else t for t in tensors
+            ]
+            max_len = max(t.size(dim) for t in tensors)
+            padded = []
+            for t in tensors:
+                pad_shape = list(t.shape)
+                pad_shape[dim] = max_len - t.size(dim)
+                if pad_shape[dim] > 0:
+                    pad_t = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
+                    pad_t.fill_(value)
+                    padded.append(torch.cat([t, pad_t], dim=dim))
+                else:
+                    padded.append(t)
+            return torch.stack(padded, dim=0)
+
+        bsz = len(ids_list)
+        input_ids = _pad(ids_list, dim=0, value=self.pad_token_id).unsqueeze(1)
+        hidden_states = _pad(hidden_list, dim=0).unsqueeze(1)
+        loss_mask = _pad(mask_list, dim=0, value=0.0).unsqueeze(1)
+        if pos_list is not None and pos_list[0] is not None:
+            position_ids = _pad(pos_list, dim=0, value=0).unsqueeze(1)
+        else:
+            max_len = input_ids.size(1)
+            position_ids = (
+                torch.arange(max_len, device=dev)
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .expand(bsz, 1, max_len)
+            )
+
+        attn_mask = (input_ids != self.pad_token_id).long()
+        batch = {
+            "input_ids": input_ids,
+            "hidden_states": hidden_states,
+            "attention_mask": attn_mask,
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
+        }
+        if self.backend.model_type == "eagle3" and not use_logits:
+            if last_h_list is None or last_h_list[0] is None:
+                return {}
+            batch["last_hidden_states"] = _pad(last_h_list, dim=0).unsqueeze(1)
+        elif self.backend.model_type == "eagle3" and use_logits:
+            if target_lp_list is None or target_lp_list[0] is None:
+                return {}
+            batch["target_logprobs"] = _pad(target_lp_list, dim=0).unsqueeze(1)
+
+        draft_model = self.model
+        try:
+            with torch.amp.autocast(device_type=device_name, dtype=torch.bfloat16):
+                outputs = draft_model(
+                    input_ids=batch["input_ids"],
+                    hidden_states=batch["hidden_states"],
+                    attention_mask=batch["attention_mask"],
+                    loss_mask=batch["loss_mask"],
+                    position_ids=batch["position_ids"],
+                    ttt_length=1,
+                )
+            drafter_logits = outputs["logits"][0]
+        except Exception:
+            logger.debug("[drafter eval probe] drafter forward failed")
+            return {}
+
+        if use_logits:
+            target_topk = batch["target_logprobs"]
+            from verl_speco.backends.eagle3_trainer_backend import (
+                _target_topk_to_draft_ids,
+            )
+
+            t2d = draft_model.t2d.to(device=dev, dtype=torch.bool)
+            token_ids = target_topk[..., 1].long()
+            valid = torch.isfinite(target_topk[..., 0])
+            draft_ids, in_draft = _target_topk_to_draft_ids(token_ids, valid, t2d)
+            actor_top1 = draft_ids[..., 0]
+            actor_logprobs_vals = target_topk[..., 0]
+        else:
+            last_hidden = batch["last_hidden_states"]
+            with torch.amp.autocast(device_type=device_name, dtype=torch.bfloat16):
+                target_scores = self.backend.target_model(last_hidden)
+            t2d = draft_model.t2d.to(device=dev, dtype=torch.bool)
+            if target_scores.size(-1) == t2d.numel():
+                target_subset = target_scores[..., t2d]
+            else:
+                target_subset = target_scores
+            actor_logprobs_full = F.log_softmax(target_subset.float(), dim=-1)
+            actor_top1 = actor_logprobs_full.argmax(dim=-1)
+            actor_logprobs_vals = actor_logprobs_full.gather(
+                -1, actor_top1.unsqueeze(-1)
+            ).squeeze(-1)
+
+        drafter_step_logits = drafter_logits[0]
+        drafter_logprobs = F.log_softmax(drafter_step_logits.float(), dim=-1)
+        drafter_top1 = drafter_logprobs.argmax(dim=-1)
+
+        pos_mask = batch["loss_mask"][0].squeeze(-1)
+        if pos_mask.dim() > 1:
+            pos_mask = pos_mask.squeeze(-1)
+        seq_len = min(
+            drafter_top1.size(0),
+            actor_top1.size(0),
+            pos_mask.size(0),
+        )
+        pos_mask = pos_mask[:seq_len].bool()
+        if not pos_mask.any():
+            return {}
+
+        drafter_top1 = drafter_top1[:seq_len]
+        actor_top1 = actor_top1[:seq_len]
+        drafter_lp = drafter_logprobs[:seq_len]
+        if use_logits:
+            actor_lp = actor_logprobs_vals[:seq_len]
+        else:
+            actor_lp_full = actor_logprobs_full[:seq_len]
+            actor_lp = actor_lp_full.gather(-1, actor_top1.unsqueeze(-1)).squeeze(-1)
+
+        top1_match = (drafter_top1 == actor_top1).float()
+        top1_match = top1_match[pos_mask]
+
+        drafter_topk = drafter_logprobs[:seq_len].topk(5, dim=-1).indices
+        top5_match = (drafter_topk == actor_top1.unsqueeze(-1)).any(dim=-1).float()
+        top5_match = top5_match[pos_mask]
+
+        drafter_probs = drafter_lp.exp()
+        drafter_entropy = -(drafter_probs * drafter_lp).sum(dim=-1)
+        if use_logits:
+            actor_probs = actor_lp.exp()
+            actor_entropy = -(actor_probs * actor_lp)
+        else:
+            actor_entropy = -(actor_lp_full.exp() * actor_lp_full).sum(dim=-1)
+        actor_entropy = actor_entropy[:seq_len]
+
+        if use_logits:
+            min_v = min(drafter_lp.size(-1), actor_lp.size(-1))
+        else:
+            min_v = min(drafter_lp.size(-1), actor_lp_full.size(-1))
+        d_p = drafter_probs[:seq_len, :min_v] + 1e-12
+        if use_logits:
+            a_p = actor_probs[:seq_len, :min_v] + 1e-12
+        else:
+            a_p = actor_lp_full[:seq_len, :min_v].exp() + 1e-12
+        kl_ad = (a_p * (a_p.log() - d_p.log())).sum(dim=-1)
+        kl_ad = kl_ad[pos_mask]
+
+        log_ratio = drafter_lp[:seq_len, :min_v] - (
+            actor_lp[:seq_len, :min_v]
+            if use_logits
+            else actor_lp_full[:seq_len, :min_v]
+        )
+        exp_acc = (a_p * torch.exp(log_ratio).clamp(max=1.0)).sum(dim=-1)
+        exp_acc = exp_acc[pos_mask]
+
+        token_count = pos_mask.float().sum().item()
+        if token_count <= 0:
+            return {}
+
+        return {
+            "drafter/eval_top1_match": top1_match.mean().item(),
+            "drafter/eval_top5_match": top5_match.mean().item(),
+            "drafter/eval_actor_entropy": actor_entropy[pos_mask].mean().item(),
+            "drafter/eval_drafter_entropy": drafter_entropy[pos_mask].mean().item(),
+            "drafter/eval_kl_actor_drafter": kl_ad.mean().item(),
+            "drafter/eval_exp_acceptance": exp_acc.mean().item(),
+            "drafter/eval_token_count": token_count,
+        }
 
     def increment_rl_step(self, global_step: Optional[int] = None):
         """Increment the RL step counter in the data buffer.
