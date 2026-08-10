@@ -54,7 +54,6 @@ from verl_speco.integration.oldlogprob_runtime import (
 )
 from verl_speco.integration.oldlogprob_layer_ids import (
     assert_sglang_aux_last_layer_norm_safe,
-    resolve_drafter_hidden_states_layout,
     resolve_oldlogprob_aux_layer_ids,
 )
 from verl_speco.integration.sglang_adapter import (
@@ -72,7 +71,6 @@ from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
     configure_vllm_runtime_from_config,
 )
-from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
 from verl_speco.workers import SpecoWorker
 
 
@@ -889,10 +887,43 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             _get_nested(self.config, ("actor_rollout_ref", "actor", "strategy"), "")
             or ""
         ).lower()
-        if strategy not in {"fsdp", "fsdp2"}:
+        if strategy not in {"fsdp", "fsdp2", "megatron"}:
             raise ValueError(
-                "SPECO old-logprob hidden collection currently supports actor.strategy=fsdp/fsdp2 only, "
+                "SPECO old-logprob hidden collection currently supports actor.strategy=fsdp/fsdp2/megatron only, "
                 f"got {strategy!r}"
+            )
+        if strategy == "megatron":
+            tp_size = int(
+                _get_nested(
+                    self.config,
+                    (
+                        "actor_rollout_ref",
+                        "actor",
+                        "megatron",
+                        "tensor_model_parallel_size",
+                    ),
+                    1,
+                )
+                or 1
+            )
+            pp_size = int(
+                _get_nested(
+                    self.config,
+                    (
+                        "actor_rollout_ref",
+                        "actor",
+                        "megatron",
+                        "pipeline_model_parallel_size",
+                    ),
+                    1,
+                )
+                or 1
+            )
+            logger.warning(
+                "SPECO old-logprob hidden collection with Megatron backend: "
+                f"TP={tp_size}, PP={pp_size}. "
+                "TP>1 uses Megatron native sequence parallelism for hidden-state gathering. "
+                "PP>1 uses cross-stage dist communication for capture transfer."
             )
         capture_impl = str(
             training_cfg.get("old_logprob_hidden_capture_impl", "forward_hook")
@@ -901,6 +932,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if capture_impl not in {"forward_hook", "output_hidden_states"}:
             raise ValueError(
                 f"Unsupported SPECO old-logprob hidden capture impl: {capture_impl!r}"
+            )
+        if strategy == "megatron" and capture_impl != "forward_hook":
+            raise ValueError(
+                "SPECO old-logprob hidden collection with Megatron backend supports "
+                f"forward_hook capture only, got {capture_impl!r}"
             )
         return True
 
@@ -940,9 +976,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_oldlogprob_hidden_layout(self) -> str:
         drafter_cfg = self._speco_drafter_config()
-        algorithm = _get_nested(drafter_cfg, ("speculative_algorithm",), "")
-        return resolve_drafter_hidden_states_layout(
-            algorithm, self._speco_drafter_training_config()
+        algorithm = str(
+            _get_nested(drafter_cfg, ("speculative_algorithm",), "") or ""
+        ).upper()
+        training_cfg = self._speco_drafter_training_config()
+        if (
+            algorithm == "DSPARK"
+            and float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
+        ):
+            return "dflash_aux_plus_last"
+        return (
+            "dflash_aux"
+            if algorithm in {"DFLASH", "DSPARK"}
+            else "eagle3_aux_plus_last"
         )
 
     @staticmethod
@@ -1987,30 +2033,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         finally:
             rollout_generation_target.generate_sequences = original_generate_sequences
 
-    def _speco_bubble_profiler_enabled(self) -> bool:
-        return bool(
-            _get_nested(
-                self.config,
-                ("actor_rollout_ref", "rollout", "drafter", "profile_bubble"),
-                False,
-            )
-        )
-
-    def _speco_augment_log_data(
-        self, data: Any, latest_rollout_metrics: dict[str, float]
-    ) -> Any:
-        if (
-            isinstance(data, dict)
-            and isinstance(latest_rollout_metrics, dict)
-            and data.get("training/global_step") == self.global_steps
-        ):
-            data = dict(data)
-            data.update(latest_rollout_metrics)
-        data = _speco_move_drafter_timing_next_to_update_actor(data)
-        if self._speco_bubble_profiler_enabled():
-            data = inject_bubble_metrics(data)
-        return data
-
     @contextmanager
     def _speco_tracking_metrics_hook(self):
         try:
@@ -2030,13 +2052,27 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             latest_rollout_metrics = self._speco_current_step_rollout_metrics()
             if "data" in kwargs:
                 kwargs = dict(kwargs)
-                kwargs["data"] = self._speco_augment_log_data(
-                    kwargs["data"], latest_rollout_metrics
-                )
+                data = kwargs["data"]
+                if (
+                    isinstance(data, dict)
+                    and isinstance(latest_rollout_metrics, dict)
+                    and data.get("training/global_step") == self.global_steps
+                ):
+                    data = dict(data)
+                    data.update(latest_rollout_metrics)
+                kwargs["data"] = _speco_move_drafter_timing_next_to_update_actor(data)
                 return original_log(tracking_self, *args, **kwargs)
             if args:
+                data = args[0]
+                if (
+                    isinstance(data, dict)
+                    and isinstance(latest_rollout_metrics, dict)
+                    and data.get("training/global_step") == self.global_steps
+                ):
+                    data = dict(data)
+                    data.update(latest_rollout_metrics)
                 args = (
-                    self._speco_augment_log_data(args[0], latest_rollout_metrics),
+                    _speco_move_drafter_timing_next_to_update_actor(data),
                     *args[1:],
                 )
             return original_log(tracking_self, *args, **kwargs)
@@ -2225,6 +2261,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 self._speco_oldlogprob_hidden_layout(),
             )
             tu.assign_non_tensor_data(batch_td, OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY, True)
+            # Pass the user's sequence_parallel setting through the batch,
+            # because MindSpeed repatch may override tf_config.sequence_parallel
+            # back to True even when the user sets it to False.
+            _actor_megatron_cfg = _get_nested(
+                self.config, ("actor_rollout_ref", "actor", "megatron"), {}
+            )
+            _user_seq_parallel = _actor_megatron_cfg.get("sequence_parallel", True)
+            tu.assign_non_tensor_data(
+                batch_td,
+                "speco_oldlogprob_sp_disabled",
+                not bool(_user_seq_parallel),
+            )
 
             self._speco_last_oldlogprob_prepare_elapsed_sec = (
                 time.perf_counter() - prepare_started
