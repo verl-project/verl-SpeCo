@@ -16,7 +16,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-import torch
+
+torch = pytest.importorskip(
+    "torch",
+    reason="drafter runtime control contract needs PyTorch",
+)
 
 
 _speco_ray_trainer = pytest.importorskip(

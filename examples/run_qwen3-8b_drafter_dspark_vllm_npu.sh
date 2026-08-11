@@ -39,6 +39,13 @@ export VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH="${REQUEST_ACCEPT_LEN_LOG_PAT
 # Disable printing of request-level speculative acceptance statistics to avoid cluttering the console output.
 export VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_PRINT=0
 
+# Hard-sample presets (candidate ratio / training-batch ratio):
+# - Disable: 0.0 / 0.0
+# - Downsample hard requests: 0.4 / 0.1 (collect broadly, train with 10% hard samples)
+# - Strengthen hard requests: 0.5 / 0.5 (reserve half of collection/training for hard samples)
+DSPARK_HARD_CANDIDATE_RATIO=${DSPARK_HARD_CANDIDATE_RATIO:-0.4}
+DSPARK_HARD_SAMPLE_RATIO=${DSPARK_HARD_SAMPLE_RATIO:-0.1}
+
 
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \
@@ -106,8 +113,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_head_type=vanilla \
     actor_rollout_ref.rollout.drafter.training.target_lm_head_row_restricted_sync=False \
     actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=0.0 \
-    actor_rollout_ref.rollout.drafter.training.dspark_hard_candidate_ratio=0.4 \
-    actor_rollout_ref.rollout.drafter.training.dspark_hard_sample_ratio=0.1 \
+    actor_rollout_ref.rollout.drafter.training.dspark_hard_candidate_ratio=${DSPARK_HARD_CANDIDATE_RATIO} \
+    actor_rollout_ref.rollout.drafter.training.dspark_hard_sample_ratio=${DSPARK_HARD_SAMPLE_RATIO} \
     actor_rollout_ref.rollout.drafter.training.request_accept_len_variance_interval_steps=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_steps=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
