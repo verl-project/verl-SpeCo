@@ -313,10 +313,6 @@ def _speco_diag_enabled(name: str, default: str = "1") -> bool:
     return str(value).strip().lower() not in {"0", "false", "off", "no", "n", ""}
 
 
-def _speco_append_jsonl(path: str | None, payload: dict[str, Any]) -> None:
-    _speco_append_jsonl_batch(path, [payload])
-
-
 def _speco_append_jsonl_batch(path: str | None, payloads: list[dict[str, Any]]) -> None:
     if not path:
         return
