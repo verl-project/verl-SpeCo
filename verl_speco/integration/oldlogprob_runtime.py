@@ -26,7 +26,7 @@ import logging
 import os
 import time
 from functools import wraps
-from typing import Any, Optional, cast
+from typing import Any, cast
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -41,6 +41,13 @@ OLD_LOGPROB_HIDDEN_STATES_KEY = "speco_oldlogprob_hidden_states"
 OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY = "speco_oldlogprob_hidden_object_ref"
 OLD_LOGPROB_HIDDEN_REFS_KEY = "speco_oldlogprob_hidden_refs"
 OLD_LOGPROB_HIDDEN_REF_META_KEY = "speco_oldlogprob_hidden_ref_meta"
+# PP>1 single-put path: the last stage ray.put()s the concatenated hidden
+# tensor once (owner = last-stage process) and returns the ObjectRef here.
+# The task runner ray.get()s it once and releases the ref immediately so the
+# object does not pin the store.  Storing the ref (not the inline tensor) keeps
+# the RPC return value small and lets the big tensor be freed independently.
+OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY = "speco_oldlogprob_hidden_whole_ref"
+OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY = "speco_oldlogprob_hidden_whole_ref_meta"
 OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY = "speco_oldlogprob_hidden_chunk_refs"
 OLD_LOGPROB_HIDDEN_CHUNK_META_KEY = "speco_oldlogprob_hidden_chunk_meta"
 OLD_LOGPROB_AUX_LAYER_IDS_KEY = "speco_oldlogprob_aux_layer_ids"
@@ -517,7 +524,7 @@ def _put_oldlogprob_hidden_refs(
                 row_indices = row_indices_payload[sample_pos]
                 if row_indices is not None:
                     metas[batch_idx]["chunk_row_indices"] = row_indices
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("Unable to export SPECO old-logprob hidden ObjectRefs: %s", exc)
         if (
             selected_is_sparse
@@ -586,6 +593,8 @@ def _install_oldlogprob_training_worker_postprocess_patch() -> bool:
                 OLD_LOGPROB_HIDDEN_REF_META_KEY,
                 OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
                 OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
+                OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY,
+                OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY,
             ):
                 if key in source_dict and key not in speco_non_tensor:
                     speco_non_tensor[key] = source_dict.pop(key)
@@ -633,6 +642,13 @@ def _install_oldlogprob_training_worker_postprocess_patch() -> bool:
                 result = original_aggregate(output_lst, indices, data)
                 if not isinstance(result, dict):
                     return result
+
+                # Stash the micro-batch indices so the PP>1 post-schedule
+                # exchange can reorder its concatenated hidden tensor from
+                # micro-batch order to full-batch order (matching what this
+                # aggregate does for the PP=1 per-sample ObjectRef path).
+                if indices:
+                    result["_speco_microbatch_indices"] = indices
 
                 # Determine full-batch size from indices for ref remapping.
                 # indices is a list of lists: [[full_idx, ...], ...] per micro-batch.
@@ -1577,7 +1593,7 @@ def _get_module_by_path(root: Any, path: str):
 
 
 def _find_layers_and_final_norm(engine: Any):
-    import torch.nn as nn
+    from torch import nn
 
     module = getattr(engine, "module", None)
     roots: list[Any] = []
@@ -1768,6 +1784,13 @@ def _consume_oldlogprob_hidden_capture(engine: Any):
         final_key = context.get("final_key")
         if final_key is not None and final_key in captures:
             hidden_parts.append(captures[final_key])
+        if not hidden_parts:
+            logger.warning(
+                "SPECO consume: no hidden parts to merge (captures empty); "
+                "capture_keys=%s required_keys=%s",
+                list(captures.keys()),
+                required_keys,
+            )
         selected, owner_mask = _select_and_merge_concatenated_hidden(
             context,
             hidden_parts,
@@ -1776,6 +1799,12 @@ def _consume_oldlogprob_hidden_capture(engine: Any):
         if _is_sparse_sp_non_source_context(context):
             return {}
         if selected is None:
+            logger.warning(
+                "SPECO consume: _select_and_merge_concatenated_hidden returned None; "
+                "hidden_parts=%d context_local_positions=%d",
+                len(hidden_parts),
+                len(context.get("local_positions", []) or []),
+            )
             return {}
         output = {
             OLD_LOGPROB_HIDDEN_STATES_KEY: selected,
@@ -2011,7 +2040,7 @@ def _find_megatron_layers_and_final_norm(engine: Any, model: Any):
     ``nn.Module`` and *final_norm* is the ``nn.Module`` for the decoder's
     final layernorm (or ``None`` if not found).
     """
-    import torch.nn as nn
+    from torch import nn
 
     roots: list[Any] = []
     # The model passed to forward_step is typically DDP/FSDP wrapped; unwrap
@@ -2359,7 +2388,7 @@ def _install_megatron_hidden_hooks(engine: Any, model: Any, micro_batch: Any) ->
             # "skip" — the layer is on a different PP stage.
             aux_keys.append(global_key)
 
-    final_key: Optional[str] = None
+    final_key: str | None = None
     if hidden_layout in {"eagle3_aux_plus_last", "dflash_aux_plus_last"}:
         if final_norm is not None:
             final_key = "final"
@@ -2393,23 +2422,363 @@ def _install_megatron_hidden_hooks(engine: Any, model: Any, micro_batch: Any) ->
     engine._speco_oldlogprob_hidden_context = context
 
 
-def _megatron_gather_cross_stage_captures(engine: Any, micro_batch: Any) -> None:
-    """Gather captures from non-last PP stages. Currently disabled.
+def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) -> None:
+    """Post-schedule: exchange captures across PP stages via Ray object store
+    + temp files (completely avoids HCCL dist communication).
 
-    Blocking ``dist.recv`` deadlocks on NPU/HCCL when the matching ``isend``
-    was skipped.  Re-enable when HCCL supports ``irecv`` with timeout.
+    Non-last PP stages pickle their CPU captures directly to a temp file.
+    The last stage polls for the files, loads them, merges into saved
+    contexts, then consumes.  Uses pure file I/O — no Ray object store
+    (avoids blocking the WorkerDict async actor's event loop) and no
+    HCCL dist communication (avoids NPU P2P/broadcast issues).
     """
-    return
+    context = getattr(engine, "_speco_oldlogprob_hidden_context", None)
+    if not context:
+        logger.warning(
+            "SPECO PP exchange: no hidden context on a rank; hooks may not have fired"
+        )
+        return
+    pp_size = int(context.get("pp_size", 1) or 1)
+    if pp_size <= 1:
+        return
+
+    import os
+    import pickle
+    import time
+
+    import torch
+
+    mpu = _megatron_mpu()
+    if mpu is None:
+        return
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    is_last_stage = pp_rank == pp_size - 1
+    # Only tp_rank 0 does file I/O (when SP=False, all TP ranks in the same PP
+    # stage have identical captures; avoids a multi-way file write race).
+    is_io_rank = tp_rank == 0
+
+    stage_captures = getattr(engine, "_speco_pp_stage_captures", [])
+    saved_contexts = getattr(engine, "_speco_pp_saved_contexts", [])
+
+    # Use a unique temp dir per engine instance
+    tmp_dir = os.environ.get(
+        "SPECO_PP_EXCHANGE_DIR", "/home/model/tmp/speco_pp_exchange"
+    )
+    os.makedirs(tmp_dir, exist_ok=True)
+    # Use a fixed tag (same across all PP ranks in the same forward_backward_batch call).
+    # id(engine) differs per-rank (separate processes), so a fixed tag is needed.
+    tag = "fbb"
+
+    if not is_last_stage and is_io_rank:
+        # Non-last stage: pickle CPU captures directly to a file (no ray.put/get
+        # to avoid blocking the Ray actor's event loop).
+        # Skip writing an empty file: a stale empty file from a non-collect
+        # call (e.g. ref log_prob with a leftover context) would be read by
+        # the next old_log_prob's last stage instead of the real captures.
+        if not stage_captures or not any(caps_mb for caps_mb in stage_captures):
+            pass  # skip writing an empty file
+        else:
+            cpu_caps = []
+            for caps_mb in stage_captures:
+                cpu_mb = {}
+                for k, v in caps_mb.items():
+                    if torch.is_tensor(v):
+                        cpu_mb[k] = v.detach().cpu().clone()
+                    elif _is_sparse_selected(v):
+                        cpu_mb[k] = {
+                            k2: (
+                                v2.detach().cpu().clone() if torch.is_tensor(v2) else v2
+                            )
+                            for k2, v2 in v.items()
+                        }
+                    else:
+                        cpu_mb[k] = v
+                cpu_caps.append(cpu_mb)
+            ref_path = os.path.join(tmp_dir, f"pp_{pp_rank}_{tag}.pkl")
+            tmp_path = ref_path + ".tmp"
+            try:
+                with open(tmp_path, "wb") as f:
+                    pickle.dump(cpu_caps, f)
+                os.rename(tmp_path, ref_path)
+            except Exception:
+                raise
+            logger.warning(
+                "SPECO PP exchange: stage pp_rank=%s wrote %d microbatch captures to %s",
+                pp_rank,
+                len(cpu_caps),
+                ref_path,
+            )
+
+    if is_last_stage and is_io_rank:
+        # Last stage: poll for non-last stages' files, load directly (no ray.get).
+        all_stage_captures = [None] * pp_size
+        all_stage_captures[pp_rank] = stage_captures
+
+        for src_rank in range(pp_size - 1):
+            ref_path = os.path.join(tmp_dir, f"pp_{src_rank}_{tag}.pkl")
+            # Poll for the file (non-last stage writes after its schedule)
+            for _ in range(300):  # 30s timeout
+                if os.path.exists(ref_path):
+                    break
+                time.sleep(0.1)
+            if not os.path.exists(ref_path):
+                logger.warning(
+                    "SPECO PP cross-stage: timed out waiting for stage %s captures",
+                    src_rank,
+                )
+                continue
+            try:
+                with open(ref_path, "rb") as f:
+                    stage_captures_from_src = pickle.load(f)
+            except Exception:
+                continue
+            all_stage_captures[src_rank] = stage_captures_from_src
+            try:
+                os.remove(ref_path)
+            except Exception:
+                pass
+            logger.warning(
+                "SPECO PP exchange: last stage loaded %d microbatch captures from stage %s",
+                len(stage_captures_from_src) if stage_captures_from_src else 0,
+                src_rank,
+            )
+
+        # Merge non-last stages' captures into saved contexts + consume
+        saved_contexts = getattr(engine, "_speco_pp_saved_contexts", [])
+        # Infer the runtime device from saved captures (already on the
+        # accelerator) instead of hardcoding a device-specific call.
+        device = torch.device("cpu")
+        for _ctx in saved_contexts:
+            _caps = _ctx.get("captures", {}) if isinstance(_ctx, dict) else {}
+            for _v in _caps.values():
+                if torch.is_tensor(_v) and _v.device.type != "cpu":
+                    device = _v.device
+                    break
+            else:
+                continue
+            break
+
+        if not saved_contexts:
+            logger.warning(
+                "SPECO PP exchange: last stage has %d saved contexts (empty!); "
+                "postprocess may not have run for PP>1",
+                len(saved_contexts),
+            )
+
+        all_hidden_outputs = []
+        for mb_idx in range(len(saved_contexts)):
+            saved_ctx = saved_contexts[mb_idx]
+            merged = saved_ctx.get("captures", {})
+            for stage in range(pp_size - 1):
+                stage_mbs = all_stage_captures[stage]
+                if stage_mbs and mb_idx < len(stage_mbs):
+                    for key, tensor in stage_mbs[mb_idx].items():
+                        if key not in merged:
+                            if torch.is_tensor(tensor):
+                                merged[key] = tensor.to(device).clone()
+                            else:
+                                merged[key] = tensor
+            saved_ctx["captures"] = merged
+            engine._speco_oldlogprob_hidden_context = saved_ctx
+
+            hidden_output = _consume_oldlogprob_hidden_capture(engine)
+            if hidden_output:
+                # Skip _put_oldlogprob_hidden_refs for PP>1: creating Ray
+                # ObjectRefs causes disk pressure.  Keep hidden states as
+                # inline tensors; the task runner handles both modes.
+                all_hidden_outputs.append(hidden_output)
+            else:
+                logger.warning(
+                    "SPECO PP exchange: consume returned empty for mb_idx=%d; "
+                    "merged capture keys=%s",
+                    mb_idx,
+                    list(merged.keys()),
+                )
+
+        # Put merged hidden_output into the aggregated result dict (NOT a list).
+        # The result from forward_backward_batch is the output of
+        # postprocess_batch_func (an aggregated dict), not the raw per-microbatch
+        # losses_reduced list.  Concatenate tensor keys across microbatches (dim=0)
+        # and extend ref/meta lists.
+        if not all_hidden_outputs:
+            logger.warning(
+                "SPECO PP exchange: no hidden outputs produced (all consume empty); "
+                "losses_reduced type=%s",
+                type(losses_reduced).__name__,
+            )
+        elif not isinstance(losses_reduced, dict):
+            logger.warning(
+                "SPECO PP exchange: losses_reduced is not a dict (%s); "
+                "cannot attach hidden states",
+                type(losses_reduced).__name__,
+            )
+        else:
+            model_output = losses_reduced.setdefault("model_output", {})
+            if not isinstance(model_output, dict):
+                model_output = {}
+                losses_reduced["model_output"] = model_output
+
+            # Timing tensor is small; keep it inline.
+            timing_tensors = [
+                ho[OLD_LOGPROB_TIMING_KEY]
+                for ho in all_hidden_outputs
+                if OLD_LOGPROB_TIMING_KEY in ho
+                and torch.is_tensor(ho[OLD_LOGPROB_TIMING_KEY])
+            ]
+            if timing_tensors:
+                model_output[OLD_LOGPROB_TIMING_KEY] = (
+                    torch.cat(timing_tensors, dim=0)
+                    if len(timing_tensors) > 1
+                    else timing_tensors[0]
+                )
+
+            # Concatenate all microbatches' hidden states into one big tensor,
+            # then ray.put() ONCE.  Owner = this last-stage process, so the
+            # ObjectRef metadata is correct and any process can ray.get() it.
+            # The task runner ray.get()s it once and releases the ref, so the
+            # big tensor does not stay pinned in the object store (unlike the
+            # inline path, where it rides the RPC return and fills the store).
+            hs_tensors = [
+                ho[OLD_LOGPROB_HIDDEN_STATES_KEY]
+                for ho in all_hidden_outputs
+                if OLD_LOGPROB_HIDDEN_STATES_KEY in ho
+                and torch.is_tensor(ho[OLD_LOGPROB_HIDDEN_STATES_KEY])
+            ]
+            if hs_tensors:
+                big_tensor = (
+                    torch.cat(hs_tensors, dim=0)
+                    if len(hs_tensors) > 1
+                    else hs_tensors[0]
+                )
+
+                # Reorder dim-0 from micro-batch order to full-batch order.
+                # The per-microbatch hidden tensors are concatenated in
+                # micro-batch order, but the task runner indexes them by the
+                # full-batch batch_idx.  With use_dynamic_bsz the micro-batches
+                # are permuted, so without this reorder the hidden states are
+                # misaligned with the prompts/responses → the drafter trains on
+                # wrong data and acceptance degrades.  The PP=1 path gets this
+                # reorder for free via speco_aggregate_output's indices remap;
+                # PP>1 bypasses that aggregate, so we do it here.
+                mb_indices = losses_reduced.pop("_speco_microbatch_indices", None)
+                if mb_indices and big_tensor.dim() >= 1:
+                    try:
+                        # Flatten indices: position i in big_tensor (micro-batch
+                        # order) maps to full_idx in the full batch.
+                        flat_indices: list[int] = []
+                        for part in mb_indices:
+                            flat_indices.extend(int(x) for x in part)
+                        if len(flat_indices) == int(big_tensor.shape[0]):
+                            idx_tensor = torch.tensor(
+                                flat_indices, dtype=torch.long, device=big_tensor.device
+                            )
+                            reordered = torch.zeros_like(big_tensor)
+                            reordered.index_copy_(0, idx_tensor, big_tensor)
+                            big_tensor = reordered
+                    except Exception:
+                        pass
+
+                whole_ref = None
+                try:
+                    import ray as _ray
+
+                    whole_ref = _ray.put(big_tensor)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "SPECO PP exchange: single ray.put failed (%s); "
+                        "falling back to inline tensor (may raise object-store pressure)",
+                        exc,
+                    )
+                if whole_ref is not None:
+                    model_output[OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY] = whole_ref
+                    model_output[OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY] = {
+                        "shape": tuple(int(s) for s in big_tensor.shape),
+                        "dtype": str(big_tensor.dtype),
+                        "nbytes": int(big_tensor.nbytes),
+                        "num_samples": int(big_tensor.shape[0])
+                        if big_tensor.dim() >= 1
+                        else 0,
+                        "num_microbatches": len(all_hidden_outputs),
+                    }
+                    logger.warning(
+                        "SPECO PP exchange: put hidden states as single ObjectRef "
+                        "(shape=%s, %.1f MiB) from %d microbatch(s)",
+                        tuple(big_tensor.shape),
+                        big_tensor.nbytes / (1024 * 1024),
+                        len(all_hidden_outputs),
+                    )
+                else:
+                    model_output[OLD_LOGPROB_HIDDEN_STATES_KEY] = big_tensor
+            else:
+                logger.warning(
+                    "SPECO PP exchange: no hidden-state tensors to attach "
+                    "(all_hidden_outputs=%d)",
+                    len(all_hidden_outputs),
+                )
+
+            # Per-owner ObjectRefs are not produced for PP>1 (we skipped
+            # _put_oldlogprob_hidden_refs), so this merge is a no-op here;
+            # kept for parity with the PP=1 path.
+            refs_merged: list[Any] = []
+            metas_merged: list[Any] = []
+            for ho in all_hidden_outputs:
+                refs = ho.get(OLD_LOGPROB_HIDDEN_REFS_KEY)
+                metas = ho.get(OLD_LOGPROB_HIDDEN_REF_META_KEY)
+                if isinstance(refs, (list, tuple)):
+                    refs_merged.extend(refs)
+                if isinstance(metas, (list, tuple)):
+                    metas_merged.extend(metas)
+            if refs_merged:
+                losses_reduced[OLD_LOGPROB_HIDDEN_REFS_KEY] = refs_merged
+            if metas_merged:
+                losses_reduced[OLD_LOGPROB_HIDDEN_REF_META_KEY] = metas_merged
+
+    # Cleanup
+    engine._speco_pp_stage_captures = []
+    if hasattr(engine, "_speco_pp_saved_contexts"):
+        engine._speco_pp_saved_contexts = []
+    # Clear the hidden context so a subsequent forward_backward_batch without
+    # the collect mask (e.g. ref log_prob) does NOT enter the exchange with a
+    # stale context and write an empty temp file that the next step's
+    # old_log_prob would read instead of the real captures.
+    _cleanup_oldlogprob_hidden_capture(engine)
 
 
-def _megatron_send_cross_stage_captures(engine: Any, micro_batch: Any) -> None:
-    """Send captures from non-last PP stages to the last stage. Currently disabled.
+def _megatron_save_stage_captures(engine: Any, micro_batch: Any) -> None:
+    """Save this PP stage's captures to engine storage for post-schedule aggregation.
 
-    ``dist.isend`` on NPU/HCCL fails due to communicator port conflicts and the
-    matching ``recv`` deadlocks.  Re-enable when HCCL supports ``irecv`` with
-    timeout.
+    Replaces the disabled P2P isend approach.  Each stage independently stores
+    its per-micro-batch captures; the post-schedule function
+    ``_megatron_post_stage_exchange_and_consume`` exchanges them via
+    ``dist.broadcast`` (collective, HCCL-safe) after the pipeline schedule.
     """
-    return
+    context = getattr(engine, "_speco_oldlogprob_hidden_context", None)
+    if not context:
+        return
+    pp_size = int(context.get("pp_size", 1) or 1)
+    if pp_size <= 1:
+        return  # PP=1: no cross-stage exchange needed
+
+    import torch
+
+    captures = context.get("captures", {})
+    # Clone tensors so they survive the next micro-batch's context cleanup
+    saved = {}
+    for key, val in captures.items():
+        if torch.is_tensor(val):
+            saved[key] = val.detach().clone()
+        elif _is_sparse_selected(val):
+            saved[key] = {
+                k2: (v2.detach().clone() if torch.is_tensor(v2) else v2)
+                for k2, v2 in val.items()
+            }
+        else:
+            saved[key] = val
+
+    if not hasattr(engine, "_speco_pp_stage_captures"):
+        engine._speco_pp_stage_captures = []
+    engine._speco_pp_stage_captures.append(saved)
 
 
 def install_oldlogprob_hidden_runtime_patch_megatron() -> bool:
@@ -2486,6 +2855,9 @@ def install_oldlogprob_hidden_runtime_patch_megatron() -> bool:
                 postprocess_micro_batch_func,
             )
 
+            if has_collect:
+                _megatron_save_stage_captures(self, batch)
+
             return result
 
         engine_cls.forward_step = speco_megatron_forward_step
@@ -2500,36 +2872,54 @@ def install_oldlogprob_hidden_runtime_patch_megatron() -> bool:
 
             context = getattr(self, "_speco_oldlogprob_hidden_context", None)
             if context:
-                _megatron_gather_cross_stage_captures(self, data)
+                _ctx_pp_size = int(context.get("pp_size", 1) or 1)
+                if _ctx_pp_size > 1:
+                    # PP>1: defer consume to post-schedule exchange.
+                    # Save this (last stage) context for later merge + consume.
+                    import torch as _torch
 
-                hidden_output = _consume_oldlogprob_hidden_capture(self)
-                if hidden_output and isinstance(result, tuple) and len(result) == 2:
-                    _ctx_sp_size = int(context.get("sp_size", 1) or 1)
-                    hidden_output = _put_oldlogprob_hidden_refs(hidden_output, data)
-                    scaled_loss, output_dict = result
-                    if isinstance(output_dict, dict):
-                        import torch as _torch
+                    _saved_captures = {}
+                    for _k, _v in context.get("captures", {}).items():
+                        _saved_captures[_k] = (
+                            _v.detach().clone() if _torch.is_tensor(_v) else _v
+                        )
+                    _saved_ctx = dict(context)
+                    _saved_ctx["captures"] = _saved_captures
+                    if not hasattr(self, "_speco_pp_saved_contexts"):
+                        self._speco_pp_saved_contexts = []
+                    self._speco_pp_saved_contexts.append(_saved_ctx)
+                else:
+                    # PP=1: consume immediately (existing behavior)
+                    hidden_output = _consume_oldlogprob_hidden_capture(self)
+                    if hidden_output and isinstance(result, tuple) and len(result) == 2:
+                        _ctx_sp_size = int(context.get("sp_size", 1) or 1)
+                        hidden_output = _put_oldlogprob_hidden_refs(hidden_output, data)
+                        scaled_loss, output_dict = result
+                        if isinstance(output_dict, dict):
+                            import torch as _torch
 
-                        model_output = output_dict.setdefault("model_output", {})
-                        if not isinstance(model_output, dict):
-                            model_output = {}
-                            output_dict["model_output"] = model_output
-                        for k, v in hidden_output.items():
-                            if k == OLD_LOGPROB_HIDDEN_STATES_KEY:
-                                if _torch.is_tensor(v):
+                            model_output = output_dict.setdefault("model_output", {})
+                            if not isinstance(model_output, dict):
+                                model_output = {}
+                                output_dict["model_output"] = model_output
+                            for k, v in hidden_output.items():
+                                if k == OLD_LOGPROB_HIDDEN_STATES_KEY:
+                                    if _torch.is_tensor(v):
+                                        model_output[k] = v
+                                    elif _is_sparse_selected(v):
+                                        output_dict[k] = v
+                                elif k == OLD_LOGPROB_TIMING_KEY and _torch.is_tensor(
+                                    v
+                                ):
                                     model_output[k] = v
-                                elif _is_sparse_selected(v):
+                                elif k in (
+                                    OLD_LOGPROB_HIDDEN_REFS_KEY,
+                                    OLD_LOGPROB_HIDDEN_REF_META_KEY,
+                                    OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
+                                    OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
+                                ):
                                     output_dict[k] = v
-                            elif k == OLD_LOGPROB_TIMING_KEY and _torch.is_tensor(v):
-                                model_output[k] = v
-                            elif k in (
-                                OLD_LOGPROB_HIDDEN_REFS_KEY,
-                                OLD_LOGPROB_HIDDEN_REF_META_KEY,
-                                OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
-                                OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
-                            ):
-                                output_dict[k] = v
-                    return scaled_loss, output_dict
+                        return scaled_loss, output_dict
 
             # When sp_size=1 and SP is disabled, hidden states are only on
             # participating ranks (those that called forward_step).  The
@@ -2541,6 +2931,24 @@ def install_oldlogprob_hidden_runtime_patch_megatron() -> bool:
 
         engine_cls.postprocess_micro_batch_func = speco_megatron_postprocess
         engine_cls._speco_oldlogprob_megatron_patched_postprocess = True
+
+    # --- Patch forward_backward_batch: post-schedule cross-stage exchange ---
+    if not getattr(engine_cls, "_speco_oldlogprob_megatron_patched_fbb", False):
+        original_fbb = engine_cls.forward_backward_batch
+
+        @wraps(original_fbb)
+        def speco_megatron_forward_backward_batch(
+            self, data, loss_function, forward_only=False
+        ):
+            result = original_fbb(self, data, loss_function, forward_only)
+            # After the pipeline schedule completes, exchange captures across
+            # PP stages via dist.broadcast (collective, HCCL-safe) and consume
+            # on the last stage.  No-op for PP=1.
+            _megatron_post_stage_exchange_and_consume(self, result)
+            return result
+
+        engine_cls.forward_backward_batch = speco_megatron_forward_backward_batch
+        engine_cls._speco_oldlogprob_megatron_patched_fbb = True
 
     _MEGATRON_PATCHED = True
     logger.warning(

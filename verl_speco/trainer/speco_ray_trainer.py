@@ -31,31 +31,34 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.utils import Role
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
 from verl_speco.integration.agent_loop_runtime import (
     SPECO_AGENT_LOOP_MANAGER_CLASS,
     install_agent_loop_runtime_patch,
 )
-from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
+from verl_speco.integration.oldlogprob_layer_ids import (
+    assert_sglang_aux_last_layer_norm_safe,
+    resolve_oldlogprob_aux_layer_ids,
+)
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_AUX_LAYER_IDS_KEY,
     OLD_LOGPROB_COLLECT_MASK_KEY,
     OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
     OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
     OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
-    OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY,
     OLD_LOGPROB_HIDDEN_LAYOUT_KEY,
+    OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY,
     OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY,
     OLD_LOGPROB_HIDDEN_POSITIONS_KEY,
     OLD_LOGPROB_HIDDEN_REF_META_KEY,
     OLD_LOGPROB_HIDDEN_REFS_KEY,
     OLD_LOGPROB_HIDDEN_STATES_KEY,
+    OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY,
+    OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY,
     OLD_LOGPROB_OWNER_RANK_KEY,
     OLD_LOGPROB_TIMING_KEY,
 )
-from verl_speco.integration.oldlogprob_layer_ids import (
-    assert_sglang_aux_last_layer_norm_safe,
-    resolve_oldlogprob_aux_layer_ids,
-)
+from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
 from verl_speco.integration.sglang_adapter import (
     bucket_drafter_samples_by_replica,
     pop_drafter_samples,
@@ -72,7 +75,6 @@ from verl_speco.integration.vllm_runtime import (
     configure_vllm_runtime_from_config,
 )
 from verl_speco.workers import SpecoWorker
-
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -1359,6 +1361,30 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         chunk_meta = self._speco_flatten_non_tensor_rows(
             tu.get(output, OLD_LOGPROB_HIDDEN_CHUNK_META_KEY)
         )
+        # PP>1 single-put path: the last stage ray.put()s the concatenated
+        # hidden tensor once and returns the ObjectRef.  Materialize it here
+        # (once) and release the ref immediately so the big tensor does not pin
+        # the Ray object store; the rest of this function treats it as an
+        # inline tensor.
+        whole_ref = tu.get(output, OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY)
+        if hidden_states is None and whole_ref is not None:
+            import ray as _ray
+
+            hidden_states = _ray.get(whole_ref)
+            # Drop every reference to the ObjectRef (local var + the copy held
+            # inside the output TensorDict) so Ray can free the big tensor from
+            # the object store as soon as this materialization completes,
+            # instead of waiting for the whole step output to be GC'd.
+            del whole_ref
+            try:
+                tu.assign_non_tensor_data(
+                    output, OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY, None
+                )
+                tu.assign_non_tensor_data(
+                    output, OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY, None
+                )
+            except Exception:
+                pass
         if hidden_states is None and hidden_refs is None and chunk_refs is None:
             return 0
         hidden_rows = self._speco_tensor_rows(hidden_states)
@@ -2400,14 +2426,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             generate_sequences_with_speco,
             rollout_generation_target,
         )
-        if self._speco_oldlogprob_collection_requested():
+        if (
+            self._speco_oldlogprob_collection_requested()
+            or self._speco_oldlogprob_entropy_hook_enabled()
+        ):
             self._compute_old_log_prob = MethodType(
                 compute_old_log_prob_with_speco, self
-            )
-        elif self._speco_oldlogprob_entropy_hook_enabled():
-            self._compute_old_log_prob = MethodType(
-                compute_old_log_prob_with_speco,
-                self,
             )
         self._update_actor = MethodType(update_actor_with_speco, self)
         if defer_publish_until_update_weights:
