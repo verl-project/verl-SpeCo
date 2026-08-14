@@ -2434,7 +2434,7 @@ def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) 
     """
     context = getattr(engine, "_speco_oldlogprob_hidden_context", None)
     if not context:
-        logger.warning(
+        logger.debug(
             "SPECO PP exchange: no hidden context on a rank; hooks may not have fired"
         )
         return
@@ -2454,9 +2454,13 @@ def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) 
     pp_rank = mpu.get_pipeline_model_parallel_rank()
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_last_stage = pp_rank == pp_size - 1
-    # Only tp_rank 0 does file I/O (when SP=False, all TP ranks in the same PP
-    # stage have identical captures; avoids a multi-way file write race).
-    is_io_rank = tp_rank == 0
+    # When SP=True each TP rank holds a different shard of the hidden states,
+    # so ALL TP ranks must participate in the temp-file exchange and the
+    # subsequent SP all-reduce inside _consume_oldlogprob_hidden_capture.
+    # When SP=False all TP ranks have identical captures, so only tp_rank=0
+    # does I/O (avoids a multi-way file write race).
+    sp_size = int(context.get("sp_size", 1) or 1)
+    is_io_rank = True if sp_size > 1 else (tp_rank == 0)
 
     stage_captures = getattr(engine, "_speco_pp_stage_captures", [])
     saved_contexts = getattr(engine, "_speco_pp_saved_contexts", [])
@@ -2466,9 +2470,8 @@ def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) 
         "SPECO_PP_EXCHANGE_DIR", "/home/model/tmp/speco_pp_exchange"
     )
     os.makedirs(tmp_dir, exist_ok=True)
-    # Use a fixed tag (same across all PP ranks in the same forward_backward_batch call).
-    # id(engine) differs per-rank (separate processes), so a fixed tag is needed.
-    tag = "fbb"
+    # Tag includes tp_rank when SP=True (each TP rank has different captures).
+    tag = f"fbb_tp{tp_rank}" if sp_size > 1 else "fbb"
 
     if not is_last_stage and is_io_rank:
         # Non-last stage: pickle CPU captures directly to a file (no ray.put/get
@@ -2512,6 +2515,9 @@ def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) 
 
     if is_last_stage and is_io_rank:
         # Last stage: poll for non-last stages' files, load directly (no ray.get).
+        # With SP=True ALL TP ranks enter here (each reads its own tp_rank-tagged
+        # file), participate in the SP all-reduce inside consume, but only
+        # tp_rank=0 attaches the result to the output dict.
         all_stage_captures = [None] * pp_size
         all_stage_captures[pp_rank] = stage_captures
 
@@ -2544,16 +2550,22 @@ def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) 
                 src_rank,
             )
 
-        # Merge non-last stages' captures into saved contexts + consume
+        # Merge non-last stages' captures into saved contexts + consume.
+        # ALL io ranks do this (the consume includes the SP all-reduce when
+        # sp_size>1, which requires every TP rank to participate).
         saved_contexts = getattr(engine, "_speco_pp_saved_contexts", [])
-        # Infer the runtime device from saved captures (already on the
-        # accelerator) instead of hardcoding a device-specific call.
+        # Infer the runtime device from saved captures.  With SP=True the
+        # captures are sparse_selected dicts (not plain tensors), so look
+        # inside the "rows" field for the device.
         device = torch.device("cpu")
         for _ctx in saved_contexts:
             _caps = _ctx.get("captures", {}) if isinstance(_ctx, dict) else {}
             for _v in _caps.values():
-                if torch.is_tensor(_v) and _v.device.type != "cpu":
-                    device = _v.device
+                _probe = _v
+                if _is_sparse_selected(_v):
+                    _probe = _v.get("rows")
+                if torch.is_tensor(_probe) and _probe.device.type != "cpu":
+                    device = _probe.device
                     break
             else:
                 continue
@@ -2577,6 +2589,18 @@ def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) 
                         if key not in merged:
                             if torch.is_tensor(tensor):
                                 merged[key] = tensor.to(device).clone()
+                            elif _is_sparse_selected(tensor):
+                                # SP=True: captures are sparse dicts with inner
+                                # tensors.  Move them to the runtime device (they
+                                # were pickled to CPU for the temp-file exchange).
+                                merged[key] = {
+                                    k2: (
+                                        v2.to(device).clone()
+                                        if torch.is_tensor(v2)
+                                        else v2
+                                    )
+                                    for k2, v2 in tensor.items()
+                                }
                             else:
                                 merged[key] = tensor
             saved_ctx["captures"] = merged
@@ -2584,24 +2608,35 @@ def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) 
 
             hidden_output = _consume_oldlogprob_hidden_capture(engine)
             if hidden_output:
-                # Skip _put_oldlogprob_hidden_refs for PP>1: creating Ray
-                # ObjectRefs causes disk pressure.  Keep hidden states as
-                # inline tensors; the task runner handles both modes.
+                # With SP=True the consume returns a sparse_selected dict
+                # (not a plain tensor).  Convert to dense so the single-put
+                # + reorder + task-runner inline path handles it uniformly.
+                hs = hidden_output.get(OLD_LOGPROB_HIDDEN_STATES_KEY)
+                if _is_sparse_selected(hs):
+                    hs = _dense_selected_from_sparse(saved_ctx, hs)
+                    hidden_output[OLD_LOGPROB_HIDDEN_STATES_KEY] = hs
                 all_hidden_outputs.append(hidden_output)
             else:
-                logger.warning(
-                    "SPECO PP exchange: consume returned empty for mb_idx=%d; "
-                    "merged capture keys=%s",
-                    mb_idx,
-                    list(merged.keys()),
-                )
+                if _is_sparse_sp_non_source_context(saved_ctx):
+                    logger.debug(
+                        "SPECO PP exchange: consume returned empty (SP non-source "
+                        "rank, expected) for mb_idx=%d",
+                        mb_idx,
+                    )
+                else:
+                    logger.warning(
+                        "SPECO PP exchange: consume returned empty for mb_idx=%d; "
+                        "merged capture keys=%s",
+                        mb_idx,
+                        list(merged.keys()),
+                    )
 
-        # Put merged hidden_output into the aggregated result dict (NOT a list).
-        # The result from forward_backward_batch is the output of
-        # postprocess_batch_func (an aggregated dict), not the raw per-microbatch
-        # losses_reduced list.  Concatenate tensor keys across microbatches (dim=0)
-        # and extend ref/meta lists.
-        if not all_hidden_outputs:
+        # Only tp_rank=0 attaches the result to the output dict.  Other TP
+        # ranks participated in the SP all-reduce above; their result is
+        # discarded (only tp_rank=0's output is returned by the worker).
+        if tp_rank != 0:
+            pass  # SP all-reduce done; nothing more to do
+        elif not all_hidden_outputs:
             logger.warning(
                 "SPECO PP exchange: no hidden outputs produced (all consume empty); "
                 "losses_reduced type=%s",
