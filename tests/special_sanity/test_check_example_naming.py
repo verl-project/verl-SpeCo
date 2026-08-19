@@ -19,7 +19,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from tests.special_sanity.check_example_naming import (
-    DRAFTER_BACKENDS,
     ROLLOUT_BACKENDS,
     check_filename,
     main,
@@ -31,22 +30,55 @@ def _violations(name: str) -> list[str]:
 
 
 def test_backend_matrix_names_pass():
-    for drafter_backend in DRAFTER_BACKENDS:
-        for rollout_backend in ROLLOUT_BACKENDS:
-            assert (
-                _violations(
-                    f"run_qwen3-8b_drafter_{drafter_backend}_{rollout_backend}.sh"
-                )
-                == []
+    for rollout_backend in ROLLOUT_BACKENDS:
+        assert (
+            _violations(
+                f"run_qwen3-8b_drafter_anystrategy_{rollout_backend}.sh"
             )
+            == []
+        )
 
 
 def test_npu_suffix_passes():
     assert _violations("run_qwen3-8b_drafter_eagle3_vllm_npu.sh") == []
 
 
+def test_actor_backend_with_multiple_tokens_passes():
+    assert (
+        _violations(
+            "run_qwen3-8b_actor_custom_distributed_drafter_eagle3_vllm.sh"
+        )
+        == []
+    )
+
+
+def test_actor_backend_is_optional_for_separate_training():
+    assert (
+        _violations("run_qwen3-8b_actor_fsdp2_drafter_eagle3_separate_training.sh")
+        == []
+    )
+
+
+def test_arbitrary_actor_backend_passes():
+    assert _violations("run_qwen3-8b_actor_newbackend_drafter_eagle3_vllm.sh") == []
+
+
+def test_missing_actor_backend_rejected():
+    errs = _violations("run_qwen3-8b_actor_drafter_eagle3_vllm.sh")
+    assert errs and "non-empty actor backend" in errs[0]
+
+
 def test_separate_training_entrypoint_passes():
     assert _violations("run_qwen3-8b_drafter_separate_training.sh") == []
+
+
+def test_separate_training_may_name_its_drafter_backends():
+    assert _violations("run_qwen3-8b_drafter_newstrategy_separate_training.sh") == []
+    assert _violations("run_qwen3-8b_drafter_strategy_a_strategy_b_separate_training.sh") == []
+
+
+def test_arbitrary_drafter_backend_passes():
+    assert _violations("run_qwen3-8b_drafter_newstrategy_vllm.sh") == []
 
 
 def test_missing_drafter_marker_rejected():
@@ -54,9 +86,9 @@ def test_missing_drafter_marker_rejected():
     assert errs and "drafter" in errs[0]
 
 
-def test_unknown_drafter_backend_rejected():
-    errs = _violations("run_qwen3-8b_drafter_unknown_vllm.sh")
-    assert errs and "unknown drafter backend" in errs[0]
+def test_missing_drafter_backend_rejected():
+    errs = _violations("run_qwen3-8b_drafter__vllm.sh")
+    assert errs and "non-empty drafter backend" in errs[0]
 
 
 def test_unknown_rollout_backend_rejected():

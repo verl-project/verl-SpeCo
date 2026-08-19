@@ -77,12 +77,19 @@ def test_ci_layers_match_required_shape() -> None:
     assert expected <= {path.name for path in WORKFLOWS.glob("*.yml")}
     assert "pull_request" in _workflow("cpu_unit_tests.yml")["on"]
 
-    manual_hardware_workflows = rollout_workflows | {
+    manual_hardware_workflows = (rollout_workflows - {"npu_vllm_unit_tests.yml"}) | {
         "gpu_drafter_training_smoke.yml",
     }
     for workflow_name in manual_hardware_workflows:
         triggers = _workflow(workflow_name)["on"]
         assert set(triggers) == {"workflow_dispatch"}
+
+    npu_vllm_triggers = _workflow("npu_vllm_unit_tests.yml")["on"]
+    assert set(npu_vllm_triggers) == {
+        "pull_request",
+        "push",
+        "workflow_dispatch",
+    }
 
 
 def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
@@ -118,12 +125,15 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
         workflow = _workflow(workflow_name)
         assert "ci/run_example_test.sh" in source
         assert f"bash ci/run_example_test.sh {accelerator} {backend}" in source
-        assert "SPECO_DEFAULT_MODEL_ROOT" in source
-        assert "SPECO_DEFAULT_DATA_ROOT" in source
         if workflow_name == "npu_vllm_unit_tests.yml":
-            assert "/root/.cache/models" in source
-            assert "/root/.cache/models/hf_data" in source
+            assert "SPECO_DEFAULT_MODEL_ROOT" not in source
+            assert "SPECO_DEFAULT_DATA_ROOT" not in source
+            assert "/root/.cache/huggingface/hub" in source
+            assert "dapo-math-17k.parquet" in source
+            assert "aime-2024.parquet" in source
         else:
+            assert "SPECO_DEFAULT_MODEL_ROOT" in source
+            assert "SPECO_DEFAULT_DATA_ROOT" in source
             assert "/home/runner/models" in source
             assert "/home/runner/models/hf_data" in source
         assert "SPECO_TARGET_MODEL" in source
@@ -131,9 +141,15 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
         assert "SPECO_DFLASH_DRAFT_MODEL" in source
         if backend == "vllm" and accelerator == "npu":
             assert "SPECO_DSPARK_DRAFT_MODEL" in source
+            assert {
+                entry["drafter"]
+                for entry in workflow["jobs"]["example"]["strategy"]["matrix"][
+                    "include"
+                ]
+            } == {"eagle3", "dflash", "dspark"}
             assert workflow["jobs"]["example"]["container"]["image"] == (
                 "swr.cn-north-4.myhuaweicloud.com/"
-                "mindspeed/verl0.8.0_speco:v1"
+                "mindspeed/verl0.8.0_vllm_910b_speco:v1"
             )
             assert (
                 workflow["jobs"]["example"]["container"]["options"]
@@ -141,11 +157,18 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             )
             assert "python -m pip install --no-deps -e ." in source
             assert "verl_speco imported from" in source
-            assert "ln -sfn /root/.cache/models" in source
-            assert "Verify model and dataset paths" in source
+            assert workflow["jobs"]["example"]["env"]["HF_ENDPOINT"] == (
+                "https://hf-mirror.com"
+            )
+            assert workflow["jobs"]["example"]["env"]["HF_HUB_ENABLE_HF_TRANSFER"] == "0"
+            assert "find /root/.cache/huggingface/hub" in source
+            assert "Verify model paths" in source
             assert "Missing target model directory" in source
-            assert "Missing training dataset file" in source
             assert "SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '8' }}" in source
+            assert "SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE || '8' }}" in source
+            assert "SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '32' }}" in source
+            assert "SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES || '32' }}" in source
+            assert "SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE || '8' }}" in source
         assert "SPECO_ACCELERATOR_COUNT" in source
         assert "SPECO_TENSOR_PARALLEL_SIZE" in source
         assert "SPECO_SEQUENCE_PARALLEL_SIZE" in source
