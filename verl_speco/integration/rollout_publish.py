@@ -165,6 +165,7 @@ def install_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
     try:
         from verl_speco.integration.oldlogprob_runtime import (
             install_oldlogprob_hidden_runtime_patch,
+            install_oldlogprob_hidden_runtime_patch_megatron,
             oldlogprob_hidden_runtime_enabled,
         )
     except Exception:  # noqa: BLE001
@@ -178,6 +179,7 @@ def install_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
     ):
         return
     install_oldlogprob_hidden_runtime_patch()
+    install_oldlogprob_hidden_runtime_patch_megatron()
 
 
 def _normalize_lm_head_row_indices(row_indices: Any, *, device: Any = None):
