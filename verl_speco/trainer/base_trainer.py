@@ -700,11 +700,17 @@ class DrafterBaseTrainer:
             metrics[f"{prefix}/l1_loss"] = (
                 sums.get(f"{prefix}/l1_loss_sum", 0.0) / l1_tokens
             )
+        confidence_tokens = sums.get(f"{prefix}/confidence_weighted_token_count", 0.0)
+        if confidence_tokens > 0:
+            metrics[f"{prefix}/confidence_loss"] = (
+                sums.get(f"{prefix}/confidence_loss_sum", 0.0) / confidence_tokens
+            )
         for key in (
             f"{prefix}/valid_token_count",
             f"{prefix}/weighted_token_count",
             f"{prefix}/ce_weighted_token_count",
             f"{prefix}/l1_weighted_token_count",
+            f"{prefix}/confidence_weighted_token_count",
             f"{prefix}/quality_token_count",
             f"{prefix}/sanitized_rows",
             f"{prefix}/masked_rows",
@@ -777,6 +783,8 @@ class DrafterBaseTrainer:
             "ce_weighted_token_count": f"{prefix}/ce_weighted_token_count",
             "l1_loss_sum": f"{prefix}/l1_loss_sum",
             "l1_weighted_token_count": f"{prefix}/l1_weighted_token_count",
+            "confidence_loss_sum": f"{prefix}/confidence_loss_sum",
+            "confidence_weighted_token_count": f"{prefix}/confidence_weighted_token_count",
             "sanitized_rows": f"{prefix}/sanitized_rows",
             "masked_rows": f"{prefix}/masked_rows",
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
@@ -3408,13 +3416,15 @@ class DrafterBaseTrainer:
         mask_list = preprocessed_lists["masks"]
         position_list = preprocessed_lists.get("position_ids")
         target_last_h_list = preprocessed_lists.get("target_last_h_states")
-        dspark_l1_enabled = (
-            self.backend.model_type == "dspark"
-            and float(
-                self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.9)
-                or 0.0
-            )
-            > 0
+        training_cfg = self.config.rollout.drafter.training
+        dspark_l1_loss_alpha = float(
+            training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0
+        )
+        dspark_confidence_loss_alpha = float(
+            training_cfg.get("dspark_confidence_loss_alpha", 0.0) or 0.0
+        )
+        dspark_distribution_loss_enabled = self.backend.model_type == "dspark" and (
+            dspark_l1_loss_alpha > 0 or dspark_confidence_loss_alpha > 0
         )
         if position_list is None:
             position_list = [
@@ -3444,7 +3454,9 @@ class DrafterBaseTrainer:
             if seq_len < 1:
                 items_dropped_short += 1
                 continue
-            if dspark_l1_enabled and not torch.is_tensor(target_last_h_states):
+            if dspark_distribution_loss_enabled and not torch.is_tensor(
+                target_last_h_states
+            ):
                 items_dropped_missing_target += 1
                 continue
 
@@ -3797,7 +3809,9 @@ class DrafterBaseTrainer:
                 # Reference-shifted: last_hidden[p+1] scores x[p+2], the token
                 # after the drafted input token x[p+1] at row p.
                 last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
-            elif dspark_l1_enabled and torch.is_tensor(target_last_h_states):
+            elif dspark_distribution_loss_enabled and torch.is_tensor(
+                target_last_h_states
+            ):
                 target_last_h_states = cast(torch.Tensor, target_last_h_states)
                 target_last_hidden_state_chunks.append(
                     target_last_h_states[:train_seq_len]

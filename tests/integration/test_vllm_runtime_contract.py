@@ -366,6 +366,85 @@ def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(
     }
 
 
+def test_vllm_dynamic_dspark_uses_native_method_on_npu_contract(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        """
+        {
+          "architectures": ["Qwen3DSparkModel"],
+          "markov_head_type": "vanilla",
+          "enable_confidence_head": true,
+          "target_layer_ids": [1, 9, 17, 25, 33]
+        }
+        """,
+        encoding="utf-8",
+    )
+    rollout_cfg = {
+        "engine_kwargs": {
+            "vllm": {
+                "additional_config": {
+                    "dynamic_spec_config": {
+                        "method": "dspark",
+                        "method_params": {
+                            "initial_verify_budget_per_req": 5,
+                            "budget_update_interval": 50,
+                            "budget_threshold": 0.7,
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    config = build_vllm_speculative_config_from_drafter(
+        _drafter(
+            speculative_algorithm="DSPARK",
+            model_path=str(model_path),
+            rollout={"spec_steps": 1, "spec_verify_tokens": 7},
+        ),
+        rollout_cfg=rollout_cfg,
+    )
+
+    assert config["method"] == "dspark"
+    assert config["num_speculative_tokens"] == 7
+
+
+def test_vllm_dynamic_dspark_rejects_static_dflash_override(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+    rollout_cfg = {
+        "engine_kwargs": {
+            "vllm": {"additional_config": {"dynamic_spec_config": {"method": "dspark"}}}
+        }
+    }
+
+    with pytest.raises(ValueError, match="requires speculative_config.method=dspark"):
+        build_vllm_speculative_config_from_drafter(
+            _drafter(
+                speculative_algorithm="DSPARK",
+                model_path=str(model_path),
+                rollout={"spec_steps": 1, "spec_verify_tokens": 7},
+                vllm={"speculative_config_overrides": {"method": "dflash"}},
+            ),
+            rollout_cfg=rollout_cfg,
+        )
+
+
 def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(
     tmp_path, monkeypatch
 ) -> None:

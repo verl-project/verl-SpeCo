@@ -130,10 +130,16 @@ def test_publish_state_filter_excludes_block_drafter_embedding() -> None:
         state_dict=lambda: {
             "draft_model.embed_tokens.weight": torch.ones(2, 2),
             "draft_model.fc.weight": torch.ones(2, 2),
+            "draft_model.confidence_head.proj.weight": torch.ones(1, 4),
+            "draft_model.confidence_head.proj.bias": torch.ones(1),
         }
     )
 
-    assert set(trainer._get_trainable_state_dict()) == {"draft_model.fc.weight"}
+    assert set(trainer._get_trainable_state_dict()) == {
+        "draft_model.fc.weight",
+        "draft_model.confidence_head.proj.weight",
+        "draft_model.confidence_head.proj.bias",
+    }
 
 
 def test_target_lm_head_device_helper_handles_dflash_style_backend() -> None:
@@ -200,6 +206,8 @@ def test_dspark_pretrained_export_strips_only_training_wrapper_prefix() -> None:
             "draft_model.hidden_norm.weight": torch.ones(2),
             "draft_model.norm.weight": torch.ones(2),
             "draft_model.markov_head.markov_w1.weight": torch.ones(2, 2),
+            "draft_model.confidence_head.proj.weight": torch.ones(1, 4),
+            "draft_model.confidence_head.proj.bias": torch.ones(1),
         },
     )
 
@@ -210,4 +218,34 @@ def test_dspark_pretrained_export_strips_only_training_wrapper_prefix() -> None:
         "hidden_norm.weight",
         "norm.weight",
         "markov_head.markov_w1.weight",
+        "confidence_head.proj.weight",
+        "confidence_head.proj.bias",
     }
+
+
+def test_dspark_training_metrics_report_confidence_loss() -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="confidence metrics need the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(model_type="dspark")
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(training={"dspark_block_size": 2})
+        )
+    )
+    trainer._training_metric_sums = {
+        "dspark/confidence_loss_sum": 3.0,
+        "dspark/confidence_weighted_token_count": 2.0,
+    }
+    trainer._training_metric_steps = 1
+    trainer.optimizer_steps_total = 0
+    trainer.optimizer = None
+
+    metrics = trainer.get_training_metrics()
+
+    assert metrics["dspark/confidence_loss"] == pytest.approx(1.5)
+    assert metrics["dspark/confidence_weighted_token_count"] == pytest.approx(2.0)

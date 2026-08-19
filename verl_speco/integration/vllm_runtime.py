@@ -1007,6 +1007,63 @@ def assert_lossless_vllm_speculative_config(config: Any, *, allow_lossy: bool) -
         )
 
 
+def _dspark_dynamic_spec_config_from_rollout(
+    rollout_cfg: Any,
+) -> dict[str, Any] | None:
+    dynamic_config = _get_nested(
+        rollout_cfg,
+        (
+            "engine_kwargs",
+            "vllm",
+            "additional_config",
+            "dynamic_spec_config",
+        ),
+        None,
+    )
+    if dynamic_config is None:
+        return None
+    dynamic_config = _plain_container(dynamic_config)
+    if not isinstance(dynamic_config, dict):
+        raise TypeError(
+            "rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config "
+            "must be a mapping"
+        )
+    method = dynamic_config.get("method")
+    if method is None or str(method).strip() == "":
+        return None
+    if str(method).strip().lower() != "dspark":
+        raise ValueError(
+            "vLLM-Ascend dynamic speculative decoding currently supports only "
+            "dynamic_spec_config.method=dspark"
+        )
+    method_params = dynamic_config.get("method_params") or {}
+    if not isinstance(method_params, dict):
+        raise TypeError("dynamic_spec_config.method_params must be a mapping")
+    positive_int_params = (
+        "initial_verify_budget_per_req",
+        "budget_update_interval",
+    )
+    for key in positive_int_params:
+        value = method_params.get(key)
+        if value is not None and _positive_int_or_none(value) is None:
+            raise ValueError(
+                f"dynamic_spec_config.method_params.{key} must be positive"
+            )
+    threshold = method_params.get("budget_threshold")
+    if threshold is not None:
+        try:
+            threshold_value = float(threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "dynamic_spec_config.method_params.budget_threshold must be a number"
+            ) from exc
+        if not 0.0 <= threshold_value <= 1.0:
+            raise ValueError(
+                "dynamic_spec_config.method_params.budget_threshold must be in [0, 1]"
+            )
+    return dynamic_config
+
+
 def build_vllm_speculative_config_from_drafter(
     drafter_cfg: dict[str, Any],
     rollout_cfg: Any = None,
@@ -1017,7 +1074,18 @@ def build_vllm_speculative_config_from_drafter(
         return {}
 
     algorithm = _drafter_algorithm(drafter_cfg)
+    dynamic_spec_config = _dspark_dynamic_spec_config_from_rollout(rollout_cfg)
+    if dynamic_spec_config is not None and algorithm != "DSPARK":
+        raise ValueError(
+            "dynamic_spec_config.method=dspark requires "
+            "drafter.speculative_algorithm=DSPARK"
+        )
     method = _speculative_method_from_drafter(drafter_cfg)
+    if dynamic_spec_config is not None:
+        # Static DSpark keeps the legacy Ascend dflash alias for older runtimes.
+        # The dynamic pipeline added by vllm-ascend#13216 is registered under the
+        # native dspark method and consumes confidence-head outputs.
+        method = "dspark"
     spec_model_path = _first_present(
         drafter_cfg.get("model_path"),
         drafter_cfg.get("checkpoint_path"),
@@ -1096,6 +1164,10 @@ def build_vllm_speculative_config_from_drafter(
             "drafter.vllm.speculative_config_overrides must be a mapping when provided"
         )
     speculative_config.update(_plain_container(overrides))
+    if dynamic_spec_config is not None and speculative_config.get("method") != "dspark":
+        raise ValueError(
+            "dynamic_spec_config.method=dspark requires speculative_config.method=dspark"
+        )
     assert_lossless_vllm_speculative_config(
         speculative_config,
         allow_lossy=bool(
