@@ -638,9 +638,13 @@ class DrafterBaseTrainer:
     def _use_flattened_drafter_fsdp_mesh(self) -> bool:
         actor_config = getattr(self.config, "actor", None)
         actor_strategy = (
-            actor_config.get("strategy", "")
-            if hasattr(actor_config, "get")
-            else getattr(actor_config, "strategy", "")
+            ""
+            if actor_config is None
+            else (
+                actor_config.get("strategy", "")
+                if hasattr(actor_config, "get")
+                else getattr(actor_config, "strategy", "")
+            )
         )
         return (
             device_name == "npu"
@@ -653,18 +657,26 @@ class DrafterBaseTrainer:
     def _use_blocking_npu_optimizer_offload(self) -> bool:
         actor_config = getattr(self.config, "actor", None)
         actor_strategy = (
-            actor_config.get("strategy", "")
-            if hasattr(actor_config, "get")
-            else getattr(actor_config, "strategy", "")
+            ""
+            if actor_config is None
+            else (
+                actor_config.get("strategy", "")
+                if hasattr(actor_config, "get")
+                else getattr(actor_config, "strategy", "")
+            )
         )
         return device_name == "npu" and str(actor_strategy).lower() == "veomni"
 
     def _should_park_drafter_hccl(self) -> bool:
         actor_config = getattr(self.config, "actor", None)
         actor_strategy = (
-            actor_config.get("strategy", "")
-            if hasattr(actor_config, "get")
-            else getattr(actor_config, "strategy", "")
+            ""
+            if actor_config is None
+            else (
+                actor_config.get("strategy", "")
+                if hasattr(actor_config, "get")
+                else getattr(actor_config, "strategy", "")
+            )
         )
         return (
             self.park_hccl_after_drafter_training
@@ -679,7 +691,7 @@ class DrafterBaseTrainer:
         if not self._should_park_drafter_hccl() or not dist.is_initialized():
             return
 
-        groups = []
+        groups: list[Any] = []
         for group in (
             self.fsdp_device_mesh.get_group()
             if self.fsdp_device_mesh is not None
