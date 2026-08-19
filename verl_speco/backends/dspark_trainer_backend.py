@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import os
 from copy import deepcopy
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import torch
 import torch.nn.functional as F
@@ -678,9 +678,10 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             str(actor_strategy).lower() == "veomni"
             and torch.is_tensor(target_weight)
         ):
+            target_weight_tensor = cast(torch.Tensor, target_weight)
             if (
-                target_weight.device.type == "npu"
-                and target_weight.dtype != torch.bfloat16
+                target_weight_tensor.device.type == "npu"
+                and target_weight_tensor.dtype != torch.bfloat16
             ):
                 target_lm_head = target_lm_head.to(dtype=torch.bfloat16)
                 logger.debug(
