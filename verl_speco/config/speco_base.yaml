@@ -179,3 +179,16 @@ actor_rollout_ref:
           repeat: true
           prefetch_depth: 2
           strict_schema: true
+        # TransferQueue transport for drafter features (P0: hidden states only).
+        # When enabled and the `transfer_queue` package is installed, the SGLang
+        # rollout server writes hidden states directly to TQ and the drafter
+        # worker reads them by key, bypassing the RayPPOTrainer driver and the
+        # Ray object store for the dominant tensor. Default off -> unchanged
+        # Ray path. Requires `pip install TransferQueue==0.1.7`.
+        transfer_queue:
+          enable: false
+          backend:
+            storage_backend: SimpleStorage
+            SimpleStorage:
+              total_storage_size: 100000
+              num_data_storage_units: 8

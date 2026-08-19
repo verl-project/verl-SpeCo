@@ -72,10 +72,54 @@ def _resolve_ray_object_ref(value):
     return value
 
 
-def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
+def _densify_tq_tensor(tensor):
+    """Unwrap a tensor returned by TransferQueue into a plain dense tensor.
+
+    TQ stores each ``put_sample`` payload inside a TensorDict and
+    ``kv_batch_get`` returns it with an added batch dimension, as a NestedTensor
+    (jagged on dim 0). The old-logprob chunk resolver slices
+    ``tensor[start:start + length]`` on dim 0, which NestedTensor does not
+    support (``slice(): not supported for NestedTensor on dim=0``). The producer
+    put a dense ``[rows, hidden]`` tensor, so flatten the NestedTensor back to
+    that 2-D form. Mirrors ``_speco_tensor_rows`` which uses ``tensor.unbind()``
+    for the same nested-tensor case.
+    """
+    if not torch.is_tensor(tensor):
+        return tensor
+    if tensor.is_nested:
+        parts = [p for p in tensor.unbind() if p.numel() > 0]
+        if not parts:
+            return None
+        tensor = torch.cat(parts, dim=0)
+    if tensor.dim() == 3:
+        tensor = tensor.squeeze(0)
+    elif tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    return tensor.contiguous()
+
+
+def _resolve_tq_or_ray_ref(ref):
+    # P1: old-logprob chunk refs may be TransferQueue keys ("speco:" prefix)
+    # instead of Ray ObjectRefs. Fetch the stored chunk via TQ and fall back to
+    # ray.get otherwise. Multiple SP ranks of one replica read the same key;
+    # TQ samples are not cleared on read (see transferqueue_bridge.get_sample).
+    if isinstance(ref, str) and ref.startswith("speco:"):
+        from verl_speco.integration.transferqueue_bridge import get_sample
+
+        return _densify_tq_tensor(get_sample(ref).get("hidden"))
+    return _resolve_ray_object_ref(ref)
+
+
+def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None, cache=None):
     if not chunks:
         return None
-    resolved_cache = {}
+    # Cross-sample cache: callers pass a per-step cache so multiple samples
+    # sharing the same owner chunk (same TQ key / ObjectRef) are fetched only
+    # once. Without this, ~16 samples in one owner each trigger a full TQ
+    # kv_batch_get (or ray.get) on the same ~400MB chunk. ray.get dedups at
+    # the object store; TQ get_sample does NOT, so the cache is essential.
+    if cache is None:
+        cache = {}
     pieces = []
     full_rows = int(expected_rows or 0)
     hidden_size = None
@@ -86,10 +130,10 @@ def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
         ref = chunk.get("ref")
         if ref is None:
             continue
-        cache_key = id(ref)
-        if cache_key not in resolved_cache:
-            resolved_cache[cache_key] = _resolve_ray_object_ref(ref)
-        tensor = resolved_cache[cache_key]
+        cache_key = ref if isinstance(ref, str) else id(ref)
+        if cache_key not in cache:
+            cache[cache_key] = _resolve_tq_or_ray_ref(ref)
+        tensor = cache[cache_key]
         if not torch.is_tensor(tensor):
             continue
         tensor = cast(torch.Tensor, tensor)
@@ -367,6 +411,14 @@ class SpecoWorker(Worker):
         self.train_steps_per_trigger = int(
             self.config.rollout.drafter.training.get("step", 100)
         )
+
+        # Configure TransferQueue transport for drafter features. No-op when
+        # disabled or when the transfer_queue package is not installed; the
+        # existing inline Ray path is used otherwise. Cached on the instance so
+        # collect_rollout_features can branch without re-reading config.
+        from verl_speco.integration.transferqueue_bridge import configure_transfer_queue
+
+        self._speco_tq_enabled = configure_transfer_queue(self.config.rollout.drafter.training)
 
     def _ensure_process_group_initialized(self):
         if not dist.is_initialized():
@@ -761,9 +813,39 @@ class SpecoWorker(Worker):
     def collect_rollout_features(self, samples: list[dict]):
         if not samples:
             return
+        # Per-step cross-sample cache for chunk fetches. Reset every collect
+        # call so keys (which carry global_step) never stale and the cache
+        # cannot grow unbounded. Shared across all samples in this step.
+        self._tq_chunk_cache = {}
         for sample in samples:
             if not sample:
                 continue
+            # P2: restore TransferQueue-offloaded tensors into the sample before
+            # building the batch. One fetch restores hidden_states plus the other
+            # large tensors (target_logprobs, raw target logprobs) so they all
+            # bypass the driver. a2 old-logprob samples (which carry
+            # hidden_states_ref_chunks, not a tq key) skip this and resolve below.
+            tq_key = sample.get("hidden_states_tq_key")
+            if tq_key is not None and self._speco_tq_enabled:
+                from verl_speco.integration.transferqueue_bridge import get_sample
+
+                payload = get_sample(tq_key)
+                for _field in (
+                    "hidden_states",
+                    "target_logprobs",
+                    "hidden_raw_target_logprobs",
+                    "hidden_raw_target_logprobs_positions",
+                ):
+                    if payload.get(_field) is not None:
+                        sample[_field] = payload[_field]
+                if sample.get("hidden_states") is None:
+                    # Fail loud: a TQ key was produced but the payload is
+                    # missing -> transport is broken. Do NOT silently drop the
+                    # sample (that would corrupt training data).
+                    raise RuntimeError(
+                        f"[SpeCo TQ] drafter worker got empty hidden_states for "
+                        f"key={tq_key}; TQ enabled but producer payload missing."
+                    )
             batch = {
                 "input_ids": sample["input_ids"],
                 "prompts": sample["prompts"],
@@ -795,6 +877,8 @@ class SpecoWorker(Worker):
                     batch[key] = sample[key]
             hidden = sample.get("hidden_states")
             if hidden is None:
+                # a2 old-logprob path: resolve Ray ObjectRefs (or TQ keys, P1)
+                # from per-owner chunks / single ref.
                 hidden_chunks = sample.get("hidden_states_ref_chunks")
                 if hidden_chunks:
                     expected_rows = None
@@ -803,7 +887,9 @@ class SpecoWorker(Worker):
                         hidden_positions = cast(torch.Tensor, hidden_positions)
                         expected_rows = int(hidden_positions.numel())
                     hidden = _resolve_hidden_state_chunks(
-                        hidden_chunks, expected_rows=expected_rows
+                        hidden_chunks,
+                        expected_rows=expected_rows,
+                        cache=self._tq_chunk_cache,
                     )
                 else:
                     hidden = _resolve_ray_object_ref(sample.get("hidden_states_ref"))

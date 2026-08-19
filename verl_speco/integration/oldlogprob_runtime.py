@@ -48,6 +48,9 @@ OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY = "speco_oldlogprob_hidden_capture_impl"
 OLD_LOGPROB_HIDDEN_LAYOUT_KEY = "speco_oldlogprob_hidden_layout"
 OLD_LOGPROB_TIMING_KEY = "speco_oldlogprob_timing"
 OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY = "speco_oldlogprob_selected_batch_indices"
+# Stamped on the micro-batch by the collect plan so the actor-worker producer
+# can build step-unique TransferQueue keys for old-logprob hidden chunks (P1).
+OLD_LOGPROB_GLOBAL_STEP_KEY = "speco_oldlogprob_global_step"
 
 _TIMING_SELECT_US = 0
 _TIMING_SP_MERGE_US = 1
@@ -202,6 +205,45 @@ def _oldlogprob_hidden_object_ref_enabled(micro_batch: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"", "0", "false", "no", "off", "n"}
     return bool(value)
+
+
+def _oldlogprob_global_step(micro_batch: Any) -> int:
+    """Read the global step stamped on the micro-batch by the collect plan."""
+
+    value = 0
+    try:
+        from verl.utils import tensordict_utils as tu
+
+        value = tu.get_non_tensor_data(data=micro_batch, key=OLD_LOGPROB_GLOBAL_STEP_KEY, default=0)
+    except Exception:  # noqa: BLE001
+        try:
+            value = micro_batch.get(OLD_LOGPROB_GLOBAL_STEP_KEY, 0)
+        except Exception:  # noqa: BLE001
+            if _tensor_key_present(micro_batch, OLD_LOGPROB_GLOBAL_STEP_KEY):
+                value = micro_batch[OLD_LOGPROB_GLOBAL_STEP_KEY]
+    value = getattr(value, "data", value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _speco_tq_enabled_for_oldlogprob() -> bool:
+    """Configure (idempotently) and report whether TQ transport is usable here.
+
+    The actor worker reaches its drafter training config through the same env
+    serialization the SGLang server uses (``SPECO_SGLANG_DRAFTER_CONFIG_ENV``).
+    """
+
+    from verl_speco.integration.transferqueue_bridge import (
+        configure_transfer_queue,
+        is_transfer_queue_enabled,
+    )
+
+    drafter = _load_drafter_env()
+    training = _get_nested(drafter, ("training",), None)
+    configure_transfer_queue(training)
+    return is_transfer_queue_enabled()
 
 
 def _is_sparse_sp_non_source_context(context: dict[str, Any]) -> bool:
@@ -491,7 +533,27 @@ def _put_oldlogprob_hidden_refs(
                 else tensors[0].contiguous()
             )
             ray_put_started = time.perf_counter()
-            chunk_ref = ray.put(hidden_chunk)
+            # P1: when TQ is enabled, store the owner's concatenated hidden chunk
+            # in TransferQueue and carry the key in place of the Ray ObjectRef.
+            # The driver treats the token as opaque; the drafter consumer
+            # resolves "speco:" keys via TQ instead of ray.get. Falls back to
+            # ray.put otherwise (unchanged behavior).
+            if _speco_tq_enabled_for_oldlogprob():
+                from verl_speco.integration.transferqueue_bridge import make_sample_key, put_sample
+
+                tq_key = make_sample_key(
+                    _oldlogprob_global_step(micro_batch),
+                    int(owner),
+                    f"chunk{len(chunk_refs)}",
+                )
+                put_sample(
+                    tq_key,
+                    {"hidden": hidden_chunk},
+                    tag={"global_step": _oldlogprob_global_step(micro_batch), "owner": int(owner)},
+                )
+                chunk_ref = tq_key
+            else:
+                chunk_ref = ray.put(hidden_chunk)
             ray_put_us += (time.perf_counter() - ray_put_started) * 1_000_000.0
             chunk_index = len(chunk_refs)
             chunk_refs.append(chunk_ref)
