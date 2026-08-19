@@ -768,7 +768,9 @@ def _install_oldlogprob_backend_batch_postprocess_patch(
         )
         return False
     try:
-        fsdp_module = importlib.import_module("verl.workers.engine.fsdp.transformer_impl")
+        fsdp_module = importlib.import_module(
+            "verl.workers.engine.fsdp.transformer_impl"
+        )
         fsdp_engine_cls = getattr(fsdp_module, "FSDPEngineWithLMHead", None)
         if fsdp_engine_cls is None or not issubclass(engine_cls, fsdp_engine_cls):
             logger.warning(
@@ -1728,9 +1730,7 @@ def install_oldlogprob_hidden_runtime_patch(
     if _PATCHED:
         module = importlib.import_module("verl.workers.engine.fsdp.transformer_impl")
         _install_oldlogprob_fsdp_batch_postprocess_patch(module)
-        backend_patched = _install_oldlogprob_backend_batch_postprocess_patch(
-            backend
-        )
+        backend_patched = _install_oldlogprob_backend_batch_postprocess_patch(backend)
         worker_patched = _install_oldlogprob_training_worker_postprocess_patch()
         if backend != "veomni":
             return True
@@ -1761,12 +1761,8 @@ def install_oldlogprob_hidden_runtime_patch(
         return False
 
     fsdp_batch_patched = _install_oldlogprob_fsdp_batch_postprocess_patch(module)
-    backend_batch_patched = _install_oldlogprob_backend_batch_postprocess_patch(
-        backend
-    )
-    if backend == "veomni" and (
-        not fsdp_batch_patched or not backend_batch_patched
-    ):
+    backend_batch_patched = _install_oldlogprob_backend_batch_postprocess_patch(backend)
+    if backend == "veomni" and (not fsdp_batch_patched or not backend_batch_patched):
         return False
 
     if not getattr(engine_cls, "_speco_oldlogprob_patched_inputs", False):

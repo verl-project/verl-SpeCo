@@ -674,10 +674,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             )
         )
         target_weight = getattr(getattr(target_lm_head, "fc", None), "weight", None)
-        if (
-            str(actor_strategy).lower() == "veomni"
-            and torch.is_tensor(target_weight)
-        ):
+        if str(actor_strategy).lower() == "veomni" and torch.is_tensor(target_weight):
             target_weight_tensor = cast(torch.Tensor, target_weight)
             if (
                 target_weight_tensor.device.type == "npu"

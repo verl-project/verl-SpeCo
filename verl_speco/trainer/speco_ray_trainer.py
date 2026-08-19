@@ -1713,14 +1713,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         get_actor_lm_head_weight = self._speco_actor_rollout_method(
             "get_actor_lm_head_weight"
         )
-        actor_backend = str(
-            _get_nested(
-                self.config,
-                ("actor_rollout_ref", "actor", "strategy"),
-                "",
+        actor_backend = (
+            str(
+                _get_nested(
+                    self.config,
+                    ("actor_rollout_ref", "actor", "strategy"),
+                    "",
+                )
+                or ""
             )
-            or ""
-        ).strip().lower()
+            .strip()
+            .lower()
+        )
         actor_veomni_param_offload = bool(
             _get_nested(
                 self.config,
@@ -1734,12 +1738,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             and actor_veomni_param_offload
         )
         fetch_started = time.perf_counter()
-        payloads = self._ray_get_if_needed(
-            get_actor_lm_head_weight(
-                row_indices,
-                keep_model_on_device=keep_actor_model_on_device,
+        payloads = (
+            self._ray_get_if_needed(
+                get_actor_lm_head_weight(
+                    row_indices,
+                    keep_model_on_device=keep_actor_model_on_device,
+                )
             )
-        ) or []
+            or []
+        )
         fetch_elapsed = time.perf_counter() - fetch_started
         payload = self._first_non_null(payloads)
         if payload is None:
@@ -1780,8 +1787,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "drafter/target_lm_head_selected_rows": selected_rows,
             "drafter/target_lm_head_source_vocab_size": source_vocab_size,
             "drafter/target_lm_head_direct_sparse_export": int(
-                export_strategy
-                in {"direct_sparse", "veomni_lm_head_sparse"}
+                export_strategy in {"direct_sparse", "veomni_lm_head_sparse"}
             ),
             "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
             "timing_s/drafter_sync_target_lm_head_dispatch": dispatch_elapsed,
@@ -1806,9 +1812,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         finished = time.perf_counter()
         wait_elapsed = finished - wait_started
         dispatch_elapsed = float(pending.get("dispatch_elapsed", 0.0) or 0.0)
-        pre_dispatch_elapsed = float(
-            pending.get("pre_dispatch_elapsed", 0.0) or 0.0
-        )
+        pre_dispatch_elapsed = float(pending.get("pre_dispatch_elapsed", 0.0) or 0.0)
         dispatch_finished = float(
             pending.get("dispatch_finished", wait_started) or wait_started
         )
@@ -1816,9 +1820,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             wait_started - dispatch_finished,
             0.0,
         )
-        critical_path_elapsed = (
-            pre_dispatch_elapsed + dispatch_elapsed + wait_elapsed
-        )
+        critical_path_elapsed = pre_dispatch_elapsed + dispatch_elapsed + wait_elapsed
         return {
             "drafter/target_lm_head_synced": 1,
             "timing_s/drafter_sync_target_lm_head": critical_path_elapsed,

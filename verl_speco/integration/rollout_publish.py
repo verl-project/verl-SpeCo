@@ -94,9 +94,7 @@ def veomni_parallel_layout(config: Any) -> dict[str, Any]:
             or "disabled"
         ).upper(),
         "rollout_routing_replay": bool(
-            _get_nested(
-                rollout_config, ("enable_rollout_routing_replay",), False
-            )
+            _get_nested(rollout_config, ("enable_rollout_routing_replay",), False)
         ),
     }
 
@@ -296,8 +294,7 @@ def validate_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
     lm_head_name, lm_head_weight = _select_lm_head_named_tensor(module)
     if lm_head_weight is None:
         raise RuntimeError(
-            "SPECO could not locate VeOmni lm_head.weight or tied "
-            "embed_tokens.weight"
+            "SPECO could not locate VeOmni lm_head.weight or tied embed_tokens.weight"
         )
 
     layout = veomni_parallel_layout(config)
@@ -500,9 +497,7 @@ def _materialize_veomni_lm_head_rows(selected_weight: Any, row_indices: Any):
 
     torch = _torch_module()
     if not callable(getattr(selected_weight, "to_local", None)):
-        rows_on_device = row_indices.to(
-            device=selected_weight.device, dtype=torch.long
-        )
+        rows_on_device = row_indices.to(device=selected_weight.device, dtype=torch.long)
         return selected_weight.detach().index_select(0, rows_on_device)
 
     try:
@@ -679,9 +674,11 @@ def _export_veomni_actor_lm_head_weight(
         if getattr(worker, "rank", None) != 0:
             return None
 
-        weight = materialized_weight.detach().to(
-            device="cpu", dtype=torch.bfloat16
-        ).contiguous()
+        weight = (
+            materialized_weight.detach()
+            .to(device="cpu", dtype=torch.bfloat16)
+            .contiguous()
+        )
         logger.warning(
             "[actor lm_head export] veomni_lm_head_only name=%s shape=%s "
             "source_vocab=%s selected_rows=%s device=%s reclaim_staging=%s",

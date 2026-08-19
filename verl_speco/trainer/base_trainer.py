@@ -748,9 +748,7 @@ class DrafterBaseTrainer:
                 continue
             for key, value in state.items():
                 local_value = (
-                    self._tensor_local_shard(value)
-                    if torch.is_tensor(value)
-                    else None
+                    self._tensor_local_shard(value) if torch.is_tensor(value) else None
                 )
                 if local_value is not None and local_value.device.type != "cpu":
                     state[key] = value.to("cpu", non_blocking=False)
@@ -767,9 +765,9 @@ class DrafterBaseTrainer:
         # metric collectives.
         mesh_ranks = mesh.mesh.reshape(-1)
         world_ranks = list(range(dist.get_world_size()))
-        covers_default_world = (
-            [int(rank) for rank in mesh_ranks.tolist()] == world_ranks
-        )
+        covers_default_world = [
+            int(rank) for rank in mesh_ranks.tolist()
+        ] == world_ranks
         from_group = getattr(DeviceMesh, "from_group", None)
         if covers_default_world and callable(from_group):
             # The SpecoWorker default group already spans these exact ranks.
@@ -1540,9 +1538,7 @@ class DrafterBaseTrainer:
             "save_sp_world_size": int(self._get_sp_world_size()),
             "save_dp_world_size": int(self._get_dp_world_size()),
             "save_fsdp_shard_world_size": int(
-                self.fsdp_device_mesh.size()
-                if self.fsdp_device_mesh is not None
-                else 1
+                self.fsdp_device_mesh.size() if self.fsdp_device_mesh is not None else 1
             ),
         }
         if is_leader:
@@ -2026,9 +2022,7 @@ class DrafterBaseTrainer:
         )
         pending_source_vocab_size = self._pending_target_lm_head_source_vocab_size
         applied = (
-            False
-            if defer_device_apply
-            else self._apply_pending_target_lm_head_weight()
+            False if defer_device_apply else self._apply_pending_target_lm_head_weight()
         )
         return {
             "accepted": True,
