@@ -282,6 +282,23 @@ def _batch_item_float(value: Any, index: int = 0) -> float | None:
         return None
 
 
+def _batch_item_value(value: Any, index: int = 0) -> Any:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return None
+        flat = value.detach().view(-1).cpu()
+        index = min(max(int(index), 0), flat.numel() - 1)
+        return flat[index].item()
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        index = min(max(int(index), 0), len(value) - 1)
+        return value[index]
+    return value
+
+
 def _tensor_sum_int(tensor: torch.Tensor) -> int:
     return int(tensor.detach().float().sum().cpu().item())
 
@@ -2910,6 +2927,25 @@ class DrafterBaseTrainer:
                 else None,
                 "_verl_accept_len": accept_len,
                 "_verl_accept_rate": accept_rate,
+                "_verl_request_mean_accept_len": _batch_item_float(
+                    batch.get("_verl_request_mean_accept_len"),
+                    i,
+                ),
+                "_speco_vllm_request_id": _batch_item_value(
+                    batch.get("_speco_vllm_request_id"), i
+                ),
+                "_speco_vllm_request_elapsed_sec": _batch_item_float(
+                    batch.get("_speco_vllm_request_elapsed_sec"),
+                    i,
+                ),
+                "_verl_is_hard": bool(
+                    _batch_item_int(batch.get("_verl_is_hard"), i) or 0
+                ),
+                "_verl_hard_score": _batch_item_float(batch.get("_verl_hard_score"), i),
+                "_speco_vllm_request_completion_index": _batch_item_int(
+                    batch.get("_speco_vllm_request_completion_index"),
+                    i,
+                ),
                 "_verl_input_seq_length": input_seq_length,
                 "hidden_lm_head_fingerprint": batch.get("hidden_lm_head_fingerprint"),
                 "hidden_last_hidden_logprob_check": batch.get(
@@ -3222,6 +3258,7 @@ class DrafterBaseTrainer:
         explicit_score = self._item_float(
             item,
             (
+                "_verl_hard_score",
                 "_verl_dflash_hard_score",
                 "dflash_hard_score",
                 "_verl_sample_loss",
@@ -3250,6 +3287,20 @@ class DrafterBaseTrainer:
 
         return None
 
+    @staticmethod
+    def _explicit_hard_label(item: dict[str, Any]) -> Optional[bool]:
+        if "_verl_is_hard" not in item:
+            return None
+        value = item.get("_verl_is_hard")
+        if torch.is_tensor(value):
+            tensor_value = cast(torch.Tensor, value)
+            if tensor_value.numel() != 1:
+                return None
+            value = tensor_value.detach().cpu().item()
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
+
     def _sample_training_items(
         self,
         available_data: list[dict[str, Any]],
@@ -3266,6 +3317,34 @@ class DrafterBaseTrainer:
             return rng.sample(available_data, batch_size)
 
         hard_count = min(batch_size, max(0, round(batch_size * hard_ratio)))
+        explicit_hard = [
+            item for item in available_data if self._explicit_hard_label(item) is True
+        ]
+        if explicit_hard:
+            explicit_selected = rng.sample(
+                explicit_hard, min(hard_count, len(explicit_hard))
+            )
+            if len(explicit_selected) < hard_count:
+                logger.warning(
+                    "[Rank %s] DSpark hard sample quota underfilled: selected %s/%s hard samples",
+                    self.rank,
+                    len(explicit_selected),
+                    hard_count,
+                )
+            selected_ids = {id(item) for item in explicit_selected}
+            remaining = [
+                item
+                for item in available_data
+                if id(item) not in selected_ids
+                and self._explicit_hard_label(item) is not True
+            ]
+            random_count = batch_size - len(explicit_selected)
+            if random_count > 0:
+                explicit_selected.extend(
+                    rng.sample(remaining, min(random_count, len(remaining)))
+                )
+            return explicit_selected
+
         scored: list[tuple[float, float, dict[str, Any]]] = []
         for item in available_data:
             score = self._dflash_hard_sample_score(item)

@@ -56,6 +56,9 @@ actor_rollout_ref:
         old_logprob_hidden_capture_impl: forward_hook
         use_data_buffer: false
         collect_interval_steps: 5
+        # Print request mean-accept-length variance every N trainer steps.
+        # Set to 0 to disable the periodic variance summary.
+        request_accept_len_variance_interval_steps: 0
         collection_sample_rate: 1.0
         max_collect_samples_per_step_per_replica: 16
         max_collect_tokens_per_step_per_replica: 16384
@@ -115,6 +118,11 @@ actor_rollout_ref:
         dspark_block_size: 7
         dspark_num_anchors: 32
         dspark_loss_decay_gamma: 7.0
+        # Target fraction of collection capacity filled with requests having the
+        # lowest mean accept length. Set to 0 to disable hard-prioritized collection.
+        dspark_hard_candidate_ratio: 0.0
+        # Target fraction of each DSpark training batch selected from hard samples;
+        # also sets the minimum hard collection quota. Set to 0 for random sampling.
         dspark_hard_sample_ratio: 0.0
         dspark_hidden_size: null
         dspark_num_target_layers: 5
