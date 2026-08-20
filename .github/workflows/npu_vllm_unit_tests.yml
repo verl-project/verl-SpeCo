@@ -196,6 +196,8 @@ jobs:
           SPECO_SEQUENCE_PARALLEL_SIZE: ${{ inputs.sequence_parallel_size || env.SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE }}
           SPECO_ENABLE_TRAINING: ${{ github.event_name != 'workflow_dispatch' && 'true' || inputs.run_training }}
           SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS || '1' }}
+          SPECO_HIDDEN_STATE_WINDOW_MIN_ROWS: "32"
+          SPECO_HIDDEN_STATE_WINDOW_TOKENS_PER_SAMPLE: "32"
           SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE || '8' }}
           SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '32' }}
           SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES || '32' }}

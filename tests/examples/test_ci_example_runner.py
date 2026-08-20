@@ -275,6 +275,8 @@ def test_example_runner_exposes_required_hydra_overrides() -> None:
     assert "SPECO_TENSOR_PARALLEL_SIZE" in source
     assert "SPECO_SEQUENCE_PARALLEL_SIZE" in source
     assert "SPECO_ENABLE_TRAINING" in source
+    assert "SPECO_HIDDEN_STATE_WINDOW_MIN_ROWS" in source
+    assert "SPECO_HIDDEN_STATE_WINDOW_TOKENS_PER_SAMPLE" in source
     assert "SPECO_SPEC_STEPS" in source
     assert "SPECO_SPEC_TOPK" in source
     assert "SPECO_SPEC_VERIFY_TOKENS" in source
