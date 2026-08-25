@@ -225,6 +225,7 @@ def install_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
     try:
         from verl_speco.integration.oldlogprob_runtime import (
             install_oldlogprob_hidden_runtime_patch,
+            install_oldlogprob_hidden_runtime_patch_megatron,
             oldlogprob_hidden_runtime_enabled,
         )
     except Exception:  # noqa: BLE001
@@ -240,6 +241,7 @@ def install_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
     actor_backend = actor_training_backend_name(getattr(worker, "config", None))
     if actor_backend != "veomni":
         install_oldlogprob_hidden_runtime_patch()
+        install_oldlogprob_hidden_runtime_patch_megatron()
         return
 
     patched = install_oldlogprob_hidden_runtime_patch(actor_backend="veomni")
