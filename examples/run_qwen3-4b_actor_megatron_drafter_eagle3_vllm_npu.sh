@@ -1,7 +1,7 @@
 set -x
 export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
 export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
-export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export TORCH_COMPILE_DISABLE=1
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 case "${LD_PRELOAD:-}" in
     *libjemalloc*) ;;
@@ -28,8 +28,8 @@ project_name='verl_grpo_megatron_eagle3_drafter'
 exp_name='qwen3_4b_eagle3_drafter_megatron_vllm_npu'
 
 gen_tp=2
-actor_tp=4
-actor_pp=2
+actor_tp=8
+actor_pp=1
 ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
