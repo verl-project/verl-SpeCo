@@ -2603,9 +2603,6 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         source = getattr(self, "_speco_draft_weight_source", None)
         if source not in {"checkpoint", "online"}:
             if self._speco_is_dflash_draft():
-                logger.warning(
-                    "[speco draft sleep] skip snapshot of uninitialized drafter state"
-                )
                 return 0
             # Other speculative methods use vLLM's native checkpoint loading,
             # which is already valid before this extension observes the model.
@@ -2882,9 +2879,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 )
 
         self._speco_draft_weight_source = "online"
-        self._speco_diag_draft_state(
-            "after_draft_ipc_update", remember_as_latest_online=True
-        )
+        self._speco_diag_draft_state("after_draft_ipc_update")
         # One-time diagnostic: check whether probabilistic sampling is active
         proposer = self._speco_resolve_draft_proposer()
         if proposer is not None and not getattr(
@@ -3010,12 +3005,6 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 "checkpoint before the first rollout request"
             )
         self._speco_draft_weight_source = "checkpoint"
-        self._speco_diag_draft_state("after_initial_checkpoint_load")
-        logger.warning(
-            "[speco draft init] initialized serving drafter from checkpoint "
-            "before first request (%d tensors)",
-            loaded_params,
-        )
         return {
             "initialized": True,
             "source": "checkpoint",
@@ -3034,7 +3023,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         patch_verl_bucketed_weight_transfer_npu_staging()
         is_npu = _speco_is_npu_vllm_worker(self)
         # Diagnostic: check draft state BEFORE target sync.
-        before_target_sync = self._speco_diag_draft_state("before_target_sync")
+        self._speco_diag_draft_state("before_target_sync")
         try:
             with _speco_npu_target_staging(
                 self, peft_config=peft_config, use_shm=use_shm
@@ -3045,31 +3034,25 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                     use_shm=use_shm,
                 )
             # Diagnostic: check draft state AFTER target sync (may be zeroed by wake_up)
-            after_target_sync = self._speco_diag_draft_state("after_target_sync")
+            self._speco_diag_draft_state("after_target_sync")
             # Do not reload the configured checkpoint here. The wake-up hook
             # above already restores a level-2 snapshot (or falls back to the
             # checkpoint when no snapshot exists). Reloading again after target
             # sync would overwrite the most recently published online drafter.
-            self._speco_diag_draft_sync_result(
-                before_target_sync=before_target_sync,
-                after_target_sync=after_target_sync,
-            )
             return result
         finally:
             if is_npu:
                 trim_process_host_memory()
 
-    def _speco_diag_draft_state(
-        self, phase: str, *, remember_as_latest_online: bool = False
-    ) -> str | None:
-        """Log a deterministic TP-local fingerprint of representative draft weights."""
+    def _speco_diag_draft_state(self, phase: str):
+        """Log norms of key draft model parameters for debugging."""
         if not bool(_bool_or_none(os.getenv(SPECO_VLLM_DRAFT_DIAG_ENV))):
-            return None
+            return
 
         draft_model, _ = self._speco_resolve_draft_model()
         if draft_model is None:
             logger.warning("[speco-diag:%s] no draft model found", phase)
-            return None
+            return
         try:
             params = dict(draft_model.named_parameters())
             diag_keys = [
@@ -3079,101 +3062,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             ]
             if not diag_keys:
                 diag_keys = list(params.keys())[:5]
-            diag_keys = diag_keys[:6]
-            if not diag_keys:
-                logger.warning("[speco-diag:%s] draft model has no parameters", phase)
-                return None
-            fingerprint = hashlib.sha256()
-            norms = {}
-            for name in diag_keys:
-                tensor = params[name].detach()
-                flat = tensor.reshape(-1)
-                if flat.numel() == 0:
-                    samples = []
-                    norm = 0.0
-                else:
-                    sample_indices = sorted(
-                        {
-                            0,
-                            flat.numel() // 4,
-                            flat.numel() // 2,
-                            (3 * flat.numel()) // 4,
-                            flat.numel() - 1,
-                        }
-                    )
-                    samples = flat[sample_indices].float().cpu().tolist()
-                    norm = tensor.float().norm().item()
-                fingerprint.update(name.encode("utf-8"))
-                fingerprint.update(str(tuple(tensor.shape)).encode("ascii"))
-                fingerprint.update(repr(samples).encode("ascii"))
-                fingerprint.update(float(norm).hex().encode("ascii"))
-                norms[name] = f"{norm:.9e}"
-
-            digest = fingerprint.hexdigest()[:16]
-            if remember_as_latest_online:
-                self._speco_latest_online_draft_fingerprint = digest
-                self._speco_latest_online_draft_version = (
-                    int(getattr(self, "_speco_latest_online_draft_version", 0)) + 1
-                )
-            latest_online = getattr(
-                self, "_speco_latest_online_draft_fingerprint", None
-            )
-            matches_latest_online = (
-                digest == latest_online if latest_online is not None else None
-            )
-            logger.warning(
-                "[speco-diag:%s] draft fingerprint=%s source=%s tensors=%d "
-                "online_version=%s matches_latest_online=%s norms=%s",
-                phase,
-                digest,
-                getattr(self, "_speco_draft_weight_source", None),
-                len(diag_keys),
-                getattr(self, "_speco_latest_online_draft_version", None),
-                matches_latest_online,
-                norms,
-            )
-            return digest
+            norms = {
+                k: f"{params[k].data.float().norm().item():.4f}" for k in diag_keys[:6]
+            }
+            logger.warning("[speco-diag:%s] draft param norms: %s", phase, norms)
         except Exception as exc:
             logger.warning("[speco-diag:%s] failed: %s", phase, exc)
-            return None
-
-    def _speco_diag_draft_sync_result(
-        self,
-        *,
-        before_target_sync: str | None,
-        after_target_sync: str | None,
-    ) -> None:
-        """Report whether target sync preserved the latest online drafter."""
-        if not bool(_bool_or_none(os.getenv(SPECO_VLLM_DRAFT_DIAG_ENV))):
-            return
-
-        latest_online = getattr(self, "_speco_latest_online_draft_fingerprint", None)
-        if latest_online is None:
-            logger.warning(
-                "[speco-diag:draft-sync-check] verdict=NO_ONLINE_PUBLISH_SEEN"
-            )
-            return
-
-        before_matches = before_target_sync == latest_online
-        after_sync_matches = after_target_sync == latest_online
-        if before_matches and after_sync_matches:
-            verdict = "LATEST_ONLINE_STATE_PRESERVED"
-        elif before_matches:
-            verdict = "CONFIRMED_LOST_DURING_TARGET_SYNC_OR_WAKEUP"
-        elif not before_matches:
-            verdict = "ONLINE_STATE_ALREADY_ABSENT_BEFORE_TARGET_SYNC"
-        else:
-            verdict = "INCONCLUSIVE"
-
-        logger.warning(
-            "[speco-diag:draft-sync-check] online_version=%s "
-            "latest_online=%s before=%s after_sync=%s "
-            "before_matches_online=%s after_sync_matches_online=%s verdict=%s",
-            getattr(self, "_speco_latest_online_draft_version", None),
-            latest_online,
-            before_target_sync,
-            after_target_sync,
-            before_matches,
-            after_sync_matches,
-            verdict,
-        )
