@@ -2020,6 +2020,44 @@ class _SpecoSGLangHttpServerMixin:
                         "global_step": collection_global_steps,
                         "replica_rank": self.replica_rank,
                     }
+                    # P0: offload the dominant hidden_states tensor to
+                    # TransferQueue so it bypasses the RayPPOTrainer driver and
+                    # the Ray object store. The key rides with the sample dict;
+                    # the drafter worker fetches by key. No-op when TQ disabled.
+                    from verl_speco.integration.transferqueue_bridge import (
+                        configure_transfer_queue,
+                        is_transfer_queue_enabled,
+                        make_sample_key,
+                        put_sample,
+                    )
+                    configure_transfer_queue(training_cfg)
+                    if is_transfer_queue_enabled():
+                        tq_key = make_sample_key(collection_global_steps, self.replica_rank, request_id)
+                        tq_payload = {"hidden_states": hidden_states.unsqueeze(0).cpu()}
+                        # P2: also offload the other large tensors so they bypass
+                        # the driver too. The drafter consumer restores them from
+                        # this same TQ payload.
+                        if target_logprobs is not None:
+                            tq_payload["target_logprobs"] = target_logprobs.unsqueeze(0).cpu()
+                        if torch.is_tensor(hidden_raw_target_logprobs):
+                            tq_payload["hidden_raw_target_logprobs"] = hidden_raw_target_logprobs.unsqueeze(0).cpu()
+                        if torch.is_tensor(hidden_raw_target_logprobs_positions):
+                            tq_payload["hidden_raw_target_logprobs_positions"] = (
+                                hidden_raw_target_logprobs_positions.unsqueeze(0).cpu()
+                            )
+                        put_sample(
+                            tq_key,
+                            tq_payload,
+                            tag={"global_step": collection_global_steps, "replica_rank": self.replica_rank},
+                        )
+                        drafter_sample["hidden_states_tq_key"] = tq_key
+                        drafter_sample["hidden_states"] = None
+                        if target_logprobs is not None:
+                            drafter_sample["target_logprobs"] = None
+                        if torch.is_tensor(hidden_raw_target_logprobs):
+                            drafter_sample["hidden_raw_target_logprobs"] = None
+                        if torch.is_tensor(hidden_raw_target_logprobs_positions):
+                            drafter_sample["hidden_raw_target_logprobs_positions"] = None
             else:
                 self._speco_log_missing_hidden_states_once(
                     collection_global_steps=collection_global_steps,

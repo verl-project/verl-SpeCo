@@ -39,6 +39,7 @@ from verl_speco.integration.rollout_publish import resolve_drafter_publish_paylo
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_AUX_LAYER_IDS_KEY,
     OLD_LOGPROB_COLLECT_MASK_KEY,
+    OLD_LOGPROB_GLOBAL_STEP_KEY,
     OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
     OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
     OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
@@ -2313,6 +2314,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 self._speco_oldlogprob_hidden_layout(),
             )
             tu.assign_non_tensor_data(batch_td, OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY, True)
+            # Stamp the global step so the actor-worker producer can build
+            # step-unique TransferQueue keys for old-logprob hidden chunks (P1).
+            tu.assign_non_tensor_data(batch_td, OLD_LOGPROB_GLOBAL_STEP_KEY, self.global_steps)
 
             self._speco_last_oldlogprob_prepare_elapsed_sec = (
                 time.perf_counter() - prepare_started
