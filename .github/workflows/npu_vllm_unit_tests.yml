@@ -109,10 +109,10 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          - drafter: eagle3
+          - drafter: megatron-eagle3
             enable_training: true
             disable_eagle3_torch_compile: true
-          - drafter: megatron-eagle3
+          - drafter: eagle3
             enable_training: true
             disable_eagle3_torch_compile: true
           - drafter: dflash

@@ -154,8 +154,6 @@ overrides=(
   "trainer.n_gpus_per_node=${accelerator_count}"
   "actor_rollout_ref.rollout.tensor_model_parallel_size=${tensor_parallel_size}"
   "actor_rollout_ref.rollout.drafter.vllm.draft_tensor_parallel_size=${SPECO_DRAFT_TENSOR_PARALLEL_SIZE:-${tensor_parallel_size}}"
-  "actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sequence_parallel_size}"
-  "actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sequence_parallel_size}"
   "data.train_batch_size=${SPECO_TRAIN_BATCH_SIZE:-1}"
   "data.max_prompt_length=${SPECO_MAX_PROMPT_LENGTH:-256}"
   "data.max_response_length=${SPECO_MAX_RESPONSE_LENGTH:-64}"
@@ -189,6 +187,13 @@ overrides=(
   "actor_rollout_ref.rollout.drafter.training.hidden_state_window_min_rows=${hidden_state_window_min_rows}"
   "actor_rollout_ref.rollout.drafter.training.hidden_state_window_tokens_per_sample=${hidden_state_window_tokens_per_sample}"
 )
+
+if [[ "${drafter}" != "megatron-eagle3" ]]; then
+  overrides+=(
+    "actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sequence_parallel_size}"
+    "actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sequence_parallel_size}"
+  )
+fi
 
 if [[ "${drafter}" == "dflash" ]]; then
   overrides+=(
