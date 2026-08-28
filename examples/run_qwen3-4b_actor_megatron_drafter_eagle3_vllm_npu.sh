@@ -27,12 +27,21 @@ export HCCL_OP_EXPANSION_MOD=AIV
 project_name='verl_grpo_megatron_eagle3_drafter'
 exp_name='qwen3_4b_eagle3_drafter_megatron_vllm_npu'
 
-gen_tp=2
-actor_tp=8
-actor_pp=1
 ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
+gen_tp=${SPECO_TENSOR_PARALLEL_SIZE:-2}
+actor_tp=${SPECO_MEGATRON_TENSOR_PARALLEL_SIZE:-${ppo_gpus_per_node}}
+actor_pp=${SPECO_MEGATRON_PIPELINE_PARALLEL_SIZE:-1}
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
+
+if (( ppo_gpus_per_node < 1 || actor_tp < 1 || actor_pp < 1 )); then
+    echo "SPECO_ACCELERATOR_COUNT, Megatron TP, and Megatron PP must all be positive" >&2
+    exit 2
+fi
+if (( ppo_gpus_per_node % (actor_tp * actor_pp) != 0 )); then
+    echo "SPECO_ACCELERATOR_COUNT=${ppo_gpus_per_node} must be divisible by Megatron TP x PP (${actor_tp} x ${actor_pp})" >&2
+    exit 2
+fi
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint

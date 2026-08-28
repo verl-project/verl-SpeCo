@@ -24,6 +24,9 @@ case "${platform}/${backend}/${drafter}" in
   npu/vllm/eagle3)
     example="examples/run_qwen3-8b_drafter_eagle3_vllm_npu.sh"
     ;;
+  npu/vllm/megatron-eagle3)
+    example="examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh"
+    ;;
   npu/vllm/dflash)
     example="examples/run_qwen3-8b_drafter_dflash_vllm_npu.sh"
     ;;
@@ -37,7 +40,7 @@ case "${platform}/${backend}/${drafter}" in
     example="examples/run_qwen3-8b_drafter_dflash_sglang.sh"
     ;;
   *)
-    echo "usage: $0 {gpu|npu} {vllm|sglang} {eagle3|dflash|dspark}" >&2
+    echo "usage: $0 {gpu|npu} {vllm|sglang} {eagle3|megatron-eagle3|dflash|dspark}" >&2
     exit 2
     ;;
 esac
@@ -56,7 +59,7 @@ for name in "${required_vars[@]}"; do
 done
 
 case "${drafter}" in
-  eagle3)
+  eagle3|megatron-eagle3)
     draft_model="${SPECO_EAGLE3_DRAFT_MODEL:-}"
     draft_algorithm="EAGLE3"
     ;;

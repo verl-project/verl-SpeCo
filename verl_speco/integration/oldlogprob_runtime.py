@@ -238,7 +238,7 @@ def _selected_device(selected: Any):
 def _to_cpu_transfer_tensor(value: Any):
     """Detach tensors before sending SPECO side-channel data through Ray.
 
-    ``DataProto.non_tensor_batch`` is serialized by Ray as a Python payload.
+    ``non_tensor_batch`` is serialized by Ray as a Python payload.
     It must therefore never contain an accelerator-resident tensor: the
     receiving task runner deliberately owns no accelerator resources.  Drafter
     workers move collected features back to their local device before training.
@@ -2786,9 +2786,7 @@ def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) 
                 )
                 # Timing follows the same non-tensor Ray side channel as
                 # hidden-state metadata after worker postprocessing.
-                model_output[OLD_LOGPROB_TIMING_KEY] = _to_cpu_transfer_tensor(
-                    timing
-                )
+                model_output[OLD_LOGPROB_TIMING_KEY] = _to_cpu_transfer_tensor(timing)
 
             # Concatenate all microbatches' hidden states into one big tensor,
             # then ray.put() ONCE.  Owner = this last-stage process, so the

@@ -110,6 +110,7 @@ jobs:
       matrix:
         include:
           - drafter: eagle3
+          - drafter: megatron-eagle3
           - drafter: dflash
           - drafter: dspark
 
@@ -150,7 +151,7 @@ jobs:
           SPECO_DSPARK_DRAFT_MODEL: ${{ inputs.dspark_draft_model || env.SPECO_DEFAULT_DSPARK_DRAFT_MODEL }}
         run: |
           case "${{ matrix.drafter }}" in
-            eagle3)
+            eagle3|megatron-eagle3)
               draft_model="${SPECO_EAGLE3_DRAFT_MODEL}"
               ;;
             dflash)
