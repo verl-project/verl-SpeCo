@@ -31,6 +31,10 @@ training, and hot-update logic through `verl_speco`.
 
 ![verl-SpeCo architecture](docs/assets/speco-architecture.svg)
 
+For the online drafter collection, training, and publish scheduling boundary,
+including how to add a new execution or collection strategy, see the
+[Drafter Scheduler guide](docs/drafter_scheduler.md).
+
 ## Performance Preview
 
 The current results focus on EAGLE3 with the vLLM rollout engine, where

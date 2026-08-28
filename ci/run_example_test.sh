@@ -137,6 +137,11 @@ fi
 
 export PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}"
 
+# The CI runner uses a short feature window for every drafter. A one-step
+# rollout smoke test cannot populate the production 512-token window.
+hidden_state_window_min_rows="${SPECO_HIDDEN_STATE_WINDOW_MIN_ROWS:-32}"
+hidden_state_window_tokens_per_sample="${SPECO_HIDDEN_STATE_WINDOW_TOKENS_PER_SAMPLE:-32}"
+
 overrides=(
   "actor_rollout_ref.model.path=${SPECO_TARGET_MODEL}"
   "actor_rollout_ref.rollout.drafter.model_path=${draft_model}"
@@ -181,12 +186,12 @@ overrides=(
   "data.train_max_samples=${SPECO_TRAIN_MAX_SAMPLES:-1}"
   "data.val_max_samples=${SPECO_VAL_MAX_SAMPLES:-1}"
   "data.dataloader_num_workers=${SPECO_DATALOADER_NUM_WORKERS:-0}"
+  "actor_rollout_ref.rollout.drafter.training.hidden_state_window_min_rows=${hidden_state_window_min_rows}"
+  "actor_rollout_ref.rollout.drafter.training.hidden_state_window_tokens_per_sample=${hidden_state_window_tokens_per_sample}"
 )
 
 if [[ "${drafter}" == "dflash" ]]; then
   overrides+=(
-    "actor_rollout_ref.rollout.drafter.training.hidden_state_window_min_rows=${SPECO_HIDDEN_STATE_WINDOW_MIN_ROWS:-1}"
-    "actor_rollout_ref.rollout.drafter.training.hidden_state_window_tokens_per_sample=${SPECO_HIDDEN_STATE_WINDOW_TOKENS_PER_SAMPLE:-64}"
     "actor_rollout_ref.rollout.drafter.training.dflash_num_anchors=${SPECO_DFLASH_NUM_ANCHORS:-8}"
     "actor_rollout_ref.rollout.drafter.training.dflash_max_window=${SPECO_DFLASH_MAX_WINDOW:-64}"
     "actor_rollout_ref.rollout.drafter.training.dflash_loss_decay_gamma=${SPECO_DFLASH_LOSS_DECAY_GAMMA:-7}"
@@ -200,8 +205,6 @@ if [[ "${drafter}" == "dspark" ]]; then
   overrides+=(
     "actor_rollout_ref.rollout.drafter.rollout.spec_steps=${SPECO_DSPARK_SPEC_STEPS:-1}"
     "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=${SPECO_DSPARK_SPEC_VERIFY_TOKENS:-7}"
-    "actor_rollout_ref.rollout.drafter.training.hidden_state_window_min_rows=${SPECO_HIDDEN_STATE_WINDOW_MIN_ROWS:-1}"
-    "actor_rollout_ref.rollout.drafter.training.hidden_state_window_tokens_per_sample=${SPECO_HIDDEN_STATE_WINDOW_TOKENS_PER_SAMPLE:-64}"
     "actor_rollout_ref.rollout.drafter.training.dspark_block_size=${SPECO_DSPARK_BLOCK_SIZE:-7}"
     "actor_rollout_ref.rollout.drafter.training.dspark_num_anchors=${SPECO_DSPARK_NUM_ANCHORS:-8}"
     "actor_rollout_ref.rollout.drafter.training.dspark_max_window=${SPECO_DSPARK_MAX_WINDOW:-64}"

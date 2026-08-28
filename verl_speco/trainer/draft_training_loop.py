@@ -107,6 +107,8 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 shuffle=bool(feature_store_cfg.get("shuffle", True)),
                 repeat=bool(feature_store_cfg.get("repeat", True)),
                 seed=int(training_cfg.get("seed", 0) or 0),
+                min_sample_step=_optional_int(feature_store_cfg.get("min_sample_step")),
+                max_sample_step=_optional_int(feature_store_cfg.get("max_sample_step")),
             ),
         )
         for samples in loader:
@@ -499,6 +501,10 @@ def _configure_device(local_rank: int) -> None:
     set_device = getattr(device_module, "set_device", None)
     if callable(set_device):
         set_device(int(local_rank))
+
+
+def _optional_int(value: object) -> int | None:
+    return None if value is None else int(cast(Any, value))
 
 
 def _barrier() -> None:

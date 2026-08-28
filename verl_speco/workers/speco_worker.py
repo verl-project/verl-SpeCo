@@ -23,6 +23,8 @@ import logging
 import os
 import random
 import time
+import uuid
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -328,6 +330,12 @@ class SpecoWorker(Worker):
         self.feature_writer_path: Optional[str] = None
         self.last_global_step: Optional[int] = None
         self.last_trained_step: Optional[int] = None
+        self.worker_incarnation = uuid.uuid4().hex
+        self._staged_rollout_features: dict[str, dict[str, object]] = {}
+        self._collection_commit_journals: dict[str, dict[str, object]] = {}
+        self._prepared_training_plan_id: Optional[str] = None
+        self._prepared_training_data_version: Optional[int] = None
+        self._prepared_training_target_version: Optional[int] = None
         self.training_process_group = None
         self.dp_process_group = None
         self.training_group_ranks: list[int] = []
@@ -357,15 +365,6 @@ class SpecoWorker(Worker):
         self.enable_drafter = bool(
             self.config.rollout.drafter.enable
             and self.config.rollout.drafter.enable_drafter_training
-        )
-        self.training_interval_steps = int(
-            self.config.rollout.drafter.training.get("training_interval_steps", 1)
-        )
-        self.publish_interval_steps = int(
-            self.config.rollout.drafter.training.get("publish_interval_steps", 0)
-        )
-        self.train_steps_per_trigger = int(
-            self.config.rollout.drafter.training.get("step", 100)
         )
 
     def _ensure_process_group_initialized(self):
@@ -476,17 +475,28 @@ class SpecoWorker(Worker):
         batch: dict,
         hidden_states: torch.Tensor,
         target_logprobs: Optional[torch.Tensor] = None,
-    ):
+        *,
+        collection_id: Optional[str] = None,
+    ) -> bool:
         if (
             not self.enable_drafter
             or not self.in_drafter_train_group
             or self.trainer is None
         ):
-            return
+            return False
         if self._drafter_training_mode() == "collect_only":
-            self._write_rollout_feature_sample(batch, hidden_states, target_logprobs)
-            return
+            return self._write_rollout_feature_sample(
+                batch,
+                hidden_states,
+                target_logprobs,
+                collection_id=collection_id,
+            )
+        if hidden_states is None:
+            raise RuntimeError(
+                "Online drafter training requires collected hidden states"
+            )
         self.trainer.collect_online_data(batch, hidden_states, target_logprobs)
+        return True
 
     def _drafter_training_mode(self) -> str:
         return (
@@ -569,14 +579,16 @@ class SpecoWorker(Worker):
         batch: dict,
         hidden_states: torch.Tensor,
         target_logprobs: Optional[torch.Tensor],
-    ) -> None:
+        *,
+        collection_id: Optional[str] = None,
+    ) -> bool:
         writer = self._get_feature_writer()
         if writer is None:
             logger.warning(
                 "[SpecoWorker rank=%s] training.mode=collect_only but feature_store.path is empty; drop sample",
                 self.rank,
             )
-            return
+            return False
         full_input_ids = batch["input_ids"].detach().cpu().reshape(-1)
         full_loss_mask = self._build_rollout_loss_mask(batch, full_input_ids)
         hidden_states = hidden_states.detach().cpu()
@@ -652,7 +664,7 @@ class SpecoWorker(Worker):
         ):
             if key in batch:
                 metadata[key] = batch[key]
-        sample = DraftFeatureSample(
+        feature_sample = DraftFeatureSample(
             algorithm=algorithm,
             input_ids=input_ids,
             loss_mask=loss_mask,
@@ -661,7 +673,21 @@ class SpecoWorker(Worker):
             position_ids=position_ids,
             metadata=metadata,
         )
-        writer.write_many([sample])
+        if collection_id is None:
+            writer.write_many([feature_sample])
+            return True
+        journal = self._collection_commit_journals.get(collection_id)
+        if journal is None:
+            raise RuntimeError(
+                f"Missing collection journal for Feature Store transaction {collection_id}"
+            )
+        pending = journal.setdefault("feature_store_samples", [])
+        if not isinstance(pending, list):
+            raise RuntimeError(
+                f"Invalid Feature Store transaction journal for {collection_id}"
+            )
+        pending.append(feature_sample)
+        return True
 
     @staticmethod
     def _align_rollout_target_logprobs(
@@ -755,14 +781,244 @@ class SpecoWorker(Worker):
         flush_interval = int(feature_store_cfg.get("flush_interval_steps", 1))
         self.feature_writer.flush_on_step(self.last_global_step, flush_interval)
 
+    def _finalize_feature_store_collection(self, journal: dict[str, object]) -> None:
+        samples = journal.get("feature_store_samples")
+        if not samples:
+            return
+        if not isinstance(samples, list):
+            raise RuntimeError("Invalid staged Feature Store collection")
+        writer = self._get_feature_writer()
+        if writer is None:
+            raise RuntimeError(
+                "Cannot finalize collect_only samples without a Feature Store writer"
+            )
+        writer.write_many(samples)
+        self._flush_rollout_features_for_step()
+
+    def _collection_worker_result(
+        self,
+        *,
+        collection_id: str,
+        staged_samples: int = 0,
+        accepted_samples: int = 0,
+        rejected_samples: int = 0,
+        collected: bool = False,
+        reason: str,
+        buffer_version_before: int | None = None,
+        expired_stages: int = 0,
+    ) -> dict[str, Any]:
+        if self.last_global_step is None:
+            raise RuntimeError(
+                "Cannot collect drafter samples before setting global_step"
+            )
+        source_global_step = int(self.last_global_step)
+        current_buffer_version = int(
+            self.trainer.buffer_version if self.trainer is not None else 0
+        )
+        if buffer_version_before is None:
+            buffer_version_before = current_buffer_version
+        return {
+            "collection_id": collection_id,
+            "worker_id": str(self.replica_rank),
+            "worker_incarnation": self.worker_incarnation,
+            "source_global_step": source_global_step,
+            "staged_samples": staged_samples,
+            "accepted_samples": accepted_samples,
+            "rejected_samples": rejected_samples,
+            "buffer_version_before": buffer_version_before,
+            "buffer_version_after": current_buffer_version,
+            "data_version": source_global_step,
+            "collected": collected,
+            "reason": reason,
+            "expired_stages": expired_stages,
+        }
+
+    @staticmethod
+    def _collection_request(requests: list[dict]) -> dict:
+        if len(requests) != 1 or not isinstance(requests[0], dict):
+            raise ValueError("Expected exactly one drafter collection request")
+        return requests[0]
+
+    def _cleanup_expired_collection_stages(self) -> int:
+        ttl_sec = float(
+            cast(
+                Any,
+                self.config.rollout.drafter.training.get(
+                    "collection_stage_ttl_sec", 300.0
+                )
+                or 0.0,
+            )
+        )
+        if ttl_sec <= 0:
+            return 0
+        deadline = time.monotonic() - ttl_sec
+        expired = [
+            collection_id
+            for collection_id, entry in self._staged_rollout_features.items()
+            if float(cast(Any, entry.get("staged_at", 0.0))) < deadline
+        ]
+        for collection_id in expired:
+            self._staged_rollout_features.pop(collection_id, None)
+        return len(expired)
+
+    def _snapshot_collection_buffer(self) -> dict[str, object]:
+        trainer = self.trainer
+        if trainer is None:
+            return {}
+        return {
+            "buffer_version": int(trainer.buffer_version),
+            "collected_data": deque(
+                trainer.collected_data, maxlen=trainer.collected_data.maxlen
+            ),
+            "data_buffer": deque(
+                trainer.data_buffer.buffer,
+                maxlen=trainer.data_buffer.buffer.maxlen,
+            ),
+            "data_buffer_step": trainer.data_buffer._current_step,
+        }
+
+    def _restore_collection_buffer(self, snapshot: dict[str, object]) -> None:
+        trainer = self.trainer
+        if trainer is None or not snapshot:
+            return
+        trainer.collected_data = cast(deque, snapshot["collected_data"])
+        trainer.data_buffer.buffer = cast(deque, snapshot["data_buffer"])
+        trainer.data_buffer._current_step = cast(
+            Optional[int], snapshot["data_buffer_step"]
+        )
+        trainer.buffer_version = int(cast(Any, snapshot["buffer_version"]))
+
     @register(
         dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
     )
-    def collect_rollout_features(self, samples: list[dict]):
+    def stage_rollout_features(self, requests: list[dict]):
+        expired_stages = self._cleanup_expired_collection_stages()
+        request = self._collection_request(requests)
+        collection_id = str(request.get("collection_id", ""))
+        samples = request.get("samples")
+        if (
+            not self.enable_drafter
+            or not self.in_drafter_train_group
+            or self.trainer is None
+        ):
+            return self._collection_worker_result(
+                collection_id=collection_id, reason="worker_not_ready"
+            )
+        if not collection_id:
+            return self._collection_worker_result(
+                collection_id="", reason="missing_collection_id"
+            )
+        if (
+            collection_id in self._staged_rollout_features
+            or collection_id in self._collection_commit_journals
+        ):
+            return self._collection_worker_result(
+                collection_id=collection_id,
+                reason="collection_already_staged",
+                expired_stages=expired_stages,
+            )
+        if not isinstance(samples, list):
+            return self._collection_worker_result(
+                collection_id=collection_id, reason="invalid_collection_samples"
+            )
+        self._staged_rollout_features[collection_id] = {
+            "samples": samples,
+            "staged_at": time.monotonic(),
+        }
+        return self._collection_worker_result(
+            collection_id=collection_id,
+            staged_samples=len(samples),
+            reason="collection_staged",
+            expired_stages=expired_stages,
+        )
+
+    @register(
+        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
+    )
+    def commit_rollout_features(self, requests: list[dict]):
+        request = self._collection_request(requests)
+        collection_id = str(request.get("collection_id", ""))
+        staged = self._staged_rollout_features.pop(collection_id, None)
+        if staged is None:
+            return self._collection_worker_result(
+                collection_id=collection_id, reason="collection_not_staged"
+            )
+        samples = staged.get("samples")
+        if not isinstance(samples, list):
+            return self._collection_worker_result(
+                collection_id=collection_id, reason="invalid_staged_collection"
+            )
+        snapshot = self._snapshot_collection_buffer()
+        self._collection_commit_journals[collection_id] = snapshot
+        return self._commit_rollout_features(collection_id, samples)
+
+    @register(
+        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
+    )
+    def abort_rollout_features(self, requests: list[dict]):
+        request = self._collection_request(requests)
+        collection_id = str(request.get("collection_id", ""))
+        removed = self._staged_rollout_features.pop(collection_id, None)
+        return self._collection_worker_result(
+            collection_id=collection_id,
+            reason="collection_aborted" if removed is not None else "collection_absent",
+        )
+
+    @register(
+        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
+    )
+    def rollback_rollout_features(self, requests: list[dict]):
+        request = self._collection_request(requests)
+        collection_id = str(request.get("collection_id", ""))
+        self._staged_rollout_features.pop(collection_id, None)
+        snapshot = self._collection_commit_journals.pop(collection_id, None)
+        if snapshot is not None:
+            self._restore_collection_buffer(snapshot)
+        return self._collection_worker_result(
+            collection_id=collection_id,
+            reason=(
+                "collection_rolled_back"
+                if snapshot is not None
+                else "collection_rollback_absent"
+            ),
+        )
+
+    @register(
+        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
+    )
+    def finalize_rollout_features(self, requests: list[dict]):
+        request = self._collection_request(requests)
+        collection_id = str(request.get("collection_id", ""))
+        journal = self._collection_commit_journals.get(collection_id)
+        if journal is not None:
+            self._finalize_feature_store_collection(journal)
+            self._collection_commit_journals.pop(collection_id, None)
+        return self._collection_worker_result(
+            collection_id=collection_id,
+            reason=(
+                "collection_finalized"
+                if journal is not None
+                else "collection_finalize_absent"
+            ),
+        )
+
+    def _commit_rollout_features(
+        self, collection_id: str, samples: list[dict]
+    ) -> dict[str, Any]:
+        buffer_version_before = int(
+            self.trainer.buffer_version if self.trainer is not None else 0
+        )
+        result = self._collection_worker_result(
+            collection_id=collection_id,
+            buffer_version_before=buffer_version_before,
+            collected=True,
+            reason="collection_completed",
+        )
         if not samples:
-            return
+            return result
         for sample in samples:
             if not sample:
+                result["rejected_samples"] += 1
                 continue
             batch = {
                 "input_ids": sample["input_ids"],
@@ -813,13 +1069,25 @@ class SpecoWorker(Worker):
                     sample.get("target_logprobs_ref")
                 )
             if hidden is None:
+                result["rejected_samples"] += 1
                 continue
-            self._store_rollout_sample(
+            stored = self._store_rollout_sample(
                 batch=batch,
                 hidden_states=hidden,
                 target_logprobs=target_logprobs,
+                collection_id=collection_id,
             )
-        self._flush_rollout_features_for_step()
+            if stored:
+                result["accepted_samples"] += 1
+            else:
+                result["rejected_samples"] += 1
+        result["buffer_version_after"] = int(
+            self.trainer.buffer_version if self.trainer is not None else 0
+        )
+        if result["rejected_samples"]:
+            result["collected"] = False
+            result["reason"] = "samples_rejected"
+        return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_global_step(self, global_step: int):
@@ -967,8 +1235,140 @@ class SpecoWorker(Worker):
             )
             return result
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_drafter_training_data_status(
+        self,
+        sample_last_n_steps: int = 2,
+        require_full_batch: bool = False,
+    ):
+        if not self.enable_drafter:
+            return {"available": False, "reason": "disabled"}
+        if not self.in_drafter_train_group or self.trainer is None:
+            return {"available": False, "reason": "not_in_training_group"}
+        status = self.trainer.get_training_data_status(
+            sample_last_n_steps=sample_last_n_steps,
+            require_full_batch=require_full_batch,
+        )
+        status.update(
+            {
+                "available": True,
+                "replica_rank": self.replica_rank,
+                "rank": self.rank,
+                "worker_id": str(self.rank),
+                "worker_incarnation": self.worker_incarnation,
+            }
+        )
+        return status
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def preflight_drafter_training(self, training_plan=None):
+        result = {
+            "ready": False,
+            "participating": False,
+            "activated": False,
+            "rank": self.rank,
+            "worker_id": str(self.rank),
+            "worker_incarnation": self.worker_incarnation,
+            "reason": "",
+        }
+        self._prepared_training_plan_id = None
+        self._prepared_training_data_version = None
+        self._prepared_training_target_version = None
+        if not self.enable_drafter:
+            result["reason"] = "disabled"
+            return result
+        if not self.in_drafter_train_group or self.trainer is None:
+            result["reason"] = "not_in_training_group"
+            return result
+        result["participating"] = True
+        if not isinstance(training_plan, dict) or not training_plan.get("launch"):
+            result["reason"] = "missing_or_inactive_training_plan"
+            return result
+        if training_plan.get("execution_strategy") != "sync":
+            result["reason"] = "unsupported_execution_strategy"
+            return result
+        if training_plan.get("source_global_step") != self.last_global_step:
+            result["reason"] = "stale_training_plan"
+            return result
+
+        snapshot = (training_plan.get("worker_snapshots") or {}).get(str(self.rank))
+        if not isinstance(snapshot, dict):
+            result["reason"] = "missing_worker_snapshot"
+            return result
+        if snapshot.get("worker_incarnation") != self.worker_incarnation:
+            result["reason"] = "worker_restarted"
+            return result
+        if int(snapshot.get("buffer_version", -1)) != int(self.trainer.buffer_version):
+            result["reason"] = "buffer_version_changed"
+            return result
+        required_target_version = training_plan.get("required_target_version")
+        current_target_version = getattr(
+            self.trainer, "_target_lm_head_weight_step", None
+        )
+        if required_target_version is not None and int(required_target_version) != int(
+            current_target_version if current_target_version is not None else -1
+        ):
+            result["reason"] = "target_version_mismatch"
+            return result
+        data_status = self.trainer.get_training_data_status(
+            sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
+            require_full_batch=bool(training_plan.get("require_full_batch", False)),
+            min_sample_step=training_plan.get("min_sample_step"),
+            max_sample_step=training_plan.get("max_sample_step"),
+        )
+        actual_data_version = data_status.get("data_version")
+        planned_data_version = training_plan.get("data_version")
+        snapshot_data_version = snapshot.get("data_version")
+        if (
+            actual_data_version != planned_data_version
+            or actual_data_version != snapshot_data_version
+        ):
+            result.update(
+                {
+                    "reason": "data_version_changed",
+                    "data_version": actual_data_version,
+                    "target_version": current_target_version,
+                }
+            )
+            return result
+        if int(data_status["trainable_batches"]) < int(
+            training_plan.get("min_batches", 1)
+        ):
+            result["reason"] = "insufficient_worker_data"
+            return result
+
+        self._prepared_training_plan_id = str(training_plan.get("plan_id", ""))
+        self._prepared_training_data_version = actual_data_version
+        self._prepared_training_target_version = current_target_version
+        with _preserve_process_rng_state(self.device_name):
+            activated = bool(await self.trainer.activate_training_model())
+        result["activated"] = activated
+        if not activated:
+            result["reason"] = "activation_failed"
+            return result
+        result.update(
+            {
+                "ready": True,
+                "reason": "ready",
+                "buffer_version": int(self.trainer.buffer_version),
+                "data_version": actual_data_version,
+                "target_version": current_target_version,
+            }
+        )
+        return result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def abort_drafter_training_preflight(self, plan_id: str):
+        was_prepared = self._prepared_training_plan_id == str(plan_id)
+        self._prepared_training_plan_id = None
+        self._prepared_training_data_version = None
+        self._prepared_training_target_version = None
+        if was_prepared and self.trainer is not None:
+            await self.trainer.cleanup_training(clear_data=False)
+        return {"aborted": was_prepared, "rank": self.rank}
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def train_drafter(self):
+    async def train_drafter(self, training_plan=None):
         result = {
             "trained": False,
             "triggered": False,
@@ -976,6 +1376,9 @@ class SpecoWorker(Worker):
             "attempted_steps": 0,
             "elapsed_sec": 0.0,
             "reason": "",
+            "worker_id": str(self.rank),
+            "worker_incarnation": self.worker_incarnation,
+            "is_publish_leader": self.is_global_publish_leader,
         }
         if not self.enable_drafter:
             result["reason"] = "disabled"
@@ -983,53 +1386,57 @@ class SpecoWorker(Worker):
         if not self.in_drafter_train_group or self.trainer is None:
             result["reason"] = "not_in_training_group"
             return result
-        if self.last_global_step is None:
-            result["reason"] = "missing_global_step"
+        plan_id = (
+            str(training_plan.get("plan_id", ""))
+            if isinstance(training_plan, dict)
+            else ""
+        )
+        if not plan_id or self._prepared_training_plan_id != plan_id:
+            result["reason"] = "preflight_not_ready"
             return result
-        if self.training_interval_steps <= 0:
-            result["reason"] = "invalid_interval"
-            return result
-        if self.last_global_step % self.training_interval_steps != 0:
-            result["reason"] = "interval_not_reached"
-            return result
+        prepared_data_version = self._prepared_training_data_version
+        prepared_target_version = self._prepared_training_target_version
+        self._prepared_training_plan_id = None
+        self._prepared_training_data_version = None
+        self._prepared_training_target_version = None
+        max_batches = max(int(training_plan.get("max_batches", 0)), 0)
+        prepare_publish = bool(training_plan.get("publish_after_success", False))
+        snapshot = (training_plan.get("worker_snapshots") or {})[str(self.rank)]
+        buffer_size_before = int(snapshot.get("trainable_samples", 0))
+        result.update(
+            {
+                "source_global_step": int(training_plan["source_global_step"]),
+                "plan_id": plan_id,
+                "data_version": prepared_data_version,
+                "target_version": prepared_target_version,
+                "execution_strategy": str(training_plan["execution_strategy"]),
+                "buffer_size_before": buffer_size_before,
+                "buffer_size_after": buffer_size_before,
+                "optimizer_step": int(self.trainer.optimizer_steps_total),
+                "publish_snapshot_cached": 0,
+            }
+        )
 
         with _preserve_process_rng_state(self.device_name):
             result["triggered"] = True
             start_ts = time.time()
             self.trainer.clear_pending_publish_state_dict()
-            activation_ts = time.time()
-            success = await self.trainer.activate_training_model()
-            result["activation_elapsed_sec"] = time.time() - activation_ts
-            if not success:
-                logger.error(
-                    "[SpecoWorker replica=%s] failed to activate trainer at step %s",
-                    self.replica_rank,
-                    self.last_global_step,
-                )
-                self.trainer.clear_pending_publish_state_dict()
-                cleanup_ts = time.time()
-                await self.trainer.cleanup_training(clear_data=False)
-                result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
-                result["reason"] = "activation_failed"
-                result["elapsed_sec"] = time.time() - start_ts
-                return result
-
             try:
                 train_loop_ts = time.time()
                 self.trainer.reset_training_metrics()
-                for _ in range(self.train_steps_per_trigger):
+                for _ in range(max_batches):
                     result["attempted_steps"] += 1
-                    step_ok = await self.trainer.training_step(self.last_global_step)
+                    step_ok = await self.trainer.training_step(
+                        self.last_global_step,
+                        min_sample_step=training_plan.get("min_sample_step"),
+                        max_sample_step=training_plan.get("max_sample_step"),
+                    )
                     if step_ok:
                         result["successful_steps"] += 1
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
                 result.update(self.trainer.get_training_metrics())
                 if result["successful_steps"] > 0:
-                    should_prepare_publish = (
-                        self.publish_interval_steps <= 0
-                        or self.last_global_step % self.publish_interval_steps == 0
-                    )
-                    if should_prepare_publish:
+                    if prepare_publish:
                         snapshot_ts = time.time()
                         cached = self.trainer.prepare_model_state_dict_for_publish(
                             self.last_global_step
@@ -1059,6 +1466,14 @@ class SpecoWorker(Worker):
             result["reason"] = "trained" if result["trained"] else "no_trainable_batch"
             if result["trained"]:
                 self.last_trained_step = self.last_global_step
+            data_status_after = self.trainer.get_training_data_status(
+                sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
+                require_full_batch=bool(training_plan.get("require_full_batch", False)),
+                min_sample_step=training_plan.get("min_sample_step"),
+                max_sample_step=training_plan.get("max_sample_step"),
+            )
+            result["buffer_size_after"] = int(data_status_after["trainable_samples"])
+            result["optimizer_step"] = int(self.trainer.optimizer_steps_total)
             result["elapsed_sec"] = time.time() - start_ts
             return result
 
@@ -1071,11 +1486,6 @@ class SpecoWorker(Worker):
         ):
             return None
         if self.last_global_step is None:
-            return None
-        if (
-            self.training_interval_steps <= 0
-            or self.last_global_step % self.training_interval_steps != 0
-        ):
             return None
         if self.last_trained_step != self.last_global_step:
             return None

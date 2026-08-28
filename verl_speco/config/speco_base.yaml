@@ -181,3 +181,5 @@ actor_rollout_ref:
           repeat: true
           prefetch_depth: 2
           strict_schema: true
+          min_sample_step: null
+          max_sample_step: null

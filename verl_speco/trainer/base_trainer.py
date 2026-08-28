@@ -482,6 +482,7 @@ class DrafterBaseTrainer:
             config.rollout.drafter.training.get("use_data_buffer", False)
         )
         self.current_rl_step = 0
+        self.buffer_version = 0
 
         self.device_id = get_device_id()
         self.device_module = get_torch_device()
@@ -3319,6 +3320,7 @@ class DrafterBaseTrainer:
             else:
                 data_item["step"] = self.current_rl_step
                 self.collected_data.append(data_item)
+            self._mark_buffer_changed()
 
     def _get_hidden_state_clip_value(self) -> Optional[float]:
         clip_value = self.config.rollout.drafter.training.get(
@@ -3528,6 +3530,9 @@ class DrafterBaseTrainer:
     def _prepare_training_batch(
         self,
         buffer_steps: int = 2,
+        *,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
     ) -> Optional[dict[str, torch.Tensor]]:
         """Prepare a batch for training using Ulysses SP to remove padding.
 
@@ -3554,16 +3559,26 @@ class DrafterBaseTrainer:
         # head version that produced those hidden states, so older buffered Eagle3
         # samples are not valid for the actor head synced for this rollout step.
         if self.use_data_buffer and len(self.data_buffer) > 0:
-            if same_step_target_head_required:
-                buffer_steps = 0
-            else:
-                # Use data from last N RL steps via DataBuffer
-                buffer_steps = int(
-                    self.config.rollout.drafter.training.get(
-                        "sample_last_n_steps", buffer_steps
-                    )
+            if min_sample_step is not None or max_sample_step is not None:
+                available_data = self._filter_training_data_by_step(
+                    self.data_buffer.get_all_data(),
+                    current_step=current_step,
+                    min_sample_step=min_sample_step,
+                    max_sample_step=max_sample_step,
                 )
-            available_data = self.data_buffer.get_data_from_last_n_steps(buffer_steps)
+            else:
+                if same_step_target_head_required:
+                    buffer_steps = 0
+                else:
+                    # Use data from last N RL steps via DataBuffer
+                    buffer_steps = int(
+                        self.config.rollout.drafter.training.get(
+                            "sample_last_n_steps", buffer_steps
+                        )
+                    )
+                available_data = self.data_buffer.get_data_from_last_n_steps(
+                    buffer_steps
+                )
             if len(available_data) < effective_batch_size:
                 if len(available_data) >= min_items_for_batch:
                     items = available_data
@@ -3582,11 +3597,16 @@ class DrafterBaseTrainer:
         else:
             # Fall back to current step data only. collected_data can contain
             # older rollout steps when drafter training is triggered sparsely.
-            current_step_data = [
-                item
-                for item in self.collected_data
-                if int(item.get("step", current_step)) == current_step
-            ]
+            current_step_data = self._filter_training_data_by_step(
+                self.collected_data,
+                current_step=current_step,
+                min_sample_step=(
+                    current_step if min_sample_step is None else min_sample_step
+                ),
+                max_sample_step=(
+                    current_step if max_sample_step is None else max_sample_step
+                ),
+            )
             if len(current_step_data) < effective_batch_size:
                 if len(current_step_data) >= min_items_for_batch:
                     items = current_step_data
@@ -4407,9 +4427,123 @@ class DrafterBaseTrainer:
         dist.all_reduce(readiness, op=dist.ReduceOp.MIN, group=dp_group)
         return bool(readiness.item())
 
-    def prepare_training_batch(self) -> Optional[dict[str, torch.Tensor]]:
+    @staticmethod
+    def _filter_training_data_by_step(
+        data: Any,
+        *,
+        current_step: int,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        min_step = current_step if min_sample_step is None else int(min_sample_step)
+        max_step = current_step if max_sample_step is None else int(max_sample_step)
+        return [
+            item
+            for item in data
+            if min_step <= int(item.get("step", current_step)) <= max_step
+        ]
+
+    def prepare_training_batch(
+        self,
+        *,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> Optional[dict[str, torch.Tensor]]:
         with self._ulysses_group_context():
-            return self._prepare_training_batch()
+            return self._prepare_training_batch(
+                min_sample_step=min_sample_step,
+                max_sample_step=max_sample_step,
+            )
+
+    def get_training_data_status(
+        self,
+        *,
+        sample_last_n_steps: int = 2,
+        require_full_batch: bool = False,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Return a non-mutating snapshot of data that can form training batches."""
+
+        current_step = int(self.current_rl_step)
+        use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
+        same_step_data_required = self.backend.model_type == "eagle3" and not use_logits
+        current_step_data = [
+            item
+            for item in self.collected_data
+            if int(item.get("step", current_step)) == current_step
+        ]
+        buffer_data = self.data_buffer.get_all_data() if self.use_data_buffer else []
+        if self.use_data_buffer and buffer_data:
+            if min_sample_step is not None or max_sample_step is not None:
+                trainable_data = self._filter_training_data_by_step(
+                    buffer_data,
+                    current_step=current_step,
+                    min_sample_step=min_sample_step,
+                    max_sample_step=max_sample_step,
+                )
+                effective_min_sample_step = min_sample_step
+                effective_max_sample_step = max_sample_step
+            else:
+                recent_steps = (
+                    0 if same_step_data_required else int(sample_last_n_steps)
+                )
+                trainable_data = self.data_buffer.get_data_from_last_n_steps(
+                    recent_steps
+                )
+                effective_min_sample_step = max(0, current_step - recent_steps)
+                effective_max_sample_step = current_step
+        else:
+            trainable_data = self._filter_training_data_by_step(
+                self.collected_data,
+                current_step=current_step,
+                min_sample_step=(
+                    current_step if min_sample_step is None else min_sample_step
+                ),
+                max_sample_step=(
+                    current_step if max_sample_step is None else max_sample_step
+                ),
+            )
+            effective_min_sample_step = (
+                current_step if min_sample_step is None else min_sample_step
+            )
+            effective_max_sample_step = (
+                current_step if max_sample_step is None else max_sample_step
+            )
+
+        batch_size = max(int(self.batch_size), 1)
+        trainable_samples = len(trainable_data)
+        full_batches, remainder = divmod(trainable_samples, batch_size)
+        partial_batch_available = remainder > 0
+        trainable_batches = full_batches
+        if partial_batch_available and not require_full_batch:
+            trainable_batches += 1
+
+        sample_steps = [
+            int(item.get("step", current_step))
+            for item in trainable_data
+            if item is not None
+        ]
+        return {
+            "current_step": current_step,
+            "current_step_samples": len(current_step_data),
+            "buffer_samples": len(buffer_data),
+            "trainable_samples": trainable_samples,
+            "trainable_batches": trainable_batches,
+            "batch_size_per_gpu": batch_size,
+            "partial_batch_available": partial_batch_available,
+            "oldest_sample_step": min(sample_steps) if sample_steps else None,
+            "newest_sample_step": max(sample_steps) if sample_steps else None,
+            "same_step_data_required": same_step_data_required,
+            "target_version": getattr(self, "_target_lm_head_weight_step", None),
+            "buffer_version": self.buffer_version,
+            "data_version": max(sample_steps) if sample_steps else None,
+            "min_sample_step": effective_min_sample_step,
+            "max_sample_step": effective_max_sample_step,
+        }
+
+    def _mark_buffer_changed(self) -> None:
+        self.buffer_version += 1
 
     def add_feature_sample(self, sample: DraftFeatureSample | dict[str, Any]) -> None:
         """Append a normalized standalone sample to the in-memory training buffer."""
@@ -4423,6 +4557,7 @@ class DrafterBaseTrainer:
             item.get("step", self.current_rl_step) or self.current_rl_step
         )
         self.collected_data.append(item)
+        self._mark_buffer_changed()
 
     def prepare_training_batch_from_samples(
         self,
@@ -4471,10 +4606,20 @@ class DrafterBaseTrainer:
             logger.exception(f"Standalone training step {step} failed with error: {e}")
             return False
 
-    async def training_step(self, step: int) -> bool:
+    async def training_step(
+        self,
+        step: int,
+        *,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> bool:
         try:
             with torch.enable_grad():
-                return await self._training_step_impl(step)
+                return await self._training_step_impl(
+                    step,
+                    min_sample_step=min_sample_step,
+                    max_sample_step=max_sample_step,
+                )
         except Exception as e:  # noqa: BLE001
             logger.exception(f"Training step {step} failed with error: {e}")
             return False
@@ -4494,7 +4639,13 @@ class DrafterBaseTrainer:
         finally:
             set_ulysses_sequence_parallel_group(prev_group)
 
-    async def _training_step_impl(self, step: int) -> bool:
+    async def _training_step_impl(
+        self,
+        step: int,
+        *,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> bool:
         """Execute a single training step."""
         if not self.model:
             logger.debug("No model available for training")
@@ -4518,7 +4669,10 @@ class DrafterBaseTrainer:
             return False
 
         prepare_ts = time.time()
-        batch = self.prepare_training_batch()
+        batch = self.prepare_training_batch(
+            min_sample_step=min_sample_step,
+            max_sample_step=max_sample_step,
+        )
         self.record_training_timing(
             "timing_s/drafter_prepare_batch", time.time() - prepare_ts
         )
@@ -4920,7 +5074,9 @@ class DrafterBaseTrainer:
         else:
             self.current_rl_step = int(global_step)
         if not self.use_data_buffer and self.current_rl_step != previous_step:
-            self.collected_data.clear()
+            if self.collected_data:
+                self.collected_data.clear()
+                self._mark_buffer_changed()
         self.data_buffer.update_rl_step(self.current_rl_step)
         logger.debug(
             f"[Rank {self.rank}] DataBuffer RL step incremented to {self.data_buffer.get_current_step()}, "
@@ -5062,6 +5218,7 @@ class DrafterBaseTrainer:
             if clear_data:
                 self.collected_data.clear()
                 self.data_buffer.clear()
+                self._mark_buffer_changed()
             self._training_initialized = False
             self._training_active = False
             self._last_ckpt_step = -1
@@ -5099,6 +5256,7 @@ class DrafterBaseTrainer:
         if clear_data:
             self.collected_data.clear()
             self.data_buffer.clear()  # Clear the cross-step data buffer
+            self._mark_buffer_changed()
         if self._full_checkpoint_executor is not None:
             self._full_checkpoint_executor.shutdown(wait=False)
             self._full_checkpoint_executor = None
