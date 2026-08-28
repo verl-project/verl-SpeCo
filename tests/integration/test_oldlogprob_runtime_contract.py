@@ -226,7 +226,7 @@ def test_unselected_flat_hidden_keeps_original_row_selection() -> None:
     torch.testing.assert_close(selected[1, 0], hidden[2])
 
 
-def test_cpu_transfer_tensor_detaches_and_copies_tensor_payload() -> None:
+def test_cpu_transfer_tensor_detaches_cpu_tensor_without_copy() -> None:
     torch = pytest.importorskip("torch")
     source = torch.tensor([1.0], requires_grad=True)
 
@@ -234,8 +234,24 @@ def test_cpu_transfer_tensor_detaches_and_copies_tensor_payload() -> None:
 
     assert transferred.device.type == "cpu"
     assert transferred.requires_grad is False
-    assert transferred.data_ptr() != source.data_ptr()
+    assert transferred.data_ptr() == source.data_ptr()
     torch.testing.assert_close(transferred, source.detach())
+
+
+def test_cpu_transfer_tensor_detaches_sparse_payload_rows() -> None:
+    torch = pytest.importorskip("torch")
+    payload = {
+        "rows": torch.tensor([[1.0]], requires_grad=True),
+        "batch_indices": [0],
+        "row_indices": [[0]],
+    }
+
+    transferred = _to_cpu_transfer_tensor(payload)
+
+    assert transferred["rows"].device.type == "cpu"
+    assert transferred["rows"].requires_grad is False
+    assert transferred["rows"].data_ptr() == payload["rows"].data_ptr()
+    assert transferred["batch_indices"] == [0]
 
 
 def test_forward_hook_rejects_malformed_selected_hidden() -> None:

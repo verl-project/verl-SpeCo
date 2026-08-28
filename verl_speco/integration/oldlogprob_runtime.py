@@ -246,12 +246,24 @@ def _to_cpu_transfer_tensor(value: Any):
 
     try:
         import torch
+    except ImportError:
+        torch = None
 
-        if torch.is_tensor(value):
-            return value.detach().to(device="cpu", copy=True).contiguous()
-    except Exception:  # noqa: BLE001
-        pass
-    return value
+    def transfer(item: Any):
+        if torch is not None and torch.is_tensor(item):
+            item = item.detach()
+            if item.device.type == "cpu":
+                return item.contiguous()
+            return item.to(device="cpu", copy=True).contiguous()
+        if isinstance(item, dict):
+            return {key: transfer(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [transfer(child) for child in item]
+        if isinstance(item, tuple):
+            return tuple(transfer(child) for child in item)
+        return item
+
+    return transfer(value)
 
 
 def _row_indices_payload(row_indices: Any):
