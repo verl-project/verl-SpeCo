@@ -235,6 +235,25 @@ def _selected_device(selected: Any):
     return selected.device
 
 
+def _to_cpu_transfer_tensor(value: Any):
+    """Detach tensors before sending SPECO side-channel data through Ray.
+
+    ``DataProto.non_tensor_batch`` is serialized by Ray as a Python payload.
+    It must therefore never contain an accelerator-resident tensor: the
+    receiving task runner deliberately owns no accelerator resources.  Drafter
+    workers move collected features back to their local device before training.
+    """
+
+    try:
+        import torch
+
+        if torch.is_tensor(value):
+            return value.detach().to(device="cpu", copy=True).contiguous()
+    except Exception:  # noqa: BLE001
+        pass
+    return value
+
+
 def _row_indices_payload(row_indices: Any):
     if row_indices is None:
         return None
@@ -618,7 +637,12 @@ def _install_oldlogprob_training_worker_postprocess_patch() -> bool:
             from verl.utils import tensordict_utils as tu
 
             for key, value in speco_tensor.items():
-                tu.assign_non_tensor_data(final_output, key, value)
+                # These values cross a Ray boundary in non_tensor_data.  Keep
+                # that side channel CPU-only so a CPU-only TaskRunner can
+                # deserialize GPU, NPU, and other accelerator worker outputs.
+                tu.assign_non_tensor_data(
+                    final_output, key, _to_cpu_transfer_tensor(value)
+                )
         return final_output
 
     worker_cls._postprocess_output = speco_postprocess_output
@@ -2755,10 +2779,15 @@ def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) 
                 and torch.is_tensor(ho[OLD_LOGPROB_TIMING_KEY])
             ]
             if timing_tensors:
-                model_output[OLD_LOGPROB_TIMING_KEY] = (
+                timing = (
                     torch.cat(timing_tensors, dim=0)
                     if len(timing_tensors) > 1
                     else timing_tensors[0]
+                )
+                # Timing follows the same non-tensor Ray side channel as
+                # hidden-state metadata after worker postprocessing.
+                model_output[OLD_LOGPROB_TIMING_KEY] = _to_cpu_transfer_tensor(
+                    timing
                 )
 
             # Concatenate all microbatches' hidden states into one big tensor,
@@ -2806,6 +2835,11 @@ def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) 
                             big_tensor = reordered
                     except Exception:
                         pass
+
+                # The ObjectRef is consumed by SpecoTaskRunner, which has no
+                # accelerator allocation.  CPU staging is intentional and
+                # matches the existing PP=1 per-sample ObjectRef transport.
+                big_tensor = _to_cpu_transfer_tensor(big_tensor)
 
                 whole_ref = None
                 try:

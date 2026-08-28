@@ -24,6 +24,7 @@ from verl_speco.integration.oldlogprob_runtime import (
     _find_layers_and_final_norm,
     _install_oldlogprob_fsdp_batch_postprocess_patch,
     _select_and_merge_concatenated_hidden,
+    _to_cpu_transfer_tensor,
     oldlogprob_hidden_runtime_enabled,
 )
 from verl_speco.integration.oldlogprob_layer_ids import (
@@ -223,6 +224,18 @@ def test_unselected_flat_hidden_keeps_original_row_selection() -> None:
     assert selected.shape == (2, 2, 2)
     torch.testing.assert_close(selected[0, 0], hidden[0])
     torch.testing.assert_close(selected[1, 0], hidden[2])
+
+
+def test_cpu_transfer_tensor_detaches_and_copies_tensor_payload() -> None:
+    torch = pytest.importorskip("torch")
+    source = torch.tensor([1.0], requires_grad=True)
+
+    transferred = _to_cpu_transfer_tensor(source)
+
+    assert transferred.device.type == "cpu"
+    assert transferred.requires_grad is False
+    assert transferred.data_ptr() != source.data_ptr()
+    torch.testing.assert_close(transferred, source.detach())
 
 
 def test_forward_hook_rejects_malformed_selected_hidden() -> None:
