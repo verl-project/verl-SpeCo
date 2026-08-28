@@ -117,7 +117,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             "npu_vllm_unit_tests.yml",
             "npu",
             "vllm",
-            {"eagle3", "dflash", "dspark"},
+            {"eagle3", "megatron-eagle3", "dflash", "dspark"},
         ),
         ("npu_sglang_unit_tests.yml", "npu", "sglang", {"eagle3", "dflash"}),
     ):
@@ -146,7 +146,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 for entry in workflow["jobs"]["example"]["strategy"]["matrix"][
                     "include"
                 ]
-            } == {"eagle3", "dflash", "dspark"}
+            } == expected_drafters
             assert {
                 (entry["drafter"], entry["enable_training"])
                 for entry in workflow["jobs"]["example"]["strategy"]["matrix"][
@@ -154,6 +154,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 ]
             } == {
                 ("eagle3", "true"),
+                ("megatron-eagle3", "true"),
                 ("dflash", "true"),
                 ("dspark", "true"),
             }
@@ -164,6 +165,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 ]
             } == {
                 ("eagle3", "true"),
+                ("megatron-eagle3", "true"),
                 ("dflash", "false"),
                 ("dspark", "false"),
             }
