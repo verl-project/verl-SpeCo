@@ -32,6 +32,20 @@ TRAIN_FILE=/path/to/train_file
 TEST_FILE=/path/to/test_file
 DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter
 
+# Request-level speculative acceptance statistics.
+REQUEST_ACCEPT_LEN_LOG_PATH=${REQUEST_ACCEPT_LEN_LOG_PATH:-./logs/${exp_name}_request_accept_len_hist.jsonl}
+mkdir -p "$(dirname "${REQUEST_ACCEPT_LEN_LOG_PATH}")"
+export VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH="${REQUEST_ACCEPT_LEN_LOG_PATH}"
+# Disable printing of request-level speculative acceptance statistics to avoid cluttering the console output.
+export VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_PRINT=0
+
+# Hard-sample presets (candidate ratio / training-batch ratio):
+# - Disable: 0.0 / 0.0
+# - Downsample hard requests: 0.4 / 0.1 (collect broadly, train with 10% hard samples)
+# - Strengthen hard requests: 0.5 / 0.5 (reserve half of collection/training for hard samples)
+DSPARK_HARD_CANDIDATE_RATIO=${DSPARK_HARD_CANDIDATE_RATIO:-0.4}
+DSPARK_HARD_SAMPLE_RATIO=${DSPARK_HARD_SAMPLE_RATIO:-0.1}
+
 
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \
@@ -60,7 +74,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.actor.calculate_entropy=False \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.offload_policy=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${train_sp} \
@@ -80,7 +95,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n=5 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=10 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.drafter.enable=True \
     actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
     actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH} \
@@ -90,16 +105,17 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.dspark_block_size=7 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_anchors=32 \
     actor_rollout_ref.rollout.drafter.training.dspark_max_window=512 \
-    actor_rollout_ref.rollout.drafter.training.dspark_loss_mode=restricted_ce \
-    actor_rollout_ref.rollout.drafter.training.dspark_loss_decay_gamma=7 \
+    actor_rollout_ref.rollout.drafter.training.dspark_loss_mode=full_vocab \
+    actor_rollout_ref.rollout.drafter.training.dspark_loss_decay_gamma=4 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_target_layers=5 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_hidden_layers=5 \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_rank=256 \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_head_type=vanilla \
     actor_rollout_ref.rollout.drafter.training.target_lm_head_row_restricted_sync=False \
-    actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=0.1 \
-    actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=0.9 \
     actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=0.0 \
+    actor_rollout_ref.rollout.drafter.training.dspark_hard_candidate_ratio=${DSPARK_HARD_CANDIDATE_RATIO} \
+    actor_rollout_ref.rollout.drafter.training.dspark_hard_sample_ratio=${DSPARK_HARD_SAMPLE_RATIO} \
+    actor_rollout_ref.rollout.drafter.training.request_accept_len_variance_interval_steps=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_steps=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=7 \
@@ -117,6 +133,9 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.draft_update_flush_after=True \
     actor_rollout_ref.rollout.load_format="auto" \
     actor_rollout_ref.actor.strategy=fsdp2 \
+    actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu=8 \
+    actor_rollout_ref.rollout.drafter.training.sample_last_n_steps=8 \
+    actor_rollout_ref.rollout.drafter.training.train_batches_per_cycle=8 \
     algorithm.use_kl_in_reward=False \
     trainer.val_before_train=False \
     trainer.critic_warmup=0 \
