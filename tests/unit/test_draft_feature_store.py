@@ -46,6 +46,13 @@ def _sample(index: int = 0):
     )
 
 
+def _sample_without_step(index: int = 0):
+    sample = _sample(index)
+    sample.metadata.pop("global_step", None)
+    sample.metadata.pop("step", None)
+    return sample
+
+
 def test_torch_shard_feature_store_roundtrip(tmp_path):
     store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=2)
     store.write_many([_sample(0), _sample(1)])
@@ -162,6 +169,80 @@ def test_draft_feature_dataloader_balances_uneven_distributed_shards(tmp_path):
         rank_batches.append(list(loader))
 
     assert [len(batches) for batches in rank_batches] == [2, 2]
+
+
+def test_draft_feature_dataloader_filters_samples_by_step_window(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=8)
+    store.write_many([_sample(i) for i in range(6)])
+    store.close()
+
+    loader = DraftFeatureDataLoader(
+        TorchShardFeatureStore(tmp_path, read_only=True),
+        DraftFeatureDataLoaderConfig(
+            batch_size=8,
+            shuffle=False,
+            repeat=False,
+            min_sample_step=2,
+            max_sample_step=4,
+        ),
+    )
+
+    steps = [
+        int(sample.metadata["global_step"]) for batch in loader for sample in batch
+    ]
+    assert steps == [2, 3, 4]
+
+
+def test_draft_feature_dataloader_keeps_samples_without_step_metadata(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=8)
+    store.write_many([_sample(1), _sample_without_step(10), _sample(5)])
+    store.close()
+
+    loader = DraftFeatureDataLoader(
+        TorchShardFeatureStore(tmp_path, read_only=True),
+        DraftFeatureDataLoaderConfig(
+            batch_size=8,
+            shuffle=False,
+            repeat=False,
+            min_sample_step=2,
+            max_sample_step=4,
+        ),
+    )
+
+    input_starts = [
+        int(sample.input_ids[0].item()) for batch in loader for sample in batch
+    ]
+    assert input_starts == [11]
+
+
+def test_draft_feature_dataloader_filters_before_distributed_slicing(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=8)
+    store.write_many([_sample(i) for i in range(6)])
+    store.close()
+
+    rank_batches = []
+    for rank in range(2):
+        loader = DraftFeatureDataLoader(
+            TorchShardFeatureStore(tmp_path, read_only=True),
+            DraftFeatureDataLoaderConfig(
+                batch_size=8,
+                rank=rank,
+                world_size=2,
+                shuffle=False,
+                repeat=False,
+                min_sample_step=1,
+                max_sample_step=4,
+            ),
+        )
+        rank_batches.append(
+            [
+                int(sample.metadata["global_step"])
+                for batch in loader
+                for sample in batch
+            ]
+        )
+
+    assert rank_batches == [[1, 3], [2, 4]]
 
 
 def test_draft_feature_dataloader_rejects_rank_out_of_range(tmp_path):

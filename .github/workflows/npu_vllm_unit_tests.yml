@@ -10,7 +10,6 @@ on:
       - ".github/workflows/npu_vllm_unit_tests.yml"
       - "ci/**"
       - "examples/*vllm*.sh"
-      - "tests/**"
       - "verl_speco/**"
       - "pyproject.toml"
       - "REQUIRED_VERL.txt"
@@ -21,7 +20,6 @@ on:
       - ".github/workflows/npu_vllm_unit_tests.yml"
       - "ci/**"
       - "examples/*vllm*.sh"
-      - "tests/**"
       - "verl_speco/**"
       - "pyproject.toml"
       - "REQUIRED_VERL.txt"
@@ -112,8 +110,14 @@ jobs:
       matrix:
         include:
           - drafter: eagle3
+            enable_training: true
+            disable_eagle3_torch_compile: true
           - drafter: dflash
+            enable_training: true
+            disable_eagle3_torch_compile: false
           - drafter: dspark
+            enable_training: true
+            disable_eagle3_torch_compile: false
 
     steps:
       - name: Check out verl-SpeCo
@@ -196,12 +200,22 @@ jobs:
           SPECO_ACCELERATOR_COUNT: ${{ inputs.accelerator_count || env.SPECO_DEFAULT_ACCELERATOR_COUNT }}
           SPECO_TENSOR_PARALLEL_SIZE: ${{ inputs.tensor_parallel_size || env.SPECO_DEFAULT_TENSOR_PARALLEL_SIZE }}
           SPECO_SEQUENCE_PARALLEL_SIZE: ${{ inputs.sequence_parallel_size || env.SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE }}
-          SPECO_ENABLE_TRAINING: ${{ github.event_name != 'workflow_dispatch' && 'true' || inputs.run_training }}
-          SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS || '1' }}
-          SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE || '8' }}
-          SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '32' }}
+          SPECO_ENABLE_TRAINING: ${{ matrix.enable_training && (github.event_name != 'workflow_dispatch' || inputs.run_training) && 'true' || 'false' }}
+          SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS || '2' }}
+          SPECO_MAX_RESPONSE_LENGTH: ${{ vars.SPECO_MAX_RESPONSE_LENGTH || '512' }}
+          SPECO_HIDDEN_STATE_WINDOW_MIN_ROWS: "32"
+          SPECO_HIDDEN_STATE_WINDOW_TOKENS_PER_SAMPLE: "32"
+          SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE || '64' }}
+          SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '128' }}
           SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES || '32' }}
           SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE || '8' }}
+          SPECO_DRAFTER_TRAINING_STEPS: ${{ vars.SPECO_DRAFTER_TRAINING_STEPS || '1' }}
+          SPECO_DRAFTER_BATCH_SIZE_PER_GPU: ${{ vars.SPECO_DRAFTER_BATCH_SIZE_PER_GPU || '1' }}
+          SPECO_EAGLE3_DISABLE_TORCH_COMPILE: ${{ matrix.disable_eagle3_torch_compile }}
+          SPECO_TRAIN_BATCHES_PER_CYCLE: ${{ vars.SPECO_TRAIN_BATCHES_PER_CYCLE || '1' }}
+          SPECO_COLLECT_INTERVAL_STEPS: ${{ vars.SPECO_COLLECT_INTERVAL_STEPS || '1' }}
+          SPECO_TRAINING_INTERVAL_STEPS: ${{ vars.SPECO_TRAINING_INTERVAL_STEPS || '1' }}
+          SPECO_PUBLISH_INTERVAL_STEPS: ${{ vars.SPECO_PUBLISH_INTERVAL_STEPS || '1' }}
           SPECO_DATALOADER_NUM_WORKERS: ${{ vars.SPECO_DATALOADER_NUM_WORKERS || '0' }}
           SPECO_EXTRA_HYDRA_ARGS: ${{ inputs.extra_hydra_args || vars.SPECO_EXTRA_HYDRA_ARGS }}
         run: bash ci/run_example_test.sh npu vllm "${{ matrix.drafter }}"

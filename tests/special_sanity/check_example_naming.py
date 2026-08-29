@@ -17,15 +17,15 @@
 SpeCo examples intentionally expose both the drafter backend and rollout
 backend in the filename because those combinations are the product surface:
 
-    run_<model>_drafter_<drafter-backend>_<rollout-backend>[_npu].sh
+    run_<model>_[actor_<actor-backend>_]drafter_<drafter-backend>_<rollout-backend>[_npu].sh
 
 The standalone/offline draft-training entry point uses:
 
-    run_<model>_drafter_[<drafter-backend>...]_separate_training.sh
+    run_<model>_[actor_<actor-backend>_]drafter_[<drafter-backend>...]_separate_training.sh
 
-Backends an inference engine cannot serve on its own (Domino, P-EAGLE and
-EAGLE-1/2) exist only in that standalone form, so they may name themselves in
-the filename but never pair with a rollout backend.
+Actor and drafter backend identifiers are intentionally not enumerated here.
+This check validates filename structure without duplicating the backend
+registries owned by the implementations.
 """
 
 from __future__ import annotations
@@ -34,10 +34,6 @@ import argparse
 import sys
 from pathlib import Path
 
-DRAFTER_BACKENDS = ("dflash", "dspark", "eagle3")
-# Drafters no inference engine serves directly, so they never pair with a
-# rollout backend and only ever appear in the standalone form.
-STANDALONE_ONLY_BACKENDS = ("domino", "peagle", "eagle1", "eagle2")
 ROLLOUT_BACKENDS = ("vllm", "sglang")
 OPTIONAL_SUFFIXES = ("npu",)
 STANDALONE_SUFFIX = ("separate", "training")
@@ -67,11 +63,14 @@ def _is_ignored(
 
 def _format_expected() -> str:
     return (
-        "expected run_<model>_drafter_<drafter-backend>_<rollout-backend>[_npu].sh "
-        f"with drafter-backend in {list(DRAFTER_BACKENDS)} and rollout-backend "
-        f"in {list(ROLLOUT_BACKENDS)}, or "
-        "run_<model>_drafter_[<drafter-backend>...]_separate_training.sh with "
-        f"drafter-backend in {list(DRAFTER_BACKENDS + STANDALONE_ONLY_BACKENDS)}"
+        "expected run_<model>_[actor_<actor-backend>_]drafter_"
+        "<drafter-backend>_<rollout-backend>[_npu].sh "
+        "with actor-backend set to any non-empty backend identifier, "
+        "with drafter-backend set to any non-empty backend identifier and "
+        f"rollout-backend in {list(ROLLOUT_BACKENDS)}, or "
+        "run_<model>_[actor_<actor-backend>_]drafter_"
+        "[<drafter-backend>...]_separate_training.sh with "
+        "zero or more non-empty drafter backend identifiers"
     )
 
 
@@ -92,15 +91,23 @@ def check_filename(path: Path, display: str | None = None) -> list[str]:
     drafter_index = tokens.index("drafter")
     model_tokens = tokens[:drafter_index]
     spec_tokens = tokens[drafter_index + 1 :]
+    if "actor" in model_tokens:
+        actor_index = model_tokens.index("actor")
+        actor_tokens = model_tokens[actor_index + 1 :]
+        model_tokens = model_tokens[:actor_index]
+        if not actor_tokens or any(not token for token in actor_tokens):
+            errors.append(
+                f"{shown}: expected a non-empty actor backend between '_actor_' "
+                "and '_drafter_'"
+            )
     if not model_tokens:
         errors.append(f"{shown}: model name is missing before '_drafter_'")
 
     if tuple(spec_tokens[-len(STANDALONE_SUFFIX) :]) == STANDALONE_SUFFIX:
-        known_backends = DRAFTER_BACKENDS + STANDALONE_ONLY_BACKENDS
         for token in spec_tokens[: -len(STANDALONE_SUFFIX)]:
-            if token not in known_backends:
+            if not token:
                 errors.append(
-                    f"{shown}: unknown drafter backend '{token}', expected one of {list(known_backends)}"
+                    f"{shown}: expected non-empty drafter backend identifiers"
                 )
         return errors
 
@@ -110,9 +117,9 @@ def check_filename(path: Path, display: str | None = None) -> list[str]:
 
     drafter_backend, rollout_backend = spec_tokens[0], spec_tokens[1]
     suffix = spec_tokens[2] if len(spec_tokens) == 3 else None
-    if drafter_backend not in DRAFTER_BACKENDS:
+    if not drafter_backend:
         errors.append(
-            f"{shown}: unknown drafter backend '{drafter_backend}', expected one of {list(DRAFTER_BACKENDS)}"
+            f"{shown}: expected a non-empty drafter backend before the rollout backend"
         )
     if rollout_backend not in ROLLOUT_BACKENDS:
         errors.append(

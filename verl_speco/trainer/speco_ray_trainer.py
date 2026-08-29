@@ -58,11 +58,7 @@ from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
     resolve_oldlogprob_aux_layer_ids,
 )
-from verl_speco.integration.sglang_adapter import (
-    bucket_drafter_samples_by_replica,
-    pop_drafter_samples,
-    speco_step_matches_interval,
-)
+from verl_speco.integration.sglang_adapter import pop_drafter_samples
 from verl_speco.integration.sglang_runtime import (
     clear_sglang_runtime_config,
     configure_sglang_runtime_from_config,
@@ -72,6 +68,26 @@ from verl_speco.integration.sglang_runtime import (
 from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
     configure_vllm_runtime_from_config,
+)
+from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
+from verl_speco.trainer.scheduler import (
+    AfterActorUpdateContext,
+    AfterWeightUpdateContext,
+    BeforeActorUpdateContext,
+    CallbackDrafterCollectionExecutor,
+    CallbackDrafterPublishExecutor,
+    CallbackDrafterWorkerExecutor,
+    CollectionPlan,
+    CollectionPayload,
+    CollectionOutcome,
+    DrafterCollectionContext,
+    DrafterCollectionSource,
+    DrafterRuntimeState,
+    DrafterRuntimeStatus,
+    DrafterScheduleConfig,
+    DrafterScheduleContext,
+    DrafterScheduler,
+    TrainingPlan,
 )
 from verl_speco.workers import SpecoWorker
 
@@ -143,17 +159,6 @@ def _get_nested(config, path, default=None):
         else:
             current = getattr(current, key, default)
     return current
-
-
-def _speco_alpha_counter(value: int) -> str:
-    """Encode a positive counter with letters so Ray log dedup keeps each sample."""
-
-    value = max(int(value), 1)
-    chars = []
-    while value:
-        value, remainder = divmod(value - 1, 26)
-        chars.append(chr(ord("a") + remainder))
-    return "".join(reversed(chars))
 
 
 def _speco_ref_meta_rows(meta: Any) -> int:
@@ -462,12 +467,6 @@ def _speco_vllm_spec_decode_metrics_from_stats(
     }
 
 
-def _speco_vllm_spec_decode_metrics_from_batch(batch: Any) -> dict[str, float]:
-    return _speco_vllm_spec_decode_metrics_from_stats(
-        _speco_vllm_spec_decode_stats_from_batch(batch)
-    )
-
-
 def _speco_truthy_meta_value(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -548,8 +547,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self.speco_worker_cls = kwargs.pop("speco_worker_cls", None)
         super().__init__(*args, **kwargs)
         self.drafter_wg = None
+        self._drafter_scheduler = DrafterScheduler()
+        self._drafter_runtime_state = DrafterRuntimeState()
         self._pending_drafter_publish_refs = None
         self._pending_drafter_checkpoint_refs = []
+        self._pending_target_lm_head_sync = None
         self._speco_last_raw_drafter_samples = 0
         self._speco_last_collected_samples = 0
         self._speco_last_oldlogprob_candidate_samples = 0
@@ -569,9 +571,43 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_oldlogprob_total_elapsed_sec = 0.0
         self._speco_last_collect_interval_matched = 0
         self._speco_pending_request_accept_len_payloads = []
+        self._speco_last_collection_outcome = None
 
     def attach_speco_worker_group(self, worker_group):
         self.drafter_wg = worker_group
+        self._speco_get_drafter_scheduler().bind_worker_executor(
+            CallbackDrafterWorkerExecutor(
+                submit=self.speco_train_drafter,
+                resolve=self._ray_get_if_needed,
+                inspect_data=self.speco_get_drafter_training_data_status,
+                prepare=self._speco_prepare_drafter_training_rpc,
+                activate=self.speco_activate_drafter_training_model,
+                preflight=self.speco_preflight_drafter_training,
+                abort_preflight=self.speco_abort_drafter_training_preflight,
+            )
+        )
+        self._speco_get_drafter_scheduler().bind_collection_executor(
+            CallbackDrafterCollectionExecutor(
+                set_step=self.speco_set_global_step,
+                stage_submit=self.speco_stage_rollout_features,
+                commit_submit=self.speco_commit_rollout_features,
+                abort_submit=self.speco_abort_rollout_features,
+                rollback_submit=self.speco_rollback_rollout_features,
+                finalize_submit=self.speco_finalize_rollout_features,
+                resolve=self._ray_get_if_needed,
+            )
+        )
+        self._speco_bind_publish_executor()
+
+    def _speco_bind_publish_executor(self) -> None:
+        self._speco_get_drafter_scheduler().bind_publish_executor(
+            CallbackDrafterPublishExecutor(
+                wait=self._speco_wait_pending_drafter_publish_rpc,
+                fetch=self._speco_get_published_drafter_weights,
+                update=self._speco_update_rollout_drafter_weights,
+                normalize_payload=resolve_drafter_publish_payload,
+            )
+        )
 
     def _require_speco_worker_group(self):
         if self.drafter_wg is None:
@@ -581,8 +617,20 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def speco_set_global_step(self, global_step: int):
         return self._require_speco_worker_group().set_global_step(global_step)
 
-    def speco_collect_rollout_features(self, samples: list[list[dict]]):
-        return self._require_speco_worker_group().collect_rollout_features(samples)
+    def speco_stage_rollout_features(self, requests: list[list[dict]]):
+        return self._require_speco_worker_group().stage_rollout_features(requests)
+
+    def speco_commit_rollout_features(self, requests: list[list[dict]]):
+        return self._require_speco_worker_group().commit_rollout_features(requests)
+
+    def speco_abort_rollout_features(self, requests: list[list[dict]]):
+        return self._require_speco_worker_group().abort_rollout_features(requests)
+
+    def speco_rollback_rollout_features(self, requests: list[list[dict]]):
+        return self._require_speco_worker_group().rollback_rollout_features(requests)
+
+    def speco_finalize_rollout_features(self, requests: list[list[dict]]):
+        return self._require_speco_worker_group().finalize_rollout_features(requests)
 
     def speco_sync_target_lm_head_weight(self, payload: Any, global_step: Any = None):
         return self._require_speco_worker_group().sync_target_lm_head_weight(
@@ -594,8 +642,28 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._require_speco_worker_group().get_drafter_target_lm_head_row_indices()
         )
 
-    def speco_train_drafter(self):
-        return self._require_speco_worker_group().train_drafter()
+    def speco_train_drafter(self, training_plan: dict[str, object]):
+        return self._require_speco_worker_group().train_drafter(training_plan)
+
+    def speco_preflight_drafter_training(self, training_plan: dict[str, object]):
+        return self._require_speco_worker_group().preflight_drafter_training(
+            training_plan
+        )
+
+    def speco_abort_drafter_training_preflight(self, plan_id: str):
+        return self._require_speco_worker_group().abort_drafter_training_preflight(
+            plan_id
+        )
+
+    def speco_get_drafter_training_data_status(
+        self,
+        sample_last_n_steps: int,
+        require_full_batch: bool,
+    ):
+        return self._require_speco_worker_group().get_drafter_training_data_status(
+            sample_last_n_steps,
+            require_full_batch,
+        )
 
     def speco_activate_drafter_training_model(self):
         return self._require_speco_worker_group().activate_drafter_training_model()
@@ -725,13 +793,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             device_name=self.device_name,
         )
 
-        self.drafter_wg = self.ray_worker_group_cls(
+        worker_group = self.ray_worker_group_cls(
             resource_pool=resource_pool,
             ray_cls_with_init=drafter_cls,
             name_prefix="speco_drafter",
             device_name=self.device_name,
         )
-        self.drafter_wg.init_model()
+        worker_group.init_model()
+        self.attach_speco_worker_group(worker_group)
 
     def _ray_get_if_needed(self, value):
         if value is None:
@@ -982,17 +1051,75 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             raise RuntimeError(f"Drafter checkpoint wait failed: {incomplete}")
         return len(pending_refs)
 
-    def _speco_should_collect_drafter_this_step(self) -> bool:
+    def _speco_plan_drafter_collection(
+        self,
+        source: DrafterCollectionSource,
+        *,
+        validation: bool = False,
+    ) -> CollectionPlan:
+        self._speco_last_collection_outcome = None
         training_cfg = self._speco_drafter_training_config()
-        return speco_step_matches_interval(
-            self.global_steps, training_cfg.get("collect_interval_steps", 1)
+        source_enabled = bool(
+            training_cfg.get(
+                "collect_hidden_states_from_sgl"
+                if source is DrafterCollectionSource.SGLANG
+                else "collect_hidden_states_from_old_logprob",
+                False,
+            )
+        )
+        plan = self._speco_get_drafter_scheduler().plan_collection(
+            DrafterCollectionContext(
+                global_step=self.global_steps,
+                source=source,
+                drafter_enabled=self._speco_online_enabled(),
+                source_enabled=source_enabled,
+                validation=validation,
+                require_training_interval=(
+                    source is DrafterCollectionSource.OLD_LOGPROB
+                ),
+            ),
+            self._speco_drafter_schedule_config(),
+        )
+        self._speco_last_collection_plan = plan
+        return plan
+
+    @staticmethod
+    def _speco_log_drafter_collection_plan(plan: CollectionPlan) -> None:
+        logger.info(
+            "[DrafterScheduler] collection step=%s source=%s collect=%s reason=%s "
+            "collect_interval_matched=%s training_interval_matched=%s "
+            "sample_rate=%s max_samples_per_replica=%s max_tokens_per_replica=%s "
+            "window_mode=%s window_tokens=%s window_min_rows=%s",
+            plan.source_global_step,
+            plan.source.value,
+            plan.collect,
+            plan.reason,
+            plan.collect_interval_matched,
+            plan.training_interval_matched,
+            plan.sample_rate,
+            plan.max_samples_per_replica,
+            plan.max_tokens_per_replica,
+            plan.hidden_window_mode,
+            plan.hidden_window_tokens_per_sample,
+            plan.hidden_window_min_rows,
         )
 
-    def _speco_should_train_drafter_this_step(self) -> bool:
-        training_cfg = self._speco_drafter_training_config()
-        return speco_step_matches_interval(
-            self.global_steps, training_cfg.get("training_interval_steps", 1)
-        )
+    def _speco_get_drafter_scheduler(self) -> DrafterScheduler:
+        scheduler = getattr(self, "_drafter_scheduler", None)
+        if scheduler is None:
+            scheduler = DrafterScheduler()
+            self._drafter_scheduler = scheduler
+        return scheduler
+
+    def _speco_get_drafter_runtime_state(self) -> DrafterRuntimeState:
+        runtime_state = getattr(self, "_drafter_runtime_state", None)
+        if runtime_state is None:
+            runtime_state = DrafterRuntimeState()
+            self._drafter_runtime_state = runtime_state
+        return runtime_state
+
+    def _speco_drafter_schedule_config(self) -> DrafterScheduleConfig:
+        return DrafterScheduleConfig.from_mapping(self._speco_drafter_training_config())
 
     def _speco_should_log_request_accept_len_variance(self) -> bool:
         training_cfg = self._speco_drafter_training_config()
@@ -1005,36 +1132,69 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         training_cfg = self._speco_drafter_training_config()
         return str(training_cfg.get("mode", "online") or "online").strip().lower()
 
-    def _speco_has_collected_drafter_samples_this_step(self) -> bool:
-        return int(getattr(self, "_speco_last_collected_samples", 0) or 0) > 0
+    def _speco_drafter_schedule_context(self) -> DrafterScheduleContext:
+        return DrafterScheduleContext(
+            global_step=self.global_steps,
+            training_mode=self._speco_drafter_training_mode(),
+            collected_samples_this_step=int(
+                getattr(self, "_speco_last_collected_samples", 0) or 0
+            ),
+            oldlogprob_collection_requested=(
+                self._speco_oldlogprob_collection_requested()
+            ),
+            data_status=None,
+            pending_training_count=int(
+                self._speco_get_drafter_runtime_state().status
+                in {DrafterRuntimeStatus.SUBMITTED, DrafterRuntimeStatus.RUNNING}
+            ),
+        )
 
-    def _speco_should_attempt_drafter_train_this_step(self) -> bool:
-        if self._speco_drafter_training_mode() == "collect_only":
-            return False
-        if not self._speco_should_train_drafter_this_step():
-            return False
-        if self._speco_has_collected_drafter_samples_this_step():
-            return True
-        training_cfg = self._speco_drafter_training_config()
-        if self._speco_oldlogprob_collection_requested():
-            return False
-        return bool(training_cfg.get("use_data_buffer", False))
+    def _speco_on_before_actor_update(self):
+        return self._speco_get_drafter_scheduler().on_before_actor_update(
+            BeforeActorUpdateContext(
+                schedule_context=self._speco_drafter_schedule_context(),
+                config=self._speco_drafter_schedule_config(),
+            )
+        )
 
-    def _speco_set_drafter_global_step(self, *, log_timing: bool = True):
+    @staticmethod
+    def _speco_log_drafter_training_plan(plan: TrainingPlan) -> None:
+        logger.info(
+            "[DrafterScheduler] step=%s strategy=%s launch=%s reason=%s "
+            "interval_matched=%s max_batches=%s publish_after_success=%s",
+            plan.source_global_step,
+            plan.execution_strategy.value,
+            plan.launch,
+            plan.reason,
+            plan.interval_matched,
+            plan.max_batches,
+            plan.publish_after_success,
+        )
+
+    def _speco_set_drafter_global_step(self):
         return self._ray_get_if_needed(self.speco_set_global_step(self.global_steps))
 
-    def _speco_collect_rollout_features_rpc(
-        self, source: str, buckets: list[list[dict]]
-    ):
-        if not buckets or not any(bucket for bucket in buckets):
-            return None
-        rpc_started = time.perf_counter()
-        result = self.speco_collect_rollout_features(buckets)
-        if source == "oldlogprob":
-            self._speco_last_oldlogprob_collect_rpc_elapsed_sec = (
-                time.perf_counter() - rpc_started
-            )
-        return result
+    def _speco_prepare_drafter_training_rpc(
+        self, training_plan: TrainingPlan
+    ) -> dict[str, Any]:
+        self._speco_set_drafter_global_step()
+        metrics, pending = self._speco_start_target_lm_head_weight_sync(training_plan)
+        self._pending_target_lm_head_sync = pending
+        return metrics
+
+    def _speco_execute_collection(
+        self,
+        plan: CollectionPlan,
+        payload: CollectionPayload,
+    ) -> CollectionOutcome:
+        outcome = self._speco_get_drafter_scheduler().on_collection_ready(
+            plan,
+            payload,
+        )
+        self._speco_last_collection_outcome = outcome
+        if plan.source is DrafterCollectionSource.OLD_LOGPROB:
+            self._speco_last_oldlogprob_collect_rpc_elapsed_sec = outcome.elapsed_sec
+        return outcome
 
     def _speco_oldlogprob_collection_requested(self) -> bool:
         training_cfg = self._speco_drafter_training_config()
@@ -1060,9 +1220,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             _get_nested(self.config, ("actor_rollout_ref", "actor", "strategy"), "")
             or ""
         ).lower()
-        if strategy not in {"fsdp", "fsdp2"}:
+        if strategy not in {"fsdp", "fsdp2", "veomni"}:
             raise ValueError(
-                "SPECO old-logprob hidden collection currently supports actor.strategy=fsdp/fsdp2 only, "
+                "SPECO old-logprob hidden collection supports "
+                "actor.strategy=fsdp/fsdp2/veomni, "
                 f"got {strategy!r}"
             )
         capture_impl = str(
@@ -1135,39 +1296,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return mode
 
     @staticmethod
-    def _speco_oldlogprob_aux_layer_ids_from_config(config) -> Any | None:
-        candidates = (
-            ("model", "eagle_config", "target_hidden_layer_ids"),
-            ("model", "eagle_config", "eagle_aux_hidden_state_layer_ids"),
-            ("eagle_config", "target_hidden_layer_ids"),
-            ("eagle_config", "eagle_aux_hidden_state_layer_ids"),
-            ("target_hidden_layer_ids",),
-            ("eagle_aux_hidden_state_layer_ids",),
-            ("target_layer_ids",),
-        )
-        for path in candidates:
-            layer_ids = _get_nested(config, path, None)
-            if layer_ids is not None:
-                return layer_ids
-        return None
-
-    @staticmethod
-    def _speco_normalize_oldlogprob_aux_layer_ids(layer_ids) -> list[int] | None:
-        if layer_ids is None:
-            return None
-        if isinstance(layer_ids, int):
-            return [int(layer_ids)]
-        if isinstance(layer_ids, str):
-            raw = layer_ids.strip()
-            if not raw:
-                return None
-            if raw.startswith("["):
-                layer_ids = json.loads(raw)
-            else:
-                layer_ids = [part.strip() for part in raw.split(",") if part.strip()]
-        return [int(layer_id) for layer_id in list(layer_ids)]
-
-    @staticmethod
     def _speco_load_model_config(model_path: Any) -> dict[str, Any] | None:
         if not model_path:
             return None
@@ -1204,15 +1332,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         target_model_path = _get_nested(target_model_cfg, ("path",), None)
         target_config = self._speco_load_model_config(target_model_path)
         return self._speco_num_hidden_layers_from_config(target_config)
-
-    @staticmethod
-    def _speco_default_eagle3_aux_layer_ids(num_hidden_layers: int) -> list[int]:
-        num_hidden_layers = int(num_hidden_layers)
-        if num_hidden_layers <= 0:
-            raise RuntimeError(
-                f"SPECO cannot derive EAGLE3 aux hidden layers from num_hidden_layers={num_hidden_layers}"
-            )
-        return [2, num_hidden_layers // 2, num_hidden_layers - 3]
 
     def _speco_validate_sglang_aux_last_layer_norm(self) -> None:
         """Fail closed if SGLang collection would capture the last aux layer pre-norm.
@@ -1532,14 +1651,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     ) -> dict[str, Any] | None:
         if not self._speco_oldlogprob_collection_enabled():
             return None
-        if not self._speco_should_collect_drafter_this_step():
-            return None
-        if not self._speco_should_train_drafter_this_step():
+        collection_plan = self._speco_plan_drafter_collection(
+            DrafterCollectionSource.OLD_LOGPROB
+        )
+        self._speco_log_drafter_collection_plan(collection_plan)
+        if not collection_plan.collect:
             return None
         training_cfg = self._speco_drafter_training_config()
-        sample_rate = float(training_cfg.get("collection_sample_rate", 1.0) or 0.0)
-        if sample_rate <= 0:
-            return None
+        sample_rate = collection_plan.sample_rate
         window_mode = self._speco_oldlogprob_window_mode(training_cfg)
 
         batch_tensors = batch.batch
@@ -1566,15 +1685,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if owner_count is None:
             owner_count = 1
         owner_count = max(int(owner_count), 1)
-        max_per_owner = training_cfg.get("max_collect_samples_per_step_per_replica", 16)
-        max_per_owner = int(max_per_owner) if max_per_owner is not None else batch_size
+        max_per_owner = collection_plan.max_samples_per_replica
+        max_per_owner = max_per_owner if max_per_owner is not None else batch_size
         max_per_owner = max(max_per_owner, 0)
-        max_tokens_per_owner = training_cfg.get(
-            "max_collect_tokens_per_step_per_replica", None
-        )
-        max_tokens_per_owner = (
-            int(max_tokens_per_owner) if max_tokens_per_owner is not None else None
-        )
+        max_tokens_per_owner = collection_plan.max_tokens_per_replica
         if max_tokens_per_owner is not None:
             max_tokens_per_owner = max(max_tokens_per_owner, 0)
         owner_counts = [0 for _ in range(owner_count)]
@@ -1799,6 +1913,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if selected_count <= 0:
             return None
         return {
+            "collection_plan": collection_plan,
             "collect_mask": collect_mask,
             "hidden_positions": hidden_positions,
             "hidden_position_mask": hidden_position_mask,
@@ -1943,9 +2058,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if torch.is_tensor(request_hard_score)
             else None
         )
-        buckets: list[list[dict[str, Any]]] = [
-            [] for _ in range(int(collect_plan["owner_count"]))
-        ]
+        samples: list[dict[str, Any]] = []
+        owners: list[int] = []
         collected_rows = 0
         payload_bytes = 0
         sample_ref_chunks: dict[int, list[dict[str, Any]]] = {}
@@ -2097,21 +2211,31 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             else:
                 sample["hidden_states_ref"] = hidden_ref
                 sample["hidden_states_ref_meta"] = ref_meta
-            buckets[owner].append(sample)
+            samples.append(sample)
+            owners.append(owner)
 
-        collected = sum(len(bucket) for bucket in buckets)
+        collected = len(samples)
         if collected <= 0:
             return 0
         dispatch_bucket_count = self._speco_dispatch_bucket_count()
-        if dispatch_bucket_count is not None and dispatch_bucket_count > len(buckets):
-            buckets.extend([[] for _ in range(dispatch_bucket_count - len(buckets))])
-        self._speco_set_drafter_global_step(log_timing=False)
-        self._speco_collect_rollout_features_rpc("oldlogprob", buckets)
-        self._speco_last_collected_samples = collected
-        self._speco_last_oldlogprob_collected_samples = collected
+        payload = self._speco_get_drafter_scheduler().prepare_collection_payload(
+            source=DrafterCollectionSource.OLD_LOGPROB,
+            samples=samples,
+            owners=owners,
+            owner_count=int(collect_plan["owner_count"]),
+            dispatch_bucket_count=dispatch_bucket_count,
+            raw_samples=int(collect_plan.get("candidate_count", collected)),
+            collection_id=collect_plan["collection_plan"].collection_id,
+        )
+        outcome = self._speco_execute_collection(
+            collect_plan["collection_plan"],
+            payload,
+        )
+        self._speco_last_collected_samples = outcome.collected_samples
+        self._speco_last_oldlogprob_collected_samples = outcome.collected_samples
         self._speco_last_oldlogprob_collected_rows = collected_rows
         self._speco_last_oldlogprob_payload_mib = payload_bytes / float(1024 * 1024)
-        return collected
+        return outcome.collected_samples
 
     def _speco_num_rollout_replicas(self, samples: list[dict]) -> int:
         sample_max = (
@@ -2125,8 +2249,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_collect_generation_samples(self, gen_batch_output: Any) -> int:
         self._speco_last_raw_drafter_samples = 0
         self._speco_last_collected_samples = 0
+        collection_plan = self._speco_plan_drafter_collection(
+            DrafterCollectionSource.SGLANG
+        )
+        self._speco_log_drafter_collection_plan(collection_plan)
         self._speco_last_collect_interval_matched = int(
-            self._speco_should_collect_drafter_this_step()
+            collection_plan.collect_interval_matched
         )
         if not self._speco_online_enabled():
             return 0
@@ -2134,23 +2262,26 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_raw_drafter_samples = len(samples)
         if not samples:
             return 0
-        if not self._speco_should_collect_drafter_this_step():
+        if not collection_plan.collect:
             return 0
 
         num_replicas = self._speco_num_rollout_replicas(samples)
-        buckets = bucket_drafter_samples_by_replica(samples, num_replicas=num_replicas)
-
-        # Some verl worker-group dispatch meshes may expose more owner buckets
-        # than rollout replicas. Extend with empty buckets when that mapping is
-        # discoverable, while keeping sample validation based on replicas.
         dispatch_bucket_count = self._speco_dispatch_bucket_count()
-        if dispatch_bucket_count is not None and dispatch_bucket_count > len(buckets):
-            buckets.extend([[] for _ in range(dispatch_bucket_count - len(buckets))])
+        payload = self._speco_get_drafter_scheduler().prepare_collection_payload(
+            source=DrafterCollectionSource.SGLANG,
+            samples=samples,
+            owner_count=num_replicas,
+            dispatch_bucket_count=dispatch_bucket_count,
+            raw_samples=len(samples),
+            collection_id=collection_plan.collection_id,
+        )
 
-        self._speco_set_drafter_global_step()
-        self._speco_collect_rollout_features_rpc("rollout", buckets)
-        self._speco_last_collected_samples = len(samples)
-        return len(samples)
+        outcome = self._speco_execute_collection(
+            collection_plan,
+            payload,
+        )
+        self._speco_last_collected_samples = outcome.collected_samples
+        return outcome.collected_samples
 
     def _speco_owner_route_mapping(self):
         worker_group = self.drafter_wg
@@ -2310,13 +2441,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ]
         return payload_buckets, global_step_buckets, target_sync_bucket_count
 
-    def _speco_sync_target_lm_head_weight(self) -> dict[str, Any]:
+    def _speco_start_target_lm_head_weight_sync(
+        self,
+        training_plan: TrainingPlan | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         sync_started = time.perf_counter()
         training_cfg = self._speco_drafter_training_config()
         if bool(training_cfg.get("use_logits", False)):
-            return {"drafter/target_lm_head_synced": 0}
-        if not self._speco_should_train_drafter_this_step():
-            return {"drafter/target_lm_head_synced": 0}
+            return {"drafter/target_lm_head_synced": 0}, None
+        if training_plan is not None and not training_plan.launch:
+            return {"drafter/target_lm_head_synced": 0}, None
 
         row_selection = self._speco_get_drafter_target_lm_head_row_selection()
         row_indices = (
@@ -2335,156 +2469,164 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         get_actor_lm_head_weight = self._speco_actor_rollout_method(
             "get_actor_lm_head_weight"
         )
+        actor_backend = (
+            str(
+                _get_nested(
+                    self.config,
+                    ("actor_rollout_ref", "actor", "strategy"),
+                    "",
+                )
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+        actor_veomni_param_offload = bool(
+            _get_nested(
+                self.config,
+                ("actor_rollout_ref", "actor", "veomni", "param_offload"),
+                False,
+            )
+        )
+        keep_actor_model_on_device = bool(
+            actor_backend == "veomni"
+            and str(self.device_name).lower() == "npu"
+            and actor_veomni_param_offload
+        )
         fetch_started = time.perf_counter()
-        payloads = self._ray_get_if_needed(get_actor_lm_head_weight(row_indices)) or []
+        payloads = (
+            self._ray_get_if_needed(
+                get_actor_lm_head_weight(
+                    row_indices,
+                    keep_model_on_device=keep_actor_model_on_device,
+                )
+            )
+            or []
+        )
         fetch_elapsed = time.perf_counter() - fetch_started
         payload = self._first_non_null(payloads)
         if payload is None:
-            return {
-                "drafter/target_lm_head_synced": 0,
-                "drafter/target_lm_head_selected_rows": selected_rows,
-                "drafter/target_lm_head_source_vocab_size": source_vocab_size,
-                "timing_s/drafter_sync_target_lm_head": time.perf_counter()
-                - sync_started,
-                "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
-            }
-
-        payload_arg, global_step_arg, _ = (
-            self._speco_build_drafter_target_lm_head_sync_args(payload)
-        )
-        apply_started = time.perf_counter()
-        self._ray_get_if_needed(
-            self.speco_sync_target_lm_head_weight(
-                payload_arg, global_step=global_step_arg
+            return (
+                {
+                    "drafter/target_lm_head_synced": 0,
+                    "drafter/target_lm_head_selected_rows": selected_rows,
+                    "drafter/target_lm_head_source_vocab_size": source_vocab_size,
+                    "timing_s/drafter_sync_target_lm_head": time.perf_counter()
+                    - sync_started,
+                    "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
+                },
+                None,
             )
-        )
-        apply_elapsed = time.perf_counter() - apply_started
+
         export_strategy = (
             str(payload.get("export_strategy", "unknown"))
             if isinstance(payload, dict)
             else "unknown"
         )
-        return {
-            "drafter/target_lm_head_synced": 1,
+        # Reconstructing supervision from last hidden states requires a fresh
+        # target head for every drafter backend. Stage the payload on CPU while
+        # the actor updates, then apply it when the drafter activates.
+        defer_device_apply = isinstance(payload, dict)
+        if defer_device_apply:
+            payload = dict(payload)
+            payload["defer_device_apply"] = True
+        payload_arg, global_step_arg, _ = (
+            self._speco_build_drafter_target_lm_head_sync_args(payload)
+        )
+        dispatch_started = time.perf_counter()
+        pending_refs = self.speco_sync_target_lm_head_weight(
+            payload_arg, global_step=global_step_arg
+        )
+        dispatch_elapsed = time.perf_counter() - dispatch_started
+        metrics = {
+            "drafter/target_lm_head_apply_deferred": int(defer_device_apply),
             "drafter/target_lm_head_selected_rows": selected_rows,
             "drafter/target_lm_head_source_vocab_size": source_vocab_size,
             "drafter/target_lm_head_direct_sparse_export": int(
-                export_strategy == "direct_sparse"
+                export_strategy in {"direct_sparse", "veomni_lm_head_sparse"}
             ),
-            "timing_s/drafter_sync_target_lm_head": time.perf_counter() - sync_started,
             "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
-            "timing_s/drafter_sync_target_lm_head_apply": apply_elapsed,
+            "timing_s/drafter_sync_target_lm_head_dispatch": dispatch_elapsed,
         }
+        pending = {
+            "refs": pending_refs,
+            "dispatch_finished": dispatch_started + dispatch_elapsed,
+            "dispatch_elapsed": dispatch_elapsed,
+            "pre_dispatch_elapsed": dispatch_started - sync_started,
+        }
+        if defer_device_apply and pending_refs is not None:
+            return metrics, pending
 
-    def _speco_train_drafter(self) -> tuple[bool, dict[str, Any]]:
-        train_rpc_started = time.perf_counter()
-        train_results = self._ray_get_if_needed(self.speco_train_drafter()) or []
-        train_rpc_elapsed = time.perf_counter() - train_rpc_started
-        if not isinstance(train_results, list):
-            train_results = [train_results]
+        metrics.update(self._speco_finish_target_lm_head_weight_sync(pending))
+        return metrics, None
 
-        normalized_results = []
-        for result in train_results:
-            if isinstance(result, dict):
-                normalized_results.append(result)
-            else:
-                normalized_results.append(
-                    {
-                        "trained": bool(result),
-                        "triggered": bool(result),
-                        "attempted_steps": int(bool(result)),
-                        "successful_steps": int(bool(result)),
-                        "elapsed_sec": 0.0,
-                        "reason": "legacy_bool_result",
-                    }
-                )
-
-        trained = any(
-            bool(result.get("trained", False)) for result in normalized_results
+    def _speco_finish_target_lm_head_weight_sync(
+        self, pending: dict[str, Any]
+    ) -> dict[str, Any]:
+        wait_started = time.perf_counter()
+        self._ray_get_if_needed(pending.get("refs"))
+        finished = time.perf_counter()
+        wait_elapsed = finished - wait_started
+        dispatch_elapsed = float(pending.get("dispatch_elapsed", 0.0) or 0.0)
+        pre_dispatch_elapsed = float(pending.get("pre_dispatch_elapsed", 0.0) or 0.0)
+        dispatch_finished = float(
+            pending.get("dispatch_finished", wait_started) or wait_started
         )
-        successful_steps_max = max(
-            (int(result.get("successful_steps", 0)) for result in normalized_results),
-            default=0,
+        overlap_window_elapsed = max(
+            wait_started - dispatch_finished,
+            0.0,
         )
-
-        metrics: dict[str, float | int] = {
-            "drafter/trained": int(trained),
-            "drafter/train_successful_steps_max": successful_steps_max,
-            "drafter/train_no_trainable_batch": int(
-                any(
-                    result.get("reason") == "no_trainable_batch"
-                    for result in normalized_results
-                )
+        critical_path_elapsed = pre_dispatch_elapsed + dispatch_elapsed + wait_elapsed
+        return {
+            "drafter/target_lm_head_synced": 1,
+            "timing_s/drafter_sync_target_lm_head": critical_path_elapsed,
+            "timing_s/drafter_sync_target_lm_head_apply": (
+                dispatch_elapsed + wait_elapsed
             ),
-            "drafter/train_activation_failed": int(
-                any(
-                    result.get("reason") == "activation_failed"
-                    for result in normalized_results
-                )
+            "timing_s/drafter_sync_target_lm_head_wait": wait_elapsed,
+            "timing_s/drafter_sync_target_lm_head_overlap_window": (
+                overlap_window_elapsed
             ),
         }
-        for key in (
-            "timing_s/drafter_prepare_batch",
-            "timing_s/drafter_forward_loss",
-            "timing_s/drafter_reduce_loss",
-            "timing_s/drafter_backward",
-            "timing_s/drafter_optimizer",
-            "timing_s/drafter_publish_snapshot",
-            "activation_elapsed_sec",
-            "training_loop_elapsed_sec",
-            "cleanup_elapsed_sec",
-            "elapsed_sec",
-        ):
-            values = []
-            for result in normalized_results:
-                value = _speco_metric_float(result.get(key))
-                if value is not None:
-                    values.append(value)
-            if values:
-                metric_key = {
-                    "activation_elapsed_sec": "timing_s/drafter_worker_activation",
-                    "training_loop_elapsed_sec": "timing_s/drafter_worker_training_loop",
-                    "cleanup_elapsed_sec": "timing_s/drafter_worker_cleanup",
-                    "elapsed_sec": "timing_s/drafter_worker_elapsed",
-                }.get(key, key)
-                metrics[metric_key] = max(values)
-        metrics["timing_s/drafter_train_rpc"] = train_rpc_elapsed
-        return trained, metrics
+
+    def _speco_sync_target_lm_head_weight(
+        self, training_plan: TrainingPlan | None = None
+    ) -> dict[str, Any]:
+        metrics, pending = self._speco_start_target_lm_head_weight_sync(training_plan)
+        if pending is not None:
+            metrics.update(self._speco_finish_target_lm_head_weight_sync(pending))
+        return metrics
+
+    def _speco_train_drafter(
+        self, training_plan: TrainingPlan
+    ) -> tuple[bool, dict[str, Any]]:
+        runtime_state = self._speco_get_drafter_runtime_state()
+        try:
+            event = self._speco_get_drafter_scheduler().on_after_actor_update(
+                AfterActorUpdateContext(
+                    training_plan=training_plan,
+                    runtime_state=runtime_state,
+                )
+            )
+            outcome = event.training_execution
+            if outcome is None:
+                raise RuntimeError(
+                    "Drafter after-actor-update event returned no training outcome"
+                )
+        except Exception:
+            logger.exception(
+                "[DrafterRuntime] synchronous training failed at step=%s",
+                training_plan.source_global_step,
+            )
+            raise
+        return outcome.trained, dict(outcome.metrics)
 
     def _speco_activate_drafter_training_model_before_fit(self) -> None:
         if not self.is_drafter_training_enabled(self.config):
             return
-        activation_results = (
-            self._ray_get_if_needed(self.speco_activate_drafter_training_model()) or []
-        )
-        if not isinstance(activation_results, list):
-            activation_results = [activation_results]
+        self._speco_get_drafter_scheduler().activate_training_workers()
 
-        active_results = [
-            result
-            for result in activation_results
-            if isinstance(result, dict)
-            and result.get("reason") not in {"disabled", "not_in_training_group"}
-        ]
-        failed_results = [
-            result
-            for result in active_results
-            if not bool(result.get("activated", False))
-        ]
-        if failed_results:
-            raise RuntimeError(
-                "SPECO drafter trainer activation failed before RL fit: "
-                f"{failed_results[:3]}"
-            )
-
-    def _speco_should_publish_drafter_weights(self, drafter_trained: bool) -> bool:
-        if not drafter_trained:
-            return False
-        training_cfg = self._speco_drafter_training_config()
-        publish_interval = int(training_cfg.get("publish_interval_steps", 0) or 0)
-        return publish_interval <= 0 or self.global_steps % publish_interval == 0
-
-    def _speco_wait_pending_drafter_publish(self) -> int:
+    def _speco_wait_pending_drafter_publish_rpc(self) -> int:
         if not self._pending_drafter_publish_refs:
             return 0
         pending_refs = self._pending_drafter_publish_refs
@@ -2492,51 +2634,52 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._ray_get_if_needed(pending_refs)
         return len(pending_refs) if isinstance(pending_refs, (list, tuple)) else 1
 
+    def _speco_wait_pending_drafter_publish(self) -> int:
+        scheduler = self._speco_get_drafter_scheduler()
+        if getattr(scheduler, "_publish_executor", None) is None:
+            self._speco_bind_publish_executor()
+        return scheduler.wait_pending_publish()
+
     def _speco_get_published_drafter_weights(self):
         published = self._ray_get_if_needed(self.speco_maybe_publish()) or []
         return self._first_non_null(published)
 
-    def _speco_publish_drafter_weights(self, drafter_trained: bool) -> dict[str, Any]:
-        if not self._speco_should_publish_drafter_weights(drafter_trained):
-            return {"drafter/publish_attempted": 0, "drafter/published": 0}
-
-        wait_started = time.perf_counter()
-        self._speco_wait_pending_drafter_publish()
-        wait_elapsed = time.perf_counter() - wait_started
-        fetch_started = time.perf_counter()
-        published = self._speco_get_published_drafter_weights()
-        fetch_elapsed = time.perf_counter() - fetch_started
-        metrics = {
-            "drafter/publish_attempted": 1,
-            "timing_s/drafter_publish_wait_pending": wait_elapsed,
-            "timing_s/drafter_publish_fetch_snapshot": fetch_elapsed,
-        }
-        if published is None:
-            metrics["drafter/published"] = 0
-            return metrics
-
-        payload = resolve_drafter_publish_payload(published)
-        training_cfg = self._speco_drafter_training_config()
-        publish_async = bool(training_cfg.get("publish_async", False))
+    def _speco_update_rollout_drafter_weights(
+        self, payload: Any, global_step: object, asynchronous: bool
+    ) -> None:
         method_name = (
-            "update_draft_weights_async" if publish_async else "update_draft_weights"
+            "update_draft_weights_async" if asynchronous else "update_draft_weights"
         )
-        update_draft_weights = self._speco_actor_rollout_method(method_name)
-        update_started = time.perf_counter()
-        update_result = update_draft_weights(payload, global_steps=self.global_steps)
-        if publish_async:
+        update_result = self._speco_actor_rollout_method(method_name)(
+            payload, global_steps=global_step
+        )
+        if asynchronous:
             self._pending_drafter_publish_refs = update_result
         else:
             self._ray_get_if_needed(update_result)
-        update_elapsed = time.perf_counter() - update_started
 
-        metrics.update(
-            {
-                "drafter/published": 1,
-                "timing_s/drafter_publish_update_weights": update_elapsed,
-            }
+    def _speco_publish_drafter_weights(
+        self,
+        drafter_trained: bool,
+        training_plan: TrainingPlan | None = None,
+        *,
+        after_weight_update: bool = False,
+    ) -> dict[str, Any]:
+        scheduler = self._speco_get_drafter_scheduler()
+        if getattr(scheduler, "_publish_executor", None) is None:
+            self._speco_bind_publish_executor()
+        context = AfterWeightUpdateContext(
+            global_step=self.global_steps,
+            drafter_trained=drafter_trained,
+            config=self._speco_drafter_schedule_config(),
+            training_plan=training_plan,
         )
-        return metrics
+        event = (
+            scheduler.on_after_weight_update(context)
+            if after_weight_update
+            else scheduler.on_safe_point(context)
+        )
+        return dict(event.metrics or {})
 
     def _speco_update_output_metrics(self, output: Any, metrics: dict[str, Any]):
         if not metrics:
@@ -2620,6 +2763,30 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         finally:
             rollout_generation_target.generate_sequences = original_generate_sequences
 
+    def _speco_bubble_profiler_enabled(self) -> bool:
+        return bool(
+            _get_nested(
+                self.config,
+                ("actor_rollout_ref", "rollout", "drafter", "profile_bubble"),
+                False,
+            )
+        )
+
+    def _speco_augment_log_data(
+        self, data: Any, latest_rollout_metrics: dict[str, float]
+    ) -> Any:
+        if (
+            isinstance(data, dict)
+            and isinstance(latest_rollout_metrics, dict)
+            and data.get("training/global_step") == self.global_steps
+        ):
+            data = dict(data)
+            data.update(latest_rollout_metrics)
+        data = _speco_move_drafter_timing_next_to_update_actor(data)
+        if self._speco_bubble_profiler_enabled():
+            data = inject_bubble_metrics(data)
+        return data
+
     @contextmanager
     def _speco_tracking_metrics_hook(self):
         try:
@@ -2639,27 +2806,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             latest_rollout_metrics = self._speco_current_step_rollout_metrics()
             if "data" in kwargs:
                 kwargs = dict(kwargs)
-                data = kwargs["data"]
-                if (
-                    isinstance(data, dict)
-                    and isinstance(latest_rollout_metrics, dict)
-                    and data.get("training/global_step") == self.global_steps
-                ):
-                    data = dict(data)
-                    data.update(latest_rollout_metrics)
-                kwargs["data"] = _speco_move_drafter_timing_next_to_update_actor(data)
+                kwargs["data"] = self._speco_augment_log_data(
+                    kwargs["data"], latest_rollout_metrics
+                )
                 return original_log(tracking_self, *args, **kwargs)
             if args:
-                data = args[0]
-                if (
-                    isinstance(data, dict)
-                    and isinstance(latest_rollout_metrics, dict)
-                    and data.get("training/global_step") == self.global_steps
-                ):
-                    data = dict(data)
-                    data.update(latest_rollout_metrics)
                 args = (
-                    _speco_move_drafter_timing_next_to_update_actor(data),
+                    self._speco_augment_log_data(args[0], latest_rollout_metrics),
                     *args[1:],
                 )
             return original_log(tracking_self, *args, **kwargs)
@@ -2739,6 +2892,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "ready": False,
             "drafter_trained": False,
             "actor_output": None,
+            "training_plan": None,
         }
 
         def generate_sequences_with_speco(manager_self, *args, **kwargs):
@@ -2785,9 +2939,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_last_oldlogprob_collect_elapsed_sec = 0.0
             self._speco_last_oldlogprob_collect_rpc_elapsed_sec = 0.0
             self._speco_last_oldlogprob_total_elapsed_sec = 0.0
-            collect_interval_matched = self._speco_should_collect_drafter_this_step()
-            train_interval_matched = self._speco_should_train_drafter_this_step()
-            self._speco_last_collect_interval_matched = int(collect_interval_matched)
+            collection_plan = self._speco_plan_drafter_collection(
+                DrafterCollectionSource.OLD_LOGPROB
+            )
+            self._speco_log_drafter_collection_plan(collection_plan)
+            self._speco_last_collect_interval_matched = int(
+                collection_plan.collect_interval_matched
+            )
             prepare_started = time.perf_counter()
             original_batch = batch
 
@@ -2814,7 +2972,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
                 return old_log_prob, old_log_prob_mfu
 
-            if not collect_interval_matched or not train_interval_matched:
+            if not collection_plan.collect:
                 return compute_old_log_prob_without_collection()
 
             batch = _select_policy_model_batch(batch)
@@ -2896,6 +3054,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         def update_actor_with_speco(trainer_self, *args, **kwargs):
             update_actor_started = time.perf_counter()
+            pending_target_lm_head_sync = None
             metrics = {
                 "drafter/raw_drafter_samples": int(
                     getattr(self, "_speco_last_raw_drafter_samples", 0)
@@ -2906,21 +3065,39 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "drafter/collect_interval_matched": int(
                     getattr(self, "_speco_last_collect_interval_matched", 0)
                 ),
-                "drafter/train_interval_matched": int(
-                    self._speco_should_train_drafter_this_step()
-                ),
             }
-            should_train_drafter = self._speco_should_attempt_drafter_train_this_step()
-            if should_train_drafter:
-                self._speco_set_drafter_global_step()
-                metrics.update(self._speco_sync_target_lm_head_weight())
-            else:
-                metrics["drafter/target_lm_head_synced"] = 0
+            collection_plan = getattr(self, "_speco_last_collection_plan", None)
+            if isinstance(collection_plan, CollectionPlan):
+                metrics.update(collection_plan.metrics())
+            collection_outcome = getattr(self, "_speco_last_collection_outcome", None)
+            if isinstance(collection_outcome, CollectionOutcome):
+                metrics.update(collection_outcome.metrics())
+            before_actor_event = self._speco_on_before_actor_update()
+            training_plan = before_actor_event.training_plan
+            if training_plan is None:
+                raise RuntimeError(
+                    "Drafter before-actor-update event returned no training plan"
+                )
+            self._speco_log_drafter_training_plan(training_plan)
+            metrics.update(before_actor_event.metrics or {})
+            metrics["drafter/train_interval_matched"] = int(
+                training_plan.interval_matched
+            )
             actor_started = time.perf_counter()
             actor_output = original_update_actor(*args, **kwargs)
             actor_elapsed = time.perf_counter() - actor_started
-            if should_train_drafter:
-                drafter_trained, train_metrics = self._speco_train_drafter()
+            pending_target_lm_head_sync = self._pending_target_lm_head_sync
+            self._pending_target_lm_head_sync = None
+            if pending_target_lm_head_sync is not None:
+                metrics.update(
+                    self._speco_finish_target_lm_head_weight_sync(
+                        pending_target_lm_head_sync
+                    )
+                )
+            if training_plan.launch:
+                drafter_trained, train_metrics = self._speco_train_drafter(
+                    training_plan
+                )
             else:
                 drafter_trained, train_metrics = (
                     False,
@@ -2928,18 +3105,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         "drafter/trained": 0,
                         "drafter/train_successful_steps_max": 0,
                         "drafter/train_no_trainable_batch": int(
-                            self._speco_should_train_drafter_this_step()
+                            training_plan.reason == "no_trainable_batch"
                         ),
                         "drafter/train_activation_failed": 0,
                     },
                 )
+                train_metrics.update(self._speco_get_drafter_runtime_state().metrics())
             metrics.update(train_metrics)
             if defer_publish_until_update_weights and drafter_trained:
                 pending_drafter_publish["ready"] = True
                 pending_drafter_publish["drafter_trained"] = drafter_trained
                 pending_drafter_publish["actor_output"] = actor_output
+                pending_drafter_publish["training_plan"] = training_plan
             else:
-                metrics.update(self._speco_publish_drafter_weights(drafter_trained))
+                metrics.update(
+                    self._speco_publish_drafter_weights(drafter_trained, training_plan)
+                )
             metrics["timing_s/drafter"] = max(
                 0.0, time.perf_counter() - update_actor_started - actor_elapsed
             )
@@ -2965,7 +3146,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             result = original_checkpoint_update_weights(*args, **kwargs)
             if pending_drafter_publish["ready"]:
                 publish_metrics = self._speco_publish_drafter_weights(
-                    pending_drafter_publish["drafter_trained"]
+                    pending_drafter_publish["drafter_trained"],
+                    pending_drafter_publish["training_plan"],
+                    after_weight_update=True,
                 )
                 self._speco_update_output_metrics(
                     pending_drafter_publish["actor_output"], publish_metrics
@@ -2973,6 +3156,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 pending_drafter_publish["ready"] = False
                 pending_drafter_publish["drafter_trained"] = False
                 pending_drafter_publish["actor_output"] = None
+                pending_drafter_publish["training_plan"] = None
             return result
 
         rollout_generation_target.generate_sequences = MethodType(

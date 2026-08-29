@@ -21,6 +21,8 @@ training, and hot-update logic through `verl_speco`.
   engine.
 - **GPU and NPU examples**: provides example scripts for vLLM, SGLang, and
   vLLM-Ascend style graph settings.
+- **FSDP2 and VeOmni actors**: keeps the drafter trainer on FSDP2 while the
+  main actor can use verl's FSDP/FSDP2 or VeOmni model engine.
 - **Step-level observability**: exposes drafter timing and vLLM speculative
   decoding acceptance metrics, including
   `drafter/spec_decode/mean_acceptance_length`.
@@ -28,6 +30,10 @@ training, and hot-update logic through `verl_speco`.
 ## Architecture
 
 ![verl-SpeCo architecture](docs/assets/speco-architecture.svg)
+
+For the online drafter collection, training, and publish scheduling boundary,
+including how to add a new execution or collection strategy, see the
+[Drafter Scheduler guide](docs/drafter_scheduler.md).
 
 ## Performance Preview
 
@@ -106,6 +112,41 @@ and vLLM-Ascend
 SpeCo keeps the user-facing algorithm as `DSPARK`; on vLLM-Ascend/NPU it
 follows that PR's DSpark path.
 
+### VeOmni Actor Compatibility
+
+VeOmni is an actor training engine in this integration; the drafter itself
+continues to use SpeCo's FSDP2 trainer. Match Uni-Agent's current source
+recommendation when installing VeOmni:
+
+```bash
+uv pip install --no-deps "git+https://github.com/ByteDance-Seed/VeOmni.git@main"
+```
+
+Use `--config-name=speco_veomni_trainer`. The adapter preserves verl's native
+VeOmni handling for dense, MoE, and multimodal actors and adds the SpeCo
+old-logprob hidden-state and lm-head synchronization paths. Ulysses SP, expert
+parallelism, multi-node execution, and router replay remain controlled by
+VeOmni/verl settings; for R3, rollout routing replay must also be enabled.
+
+| VeOmni capability | SpeCo integration |
+| --- | --- |
+| Dense and MoE actor | Supported through verl's VeOmni engine |
+| Ulysses SP | Selected hidden rows are merged over the VeOmni SP group |
+| Expert parallelism | Preserved; lm-head export avoids expert state-dict materialization |
+| Router replay R2 | Preserved through old-logprob and actor update |
+| Router replay R3 | Supported when the rollout backend returns `routed_experts` |
+| Qwen3-VL / Qwen3-Omni / Qwen3.5 text backbone | Explicit layer and final-norm discovery |
+| Multi-node | Uses the distributed groups and Ray ObjectRef routing supplied by verl |
+
+The GPU and NPU entrypoints are
+`examples/run_qwen3-8b_drafter_dspark_veomni_vllm.sh` and
+`examples/run_qwen3-8b_drafter_dspark_veomni_vllm_npu.sh`. Set
+`VEOMNI_SP_SIZE`, `VEOMNI_EP_SIZE`, `VEOMNI_ROUTER_REPLAY_MODE`, `NNODES`,
+`ROLLOUT_DP_SIZE`, and `ROLLOUT_EP_SIZE` to select the parallel layout. R3
+automatically enables rollout routing replay in these scripts.
+The NPU version pair listed in the DSpark compatibility table includes the
+vLLM and vLLM-Ascend routed-experts capture path required by R3.
+
 ## Repository Layout
 
 ```text
@@ -113,6 +154,7 @@ verl_speco/
   main.py                         # Hydra entrypoint
   config/speco_base.yaml          # shared SPECO/drafter defaults
   config/speco_trainer.yaml       # online PPO primary config
+  config/speco_veomni_trainer.yaml # online PPO with a VeOmni actor
   config/draft_trainer.yaml       # standalone drafter primary config
   trainer/speco_ray_trainer.py    # RayPPOTrainer adapter
   workers/speco_worker.py         # drafter trainer worker

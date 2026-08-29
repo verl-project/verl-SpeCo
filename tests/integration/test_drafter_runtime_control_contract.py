@@ -87,6 +87,22 @@ def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
     trainer._pending_drafter_publish_refs = None
     trainer._speco_last_collected_samples = 0
     trainer._ray_get_if_needed = lambda value: value
+    trainer.speco_get_drafter_training_data_status = lambda *args: [
+        {
+            "available": True,
+            "current_step": trainer.global_steps,
+            "current_step_samples": trainer._speco_last_collected_samples,
+            "buffer_samples": trainer._speco_last_collected_samples,
+            "trainable_samples": trainer._speco_last_collected_samples,
+            "trainable_batches": int(trainer._speco_last_collected_samples > 0),
+            "batch_size_per_gpu": 1,
+            "partial_batch_available": False,
+            "oldest_sample_step": trainer.global_steps,
+            "newest_sample_step": trainer.global_steps,
+            "same_step_data_required": False,
+            "target_version": trainer.global_steps,
+        }
+    ]
     return trainer
 
 
@@ -120,29 +136,120 @@ def test_drafter_collect_train_and_publish_intervals() -> None:
         step=6,
     )
 
-    assert trainer._speco_should_collect_drafter_this_step() is True
-    assert trainer._speco_should_train_drafter_this_step() is True
-    assert trainer._speco_should_publish_drafter_weights(True) is False
+    config = trainer._speco_drafter_schedule_config()
+    scheduler = trainer._speco_get_drafter_scheduler()
+    assert scheduler.should_collect(trainer.global_steps, config) is True
+    assert scheduler.training_interval_matched(trainer.global_steps, config) is True
+    assert not scheduler.plan_publish(
+        global_step=trainer.global_steps, drafter_trained=True, config=config
+    ).publish
 
     trainer.global_steps = 8
-    assert trainer._speco_should_collect_drafter_this_step() is True
-    assert trainer._speco_should_train_drafter_this_step() is False
-    assert trainer._speco_should_publish_drafter_weights(True) is True
-    assert trainer._speco_should_publish_drafter_weights(False) is False
+    assert scheduler.should_collect(trainer.global_steps, config) is True
+    assert scheduler.training_interval_matched(trainer.global_steps, config) is False
+    assert scheduler.plan_publish(
+        global_step=trainer.global_steps, drafter_trained=True, config=config
+    ).publish
+    assert not scheduler.plan_publish(
+        global_step=trainer.global_steps, drafter_trained=False, config=config
+    ).publish
 
 
 def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     trainer = _trainer({"training_interval_steps": 5}, step=4)
     trainer._speco_last_collected_samples = 10
-    assert trainer._speco_should_attempt_drafter_train_this_step() is False
+    scheduler = trainer._speco_get_drafter_scheduler()
+    config = trainer._speco_drafter_schedule_config()
+    def plan():
+        return scheduler.prepare_training_plan(
+            trainer._speco_drafter_schedule_context(), config
+        )
+    assert plan().launch is False
 
     trainer.global_steps = 5
     trainer._speco_last_collected_samples = 0
     trainer._speco_oldlogprob_collection_requested = lambda: True
-    assert trainer._speco_should_attempt_drafter_train_this_step() is False
+    assert plan().launch is False
 
     trainer._speco_last_collected_samples = 1
-    assert trainer._speco_should_attempt_drafter_train_this_step() is True
+    assert plan().launch is True
+
+
+def test_sync_scheduler_preserves_released_training_call_order() -> None:
+    trainer = _trainer(
+        {
+            "training_interval_steps": 1,
+            "publish_interval_steps": 0,
+        },
+        step=5,
+    )
+    trainer._speco_last_collected_samples = 1
+    trainer.actor_rollout_wg = _FakeRolloutWorkerGroup()
+    trainer._compute_old_log_prob = lambda batch: batch
+    events = []
+
+    trainer._speco_set_drafter_global_step = lambda **kwargs: events.append(
+        "set_global_step"
+    )
+    trainer._speco_sync_target_lm_head_weight = lambda plan: events.append(
+        "sync_target_lm_head"
+    ) or {"drafter/target_lm_head_synced": 1}
+    trainer._update_actor = lambda *args, **kwargs: events.append(
+        "update_actor"
+    ) or SimpleNamespace(meta_info={"metrics": {}})
+    trainer._speco_train_drafter = lambda plan: events.append(
+        ("train_drafter", plan.max_batches, plan.publish_after_success)
+    ) or (
+        True,
+        {"drafter/trained": 1},
+    )
+    trainer._speco_publish_drafter_weights = lambda trained, plan: events.append(
+        ("publish", trained)
+    ) or {"drafter/publish_attempted": 1, "drafter/published": 1}
+
+    with trainer._speco_online_fit_hooks():
+        output = trainer._update_actor("batch")
+
+    assert events == [
+        "set_global_step",
+        "sync_target_lm_head",
+        "update_actor",
+        ("train_drafter", 100, True),
+        ("publish", True),
+    ]
+    assert output.meta_info["metrics"]["drafter/trained"] == 1
+    assert output.meta_info["metrics"]["drafter/scheduler_used"] == 1
+    assert output.meta_info["metrics"]["drafter/schedule_strategy"] == 0
+    assert output.meta_info["metrics"]["drafter/schedule_reason"] == 3
+
+
+@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "veomni"])
+def test_oldlogprob_collection_accepts_supported_actor_backends(strategy: str) -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_hidden_states_from_sgl": False,
+            "use_logits": False,
+            "old_logprob_hidden_capture_impl": "forward_hook",
+        }
+    )
+    trainer.config.actor_rollout_ref.actor.strategy = strategy
+
+    assert trainer._speco_oldlogprob_collection_enabled() is True
+
+
+def test_oldlogprob_collection_rejects_unknown_actor_backend() -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_hidden_states_from_sgl": False,
+            "use_logits": False,
+        }
+    )
+    trainer.config.actor_rollout_ref.actor.strategy = "unknown"
+
+    with pytest.raises(ValueError, match="fsdp/fsdp2/veomni"):
+        trainer._speco_oldlogprob_collection_enabled()
 
 
 def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None:
@@ -565,6 +672,101 @@ def test_block_drafter_training_sampler_normal_fill_excludes_explicit_hard() -> 
 
     assert len(selected) == 8
     assert sum(1 for item in selected if item["_verl_is_hard"]) == 1
+@pytest.mark.parametrize(
+    ("algorithm", "actor_backend", "actor_device_type", "export_strategy"),
+    [
+        ("DSPARK", "veomni", "npu", "veomni_lm_head_full"),
+        ("DFLASH", "veomni", "npu", "veomni_lm_head_sparse"),
+        ("EAGLE3", "veomni", "cuda", "veomni_lm_head_full"),
+        ("EAGLE1", "fsdp", "npu", "engine_full_param"),
+        ("DOMINO", "fsdp2", "cuda", "engine_full_param"),
+    ],
+)
+def test_target_head_sync_defers_for_all_lm_head_drafters(
+    algorithm: str,
+    actor_backend: str,
+    actor_device_type: str,
+    export_strategy: str,
+) -> None:
+    trainer = _trainer({"training_interval_steps": 1}, step=1)
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = algorithm
+    payload = {
+        "weight": "cpu-weight",
+        "actor_backend": actor_backend,
+        "actor_device_type": actor_device_type,
+        "export_strategy": export_strategy,
+    }
+    received = []
+    trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
+    trainer._speco_actor_rollout_method = lambda name: lambda rows: [payload]
+    trainer._speco_build_drafter_target_lm_head_sync_args = (
+        lambda value: (value, trainer.global_steps, 1)
+    )
+    trainer.speco_sync_target_lm_head_weight = (
+        lambda value, global_step=None: received.append((value, global_step))
+    )
+
+    metrics = trainer._speco_sync_target_lm_head_weight()
+
+    assert metrics["drafter/target_lm_head_apply_deferred"] == 1
+    assert received[0][0].get("defer_device_apply", False) is True
+    assert received[0][1] == 1
+
+
+def test_target_head_transfer_waits_after_actor_update() -> None:
+    trainer = _trainer({"training_interval_steps": 1}, step=1)
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DSPARK"
+    payload = {
+        "weight": "cpu-weight",
+        "actor_backend": "veomni",
+        "actor_device_type": "npu",
+        "export_strategy": "veomni_lm_head_full",
+    }
+    pending_refs = ["pending-target-sync"]
+    resolved = []
+    trainer._ray_get_if_needed = lambda value: resolved.append(value) or value
+    trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
+    trainer._speco_actor_rollout_method = lambda name: lambda rows: [payload]
+    trainer._speco_build_drafter_target_lm_head_sync_args = (
+        lambda value: (value, trainer.global_steps, 1)
+    )
+    trainer.speco_sync_target_lm_head_weight = (
+        lambda value, global_step=None: pending_refs
+    )
+
+    metrics, pending = trainer._speco_start_target_lm_head_weight_sync()
+
+    assert pending is not None
+    assert metrics["drafter/target_lm_head_apply_deferred"] == 1
+    assert resolved == [[payload]]
+
+    metrics.update(trainer._speco_finish_target_lm_head_weight_sync(pending))
+
+    assert resolved == [[payload], pending_refs]
+    assert metrics["drafter/target_lm_head_synced"] == 1
+
+
+def test_target_head_sync_is_skipped_when_training_uses_logits() -> None:
+    trainer = _trainer({"training_interval_steps": 1, "use_logits": True}, step=1)
+
+    def unexpected_actor_method(name):
+        raise AssertionError(f"unexpected actor method lookup: {name}")
+
+    trainer._speco_actor_rollout_method = unexpected_actor_method
+
+    metrics, pending = trainer._speco_start_target_lm_head_weight_sync()
+
+    assert metrics["drafter/target_lm_head_synced"] == 0
+    assert pending is None
+
+
+def test_target_head_worker_dispatch_is_nonblocking() -> None:
+    from verl.single_controller.base.decorator import MAGIC_ATTR
+    from verl_speco.workers.speco_worker import SpecoWorker
+
+    attrs = getattr(SpecoWorker.sync_target_lm_head_weight, MAGIC_ATTR)
+
+    assert attrs["blocking"] is False
 
 
 def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:

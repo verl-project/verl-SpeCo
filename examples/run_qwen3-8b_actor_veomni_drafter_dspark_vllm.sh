@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+set -xeuo pipefail
+
+# VeOmni follows the same source recommendation as Uni-Agent:
+# uv pip install --no-deps "git+https://github.com/ByteDance-Seed/VeOmni.git@main"
+
+project_name='verl_grpo_example_dspark_veomni'
+exp_name='qwen3_8b_dspark_veomni_vllm_gpu'
+
+gen_tp=${GEN_TP:-2}
+ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
+nnodes=${NNODES:-1}
+veomni_sp_size=${VEOMNI_SP_SIZE:-1}
+veomni_ep_size=${VEOMNI_EP_SIZE:-1}
+rollout_dp_size=${ROLLOUT_DP_SIZE:-1}
+rollout_ep_size=${ROLLOUT_EP_SIZE:-1}
+router_replay_mode=${VEOMNI_ROUTER_REPLAY_MODE:-disabled}
+ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
+ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
+
+case "${router_replay_mode,,}" in
+    disabled)
+        router_replay_mode=disabled
+        enable_rollout_routing_replay=False
+        ;;
+    r2)
+        router_replay_mode=R2
+        enable_rollout_routing_replay=False
+        ;;
+    r3)
+        router_replay_mode=R3
+        enable_rollout_routing_replay=True
+        ;;
+    *)
+        echo "VEOMNI_ROUTER_REPLAY_MODE must be disabled, R2, or R3" >&2
+        exit 2
+        ;;
+esac
+
+MODEL_PATH=${MODEL_PATH:-/path/to/model}
+CKPTS_DIR=${CKPTS_DIR:-/path/to/checkpoint}
+TRAIN_FILE=${TRAIN_FILE:-/path/to/train_file}
+TEST_FILE=${TEST_FILE:-/path/to/test_file}
+DRAFTER_PATH=${DRAFTER_PATH:-/path/to/vllm-compatible-dspark-drafter}
+
+PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_veomni_trainer \
+    algorithm.adv_estimator=grpo \
+    ray_kwargs.ray_init.num_cpus=${ray_num_cpus} \
+    +ray_kwargs.ray_init._system_config.prestart_worker_first_driver=false \
+    +ray_kwargs.ray_init._system_config.num_workers_soft_limit=${ray_worker_soft_limit} \
+    data.train_files=${TRAIN_FILE} \
+    data.val_files=${TEST_FILE} \
+    data.train_batch_size=16 \
+    data.max_prompt_length=512 \
+    data.max_response_length=8192 \
+    data.filter_overlong_prompts=True \
+    data.filter_overlong_prompts_workers=64 \
+    data.truncation=error \
+    actor_rollout_ref.model.path=${MODEL_PATH} \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.calculate_entropy=False \
+    actor_rollout_ref.actor.use_torch_compile=False \
+    actor_rollout_ref.actor.veomni.param_offload=True \
+    actor_rollout_ref.actor.veomni.optimizer_offload=True \
+    actor_rollout_ref.actor.veomni.enable_full_shard=True \
+    actor_rollout_ref.actor.veomni.fsdp_size=-1 \
+    actor_rollout_ref.actor.veomni.ulysses_parallel_size=${veomni_sp_size} \
+    actor_rollout_ref.actor.veomni.expert_parallel_size=${veomni_ep_size} \
+    actor_rollout_ref.actor.veomni.attn_implementation=flash_attention_2 \
+    actor_rollout_ref.actor.veomni.router_replay.mode=${router_replay_mode} \
+    actor_rollout_ref.rollout.temperature=0.6 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
+    actor_rollout_ref.rollout.data_parallel_size=${rollout_dp_size} \
+    actor_rollout_ref.rollout.expert_parallel_size=${rollout_ep_size} \
+    actor_rollout_ref.rollout.enable_rollout_routing_replay=${enable_rollout_routing_replay} \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.enforce_eager=False \
+    actor_rollout_ref.rollout.enable_chunked_prefill=True \
+    actor_rollout_ref.rollout.enable_prefix_caching=True \
+    actor_rollout_ref.rollout.max_num_seqs=256 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=12288 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.n=5 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.veomni.param_offload=True \
+    actor_rollout_ref.ref.veomni.ulysses_parallel_size=${veomni_sp_size} \
+    actor_rollout_ref.ref.veomni.expert_parallel_size=${veomni_ep_size} \
+    actor_rollout_ref.rollout.drafter.enable=True \
+    actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
+    actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH} \
+    actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK \
+    actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True \
+    actor_rollout_ref.rollout.drafter.training.old_logprob_hidden_capture_impl=forward_hook \
+    actor_rollout_ref.rollout.drafter.training.dspark_block_size=7 \
+    actor_rollout_ref.rollout.drafter.training.dspark_num_anchors=32 \
+    actor_rollout_ref.rollout.drafter.training.dspark_max_window=512 \
+    actor_rollout_ref.rollout.drafter.training.dspark_loss_mode=full_vocab \
+    actor_rollout_ref.rollout.drafter.training.dspark_loss_decay_gamma=7 \
+    actor_rollout_ref.rollout.drafter.training.dspark_num_target_layers=5 \
+    actor_rollout_ref.rollout.drafter.training.dspark_num_hidden_layers=5 \
+    actor_rollout_ref.rollout.drafter.training.dspark_markov_rank=256 \
+    actor_rollout_ref.rollout.drafter.training.dspark_markov_head_type=vanilla \
+    actor_rollout_ref.rollout.drafter.training.target_lm_head_row_restricted_sync=False \
+    actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=0.1 \
+    actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=0.45 \
+    actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=0.0 \
+    actor_rollout_ref.rollout.drafter.rollout.spec_steps=1 \
+    actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
+    actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=7 \
+    actor_rollout_ref.rollout.drafter.training.step=10 \
+    actor_rollout_ref.rollout.drafter.training.collect_interval_steps=5 \
+    actor_rollout_ref.rollout.drafter.training.training_interval_steps=5 \
+    actor_rollout_ref.rollout.drafter.training.publish_async=False \
+    actor_rollout_ref.rollout.drafter.training.publish_dtype=bf16 \
+    actor_rollout_ref.rollout.drafter.training.draft_update_weights_bucket_megabytes=512 \
+    actor_rollout_ref.rollout.load_format=auto \
+    algorithm.use_kl_in_reward=False \
+    trainer.val_before_train=False \
+    trainer.critic_warmup=0 \
+    trainer.logger='["console"]' \
+    trainer.project_name=${project_name} \
+    trainer.experiment_name=${exp_name} \
+    trainer.n_gpus_per_node=${ppo_gpus_per_node} \
+    trainer.nnodes=${nnodes} \
+    trainer.default_local_dir=${CKPTS_DIR} \
+    trainer.total_training_steps=100 \
+    trainer.save_freq=20 \
+    trainer.test_freq=5 \
+    trainer.total_epochs=6 \
+    "$@"

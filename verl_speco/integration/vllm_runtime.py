@@ -2971,21 +2971,55 @@ class SpecoVLLMWeightSyncCompatExtension(_VLLMWorkerExtensionBase):
 class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     """vLLM worker extension that can update only the speculative draft model."""
 
+    _speco_draft_level2_snapshot: dict[str, Any] | None = None
+
     def __new__(cls, **kwargs):
         try:
             instance = super().__new__(cls, **kwargs)
         except TypeError:
             instance = super().__new__(cls)
         # vLLM's extension mechanism forbids overriding methods that already
-        # exist on Worker (e.g. wake_up). Use __new__ (dunder, skipped by the
-        # conflict check) to install an instance-level wrapper instead.
+        # exist on Worker (e.g. sleep/wake_up). Use __new__ (dunder, skipped by
+        # the conflict check) to install instance-level wrappers instead.
         # Python resolves instance attributes before class methods.
+        _orig_sleep = getattr(type(instance), "sleep", None)
         _orig_wake_up = getattr(type(instance), "wake_up", None)
+
+        if callable(_orig_sleep):
+
+            def _speco_sleep_hook(*args, **kwargs):
+                level = kwargs.get("level", args[0] if args else 1)
+                if int(level) == 2:
+                    saved = instance._speco_snapshot_draft_for_level2()
+                    if saved > 0:
+                        logger.warning(
+                            "[speco draft sleep] drafter state saved before "
+                            "level-2 sleep (%d tensors)",
+                            saved,
+                        )
+                return _orig_sleep(instance, *args, **kwargs)
+
+            instance.sleep = _speco_sleep_hook
+
         if not callable(_orig_wake_up):
             return instance
 
         def _speco_wake_up_hook(*args, **kwargs):
             result = _orig_wake_up(instance, *args, **kwargs)
+            tags = kwargs.get("tags", args[0] if args else None)
+            wakes_weights = tags is None or "weights" in tags
+            if not wakes_weights:
+                return result
+
+            restored = instance._speco_restore_draft_after_level2()
+            if restored > 0:
+                logger.warning(
+                    "[speco draft wake_up] drafter state restored after "
+                    "level-2 wake_up (%d tensors)",
+                    restored,
+                )
+                return result
+
             reloaded = instance._speco_reload_draft_from_checkpoint()
             if reloaded > 0:
                 logger.warning(
@@ -3051,6 +3085,84 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
 
     def _speco_is_dflash_draft(self) -> bool:
         return self._speco_draft_method() in ("dflash", "dspark")
+
+    def _speco_snapshot_draft_for_level2(self) -> int:
+        """Keep the current TP-local draft state across level-2 sleep.
+
+        vLLM allocates target and draft parameters in the ``weights`` CuMem
+        pool. Level-2 sleep discards that pool, while verl reloads only the
+        target model from the actor. Snapshotting the draft preserves the
+        latest online-published state for every speculative method.
+        """
+        draft_model, _ = self._speco_resolve_draft_model()
+        if draft_model is None:
+            return 0
+
+        snapshot = {
+            name: tensor.detach().to(device="cpu", copy=True)
+            for named_tensors in (
+                draft_model.named_parameters(),
+                draft_model.named_buffers(),
+            )
+            for name, tensor in named_tensors
+        }
+        if not snapshot:
+            return 0
+
+        self._speco_draft_level2_snapshot = snapshot
+        return len(snapshot)
+
+    def _speco_restore_draft_after_level2(self) -> int:
+        snapshot = getattr(self, "_speco_draft_level2_snapshot", None)
+        if snapshot is None:
+            return 0
+
+        draft_model, _ = self._speco_resolve_draft_model()
+        if draft_model is None:
+            raise RuntimeError(
+                "Cannot restore the draft level-2 snapshot: draft model not found"
+            )
+
+        current_tensors = dict(draft_model.named_parameters())
+        current_tensors.update(draft_model.named_buffers())
+        restore_errors = []
+
+        import torch
+
+        with torch.no_grad():
+            for name, saved_tensor in snapshot.items():
+                current_tensor = current_tensors.get(name)
+                if current_tensor is None:
+                    restore_errors.append(f"missing tensor {name}")
+                    continue
+                if tuple(current_tensor.shape) != tuple(saved_tensor.shape):
+                    restore_errors.append(
+                        f"shape mismatch for {name}: expected {tuple(saved_tensor.shape)}, "
+                        f"got {tuple(current_tensor.shape)}"
+                    )
+                    continue
+                try:
+                    current_tensor.copy_(saved_tensor, non_blocking=False)
+                except Exception as exc:  # noqa: BLE001
+                    restore_errors.append(f"failed to restore {name}: {exc}")
+
+        if restore_errors:
+            raise RuntimeError(
+                "Failed to restore the draft after level-2 wake-up: "
+                + "; ".join(restore_errors[:8])
+            )
+
+        self._speco_rebuild_draft_metadata_buffers(draft_model)
+        restored = len(snapshot)
+        self._speco_draft_level2_snapshot = None
+        return restored
+
+    @staticmethod
+    def _speco_rebuild_draft_metadata_buffers(draft_model) -> None:
+        inner_model = getattr(draft_model, "model", None)
+        rebuild = getattr(inner_model, "_build_fused_kv_buffers", None)
+        if callable(rebuild):
+            rebuild()
 
     def _speco_update_draft_weights(self, weights: list[tuple[str, Any]]) -> int:
         draft_model, proposer = self._speco_resolve_draft_model()
@@ -3235,9 +3347,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             )
             inner_model.load_weights(iter(translated_weights))
 
-            # Rebuild fused KV buffers (torch.cat snapshot, not a view)
+            # Rebuild fused KV buffers (torch.cat snapshot, not a view).
             try:
-                inner_model._build_fused_kv_buffers()
+                self._speco_rebuild_draft_metadata_buffers(draft_model)
             except Exception as exc:
                 logger.warning(
                     "[speco draft update] _build_fused_kv_buffers failed: %s", exc

@@ -14,8 +14,9 @@
 """Runtime patch for SPECO old-logprob hidden-state collection.
 
 The SPECO package must not edit the upstream ``verl`` source tree. This module
-therefore installs a narrow in-process patch on the upstream FSDP LM-head engine
-inside actor worker processes when old-logprob collection is explicitly enabled.
+therefore installs narrow in-process patches on upstream FSDP/VeOmni LM-head
+engines inside actor worker processes when old-logprob collection is explicitly
+enabled.
 """
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ _TIMING_WIDTH = 5
 
 _PATCHED = False
 _BATCH_POSTPROCESS_PATCHED = False
+_BATCH_POSTPROCESS_PATCHED_MODULES: set[str] = set()
 _POSTPROCESS_PATCHED = False
 
 
@@ -692,7 +694,9 @@ def _extract_oldlogprob_non_tensor_model_output(
 
 def _install_oldlogprob_fsdp_batch_postprocess_patch(transformer_module: Any) -> bool:
     global _BATCH_POSTPROCESS_PATCHED
-    if _BATCH_POSTPROCESS_PATCHED:
+
+    module_name = str(getattr(transformer_module, "__name__", "unknown"))
+    if module_name in _BATCH_POSTPROCESS_PATCHED_MODULES:
         return True
 
     postprocess_batch_func = getattr(transformer_module, "postprocess_batch_func", None)
@@ -704,6 +708,7 @@ def _install_oldlogprob_fsdp_batch_postprocess_patch(transformer_module: Any) ->
     if getattr(
         transformer_module, "_speco_oldlogprob_patched_batch_postprocess", False
     ):
+        _BATCH_POSTPROCESS_PATCHED_MODULES.add(module_name)
         _BATCH_POSTPROCESS_PATCHED = True
         return True
 
@@ -730,9 +735,57 @@ def _install_oldlogprob_fsdp_batch_postprocess_patch(transformer_module: Any) ->
 
     transformer_module.postprocess_batch_func = speco_postprocess_batch_func
     transformer_module._speco_oldlogprob_patched_batch_postprocess = True
+    _BATCH_POSTPROCESS_PATCHED_MODULES.add(module_name)
     _BATCH_POSTPROCESS_PATCHED = True
-    logger.warning("SPECO old-logprob hidden ObjectRef batch postprocess patch active")
+    logger.warning(
+        "SPECO old-logprob hidden ObjectRef batch postprocess patch active: module=%s",
+        module_name,
+    )
     return True
+
+
+def _install_oldlogprob_backend_batch_postprocess_patch(
+    actor_backend: str | None,
+) -> bool:
+    backend = str(actor_backend or "fsdp").strip().lower()
+    if backend != "veomni":
+        return True
+
+    try:
+        module = importlib.import_module("verl.workers.engine.veomni.transformer_impl")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Unable to install SPECO VeOmni old-logprob batch postprocess patch: %s",
+            exc,
+        )
+        return False
+
+    engine_cls = getattr(module, "VeOmniEngineWithLMHead", None)
+    if engine_cls is None:
+        logger.warning(
+            "Unable to install SPECO VeOmni old-logprob batch postprocess patch: "
+            "missing VeOmniEngineWithLMHead"
+        )
+        return False
+    try:
+        fsdp_module = importlib.import_module(
+            "verl.workers.engine.fsdp.transformer_impl"
+        )
+        fsdp_engine_cls = getattr(fsdp_module, "FSDPEngineWithLMHead", None)
+        if fsdp_engine_cls is None or not issubclass(engine_cls, fsdp_engine_cls):
+            logger.warning(
+                "Unable to install SPECO VeOmni old-logprob batch postprocess "
+                "patch: VeOmniEngineWithLMHead no longer inherits "
+                "FSDPEngineWithLMHead"
+            )
+            return False
+    except (ImportError, TypeError) as exc:
+        logger.warning(
+            "Unable to validate the SPECO VeOmni old-logprob engine contract: %s",
+            exc,
+        )
+        return False
+    return _install_oldlogprob_fsdp_batch_postprocess_patch(module)
 
 
 def _build_selection_context(
@@ -1418,6 +1471,9 @@ def _find_layers_and_final_norm(engine: Any):
 
     candidates = (
         ("model.layers", "model.norm"),
+        ("model.language_model.layers", "model.language_model.norm"),
+        ("language_model.layers", "language_model.norm"),
+        ("thinker.model.layers", "thinker.model.norm"),
         ("base_model.model.layers", "base_model.model.norm"),
         ("model.decoder.layers", "model.decoder.final_layer_norm"),
         ("transformer.h", "transformer.ln_f"),
@@ -1664,15 +1720,21 @@ def _select_oldlogprob_hidden_states(
     return output
 
 
-def install_oldlogprob_hidden_runtime_patch() -> bool:
-    """Patch upstream FSDP LM-head engine methods in the current process."""
+def install_oldlogprob_hidden_runtime_patch(
+    actor_backend: str | None = None,
+) -> bool:
+    """Patch upstream FSDP/VeOmni LM-head paths in the current process."""
 
     global _PATCHED
+    backend = str(actor_backend or "fsdp").strip().lower()
     if _PATCHED:
         module = importlib.import_module("verl.workers.engine.fsdp.transformer_impl")
         _install_oldlogprob_fsdp_batch_postprocess_patch(module)
-        _install_oldlogprob_training_worker_postprocess_patch()
-        return True
+        backend_patched = _install_oldlogprob_backend_batch_postprocess_patch(backend)
+        worker_patched = _install_oldlogprob_training_worker_postprocess_patch()
+        if backend != "veomni":
+            return True
+        return bool(backend_patched and worker_patched)
 
     try:
         module = importlib.import_module("verl.workers.engine.fsdp.transformer_impl")
@@ -1698,7 +1760,10 @@ def install_oldlogprob_hidden_runtime_patch() -> bool:
         )
         return False
 
-    _install_oldlogprob_fsdp_batch_postprocess_patch(module)
+    fsdp_batch_patched = _install_oldlogprob_fsdp_batch_postprocess_patch(module)
+    backend_batch_patched = _install_oldlogprob_backend_batch_postprocess_patch(backend)
+    if backend == "veomni" and (not fsdp_batch_patched or not backend_batch_patched):
+        return False
 
     if not getattr(engine_cls, "_speco_oldlogprob_patched_inputs", False):
 
@@ -1789,10 +1854,13 @@ def install_oldlogprob_hidden_runtime_patch() -> bool:
         engine_cls.forward_step = speco_forward_step
         engine_cls._speco_oldlogprob_patched_forward_step = True
 
-    _install_oldlogprob_training_worker_postprocess_patch()
+    worker_patched = _install_oldlogprob_training_worker_postprocess_patch()
+    if backend == "veomni" and not worker_patched:
+        return False
 
     _PATCHED = True
     logger.warning(
-        "SPECO old-logprob hidden runtime patch active for upstream FSDP LM-head engine"
+        "SPECO old-logprob hidden runtime patch active: actor_backend=%s",
+        backend,
     )
     return True

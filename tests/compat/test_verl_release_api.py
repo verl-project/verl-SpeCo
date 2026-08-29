@@ -70,6 +70,14 @@ REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
         "set_numa_affinity",
     ),
     "verl.workers.engine_workers": ("ActorRolloutRefWorker", "TrainingWorker"),
+    "verl.workers.engine.veomni.transformer_impl": (
+        "VeOmniEngineWithLMHead",
+        "postprocess_batch_func",
+    ),
+    "verl.workers.engine.veomni.utils": (
+        "load_veomni_model_to_gpu",
+        "offload_veomni_model_to_cpu",
+    ),
     "verl.workers.rollout.replica": ("RolloutReplica", "TokenOutput"),
     "verl.workers.rollout.llm_server": ("LLMServerClient",),
     "verl.workers.rollout.vllm_rollout.vllm_async_server": (

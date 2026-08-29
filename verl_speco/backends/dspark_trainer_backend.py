@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import os
 from copy import deepcopy
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import torch
 import torch.nn.functional as F
@@ -658,6 +658,33 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         if value is not None:
             return value
         return training_cfg.get(dflash_key, default)
+
+    def _build_target_lm_head(self, target_model_path: str, target_hf_config=None):
+        target_lm_head = super()._build_target_lm_head(
+            target_model_path, target_hf_config
+        )
+        actor_config = getattr(self.config, "actor", None)
+        actor_strategy = (
+            ""
+            if actor_config is None
+            else (
+                actor_config.get("strategy", "")
+                if hasattr(actor_config, "get")
+                else getattr(actor_config, "strategy", "")
+            )
+        )
+        target_weight = getattr(getattr(target_lm_head, "fc", None), "weight", None)
+        if str(actor_strategy).lower() == "veomni" and torch.is_tensor(target_weight):
+            target_weight_tensor = cast(torch.Tensor, target_weight)
+            if (
+                target_weight_tensor.device.type == "npu"
+                and target_weight_tensor.dtype != torch.bfloat16
+            ):
+                target_lm_head = target_lm_head.to(dtype=torch.bfloat16)
+                logger.debug(
+                    "[dspark-trainer] keep the frozen NPU VeOmni target lm_head in bfloat16"
+                )
+        return target_lm_head
 
     def _normalize_dflash_config(
         self, drafter_config, target_hf_config, normalized_state, spec_model_path

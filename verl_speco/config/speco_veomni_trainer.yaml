@@ -1,0 +1,24 @@
+# SPECO online PPO trainer with a VeOmni actor and an FSDP2 drafter.
+
+defaults:
+  - ppo_trainer
+  - speco_base
+  - _self_
+  - override model_engine: veomni
+  - override actor@actor_rollout_ref.actor: veomni_actor
+  - override ref@actor_rollout_ref.ref: veomni_ref
+  - override critic@critic: veomni_critic
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+actor_rollout_ref:
+  rollout:
+    drafter:
+      training:
+        # The drafter remains FSDP2 even though the actor uses VeOmni.
+        fsdp_config:
+          wrap_policy: {}
+          use_orig_params: false
+          forward_prefetch: false
