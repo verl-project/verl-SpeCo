@@ -79,17 +79,21 @@ def resolve_drafter_hidden_states_layout(algorithm: Any, training_cfg: Any) -> s
     DFlash-family drafters (DFlash, DSpark, Domino) consume the raw aux context
     layers, while EAGLE-family drafters also need the final hidden state to
     rebuild the target distribution. DSpark additionally needs the final hidden
-    for its L1 loss.
+    for its L1 and confidence-target losses.
     """
 
     algorithm = str(algorithm or "").strip().upper()
     if algorithm not in DFLASH_FAMILY_ALGORITHMS:
         return "eagle3_aux_plus_last"
-    if (
-        algorithm == "DSPARK"
-        and float(_get_nested(training_cfg, ("dspark_l1_loss_alpha",), 0.9) or 0.0) > 0
-    ):
-        return "dflash_aux_plus_last"
+    if algorithm == "DSPARK":
+        l1_alpha = float(
+            _get_nested(training_cfg, ("dspark_l1_loss_alpha",), 0.9) or 0.0
+        )
+        confidence_alpha = float(
+            _get_nested(training_cfg, ("dspark_confidence_loss_alpha",), 0.0) or 0.0
+        )
+        if l1_alpha > 0 or confidence_alpha > 0:
+            return "dflash_aux_plus_last"
     return "dflash_aux"
 
 

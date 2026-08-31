@@ -64,6 +64,14 @@ def test_factory_rejects_unknown_algorithm_before_importing_a_backend() -> None:
         ("DSPARK", {}, "dflash_aux_plus_last"),
         ("DSPARK", {"dspark_l1_loss_alpha": 0.0}, "dflash_aux"),
         ("DSPARK", {"dspark_l1_loss_alpha": None}, "dflash_aux"),
+        (
+            "DSPARK",
+            {
+                "dspark_l1_loss_alpha": 0.0,
+                "dspark_confidence_loss_alpha": 1.0,
+            },
+            "dflash_aux_plus_last",
+        ),
     ],
 )
 def test_hidden_states_layout_per_algorithm(algorithm, training_cfg, expected) -> None:

@@ -78,14 +78,17 @@ class DSparkTrainingModel(DFlashTrainingModel):
         self.l1_loss_alpha = float(l1_loss_alpha)
         self.confidence_head_alpha = float(confidence_head_alpha)
         self.l1_chunk_size = int(l1_chunk_size or 0)
-        if self.confidence_head_alpha > 0:
-            raise NotImplementedError(
-                "DSpark confidence loss needs target acceptance targets from target logits; "
-                "set dspark_confidence_loss_alpha=0 for the current CE-only trainer path."
-            )
+        if self.confidence_head_alpha < 0:
+            raise ValueError("DSpark confidence loss alpha must be non-negative")
         confidence_head = getattr(self.draft_model, "confidence_head", None)
+        if self.confidence_head_alpha > 0 and confidence_head is None:
+            raise ValueError(
+                "DSpark confidence loss requires an enabled confidence head. "
+                "Set dspark_confidence_head_alpha>0 or enable_confidence_head=true."
+            )
         if confidence_head is not None:
-            confidence_head.requires_grad_(False)
+            confidence_head.requires_grad_(self.confidence_head_alpha > 0)
+        if confidence_head is not None and self.confidence_head_alpha <= 0:
             logger.info(
                 "[dspark-trainer] confidence head is loaded but frozen because confidence loss is disabled"
             )
@@ -248,7 +251,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
             ),
         )
 
-    def _compute_l1_loss_for_active(
+    def _compute_distribution_losses_for_active(
         self,
         *,
         active_hidden: torch.Tensor,
@@ -257,13 +260,17 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_weights: torch.Tensor,
         lm_head_weight: torch.Tensor,
         active_draft_log_probs: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if active_hidden.numel() == 0:
             zero = active_weights.new_zeros(())
-            return zero, zero
+            return zero, zero, zero, zero
 
         l1_sum = active_weights.new_zeros((), dtype=torch.float32)
-        l1_den = active_weights.float().sum()
+        l1_den = active_weights.new_zeros((), dtype=torch.float32)
+        if self.l1_loss_alpha > 0:
+            l1_den = active_weights.float().sum()
+        confidence_sum = active_weights.new_zeros((), dtype=torch.float32)
+        confidence_den = active_weights.new_zeros((), dtype=torch.float32)
         active_count = int(active_hidden.size(0))
         if active_draft_log_probs is not None:
             expected_shape = (active_count, int(lm_head_weight.size(0)))
@@ -295,8 +302,50 @@ class DSparkTrainingModel(DFlashTrainingModel):
             target_logits = F.linear(target_hidden_chunk, lm_head_weight)
             target_probs = torch.softmax(target_logits.float(), dim=-1)
             l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
-            l1_sum = l1_sum + (l1_dist * weights_chunk).sum()
-        return l1_sum, l1_den
+            if self.l1_loss_alpha > 0:
+                l1_sum = l1_sum + (l1_dist * weights_chunk).sum()
+            if self.confidence_head_alpha > 0:
+                confidence_logits = self.draft_model.predict_confidence(
+                    hidden_chunk,
+                    prev_token_ids=prev_chunk,
+                )
+                if confidence_logits is None:
+                    raise ValueError(
+                        "DSpark confidence loss requires draft_model.confidence_head"
+                    )
+                if confidence_logits.shape != l1_dist.shape:
+                    raise ValueError(
+                        "DSpark confidence logits must match the active-token shape: "
+                        f"expected={tuple(l1_dist.shape)} got={tuple(confidence_logits.shape)}"
+                    )
+                # Under rejection sampling with tokens proposed from the draft
+                # distribution, 1 - TV(p_draft, p_target) is the expected
+                # single-token acceptance rate. Use it as a distribution-overlap
+                # target and detach it so the confidence objective cannot move
+                # the target it is trying to calibrate against.
+                acceptance_target = (1.0 - 0.5 * l1_dist).clamp(0.0, 1.0).detach()
+                confidence_loss = F.binary_cross_entropy_with_logits(
+                    confidence_logits.float(),
+                    acceptance_target,
+                    reduction="none",
+                )
+                finite_confidence = torch.isfinite(confidence_loss)
+                confidence_weights = weights_chunk * finite_confidence.to(
+                    dtype=weights_chunk.dtype
+                )
+                confidence_sum = (
+                    confidence_sum
+                    + (
+                        torch.where(
+                            finite_confidence,
+                            confidence_loss,
+                            torch.zeros_like(confidence_loss),
+                        )
+                        * confidence_weights
+                    ).sum()
+                )
+                confidence_den = confidence_den + confidence_weights.sum()
+        return l1_sum, l1_den, confidence_sum, confidence_den
 
     def _should_debug_log(self) -> bool:
         if not self.debug_log:
@@ -458,6 +507,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
         local_ce_den = torch.zeros((), dtype=torch.float32, device=device)
         local_l1_sum = torch.zeros((), dtype=torch.float32, device=device)
         local_l1_den = torch.zeros((), dtype=torch.float32, device=device)
+        local_confidence_sum = torch.zeros((), dtype=torch.float32, device=device)
+        local_confidence_den = torch.zeros((), dtype=torch.float32, device=device)
         active_logits = None
         active_log_probs = None
         restricted_vocab = None
@@ -508,38 +559,58 @@ class DSparkTrainingModel(DFlashTrainingModel):
             valid_token_count = local_ce_den.clamp(min=1e-6)
             local_ploss_sum = (active_loss * active_loss_weights).sum()
             ce_loss = local_ploss_sum / valid_token_count
-            if self.l1_loss_alpha > 0:
+            needs_target_distribution = (
+                self.l1_loss_alpha > 0 or self.confidence_head_alpha > 0
+            )
+            if needs_target_distribution:
                 if active_target_hidden is None:
                     raise ValueError(
-                        "DSpark L1 loss requires target_last_hidden_states. "
-                        "Enable old-logprob dflash_aux_plus_last collection or set dspark_l1_loss_alpha=0."
+                        "DSpark L1/confidence losses require target_last_hidden_states. "
+                        "Enable old-logprob dflash_aux_plus_last collection or disable both "
+                        "dspark_l1_loss_alpha and dspark_confidence_loss_alpha."
                     )
                 finite_target_hidden = torch.isfinite(active_target_hidden).all(dim=-1)
-                l1_mask = finite_loss & finite_target_hidden
-                if l1_mask.any():
+                distribution_mask = finite_loss & finite_target_hidden
+                if distribution_mask.any():
                     reusable_draft_log_probs = None
                     # Full-vocab CE already normalizes the complete LM head and Markov bias.
-                    # Restricted CE must build separate full-vocab probabilities for L1.
+                    # Restricted CE must build separate full-vocab probabilities for
+                    # the L1 and confidence targets.
                     if restricted_vocab is None:
                         if active_log_probs is None:
-                            raise ValueError("DSpark L1 loss requires active_log_probs")
+                            raise ValueError(
+                                "DSpark distribution losses require active_log_probs"
+                            )
                         reusable_draft_log_probs = (
                             active_log_probs
-                            if l1_mask.all()
-                            else active_log_probs[l1_mask]
+                            if distribution_mask.all()
+                            else active_log_probs[distribution_mask]
                         )
-                    local_l1_sum, local_l1_den = self._compute_l1_loss_for_active(
-                        active_hidden=active_hidden[l1_mask],
-                        active_prev_tokens=active_prev_tokens[l1_mask],
-                        active_target_hidden=active_target_hidden[l1_mask],
-                        active_weights=active_loss_weights[l1_mask],
+                    (
+                        local_l1_sum,
+                        local_l1_den,
+                        local_confidence_sum,
+                        local_confidence_den,
+                    ) = self._compute_distribution_losses_for_active(
+                        active_hidden=active_hidden[distribution_mask],
+                        active_prev_tokens=active_prev_tokens[distribution_mask],
+                        active_target_hidden=active_target_hidden[distribution_mask],
+                        active_weights=active_loss_weights[distribution_mask],
                         lm_head_weight=lm_head_weight,
                         active_draft_log_probs=reusable_draft_log_probs,
                     )
                 l1_loss = local_l1_sum / local_l1_den.clamp(min=1e-6)
+                confidence_loss = local_confidence_sum / local_confidence_den.clamp(
+                    min=1e-6
+                )
             else:
                 l1_loss = local_ploss_sum.new_zeros(())
-            loss = (ce_loss * self.ce_loss_alpha) + (l1_loss * self.l1_loss_alpha)
+                confidence_loss = local_ploss_sum.new_zeros(())
+            loss = (
+                (ce_loss * self.ce_loss_alpha)
+                + (l1_loss * self.l1_loss_alpha)
+                + (confidence_loss * self.confidence_head_alpha)
+            )
 
         with torch.no_grad():
             flat_eval_mask = eval_mask.reshape(-1)
@@ -621,6 +692,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
             "ce_weighted_token_count": local_ce_den.detach(),
             "l1_loss_sum": local_l1_sum.detach(),
             "l1_weighted_token_count": local_l1_den.detach(),
+            "confidence_loss_sum": local_confidence_sum.detach(),
+            "confidence_weighted_token_count": local_confidence_den.detach(),
             "sanitized_rows": sanitized_rows.detach(),
             "masked_rows": (~binary_eval_mask & flat_eval_mask).float().sum().detach(),
             "sampled_vocab_size": sampled_vocab_size.detach(),
@@ -695,12 +768,107 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 drafter_config.num_context_layers = int(
                     training_cfg["dspark_num_target_layers"]
                 )
-        return super()._normalize_dflash_config(
+        drafter_config = super()._normalize_dflash_config(
             drafter_config,
             target_hf_config,
             normalized_state,
             spec_model_path,
         )
+        training_head_alpha = float(
+            training_cfg.get("dspark_confidence_head_alpha", 0.0) or 0.0
+        )
+        training_loss_alpha = float(
+            training_cfg.get("dspark_confidence_loss_alpha", 0.0) or 0.0
+        )
+        if training_head_alpha < 0 or training_loss_alpha < 0:
+            raise ValueError(
+                "DSpark confidence-head and loss alphas must be non-negative"
+            )
+
+        normalized_state = normalized_state or {}
+        confidence_weight = normalized_state.get("confidence_head.proj.weight")
+        confidence_bias = normalized_state.get("confidence_head.proj.bias")
+        if (confidence_weight is None) != (confidence_bias is None):
+            raise ValueError(
+                "DSpark checkpoint must contain both confidence_head.proj.weight "
+                f"and confidence_head.proj.bias: model_path={spec_model_path}"
+            )
+
+        training_requests_head = training_head_alpha > 0 or training_loss_alpha > 0
+        config_enables_head = bool(
+            getattr(drafter_config, "enable_confidence_head", False)
+        )
+        checkpoint_has_head = confidence_weight is not None
+        enable_confidence_head = (
+            training_requests_head or config_enables_head or checkpoint_has_head
+        )
+        confidence_with_markov = bool(
+            getattr(drafter_config, "confidence_head_with_markov", True)
+        )
+        if training_requests_head:
+            confidence_with_markov = bool(
+                training_cfg.get("dspark_confidence_head_with_markov", True)
+            )
+
+        if checkpoint_has_head:
+            assert confidence_bias is not None
+            if confidence_weight.ndim != 2 or int(confidence_weight.shape[0]) != 1:
+                raise ValueError(
+                    "DSpark confidence_head.proj.weight must have shape [1, input_dim], "
+                    f"got {tuple(confidence_weight.shape)} in {spec_model_path}"
+                )
+            if confidence_bias.ndim != 1 or tuple(confidence_bias.shape) != (1,):
+                raise ValueError(
+                    "DSpark confidence_head.proj.bias must have shape [1], "
+                    f"got {tuple(confidence_bias.shape)} in {spec_model_path}"
+                )
+            hidden_size = int(drafter_config.hidden_size)
+            markov_rank = int(getattr(drafter_config, "markov_rank", 0))
+            confidence_input_dim = int(confidence_weight.shape[1])
+            if confidence_input_dim == hidden_size:
+                checkpoint_with_markov = False
+            elif confidence_input_dim == hidden_size + markov_rank and markov_rank > 0:
+                checkpoint_with_markov = True
+            else:
+                raise ValueError(
+                    "DSpark confidence-head input dim is incompatible with the draft "
+                    f"hidden/Markov dimensions: checkpoint={confidence_input_dim} "
+                    f"hidden_size={hidden_size} markov_rank={markov_rank} "
+                    f"model_path={spec_model_path}"
+                )
+            source_config = getattr(drafter_config, "_source_checkpoint_config", None)
+            topology_is_explicit = training_requests_head or (
+                isinstance(source_config, dict)
+                and "confidence_head_with_markov" in source_config
+            )
+            if (
+                topology_is_explicit
+                and confidence_with_markov != checkpoint_with_markov
+            ):
+                raise ValueError(
+                    "DSpark confidence-head topology disagrees with its checkpoint: "
+                    f"configured_with_markov={confidence_with_markov} "
+                    f"checkpoint_with_markov={checkpoint_with_markov} "
+                    f"model_path={spec_model_path}"
+                )
+            confidence_with_markov = checkpoint_with_markov
+
+        if enable_confidence_head:
+            if (
+                confidence_with_markov
+                and int(getattr(drafter_config, "markov_rank", 0)) <= 0
+            ):
+                raise ValueError(
+                    "DSpark confidence_head_with_markov requires dspark_markov_rank > 0"
+                )
+            drafter_config.enable_confidence_head = True
+            drafter_config.confidence_head_with_markov = confidence_with_markov
+            drafter_config.confidence_head_alpha = max(
+                float(getattr(drafter_config, "confidence_head_alpha", 0.0)),
+                training_head_alpha,
+                training_loss_alpha,
+            )
+        return drafter_config
 
     def _build_fallback_config(self, target_hf_config):
         training_cfg = self.config.rollout.drafter.training
@@ -738,6 +906,10 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             target_layer_ids = build_target_layer_ids(
                 num_context_layers, target_num_hidden_layers
             )
+        confidence_head_alpha = max(
+            float(training_cfg.get("dspark_confidence_head_alpha", 0.0) or 0.0),
+            float(training_cfg.get("dspark_confidence_loss_alpha", 0.0) or 0.0),
+        )
         return DSparkConfig(
             hidden_size=hidden_size,
             intermediate_size=int(
@@ -777,9 +949,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             markov_head_type=str(
                 training_cfg.get("dspark_markov_head_type", "vanilla")
             ),
-            confidence_head_alpha=float(
-                training_cfg.get("dspark_confidence_head_alpha", 0.0)
-            ),
+            confidence_head_alpha=confidence_head_alpha,
             confidence_head_with_markov=bool(
                 training_cfg.get("dspark_confidence_head_with_markov", True)
             ),
