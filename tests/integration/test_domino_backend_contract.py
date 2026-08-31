@@ -246,3 +246,139 @@ def test_domino_rejected_by_sglang_config_builder() -> None:
             {"enable": True, "speculative_algorithm": "DOMINO"},
             supported_fields={"speculative_algorithm"},
         )
+
+
+def _domino_training_model(decay_steps: int = 100):
+    from verl_speco.backends.domino_trainer_backend import DominoTrainingModel
+    from verl_speco.models.domino import DominoDraftModel
+
+    config = _tiny_domino_config()
+    model = DominoTrainingModel(
+        draft_model=DominoDraftModel(config),
+        block_size=config.block_size,
+        num_anchors=config.num_anchors,
+        pure_draft_prefix_len=config.pure_draft_prefix_len,
+        lambda_base_start=1.0,
+        lambda_base_decay_steps=decay_steps,
+    )
+    return config, model
+
+
+def _domino_batch(config, bsz: int = 2, seq_len: int = 16):
+    import torch
+
+    input_ids = torch.randint(0, config.vocab_size, (bsz, seq_len))
+    hidden_states_list = [
+        torch.randn(bsz, seq_len, config.target_hidden_size)
+        for _ in config.target_layer_ids
+    ]
+    loss_mask = torch.ones(bsz, seq_len, dtype=torch.long)
+    lm_head_weight = torch.randn(config.vocab_size, config.hidden_size)
+    return input_ids, hidden_states_list, loss_mask, lm_head_weight
+
+
+def test_domino_curriculum_step_is_seedable() -> None:
+    """A resumed run must continue the curriculum, not restart it at step zero."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    import torch
+
+    torch.manual_seed(0)
+    config, model = _domino_training_model(decay_steps=100)
+    batch = _domino_batch(config)
+
+    torch.manual_seed(1)
+    _, _, _, _, _, fresh_diagnostics = model(*batch)
+    # One forward off a fresh wrapper: still at the very start of the curriculum.
+    assert float(fresh_diagnostics["domino_lambda_base"]) == pytest.approx(0.99)
+
+    model.set_curriculum_step(100)
+    torch.manual_seed(1)
+    _, _, _, _, _, resumed_diagnostics = model(*batch)
+    # Seeded past the decay window: the curriculum is finished, not restarted.
+    assert float(resumed_diagnostics["domino_lambda_base"]) == pytest.approx(0.0)
+
+
+def test_domino_correction_head_gradient_scales_with_curriculum() -> None:
+    """``lambda_base`` gates the correction head, so losing it re-freezes the head.
+
+    The loss is ``(1 - lambda_base) * final + lambda_base * base`` and only the
+    final term depends on ``prefix_gru`` / ``embed_proj``, so the head's gradient
+    scales exactly with ``1 - lambda_base``. Restarting the curriculum on resume
+    therefore drops the head's learning signal by the full decay factor.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    import torch
+
+    torch.manual_seed(0)
+    config, model = _domino_training_model(decay_steps=100)
+    batch = _domino_batch(config)
+
+    def head_grad_norm(step: int) -> float:
+        model.set_curriculum_step(step)
+        model.zero_grad(set_to_none=True)
+        torch.manual_seed(1)
+        loss = model(*batch)[0]
+        loss.backward()
+        return sum(
+            float(param.grad.norm())
+            for param in model.draft_model.embed_proj.parameters()
+            if param.grad is not None
+        )
+
+    restarted = head_grad_norm(0)  # lambda_base == 0.99
+    resumed = head_grad_norm(100)  # lambda_base == 0.0
+
+    assert resumed > 0.0
+    assert restarted == pytest.approx(0.01 * resumed, rel=1e-3)
+
+
+def test_domino_setup_optimizer_seeds_curriculum_from_resume_steps() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    import torch
+    from omegaconf import OmegaConf
+
+    from verl_speco.backends.domino_trainer_backend import DominoTrainerBackend
+
+    torch.manual_seed(0)
+    _, model = _domino_training_model(decay_steps=100)
+    backend = DominoTrainerBackend(
+        OmegaConf.create(
+            {"rollout": {"drafter": {"training": {}}}, "model": {"path": "/tmp/none"}}
+        ),
+        OmegaConf.create({}),
+    )
+
+    optimizer = backend.setup_optimizer(
+        model,
+        OmegaConf.create({"lr": 1e-4, "_resume_optimizer_steps": 100}),
+    )
+
+    assert isinstance(optimizer, torch.optim.AdamW)
+    assert model._curriculum_step == 100
+    assert model._current_lambda_base() == pytest.approx(0.0)
+
+
+def test_domino_setup_optimizer_without_resume_starts_curriculum_at_zero() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    import torch
+    from omegaconf import OmegaConf
+
+    from verl_speco.backends.domino_trainer_backend import DominoTrainerBackend
+
+    torch.manual_seed(0)
+    _, model = _domino_training_model(decay_steps=100)
+    backend = DominoTrainerBackend(
+        OmegaConf.create(
+            {"rollout": {"drafter": {"training": {}}}, "model": {"path": "/tmp/none"}}
+        ),
+        OmegaConf.create({}),
+    )
+
+    backend.setup_optimizer(model, OmegaConf.create({"lr": 1e-4}))
+
+    assert model._curriculum_step == 0
+    assert model._current_lambda_base() == pytest.approx(1.0)

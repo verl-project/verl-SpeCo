@@ -53,6 +53,7 @@ from verl_speco.backends.dflash_trainer_backend import (
     _create_dflash_dense_attention_mask,
     _create_dflash_mask_mod,
 )
+from verl_speco.backends.lr_scheduler import _RESUME_OPTIMIZER_STEPS_KEY
 from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
 from verl_speco.models.domino import DominoConfig, DominoDraftModel
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
@@ -99,7 +100,19 @@ class DominoTrainingModel(DFlashTrainingModel):
         self.pure_draft_prefix_len = int(pure_draft_prefix_len)
         self.lambda_base_start = float(lambda_base_start)
         self.lambda_base_decay_steps = int(lambda_base_decay_steps)
-        self._forward_count = 0
+        self._curriculum_step = 0
+
+    def set_curriculum_step(self, step: int) -> None:
+        """Seed the base-anchor curriculum from already-completed optimizer steps.
+
+        ``lambda_base`` is a function of the training step, but the counter lives
+        on this wrapper and is not part of any drafter checkpoint, so a resumed
+        run would otherwise restart the curriculum at ``lambda_base_start``. At
+        the default ``lambda_base_start=1.0`` the loss is exactly the base loss,
+        so the correction head (``prefix_gru`` / ``embed_proj``) would receive
+        zero gradient for a full decay window after every resume.
+        """
+        self._curriculum_step = max(int(step), 0)
 
     @property
     def _suffix_start(self) -> int:
@@ -109,7 +122,7 @@ class DominoTrainingModel(DFlashTrainingModel):
 
     def _current_lambda_base(self) -> float:
         return get_lambda_base(
-            self._forward_count, self.lambda_base_decay_steps, self.lambda_base_start
+            self._curriculum_step, self.lambda_base_decay_steps, self.lambda_base_start
         )
 
     # --- shifted-label anchor sampling / label building (DSpark alignment) ---
@@ -201,7 +214,7 @@ class DominoTrainingModel(DFlashTrainingModel):
     def forward(self, input_ids, hidden_states_list, loss_mask, lm_head_weight):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
-        self._forward_count += 1
+        self._curriculum_step += 1
         lambda_base = self._current_lambda_base()
 
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
@@ -430,6 +443,25 @@ class DominoTrainerBackend(DFlashTrainerBackend):
     @property
     def model_type(self):
         return "domino"
+
+    def setup_optimizer(self, drafter_model, drafter_train_config):
+        """Build the optimizer and resume the base-anchor curriculum alongside it.
+
+        ``_resume_optimizer_steps`` is the only step counter that survives a
+        drafter checkpoint (the LR scheduler already restores itself from it), so
+        the Domino curriculum is seeded from the same value instead of restarting
+        at step zero.
+        """
+        optimizer = super().setup_optimizer(drafter_model, drafter_train_config)
+        module = (
+            drafter_model.module if hasattr(drafter_model, "module") else drafter_model
+        )
+        set_curriculum_step = getattr(module, "set_curriculum_step", None)
+        if callable(set_curriculum_step):
+            set_curriculum_step(
+                int(drafter_train_config.get(_RESUME_OPTIMIZER_STEPS_KEY, 0) or 0)
+            )
+        return optimizer
 
     def _training_value(
         self, training_cfg, domino_key: str, dflash_key: str, default: Any
