@@ -1277,7 +1277,12 @@ class DrafterBaseTrainer:
 
         if any(frozen_name in name for frozen_name in self._frozen_param_names):
             return True
-        return name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight")
+        if name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
+            # Most backends seed the draft embedding from the target and freeze it,
+            # so the engine already holds the same rows. Backends that fine-tune it
+            # (P-EAGLE) must publish it or the engine keeps the seed forever.
+            return not bool(getattr(self.backend, "trains_draft_embeddings", False))
+        return False
 
     def _get_trainable_state_dict(self) -> dict[str, torch.Tensor]:
         """Get floating state dict entries excluding weights shared with the target model."""
@@ -1300,10 +1305,11 @@ class DrafterBaseTrainer:
                     f"Skipping non-floating drafter state: {name}, dtype={param.dtype}"
                 )
                 continue
-            # EAGLE3 trains and publishes its own lm_head; other backends skip lm_head by default.
+            # Backends whose draft owns an lm_head (EAGLE-3, P-EAGLE) publish it;
+            # the block drafters read logits off the target head, so theirs stays out.
             if self._is_frozen_publish_param(name) or (
                 "lm_head.weight" in name
-                and getattr(self.backend, "model_type", None) != "eagle3"
+                and not bool(getattr(self.backend, "trains_draft_lm_head", False))
             ):
                 logger.debug(f"Skipping frozen parameter: {name}")
                 continue

@@ -622,6 +622,13 @@ def _apply_coverage_mask_to_loss_mask(
 
 
 class Eagle3TrainerBackend:
+    # Hot-publish contract: which target-seeded drafter tensors this backend owns
+    # and therefore has to ship to the rollout engine. The EAGLE-3 draft has its
+    # own lm_head over the draft vocabulary, but seeds the embedding from the
+    # target and freezes it.
+    trains_draft_lm_head = True
+    trains_draft_embeddings = False
+
     def __init__(self, config, target_model_config):
         self.config = config
         self.target_model_config = target_model_config

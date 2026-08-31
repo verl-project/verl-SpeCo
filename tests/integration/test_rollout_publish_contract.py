@@ -247,7 +247,11 @@ def test_publish_state_filter_keeps_eagle3_trainable_lm_head() -> None:
     DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
 
     trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
-    trainer.backend = SimpleNamespace(model_type="eagle3")
+    trainer.backend = SimpleNamespace(
+        model_type="eagle3",
+        trains_draft_lm_head=True,
+        trains_draft_embeddings=False,
+    )
     trainer.training_device_mesh = None
     trainer._frozen_param_names = ["target_model."]
     trainer.model = SimpleNamespace(
@@ -275,7 +279,11 @@ def test_publish_state_filter_skips_non_eagle_lm_head() -> None:
     DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
 
     trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
-    trainer.backend = SimpleNamespace(model_type="dflash")
+    trainer.backend = SimpleNamespace(
+        model_type="dflash",
+        trains_draft_lm_head=False,
+        trains_draft_embeddings=False,
+    )
     trainer.training_device_mesh = None
     trainer._frozen_param_names = []
     trainer.model = SimpleNamespace(
@@ -297,7 +305,11 @@ def test_publish_state_filter_excludes_block_drafter_embedding() -> None:
     DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
 
     trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
-    trainer.backend = SimpleNamespace(model_type="dspark")
+    trainer.backend = SimpleNamespace(
+        model_type="dspark",
+        trains_draft_lm_head=False,
+        trains_draft_embeddings=False,
+    )
     trainer.training_device_mesh = None
     trainer._frozen_param_names = []
     trainer.model = SimpleNamespace(
@@ -308,6 +320,77 @@ def test_publish_state_filter_excludes_block_drafter_embedding() -> None:
     )
 
     assert set(trainer._get_trainable_state_dict()) == {"draft_model.fc.weight"}
+
+
+def test_publish_state_filter_keeps_peagle_trained_head_and_embedding() -> None:
+    """P-EAGLE owns its lm_head and fine-tunes the draft embedding.
+
+    Both are trained every drafter step, so hot publish has to ship them; the
+    generic filter used to drop them and leave the rollout engine on the initial
+    weights forever.
+    """
+    torch = pytest.importorskip("torch")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="publish state filtering needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(
+        model_type="peagle",
+        trains_draft_lm_head=True,
+        trains_draft_embeddings=True,
+    )
+    trainer.training_device_mesh = None
+    trainer._frozen_param_names = ["target_model."]
+    trainer.model = SimpleNamespace(
+        state_dict=lambda: {
+            "embed_tokens.weight": torch.ones(2, 2),
+            "lm_head.weight": torch.ones(2, 2),
+            "fc.weight": torch.ones(2, 2),
+            "mask_hidden": torch.ones(1, 1, 2),
+            "target_model.fc.weight": torch.ones(2, 2),
+            "t2d": torch.ones(2, dtype=torch.bool),
+        }
+    )
+
+    assert set(trainer._get_trainable_state_dict()) == {
+        "embed_tokens.weight",
+        "lm_head.weight",
+        "fc.weight",
+        "mask_hidden",
+    }
+
+
+def test_backend_publish_contract_matches_what_each_backend_trains() -> None:
+    """The declared flags must track the real freeze/build calls in each backend.
+
+    ``model_type`` is not a usable proxy here: EAGLE-1/2 deliberately report
+    ``"eagle3"`` to reuse the data plumbing, and P-EAGLE is the only backend that
+    skips ``freeze_embedding()``.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+
+    from verl_speco.backends.dflash_trainer_backend import DFlashTrainerBackend
+    from verl_speco.backends.domino_trainer_backend import DominoTrainerBackend
+    from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend
+    from verl_speco.backends.eagle1_trainer_backend import Eagle1TrainerBackend
+    from verl_speco.backends.eagle3_trainer_backend import Eagle3TrainerBackend
+    from verl_speco.backends.peagle_trainer_backend import PEagleTrainerBackend
+
+    expected = {
+        Eagle3TrainerBackend: (True, False),
+        Eagle1TrainerBackend: (False, False),
+        PEagleTrainerBackend: (True, True),
+        DFlashTrainerBackend: (False, False),
+        DSparkTrainerBackend: (False, False),
+        DominoTrainerBackend: (False, False),
+    }
+    for backend_cls, (lm_head, embeddings) in expected.items():
+        assert backend_cls.trains_draft_lm_head is lm_head, backend_cls.__name__
+        assert backend_cls.trains_draft_embeddings is embeddings, backend_cls.__name__
 
 
 def test_target_lm_head_device_helper_handles_dflash_style_backend() -> None:

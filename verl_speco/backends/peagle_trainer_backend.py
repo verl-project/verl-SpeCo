@@ -203,6 +203,11 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
     # P-EAGLE trains on full local sequences and does not implement the SP loss.
     supports_ulysses_sp = False
 
+    # Unlike EAGLE-3, P-EAGLE fine-tunes the draft embedding instead of freezing
+    # the target-seeded copy (speculators sets embed_requires_grad=True), so hot
+    # publish has to carry it along with the draft's own lm_head.
+    trains_draft_embeddings = True
+
     def _training_cfg(self):
         return self.config.rollout.drafter.training
 
