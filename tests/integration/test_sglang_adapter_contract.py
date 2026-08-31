@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import os
 import sys
 from types import SimpleNamespace
 
@@ -183,3 +184,113 @@ def test_eagle3_last_hidden_collection_does_not_request_raw_topk_without_logits(
     assert DFLASH_RETURN_AUX_HIDDEN_PARAM not in custom_params
     assert DRAFTER_RAW_TOP_LOGPROBS_PARAM not in custom_params
     assert sampling_params["custom_params"] == custom_params
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "expected_param", "other_param"),
+    [
+        ("EAGLE1", DRAFTER_RETURN_LAST_HIDDEN_PARAM, DFLASH_RETURN_AUX_HIDDEN_PARAM),
+        ("EAGLE2", DRAFTER_RETURN_LAST_HIDDEN_PARAM, DFLASH_RETURN_AUX_HIDDEN_PARAM),
+        ("EAGLE3", DRAFTER_RETURN_LAST_HIDDEN_PARAM, DFLASH_RETURN_AUX_HIDDEN_PARAM),
+        ("PEAGLE", DRAFTER_RETURN_LAST_HIDDEN_PARAM, DFLASH_RETURN_AUX_HIDDEN_PARAM),
+        ("DFLASH", DFLASH_RETURN_AUX_HIDDEN_PARAM, DRAFTER_RETURN_LAST_HIDDEN_PARAM),
+        ("DSPARK", DFLASH_RETURN_AUX_HIDDEN_PARAM, DRAFTER_RETURN_LAST_HIDDEN_PARAM),
+        ("DOMINO", DFLASH_RETURN_AUX_HIDDEN_PARAM, DRAFTER_RETURN_LAST_HIDDEN_PARAM),
+    ],
+)
+def test_every_trainable_drafter_requests_its_hidden_state_layout(
+    algorithm, expected_param, other_param
+) -> None:
+    """Every algorithm speco_worker can train must get its hidden states.
+
+    EAGLE-1/2 and P-EAGLE hard-raise in compute_loss without last_hidden_states,
+    and Domino consumes the same aux context layers as DFlash, so none of them
+    can be left out of the request gate.
+    """
+    server = _SpecoSGLangHttpServerMixin()
+    server.replica_rank = 0
+    server._drafter_collection_step = None
+    server._drafter_collection_samples = 0
+    server._drafter_collection_tokens = 0
+    server._speco_drafter_config = {
+        "enable": True,
+        "enable_drafter_training": True,
+        "speculative_algorithm": algorithm,
+        "training": {
+            "collect_hidden_states_from_sgl": True,
+            "collect_interval_steps": 5,
+            "use_logits": False,
+            "hidden_state_window_mode": "front",
+        },
+    }
+
+    sampling_params: dict = {}
+    should_collect, _, custom_params = server._speco_request_hidden_state_params(
+        sampling_params,
+        prompt_len=8,
+        request_id=f"req-{algorithm.lower()}",
+        collection_global_steps=5,
+        max_new_tokens=16,
+    )
+
+    assert should_collect is True
+    assert custom_params[expected_param] is True
+    assert other_param not in custom_params
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "expected"),
+    [
+        ("EAGLE1", "1"),
+        ("EAGLE2", "1"),
+        ("EAGLE3", "1"),
+        ("PEAGLE", "1"),
+        ("DFLASH", "0"),
+        ("DSPARK", "0"),
+        ("DOMINO", "0"),
+    ],
+)
+def test_last_hidden_env_follows_the_shared_layout_resolver(
+    monkeypatch, algorithm, expected
+) -> None:
+    from verl_speco.integration.sglang_runtime import _set_sglang_patch_envs
+
+    monkeypatch.delenv("VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN", raising=False)
+    _set_sglang_patch_envs(
+        {
+            "enable": True,
+            "enable_drafter_training": True,
+            "speculative_algorithm": algorithm,
+            "training": {
+                "collect_hidden_states_from_sgl": True,
+                "use_logits": False,
+            },
+        }
+    )
+
+    assert os.environ["VERL_SGLANG_DRAFTER_RETURN_LAST_HIDDEN"] == expected
+
+
+def test_hidden_state_gates_stay_off_without_drafter_collection() -> None:
+    from verl_speco.integration.sglang_runtime import (
+        _drafter_uses_dflash_aux_hidden,
+        _drafter_uses_eagle_last_hidden,
+    )
+
+    for drafter_cfg in (
+        {"enable": False, "speculative_algorithm": "EAGLE3", "training": {}},
+        {
+            "enable": True,
+            "enable_drafter_training": False,
+            "speculative_algorithm": "DFLASH",
+            "training": {"collect_hidden_states_from_sgl": True},
+        },
+        {
+            "enable": True,
+            "enable_drafter_training": True,
+            "speculative_algorithm": "EAGLE3",
+            "training": {"collect_hidden_states_from_sgl": True, "use_logits": True},
+        },
+    ):
+        assert _drafter_uses_eagle_last_hidden(drafter_cfg) is False
+        assert _drafter_uses_dflash_aux_hidden(drafter_cfg) is False

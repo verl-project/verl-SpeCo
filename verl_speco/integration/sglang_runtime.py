@@ -48,6 +48,9 @@ from verl_speco.trainer.scheduler import (
     DrafterScheduleConfig,
     DrafterScheduler,
 )
+from verl_speco.integration.oldlogprob_layer_ids import (
+    resolve_drafter_hidden_states_layout,
+)
 
 try:
     import torch as _torch
@@ -187,28 +190,34 @@ def clear_sglang_runtime_config() -> None:
     os.environ.pop(SPECO_SGLANG_DRAFTER_CONFIG_ENV, None)
 
 
-def _drafter_uses_eagle_last_hidden(drafter_cfg: dict[str, Any]) -> bool:
-    algorithm = str(drafter_cfg.get("speculative_algorithm", "") or "").upper()
+def _drafter_collects_hidden_from_sgl(drafter_cfg: dict[str, Any]) -> bool:
+    """Whether drafter training reads hidden states off the SGLang rollout."""
     training_cfg = drafter_cfg.get("training") or {}
     return bool(
-        algorithm == "EAGLE3"
-        and drafter_cfg.get("enable")
+        drafter_cfg.get("enable")
         and drafter_cfg.get("enable_drafter_training")
         and training_cfg.get("collect_hidden_states_from_sgl")
         and not training_cfg.get("use_logits")
     )
+
+
+def _drafter_hidden_states_layout(drafter_cfg: dict[str, Any]) -> str:
+    return resolve_drafter_hidden_states_layout(
+        drafter_cfg.get("speculative_algorithm"),
+        drafter_cfg.get("training") or {},
+    )
+
+
+def _drafter_uses_eagle_last_hidden(drafter_cfg: dict[str, Any]) -> bool:
+    return _drafter_collects_hidden_from_sgl(
+        drafter_cfg
+    ) and _drafter_hidden_states_layout(drafter_cfg).startswith("eagle3_")
 
 
 def _drafter_uses_dflash_aux_hidden(drafter_cfg: dict[str, Any]) -> bool:
-    algorithm = str(drafter_cfg.get("speculative_algorithm", "") or "").upper()
-    training_cfg = drafter_cfg.get("training") or {}
-    return bool(
-        algorithm in {"DFLASH", "DSPARK"}
-        and drafter_cfg.get("enable")
-        and drafter_cfg.get("enable_drafter_training")
-        and training_cfg.get("collect_hidden_states_from_sgl")
-        and not training_cfg.get("use_logits")
-    )
+    return _drafter_collects_hidden_from_sgl(
+        drafter_cfg
+    ) and _drafter_hidden_states_layout(drafter_cfg).startswith("dflash_")
 
 
 def _positive_int_or_none(value: Any) -> Optional[int]:
