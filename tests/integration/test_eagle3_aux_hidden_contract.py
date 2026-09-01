@@ -84,3 +84,21 @@ def test_eagle3_model_uses_dynamic_aux_hidden_count() -> None:
 
     with pytest.raises(ValueError, match="num_aux_hidden_states=5"):
         model.project_hidden_states(torch.randn(2, 3, 12))
+
+
+def test_eagle3_model_defaults_missing_pretraining_tp() -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from verl_speco.models.auto import AutoDraftModelConfig
+    from verl_speco.models.eagle.llama_eagle import LlamaMLP
+
+    raw_config = _minimal_eagle3_config()
+    raw_config.pop("pretraining_tp")
+    config = AutoDraftModelConfig._config_mapping["LlamaForCausalLMEagle3"].from_dict(
+        raw_config
+    )
+    mlp = LlamaMLP(config)
+
+    output = mlp(torch.randn(2, 3, config.hidden_size))
+
+    assert output.shape == (2, 3, config.hidden_size)

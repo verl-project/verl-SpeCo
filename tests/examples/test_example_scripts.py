@@ -22,6 +22,11 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = sorted((ROOT / "examples").glob("*.sh"))
+PPO_EXAMPLES = [
+    script
+    for script in EXAMPLES
+    if not script.name.endswith("_separate_training.sh")
+]
 
 
 def _require_working_bash() -> str:
@@ -40,7 +45,7 @@ def test_example_shell_syntax_is_valid(script: Path) -> None:
     subprocess.run([bash, "-n", str(script)], check=True)
 
 
-@pytest.mark.parametrize("script", EXAMPLES, ids=lambda path: path.name)
+@pytest.mark.parametrize("script", PPO_EXAMPLES, ids=lambda path: path.name)
 def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
     script: Path,
 ) -> None:
@@ -60,6 +65,37 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
         "actor_rollout_ref.rollout.drafter.training.training_interval_steps=" in source
     )
     assert "actor_rollout_ref.rollout.drafter.training.publish_async=" in source
+
+
+def test_standalone_tq_training_example_uses_unified_launcher() -> None:
+    source = (
+        ROOT / "examples" / "run_qwen3-8b_drafter_dspark_separate_training.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "-m verl_speco.standalone_tq_training_launcher" in source
+    assert "data.train_files=${TRAIN_FILE}" in source
+    assert "actor_rollout_ref.rollout.drafter.enable=True" in source
+    assert "actor_rollout_ref.rollout.drafter.enable_drafter_training=True" in source
+    assert "actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH}" in source
+    assert "actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK" in source
+    assert "speco.standalone_tq_producer.max_inflight_requests=" in source
+    assert "speco.standalone_tq_producer.per_endpoint_concurrency=" in source
+    assert "actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=" in source
+    assert "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=" in source
+
+
+def test_standalone_tq_hidden_state_vllm_uses_separate_devices() -> None:
+    source = (
+        ROOT / "tools" / "run_qwen3-8b_drafter_hidden_state_vllm.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'VLLM_DEVICES=${VLLM_DEVICES:-0,1,2,3,4,5}' in source
+    assert "service_count=$((device_count / VLLM_TP))" in source
+    assert 'env "${DEVICE_ENV}=${devices}" vllm serve "${MODEL_PATH}"' in source
+    assert '--tensor-parallel-size "${VLLM_TP}"' in source
+    assert '--max-num-seqs "${VLLM_MAX_NUM_SEQS}"' in source
+    assert '"${VLLM_HIDDEN_STATE_LAYER_IDS}"' in source
+    assert '"kv_connector":"ExampleHiddenStatesConnector"' in source
 
 
 def test_vllm_eagle3_example_keeps_runtime_agnostic_training_switches() -> None:

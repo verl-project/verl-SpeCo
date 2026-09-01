@@ -19,15 +19,22 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf  # noqa: E402
 
-from verl_speco.trainer.draft_training_loop import (
+from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _build_backend,
+    _clear_tq_batch_across_ranks,
+    _connect_tq_store_across_ranks,
+    _contains_replay_samples,
+    _is_out_of_memory_error,
+    _next_batch_across_ranks,
     _rewrite_standalone_block_runtime_config,
     _save_standalone_checkpoint,
+    _should_log_batch_progress,
 )
+from verl_speco.trainer.feature_store import DraftReplaySample  # noqa: E402
 
 
 class _FakeTrainer:
@@ -44,11 +51,69 @@ class _FakeTrainer:
         return self.future
 
 
+class _FakeTQLoader:
+    def __init__(self, error: BaseException | None = None):
+        self.error = error
+        self.clear_calls: list[list[str] | None] = []
+
+    def clear_completed_batch(self, keys):
+        self.clear_calls.append(keys)
+        if self.error is not None:
+            raise self.error
+
+
+class _FakeTQStore:
+    def __init__(self, error: BaseException | None = None):
+        self.error = error
+        self.connect_calls = 0
+
+    def connect(self):
+        self.connect_calls += 1
+        if self.error is not None:
+            raise self.error
+
+
+def test_tq_completed_batch_is_cleared_once_on_rank_zero() -> None:
+    loader = _FakeTQLoader()
+    _clear_tq_batch_across_ranks(
+        loader,
+        ["k0", "k1"],
+        rank=0,
+        device=torch.device("cpu"),
+    )
+    assert loader.clear_calls == [["k0", "k1"]]
+
+
+def test_tq_clear_failure_is_reported_and_not_retried() -> None:
+    loader = _FakeTQLoader(RuntimeError("clear failed"))
+    with pytest.raises(RuntimeError, match="failed to clear"):
+        _clear_tq_batch_across_ranks(
+            loader,
+            ["k0", "k1"],
+            rank=0,
+            device=torch.device("cpu"),
+        )
+    assert loader.clear_calls == [["k0", "k1"]]
+
+
+def test_tq_store_connection_failure_is_reported() -> None:
+    store = _FakeTQStore(RuntimeError("connect failed"))
+    with pytest.raises(RuntimeError, match="failed to connect"):
+        _connect_tq_store_across_ranks(
+            store,
+            rank=0,
+            device=torch.device("cpu"),
+        )
+    assert store.connect_calls == 1
+
+
 def _export_trainer(model_type: str, model_path=None):
     """Minimal trainer stand-in for the standalone checkpoint export helpers."""
     return SimpleNamespace(
         backend=SimpleNamespace(model_type=model_type),
-        config=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=model_path))),
+        config=SimpleNamespace(
+            rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=model_path))
+        ),
     )
 
 
@@ -56,9 +121,48 @@ def _standalone_config(algorithm: str):
     return OmegaConf.create(
         {
             "model": {"path": "/does/not/exist"},
-            "rollout": {"drafter": {"speculative_algorithm": algorithm, "training": {}}},
+            "rollout": {
+                "drafter": {"speculative_algorithm": algorithm, "training": {}}
+            },
         }
     )
+
+
+@pytest.mark.parametrize(
+    ("attempted_batches", "expected"),
+    [
+        (1, True),
+        (2, True),
+        (3, True),
+        (4, False),
+        (99, False),
+        (100, True),
+        (101, False),
+    ],
+)
+def test_should_log_standalone_batch_progress(attempted_batches, expected):
+    assert _should_log_batch_progress(attempted_batches) is expected
+
+
+def test_is_out_of_memory_error_matches_npu_oom_message():
+    error = RuntimeError("NPU out of memory. Tried to allocate 258.00 MiB")
+
+    assert _is_out_of_memory_error(error)
+    assert not _is_out_of_memory_error(RuntimeError("bad batch"))
+
+
+def test_contains_replay_samples_detects_draft_replay_sample():
+    sample = DraftReplaySample(
+        input_ids=torch.arange(4),
+        loss_mask=torch.ones(4),
+        attention_mask=torch.ones(4, dtype=torch.bool),
+        position_ids=torch.arange(4),
+        feature_positions=torch.arange(1, 3),
+        draft_position_ids=torch.arange(2, 4),
+    )
+
+    assert _contains_replay_samples([sample])
+    assert not _contains_replay_samples([{"input_ids": [1, 2]}])
 
 
 @pytest.mark.parametrize(
@@ -245,6 +349,56 @@ def test_standalone_dspark_checkpoint_preserves_source_runtime_config(tmp_path):
     assert saved_training_config == training_config
 
 
+def test_standalone_dspark_checkpoint_rewrites_generic_qwen3_architecture(tmp_path):
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    source_dir = tmp_path / "source_dspark"
+    source_dir.mkdir()
+    target_dir = tmp_path / "target_qwen3"
+    target_dir.mkdir()
+    (source_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "architectures": ["DSparkDraftModel"],
+                "markov_head_type": "vanilla",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (target_dir / "config.json").write_text(
+        json.dumps({"model_type": "qwen3"}), encoding="utf-8"
+    )
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "dspark",
+                "architectures": ["DSparkDraftModel"],
+                "markov_head_type": "vanilla",
+            }
+        ),
+        encoding="utf-8",
+    )
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="dspark"),
+        config=SimpleNamespace(
+            model=SimpleNamespace(path=str(target_dir)),
+            rollout=SimpleNamespace(
+                drafter=SimpleNamespace(model_path=str(source_dir))
+            ),
+        ),
+    )
+
+    _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    runtime_config = json.loads(
+        (checkpoint_dir / "config.json").read_text(encoding="utf-8")
+    )
+    assert runtime_config["model_type"] == "qwen3"
+    assert runtime_config["architectures"] == ["DSparkDraftModel"]
+    assert runtime_config["speco_training_model_type"] == "dspark"
+
+
 def test_standalone_domino_checkpoint_exports_dflash_projector_config(tmp_path):
     checkpoint_dir = tmp_path / "draft_step_5"
     checkpoint_dir.mkdir()
@@ -337,3 +491,163 @@ def test_standalone_dflash_checkpoint_preserves_source_runtime_config(tmp_path):
     assert runtime_config["dflash_config"]["target_layer_ids"] == [2, 10, 18]
     assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [3, 11, 19]
     assert saved_training_config == training_config
+
+
+def test_standalone_block_checkpoint_uses_target_model_type_without_source_config(
+    tmp_path,
+):
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    target_dir = tmp_path / "target_qwen3"
+    target_dir.mkdir()
+    missing_source_dir = tmp_path / "missing_source_dspark"
+    (target_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "head_dim": 128,
+                "rope_theta": 1000000.0,
+                "max_position_embeddings": 40960,
+            }
+        ),
+        encoding="utf-8",
+    )
+    training_config = {
+        "model_type": "dspark",
+        "architectures": ["DSparkDraftModel"],
+        "target_layer_ids": [1, 9, 17],
+        "markov_head_type": "vanilla",
+        "head_dim": 80,
+        "rope_theta": 10000.0,
+    }
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps(training_config), encoding="utf-8"
+    )
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="dspark"),
+        config=SimpleNamespace(
+            model=SimpleNamespace(path=str(target_dir)),
+            rollout=SimpleNamespace(
+                drafter=SimpleNamespace(model_path=str(missing_source_dir))
+            ),
+        ),
+    )
+
+    _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    runtime_config = json.loads(
+        (checkpoint_dir / "config.json").read_text(encoding="utf-8")
+    )
+    saved_training_config = json.loads(
+        (checkpoint_dir / "speco_training_config.json").read_text(encoding="utf-8")
+    )
+    assert runtime_config["model_type"] == "dspark"
+    assert runtime_config["architectures"] == ["DSparkDraftModel"]
+    assert runtime_config["speco_training_model_type"] == "dspark"
+    assert runtime_config["dspark_config"]["markov_head_type"] == "vanilla"
+    assert runtime_config["head_dim"] == 80
+    assert runtime_config["rope_theta"] == 10000.0
+    assert saved_training_config == training_config
+
+
+def test_standalone_eagle3_checkpoint_exports_vllm_llama_runtime_config(tmp_path):
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    target_dir = tmp_path / "target_qwen3"
+    target_dir.mkdir()
+    missing_source_dir = tmp_path / "missing_source_eagle3"
+    (target_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "hidden_size": 4096,
+                "head_dim": 128,
+                "rope_theta": 1000000,
+                "max_position_embeddings": 40960,
+            }
+        ),
+        encoding="utf-8",
+    )
+    training_config = {
+        "model_type": "qwen3",
+        "architectures": ["LlamaForCausalLMEagle3"],
+        "num_hidden_layers": 1,
+        "hidden_size": 4096,
+        "vocab_size": 151936,
+        "tie_word_embeddings": False,
+    }
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps(training_config), encoding="utf-8"
+    )
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="eagle3"),
+        config=SimpleNamespace(
+            model=SimpleNamespace(path=str(target_dir)),
+            rollout=SimpleNamespace(
+                drafter=SimpleNamespace(model_path=str(missing_source_dir))
+            ),
+        ),
+    )
+
+    _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    runtime_config = json.loads(
+        (checkpoint_dir / "config.json").read_text(encoding="utf-8")
+    )
+    assert runtime_config["model_type"] == "qwen3"
+    assert runtime_config["architectures"] == ["LlamaForCausalLMEagle3"]
+    assert runtime_config["num_hidden_layers"] == 1
+    assert runtime_config["tie_word_embeddings"] is False
+    assert not (checkpoint_dir / "speco_training_config.json").exists()
+
+
+def test_next_batch_across_ranks_returns_local_batch_without_distributed():
+    batch = [object()]
+
+    assert _next_batch_across_ranks(
+        iter([batch]), rank=0, device=torch.device("cpu")
+    ) is batch
+
+
+def test_next_batch_across_ranks_returns_none_when_source_is_exhausted():
+    assert (
+        _next_batch_across_ranks(
+            iter(()), rank=0, device=torch.device("cpu")
+        )
+        is None
+    )
+
+
+def test_next_batch_across_ranks_preserves_local_producer_error():
+    def broken_source():
+        raise ValueError("producer failed")
+        yield []
+
+    with pytest.raises(RuntimeError, match="failed on rank=0") as exc_info:
+        _next_batch_across_ranks(
+            iter(broken_source()), rank=0, device=torch.device("cpu")
+        )
+
+    assert isinstance(exc_info.value.__cause__, ValueError)
+
+
+def test_next_batch_across_ranks_stops_for_remote_rank_failure(monkeypatch):
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.dist.is_initialized", lambda: True
+    )
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.dist.get_world_size", lambda: 2
+    )
+
+    def fake_all_reduce(state, op):
+        del op
+        state[0] = 1
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.dist.all_reduce", fake_all_reduce
+    )
+
+    with pytest.raises(RuntimeError, match="failed on another rank"):
+        _next_batch_across_ranks(
+            iter([[object()]]), rank=1, device=torch.device("cpu")
+        )

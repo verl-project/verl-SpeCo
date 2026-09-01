@@ -652,9 +652,12 @@ class DFlashTrainingModel(nn.Module):
             loss_sum_per_position = (
                 loss_per_token.view(bsz, n_blocks, self.block_size) * binary_weights
             ).sum(dim=(0, 1))
-            correct_per_position = (
-                correct.view(bsz, n_blocks, self.block_size).float().sum(dim=(0, 1))
-            )
+            correct_3d = correct.view(bsz, n_blocks, self.block_size)
+            pred_valid_3d = binary_weights[:, :, 1:].bool()
+            pred_correct_3d = correct_3d[:, :, 1:] & pred_valid_3d
+            simulated_accept_length_sum = pred_correct_3d.float().cumprod(dim=-1).sum()
+            simulated_accept_block_count = pred_valid_3d.any(dim=-1).float().sum()
+            correct_per_position = correct_3d.float().sum(dim=(0, 1))
             loss_per_position = loss_sum_per_position / count_per_pos
             acc_per_position = correct_per_position / count_per_pos
             # Prefix acceptance per block; the per-position accuracies above are
@@ -681,6 +684,8 @@ class DFlashTrainingModel(nn.Module):
                 "quality_token_count": quality_token_count,
                 "valid_token_count": binary_eval_mask.sum().float(),
                 "weighted_token_count": flat_weights.sum().float(),
+                "simulated_accept_length_sum": simulated_accept_length_sum,
+                "simulated_accept_block_count": simulated_accept_block_count,
                 "sanitized_rows": sanitized_rows,
                 "masked_rows": masked_rows,
                 "loss_sum_per_position": loss_sum_per_position,
@@ -784,6 +789,7 @@ class DFlashTrainerBackend:
             if mask_token_id_cfg is not None
             else target_text_config.vocab_size - 1
         )
+        target_head_dim = getattr(target_text_config, "head_dim", None)
         target_layer_ids = training_cfg.get("dflash_target_layer_ids", None)
         if target_layer_ids is None:
             target_layer_ids = build_target_layer_ids(
@@ -803,6 +809,7 @@ class DFlashTrainerBackend:
                     getattr(target_text_config, "num_attention_heads"),
                 )
             ),
+            head_dim=int(target_head_dim) if target_head_dim is not None else None,
             vocab_size=int(target_text_config.vocab_size),
             rms_norm_eps=float(getattr(target_text_config, "rms_norm_eps", 1e-6)),
             max_position_embeddings=int(
@@ -817,6 +824,19 @@ class DFlashTrainerBackend:
             mask_token_id=mask_token_id,
             architectures=["DFlashDraftModel"],
         )
+
+    @staticmethod
+    def _target_rope_theta(target_text_config) -> float:
+        rope_theta = getattr(target_text_config, "rope_theta", None)
+        if rope_theta is not None:
+            return float(rope_theta)
+        rope_parameters = getattr(target_text_config, "rope_parameters", None)
+        if (
+            isinstance(rope_parameters, dict)
+            and rope_parameters.get("rope_theta") is not None
+        ):
+            return float(rope_parameters["rope_theta"])
+        return 10000.0
 
     def _load_state_file(self, path: str) -> dict:
         if path.endswith(".safetensors"):

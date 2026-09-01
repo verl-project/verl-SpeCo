@@ -44,3 +44,43 @@ actor_rollout_ref:
         master_addr: ${speco.draft_training.master_addr}
         master_port: ${speco.draft_training.master_port}
         standalone: ${speco.draft_training.standalone}
+        # Standalone/offline-only reconstruction for compact token_replay stores.
+        # The frozen target model is loaded lazily after the draft trainer starts.
+        target_feature_replay:
+          backend: torch
+          model_path: null
+          target_revision: null
+          dtype: bfloat16
+          trust_remote_code: false
+          strict_target_model_path: false
+          logits_chunk_rows: 32
+          vllm_endpoint: http://localhost:8000/v1
+          # Optional endpoint pool. When non-null, this takes precedence over
+          # vllm_endpoint and requests use least-inflight routing with failover.
+          vllm_endpoints: null
+          vllm_model: null
+          request_timeout: 120
+          max_retries: 3
+          endpoint_cooldown: 5
+          on_generate: delete
+          require_arange_positions: true
+          offline_generation:
+            input_type: token_replay
+            input_path: null
+            output_path: null
+            max_samples: 0
+            batch_size: 1
+            shuffle: false
+          cache:
+            enabled: false
+            path: null
+            max_size_gb: 0
+        # Overlap vLLM file replay with FSDP training.
+        # This pipeline is standalone-only.
+        target_feature_pipeline:
+          enabled: false
+          # Global budgets. Standalone divides them across torchrun ranks.
+          concurrency: 16
+          producer_prefetch_depth: 4
+          prefetch_depth: 2
+          queue_timeout: 300

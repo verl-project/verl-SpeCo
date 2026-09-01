@@ -28,7 +28,7 @@ from verl_speco.trainer.feature_store import MANIFEST_NAME
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Inspect a torch_shard draft feature store."
+        description="Inspect a torch_shard or token_replay draft feature store."
     )
     parser.add_argument(
         "path",
@@ -133,15 +133,21 @@ def _sample_summary(sample: dict[str, Any]) -> dict[str, str]:
     keys = [
         "input_ids",
         "loss_mask",
+        "attention_mask",
         "hidden_states",
         "last_hidden_states",
         "target_logprobs",
         "position_ids",
+        "feature_positions",
+        "draft_position_ids",
     ]
     return {key: _shape(sample[key]) for key in keys if key in sample}
 
 
 def _sample_issues(sample: dict[str, Any]) -> list[str]:
+    if sample.get("sample_type") == "token_replay" or "feature_positions" in sample:
+        return _replay_sample_issues(sample)
+
     issues: list[str] = []
     input_ids = _tensor(sample.get("input_ids"), "input_ids", issues)
     loss_mask = _tensor(sample.get("loss_mask"), "loss_mask", issues)
@@ -229,6 +235,55 @@ def _sample_issues(sample: dict[str, Any]) -> list[str]:
                     f"target_logprobs rows {int(normalized.size(0))} may be too short for input_ids length {seq_len}"
                 )
 
+    return issues
+
+
+def _replay_sample_issues(sample: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    input_ids = _tensor(sample.get("input_ids"), "input_ids", issues)
+    loss_mask = _tensor(sample.get("loss_mask"), "loss_mask", issues)
+    attention_mask = _tensor(sample.get("attention_mask"), "attention_mask", issues)
+    position_ids = _tensor(sample.get("position_ids"), "position_ids", issues)
+    feature_positions = _tensor(
+        sample.get("feature_positions"), "feature_positions", issues
+    )
+    draft_position_ids = _tensor(
+        sample.get("draft_position_ids"), "draft_position_ids", issues
+    )
+    if input_ids is None:
+        return issues
+
+    seq_len = int(input_ids.numel())
+    for name, value in (
+        ("loss_mask", loss_mask),
+        ("attention_mask", attention_mask),
+        ("position_ids", position_ids),
+    ):
+        if value is not None and int(value.numel()) != seq_len:
+            issues.append(
+                f"{name} length {int(value.numel())} does not match "
+                f"input_ids length {seq_len}"
+            )
+    if feature_positions is None or draft_position_ids is None:
+        return issues
+    feature_positions = feature_positions.reshape(-1).long()
+    draft_position_ids = draft_position_ids.reshape(-1).long()
+    if int(feature_positions.numel()) == 0:
+        issues.append("feature_positions is empty")
+        return issues
+    if int(draft_position_ids.numel()) != int(feature_positions.numel()):
+        issues.append(
+            "draft_position_ids length does not match feature_positions length"
+        )
+    if (
+        int(feature_positions.min().item()) < 0
+        or int(feature_positions.max().item()) >= seq_len
+    ):
+        issues.append(f"feature_positions fall outside input_ids length {seq_len}")
+    if int(feature_positions.numel()) > 1 and not bool(
+        torch.all(feature_positions[1:] == feature_positions[:-1] + 1).item()
+    ):
+        issues.append("feature_positions are not contiguous and increasing")
     return issues
 
 

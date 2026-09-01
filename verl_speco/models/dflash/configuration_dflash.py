@@ -114,6 +114,7 @@ class DFlashConfig(PretrainedConfig):
         num_hidden_layers: int = 1,
         num_attention_heads: int = 32,
         num_key_value_heads: int = 8,
+        head_dim: Optional[int] = None,
         vocab_size: int = 152064,
         rms_norm_eps: float = 1e-6,
         max_position_embeddings: int = 32768,
@@ -133,6 +134,8 @@ class DFlashConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
+        if head_dim is not None:
+            self.head_dim = int(head_dim)
         self.vocab_size = vocab_size
         self.rms_norm_eps = rms_norm_eps
         self.max_position_embeddings = max_position_embeddings

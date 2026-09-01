@@ -60,6 +60,8 @@ def _copy_overlay_configs(
 def test_overlay_has_expected_default_drafter_shape() -> None:
     raw = OmegaConf.load(CONFIG_DIR / "speco_base.yaml")
     drafter = raw.actor_rollout_ref.rollout.drafter
+    standalone = OmegaConf.load(CONFIG_DIR / "draft_trainer.yaml")
+    standalone_training = standalone.actor_rollout_ref.rollout.drafter.training
 
     assert raw.speco.verl_base.version == "0.8.0"
     assert raw.speco.verl_base.branch == "release/v0.8.0"
@@ -76,6 +78,17 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.training.warmup_style is None
     assert drafter.training.resume_trainer_state_from_checkpoint is True
     assert drafter.training.eagle1_num_hidden_layers == 1
+    assert drafter.training.mode == "online"
+    assert drafter.training.feature_store.type == "torch_shard"
+    assert "target_feature_replay" not in drafter.training
+    assert standalone_training.target_feature_replay.cache.enabled is False
+    assert standalone_training.target_feature_replay.cache.max_size_gb == 0
+    assert standalone_training.target_feature_replay.vllm_endpoints is None
+    assert standalone_training.target_feature_replay.endpoint_cooldown == 5
+    assert standalone_training.target_feature_pipeline.enabled is False
+    assert standalone_training.target_feature_pipeline.concurrency == 16
+    assert standalone_training.target_feature_pipeline.producer_prefetch_depth == 4
+    assert standalone_training.target_feature_pipeline.prefetch_depth == 2
 
 
 def test_overlay_composes_with_release_upstream_verl(tmp_path: Path) -> None:
@@ -119,6 +132,13 @@ def test_draft_trainer_composes_as_primary_config(tmp_path: Path) -> None:
         config = compose(config_name="draft_trainer")
 
     assert config.actor_rollout_ref.rollout.drafter.training.mode == "offline"
+    assert config.actor_rollout_ref.rollout.drafter.training.feature_store.type == (
+        "torch_shard"
+    )
+    assert (
+        config.actor_rollout_ref.rollout.drafter.training.target_feature_replay.cache.enabled
+        is False
+    )
     assert config.speco.draft_training.enable is True
     assert "trainer" in config
     assert "algorithm" in config

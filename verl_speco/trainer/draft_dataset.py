@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterator
 
-from verl_speco.trainer.feature_store import DraftFeatureSample, DraftFeatureStore
+from verl_speco.trainer.feature_store import DraftFeatureStore, DraftStoredSample
 
 
 @dataclass(frozen=True)
@@ -54,7 +54,7 @@ class DraftFeatureDataLoader:
                 f"Invalid rank/world_size configuration: rank={rank}, world_size={world_size}"
             )
 
-    def _sample_in_step_window(self, sample: DraftFeatureSample) -> bool:
+    def _sample_in_step_window(self, sample: DraftStoredSample) -> bool:
         if self.config.min_sample_step is None and self.config.max_sample_step is None:
             return True
         step = self._sample_step(sample)
@@ -71,7 +71,7 @@ class DraftFeatureDataLoader:
         return True
 
     @staticmethod
-    def _sample_step(sample: DraftFeatureSample) -> int | None:
+    def _sample_step(sample: DraftStoredSample) -> int | None:
         raw_step = sample.metadata.get("global_step", sample.metadata.get("step"))
         if raw_step is None:
             return None
@@ -87,7 +87,7 @@ class DraftFeatureDataLoader:
             or self.config.max_sample_step is not None
         )
 
-    def __iter__(self) -> Iterator[list[DraftFeatureSample]]:
+    def __iter__(self) -> Iterator[list[DraftStoredSample]]:
         epoch = 0
         while True:
             keys = list(
@@ -116,7 +116,7 @@ class DraftFeatureDataLoader:
                 if world_size > 1:
                     rank_keys = rank_keys[: len(keys) // world_size]
                 rank_samples = [self.store.read(key) for key in rank_keys]
-            batch: list[DraftFeatureSample] = []
+            batch: list[DraftStoredSample] = []
             for sample in rank_samples:
                 batch.append(sample)
                 if len(batch) >= int(self.config.batch_size):

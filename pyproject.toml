@@ -16,6 +16,9 @@ dependencies = [
     "packaging>=24",
 ]
 
+[project.optional-dependencies]
+transfer-queue = ["TransferQueue==0.1.10"]
+
 [project.urls]
 Repository = "https://github.com/verl-project/verl-SpeCo"
 
@@ -23,6 +26,8 @@ Repository = "https://github.com/verl-project/verl-SpeCo"
 verl-speco = "verl_speco.main:main"
 verl-speco-draft-train = "verl_speco.draft_train_launcher:main"
 verl-speco-inspect-features = "verl_speco.inspect_feature_store:main"
+verl-speco-tq-owner = "verl_speco.tq_owner:main"
+verl-speco-tq-producer = "verl_speco.standalone_tq_producer:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "verl_speco.__version__" }

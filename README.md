@@ -300,19 +300,23 @@ actor_rollout_ref.rollout.drafter.speculative_algorithm=EAGLE3
 
 ## Separate Draft Model Training
 
-verl-SpeCo also supports a separate draft model training workflow. In this
-mode, rollout workers collect drafter training features into a feature store,
-and the draft model can be trained separately after feature collection.
+verl-SpeCo also supports standalone DSpark draft-model training from a finite
+verl-style prompt Parquet or prompt/response JSONL/Parquet file. For prompt-only
+rows, a producer asks the target vLLM service to generate the response while
+extracting prompt/output hidden states. It transfers each global batch through
+TransferQueue, and a consumer trains the drafter independently of PPO.
 
 Quickstart:
 
 ```bash
-bash examples/run_qwen3-8b_drafter_separate_training.sh
+bash examples/run_qwen3-8b_drafter_dspark_separate_training.sh
 ```
 
-Replace the model, drafter, dataset, feature-store, and checkpoint paths in
-the script before running it. The script uses `collect_only` mode for rollout
-feature collection and `offline` mode for standalone drafter training.
+Set the same model, dataset, drafter, checkpoint, GPU, and optimization values
+used by ordinary standalone training near the top of the script. Transport
+identity, Ray/TQ connection settings, and the Producer/Consumer lifecycle are
+derived and managed internally. The target hidden-state vLLM service uses the
+local port 8000 convention.
 
 The main mode values are:
 
