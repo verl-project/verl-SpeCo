@@ -31,6 +31,7 @@ from verl_speco.backends.dflash_trainer_backend import (
 from verl_speco.models.dflash import resolve_rope_theta
 from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
 from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
+from verl_speco.models.target.target_head import TargetFinalNorm
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 
 
@@ -259,6 +260,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_weights: torch.Tensor,
         lm_head_weight: torch.Tensor,
         active_draft_log_probs: Optional[torch.Tensor] = None,
+        target_norm_weight: Optional[torch.Tensor] = None,
+        target_norm_eps: float = 1e-6,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if active_hidden.numel() == 0:
             zero = active_weights.new_zeros(())
@@ -294,6 +297,17 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 draft_probs = torch.softmax(draft_logits.float(), dim=-1)
             else:
                 draft_probs = active_draft_log_probs[start:end].exp()
+            if target_norm_weight is not None:
+                # ExampleHiddenStatesConnector exports the verifier's final
+                # hidden state before its final norm; re-apply it so the L1
+                # target matches the verifier's real sampling distribution.
+                normed = target_hidden_chunk.float()
+                normed = normed * torch.rsqrt(
+                    normed.pow(2).mean(dim=-1, keepdim=True) + target_norm_eps
+                )
+                target_hidden_chunk = (normed * target_norm_weight.float()).to(
+                    dtype=target_hidden_chunk.dtype
+                )
             target_logits = F.linear(target_hidden_chunk, lm_head_weight)
             target_probs = torch.softmax(target_logits.float(), dim=-1)
             l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
@@ -366,6 +380,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
+        target_norm_weight: Optional[torch.Tensor] = None,
+        target_norm_eps: float = 1e-6,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -537,6 +553,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
                         active_weights=active_loss_weights[l1_mask],
                         lm_head_weight=lm_head_weight,
                         active_draft_log_probs=reusable_draft_log_probs,
+                        target_norm_weight=target_norm_weight,
+                        target_norm_eps=target_norm_eps,
                     )
                 l1_loss = local_l1_sum / local_l1_den.clamp(min=1e-6)
             else:
@@ -714,6 +732,37 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             spec_model_path,
         )
 
+    def _build_target_final_norm(
+        self,
+        target_model_path: str,
+        *,
+        l1_loss_alpha: float,
+    ):
+        """Frozen verifier final RMSNorm applied to the DSpark L1 target.
+
+        Returns None only when the L1 loss is off (no distillation target
+        is computed in that case).
+        """
+        if l1_loss_alpha <= 0:
+            return None
+        target_final_norm = TargetFinalNorm.from_pretrained(target_model_path)
+        target_device = (
+            next(self.target_lm_head.parameters()).device
+            if self.target_lm_head is not None
+            else target_final_norm.weight.device
+        )
+        target_final_norm = target_final_norm.to(
+            device=target_device, dtype=torch.float32
+        ).eval()
+        for param in target_final_norm.parameters():
+            param.requires_grad_(False)
+        logger.info(
+            "[dspark-trainer] loaded frozen target final norm shape=%s eps=%s",
+            tuple(target_final_norm.weight.shape),
+            target_final_norm.eps,
+        )
+        return target_final_norm
+
     def _build_fallback_config(self, target_hf_config):
         training_cfg = self.config.rollout.drafter.training
         target_text_config = getattr(target_hf_config, "text_config", target_hf_config)
@@ -844,6 +893,16 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             target_model_path, target_hf_config
         )
         training_cfg = self.config.rollout.drafter.training
+        l1_loss_alpha = float(
+            training_cfg.get(
+                "dspark_l1_loss_alpha",
+                getattr(drafter_config, "l1_loss_alpha", 0.9),
+            )
+        )
+        self.target_final_norm = self._build_target_final_norm(
+            target_model_path,
+            l1_loss_alpha=l1_loss_alpha,
+        )
         return DSparkTrainingModel(
             draft_model=draft_model,
             block_size=int(
@@ -872,12 +931,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                     getattr(drafter_config, "ce_loss_alpha", 0.1),
                 )
             ),
-            l1_loss_alpha=float(
-                training_cfg.get(
-                    "dspark_l1_loss_alpha",
-                    getattr(drafter_config, "l1_loss_alpha", 0.9),
-                )
-            ),
+            l1_loss_alpha=l1_loss_alpha,
             confidence_head_alpha=float(
                 training_cfg.get("dspark_confidence_loss_alpha", 0.0)
             ),
@@ -994,12 +1048,23 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         per_layer_dim = hidden_states.shape[-1] // num_context_layers
         hidden_states_list = list(hidden_states.split(per_layer_dim, dim=-1))
 
+        target_final_norm = getattr(self, "target_final_norm", None)
         loss, accuracy, loss_pp, acc_pp, count_pp, diagnostics = model(
             input_ids=batch["input_ids"],
             hidden_states_list=hidden_states_list,
             loss_mask=batch["loss_mask"],
             lm_head_weight=self.target_lm_head.fc.weight,
             target_last_hidden_states=batch.get("target_last_hidden_states"),
+            target_norm_weight=(
+                target_final_norm.weight
+                if target_final_norm is not None
+                else None
+            ),
+            target_norm_eps=(
+                target_final_norm.eps
+                if target_final_norm is not None
+                else 1e-6
+            ),
         )
         local_num_tokens = diagnostics.get("ce_weighted_token_count")
         if not torch.is_tensor(local_num_tokens):
