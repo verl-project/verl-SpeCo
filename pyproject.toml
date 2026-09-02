@@ -23,6 +23,7 @@ Repository = "https://github.com/verl-project/verl-SpeCo"
 verl-speco = "verl_speco.main:main"
 verl-speco-draft-train = "verl_speco.draft_train_launcher:main"
 verl-speco-inspect-features = "verl_speco.inspect_feature_store:main"
+verl-speco-convert-speculators-dflash2 = "verl_speco.convert_speculators_dflash2:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "verl_speco.__version__" }

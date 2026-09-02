@@ -641,11 +641,14 @@ def _server_args_overrides_from_drafter(
         # (dynamic convolutions + candidate selector) ride in the checkpoint's
         # dflash_config, not a distinct engine-level method. DFLASH2 is never a
         # valid SGLang ServerArgs algorithm, so fail loud instead of forwarding
-        # the raw string.
+        # the raw string. The vLLM overlay maps DFLASH2 onto its DFlash path
+        # (vllm_runtime._speculative_method_from_drafter); the SGLang co-train
+        # path is not validated for DFlash2 yet.
         raise ValueError(
             "DFLASH2 is not an engine-level speculative algorithm; DFlash2 is served as a DFlash "
-            "checkpoint. Keep DFLASH2 for drafter training (which this overlay runs offline) and "
-            "set actor_rollout_ref.rollout.drafter.speculative_algorithm=DFLASH to serve a trained "
+            "checkpoint. SGLang co-training of a DFlash2 drafter is not wired in this overlay: use "
+            "actor_rollout_ref.rollout.name=vllm (vLLM >= 0.28.0) for DFLASH2 co-training, or set "
+            "actor_rollout_ref.rollout.drafter.speculative_algorithm=DFLASH to serve a trained "
             "DFlash2 checkpoint as a frozen rollout drafter; its dflash_config carries the DFlash2 "
             "convolution and selector hyperparameters."
         )

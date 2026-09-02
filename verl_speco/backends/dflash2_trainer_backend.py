@@ -161,6 +161,8 @@ class DFlash2TrainerBackend(DFlashTrainerBackend):
     # ``nn.Parameter`` tensors, while this overlay holds them in ``nn.Embedding``
     # modules, whose state dict spells the same tensor with a trailing
     # ``.weight``. Every other DFlash2 parameter name matches upstream exactly.
+    # Publish-side inverse: vllm_runtime._dflash2_engine_param_name — keep the
+    # two in sync when adding aliases here.
     _CHECKPOINT_KEY_ALIASES = {
         "candidate_selector.predecessor_codebook": (
             "candidate_selector.predecessor_codebook.weight"

@@ -15,6 +15,9 @@ case "${platform}/${backend}/${drafter}" in
   gpu/vllm/dspark)
     example="examples/run_qwen3-8b_drafter_dspark_vllm.sh"
     ;;
+  gpu/vllm/dflash2)
+    example="examples/run_qwen3-8b_drafter_dflash2_vllm.sh"
+    ;;
   gpu/vllm/peagle|gpu/vllm/domino)
     example="examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh"
     ;;
@@ -43,7 +46,7 @@ case "${platform}/${backend}/${drafter}" in
     example="examples/run_qwen3-8b_drafter_dflash_sglang.sh"
     ;;
   *)
-    echo "usage: $0 {gpu|npu} {vllm|sglang} {eagle3|megatron-eagle3|dflash|dspark|peagle|domino}" >&2
+    echo "usage: $0 {gpu|npu} {vllm|sglang} {eagle3|megatron-eagle3|dflash|dflash2|dspark|peagle|domino}" >&2
     exit 2
     ;;
 esac
@@ -82,6 +85,10 @@ case "${drafter}" in
   dspark)
     draft_model="${SPECO_DSPARK_DRAFT_MODEL:-}"
     draft_algorithm="DSPARK"
+    ;;
+  dflash2)
+    draft_model="${SPECO_DFLASH2_DRAFT_MODEL:-}"
+    draft_algorithm="DFLASH2"
     ;;
   peagle)
     draft_model="${SPECO_EAGLE3_DRAFT_MODEL:-}"
@@ -225,6 +232,18 @@ if [[ "${drafter}" == "dflash" ]]; then
     "actor_rollout_ref.rollout.drafter.training.dflash_front_position_weight=${SPECO_DFLASH_FRONT_POSITION_WEIGHT:-2.0}"
     "actor_rollout_ref.rollout.drafter.training.dflash_front_position_count=${SPECO_DFLASH_FRONT_POSITION_COUNT:-3}"
     "actor_rollout_ref.rollout.drafter.training.dflash_hard_sample_ratio=${SPECO_DFLASH_HARD_SAMPLE_RATIO:-0.3}"
+  )
+fi
+
+if [[ "${drafter}" == "dflash2" ]]; then
+  overrides+=(
+    # vLLM sizes the DFlash2 convolution block as 1 + spec_verify_tokens, and
+    # the trainer folds by dflash2_block_size (default 8), so the two must agree.
+    "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=${SPECO_DFLASH2_SPEC_VERIFY_TOKENS:-7}"
+    "actor_rollout_ref.rollout.drafter.training.dflash2_block_size=${SPECO_DFLASH2_BLOCK_SIZE:-8}"
+    "actor_rollout_ref.rollout.drafter.training.dflash2_num_anchors=${SPECO_DFLASH2_NUM_ANCHORS:-8}"
+    "actor_rollout_ref.rollout.drafter.training.dflash2_loss_decay_gamma=${SPECO_DFLASH2_LOSS_DECAY_GAMMA:-7}"
+    "actor_rollout_ref.rollout.drafter.training.dflash_max_window=${SPECO_DFLASH_MAX_WINDOW:-64}"
   )
 fi
 

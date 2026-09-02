@@ -75,6 +75,24 @@ class DFlash2Config(DFlashConfig):
         self.selector_top_k = int(selector_top_k)
         self.selector_loss_weight = float(selector_loss_weight)
 
+    def to_dict(self):
+        """Serialize with the z-lab ``dflash_config`` block alongside the flat keys.
+
+        vLLM's DFlash2 draft reads the convolution and selector knobs strictly
+        from ``dflash_config``, so a checkpoint saved by the trainer has to carry
+        that block to be servable as a rollout drafter. The flat keys stay for
+        this overlay's own loaders; ``from_dflash2_pretrained`` lets a top-level
+        value win over the nested one, so the two never disagree.
+        """
+        output = super().to_dict()
+        nested = dict(output.get("dflash_config") or {})
+        for key in _NESTED_DFLASH_KEYS:
+            if output.get(key) is not None:
+                nested[key] = output[key]
+        if nested:
+            output["dflash_config"] = nested
+        return output
+
     @classmethod
     def from_dflash2_pretrained(cls, model_path: str):
         config_path = os.path.join(model_path, "config.json")
