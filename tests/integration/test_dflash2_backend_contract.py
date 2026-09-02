@@ -22,6 +22,8 @@ classification. The full training forward is validated on GPU by
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 
@@ -775,30 +777,74 @@ def test_plain_dflash_checkpoint_warm_starts_without_the_dflash2_modules() -> No
     backend._load_draft_checkpoint(model, "<test>", normalized_state=backbone_only)
 
 
-def test_dflash2_rejected_by_vllm_config_builder() -> None:
+def test_dflash2_maps_to_the_vllm_dflash_method() -> None:
+    """vLLM serves DFlash2 through its DFlash proposer, dispatching on the architecture."""
     from verl_speco.integration.vllm_runtime import _speculative_method_from_drafter
 
-    with pytest.raises(ValueError, match="not an engine-level speculative algorithm"):
+    assert (
         _speculative_method_from_drafter({"speculative_algorithm": "DFLASH2"})
-
-
-def test_dflash2_rejected_by_sglang_config_builder() -> None:
-    from verl_speco.integration.sglang_runtime import (
-        _server_args_overrides_from_drafter,
+        == "dflash"
     )
 
-    with pytest.raises(ValueError, match="not an engine-level speculative algorithm"):
-        _server_args_overrides_from_drafter(
-            {"enable": True, "speculative_algorithm": "DFLASH2"},
-            supported_fields={"speculative_algorithm"},
-        )
+
+def test_dflash2_config_serializes_the_runtime_dflash_config_block() -> None:
+    """A trainer-saved DFlash2 config must stay servable by vLLM (nested knobs)."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from verl_speco.models.dflash2 import DFlash2Config
+
+    config = DFlash2Config(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=256,
+        target_layer_ids=[1, 3],
+        mask_token_id=255,
+        block_size=4,
+        selector_top_k=8,
+    )
+
+    serialized = json.loads(config.to_json_string())
+    nested = serialized["dflash_config"]
+    assert nested["block_size"] == 4
+    assert nested["conv_kernel_size"] == 2
+    assert nested["conv_group_size"] == 16
+    assert nested["selector_rank"] == 256
+    assert nested["selector_top_k"] == 8
+    assert nested["mask_token_id"] == 255
+    assert nested["target_layer_ids"] == [1, 3]
+    assert serialized["architectures"] == ["DFlash2DraftModel"]
+
+    # The nested block must round-trip through the overlay's own loader too.
+    reloaded = DFlash2Config.from_dict(serialized)
+    assert reloaded.selector_top_k == 8
+    assert reloaded.block_size == 4
 
 
-def test_dflash2_never_reaches_the_sglang_aux_hidden_path() -> None:
-    """The engine rejects DFLASH2 under the same ``enable`` this helper requires."""
+def test_dflash2_maps_to_the_sglang_dflash_algorithm(monkeypatch) -> None:
+    """SGLang serves DFlash2 through the DFLASH worker, dispatching on the architecture."""
+    from verl_speco.integration import sglang_runtime
+
+    monkeypatch.setattr(sglang_runtime, "_sglang_supports_dflash2", lambda: True)
+    overrides = sglang_runtime._server_args_overrides_from_drafter(
+        {
+            "enable": True,
+            "speculative_algorithm": "DFLASH2",
+            "rollout": {"spec_verify_tokens": 8},
+            "training": {"dflash2_block_size": 8},
+        },
+        supported_fields={"speculative_algorithm"},
+    )
+    assert overrides["speculative_algorithm"] == "DFLASH"
+
+
+def test_dflash2_reaches_the_sglang_aux_hidden_path() -> None:
+    """DFlash2 consumes the same concatenated target-layer hidden states as DFlash."""
     from verl_speco.integration.sglang_runtime import _drafter_uses_dflash_aux_hidden
 
-    assert not _drafter_uses_dflash_aux_hidden(
+    assert _drafter_uses_dflash_aux_hidden(
         {
             "enable": True,
             "enable_drafter_training": True,

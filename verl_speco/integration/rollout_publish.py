@@ -745,8 +745,10 @@ def export_actor_lm_head_weight(
         )
 
     normalized_row_indices = _normalize_lm_head_row_indices(row_indices)
+    # Block drafters that train against the target's own lm_head rows.
     is_dflash = drafter_speculative_algorithm(getattr(worker, "config", None)) in {
         "DFLASH",
+        "DFLASH2",
         "DSPARK",
     }
     if (
