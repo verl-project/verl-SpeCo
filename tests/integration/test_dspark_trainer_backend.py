@@ -417,3 +417,108 @@ def test_dspark_l1_reuses_only_full_vocab_ce_log_probs(
         for parameter in model.parameters()
         if parameter.requires_grad
     )
+
+
+def _manual_l1(
+    draft_log_probs: torch.Tensor,
+    target_hidden: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    weights: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    hidden = target_hidden.float()
+    if norm_weight is not None:
+        hidden = hidden * torch.rsqrt(hidden.pow(2).mean(dim=-1, keepdim=True) + eps)
+        hidden = hidden * norm_weight.float()
+    target_probs = torch.softmax(
+        (hidden.to(lm_head_weight.dtype) @ lm_head_weight.T).float(), dim=-1
+    )
+    draft_probs = draft_log_probs.exp()
+    return (draft_probs - target_probs).abs().sum(dim=-1).mul(weights).sum()
+
+
+def test_dspark_l1_target_applies_verifier_final_norm():
+    model = _small_dspark_training_model(block_size=2, l1_loss_alpha=1.0)
+    torch.manual_seed(0)
+    active_hidden = torch.randn(6, 8)
+    active_prev_tokens = torch.zeros(6, dtype=torch.long)
+    active_target_hidden = torch.randn(6, 8)
+    active_weights = torch.rand(6) + 0.5
+    lm_head_weight = torch.randn(32, 8)
+    norm_weight = torch.randn(8)
+    draft_log_probs = torch.log_softmax(torch.randn(6, 32), dim=-1)
+
+    l1_sum, l1_den = model._compute_l1_loss_for_active(
+        active_hidden=active_hidden,
+        active_prev_tokens=active_prev_tokens,
+        active_target_hidden=active_target_hidden,
+        active_weights=active_weights,
+        lm_head_weight=lm_head_weight,
+        active_draft_log_probs=draft_log_probs,
+        target_norm_weight=norm_weight,
+        target_norm_eps=1e-6,
+    )
+
+    expected = _manual_l1(
+        draft_log_probs,
+        active_target_hidden,
+        lm_head_weight,
+        active_weights,
+        norm_weight,
+    )
+    assert l1_den.item() == pytest.approx(active_weights.sum().item())
+    assert l1_sum.item() == pytest.approx(expected.item(), rel=1e-4, abs=1e-5)
+
+    plain_sum, _ = model._compute_l1_loss_for_active(
+        active_hidden=active_hidden,
+        active_prev_tokens=active_prev_tokens,
+        active_target_hidden=active_target_hidden,
+        active_weights=active_weights,
+        lm_head_weight=lm_head_weight,
+        active_draft_log_probs=draft_log_probs,
+        target_norm_weight=None,
+    )
+    plain_expected = _manual_l1(
+        draft_log_probs,
+        active_target_hidden,
+        lm_head_weight,
+        active_weights,
+        norm_weight=None,
+    )
+    assert plain_sum.item() == pytest.approx(
+        plain_expected.item(), rel=1e-4, abs=1e-5
+    )
+    # The norm must actually change the distillation target.
+    assert l1_sum.item() != pytest.approx(plain_sum.item(), rel=1e-3)
+
+
+def test_dspark_l1_norm_flows_through_forward(monkeypatch):
+    model = _small_dspark_training_model(block_size=2, l1_loss_alpha=0.5)
+    captured_norm = []
+    original_compute_l1 = model._compute_l1_loss_for_active
+
+    def capture_compute_l1(**kwargs):
+        captured_norm.append(kwargs.get("target_norm_weight"))
+        return original_compute_l1(**kwargs)
+
+    monkeypatch.setattr(model, "_compute_l1_loss_for_active", capture_compute_l1)
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    hidden_states = [torch.randn(1, 5, 8), torch.randn(1, 5, 8)]
+    target_last_hidden_states = torch.randn(1, 5, 8)
+    lm_head_weight = torch.randn(32, 8)
+    norm_weight = torch.randn(8)
+
+    model(
+        input_ids=input_ids,
+        hidden_states_list=hidden_states,
+        loss_mask=loss_mask,
+        lm_head_weight=lm_head_weight,
+        target_last_hidden_states=target_last_hidden_states,
+        target_norm_weight=norm_weight,
+        target_norm_eps=1e-5,
+    )
+
+    assert len(captured_norm) == 1
+    assert captured_norm[0] is norm_weight
