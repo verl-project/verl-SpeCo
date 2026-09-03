@@ -1433,6 +1433,18 @@ patch_transformers_attention_layer_type_constants()
 install_verl_npu_vllm_import_compat()
 
 
+# vLLM's own Qwen3DSparkForCausalLM.load_weights() skips these
+# (``skip_substrs = ["mask_embedding", "confidence_head"]``): the confidence head
+# is not wired into inference, so the served Qwen3DSparkModel never registers it.
+# A trained DSpark drafter does carry those weights, and the online publish path
+# streams them straight into the inner model, which rejects the unknown module.
+_DSPARK_INFERENCE_ONLY_SKIPPED = ("confidence_head",)
+
+
+def _is_inference_only_skipped_dspark_param(name: str) -> bool:
+    return any(marker in name for marker in _DSPARK_INFERENCE_ONLY_SKIPPED)
+
+
 def _is_dspark_hf_config(hf_config: Any) -> bool:
     architectures = _get_nested(hf_config, ("architectures",), None) or []
     if isinstance(architectures, str):
@@ -3337,6 +3349,12 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             translated_bucket = [
                 (translate_name(str(name)), tensor) for name, tensor in bucket_weights
             ]
+            if is_dspark:
+                translated_bucket = [
+                    (name, tensor)
+                    for name, tensor in translated_bucket
+                    if not _is_inference_only_skipped_dspark_param(name)
+                ]
             if not translated_bucket:
                 return
             bucket_count += 1
