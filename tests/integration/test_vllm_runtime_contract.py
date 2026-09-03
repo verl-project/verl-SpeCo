@@ -30,6 +30,7 @@ from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_WORKER_EXTENSION_CLS,
     SpecoVLLMColocateWorkerExtension,
     SpecoVLLMWeightSyncCompatExtension,
+    _SpecoVLLMHttpServerMixin,
     _describe_vllm_draft_logits,
     _invoke_bucket_received_callback,
     _new_vllm_spec_decode_stats,
@@ -99,6 +100,60 @@ def test_vllm_worker_extension_constructs_without_wake_up_fallback() -> None:
     extension = SpecoVLLMColocateWorkerExtension()
 
     assert isinstance(extension, SpecoVLLMColocateWorkerExtension)
+
+
+def test_vllm_initial_drafter_initialization_is_serialized() -> None:
+    class Server(_SpecoVLLMHttpServerMixin):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self._speco_initial_draft_weights_required = True
+            self._speco_initial_draft_weights_ready = False
+            self._speco_initial_draft_weights_lock = None
+
+        async def collective_rpc(self, method: str) -> None:
+            self.calls.append(method)
+
+    server = Server()
+
+    async def ensure_twice() -> None:
+        await asyncio.gather(
+            server._speco_ensure_initial_draft_weights(),
+            server._speco_ensure_initial_draft_weights(),
+        )
+
+    asyncio.run(ensure_twice())
+
+    assert server.calls == ["speco_ensure_draft_initialized"]
+    assert server._speco_initial_draft_weights_ready is True
+
+
+def test_vllm_worker_initializes_dflash_drafter_once(monkeypatch) -> None:
+    extension = SpecoVLLMColocateWorkerExtension()
+    reload_calls: list[bool] = []
+
+    def reload_from_checkpoint() -> int:
+        reload_calls.append(True)
+        extension._speco_draft_weight_source = "checkpoint"
+        return 23
+
+    monkeypatch.setattr(extension, "_speco_is_dflash_draft", lambda: True)
+    monkeypatch.setattr(
+        extension,
+        "_speco_reload_draft_from_checkpoint",
+        reload_from_checkpoint,
+    )
+
+    assert extension.speco_ensure_draft_initialized() == {
+        "initialized": True,
+        "source": "checkpoint",
+        "loaded_params": 23,
+    }
+    assert extension.speco_ensure_draft_initialized() == {
+        "initialized": True,
+        "source": "checkpoint",
+        "loaded_params": 0,
+    }
+    assert reload_calls == [True]
 
 
 def _revision_runtime_extension():

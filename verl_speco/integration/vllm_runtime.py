@@ -2156,6 +2156,13 @@ class _SpecoVLLMHttpServerMixin:
 
     async def launch_server(self, *args, **kwargs):
         self._speco_vllm_spec_decode_pending_stats = _new_vllm_spec_decode_stats()
+        drafter_cfg = _load_env_drafter_config()
+        self._speco_initial_draft_weights_required = bool(
+            drafter_cfg.get("enable")
+            and _speculative_method_from_drafter(drafter_cfg) in {"dflash", "dspark"}
+        )
+        self._speco_initial_draft_weights_ready = False
+        self._speco_initial_draft_weights_lock = None
         install_vllm_runtime_observability()
         _ensure_vllm_drafter_speculative_config_from_env(self.config)
         return await super().launch_server(*args, **kwargs)
@@ -2195,7 +2202,34 @@ class _SpecoVLLMHttpServerMixin:
         finally:
             AsyncLLM.from_vllm_config = original_from_vllm_config_attr
 
+    async def _speco_ensure_initial_draft_weights(self) -> None:
+        """Initialize the serving drafter before admitting the first request."""
+        if not bool(getattr(self, "_speco_initial_draft_weights_required", False)):
+            return
+        if bool(getattr(self, "_speco_initial_draft_weights_ready", False)):
+            return
+
+        import asyncio
+
+        lock = getattr(self, "_speco_initial_draft_weights_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._speco_initial_draft_weights_lock = lock
+
+        async with lock:
+            if bool(getattr(self, "_speco_initial_draft_weights_ready", False)):
+                return
+            collective_rpc = getattr(self, "collective_rpc", None)
+            if not callable(collective_rpc):
+                raise RuntimeError(
+                    "vLLM HTTP server does not expose collective_rpc for "
+                    "initial drafter weight loading"
+                )
+            await collective_rpc("speco_ensure_draft_initialized")
+            self._speco_initial_draft_weights_ready = True
+
     async def generate(self, *args, **kwargs):
+        await self._speco_ensure_initial_draft_weights()
         output = await super().generate(*args, **kwargs)
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
@@ -2626,6 +2660,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     """vLLM worker extension that can update only the speculative draft model."""
 
     _speco_draft_level2_snapshot: dict[str, Any] | None = None
+    _speco_draft_level2_snapshot_source: str | None = None
     _speco_draft_level2_snapshot_revision: int | None = None
     _speco_draft_level2_restore_pending = False
     _speco_draft_runtime_revision = 0
@@ -2639,9 +2674,11 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         # Keep the revision/snapshot lifecycle on the instance so an online
         # update can never consume stale class-level recovery state.
         instance._speco_draft_level2_snapshot = None
+        instance._speco_draft_level2_snapshot_source = None
         instance._speco_draft_level2_snapshot_revision = None
         instance._speco_draft_level2_restore_pending = False
         instance._speco_draft_runtime_revision = 0
+        instance._speco_draft_weight_source = None
         # vLLM's extension mechanism forbids overriding methods that already
         # exist on Worker (e.g. sleep/wake_up). Use __new__ (dunder, skipped by
         # the conflict check) to install instance-level wrappers instead.
@@ -2772,6 +2809,20 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         target model from the actor. Snapshotting the draft preserves the
         latest online-published state for every speculative method.
         """
+        source = getattr(self, "_speco_draft_weight_source", None)
+        if source not in {"checkpoint", "online"}:
+            if int(getattr(self, "_speco_draft_runtime_revision", 0) or 0) > 0:
+                source = "online"
+                self._speco_draft_weight_source = source
+            elif self._speco_is_dflash_draft():
+                return 0
+            # Other speculative methods are loaded by vLLM before this
+            # extension observes the model, so their initial state is a
+            # checkpoint-derived one.
+            if source not in {"checkpoint", "online"}:
+                source = "checkpoint"
+                self._speco_draft_weight_source = source
+
         draft_model, _ = self._speco_resolve_draft_model()
         if draft_model is None:
             return 0
@@ -2788,6 +2839,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             return 0
 
         self._speco_draft_level2_snapshot = snapshot
+        self._speco_draft_level2_snapshot_source = source
         self._speco_draft_level2_snapshot_revision = int(
             getattr(self, "_speco_draft_runtime_revision", 0) or 0
         )
@@ -2805,6 +2857,12 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         snapshot = getattr(self, "_speco_draft_level2_snapshot", None)
         if snapshot is None:
             return 0
+
+        snapshot_source = getattr(self, "_speco_draft_level2_snapshot_source", None)
+        if snapshot_source not in {"checkpoint", "online"}:
+            raise RuntimeError(
+                "Cannot restore the draft level-2 snapshot: weight source is unknown"
+            )
 
         snapshot_revision = getattr(self, "_speco_draft_level2_snapshot_revision", None)
         runtime_revision = int(getattr(self, "_speco_draft_runtime_revision", 0) or 0)
@@ -2851,8 +2909,10 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             )
 
         self._speco_rebuild_draft_metadata_buffers(draft_model)
+        self._speco_draft_weight_source = snapshot_source
         restored = len(snapshot)
         self._speco_draft_level2_snapshot = None
+        self._speco_draft_level2_snapshot_source = None
         self._speco_draft_level2_snapshot_revision = None
         return restored
 
@@ -3406,6 +3466,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 self._speco_reclaim_draft_update_device_cache(torch)
                 memory_after_reclaim = self._speco_npu_memory_snapshot(torch)
 
+        self._speco_draft_weight_source = "online"
         self._speco_draft_runtime_revision = (
             int(getattr(self, "_speco_draft_runtime_revision", 0) or 0) + 1
         )
@@ -3453,7 +3514,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         return {"loaded_params": loaded_params, "has_draft_model": True}
 
     # ----------------------------------------------------------------
-    # Fix: reload DFlash drafter weights from checkpoint after wake_up
+    # Initial DFlash/DSpark checkpoint load and level-2 wake-up fallback
     # ----------------------------------------------------------------
 
     def _speco_get_draft_checkpoint_path(self) -> str | None:
@@ -3473,10 +3534,10 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         return getattr(draft_model_cfg, "model", None)
 
     def _speco_reload_draft_from_checkpoint(self) -> int:
-        """Reload DFlash drafter weights from its checkpoint (safetensors).
+        """Reload DFlash/DSpark drafter weights from checkpoint (safetensors).
 
-        Called after target model wake_up to restore drafter weights that were
-        lost during sleep(level=2). Returns the number of weight tensors loaded.
+        Used before the first serving request and as the fallback after
+        sleep(level=2). Returns the number of weight tensors loaded.
         """
         import glob as _glob
 
@@ -3520,12 +3581,38 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
 
         try:
             draft_model.load_weights(iter(weights_iter))
+            self._speco_rebuild_draft_metadata_buffers(draft_model)
             loaded_count = len(weights_iter)
         except Exception as exc:
             logger.warning("[speco draft reload] load_weights failed: %s", exc)
             return 0
 
+        self._speco_draft_weight_source = "checkpoint"
         return loaded_count
+
+    def speco_ensure_draft_initialized(self) -> dict[str, Any]:
+        """Load the base drafter once, before its first serving request."""
+        source = getattr(self, "_speco_draft_weight_source", None)
+        if source in {"checkpoint", "online"}:
+            return {"initialized": True, "source": source, "loaded_params": 0}
+        if not self._speco_is_dflash_draft():
+            return {
+                "initialized": False,
+                "source": "not_applicable",
+                "loaded_params": 0,
+            }
+
+        loaded_params = self._speco_reload_draft_from_checkpoint()
+        if loaded_params <= 0:
+            raise RuntimeError(
+                "Failed to initialize the serving drafter from its configured "
+                "checkpoint before the first rollout request"
+            )
+        return {
+            "initialized": True,
+            "source": "checkpoint",
+            "loaded_params": loaded_params,
+        }
 
     def _speco_resolve_target_model(self):
         runner = getattr(self, "model_runner", None)
