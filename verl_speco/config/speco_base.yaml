@@ -9,6 +9,8 @@ speco:
   verl_base:
     version: "0.8.0"
     branch: release/v0.8.0
+    supported_versions: ["0.8.0", "0.9.0"]
+    supported_branches: [release/v0.8.0, release/v0.9.0]
     source_modifications_allowed: false
 
   compatibility:
@@ -71,6 +73,9 @@ actor_rollout_ref:
         training_interval_steps: 5
         publish_interval_steps: 0
         publish_async: false
+        # MRV2-only safety cap applied before val_kwargs.n expansion.  The
+        # trainer ignores it for verl 0.8/MRV1 and other rollout algorithms.
+        validation_batch_size: 8
         publish_dtype: null
         publish_param_name_patterns: null
         draft_update_use_shm: null
@@ -132,7 +137,9 @@ actor_rollout_ref:
         dspark_confidence_loss_alpha: 0.0
         dspark_confidence_head_with_markov: true
         dspark_ce_loss_alpha: 0.1
-        dspark_l1_loss_alpha: 0.45
+        # DeepSpec Qwen3 fixed-K default. Confidence BCE is unsupported on MRV2
+        # and must not implicitly reduce the distribution-matching objective.
+        dspark_l1_loss_alpha: 0.9
         dspark_l1_chunk_size: 0
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
@@ -163,6 +170,23 @@ actor_rollout_ref:
         domino_shift_label: true
         domino_lambda_base_start: 1.0
         domino_lambda_base_decay_steps: 2000
+        # DFlash2 (DFlash variant: two-tap dynamic depthwise convolutions around
+        # each sublayer + a candidate selector that re-ranks the drafter's own
+        # top-k with a low-rank bilinear score over adjacent candidates).
+        # Defaults match the released z-lab/Qwen3.8-27B-DFlash2 checkpoint.
+        dflash2_block_size: 8
+        dflash2_num_anchors: 512
+        dflash2_loss_decay_gamma: 7.0
+        dflash2_hidden_size: null
+        dflash2_num_target_layers: 5
+        dflash2_num_hidden_layers: 5
+        dflash2_mask_token_id: null
+        dflash2_target_layer_ids: null
+        dflash2_conv_kernel_size: 2
+        dflash2_conv_group_size: 16
+        dflash2_selector_rank: 256
+        dflash2_selector_top_k: 16
+        dflash2_selector_loss_weight: 1.0
         # EAGLE-1 / EAGLE-2 draft training (single-step feature regression +
         # full-vocab soft-CE distillation against the frozen target head).
         eagle1_num_hidden_layers: 1
@@ -181,3 +205,5 @@ actor_rollout_ref:
           repeat: true
           prefetch_depth: 2
           strict_schema: true
+          min_sample_step: null
+          max_sample_step: null

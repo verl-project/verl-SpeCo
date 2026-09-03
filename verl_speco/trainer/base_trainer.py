@@ -28,6 +28,7 @@ from contextlib import contextmanager, nullcontext
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.nn import SmoothL1Loss
@@ -481,6 +482,7 @@ class DrafterBaseTrainer:
             config.rollout.drafter.training.get("use_data_buffer", False)
         )
         self.current_rl_step = 0
+        self.buffer_version = 0
 
         self.device_id = get_device_id()
         self.device_module = get_torch_device()
@@ -818,13 +820,14 @@ class DrafterBaseTrainer:
     def _is_block_drafter_backend(self) -> bool:
         return getattr(self.backend, "model_type", None) in {
             "dflash",
+            "dflash2",
             "dspark",
             "domino",
         }
 
     def _block_drafter_metric_prefix(self) -> str:
         model_type = str(getattr(self.backend, "model_type", "dflash") or "dflash")
-        if model_type in {"dspark", "domino"}:
+        if model_type in {"dspark", "domino", "dflash2"}:
             return model_type
         return "dflash"
 
@@ -852,6 +855,16 @@ class DrafterBaseTrainer:
         eval_tokens = sums.get(f"{prefix}/eval_token_count", 0.0)
         if eval_tokens > 0:
             metrics[f"{prefix}/accuracy"] = correct / eval_tokens
+        scored_blocks = sums.get(f"{prefix}/scored_block_count", 0.0)
+        if scored_blocks > 0:
+            # Same convention as the rollout-side drafter/spec_decode/
+            # mean_acceptance_length: the leading 1.0 is the token the target
+            # emits itself at each verification step, not a drafted one, so the
+            # training metric predicts the served one instead of sitting a token
+            # below it on the same dashboard.
+            metrics[f"{prefix}/mean_acceptance_length"] = 1.0 + (
+                sums.get(f"{prefix}/accepted_length_sum", 0.0) / scored_blocks
+            )
         quality_tokens = sums.get(f"{prefix}/quality_token_count", 0.0)
         if quality_tokens > 0:
             metrics[f"{prefix}/top1_acc"] = (
@@ -876,6 +889,8 @@ class DrafterBaseTrainer:
             f"{prefix}/ce_weighted_token_count",
             f"{prefix}/l1_weighted_token_count",
             f"{prefix}/quality_token_count",
+            f"{prefix}/accepted_length_sum",
+            f"{prefix}/scored_block_count",
             f"{prefix}/sanitized_rows",
             f"{prefix}/masked_rows",
             f"{prefix}/sampled_vocab_size",
@@ -938,6 +953,8 @@ class DrafterBaseTrainer:
         scalar_keys = {
             "correct_count": f"{prefix}/correct_count",
             "eval_token_count": f"{prefix}/eval_token_count",
+            "accepted_length_sum": f"{prefix}/accepted_length_sum",
+            "scored_block_count": f"{prefix}/scored_block_count",
             "top1_correct_count": f"{prefix}/top1_correct_count",
             "top5_correct_count": f"{prefix}/top5_correct_count",
             "quality_token_count": f"{prefix}/quality_token_count",
@@ -947,6 +964,13 @@ class DrafterBaseTrainer:
             "ce_weighted_token_count": f"{prefix}/ce_weighted_token_count",
             "l1_loss_sum": f"{prefix}/l1_loss_sum",
             "l1_weighted_token_count": f"{prefix}/l1_weighted_token_count",
+            # DFlash2 candidate selector.
+            "selector_loss": f"{prefix}/selector_loss",
+            "selector_correct_count": f"{prefix}/selector_correct_count",
+            "selector_base_correct_count": f"{prefix}/selector_base_correct_count",
+            "selector_token_count": f"{prefix}/selector_token_count",
+            "selector_coverage_count": f"{prefix}/selector_coverage_count",
+            "selector_active_count": f"{prefix}/selector_active_count",
             "sanitized_rows": f"{prefix}/sanitized_rows",
             "masked_rows": f"{prefix}/masked_rows",
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
@@ -1018,6 +1042,24 @@ class DrafterBaseTrainer:
         if fsdp_config is None:
             fsdp_config = self.config.rollout.drafter.training.get("fsdp_config")
         if fsdp_config is None:
+            # When the main model uses Megatron, the actor config has no
+            # fsdp_config (it uses megatron.* instead).  The drafter is
+            # always trained with FSDP, so provide a default config.
+            actor_strategy = ""
+            if hasattr(self.config, "actor"):
+                actor_strategy = str(
+                    getattr(self.config.actor, "strategy", "") or ""
+                ).lower()
+            if actor_strategy in {"megatron", "mindspeed_megatron"}:
+                from verl.workers.config import FSDPEngineConfig
+
+                fsdp_config = FSDPEngineConfig()
+                logger.warning(
+                    "SPECO drafter: actor strategy=%s has no fsdp_config; "
+                    "using default FSDPEngineConfig for drafter training",
+                    actor_strategy,
+                )
+        if fsdp_config is None:
             raise ValueError(
                 "FSDP config is missing: expect actor_rollout_ref.actor.fsdp_config or drafter override"
             )
@@ -1030,7 +1072,7 @@ class DrafterBaseTrainer:
         pending_target_weight = self._pending_target_lm_head_weight
         if (
             getattr(self.backend, "model_type", None)
-            in {"eagle3", "dflash", "dspark", "domino"}
+            in {"eagle3", "dflash", "dflash2", "dspark", "domino"}
             and torch.is_tensor(pending_target_weight)
             and pending_target_weight.dim() == 2
         ):
@@ -1257,6 +1299,17 @@ class DrafterBaseTrainer:
 
         if any(frozen_name in name for frozen_name in self._frozen_param_names):
             return True
+        if (
+            getattr(self.backend, "model_type", None) == "dspark"
+            and "confidence_head." in name
+            and os.getenv("VLLM_USE_V2_MODEL_RUNNER", "").lower()
+            in {"1", "true", "yes"}
+        ):
+            # The supported MRV2 runtime has no confidence-head contract, and
+            # the current trainer rejects positive confidence loss. A head
+            # inherited from an older checkpoint is frozen and must not enter
+            # the native fixed-K online update payload.
+            return True
         return name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight")
 
     def _get_trainable_state_dict(self) -> dict[str, torch.Tensor]:
@@ -1316,12 +1369,8 @@ class DrafterBaseTrainer:
 
     def _get_pretrained_export_model(self):
         model = self.model.module if hasattr(self.model, "module") else self.model
-        # Trainer wrappers (the DFlash family and P-EAGLE) keep the exportable
-        # draft as ``draft_model``; the checkpoint must hold the draft itself, so
-        # unwrap whenever a wrapper is present rather than per backend type.
-        draft_model = getattr(model, "draft_model", None)
-        if draft_model is not None:
-            return draft_model, (
+        if self._is_block_drafter_backend() and hasattr(model, "draft_model"):
+            return model.draft_model, (
                 "draft_model.",
                 "module.draft_model.",
                 "_orig_mod.draft_model.",
@@ -3304,6 +3353,7 @@ class DrafterBaseTrainer:
             else:
                 data_item["step"] = self.current_rl_step
                 self.collected_data.append(data_item)
+            self._mark_buffer_changed()
 
     def _get_hidden_state_clip_value(self) -> Optional[float]:
         clip_value = self.config.rollout.drafter.training.get(
@@ -3513,6 +3563,9 @@ class DrafterBaseTrainer:
     def _prepare_training_batch(
         self,
         buffer_steps: int = 2,
+        *,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
     ) -> Optional[dict[str, torch.Tensor]]:
         """Prepare a batch for training using Ulysses SP to remove padding.
 
@@ -3539,16 +3592,26 @@ class DrafterBaseTrainer:
         # head version that produced those hidden states, so older buffered Eagle3
         # samples are not valid for the actor head synced for this rollout step.
         if self.use_data_buffer and len(self.data_buffer) > 0:
-            if same_step_target_head_required:
-                buffer_steps = 0
-            else:
-                # Use data from last N RL steps via DataBuffer
-                buffer_steps = int(
-                    self.config.rollout.drafter.training.get(
-                        "sample_last_n_steps", buffer_steps
-                    )
+            if min_sample_step is not None or max_sample_step is not None:
+                available_data = self._filter_training_data_by_step(
+                    self.data_buffer.get_all_data(),
+                    current_step=current_step,
+                    min_sample_step=min_sample_step,
+                    max_sample_step=max_sample_step,
                 )
-            available_data = self.data_buffer.get_data_from_last_n_steps(buffer_steps)
+            else:
+                if same_step_target_head_required:
+                    buffer_steps = 0
+                else:
+                    # Use data from last N RL steps via DataBuffer
+                    buffer_steps = int(
+                        self.config.rollout.drafter.training.get(
+                            "sample_last_n_steps", buffer_steps
+                        )
+                    )
+                available_data = self.data_buffer.get_data_from_last_n_steps(
+                    buffer_steps
+                )
             if len(available_data) < effective_batch_size:
                 if len(available_data) >= min_items_for_batch:
                     items = available_data
@@ -3567,11 +3630,16 @@ class DrafterBaseTrainer:
         else:
             # Fall back to current step data only. collected_data can contain
             # older rollout steps when drafter training is triggered sparsely.
-            current_step_data = [
-                item
-                for item in self.collected_data
-                if int(item.get("step", current_step)) == current_step
-            ]
+            current_step_data = self._filter_training_data_by_step(
+                self.collected_data,
+                current_step=current_step,
+                min_sample_step=(
+                    current_step if min_sample_step is None else min_sample_step
+                ),
+                max_sample_step=(
+                    current_step if max_sample_step is None else max_sample_step
+                ),
+            )
             if len(current_step_data) < effective_batch_size:
                 if len(current_step_data) >= min_items_for_batch:
                     items = current_step_data
@@ -4392,9 +4460,123 @@ class DrafterBaseTrainer:
         dist.all_reduce(readiness, op=dist.ReduceOp.MIN, group=dp_group)
         return bool(readiness.item())
 
-    def prepare_training_batch(self) -> Optional[dict[str, torch.Tensor]]:
+    @staticmethod
+    def _filter_training_data_by_step(
+        data: Any,
+        *,
+        current_step: int,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        min_step = current_step if min_sample_step is None else int(min_sample_step)
+        max_step = current_step if max_sample_step is None else int(max_sample_step)
+        return [
+            item
+            for item in data
+            if min_step <= int(item.get("step", current_step)) <= max_step
+        ]
+
+    def prepare_training_batch(
+        self,
+        *,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> Optional[dict[str, torch.Tensor]]:
         with self._ulysses_group_context():
-            return self._prepare_training_batch()
+            return self._prepare_training_batch(
+                min_sample_step=min_sample_step,
+                max_sample_step=max_sample_step,
+            )
+
+    def get_training_data_status(
+        self,
+        *,
+        sample_last_n_steps: int = 2,
+        require_full_batch: bool = False,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Return a non-mutating snapshot of data that can form training batches."""
+
+        current_step = int(self.current_rl_step)
+        use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
+        same_step_data_required = self.backend.model_type == "eagle3" and not use_logits
+        current_step_data = [
+            item
+            for item in self.collected_data
+            if int(item.get("step", current_step)) == current_step
+        ]
+        buffer_data = self.data_buffer.get_all_data() if self.use_data_buffer else []
+        if self.use_data_buffer and buffer_data:
+            if min_sample_step is not None or max_sample_step is not None:
+                trainable_data = self._filter_training_data_by_step(
+                    buffer_data,
+                    current_step=current_step,
+                    min_sample_step=min_sample_step,
+                    max_sample_step=max_sample_step,
+                )
+                effective_min_sample_step = min_sample_step
+                effective_max_sample_step = max_sample_step
+            else:
+                recent_steps = (
+                    0 if same_step_data_required else int(sample_last_n_steps)
+                )
+                trainable_data = self.data_buffer.get_data_from_last_n_steps(
+                    recent_steps
+                )
+                effective_min_sample_step = max(0, current_step - recent_steps)
+                effective_max_sample_step = current_step
+        else:
+            trainable_data = self._filter_training_data_by_step(
+                self.collected_data,
+                current_step=current_step,
+                min_sample_step=(
+                    current_step if min_sample_step is None else min_sample_step
+                ),
+                max_sample_step=(
+                    current_step if max_sample_step is None else max_sample_step
+                ),
+            )
+            effective_min_sample_step = (
+                current_step if min_sample_step is None else min_sample_step
+            )
+            effective_max_sample_step = (
+                current_step if max_sample_step is None else max_sample_step
+            )
+
+        batch_size = max(int(self.batch_size), 1)
+        trainable_samples = len(trainable_data)
+        full_batches, remainder = divmod(trainable_samples, batch_size)
+        partial_batch_available = remainder > 0
+        trainable_batches = full_batches
+        if partial_batch_available and not require_full_batch:
+            trainable_batches += 1
+
+        sample_steps = [
+            int(item.get("step", current_step))
+            for item in trainable_data
+            if item is not None
+        ]
+        return {
+            "current_step": current_step,
+            "current_step_samples": len(current_step_data),
+            "buffer_samples": len(buffer_data),
+            "trainable_samples": trainable_samples,
+            "trainable_batches": trainable_batches,
+            "batch_size_per_gpu": batch_size,
+            "partial_batch_available": partial_batch_available,
+            "oldest_sample_step": min(sample_steps) if sample_steps else None,
+            "newest_sample_step": max(sample_steps) if sample_steps else None,
+            "same_step_data_required": same_step_data_required,
+            "target_version": getattr(self, "_target_lm_head_weight_step", None),
+            "buffer_version": self.buffer_version,
+            "data_version": max(sample_steps) if sample_steps else None,
+            "min_sample_step": effective_min_sample_step,
+            "max_sample_step": effective_max_sample_step,
+        }
+
+    def _mark_buffer_changed(self) -> None:
+        self.buffer_version += 1
 
     def add_feature_sample(self, sample: DraftFeatureSample | dict[str, Any]) -> None:
         """Append a normalized standalone sample to the in-memory training buffer."""
@@ -4408,6 +4590,7 @@ class DrafterBaseTrainer:
             item.get("step", self.current_rl_step) or self.current_rl_step
         )
         self.collected_data.append(item)
+        self._mark_buffer_changed()
 
     def prepare_training_batch_from_samples(
         self,
@@ -4456,10 +4639,20 @@ class DrafterBaseTrainer:
             logger.exception(f"Standalone training step {step} failed with error: {e}")
             return False
 
-    async def training_step(self, step: int) -> bool:
+    async def training_step(
+        self,
+        step: int,
+        *,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> bool:
         try:
             with torch.enable_grad():
-                return await self._training_step_impl(step)
+                return await self._training_step_impl(
+                    step,
+                    min_sample_step=min_sample_step,
+                    max_sample_step=max_sample_step,
+                )
         except Exception as e:  # noqa: BLE001
             logger.exception(f"Training step {step} failed with error: {e}")
             return False
@@ -4479,7 +4672,13 @@ class DrafterBaseTrainer:
         finally:
             set_ulysses_sequence_parallel_group(prev_group)
 
-    async def _training_step_impl(self, step: int) -> bool:
+    async def _training_step_impl(
+        self,
+        step: int,
+        *,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> bool:
         """Execute a single training step."""
         if not self.model:
             logger.debug("No model available for training")
@@ -4503,20 +4702,40 @@ class DrafterBaseTrainer:
             return False
 
         prepare_ts = time.time()
-        batch = self.prepare_training_batch()
+        batch = self.prepare_training_batch(
+            min_sample_step=min_sample_step,
+            max_sample_step=max_sample_step,
+        )
         self.record_training_timing(
             "timing_s/drafter_prepare_batch", time.time() - prepare_ts
         )
+        if batch is None:
+            logger.debug(
+                f"[DrafterTrainer rank {self.rank}] Not enough data at step {step} "
+                f"(have={len(self.collected_data)} need>={self.batch_size})"
+            )
+            try:
+                eval_metrics = self.evaluate_drafter_quality()
+                if eval_metrics:
+                    self._training_metric_sums.update(
+                        {f"eval_{k}": v for k, v in eval_metrics.items()}
+                    )
+                    logger.warning(
+                        "[drafter eval probe] step=%s top1=%.4f entropy=%.4f kl=%.4f tokens=%s",
+                        step,
+                        eval_metrics.get("drafter/eval_top1_match", 0.0),
+                        eval_metrics.get("drafter/eval_actor_entropy", 0.0),
+                        eval_metrics.get("drafter/eval_kl_actor_drafter", 0.0),
+                        eval_metrics.get("drafter/eval_token_count", 0),
+                    )
+            except Exception as exc:
+                logger.debug("[drafter eval probe] failed: %s", exc)
         if not self._sync_batch_readiness(batch is not None):
             logger.debug(
                 f"[DrafterTrainer rank {self.rank}] Skipping step {step} due to missing drafter batch"
             )
             return False
         if batch is None:
-            logger.debug(
-                f"[DrafterTrainer rank {self.rank}] Not enough data at step {step} "
-                f"(have={len(self.collected_data)} need>={self.batch_size})"
-            )
             return False
 
         return await self._training_step_on_batch(batch, step)
@@ -4660,6 +4879,223 @@ class DrafterBaseTrainer:
         )
         return True
 
+    @torch.no_grad()
+    def evaluate_drafter_quality(self) -> dict[str, float]:
+        """Evaluate drafter prediction quality without training.
+
+        Directly compares actor vs drafter output distributions on collected
+        rollout data.  Runs even when prepare_training_batch returns None
+        (i.e. no_trainable_batch), so quality can be tracked every step.
+
+        Produces:
+          drafter/eval_top1_match      P(drafter_argmax == actor_argmax)
+          drafter/eval_top5_match      P(actor_argmax in drafter top-5)
+          drafter/eval_actor_entropy   mean Shannon entropy of actor dist
+          drafter/eval_drafter_entropy mean Shannon entropy of drafter dist
+          drafter/eval_kl_actor_drafter  KL(actor || drafter)
+          drafter/eval_exp_acceptance    expected spec-decode acceptance prob
+          drafter/eval_token_count     number of evaluated tokens
+        """
+        if not self.model or not self.collected_data:
+            return {}
+        items = list(self.collected_data)[: min(4, len(self.collected_data))]
+        items = [it for it in items if "hidden_states" in it]
+        if not items:
+            return {}
+
+        try:
+            dev = next(self.model.parameters()).device
+        except StopIteration:
+            return {}
+
+        use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
+        try:
+            pre = self.backend.preprocess_individual_items(
+                items, dev, self.model_config
+            )
+        except Exception:
+            logger.debug(
+                "[drafter eval probe] preprocess failed for %s items", len(items)
+            )
+            return {}
+
+        ids_list = pre["ids"]
+        hidden_list = pre["h_states"]
+        mask_list = pre["masks"]
+        pos_list = pre.get("position_ids")
+        last_h_list = pre.get("last_h_states")
+        target_lp_list = pre.get("target_logprobs")
+
+        if not ids_list:
+            return {}
+
+        def _pad(tensors, dim=0, value=0):
+            tensors = [
+                t.squeeze(0) if t.dim() == 3 and t.size(0) == 1 else t for t in tensors
+            ]
+            max_len = max(t.size(dim) for t in tensors)
+            padded = []
+            for t in tensors:
+                pad_shape = list(t.shape)
+                pad_shape[dim] = max_len - t.size(dim)
+                if pad_shape[dim] > 0:
+                    pad_t = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
+                    pad_t.fill_(value)
+                    padded.append(torch.cat([t, pad_t], dim=dim))
+                else:
+                    padded.append(t)
+            return torch.stack(padded, dim=0)
+
+        bsz = len(ids_list)
+        input_ids = _pad(ids_list, dim=0, value=self.pad_token_id).unsqueeze(1)
+        hidden_states = _pad(hidden_list, dim=0).unsqueeze(1)
+        loss_mask = _pad(mask_list, dim=0, value=0.0).unsqueeze(1)
+        if pos_list is not None and pos_list[0] is not None:
+            position_ids = _pad(pos_list, dim=0, value=0).unsqueeze(1)
+        else:
+            max_len = input_ids.size(1)
+            position_ids = (
+                torch.arange(max_len, device=dev)
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .expand(bsz, 1, max_len)
+            )
+
+        attn_mask = (input_ids != self.pad_token_id).long()
+        batch = {
+            "input_ids": input_ids,
+            "hidden_states": hidden_states,
+            "attention_mask": attn_mask,
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
+        }
+        if self.backend.model_type == "eagle3" and not use_logits:
+            if last_h_list is None or last_h_list[0] is None:
+                return {}
+            batch["last_hidden_states"] = _pad(last_h_list, dim=0).unsqueeze(1)
+        elif self.backend.model_type == "eagle3" and use_logits:
+            if target_lp_list is None or target_lp_list[0] is None:
+                return {}
+            batch["target_logprobs"] = _pad(target_lp_list, dim=0).unsqueeze(1)
+
+        draft_model = self.model
+        try:
+            with torch.amp.autocast(device_type=device_name, dtype=torch.bfloat16):
+                outputs = draft_model(
+                    input_ids=batch["input_ids"],
+                    hidden_states=batch["hidden_states"],
+                    attention_mask=batch["attention_mask"],
+                    loss_mask=batch["loss_mask"],
+                    position_ids=batch["position_ids"],
+                    ttt_length=1,
+                )
+            drafter_logits = outputs["logits"][0]
+        except Exception:
+            logger.debug("[drafter eval probe] drafter forward failed")
+            return {}
+
+        if use_logits:
+            target_topk = batch["target_logprobs"]
+            from verl_speco.backends.eagle3_trainer_backend import (
+                _target_topk_to_draft_ids,
+            )
+
+            t2d = draft_model.t2d.to(device=dev, dtype=torch.bool)
+            token_ids = target_topk[..., 1].long()
+            valid = torch.isfinite(target_topk[..., 0])
+            draft_ids, in_draft = _target_topk_to_draft_ids(token_ids, valid, t2d)
+            actor_top1 = draft_ids[..., 0]
+            actor_logprobs_vals = target_topk[..., 0]
+        else:
+            last_hidden = batch["last_hidden_states"]
+            with torch.amp.autocast(device_type=device_name, dtype=torch.bfloat16):
+                target_scores = self.backend.target_model(last_hidden)
+            t2d = draft_model.t2d.to(device=dev, dtype=torch.bool)
+            if target_scores.size(-1) == t2d.numel():
+                target_subset = target_scores[..., t2d]
+            else:
+                target_subset = target_scores
+            actor_logprobs_full = F.log_softmax(target_subset.float(), dim=-1)
+            actor_top1 = actor_logprobs_full.argmax(dim=-1)
+            actor_logprobs_vals = actor_logprobs_full.gather(
+                -1, actor_top1.unsqueeze(-1)
+            ).squeeze(-1)
+
+        drafter_step_logits = drafter_logits[0]
+        drafter_logprobs = F.log_softmax(drafter_step_logits.float(), dim=-1)
+        drafter_top1 = drafter_logprobs.argmax(dim=-1)
+
+        pos_mask = batch["loss_mask"][0].squeeze(-1)
+        if pos_mask.dim() > 1:
+            pos_mask = pos_mask.squeeze(-1)
+        seq_len = min(
+            drafter_top1.size(0),
+            actor_top1.size(0),
+            pos_mask.size(0),
+        )
+        pos_mask = pos_mask[:seq_len].bool()
+        if not pos_mask.any():
+            return {}
+
+        drafter_top1 = drafter_top1[:seq_len]
+        actor_top1 = actor_top1[:seq_len]
+        drafter_lp = drafter_logprobs[:seq_len]
+        if use_logits:
+            actor_lp = actor_logprobs_vals[:seq_len]
+        else:
+            actor_lp_full = actor_logprobs_full[:seq_len]
+            actor_lp = actor_lp_full.gather(-1, actor_top1.unsqueeze(-1)).squeeze(-1)
+
+        top1_match = (drafter_top1 == actor_top1).float()
+        top1_match = top1_match[pos_mask]
+
+        drafter_topk = drafter_logprobs[:seq_len].topk(5, dim=-1).indices
+        top5_match = (drafter_topk == actor_top1.unsqueeze(-1)).any(dim=-1).float()
+        top5_match = top5_match[pos_mask]
+
+        drafter_probs = drafter_lp.exp()
+        drafter_entropy = -(drafter_probs * drafter_lp).sum(dim=-1)
+        if use_logits:
+            actor_probs = actor_lp.exp()
+            actor_entropy = -(actor_probs * actor_lp)
+        else:
+            actor_entropy = -(actor_lp_full.exp() * actor_lp_full).sum(dim=-1)
+        actor_entropy = actor_entropy[:seq_len]
+
+        if use_logits:
+            min_v = min(drafter_lp.size(-1), actor_lp.size(-1))
+        else:
+            min_v = min(drafter_lp.size(-1), actor_lp_full.size(-1))
+        d_p = drafter_probs[:seq_len, :min_v] + 1e-12
+        if use_logits:
+            a_p = actor_probs[:seq_len, :min_v] + 1e-12
+        else:
+            a_p = actor_lp_full[:seq_len, :min_v].exp() + 1e-12
+        kl_ad = (a_p * (a_p.log() - d_p.log())).sum(dim=-1)
+        kl_ad = kl_ad[pos_mask]
+
+        log_ratio = drafter_lp[:seq_len, :min_v] - (
+            actor_lp[:seq_len, :min_v]
+            if use_logits
+            else actor_lp_full[:seq_len, :min_v]
+        )
+        exp_acc = (a_p * torch.exp(log_ratio).clamp(max=1.0)).sum(dim=-1)
+        exp_acc = exp_acc[pos_mask]
+
+        token_count = pos_mask.float().sum().item()
+        if token_count <= 0:
+            return {}
+
+        return {
+            "drafter/eval_top1_match": top1_match.mean().item(),
+            "drafter/eval_top5_match": top5_match.mean().item(),
+            "drafter/eval_actor_entropy": actor_entropy[pos_mask].mean().item(),
+            "drafter/eval_drafter_entropy": drafter_entropy[pos_mask].mean().item(),
+            "drafter/eval_kl_actor_drafter": kl_ad.mean().item(),
+            "drafter/eval_exp_acceptance": exp_acc.mean().item(),
+            "drafter/eval_token_count": token_count,
+        }
+
     def increment_rl_step(self, global_step: Optional[int] = None):
         """Increment the RL step counter in the data buffer.
 
@@ -4671,7 +5107,9 @@ class DrafterBaseTrainer:
         else:
             self.current_rl_step = int(global_step)
         if not self.use_data_buffer and self.current_rl_step != previous_step:
-            self.collected_data.clear()
+            if self.collected_data:
+                self.collected_data.clear()
+                self._mark_buffer_changed()
         self.data_buffer.update_rl_step(self.current_rl_step)
         logger.debug(
             f"[Rank {self.rank}] DataBuffer RL step incremented to {self.data_buffer.get_current_step()}, "
@@ -4813,6 +5251,7 @@ class DrafterBaseTrainer:
             if clear_data:
                 self.collected_data.clear()
                 self.data_buffer.clear()
+                self._mark_buffer_changed()
             self._training_initialized = False
             self._training_active = False
             self._last_ckpt_step = -1
@@ -4850,6 +5289,7 @@ class DrafterBaseTrainer:
         if clear_data:
             self.collected_data.clear()
             self.data_buffer.clear()  # Clear the cross-step data buffer
+            self._mark_buffer_changed()
         if self._full_checkpoint_executor is not None:
             self._full_checkpoint_executor.shutdown(wait=False)
             self._full_checkpoint_executor = None

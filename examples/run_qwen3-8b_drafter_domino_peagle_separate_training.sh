@@ -27,7 +27,10 @@ RUN_STAGE=${RUN_STAGE:-both}
 gen_tp=2
 train_sp=1
 ppo_gpus_per_node=8
-draft_train_gpus_per_node=8
+# The standalone launcher resolves its device count from the FIRST matching
+# override, so appending one after "$@" cannot lower it. Read it from the
+# environment instead, which is what a smaller box (or CI) needs.
+draft_train_gpus_per_node=${DRAFT_TRAIN_GPUS_PER_NODE:-8}
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint

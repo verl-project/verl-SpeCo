@@ -13,7 +13,7 @@
 # limitations under the License.
 """Runtime bridge from external SPECO config to upstream verl SGLang rollout.
 
-verl v0.8.0 does not expose ``rollout.drafter`` in ``RolloutConfig``.  SPECO
+verl 0.8/0.9 do not expose ``rollout.drafter`` in ``RolloutConfig``.  SPECO
 therefore keeps that subtree external to upstream config validation, and uses
 this module to pass the relevant SGLang launch/update information to the Ray
 actors that own the HTTP server and rollout adapter.
@@ -40,7 +40,13 @@ from verl_speco.integration.sglang_adapter import (
     SGLANG_NPU_EAGLE_TARGET_SAMPLING_PATCH,
     SGLANG_QWEN3_ROPE_COMPAT_PATCH,
     sglang_needs_qwen3_rope_compat_patch,
-    speco_step_matches_interval,
+)
+from verl_speco.trainer.scheduler import (
+    CollectionPlan,
+    DrafterCollectionContext,
+    DrafterCollectionSource,
+    DrafterScheduleConfig,
+    DrafterScheduler,
 )
 
 try:
@@ -51,6 +57,29 @@ torch: Any = _torch
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+_DRAFTER_SCHEDULER = DrafterScheduler()
+
+
+def _plan_sglang_drafter_collection(
+    *,
+    global_step: object,
+    drafter_cfg: dict[str, Any],
+    validation: bool,
+) -> CollectionPlan:
+    training_cfg = drafter_cfg.get("training") or {}
+    return _DRAFTER_SCHEDULER.plan_collection(
+        DrafterCollectionContext(
+            global_step=global_step,
+            source=DrafterCollectionSource.SGLANG,
+            drafter_enabled=bool(
+                drafter_cfg.get("enable") and drafter_cfg.get("enable_drafter_training")
+            ),
+            source_enabled=bool(training_cfg.get("collect_hidden_states_from_sgl")),
+            validation=validation,
+        ),
+        DrafterScheduleConfig.from_mapping(training_cfg),
+    )
+
 
 SPECO_SGLANG_DRAFTER_CONFIG_ENV = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
 SPECO_SGLANG_RUNTIME_PATCHED_ENV = "VERL_SPECO_SGLANG_RUNTIME_PATCHED"
@@ -174,6 +203,10 @@ def _drafter_uses_dflash_aux_hidden(drafter_cfg: dict[str, Any]) -> bool:
     algorithm = str(drafter_cfg.get("speculative_algorithm", "") or "").upper()
     training_cfg = drafter_cfg.get("training") or {}
     return bool(
+        # DFLASH2, like DOMINO, never reaches this path: it is not an
+        # engine-level algorithm, so the ServerArgs override below fails loud
+        # for it under the same ``enable`` this check requires. A trained
+        # DFlash2 checkpoint is served as DFLASH.
         algorithm in {"DFLASH", "DSPARK"}
         and drafter_cfg.get("enable")
         and drafter_cfg.get("enable_drafter_training")
@@ -602,6 +635,19 @@ def _server_args_overrides_from_drafter(
             "for the rollout/serve path; the trained checkpoint's dflash_config.projector_type=domino "
             "enables the Domino correction head on engines that support it, keeping DOMINO for "
             "drafter training."
+        )
+    if algorithm == "DFLASH2":
+        # Same story as Domino: DFlash2 is a DFlash variant whose extra modules
+        # (dynamic convolutions + candidate selector) ride in the checkpoint's
+        # dflash_config, not a distinct engine-level method. DFLASH2 is never a
+        # valid SGLang ServerArgs algorithm, so fail loud instead of forwarding
+        # the raw string.
+        raise ValueError(
+            "DFLASH2 is not an engine-level speculative algorithm; DFlash2 is served as a DFlash "
+            "checkpoint. Keep DFLASH2 for drafter training (which this overlay runs offline) and "
+            "set actor_rollout_ref.rollout.drafter.speculative_algorithm=DFLASH to serve a trained "
+            "DFlash2 checkpoint as a frozen rollout drafter; its dflash_config carries the DFlash2 "
+            "convolution and selector hyperparameters."
         )
 
     rollout_cfg = drafter_cfg.get("rollout") or {}
@@ -1251,45 +1297,43 @@ class _SpecoSGLangHttpServerMixin:
     ) -> bool:
         self._speco_last_collection_skip_reason = None
         drafter_cfg = self._speco_drafter_cfg()
-        if not bool(
-            drafter_cfg.get("enable") and drafter_cfg.get("enable_drafter_training")
-        ):
-            return self._speco_mark_collection_skip("drafter_disabled")
-        training_cfg = drafter_cfg.get("training") or {}
-        if not bool(training_cfg.get("collect_hidden_states_from_sgl")):
-            return self._speco_mark_collection_skip("hidden_collection_disabled")
         skip_drafter_collection = bool(
             getattr(self, "_verl_skip_drafter_collection", False)
         )
-        if skip_drafter_collection:
-            return self._speco_mark_collection_skip("request_skip_flag")
         collection_global_steps = (
             request_global_steps
             if request_global_steps is not None
             else self.global_steps
         )
         self._reset_drafter_collection_budget_if_needed(collection_global_steps)
-        if collection_global_steps is not None and not speco_step_matches_interval(
-            collection_global_steps, training_cfg.get("collect_interval_steps", 1)
-        ):
-            return self._speco_mark_collection_skip("interval_mismatch")
+        collection_plan = _plan_sglang_drafter_collection(
+            global_step=collection_global_steps,
+            drafter_cfg=drafter_cfg,
+            validation=skip_drafter_collection,
+        )
+        self._speco_last_collection_plan = collection_plan
+        if not collection_plan.collect:
+            reason = {
+                "source_disabled": "hidden_collection_disabled",
+                "validation": "request_skip_flag",
+                "interval_not_reached": "interval_mismatch",
+            }.get(collection_plan.reason, collection_plan.reason)
+            return self._speco_mark_collection_skip(reason)
         if estimated_hidden_rows <= 0:
             return self._speco_mark_collection_skip("empty_hidden_window")
-        max_samples = training_cfg.get("max_collect_samples_per_step_per_replica")
+        max_samples = collection_plan.max_samples_per_replica
         if max_samples is not None:
             max_samples = int(max_samples)
             current_samples = int(getattr(self, "_drafter_collection_samples", 0))
             if current_samples >= max_samples:
                 return self._speco_mark_collection_skip("max_samples_budget")
-        max_tokens = training_cfg.get("max_collect_tokens_per_step_per_replica")
+        max_tokens = collection_plan.max_tokens_per_replica
         if max_tokens is not None:
             max_tokens = int(max_tokens)
             current_tokens = int(getattr(self, "_drafter_collection_tokens", 0))
             if current_tokens + int(estimated_hidden_rows) > max_tokens:
                 return self._speco_mark_collection_skip("max_tokens_budget")
-        sample_rate = float(training_cfg.get("collection_sample_rate", 1.0))
-        if sample_rate <= 0:
-            return self._speco_mark_collection_skip("sample_rate_zero")
+        sample_rate = collection_plan.sample_rate
         if sample_rate < 1.0:
             sampling_key = (
                 f"{collection_global_steps}:{self.replica_rank}:{request_id}".encode()
@@ -1436,14 +1480,19 @@ class _SpecoSGLangHttpServerMixin:
             if request_global_steps is not None
             else self.global_steps
         )
-        if skip_drafter_collection or (
-            collection_global_steps is not None
-            and not speco_step_matches_interval(
-                collection_global_steps, training_cfg.get("collect_interval_steps", 1)
-            )
-        ):
+        collection_plan = _plan_sglang_drafter_collection(
+            global_step=collection_global_steps,
+            drafter_cfg=drafter_cfg,
+            validation=skip_drafter_collection,
+        )
+        self._speco_last_collection_plan = collection_plan
+        if not collection_plan.collect:
             self._speco_log_collection_skip_once(
-                "request_skip_flag" if skip_drafter_collection else "interval_mismatch",
+                {
+                    "source_disabled": "hidden_collection_disabled",
+                    "validation": "request_skip_flag",
+                    "interval_not_reached": "interval_mismatch",
+                }.get(collection_plan.reason, collection_plan.reason),
                 collection_global_steps=collection_global_steps,
                 request_global_steps=request_global_steps,
                 prompt_len=len(prompt_ids),
@@ -2194,7 +2243,7 @@ def should_install_sglang_base_compat_runtime(config: Any) -> bool:
 
 
 def install_upstream_sglang_runtime_bridge(*, base_compat_only: bool = False) -> bool:
-    """Patch upstream verl v0.8.0 SGLang rollout classes in the current process."""
+    """Patch upstream verl 0.8/0.9 SGLang rollout classes in this process."""
 
     global _SGLANG_REPLICA_PATCHED
     if _SGLANG_REPLICA_PATCHED:

@@ -107,6 +107,8 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 shuffle=bool(feature_store_cfg.get("shuffle", True)),
                 repeat=bool(feature_store_cfg.get("repeat", True)),
                 seed=int(training_cfg.get("seed", 0) or 0),
+                min_sample_step=_optional_int(feature_store_cfg.get("min_sample_step")),
+                max_sample_step=_optional_int(feature_store_cfg.get("max_sample_step")),
             ),
         )
         for samples in loader:
@@ -305,6 +307,25 @@ _VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
             "target_num_hidden_layers",
         ),
     ),
+    # DFlash2 is served as a DFlash checkpoint whose dflash_config carries the
+    # selector/conv hyperparameters, matching the released z-lab layout.
+    "dflash2": (
+        "dflash_config",
+        (
+            "block_size",
+            "num_anchors",
+            "loss_decay_gamma",
+            "conv_kernel_size",
+            "conv_group_size",
+            "selector_rank",
+            "selector_top_k",
+            "target_layer_ids",
+            "num_context_layers",
+            "num_target_layers",
+            "target_num_hidden_layers",
+            "mask_token_id",
+        ),
+    ),
     "dspark": (
         "dspark_config",
         (
@@ -339,7 +360,7 @@ def _rewrite_standalone_block_runtime_config(
     contract and only merge the alias fields needed by vLLM/SGLang.
     """
     backend_type = getattr(getattr(trainer, "backend", None), "model_type", None)
-    if backend_type not in {"dflash", "dspark", "domino"}:
+    if backend_type not in {"dflash", "dflash2", "dspark", "domino"}:
         return
 
     if completed_future is not None:
@@ -499,6 +520,10 @@ def _configure_device(local_rank: int) -> None:
     set_device = getattr(device_module, "set_device", None)
     if callable(set_device):
         set_device(int(local_rank))
+
+
+def _optional_int(value: object) -> int | None:
+    return None if value is None else int(cast(Any, value))
 
 
 def _barrier() -> None:

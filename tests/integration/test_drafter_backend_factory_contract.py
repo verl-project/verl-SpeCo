@@ -34,6 +34,7 @@ def test_factory_lists_every_supported_algorithm() -> None:
         "EAGLE2",
         "EAGLE3",
         "DFLASH",
+        "DFLASH2",
         "DSPARK",
         "DOMINO",
         "PEAGLE",
@@ -61,6 +62,9 @@ def test_factory_rejects_unknown_algorithm_before_importing_a_backend() -> None:
         # Tagging it eagle3_aux_plus_last makes DFlash preprocessing fail closed.
         ("DOMINO", {}, "dflash_aux"),
         ("domino", {}, "dflash_aux"),
+        # DFlash2 is likewise a DFlash variant on the same context layers.
+        ("DFLASH2", {}, "dflash_aux"),
+        ("dflash2", {}, "dflash_aux"),
         ("DSPARK", {}, "dflash_aux_plus_last"),
         ("DSPARK", {"dspark_l1_loss_alpha": 0.0}, "dflash_aux"),
         ("DSPARK", {"dspark_l1_loss_alpha": None}, "dflash_aux"),

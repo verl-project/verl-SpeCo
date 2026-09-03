@@ -73,6 +73,22 @@ def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
     trainer._pending_drafter_publish_refs = None
     trainer._speco_last_collected_samples = 0
     trainer._ray_get_if_needed = lambda value: value
+    trainer.speco_get_drafter_training_data_status = lambda *args: [
+        {
+            "available": True,
+            "current_step": trainer.global_steps,
+            "current_step_samples": trainer._speco_last_collected_samples,
+            "buffer_samples": trainer._speco_last_collected_samples,
+            "trainable_samples": trainer._speco_last_collected_samples,
+            "trainable_batches": int(trainer._speco_last_collected_samples > 0),
+            "batch_size_per_gpu": 1,
+            "partial_batch_available": False,
+            "oldest_sample_step": trainer.global_steps,
+            "newest_sample_step": trainer.global_steps,
+            "same_step_data_required": False,
+            "target_version": trainer.global_steps,
+        }
+    ]
     return trainer
 
 
@@ -96,6 +112,95 @@ def _no_drafter_trainer(*, calculate_entropy=Ellipsis) -> SpecoRayPPOTrainer:
     return trainer
 
 
+def _validation_config(
+    *,
+    val_batch_size=None,
+    validation_batch_size=8,
+    algorithm="DSPARK",
+    enable_training=True,
+):
+    from omegaconf import OmegaConf
+
+    return OmegaConf.create(
+        {
+            "data": {"val_batch_size": val_batch_size},
+            "actor_rollout_ref": {
+                "rollout": {
+                    "name": "vllm",
+                    "drafter": {
+                        "enable": True,
+                        "enable_drafter_training": enable_training,
+                        "speculative_algorithm": algorithm,
+                        "training": {
+                            "mode": "online",
+                            "validation_batch_size": validation_batch_size,
+                        },
+                    },
+                }
+            },
+        }
+    )
+
+
+def test_online_dspark_caps_unset_validation_batch_before_dataloader_init(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = _validation_config()
+
+    assert _speco_ray_trainer._speco_cap_online_dspark_validation_batch_size(config) == 8
+    assert config.data.val_batch_size == 8
+
+
+def test_online_dspark_preserves_explicit_validation_batch_size(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = _validation_config(val_batch_size=3)
+
+    assert _speco_ray_trainer._speco_cap_online_dspark_validation_batch_size(config) == 3
+    assert config.data.val_batch_size == 3
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "enable_training"),
+    [("EAGLE3", True), ("DSPARK", False)],
+)
+def test_validation_cap_does_not_change_other_runtime_modes(
+    algorithm: str, enable_training: bool, monkeypatch
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = _validation_config(
+        algorithm=algorithm, enable_training=enable_training
+    )
+
+    assert (
+        _speco_ray_trainer._speco_cap_online_dspark_validation_batch_size(config)
+        is None
+    )
+    assert config.data.val_batch_size is None
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "invalid"])
+def test_online_dspark_rejects_invalid_validation_batch_size(
+    value, monkeypatch
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = _validation_config(validation_batch_size=value)
+
+    with pytest.raises(ValueError, match="must be a positive integer or null"):
+        _speco_ray_trainer._speco_cap_online_dspark_validation_batch_size(config)
+
+
+def test_validation_cap_preserves_mrv1_and_verl080_behavior(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    config = _validation_config()
+
+    assert (
+        _speco_ray_trainer._speco_cap_online_dspark_validation_batch_size(config)
+        is None
+    )
+    assert config.data.val_batch_size is None
+
+
 def test_drafter_collect_train_and_publish_intervals() -> None:
     trainer = _trainer(
         {
@@ -106,29 +211,91 @@ def test_drafter_collect_train_and_publish_intervals() -> None:
         step=6,
     )
 
-    assert trainer._speco_should_collect_drafter_this_step() is True
-    assert trainer._speco_should_train_drafter_this_step() is True
-    assert trainer._speco_should_publish_drafter_weights(True) is False
+    config = trainer._speco_drafter_schedule_config()
+    scheduler = trainer._speco_get_drafter_scheduler()
+    assert scheduler.should_collect(trainer.global_steps, config) is True
+    assert scheduler.training_interval_matched(trainer.global_steps, config) is True
+    assert not scheduler.plan_publish(
+        global_step=trainer.global_steps, drafter_trained=True, config=config
+    ).publish
 
     trainer.global_steps = 8
-    assert trainer._speco_should_collect_drafter_this_step() is True
-    assert trainer._speco_should_train_drafter_this_step() is False
-    assert trainer._speco_should_publish_drafter_weights(True) is True
-    assert trainer._speco_should_publish_drafter_weights(False) is False
+    assert scheduler.should_collect(trainer.global_steps, config) is True
+    assert scheduler.training_interval_matched(trainer.global_steps, config) is False
+    assert scheduler.plan_publish(
+        global_step=trainer.global_steps, drafter_trained=True, config=config
+    ).publish
+    assert not scheduler.plan_publish(
+        global_step=trainer.global_steps, drafter_trained=False, config=config
+    ).publish
 
 
 def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     trainer = _trainer({"training_interval_steps": 5}, step=4)
     trainer._speco_last_collected_samples = 10
-    assert trainer._speco_should_attempt_drafter_train_this_step() is False
+    scheduler = trainer._speco_get_drafter_scheduler()
+    config = trainer._speco_drafter_schedule_config()
+    def plan():
+        return scheduler.prepare_training_plan(
+            trainer._speco_drafter_schedule_context(), config
+        )
+    assert plan().launch is False
 
     trainer.global_steps = 5
     trainer._speco_last_collected_samples = 0
     trainer._speco_oldlogprob_collection_requested = lambda: True
-    assert trainer._speco_should_attempt_drafter_train_this_step() is False
+    assert plan().launch is False
 
     trainer._speco_last_collected_samples = 1
-    assert trainer._speco_should_attempt_drafter_train_this_step() is True
+    assert plan().launch is True
+
+
+def test_sync_scheduler_preserves_released_training_call_order() -> None:
+    trainer = _trainer(
+        {
+            "training_interval_steps": 1,
+            "publish_interval_steps": 0,
+        },
+        step=5,
+    )
+    trainer._speco_last_collected_samples = 1
+    trainer.actor_rollout_wg = _FakeRolloutWorkerGroup()
+    trainer._compute_old_log_prob = lambda batch: batch
+    events = []
+
+    trainer._speco_set_drafter_global_step = lambda **kwargs: events.append(
+        "set_global_step"
+    )
+    trainer._speco_sync_target_lm_head_weight = lambda plan: events.append(
+        "sync_target_lm_head"
+    ) or {"drafter/target_lm_head_synced": 1}
+    trainer._update_actor = lambda *args, **kwargs: events.append(
+        "update_actor"
+    ) or SimpleNamespace(meta_info={"metrics": {}})
+    trainer._speco_train_drafter = lambda plan: events.append(
+        ("train_drafter", plan.max_batches, plan.publish_after_success)
+    ) or (
+        True,
+        {"drafter/trained": 1},
+    )
+    trainer._speco_publish_drafter_weights = lambda trained, plan: events.append(
+        ("publish", trained)
+    ) or {"drafter/publish_attempted": 1, "drafter/published": 1}
+
+    with trainer._speco_online_fit_hooks():
+        output = trainer._update_actor("batch")
+
+    assert events == [
+        "set_global_step",
+        "sync_target_lm_head",
+        "update_actor",
+        ("train_drafter", 100, True),
+        ("publish", True),
+    ]
+    assert output.meta_info["metrics"]["drafter/trained"] == 1
+    assert output.meta_info["metrics"]["drafter/scheduler_used"] == 1
+    assert output.meta_info["metrics"]["drafter/schedule_strategy"] == 0
+    assert output.meta_info["metrics"]["drafter/schedule_reason"] == 3
 
 
 @pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "veomni"])

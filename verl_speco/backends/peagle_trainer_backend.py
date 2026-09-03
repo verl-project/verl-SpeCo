@@ -122,6 +122,25 @@ class PEagleTrainingModel(nn.Module):
 
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
+        if seq_lengths is not None:
+            # seq_lengths is a flat list of document lengths for ONE packed
+            # sequence, which is what base_trainer builds for P-EAGLE. There is no
+            # per-row structure to index, so a multi-row batch would silently
+            # apply one row's document layout to all of them.
+            if batch_size > 1:
+                raise ValueError(
+                    "P-EAGLE seq_lengths describe a single packed sequence, but the batch "
+                    f"has {batch_size} rows; pack the documents into one row or drop seq_lengths"
+                )
+            # Any tail past sum(seq_lengths) gets document id -1 in the COD mask,
+            # which makes those queries attend to nothing at all rather than
+            # failing, so check the invariant instead of drafting on garbage.
+            total_length = int(seq_lengths.sum())
+            if total_length != seq_len:
+                raise ValueError(
+                    f"P-EAGLE seq_lengths sum to {total_length} but the packed sequence is "
+                    f"{seq_len} tokens long"
+                )
         loss_num = torch.zeros((), device=device, dtype=torch.float32)
         loss_den = torch.zeros((), device=device, dtype=torch.float32)
         correct = torch.zeros((), device=device, dtype=torch.float32)
@@ -137,9 +156,11 @@ class PEagleTrainingModel(nn.Module):
             )
             orig_positions = anchor_pos + depth
             if seq_lengths is not None:
-                row_length = seq_lengths.to(device)
+                document_lengths = seq_lengths.to(device)
             else:
-                row_length = attention_mask[b].sum().clamp_min(1).reshape(1).to(device)
+                document_lengths = (
+                    attention_mask[b].sum().clamp_min(1).reshape(1).to(device)
+                )
             loss_positions = row_loss_mask[0, orig_positions].bool()
 
             is_depth0 = depth == 0
@@ -161,7 +182,7 @@ class PEagleTrainingModel(nn.Module):
             block_mask = draft.build_peagle_block_mask(
                 anchor_pos=anchor_pos,
                 depth=depth,
-                lengths=row_length,
+                lengths=document_lengths,
                 total_seq_len=seq_len,
             )
             hidden = draft.forward_peagle(
@@ -256,17 +277,48 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
         draft_config = self._build_draft_config(spec_model_path, target_hf_config)
         self.vocab_size = draft_config.vocab_size
 
+        checkpoint_has_vocab_mapping = False
         if spec_model_path and os.path.exists(
             os.path.join(spec_model_path, "config.json")
         ):
             log_drafter_checkpoint_step(
                 logger, spec_model_path, action="Loading P-EAGLE drafter weights"
             )
-            drafter_module = LlamaForCausalLMPeagle.from_pretrained(
-                spec_model_path, config=draft_config
+            loaded = LlamaForCausalLMPeagle.from_pretrained(
+                spec_model_path,
+                config=draft_config,
+                output_loading_info=True,
             )
+            if isinstance(loaded, tuple):
+                drafter_module, loading_info = loaded
+                missing_keys = set(loading_info.get("missing_keys", []))
+                checkpoint_has_vocab_mapping = not {"t2d", "d2t"}.intersection(
+                    missing_keys
+                )
+            else:
+                drafter_module = loaded
+                checkpoint_has_vocab_mapping = self._has_valid_vocab_mapping(
+                    drafter_module
+                )
         else:
             drafter_module = LlamaForCausalLMPeagle(draft_config)
+
+        # A reduced draft vocabulary is only meaningful with a real t2d/d2t pair
+        # derived from token frequency. The model's constructor falls back to
+        # "the first draft_vocab_size target ids", which is an arbitrary slice of
+        # any real tokenizer, so refuse it exactly like the EAGLE-3 backend does
+        # instead of silently training a draft that can never emit the rest.
+        if drafter_module.draft_vocab_size != drafter_module.vocab_size:
+            if checkpoint_has_vocab_mapping and self._has_valid_vocab_mapping(
+                drafter_module
+            ):
+                logger.debug("Using P-EAGLE vocab mapping loaded from draft checkpoint")
+            else:
+                raise ValueError(
+                    "PEAGLE draft_vocab_size differs from target vocab_size, but the draft "
+                    "checkpoint does not provide valid t2d/d2t vocab mapping buffers"
+                )
+        self._validate_vocab_mapping(drafter_module)
 
         # P-EAGLE trains the draft embeddings (speculators sets embed_requires_grad=True),
         # so seed them from the target but do NOT freeze.

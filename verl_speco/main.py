@@ -18,7 +18,7 @@ import hydra
 
 @hydra.main(config_path="config", config_name="speco_trainer", version_base=None)
 def main(config):
-    from verl.trainer.main_ppo import migrate_legacy_reward_impl, run_ppo
+    from verl.trainer import main_ppo
     from verl.utils.device import auto_set_device
 
     from verl_speco.integration.compat import check_compatible_verl
@@ -26,11 +26,14 @@ def main(config):
 
     check_compatible_verl()
     auto_set_device(config)
-    config = migrate_legacy_reward_impl(config)
-
+    migrate_legacy_reward_impl = getattr(main_ppo, "migrate_legacy_reward_impl", None)
+    if migrate_legacy_reward_impl is not None:
+        # Present in verl 0.8 and intentionally removed from the 0.9 legacy
+        # runner.  Apply it only where upstream still defines the migration.
+        config = migrate_legacy_reward_impl(config)
     import ray
 
-    run_ppo(config, task_runner_class=ray.remote(num_cpus=1)(SpecoTaskRunner))
+    main_ppo.run_ppo(config, task_runner_class=ray.remote(num_cpus=1)(SpecoTaskRunner))
 
 
 if __name__ == "__main__":

@@ -41,6 +41,11 @@ _DOMINO_ARCHITECTURE_ALIASES = {
     "Qwen3DominoModel",
 }
 
+_DFLASH2_ARCHITECTURE_ALIASES = {
+    "DFlash2DraftModel",
+    "Qwen3DFlash2Model",
+}
+
 
 def _normalize_int_list(value):
     if value is None:
@@ -201,6 +206,7 @@ class AutoDraftModelConfig:
             architecture not in cls._config_mapping
             and architecture not in _DSPARK_ARCHITECTURE_ALIASES
             and architecture not in _DOMINO_ARCHITECTURE_ALIASES
+            and architecture not in _DFLASH2_ARCHITECTURE_ALIASES
         ):
             raise ValueError(f"Architecture {architecture} not supported")
 
@@ -219,6 +225,17 @@ class AutoDraftModelConfig:
             config["model_type"] = DominoConfig.model_type
             config["architectures"] = ["DominoDraftModel"]
             config.setdefault("projector_type", "domino")
+        elif architecture in _DFLASH2_ARCHITECTURE_ALIASES:
+            from .dflash2 import DFlash2Config
+
+            config_class = DFlash2Config
+            # Upstream z-lab checkpoints nest the DFlash2 knobs under
+            # ``dflash_config``; lift them so they survive ``from_dict``.
+            nested = config.get("dflash_config") or {}
+            for key, value in nested.items():
+                config.setdefault(key, value)
+            config["model_type"] = DFlash2Config.model_type
+            config["architectures"] = ["DFlash2DraftModel"]
         elif architecture in _EAGLE3_ARCHITECTURE_ALIASES:
             config = _normalize_eagle3_config_dict(config)
 

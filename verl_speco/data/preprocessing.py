@@ -773,7 +773,11 @@ def process_token_dict_to_mappings(
     """
     if len(token_dict) < draft_vocab_size:
         existing_tokens = set(token_dict.keys())
-        missing_tokens = set(range(draft_vocab_size)) - existing_tokens
+        # Take the lowest unused ids explicitly. The set difference happens to
+        # iterate in increasing order only because every candidate is smaller
+        # than the set's table size, and this mapping is baked into the exported
+        # checkpoint, so state the intent instead of relying on that.
+        missing_tokens = sorted(set(range(draft_vocab_size)) - existing_tokens)
         for token in missing_tokens:
             token_dict[token] = 0
             if len(token_dict) >= draft_vocab_size:
@@ -796,9 +800,14 @@ def process_token_dict_to_mappings(
     used_tokens = [key for key, freq in top_N]
     used_tokens.sort()
 
+    # d2t holds offsets: the target id of draft id i is i + d2t[i].
     d2t = [used_tokens[i] - i for i in range(len(used_tokens))]
-    t2d = [i in used_tokens for i in range(target_vocab_size)]
+    # Scatter into a zero tensor rather than testing membership per target id.
+    # `i in used_tokens` is a list scan, so building t2d that way costs
+    # target_vocab_size * draft_vocab_size comparisons, which is billions of
+    # operations on a production tokenizer.
+    t2d = torch.zeros(target_vocab_size, dtype=torch.bool)
+    t2d[torch.tensor(used_tokens, dtype=torch.long)] = True
     d2t = torch.tensor(d2t)
-    t2d = torch.tensor(t2d)
 
     return d2t, t2d

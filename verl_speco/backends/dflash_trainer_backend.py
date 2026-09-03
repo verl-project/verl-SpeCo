@@ -29,6 +29,7 @@ from verl_speco.models.dflash import (
     DFlashConfig,
     DFlashDraftModel,
     build_target_layer_ids,
+    resolve_rope_theta,
 )
 from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
 from verl_speco.models.target.target_head import TargetHead
@@ -48,6 +49,38 @@ class _SyncedTargetHead(nn.Module):
 
     def forward(self, hidden_states):
         return self.fc(hidden_states)
+
+
+def _block_acceptance_counts(
+    block_correct: torch.Tensor, block_scored: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Accepted draft tokens summed over blocks, and the number of scored blocks.
+
+    A greedy verifier takes a drafted block prefix and rejects everything from
+    the first mismatch onward, so position ``k`` only counts when ``0..k`` are
+    all correct. That is a prefix property, and it cannot be recovered from the
+    per-position marginal accuracies, which count each position independently.
+
+    Both arguments cover the **drafted** positions only, shaped
+    ``[bsz, n_blocks, n_drafted]``. Callers own that slicing because the block
+    layouts differ: DFlash keeps an unscored anchor at column 0 and must drop
+    it, while Domino and DSpark build shifted labels where every column is a
+    real prediction. Slicing inside here would silently discard their first
+    drafted token and, worse, stop a wrong first token from truncating the
+    block, which is the exact failure the metric exists to catch.
+
+    ``block_scored`` must be the same mask the correctness was computed under,
+    so that an unscored position reads as "no more prefix" rather than as a
+    mismatch. Unscored positions terminate the prefix, because nothing beyond
+    the supervised region can be counted as accepted.
+
+    Returned as a sum and a count rather than a mean so the two reduce correctly
+    across microbatches and across ranks. ``cumsum`` rather than ``cumprod``
+    because it is the more broadly supported primitive across backends.
+    """
+    broken = (~(block_correct & block_scored)).cumsum(dim=-1)
+    accepted = (broken == 0).sum(dim=-1)
+    return accepted.sum().float(), block_scored.any(dim=-1).sum().float()
 
 
 def _create_dflash_mask_mod(
@@ -152,6 +185,41 @@ class DFlashTrainingModel(nn.Module):
         self.loss_mode = str(loss_mode or "full_vocab")
         self.sampled_ce_negatives = max(int(sampled_ce_negatives), 0)
         self._tensor_template_cache: dict[tuple, torch.Tensor] = {}
+
+    def _auxiliary_loss(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        safe_label_indices: torch.Tensor,
+        active_mask: torch.Tensor,
+        active_hidden: torch.Tensor,
+        active_logits: torch.Tensor,
+        active_targets: torch.Tensor,
+        active_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+        """Extra loss term contributed by a DFlash variant's own head.
+
+        Called once per step with the intermediates of the main CE path, at the
+        point where they all exist. Plain DFlash has no auxiliary head and
+        returns ``None``, leaving the loss untouched.
+
+        Args:
+            input_ids: ``[bsz, seq_len]`` full sequence, for variants that need
+                neighbouring tokens (for example a predecessor token).
+            safe_label_indices: ``[bsz, n_blocks, block_size]`` clamped absolute
+                positions each block slot predicts.
+            active_mask: ``[bsz * n_blocks * block_size]`` bool mask of the rows
+                that carry loss weight.
+            active_hidden: ``[num_active, hidden]`` backbone states of those rows.
+            active_logits: ``[num_active, vocab]`` drafter logits of those rows.
+            active_targets: ``[num_active]`` ground-truth token ids.
+            active_weights: ``[num_active]`` per-row loss weights.
+
+        Returns:
+            tuple: ``(loss_or_None, metrics)`` to add to the total loss and the
+            diagnostics dict.
+        """
+        return None, {}
 
     def _cached_arange(
         self,
@@ -451,6 +519,20 @@ class DFlashTrainingModel(nn.Module):
             local_ploss_sum = (active_loss * active_loss_weights).sum()
             loss = local_ploss_sum / valid_token_count
 
+        auxiliary_metrics: dict[str, torch.Tensor] = {}
+        if active_targets.numel() > 0:
+            auxiliary_loss, auxiliary_metrics = self._auxiliary_loss(
+                input_ids=input_ids,
+                safe_label_indices=safe_label_indices,
+                active_mask=active_mask,
+                active_hidden=active_hidden,
+                active_logits=active_logits,
+                active_targets=active_targets,
+                active_weights=active_weights,
+            )
+            if auxiliary_loss is not None:
+                loss = loss + auxiliary_loss
+
         with torch.no_grad():
             correct = torch.zeros_like(binary_eval_mask, dtype=torch.bool)
             top1_correct_count = torch.zeros((), dtype=torch.float32, device=device)
@@ -575,6 +657,21 @@ class DFlashTrainingModel(nn.Module):
             )
             loss_per_position = loss_sum_per_position / count_per_pos
             acc_per_position = correct_per_position / count_per_pos
+            # Prefix acceptance per block; the per-position accuracies above are
+            # marginals and cannot be combined into it. Column 0 is this layout's
+            # anchor, so it is dropped. The scoring mask is intersected with the
+            # reweighted mask because `correct` was only written where
+            # `active_mask` held: a position zeroed by loss decay or by
+            # `front_position_weight` is unscored, not a mismatch, and reading it
+            # as a mismatch would truncate every block's prefix.
+            block_drafted = slice(1, None)
+            block_scored = (binary_weights > 0) & (
+                flat_weights.view(bsz, n_blocks, self.block_size) > 0
+            )
+            accepted_length_sum, scored_block_count = _block_acceptance_counts(
+                correct.view(bsz, n_blocks, self.block_size)[:, :, block_drafted],
+                block_scored[:, :, block_drafted],
+            )
             masked_rows = (binary_eval_mask <= 0.5).sum().to(dtype=torch.float32)
             diagnostics = {
                 "correct_count": correct.sum().float(),
@@ -589,6 +686,8 @@ class DFlashTrainingModel(nn.Module):
                 "loss_sum_per_position": loss_sum_per_position,
                 "correct_per_position": correct_per_position,
                 "count_per_position": count_per_position,
+                "accepted_length_sum": accepted_length_sum,
+                "scored_block_count": scored_block_count,
                 "sampled_vocab_size": torch.tensor(
                     float(restricted_vocab.numel())
                     if self.loss_mode in {"restricted_ce", "sampled_ce"}
@@ -605,6 +704,7 @@ class DFlashTrainingModel(nn.Module):
                     device=device,
                 ),
             }
+            diagnostics.update(auxiliary_metrics)
 
         return (
             loss,
@@ -617,6 +717,11 @@ class DFlashTrainingModel(nn.Module):
 
 
 class DFlashTrainerBackend:
+    # Checkpoint parameter names that differ from this overlay's own spelling,
+    # as ``{checkpoint key: model key}``. Variants fill this in when the released
+    # checkpoint holds a tensor in a different module type than the overlay does.
+    _CHECKPOINT_KEY_ALIASES: dict[str, str] = {}
+
     def __init__(self, config, target_model_config):
         self.config = config
         self.target_model_config = target_model_config
@@ -703,7 +808,7 @@ class DFlashTrainerBackend:
             max_position_embeddings=int(
                 getattr(target_text_config, "max_position_embeddings", 32768)
             ),
-            rope_theta=float(getattr(target_text_config, "rope_theta", 10000.0)),
+            rope_theta=resolve_rope_theta(target_text_config),
             num_target_layers=target_num_hidden_layers,
             num_context_layers=num_context_layers,
             target_hidden_size=int(target_text_config.hidden_size),
@@ -762,7 +867,26 @@ class DFlashTrainerBackend:
                     normalized_key = normalized_key[len(prefix) :]
                     break
             normalized_state[normalized_key] = value
+        # Aliases run after prefix stripping, and a key already spelled the way
+        # the model spells it wins, so a checkpoint this overlay wrote itself is
+        # never rewritten.
+        for source, target in self._CHECKPOINT_KEY_ALIASES.items():
+            if source in normalized_state:
+                normalized_state.setdefault(target, normalized_state.pop(source))
         return normalized_state
+
+    def _validate_normalized_state(
+        self,
+        draft_model: DFlashDraftModel,
+        normalized_state: dict[str, torch.Tensor],
+        model_path: str,
+    ) -> None:
+        """Variant hook to reject a checkpoint the base gate cannot judge.
+
+        The base gate only knows the DFlash backbone, and unrecognized keys are
+        dropped rather than raised on, so a variant whose extra modules arrive
+        under other names must say so here.
+        """
 
     def _infer_num_context_layers_from_state(
         self, normalized_state: dict[str, torch.Tensor], target_hidden_size: int
@@ -908,6 +1032,7 @@ class DFlashTrainerBackend:
                 "DFlash/DSpark checkpoint does not use the canonical vLLM parameter names; "
                 f"missing={missing_backbone_keys} model_path={model_path}"
             )
+        self._validate_normalized_state(draft_model, normalized_state, model_path)
 
         model_state = draft_model.state_dict()
         filtered_state: dict[str, torch.Tensor] = {}
@@ -931,7 +1056,12 @@ class DFlashTrainerBackend:
 
         missing, _ = draft_model.load_state_dict(filtered_state, strict=False)
         if unexpected or missing or mismatched:
-            logger.debug(
+            # Dropped and shape-mismatched keys mean checkpoint tensors did not
+            # reach the model, which shows up later only as a weak drafter, so
+            # say so at warning level. Missing keys alone are routine (the
+            # embedding is loaded separately), so they stay at debug.
+            log = logger.warning if (unexpected or mismatched) else logger.debug
+            log(
                 "DFlash draft checkpoint load report from %s: loaded=%s missing=%s unexpected=%s mismatched=%s",
                 model_path,
                 len(filtered_state),

@@ -24,6 +24,7 @@ from verl_speco.integration.oldlogprob_runtime import (
     _find_layers_and_final_norm,
     _install_oldlogprob_fsdp_batch_postprocess_patch,
     _select_and_merge_concatenated_hidden,
+    _to_cpu_transfer_tensor,
     oldlogprob_hidden_runtime_enabled,
 )
 from verl_speco.integration.oldlogprob_layer_ids import (
@@ -223,6 +224,34 @@ def test_unselected_flat_hidden_keeps_original_row_selection() -> None:
     assert selected.shape == (2, 2, 2)
     torch.testing.assert_close(selected[0, 0], hidden[0])
     torch.testing.assert_close(selected[1, 0], hidden[2])
+
+
+def test_cpu_transfer_tensor_detaches_cpu_tensor_without_copy() -> None:
+    torch = pytest.importorskip("torch")
+    source = torch.tensor([1.0], requires_grad=True)
+
+    transferred = _to_cpu_transfer_tensor(source)
+
+    assert transferred.device.type == "cpu"
+    assert transferred.requires_grad is False
+    assert transferred.data_ptr() == source.data_ptr()
+    torch.testing.assert_close(transferred, source.detach())
+
+
+def test_cpu_transfer_tensor_detaches_sparse_payload_rows() -> None:
+    torch = pytest.importorskip("torch")
+    payload = {
+        "rows": torch.tensor([[1.0]], requires_grad=True),
+        "batch_indices": [0],
+        "row_indices": [[0]],
+    }
+
+    transferred = _to_cpu_transfer_tensor(payload)
+
+    assert transferred["rows"].device.type == "cpu"
+    assert transferred["rows"].requires_grad is False
+    assert transferred["rows"].data_ptr() == payload["rows"].data_ptr()
+    assert transferred["batch_indices"] == [0]
 
 
 def test_forward_hook_rejects_malformed_selected_hidden() -> None:

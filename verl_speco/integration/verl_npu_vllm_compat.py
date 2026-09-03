@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""NPU compatibility for verl release/v0.8.0 vLLM imports and checkpoints."""
+"""NPU compatibility for verl 0.8/0.9 vLLM imports and checkpoints."""
 
 from __future__ import annotations
 
@@ -22,7 +22,9 @@ import inspect
 import logging
 import sys
 import time
-from typing import Any, Callable, cast
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from typing import Any, cast
 
 from packaging import version
 
@@ -35,7 +37,10 @@ from verl_speco.trainer.checkpoint import (
 logger = logging.getLogger(__name__)
 
 _VERL_NPU_VLLM_PATCH_MODULE = "verl.utils.vllm.npu_vllm_patch"
-_VLLM_FUSED_MOE_MODULE = "vllm.model_executor.layers.fused_moe"
+_VLLM_FUSED_MOE_PACKAGE = "vllm.model_executor.layers.fused_moe"
+_VLLM_FUSED_MOE_LAYER_MODULE = "vllm.model_executor.layers.fused_moe.layer"
+# Backward-compatible name used by the release/v0.8.0 import path and tests.
+_VLLM_FUSED_MOE_MODULE = _VLLM_FUSED_MOE_PACKAGE
 _VERL_FSDP_ENGINE_MODULE = "verl.workers.engine.fsdp.transformer_impl"
 _IMPORT_COMPAT_APPLIED = False
 _NPU_CHECKPOINT_RECLAIM_APPLIED = False
@@ -65,6 +70,14 @@ def _module_available(module_name: str) -> bool:
         return False
 
 
+def _unavailable_fused_moe(*args, **kwargs):
+    del args, kwargs
+    raise RuntimeError(
+        "FusedMoE is unavailable in this vLLM build; the temporary symbol only "
+        "allows verl release/v0.9.0 to skip its inapplicable legacy NPU patch"
+    )
+
+
 def _unused_factory_weight_loader(*args, **kwargs):
     del args, kwargs
     raise RuntimeError(
@@ -72,24 +85,16 @@ def _unused_factory_weight_loader(*args, **kwargs):
     )
 
 
-def install_verl_npu_vllm_import_compat(
-    module_importer: Callable[[str], Any] = importlib.import_module,
+def _uses_verl_v090_runner() -> bool:
+    """Identify the moved legacy runner without importing accelerator modules."""
+
+    return _module_available("verl.trainer.main_ppo_v0")
+
+
+def _install_verl_v080_npu_vllm_import_compat(
+    module_importer: Callable[[str], Any],
 ) -> bool:
-    """Import verl's NPU patch without applying its obsolete class-only MoE hook.
-
-    vLLM >= 0.18 exposes ``FusedMoE`` as a factory function. The verl v0.8.0
-    patch still accesses ``FusedMoE.weight_loader`` during import. A temporary
-    attribute lets the rest of verl's NPU initialization run; it is removed
-    immediately because factory instances use their own runner weight loaders.
-    """
-
-    global _IMPORT_COMPAT_APPLIED
-    if _IMPORT_COMPAT_APPLIED or _VERL_NPU_VLLM_PATCH_MODULE in sys.modules:
-        return False
-    # Match verl's own guard: its failing import path is enabled by torch_npu,
-    # even before vllm_ascend itself has necessarily been imported.
-    if not _module_available("torch_npu"):
-        return False
+    """Import verl 0.8's NPU patch around its obsolete factory attribute."""
 
     vllm = module_importer("vllm")
     if version.parse(str(getattr(vllm, "__version__", "0"))) < version.parse("0.18.0"):
@@ -108,12 +113,67 @@ def install_verl_npu_vllm_import_compat(
     try:
         module_importer(_VERL_NPU_VLLM_PATCH_MODULE)
     finally:
-        if hasattr(fused_moe, "weight_loader"):
-            delattr(fused_moe, "weight_loader")
+        if getattr(fused_moe, "weight_loader", None) is _unused_factory_weight_loader:
+            del fused_moe.weight_loader
+    return True
 
+
+@contextmanager
+def _temporary_verl_v090_fused_moe_import(
+    module_importer: Callable[[str], Any],
+) -> Iterator[None]:
+    """Provide only the temporary package export expected by verl's NPU patch.
+
+    Some modular vLLM revisions keep ``FusedMoE`` in ``fused_moe.layer``
+    without re-exporting it; newer revisions remove that factory entirely.
+    verl v0.9 imports the package-level symbol before it can skip the obsolete
+    class-level hook. Export the exact factory or a non-class sentinel only for
+    that import, then restore the package namespace even when import fails.
+    """
+
+    fused_moe_package = module_importer(_VLLM_FUSED_MOE_PACKAGE)
+    if hasattr(fused_moe_package, "FusedMoE"):
+        yield
+        return
+
+    try:
+        fused_moe_layer = module_importer(_VLLM_FUSED_MOE_LAYER_MODULE)
+    except ModuleNotFoundError as exc:
+        if exc.name != _VLLM_FUSED_MOE_LAYER_MODULE:
+            raise
+        fused_moe_layer = None
+    fused_moe = getattr(fused_moe_layer, "FusedMoE", None)
+    if fused_moe is None:
+        fused_moe = _unavailable_fused_moe
+
+    fused_moe_package.FusedMoE = fused_moe
+    try:
+        yield
+    finally:
+        if getattr(fused_moe_package, "FusedMoE", None) is fused_moe:
+            del fused_moe_package.FusedMoE
+
+
+def install_verl_npu_vllm_import_compat(
+    module_importer: Callable[[str], Any] = importlib.import_module,
+) -> bool:
+    """Eagerly import the installed release's NPU vLLM initialization safely."""
+
+    global _IMPORT_COMPAT_APPLIED
+    if _IMPORT_COMPAT_APPLIED or _VERL_NPU_VLLM_PATCH_MODULE in sys.modules:
+        return False
+    if not _module_available("torch_npu"):
+        return False
+
+    if _uses_verl_v090_runner():
+        with _temporary_verl_v090_fused_moe_import(module_importer):
+            module_importer(_VERL_NPU_VLLM_PATCH_MODULE)
+    elif not _install_verl_v080_npu_vllm_import_compat(module_importer):
+        return False
     _IMPORT_COMPAT_APPLIED = True
     logger.warning(
-        "Applied verl release/v0.8.0 NPU import compatibility for the vLLM FusedMoE factory"
+        "Applied verl NPU vLLM import compatibility for legacy runner API %s",
+        "0.9" if _uses_verl_v090_runner() else "0.8",
     )
     return True
 
@@ -222,7 +282,7 @@ def install_verl_fsdp_training_output_release_compat(
 ) -> bool:
     """Drop unused per-micro-batch model outputs during FSDP actor training.
 
-    verl release/v0.8.0 retains every training micro-batch's full-length
+    The legacy trainer can retain every training micro-batch's full-length
     log-probability and entropy outputs until the mini-batch finishes. The
     training worker discards these outputs after the call, so retaining them
     only keeps tensors and their autograd graphs alive. This mirrors upstream
@@ -292,7 +352,7 @@ def install_verl_npu_fsdp2_weight_export_compat(
 ) -> bool:
     """Skip verl's redundant whole-shard staging during NPU FSDP2 export.
 
-    verl release/v0.8.0 moves every local FSDP2 shard to the device before
+    The legacy trainer moves every local FSDP2 shard to the device before
     ``state_dict()`` and back to CPU afterwards. FSDP2 only returns DTensor
     references there, and the returned generator already materializes each
     full tensor on the device lazily. The extra round trip increases weight
@@ -404,6 +464,9 @@ class VerlNPUVLLMImportCompatMixin:
     """Install import compatibility when WorkerDict constructs the worker."""
 
     def __init__(self, *args, **kwargs):
+        from verl_speco.integration.compat import check_compatible_verl
+
+        check_compatible_verl()
         install_verl_npu_vllm_import_compat()
         install_verl_fsdp_training_output_release_compat()
         install_verl_npu_checkpoint_reclaim()
