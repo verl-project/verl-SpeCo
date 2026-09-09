@@ -433,19 +433,36 @@ def _rewrite_standalone_block_runtime_config(
             training_config.get("projector_type", "domino") or "domino"
         )
 
-    target_layer_ids = (
-        runtime_config.get("target_layer_ids")
-        or dflash_config.get("target_layer_ids")
-        or variant_config.get("target_layer_ids")
+    training_dflash_config = training_config.get("dflash_config")
+    training_variant_config = (
+        training_config.get(variant_child_key) if variant_child_key else None
     )
-    if (
-        target_layer_ids is not None
-        and "eagle_aux_hidden_state_layer_ids" not in runtime_config
-    ):
+    target_layer_ids = (
+        training_config.get("target_layer_ids")
+        or (
+            training_dflash_config.get("target_layer_ids")
+            if isinstance(training_dflash_config, dict)
+            else None
+        )
+        or (
+            training_variant_config.get("target_layer_ids")
+            if isinstance(training_variant_config, dict)
+            else None
+        )
+    )
+    if target_layer_ids is not None:
         try:
-            runtime_config["eagle_aux_hidden_state_layer_ids"] = [
-                int(layer_id) + 1 for layer_id in target_layer_ids
-            ]
+            # Training captures these transformer layer outputs verbatim.  vLLM
+            # requires its DFlash target aliases to be one less than the EAGLE
+            # aux ids, so preserve the training ids as aux ids and shift only
+            # the runtime-facing aliases.
+            aux_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
+            runtime_target_layer_ids = [layer_id - 1 for layer_id in aux_layer_ids]
+            runtime_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
+            runtime_config["target_layer_ids"] = runtime_target_layer_ids
+            dflash_config["target_layer_ids"] = runtime_target_layer_ids
+            if variant_child_key:
+                variant_config["target_layer_ids"] = runtime_target_layer_ids
         except (TypeError, ValueError):
             logger.warning(
                 "Invalid target_layer_ids in standalone exported config: %r",

@@ -240,8 +240,10 @@ def test_standalone_dspark_checkpoint_preserves_source_runtime_config(tmp_path):
     assert runtime_config["model_type"] == "deepseek_v3"
     assert runtime_config["architectures"] == ["DeepSeekDSparkModel"]
     assert runtime_config["dspark_config"]["markov_head_type"] == "vanilla"
-    assert runtime_config["dflash_config"]["target_layer_ids"] == [1, 9, 17]
-    assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [2, 10, 18]
+    assert runtime_config["target_layer_ids"] == [0, 8, 16]
+    assert runtime_config["dflash_config"]["target_layer_ids"] == [0, 8, 16]
+    assert runtime_config["dspark_config"]["target_layer_ids"] == [0, 8, 16]
+    assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [1, 9, 17]
     assert saved_training_config == training_config
 
 
@@ -284,8 +286,9 @@ def test_standalone_domino_checkpoint_exports_dflash_projector_config(tmp_path):
     assert dflash_config["gru_hidden_dim"] == 1024
     assert dflash_config["pure_draft_prefix_len"] == 1
     assert dflash_config["block_size"] == 16
-    assert dflash_config["target_layer_ids"] == [2, 10, 18]
-    assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [3, 11, 19]
+    assert runtime_config["target_layer_ids"] == [1, 9, 17]
+    assert dflash_config["target_layer_ids"] == [1, 9, 17]
+    assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [2, 10, 18]
     assert saved_training_config == training_config
 
 
@@ -334,6 +337,7 @@ def test_standalone_dflash_checkpoint_preserves_source_runtime_config(tmp_path):
     )
     assert runtime_config["model_type"] == "qwen3"
     assert runtime_config["architectures"] == ["DFlashForCausalLM"]
-    assert runtime_config["dflash_config"]["target_layer_ids"] == [2, 10, 18]
-    assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [3, 11, 19]
+    assert runtime_config["target_layer_ids"] == [1, 9, 17]
+    assert runtime_config["dflash_config"]["target_layer_ids"] == [1, 9, 17]
+    assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [2, 10, 18]
     assert saved_training_config == training_config
