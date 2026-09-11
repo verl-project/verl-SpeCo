@@ -1433,6 +1433,23 @@ patch_transformers_attention_layer_type_constants()
 install_verl_npu_vllm_import_compat()
 
 
+# Drafter params that some DSpark runtimes do not wire into inference.  vLLM's
+# GPU-native Qwen3DSparkForCausalLM.load_weights() carries
+# ``skip_substrs = ["mask_embedding", "confidence_head"]`` and its served
+# Qwen3DSparkModel never registers the confidence head, so publishing a trained
+# drafter's confidence-head weights into it raises on the unknown module.
+#
+# This is a *candidate* list, not an unconditional skip: other DSpark backends
+# (vllm-ascend is adding confidence-head support) do register these, and dropping
+# a published tensor there would silently stall that head at its initial values.
+# Callers must additionally confirm the resolved model lacks the parameter.
+_DSPARK_INFERENCE_ONLY_SKIPPED = ("confidence_head",)
+
+
+def _is_inference_only_skipped_dspark_param(name: str) -> bool:
+    return any(marker in name for marker in _DSPARK_INFERENCE_ONLY_SKIPPED)
+
+
 def _is_dspark_hf_config(hf_config: Any) -> bool:
     architectures = _get_nested(hf_config, ("architectures",), None) or []
     if isinstance(architectures, str):
@@ -3321,14 +3338,24 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 )
             storage_signatures = self._speco_parameter_storage_signatures(draft_model)
 
+        # Which parameters the resolved draft model actually exposes.  The skip
+        # below is gated on this rather than on ``is_dspark`` so that a backend
+        # which does register the confidence head (vllm-ascend is adding it)
+        # keeps receiving its updates without another change here.
+        target_param_names: set[str] = set()
+        if inner_model is not None:
+            target_param_names = {name for name, _ in inner_model.named_parameters()}
+            target_param_names.update(name for name, _ in inner_model.named_buffers())
+
         requested_names: list[str] = []
         loaded_names: set[str] = set()
         first_keys: list[str] = []
         bucket_count = 0
         loaded_params = 0
+        warned_skipped = False
 
         def on_bucket_received(bucket_weights, _is_last: bool = False):
-            nonlocal bucket_count, loaded_params
+            nonlocal bucket_count, loaded_params, warned_skipped
             # VERL synchronizes the device after this callback and before it
             # acknowledges/reuses the SHM bucket. Loading here therefore keeps
             # the source tensor alive long enough without cloning a complete
@@ -3336,6 +3363,29 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             translated_bucket = [
                 (translate_name(str(name)), tensor) for name, tensor in bucket_weights
             ]
+            if is_dspark and target_param_names:
+                skipped = {
+                    name
+                    for name, _ in translated_bucket
+                    if _is_inference_only_skipped_dspark_param(name)
+                    and name not in target_param_names
+                }
+                if skipped:
+                    translated_bucket = [
+                        (name, tensor)
+                        for name, tensor in translated_bucket
+                        if name not in skipped
+                    ]
+                    if not warned_skipped:
+                        warned_skipped = True
+                        logger.warning(
+                            "[speco draft ipc] %s does not register %d "
+                            "inference-only drafter param(s); skipping them so "
+                            "the publish can proceed: %s",
+                            type(inner_model).__name__,
+                            len(skipped),
+                            sorted(skipped)[:5],
+                        )
             if not translated_bucket:
                 return
             bucket_count += 1
