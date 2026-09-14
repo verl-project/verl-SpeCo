@@ -6,9 +6,18 @@
 speco:
   enable: true
 
+  # Draft weight-update selection.  ``auto`` uses the vLLM native draft update
+  # when the backend advertises capability, otherwise falls back to SPECO's
+  # draft-only compat implementation.  ``native`` fails fast when the backend
+  # cannot do a draft update.  ``compat`` forces the SPECO compat path.
+  runtime:
+    weight_update_mode: auto
+
   verl_base:
     version: "0.8.0"
     branch: release/v0.8.0
+    supported_versions: ["0.8.0", "0.9.0"]
+    supported_branches: [release/v0.8.0, release/v0.9.0]
     source_modifications_allowed: false
 
   compatibility:
@@ -71,6 +80,9 @@ actor_rollout_ref:
         training_interval_steps: 5
         publish_interval_steps: 0
         publish_async: false
+        # MRV2-only safety cap applied before val_kwargs.n expansion.  The
+        # trainer ignores it for verl 0.8/MRV1 and other rollout algorithms.
+        validation_batch_size: 8
         publish_dtype: null
         publish_param_name_patterns: null
         draft_update_use_shm: null
@@ -132,7 +144,9 @@ actor_rollout_ref:
         dspark_confidence_loss_alpha: 0.0
         dspark_confidence_head_with_markov: true
         dspark_ce_loss_alpha: 0.1
-        dspark_l1_loss_alpha: 0.45
+        # DeepSpec Qwen3 fixed-K default. Confidence BCE is unsupported on MRV2
+        # and must not implicitly reduce the distribution-matching objective.
+        dspark_l1_loss_alpha: 0.9
         dspark_l1_chunk_size: 0
         dspark_debug_log: false
         dspark_debug_log_first_n: 2

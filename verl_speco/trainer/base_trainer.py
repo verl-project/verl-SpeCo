@@ -1299,6 +1299,17 @@ class DrafterBaseTrainer:
 
         if any(frozen_name in name for frozen_name in self._frozen_param_names):
             return True
+        if (
+            getattr(self.backend, "model_type", None) == "dspark"
+            and "confidence_head." in name
+            and os.getenv("VLLM_USE_V2_MODEL_RUNNER", "").lower()
+            in {"1", "true", "yes"}
+        ):
+            # The supported MRV2 runtime has no confidence-head contract, and
+            # the current trainer rejects positive confidence loss. A head
+            # inherited from an older checkpoint is frozen and must not enter
+            # the native fixed-K online update payload.
+            return True
         return name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight")
 
     def _get_trainable_state_dict(self) -> dict[str, torch.Tensor]:

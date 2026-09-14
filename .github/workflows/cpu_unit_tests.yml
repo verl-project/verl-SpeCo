@@ -31,7 +31,7 @@ jobs:
           cache: pip
           cache-dependency-path: ci/requirements-ci.txt
 
-      - name: Check out release/v0.8.0 upstream verl
+      - name: Check out supported upstream verl
         run: |
           set -euo pipefail
           verl_ref="$(awk -F= '/^VERL_BASE_BRANCH=/{print $2}' REQUIRED_VERL.txt)"

@@ -13,7 +13,7 @@
 # limitations under the License.
 """Runtime bridge from external SPECO config to upstream verl SGLang rollout.
 
-verl v0.8.0 does not expose ``rollout.drafter`` in ``RolloutConfig``.  SPECO
+verl 0.8/0.9 do not expose ``rollout.drafter`` in ``RolloutConfig``.  SPECO
 therefore keeps that subtree external to upstream config validation, and uses
 this module to pass the relevant SGLang launch/update information to the Ray
 actors that own the HTTP server and rollout adapter.
@@ -2421,7 +2421,7 @@ def should_install_sglang_base_compat_runtime(config: Any) -> bool:
 
 
 def install_upstream_sglang_runtime_bridge(*, base_compat_only: bool = False) -> bool:
-    """Patch upstream verl v0.8.0 SGLang rollout classes in the current process."""
+    """Patch upstream verl 0.8/0.9 SGLang rollout classes in this process."""
 
     global _SGLANG_REPLICA_PATCHED
     if _SGLANG_REPLICA_PATCHED:

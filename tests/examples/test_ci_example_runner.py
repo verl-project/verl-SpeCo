@@ -178,25 +178,51 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 "mindspeed/verl0.8.0_vllm_910b_speco:v1"
             )
             assert (
-                workflow["jobs"]["example"]["container"]["options"]
-                == "--shm-size 16g"
+                workflow["jobs"]["example"]["container"]["options"] == "--shm-size 16g"
             )
+            assert "repository: verl-project/verl" in source
+            assert "ref: release/v0.8.0" in source
+            assert "python -m pip install --no-deps -e upstream-verl" in source
             assert "python -m pip install --no-deps -e ." in source
+            assert "expected verl 0.8.0 base version" in source
             assert "verl_speco imported from" in source
             assert workflow["jobs"]["example"]["env"]["HF_ENDPOINT"] == (
                 "https://hf-mirror.com"
             )
-            assert workflow["jobs"]["example"]["env"]["HF_HUB_ENABLE_HF_TRANSFER"] == "0"
+            assert (
+                workflow["jobs"]["example"]["env"]["HF_HUB_ENABLE_HF_TRANSFER"] == "0"
+            )
             assert "find /root/.cache/huggingface/hub" in source
             assert "Verify model paths" in source
             assert "Missing target model directory" in source
-            assert "SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '8' }}" in source
-            assert "SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS || '2' }}" in source
-            assert "SPECO_MAX_RESPONSE_LENGTH: ${{ vars.SPECO_MAX_RESPONSE_LENGTH || '512' }}" in source
-            assert "SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE || '64' }}" in source
-            assert "SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '128' }}" in source
-            assert "SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES || '32' }}" in source
-            assert "SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE || '8' }}" in source
+            assert (
+                "SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '8' }}"
+                in source
+            )
+            assert (
+                "SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS || '2' }}"
+                in source
+            )
+            assert (
+                "SPECO_MAX_RESPONSE_LENGTH: ${{ vars.SPECO_MAX_RESPONSE_LENGTH || '512' }}"
+                in source
+            )
+            assert (
+                "SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE || '64' }}"
+                in source
+            )
+            assert (
+                "SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '128' }}"
+                in source
+            )
+            assert (
+                "SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES || '32' }}"
+                in source
+            )
+            assert (
+                "SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE || '8' }}"
+                in source
+            )
             assert "matrix.enable_training" in source
             assert "SPECO_EAGLE3_DISABLE_TORCH_COMPILE" in source
         assert "SPECO_ACCELERATOR_COUNT" in source

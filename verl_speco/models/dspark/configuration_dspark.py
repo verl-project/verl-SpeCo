@@ -48,7 +48,10 @@ class DSparkConfig(DFlashConfig):
         architectures = kwargs.pop("architectures", None)
         self._source_checkpoint_config = None
         super().__init__(*args, **kwargs)
-        self.architectures = architectures or ["DSparkDraftModel"]
+        # Native vLLM MRV2 dispatches Qwen DSpark by this architecture name.
+        # ``DSparkDraftModel`` is registered to the unrelated DeepSeek-V4
+        # implementation in current vLLM and is not a safe generic fallback.
+        self.architectures = architectures or ["Qwen3DSparkModel"]
         self.block_size = int(block_size)
         self.num_anchors = int(num_anchors)
         self.markov_rank = int(markov_rank)

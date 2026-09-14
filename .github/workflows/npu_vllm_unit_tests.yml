@@ -129,18 +129,38 @@ jobs:
           fetch-depth: 0
           clean: true
 
-      - name: Install current verl-SpeCo checkout
+      - name: Check out supported verl release
+        uses: actions/checkout@v4
+        with:
+          repository: verl-project/verl
+          ref: release/v0.8.0
+          path: upstream-verl
+          clean: true
+
+      - name: Install supported verl and current verl-SpeCo checkouts
         run: |
+          python -m pip install --no-deps -e upstream-verl
           python -m pip install --no-deps -e .
           python - <<'PY'
           import os
           from pathlib import Path
 
+          import verl
           import verl_speco
+          from packaging.version import Version
 
           workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          verl_checkout = workspace / "upstream-verl"
+          verl_package = Path(verl.__file__).resolve()
           package = Path(verl_speco.__file__).resolve()
+          print("verl imported from", verl_package, "version", verl.__version__)
           print("verl_speco imported from", package)
+          assert verl_checkout in verl_package.parents, (
+              f"expected verl from release/v0.8.0 checkout, got {verl_package}"
+          )
+          assert Version(verl.__version__).base_version == "0.8.0", (
+              f"expected verl 0.8.0 base version, got {verl.__version__}"
+          )
           assert workspace in package.parents, (
               f"expected verl_speco from PR workspace {workspace}, got {package}"
           )

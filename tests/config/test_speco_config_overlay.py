@@ -63,9 +63,16 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
 
     assert raw.speco.verl_base.version == "0.8.0"
     assert raw.speco.verl_base.branch == "release/v0.8.0"
+    assert list(raw.speco.verl_base.supported_versions) == ["0.8.0", "0.9.0"]
+    assert list(raw.speco.verl_base.supported_branches) == [
+        "release/v0.8.0",
+        "release/v0.9.0",
+    ]
     assert drafter.enable is False
     assert drafter.enable_drafter_training is False
     assert drafter.training.collect_hidden_states_from_sgl is False
+    assert drafter.training.dspark_confidence_loss_alpha == 0.0
+    assert drafter.training.dspark_l1_loss_alpha == 0.9
     assert drafter.training.collect_hidden_states_from_old_logprob is False
     assert drafter.vllm.allow_lossy_speculative_sampling is False
     assert drafter.training.allow_sglang_prenorm_last_layer is False
@@ -82,7 +89,7 @@ def test_overlay_composes_with_release_upstream_verl(tmp_path: Path) -> None:
     upstream_root = os.getenv("VERL_SPECO_UPSTREAM_ROOT")
     if not upstream_root:
         pytest.skip(
-            "set VERL_SPECO_UPSTREAM_ROOT to check compose against release/v0.8.0 verl"
+            "set VERL_SPECO_UPSTREAM_ROOT to check compose against a supported verl"
         )
     upstream_config = _upstream_repo_root(upstream_root) / "verl" / "trainer" / "config"
     assert upstream_config.is_dir()
@@ -98,6 +105,7 @@ def test_overlay_composes_with_release_upstream_verl(tmp_path: Path) -> None:
     assert config.speco.verl_base.version == "0.8.0"
     assert config.actor_rollout_ref.rollout.drafter.enable is False
     assert "trainer" in config
+    assert config.trainer.use_v1 is False
     assert "algorithm" in config
 
 
@@ -105,7 +113,7 @@ def test_draft_trainer_composes_as_primary_config(tmp_path: Path) -> None:
     upstream_root = os.getenv("VERL_SPECO_UPSTREAM_ROOT")
     if not upstream_root:
         pytest.skip(
-            "set VERL_SPECO_UPSTREAM_ROOT to check compose against release/v0.8.0 verl"
+            "set VERL_SPECO_UPSTREAM_ROOT to check compose against a supported verl"
         )
     upstream_config = _upstream_repo_root(upstream_root) / "verl" / "trainer" / "config"
     assert upstream_config.is_dir()

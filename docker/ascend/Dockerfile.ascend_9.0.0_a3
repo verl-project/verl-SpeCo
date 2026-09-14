@@ -18,8 +18,8 @@ RUN git config --global http.sslverify false
 # Prepare repositories with low update frequency
 RUN ARCH=$(uname -m) && \
     # Clone libs
-    git clone https://github.com/vllm-project/vllm.git && cd vllm && git checkout dc68bd8c4199b00631fe71eb37313f406cc66ac1 && cd .. && \
-    git clone https://github.com/chenaoxuan/vllm-ascend.git && cd vllm-ascend && git checkout 8214d19f8b505484b839469444887b404db2e3a8 && cd .. && \
+    git clone https://github.com/vllm-project/vllm.git && cd vllm && git checkout 58d3918e3ea0a544ffedadad2ba84559e9c51d8f && cd .. && \
+    git clone https://github.com/vllm-project/vllm-ascend.git && cd vllm-ascend && git checkout 6af9257e449ca139ccd228f0d71ca7d2c09909c9 && cd .. && \
     git clone https://gitcode.com/Ascend/MindSpeed.git && \
     cd MindSpeed && git checkout core_r0.16.0 && cd .. && \
     git clone --depth 1 --branch core_r0.16.0 https://github.com/NVIDIA/Megatron-LM.git && \
@@ -65,8 +65,11 @@ RUN MBRIDGE_PATH=$(pip show mbridge | grep Location | awk '{print $2}') && \
     TARGET_FILE="${MBRIDGE_PATH}/mbridge/models/ext/deepseek_v3/dequant_fp8_safetensor_io.py" && \
     sed -i '34s/cuda/npu/;51s/cuda/npu/' "$TARGET_FILE"
 
-# Prepare and install verl (verl is release/v0.8.0)
-RUN git clone -b release/v0.8.0 https://github.com/verl-project/verl.git && cd verl && \
+ARG VERL_REF=release/v0.8.0
+
+# Keep the existing 0.8 image as the default.  MRV2/verl 0.9 images can be
+# built explicitly with --build-arg VERL_REF=release/v0.9.0.
+RUN git clone -b ${VERL_REF} https://github.com/verl-project/verl.git && cd verl && \
     git submodule update --init --recursive --remote && \
     pip install -r requirements-npu.txt && pip install -v -e . && cd .. && \
     # Clear extra files
