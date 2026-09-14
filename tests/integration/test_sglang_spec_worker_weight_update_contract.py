@@ -28,6 +28,9 @@ import types
 
 import pytest
 
+# sglang_patch imports torch at module level; the CPU CI image has none.
+pytest.importorskip("torch")
+
 DRAFT_LOADER = "verl_speco.integration.sglang_runtime.speco_sglang_draft_weight_loader"
 TARGET_LOADER = (
     "verl_speco.integration.sglang_runtime.speco_sglang_target_weight_loader"
