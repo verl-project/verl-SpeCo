@@ -394,6 +394,45 @@ def _rewrite_standalone_block_runtime_config(
         )
         return
 
+    variant_child_key, variant_alias_keys = _VARIANT_RUNTIME_ALIASES.get(
+        backend_type, (None, ())
+    )
+    training_dflash_config = training_config.get("dflash_config")
+    training_variant_config = (
+        training_config.get(variant_child_key) if variant_child_key else None
+    )
+    training_target_layer_ids = (
+        training_config.get("target_layer_ids")
+        or (
+            training_dflash_config.get("target_layer_ids")
+            if isinstance(training_dflash_config, dict)
+            else None
+        )
+        or (
+            training_variant_config.get("target_layer_ids")
+            if isinstance(training_variant_config, dict)
+            else None
+        )
+    )
+    training_aux_layer_ids: list[int] | None = None
+    if training_target_layer_ids is not None:
+        try:
+            training_aux_layer_ids = [
+                int(layer_id) for layer_id in training_target_layer_ids
+            ]
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid target_layer_ids in standalone exported config: %r",
+                training_target_layer_ids,
+            )
+        else:
+            if any(layer_id < 1 for layer_id in training_aux_layer_ids):
+                raise ValueError(
+                    "Cannot export standalone DFlash runtime config with "
+                    f"target_layer_ids={training_aux_layer_ids}: each training layer id "
+                    "must be at least 1."
+                )
+
     training_config_path = os.path.join(checkpoint_path, "speco_training_config.json")
     try:
         with open(training_config_path, "w", encoding="utf-8") as f:
@@ -419,9 +458,6 @@ def _rewrite_standalone_block_runtime_config(
     dflash_config = _ensure_dict_child(runtime_config, "dflash_config")
     _fill_if_missing(dflash_config, training_config, common_alias_keys)
 
-    variant_child_key, variant_alias_keys = _VARIANT_RUNTIME_ALIASES.get(
-        backend_type, (None, ())
-    )
     variant_config = (
         _ensure_dict_child(runtime_config, variant_child_key)
         if variant_child_key
@@ -433,41 +469,17 @@ def _rewrite_standalone_block_runtime_config(
             training_config.get("projector_type", "domino") or "domino"
         )
 
-    training_dflash_config = training_config.get("dflash_config")
-    training_variant_config = (
-        training_config.get(variant_child_key) if variant_child_key else None
-    )
-    target_layer_ids = (
-        training_config.get("target_layer_ids")
-        or (
-            training_dflash_config.get("target_layer_ids")
-            if isinstance(training_dflash_config, dict)
-            else None
-        )
-        or (
-            training_variant_config.get("target_layer_ids")
-            if isinstance(training_variant_config, dict)
-            else None
-        )
-    )
-    if target_layer_ids is not None:
-        try:
-            # Training captures these transformer layer outputs verbatim.  vLLM
-            # requires its DFlash target aliases to be one less than the EAGLE
-            # aux ids, so preserve the training ids as aux ids and shift only
-            # the runtime-facing aliases.
-            aux_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
-            runtime_target_layer_ids = [layer_id - 1 for layer_id in aux_layer_ids]
-            runtime_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
-            runtime_config["target_layer_ids"] = runtime_target_layer_ids
-            dflash_config["target_layer_ids"] = runtime_target_layer_ids
-            if variant_child_key:
-                variant_config["target_layer_ids"] = runtime_target_layer_ids
-        except (TypeError, ValueError):
-            logger.warning(
-                "Invalid target_layer_ids in standalone exported config: %r",
-                target_layer_ids,
-            )
+    if training_aux_layer_ids is not None:
+        # Training captures these transformer layer outputs verbatim.  vLLM
+        # requires its DFlash target aliases to be one less than the EAGLE aux
+        # ids, so preserve the training ids as aux ids and shift only the
+        # runtime-facing aliases.
+        runtime_target_layer_ids = [layer_id - 1 for layer_id in training_aux_layer_ids]
+        runtime_config["eagle_aux_hidden_state_layer_ids"] = training_aux_layer_ids
+        runtime_config["target_layer_ids"] = runtime_target_layer_ids
+        dflash_config["target_layer_ids"] = runtime_target_layer_ids
+        if variant_child_key:
+            variant_config["target_layer_ids"] = runtime_target_layer_ids
 
     try:
         with open(config_path, "w", encoding="utf-8") as f:

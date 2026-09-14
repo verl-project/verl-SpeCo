@@ -341,3 +341,32 @@ def test_standalone_dflash_checkpoint_preserves_source_runtime_config(tmp_path):
     assert runtime_config["dflash_config"]["target_layer_ids"] == [1, 9, 17]
     assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [2, 10, 18]
     assert saved_training_config == training_config
+
+
+def test_standalone_dflash_checkpoint_rejects_layer_zero_runtime_alias(tmp_path):
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    source_dir = tmp_path / "source_dflash"
+    source_dir.mkdir()
+    source_config = {
+        "model_type": "qwen3",
+        "architectures": ["DFlashForCausalLM"],
+    }
+    (source_dir / "config.json").write_text(json.dumps(source_config), encoding="utf-8")
+    training_config = {
+        "model_type": "dflash",
+        "architectures": ["DFlashDraftModel"],
+        "target_layer_ids": [0, 9, 17],
+        "mask_token_id": 151669,
+        "num_context_layers": 3,
+    }
+    config_path = checkpoint_dir / "config.json"
+    config_path.write_text(json.dumps(training_config), encoding="utf-8")
+    trainer = _export_trainer("dflash", str(source_dir))
+
+    with pytest.raises(ValueError, match="each training layer id must be at least 1"):
+        _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    # Validate before writing either the runtime config or a training-config copy.
+    assert json.loads(config_path.read_text(encoding="utf-8")) == training_config
+    assert not (checkpoint_dir / "speco_training_config.json").exists()
