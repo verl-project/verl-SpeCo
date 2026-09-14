@@ -29,7 +29,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import fields
+import dataclasses
 from typing import Any, Optional, cast
 
 # The DFlash2 checkpoint contract and IPC allocator helpers live with the vLLM
@@ -109,6 +109,30 @@ _VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS"
 
 _SERVER_ARGS_PATCHED = False
 _SGLANG_REPLICA_PATCHED = False
+
+
+def _record_field_names(cls: Any) -> frozenset[str]:
+    """Declared field names of an sglang record, whichever shape it takes.
+
+    sglang main turned ``ServerArgs`` and the IO structs into ``msgspec.Struct``
+    records, so ``dataclasses.fields`` raises on them; older builds declare
+    them as dataclasses. sglang's own ``record_fields`` helper covers both, and
+    the fallbacks below keep working on a build that predates it.
+    """
+    try:
+        from sglang.srt.arg_groups.arg_utils import record_fields
+    except ImportError:
+        record_fields = None
+    if record_fields is not None:
+        names = frozenset(field.name for field in record_fields(cls))
+        if names:
+            return names
+    struct_fields = getattr(cls, "__struct_fields__", None)
+    if struct_fields:
+        return frozenset(struct_fields)
+    if dataclasses.is_dataclass(cls):
+        return frozenset(field.name for field in dataclasses.fields(cls))
+    return frozenset()
 
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
@@ -834,7 +858,7 @@ def _install_server_args_patch(drafter_cfg: dict[str, Any] | None = None) -> Non
     from sglang.srt.server_args import ServerArgs
 
     original_init = ServerArgs.__init__
-    supported_fields = {field.name for field in fields(ServerArgs)}
+    supported_fields = set(_record_field_names(ServerArgs))
 
     def speco_server_args_init(self, *args, **kwargs):
         cfg = drafter_cfg or _load_env_drafter_config()
@@ -987,13 +1011,7 @@ async def _sgl_update_weights_with_route(
     # Validate the routing contract on EVERY rank before the gather below: a
     # rank-0-only raise would leave the other ranks blocked in the collective
     # (an NCCL-watchdog hang instead of the intended fail-loud).
-    struct_fields = getattr(UpdateWeightsFromTensorReqInput, "__struct_fields__", None)
-    if struct_fields is None:
-        # Older sglang builds declare the request as a dataclass.
-        struct_fields = [
-            field.name for field in fields(UpdateWeightsFromTensorReqInput)
-        ]
-    request_fields = frozenset(struct_fields)
+    request_fields = _record_field_names(UpdateWeightsFromTensorReqInput)
     for field, value in (
         ("disable_target_model", disable_target_model),
         ("disable_draft_model", disable_draft_model),
@@ -1094,7 +1112,7 @@ def _supports_sglang_custom_weight_loader() -> bool:
     try:
         from sglang.srt.server_args import ServerArgs
 
-        return "custom_weight_loader" in getattr(ServerArgs, "__dataclass_fields__", {})
+        return "custom_weight_loader" in _record_field_names(ServerArgs)
     except Exception:  # noqa: BLE001
         return False
 

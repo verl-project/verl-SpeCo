@@ -241,3 +241,82 @@ def test_draft_model_detection_covers_the_dflash_family() -> None:
     assert _is_sglang_draft_model(DFlashDraftModel())
     assert _is_sglang_draft_model(EagleDraft())
     assert not _is_sglang_draft_model(Qwen3ForCausalLM())
+
+
+# --- record field names across sglang's dataclass and msgspec eras -----------
+
+
+def _install_fake_sglang_modules(monkeypatch, **modules):
+    for parent in (
+        "sglang",
+        "sglang.srt",
+        "sglang.srt.utils",
+        "sglang.srt.speculative",
+    ):
+        if parent not in sys.modules:
+            monkeypatch.setitem(sys.modules, parent, types.ModuleType(parent))
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+def test_record_field_names_prefer_sglang_record_fields(monkeypatch) -> None:
+    """sglang main's ServerArgs is a msgspec Struct: dataclasses.fields raises."""
+
+    class _Field:
+        def __init__(self, name):
+            self.name = name
+
+    arg_utils = types.ModuleType("sglang.srt.arg_groups.arg_utils")
+    arg_utils.record_fields = lambda cls: [
+        _Field("custom_weight_loader"),
+        _Field("tp_size"),
+    ]
+    for parent in ("sglang", "sglang.srt", "sglang.srt.arg_groups"):
+        if parent not in sys.modules:
+            monkeypatch.setitem(sys.modules, parent, types.ModuleType(parent))
+    monkeypatch.setitem(sys.modules, "sglang.srt.arg_groups.arg_utils", arg_utils)
+
+    class ServerArgs:  # neither a dataclass nor a Struct
+        pass
+
+    assert sglang_runtime._record_field_names(ServerArgs) == {
+        "custom_weight_loader",
+        "tp_size",
+    }
+
+
+def test_record_field_names_fall_back_without_the_helper(monkeypatch) -> None:
+    import dataclasses
+
+    monkeypatch.setitem(sys.modules, "sglang.srt.arg_groups.arg_utils", None)
+
+    class StructLike:
+        __struct_fields__ = ("load_format", "disable_draft_model")
+
+    @dataclasses.dataclass
+    class Legacy:
+        load_format: str = "auto"
+
+    assert sglang_runtime._record_field_names(StructLike) == {
+        "load_format",
+        "disable_draft_model",
+    }
+    assert sglang_runtime._record_field_names(Legacy) == {"load_format"}
+    assert sglang_runtime._record_field_names(object) == frozenset()
+
+
+def test_custom_weight_loader_probe_reads_struct_server_args(monkeypatch) -> None:
+    """sglang main's ServerArgs has no __dataclass_fields__, so the old probe
+    answered False and the draft publish lost its route marker."""
+    server_args = types.ModuleType("sglang.srt.server_args")
+
+    class ServerArgs:
+        __struct_fields__ = ("model_path", "custom_weight_loader")
+
+    server_args.ServerArgs = ServerArgs
+    _install_fake_sglang_modules(monkeypatch, **{"sglang.srt.server_args": server_args})
+    monkeypatch.setitem(sys.modules, "sglang.srt.arg_groups.arg_utils", None)
+    assert sglang_runtime._supports_sglang_custom_weight_loader() is True
+
+    ServerArgs.__struct_fields__ = ("model_path",)
+    assert sglang_runtime._supports_sglang_custom_weight_loader() is False
