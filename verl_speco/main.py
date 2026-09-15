@@ -20,6 +20,8 @@ only imported when a drafter is enabled, keeping the no-drafter reward
 distribution aligned with verl.
 """
 
+import os
+
 import hydra
 
 
@@ -91,8 +93,40 @@ def _strip_speco_overlay_for_native_run(config) -> None:
             del config["speco"]
 
 
+def _neutralize_rocm_hip_visible_devices():
+    """Keep Ray CUDA-native on ROCm by stripping HIP_VISIBLE_DEVICES on the driver.
+
+    vllm's ROCm platform module (vllm/platforms/rocm.py) runs a one-time
+    ``_sync_hip_cuda_env_vars()`` at import that copies CUDA_VISIBLE_DEVICES into
+    HIP_VISIBLE_DEVICES. If that HIP value is present when Ray initializes, Ray's AMD
+    accelerator manager switches to HIP-keyword mode and rewrites only HIP per GPU worker,
+    leaving each worker's CUDA_VISIBLE_DEVICES at the full stale mask. The ROCm HIP runtime
+    then aborts every GPU worker at ``import torch`` with "Conflicting visibility ... between
+    HIP_VISIBLE_DEVICES and CUDA_VISIBLE_DEVICES".
+
+    Pre-triggering the sync (so its module body is cached and cannot re-run) and then popping
+    HIP_VISIBLE_DEVICES leaves the driver with CUDA_VISIBLE_DEVICES only, so Ray assigns each
+    worker a single physical GPU via CUDA and never introduces a conflicting HIP mask.
+    """
+    try:
+        import torch
+
+        is_rocm = bool(getattr(torch.version, "hip", None))
+    except Exception:
+        is_rocm = os.environ.get("HIP_PLATFORM") == "amd"
+    if not is_rocm:
+        return
+    try:
+        import vllm.platforms.rocm  # noqa: F401  # runs the one-time HIP/CUDA sync
+    except Exception:
+        pass
+    os.environ.pop("HIP_VISIBLE_DEVICES", None)
+
+
 def run(config) -> None:
     """Resolve SPECO/verl compatibility, device and the task-runner dispatch."""
+
+    _neutralize_rocm_hip_visible_devices()
 
     from verl.trainer import main_ppo
     from verl.utils.device import auto_set_device
