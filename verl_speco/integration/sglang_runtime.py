@@ -109,6 +109,7 @@ _VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS"
 
 _SERVER_ARGS_PATCHED = False
 _SGLANG_REPLICA_PATCHED = False
+_AMDGPU_MEM_CAPACITY_PATCHED = False
 
 
 def _record_field_names(cls: Any) -> frozenset[str]:
@@ -880,6 +881,66 @@ def _install_server_args_patch(drafter_cfg: dict[str, Any] | None = None) -> Non
     _SERVER_ARGS_PATCHED = True
 
 
+def _install_amdgpu_memory_capacity_patch() -> None:
+    """Make SGLang's ROCm GPU-memory probe resilient inside server actors.
+
+    SGLang's ``get_amdgpu_memory_capacity`` (sglang/srt/utils/common.py) shells out to
+    ``rocminfo | grep ... | awk ...`` and parses the stdout as floats. Inside some SGLang
+    server actor processes that pipeline occasionally returns empty stdout with returncode 0
+    (the trailing awk stage masks an upstream failure), producing
+    ``ValueError: could not convert string to float: ''`` in ``ServerArgs.__post_init__`` and
+    killing the whole job. Fall back to torch's device total memory (in MiB) whenever the
+    original probe raises or yields nothing.
+    """
+
+    global _AMDGPU_MEM_CAPACITY_PATCHED
+    if _AMDGPU_MEM_CAPACITY_PATCHED:
+        return
+
+    try:
+        import sglang.srt.utils.common as sgl_common
+    except Exception:
+        return
+
+    original = getattr(sgl_common, "get_amdgpu_memory_capacity", None)
+    if original is None:
+        return
+
+    def _torch_fallback_mib():
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        caps = [
+            torch.cuda.get_device_properties(i).total_memory / (1 << 20)
+            for i in range(torch.cuda.device_count())
+        ]
+        return min(caps) if caps else None
+
+    def robust_get_amdgpu_memory_capacity(*args, **kwargs):
+        try:
+            value = original(*args, **kwargs)
+            if value:
+                return value
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "SGLang get_amdgpu_memory_capacity failed (%s); using torch fallback.", exc
+            )
+        fallback = _torch_fallback_mib()
+        if fallback is None:
+            raise RuntimeError(
+                "Unable to determine AMD GPU memory capacity from rocminfo or torch."
+            )
+        logger.warning(
+            "SGLang get_amdgpu_memory_capacity fell back to torch total memory: %.0f MiB",
+            fallback,
+        )
+        return fallback
+
+    sgl_common.get_amdgpu_memory_capacity = robust_get_amdgpu_memory_capacity
+    _AMDGPU_MEM_CAPACITY_PATCHED = True
+
+
 def _install_sglang_hidden_state_patch(drafter_cfg: dict[str, Any]) -> None:
     from verl_speco.integration.sglang_adapter import (
         SGLangSpecoPatchConfig,
@@ -905,6 +966,11 @@ def _install_sglang_hidden_state_patch(drafter_cfg: dict[str, Any]) -> None:
 
 def install_sglang_server_actor_runtime() -> dict[str, Any]:
     """Install SPECO runtime hooks inside a SGLang HTTP server actor."""
+
+    from verl_speco.integration.rocm_env import neutralize_hip_visible_devices
+
+    neutralize_hip_visible_devices(context="in SGLang server actor")
+    _install_amdgpu_memory_capacity_patch()
 
     drafter_cfg = _load_env_drafter_config()
     if not drafter_cfg:
