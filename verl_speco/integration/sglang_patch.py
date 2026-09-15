@@ -74,6 +74,7 @@ _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = None
 _SGLANG_EAGLE_UPDATE_PATCHED = False
 _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
+_SGLANG_STREAM_ACCUMULATOR_HIDDEN_STATES_PATCHED = False
 _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DRAFTER_LAST_HIDDEN_OUTPUT_PATCHED = False
@@ -5322,6 +5323,13 @@ _SGLANG_STREAM_HIDDEN_STATES_PATTERN = re.compile(
     r"(?P=indent)[ \t]+[ \t]+output_hidden_states\s*=\s*\[\]\r?\n"
     r"(?P=indent)[ \t]+output_hidden_states\.append\(req\.hidden_states\)\r?\n",
 )
+# Newer SGLang moved stream output into
+# scheduler_components/output_streamer._GenerationStreamAccumulator.accept, whose
+# hidden-state block is `if req.return_hidden_states: self.output_hidden_states.append(...)`.
+_SGLANG_ACCUMULATOR_HIDDEN_STATES_PATTERN = re.compile(
+    r"(?ms)^(?P<indent>[ \t]+)if\s+req\.return_hidden_states\s*:\r?\n"
+    r"(?P=indent)[ \t]+self\.output_hidden_states\.append\(req\.hidden_states\)\r?\n",
+)
 
 
 def _replace_sglang_hidden_states_list_output(source: str) -> tuple[str, int]:
@@ -6189,12 +6197,90 @@ def patch_sglang_dflash_verify_hidden_states() -> None:
     logger.warning("SGLang DFlash verify hidden-state patch active")
 
 
+def _render_sglang_accumulator_hidden_states(match: re.Match[str]) -> str:
+    indent = match.group("indent")
+    inner = indent + "    "
+    return (
+        f"{indent}if _sglang_req_should_stream_hidden_states(req):\n"
+        f"{inner}if not self.output_hidden_states:\n"
+        f"{inner}    self.output_hidden_states = [[] for _ in range(len(self.rids) - 1)]\n"
+        f"{inner}self.output_hidden_states.append(req.hidden_states)\n"
+        f"{indent}elif self.output_hidden_states:\n"
+        f"{inner}self.output_hidden_states.append([])\n"
+    )
+
+
+def patch_sglang_stream_accumulator_hidden_states() -> None:
+    """Keep ``_GenerationStreamAccumulator.output_hidden_states`` aligned with ``rids``.
+
+    Newer SGLang moved stream output into
+    ``sglang.srt.managers.scheduler_components.output_streamer._GenerationStreamAccumulator``,
+    whose ``accept`` appends to ``output_hidden_states`` only for requests that set
+    ``return_hidden_states``. The tokenizer manager then indexes
+    ``output_hidden_states[i]`` by full-batch position, so a partial (drafter-only)
+    collection produces a list shorter than ``rids`` and raises ``IndexError``. This
+    patch pads non-collected positions with ``[]`` so the list length always matches
+    ``rids`` (or stays empty -> ``None`` and the consumer guard short-circuits).
+    """
+    global _SGLANG_STREAM_ACCUMULATOR_HIDDEN_STATES_PATCHED
+    if _SGLANG_STREAM_ACCUMULATOR_HIDDEN_STATES_PATCHED:
+        return
+    try:
+        module = importlib.import_module(
+            "sglang.srt.managers.scheduler_components.output_streamer"
+        )
+        accumulator_cls = getattr(module, "_GenerationStreamAccumulator")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang stream accumulator hidden-state patch: %s", exc)
+        return
+
+    original_method = getattr(accumulator_cls, "accept", None)
+    if original_method is None or getattr(
+        original_method, "_verl_patched_stream_accumulator_hidden_states", False
+    ):
+        return
+
+    try:
+        source = textwrap.dedent(inspect.getsource(original_method))
+    except (OSError, TypeError) as exc:  # noqa: BLE001
+        logger.warning("Skip SGLang stream accumulator hidden-state patch: %s", exc)
+        return
+
+    patched_source, count = _SGLANG_ACCUMULATOR_HIDDEN_STATES_PATTERN.subn(
+        _render_sglang_accumulator_hidden_states, source, count=1
+    )
+    if count <= 0 or patched_source == source:
+        logger.warning(
+            "SGLang stream accumulator hidden-state append block not found; "
+            "drafter hidden-state alignment patch not applied."
+        )
+        return
+
+    globals_dict = original_method.__globals__
+    globals_dict["_sglang_req_should_stream_hidden_states"] = (
+        _sglang_req_should_stream_hidden_states
+    )
+    namespace: dict[str, Any] = {}
+    exec(  # noqa: S102
+        "from __future__ import annotations\n" + patched_source,
+        globals_dict,
+        namespace,
+    )
+    patched_method = namespace[original_method.__name__]
+    patched_method = wraps(original_method)(patched_method)
+    patched_method._verl_patched_stream_accumulator_hidden_states = True
+    setattr(accumulator_cls, "accept", patched_method)
+    _SGLANG_STREAM_ACCUMULATOR_HIDDEN_STATES_PATCHED = True
+    logger.warning("SGLang stream accumulator hidden-state alignment patch active")
+
+
 def patch_sglang_hidden_states_tensor_output() -> None:
     """Return SGLang hidden-state chunks as CPU tensors instead of Python lists."""
     global _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED
     patch_sglang_eagle_legacy_alignment_compat()
     patch_sglang_eagle_verify_hidden_states_full()
     patch_sglang_dflash_verify_hidden_states()
+    patch_sglang_stream_accumulator_hidden_states()
     raw_top_logprobs_enabled = _env_flag_enabled(
         _DRAFTER_RAW_TOP_LOGPROBS_ENV, default=False
     )
