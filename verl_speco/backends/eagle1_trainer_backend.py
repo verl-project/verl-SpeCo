@@ -72,6 +72,10 @@ class Eagle1TrainerBackend(Eagle3TrainerBackend):
     # forces ulysses_sequence_parallel_size = 1 instead of aborting mid-run.
     supports_ulysses_sp = False
 
+    # Token logits come from the frozen target head (weight tying), so the draft
+    # carries no lm_head of its own to publish.
+    trains_draft_lm_head = False
+
     def _build_draft_config(self, spec_model_path, target_hf_config):
         config_path = (
             os.path.join(spec_model_path, "config.json") if spec_model_path else None

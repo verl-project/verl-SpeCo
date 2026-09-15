@@ -465,6 +465,62 @@ def patch_sglang_qwen3_rope_compat() -> None:
     logger.warning("SGLang Qwen3 rope-parameters compatibility patch active.")
 
 
+def _runner_update_weights_from_tensor(runner, named_tensors, load_format):
+    """Load tensors through a model runner on either sglang generation.
+
+    Older builds expose ``ModelRunner.update_weights_from_tensor``; sglang main
+    moved it onto ``ModelRunner.weight_updater``.
+    """
+    update = getattr(runner, "update_weights_from_tensor", None)
+    if update is None:
+        update = runner.weight_updater.update_weights_from_tensor
+    return update(named_tensors=named_tensors, load_format=load_format)
+
+
+# Speculative workers that drive the draft through a plain TpModelWorker and
+# implement no update_weights_from_tensor of their own. Their __getattr__
+# forwards the call to the target worker, so an unpatched draft publish loads
+# the drafter's tensors into the target and leaves the served draft stale.
+_SGLANG_SPEC_WORKER_MODULES_WITHOUT_TENSOR_UPDATE = (
+    "sglang.srt.speculative.dflash_worker_v2",
+    "sglang.srt.speculative.dspark_components.dspark_worker_v2",
+)
+
+
+def _default_spec_worker_update_weights_from_tensor(self, recv_req):
+    """EAGLEWorkerV2's native behaviour for workers that lack one: both runners."""
+    serialized_named_tensors = getattr(recv_req, "serialized_named_tensors", None)
+    if not serialized_named_tensors:
+        return True, "No tensor is provided for the speculative weight update."
+    tp_rank = _get_sglang_worker_tp_rank(self)
+    if tp_rank >= len(serialized_named_tensors):
+        return (
+            False,
+            "Invalid speculative update tensor shard index: "
+            f"tp_rank={tp_rank}, num_shards={len(serialized_named_tensors)}.",
+        )
+
+    from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+    monkey_patch_torch_reductions()
+    named_tensors = MultiprocessingSerializer.deserialize(
+        serialized_named_tensors[tp_rank]
+    )
+    load_format = getattr(recv_req, "load_format", None)
+    for runner, side in (
+        (_get_sglang_draft_runner(self), "draft"),
+        (_get_sglang_target_runner(self), "target"),
+    ):
+        if runner is None:
+            return False, f"SGLang speculative {side} model runner is missing."
+        success, message = _runner_update_weights_from_tensor(
+            runner, named_tensors, load_format
+        )
+        if not success:
+            return success, message
+    return True, "Speculative weight update succeeded."
+
+
 def _make_verl_eagle_update_weights_patch(original_update_weights):
     @wraps(original_update_weights)
     def patched_update_weights_from_tensor(self, recv_req):
@@ -526,9 +582,8 @@ def _make_verl_eagle_update_weights_patch(original_update_weights):
             draft_runner = _get_sglang_draft_runner(self)
             if draft_runner is None:
                 return False, "SGLang EAGLE draft model runner is missing."
-            success, message = draft_runner.update_weights_from_tensor(
-                named_tensors=named_tensors,
-                load_format=routed_load_format,
+            success, message = _runner_update_weights_from_tensor(
+                draft_runner, named_tensors, routed_load_format
             )
             if not success:
                 return success, message
@@ -537,9 +592,8 @@ def _make_verl_eagle_update_weights_patch(original_update_weights):
             target_runner = _get_sglang_target_runner(self)
             if target_runner is None:
                 return False, "SGLang EAGLE target model runner is missing."
-            success, message = target_runner.update_weights_from_tensor(
-                named_tensors=named_tensors,
-                load_format=routed_load_format,
+            success, message = _runner_update_weights_from_tensor(
+                target_runner, named_tensors, routed_load_format
             )
             if not success:
                 return success, message
@@ -555,15 +609,25 @@ def _make_verl_eagle_update_weights_patch(original_update_weights):
 
 
 def patch_sglang_eagle_update_weights_from_tensor() -> None:
-    """Patch SGLang EAGLE update so target-only and draft-only sync skip the wrong side early."""
+    """Patch SGLang speculative workers so target-only and draft-only sync skip the wrong side early.
+
+    EAGLE workers ship an ``update_weights_from_tensor`` that is wrapped in
+    place. The DFlash-family workers ship none and forward the call to the
+    target worker, so they get an EAGLEWorkerV2-style both-runners default
+    underneath the same routing wrapper.
+    """
     global _SGLANG_EAGLE_UPDATE_PATCHED
     if _SGLANG_EAGLE_UPDATE_PATCHED:
         return
 
     patched_classes = []
-    for module_name in (
+    eagle_modules = (
         "sglang.srt.speculative.eagle_worker",
         "sglang.srt.speculative.eagle_worker_v2",
+    )
+    for module_name in (
+        *eagle_modules,
+        *_SGLANG_SPEC_WORKER_MODULES_WITHOUT_TENSOR_UPDATE,
     ):
         try:
             module = importlib.import_module(module_name)
@@ -571,11 +635,24 @@ def patch_sglang_eagle_update_weights_from_tensor() -> None:
             continue
 
         for class_name, cls in vars(module).items():
-            if not isinstance(cls, type) or not class_name.lower().startswith("eagle"):
+            if not isinstance(cls, type):
                 continue
-
-            original_update_weights = getattr(cls, "update_weights_from_tensor", None)
-            if original_update_weights is None or getattr(
+            if module_name in eagle_modules:
+                if not class_name.lower().startswith("eagle"):
+                    continue
+                original_update_weights = getattr(
+                    cls, "update_weights_from_tensor", None
+                )
+                if original_update_weights is None:
+                    continue
+            else:
+                if not class_name.lower().endswith("worker" + "v2"):
+                    continue
+                original_update_weights = vars(cls).get(
+                    "update_weights_from_tensor",
+                    _default_spec_worker_update_weights_from_tensor,
+                )
+            if getattr(
                 original_update_weights, "_verl_patched_eagle_update_weights", False
             ):
                 continue
@@ -590,7 +667,7 @@ def patch_sglang_eagle_update_weights_from_tensor() -> None:
     if patched_classes:
         _SGLANG_EAGLE_UPDATE_PATCHED = True
         logger.info(
-            "Patched SGLang EAGLE routed weight update for %s",
+            "Patched SGLang speculative routed weight update for %s",
             ", ".join(patched_classes),
         )
 

@@ -13,19 +13,31 @@
 # limitations under the License.
 """TaskRunner hook for the SPECO trainer."""
 
-import os
-import socket
 import json
 import logging
-from contextlib import contextmanager, nullcontext
+import os
+import socket
 from pprint import pprint
 
 import ray
-from omegaconf import OmegaConf, open_dict
-
-from verl.trainer.main_ppo import TaskRunner, create_rl_dataset, create_rl_sampler
-from verl.trainer.ppo.utils import need_critic, need_reference_policy
+from omegaconf import OmegaConf
+from verl.trainer.ppo.utils import (
+    need_critic,
+    need_reference_policy,
+)
 from verl.utils.config import validate_config
+
+try:
+    from verl.trainer.main_ppo_v0 import BaseTaskRunner as _TaskRunnerBase
+except ImportError:
+    # verl 0.8 exposes the legacy runner directly from main_ppo.  Keep this
+    # import isolated from the 0.9-only module so importing verl-SpeCo does not
+    # require both release APIs to exist in the same environment.
+    from verl.trainer.main_ppo import TaskRunner as _TaskRunnerBase
+
+    _VERL_TASK_RUNNER_API = "0.8"
+else:
+    _VERL_TASK_RUNNER_API = "0.9"
 
 logger = logging.getLogger(__name__)
 
@@ -79,77 +91,12 @@ def _install_vllm_import_compat_for_task_runner(config) -> bool:
     return install_verl_npu_vllm_import_compat()
 
 
-def _open_config_mapping(mapping):
-    return open_dict(mapping) if OmegaConf.is_config(mapping) else nullcontext()
-
-
-@contextmanager
-def _prepare_no_drafter_runtime_config(config):
-    from verl_speco.integration.vllm_runtime import (
-        SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS,
-        install_upstream_vllm_runtime_bridge,
-    )
-
-    rollout_config = getattr(
-        getattr(config, "actor_rollout_ref", None), "rollout", None
-    )
-    missing = object()
-    no_async_scheduling = missing
-    worker_extension_cls = missing
-    vllm_engine_kwargs = None
-    if rollout_config is not None and rollout_config.get("name") == "vllm":
-        # Keep the no-drafter HTTP server on the same import-safe Ray actor
-        # path as speculative rollout. This avoids hiding child-process import
-        # failures behind Ray's TemporaryActor coroutine error.
-        if not install_upstream_vllm_runtime_bridge():
-            logger.warning(
-                "SPECO no-drafter baseline could not install the vLLM server runtime bridge"
-            )
-        with _open_config_mapping(rollout_config):
-            engine_kwargs = rollout_config.get("engine_kwargs")
-            if engine_kwargs is None:
-                engine_kwargs = {}
-                rollout_config["engine_kwargs"] = engine_kwargs
-            with _open_config_mapping(engine_kwargs):
-                vllm_engine_kwargs = engine_kwargs.get("vllm")
-                if vllm_engine_kwargs is None:
-                    vllm_engine_kwargs = {}
-                    engine_kwargs["vllm"] = vllm_engine_kwargs
-                with _open_config_mapping(vllm_engine_kwargs):
-                    no_async_scheduling = vllm_engine_kwargs.get(
-                        "no-async-scheduling", missing
-                    )
-                    vllm_engine_kwargs["no-async-scheduling"] = True
-                    worker_extension_cls = vllm_engine_kwargs.get(
-                        "worker_extension_cls", missing
-                    )
-                    if worker_extension_cls is missing or worker_extension_cls is None:
-                        vllm_engine_kwargs["worker_extension_cls"] = (
-                            SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS
-                        )
-        logger.info(
-            "SPECO no-drafter baseline: forcing vLLM async scheduling off with IPC weight-sync compatibility"
-        )
-    try:
-        yield
-    finally:
-        if vllm_engine_kwargs is not None:
-            with _open_config_mapping(vllm_engine_kwargs):
-                if no_async_scheduling is missing:
-                    del vllm_engine_kwargs["no-async-scheduling"]
-                else:
-                    vllm_engine_kwargs["no-async-scheduling"] = no_async_scheduling
-                if worker_extension_cls is missing:
-                    del vllm_engine_kwargs["worker_extension_cls"]
-                else:
-                    vllm_engine_kwargs["worker_extension_cls"] = worker_extension_cls
-
-
-class SpecoTaskRunner(TaskRunner):
+class SpecoTaskRunner(_TaskRunnerBase):
     """External TaskRunner that swaps in SpecoRayPPOTrainer.
 
-    Adapted from verl v0.8.0
-    ``verl/trainer/main_ppo.py::TaskRunner.run``.
+    The upstream runner moved from ``main_ppo.TaskRunner`` in verl 0.8 to
+    ``main_ppo_v0.BaseTaskRunner`` in verl 0.9.  The shared SPECO hooks are the
+    same, while dataset/model construction is selected below per release.
     """
 
     def add_actor_rollout_worker(self, config):
@@ -224,25 +171,42 @@ class SpecoTaskRunner(TaskRunner):
         return _remotify_like_worker_mapping_value(worker_cls, wrapped_cls)
 
     def run(self, config):
+        from verl_speco.integration.compat import check_compatible_verl
+
+        check_compatible_verl()
+        if _VERL_TASK_RUNNER_API == "0.9" and bool(config.trainer.get("use_v1", False)):
+            raise RuntimeError(
+                "verl-SpeCo extends the legacy RayPPOTrainer on release/v0.9.0; "
+                "set trainer.use_v1=false. The V1 trainer does not expose the "
+                "online drafter training and atomic weight-publish hooks yet."
+            )
+        if not _drafter_rollout_enabled(config):
+            # The no-drafter path must reach verl through the entry-level bypass
+            # in ``verl_speco.main`` so SPECO runtime/compat patches stay
+            # unloaded.  Refuse here so accidental reuse of the SPECO runner can
+            # never change the actor -> rollout weight-sync path.
+            raise RuntimeError(
+                "SpecoTaskRunner requires drafter.enable=true; "
+                "use the native verl bypass path for a no-drafter run"
+            )
         # Ray actors do not share imported modules. Install this in the task
         # runner process before LLMServerManager imports verl's vLLM adapter.
         _install_vllm_import_compat_for_task_runner(config)
-        if not _drafter_rollout_enabled(config):
-            if _rollout_name(config) != "vllm":
-                return super().run(config)
-            # Keep the SPECO trainer's calculate_entropy=False old-logprob path.
-            # Upstream release/v0.8.0 forces entropy on here, which triggers a
-            # costly torch.compile on NPU during the first training step.
-            with _prepare_no_drafter_runtime_config(config):
-                return self._run_with_speco_trainer(config)
-
         return self._run_with_speco_trainer(config)
 
     def _run_with_speco_trainer(self, config):
-        from verl.utils import hf_processor, hf_tokenizer
         from verl.utils.dataset.rl_dataset import collate_fn
-        from verl.utils.fs import copy_to_local
+
         from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
+
+        if _VERL_TASK_RUNNER_API == "0.9":
+            from verl.trainer.ppo.utils import create_rl_dataset, create_rl_sampler
+            from verl.utils.config import omega_conf_to_dataclass
+            from verl.workers.config import HFModelConfig
+        else:
+            from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
+            from verl.utils import hf_processor, hf_tokenizer
+            from verl.utils.fs import copy_to_local
 
         print(f"SpecoTaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
@@ -264,16 +228,24 @@ class SpecoTaskRunner(TaskRunner):
             use_critic=need_critic(config),
         )
 
-        local_path = copy_to_local(
-            config.actor_rollout_ref.model.path,
-            use_shm=config.actor_rollout_ref.model.get("use_shm", False),
-        )
-
-        trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        processor = hf_processor(
-            local_path, trust_remote_code=trust_remote_code, use_fast=True
-        )
+        if _VERL_TASK_RUNNER_API == "0.9":
+            model_config: HFModelConfig = omega_conf_to_dataclass(
+                config.actor_rollout_ref.model
+            )
+            tokenizer = model_config.tokenizer
+            processor = model_config.processor
+        else:
+            local_path = copy_to_local(
+                config.actor_rollout_ref.model.path,
+                use_shm=config.actor_rollout_ref.model.get("use_shm", False),
+            )
+            trust_remote_code = config.data.get("trust_remote_code", False)
+            tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+            processor = hf_processor(
+                local_path,
+                trust_remote_code=trust_remote_code,
+                use_fast=True,
+            )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 

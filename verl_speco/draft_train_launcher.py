@@ -57,6 +57,14 @@ _STANDALONE_KEYS = (
     "speco.draft_training.standalone",
     "actor_rollout_ref.rollout.drafter.training.standalone",
 )
+_FEATURE_STORE_TYPE_KEY = (
+    "actor_rollout_ref.rollout.drafter.training.feature_store.type"
+)
+_TQ_ENABLE_KEY = "actor_rollout_ref.rollout.drafter.training.transfer_queue.enable"
+_TQ_RAY_ADDRESS_KEY = (
+    "actor_rollout_ref.rollout.drafter.training.transfer_queue.ray.address"
+)
+_TQ_RUN_ID_KEY = "actor_rollout_ref.rollout.drafter.training.transfer_queue.run_id"
 
 _LAUNCH_OVERRIDE_KEYS = frozenset(
     _NPROC_KEYS
@@ -166,6 +174,29 @@ def normalize_training_args(
     return normalized
 
 
+def validate_tq_launch_config(overrides: list[str]) -> None:
+    """Fail early when the standalone TQ Consumer lacks connection identity."""
+
+    store_type = _find_override(overrides, (_FEATURE_STORE_TYPE_KEY,))
+    if str(store_type or "").strip().lower() != "tq":
+        return
+    enabled = _find_override(overrides, (_TQ_ENABLE_KEY,))
+    if not _parse_bool(enabled, default=False):
+        raise ValueError(
+            "feature_store.type=tq requires training.transfer_queue.enable=true"
+        )
+    ray_address = str(_find_override(overrides, (_TQ_RAY_ADDRESS_KEY,)) or "").strip()
+    if not ray_address or ray_address.lower() in {"null", "none"}:
+        raise ValueError(
+            "feature_store.type=tq requires training.transfer_queue.ray.address"
+        )
+    run_id = str(_find_override(overrides, (_TQ_RUN_ID_KEY,)) or "").strip()
+    if not run_id or run_id.lower() in {"null", "none"}:
+        raise ValueError(
+            "feature_store.type=tq requires training.transfer_queue.run_id"
+        )
+
+
 def build_torch_distributed_command(
     config: DraftTrainLaunchConfig,
     training_args: list[str],
@@ -220,6 +251,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args, training_args = parser.parse_known_args(argv)
 
+    validate_tq_launch_config(training_args)
     launch_config = resolve_launch_config(training_args, module=args.module)
     normalized_training_args = normalize_training_args(training_args, launch_config)
     command = build_torch_distributed_command(

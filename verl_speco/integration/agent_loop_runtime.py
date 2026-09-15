@@ -252,7 +252,7 @@ def _load_agent_loop_module():
 
 
 def _resolve_llm_server_client_class(agent_loop_module: Any) -> Any:
-    """Resolve the request client used by legacy and release/v0.8.0 agent loops."""
+    """Resolve the request client used by verl 0.8/0.9 agent loops."""
 
     client_cls = getattr(agent_loop_module, "LLMServerClient", None)
     if client_cls is not None:

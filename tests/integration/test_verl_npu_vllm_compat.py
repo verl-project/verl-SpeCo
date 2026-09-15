@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import sys
 import types
 
@@ -23,7 +22,7 @@ import pytest
 from verl_speco.integration import verl_npu_vllm_compat as compat
 
 
-def test_factory_fused_moe_survives_verl_npu_patch_import(monkeypatch) -> None:
+def test_v080_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> None:
     vllm = types.ModuleType("vllm")
     vllm.__version__ = "0.23.0"
     fused_moe_module = types.ModuleType(compat._VLLM_FUSED_MOE_MODULE)
@@ -32,29 +31,130 @@ def test_factory_fused_moe_survives_verl_npu_patch_import(monkeypatch) -> None:
         return args, kwargs
 
     fused_moe_module.FusedMoE = fused_moe_factory
-    monkeypatch.setitem(sys.modules, "vllm", vllm)
     monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
-    monkeypatch.setitem(sys.modules, "vllm_ascend", types.ModuleType("vllm_ascend"))
-    monkeypatch.setitem(sys.modules, compat._VLLM_FUSED_MOE_MODULE, fused_moe_module)
     monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_verl_v090_runner", lambda: False)
 
     def module_importer(module_name: str):
+        if module_name == "vllm":
+            return vllm
+        if module_name == compat._VLLM_FUSED_MOE_MODULE:
+            return fused_moe_module
         if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
-            assert hasattr(fused_moe_factory, "weight_loader")
-            original = fused_moe_factory.weight_loader
-
-            def wrapped_weight_loader(*args, **kwargs):
-                return original(*args, **kwargs)
-
-            fused_moe_factory.weight_loader = wrapped_weight_loader
-            module = types.ModuleType(module_name)
-            monkeypatch.setitem(sys.modules, module_name, module)
-            return module
-        return importlib.import_module(module_name)
+            assert fused_moe_factory.weight_loader is compat._unused_factory_weight_loader
+            return types.ModuleType(module_name)
+        raise AssertionError(f"unexpected import: {module_name}")
 
     assert compat.install_verl_npu_vllm_import_compat(module_importer) is True
     assert not hasattr(fused_moe_factory, "weight_loader")
     assert compat._IMPORT_COMPAT_APPLIED is True
+
+
+def test_v090_npu_patch_import_does_not_mutate_fused_moe_factory(monkeypatch) -> None:
+    def fused_moe_factory(*args, **kwargs):
+        return args, kwargs
+
+    fused_moe_package = types.ModuleType(compat._VLLM_FUSED_MOE_PACKAGE)
+    fused_moe_layer = types.ModuleType(compat._VLLM_FUSED_MOE_LAYER_MODULE)
+    fused_moe_layer.FusedMoE = fused_moe_factory
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_verl_v090_runner", lambda: True)
+    imported = []
+
+    def module_importer(module_name: str):
+        imported.append(module_name)
+        if module_name == compat._VLLM_FUSED_MOE_PACKAGE:
+            return fused_moe_package
+        if module_name == compat._VLLM_FUSED_MOE_LAYER_MODULE:
+            return fused_moe_layer
+        if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
+            assert fused_moe_package.FusedMoE is fused_moe_factory
+            return types.ModuleType(module_name)
+        raise AssertionError(f"unexpected import: {module_name}")
+
+    assert compat.install_verl_npu_vllm_import_compat(module_importer) is True
+    assert not hasattr(fused_moe_package, "FusedMoE")
+    assert not hasattr(fused_moe_factory, "weight_loader")
+    assert imported == [
+        compat._VLLM_FUSED_MOE_PACKAGE,
+        compat._VLLM_FUSED_MOE_LAYER_MODULE,
+        compat._VERL_NPU_VLLM_PATCH_MODULE,
+    ]
+    assert compat._IMPORT_COMPAT_APPLIED is True
+
+
+def test_v090_npu_patch_skips_removed_fused_moe_factory(monkeypatch) -> None:
+    fused_moe_package = types.ModuleType(compat._VLLM_FUSED_MOE_PACKAGE)
+    fused_moe_layer = types.ModuleType(compat._VLLM_FUSED_MOE_LAYER_MODULE)
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_verl_v090_runner", lambda: True)
+
+    def module_importer(module_name: str):
+        if module_name == compat._VLLM_FUSED_MOE_PACKAGE:
+            return fused_moe_package
+        if module_name == compat._VLLM_FUSED_MOE_LAYER_MODULE:
+            return fused_moe_layer
+        if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
+            assert fused_moe_package.FusedMoE is compat._unavailable_fused_moe
+            return types.ModuleType(module_name)
+        raise AssertionError(f"unexpected import: {module_name}")
+
+    assert compat.install_verl_npu_vllm_import_compat(module_importer) is True
+    assert not hasattr(fused_moe_package, "FusedMoE")
+    assert compat._IMPORT_COMPAT_APPLIED is True
+
+
+def test_v090_npu_patch_removes_temporary_export_after_import_failure(
+    monkeypatch,
+) -> None:
+    fused_moe_package = types.ModuleType(compat._VLLM_FUSED_MOE_PACKAGE)
+    fused_moe_layer = types.ModuleType(compat._VLLM_FUSED_MOE_LAYER_MODULE)
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_verl_v090_runner", lambda: True)
+
+    def module_importer(module_name: str):
+        if module_name == compat._VLLM_FUSED_MOE_PACKAGE:
+            return fused_moe_package
+        if module_name == compat._VLLM_FUSED_MOE_LAYER_MODULE:
+            return fused_moe_layer
+        if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
+            raise RuntimeError("upstream patch import failed")
+        raise AssertionError(f"unexpected import: {module_name}")
+
+    with pytest.raises(RuntimeError, match="upstream patch import failed"):
+        compat.install_verl_npu_vllm_import_compat(module_importer)
+    assert not hasattr(fused_moe_package, "FusedMoE")
+    assert compat._IMPORT_COMPAT_APPLIED is False
+
+
+def test_v090_npu_patch_preserves_existing_fused_moe_export(monkeypatch) -> None:
+    class LegacyFusedMoE:
+        pass
+
+    fused_moe_package = types.ModuleType(compat._VLLM_FUSED_MOE_PACKAGE)
+    fused_moe_package.FusedMoE = LegacyFusedMoE
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_verl_v090_runner", lambda: True)
+    imported = []
+
+    def module_importer(module_name: str):
+        imported.append(module_name)
+        if module_name == compat._VLLM_FUSED_MOE_PACKAGE:
+            return fused_moe_package
+        if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
+            return types.ModuleType(module_name)
+        raise AssertionError(f"unexpected import: {module_name}")
+
+    assert compat.install_verl_npu_vllm_import_compat(module_importer) is True
+    assert fused_moe_package.FusedMoE is LegacyFusedMoE
+    assert imported == [
+        compat._VLLM_FUSED_MOE_PACKAGE,
+        compat._VERL_NPU_VLLM_PATCH_MODULE,
+    ]
 
 
 def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
@@ -164,8 +264,10 @@ def test_npu_checkpoint_reclaim_preserves_native_save(monkeypatch) -> None:
     monkeypatch.setattr(
         compat,
         "release_checkpoint_host_memory",
-        lambda path, drop_file_cache: events.append(("reclaim", path, drop_file_cache))
-        or {"elapsed_sec": 0.1, "files_advised": 3, "files_failed": 0},
+        lambda path, drop_file_cache: (
+            events.append(("reclaim", path, drop_file_cache))
+            or {"elapsed_sec": 0.1, "files_advised": 3, "files_failed": 0}
+        ),
     )
     monkeypatch.setattr(compat, "format_checkpoint_memory_snapshot", lambda: "memory")
 
@@ -213,8 +315,10 @@ def test_npu_checkpoint_reclaim_runs_after_native_save_failure(monkeypatch) -> N
     monkeypatch.setattr(
         compat,
         "release_checkpoint_host_memory",
-        lambda path, drop_file_cache: events.append((path, drop_file_cache))
-        or {"elapsed_sec": 0.1, "files_advised": 0, "files_failed": 0},
+        lambda path, drop_file_cache: (
+            events.append((path, drop_file_cache))
+            or {"elapsed_sec": 0.1, "files_advised": 0, "files_failed": 0}
+        ),
     )
 
     assert compat.install_verl_npu_checkpoint_reclaim(modules.__getitem__) is True
@@ -252,8 +356,10 @@ def test_npu_checkpoint_skips_manual_move_with_fsdp2_cpu_offload(monkeypatch) ->
     monkeypatch.setattr(
         compat,
         "release_checkpoint_host_memory",
-        lambda path, drop_file_cache: events.append(("reclaim", path, drop_file_cache))
-        or {"elapsed_sec": 0.1, "files_advised": 0, "files_failed": 0},
+        lambda path, drop_file_cache: (
+            events.append(("reclaim", path, drop_file_cache))
+            or {"elapsed_sec": 0.1, "files_advised": 0, "files_failed": 0}
+        ),
     )
     monkeypatch.setattr(compat, "format_checkpoint_memory_snapshot", lambda: "memory")
 

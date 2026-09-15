@@ -1,0 +1,17 @@
+# GPU vLLM runtime image.
+FROM verlai/verl:vllm023.dev1
+
+ARG VERL_REF=release/v0.9.0
+ARG VERL_REPO=https://github.com/verl-project/verl.git
+
+WORKDIR /workspace
+
+RUN git clone ${VERL_REPO} /workspace/verl \
+    && cd /workspace/verl \
+    && git checkout ${VERL_REF} \
+    && pip install -e .
+
+COPY . /workspace/verl-SpeCo
+
+WORKDIR /workspace/verl-SpeCo
+RUN pip install -e .

@@ -32,6 +32,11 @@ Push, scheduled, and manual NPU runs use the broader matrix:
 - SGLang + EAGLE3
 - SGLang + DFlash
 
+Online drafter training is enabled for all NPU vLLM drafters. The EAGLE3 job
+sets `SPECO_EAGLE3_DISABLE_TORCH_COMPILE=true` to avoid the EAGLE3 NPU
+`torch.compile` training path that can fail with Ascend vector-core exceptions,
+while still exercising online drafter collect/train/publish in CI.
+
 Like verl's CI, the hardware workflows assume the runner image has the runtime
 stack and a small default model cache. Most workflows default to:
 
@@ -94,6 +99,7 @@ environments, or pass them as manual workflow inputs where available:
 - `SPECO_TENSOR_PARALLEL_SIZE`
 - `SPECO_SEQUENCE_PARALLEL_SIZE`
 - `SPECO_ENABLE_TRAINING`
+- `SPECO_EAGLE3_DISABLE_TORCH_COMPILE`
 - `SPECO_SPEC_STEPS`
 - `SPECO_SPEC_TOPK`
 - `SPECO_SPEC_VERIFY_TOKENS`
@@ -119,17 +125,27 @@ caller has not already set `ASCEND_RT_VISIBLE_DEVICES`. If the caller provides
 NPU vLLM smoke jobs use lightweight fallback settings for pull requests, pushes,
 and manual runs:
 
-- `SPECO_TOTAL_TRAINING_STEPS=1`
-- `SPECO_TRAIN_BATCH_SIZE=8`
-- `SPECO_TRAIN_MAX_SAMPLES=32`
+- `SPECO_TOTAL_TRAINING_STEPS=2`
+- `SPECO_MAX_RESPONSE_LENGTH=512`
+- `SPECO_TRAIN_BATCH_SIZE=64`
+- `SPECO_TRAIN_MAX_SAMPLES=128`
 - `SPECO_VAL_MAX_SAMPLES=32`
 - `SPECO_PPO_MINI_BATCH_SIZE=8`
+- `SPECO_DRAFTER_TRAINING_STEPS=1`
+- `SPECO_DRAFTER_BATCH_SIZE_PER_GPU=1`
+- `SPECO_TRAIN_BATCHES_PER_CYCLE=1`
+- `SPECO_COLLECT_INTERVAL_STEPS=1`
+- `SPECO_TRAINING_INTERVAL_STEPS=1`
+- `SPECO_PUBLISH_INTERVAL_STEPS=1`
 - `SPECO_DATALOADER_NUM_WORKERS=0`
 
-The NPU vLLM smoke batch uses eight samples so the generation batch can be
-split evenly across the eight NPU agent-loop workers. The PPO mini-batch also
-uses eight samples so actor updates split evenly across the eight data-parallel
-workers.
+The NPU vLLM smoke batch uses sixty-four samples so the generation batch can be
+split evenly across the eight NPU agent-loop workers while giving the drafter
+owner buckets enough candidates to form at least one training batch even when
+only a subset of rollout samples pass the hidden-state collection filters. The
+PPO mini-batch uses eight samples so actor updates split evenly across the
+eight data-parallel workers. These training-oriented defaults apply to the NPU
+vLLM jobs that enable online drafter training.
 
 The runner image is responsible for providing the matching verl, vLLM/SGLang,
 PyTorch accelerator runtime, and model files. Hardware workflows deliberately

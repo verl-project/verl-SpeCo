@@ -22,6 +22,8 @@ ppo_gpus_per_node=8
 draft_train_gpus_per_node=8
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
+feature_store_min_sample_step=${SPECO_FEATURE_STORE_MIN_SAMPLE_STEP:-3}
+feature_store_max_sample_step=${SPECO_FEATURE_STORE_MAX_SAMPLE_STEP:-5}
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint
@@ -135,6 +137,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.draft_train_launcher \
     actor_rollout_ref.rollout.drafter.training.use_logits=False \
     actor_rollout_ref.rollout.drafter.training.feature_store.type=torch_shard \
     actor_rollout_ref.rollout.drafter.training.feature_store.path=${FEATURE_STORE_DIR} \
+    actor_rollout_ref.rollout.drafter.training.feature_store.min_sample_step=${feature_store_min_sample_step} \
+    actor_rollout_ref.rollout.drafter.training.feature_store.max_sample_step=${feature_store_max_sample_step} \
     actor_rollout_ref.rollout.drafter.training.feature_store.shuffle=True \
     actor_rollout_ref.rollout.drafter.training.feature_store.repeat=True \
     actor_rollout_ref.rollout.drafter.training.feature_store.strict_schema=True $@

@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import asyncio
 from inspect import getsource
 from types import SimpleNamespace
 
@@ -49,6 +50,100 @@ def test_materialize_direct_and_object_ref_payloads(monkeypatch) -> None:
     )
 
 
+def test_release_draft_weights_payload_clears_before_host_reclaim(monkeypatch) -> None:
+    payload = {"weight": object(), "bias": object()}
+    reclaim_calls = []
+
+    def fake_reclaim():
+        reclaim_calls.append(dict(payload))
+        return {
+            "elapsed_sec": 0.25,
+            "heap_trimmed": True,
+            "allocator": "jemalloc",
+            "reclaim_action": "purge",
+        }
+
+    monkeypatch.setattr(rollout_publish, "_release_publish_host_memory", fake_reclaim)
+
+    result = rollout_publish.release_draft_weights_payload(payload)
+
+    assert reclaim_calls == [{}]
+    assert payload == {}
+    assert result["num_weights"] == 2
+    assert result["payload_cleared"] == 1
+
+
+class _FakeDraftRollout:
+    def __init__(self, *, fail: bool = False):
+        self.fail = fail
+        self.seen = []
+
+    async def update_draft_weights(self, weights, global_steps=None):
+        self.seen.append((dict(weights), global_steps))
+        if self.fail:
+            raise RuntimeError("publish failed")
+
+
+def _publish_worker(rollout):
+    worker = rollout_publish.DraftWeightPublishMixin()
+    worker.config = {"rollout": {"drafter": {"enable": True}}}
+    worker.rollout = rollout
+    worker._attach_update_draft_weights_to_rollout = lambda: None
+    return worker
+
+
+@pytest.mark.parametrize("publish_async", [False, True])
+def test_ref_backed_publish_releases_materialized_payload(
+    monkeypatch, publish_async
+) -> None:
+    weight = object()
+    materialized = {"weight": weight}
+    rollout = _FakeDraftRollout()
+    worker = _publish_worker(rollout)
+    monkeypatch.setattr(
+        rollout_publish,
+        "materialize_draft_weights_payload",
+        lambda _payload: (materialized, True),
+    )
+    monkeypatch.setattr(
+        rollout_publish,
+        "_release_publish_host_memory",
+        lambda: {"elapsed_sec": 0.0, "allocator": "jemalloc"},
+    )
+
+    method = (
+        worker.update_draft_weights_async
+        if publish_async
+        else worker.update_draft_weights
+    )
+    asyncio.run(method({"weights_ref": object()}, global_steps=2))
+
+    assert rollout.seen == [({"weight": weight}, 2)]
+    assert materialized == {}
+
+
+def test_ref_backed_publish_releases_payload_after_failure(monkeypatch) -> None:
+    materialized = {"weight": object()}
+    worker = _publish_worker(_FakeDraftRollout(fail=True))
+    monkeypatch.setattr(
+        rollout_publish,
+        "materialize_draft_weights_payload",
+        lambda _payload: (materialized, True),
+    )
+    monkeypatch.setattr(
+        rollout_publish,
+        "_release_publish_host_memory",
+        lambda: {"elapsed_sec": 0.0, "allocator": "glibc"},
+    )
+
+    with pytest.raises(RuntimeError, match="publish failed"):
+        asyncio.run(
+            worker.update_draft_weights_async({"weights_ref": object()}, global_steps=2)
+        )
+
+    assert materialized == {}
+
+
 def test_rollout_backend_and_drafter_gates_support_both_config_shapes() -> None:
     assert rollout_publish.rollout_backend_name({"rollout": {"name": "vllm"}}) == "vllm"
     assert rollout_publish.actor_training_backend_name({}) == "fsdp"
@@ -67,6 +162,17 @@ def test_rollout_backend_and_drafter_gates_support_both_config_shapes() -> None:
     assert rollout_publish.drafter_rollout_enabled(
         {"actor_rollout_ref": {"rollout": {"drafter": {"enable": True}}}}
     )
+    assert not rollout_publish.drafter_rollout_enabled(
+        {"actor_rollout_ref": {"rollout": {"drafter": {"enable": False}}}}
+    )
+
+
+def test_explicit_disabled_drafter_wins_over_stale_runtime_env(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.sglang_runtime._load_env_drafter_config",
+        lambda: {"enable": True},
+    )
+
     assert not rollout_publish.drafter_rollout_enabled(
         {"actor_rollout_ref": {"rollout": {"drafter": {"enable": False}}}}
     )
@@ -247,7 +353,9 @@ def test_publish_state_filter_keeps_eagle3_trainable_lm_head() -> None:
     DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
 
     trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
-    trainer.backend = SimpleNamespace(model_type="eagle3")
+    trainer.backend = SimpleNamespace(
+        model_type="eagle3", trains_draft_lm_head=True, trains_draft_embeddings=False
+    )
     trainer.training_device_mesh = None
     trainer._frozen_param_names = ["target_model."]
     trainer.model = SimpleNamespace(
@@ -275,7 +383,9 @@ def test_publish_state_filter_skips_non_eagle_lm_head() -> None:
     DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
 
     trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
-    trainer.backend = SimpleNamespace(model_type="dflash")
+    trainer.backend = SimpleNamespace(
+        model_type="dflash", trains_draft_lm_head=False, trains_draft_embeddings=False
+    )
     trainer.training_device_mesh = None
     trainer._frozen_param_names = []
     trainer.model = SimpleNamespace(
@@ -297,7 +407,9 @@ def test_publish_state_filter_excludes_block_drafter_embedding() -> None:
     DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
 
     trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
-    trainer.backend = SimpleNamespace(model_type="dspark")
+    trainer.backend = SimpleNamespace(
+        model_type="dspark", trains_draft_lm_head=False, trains_draft_embeddings=False
+    )
     trainer.training_device_mesh = None
     trainer._frozen_param_names = []
     trainer.model = SimpleNamespace(
@@ -308,6 +420,36 @@ def test_publish_state_filter_excludes_block_drafter_embedding() -> None:
     )
 
     assert set(trainer._get_trainable_state_dict()) == {"draft_model.fc.weight"}
+
+
+def test_mrv2_dspark_publish_excludes_frozen_confidence_head(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    torch = pytest.importorskip("torch")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="publish state filtering needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(
+        model_type="dspark", trains_draft_lm_head=False, trains_draft_embeddings=False
+    )
+    trainer.training_device_mesh = None
+    trainer._frozen_param_names = []
+    trainer.model = SimpleNamespace(
+        state_dict=lambda: {
+            "draft_model.confidence_head.proj.weight": torch.ones(1, 2),
+            "draft_model.confidence_head.proj.bias": torch.ones(1),
+            "draft_model.embed_tokens.weight": torch.ones(2, 2),
+            "draft_model.lm_head.weight": torch.ones(2, 2),
+            "draft_model.markov_head.markov_w1.weight": torch.ones(2, 2),
+        }
+    )
+
+    assert set(trainer._get_trainable_state_dict()) == {
+        "draft_model.markov_head.markov_w1.weight"
+    }
 
 
 def test_target_lm_head_device_helper_handles_dflash_style_backend() -> None:
@@ -354,6 +496,58 @@ def test_target_lm_head_device_helper_preserves_eagle_backend() -> None:
 
     assert trainer._move_target_lm_head("npu:0") is True
     assert head.devices == ["npu:0"]
+
+
+@pytest.mark.parametrize(
+    "release_method",
+    ["release_training_memory_after_activation", "cleanup_training"],
+)
+def test_idle_drafter_lifecycle_offloads_dspark_target_lm_head(
+    monkeypatch, release_method
+) -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="target lm_head lifecycle contract needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    class _FakeHead:
+        def __init__(self):
+            self.devices = []
+
+        def to(self, device):
+            self.devices.append(device)
+            return self
+
+    head = _FakeHead()
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.rank = 3
+    trainer.backend = SimpleNamespace(
+        model_type="dspark", target_model=None, target_lm_head=head
+    )
+    trainer.model = None
+    trainer.optimizer = None
+    trainer._training_active = True
+    trainer._training_initialized = True
+    monkeypatch.setattr(base_trainer, "device_name", "cpu")
+
+    if release_method == "cleanup_training":
+        trainer._pending_checkpoint_future = None
+        trainer._pending_full_checkpoint_future = None
+        trainer.skip_heavy_cleanup_after_drafter_training = False
+        trainer._get_sp_group = lambda: None
+        trainer._get_dp_group = lambda: None
+        trainer.training_device_mesh = None
+        trainer.collected_data = []
+        trainer.data_buffer = []
+        trainer._full_checkpoint_executor = None
+        trainer._last_ckpt_step = 0
+        trainer.training_steps = 1
+        asyncio.run(trainer.cleanup_training(clear_data=True))
+    else:
+        asyncio.run(trainer.release_training_memory_after_activation())
+
+    assert head.devices == ["cpu"]
 
 
 def test_drafter_state_is_offloaded_after_training_and_warmup() -> None:
@@ -438,7 +632,9 @@ def test_dspark_pretrained_export_strips_only_training_wrapper_prefix() -> None:
     DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
 
     trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
-    trainer.backend = SimpleNamespace(model_type="dspark")
+    trainer.backend = SimpleNamespace(
+        model_type="dspark", trains_draft_lm_head=False, trains_draft_embeddings=False
+    )
     trainer.training_device_mesh = None
     trainer.model = SimpleNamespace(
         draft_model=SimpleNamespace(),
@@ -458,3 +654,80 @@ def test_dspark_pretrained_export_strips_only_training_wrapper_prefix() -> None:
         "norm.weight",
         "markov_head.markov_w1.weight",
     }
+
+
+@pytest.mark.parametrize("runner", ["0", "1"])
+def test_publish_state_filter_keeps_peagle_trained_head_and_embedding(
+    monkeypatch, runner
+) -> None:
+    """P-EAGLE owns its lm_head and fine-tunes the draft embedding.
+
+    Both are trained every drafter step, so hot publish has to ship them; the
+    generic filter used to drop them and leave the rollout engine on the initial
+    weights forever.
+    """
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", runner)
+    torch = pytest.importorskip("torch")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="publish state filtering needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(
+        model_type="peagle",
+        trains_draft_lm_head=True,
+        trains_draft_embeddings=True,
+    )
+    trainer.training_device_mesh = None
+    trainer._frozen_param_names = ["target_model."]
+    trainer.model = SimpleNamespace(
+        state_dict=lambda: {
+            "embed_tokens.weight": torch.ones(2, 2),
+            "lm_head.weight": torch.ones(2, 2),
+            "fc.weight": torch.ones(2, 2),
+            "mask_hidden": torch.ones(1, 1, 2),
+            "target_model.fc.weight": torch.ones(2, 2),
+            "t2d": torch.ones(2, dtype=torch.bool),
+        }
+    )
+
+    assert set(trainer._get_trainable_state_dict()) == {
+        "embed_tokens.weight",
+        "lm_head.weight",
+        "fc.weight",
+        "mask_hidden",
+    }
+
+
+def test_backend_publish_contract_matches_what_each_backend_trains() -> None:
+    """The declared flags must track the real freeze/build calls in each backend.
+
+    ``model_type`` is not a usable proxy here: EAGLE-1/2 deliberately report
+    ``"eagle3"`` to reuse the data plumbing, and P-EAGLE is the only backend that
+    skips ``freeze_embedding()``.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+
+    from verl_speco.backends.dflash2_trainer_backend import DFlash2TrainerBackend
+    from verl_speco.backends.dflash_trainer_backend import DFlashTrainerBackend
+    from verl_speco.backends.domino_trainer_backend import DominoTrainerBackend
+    from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend
+    from verl_speco.backends.eagle1_trainer_backend import Eagle1TrainerBackend
+    from verl_speco.backends.eagle3_trainer_backend import Eagle3TrainerBackend
+    from verl_speco.backends.peagle_trainer_backend import PEagleTrainerBackend
+
+    expected = {
+        Eagle3TrainerBackend: (True, False),
+        Eagle1TrainerBackend: (False, False),
+        PEagleTrainerBackend: (True, True),
+        DFlashTrainerBackend: (False, False),
+        DFlash2TrainerBackend: (False, False),
+        DSparkTrainerBackend: (False, False),
+        DominoTrainerBackend: (False, False),
+    }
+    for backend_cls, (lm_head, embeddings) in expected.items():
+        assert backend_cls.trains_draft_lm_head is lm_head, backend_cls.__name__
+        assert backend_cls.trains_draft_embeddings is embeddings, backend_cls.__name__
