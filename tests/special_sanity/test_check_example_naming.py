@@ -69,7 +69,7 @@ def test_missing_actor_backend_rejected():
 
 
 def test_separate_training_entrypoint_passes():
-    assert _violations("run_qwen3-8b_drafter_separate_training.sh") == []
+    assert _violations("run_qwen3-8b_drafter_dspark_separate_training.sh") == []
 
 
 def test_separate_training_may_name_its_drafter_backends():

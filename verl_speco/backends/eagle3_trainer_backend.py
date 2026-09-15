@@ -13,7 +13,6 @@
 # limitations under the License.
 import logging
 import os
-from copy import deepcopy
 from typing import Any, Optional, cast
 
 import torch
@@ -23,7 +22,11 @@ from transformers import AutoConfig
 
 from verl.utils.device import get_device_id, get_device_name
 from verl_speco.backends.lr_scheduler import build_drafter_lr_scheduler
-from verl_speco.models.auto import AutoDraftModelConfig, AutoEagle3DraftModel
+from verl_speco.models.auto import (
+    AutoDraftModelConfig,
+    AutoEagle3DraftModel,
+    eagle3_draft_config_from_target,
+)
 from verl_speco.models.eagle.llama_eagle import resolve_eagle3_num_aux_hidden_states
 from verl_speco.models.target.target_head import TargetHead
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
@@ -622,6 +625,13 @@ def _apply_coverage_mask_to_loss_mask(
 
 
 class Eagle3TrainerBackend:
+    # Hot-publish contract: which target-seeded drafter tensors this backend owns
+    # and therefore has to ship to the rollout engine. The EAGLE-3 draft has its
+    # own lm_head over the draft vocabulary, but seeds the embedding from the
+    # target and freezes it.
+    trains_draft_lm_head = True
+    trains_draft_embeddings = False
+
     def __init__(self, config, target_model_config):
         self.config = config
         self.target_model_config = target_model_config
@@ -678,17 +688,20 @@ class Eagle3TrainerBackend:
         spec_model_path = self.config.rollout.drafter.model_path
         config_path = os.path.join(spec_model_path, "config.json")
         target_hf_config = self._get_target_hf_config()
+        training_cfg = self.config.rollout.drafter.training
 
         # 1. Load config
         if os.path.exists(config_path):
             drafter_config = AutoDraftModelConfig.from_file(config_path)
         else:
-            drafter_config = deepcopy(target_hf_config)
-            drafter_config.num_hidden_layers = 1
-            drafter_config.torch_dtype = torch.bfloat16
-            drafter_config.tie_word_embeddings = False
-            drafter_config.architectures = ["LlamaForCausalLMEagle3"]
+            drafter_config = eagle3_draft_config_from_target(
+                target_hf_config,
+                training_cfg.get("eagle3_target_layer_ids"),
+            )
+            drafter_config.dtype = torch.bfloat16
 
+        if not hasattr(drafter_config, "pretraining_tp"):
+            drafter_config.pretraining_tp = 1
         if not hasattr(drafter_config, "draft_vocab_size"):
             drafter_config.draft_vocab_size = drafter_config.vocab_size
         if not hasattr(drafter_config, "target_hidden_size"):
@@ -738,7 +751,6 @@ class Eagle3TrainerBackend:
         drafter_module.load_embedding(target_model_path)
         drafter_module.freeze_embedding()
 
-        training_cfg = self.config.rollout.drafter.training
         if drafter_module.draft_vocab_size != drafter_module.vocab_size:
             if checkpoint_has_vocab_mapping and self._has_valid_vocab_mapping(
                 drafter_module
@@ -786,26 +798,29 @@ class Eagle3TrainerBackend:
             return False
 
     def _validate_vocab_mapping(self, drafter_module) -> None:
+        # Subclasses share this validator, so name the algorithm that actually
+        # failed instead of always blaming EAGLE3.
+        label = str(self.model_type).upper()
         if not hasattr(drafter_module, "t2d") or not hasattr(drafter_module, "d2t"):
             raise AttributeError(
-                "EAGLE3 draft model does not have t2d/d2t vocab mapping buffers"
+                f"{label} draft model does not have t2d/d2t vocab mapping buffers"
             )
 
         if drafter_module.t2d.numel() != drafter_module.vocab_size:
             raise ValueError(
-                f"EAGLE3 t2d shape mismatch: expected {drafter_module.vocab_size}, "
+                f"{label} t2d shape mismatch: expected {drafter_module.vocab_size}, "
                 f"got {drafter_module.t2d.numel()}"
             )
         if drafter_module.d2t.numel() != drafter_module.draft_vocab_size:
             raise ValueError(
-                f"EAGLE3 d2t shape mismatch: expected {drafter_module.draft_vocab_size}, "
+                f"{label} d2t shape mismatch: expected {drafter_module.draft_vocab_size}, "
                 f"got {drafter_module.d2t.numel()}"
             )
 
         selected_vocab_size = int(drafter_module.t2d.sum().item())
         if selected_vocab_size != drafter_module.draft_vocab_size:
             raise ValueError(
-                f"EAGLE3 vocab mapping selects {selected_vocab_size} tokens, "
+                f"{label} vocab mapping selects {selected_vocab_size} tokens, "
                 f"but draft_vocab_size is {drafter_module.draft_vocab_size}"
             )
 
@@ -1165,6 +1180,22 @@ class Eagle3TrainerBackend:
         quality_tokens = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
         quality_topk = min(5, int(all_step_logits[0].size(-1)))
         quality_step_stats = []
+        collect_diagnostics = bool(
+            getattr(self, "enable_standalone_training_metrics", False)
+        )
+        loss_sum_per_position = None
+        correct_per_position = None
+        count_per_position = None
+        if collect_diagnostics:
+            loss_sum_per_position = torch.zeros(
+                length, device=input_ids.device, dtype=torch.float32
+            )
+            correct_per_position = torch.zeros(
+                length, device=input_ids.device, dtype=torch.float32
+            )
+            count_per_position = torch.zeros(
+                length, device=input_ids.device, dtype=torch.float32
+            )
         sparse_base_tokens = torch.tensor(
             0.0, device=input_ids.device, dtype=torch.float32
         )
@@ -1178,6 +1209,10 @@ class Eagle3TrainerBackend:
             0.0, device=input_ids.device, dtype=torch.float32
         )
         gamma = 0.8
+        # The per-step quality stats below are log-only, and every one of them
+        # forces a device sync. Collect them only when the log will be emitted,
+        # matching how the EAGLE-1/2 backend gates the same diagnostics.
+        diagnostics_enabled = logger.isEnabledFor(logging.DEBUG)
 
         # Preprocess shifted targets
         for idx in range(length):
@@ -1234,7 +1269,7 @@ class Eagle3TrainerBackend:
                     position_mask=position_mask,
                 )
                 target_top1 = target_p.argmax(dim=-1)
-            if (
+            if diagnostics_enabled and (
                 base_valid_position.any()
                 and not valid_position[base_valid_position].all()
             ):
@@ -1244,7 +1279,7 @@ class Eagle3TrainerBackend:
                     int(dropped_tokens.detach().cpu().item()),
                 )
             with torch.no_grad():
-                if valid_position.any():
+                if diagnostics_enabled and valid_position.any():
                     draft_top1 = logits.argmax(dim=-1)
                     step_top1_correct = (
                         (draft_top1[valid_position] == target_top1[valid_position])
@@ -1273,6 +1308,9 @@ class Eagle3TrainerBackend:
                         quality_topk_correct += step_topk_correct
                     step_tokens = valid_position.float().sum()
                     quality_tokens += step_tokens
+                    if collect_diagnostics:
+                        correct_per_position[idx] = step_top1_correct
+                        count_per_position[idx] = step_tokens
                     quality_step_stats.append(
                         {
                             "step": idx,
@@ -1298,12 +1336,18 @@ class Eagle3TrainerBackend:
                         }
                     )
             step_loss_sum = per_token_ploss.sum()
+            if collect_diagnostics:
+                loss_sum_per_position[idx] = step_loss_sum
 
             # Apply EAGLE3 step-wise temporal decay
             total_local_ploss += (gamma**idx) * step_loss_sum
             total_local_tokens += valid_position.float().sum()
 
-        if use_sparse_restricted_ce and sparse_base_tokens.detach().float().item() > 0:
+        if (
+            diagnostics_enabled
+            and use_sparse_restricted_ce
+            and sparse_base_tokens.detach().float().item() > 0
+        ):
             logger.debug(
                 "[drafter sparse restricted ce] base_tokens=%s valid_tokens=%s dropped=%s "
                 "intersection_mean=%.6f hit_mass_mean=%.6f min_intersection=%s min_hit_mass=%s",
@@ -1326,8 +1370,8 @@ class Eagle3TrainerBackend:
                 logits_sparse_min_mass,
             )
 
-        if quality_tokens.detach().float().item() > 0:
-            logger.warning(
+        if diagnostics_enabled and quality_tokens.detach().float().item() > 0:
+            logger.debug(
                 "[drafter logits quality] valid_tokens=%s top1_acc=%.6f top%s_acc=%.6f "
                 "local_ploss_sum=%.6f local_tokens=%s per_step=%s",
                 int(quality_tokens.detach().cpu().item()),
@@ -1339,13 +1383,27 @@ class Eagle3TrainerBackend:
                 quality_step_stats,
             )
 
-        return {
+        result = {
             "total_local_vloss": torch.tensor(0.0, device=input_ids.device),
             "total_local_ploss": total_local_ploss,
             "local_num_tokens": total_local_tokens,
             "v_weight": 0.0,
             "p_weight": 1.0,
         }
+        if collect_diagnostics:
+            result["diagnostics"] = {
+                "correct_count": quality_top1_correct.detach(),
+                "eval_token_count": quality_tokens.detach(),
+                "top1_correct_count": quality_top1_correct.detach(),
+                "top5_correct_count": quality_topk_correct.detach(),
+                "quality_token_count": quality_tokens.detach(),
+                "valid_token_count": quality_tokens.detach(),
+                "weighted_token_count": total_local_tokens.detach(),
+                "loss_sum_per_position": loss_sum_per_position.detach(),
+                "correct_per_position": correct_per_position.detach(),
+                "count_per_position": count_per_position.detach(),
+            }
+        return result
 
     def _compute_target_p_padded(self, target_scores, t2d, loss_mask, length):
         with torch.no_grad():

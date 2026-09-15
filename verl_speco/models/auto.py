@@ -41,6 +41,11 @@ _DOMINO_ARCHITECTURE_ALIASES = {
     "Qwen3DominoModel",
 }
 
+_DFLASH2_ARCHITECTURE_ALIASES = {
+    "DFlash2DraftModel",
+    "Qwen3DFlash2Model",
+}
+
 
 def _normalize_int_list(value):
     if value is None:
@@ -160,6 +165,37 @@ class AutoEagle3DraftModel(AutoDraftModel):
     }
 
 
+def eagle3_draft_config_from_target(
+    target_config: PretrainedConfig, target_layer_ids=None
+) -> LlamaConfig:
+    """Convert a target-model config to the Llama-compatible EAGLE3 config."""
+    if not isinstance(target_config, PretrainedConfig):
+        raise TypeError(
+            "EAGLE3 target config must be a transformers.PretrainedConfig, got "
+            f"{type(target_config)!r}"
+        )
+
+    config = target_config.to_dict()
+    config.update(
+        {
+            "architectures": ["LlamaForCausalLMEagle3"],
+            "model_type": "llama",
+            "num_hidden_layers": 1,
+            "pretraining_tp": int(config.get("pretraining_tp") or 1),
+            "target_hidden_size": int(target_config.hidden_size),
+            "tie_word_embeddings": False,
+        }
+    )
+    if target_layer_ids is not None:
+        layer_ids = _normalize_int_list(target_layer_ids)
+        if not layer_ids:
+            raise ValueError("EAGLE3 target_layer_ids must not be empty")
+        config["target_hidden_layer_ids"] = layer_ids
+        config["eagle_aux_hidden_state_layer_ids"] = layer_ids
+
+    return LlamaConfig.from_dict(_normalize_eagle3_config_dict(config))
+
+
 class AutoDraftModelConfig:
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
@@ -201,6 +237,7 @@ class AutoDraftModelConfig:
             architecture not in cls._config_mapping
             and architecture not in _DSPARK_ARCHITECTURE_ALIASES
             and architecture not in _DOMINO_ARCHITECTURE_ALIASES
+            and architecture not in _DFLASH2_ARCHITECTURE_ALIASES
         ):
             raise ValueError(f"Architecture {architecture} not supported")
 
@@ -219,6 +256,17 @@ class AutoDraftModelConfig:
             config["model_type"] = DominoConfig.model_type
             config["architectures"] = ["DominoDraftModel"]
             config.setdefault("projector_type", "domino")
+        elif architecture in _DFLASH2_ARCHITECTURE_ALIASES:
+            from .dflash2 import DFlash2Config
+
+            config_class = DFlash2Config
+            # Upstream z-lab checkpoints nest the DFlash2 knobs under
+            # ``dflash_config``; lift them so they survive ``from_dict``.
+            nested = config.get("dflash_config") or {}
+            for key, value in nested.items():
+                config.setdefault(key, value)
+            config["model_type"] = DFlash2Config.model_type
+            config["architectures"] = ["DFlash2DraftModel"]
         elif architecture in _EAGLE3_ARCHITECTURE_ALIASES:
             config = _normalize_eagle3_config_dict(config)
 

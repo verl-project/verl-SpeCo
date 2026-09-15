@@ -19,6 +19,7 @@ from verl_speco.draft_train_launcher import (
     build_torch_distributed_command,
     normalize_training_args,
     resolve_launch_config,
+    validate_tq_launch_config,
 )
 
 
@@ -108,5 +109,48 @@ def test_launcher_rejects_standalone_multinode() -> None:
             [
                 "speco.draft_training.nnodes=2",
                 "speco.draft_training.standalone=true",
+            ]
+        )
+
+
+def test_launcher_accepts_complete_tq_consumer_config() -> None:
+    validate_tq_launch_config(
+        [
+            "actor_rollout_ref.rollout.drafter.training.feature_store.type=tq",
+            "actor_rollout_ref.rollout.drafter.training.transfer_queue.enable=true",
+            "actor_rollout_ref.rollout.drafter.training.transfer_queue.ray.address=ray:6379",
+            "actor_rollout_ref.rollout.drafter.training.transfer_queue.run_id=run-a",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ([], "enable=true"),
+        (
+            [
+                "actor_rollout_ref.rollout.drafter.training.transfer_queue.enable=true",
+                "actor_rollout_ref.rollout.drafter.training.transfer_queue.run_id=run-a",
+            ],
+            "ray.address",
+        ),
+        (
+            [
+                "actor_rollout_ref.rollout.drafter.training.transfer_queue.enable=true",
+                "actor_rollout_ref.rollout.drafter.training.transfer_queue.ray.address=ray:6379",
+            ],
+            "run_id",
+        ),
+    ],
+)
+def test_launcher_tq_validation_requires_canonical_connection_overrides(
+    overrides, message
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        validate_tq_launch_config(
+            [
+                "actor_rollout_ref.rollout.drafter.training.feature_store.type=tq",
+                *overrides,
             ]
         )

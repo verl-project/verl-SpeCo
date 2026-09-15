@@ -268,9 +268,12 @@ class LlamaForCausalLMPeagle(DraftModel):
 
         self.post_init()
 
+        # d2t holds OFFSETS, not absolute ids: the target id of draft id i is
+        # `i + d2t[i]`, so the identity mapping is all zeros. See the EAGLE-3
+        # draft for the full note.
         t2d = torch.zeros(self.vocab_size, dtype=torch.bool)
         t2d[: self.draft_vocab_size] = True
-        d2t = torch.arange(self.draft_vocab_size, dtype=torch.int64)
+        d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
         nn.init.normal_(self.mask_hidden, mean=0.0, std=1.0)

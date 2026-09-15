@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .configuration_dflash import DFlashConfig
+from .configuration_dflash import DFlashConfig, resolve_rope_theta
 from .modeling_dflash import (
     DFlashAttention,
     DFlashDecoderLayer,
@@ -31,4 +31,5 @@ __all__ = [
     "DFlashRMSNorm",
     "DFlashRotaryEmbedding",
     "build_target_layer_ids",
+    "resolve_rope_theta",
 ]

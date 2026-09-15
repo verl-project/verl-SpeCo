@@ -109,9 +109,18 @@ jobs:
       max-parallel: 1
       matrix:
         include:
+          - drafter: megatron-eagle3
+            enable_training: true
+            disable_eagle3_torch_compile: true
           - drafter: eagle3
+            enable_training: true
+            disable_eagle3_torch_compile: true
           - drafter: dflash
+            enable_training: true
+            disable_eagle3_torch_compile: false
           - drafter: dspark
+            enable_training: true
+            disable_eagle3_torch_compile: false
 
     steps:
       - name: Check out verl-SpeCo
@@ -120,18 +129,38 @@ jobs:
           fetch-depth: 0
           clean: true
 
-      - name: Install current verl-SpeCo checkout
+      - name: Check out supported verl release
+        uses: actions/checkout@v4
+        with:
+          repository: verl-project/verl
+          ref: release/v0.8.0
+          path: upstream-verl
+          clean: true
+
+      - name: Install supported verl and current verl-SpeCo checkouts
         run: |
+          python -m pip install --no-deps -e upstream-verl
           python -m pip install --no-deps -e .
           python - <<'PY'
           import os
           from pathlib import Path
 
+          import verl
           import verl_speco
+          from packaging.version import Version
 
           workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          verl_checkout = workspace / "upstream-verl"
+          verl_package = Path(verl.__file__).resolve()
           package = Path(verl_speco.__file__).resolve()
+          print("verl imported from", verl_package, "version", verl.__version__)
           print("verl_speco imported from", package)
+          assert verl_checkout in verl_package.parents, (
+              f"expected verl from release/v0.8.0 checkout, got {verl_package}"
+          )
+          assert Version(verl.__version__).base_version == "0.8.0", (
+              f"expected verl 0.8.0 base version, got {verl.__version__}"
+          )
           assert workspace in package.parents, (
               f"expected verl_speco from PR workspace {workspace}, got {package}"
           )
@@ -150,7 +179,7 @@ jobs:
           SPECO_DSPARK_DRAFT_MODEL: ${{ inputs.dspark_draft_model || env.SPECO_DEFAULT_DSPARK_DRAFT_MODEL }}
         run: |
           case "${{ matrix.drafter }}" in
-            eagle3)
+            eagle3|megatron-eagle3)
               draft_model="${SPECO_EAGLE3_DRAFT_MODEL}"
               ;;
             dflash)
@@ -194,12 +223,22 @@ jobs:
           SPECO_ACCELERATOR_COUNT: ${{ inputs.accelerator_count || env.SPECO_DEFAULT_ACCELERATOR_COUNT }}
           SPECO_TENSOR_PARALLEL_SIZE: ${{ inputs.tensor_parallel_size || env.SPECO_DEFAULT_TENSOR_PARALLEL_SIZE }}
           SPECO_SEQUENCE_PARALLEL_SIZE: ${{ inputs.sequence_parallel_size || env.SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE }}
-          SPECO_ENABLE_TRAINING: ${{ github.event_name != 'workflow_dispatch' && 'true' || inputs.run_training }}
-          SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS || '1' }}
-          SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE || '8' }}
-          SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '32' }}
+          SPECO_ENABLE_TRAINING: ${{ matrix.enable_training && (github.event_name != 'workflow_dispatch' || inputs.run_training) && 'true' || 'false' }}
+          SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS || '2' }}
+          SPECO_MAX_RESPONSE_LENGTH: ${{ vars.SPECO_MAX_RESPONSE_LENGTH || '512' }}
+          SPECO_HIDDEN_STATE_WINDOW_MIN_ROWS: "32"
+          SPECO_HIDDEN_STATE_WINDOW_TOKENS_PER_SAMPLE: "32"
+          SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE || '64' }}
+          SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '128' }}
           SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES || '32' }}
           SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE || '8' }}
+          SPECO_DRAFTER_TRAINING_STEPS: ${{ vars.SPECO_DRAFTER_TRAINING_STEPS || '1' }}
+          SPECO_DRAFTER_BATCH_SIZE_PER_GPU: ${{ vars.SPECO_DRAFTER_BATCH_SIZE_PER_GPU || '1' }}
+          SPECO_EAGLE3_DISABLE_TORCH_COMPILE: ${{ matrix.disable_eagle3_torch_compile }}
+          SPECO_TRAIN_BATCHES_PER_CYCLE: ${{ vars.SPECO_TRAIN_BATCHES_PER_CYCLE || '1' }}
+          SPECO_COLLECT_INTERVAL_STEPS: ${{ vars.SPECO_COLLECT_INTERVAL_STEPS || '1' }}
+          SPECO_TRAINING_INTERVAL_STEPS: ${{ vars.SPECO_TRAINING_INTERVAL_STEPS || '1' }}
+          SPECO_PUBLISH_INTERVAL_STEPS: ${{ vars.SPECO_PUBLISH_INTERVAL_STEPS || '1' }}
           SPECO_DATALOADER_NUM_WORKERS: ${{ vars.SPECO_DATALOADER_NUM_WORKERS || '0' }}
           SPECO_EXTRA_HYDRA_ARGS: ${{ inputs.extra_hydra_args || vars.SPECO_EXTRA_HYDRA_ARGS }}
         run: bash ci/run_example_test.sh npu vllm "${{ matrix.drafter }}"

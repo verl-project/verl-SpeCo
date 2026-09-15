@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterator
 
-from verl_speco.trainer.feature_store import DraftFeatureSample, DraftFeatureStore
+from verl_speco.trainer.feature_store import DraftFeatureStore, DraftStoredSample
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,8 @@ class DraftFeatureDataLoaderConfig:
     shuffle: bool = True
     seed: int = 0
     repeat: bool = True
+    min_sample_step: int | None = None
+    max_sample_step: int | None = None
 
 
 class DraftFeatureDataLoader:
@@ -52,7 +54,40 @@ class DraftFeatureDataLoader:
                 f"Invalid rank/world_size configuration: rank={rank}, world_size={world_size}"
             )
 
-    def __iter__(self) -> Iterator[list[DraftFeatureSample]]:
+    def _sample_in_step_window(self, sample: DraftStoredSample) -> bool:
+        if self.config.min_sample_step is None and self.config.max_sample_step is None:
+            return True
+        step = self._sample_step(sample)
+        if step is None:
+            return True
+        if self.config.min_sample_step is not None and step < int(
+            self.config.min_sample_step
+        ):
+            return False
+        if self.config.max_sample_step is not None and step > int(
+            self.config.max_sample_step
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _sample_step(sample: DraftStoredSample) -> int | None:
+        raw_step = sample.metadata.get("global_step", sample.metadata.get("step"))
+        if raw_step is None:
+            return None
+        try:
+            return int(raw_step)
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def _uses_step_window(self) -> bool:
+        return (
+            self.config.min_sample_step is not None
+            or self.config.max_sample_step is not None
+        )
+
+    def __iter__(self) -> Iterator[list[DraftStoredSample]]:
         epoch = 0
         while True:
             keys = list(
@@ -65,12 +100,25 @@ class DraftFeatureDataLoader:
                 return
             rank = int(self.config.rank)
             world_size = int(self.config.world_size)
-            rank_keys = keys[rank::world_size]
-            if world_size > 1:
-                rank_keys = rank_keys[: len(keys) // world_size]
-            batch: list[DraftFeatureSample] = []
-            for key in rank_keys:
-                batch.append(self.store.read(key))
+            if self._uses_step_window:
+                samples = [
+                    sample
+                    for key in keys
+                    if self._sample_in_step_window(sample := self.store.read(key))
+                ]
+                if not samples:
+                    return
+                rank_samples = samples[rank::world_size]
+                if world_size > 1:
+                    rank_samples = rank_samples[: len(samples) // world_size]
+            else:
+                rank_keys = keys[rank::world_size]
+                if world_size > 1:
+                    rank_keys = rank_keys[: len(keys) // world_size]
+                rank_samples = [self.store.read(key) for key in rank_keys]
+            batch: list[DraftStoredSample] = []
+            for sample in rank_samples:
+                batch.append(sample)
                 if len(batch) >= int(self.config.batch_size):
                     yield batch
                     batch = []
