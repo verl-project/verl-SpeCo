@@ -2915,6 +2915,17 @@ class DrafterBaseTrainer:
             getattr(model_config, "pad_token_id", self.pad_token_id)
             or self.pad_token_id
         )
+        # Block drafters (DFlash/DSpark/Domino) consume aux hidden states that are
+        # collected WITHOUT positions by design: sglang_patch never attaches a
+        # positions tensor for the dflash-aux path and sglang_runtime skips its own
+        # positions fail-closed check for `uses_dflash_aux_hidden`. The block backend
+        # does not read hidden_positions either. Mirror that waiver here so these
+        # samples are not dropped when collect_hidden_states_from_sgl is enabled.
+        require_sglang_positions = bool(
+            self.config.rollout.drafter.training.get(
+                "collect_hidden_states_from_sgl", False
+            )
+        ) and not self._is_block_drafter_backend()
         for i in range(batch_size):
             expected_hidden_rows = max(input_seq_length - 1, 0)
             raw_positions_item_for_alignment = None
@@ -2941,11 +2952,6 @@ class DrafterBaseTrainer:
                 batch.get("hidden_position_start"), i
             )
             uses_hidden_positions = hidden_positions_item is not None
-            require_sglang_positions = bool(
-                self.config.rollout.drafter.training.get(
-                    "collect_hidden_states_from_sgl", False
-                )
-            )
             if require_sglang_positions and (
                 hidden_positions_item is None
                 or int(hidden_positions_item.numel()) != hidden_seq_length
