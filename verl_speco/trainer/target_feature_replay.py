@@ -802,7 +802,13 @@ class TargetFeatureReplayer:
         return materialized
 
     def _validate_target_path(self, sample: DraftReplaySample) -> None:
-        if sample.algorithm.upper() != self.algorithm:
+        # Only warn when the source actually declared an algorithm; stores that
+        # do not record one fall back to the dataclass default and would always
+        # mismatch a non-EAGLE3 training run.
+        declared_algorithm = bool(
+            (getattr(sample, "metadata", {}) or {}).get("declared_algorithm", True)
+        )
+        if declared_algorithm and sample.algorithm.upper() != self.algorithm:
             if not self._warned_replay_algorithm_mismatch:
                 logger.warning(
                     "[target replay rank=%s] token replay algorithm differs from "

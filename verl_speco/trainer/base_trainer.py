@@ -4896,15 +4896,16 @@ class DrafterBaseTrainer:
         )
 
         self.training_steps += 1
-        logger.warning(
-            "[drafter loss] step=%s optimizer_step_total=%s lr=%.3e loss=%.4f vloss=%.4f ploss=%.4f",
-            self.training_steps,
-            self.optimizer_steps_total,
-            current_lr,
-            float(loss.item()),
-            float(vloss.item()),
-            float(ploss.item()),
-        )
+        if self._is_checkpoint_leader():
+            logger.info(
+                "[drafter loss] step=%s optimizer_step_total=%s lr=%.3e loss=%.4f vloss=%.4f ploss=%.4f",
+                self.training_steps,
+                self.optimizer_steps_total,
+                current_lr,
+                float(loss.item()),
+                float(vloss.item()),
+                float(ploss.item()),
+            )
         return True
 
     @torch.no_grad()

@@ -1111,7 +1111,7 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
             fields.append(f"{label}={value:.3f}s")
         else:
             fields.append(f"{label}={value:.4f}")
-    logger.warning("[standalone drafter metrics] %s", " ".join(fields))
+    logger.info("[standalone drafter metrics] %s", " ".join(fields))
 
 
 def _init_distributed() -> tuple[int, int, int]:
