@@ -268,6 +268,21 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                     max_sample_step=_optional_int(
                         feature_store_cfg.get("max_sample_step")
                     ),
+                    group_by_length=bool(training_cfg.get("group_by_length", False)),
+                    group_by_length_megabatch=int(
+                        training_cfg.get("group_by_length_megabatch", 8) or 8
+                    ),
+                    on_error=str(feature_store_cfg.get("on_error", "skip") or "skip"),
+                    max_consecutive_errors=int(
+                        feature_store_cfg.get("max_consecutive_errors", 20) or 20
+                    ),
+                    min_supervised_tokens=int(
+                        feature_store_cfg.get("min_supervised_tokens", 1) or 0
+                    ),
+                    strict_token_alignment=str(
+                        feature_store_cfg.get("strict_token_alignment", "warn")
+                        or "warn"
+                    ),
                 ),
             )
         logger.info(

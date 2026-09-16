@@ -22,9 +22,87 @@ from transformers import PreTrainedTokenizer
 
 from .template import ChatTemplate
 
-__all__ = ["GeneralParser", "HarmonyParser", "ThinkingParser"]
+__all__ = [
+    "GeneralParser",
+    "HarmonyParser",
+    "ThinkingParser",
+    "clean_conversation_roles",
+]
 
 Conversation = List[Dict[str, Any]]
+
+VALID_CHAT_ROLES = {"system", "user", "assistant", "tool"}
+
+# Unknown roles are mapped to assistant once per role, across all conversations,
+# so a noisy dataset does not flood the log.
+_warned_roles: set[str] = set()
+
+
+def clean_conversation_roles(
+    conversation_items: List[Dict[str, Any]],
+    *,
+    strict: bool = False,
+    sanitize: Any = None,
+    stats: Dict[str, int] | None = None,
+) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Normalize roles and drop order-violating turns.
+
+    Shared by :class:`GeneralParser` and the standalone TQ Producer. Unknown
+    roles map to ``assistant`` and are warned once per role. In tolerant mode a
+    bad turn is dropped and the conversation continues; ``strict`` restores the
+    legacy warn-and-truncate behavior. ``sanitize`` optionally post-processes
+    each kept turn (the parser's ``_sanitize_message``).
+    """
+    if stats is None:
+        stats = {"mapped_roles": 0, "dropped_role_turns": 0}
+    cleaned_items: List[Dict[str, Any]] = []
+    prev_role: str | None = None
+    for sentence in conversation_items:
+        role = sentence.get("role")
+        if role not in VALID_CHAT_ROLES:
+            if strict:
+                # Legacy behavior: keep the role and let the order checks and
+                # template decide what happens to it.
+                pass
+            else:
+                role_name = str(role)
+                if role_name not in _warned_roles:
+                    _warned_roles.add(role_name)
+                    warnings.warn(f"Mapping unknown role '{role_name}' to 'assistant'")
+                stats["mapped_roles"] += 1
+                role = "assistant"
+
+        violation: str | None = None
+        if prev_role is None:
+            if role != "user":
+                violation = (
+                    f"Conversation must start with a 'user' role, but found '{role}'."
+                )
+        elif role == "tool" and prev_role not in ("assistant", "tool"):
+            violation = (
+                f"A 'tool' message must follow an 'assistant' or 'tool' message, "
+                f"but was preceded by '{prev_role}'."
+            )
+        elif role == "assistant" and prev_role not in ("user", "tool"):
+            violation = (
+                f"An 'assistant' message must follow a 'user' or 'tool' message, "
+                f"but was preceded by '{prev_role}'."
+            )
+
+        if violation is not None:
+            if strict:
+                warnings.warn(f"{violation} Conversation truncated.")
+                break
+            warnings.warn(f"{violation} Dropping the offending turn.")
+            stats["dropped_role_turns"] += 1
+            continue
+
+        cleaned = dict(sentence, role=role)
+        if sanitize is not None:
+            cleaned = sanitize(cleaned)
+        cleaned_items.append(cleaned)
+        prev_role = role
+    return cleaned_items, stats
 
 
 class Parser(ABC):
@@ -129,12 +207,34 @@ class GeneralParser(Parser):
         self,
         tokenizer: PreTrainedTokenizer,
         chat_template: ChatTemplate,
+        parser_strict_roles: bool = False,
     ):
         super().__init__(tokenizer, chat_template)
         self.system_prompt = chat_template.system_prompt
         self.user_message_separator = f"{chat_template.end_of_turn_token}"
         self.assistant_message_separator = f"{chat_template.assistant_header}"
+        self.parser_strict_roles = bool(parser_strict_roles)
+        self.role_cleanup_stats = {"mapped_roles": 0, "dropped_role_turns": 0}
         self.set_assistant_pattern(chat_template)
+
+    def _clean_conversation_roles(
+        self, conversation_items: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Normalize roles, dropping order-violating turns unless strict."""
+        cleaned, _ = clean_conversation_roles(
+            conversation_items,
+            strict=self.parser_strict_roles,
+            sanitize=self._sanitize_message,
+            stats=self.role_cleanup_stats,
+        )
+        return cleaned
+
+    def format_role_cleanup_stats(self) -> str:
+        stats = self.role_cleanup_stats
+        return (
+            f"mapped_roles={stats['mapped_roles']} "
+            f"dropped_role_turns={stats['dropped_role_turns']}"
+        )
 
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
         conversation = self.tokenizer.apply_chat_template(
@@ -190,28 +290,8 @@ class GeneralParser(Parser):
                 if self.system_prompt:
                     messages.append({"role": "system", "content": self.system_prompt})
 
-            for j, sentence in enumerate(conversation_items):
-                role = sentence["role"]
-                if j == 0:
-                    if role != "user":
-                        warnings.warn(
-                            f"Conversation must start with a 'user' role, but found '{role}'. Conversation truncated."
-                        )
-                        break
-                else:
-                    prev_role = conversation_items[j - 1]["role"]
-                    if role == "tool" and prev_role not in ["assistant", "tool"]:
-                        warnings.warn(
-                            f"A 'tool' message must follow an 'assistant' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
-                        )
-                        break
-                    if role == "assistant" and prev_role not in ["user", "tool"]:
-                        warnings.warn(
-                            f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
-                        )
-                        break
-                sentence = self._sanitize_message(sentence)
-                messages.append(sentence)
+            conversation_items = self._clean_conversation_roles(conversation_items)
+            messages.extend(conversation_items)
             try:
                 conversation_text = self.apply_chat_template(
                     messages, tool=tool, **kwargs
@@ -448,8 +528,11 @@ class ThinkingParser(GeneralParser):
         self,
         tokenizer: PreTrainedTokenizer,
         chat_template: ChatTemplate,
+        parser_strict_roles: bool = False,
     ):
-        super().__init__(tokenizer, chat_template)
+        super().__init__(
+            tokenizer, chat_template, parser_strict_roles=parser_strict_roles
+        )
         self.standard_keys = {"role", "content", "tool_calls", "reasoning_content"}
 
     def apply_chat_template(self, messages, tool, **kwargs) -> str:

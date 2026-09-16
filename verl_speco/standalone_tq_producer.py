@@ -32,11 +32,14 @@ from verl_speco.integration.oldlogprob_layer_ids import (
 )
 from verl_speco.producer.input_reader import (
     GenerationRequest,
+    SampleFilteredError,
     TokenizedRequest,
+    build_render_fn,
     iter_input_records,
     prepare_generation_request,
     prepare_generated_prefill_request,
     tokenize_record,
+    tokenize_record_with_render_boundary,
 )
 from verl_speco.producer.vllm_feature_client import (
     RawVllmFeature,
@@ -77,6 +80,7 @@ class ProducerStats:
     published_count: int = 0
     failed_count: int = 0
     dropped_count: int = 0
+    filtered_count: int = 0
     pending_bytes: int = 0
 
 
@@ -315,10 +319,34 @@ async def run_producer(
         def iter_requests():
             epoch = 0
             source_sequence_no = 0
+            render_boundary_cfg = producer_cfg.get("render_boundary", {}) or {}
+            render_fn = None
+            if bool(render_boundary_cfg.get("enabled", False)):
+                endpoints = list(producer_cfg.get("vllm_endpoints") or [])
+                if not endpoints:
+                    raise ValueError(
+                        "render_boundary.enabled requires a vllm_endpoints entry"
+                    )
+                render_fn = build_render_fn(
+                    str(endpoints[0]),
+                    timeout=float(render_boundary_cfg.get("timeout", 30.0) or 30.0),
+                )
+                logger.info(
+                    "Standalone TQ Producer using render-boundary loss masks "
+                    "endpoint=%s",
+                    endpoints[0],
+                )
             while True:
                 scanned_count = 0
                 for source_record in iter_input_records(
-                    str(producer_cfg["input_path"])
+                    str(producer_cfg["input_path"]),
+                    on_error=str(producer_cfg.get("on_error", "skip") or "skip"),
+                    max_consecutive_errors=int(
+                        producer_cfg.get("max_consecutive_errors", 20) or 20
+                    ),
+                    parser_strict_roles=bool(
+                        producer_cfg.get("parser_strict_roles", False)
+                    ),
                 ):
                     sequence_no = source_sequence_no
                     source_sequence_no += 1
@@ -332,11 +360,41 @@ async def run_producer(
                         source_record,
                         sequence_no=sequence_no,
                     )
-                    request = (
-                        prepare_generation_request(record, tokenizer, producer_cfg)
-                        if record.response is None
-                        else tokenize_record(record, tokenizer, producer_cfg)
-                    )
+                    try:
+                        if record.response is None:
+                            request = prepare_generation_request(
+                                record, tokenizer, producer_cfg
+                            )
+                        elif render_fn is not None:
+                            try:
+                                request = tokenize_record_with_render_boundary(
+                                    record, tokenizer, producer_cfg, render_fn
+                                )
+                            except SampleFilteredError:
+                                raise
+                            except Exception as exc:  # noqa: BLE001 - fall back locally
+                                logger.warning(
+                                    "Render-boundary tokenization failed for %s (%s); "
+                                    "falling back to the local tokenizer",
+                                    record.sample_id,
+                                    exc,
+                                )
+                                request = tokenize_record(
+                                    record, tokenizer, producer_cfg
+                                )
+                        else:
+                            request = tokenize_record(record, tokenizer, producer_cfg)
+                    except SampleFilteredError as exc:
+                        stats.filtered_count += 1
+                        logger.warning(
+                            "Standalone TQ Producer filtered sample "
+                            "sequence_no=%s sample_id=%s filtered=%s reason=%s",
+                            sequence_no,
+                            record.sample_id,
+                            stats.filtered_count,
+                            exc,
+                        )
+                        continue
                     yield request
                 if scanned_count == 0:
                     raise ValueError("Standalone TQ Producer input contains no samples")
@@ -418,11 +476,25 @@ async def run_producer(
                     mark_stage(worker, "vllm_generate", request.sample_id)
                     generated = await pool.generate(request)
                     try:
-                        request = prepare_generated_prefill_request(
-                            request,
-                            generated.generated_token_ids,
-                            producer_cfg,
-                        )
+                        try:
+                            request = prepare_generated_prefill_request(
+                                request,
+                                generated.generated_token_ids,
+                                producer_cfg,
+                            )
+                        except SampleFilteredError as exc:
+                            stats.filtered_count += 1
+                            logger.warning(
+                                "Standalone TQ Producer filtered generated sample "
+                                "sequence_no=%s sample_id=%s filtered=%s reason=%s",
+                                request.sequence_no,
+                                request.sample_id,
+                                stats.filtered_count,
+                                exc,
+                            )
+                            if max_samples > 0:
+                                replacement_request = next_request()
+                            continue
                     finally:
                         # The generation request may still produce a prompt-only
                         # connector file. It is not the training payload; the
