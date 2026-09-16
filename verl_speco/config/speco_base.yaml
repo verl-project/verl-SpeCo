@@ -128,9 +128,6 @@ actor_rollout_ref:
         training_interval_steps: 5
         publish_interval_steps: 0
         publish_async: false
-        # MRV2-only safety cap applied before val_kwargs.n expansion.  The
-        # trainer ignores it for verl 0.8/MRV1 and other rollout algorithms.
-        validation_batch_size: 8
         publish_dtype: null
         publish_param_name_patterns: null
         draft_update_use_shm: null
