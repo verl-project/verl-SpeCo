@@ -63,7 +63,9 @@ def _load_checkpoint_tensor(model_path: str, key: str) -> torch.Tensor:
         if ckpt_file.endswith(".safetensors"):
             with safe_open(ckpt_file, framework="pt", device="cpu") as f:
                 return f.get_tensor(resolved_key)
-        return torch.load(ckpt_file, map_location="cpu", weights_only=True)[resolved_key]
+        return torch.load(ckpt_file, map_location="cpu", weights_only=True)[
+            resolved_key
+        ]
 
     safetensors_path = os.path.join(model_path, "model.safetensors")
     if os.path.exists(safetensors_path):
