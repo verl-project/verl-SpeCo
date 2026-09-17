@@ -17,6 +17,7 @@ import asyncio
 from inspect import getsource
 from types import SimpleNamespace
 
+from omegaconf import OmegaConf
 import pytest
 
 from verl_speco.integration import rollout_publish
@@ -26,12 +27,53 @@ class _FakeObjectRef:
     pass
 
 
+@pytest.mark.parametrize("use_omegaconf", [False, True])
+def test_upstream_rollout_init_temporarily_hides_speco_drafter_config(
+    use_omegaconf: bool,
+) -> None:
+    config = {"rollout": {"name": "vllm", "drafter": {"enable": True}}}
+    worker = SimpleNamespace(config=OmegaConf.create(config) if use_omegaconf else config)
+
+    with rollout_publish._without_speco_drafter_rollout_config(worker):
+        rollout = worker.config.rollout if use_omegaconf else worker.config["rollout"]
+        assert "drafter" not in rollout
+        assert rollout["name"] == "vllm"
+
+    rollout = worker.config.rollout if use_omegaconf else worker.config["rollout"]
+    assert rollout["drafter"]["enable"] is True
+
+
 class _FakeRay:
     ObjectRef = _FakeObjectRef
 
     @staticmethod
     def get(value):
         return {"resolved": value}
+
+
+@pytest.mark.parametrize("use_omegaconf", [False, True])
+def test_vllm_replica_config_excludes_speco_drafter(use_omegaconf: bool) -> None:
+    config = {"name": "vllm", "drafter": {"enable": True}}
+    value = OmegaConf.create(config) if use_omegaconf else config
+    from verl_speco.integration.vllm_runtime import _rollout_config_without_drafter
+
+    result = _rollout_config_without_drafter(value)
+    assert "drafter" not in result
+    assert result["name"] == "vllm"
+    assert "drafter" in value
+
+
+def test_v1_agent_loop_config_excludes_speco_drafter() -> None:
+    pytest.importorskip("ray")
+    from verl_speco.integration.task_runner import SpecoTaskRunner
+
+    config = OmegaConf.create(
+        {"actor_rollout_ref": {"rollout": {"name": "vllm", "drafter": {"enable": True}}}}
+    )
+    agent_config = SpecoTaskRunner._v1_agent_loop_config(config)
+
+    assert "drafter" not in agent_config.actor_rollout_ref.rollout
+    assert config.actor_rollout_ref.rollout.drafter.enable is True
 
 
 def test_materialize_direct_and_object_ref_payloads(monkeypatch) -> None:
@@ -527,6 +569,9 @@ def test_idle_drafter_lifecycle_offloads_dspark_target_lm_head(
     )
     trainer.model = None
     trainer.optimizer = None
+    trainer.config = SimpleNamespace(actor=SimpleNamespace(strategy="fsdp"))
+    trainer.park_hccl_after_drafter_training = False
+    trainer.buffer_version = 0
     trainer._training_active = True
     trainer._training_initialized = True
     monkeypatch.setattr(base_trainer, "device_name", "cpu")

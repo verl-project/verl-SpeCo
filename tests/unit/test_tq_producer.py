@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.producer.vllm_feature_client import RawVllmFeature
 from verl_speco.standalone_tq_producer import run_producer, validate_producer_config

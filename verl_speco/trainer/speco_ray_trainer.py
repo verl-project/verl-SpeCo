@@ -392,6 +392,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     ``verl_speco`` instead of requiring external ``verl`` source edits.
     """
 
+    _speco_last_published_drafter_step: object = 0
+    _pending_drafter_publish_step: object | None = None
+
     def __init__(self, *args, **kwargs):
         self.speco_worker_cls = kwargs.pop("speco_worker_cls", None)
         super().__init__(*args, **kwargs)
@@ -404,6 +407,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_raw_drafter_samples = 0
         self._speco_last_collected_samples = 0
         self._speco_last_oldlogprob_candidate_samples = 0
+        self._speco_last_oldlogprob_short_response_skipped = 0
         self._speco_last_oldlogprob_planned_samples = 0
         self._speco_last_oldlogprob_collected_samples = 0
         self._speco_last_oldlogprob_collected_rows = 0
@@ -531,6 +535,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def speco_wait_checkpoint(self):
         return self._require_speco_worker_group().wait_checkpoint()
+
+    def speco_get_feature_store_checkpoint_state(self, global_step: int):
+        return self._require_speco_worker_group().get_feature_store_checkpoint_state(
+            global_step
+        )
+
+    def speco_restore_feature_store_checkpoint_state(self, state: dict[str, Any]):
+        return (
+            self._require_speco_worker_group().restore_feature_store_checkpoint_state(
+                state
+            )
+        )
 
     def init_workers(self):
         drafter_rollout_enabled = self.is_drafter_rollout_enabled(self.config)
@@ -772,6 +788,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if drafter_cfg is None:
             return
 
+        # collect_only persists Feature Store state, not a trainable drafter state.
+        # Requiring draft_step_<N> here would make a valid feature-store-only
+        # checkpoint impossible to resume.
+        if self._speco_drafter_training_mode() == "collect_only":
+            logger.info(
+                "[drafter resume] collect_only mode: skipping drafter checkpoint restore"
+            )
+            return
+
         checkpoint_save_enabled = self._speco_drafter_checkpoint_save_config_enabled()
         if checkpoint_save_enabled:
             self._speco_ensure_drafter_checkpoint_path()
@@ -915,6 +940,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 False,
             )
         )
+        schedule_config = self._speco_drafter_schedule_config()
         plan = self._speco_get_drafter_scheduler().plan_collection(
             DrafterCollectionContext(
                 global_step=self.global_steps,
@@ -924,9 +950,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 validation=validation,
                 require_training_interval=(
                     source is DrafterCollectionSource.OLD_LOGPROB
+                    and not schedule_config.use_data_buffer
                 ),
             ),
-            self._speco_drafter_schedule_config(),
+            schedule_config,
         )
         self._speco_last_collection_plan = plan
         return plan
@@ -1340,6 +1367,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         prompt_lens: list[int] = []
         response_lens: list[int] = []
         candidate_count = 0
+        short_response_skipped = 0
         selected_count = 0
         for batch_idx in range(batch_size):
             prompt_len = int(
@@ -1353,7 +1381,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
             prompt_lens.append(prompt_len)
             response_lens.append(response_len)
-            if prompt_len <= 0 or response_len < hidden_rows:
+            if prompt_len <= 0:
+                continue
+            if response_len < hidden_rows:
+                short_response_skipped += 1
                 continue
             candidate_count += 1
             sample_key = f"{step_key}:{batch_idx}:{prompt_len}:{response_len}"
@@ -1389,6 +1420,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         self._speco_last_raw_drafter_samples = candidate_count
         self._speco_last_oldlogprob_candidate_samples = candidate_count
+        self._speco_last_oldlogprob_short_response_skipped = short_response_skipped
         self._speco_last_oldlogprob_planned_samples = selected_count
         if selected_count <= 0:
             return None
@@ -2066,13 +2098,30 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not self.is_drafter_training_enabled(self.config):
             return
         self._speco_get_drafter_scheduler().activate_training_workers()
+        # Keep the initialized drafter payload as rollback revision zero.  The
+        # rollout replicas start from this same checkpoint, so it lets a first
+        # online publish restore every replica after a partial failure.
+        payload = self._speco_get_published_drafter_weights()
+        if payload:
+            self._speco_last_published_drafter_payload = payload
+            self._speco_last_published_drafter_step = 0
 
     def _speco_wait_pending_drafter_publish_rpc(self) -> int:
         if not self._pending_drafter_publish_refs:
             return 0
         pending_refs = self._pending_drafter_publish_refs
+        pending_payload = getattr(self, "_pending_drafter_publish_payload", None)
+        pending_step = getattr(self, "_pending_drafter_publish_step", None)
         self._pending_drafter_publish_refs = None
-        self._ray_get_if_needed(pending_refs)
+        self._pending_drafter_publish_payload = None
+        self._pending_drafter_publish_step = None
+        try:
+            self._ray_get_if_needed(pending_refs)
+        except Exception:
+            self._speco_restore_last_published_drafter_weights()
+            raise
+        if pending_payload:
+            self._speco_record_published_drafter_weights(pending_payload, pending_step)
         return len(pending_refs) if isinstance(pending_refs, (list, tuple)) else 1
 
     def _speco_wait_pending_drafter_publish(self) -> int:
@@ -2085,6 +2134,28 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         published = self._ray_get_if_needed(self.speco_maybe_publish()) or []
         return self._first_non_null(published)
 
+    def _speco_record_published_drafter_weights(
+        self, payload: Any, global_step: object
+    ) -> None:
+        self._speco_last_published_drafter_payload = payload
+        self._speco_last_published_drafter_step = global_step
+
+    def _speco_restore_last_published_drafter_weights(self) -> None:
+        payload = getattr(self, "_speco_last_published_drafter_payload", None)
+        if not payload:
+            logger.error(
+                "SPECO drafter publish failed before any rollback payload was available"
+            )
+            return
+        try:
+            result = self._speco_actor_rollout_method("update_draft_weights")(
+                payload,
+                global_steps=getattr(self, "_speco_last_published_drafter_step", 0),
+            )
+            self._ray_get_if_needed(result)
+        except Exception:
+            logger.exception("SPECO drafter rollback after publish failure failed")
+
     def _speco_update_rollout_drafter_weights(
         self, payload: Any, global_step: object, asynchronous: bool
     ) -> None:
@@ -2096,8 +2167,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         if asynchronous:
             self._pending_drafter_publish_refs = update_result
+            self._pending_drafter_publish_payload = payload
+            self._pending_drafter_publish_step = global_step
         else:
-            self._ray_get_if_needed(update_result)
+            try:
+                self._ray_get_if_needed(update_result)
+            except Exception:
+                self._speco_restore_last_published_drafter_weights()
+                raise
+            self._speco_record_published_drafter_weights(payload, global_step)
 
     def _speco_publish_drafter_weights(
         self,
@@ -2658,7 +2736,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         return drafter_enabled and training_enabled
 
+    def _speco_ensure_legacy_skip_config(self) -> None:
+        """Supply the upstream SkipManager compatibility default for legacy runs."""
+        trainer_config = getattr(self.config, "trainer", None)
+        if trainer_config is None or bool(trainer_config.get("use_v1", False)):
+            return
+        with open_dict(trainer_config):
+            if "v1" not in trainer_config:
+                trainer_config["v1"] = {}
+            if not trainer_config.v1.get("trainer_mode"):
+                trainer_config.v1["trainer_mode"] = "sync"
+
     def fit(self):
+        self._speco_ensure_legacy_skip_config()
         try:
             if self.is_drafter_training_enabled(self.config):
                 self._speco_activate_drafter_training_model_before_fit()

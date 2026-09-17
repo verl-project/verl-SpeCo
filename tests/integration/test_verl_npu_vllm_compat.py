@@ -50,7 +50,49 @@ def test_v080_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> N
     assert compat._IMPORT_COMPAT_APPLIED is True
 
 
-def test_v090_npu_patch_import_does_not_mutate_fused_moe_factory(monkeypatch) -> None:
+def test_unrecognized_runner_layout_falls_back_to_safe_factory_import(monkeypatch) -> None:
+    vllm = types.ModuleType("vllm")
+    # CI's release/0.9 packaging keeps main_ppo.py, so the old layout probe
+    # returns false and the v0.8 version gate rejects this vLLM revision.
+    vllm.__version__ = "0.13.0"
+    fused_moe_package = types.ModuleType(compat._VLLM_FUSED_MOE_PACKAGE)
+
+    def fused_moe_factory(*args, **kwargs):
+        return args, kwargs
+
+    fused_moe_package.FusedMoE = fused_moe_factory
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_verl_v090_runner", lambda: False)
+
+    def module_importer(module_name: str):
+        if module_name == "vllm":
+            return vllm
+        if module_name == compat._VLLM_FUSED_MOE_PACKAGE:
+            return fused_moe_package
+        if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
+            assert fused_moe_factory.weight_loader is compat._unused_factory_weight_loader
+            return types.ModuleType(module_name)
+        raise AssertionError(f"unexpected import: {module_name}")
+
+    assert compat.install_verl_npu_vllm_import_compat(module_importer) is True
+    assert not hasattr(fused_moe_factory, "weight_loader")
+    assert compat._IMPORT_COMPAT_APPLIED is True
+
+
+def test_worker_process_setup_hook_installs_import_compat(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        compat,
+        "install_verl_npu_vllm_import_compat",
+        lambda: calls.append("compat"),
+    )
+
+    assert compat.install_verl_npu_vllm_worker_process_compat() is None
+    assert calls == ["compat"]
+
+
+def test_v090_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> None:
     def fused_moe_factory(*args, **kwargs):
         return args, kwargs
 
@@ -70,6 +112,10 @@ def test_v090_npu_patch_import_does_not_mutate_fused_moe_factory(monkeypatch) ->
             return fused_moe_layer
         if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
             assert fused_moe_package.FusedMoE is fused_moe_factory
+            assert fused_moe_factory.weight_loader is compat._unused_factory_weight_loader
+            # Mirror verl 0.9's import-time wrapper assignment. The temporary
+            # compatibility attribute must still be removed afterwards.
+            fused_moe_factory.weight_loader = lambda *args: args
             return types.ModuleType(module_name)
         raise AssertionError(f"unexpected import: {module_name}")
 
@@ -82,6 +128,30 @@ def test_v090_npu_patch_import_does_not_mutate_fused_moe_factory(monkeypatch) ->
         compat._VERL_NPU_VLLM_PATCH_MODULE,
     ]
     assert compat._IMPORT_COMPAT_APPLIED is True
+
+
+def test_v090_npu_patch_handles_package_exported_factory(monkeypatch) -> None:
+    def fused_moe_factory(*args, **kwargs):
+        return args, kwargs
+
+    fused_moe_package = types.ModuleType(compat._VLLM_FUSED_MOE_PACKAGE)
+    fused_moe_package.FusedMoE = fused_moe_factory
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_verl_v090_runner", lambda: True)
+
+    def module_importer(module_name: str):
+        if module_name == compat._VLLM_FUSED_MOE_PACKAGE:
+            return fused_moe_package
+        if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
+            assert fused_moe_package.FusedMoE is fused_moe_factory
+            assert fused_moe_factory.weight_loader is compat._unused_factory_weight_loader
+            return types.ModuleType(module_name)
+        raise AssertionError(f"unexpected import: {module_name}")
+
+    assert compat.install_verl_npu_vllm_import_compat(module_importer) is True
+    assert fused_moe_package.FusedMoE is fused_moe_factory
+    assert not hasattr(fused_moe_factory, "weight_loader")
 
 
 def test_v090_npu_patch_skips_removed_fused_moe_factory(monkeypatch) -> None:
@@ -160,6 +230,10 @@ def test_v090_npu_patch_preserves_existing_fused_moe_export(monkeypatch) -> None
 def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
     events = []
     monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_vllm_runtime_for_worker",
+        lambda worker: events.append(("vllm_runtime", worker.__class__.__name__)),
+    )
+    monkeypatch.setattr(
         compat, "install_verl_npu_vllm_import_compat", lambda: events.append("compat")
     )
     monkeypatch.setattr(
@@ -191,8 +265,27 @@ def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:
         "training_output_release",
         "reclaim",
         "fsdp2_export",
+        ("vllm_runtime", "WrappedWorker"),
         "base",
     ]
+
+
+def test_worker_mixin_hides_drafter_from_upstream_init_model() -> None:
+    drafter = {"enable": False}
+
+    class BaseWorker:
+        def init_model(self):
+            assert "drafter" not in self.config["rollout"]
+            return "initialized"
+
+    class WrappedWorker(compat.VerlNPUVLLMImportCompatMixin, BaseWorker):
+        pass
+
+    worker = WrappedWorker.__new__(WrappedWorker)
+    worker.config = {"rollout": {"name": "vllm", "drafter": drafter}}
+
+    assert worker.init_model() == "initialized"
+    assert worker.config["rollout"]["drafter"] is drafter
 
 
 def test_worker_mixin_installs_shm_reuse_before_weight_update(monkeypatch) -> None:

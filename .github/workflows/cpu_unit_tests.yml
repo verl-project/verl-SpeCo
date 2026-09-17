@@ -49,7 +49,7 @@ jobs:
         run: python -m compileall verl_speco
 
       - name: Validate example shell syntax
-        run: bash -n examples/*.sh
+        run: find examples -type f -name "*.sh" -print0 | xargs -0 -r bash -n
 
       - name: Run CPU unit contract tests
         env:
@@ -61,4 +61,6 @@ jobs:
           tests/config
           tests/examples
           tests/integration
+          tests/unit
+          tests/v1
           -q

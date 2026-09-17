@@ -818,11 +818,12 @@ class DrafterBaseTrainer:
         )
 
     def _is_block_drafter_backend(self) -> bool:
-        return getattr(self.backend, "model_type", None) in {
+        return getattr(getattr(self, "backend", None), "model_type", None) in {
             "dflash",
             "dflash2",
             "dspark",
             "domino",
+            "peagle",
         }
 
     def _block_drafter_metric_prefix(self) -> str:
@@ -1104,12 +1105,19 @@ class DrafterBaseTrainer:
         else:
             setattr(self.backend, "_initial_target_lm_head_shape", None)
         raw_model, drafter_model_config = self.backend.build_model()
-        raw_model.to(self.runtime_device)
+
+        # FSDP2 loads the full state through fsdp2_load_full_state_dict(), which
+        # places only rank 0 on the accelerator during the broadcast. Moving the
+        # raw model first would materialize a full drafter replica on every rank
+        # and can exhaust NPU memory during checkpoint resume.
+        use_fsdp2 = self.fsdp_device_mesh is not None and dist.is_initialized()
+        if not use_fsdp2:
+            raw_model.to(self.runtime_device)
 
         # B. 获取全量状态用于 FSDP 初始化
 
         # C. FSDP包装
-        if self.fsdp_device_mesh is not None and dist.is_initialized():
+        if use_fsdp2:
             fsdp_config = self._resolve_fsdp_config()
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
@@ -1263,6 +1271,33 @@ class DrafterBaseTrainer:
                     )
         self.optimizer_steps_total = resume_optimizer_steps
         self.training_steps = resume_training_steps
+        buffer_state_file = (
+            resume_metadata.get("buffer_state_file") if resume_enabled else None
+        )
+        if buffer_state_file:
+            buffer_state_path = os.path.join(
+                str(spec_model_path), str(buffer_state_file)
+            )
+            try:
+                buffer_state = torch.load(
+                    buffer_state_path, map_location="cpu", weights_only=False
+                )
+                if (
+                    not isinstance(buffer_state, dict)
+                    or int(buffer_state.get("version", 0)) != 1
+                ):
+                    raise RuntimeError("invalid buffer state")
+                self.data_buffer.buffer.clear()
+                self.data_buffer.buffer.extend(buffer_state.get("data_buffer", []))
+                self.data_buffer._current_step = buffer_state.get("data_buffer_step")
+                self.collected_data.clear()
+                self.collected_data.extend(buffer_state.get("collected_data", []))
+                self.buffer_version = int(buffer_state.get("buffer_version", 0))
+                self.current_rl_step = int(buffer_state.get("current_rl_step", 0))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to restore drafter buffer checkpoint from {buffer_state_path}: {exc}"
+                ) from exc
         self.drafter_train_config = drafter_train_config
         self.model_config = drafter_model_config
         self.pad_token_id = int(
@@ -1304,8 +1339,15 @@ class DrafterBaseTrainer:
                         "speculative_algorithm"
                     ],
                     "model_path": rollout_config["drafter"]["model_path"],
-                    "is_offload_optimizer": False,
-                    "is_offload_param": False,
+                    # Preserve explicit drafter offload settings.  In particular,
+                    # checkpoint resume may need CPU-resident state until the
+                    # training window is activated.
+                    "is_offload_optimizer": bool(
+                        drafter_train_config.get("is_offload_optimizer", False)
+                    ),
+                    "is_offload_param": bool(
+                        drafter_train_config.get("is_offload_param", False)
+                    ),
                     "vloss_weight": 1.0,
                     "ploss_weight": 0.1,
                     "data_augment_std": 0.2,
@@ -1395,7 +1437,11 @@ class DrafterBaseTrainer:
 
     def _get_pretrained_export_model(self):
         model = self.model.module if hasattr(self.model, "module") else self.model
-        if self._is_block_drafter_backend() and hasattr(model, "draft_model"):
+        # A standalone export helper may be exercised before backend attachment;
+        # a training wrapper with draft_model is still safe to unwrap.
+        if hasattr(model, "draft_model") and (
+            self._is_block_drafter_backend() or not hasattr(self, "backend")
+        ):
             return model.draft_model, (
                 "draft_model.",
                 "module.draft_model.",
@@ -1729,6 +1775,8 @@ class DrafterBaseTrainer:
 
         save_kwargs = self._infer_pretrained_save_kwargs()
         metadata_path = os.path.join(checkpoint_path, "metadata.json")
+        buffer_state = self._speco_checkpoint_buffer_state()
+        buffer_state_file = "buffer_state.pt" if buffer_state is not None else None
         trainer_state = {
             "version": 2,
             "optimizer_steps_total": int(self.optimizer_steps_total),
@@ -1756,6 +1804,10 @@ class DrafterBaseTrainer:
                     checkpoint_path, state_dict=model_state_dict, **save_kwargs
                 )
                 self._copy_drafter_auxiliary_files(checkpoint_path)
+                if buffer_state_file is not None:
+                    self._atomic_torch_save(
+                        buffer_state, os.path.join(checkpoint_path, buffer_state_file)
+                    )
                 self._atomic_json_dump(
                     {
                         "step": step,
@@ -1764,6 +1816,7 @@ class DrafterBaseTrainer:
                         "complete": True,
                         "trainer_state": trainer_state,
                         "optimizer": optimizer_manifest,
+                        "buffer_state_file": buffer_state_file,
                     },
                     metadata_path,
                 )
@@ -1834,6 +1887,18 @@ class DrafterBaseTrainer:
             step,
             optimizer_manifest,
         )
+
+    def _speco_checkpoint_buffer_state(self) -> dict[str, Any] | None:
+        if not self.use_data_buffer:
+            return None
+        return {
+            "version": 1,
+            "buffer_version": int(self.buffer_version),
+            "current_rl_step": int(self.current_rl_step),
+            "data_buffer_step": self.data_buffer._current_step,
+            "data_buffer": list(self.data_buffer.buffer),
+            "collected_data": list(self.collected_data),
+        }
 
     def save_checkpoint(
         self,
@@ -3815,7 +3880,16 @@ class DrafterBaseTrainer:
 
             items_used += 1
             packed_tokens_before_shift += train_seq_len
-            if self._is_block_drafter_backend():
+            if self.backend.model_type == "peagle":
+                packed_loss_tokens += int(
+                    item_loss_mask[1 : 1 + train_seq_len]
+                    .detach()
+                    .float()
+                    .sum()
+                    .cpu()
+                    .item()
+                )
+            elif self._is_block_drafter_backend():
                 packed_loss_tokens += int(
                     item_loss_mask[:train_seq_len].detach().float().sum().cpu().item()
                 )
@@ -4091,7 +4165,9 @@ class DrafterBaseTrainer:
                 input_id_chunks.append(ids[:train_seq_len])
                 hidden_state_chunks.append(h_states[:train_seq_len])
                 position_id_chunks.append(item_position_ids[:train_seq_len])
-            if self._is_block_drafter_backend():
+            if self.backend.model_type == "peagle":
+                loss_mask_chunks.append(item_loss_mask[1 : 1 + train_seq_len])
+            elif self._is_block_drafter_backend():
                 loss_mask_chunks.append(item_loss_mask[:train_seq_len])
             elif uses_shifted_eagle_inputs:
                 loss_mask_chunks.append(item_loss_mask[2 : 2 + train_seq_len])

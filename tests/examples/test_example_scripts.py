@@ -171,7 +171,9 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     mrv2 = _launch_assignments(mrv2_source)
     added_keys = {
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling",
+        "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes",
         "actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha",
+        "data.val_batch_size",
     }
     changed_keys = {
         "data.filter_overlong_prompts",

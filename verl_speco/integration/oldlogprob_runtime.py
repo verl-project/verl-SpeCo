@@ -29,10 +29,13 @@ import time
 from functools import wraps
 from typing import Any, cast
 
+from verl_speco.integration.drafter_config_env import (
+    SPECO_DRAFTER_CONFIG_ENV,
+    get_drafter_config_env,
+)
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-SPECO_SGLANG_DRAFTER_CONFIG_ENV = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
 
 OLD_LOGPROB_COLLECT_MASK_KEY = "speco_oldlogprob_collect_mask"
 OLD_LOGPROB_HIDDEN_POSITIONS_KEY = "speco_oldlogprob_hidden_positions"
@@ -84,7 +87,7 @@ def _get_nested(config: Any, path: tuple[str, ...], default=None):
 
 
 def _load_drafter_env(raw: str | None = None) -> dict[str, Any]:
-    raw = raw if raw is not None else os.getenv(SPECO_SGLANG_DRAFTER_CONFIG_ENV, "")
+    raw = raw if raw is not None else get_drafter_config_env()
     if not raw:
         return {}
     try:
@@ -92,7 +95,7 @@ def _load_drafter_env(raw: str | None = None) -> dict[str, Any]:
     except json.JSONDecodeError:
         logger.warning(
             "Invalid %s while checking old-logprob hidden runtime",
-            SPECO_SGLANG_DRAFTER_CONFIG_ENV,
+            SPECO_DRAFTER_CONFIG_ENV,
         )
         return {}
     return value if isinstance(value, dict) else {}

@@ -88,11 +88,18 @@ def test_dspark_checkpoint_preserves_source_config_and_vllm_weight_names(
     assert config.model_type == "dspark"
     model.save_pretrained(output_dir, safe_serialization=False)
     saved_config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
-    saved_state = torch.load(
-        output_dir / "pytorch_model.bin", map_location="cpu", weights_only=True
-    )
+    legacy_weights = output_dir / "pytorch_model.bin"
+    safe_weights = output_dir / "model.safetensors"
+    if legacy_weights.exists():
+        saved_state = torch.load(legacy_weights, map_location="cpu", weights_only=True)
+    else:
+        from safetensors.torch import load_file
+
+        assert safe_weights.exists()
+        saved_state = load_file(safe_weights, device="cpu")
     for key, value in source_config.items():
-        assert saved_config[key] == value
+        # JSON serialization canonicalizes integer dictionary keys to strings.
+        assert saved_config[key] == json.loads(json.dumps(value))
     assert saved_config["enable_confidence_head"] is False
     assert {"fc.weight", "hidden_norm.weight", "norm.weight"}.issubset(saved_state)
 
