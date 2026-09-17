@@ -286,3 +286,11 @@ actor_rollout_ref:
             SimpleStorage:
               total_storage_size: 100000
               num_data_storage_units: 8
+            MooncakeStore:
+              auto_init: false
+              metadata_server: P2PHANDSHAKE
+              master_server_address: 127.0.0.1:50051
+              local_hostname: ""
+              protocol: tcp
+              global_segment_size: 4294967296
+              local_buffer_size: 2147483648

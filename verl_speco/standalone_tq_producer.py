@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -576,6 +577,18 @@ async def run_producer(
                     feature_executor.shutdown(wait=True)
         finally:
             if connected:
+                linger_seconds = float(
+                    os.environ.get("SPECO_TQ_PRODUCER_LINGER_SECONDS", "0") or 0
+                )
+                if linger_seconds > 0:
+                    # Closing a remote store client unmounts the producer's
+                    # segment, dropping samples a slower consumer has not fetched.
+                    logger.info(
+                        "Standalone TQ Producer draining for %.1fs before closing "
+                        "the transfer-queue client",
+                        linger_seconds,
+                    )
+                    await asyncio.sleep(linger_seconds)
                 transport.close_transfer_queue_client()
 
 
