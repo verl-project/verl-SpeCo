@@ -61,6 +61,22 @@ speco:
     max_sequence_length: 8192
     max_feature_length: 512
     generation_max_tokens: 511
+    # Server-side differential rendering for the assistant loss boundary.
+    # Requires a vLLM /render endpoint at the first vllm_endpoints entry.
+    render_boundary:
+      enabled: false
+      timeout: 30
+    # Bad-row policy while scanning the input file: skip drops and counts an
+    # unparseable row, raise aborts; max_consecutive_errors is the breaker.
+    on_error: skip
+    max_consecutive_errors: 20
+    # Tolerant role cleaning for ShareGPT rows (unknown roles map to assistant,
+    # order-violating turns are dropped instead of aborting the run).
+    parser_strict_roles: false
+    # Filter rows whose feature window leaves too few supervised tokens.
+    min_supervised_tokens: 1
+    # drop|keep when the feature window cuts the supervised response.
+    on_truncated_supervision: keep
 
 actor_rollout_ref:
   rollout:
@@ -142,6 +158,11 @@ actor_rollout_ref:
         logits_coverage_mask_min_ratio: 0.1
         logits_coverage_mask_require_top1: false
         ttt_length: 1
+        # Group similar-length samples into a batch to cut padding. Off by
+        # default because batch composition changes the loss trajectory.
+        group_by_length: false
+        # Samples per grouping megabatch, as a multiple of batch_size_per_gpu.
+        group_by_length_megabatch: 8
         vocab_mapping_path: null
         dflash_block_size: 16
         dflash_num_anchors: 512
@@ -253,6 +274,12 @@ actor_rollout_ref:
           train_on: last_assistant
           min_sample_step: null
           max_sample_step: null
+          # Read-side filtering for stored feature samples: skip/raise on a
+          # corrupt sample, minimum supervised tokens, and alignment validation.
+          on_error: skip
+          max_consecutive_errors: 20
+          min_supervised_tokens: 1
+          strict_token_alignment: warn
         # TransferQueue transport for standalone drafter training. The owner,
         # vLLM Producer, and every torchrun Consumer rank share this connection
         # configuration. Default off; requires TransferQueue==0.1.10.

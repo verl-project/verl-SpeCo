@@ -449,6 +449,12 @@ def feature_from_vllm_payload(
             "vLLM hidden_states must have shape [seq, layers, hidden], "
             f"got {tuple(hidden.shape)}"
         )
+    if torch.is_floating_point(hidden) and not bool(
+        torch.isfinite(hidden).all().item()
+    ):
+        raise HiddenStateAlignmentError(
+            "vLLM hidden_states contain NaN/Inf; refusing to train on them"
+        )
 
     algorithm = str(feature_config.algorithm).strip().upper()
     if algorithm not in {"EAGLE3", "DFLASH", "DSPARK"}:
