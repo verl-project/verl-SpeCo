@@ -22,6 +22,7 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import PretrainedConfig, PreTrainedModel
 
+from ..eagle.base import resolve_embedding_key
 from .configuration_dflash import DFlashConfig, resolve_rope_theta
 from .flex_attention import compile_friendly_flex_attention
 
@@ -397,6 +398,8 @@ class DFlashDraftModel(PreTrainedModel):
     ) -> None:
         if not os.path.exists(model_path):
             model_path = snapshot_download(repo_id=model_path)
+        # Multimodal / MoE targets nest the text embedding under a different key.
+        embedding_key = resolve_embedding_key(model_path, embedding_key)
 
         import glob as glob_mod
 
