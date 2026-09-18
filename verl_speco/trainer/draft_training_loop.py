@@ -31,7 +31,10 @@ from omegaconf import OmegaConf, open_dict
 from verl.utils.device import get_device_name, get_torch_device
 
 from verl_speco.backends.factory import build_trainer_backend
-from verl_speco.trainer.base_trainer import DrafterBaseTrainer
+from verl_speco.trainer.base_trainer import (
+    DrafterBaseTrainer,
+    resolve_drafter_strategy,
+)
 from verl_speco.trainer.draft_dataset import (
     DraftFeatureDataLoader,
     DraftFeatureDataLoaderConfig,
@@ -104,6 +107,7 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             "standalone training.mode=offline"
         )
     _disable_standalone_sequence_parallel(draft_config)
+    _apply_standalone_fsdp_shard_default(draft_config)
 
     _configure_device(local_rank)
     backend = _build_backend(draft_config)
@@ -960,12 +964,19 @@ def _disable_standalone_sequence_parallel(draft_config) -> None:
         rollout_cfg.tensor_model_parallel_size = 1
 
 
+def _apply_standalone_fsdp_shard_default(draft_config) -> None:
+    """Standalone drafters replicate by default; fsdp_shard_size>1 opts into sharding."""
+
+    training_cfg = draft_config.rollout.drafter.training
+    with open_dict(training_cfg):
+        if training_cfg.get("fsdp_shard_size", None) is None:
+            training_cfg.fsdp_shard_size = 1
+
+
 def _build_training_device_mesh(draft_config, world_size: int) -> DeviceMesh | None:
     if world_size <= 1 or not dist.is_initialized():
         return None
-    strategy = str(
-        draft_config.actor.get("strategy", "") if hasattr(draft_config, "actor") else ""
-    ).lower()
+    strategy = resolve_drafter_strategy(draft_config)
     if strategy != "fsdp2":
         return None
     return DeviceMesh(

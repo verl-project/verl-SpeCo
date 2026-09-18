@@ -141,12 +141,48 @@ def alignment_debug_rank_selected(rank: int | None) -> bool:
     return False
 
 
+def is_ddp_wrapped(model) -> bool:
+    return isinstance(model, torch.nn.parallel.DistributedDataParallel)
+
+
+def resolve_drafter_strategy(config) -> str:
+    """Drafter parallelism strategy from an ``actor_rollout_ref`` config.
+
+    Prefers the drafter-specific ``rollout.drafter.training.strategy`` so the
+    drafter can use DDP while the main actor keeps a backend upstream supports
+    (fsdp/fsdp2/megatron/veomni). Falls back to ``actor.strategy`` when the
+    drafter setting is null.
+    """
+    training = None
+    rollout = getattr(config, "rollout", None)
+    if rollout is not None:
+        drafter = getattr(rollout, "drafter", None)
+        if drafter is not None:
+            training = getattr(drafter, "training", None)
+    strategy = (
+        training.get("strategy")
+        if training is not None and hasattr(training, "get")
+        else None
+    )
+    if not strategy:
+        actor = getattr(config, "actor", None)
+        strategy = (
+            actor.get("strategy")
+            if actor is not None and hasattr(actor, "get")
+            else None
+        )
+    return str(strategy or "").lower()
+
+
 class _DrafterOptimizerState:
     """DCP Stateful adapter for FSDP1/FSDP2 optimizer state dicts."""
 
     def __init__(self, model, optimizer):
         self.model = model
         self.optimizer = optimizer
+
+    def _is_ddp(self) -> bool:
+        return is_ddp_wrapped(self.model)
 
     @staticmethod
     def _options():
@@ -155,6 +191,11 @@ class _DrafterOptimizerState:
         return StateDictOptions(full_state_dict=False, cpu_offload=True)
 
     def state_dict(self):
+        if self._is_ddp():
+            # DDP keeps a full optimizer replica on every rank; the DCP
+            # optimizer API is only defined for FSDP-wrapped models, so save
+            # the plain state dict to stay checkpointable on every torch build.
+            return self.optimizer.state_dict()
         from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
         return get_optimizer_state_dict(
@@ -162,6 +203,9 @@ class _DrafterOptimizerState:
         )
 
     def load_state_dict(self, state_dict):
+        if self._is_ddp():
+            self.optimizer.load_state_dict(state_dict)
+            return
         from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
         set_optimizer_state_dict(
@@ -638,52 +682,22 @@ class DrafterBaseTrainer:
         return local_tensor if torch.is_tensor(local_tensor) else tensor
 
     def _use_flattened_drafter_fsdp_mesh(self) -> bool:
-        actor_config = getattr(self.config, "actor", None)
-        actor_strategy = (
-            ""
-            if actor_config is None
-            else (
-                actor_config.get("strategy", "")
-                if hasattr(actor_config, "get")
-                else getattr(actor_config, "strategy", "")
-            )
-        )
         return (
             device_name == "npu"
-            and str(actor_strategy).lower() == "veomni"
+            and self._drafter_strategy() == "veomni"
             and getattr(self.backend, "model_type", None) == "dspark"
             and self.training_device_mesh is not None
             and self.dp_group_world_size > 1
         )
 
     def _use_blocking_npu_optimizer_offload(self) -> bool:
-        actor_config = getattr(self.config, "actor", None)
-        actor_strategy = (
-            ""
-            if actor_config is None
-            else (
-                actor_config.get("strategy", "")
-                if hasattr(actor_config, "get")
-                else getattr(actor_config, "strategy", "")
-            )
-        )
-        return device_name == "npu" and str(actor_strategy).lower() == "veomni"
+        return device_name == "npu" and self._drafter_strategy() == "veomni"
 
     def _should_park_drafter_hccl(self) -> bool:
-        actor_config = getattr(self.config, "actor", None)
-        actor_strategy = (
-            ""
-            if actor_config is None
-            else (
-                actor_config.get("strategy", "")
-                if hasattr(actor_config, "get")
-                else getattr(actor_config, "strategy", "")
-            )
-        )
         return (
             self.park_hccl_after_drafter_training
             and device_name == "npu"
-            and str(actor_strategy).lower() == "veomni"
+            and self._drafter_strategy() == "veomni"
             and getattr(self.backend, "model_type", None) == "dspark"
         )
 
@@ -755,46 +769,131 @@ class DrafterBaseTrainer:
                 if local_value is not None and local_value.device.type != "cpu":
                     state[key] = value.to("cpu", non_blocking=False)
 
+    def _drafter_strategy(self) -> str:
+        """Drafter parallelism strategy (see :func:`resolve_drafter_strategy`)."""
+        return resolve_drafter_strategy(self.config)
+
+    def _drafter_ddp_find_unused_parameters(self) -> bool:
+        return bool(
+            self.config.rollout.drafter.training.get(
+                "ddp_find_unused_parameters", False
+            )
+        )
+
+    def _is_ddp_wrapped(self) -> bool:
+        return isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
+
+    def _full_training_group(self):
+        """Process group spanning every rank that holds a drafter replica.
+
+        DDP must all-reduce gradients over the same ranks the loss metrics are
+        reduced over (SP x DP). Synchronizing only within ``sp`` leaves the
+        rollout replicas diverged and leaves the ``reduce_world_size`` loss
+        scaling uncancelled on the DP dimension.
+        """
+        if self.training_device_mesh is None:
+            return self.training_process_group
+        group = getattr(self, "_full_training_process_group", None)
+        if group is None:
+            mesh = self.training_device_mesh
+            if getattr(mesh, "ndim", 1) > 1:
+                # A 2D (DP, SP) mesh has no single group; flatten it so DDP can
+                # all-reduce across every replica. Cached to create it once.
+                mesh = mesh._flatten(mesh_dim_name="ddp")
+            group = mesh.get_group()
+            self._full_training_process_group = group
+        return group
+
+    def _full_training_world_size(self) -> int:
+        if self.training_device_mesh is not None:
+            return int(self.training_device_mesh.size())
+        return int(self.training_group_world_size)
+
+    def _resolve_fsdp_shard_size(self) -> Optional[int]:
+        """Resolve ``fsdp_shard_size``, preferring the drafter-specific setting.
+
+        The drafter's ``rollout.drafter.training.fsdp_shard_size`` wins; the
+        actor's ``fsdp_config.fsdp_shard_size`` is only a fallback so an
+        actor-side value cannot silently reshape the drafter.
+        """
+
+        value = self.config.rollout.drafter.training.get("fsdp_shard_size")
+        if value is None:
+            actor_config = getattr(self.config, "actor", None)
+            if actor_config is not None and hasattr(actor_config, "get"):
+                fsdp_config = actor_config.get("fsdp_config")
+                if fsdp_config is not None:
+                    value = fsdp_config.get("fsdp_shard_size")
+        if value is None:
+            return None
+        value = int(value)
+        return value if value > 0 else None
+
+    def _shard_sized_fsdp_mesh(self, mesh):
+        """Reshape the FSDP mesh so parameters shard over ``fsdp_shard_size`` ranks."""
+
+        shard_size = self._resolve_fsdp_shard_size()
+        world_size = int(mesh.size())
+        if shard_size is None or shard_size >= world_size:
+            return mesh
+        if world_size % shard_size != 0:
+            raise ValueError(
+                f"fsdp_shard_size={shard_size} must divide the drafter world "
+                f"size {world_size}"
+            )
+        ranks = mesh.mesh.reshape(-1)
+        logger.info(
+            "[drafter-fsdp] fsdp_shard_size=%s -> HSDP mesh dp=%s x sp=%s",
+            shard_size,
+            world_size // shard_size,
+            shard_size,
+        )
+        return DeviceMesh(
+            device_type=mesh.device_type,
+            mesh=ranks.reshape(world_size // shard_size, shard_size),
+            mesh_dim_names=("dp", "sp"),
+        )
+
     def _resolve_drafter_fsdp_device_mesh(self):
         mesh = self.training_device_mesh
-        if mesh is None or not self._use_flattened_drafter_fsdp_mesh():
-            return mesh
-
-        # A 2D mesh makes FSDP2 use HSDP: parameters and optimizer state are
-        # sharded over SP but replicated over every rollout DP replica. DSpark
-        # does not use Ulysses SP, so flatten all drafter ranks into one full-
-        # shard dimension while retaining the original dp/sp mesh for data and
-        # metric collectives.
-        mesh_ranks = mesh.mesh.reshape(-1)
-        world_ranks = list(range(dist.get_world_size()))
-        covers_default_world = [
-            int(rank) for rank in mesh_ranks.tolist()
-        ] == world_ranks
-        from_group = getattr(DeviceMesh, "from_group", None)
-        if covers_default_world and callable(from_group):
-            # The SpecoWorker default group already spans these exact ranks.
-            # Reusing it avoids creating one more HCCL communicator on every
-            # NPU while preserving a 1D full-shard mesh for drafter FSDP2.
-            flattened_mesh = from_group(
-                dist.group.WORLD,
-                device_type=device_name,
-                mesh=mesh_ranks,
-                mesh_dim_names=("fsdp",),
-            )
-            self._fsdp_mesh_reuses_default_group = True
-        else:
-            flattened_mesh = mesh._flatten(mesh_dim_name="fsdp")
-        if dist.get_rank() == int(flattened_mesh.mesh.reshape(-1)[0].item()):
-            logger.info(
-                "[drafter-fsdp] NPU VeOmni DSpark uses a 1D full-shard mesh "
-                "across %s ranks instead of dp=%s x sp=%s HSDP "
-                "reuse_default_world_group=%s",
-                flattened_mesh.size(),
-                self.dp_group_world_size,
-                self.training_group_world_size,
-                int(self._fsdp_mesh_reuses_default_group),
-            )
-        return flattened_mesh
+        if mesh is None:
+            return None
+        if self._use_flattened_drafter_fsdp_mesh():
+            # A 2D mesh makes FSDP2 use HSDP: parameters and optimizer state are
+            # sharded over SP but replicated over every rollout DP replica. DSpark
+            # does not use Ulysses SP, so flatten all drafter ranks into one full-
+            # shard dimension while retaining the original dp/sp mesh for data and
+            # metric collectives.
+            mesh_ranks = mesh.mesh.reshape(-1)
+            world_ranks = list(range(dist.get_world_size()))
+            covers_default_world = [
+                int(rank) for rank in mesh_ranks.tolist()
+            ] == world_ranks
+            from_group = getattr(DeviceMesh, "from_group", None)
+            if covers_default_world and callable(from_group):
+                # The SpecoWorker default group already spans these exact ranks.
+                # Reusing it avoids creating one more HCCL communicator on every
+                # NPU while preserving a 1D full-shard mesh for drafter FSDP2.
+                mesh = from_group(
+                    dist.group.WORLD,
+                    device_type=device_name,
+                    mesh=mesh_ranks,
+                    mesh_dim_names=("fsdp",),
+                )
+                self._fsdp_mesh_reuses_default_group = True
+            else:
+                mesh = mesh._flatten(mesh_dim_name="fsdp")
+            if dist.get_rank() == int(mesh.mesh.reshape(-1)[0].item()):
+                logger.info(
+                    "[drafter-fsdp] NPU VeOmni DSpark uses a 1D full-shard mesh "
+                    "across %s ranks instead of dp=%s x sp=%s HSDP "
+                    "reuse_default_world_group=%s",
+                    mesh.size(),
+                    self.dp_group_world_size,
+                    self.training_group_world_size,
+                    int(self._fsdp_mesh_reuses_default_group),
+                )
+        return self._shard_sized_fsdp_mesh(mesh)
 
     def _create_copy_stream(self):
         if device_name == "cpu":
@@ -1063,8 +1162,8 @@ class DrafterBaseTrainer:
             fsdp_config = self.config.rollout.drafter.training.get("fsdp_config")
         if fsdp_config is None:
             # When the main model uses Megatron, the actor config has no
-            # fsdp_config (it uses megatron.* instead).  The drafter is
-            # always trained with FSDP, so provide a default config.
+            # fsdp_config (it uses megatron.* instead). The drafter defaults to
+            # FSDP, so provide a default config for it.
             actor_strategy = ""
             if hasattr(self.config, "actor"):
                 actor_strategy = str(
@@ -1108,8 +1207,24 @@ class DrafterBaseTrainer:
 
         # B. 获取全量状态用于 FSDP 初始化
 
-        # C. FSDP包装
-        if self.fsdp_device_mesh is not None and dist.is_initialized():
+        # C. 模型并行包装
+        if (
+            self._drafter_strategy() == "ddp"
+            and self._full_training_group() is not None
+            and self._full_training_world_size() > 1
+            and dist.is_initialized()
+        ):
+            logger.info(
+                "[drafter-ddp] wrapping drafter in DDP over %s ranks",
+                self._full_training_world_size(),
+            )
+            self.model = torch.nn.parallel.DistributedDataParallel(
+                raw_model,
+                process_group=self._full_training_group(),
+                find_unused_parameters=self._drafter_ddp_find_unused_parameters(),
+                broadcast_buffers=False,
+            )
+        elif self.fsdp_device_mesh is not None and dist.is_initialized():
             fsdp_config = self._resolve_fsdp_config()
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
@@ -1337,16 +1452,30 @@ class DrafterBaseTrainer:
             return not getattr(self.backend, "trains_draft_embeddings", False)
         return False
 
-    def _get_trainable_state_dict(self) -> dict[str, torch.Tensor]:
-        """Get floating state dict entries excluding weights shared with the target model."""
+    def _get_full_model_state_dict(self) -> dict[str, torch.Tensor]:
+        """Return an unsharded state dict for the wrapped drafter model.
+
+        DDP holds a full replica on every rank, so its inner module state dict
+        is already complete. Route it explicitly before the FSDP check: online
+        DDP also has a non-null ``training_device_mesh``, and sending a DDP
+        module through the FSDP2 state-dict API raises ``NotImplementedError``
+        on weight publication and checkpoint export.
+        """
+        if self._is_ddp_wrapped():
+            return self.model.module.state_dict()
         if isinstance(self.model, FSDP) or (
             self.training_device_mesh is not None and dist.is_initialized()
         ):
-            full_state_dict = get_fsdp_full_state_dict(
+            return get_fsdp_full_state_dict(
                 self.model, offload_to_cpu=True, rank0_only=True
             )
-        else:
-            full_state_dict = self.model.state_dict()
+        if hasattr(self.model, "module"):
+            return self.model.module.state_dict()
+        return self.model.state_dict()
+
+    def _get_trainable_state_dict(self) -> dict[str, torch.Tensor]:
+        """Get floating state dict entries excluding weights shared with the target model."""
+        full_state_dict = self._get_full_model_state_dict()
         if not full_state_dict:
             return {}
         trainable_state_dict = {}
@@ -1377,14 +1506,7 @@ class DrafterBaseTrainer:
         persistent buffers such as vocab mappings. It is intentionally not used
         by hot publish.
         """
-        if isinstance(self.model, FSDP) or (
-            self.training_device_mesh is not None and dist.is_initialized()
-        ):
-            full_state_dict = get_fsdp_full_state_dict(
-                self.model, offload_to_cpu=True, rank0_only=True
-            )
-        else:
-            full_state_dict = self.model.state_dict()
+        full_state_dict = self._get_full_model_state_dict()
         if not full_state_dict:
             return {}
         return {
