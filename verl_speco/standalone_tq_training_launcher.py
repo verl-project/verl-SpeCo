@@ -97,6 +97,8 @@ _PRODUCER_TUNING_KEYS = frozenset(
         f"{_PRODUCER_PREFIX}.max_feature_length",
         f"{_PRODUCER_PREFIX}.generation_max_tokens",
         _PRODUCER_HIDDEN_DTYPE_KEY,
+        f"{_PRODUCER_PREFIX}.shuffle",
+        f"{_PRODUCER_PREFIX}.shuffle_seed",
     }
 )
 _INTERNAL_OVERRIDE_KEYS = frozenset(

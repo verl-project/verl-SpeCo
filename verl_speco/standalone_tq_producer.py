@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -313,13 +314,32 @@ async def run_producer(
                 )
 
         def iter_requests():
+            shuffle = bool(producer_cfg.get("shuffle", False))
+            shuffle_seed = int(producer_cfg.get("shuffle_seed", 42))
+            buffered_records: list | None = None
+            if shuffle:
+                buffered_records = list(
+                    iter_input_records(str(producer_cfg["input_path"]))
+                )
+                logger.info(
+                    "Standalone TQ Producer buffered %s records for shuffle_seed=%s",
+                    len(buffered_records),
+                    shuffle_seed,
+                )
             epoch = 0
             source_sequence_no = 0
             while True:
                 scanned_count = 0
-                for source_record in iter_input_records(
-                    str(producer_cfg["input_path"])
-                ):
+                if shuffle:
+                    # Deterministic per-epoch permutation (seed + epoch), so a
+                    # resumed run replays the same order and the consumed
+                    # sequence set stays aligned across restarts.
+                    record_order = list(range(len(buffered_records)))
+                    random.Random(shuffle_seed + epoch).shuffle(record_order)
+                    record_iter = (buffered_records[i] for i in record_order)
+                else:
+                    record_iter = iter_input_records(str(producer_cfg["input_path"]))
+                for source_record in record_iter:
                     sequence_no = source_sequence_no
                     source_sequence_no += 1
                     scanned_count += 1

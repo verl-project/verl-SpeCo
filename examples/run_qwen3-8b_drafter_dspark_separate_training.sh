@@ -56,6 +56,10 @@ PRODUCER_PENDING_POLL_INTERVAL=${PRODUCER_PENDING_POLL_INTERVAL:-0.5}
 PRODUCER_MAX_SEQUENCE_LENGTH=${PRODUCER_MAX_SEQUENCE_LENGTH:-8192}
 PRODUCER_MAX_FEATURE_LENGTH=${PRODUCER_MAX_FEATURE_LENGTH:-512}
 PRODUCER_GENERATION_MAX_TOKENS=${PRODUCER_GENERATION_MAX_TOKENS:-512}
+# Per-epoch input shuffle (speculators rng.permutation(seed, epoch) recipe).
+# Opt-in at the library level; this recipe turns it on by default.
+PRODUCER_SHUFFLE=${PRODUCER_SHUFFLE:-true}
+PRODUCER_SHUFFLE_SEED=${PRODUCER_SHUFFLE_SEED:-42}
 
 # Standalone trainer.
 MAX_STEPS=${MAX_STEPS:-10}
@@ -160,6 +164,8 @@ PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher
     speco.standalone_tq_producer.max_sequence_length=${PRODUCER_MAX_SEQUENCE_LENGTH} \
     speco.standalone_tq_producer.max_feature_length=${PRODUCER_MAX_FEATURE_LENGTH} \
     speco.standalone_tq_producer.generation_max_tokens=${PRODUCER_GENERATION_MAX_TOKENS} \
+    speco.standalone_tq_producer.shuffle=${PRODUCER_SHUFFLE} \
+    speco.standalone_tq_producer.shuffle_seed=${PRODUCER_SHUFFLE_SEED} \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${exp_name} \
     "$@"
