@@ -1,0 +1,71 @@
+{
+  "scope": "tiny dense P-EAGLE, standalone feature replay, two L20s, six steps and checkpoints; not RL",
+  "order": "A0 P0 P1 A1; independent processes",
+  "rows": [
+    {
+      "arm": "A0",
+      "engine": "fsdp",
+      "wall_seconds": 32.935,
+      "step_seconds": [
+        2.642,
+        0.744,
+        0.305,
+        0.305,
+        0.334,
+        2.677
+      ],
+      "successful_steps": 6,
+      "log_sha256": "52f62c3badaacbb1e238c14630c133198492cf72dc303a1e37d520112c81303f"
+    },
+    {
+      "arm": "P0",
+      "engine": "veomni",
+      "wall_seconds": 31.518,
+      "step_seconds": [
+        2.081,
+        0.571,
+        0.298,
+        1.067,
+        0.842,
+        0.297
+      ],
+      "successful_steps": 6,
+      "log_sha256": "45c4fefe4ec0097d596b7daf456932d3c34c266b7c18b0c2a577a8008944dd18"
+    },
+    {
+      "arm": "P1",
+      "engine": "veomni",
+      "wall_seconds": 28.632,
+      "step_seconds": [
+        2.045,
+        0.96,
+        0.555,
+        0.688,
+        0.413,
+        0.847
+      ],
+      "successful_steps": 6,
+      "log_sha256": "d759498a8d9310336d74aa0ea514a6a624fd23f8c8c1dd54a01663760e60fbc6"
+    },
+    {
+      "arm": "A1",
+      "engine": "fsdp",
+      "wall_seconds": 29.243,
+      "step_seconds": [
+        2.102,
+        0.583,
+        0.308,
+        0.303,
+        0.637,
+        0.331
+      ],
+      "successful_steps": 6,
+      "log_sha256": "e933ea29c17028db3d746e0abf471eba8a2036b4c19355cb2098a7d5475f25f1"
+    }
+  ],
+  "baseline_geomean_seconds": 31.034145791369866,
+  "candidate_geomean_seconds": 30.04036244788002,
+  "observed_speedup_percent": 3.308160296714324,
+  "baseline_max_min_ratio": 1.1262524364805253,
+  "conclusion": "INCONCLUSIVE: one quartet on shared GPUs; no stable speedup claim"
+}

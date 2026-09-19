@@ -1,0 +1,11 @@
+{
+  "baseline": "18dd7094c35d61a1710a73e8b3bd9630d0d0ffb3",
+  "tested_implementation_commit": "98ace9d",
+  "header_only_commit": "43691fa",
+  "final_files": {
+    "verl_speco/trainer/veomni_drafter.py": "6bde6755d6dc50157b34fff709fe0f0e205cdb850c22e218d0d7c521b0af5a7f",
+    "verl_speco/trainer/base_trainer.py": "2a67f440788de3d747a5d684ad1b220d3a606d3cfe064b1fc81f74412d44d0bc",
+    "verl_speco/backends/peagle_trainer_backend.py": "7fccec28a869e16fbedd3bca0853f582e90e5fbd5b53ea8fa1bd0c6b817f03c4",
+    "verl_speco/config/speco_base.yaml": "1db88cc9473ed8029e7d630b313a3ac23a14cc6ce9839300adbda2273ec2cedc"
+  }
+}
