@@ -4,8 +4,8 @@ engine=${1:?fsdp or veomni}
 label=${2:?output label}
 shift 2
 export OMP_NUM_THREADS=4 HF_HUB_OFFLINE=1
-export PYTHONPATH=/experiment/veomni-deps:/experiment/online-deps:/experiment/variants/veomni
-cd /experiment/variants/veomni
+export PYTHONPATH=/experiment/veomni-deps:/experiment/online-deps:/experiment/variants/partition-e2e
+cd /experiment/variants/partition-e2e
 /experiment/.venv-clean/bin/python -m torch.distributed.run \
   --nproc-per-node=2 --master-port=29592 experiment/l20/seeded_train.py \
   actor_rollout_ref.actor.strategy=fsdp2 \
