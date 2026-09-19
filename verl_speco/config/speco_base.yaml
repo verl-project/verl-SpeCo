@@ -88,6 +88,7 @@ actor_rollout_ref:
         allow_lossy_speculative_sampling: false
 
       training:
+        engine: fsdp  # fsdp or veomni; VeOmni requires a full-world FSDP2 mesh.
         mode: online
         collect_hidden_states_from_sgl: false
         collect_hidden_states_from_old_logprob: false

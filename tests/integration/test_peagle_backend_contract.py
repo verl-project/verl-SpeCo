@@ -323,13 +323,18 @@ def test_peagle_layers_are_callable_fsdp_wrap_targets() -> None:
     ``forward``; see ``PEagleTrainingModel`` for why."""
     pytest.importorskip("torch")
     from verl_speco.backends.peagle_trainer_backend import PEagleTrainingModel
-    from verl_speco.models.peagle.modeling_peagle import PeagleFusedLayer, PeagleVanillaLayer
+    from verl_speco.models.peagle.modeling_peagle import (
+        PeagleFusedLayer,
+        PeagleVanillaLayer,
+    )
 
     wrap_targets = set(PEagleTrainingModel._no_split_modules)
     assert wrap_targets == {"PeagleFusedLayer", "PeagleVanillaLayer"}
     for layer_cls in (PeagleFusedLayer, PeagleVanillaLayer):
         assert layer_cls.__name__ in wrap_targets
-        assert "forward" in vars(layer_cls), f"{layer_cls.__name__} must define forward for FSDP wrapping"
+        assert "forward" in vars(layer_cls), (
+            f"{layer_cls.__name__} must define forward for FSDP wrapping"
+        )
         assert not hasattr(layer_cls, "forward_peagle")
 
 
@@ -340,7 +345,9 @@ def test_peagle_training_model_wraps_the_draft() -> None:
 
     config = _tiny_peagle_config()
     draft = LlamaForCausalLMPeagle(config)
-    training_model = PEagleTrainingModel(draft, num_depths=4, down_sample_ratio=0.5, down_sample_ratio_min=0.1)
+    training_model = PEagleTrainingModel(
+        draft, num_depths=4, down_sample_ratio=0.5, down_sample_ratio_min=0.1
+    )
 
     assert training_model.draft_model is draft
     assert training_model.config is draft.config
@@ -359,7 +366,9 @@ def test_peagle_compute_loss_calls_the_module_forward() -> None:
     from verl_speco.backends.peagle_trainer_backend import PEagleTrainerBackend
 
     backend = PEagleTrainerBackend(
-        OmegaConf.create({"rollout": {"drafter": {"training": {}}}, "model": {"path": "/tmp/none"}}),
+        OmegaConf.create(
+            {"rollout": {"drafter": {"training": {}}}, "model": {"path": "/tmp/none"}}
+        ),
         OmegaConf.create({}),
     )
     backend.target_model = lambda last_hidden: torch.zeros(*last_hidden.shape[:-1], 6)
@@ -382,7 +391,14 @@ def test_peagle_compute_loss_calls_the_module_forward() -> None:
     out = backend.compute_loss(_model, batch, 0)
 
     assert len(calls) == 1
-    assert set(calls[0]) == {"input_ids", "aux_hidden", "loss_mask", "attention_mask", "target_logits", "seq_lengths"}
+    assert set(calls[0]) == {
+        "input_ids",
+        "aux_hidden",
+        "loss_mask",
+        "attention_mask",
+        "target_logits",
+        "seq_lengths",
+    }
     assert calls[0]["target_logits"].shape == (1, 5, 6)
     assert float(out["total_local_ploss"]) == 8.0
     assert float(out["local_num_tokens"]) == 4.0
@@ -449,8 +465,42 @@ def test_peagle_checkpoint_export_unwraps_the_training_model() -> None:
     draft = SimpleNamespace(name="draft")
     trainer = object.__new__(base_trainer_mod.DrafterBaseTrainer)
     trainer.model = SimpleNamespace(draft_model=draft)
+    trainer.backend = SimpleNamespace(model_type="peagle")
 
     export_model, strip_prefixes = trainer._get_pretrained_export_model()
 
     assert export_model is draft
     assert "draft_model." in strip_prefixes
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_peagle_preserves_trained_embedding(tmp_path, monkeypatch, resume):
+    import torch
+    from verl_speco.backends import peagle_trainer_backend
+    from verl_speco.models.peagle import LlamaForCausalLMPeagle
+
+    monkeypatch.setattr(peagle_trainer_backend, "device_name", "cpu")
+    backend, target_config = _peagle_backend_and_target()
+    draft_config = backend._build_draft_config(None, target_config)
+    draft = LlamaForCausalLMPeagle(draft_config)
+    with torch.no_grad():
+        draft.embed_tokens.weight.fill_(0.25)
+    if resume:
+        draft.save_pretrained(tmp_path)
+        backend.config.rollout.drafter.model_path = str(tmp_path)
+
+    def seed_embedding(model, path):
+        with torch.no_grad():
+            model.embed_tokens.weight.fill_(0.5)
+
+    monkeypatch.setattr(LlamaForCausalLMPeagle, "load_embedding", seed_embedding)
+    monkeypatch.setattr(
+        backend, "_build_target_model", lambda *args: torch.nn.Linear(8, 32)
+    )
+    model, _ = backend.build_model()
+    expected = torch.full_like(
+        model.draft_model.embed_tokens.weight, 0.25 if resume else 0.5
+    )
+    torch.testing.assert_close(
+        model.draft_model.embed_tokens.weight, expected, rtol=0, atol=0
+    )
