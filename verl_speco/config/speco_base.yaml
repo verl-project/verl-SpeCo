@@ -125,6 +125,14 @@ actor_rollout_ref:
         save_full_drafter_checkpoint: true
         sample_last_n_steps: 20
         train_batches_per_cycle: 4
+        # FSDP2 shard dimension. null keeps the training mesh as-is (online
+        # co-train shards over the replica's SP size). The standalone loop
+        # defaults null to 1 (replicate, no sharding); >1 shards over that many
+        # ranks and -1 shards over all of them.
+        fsdp_shard_size: null
+        # DDP (strategy=ddp) graph traversal for unused parameters. Off by
+        # default: it is only needed when a trainable param can miss a gradient.
+        ddp_find_unused_parameters: false
         lr: 1e-5
         lr_warmup_steps: 0
         # Supported standalone drafter scheduler types:
