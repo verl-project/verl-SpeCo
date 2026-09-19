@@ -68,3 +68,5 @@ Every graph-mode output also matches the earlier eager target-only token IDs. Re
 TP2 was also attempted. The target-only baseline stalled inside FlashAttention; switching off custom all-reduce and switching V2 to V1 did not resolve it. One separate startup failure was caused by insufficient free memory and is retained as such. Worker stack captures and raw failures are retained. TP2 parameter-shard assertions were added to the driver but have not yet passed on a live TP2 draft. This is not evidence of a P-EAGLE regression, because the failing arm does not load a drafter.
 
 Evidence for this continuation is in `evidence/l20-20260920/continuation/`. `run_serving_matrix.sh` specifies the attempted matrix; it stops on failure so worker cleanup precedes any retry. The successful single-card graph runs were dispatched separately after cleaning the stalled TP2 workers.
+
+A final TP2 V1/spawn attempt also stalled in target-only generation and reached its 240-second timeout (exit 124). Its remaining engine/worker processes were explicitly stopped before cleanup. Spawn did not resolve the failure; no TP2 draft result was obtained.
