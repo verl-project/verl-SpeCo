@@ -50,3 +50,21 @@ python experiment/l20/check_peagle_decode_logits.py \
 Run with `CUDA_VISIBLE_DEVICES=0`, `VLLM_ALLOW_INSECURE_SERIALIZATION=1` on the isolated test container. The converter requires ordered target feature IDs, full vocabulary, and safetensors. Reduced vocabulary and other runtime versions have not been validated. Completed model weights were removed after evidence capture at the user's request; regeneration is required to rerun.
 
 The raw serving log retains vLLM’s chat-template warmup warning (`skip_tokenizer_init=True`); token-ID generation and numerical checks completed successfully. Raw logs are preserved byte-for-byte, including their original whitespace.
+
+## Continued validation: CUDA Graph (2026-09-20)
+
+The deterministic original tiny fixture was regenerated after cleanup. This run uses the original fixture, rather than the previous six-step trained checkpoint. Both arms use vLLM V1 runner, TP1, BF16, 128 MiB KV cache, CUDA Graph capture sizes `[1, 2, 4, 8]`, and the same two prompts, generated twice in the same engine. Source and runtime remain vLLM 0.29.0 with the unmodified public loader.
+
+| Complete generation correctness | Target-only | Frozen P-EAGLE | Speed improvement |
+|---|---:|---:|---|
+| Output tokens, two repeated rounds | 64 | 64 identical | N/A: instrumentation and shared GPUs |
+| Actual CUDA graph replay calls | 80 | 272 | Not a timing metric |
+| Captured CUDA graphs | 21 | 17 | Not a timing metric |
+| Loaded logical tensors | N/A | 25/25 exact | N/A |
+| Process exit | 0 | 0 | N/A |
+
+Every graph-mode output also matches the earlier eager target-only token IDs. Replay calls were counted on real `torch.cuda.CUDAGraph.replay` invocations after capture. Baseline roles: `LlamaForCausalLM=60`, `PiecewiseBackend=20`; speculative roles: `LlamaForCausalLM=60`, `PiecewiseBackend=212`. Piecewise entries are not individually attributed to draft layers; these counts establish graph execution in the complete speculative engine, not a separate draft-only logits oracle under graph capture.
+
+TP2 was also attempted. The target-only baseline stalled inside FlashAttention; switching off custom all-reduce and switching V2 to V1 did not resolve it. One separate startup failure was caused by insufficient free memory and is retained as such. Worker stack captures and raw failures are retained. TP2 parameter-shard assertions were added to the driver but have not yet passed on a live TP2 draft. This is not evidence of a P-EAGLE regression, because the failing arm does not load a drafter.
+
+Evidence for this continuation is in `evidence/l20-20260920/continuation/`. `run_serving_matrix.sh` specifies the attempted matrix; it stops on failure so worker cleanup precedes any retry. The successful single-card graph runs were dispatched separately after cleaning the stalled TP2 workers.
