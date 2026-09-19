@@ -1,0 +1,70 @@
+{
+  "scope": "tiny P-EAGLE standalone, two L20, six steps plus two checkpoints, not full RL",
+  "rows": [
+    {
+      "arm": "A0",
+      "partitions": 1,
+      "wall_seconds": 18.587,
+      "steps": 6,
+      "step_seconds": [
+        2.382,
+        0.993,
+        0.32,
+        0.342,
+        0.335,
+        0.341
+      ],
+      "log_sha256": "5514fc1d8374fe5e2a0fc8ef46eb947f84a22dde565c7c80a3d5a9e16eabfa9b"
+    },
+    {
+      "arm": "P0",
+      "partitions": 2,
+      "wall_seconds": 23.261,
+      "steps": 6,
+      "step_seconds": [
+        3.686,
+        1.071,
+        0.62,
+        1.323,
+        0.623,
+        0.626
+      ],
+      "log_sha256": "34d77a077e48e45b1548d5d7503c08fdcf23045ac54f4dd2865c960036fd0406"
+    },
+    {
+      "arm": "P1",
+      "partitions": 2,
+      "wall_seconds": 23.044,
+      "steps": 6,
+      "step_seconds": [
+        3.183,
+        1.072,
+        0.633,
+        0.909,
+        0.644,
+        0.627
+      ],
+      "log_sha256": "bb83272a964988ab1ea8c00f75b3251369a803cd487947629583f95efe1a4a2b"
+    },
+    {
+      "arm": "A1",
+      "partitions": 1,
+      "wall_seconds": 23.78,
+      "steps": 6,
+      "step_seconds": [
+        2.531,
+        0.586,
+        0.322,
+        0.324,
+        0.316,
+        0.325
+      ],
+      "log_sha256": "8f976397d50bf069476cb0b6a2e73f341e83ed3b2ffaef6662338f8b1ce92251"
+    }
+  ],
+  "baseline_seconds": 21.02376892947599,
+  "partition_seconds": 23.15224576579991,
+  "speedup_percent": -9.193392545392154,
+  "baseline_ratio": 1.279388820143111,
+  "source_commit": "30e992b4473ac70a98a7f9ee0103860cf4dab348"
+}
