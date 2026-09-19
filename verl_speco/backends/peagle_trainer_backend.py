@@ -36,6 +36,7 @@ import os
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from verl_speco.backends.eagle3_trainer_backend import Eagle3TrainerBackend
 from verl_speco.models.peagle import LlamaForCausalLMPeagle, PeagleConfig
@@ -91,6 +92,7 @@ class PEagleTrainingModel(nn.Module):
         num_depths: int = 8,
         down_sample_ratio: float = 0.7,
         down_sample_ratio_min: float = 0.2,
+        sequence_partitions: int = 1,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -98,6 +100,9 @@ class PEagleTrainingModel(nn.Module):
         self.num_depths = int(num_depths)
         self.down_sample_ratio = float(down_sample_ratio)
         self.down_sample_ratio_min = float(down_sample_ratio_min)
+        if sequence_partitions < 1:
+            raise ValueError("sequence_partitions must be positive")
+        self.sequence_partitions = sequence_partitions
 
     def forward(
         self,
@@ -114,12 +119,6 @@ class PEagleTrainingModel(nn.Module):
         backend outside this module, the way ``DFlashTrainingModel`` receives
         ``lm_head_weight``, so the target head never becomes an FSDP parameter.
         """
-        draft = self.draft_model
-        mask_token_id = int(
-            getattr(draft.config, "mask_token_id", draft.vocab_size - 1)
-        )
-        selected_token_ids = draft.selected_token_ids().to(input_ids.device)
-
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         if seq_lengths is not None:
@@ -163,55 +162,98 @@ class PEagleTrainingModel(nn.Module):
                 )
             loss_positions = row_loss_mask[0, orig_positions].bool()
 
-            is_depth0 = depth == 0
-            mask_hidden_proj = draft.masked_projected_hidden()  # [1, H]
-            flat_ids = torch.where(
-                is_depth0,
-                input_ids[b][orig_positions],
-                torch.full_like(orig_positions, mask_token_id),
-            ).unsqueeze(0)
-            real_proj = draft.project_hidden_states(
-                aux_hidden[b : b + 1][:, orig_positions]
-            )[0]  # [n, H]
-            flat_hidden = torch.where(
-                is_depth0.unsqueeze(-1),
-                real_proj,
-                mask_hidden_proj.expand(orig_positions.shape[0], -1),
-            ).unsqueeze(0)
-
-            block_mask = draft.build_peagle_block_mask(
-                anchor_pos=anchor_pos,
-                depth=depth,
-                lengths=document_lengths,
-                total_seq_len=seq_len,
-            )
-            hidden = draft.forward_peagle(
-                sampled_input_ids=flat_ids,
-                sampled_projected_hidden=flat_hidden,
-                position_ids=orig_positions.unsqueeze(0),
-                block_mask=block_mask,
-            )
-            logits = draft.compute_logits(hidden)[0]  # [n, draft_vocab]
-            draft_target_logits = target_logits[b][orig_positions].index_select(
-                dim=-1, index=selected_token_ids
-            )
-
-            elementwise = _kl_div_loss(logits, draft_target_logits)
-            mask_f = loss_positions.to(elementwise.dtype)
-            loss_num = loss_num + (elementwise * mask_f).sum()
-            loss_den = loss_den + mask_f.sum()
-            with torch.no_grad():
-                correct = (
-                    correct
-                    + (
-                        (logits.argmax(dim=-1) == draft_target_logits.argmax(dim=-1))
-                        & loss_positions
-                    )
-                    .float()
-                    .sum()
+            if self.sequence_partitions == 1:
+                num, den, hits = self._position_loss(
+                    input_ids[b],
+                    aux_hidden[b : b + 1],
+                    target_logits[b],
+                    anchor_pos,
+                    depth,
+                    loss_positions,
+                    document_lengths,
                 )
+                loss_num = loss_num + num
+                loss_den = loss_den + den
+                correct = correct + hits
+                continue
+
+            # Algorithm 1: descendants inherit their depth-1 ancestor's segment.
+            owners = (anchor_pos + (depth > 0)) * self.sequence_partitions // seq_len
+            owners = owners.clamp_max(self.sequence_partitions - 1)
+            for segment in range(self.sequence_partitions):
+                owned = owners == segment
+                indices = torch.where(owned | ((depth == 0) & (owners <= segment)))[0]
+                if indices.numel() == 0:
+                    continue
+                args = (
+                    input_ids[b],
+                    aux_hidden[b : b + 1],
+                    target_logits[b],
+                    anchor_pos[indices],
+                    depth[indices],
+                    loss_positions[indices] & owned[indices],
+                    document_lengths,
+                )
+                if self.training:
+                    # Retain only inputs/scalars until backward, then recompute
+                    # one segment at a time through the existing wrapped forward.
+                    num, den, hits = checkpoint(
+                        self._position_loss, *args, use_reentrant=False
+                    )
+                else:
+                    num, den, hits = self._position_loss(*args)
+                loss_num = loss_num + num
+                loss_den = loss_den + den
+                correct = correct + hits
 
         return loss_num, loss_den, correct
+
+    def _position_loss(
+        self,
+        input_ids: torch.Tensor,
+        aux_hidden: torch.Tensor,
+        target_logits: torch.Tensor,
+        anchor_pos: torch.Tensor,
+        depth: torch.Tensor,
+        loss_positions: torch.Tensor,
+        document_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        draft = self.draft_model
+        orig_positions = anchor_pos + depth
+        is_depth0 = depth == 0
+        flat_ids = torch.where(
+            is_depth0,
+            input_ids[orig_positions],
+            torch.full_like(orig_positions, draft.config.mask_token_id),
+        ).unsqueeze(0)
+        real_proj = draft.project_hidden_states(aux_hidden[:, orig_positions])[0]
+        flat_hidden = torch.where(
+            is_depth0.unsqueeze(-1),
+            real_proj,
+            draft.masked_projected_hidden().expand(orig_positions.shape[0], -1),
+        ).unsqueeze(0)
+        block_mask = draft.build_peagle_block_mask(
+            anchor_pos=anchor_pos,
+            depth=depth,
+            lengths=document_lengths,
+            total_seq_len=input_ids.shape[0],
+        )
+        hidden = draft.forward_peagle(
+            sampled_input_ids=flat_ids,
+            sampled_projected_hidden=flat_hidden,
+            position_ids=orig_positions.unsqueeze(0),
+            block_mask=block_mask,
+        )
+        logits = draft.compute_logits(hidden)[0]
+        targets = target_logits[orig_positions].index_select(
+            -1, draft.selected_token_ids()
+        )
+        elementwise = _kl_div_loss(logits, targets)
+        mask = loss_positions.to(elementwise.dtype)
+        correct = (
+            ((logits.argmax(-1) == targets.argmax(-1)) & loss_positions).float().sum()
+        )
+        return (elementwise * mask).sum(), mask.sum(), correct
 
 
 class PEagleTrainerBackend(Eagle3TrainerBackend):
@@ -348,6 +390,7 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
         training_cfg = self._training_cfg()
         training_model = PEagleTrainingModel(
             draft_model=drafter_module,
+            sequence_partitions=int(training_cfg.get("peagle_sequence_partitions", 1)),
             num_depths=int(
                 training_cfg.get(
                     "peagle_num_depths", getattr(draft_config, "num_depths", 8)

@@ -190,6 +190,7 @@ actor_rollout_ref:
         peagle_num_aux_hidden_states: 3
         peagle_draft_vocab_size: null
         peagle_num_depths: 8
+        peagle_sequence_partitions: 1
         peagle_down_sample_ratio: 0.7
         peagle_down_sample_ratio_min: 0.2
         peagle_mask_token_id: null
