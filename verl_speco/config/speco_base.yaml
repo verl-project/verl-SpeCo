@@ -126,6 +126,19 @@ actor_rollout_ref:
         sample_last_n_steps: 20
         train_batches_per_cycle: 4
         lr: 1e-5
+        # Optimizer for drafter training. "adamw" keeps the historical single
+        # AdamW over all trainable params. "muon" applies Muon to 2D hidden
+        # weight matrices and AdamW to the rest (norms, biases, embeddings,
+        # and output heads), mirroring speculators.train.optimizers.
+        optimizer: adamw
+        weight_decay: 1e-2
+        # Muon-only options (ignored when optimizer=adamw).
+        muon_lr: null
+        muon_momentum: 0.95
+        muon_nesterov: true
+        muon_weight_decay: 0.1
+        muon_ns_steps: 5
+        muon_adjust_lr_fn: match_rms_adamw
         lr_warmup_steps: 0
         # Supported standalone drafter scheduler types:
         # constant, cosine, linear, global_cosine.
