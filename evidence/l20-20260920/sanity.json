@@ -1,0 +1,42 @@
+[
+  {
+    "check": "check_docs_time_info.py",
+    "exit_code": 0,
+    "output": ""
+  },
+  {
+    "check": "check_license.py",
+    "exit_code": 0,
+    "output": ""
+  },
+  {
+    "check": "check_device_api_usage.py",
+    "exit_code": 0,
+    "output": ""
+  },
+  {
+    "check": "check_dataproto_usage.py",
+    "exit_code": 0,
+    "output": ""
+  },
+  {
+    "check": "validate_structure.py",
+    "exit_code": 0,
+    "output": ""
+  },
+  {
+    "check": "check_naming_conventions.py",
+    "exit_code": 0,
+    "output": ""
+  },
+  {
+    "check": "check_example_naming.py",
+    "exit_code": 0,
+    "output": ""
+  },
+  {
+    "check": "compile_all.py",
+    "exit_code": 0,
+    "output": ""
+  }
+]
