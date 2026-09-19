@@ -38,7 +38,7 @@ Use the pinned vLLM 0.29.0 / PyTorch 2.13.0+cu130 environment recorded by the pa
 python -m verl_speco.convert_peagle_vllm \
   /experiment/evidence/l20-20260919/veomni-P1/draft_step_6 \
   /experiment/tiny-peagle/trained-serving --target-layer-ids 0 1 2
-python experiment/l20/check_tiny_peagle_serving.py \
+python experiment/l20/check_tiny_peagle_serving.py draft-eagle3 \
   --draft-model /experiment/tiny-peagle/trained-serving \
   --reference-model /experiment/evidence/l20-20260919/veomni-P1/draft_step_6 \
   --output-prefix trained-peagle
@@ -48,3 +48,5 @@ python experiment/l20/check_peagle_decode_logits.py \
 ```
 
 Run with `CUDA_VISIBLE_DEVICES=0`, `VLLM_ALLOW_INSECURE_SERIALIZATION=1` on the isolated test container. The converter requires ordered target feature IDs, full vocabulary, and safetensors. Reduced vocabulary and other runtime versions have not been validated. Completed model weights were removed after evidence capture at the user's request; regeneration is required to rerun.
+
+The raw serving log retains vLLM’s chat-template warmup warning (`skip_tokenizer_init=True`); token-ID generation and numerical checks completed successfully. Raw logs are preserved byte-for-byte, including their original whitespace.
