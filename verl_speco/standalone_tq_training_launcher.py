@@ -410,6 +410,44 @@ def _replace_internal_overrides(
     return [*cleaned, *internal]
 
 
+def _tq_backend_overrides(env: Mapping[str, str]) -> list[str]:
+    """Internal TQ storage-backend overrides.
+
+    Transport backend selection is not exposed through the Hydra CLI. It
+    defaults to the in-memory ``SimpleStorage``; set
+    ``SPECO_TQ_STORAGE_BACKEND=MooncakeStore`` to use a Mooncake store
+    (``SPECO_TQ_MOONCAKE_*`` tune its client configuration).
+    """
+    backend = str(env.get("SPECO_TQ_STORAGE_BACKEND", "SimpleStorage")).strip()
+
+    def _env(name: str, default: str) -> str:
+        return str(env.get(name, default)).strip()
+
+    if backend == "MooncakeStore":
+        return [
+            f"{_TQ_PREFIX}.backend.storage_backend=MooncakeStore",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.auto_init="
+            f"{_env('SPECO_TQ_MOONCAKE_AUTO_INIT', 'false')}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.metadata_server="
+            f"{_env('SPECO_TQ_MOONCAKE_METADATA_SERVER', 'P2PHANDSHAKE')}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.master_server_address="
+            f"{_env('SPECO_TQ_MOONCAKE_MASTER', '127.0.0.1:50051')}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.local_hostname="
+            f"{_env('SPECO_TQ_MOONCAKE_LOCAL_HOSTNAME', '')}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.protocol="
+            f"{_env('SPECO_TQ_MOONCAKE_PROTOCOL', 'tcp')}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.global_segment_size="
+            f"{_env('SPECO_TQ_MOONCAKE_GLOBAL_SEGMENT_BYTES', str(4 * 1024**3))}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.local_buffer_size="
+            f"{_env('SPECO_TQ_MOONCAKE_LOCAL_BUFFER_BYTES', str(2 * 1024**3))}",
+        ]
+    return [
+        f"{_TQ_PREFIX}.backend.storage_backend=SimpleStorage",
+        f"{_TQ_PREFIX}.backend.SimpleStorage.total_storage_size=17179869184",
+        f"{_TQ_PREFIX}.backend.SimpleStorage.num_data_storage_units=8",
+    ]
+
+
 def build_pipeline_commands(
     config: PipelineConfig,
     training_args: Sequence[str],
@@ -436,9 +474,7 @@ def build_pipeline_commands(
         f"{_TQ_PREFIX}.partition_id={_TQ_PARTITION}",
         f"{_TQ_PREFIX}.run_id={config.run_id}",
         f"{_TQ_PREFIX}.drop_last=true",
-        f"{_TQ_PREFIX}.backend.storage_backend=SimpleStorage",
-        f"{_TQ_PREFIX}.backend.SimpleStorage.total_storage_size=17179869184",
-        f"{_TQ_PREFIX}.backend.SimpleStorage.num_data_storage_units=8",
+        *_tq_backend_overrides(os.environ),
     ]
     parsed_endpoint = urlparse(config.vllm_endpoints[0])
     vllm_port = parsed_endpoint.port or (
