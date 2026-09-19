@@ -162,6 +162,7 @@ actor_rollout_ref:
         dspark_loss_decay_gamma: 7.0
         dspark_hard_sample_ratio: 0.0
         dspark_hidden_size: null
+        dspark_intermediate_size: null
         dspark_num_target_layers: 5
         dspark_num_hidden_layers: 5
         dspark_mask_token_id: null
