@@ -1,5 +1,6 @@
 """Freeze real target forwards for the standalone drafter lifecycle test."""
 
+import argparse
 from pathlib import Path
 
 import torch
@@ -7,7 +8,11 @@ from transformers import LlamaForCausalLM
 
 from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
 
-root = Path("/experiment/tiny-peagle")
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "root", type=Path, nargs="?", default=Path("/experiment/tiny-peagle")
+)
+root = parser.parse_args().root
 target = LlamaForCausalLM.from_pretrained(root / "target").eval()
 store = TorchShardFeatureStore(root / "features-packed")
 torch.manual_seed(23)
