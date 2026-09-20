@@ -70,3 +70,63 @@ TP2 was also attempted. The target-only baseline stalled inside FlashAttention; 
 Evidence for this continuation is in `evidence/l20-20260920/continuation/`. `run_serving_matrix.sh` specifies the attempted matrix; it stops on failure so worker cleanup precedes any retry. The successful single-card graph runs were dispatched separately after cleaning the stalled TP2 workers.
 
 A final TP2 V1/spawn attempt also stalled in target-only generation and reached its 240-second timeout (exit 124). Its remaining engine/worker processes were explicitly stopped before cleanup. Spawn did not resolve the failure; no TP2 draft result was obtained.
+
+## Native latest-release validation — 2026-09-20
+
+The new L20 native environment uses vLLM 0.29.0, PyTorch 2.13.0+cu130,
+Transformers 5.17.0 and Python 3.13.14. The wheel SHA-256 matches official PyPI
+metadata. The existing native 0.18 installation is unchanged. First startup
+included a FlashInfer sampling-kernel build; compilation and per-forward capture
+I/O are excluded from any speedup claim.
+
+This checkpoint is from the C2 fix's actual two-rank FSDP2 standalone run,
+`c2-pruned-P0/draft_step_6` (six optimizer updates). It was copied before completed
+training weights were cleaned, then exported with the converter. TP1 BF16/eager
+loads all 25 logical tensors exactly; both prompts generated twice match the
+target-only reference. All 64 cached draft-forward comparisons pass, with a
+maximum logits error of 0.00390625. This is a tiny frozen-serving E2E, not an
+online RL or quality result.
+
+The native target-only TP2 run reproduced the earlier FlashAttention 2 stall
+at the first generation. Its worker stack is inside `flash_attn_varlen_func`;
+no draft model is loaded in that failed arm. The run was explicitly terminated
+and its workers cleaned. A subsequent run explicitly selected `FLEX_ATTENTION` and also failed.
+The reproduction recipe retains FlashAttention for TP2 and records backend
+selection; it does not imply the full matrix passed.
+
+The native TP1 graph run uses this same six-step checkpoint. Both eager and
+graph arms produce the same two rounds of token IDs, and graph mode again checks
+all 25 logical tensors against the original checkpoint. Converter unit tests:
+7 passed.
+
+| Native C1 check | Target-only | Frozen trained P-EAGLE | Speed improvement |
+|---|---:|---:|---|
+| TP1 eager, generated tokens across two rounds | 64 | 64, identical | N/A: correctness capture |
+| TP1 graph, generated tokens across two rounds | 64 | 64, identical | N/A: shared GPU correctness run |
+| Actual graph replay calls | 80 | 272 | Not a timing metric |
+| Cached draft logits comparisons | N/A | 64/64 pass; max error 0.00390625 | N/A |
+| TP1 logical parameters, eager and graph | N/A | 25/25 exact in each mode | N/A |
+
+Native TP2 diagnostics preserve the target-only failures: FlexAttention reached
+its 300-second executor RPC timeout; disabling NCCL P2P, disabling async
+scheduling, and moving to physical GPUs 2/3 did not unblock first generation.
+The FlexAttention native stack waits in `cudaStreamSynchronize`; the FlashAttention
+native stack waits in `cuLaunchKernel`. These observations identify blocking
+locations, not a proven root cause. No TP2 draft result or TP2 speedup is claimed.
+
+Enabling custom all-reduce and setting `CUDA_MODULE_LOADING=EAGER` (with and
+without synchronous scheduling) also failed to produce the first token. Eager
+module loading moved the sampled blocking location to output synchronization;
+the synchronous variant waited in `_bookkeeping_sync` / `_to_list`. These bounded
+attempts were explicitly stopped, with worker stacks retained. Only the
+FlexAttention arm reached its own RPC timeout; other stops are not reported as
+completed benchmark timings.
+
+`evidence/l20-20260920/native-latest/matrix-summary.json` records the partial
+matrix: TP1 eager/graph pass; TP2 baseline not passed; TP2 draft/graph not run.
+All task-owned workers were stopped. Three completed tiny checkpoint weights
+were deleted (1,757,048 bytes), with SHA-256 and paths in `cleanup.json`. Raw
+forward captures remain as numerical evidence. Ruff check/format and shell
+syntax checks pass; the seven converter unit tests pass. The unit tests used
+the existing container; all native serving results above used the new native
+environment.

@@ -1,0 +1,18 @@
+{
+  "tp1_eager": "PASS",
+  "tp1_graph": "PASS",
+  "tp1_tokens_match": true,
+  "tp2": "NOT_PASSED",
+  "tp2_flex_attention": "RPC_TIMEOUT_300_SECONDS",
+  "tp2_stopped_no_first_token": [
+    "flash_attention_default",
+    "nccl_p2p_disabled",
+    "sync_scheduling",
+    "physical_gpu_2_3",
+    "custom_allreduce",
+    "cuda_module_loading_eager",
+    "cuda_module_loading_eager_and_sync_scheduling"
+  ],
+  "tp2_draft_and_graph": "NOT_RUN_BASELINE_BLOCKED",
+  "speed_improvement": null
+}

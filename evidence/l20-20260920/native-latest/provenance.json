@@ -1,0 +1,11 @@
+{
+  "checkpoint_source": "c2-pruned-P0/draft_step_6",
+  "training_engine": "FSDP2",
+  "optimizer_steps": 6,
+  "sha256": {
+    "variants/partition-e2e/verl_speco/backends/peagle_trainer_backend.py": "933a15d52f8553c92db7287c164f3c0c99968060fdd9439a12526d7b3ed00120",
+    "c5-native-latest/c1-models/draft-original/model.safetensors": "92eb5351c947ae315fe777ce320c29930c0f75449143afb5ac6a6bf30205dad3",
+    "c5-native-latest/c1-models/draft-original/config.json": "501f1dc463e62cc93cf5163a0483040a3a9481d81371fef0fde79b6f513057db",
+    "c5-native-latest/c1-models/target/model.safetensors": "9bc8ce7ea08dbd17ac2815ce1fc3e7d0e4e1b071c6969bca7d0e252d5d40da34"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "status": "STOPPED_NO_PROGRESS",
+  "phase": "target-only first generation",
+  "stack": "tp2-worker0-stack.txt",
+  "time_utc": "2026-09-20T02:20:16.250077+00:00"
+}

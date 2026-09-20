@@ -1,0 +1,20 @@
+{
+  "files": [
+    {
+      "path": "/home/kxqandccx/0z5a/speco-l20-20260919/c5-native-latest/c1-models/target/model.safetensors",
+      "bytes": 727208,
+      "sha256": "9bc8ce7ea08dbd17ac2815ce1fc3e7d0e4e1b071c6969bca7d0e252d5d40da34"
+    },
+    {
+      "path": "/home/kxqandccx/0z5a/speco-l20-20260919/c5-native-latest/c1-models/draft-original/model.safetensors",
+      "bytes": 514920,
+      "sha256": "92eb5351c947ae315fe777ce320c29930c0f75449143afb5ac6a6bf30205dad3"
+    },
+    {
+      "path": "/home/kxqandccx/0z5a/speco-l20-20260919/c5-native-latest/c1-models/converted/model.safetensors",
+      "bytes": 514920,
+      "sha256": "92eb5351c947ae315fe777ce320c29930c0f75449143afb5ac6a6bf30205dad3"
+    }
+  ],
+  "bytes": 1757048
+}

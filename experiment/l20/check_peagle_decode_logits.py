@@ -4,8 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
-from safetensors.torch import load_file
 import torch
+from safetensors.torch import load_file
 from torch.nn.attention.flex_attention import create_block_mask
 
 from verl_speco.models.peagle import LlamaForCausalLMPeagle, PeagleConfig
@@ -15,9 +15,11 @@ parser.add_argument("--prefix", default="tiny-peagle")
 parser.add_argument(
     "--reference", type=Path, default=Path("/experiment/tiny-peagle/draft-original")
 )
+parser.add_argument(
+    "--evidence-root", type=Path, default=Path("/experiment/evidence/l20-20260919")
+)
 args = parser.parse_args()
-root = Path("/experiment")
-evidence = root / "evidence/l20-20260919"
+evidence = args.evidence_root
 records = torch.load(evidence / f"{args.prefix}-forwards.pt", weights_only=True)
 model = LlamaForCausalLMPeagle(PeagleConfig.from_pretrained(args.reference))
 model.load_state_dict(load_file(args.reference / "model.safetensors"))

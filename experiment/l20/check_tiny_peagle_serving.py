@@ -10,7 +10,7 @@ from safetensors.torch import load_file
 from vllm import LLM, SamplingParams
 
 
-def capture_first_forward(worker, prefix):
+def capture_first_forward(worker, prefix, evidence_root):
     from vllm.forward_context import get_forward_context
 
     draft = worker.get_draft_model()
@@ -43,11 +43,9 @@ def capture_first_forward(worker, prefix):
             },
         }
         records.append(record)
-        torch.save(records, f"/experiment/evidence/l20-20260919/{prefix}-forwards.pt")
+        torch.save(records, str(Path(evidence_root) / f"{prefix}-forwards.pt"))
         if len(records) == 1:
-            torch.save(
-                record, f"/experiment/evidence/l20-20260919/{prefix}-first-forward.pt"
-            )
+            torch.save(record, str(Path(evidence_root) / f"{prefix}-first-forward.pt"))
 
     draft.register_forward_pre_hook(capture_inputs, with_kwargs=True)
     draft.register_forward_hook(capture, with_kwargs=True)
@@ -151,6 +149,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--tp", type=int, choices=[1, 2], default=1)
     parser.add_argument("--graph", action="store_true")
+    parser.add_argument("--attention-backend", choices=["FLASH_ATTN", "FLEX_ATTENTION"])
+    parser.add_argument("--sync-scheduling", action="store_true")
     parser.add_argument("--no-capture", action="store_true")
     parser.add_argument("--draft-model", type=Path)
     parser.add_argument(
@@ -159,12 +159,19 @@ if __name__ == "__main__":
         default=Path("/experiment/tiny-peagle/draft-original"),
     )
     parser.add_argument("--output-prefix", default="tiny-peagle")
+    parser.add_argument(
+        "--models-root", type=Path, default=Path("/experiment/tiny-peagle")
+    )
+    parser.add_argument(
+        "--evidence-root", type=Path, default=Path("/experiment/evidence/l20-20260919")
+    )
     args = parser.parse_args()
     if (args.tp > 1 or args.graph) and not args.no_capture:
         parser.error(
             "TP and graph runs require --no-capture; use the eager logits oracle separately"
         )
-    root = Path("/experiment/tiny-peagle")
+    root = args.models_root
+    args.evidence_root.mkdir(parents=True, exist_ok=True)
     speculative = (
         None
         if args.mode == "baseline"
@@ -182,6 +189,10 @@ if __name__ == "__main__":
         enforce_eager=not args.graph,
         tensor_parallel_size=args.tp,
         disable_custom_all_reduce=True,
+        async_scheduling=False if args.sync_scheduling else None,
+        attention_config={"backend": args.attention_backend}
+        if args.attention_backend
+        else {},
         kv_cache_memory_bytes=128 * 1024 * 1024,
         compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8]}
         if args.graph
@@ -196,7 +207,13 @@ if __name__ == "__main__":
         {"prompt_token_ids": tokens} for tokens in [[1, 4, 7], [1, 8, 9, 10, 11]]
     ]
     if speculative is not None and not args.no_capture:
-        llm.collective_rpc(capture_first_forward, kwargs={"prefix": args.output_prefix})
+        llm.collective_rpc(
+            capture_first_forward,
+            kwargs={
+                "prefix": args.output_prefix,
+                "evidence_root": str(args.evidence_root),
+            },
+        )
     if args.graph:
         llm.collective_rpc(count_graph_replays)
     outputs = llm.generate(prompts, SamplingParams(temperature=0, max_tokens=16))
@@ -209,12 +226,14 @@ if __name__ == "__main__":
         report["parameters"] = llm.collective_rpc(
             check_parameters, kwargs={"checkpoint": str(args.reference_model)}
         )
+    report["sync_scheduling"] = args.sync_scheduling
     report["tp"] = args.tp
     report["graph"] = args.graph
+    report["attention_backend"] = args.attention_backend or "auto"
     if args.graph:
         report["graph_execution"] = llm.collective_rpc(graph_counts)
         assert all(row["replays"] > 0 for row in report["graph_execution"])
-    Path(
-        f"/experiment/evidence/l20-20260919/{args.output_prefix}-{args.mode}.json"
-    ).write_text(json.dumps(report, indent=2) + "\n")
+    (args.evidence_root / f"{args.output_prefix}-{args.mode}.json").write_text(
+        json.dumps(report, indent=2) + "\n"
+    )
     print(json.dumps(report))
