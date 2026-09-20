@@ -1,0 +1,78 @@
+{
+  "mode": "hot",
+  "tp": 2,
+  "graph": false,
+  "target_hashes": [
+    "296ed127c251f9e32d216ae56b31552f2207e5441fe52fb0d15821b579eada0c",
+    "90e59c7800c8e20631b1d9f3026212bb3d75a61c991bacc8376beab4c4ff1d07"
+  ],
+  "tokens": [
+    [
+      144,
+      144,
+      144,
+      144,
+      144,
+      144,
+      144,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242
+    ],
+    [
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235
+    ]
+  ],
+  "updates": [
+    {
+      "parameters": {
+        "rank": 0,
+        "tp": 2,
+        "class": "Eagle3LlamaForCausalLM",
+        "compared_logical_tensors": 25,
+        "runtime_only_parameters": [
+          "model.layers.1.hidden_norm.weight"
+        ]
+      },
+      "target_unchanged": true,
+      "stale_mask_cache_error": 0.0185546875,
+      "cache_address_preserved": true
+    },
+    {
+      "parameters": {
+        "rank": 1,
+        "tp": 2,
+        "class": "Eagle3LlamaForCausalLM",
+        "compared_logical_tensors": 25,
+        "runtime_only_parameters": [
+          "model.layers.1.hidden_norm.weight"
+        ]
+      },
+      "target_unchanged": true,
+      "stale_mask_cache_error": 0.0185546875,
+      "cache_address_preserved": true
+    }
+  ],
+  "graph_execution": []
+}

@@ -1,0 +1,63 @@
+{
+  "mode": "hot",
+  "tp": 1,
+  "graph": false,
+  "target_hashes": [
+    "b88634765a4ea4505dfa96124080849537b90005623581588411feac8ea513e6"
+  ],
+  "tokens": [
+    [
+      144,
+      144,
+      144,
+      144,
+      144,
+      144,
+      144,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242
+    ],
+    [
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235
+    ]
+  ],
+  "updates": [
+    {
+      "parameters": {
+        "rank": 0,
+        "tp": 1,
+        "class": "Eagle3LlamaForCausalLM",
+        "compared_logical_tensors": 25,
+        "runtime_only_parameters": [
+          "model.layers.1.hidden_norm.weight"
+        ]
+      },
+      "target_unchanged": true,
+      "stale_mask_cache_error": 0.0185546875,
+      "cache_address_preserved": true
+    }
+  ],
+  "graph_execution": []
+}

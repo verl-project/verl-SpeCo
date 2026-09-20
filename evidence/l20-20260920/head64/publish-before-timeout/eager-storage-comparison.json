@@ -1,0 +1,20 @@
+[
+  {
+    "tp": 1,
+    "rank": 0,
+    "tensor_metadata_equal": true,
+    "storage_bytes_equal": true
+  },
+  {
+    "tp": 2,
+    "rank": 0,
+    "tensor_metadata_equal": true,
+    "storage_bytes_equal": true
+  },
+  {
+    "tp": 2,
+    "rank": 1,
+    "tensor_metadata_equal": true,
+    "storage_bytes_equal": true
+  }
+]

@@ -1,0 +1,39 @@
+[
+  {
+    "tp": 1,
+    "mode": "eager",
+    "tokens_equal": true,
+    "target_equal": true,
+    "rank_draft_logits_max_error": [
+      0.0
+    ],
+    "logits_checked": true
+  },
+  {
+    "tp": 1,
+    "mode": "graph",
+    "tokens_equal": true,
+    "target_equal": true,
+    "rank_draft_logits_max_error": [],
+    "logits_checked": false
+  },
+  {
+    "tp": 2,
+    "mode": "eager",
+    "tokens_equal": true,
+    "target_equal": true,
+    "rank_draft_logits_max_error": [
+      0.0,
+      0.0
+    ],
+    "logits_checked": true
+  },
+  {
+    "tp": 2,
+    "mode": "graph",
+    "tokens_equal": true,
+    "target_equal": true,
+    "rank_draft_logits_max_error": [],
+    "logits_checked": false
+  }
+]

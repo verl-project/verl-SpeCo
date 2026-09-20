@@ -38,4 +38,26 @@ separately. The complete matrix does not override the failed numerical gate.
 `check_trained_publish.py` additionally exercises a drained-engine checkpoint
 change and a separate cold engine. Its in-place parallel-mask cache refresh is
 test-side diagnosis, not a production online P-EAGLE implementation. Publication
-results will be recorded separately after the full hot/cold matrix completes.
+results are now complete:
+
+| Trained step 3 → step 6 publication | TP1 eager | TP2 eager | TP1 graph | TP2 graph |
+|---|---|---|---|---|
+| Hot-B versus independent cold-B tokens | Exact | Exact | Exact | Exact |
+| Target hashes before/after and hot/cold | Unchanged | Unchanged on both ranks | Unchanged | Unchanged on both ranks |
+| Hot-B versus cold-B draft logits | Max error 0 | Max error 0 on both ranks | Not independently captured | Not independently captured |
+| Post-update logical checkpoint tensors | 25/25 | 25/25 on both ranks | 25/25 | 25/25 on both ranks |
+| Graph replay after publication | N/A | N/A | Observed | Observed on both ranks |
+
+The stale parallel-mask cache error before the test-side refresh is 0.0185546875;
+the refresh preserves its allocation address. This confirms the cache dependency,
+not a production online P-EAGLE adapter. No timing speedup is claimed.
+The TP2 graph continuation and all-rank comparison exit 0; the earlier I/O
+timeout is retained separately in `publish-before-timeout/`.
+
+The six-step flat and sequence-partition checkpoints also each complete fresh
+TP2 serving, checking 25 logical tensors on both ranks and matching target-only
+tokens over two rounds. `partition-serving/suite.exit` is 0.
+
+All completed fixture/export/checkpoint model weights were then removed:
+27 files, 181,914,574 bytes. The manifest retains sizes and SHA-256 hashes;
+forward/logit captures and raw logs remain. Real models required by C5 are kept.
