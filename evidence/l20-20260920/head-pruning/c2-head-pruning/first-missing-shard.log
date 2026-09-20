@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "/experiment/benchmark_training.py", line 27, in <module>
+    AutoModelForCausalLM.from_pretrained(
+  File "/experiment/online-deps/transformers/models/auto/auto_factory.py", line 404, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/experiment/online-deps/transformers/modeling_utils.py", line 4308, in from_pretrained
+    loading_info, disk_offload_index = cls._load_pretrained_model(model, state_dict, checkpoint_files, load_config)
+                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/experiment/online-deps/transformers/modeling_utils.py", line 4426, in _load_pretrained_model
+    file_pointer = safe_open(file, framework="pt", device="cpu")
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: No such file or directory: /experiment/models/target/model-00003-of-00003.safetensors

@@ -1,0 +1,20 @@
+Loading weights:   0%|          | 0/398 [00:00<?, ?it/s]Loading weights: 100%|██████████| 398/398 [00:00<00:00, 48274.52it/s]
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+/usr/local/lib/python3.12/dist-packages/torch/nn/attention/flex_attention.py:2481: UserWarning: flex_attention called without torch.compile() - this will use an unfused implementation that materializes the full scores matrix instead of generating a fused kernel.
+
+SOLUTION: Use torch.compile(flex_attention)(...)
+
+If you want to debug your score_mod/mask_mod, you can set:
+torch.nn.attention.flex_attention._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True
+
+This will allow you to use print statements or breakpoints. Note: This doesn't work with the backwards pass and may produce incorrect results.
+  _warn_once(
+{"step": 0, "seconds": 7.019041320003453, "loss": 12.258745193481445, "tokens": 3442.0}
+[W920 01:59:36.794557672 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 2092957696 bytes (free: 986054656, total: 47667740672).
+{"step": 1, "seconds": 1.4100884640065487, "loss": 5.612250804901123, "tokens": 3442.0}
+{"step": 2, "seconds": 1.583310125002754, "loss": 4.246442794799805, "tokens": 3443.0}
+{"step": 3, "seconds": 1.302595047003706, "loss": 3.8118984699249268, "tokens": 3442.0}
+{"step": 4, "seconds": 1.3167386860004626, "loss": 2.9504213333129883, "tokens": 3442.0}
+{"step": 5, "seconds": 1.3198644270014483, "loss": 2.47676682472229, "tokens": 3443.0}
+{"step": 6, "seconds": 1.323632521001855, "loss": 2.748300790786743, "tokens": 3441.0}
+{"step": 7, "seconds": 1.3221519859944237, "loss": 2.3363049030303955, "tokens": 3443.0}

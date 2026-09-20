@@ -244,16 +244,14 @@ class PEagleTrainingModel(nn.Module):
             position_ids=orig_positions.unsqueeze(0),
             block_mask=block_mask,
         )
-        logits = draft.compute_logits(hidden)[0]
-        targets = target_logits[orig_positions].index_select(
+        # Context-only positions participate in attention, but need no vocab head.
+        logits = draft.compute_logits(hidden[:, loss_positions])[0]
+        targets = target_logits[orig_positions[loss_positions]].index_select(
             -1, draft.selected_token_ids()
         )
         elementwise = _kl_div_loss(logits, targets)
-        mask = loss_positions.to(elementwise.dtype)
-        correct = (
-            ((logits.argmax(-1) == targets.argmax(-1)) & loss_positions).float().sum()
-        )
-        return (elementwise * mask).sum(), mask.sum(), correct
+        correct = (logits.argmax(-1) == targets.argmax(-1)).float().sum()
+        return elementwise.sum(), loss_positions.float().sum(), correct
 
 
 class PEagleTrainerBackend(Eagle3TrainerBackend):

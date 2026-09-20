@@ -1,0 +1,20 @@
+Loading weights:   0%|          | 0/398 [00:00<?, ?it/s]Loading weights:  26%|██▋       | 105/398 [00:00<00:00, 620.26it/s]Loading weights:  42%|████▏     | 168/398 [00:00<00:01, 180.82it/s]Loading weights:  50%|█████     | 200/398 [00:01<00:01, 123.00it/s]Loading weights:  55%|█████▌    | 220/398 [00:02<00:02, 76.09it/s] Loading weights:  59%|█████▉    | 234/398 [00:02<00:02, 62.53it/s]Loading weights:  61%|██████▏   | 244/398 [00:03<00:03, 44.23it/s]Loading weights:  63%|██████▎   | 251/398 [00:03<00:03, 44.10it/s]Loading weights: 100%|██████████| 398/398 [00:03<00:00, 121.06it/s]
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+/usr/local/lib/python3.12/dist-packages/torch/nn/attention/flex_attention.py:2481: UserWarning: flex_attention called without torch.compile() - this will use an unfused implementation that materializes the full scores matrix instead of generating a fused kernel.
+
+SOLUTION: Use torch.compile(flex_attention)(...)
+
+If you want to debug your score_mod/mask_mod, you can set:
+torch.nn.attention.flex_attention._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True
+
+This will allow you to use print statements or breakpoints. Note: This doesn't work with the backwards pass and may produce incorrect results.
+  _warn_once(
+{"step": 0, "seconds": 12.017632453003898, "loss": 12.258712768554688, "tokens": 3442.0}
+{"step": 1, "seconds": 1.8716123820049688, "loss": 5.616039752960205, "tokens": 3442.0}
+{"step": 2, "seconds": 1.832320781002636, "loss": 4.251337051391602, "tokens": 3443.0}
+{"step": 3, "seconds": 1.839945298008388, "loss": 3.8099844455718994, "tokens": 3442.0}
+{"step": 4, "seconds": 1.821507874992676, "loss": 2.9702868461608887, "tokens": 3442.0}
+{"step": 5, "seconds": 1.8459154979937011, "loss": 2.4943978786468506, "tokens": 3443.0}
+{"step": 6, "seconds": 1.8408581969997613, "loss": 2.7421011924743652, "tokens": 3441.0}
+[W920 01:54:27.067244282 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1384120320 bytes (free: 1244004352, total: 47667740672).
+{"step": 7, "seconds": 2.8964197330060415, "loss": 2.3310904502868652, "tokens": 3443.0}

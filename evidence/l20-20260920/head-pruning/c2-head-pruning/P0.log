@@ -1,0 +1,19 @@
+Loading weights:   0%|          | 0/398 [00:00<?, ?it/s]Loading weights:   5%|▍         | 18/398 [00:00<00:05, 70.32it/s]Loading weights:   7%|▋         | 26/398 [00:00<00:16, 22.91it/s]Loading weights:   8%|▊         | 30/398 [00:01<00:18, 19.63it/s]Loading weights:  11%|█         | 42/398 [00:01<00:17, 20.90it/s]Loading weights:  11%|█▏        | 45/398 [00:02<00:31, 11.34it/s]Loading weights:  17%|█▋        | 66/398 [00:03<00:15, 22.02it/s]Loading weights:  18%|█▊        | 70/398 [00:04<00:33,  9.75it/s]Loading weights:  18%|█▊        | 73/398 [00:05<00:31, 10.21it/s]Loading weights:  19%|█▉        | 75/398 [00:06<00:50,  6.42it/s]Loading weights:  19%|█▉        | 77/398 [00:06<00:46,  6.89it/s]Loading weights:  20%|█▉        | 79/398 [00:06<00:46,  6.81it/s]Loading weights:  20%|██        | 81/398 [00:07<01:02,  5.09it/s]Loading weights:  32%|███▏      | 127/398 [00:07<00:08, 33.28it/s]Loading weights:  35%|███▍      | 138/398 [00:08<00:10, 24.78it/s]Loading weights:  37%|███▋      | 146/398 [00:09<00:10, 23.11it/s]Loading weights:  38%|███▊      | 152/398 [00:09<00:11, 20.66it/s]Loading weights:  39%|███▉      | 157/398 [00:10<00:14, 16.74it/s]Loading weights:  40%|████      | 161/398 [00:10<00:13, 17.24it/s]Loading weights:  41%|████      | 164/398 [00:11<00:20, 11.26it/s]Loading weights:  42%|████▏     | 167/398 [00:11<00:23,  9.85it/s]Loading weights: 100%|██████████| 398/398 [00:11<00:00, 34.22it/s]
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+/usr/local/lib/python3.12/dist-packages/torch/nn/attention/flex_attention.py:2481: UserWarning: flex_attention called without torch.compile() - this will use an unfused implementation that materializes the full scores matrix instead of generating a fused kernel.
+
+SOLUTION: Use torch.compile(flex_attention)(...)
+
+If you want to debug your score_mod/mask_mod, you can set:
+torch.nn.attention.flex_attention._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True
+
+This will allow you to use print statements or breakpoints. Note: This doesn't work with the backwards pass and may produce incorrect results.
+  _warn_once(
+{"step": 0, "seconds": 2.9389181879960233, "loss": 12.258710861206055, "tokens": 3442.0}
+{"step": 1, "seconds": 1.7046351609897101, "loss": 5.614695072174072, "tokens": 3442.0}
+{"step": 2, "seconds": 1.6892546320013935, "loss": 4.25068998336792, "tokens": 3443.0}
+{"step": 3, "seconds": 1.6910137130034855, "loss": 3.817077875137329, "tokens": 3442.0}
+{"step": 4, "seconds": 1.684495692999917, "loss": 2.9683516025543213, "tokens": 3442.0}
+{"step": 5, "seconds": 1.6790470259875292, "loss": 2.479152202606201, "tokens": 3443.0}
+{"step": 6, "seconds": 1.6760793599969475, "loss": 2.7231781482696533, "tokens": 3441.0}
+{"step": 7, "seconds": 1.6951109469955554, "loss": 2.3179128170013428, "tokens": 3443.0}

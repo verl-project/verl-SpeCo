@@ -1,0 +1,39 @@
+{
+  "scope": "target feature collection plus full drafter training; no rollout publication",
+  "source": "/experiment/variants/partition-e2e/verl_speco/backends/peagle_trainer_backend.py",
+  "source_sha256": "933a15d52f8553c92db7287c164f3c0c99968060fdd9439a12526d7b3ed00120",
+  "input_sha256": "2db0ec9f2348041859f8d861bb01baca55e0ccd4b22d2879dc27888ee37f420a",
+  "partitions": 2,
+  "tokens": 1024,
+  "step_seconds": [
+    1.6907731630053604,
+    1.6987683230108814,
+    1.703691054994124,
+    1.7008436869946308,
+    1.7043367019941797
+  ],
+  "losses": [
+    12.258710861206055,
+    5.614695072174072,
+    4.25068998336792,
+    3.817077875137329,
+    2.9683516025543213,
+    2.479152202606201,
+    2.7231781482696533,
+    2.3179128170013428
+  ],
+  "sampled_counts": [
+    3442.0,
+    3442.0,
+    3443.0,
+    3442.0,
+    3442.0,
+    3443.0,
+    3441.0,
+    3443.0
+  ],
+  "peak_allocated_bytes": 15282227200,
+  "peak_reserved_bytes": 23223861248,
+  "torch": "2.13.0+cu130",
+  "gpu": "NVIDIA L20"
+}

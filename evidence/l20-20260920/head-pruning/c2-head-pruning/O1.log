@@ -1,0 +1,20 @@
+Loading weights:   0%|          | 0/398 [00:00<?, ?it/s]Loading weights: 100%|██████████| 398/398 [00:00<00:00, 4661.98it/s]
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+/usr/local/lib/python3.12/dist-packages/torch/nn/attention/flex_attention.py:2481: UserWarning: flex_attention called without torch.compile() - this will use an unfused implementation that materializes the full scores matrix instead of generating a fused kernel.
+
+SOLUTION: Use torch.compile(flex_attention)(...)
+
+If you want to debug your score_mod/mask_mod, you can set:
+torch.nn.attention.flex_attention._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True
+
+This will allow you to use print statements or breakpoints. Note: This doesn't work with the backwards pass and may produce incorrect results.
+  _warn_once(
+{"step": 0, "seconds": 3.018761295999866, "loss": 12.258712768554688, "tokens": 3442.0}
+{"step": 1, "seconds": 1.856059068988543, "loss": 5.616039752960205, "tokens": 3442.0}
+{"step": 2, "seconds": 1.867172889993526, "loss": 4.251337051391602, "tokens": 3443.0}
+{"step": 3, "seconds": 1.8677658029919257, "loss": 3.8099844455718994, "tokens": 3442.0}
+{"step": 4, "seconds": 1.8965155759942718, "loss": 2.9702868461608887, "tokens": 3442.0}
+{"step": 5, "seconds": 2.01034187899495, "loss": 2.4943978786468506, "tokens": 3443.0}
+{"step": 6, "seconds": 1.82962803299597, "loss": 2.7421011924743652, "tokens": 3441.0}
+[W920 01:58:57.201626159 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1384120320 bytes (free: 1244004352, total: 47667740672).
+{"step": 7, "seconds": 2.366789815001539, "loss": 2.3310904502868652, "tokens": 3443.0}

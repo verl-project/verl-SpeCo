@@ -96,3 +96,56 @@ def test_partition_count_must_be_positive():
             ),
             sequence_partitions=0,
         )
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_pruned_head_matches_full_masked_loss(monkeypatch, active):
+    torch.manual_seed(29)
+    draft = LlamaForCausalLMPeagle(
+        PeagleConfig(
+            hidden_size=16,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            num_draft_layers=2,
+            vocab_size=32,
+            draft_vocab_size=16,
+            mask_token_id=31,
+            num_depths=3,
+        )
+    )
+    model = backend.PEagleTrainingModel(draft, num_depths=3)
+    mask = torch.tensor([[0, 1, 1, 0, 1, 1, 1, 0]]) * active
+    anchors, depths = backend.generate_cod_sample_indices(8, mask, num_depths=3)
+    monkeypatch.setattr(
+        backend, "generate_cod_sample_indices", lambda **kwargs: (anchors, depths)
+    )
+    captured = []
+    forward = draft.forward_peagle
+
+    def capture(**kwargs):
+        hidden = forward(**kwargs)
+        captured.append(hidden)
+        return hidden
+
+    monkeypatch.setattr(draft, "forward_peagle", capture)
+    targets = torch.randn(1, 8, 32)
+    num, _, _ = model(
+        torch.randint(0, 31, (1, 8)),
+        torch.randn(1, 8, 48),
+        mask,
+        torch.ones(1, 8),
+        targets,
+        torch.tensor([8]),
+    )
+    positions = anchors + depths
+    full_loss = backend._kl_div_loss(
+        draft.compute_logits(captured[0])[0],
+        targets[0, positions].index_select(-1, draft.selected_token_ids()),
+    )
+    reference = (full_loss * mask[0, positions]).sum()
+    torch.testing.assert_close(num, reference, atol=2e-5, rtol=2e-5)
+    parameters = [p for p in draft.parameters() if p.requires_grad]
+    actual_grad = torch.autograd.grad(num, parameters, retain_graph=True)
+    reference_grad = torch.autograd.grad(reference, parameters)
+    torch.testing.assert_close(actual_grad, reference_grad, atol=2e-5, rtol=2e-4)
