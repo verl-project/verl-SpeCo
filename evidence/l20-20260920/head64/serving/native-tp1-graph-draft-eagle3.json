@@ -1,0 +1,66 @@
+{
+  "mode": "draft-eagle3",
+  "token_ids": [
+    [
+      144,
+      144,
+      144,
+      144,
+      144,
+      144,
+      144,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242
+    ],
+    [
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235
+    ]
+  ],
+  "parameters": [
+    {
+      "rank": 0,
+      "tp": 1,
+      "class": "Eagle3LlamaForCausalLM",
+      "compared_logical_tensors": 25,
+      "runtime_only_parameters": [
+        "model.layers.1.hidden_norm.weight"
+      ]
+    }
+  ],
+  "sync_scheduling": false,
+  "tp": 1,
+  "graph": true,
+  "attention_backend": "auto",
+  "graph_execution": [
+    {
+      "captures": 17,
+      "replays": 272,
+      "roles": {
+        "PiecewiseBackend": 212,
+        "LlamaForCausalLM": 60
+      }
+    }
+  ]
+}

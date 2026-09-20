@@ -77,18 +77,20 @@ def check_parameters(worker, checkpoint):
             projection = name.rpartition(".")[0].rpartition(".")[2]
             if projection in {"q_proj", "k_proj", "v_proj"}:
                 target = target.replace(projection, "qkv_proj")
-                widths = {
-                    "q_proj": (0, 64 // tp),
-                    "k_proj": (64 // tp, 96 // tp),
-                    "v_proj": (96 // tp, 128 // tp),
-                }
-                start, end = widths[projection]
+                prefix = name.rsplit(".", 2)[0]
+                q_width = expected[f"{prefix}.q_proj.weight"].shape[0] // tp
+                k_width = expected[f"{prefix}.k_proj.weight"].shape[0] // tp
+                start = {"q_proj": 0, "k_proj": q_width, "v_proj": q_width + k_width}[
+                    projection
+                ]
+                end = start + value.shape[0] // tp
                 actual = parameters[target][start:end]
                 value = value.chunk(tp, dim=0)[rank]
             elif projection in {"gate_proj", "up_proj"}:
                 target = target.replace(projection, "gate_up_proj")
-                start = 0 if projection == "gate_proj" else 128 // tp
-                actual = parameters[target][start : start + 128 // tp]
+                width = value.shape[0] // tp
+                start = 0 if projection == "gate_proj" else width
+                actual = parameters[target][start : start + width]
                 value = value.chunk(tp, dim=0)[rank]
             else:
                 actual = parameters[target]

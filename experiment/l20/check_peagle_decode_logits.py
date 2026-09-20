@@ -62,6 +62,9 @@ for record in records:
         )
         actual = model.compute_logits(hidden)[0, start:end].float().cpu()
     expected = record["logits"][valid].float()
+    actual_top = actual.topk(2, dim=-1)
+    expected_top = expected.topk(2, dim=-1)
+    mismatched = actual.argmax(-1) != expected.argmax(-1)
     result = {
         "start": start,
         "end": end,
@@ -69,13 +72,25 @@ for record in records:
         "masked_rows": int((inputs["input_ids"] == model.config.mask_token_id).sum()),
         "max_logit_error": float((actual - expected).abs().max()),
         "argmax_equal": torch.equal(actual.argmax(-1), expected.argmax(-1)),
+        "mismatched_rows": mismatched.nonzero().flatten().tolist(),
+        "reference_top2_gap": (actual_top.values[:, 0] - actual_top.values[:, 1])[
+            mismatched
+        ].tolist(),
+        "serving_top2_gap": (expected_top.values[:, 0] - expected_top.values[:, 1])[
+            mismatched
+        ].tolist(),
+        "logits_close": bool(
+            torch.isclose(actual, expected, atol=0.01, rtol=0.02).all()
+        ),
     }
     results.append(result)
     (evidence / f"{args.prefix}-decode-parity.json").write_text(
         json.dumps(results, indent=2) + "\n"
     )
-    torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.02)
-    assert result["argmax_equal"]
+assert all(row["logits_close"] for row in results), "Draft logits exceed tolerance"
+assert all(row["argmax_equal"] for row in results), (
+    "Draft argmax mismatch; see per-call diagnostics"
+)
 print(
     json.dumps(
         {

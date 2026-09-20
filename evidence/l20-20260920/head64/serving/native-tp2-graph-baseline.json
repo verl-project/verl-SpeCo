@@ -1,0 +1,63 @@
+{
+  "mode": "baseline",
+  "token_ids": [
+    [
+      144,
+      144,
+      144,
+      144,
+      144,
+      144,
+      144,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242
+    ],
+    [
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235
+    ]
+  ],
+  "sync_scheduling": false,
+  "tp": 2,
+  "graph": true,
+  "attention_backend": "FLASH_ATTN",
+  "graph_execution": [
+    {
+      "captures": 21,
+      "replays": 80,
+      "roles": {
+        "PiecewiseBackend": 20,
+        "LlamaForCausalLM": 60
+      }
+    },
+    {
+      "captures": 21,
+      "replays": 80,
+      "roles": {
+        "PiecewiseBackend": 20,
+        "LlamaForCausalLM": 60
+      }
+    }
+  ]
+}

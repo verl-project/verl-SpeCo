@@ -1,0 +1,34 @@
+[
+  {
+    "start": 0,
+    "end": 5,
+    "padding_rows": 0,
+    "masked_rows": 2,
+    "max_logit_error": 0.005126953125,
+    "argmax_equal": true
+  },
+  {
+    "start": 3,
+    "end": 6,
+    "padding_rows": 3,
+    "masked_rows": 2,
+    "max_logit_error": 0.00390625,
+    "argmax_equal": true
+  },
+  {
+    "start": 4,
+    "end": 7,
+    "padding_rows": 3,
+    "masked_rows": 2,
+    "max_logit_error": 0.005859375,
+    "argmax_equal": true
+  },
+  {
+    "start": 5,
+    "end": 8,
+    "padding_rows": 3,
+    "masked_rows": 2,
+    "max_logit_error": 0.0048828125,
+    "argmax_equal": false
+  }
+]

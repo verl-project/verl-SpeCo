@@ -1,0 +1,55 @@
+{
+  "mode": "baseline",
+  "token_ids": [
+    [
+      144,
+      144,
+      144,
+      144,
+      144,
+      144,
+      144,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242
+    ],
+    [
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235
+    ]
+  ],
+  "sync_scheduling": false,
+  "tp": 1,
+  "graph": true,
+  "attention_backend": "auto",
+  "graph_execution": [
+    {
+      "captures": 21,
+      "replays": 80,
+      "roles": {
+        "PiecewiseBackend": 20,
+        "LlamaForCausalLM": 60
+      }
+    }
+  ]
+}

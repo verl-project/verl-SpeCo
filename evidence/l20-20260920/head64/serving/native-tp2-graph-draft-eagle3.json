@@ -1,0 +1,83 @@
+{
+  "mode": "draft-eagle3",
+  "token_ids": [
+    [
+      144,
+      144,
+      144,
+      144,
+      144,
+      144,
+      144,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242,
+      242
+    ],
+    [
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235,
+      235
+    ]
+  ],
+  "parameters": [
+    {
+      "rank": 0,
+      "tp": 2,
+      "class": "Eagle3LlamaForCausalLM",
+      "compared_logical_tensors": 25,
+      "runtime_only_parameters": [
+        "model.layers.1.hidden_norm.weight"
+      ]
+    },
+    {
+      "rank": 1,
+      "tp": 2,
+      "class": "Eagle3LlamaForCausalLM",
+      "compared_logical_tensors": 25,
+      "runtime_only_parameters": [
+        "model.layers.1.hidden_norm.weight"
+      ]
+    }
+  ],
+  "sync_scheduling": false,
+  "tp": 2,
+  "graph": true,
+  "attention_backend": "FLASH_ATTN",
+  "graph_execution": [
+    {
+      "captures": 17,
+      "replays": 272,
+      "roles": {
+        "PiecewiseBackend": 212,
+        "LlamaForCausalLM": 60
+      }
+    },
+    {
+      "captures": 17,
+      "replays": 272,
+      "roles": {
+        "PiecewiseBackend": 212,
+        "LlamaForCausalLM": 60
+      }
+    }
+  ]
+}
