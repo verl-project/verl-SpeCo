@@ -39,6 +39,7 @@ except ImportError:  # CPU-only development and eager fallback.
 
 
 FusedLossBackend = Literal["cuda", "ascend"]
+MAX_FUSED_SIZE = 131072
 MAX_FUSED_SIZE_NPU = 4096
 _N_STATS = 5
 
@@ -105,41 +106,22 @@ if triton is not None:
     _OP_LABEL_CE = tl.constexpr(0)
     _OP_TV = tl.constexpr(1)
 
-    def _is_npu_available() -> bool:
-        try:
-            import torch_npu  # noqa: F401
-        except ImportError:
-            return False
-        npu = getattr(torch, "npu", None)
-        return npu is not None and bool(npu.is_available())
-
-    def _tile_configs():
-        if _is_npu_available():
-            # Ascend UB overflows above 4096 for the two-row TV kernel.
-            return [triton.Config({"BLOCK_SIZE": MAX_FUSED_SIZE_NPU}, num_warps=4)]
-        block_sizes = (512, 1024, 2048, 4096, 8192, 16384, 32768)
-        threads = (128, 256, 512, 1024)
-        warp_size = 64 if getattr(torch.version, "hip", None) is not None else 32
-        return [
-            triton.Config({"BLOCK_SIZE": block}, num_warps=n_threads // warp_size)
-            for n_threads in threads
-            for block in block_sizes
-            if 4 <= block // n_threads <= 128
-        ]
-
-    def _prune_oversized_tiles(configs, nargs, **_):
-        cap = triton.next_power_of_2(nargs["n_cols"])
-        keep = [config for config in configs if config.kwargs["BLOCK_SIZE"] <= cap]
-        if keep:
-            return keep
-        floor = min(config.kwargs["BLOCK_SIZE"] for config in configs)
-        return [config for config in configs if config.kwargs["BLOCK_SIZE"] == floor]
-
-    _autotune_tile = triton.autotune(
-        configs=_tile_configs(),
-        key=["n_cols", "OP"],
-        prune_configs_by={"early_config_prune": _prune_oversized_tiles},
-    )
+    def _calculate_settings(n_cols: int, device: torch.device) -> tuple[int, int]:
+        """Match speculators' deterministic fused-loss launch policy."""
+        max_size = MAX_FUSED_SIZE_NPU if device.type == "npu" else MAX_FUSED_SIZE
+        block_size = min(triton.next_power_of_2(n_cols), max_size)
+        # Use speculators' fixed vocabulary-size heuristic on every backend;
+        # Ascend's smaller cap additionally avoids UB overflow.
+        num_warps = 4
+        if block_size >= 32768:
+            num_warps = 32
+        elif block_size >= 8192:
+            num_warps = 16
+        elif block_size >= 2048:
+            num_warps = 8
+        if getattr(torch.version, "hip", None) is not None:
+            num_warps //= 2
+        return block_size, num_warps
 
     @triton.jit
     def _online_stats(row_ptr, n_cols, BLOCK_SIZE: tl.constexpr):
@@ -157,7 +139,6 @@ if triton is not None:
             m = m_new
         return m, d
 
-    @_autotune_tile
     @triton.jit
     def _loss_forward_kernel(
         logits_ptr,
@@ -204,7 +185,6 @@ if triton is not None:
             tl.store(loss_ptr + pid, 1.0 - overlap)
             tl.store(stats_ptr + 4 * stats_row + pid, draft_small)
 
-    @_autotune_tile
     @triton.jit
     def _loss_backward_kernel(
         logits_ptr,
@@ -265,6 +245,7 @@ if triton is not None:
             stats = torch.empty(
                 _N_STATS, rows, device=logits.device, dtype=torch.float32
             )
+            block_size, num_warps = _calculate_settings(vocab, logits.device)
             _loss_forward_kernel[(rows,)](
                 logits_flat,
                 targets_flat,
@@ -274,15 +255,19 @@ if triton is not None:
                 stats.stride(0),
                 vocab,
                 OP=op,
+                BLOCK_SIZE=block_size,
+                num_warps=num_warps,
             )
             ctx.save_for_backward(logits_flat, targets_flat, stats)
             ctx.op = op
+            ctx.settings = (block_size, num_warps)
             return loss
 
         @staticmethod
         def backward(ctx, grad_output):
             logits, targets, stats = ctx.saved_tensors
             rows, vocab = logits.shape
+            block_size, num_warps = ctx.settings
             grad_logits = torch.empty_like(logits)
             _loss_backward_kernel[(rows,)](
                 logits,
@@ -293,6 +278,8 @@ if triton is not None:
                 stats.stride(0),
                 vocab,
                 OP=ctx.op,
+                BLOCK_SIZE=block_size,
+                num_warps=num_warps,
             )
             return grad_logits, None, None, None
 

@@ -176,6 +176,72 @@ def test_dspark_forced_fused_loss_fails_closed_on_cpu():
         model._use_fused_distribution_loss(torch.device("cpu"))
 
 
+def test_dspark_fused_l1_honors_chunk_size(monkeypatch):
+    model = _small_dspark_training_model(l1_loss_alpha=1.0, l1_chunk_size=2)
+    rows = 5
+    vocab = model.draft_model.config.vocab_size
+    hidden_size = model.draft_model.config.hidden_size
+    active_hidden = torch.randn(rows, hidden_size)
+    active_target_hidden = torch.randn(rows, hidden_size)
+    active_prev_tokens = torch.arange(rows, dtype=torch.long)
+    active_weights = torch.linspace(0.5, 1.0, rows)
+    lm_head_weight = torch.randn(vocab, hidden_size)
+    active_draft_logits = torch.randn(rows, vocab, requires_grad=True)
+    chunk_rows = []
+
+    def eager_total_variation(draft_logits, target_logits):
+        chunk_rows.append(int(draft_logits.size(0)))
+        draft_probs = torch.softmax(draft_logits.float(), dim=-1)
+        target_probs = torch.softmax(target_logits.float(), dim=-1)
+        return 0.5 * (draft_probs - target_probs).abs().sum(dim=-1)
+
+    monkeypatch.setattr(
+        dspark_backend, "fused_total_variation", eager_total_variation
+    )
+    l1_sum, l1_den = model._compute_fused_l1_loss_for_active(
+        active_hidden=active_hidden,
+        active_prev_tokens=active_prev_tokens,
+        active_target_hidden=active_target_hidden,
+        active_weights=active_weights,
+        lm_head_weight=lm_head_weight,
+        active_draft_logits=active_draft_logits,
+    )
+
+    assert chunk_rows == [2, 2, 1]
+    assert l1_sum.ndim == 0
+    assert l1_den == pytest.approx(float(active_weights.sum()))
+    with torch.no_grad():
+        target_logits = torch.nn.functional.linear(
+            active_target_hidden, lm_head_weight
+        )
+        expected_l1 = (
+            (
+                torch.softmax(active_draft_logits.float(), dim=-1)
+                - torch.softmax(target_logits.float(), dim=-1)
+            )
+            .abs()
+            .sum(dim=-1)
+            .mul(active_weights)
+            .sum()
+        )
+    torch.testing.assert_close(l1_sum.detach(), expected_l1)
+    l1_sum.backward()
+    assert active_draft_logits.grad is not None
+
+    chunk_rows.clear()
+    recomputed_sum, recomputed_den = model._compute_fused_l1_loss_for_active(
+        active_hidden=active_hidden,
+        active_prev_tokens=active_prev_tokens,
+        active_target_hidden=active_target_hidden,
+        active_weights=active_weights,
+        lm_head_weight=lm_head_weight,
+        active_draft_logits=None,
+    )
+    assert chunk_rows == [2, 2, 1]
+    assert recomputed_sum.ndim == 0
+    assert recomputed_den == pytest.approx(float(active_weights.sum()))
+
+
 def test_dspark_untrained_confidence_head_is_kept_but_excluded_from_optimizer():
     config = DSparkConfig(
         hidden_size=8,

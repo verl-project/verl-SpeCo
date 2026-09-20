@@ -366,20 +366,41 @@ class DSparkTrainingModel(DFlashTrainingModel):
         if active_hidden.numel() == 0:
             zero = active_weights.new_zeros((), dtype=torch.float32)
             return zero, zero
-        if active_draft_logits is None:
-            active_draft_logits = F.linear(active_hidden, lm_head_weight)
-            markov_bias = self._markov_bias_for_active(
-                active_hidden=active_hidden,
-                active_prev_tokens=active_prev_tokens,
-                restricted_vocab=None,
-            )
-            if markov_bias is not None:
-                active_draft_logits = active_draft_logits + markov_bias
-        with torch.no_grad():
-            target_logits = F.linear(active_target_hidden, lm_head_weight)
-        l1_per_token = 2.0 * fused_total_variation(active_draft_logits, target_logits)
-        weights = active_weights.float()
-        return (l1_per_token * weights).sum(), weights.sum()
+        active_count = int(active_hidden.size(0))
+        if active_draft_logits is not None:
+            expected_shape = (active_count, int(lm_head_weight.size(0)))
+            if tuple(active_draft_logits.shape) != expected_shape:
+                raise ValueError(
+                    "DSpark precomputed draft logits must have shape "
+                    f"{expected_shape}, got {tuple(active_draft_logits.shape)}"
+                )
+
+        l1_sum = active_weights.new_zeros((), dtype=torch.float32)
+        l1_den = active_weights.float().sum()
+        chunk_size = self.l1_chunk_size if self.l1_chunk_size > 0 else active_count
+        for start in range(0, active_count, chunk_size):
+            end = min(start + chunk_size, active_count)
+            hidden_chunk = active_hidden[start:end]
+            prev_chunk = active_prev_tokens[start:end]
+            if active_draft_logits is None:
+                draft_logits = F.linear(hidden_chunk, lm_head_weight)
+                markov_bias = self._markov_bias_for_active(
+                    active_hidden=hidden_chunk,
+                    active_prev_tokens=prev_chunk,
+                    restricted_vocab=None,
+                )
+                if markov_bias is not None:
+                    draft_logits = draft_logits + markov_bias
+            else:
+                draft_logits = active_draft_logits[start:end]
+            with torch.no_grad():
+                target_logits = F.linear(
+                    active_target_hidden[start:end], lm_head_weight
+                )
+            l1_per_token = 2.0 * fused_total_variation(draft_logits, target_logits)
+            weights_chunk = active_weights[start:end].float()
+            l1_sum = l1_sum + (l1_per_token * weights_chunk).sum()
+        return l1_sum, l1_den
 
     def _should_debug_log(self) -> bool:
         if not self.debug_log:
