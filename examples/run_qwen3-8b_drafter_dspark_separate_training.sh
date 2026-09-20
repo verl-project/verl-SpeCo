@@ -85,6 +85,8 @@ DSPARK_MARKOV_RANK=${DSPARK_MARKOV_RANK:-256}
 DSPARK_MARKOV_HEAD_TYPE=${DSPARK_MARKOV_HEAD_TYPE:-vanilla}
 DSPARK_CE_LOSS_ALPHA=${DSPARK_CE_LOSS_ALPHA:-0.1}
 DSPARK_L1_LOSS_ALPHA=${DSPARK_L1_LOSS_ALPHA:-0.45}
+# auto selects the native CUDA/Ascend fused loss when its Triton backend is available.
+DSPARK_DISTRIBUTION_LOSS_IMPL=${DSPARK_DISTRIBUTION_LOSS_IMPL:-auto}
 DSPARK_L1_CHUNK_SIZE=${DSPARK_L1_CHUNK_SIZE:-0}
 # The current DSpark trainer rejects nonzero confidence loss because target
 # acceptance labels are not part of the standalone feature protocol yet.
@@ -145,6 +147,7 @@ PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher
     actor_rollout_ref.rollout.drafter.training.dspark_markov_head_type=${DSPARK_MARKOV_HEAD_TYPE} \
     actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=${DSPARK_CE_LOSS_ALPHA} \
     actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=${DSPARK_L1_LOSS_ALPHA} \
+    actor_rollout_ref.rollout.drafter.training.dspark_distribution_loss_impl=${DSPARK_DISTRIBUTION_LOSS_IMPL} \
     actor_rollout_ref.rollout.drafter.training.dspark_l1_chunk_size=${DSPARK_L1_CHUNK_SIZE} \
     actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=${DSPARK_CONFIDENCE_LOSS_ALPHA} \
     actor_rollout_ref.rollout.drafter.training.dspark_debug_log=${DSPARK_DEBUG_LOG} \

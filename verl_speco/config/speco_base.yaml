@@ -178,6 +178,9 @@ actor_rollout_ref:
         # DeepSpec Qwen3 fixed-K default. Confidence BCE is unsupported on MRV2
         # and must not implicitly reduce the distribution-matching objective.
         dspark_l1_loss_alpha: 0.9
+        # auto | fused | eager. Fused uses the native CUDA/Ascend Triton kernel.
+        dspark_distribution_loss_impl: auto
+        # Only used by the eager fallback/reference implementation.
         dspark_l1_chunk_size: 0
         dspark_debug_log: false
         dspark_debug_log_first_n: 2

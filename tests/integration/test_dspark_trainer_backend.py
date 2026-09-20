@@ -107,6 +107,7 @@ def _small_dspark_training_model(
     l1_loss_alpha: float = 0.0,
     l1_chunk_size: int = 0,
     loss_mode: str = "full_vocab",
+    distribution_loss_impl: str = "auto",
 ):
     config = DSparkConfig(
         hidden_size=8,
@@ -134,6 +135,7 @@ def _small_dspark_training_model(
         loss_mode=loss_mode,
         l1_loss_alpha=l1_loss_alpha,
         l1_chunk_size=l1_chunk_size,
+        distribution_loss_impl=distribution_loss_impl,
     )
 
 
@@ -159,6 +161,19 @@ def test_dspark_default_loss_weights_match_deepspec():
     assert model.ce_loss_alpha == pytest.approx(0.1)
     assert model.l1_loss_alpha == pytest.approx(0.9)
     assert model.l1_chunk_size == 0
+    assert model.distribution_loss_impl == "auto"
+
+
+def test_dspark_rejects_unknown_distribution_loss_implementation():
+    with pytest.raises(ValueError, match="auto, fused, eager"):
+        _small_dspark_training_model(distribution_loss_impl="unknown")
+
+
+def test_dspark_forced_fused_loss_fails_closed_on_cpu():
+    model = _small_dspark_training_model(distribution_loss_impl="fused")
+
+    with pytest.raises(RuntimeError, match="fused distribution loss"):
+        model._use_fused_distribution_loss(torch.device("cpu"))
 
 
 def test_dspark_untrained_confidence_head_is_kept_but_excluded_from_optimizer():
@@ -215,6 +230,56 @@ def test_dspark_label_and_prev_token_alignment():
     assert target_ids.tolist() == [[[13, 14, 15, 16]]]
     assert prev_token_ids.tolist() == [[[12, 13, 14, 15]]]
     assert eval_mask.tolist() == [[[True, True, True, True]]]
+
+
+def test_dspark_target_hidden_gather_matches_reference_for_multiple_batches():
+    model = _small_dspark_training_model(block_size=3)
+    target_hidden = torch.arange(2 * 6 * 4, dtype=torch.float32).view(2, 6, 4)
+    label_indices = torch.tensor(
+        [
+            [[1, 3, 6], [2, 4, 5]],
+            [[6, 5, 4], [1, 2, 3]],
+        ],
+        dtype=torch.long,
+    )
+    block_keep_mask = torch.tensor(
+        [[True, False], [False, True]], dtype=torch.bool
+    )
+
+    actual = model._gather_aligned_target_hidden(
+        target_last_hidden_states=target_hidden,
+        label_indices=label_indices,
+        block_keep_mask=block_keep_mask,
+    )
+
+    target_pred_indices = (label_indices - 1).clamp(min=0, max=5)
+    target_pred_indices = torch.where(
+        block_keep_mask.unsqueeze(-1),
+        target_pred_indices,
+        torch.zeros_like(target_pred_indices),
+    )
+    expected = torch.gather(
+        target_hidden.unsqueeze(1).expand(-1, 2, -1, -1),
+        2,
+        target_pred_indices.unsqueeze(-1).expand(-1, -1, -1, 4),
+    )
+
+    assert actual.shape == (2, 2, 3, 4)
+    assert torch.equal(actual, expected)
+    # Masked blocks still select token zero from their own batch.  This catches
+    # a missing or incorrect batch offset in the flattened implementation.
+    assert torch.equal(actual[1, 0, 0], target_hidden[1, 0])
+
+
+def test_dspark_target_hidden_gather_rejects_batch_size_mismatch():
+    model = _small_dspark_training_model(block_size=3)
+
+    with pytest.raises(ValueError, match="batch size must match"):
+        model._gather_aligned_target_hidden(
+            target_last_hidden_states=torch.zeros(2, 6, 4),
+            label_indices=torch.ones(1, 2, 3, dtype=torch.long),
+            block_keep_mask=torch.ones(1, 2, dtype=torch.bool),
+        )
 
 
 def test_dspark_dense_attention_mask_matches_deepspec_block_contract():
