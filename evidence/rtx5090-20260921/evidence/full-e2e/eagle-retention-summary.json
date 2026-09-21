@@ -1,0 +1,23 @@
+{
+  "log": "evidence/full-e2e/online-eagle-20260921-041402.log",
+  "logged_steps": 20,
+  "first_step_seconds": 71.00223659910262,
+  "steady_mean_seconds": 29.747,
+  "total_step_seconds": 636.19,
+  "drafter_trained_metrics": 20,
+  "drafter_published_metrics": 20,
+  "public_load_events": 40,
+  "retention_checks": 38,
+  "retention_passed": 38,
+  "retention_failed": 0,
+  "retention_by_rank": {
+    "0": {
+      "passed": 19,
+      "failed": 0
+    },
+    "1": {
+      "passed": 19,
+      "failed": 0
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "verl_source": "/tmp/verl-probe",
+  "change": "Redirect only the flash_attn.bert_padding import to a pure-torch module; no other verl file is modified",
+  "attention_utils_sha256": "6ea383f5ae34db8be9f7a1115cddad615a1b7e9a8483d61f491c6222c491f3d2",
+  "vllm_fp8_utils_sha256": "2d9ac2e820327917358b899e91eade89ee165b007fea7bee5bb7ae45e5c251f8",
+  "compat_module_sha256": "d47f45754edeafc0c61cdeafb10e0fcd6fd91ee08528463d291b9139874acd8a",
+  "padding_module_sha256": "dac0c5a0299f31d4489563ccec7cfc6fef0206aa87107695a3894568fed3502c"
+}

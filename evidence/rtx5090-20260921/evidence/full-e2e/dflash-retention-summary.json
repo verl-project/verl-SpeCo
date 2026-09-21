@@ -1,0 +1,14 @@
+{
+  "log": "evidence/full-e2e/online-dflash-20260921-041402.log",
+  "logged_steps": 20,
+  "first_step_seconds": 130.88401494082063,
+  "steady_mean_seconds": 30.662,
+  "total_step_seconds": 713.468,
+  "drafter_trained_metrics": 0,
+  "drafter_published_metrics": 0,
+  "public_load_events": 0,
+  "retention_checks": 0,
+  "retention_passed": 0,
+  "retention_failed": 0,
+  "retention_by_rank": {}
+}

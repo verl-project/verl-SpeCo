@@ -1,0 +1,5 @@
+[
+  {"name": "target-qwen3-4b", "repo": "Qwen/Qwen3-4B", "rev": "main", "drop": []},
+  {"name": "eagle3-qwen3-4b", "repo": "AngelSlim/Qwen3-4B_eagle3", "rev": "main", "drop": []},
+  {"name": "dflash-qwen3-4b-b16", "repo": "z-lab/Qwen3-4B-DFlash-b16", "rev": "main", "drop": []}
+]

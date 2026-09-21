@@ -1,0 +1,6 @@
+{
+  "source": ".",
+  "original_sha256": "8ae04b0a27eb17c4a0e5c321552a3fbe774c59bfe23ac8fb2c6a0068f6b654be",
+  "audited_sha256": "9cbd9bb50492c67198a1d6c48ba16600def35057a4b33867bd349943acb9a4ca",
+  "change": "Log the public draft fingerprint after a committed draft update and after target sync; no loader logic changes"
+}
