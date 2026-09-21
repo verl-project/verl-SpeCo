@@ -1,0 +1,16 @@
+# SPECO online PPO trainer primary config.
+
+defaults:
+  - ppo_trainer
+  - speco_base
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+# On verl 0.9 SPECO subclasses the legacy RayPPOTrainer (use_v1=false) to inject
+# online drafter training and atomic rollout weight publication.  verl 0.8 does
+# not consume this selector, so retaining it is backward compatible.
+trainer:
+  use_v1: false

@@ -1,0 +1,4 @@
+removed=/home/gongji/0z5a-work/speco-retention/models/target-qwen3-4b
+bytes=8060929160
+reason=C5 DFlash root-cause debug complete (issue #99); logs archived
+kept=eagle3-qwen3-4b,dflash-qwen3-4b-b16,eagle-training-alias,nfs_touched=false,machine_restarted=false

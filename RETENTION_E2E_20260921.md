@@ -83,7 +83,13 @@ all 20 steps, so a DFLASH retention audit would be vacuous even if the checks we
 The row counts prove this is not the padding shim: the shim produces exact row counts on the
 same `left_right_2_no_padding` path. The 34-vs-33 mismatch is between captured hidden-state rows
 and input/mask rows inside the DFLASH feature path. This is a separate defect from the C5
-retention item and needs its own root cause before DFLASH can be reported on `main`.
+retention item. Its root cause was located after this report and filed as
+[verl-SpeCo#99](https://github.com/verl-project/verl-SpeCo/issues/99): in the `dflash_aux` layout the
+token-indexed inputs carry 34 rows (`ids=(34,)`, `loss_mask=(34,)`, `prompts=(38,)`,
+`responses=(64,)`) while the captured hidden rows carry 33 (`hidden_states=(33, 12800)`) because the
+hidden rows are indexed by `hidden_positions`. EAGLE3 is unaffected because it consumes
+`hidden_positions` directly; the DFlash backend has no position handling at all. The instrumented
+log is `evidence/rtx5090-20260921/dflash-debug/dflash-debug.log`.
 
 ## Evidence
 
