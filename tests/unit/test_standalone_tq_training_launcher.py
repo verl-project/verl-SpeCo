@@ -20,6 +20,8 @@ import threading
 from omegaconf import OmegaConf
 import pytest
 
+pytest.importorskip("torch")
+
 from verl_speco.standalone_tq_training_launcher import (
     _preflight_input_file,
     _producer_max_samples,

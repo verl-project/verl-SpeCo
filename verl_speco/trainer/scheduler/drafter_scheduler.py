@@ -107,6 +107,7 @@ class DrafterScheduler:
         self._publish_executor = publish_executor
         self.collection_strategy = SyncCollectionStrategy()
         self._collection_executor = collection_executor
+        self._collection_sequence = 0
         self._collection_adapters: dict[
             DrafterCollectionSource, DrafterCollectionAdapter
         ] = {
@@ -236,6 +237,19 @@ class DrafterScheduler:
     ) -> bool:
         return step_matches_interval(global_step, config.collect_interval_steps)
 
+    def _next_collection_id(
+        self, source: DrafterCollectionSource, global_step: object
+    ) -> str:
+        try:
+            source_global_step = int(str(global_step))
+        except (TypeError, ValueError):
+            source_global_step = -1
+        self._collection_sequence += 1
+        return (
+            f"collection-{source_global_step:020d}-"
+            f"{self._collection_sequence:020d}-{source.value}"
+        )
+
     def plan_collection(
         self,
         context: DrafterCollectionContext,
@@ -246,7 +260,9 @@ class DrafterScheduler:
             context.global_step, config
         )
         common: Any = {
-            "collection_id": uuid4().hex,
+            "collection_id": self._next_collection_id(
+                context.source, context.global_step
+            ),
             "source": context.source,
             "source_global_step": context.global_step,
             "collect_interval_matched": collect_interval_matched,

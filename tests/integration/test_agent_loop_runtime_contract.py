@@ -55,3 +55,56 @@ def test_agent_loop_patch_supports_release_v080_llm_server_client(monkeypatch) -
     finally:
         agent_loop_runtime._CURRENT_GLOBAL_STEPS.reset(global_steps_token)
     assert sampling_params["_verl_global_steps"] == 17
+
+
+def test_agent_loop_drain_waits_for_an_inflight_async_generation(monkeypatch) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class AgentLoopWorker:
+        async def generate_sequences(self, batch):
+            started.set()
+            await release.wait()
+            return batch
+
+        async def _run_agent_loop(self, sampling_params, trajectory):
+            return sampling_params, trajectory
+
+        def _postprocess(self, inputs, input_non_tensor_batch=None, validate=False):
+            return inputs
+
+    class AgentLoopManager:
+        def __init__(self):
+            self.config = None
+
+        async def generate_sequences(self, prompts):
+            return prompts
+
+    class LLMServerClient:
+        async def generate(self, *, sampling_params):
+            return sampling_params
+
+    monkeypatch.setattr(agent_loop_runtime, "_PATCHED", False)
+    monkeypatch.setattr(
+        agent_loop_runtime,
+        "_load_agent_loop_module",
+        lambda: SimpleNamespace(
+            AgentLoopWorker=AgentLoopWorker,
+            AgentLoopManager=AgentLoopManager,
+            LLMServerClient=LLMServerClient,
+        ),
+    )
+    assert agent_loop_runtime.install_agent_loop_runtime_patch() is True
+
+    async def exercise() -> None:
+        worker = AgentLoopWorker()
+        generation = asyncio.create_task(worker.generate_sequences({}))
+        await started.wait()
+        drain = asyncio.create_task(worker.speco_drain())
+        await asyncio.sleep(0)
+        assert not drain.done()
+        release.set()
+        await generation
+        await drain
+
+    asyncio.run(exercise())

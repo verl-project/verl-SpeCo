@@ -105,7 +105,8 @@ def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
     assert "pip install -e ." not in source
     assert "uv pip install --system -e ." not in source
     assert "python -m compileall verl_speco" in source
-    assert "bash -n examples/*.sh" in source
+    assert 'find examples -type f -name "*.sh"' in source
+    assert "xargs -0 -r bash -n" in source
     assert "tests/compat" in source
     assert "tests/config" in source
     assert "tests/examples" in source

@@ -117,6 +117,27 @@ def test_sglang_collection_plan_contains_static_budget_and_metrics() -> None:
     assert plan.metrics()["drafter/collection_plan_reason"] == 7
 
 
+def test_collection_ids_are_unique_and_ordered_by_source_step() -> None:
+    scheduler = DrafterScheduler()
+    config = DrafterScheduleConfig(collect_interval_steps=1)
+    first = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=1, source=DrafterCollectionSource.OLD_LOGPROB
+        ),
+        config,
+    )
+    second = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=2, source=DrafterCollectionSource.OLD_LOGPROB
+        ),
+        config,
+    )
+
+    assert first.collection_id < second.collection_id
+    assert first.collection_id == "collection-00000000000000000001-00000000000000000001-oldlogprob"
+    assert second.collection_id == "collection-00000000000000000002-00000000000000000002-oldlogprob"
+
+
 def test_oldlogprob_collection_plan_preserves_training_interval_requirement() -> None:
     scheduler = DrafterScheduler()
     config = DrafterScheduleConfig(

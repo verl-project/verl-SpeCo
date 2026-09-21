@@ -1,0 +1,44 @@
+# SPECO Phase 1 V1 trainer overlay.
+
+defaults:
+  - ppo_trainer
+  - speco_base
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+trainer:
+  use_v1: true
+
+  v1:
+    trainer_mode: sync
+    # Async V1 normally submits its first rollout batch from on_train_begin and
+    # charges the first real vLLM/MRV2 decode to step 1. SPECO completes that
+    # same batch before trainer.fit; set false only for upstream timing parity.
+    pre_fit_rollout_warmup: true
+
+transfer_queue:
+  enable: true
+
+# V1 instantiates CriticConfig even for GRPO recipes. Keep the default local
+# model path valid when a recipe only supplies actor_rollout_ref.model.path.
+critic:
+  model:
+    path: ${actor_rollout_ref.model.path}
+  ppo_micro_batch_size_per_gpu: ${actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu}
+
+actor_rollout_ref:
+  rollout:
+    # Ascend registers its HCCL checkpoint engine under the upstream "nccl" name.
+    # This is required by V1 separate_async, which has standalone rollout replicas.
+    checkpoint_engine:
+      backend: nccl
+    drafter:
+      enable: true
+      enable_drafter_training: true
+      speculative_algorithm: DSPARK
+      training:
+        collect_hidden_states_from_sgl: false
+        collect_hidden_states_from_old_logprob: true

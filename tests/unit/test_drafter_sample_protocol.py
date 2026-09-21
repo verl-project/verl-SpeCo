@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.trainer.feature_store import DraftFeatureSample
 from verl_speco.transport.drafter_sample_protocol import (

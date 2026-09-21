@@ -14,10 +14,14 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("torch")
+
 from verl_speco.trainer import checkpoint as checkpoint_utils
+from verl_speco.trainer.base_trainer import DrafterBaseTrainer
 from verl_speco.trainer.checkpoint import (
     DrafterCheckpointMetadataError,
     get_drafter_checkpoint_metadata,
@@ -29,6 +33,27 @@ from verl_speco.trainer.checkpoint import (
     resolve_drafter_checkpoint_path,
     trim_process_host_memory,
 )
+
+
+def test_checkpoint_buffer_state_preserves_nonempty_samples_and_versions() -> None:
+    trainer = SimpleNamespace(
+        use_data_buffer=True,
+        buffer_version=7,
+        current_rl_step=3,
+        data_buffer=SimpleNamespace(_current_step=2, buffer=["sample-a", "sample-b"]),
+        collected_data=["pending"],
+    )
+
+    state = DrafterBaseTrainer._speco_checkpoint_buffer_state(trainer)
+
+    assert state == {
+        "version": 1,
+        "buffer_version": 7,
+        "current_rl_step": 3,
+        "data_buffer_step": 2,
+        "data_buffer": ["sample-a", "sample-b"],
+        "collected_data": ["pending"],
+    }
 
 
 def test_drafter_checkpoint_reads_nested_trainer_state(tmp_path) -> None:
