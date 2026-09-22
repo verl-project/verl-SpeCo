@@ -59,6 +59,35 @@ def test_before_actor_update_plans_then_prepares() -> None:
     scheduler.prepare_training_execution.assert_called_once_with(plan)
 
 
+def test_before_actor_update_frozen_plan_skips_prepare() -> None:
+    scheduler = DrafterScheduler()
+    plan = _training_plan()
+    scheduler.prepare_training_plan = Mock(return_value=plan)
+    # NOTE: prepare_training_execution is intentionally NOT mocked: with no
+    # worker executor bound, a launch=True plan would raise RuntimeError. The
+    # frozen context must flip the plan to launch=False, which returns the
+    # synced=0 marker without any worker RPC (no target lm-head sync).
+    context = BeforeActorUpdateContext(
+        schedule_context=DrafterScheduleContext(
+            global_step=4,
+            training_mode="online",
+            collected_samples_this_step=1,
+            oldlogprob_collection_requested=False,
+        ),
+        config=DrafterScheduleConfig(),
+        drafter_frozen=True,
+    )
+
+    outcome = scheduler.on_before_actor_update(context)
+
+    assert outcome.training_plan is not plan
+    assert outcome.training_plan.launch is False
+    assert outcome.training_plan.reason == "drafter_convergence_frozen"
+    assert outcome.training_plan.interval_matched is True
+    assert outcome.metrics["drafter/target_lm_head_synced"] == 0
+    scheduler.prepare_training_plan.assert_called_once()
+
+
 def test_after_actor_update_executes_prepared_plan() -> None:
     scheduler = DrafterScheduler()
     execution = ExecutionOutcome(
