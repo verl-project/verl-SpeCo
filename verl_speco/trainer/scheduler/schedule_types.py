@@ -354,6 +354,7 @@ class TrainingPlan:
         "inconsistent_target_version": 13,
         "inconsistent_data_version": 14,
         "worker_preflight_failed": 15,
+        "drafter_convergence_frozen": 16,
     }
 
     def to_worker_payload(self) -> dict[str, object]:
