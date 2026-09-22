@@ -925,6 +925,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 require_training_interval=(
                     source is DrafterCollectionSource.OLD_LOGPROB
                 ),
+                total_training_steps=self._speco_total_training_steps(),
             ),
             self._speco_drafter_schedule_config(),
         )
@@ -973,6 +974,35 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         training_cfg = self._speco_drafter_training_config()
         return str(training_cfg.get("mode", "online") or "online").strip().lower()
 
+    def _speco_total_training_steps(self) -> int | None:
+        """Return the main-model training horizon, or None when unavailable."""
+        value = getattr(self, "total_training_steps", None)
+        if value is None:
+            value = _get_nested(self.config, ("data", "total_training_steps"), None)
+        if value is None:
+            value = _get_nested(
+                self.config, ("algorithm", "total_training_steps"), None
+            )
+        try:
+            total = int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+        return total if total is not None and total > 0 else None
+
+    def _speco_prev_acceptance_length(self) -> float | None:
+        """Return the latest rollout mean acceptance length, if any.
+
+        Planning happens after the current-step rollout, whose drafter weights
+        are the ones about to be trained, so the acceptance it measured is the
+        correct feedback for the adaptive training budget.  Absent or
+        non-numeric values degrade to the neutral acceptance factor.
+        """
+        return _speco_metric_float(
+            self._speco_current_step_rollout_metrics().get(
+                SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC
+            )
+        )
+
     def _speco_drafter_schedule_context(self) -> DrafterScheduleContext:
         return DrafterScheduleContext(
             global_step=self.global_steps,
@@ -988,6 +1018,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 self._speco_get_drafter_runtime_state().status
                 in {DrafterRuntimeStatus.SUBMITTED, DrafterRuntimeStatus.RUNNING}
             ),
+            total_training_steps=self._speco_total_training_steps(),
+            prev_acceptance_length=self._speco_prev_acceptance_length(),
         )
 
     def _speco_on_before_actor_update(self):
@@ -1010,6 +1042,59 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             plan.interval_matched,
             plan.max_batches,
             plan.publish_after_success,
+        )
+
+    @staticmethod
+    def _speco_drafter_train_steps_metric(
+        train_metrics: dict[str, Any],
+    ) -> dict[str, int]:
+        """Return the drafter optimizer steps executed by the step that just ran.
+
+        Published as a per-step curve: the value is how many optimizer steps
+        this round trained, and a round that trained nothing contributes no
+        point at all instead of a zero that reads as "trained 0 steps".  Same
+        quantity as ``drafter/train_successful_steps_max``, which stays present
+        on every step for the other consumers.
+        """
+
+        if not bool(train_metrics.get("drafter/trained", 0)):
+            return {}
+        trained_steps = int(
+            train_metrics.get("drafter/train_successful_steps_max", 0) or 0
+        )
+        if trained_steps <= 0:
+            return {}
+        return {"drafter/train_steps": trained_steps}
+
+    def _speco_log_adaptive_drafter_schedule(
+        self,
+        training_plan: TrainingPlan,
+        train_metrics: dict[str, Any],
+    ) -> None:
+        """Report the adaptive drafter schedule of the step that just ran.
+
+        Only emitted while ``adaptive_schedule.enable`` is true, because the
+        rollout acceptance length and the resulting optimizer-step count only
+        mean something together when the adaptive budget is in charge.
+        """
+
+        config = self._speco_drafter_schedule_config()
+        if not config.adaptive_schedule_enabled:
+            return
+        acceptance = self._speco_prev_acceptance_length()
+        logger.warning(
+            "[AdaptiveSchedule] step=%s warmup=%d interval_matched=%d launch=%d "
+            "reason=%s acceptance_length=%s budget_steps=%d trained_steps=%d "
+            "trained=%d",
+            training_plan.source_global_step,
+            int(training_plan.warmup_active),
+            int(training_plan.interval_matched),
+            int(training_plan.launch),
+            training_plan.reason,
+            "n/a" if acceptance is None else f"{acceptance:.4f}",
+            training_plan.max_batches,
+            int(train_metrics.get("drafter/train_successful_steps_max", 0) or 0),
+            int(bool(train_metrics.get("drafter/trained", 0))),
         )
 
     def _speco_set_drafter_global_step(self):
@@ -2562,6 +2647,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
                 train_metrics.update(self._speco_get_drafter_runtime_state().metrics())
             metrics.update(train_metrics)
+            metrics.update(self._speco_drafter_train_steps_metric(train_metrics))
+            self._speco_log_adaptive_drafter_schedule(training_plan, train_metrics)
             if defer_publish_until_update_weights and drafter_trained:
                 pending_drafter_publish["ready"] = True
                 pending_drafter_publish["drafter_trained"] = drafter_trained

@@ -21,6 +21,7 @@ remain unchanged.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
@@ -37,7 +38,11 @@ from verl_speco.trainer.scheduler.schedule_types import (
     _as_int,
 )
 from verl_speco.trainer.scheduler.execution_strategy import SyncExecutionStrategy
-from verl_speco.trainer.scheduler.training_budget import SyncTrainingBudgetPolicy
+from verl_speco.trainer.scheduler.training_budget import (
+    AdaptiveTrainingBudgetPolicy,
+    SyncTrainingBudgetPolicy,
+    adaptive_warmup_window_end,
+)
 from verl_speco.trainer.scheduler.training_trigger import IntervalAndBufferTrigger
 from verl_speco.trainer.scheduler.worker_executor import DrafterWorkerExecutor
 from verl_speco.trainer.scheduler.publish_executor import DrafterPublishExecutor
@@ -100,6 +105,7 @@ class DrafterScheduler:
     ) -> None:
         self.trigger_policy = IntervalAndBufferTrigger()
         self.sync_budget_policy = SyncTrainingBudgetPolicy()
+        self.adaptive_budget_policy = AdaptiveTrainingBudgetPolicy()
         self.sync_execution_strategy = SyncExecutionStrategy()
         self._worker_executor = worker_executor
         self.data_status_policy = ConservativeTrainingDataStatusPolicy()
@@ -171,7 +177,7 @@ class DrafterScheduler:
     ) -> TrainingPlan:
         """Build a plan while avoiding worker RPCs for cheap skip conditions."""
 
-        interval_matched = self.training_interval_matched(context.global_step, config)
+        interval_matched = self.trigger_interval_matched(context, config)
         if (
             context.training_mode == "collect_only"
             or context.pending_training_count > 0
@@ -188,17 +194,9 @@ class DrafterScheduler:
         data_status = context.data_status or self.inspect_training_data(
             global_step=context.global_step, config=config
         )
-        return self.plan_training(
-            DrafterScheduleContext(
-                global_step=context.global_step,
-                training_mode=context.training_mode,
-                collected_samples_this_step=context.collected_samples_this_step,
-                oldlogprob_collection_requested=context.oldlogprob_collection_requested,
-                data_status=data_status,
-                pending_training_count=context.pending_training_count,
-            ),
-            config,
-        )
+        # Copy the whole context: the adaptive schedule reads fields beyond
+        # data_status that a hand-built context would drop.
+        return self.plan_training(replace(context, data_status=data_status), config)
 
     def prepare_training_execution(self, plan: TrainingPlan) -> dict[str, Any]:
         if not plan.launch:
@@ -241,9 +239,17 @@ class DrafterScheduler:
         context: DrafterCollectionContext,
         config: DrafterScheduleConfig,
     ) -> CollectionPlan:
-        collect_interval_matched = self.should_collect(context.global_step, config)
-        training_interval_matched = self.training_interval_matched(
-            context.global_step, config
+        """Decide target-feature collection for one main step.
+
+        Inside the adaptive warmup window both interval gates count as reached,
+        so features are collected on the same step they are trained on.
+        """
+
+        interval_matched = self.should_collect(context.global_step, config)
+        warmup_active = self.adaptive_warmup_active(context, config)
+        collect_interval_matched = interval_matched or warmup_active
+        training_interval_matched = (
+            self.training_interval_matched(context.global_step, config) or warmup_active
         )
         common: Any = {
             "collection_id": uuid4().hex,
@@ -276,7 +282,11 @@ class DrafterScheduler:
             )
         if config.collection_sample_rate <= 0:
             return CollectionPlan(collect=False, reason="sample_rate_zero", **common)
-        return CollectionPlan(collect=True, reason="collection_enabled", **common)
+        if interval_matched:
+            return CollectionPlan(collect=True, reason="collection_enabled", **common)
+        return CollectionPlan(
+            collect=True, reason="warmup_collection_enabled", **common
+        )
 
     def execute_collection_plan(self, plan: CollectionPlan, payload: CollectionPayload):
         if self._collection_executor is None:
@@ -357,18 +367,76 @@ class DrafterScheduler:
     ) -> bool:
         return step_matches_interval(global_step, config.training_interval_steps)
 
+    @staticmethod
+    def adaptive_warmup_active(
+        context: DrafterScheduleContext | DrafterCollectionContext,
+        config: DrafterScheduleConfig,
+    ) -> bool:
+        """Whether the current main step lies inside the adaptive warmup window.
+
+        The window is the first ``warmup_ratio`` of the main-training horizon,
+        capped at ``warmup_max_steps``.  Inside it, both collection and training
+        treat their configured intervals as matched so the drafter can collect
+        and train on every main step.  Gated off by
+        ``adaptive_schedule.train_every_step_in_warmup``.  Without a known
+        horizon the window is empty and this returns False.
+
+        Both planning contexts carry ``global_step`` and
+        ``total_training_steps``, so the same window answers for the collection
+        decision and for the training decision.
+        """
+
+        if (
+            not config.adaptive_schedule_enabled
+            or not config.adaptive_train_every_step_in_warmup
+        ):
+            return False
+        warmup_end = adaptive_warmup_window_end(
+            total_training_steps=context.total_training_steps,
+            warmup_ratio=config.adaptive_warmup_ratio,
+            warmup_max_steps=config.adaptive_warmup_max_steps,
+        )
+        if warmup_end <= 0:
+            return False
+        try:
+            step = _as_int(context.global_step)
+        except (TypeError, ValueError):
+            return False
+        return 0 <= step < warmup_end
+
+    @classmethod
+    def trigger_interval_matched(
+        cls,
+        context: DrafterScheduleContext,
+        config: DrafterScheduleConfig,
+    ) -> bool:
+        """Interval readiness used by the training trigger.
+
+        Inside the adaptive warmup window every main step counts as matched;
+        elsewhere the configured ``training_interval_steps`` rule applies.
+        """
+
+        return cls.training_interval_matched(
+            context.global_step, config
+        ) or cls.adaptive_warmup_active(context, config)
+
     def plan_training(
         self,
         context: DrafterScheduleContext,
         config: DrafterScheduleConfig,
     ) -> TrainingPlan:
-        interval_matched = self.training_interval_matched(context.global_step, config)
+        interval_matched = self.trigger_interval_matched(context, config)
         trigger = self.trigger_policy.should_train(
             context,
             config,
             interval_matched=interval_matched,
         )
-        budget = self.sync_budget_policy.make_budget(context, config)
+        budget_policy = (
+            self.adaptive_budget_policy
+            if config.adaptive_schedule_enabled
+            else self.sync_budget_policy
+        )
+        budget = budget_policy.make_budget(context, config)
         min_sample_step, max_sample_step, data_filter_reason = (
             self._training_data_filter_window(
                 context, config, budget.sample_last_n_steps
@@ -376,6 +444,7 @@ class DrafterScheduler:
         )
         common: Any = {
             "interval_matched": interval_matched,
+            "warmup_active": self.adaptive_warmup_active(context, config),
             "execution_strategy": DrafterExecutionStrategy.SYNC,
             "source_global_step": context.global_step,
             "max_batches": budget.max_batches,

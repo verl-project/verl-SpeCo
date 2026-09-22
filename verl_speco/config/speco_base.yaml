@@ -256,6 +256,20 @@ actor_rollout_ref:
           train_on: last_assistant
           min_sample_step: null
           max_sample_step: null
+        # Adaptive drafter schedule.  The two flags below are independent and
+        # take effect only when enable is true.
+        adaptive_schedule:
+          enable: false
+          # Use the acceptance/progress-decayed step count instead of training.step.
+          train_steps_by_acceptance: true
+          # Train every main step inside the warmup window (both intervals relaxed).
+          train_every_step_in_warmup: true
+          warmup_ratio: 0.1
+          warmup_max_steps: 20
+          max_train_steps: 25
+          min_train_steps: 5
+          low_acceptance: 2.5
+          high_acceptance: 4.0
         # TransferQueue transport for standalone drafter training. The owner,
         # vLLM Producer, and every torchrun Consumer rank share this connection
         # configuration. Default off; requires TransferQueue==0.1.10.

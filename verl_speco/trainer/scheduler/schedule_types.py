@@ -71,12 +71,26 @@ class DrafterScheduleConfig:
     min_trainable_batches: int = 1
     require_full_batch: bool = False
     sample_last_n_steps: int = 2
+    # Adaptive drafter schedule; master switch for the two features below.
+    adaptive_schedule_enabled: bool = False
+    adaptive_train_steps_by_acceptance: bool = True
+    adaptive_train_every_step_in_warmup: bool = True
+    adaptive_max_train_steps: int = 25
+    adaptive_min_train_steps: int = 5
+    adaptive_low_acceptance: float = 2.5
+    adaptive_high_acceptance: float = 4.0
+    adaptive_warmup_ratio: float = 0.1
+    adaptive_warmup_max_steps: int = 20
 
     @classmethod
     def from_mapping(cls, config) -> "DrafterScheduleConfig":
         config = config or {}
         get = config.get if hasattr(config, "get") else lambda key, default: default
         train_batches = int(get("step", 100))
+        adaptive = get("adaptive_schedule", None)
+        adaptive_get = (
+            adaptive.get if hasattr(adaptive, "get") else lambda key, default: default
+        )
         return cls(
             collect_interval_steps=get("collect_interval_steps", 1),
             training_interval_steps=get("training_interval_steps", 1),
@@ -100,6 +114,19 @@ class DrafterScheduleConfig:
             min_trainable_batches=int(get("min_trainable_batches", 1)),
             require_full_batch=bool(get("require_full_batch", False)),
             sample_last_n_steps=int(get("sample_last_n_steps", 2)),
+            adaptive_schedule_enabled=bool(adaptive_get("enable", False)),
+            adaptive_train_steps_by_acceptance=bool(
+                adaptive_get("train_steps_by_acceptance", True)
+            ),
+            adaptive_train_every_step_in_warmup=bool(
+                adaptive_get("train_every_step_in_warmup", True)
+            ),
+            adaptive_max_train_steps=int(adaptive_get("max_train_steps", 25)),
+            adaptive_min_train_steps=int(adaptive_get("min_train_steps", 5)),
+            adaptive_low_acceptance=float(adaptive_get("low_acceptance", 2.5)),
+            adaptive_high_acceptance=float(adaptive_get("high_acceptance", 4.0)),
+            adaptive_warmup_ratio=float(adaptive_get("warmup_ratio", 0.1)),
+            adaptive_warmup_max_steps=int(adaptive_get("warmup_max_steps", 20)),
         )
 
 
@@ -117,6 +144,7 @@ class DrafterCollectionContext:
     source_enabled: bool = True
     validation: bool = False
     require_training_interval: bool = False
+    total_training_steps: int | None = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +173,7 @@ class CollectionPlan:
         "training_interval_not_reached": 5,
         "sample_rate_zero": 6,
         "collection_enabled": 7,
+        "warmup_collection_enabled": 8,
     }
 
     def metrics(self) -> dict[str, float | int]:
@@ -229,6 +258,8 @@ class DrafterScheduleContext:
     oldlogprob_collection_requested: bool
     data_status: TrainingDataStatus | None = None
     pending_training_count: int = 0
+    total_training_steps: int | None = None
+    prev_acceptance_length: float | None = None
 
 
 @dataclass(frozen=True)
@@ -335,6 +366,8 @@ class TrainingPlan:
     min_sample_step: int | None = None
     max_sample_step: int | None = None
     data_filter_reason: str = ""
+    # True when the adaptive warmup window, not the configured interval, matched.
+    warmup_active: bool = False
     plan_id: str = ""
     worker_snapshots: dict[str, dict[str, object]] | None = None
 

@@ -161,6 +161,63 @@ def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     assert plan().launch is True
 
 
+def test_drafter_collection_relaxes_its_interval_inside_the_warmup_window() -> None:
+    """The trainer must hand the planning horizon to the collection decision.
+
+    Under the released DFlash config the drafter collects and trains every
+    fifth main step.  Inside the adaptive warmup window training runs on every
+    main step and consumes the features of that same step, so collection has
+    to be relaxed with it.  A context without the horizon keeps both intervals
+    gated and the warmup silently does nothing.
+    """
+
+    from verl_speco.trainer.scheduler import DrafterCollectionSource
+
+    trainer = _trainer(
+        {
+            "collect_interval_steps": 5,
+            "training_interval_steps": 5,
+            "step": 20,
+            "collect_hidden_states_from_old_logprob": True,
+            "adaptive_schedule": {
+                "enable": True,
+                "warmup_ratio": 0.1,
+                "warmup_max_steps": 20,
+            },
+        },
+        step=1,
+    )
+    trainer.total_training_steps = 100
+
+    warmup_plan = trainer._speco_plan_drafter_collection(
+        DrafterCollectionSource.OLD_LOGPROB
+    )
+    assert warmup_plan.collect
+    assert warmup_plan.reason == "warmup_collection_enabled"
+
+    trainer.global_steps = 11  # past the window and below the interval
+    interval_plan = trainer._speco_plan_drafter_collection(
+        DrafterCollectionSource.OLD_LOGPROB
+    )
+    assert not interval_plan.collect
+    assert interval_plan.reason == "interval_not_reached"
+
+
+def test_drafter_train_steps_metric_only_reports_trained_rounds() -> None:
+    """A round that trained nothing must contribute no point to the curve."""
+
+    metric = SpecoRayPPOTrainer._speco_drafter_train_steps_metric
+
+    assert metric(
+        {"drafter/trained": 1, "drafter/train_successful_steps_max": 20}
+    ) == {"drafter/train_steps": 20}
+    assert metric({"drafter/trained": 0, "drafter/train_successful_steps_max": 0}) == {}
+    assert (
+        metric({"drafter/trained": 0, "drafter/train_successful_steps_max": 20}) == {}
+    )
+    assert metric({}) == {}
+
+
 def test_sync_scheduler_preserves_released_training_call_order() -> None:
     trainer = _trainer(
         {
