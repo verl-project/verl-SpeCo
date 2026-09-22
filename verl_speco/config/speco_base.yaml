@@ -56,6 +56,12 @@ speco:
     # Zero means one input-file pass. The unified launcher sets this to the
     # exact number of samples required by max_steps and the global batch size.
     max_samples: 0
+    # When true the Producer buffers the input file once and queues records in
+    # a per-epoch permutation seeded with shuffle_seed + epoch, matching the
+    # speculators rng.permutation(seed, epoch) recipe. Deterministic across
+    # restarts so resumed runs replay the same per-epoch order.
+    shuffle: false
+    shuffle_seed: 42
     pending_poll_interval_seconds: 0.5
     # After publishing EOS the producer waits until the consumer clears every
     # published sample before closing the remote client. Bound that wait with
@@ -164,6 +170,27 @@ actor_rollout_ref:
         # default: it is only needed when a trainable param can miss a gradient.
         ddp_find_unused_parameters: false
         lr: 1e-5
+        # Optimizer for drafter training. "adamw" keeps the historical single
+        # AdamW over all trainable params. "muon" applies Muon to 2D hidden
+        # weight matrices and AdamW to the rest (norms, biases, embeddings,
+        # and output heads), mirroring speculators.train.optimizers. Muon needs
+        # fsdp2 or ddp: FSDP1 shards parameters to 1D and is rejected.
+        optimizer: adamw
+        weight_decay: 1e-2
+        # AdamW (running-momentum) betas for the non-Muon parameter group.
+        adamw_betas: [0.9, 0.95]
+        # Muon-only options (ignored when optimizer=adamw).
+        # null uses the same lr as AdamW, matching speculators; set an explicit
+        # value to override (muon_adjust_lr_fn rescales the update to AdamW RMS).
+        muon_lr: null
+        muon_momentum: 0.95
+        muon_nesterov: true
+        muon_weight_decay: 0.1
+        muon_ns_steps: 5
+        muon_adjust_lr_fn: match_rms_adamw
+        # Extra parameter-name substrings kept on AdamW even when 2D, on top of
+        # the built-in defaults (embeddings, lm_head, codebook, markov_w1/w2).
+        muon_adamw_name_hints: null
         lr_warmup_steps: 0
         # Supported standalone drafter scheduler types:
         # constant, cosine, linear, global_cosine.

@@ -211,3 +211,28 @@ jobs:
           tests/unit/test_standalone_tq_training_launcher.py
           -q
 
+  drafter-optimizer:
+    name: Drafter optimizer tests (torch CPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out verl-SpeCo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CPU torch and test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r ci/requirements-ci.txt
+
+      - name: Run drafter optimizer tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest tests/unit/test_drafter_optimizers.py -q
