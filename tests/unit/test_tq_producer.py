@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -357,6 +358,96 @@ def test_run_producer_restarts_input_until_max_samples(tmp_path: Path) -> None:
     assert sorted(tag["sequence_no"] for tag in sample_tags) == [0, 1, 2, 3, 4]
     assert pool.prefill_calls == 5
     assert eos_tags[0]["total_samples"] == 5
+
+
+def test_run_producer_shuffle_permutes_per_epoch_deterministically(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    producer_cfg = config["speco"]["standalone_tq_producer"]
+    producer_cfg["max_samples"] = 4  # two epochs over the two-record file
+    producer_cfg["shuffle"] = True
+    producer_cfg["shuffle_seed"] = 42
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    sample_tags = sorted(
+        (
+            tag
+            for tag in transport.records.values()
+            if tag.get("record_type") == "sample"
+        ),
+        key=lambda tag: int(tag["sequence_no"]),
+    )
+    assert stats.input_count == 4
+    assert [int(tag["sequence_no"]) for tag in sample_tags] == [0, 1, 2, 3]
+    # sequence_no is run-global and follows the permuted queue order, so the
+    # sample_id sequence must equal the per-epoch permutations.
+    epoch0 = [0, 1]
+    epoch1 = [0, 1]
+    random.Random(42).shuffle(epoch0)
+    random.Random(43).shuffle(epoch1)
+    records = ["sample-1", "sample-2"]
+    expected = [records[i] for i in [*epoch0, *epoch1]]
+    assert [tag["sample_id"] for tag in sample_tags] == expected
+
+
+def test_run_producer_shuffle_resume_replays_epoch_order(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    # Epoch 0 already fully consumed: sequence_nos 0 and 1.
+    checkpoint_path = tmp_path / "draft_step_1"
+    save_standalone_resume(
+        checkpoint_path,
+        [0, 1],
+        optimizer_step=1,
+        input_path=input_path,
+    )
+    config = _config(input_path)
+    producer_cfg = config["speco"]["standalone_tq_producer"]
+    producer_cfg["resume_checkpoint_path"] = str(checkpoint_path)
+    producer_cfg["max_samples"] = 2
+    producer_cfg["shuffle"] = True
+    producer_cfg["shuffle_seed"] = 42
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    sample_tags = sorted(
+        (
+            tag
+            for tag in transport.records.values()
+            if tag.get("record_type") == "sample"
+        ),
+        key=lambda tag: int(tag["sequence_no"]),
+    )
+    assert stats.input_count == 2
+    # Only the replayed epoch-1 permutation is queued, with fresh run-global
+    # sequence numbers continuing after the consumed prefix.
+    assert [int(tag["sequence_no"]) for tag in sample_tags] == [2, 3]
+    epoch1 = [0, 1]
+    random.Random(43).shuffle(epoch1)
+    records = ["sample-1", "sample-2"]
+    assert [tag["sample_id"] for tag in sample_tags] == [records[i] for i in epoch1]
 
 
 def test_run_producer_skips_consumed_sequences_before_vllm(tmp_path: Path) -> None:

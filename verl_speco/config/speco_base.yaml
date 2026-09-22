@@ -56,6 +56,12 @@ speco:
     # Zero means one input-file pass. The unified launcher sets this to the
     # exact number of samples required by max_steps and the global batch size.
     max_samples: 0
+    # When true the Producer buffers the input file once and queues records in
+    # a per-epoch permutation seeded with shuffle_seed + epoch, matching the
+    # speculators rng.permutation(seed, epoch) recipe. Deterministic across
+    # restarts so resumed runs replay the same per-epoch order.
+    shuffle: false
+    shuffle_seed: 42
     pending_poll_interval_seconds: 0.5
     owner_ready_timeout_seconds: 120
     max_sequence_length: 8192
