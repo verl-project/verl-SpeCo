@@ -402,6 +402,59 @@ def test_muon_steps_with_fsdp2_dtensor_parameters() -> None:
         optimizer.step()
 
 
+def _multirank_fsdp2_muon_child(rank: int, world_size: int, port: int) -> None:
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        torch.manual_seed(0)
+        mesh = init_device_mesh("cpu", (world_size,))
+        model = _DraftModel()
+        for module in model.children():
+            fully_shard(module, mesh=mesh)
+        fully_shard(model, mesh=mesh)
+
+        # Real FULL_SHARD splits each parameter across ranks even though the
+        # logical DTensor keeps its original 2D shape, so the dimension-based
+        # split must still route the hidden matrices to Muon.
+        sharded = [
+            name
+            for name, param in model.named_parameters()
+            if param.to_local().shape != param.shape
+        ]
+        assert sharded, "FSDP2 did not shard any parameter"
+
+        optimizer = build_drafter_optimizer(
+            model, OmegaConf.create({"optimizer": "muon", "lr": 1e-3})
+        )
+        assert len(optimizer.param_groups) == 2
+        muon_group = next(g for g in optimizer.param_groups if g["use_muon"])
+        assert len(muon_group["params"]) == 2, len(muon_group["params"])
+
+        model(torch.randn(4, 8)).sum().backward()
+        optimizer.step()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_muon_steps_with_multirank_fsdp2() -> None:
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_gloo_available():
+        pytest.skip("gloo backend is required for the FSDP2 optimizer tests")
+    try:
+        from torch.distributed.fsdp import fully_shard  # noqa: F401
+    except ImportError as exc:  # pragma: no cover - torch build without FSDP2
+        pytest.skip(f"FSDP2 is unavailable on this torch build: {exc}")
+    import torch.multiprocessing as mp
+
+    mp.spawn(_multirank_fsdp2_muon_child, args=(2, _free_port()), nprocs=2, join=True)
+
+
 def test_muon_optimizer_checkpoint_roundtrip(tmp_path) -> None:
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.state_dict import (
