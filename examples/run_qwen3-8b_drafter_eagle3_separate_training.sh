@@ -41,6 +41,7 @@ DEVICE_ENV=${DEVICE_ENV:-CUDA_VISIBLE_DEVICES}
 TRAIN_DEVICES=${TRAIN_DEVICES:-6,7}
 SPECO_VLLM_ENDPOINTS=${SPECO_VLLM_ENDPOINTS:-'[http://127.0.0.1:8000/v1]'}
 VLLM_READY_TIMEOUT_SECONDS=${VLLM_READY_TIMEOUT_SECONDS:-120}
+export SPECO_STANDALONE_LOG_LEVEL=${SPECO_STANDALONE_LOG_LEVEL:-INFO}
 
 # These IDs must equal the auxiliary prefix of VLLM_HIDDEN_STATE_LAYER_IDS in
 # run_qwen3-8b_drafter_hidden_state_vllm.sh.  Do not include the final layer.
@@ -50,6 +51,7 @@ EAGLE3_TARGET_LAYER_IDS=${EAGLE3_TARGET_LAYER_IDS:-'[1,9,17,25,33]'}
 VLLM_REQUEST_TIMEOUT=${VLLM_REQUEST_TIMEOUT:-120}
 VLLM_MAX_INFLIGHT_REQUESTS=${VLLM_MAX_INFLIGHT_REQUESTS:-16}
 VLLM_PER_ENDPOINT_CONCURRENCY=${VLLM_PER_ENDPOINT_CONCURRENCY:-4}
+VLLM_SUCCESS_LOG_INTERVAL=${VLLM_SUCCESS_LOG_INTERVAL:-100}
 PRODUCER_INPUT_QUEUE_SIZE=${PRODUCER_INPUT_QUEUE_SIZE:-32}
 PRODUCER_PUBLISH_QUEUE_SIZE=${PRODUCER_PUBLISH_QUEUE_SIZE:-16}
 PRODUCER_MAX_PENDING_SAMPLES=${PRODUCER_MAX_PENDING_SAMPLES:-1024}
@@ -57,6 +59,11 @@ PRODUCER_PENDING_POLL_INTERVAL=${PRODUCER_PENDING_POLL_INTERVAL:-0.5}
 PRODUCER_MAX_SEQUENCE_LENGTH=${PRODUCER_MAX_SEQUENCE_LENGTH:-8192}
 PRODUCER_MAX_FEATURE_LENGTH=${PRODUCER_MAX_FEATURE_LENGTH:-512}
 PRODUCER_GENERATION_MAX_TOKENS=${PRODUCER_GENERATION_MAX_TOKENS:-511}
+
+# Event-driven Ray scheduler watermarks. Both values count global ready
+# samples in TQ; low defaults to half of Producer capacity.
+SCHEDULER_LOW_WATERMARK_SAMPLES=${SCHEDULER_LOW_WATERMARK_SAMPLES:-$((PRODUCER_MAX_PENDING_SAMPLES / 2))}
+SCHEDULER_HIGH_WATERMARK_SAMPLES=${SCHEDULER_HIGH_WATERMARK_SAMPLES:-${PRODUCER_MAX_PENDING_SAMPLES}}
 
 # Standalone EAGLE3 trainer settings.
 MAX_STEPS=${MAX_STEPS:-1000}
@@ -120,9 +127,12 @@ while pending:
 PY
 
 PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher \
+    speco.draft_training.runtime_backend=ray \
     speco.draft_training.num_gpus_per_node=${draft_train_gpus_per_node} \
     speco.draft_training.nnodes=1 \
     speco.draft_training.standalone=True \
+    speco.draft_training.scheduler.low_watermark_samples=${SCHEDULER_LOW_WATERMARK_SAMPLES} \
+    speco.draft_training.scheduler.high_watermark_samples=${SCHEDULER_HIGH_WATERMARK_SAMPLES} \
     data.train_files=${TRAIN_FILE} \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.actor.strategy=fsdp2 \
@@ -152,6 +162,7 @@ PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher
     speco.standalone_tq_producer.request_timeout=${VLLM_REQUEST_TIMEOUT} \
     speco.standalone_tq_producer.max_inflight_requests=${VLLM_MAX_INFLIGHT_REQUESTS} \
     speco.standalone_tq_producer.per_endpoint_concurrency=${VLLM_PER_ENDPOINT_CONCURRENCY} \
+    speco.standalone_tq_producer.vllm_success_log_interval=${VLLM_SUCCESS_LOG_INTERVAL} \
     speco.standalone_tq_producer.input_queue_size=${PRODUCER_INPUT_QUEUE_SIZE} \
     speco.standalone_tq_producer.publish_queue_size=${PRODUCER_PUBLISH_QUEUE_SIZE} \
     speco.standalone_tq_producer.max_pending_samples=${PRODUCER_MAX_PENDING_SAMPLES} \

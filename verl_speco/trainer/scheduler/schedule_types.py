@@ -35,13 +35,78 @@ def _as_float(value: object) -> float:
 class DrafterExecutionStrategy(str, Enum):
     """Supported drafter-training execution strategies.
 
-    PR 1 intentionally executes only ``SYNC``. ``ROLLOUT_IDLE_WORKER`` is
-    reserved in the contract so the later bubble-time implementation can reuse
-    the same plan type without changing the released synchronous path.
+    ``SYNC`` blocks until co-training workers return. ``STANDALONE_ASYNC``
+    submits a Consumer command and completes later through an event.
+    ``ROLLOUT_IDLE_WORKER`` is reserved for bubble-time execution.
     """
 
     SYNC = "sync"
     ROLLOUT_IDLE_WORKER = "rollout_idle_worker"
+    STANDALONE_ASYNC = "standalone_async"
+
+
+class DrafterTrainingDataSource(str, Enum):
+    """Storage that supplies samples selected by a training plan."""
+
+    LOCAL_BUFFER = "local_buffer"
+    TRANSFER_QUEUE = "transfer_queue"
+
+
+class ProducerAction(str, Enum):
+    """Backpressure action for the standalone feature Producer."""
+
+    RUN = "run"
+    PAUSE = "pause"
+    STOP = "stop"
+
+
+@dataclass(frozen=True)
+class QueueStatus:
+    """Authoritative queue facts returned by one queue listing snapshot."""
+
+    ready_samples: int
+
+    def __post_init__(self) -> None:
+        if self.ready_samples < 0:
+            raise ValueError("ready_samples must be non-negative")
+
+
+@dataclass(frozen=True)
+class QueueScheduleConfig:
+    """Queue watermarks and one complete global batch size."""
+
+    low_watermark_samples: int
+    high_watermark_samples: int
+    global_batch_size: int
+
+    def __post_init__(self) -> None:
+        if self.global_batch_size <= 0:
+            raise ValueError("global_batch_size must be positive")
+        if self.low_watermark_samples < 0:
+            raise ValueError("low_watermark_samples must be non-negative")
+        if self.low_watermark_samples < self.global_batch_size:
+            raise ValueError(
+                "low_watermark_samples must cover at least one global batch"
+            )
+        if self.low_watermark_samples >= self.high_watermark_samples:
+            raise ValueError(
+                "low_watermark_samples must be smaller than high_watermark_samples"
+            )
+        if self.high_watermark_samples < self.global_batch_size:
+            raise ValueError(
+                "high_watermark_samples must cover at least one global batch"
+            )
+
+
+@dataclass(frozen=True)
+class QueueScheduleContext:
+    """Inputs used to plan queue production and consumption."""
+
+    queue_status: QueueStatus
+    config: QueueScheduleConfig
+    producer_done: bool = False
+    producer_paused: bool = False
+    consumer_training: bool = False
 
 
 class DrafterCollectionSource(str, Enum):
@@ -49,6 +114,7 @@ class DrafterCollectionSource(str, Enum):
 
     SGLANG = "sglang"
     OLD_LOGPROB = "oldlogprob"
+    TRANSFER_QUEUE = "transfer_queue"
 
 
 @dataclass(frozen=True)
@@ -136,6 +202,8 @@ class CollectionPlan:
     hidden_window_tokens_per_sample: int | None
     hidden_window_min_rows: int
     collection_id: str = ""
+    producer_action: ProducerAction = ProducerAction.RUN
+    max_new_samples: int | None = None
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
         "drafter_disabled": 1,
@@ -145,12 +213,18 @@ class CollectionPlan:
         "training_interval_not_reached": 5,
         "sample_rate_zero": 6,
         "collection_enabled": 7,
+        "producer_done": 8,
+        "high_watermark_reached": 9,
+        "low_watermark_reached": 10,
+        "watermark_hysteresis_paused": 11,
+        "watermark_hysteresis_running": 12,
     }
 
     def metrics(self) -> dict[str, float | int]:
         source_code = {
             DrafterCollectionSource.SGLANG: 1,
             DrafterCollectionSource.OLD_LOGPROB: 2,
+            DrafterCollectionSource.TRANSFER_QUEUE: 3,
         }[self.source]
         metrics: dict[str, float | int] = {
             "drafter/collection_plan_used": 1,
@@ -337,6 +411,9 @@ class TrainingPlan:
     data_filter_reason: str = ""
     plan_id: str = ""
     worker_snapshots: dict[str, dict[str, object]] | None = None
+    data_source: DrafterTrainingDataSource = DrafterTrainingDataSource.LOCAL_BUFFER
+    required_samples: int | None = None
+    selected_keys: tuple[str, ...] = ()
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
         "collect_only": 1,
@@ -354,6 +431,8 @@ class TrainingPlan:
         "inconsistent_target_version": 13,
         "inconsistent_data_version": 14,
         "worker_preflight_failed": 15,
+        "consumer_training": 16,
+        "insufficient_ready_samples": 17,
     }
 
     def to_worker_payload(self) -> dict[str, object]:
@@ -376,6 +455,9 @@ class TrainingPlan:
             "data_filter_reason": self.data_filter_reason,
             "plan_id": self.plan_id,
             "worker_snapshots": self.worker_snapshots or {},
+            "data_source": self.data_source.value,
+            "required_samples": self.required_samples,
+            "selected_keys": list(self.selected_keys),
         }
 
     def metrics(self) -> dict[str, int]:
@@ -384,6 +466,7 @@ class TrainingPlan:
         strategy_code = {
             DrafterExecutionStrategy.SYNC: 0,
             DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER: 1,
+            DrafterExecutionStrategy.STANDALONE_ASYNC: 2,
         }[self.execution_strategy]
         metrics = {
             "drafter/scheduler_used": 1,

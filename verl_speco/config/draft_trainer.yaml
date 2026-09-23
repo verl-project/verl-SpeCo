@@ -23,7 +23,15 @@ speco:
     master_port: null
     standalone: true
     mode: feature_store
+    # Ray is the default runtime (StandaloneRayTrainer + Ray WorkerGroup);
+    # set to subprocess only as a rollback path for debugging.
+    runtime_backend: ray
     use_ray_controller: false
+    scheduler:
+      # Zero derives low from half the Producer capacity (but never below one
+      # global batch), and high from the full Producer capacity.
+      low_watermark_samples: 0
+      high_watermark_samples: 0
 
 actor_rollout_ref:
   rollout:
