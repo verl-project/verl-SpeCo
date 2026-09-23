@@ -1,0 +1,4 @@
+torch==2.11.0+rocm7.2
+numpy==2.2.6
+transformers==5.8.1
+sglang==0.5.14
