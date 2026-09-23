@@ -123,6 +123,17 @@ class DSparkConfig(DFlashConfig):
                 and rope_parameters.get("rope_theta") is not None
             ):
                 internal_config["rope_theta"] = rope_parameters["rope_theta"]
+        # Released speculators checkpoints record the auxiliary context layers
+        # under ``aux_hidden_state_layer_ids`` (EAGLE ``output_hidden_states``
+        # indices). That is the same indexing SpeCo uses for the training-side
+        # ``target_layer_ids``, so lift the list verbatim; otherwise
+        # ``_normalize_dflash_config`` silently substitutes an evenly spaced set
+        # that does not match the pretrained ``fc`` projection.
+        aux_layer_ids = internal_config.get("aux_hidden_state_layer_ids")
+        if internal_config.get("target_layer_ids") is None and aux_layer_ids:
+            internal_config["target_layer_ids"] = [
+                int(layer_id) for layer_id in aux_layer_ids
+            ]
         if "enable_confidence_head" not in internal_config:
             internal_config["enable_confidence_head"] = (
                 float(internal_config.get("confidence_head_alpha", 0.0)) > 0.0

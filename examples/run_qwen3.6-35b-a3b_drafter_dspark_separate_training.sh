@@ -26,7 +26,7 @@ cd "${repo_root}"
 #
 # Hyperparameters mirror the released RedHatAI/Qwen3.6-35B-A3B-speculator.dspark
 # config as used by speculators/examples/train/dspark_qwen3_6_35B_redhat.sh:
-#   aux layers [2,10,20,30,37], block_size=8, max_anchors=512, markov_rank=256,
+#   aux layers [2,10,20,30,37], block_size=8, max_anchors=3072, markov_rank=256,
 #   lr=3e-4, ce=0.1, tv/l1=0.9, mask_token_id=248077.
 #
 # This script starts the target-model hidden-state vLLM itself on cards 0-3
@@ -111,7 +111,7 @@ OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-true}
 # (40 layers) this is the RedHatAI 5-aux-layer recipe, with final layer 40
 # appended by the vLLM service.
 DSPARK_BLOCK_SIZE=${DSPARK_BLOCK_SIZE:-8}
-DSPARK_NUM_ANCHORS=${DSPARK_NUM_ANCHORS:-512}
+DSPARK_NUM_ANCHORS=${DSPARK_NUM_ANCHORS:-3072}
 DSPARK_MAX_WINDOW=${DSPARK_MAX_WINDOW:-512}
 DSPARK_LOSS_MODE=${DSPARK_LOSS_MODE:-full_vocab}
 DSPARK_SAMPLED_CE_NEGATIVES=${DSPARK_SAMPLED_CE_NEGATIVES:-0}
