@@ -160,6 +160,8 @@ def validate_producer_config(config: Any) -> None:
     invalid = [name for name in positive_fields if int(producer_cfg.get(name, 0)) <= 0]
     if invalid:
         raise ValueError(f"standalone_tq_producer fields must be positive: {invalid}")
+    if int(producer_cfg.get("vllm_success_log_interval", 100)) < 0:
+        raise ValueError("vllm_success_log_interval must be non-negative")
 
 
 def _should_log_sample_progress(count: int) -> bool:
@@ -172,6 +174,9 @@ async def run_producer(
     transport: Any = default_transport,
     tokenizer: Any | None = None,
     client_pool: Any | None = None,
+    before_request: Any | None = None,
+    on_published: Any | None = None,
+    get_runtime_state: Any | None = None,
 ) -> ProducerStats:
     """Run the bounded input -> vLLM -> TQ pipeline and publish EOS on success."""
 
@@ -246,6 +251,9 @@ async def run_producer(
                 model=str(producer_cfg["vllm_model"]),
                 max_inflight_requests=int(producer_cfg["max_inflight_requests"]),
                 request_timeout=float(producer_cfg["request_timeout"]),
+                success_log_interval=int(
+                    producer_cfg.get("vllm_success_log_interval", 100)
+                ),
             )
         await pool.start()
         logger.info("Standalone TQ Producer vLLM client pool started")
@@ -287,15 +295,20 @@ async def run_producer(
         )
         stages: dict[str, tuple[str, float, str]] = {}
         last_published_at = time.monotonic()
+        producer_started_at = last_published_at
         max_samples = int(producer_cfg.get("max_samples", 0) or 0)
 
         def mark_stage(worker: str, stage: str, sample_id: str = "") -> None:
             stages[worker] = (stage, time.monotonic(), sample_id)
 
         async def log_heartbeat() -> None:
+            last_inputs = 0
+            last_published = 0
+            last_heartbeat_at = producer_started_at
             while True:
                 await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
                 now = time.monotonic()
+                elapsed = max(now - last_heartbeat_at, 1e-9)
                 oldest = sorted(
                     (
                         (now - started, worker, stage, sample_id)
@@ -303,17 +316,22 @@ async def run_producer(
                     ),
                     reverse=True,
                 )[:3]
-                logger.warning(
-                    "Standalone TQ Producer heartbeat inputs=%s published=%s "
-                    "dropped=%s input_queue=%s/%s publish_queue=%s/%s "
+                logger.info(
+                    "Standalone TQ Producer heartbeat state=%s inputs=%s "
+                    "published=%s dropped=%s input_rate=%.2f/s publish_rate=%.2f/s "
+                    "input_queue=%s/%s publish_queue=%s/%s pending_bytes=%s "
                     "seconds_since_publish=%.0f stages=%s oldest=%s",
+                    get_runtime_state() if get_runtime_state is not None else "running",
                     stats.input_count,
                     stats.published_count,
                     stats.dropped_count,
+                    (stats.input_count - last_inputs) / elapsed,
+                    (stats.published_count - last_published) / elapsed,
                     input_queue.qsize(),
                     input_queue.maxsize,
                     publish_queue.qsize(),
                     publish_queue.maxsize,
+                    stats.pending_bytes,
                     now - last_published_at,
                     dict(Counter(stage for stage, _, _ in stages.values())),
                     [
@@ -321,6 +339,9 @@ async def run_producer(
                         for age, worker, stage, sample_id in oldest
                     ],
                 )
+                last_inputs = stats.input_count
+                last_published = stats.published_count
+                last_heartbeat_at = now
 
         def iter_requests():
             epoch = 0
@@ -492,13 +513,25 @@ async def run_producer(
                     await publish_queue.put(_PUBLISH_DONE)
                     stages.pop(worker, None)
                     return
+                if before_request is not None:
+                    if (
+                        get_runtime_state is not None
+                        and get_runtime_state() == "paused"
+                    ):
+                        mark_stage(worker, "scheduler_paused", request.sample_id)
+                    await before_request()
                 mark_stage(worker, "tq_capacity", request.sample_id)
-                await _wait_for_pending_capacity(
-                    transport,
-                    run_id,
-                    max_pending_samples=int(producer_cfg["max_pending_samples"]),
-                    poll_interval=float(producer_cfg["pending_poll_interval_seconds"]),
-                )
+                # The scheduled Ray path applies high/low-watermark control in
+                # the Driver. Keep legacy polling only for the subprocess path.
+                if before_request is None:
+                    await _wait_for_pending_capacity(
+                        transport,
+                        run_id,
+                        max_pending_samples=int(producer_cfg["max_pending_samples"]),
+                        poll_interval=float(
+                            producer_cfg["pending_poll_interval_seconds"]
+                        ),
+                    )
                 if _should_log_sample_progress(int(request.sequence_no) + 1):
                     logger.info(
                         "Standalone TQ Producer requesting vLLM sequence_no=%s "
@@ -646,6 +679,8 @@ async def run_producer(
                         put_elapsed,
                     )
                 stats.published_count += 1
+                if on_published is not None:
+                    await on_published(result.request.sequence_no)
                 last_published_at = time.monotonic()
                 if _should_log_sample_progress(stats.published_count):
                     logger.info(
@@ -712,10 +747,14 @@ async def run_producer(
         eos_key, eos_fields, eos_tag = make_eos_record(run_id, stats.published_count)
         await asyncio.to_thread(transport.put_sample, eos_key, eos_fields, tag=eos_tag)
         logger.info(
-            "Standalone TQ Producer completed inputs=%s published=%s dropped=%s",
+            "Standalone TQ Producer completed inputs=%s published=%s dropped=%s "
+            "failed=%s elapsed=%.3fs average_rate=%.2f/s",
             stats.input_count,
             stats.published_count,
             stats.dropped_count,
+            stats.failed_count,
+            time.monotonic() - producer_started_at,
+            stats.published_count / max(time.monotonic() - producer_started_at, 1e-9),
         )
         return stats
     finally:

@@ -179,6 +179,7 @@ class VllmFeatureClientPool:
         model: str,
         max_inflight_requests: int,
         request_timeout: float,
+        success_log_interval: int = 100,
     ) -> None:
         if not endpoints:
             raise ValueError("At least one vLLM endpoint is required")
@@ -189,6 +190,9 @@ class VllmFeatureClientPool:
         self.endpoints = list(endpoints)
         self.model = model
         self.request_timeout = float(request_timeout)
+        self.success_log_interval = int(success_log_interval)
+        if self.success_log_interval < 0:
+            raise ValueError("success_log_interval must be non-negative")
         self._global_semaphore = asyncio.Semaphore(max_inflight_requests)
         self._states: list[_EndpointState] = []
 
@@ -199,6 +203,10 @@ class VllmFeatureClientPool:
             from openai import AsyncOpenAI
         except ImportError as exc:
             raise RuntimeError("vLLM Producer requires the openai package") from exc
+        # Suppress the SDK transport's one-line INFO message for every 2xx.
+        # This pool emits endpoint-aware, rate-limited success logs below.
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpx2").setLevel(logging.WARNING)
         self._states = [
             _EndpointState(
                 endpoint=endpoint,
@@ -243,6 +251,7 @@ class VllmFeatureClientPool:
                 candidates = self._states
             state = choose_endpoint(candidates)
             state.inflight += 1
+            request_started = time.monotonic()
             try:
                 async with state.semaphore:
                     if generate:
@@ -264,6 +273,17 @@ class VllmFeatureClientPool:
                         )
                     raw = await asyncio.to_thread(load_hidden_state_result, response)
                 state.requests += 1
+                if self._should_log_success(state.requests):
+                    logger.info(
+                        "vLLM endpoint request succeeded endpoint=%s "
+                        "request_type=%s successful_requests=%s inflight=%s "
+                        "elapsed=%.3fs",
+                        state.endpoint.base_url,
+                        "generate" if generate else "prefill",
+                        state.requests,
+                        state.inflight,
+                        time.monotonic() - request_started,
+                    )
                 return raw
             except ValueError:
                 # Response validation failures are deterministic protocol/data
@@ -272,23 +292,34 @@ class VllmFeatureClientPool:
             except Exception as exc:
                 failed_in_round.add(state.endpoint.base_url)
                 if attempt >= total_attempts:
+                    status_code, request_id, response_body = _http_error_detail(exc)
                     logger.error(
                         "vLLM request failed after %s attempts last_endpoint=%s "
-                        "sample_id=%s error=%s",
+                        "request_type=%s sample_id=%s status_code=%s request_id=%s "
+                        "response_body=%s elapsed=%.3fs error=%s",
                         total_attempts,
                         state.endpoint.base_url,
+                        "generate" if generate else "prefill",
                         getattr(request, "sample_id", None),
+                        status_code,
+                        request_id,
+                        response_body,
+                        time.monotonic() - request_started,
                         exc,
                     )
                     raise
                 backoff = _RETRY_BACKOFF_BASE_SECONDS**attempt
                 logger.warning(
                     "vLLM request aborted attempt=%s/%s endpoint=%s "
-                    "sample_id=%s error=%s; failing over in %ss",
+                    "request_type=%s sample_id=%s status_code=%s request_id=%s "
+                    "response_body=%s elapsed=%.3fs error=%s; failing over in %ss",
                     attempt,
                     total_attempts,
                     state.endpoint.base_url,
+                    "generate" if generate else "prefill",
                     getattr(request, "sample_id", None),
+                    *_http_error_detail(exc),
+                    time.monotonic() - request_started,
                     exc,
                     backoff,
                 )
@@ -299,6 +330,10 @@ class VllmFeatureClientPool:
             "unreachable: vLLM request retry loop exhausted without returning"
         )
 
+    def _should_log_success(self, count: int) -> bool:
+        interval = self.success_log_interval
+        return interval > 0 and (count <= 3 or count % interval == 0)
+
     async def close(self) -> None:
         states, self._states = self._states, []
         for state in states:
@@ -308,6 +343,19 @@ class VllmFeatureClientPool:
             result = close()
             if inspect.isawaitable(result):
                 await result
+
+
+def _http_error_detail(exc: Exception) -> tuple[Any, Any, str]:
+    """Extract bounded HTTP diagnostics without depending on one SDK version."""
+
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    headers = getattr(response, "headers", {}) or {}
+    request_id = headers.get("x-request-id") if hasattr(headers, "get") else None
+    body = getattr(response, "text", "") if response is not None else ""
+    if not isinstance(body, str):
+        body = repr(body)
+    return status_code, request_id, body[:2048]
 
 
 def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:

@@ -22,6 +22,8 @@ from verl_speco.trainer.scheduler import (
     DrafterScheduleConfig,
     DrafterScheduleContext,
     DrafterScheduler,
+    DrafterTrainingDataSource,
+    ProducerAction,
     TrainingDataStatus,
     TrainingPlan,
     step_matches_interval,
@@ -115,6 +117,8 @@ def test_sglang_collection_plan_contains_static_budget_and_metrics() -> None:
     assert plan.max_tokens_per_replica == 2048
     assert plan.metrics()["drafter/collection_plan_source"] == 1
     assert plan.metrics()["drafter/collection_plan_reason"] == 7
+    assert plan.producer_action is ProducerAction.RUN
+    assert plan.max_new_samples is None
 
 
 def test_oldlogprob_collection_plan_preserves_training_interval_requirement() -> None:
@@ -209,6 +213,8 @@ def test_sync_plan_launches_for_current_step_samples() -> None:
     assert plan.max_sample_step == 5
     assert plan.data_filter_reason == "current_step_only"
     assert plan.publish_after_success
+    assert plan.data_source is DrafterTrainingDataSource.LOCAL_BUFFER
+    assert plan.required_samples is None
     assert plan.to_worker_payload()["execution_strategy"] == "sync"
     assert plan.to_worker_payload()["min_sample_step"] == 5
     assert plan.to_worker_payload()["max_sample_step"] == 5

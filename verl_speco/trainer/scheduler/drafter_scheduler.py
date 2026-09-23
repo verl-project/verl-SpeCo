@@ -21,7 +21,7 @@ remain unchanged.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 from uuid import uuid4
 
 from verl_speco.trainer.scheduler.schedule_types import (
@@ -32,7 +32,10 @@ from verl_speco.trainer.scheduler.schedule_types import (
     DrafterExecutionStrategy,
     DrafterScheduleConfig,
     DrafterScheduleContext,
+    DrafterTrainingDataSource,
+    ProducerAction,
     PublishPlan,
+    QueueScheduleContext,
     TrainingPlan,
     _as_int,
 )
@@ -61,6 +64,15 @@ from verl_speco.trainer.scheduler.collection_adapter import (
     SGLangCollectionAdapter,
 )
 from verl_speco.trainer.scheduler.training_outcome import TrainingOutcome
+from verl_speco.trainer.scheduler.drafter_runtime_state import DrafterRuntimeState
+from verl_speco.trainer.scheduler.standalone_executor import (
+    StandaloneCollectionExecutionStrategy,
+    StandaloneCollectionExecutor,
+    StandaloneCollectionOutcome,
+    StandaloneTrainingExecutionStrategy,
+    StandaloneTrainingExecutor,
+    StandaloneTrainingOutcome,
+)
 
 
 def step_matches_interval(
@@ -97,6 +109,8 @@ class DrafterScheduler:
         worker_executor: DrafterWorkerExecutor | None = None,
         publish_executor: DrafterPublishExecutor | None = None,
         collection_executor: DrafterCollectionExecutor | None = None,
+        standalone_collection_executor: StandaloneCollectionExecutor | None = None,
+        standalone_training_executor: StandaloneTrainingExecutor | None = None,
     ) -> None:
         self.trigger_policy = IntervalAndBufferTrigger()
         self.sync_budget_policy = SyncTrainingBudgetPolicy()
@@ -107,6 +121,10 @@ class DrafterScheduler:
         self._publish_executor = publish_executor
         self.collection_strategy = SyncCollectionStrategy()
         self._collection_executor = collection_executor
+        self.standalone_collection_strategy = StandaloneCollectionExecutionStrategy()
+        self.standalone_training_strategy = StandaloneTrainingExecutionStrategy()
+        self._standalone_collection_executor = standalone_collection_executor
+        self._standalone_training_executor = standalone_training_executor
         self._collection_adapters: dict[
             DrafterCollectionSource, DrafterCollectionAdapter
         ] = {
@@ -118,6 +136,147 @@ class DrafterScheduler:
         """Bind the worker execution port used by all execution strategies."""
 
         self._worker_executor = worker_executor
+
+    def bind_standalone_collection_executor(
+        self, executor: StandaloneCollectionExecutor
+    ) -> None:
+        self._standalone_collection_executor = executor
+
+    def bind_standalone_training_executor(
+        self, executor: StandaloneTrainingExecutor
+    ) -> None:
+        self._standalone_training_executor = executor
+
+    @staticmethod
+    def plan_queue_collection(
+        context: QueueScheduleContext,
+    ) -> CollectionPlan:
+        """Build a queue Producer plan with high/low-watermark backpressure."""
+
+        status = context.queue_status
+        config = context.config
+        if context.producer_done:
+            action = ProducerAction.STOP
+            reason = "producer_done"
+        elif status.ready_samples >= config.high_watermark_samples:
+            action = ProducerAction.PAUSE
+            reason = "high_watermark_reached"
+        elif status.ready_samples <= config.low_watermark_samples:
+            action = ProducerAction.RUN
+            reason = "low_watermark_reached"
+        elif context.producer_paused:
+            action = ProducerAction.PAUSE
+            reason = "watermark_hysteresis_paused"
+        else:
+            action = ProducerAction.RUN
+            reason = "watermark_hysteresis_running"
+        return CollectionPlan(
+            collect=action is ProducerAction.RUN,
+            reason=reason,
+            source=DrafterCollectionSource.TRANSFER_QUEUE,
+            source_global_step=0,
+            collect_interval_matched=True,
+            training_interval_matched=True,
+            sample_rate=1.0,
+            max_samples_per_replica=None,
+            max_tokens_per_replica=None,
+            hidden_window_mode="front",
+            hidden_window_tokens_per_sample=None,
+            hidden_window_min_rows=0,
+            producer_action=action,
+            max_new_samples=None,
+        )
+
+    @staticmethod
+    def plan_queue_training(
+        context: QueueScheduleContext,
+        *,
+        selected_keys: tuple[str, ...] = (),
+    ) -> TrainingPlan:
+        """Plan at most one complete standalone global batch."""
+
+        status = context.queue_status
+        config = context.config
+        common: dict[str, Any] = {
+            "interval_matched": True,
+            "execution_strategy": DrafterExecutionStrategy.STANDALONE_ASYNC,
+            "source_global_step": 0,
+            "max_batches": 1,
+            "publish_after_success": False,
+            "min_batches": 1,
+            "require_full_batch": True,
+            "data_filter_reason": "transfer_queue",
+            "data_source": DrafterTrainingDataSource.TRANSFER_QUEUE,
+            "required_samples": config.global_batch_size,
+        }
+        if context.consumer_training:
+            return TrainingPlan(
+                launch=False,
+                reason="consumer_training",
+                **common,
+            )
+        if status.ready_samples < config.global_batch_size:
+            return TrainingPlan(
+                launch=False,
+                reason="insufficient_ready_samples",
+                **common,
+            )
+        return TrainingPlan(
+            launch=True,
+            reason="training_ready",
+            selected_keys=selected_keys,
+            **common,
+        )
+
+    def execute_standalone_collection_plan(
+        self,
+        plan: CollectionPlan,
+        *,
+        producer_paused: bool,
+        producer_done: bool,
+    ) -> StandaloneCollectionOutcome:
+        if self._standalone_collection_executor is None:
+            raise RuntimeError("Standalone collection executor has not been bound")
+        return self.standalone_collection_strategy.execute(
+            plan,
+            executor=self._standalone_collection_executor,
+            producer_paused=producer_paused,
+            producer_done=producer_done,
+        )
+
+    def execute_standalone_training_plan(
+        self,
+        plan: TrainingPlan,
+        *,
+        runtime_state: DrafterRuntimeState,
+        selected_entries: Sequence[Any],
+    ) -> StandaloneTrainingOutcome:
+        if self._standalone_training_executor is None:
+            raise RuntimeError("Standalone training executor has not been bound")
+        return self.standalone_training_strategy.execute(
+            plan,
+            executor=self._standalone_training_executor,
+            runtime_state=runtime_state,
+            selected_entries=selected_entries,
+        )
+
+    def complete_standalone_training(
+        self,
+        *,
+        runtime_state: DrafterRuntimeState,
+        completed_keys: Sequence[str],
+        successful: bool,
+    ) -> StandaloneTrainingOutcome:
+        return self.standalone_training_strategy.complete(
+            runtime_state=runtime_state,
+            completed_keys=completed_keys,
+            successful=successful,
+        )
+
+    def stop_standalone_consumer(self) -> Any:
+        if self._standalone_training_executor is None:
+            raise RuntimeError("Standalone training executor has not been bound")
+        return self._standalone_training_executor.stop_consumer()
 
     def bind_publish_executor(self, publish_executor: DrafterPublishExecutor) -> None:
         self._publish_executor = publish_executor

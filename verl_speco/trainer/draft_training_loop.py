@@ -52,6 +52,8 @@ from verl_speco.trainer.tq_sample_source import TQFeatureDataLoader, TQLocalBatc
 
 logger = logging.getLogger(__name__)
 
+_TQ_GET_MAX_SYNC_INTERVAL_STEPS = 50
+
 
 def _should_log_batch_progress(attempted_batches: int) -> bool:
     return attempted_batches <= 3 or attempted_batches % 100 == 0
@@ -73,7 +75,12 @@ def run_standalone_draft_training(config) -> dict[str, Any]:
     return asyncio.run(_run_standalone_draft_training_async(config))
 
 
-async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
+async def _run_standalone_draft_training_async(
+    config,
+    *,
+    scheduled_commands: Any | None = None,
+    training_events: Any | None = None,
+) -> dict[str, Any]:
     rank, local_rank, world_size = _init_distributed()
     logger.info(
         "[standalone rank=%s] distributed runtime initialized local_rank=%s world_size=%s",
@@ -256,6 +263,7 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                     tq_cfg.get("poll_interval_seconds", 0.5) or 0.5
                 ),
                 drop_last=bool(tq_cfg.get("drop_last", True)),
+                scheduled_commands=scheduled_commands,
             )
         else:
             loader = DraftFeatureDataLoader(
@@ -353,8 +361,27 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 if tq_local_batch is not None
                 else loaded_batch
             )
-            step_started = time.perf_counter()
+            processing_started = time.perf_counter()
+            batch_prepare_seconds = 0.0
+            train_seconds = 0.0
+            tq_clear_seconds = 0.0
+            tq_get_seconds = (
+                float(tq_local_batch.tq_get_seconds)
+                if tq_local_batch is not None
+                else 0.0
+            )
             attempted_batches += 1
+            # Computing the slowest-rank TQ fetch time requires a collective.
+            # Keep per-step precision while debugging, but avoid paying for a
+            # logging-only all-reduce on every normal training step.
+            if tq_local_batch is not None and (
+                logger.isEnabledFor(logging.DEBUG)
+                or attempted_batches % _TQ_GET_MAX_SYNC_INTERVAL_STEPS == 0
+            ):
+                tq_get_seconds = _max_across_ranks_float(
+                    tq_get_seconds,
+                    trainer.runtime_device,
+                )
             log_batch_progress = _should_log_batch_progress(attempted_batches)
             if log_batch_progress:
                 logger.info(
@@ -407,10 +434,12 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             else:
                 materialized_samples = samples
             current_stage = "prepare_training_batch"
+            batch_prepare_started = time.perf_counter()
             batch = trainer.prepare_training_batch_from_samples(
                 cast(list[Any], materialized_samples),
                 step=optimizer_step,
             )
+            batch_prepare_seconds = time.perf_counter() - batch_prepare_started
             has_batch = batch is not None
             current_stage = "synchronize_batch_readiness"
             if not _all_ranks_true(has_batch, trainer.runtime_device):
@@ -436,7 +465,9 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                     attempted_batches,
                     optimizer_step,
                 )
+            train_started = time.perf_counter()
             ok = await trainer.training_step_from_batch(batch, optimizer_step)
+            train_seconds = time.perf_counter() - train_started
             step_error = getattr(trainer, "last_standalone_training_error", None)
             if step_error is not None and _is_out_of_memory_error(step_error):
                 raise RuntimeError(
@@ -455,16 +486,26 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 continue
             if tq_local_batch is not None:
                 current_stage = "clear_tq_batch"
+                tq_clear_started = time.perf_counter()
                 _clear_tq_batch_across_ranks(
                     cast(TQFeatureDataLoader, loader),
                     tq_local_batch.global_keys,
                     rank=rank,
                     device=trainer.runtime_device,
                 )
+                tq_clear_seconds = time.perf_counter() - tq_clear_started
                 if rank == 0:
                     consumed_sequence_nos.update(
                         tq_local_batch.global_sequence_nos or []
                     )
+                    if training_events is not None:
+                        training_events.put(
+                            {
+                                "kind": "training_completed",
+                                "keys": list(tq_local_batch.global_keys or []),
+                                "successful": True,
+                            }
+                        )
             successful_steps += 1
             optimizer_step = int(trainer.optimizer_steps_total)
             if optimizer_step <= initial_optimizer_step:
@@ -473,8 +514,20 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 trainer,
                 successful_steps=successful_steps,
                 attempted_batches=attempted_batches,
-                step_elapsed_sec=time.perf_counter() - step_started,
+                step_elapsed_sec=(
+                    time.perf_counter() - tq_local_batch.cycle_started_at
+                    if tq_local_batch is not None
+                    else time.perf_counter() - processing_started
+                ),
             )
+            step_metrics["perf/batch_prepare_time"] = batch_prepare_seconds
+            step_metrics["perf/train_time"] = train_seconds
+            step_metrics["perf/tq_clear_time"] = tq_clear_seconds
+            if tq_local_batch is not None:
+                step_metrics["perf/consumer_wait_time"] = float(
+                    tq_local_batch.command_wait_seconds
+                )
+                step_metrics["perf/tq_get_time"] = tq_get_seconds
             if feature_replayer is not None:
                 step_metrics.update(feature_replayer.metrics())
             if feature_producer is not None:
@@ -482,6 +535,13 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             _log_standalone_step_metrics(step_metrics, rank=rank)
             if save_interval > 0 and optimizer_step % save_interval == 0:
                 current_stage = "save_checkpoint"
+                checkpoint_started = time.perf_counter()
+                if rank == 0:
+                    logger.info(
+                        "[standalone rank=%s] checkpoint saving step=%s",
+                        rank,
+                        optimizer_step,
+                    )
                 last_save_result = _save_standalone_checkpoint(
                     trainer,
                     optimizer_step,
@@ -490,6 +550,13 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                         standalone_input_path if feature_store_type == "tq" else None
                     ),
                 )
+                if rank == 0:
+                    logger.info(
+                        "[standalone rank=%s] checkpoint saved step=%s elapsed=%.3fs",
+                        rank,
+                        optimizer_step,
+                        time.perf_counter() - checkpoint_started,
+                    )
                 if _sync_any_rank_saved_checkpoint(last_save_result.get("saved")):
                     last_saved_step = optimizer_step
                 _barrier()
@@ -497,6 +564,13 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         final_save = bool(training_cfg.get("save_final_checkpoint", True))
         if final_save and successful_steps > 0 and optimizer_step != last_saved_step:
             current_stage = "save_final_checkpoint"
+            checkpoint_started = time.perf_counter()
+            if rank == 0:
+                logger.info(
+                    "[standalone rank=%s] final checkpoint saving step=%s",
+                    rank,
+                    optimizer_step,
+                )
             last_save_result = _save_standalone_checkpoint(
                 trainer,
                 optimizer_step,
@@ -506,6 +580,13 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                     standalone_input_path if feature_store_type == "tq" else None
                 ),
             )
+            if rank == 0:
+                logger.info(
+                    "[standalone rank=%s] final checkpoint saved step=%s elapsed=%.3fs",
+                    rank,
+                    optimizer_step,
+                    time.perf_counter() - checkpoint_started,
+                )
             _barrier()
     except Exception:
         logger.exception(
@@ -1120,6 +1201,11 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         ("train/simulated_acc_len", "sim_acc_len"),
         ("train/lr", "lr"),
         ("perf/step_time", "step_time"),
+        ("perf/consumer_wait_time", "wait_time"),
+        ("perf/tq_get_time", "tq_get_time"),
+        ("perf/batch_prepare_time", "batch_prepare_time"),
+        ("perf/train_time", "train_time"),
+        ("perf/tq_clear_time", "tq_clear_time"),
         ("replay/cache_hit_ratio", "cache_hit"),
         ("replay/target_forward_time_total", "target_forward_total"),
         ("replay/vllm_request_time_total", "vllm_request_total"),
@@ -1131,10 +1217,15 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         value = float(metrics[key])
         if key == "train/lr":
             fields.append(f"{label}={value:.3e}")
-        elif key.endswith("_time_total") or key in {
-            "perf/step_time",
-            "replay/target_forward_time_total",
-        }:
+        elif (
+            key.endswith("_time_total")
+            or key.startswith("perf/")
+            or key
+            in {
+                "perf/step_time",
+                "replay/target_forward_time_total",
+            }
+        ):
             fields.append(f"{label}={value:.3f}s")
         else:
             fields.append(f"{label}={value:.4f}")
@@ -1187,6 +1278,15 @@ def _all_ranks_true(value: bool, device: torch.device) -> bool:
     ready = torch.tensor(1 if value else 0, dtype=torch.int32, device=device)
     dist.all_reduce(ready, op=dist.ReduceOp.MIN)
     return bool(ready.item())
+
+
+def _max_across_ranks_float(value: float, device: torch.device) -> float:
+    """Return the slowest-rank duration for a distributed standalone stage."""
+
+    maximum = torch.tensor(float(value), dtype=torch.float32, device=device)
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+    return float(maximum.item())
 
 
 def _clear_tq_batch_across_ranks(

@@ -61,6 +61,9 @@ speco:
     max_sequence_length: 8192
     max_feature_length: 512
     generation_max_tokens: 511
+    # Per endpoint: log the first three successful HTTP requests, then every N.
+    # Zero disables successful-request logs; failures are always logged.
+    vllm_success_log_interval: 100
     # Server-side differential rendering for the assistant loss boundary.
     # Requires a vLLM /render endpoint at the first vllm_endpoints entry.
     render_boundary:
