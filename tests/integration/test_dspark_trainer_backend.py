@@ -613,3 +613,72 @@ def test_dspark_fallback_prefers_dspark_intermediate_size() -> None:
     defaulted = backend._build_fallback_config(target)
     # MoE targets have no dense intermediate_size, so hidden_size * 4 is used.
     assert defaulted.intermediate_size == 2048 * 4
+
+
+def test_from_dspark_dict_lifts_released_aux_layer_ids_into_serving_config(
+    tmp_path,
+) -> None:
+    from types import SimpleNamespace
+
+    from verl_speco.trainer.draft_training_loop import (
+        _rewrite_standalone_block_runtime_config,
+    )
+
+    # Mirrors the released RedHatAI/Qwen3.6-35B-A3B-speculator.dspark config
+    # (40-layer target): the architecture is nested and the context layers live
+    # under ``aux_hidden_state_layer_ids``.
+    released_config = {
+        "architectures": ["Qwen3DSparkModel"],
+        "speculators_model_type": "dspark",
+        "transformer_layer_config": {
+            "model_type": "qwen3",
+            "hidden_size": 2048,
+            "intermediate_size": 6144,
+            "num_hidden_layers": 5,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "vocab_size": 151936,
+            "head_dim": 128,
+        },
+        "aux_hidden_state_layer_ids": [2, 10, 20, 30, 37],
+        "block_size": 8,
+        "num_anchors": 512,
+        "markov_rank": 256,
+    }
+
+    config = DSparkConfig.from_dspark_dict(released_config)
+    # ``aux_hidden_state_layer_ids`` uses the same EAGLE ``output_hidden_states``
+    # indexing as SpeCo's training-side ``target_layer_ids``, so it must be kept
+    # verbatim rather than shifted or replaced by the spaced fallback.
+    assert config.target_layer_ids == [2, 10, 20, 30, 37]
+
+    checkpoint_dir = tmp_path / "draft_step_10"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps(config.to_dict()), encoding="utf-8"
+    )
+    source_dir = tmp_path / "source_dspark"
+    source_dir.mkdir()
+    (source_dir / "config.json").write_text(
+        json.dumps({"model_type": "qwen3", "architectures": ["Qwen3DSparkModel"]}),
+        encoding="utf-8",
+    )
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="dspark"),
+        config=SimpleNamespace(
+            rollout=SimpleNamespace(
+                drafter=SimpleNamespace(model_path=str(source_dir))
+            )
+        ),
+    )
+
+    _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    runtime_config = json.loads(
+        (checkpoint_dir / "config.json").read_text(encoding="utf-8")
+    )
+    # vLLM reads ``eagle_aux_hidden_state_layer_ids`` directly; the z-lab
+    # ``target_layer_ids`` aliases are one less and vLLM adds the +1 back.
+    assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [2, 10, 20, 30, 37]
+    assert runtime_config["target_layer_ids"] == [1, 9, 19, 29, 36]
+    assert runtime_config["dflash_config"]["target_layer_ids"] == [1, 9, 19, 29, 36]
