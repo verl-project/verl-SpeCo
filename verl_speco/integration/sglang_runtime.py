@@ -200,73 +200,41 @@ def _install_verl_server_args_fields_compat(upstream_module: Any) -> None:
 
 
 def _install_verl_launch_subprocesses_compat() -> None:
-    """Expose current SGLang's Engine launcher in the shape older verl expects."""
+    """Inject SPECO args at launch and expose the legacy verl launcher shape."""
     import importlib
 
     http_server = importlib.import_module("sglang.srt.entrypoints.http_server")
 
-    if callable(getattr(http_server, "_launch_subprocesses", None)):
-        return
     engine = getattr(http_server, "Engine", None)
     launcher = getattr(engine, "_launch_subprocesses", None)
     if not callable(launcher):
         return
 
-    def _launch_subprocesses(*args, **kwargs):
-        try:
-            bound = inspect.signature(launcher).bind_partial(*args, **kwargs)
-            server_args = bound.arguments.get("server_args")
-        except (TypeError, ValueError):
-            server_args = kwargs.get("server_args")
-        drafter_cfg = _load_env_drafter_config()
-        if drafter_cfg and server_args is not None:
-            overrides = _server_args_overrides_from_drafter(
-                drafter_cfg, set(_record_field_names(type(server_args)))
-            )
-            for key, value in overrides.items():
-                if key == "custom_weight_loader":
-                    current = list(getattr(server_args, key, None) or [])
-                    value = current + [item for item in value if item not in current]
-                try:
-                    setattr(server_args, key, value)
-                except (AttributeError, TypeError) as exc:
-                    raise RuntimeError(
-                        "SPECO could not apply SGLang ServerArgs override "
-                        f"{key}={value!r} before scheduler launch"
-                    ) from exc
+    if not getattr(engine, "_speco_patched_launch_subprocesses", False):
+        original_launcher = launcher
 
-            requested_algorithm = str(
-                drafter_cfg.get("speculative_algorithm", "") or ""
-            ).upper()
-            actual_algorithm = str(
-                getattr(server_args, "speculative_algorithm", "") or ""
-            ).upper()
-            logger.warning(
-                "[speco sglang launch] requested_algorithm=%s "
-                "server_args_algorithm=%s draft_model=%s "
-                "draft_attention_backend=%s prefill_attention_backend=%s "
-                "decode_attention_backend=%s server_args_type=%s resolution_finished=%s",
-                requested_algorithm,
-                actual_algorithm or None,
-                getattr(server_args, "speculative_draft_model_path", None),
-                getattr(server_args, "speculative_draft_attention_backend", None),
-                getattr(server_args, "prefill_attention_backend", None),
-                getattr(server_args, "decode_attention_backend", None),
-                type(server_args).__name__,
-                bool(getattr(server_args, "_resolution_finished", False)),
-            )
-            expected_algorithm = (
-                "DFLASH" if requested_algorithm == "DFLASH2" else requested_algorithm
-            )
-            if expected_algorithm and actual_algorithm != expected_algorithm:
-                raise RuntimeError(
-                    "SPECO SGLang speculative configuration was lost before "
-                    "scheduler launch: "
-                    f"requested_algorithm={requested_algorithm!r}, "
-                    f"server_args_algorithm={actual_algorithm or None!r}, "
-                    f"supported_fields={sorted(_record_field_names(type(server_args)))}"
+        @classmethod
+        def speco_engine_launch_subprocesses(cls, *args, **kwargs):
+            del cls
+            try:
+                bound = inspect.signature(original_launcher).bind_partial(
+                    *args, **kwargs
                 )
+                server_args = bound.arguments.get("server_args")
+            except (TypeError, ValueError):
+                server_args = kwargs.get("server_args")
+            _apply_drafter_config_at_scheduler_boundary(server_args)
+            return original_launcher(*args, **kwargs)
 
+        engine._speco_original_launch_subprocesses = original_launcher
+        engine._launch_subprocesses = speco_engine_launch_subprocesses
+        engine._speco_patched_launch_subprocesses = True
+        launcher = getattr(engine, "_launch_subprocesses")
+
+    if callable(getattr(http_server, "_launch_subprocesses", None)):
+        return
+
+    def _launch_subprocesses(*args, **kwargs):
         kwargs.setdefault(
             "init_tokenizer_manager_func",
             getattr(engine, "init_tokenizer_manager_func", None)
@@ -290,6 +258,61 @@ def _install_verl_launch_subprocesses_compat() -> None:
         return result
 
     http_server._launch_subprocesses = _launch_subprocesses
+
+
+def _apply_drafter_config_at_scheduler_boundary(server_args: Any) -> None:
+    """Mutate the constructed ServerArgs before SGLang resolves and publishes it."""
+
+    drafter_cfg = _load_env_drafter_config()
+    if not drafter_cfg or server_args is None:
+        return
+
+    overrides = _server_args_overrides_from_drafter(
+        drafter_cfg, set(_record_field_names(type(server_args)))
+    )
+    for key, value in overrides.items():
+        if key == "custom_weight_loader":
+            current = list(getattr(server_args, key, None) or [])
+            value = current + [item for item in value if item not in current]
+        try:
+            setattr(server_args, key, value)
+        except (AttributeError, TypeError) as exc:
+            raise RuntimeError(
+                "SPECO could not apply SGLang ServerArgs override "
+                f"{key}={value!r} before scheduler launch"
+            ) from exc
+
+    requested_algorithm = str(
+        drafter_cfg.get("speculative_algorithm", "") or ""
+    ).upper()
+    actual_algorithm = str(
+        getattr(server_args, "speculative_algorithm", "") or ""
+    ).upper()
+    logger.warning(
+        "[speco sglang launch] requested_algorithm=%s "
+        "server_args_algorithm=%s draft_model=%s "
+        "draft_attention_backend=%s prefill_attention_backend=%s "
+        "decode_attention_backend=%s server_args_type=%s resolution_finished=%s",
+        requested_algorithm,
+        actual_algorithm or None,
+        getattr(server_args, "speculative_draft_model_path", None),
+        getattr(server_args, "speculative_draft_attention_backend", None),
+        getattr(server_args, "prefill_attention_backend", None),
+        getattr(server_args, "decode_attention_backend", None),
+        type(server_args).__name__,
+        bool(getattr(server_args, "_resolution_finished", False)),
+    )
+    expected_algorithm = (
+        "DFLASH" if requested_algorithm == "DFLASH2" else requested_algorithm
+    )
+    if expected_algorithm and actual_algorithm != expected_algorithm:
+        raise RuntimeError(
+            "SPECO SGLang speculative configuration was lost before "
+            "scheduler launch: "
+            f"requested_algorithm={requested_algorithm!r}, "
+            f"server_args_algorithm={actual_algorithm or None!r}, "
+            f"supported_fields={sorted(_record_field_names(type(server_args)))}"
+        )
 
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
@@ -2730,28 +2753,9 @@ def _build_speco_replica_class(upstream_module):
     return SpecoSGLangReplica
 
 
-def _sglang_server_args_needs_fields_compat(server_args_cls: Any = None) -> bool:
-    """Whether upstream verl must be taught to inspect SGLang records."""
-
-    if server_args_cls is None:
-        try:
-            from sglang.srt.server_args import ServerArgs
-        except Exception:  # noqa: BLE001
-            return False
-        server_args_cls = ServerArgs
-    return not dataclasses.is_dataclass(server_args_cls) and bool(
-        _record_field_names(server_args_cls)
-    )
-
-
 def should_install_sglang_base_compat_runtime(config: Any) -> bool:
     rollout_name = _get_nested(config, ("actor_rollout_ref", "rollout", "name"), None)
-    if rollout_name != "sglang":
-        return False
-    return (
-        sglang_needs_qwen3_rope_compat_patch()
-        or _sglang_server_args_needs_fields_compat()
-    )
+    return rollout_name == "sglang" and sglang_needs_qwen3_rope_compat_patch()
 
 
 def install_upstream_sglang_runtime_bridge(*, base_compat_only: bool = False) -> bool:

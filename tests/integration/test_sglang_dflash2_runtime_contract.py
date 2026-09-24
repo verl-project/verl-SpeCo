@@ -690,33 +690,6 @@ def test_verl_server_args_probe_accepts_current_sglang_records(monkeypatch) -> N
         dataclasses.fields(ServerArgs)
 
 
-def test_base_compat_detects_current_sglang_records() -> None:
-    class CurrentServerArgs:
-        __struct_fields__ = ("model_path", "enable_weights_cpu_backup")
-
-    @dataclasses.dataclass
-    class LegacyServerArgs:
-        model_path: str
-
-    assert sglang_runtime._sglang_server_args_needs_fields_compat(CurrentServerArgs)
-    assert not sglang_runtime._sglang_server_args_needs_fields_compat(LegacyServerArgs)
-
-
-def test_base_compat_bridge_is_selected_without_drafter(monkeypatch) -> None:
-    monkeypatch.setattr(
-        sglang_runtime, "sglang_needs_qwen3_rope_compat_patch", lambda: False
-    )
-    monkeypatch.setattr(
-        sglang_runtime, "_sglang_server_args_needs_fields_compat", lambda: True
-    )
-
-    sglang_config = {"actor_rollout_ref": {"rollout": {"name": "sglang"}}}
-    vllm_config = {"actor_rollout_ref": {"rollout": {"name": "vllm"}}}
-
-    assert sglang_runtime.should_install_sglang_base_compat_runtime(sglang_config)
-    assert not sglang_runtime.should_install_sglang_base_compat_runtime(vllm_config)
-
-
 def test_http_server_installs_fields_compat_inside_actor(monkeypatch) -> None:
     import dataclasses
 
@@ -868,4 +841,61 @@ def test_verl_legacy_launcher_applies_drafter_config_at_scheduler_boundary(
     assert server_args.speculative_draft_attention_backend is None
     assert server_args.prefill_attention_backend is None
     assert server_args.decode_attention_backend is None
+    assert server_args.enable_draft_weights_cpu_backup is True
+
+
+def test_engine_launcher_applies_drafter_config_when_constructor_bypasses_init(
+    monkeypatch,
+) -> None:
+    entrypoints = types.ModuleType("sglang.srt.entrypoints")
+    http_server = types.ModuleType("sglang.srt.entrypoints.http_server")
+    received = {}
+
+    class StructLikeMeta(type):
+        def __call__(cls):
+            instance = object.__new__(cls)
+            for field in cls.__struct_fields__:
+                setattr(instance, field, None)
+            return instance
+
+    class ServerArgs(metaclass=StructLikeMeta):
+        __struct_fields__ = tuple(_SUPPORTED_FIELDS)
+
+        def __init__(self):
+            raise AssertionError("Struct-like construction must bypass __init__")
+
+    class Engine:
+        @classmethod
+        def _launch_subprocesses(cls, *, server_args, **kwargs):
+            received["server_args"] = server_args
+            return ("tokenizer", "template", "port_args", {}, "watchdog")
+
+    http_server.Engine = Engine
+    http_server._launch_subprocesses = lambda **kwargs: None
+    entrypoints.http_server = http_server
+    monkeypatch.setitem(sys.modules, "sglang.srt.entrypoints", entrypoints)
+    monkeypatch.setitem(sys.modules, "sglang.srt.entrypoints.http_server", http_server)
+    monkeypatch.setenv(
+        sglang_runtime.SPECO_SGLANG_DRAFTER_CONFIG_ENV,
+        json.dumps(
+            {
+                "enable": True,
+                "speculative_algorithm": "DSPARK",
+                "model_path": "/models/dspark",
+                "rollout": {
+                    "spec_steps": 1,
+                    "spec_topk": 1,
+                    "spec_verify_tokens": 7,
+                },
+            }
+        ),
+    )
+
+    sglang_runtime._install_verl_launch_subprocesses_compat()
+    Engine._launch_subprocesses(server_args=ServerArgs())
+
+    server_args = received["server_args"]
+    assert server_args.speculative_algorithm == "DSPARK"
+    assert server_args.speculative_draft_model_path == "/models/dspark"
+    assert server_args.speculative_num_draft_tokens == 8
     assert server_args.enable_draft_weights_cpu_backup is True

@@ -15,9 +15,9 @@
 
 When speculative drafting is disabled, SPECO falls through to verl's native
 ``run_ppo`` so the actor -> rollout weight-sync path matches upstream verl
-exactly.  A lightweight TaskRunner installs launch-only compatibility when a
-current SGLang record is paired with an older verl launcher; drafter and
-weight-sync extensions remain disabled.
+exactly.  SPECO's runtime bridge, weight-sync compat extension and trainer are
+only imported when a drafter is enabled, keeping the no-drafter reward
+distribution aligned with verl.
 """
 
 import hydra
@@ -108,24 +108,11 @@ def run(config) -> None:
         config = migrate_legacy_reward_impl(config)
 
     if should_bypass_speco(config):
-        rollout_name = _config_get(config, "actor_rollout_ref", "rollout", "name")
+        # Native verl path: keep SPECO runtime/compat patches unloaded so the
+        # actor -> rollout weight sync matches verl exactly.  verl selects its
+        # own TaskRunner (legacy on 0.8, legacy or V1 on 0.9).
         _strip_speco_overlay_for_native_run(config)
-        if rollout_name == "sglang":
-            # This must run inside Ray's TaskRunner process: patching the
-            # driver's imported modules does not affect the actor that creates
-            # SGLangHttpServer instances.
-            import ray
-
-            from verl_speco.integration.native_sglang_compat import (
-                NativeSGLangCompatTaskRunner,
-            )
-
-            main_ppo.run_ppo(
-                config,
-                task_runner_class=ray.remote(num_cpus=1)(NativeSGLangCompatTaskRunner),
-            )
-        else:
-            main_ppo.run_ppo(config)
+        main_ppo.run_ppo(config)
         return
 
     import ray
