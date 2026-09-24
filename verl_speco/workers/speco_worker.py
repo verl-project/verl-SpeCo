@@ -75,9 +75,9 @@ def _resolve_ray_object_ref(value):
     return value
 
 
-def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
+def _resolve_feature_chunks(chunks, expected_rows: int | None = None):
     if not chunks:
-        return None
+        return None, None
     resolved_cache = {}
     pieces = []
     full_rows = int(expected_rows or 0)
@@ -92,7 +92,11 @@ def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
         cache_key = id(ref)
         if cache_key not in resolved_cache:
             resolved_cache[cache_key] = _resolve_ray_object_ref(ref)
-        tensor = resolved_cache[cache_key]
+        payload = resolved_cache[cache_key]
+        target_logz_tensor = (
+            payload.get("target_logz") if isinstance(payload, dict) else None
+        )
+        tensor = payload.get("hidden_states") if isinstance(payload, dict) else payload
         if not torch.is_tensor(tensor):
             continue
         tensor = cast(torch.Tensor, tensor)
@@ -101,6 +105,11 @@ def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
         if length <= 0:
             continue
         part = tensor[start : start + length]
+        target_logz_part = (
+            cast(torch.Tensor, target_logz_tensor)[start : start + length]
+            if torch.is_tensor(target_logz_tensor)
+            else None
+        )
         row_indices = chunk.get("chunk_row_indices")
         if torch.is_tensor(row_indices):
             row_indices = cast(torch.Tensor, row_indices)
@@ -118,7 +127,7 @@ def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
                 int(part.shape[0]),
             )
             continue
-        pieces.append((row_indices, part))
+        pieces.append((row_indices, part, target_logz_part))
         full_rows = max(
             full_rows,
             int(row_indices.max().item()) + 1 if int(row_indices.numel()) > 0 else 0,
@@ -126,11 +135,27 @@ def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
         hidden_size = int(part.shape[-1])
         dtype = part.dtype
     if not pieces or hidden_size is None:
-        return None
+        return None, None
     output = torch.zeros((full_rows, hidden_size), dtype=dtype)
-    for row_indices, part in pieces:
+    has_target_logz = all(target_part is not None for _, _, target_part in pieces)
+    target_logz_output = (
+        torch.zeros((full_rows,), dtype=torch.float32) if has_target_logz else None
+    )
+    for row_indices, part, target_part in pieces:
         output[row_indices] = part.to(device=output.device, dtype=output.dtype)
-    return output.unsqueeze(0)
+        if target_logz_output is not None and target_part is not None:
+            target_logz_output[row_indices] = target_part.reshape(-1).to(
+                device=target_logz_output.device, dtype=torch.float32
+            )
+    return (
+        output.unsqueeze(0),
+        target_logz_output.unsqueeze(0) if target_logz_output is not None else None,
+    )
+
+
+def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
+    hidden, _target_logz = _resolve_feature_chunks(chunks, expected_rows=expected_rows)
+    return hidden
 
 
 @dataclass(frozen=True)
@@ -477,6 +502,7 @@ class SpecoWorker(Worker):
         hidden_states: torch.Tensor,
         target_logprobs: Optional[torch.Tensor] = None,
         *,
+        target_logz: Optional[torch.Tensor] = None,
         collection_id: Optional[str] = None,
     ) -> bool:
         if (
@@ -485,6 +511,9 @@ class SpecoWorker(Worker):
             or self.trainer is None
         ):
             return False
+        if target_logz is not None:
+            batch = dict(batch)
+            batch["target_logz"] = target_logz
         if self._drafter_training_mode() == "collect_only":
             return self._write_rollout_feature_sample(
                 batch,
@@ -604,6 +633,14 @@ class SpecoWorker(Worker):
             hidden_positions = hidden_positions.detach().cpu().long().reshape(-1)
         else:
             hidden_positions = None
+        target_logz = batch.get("target_logz")
+        if torch.is_tensor(target_logz):
+            target_logz = cast(torch.Tensor, target_logz).detach().cpu().float()
+            while target_logz.dim() > 1 and target_logz.size(0) == 1:
+                target_logz = target_logz.squeeze(0)
+            target_logz = target_logz.reshape(-1)[:hidden_rows].contiguous()
+        else:
+            target_logz = None
         feature_start, feature_end, position_ids = self._resolve_rollout_feature_window(
             full_input_ids,
             hidden_rows,
@@ -647,6 +684,9 @@ class SpecoWorker(Worker):
             "full_sequence_length": int(full_input_ids.numel()),
             "feature_start": int(feature_start),
             "feature_end": int(feature_end),
+            "target_logz_temperature": self.config.rollout.drafter.training.get(
+                "lk_temperature", 1.0
+            ),
         }
         for key in (
             "hidden_position_start",
@@ -670,6 +710,7 @@ class SpecoWorker(Worker):
             input_ids=input_ids,
             loss_mask=loss_mask,
             hidden_states=hidden_states,
+            target_logz=target_logz,
             target_logprobs=target_logprobs,
             position_ids=position_ids,
             metadata=metadata,
@@ -1051,6 +1092,7 @@ class SpecoWorker(Worker):
                 if key in sample:
                     batch[key] = sample[key]
             hidden = sample.get("hidden_states")
+            target_logz = sample.get("target_logz")
             if hidden is None:
                 hidden_chunks = sample.get("hidden_states_ref_chunks")
                 if hidden_chunks:
@@ -1059,11 +1101,16 @@ class SpecoWorker(Worker):
                     if torch.is_tensor(hidden_positions):
                         hidden_positions = cast(torch.Tensor, hidden_positions)
                         expected_rows = int(hidden_positions.numel())
-                    hidden = _resolve_hidden_state_chunks(
+                    hidden, target_logz = _resolve_feature_chunks(
                         hidden_chunks, expected_rows=expected_rows
                     )
                 else:
-                    hidden = _resolve_ray_object_ref(sample.get("hidden_states_ref"))
+                    resolved = _resolve_ray_object_ref(sample.get("hidden_states_ref"))
+                    if isinstance(resolved, dict):
+                        hidden = resolved.get("hidden_states")
+                        target_logz = resolved.get("target_logz")
+                    else:
+                        hidden = resolved
             target_logprobs = sample.get("target_logprobs")
             if target_logprobs is None:
                 target_logprobs = _resolve_ray_object_ref(
@@ -1077,6 +1124,7 @@ class SpecoWorker(Worker):
                 hidden_states=hidden,
                 target_logprobs=target_logprobs,
                 collection_id=collection_id,
+                target_logz=target_logz,
             )
             if stored:
                 result["accepted_samples"] += 1
@@ -1425,6 +1473,27 @@ class SpecoWorker(Worker):
             try:
                 train_loop_ts = time.time()
                 self.trainer.reset_training_metrics()
+                data_stats = self.trainer.get_training_data_stats()
+                result.update(
+                    {
+                        "train_buffer_total": int(data_stats["buffer_total"]),
+                        "train_eligible_samples": int(data_stats["eligible_samples"]),
+                    }
+                )
+                if self.is_drafter_group_leader:
+                    logger.warning(
+                        "[drafter data] rl_step=%s replica=%s buffer_total=%s "
+                        "eligible_samples=%s eligible_step_counts=%s "
+                        "sample_last_n_steps=%s batch_size=%s train_steps=%s",
+                        self.last_global_step,
+                        self.replica_rank,
+                        data_stats["buffer_total"],
+                        data_stats["eligible_samples"],
+                        data_stats["eligible_step_counts"],
+                        data_stats["sample_last_n_steps"],
+                        data_stats["batch_size"],
+                        max_batches,
+                    )
                 for _ in range(max_batches):
                     result["attempted_steps"] += 1
                     step_ok = await self.trainer.training_step(
@@ -1436,6 +1505,16 @@ class SpecoWorker(Worker):
                         result["successful_steps"] += 1
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
                 result.update(self.trainer.get_training_metrics())
+                if self.is_drafter_group_leader:
+                    logger.warning(
+                        "[drafter data used] rl_step=%s replica=%s "
+                        "successful_steps=%s sample_draws=%s unique_samples=%s",
+                        self.last_global_step,
+                        self.replica_rank,
+                        result["successful_steps"],
+                        int(result.get("drafter/train_sample_draws", 0)),
+                        int(result.get("drafter/train_unique_samples", 0)),
+                    )
                 if result["successful_steps"] > 0:
                     if prepare_publish:
                         snapshot_ts = time.time()

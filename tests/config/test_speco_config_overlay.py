@@ -96,6 +96,21 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert standalone_training.target_feature_pipeline.concurrency == 16
     assert standalone_training.target_feature_pipeline.producer_prefetch_depth == 4
     assert standalone_training.target_feature_pipeline.prefetch_depth == 2
+    assert drafter.vllm.draft_sample_method == "greedy"
+    assert drafter.training.lk_temperature == pytest.approx(1.0)
+    assert drafter.training.dflash_lk_loss_alpha == 0.0
+    assert drafter.training.dflash_lk_loss_type == "alpha"
+    assert drafter.training.dflash_lk_hybrid_eta == pytest.approx(3.0)
+    assert drafter.training.dflash_per_position_loss_weight == "fixed_exp_decay"
+    assert drafter.training.dflash_dpace_alpha == pytest.approx(0.5)
+    assert drafter.training.dspark_lk_loss_alpha == 0.0
+    assert drafter.training.dspark_lk_loss_type == "alpha"
+    assert drafter.training.dspark_lk_hybrid_eta == pytest.approx(3.0)
+    assert drafter.training.dspark_per_position_loss_weight == "fixed_exp_decay"
+    assert drafter.training.dspark_dpace_alpha == pytest.approx(0.5)
+    assert drafter.training.eagle3_lk_loss_alpha == 0.0
+    assert drafter.training.eagle3_lk_loss_type == "alpha"
+    assert drafter.training.eagle3_lk_hybrid_eta == pytest.approx(3.0)
 
 
 def test_overlay_composes_with_release_upstream_verl(tmp_path: Path) -> None:

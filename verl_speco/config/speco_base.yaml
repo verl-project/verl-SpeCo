@@ -116,6 +116,7 @@ actor_rollout_ref:
         draft_tensor_parallel_size: null
         max_model_len: null
         enforce_eager: null
+        draft_sample_method: greedy
         speculative_config_overrides: {}
         # RL rollout assumes exact target-distribution verification. Set this
         # only when intentionally opting into a lossy acceptance method.
@@ -215,6 +216,20 @@ actor_rollout_ref:
         group_by_length: false
         # Samples per grouping megabatch, as a multiple of batch_size_per_gpu.
         group_by_length_megabatch: 8
+        # Temperature used for both target and draft distributions in LK losses.
+        # Set this to actor_rollout_ref.rollout.temperature for probabilistic drafts.
+        lk_temperature: 1.0
+        # null enables actor-side full-vocabulary logZ capture automatically when
+        # EAGLE3 LK is active; set true for collect-only fixed-data ablations.
+        capture_target_logz: null
+        eagle3_ce_loss_alpha: 1.0
+        eagle3_lk_loss_alpha: 0.0
+        # alpha: -log acceptance; adaptive_hybrid: lambda * KL + (1-lambda) * TV.
+        eagle3_lk_loss_type: alpha
+        # Paper default for lambda = exp(-eta * stop_gradient(mean_acceptance)).
+        eagle3_lk_hybrid_eta: 3.0
+        # Aggregate adaptive diagnostics on GPU and copy them once at this cadence.
+        eagle3_lk_telemetry_interval_steps: 20
         vocab_mapping_path: null
         dflash_block_size: 16
         dflash_num_anchors: 512
@@ -230,6 +245,13 @@ actor_rollout_ref:
         dflash_max_window: 512
         dflash_loss_mode: full_vocab
         dflash_sampled_ce_negatives: 0
+        dflash_ce_loss_alpha: 1.0
+        dflash_lk_loss_alpha: 0.0
+        # alpha: -log acceptance; adaptive_hybrid: lambda * KL + (1-lambda) * TV.
+        dflash_lk_loss_type: alpha
+        dflash_lk_hybrid_eta: 3.0
+        dflash_per_position_loss_weight: fixed_exp_decay
+        dflash_dpace_alpha: 0.5
         dspark_block_size: 7
         dspark_num_anchors: 32
         dspark_loss_decay_gamma: 7.0
@@ -243,6 +265,9 @@ actor_rollout_ref:
         dspark_max_window: 512
         dspark_loss_mode: full_vocab
         dspark_sampled_ce_negatives: 0
+        # D-PACE affects DSpark CE only; L1/LK keep dspark_loss_decay_gamma.
+        dspark_per_position_loss_weight: fixed_exp_decay
+        dspark_dpace_alpha: 0.5
         dspark_markov_rank: 256
         dspark_markov_head_type: vanilla
         dspark_confidence_head_alpha: 0.0
@@ -255,6 +280,10 @@ actor_rollout_ref:
         # auto | fused | eager. Fused uses the native CUDA/Ascend Triton kernel.
         dspark_distribution_loss_impl: auto
         # Only used by the eager fallback/reference implementation.
+        dspark_lk_loss_alpha: 0.0
+        # alpha: -log acceptance; adaptive_hybrid: lambda * KL + (1-lambda) * TV.
+        dspark_lk_loss_type: alpha
+        dspark_lk_hybrid_eta: 3.0
         dspark_l1_chunk_size: 0
         dspark_debug_log: false
         dspark_debug_log_first_n: 2

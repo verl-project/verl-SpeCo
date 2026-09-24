@@ -14,6 +14,7 @@
 import logging
 import glob
 import json
+import math
 import os
 from copy import deepcopy
 
@@ -24,6 +25,11 @@ from safetensors import safe_open
 from transformers import AutoConfig
 
 from verl.utils.device import get_device_id, get_device_name
+from verl_speco.backends.dpace_loss import dpace_position_weights
+from verl_speco.backends.lk_loss import (
+    adaptive_hybrid_acceptance_loss,
+    negative_log_acceptance_loss,
+)
 from verl_speco.backends.lr_scheduler import build_drafter_lr_scheduler
 from verl_speco.backends.optimizers import build_drafter_optimizer
 from verl_speco.models.dflash import (
@@ -174,6 +180,13 @@ class DFlashTrainingModel(nn.Module):
         front_position_count: int = 0,
         loss_mode: str = "full_vocab",
         sampled_ce_negatives: int = 0,
+        ce_loss_alpha: float = 1.0,
+        lk_loss_alpha: float = 0.0,
+        per_position_loss_weight: str = "fixed_exp_decay",
+        dpace_alpha: float = 0.5,
+        lk_temperature: float = 1.0,
+        lk_loss_type: str = "alpha",
+        lk_hybrid_eta: float = 3.0,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -185,6 +198,35 @@ class DFlashTrainingModel(nn.Module):
         self.front_position_count = max(int(front_position_count), 0)
         self.loss_mode = str(loss_mode or "full_vocab")
         self.sampled_ce_negatives = max(int(sampled_ce_negatives), 0)
+        self.ce_loss_alpha = float(ce_loss_alpha)
+        self.lk_loss_alpha = float(lk_loss_alpha)
+        self.per_position_loss_weight = str(
+            per_position_loss_weight or "fixed_exp_decay"
+        ).strip().lower()
+        if self.per_position_loss_weight not in {"fixed_exp_decay", "dpace"}:
+            raise ValueError(
+                "per_position_loss_weight must be 'fixed_exp_decay' or 'dpace', "
+                f"got {per_position_loss_weight!r}"
+            )
+        self.dpace_alpha = float(dpace_alpha)
+        if not 0.0 <= self.dpace_alpha <= 1.0:
+            raise ValueError(f"dpace_alpha must be in [0, 1], got {dpace_alpha!r}")
+        self.lk_temperature = float(lk_temperature)
+        if not math.isfinite(self.lk_temperature) or self.lk_temperature <= 0:
+            raise ValueError(
+                f"lk_temperature must be finite and positive, got {lk_temperature!r}"
+            )
+        self.lk_loss_type = str(lk_loss_type or "alpha").strip().lower()
+        if self.lk_loss_type not in {"alpha", "adaptive_hybrid"}:
+            raise ValueError(
+                "lk_loss_type must be 'alpha' or 'adaptive_hybrid', "
+                f"got {lk_loss_type!r}"
+            )
+        self.lk_hybrid_eta = float(lk_hybrid_eta)
+        if not math.isfinite(self.lk_hybrid_eta) or self.lk_hybrid_eta < 0:
+            raise ValueError(
+                f"lk_hybrid_eta must be finite and non-negative, got {lk_hybrid_eta!r}"
+            )
         self._tensor_template_cache: dict[tuple, torch.Tensor] = {}
 
     def _auxiliary_loss(
@@ -250,6 +292,22 @@ class DFlashTrainingModel(nn.Module):
             cached = torch.exp(-(k - 1).clamp(min=0).float() / gamma)
             self._tensor_template_cache[key] = cached
         return cached
+
+    def _dpace_weight_mask(
+        self,
+        *,
+        per_token_ce: torch.Tensor,
+        finite_loss: torch.Tensor,
+        active_mask: torch.Tensor,
+        base_loss_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        ce_grid = torch.zeros_like(base_loss_mask, dtype=torch.float32)
+        ce_grid.view(-1)[active_mask] = per_token_ce.detach().float()
+        valid_mask = base_loss_mask.clone()
+        valid_mask.view(-1)[active_mask] *= finite_loss.to(valid_mask.dtype)
+        return dpace_position_weights(
+            ce_grid, valid_mask, dpace_alpha=self.dpace_alpha
+        ).to(dtype=base_loss_mask.dtype)
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
@@ -372,12 +430,38 @@ class DFlashTrainingModel(nn.Module):
             )
         return torch.unique(torch.cat(candidates), sorted=True)
 
+    @staticmethod
+    def _gather_dflash_aligned_target_hidden(
+        target_last_hidden_states: torch.Tensor | None,
+        label_indices: torch.Tensor,
+        block_keep_mask: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if target_last_hidden_states is None:
+            return None
+        seq_len = int(target_last_hidden_states.size(1))
+        target_pred_indices = (label_indices - 1).clamp(min=0, max=seq_len - 1)
+        target_pred_indices = torch.where(
+            block_keep_mask.unsqueeze(-1),
+            target_pred_indices,
+            torch.zeros_like(target_pred_indices),
+        )
+        return torch.gather(
+            target_last_hidden_states.unsqueeze(1).expand(
+                -1, target_pred_indices.size(1), -1, -1
+            ),
+            2,
+            target_pred_indices.unsqueeze(-1).expand(
+                -1, -1, -1, target_last_hidden_states.size(-1)
+            ),
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
         hidden_states_list: list[torch.Tensor],
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
+        target_last_hidden_states: torch.Tensor | None = None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -433,6 +517,9 @@ class DFlashTrainingModel(nn.Module):
         target_ids = torch.gather(
             input_ids.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
         )
+        aligned_target_hidden = self._gather_dflash_aligned_target_hidden(
+            target_last_hidden_states, label_indices, block_keep_mask
+        )
 
         weight_mask = (
             block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
@@ -447,6 +534,7 @@ class DFlashTrainingModel(nn.Module):
         )
         weight_mask = weight_mask * original_loss_mask
         binary_eval_mask = weight_mask.view(-1)
+        base_loss_mask = weight_mask.clone()
 
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             decay_weights = self._cached_decay_weights(device)
@@ -473,10 +561,25 @@ class DFlashTrainingModel(nn.Module):
         active_hidden = flat_hidden[active_mask]
         active_targets = flat_targets[active_mask]
         active_weights = flat_weights[active_mask]
+        active_target_hidden = (
+            aligned_target_hidden.reshape(-1, aligned_target_hidden.size(-1))[
+                active_mask
+            ]
+            if aligned_target_hidden is not None
+            else None
+        )
         loss_per_token = torch.zeros_like(flat_weights)
 
         sanitized_rows = torch.zeros((), dtype=torch.float32, device=device)
         local_ploss_sum = torch.zeros((), dtype=torch.float32, device=device)
+        local_ce_den = torch.zeros((), dtype=torch.float32, device=device)
+        local_lk_sum = torch.zeros((), dtype=torch.float32, device=device)
+        local_lk_den = torch.zeros((), dtype=torch.float32, device=device)
+        lk_diagnostic_count = torch.zeros((), dtype=torch.float32, device=device)
+        lk_acceptance_sum = torch.zeros((), dtype=torch.float32, device=device)
+        lk_kl_weight_sum = torch.zeros((), dtype=torch.float32, device=device)
+        lk_forward_kl_sum = torch.zeros((), dtype=torch.float32, device=device)
+        lk_tv_sum = torch.zeros((), dtype=torch.float32, device=device)
         if active_targets.numel() == 0:
             loss = flat_weights.sum() * 0.0
         elif self.loss_mode in {"restricted_ce", "sampled_ce"}:
@@ -495,11 +598,21 @@ class DFlashTrainingModel(nn.Module):
             active_loss = torch.where(
                 finite_loss, active_loss, torch.zeros_like(active_loss)
             )
+            if self.per_position_loss_weight == "dpace":
+                weight_mask = self._dpace_weight_mask(
+                    per_token_ce=active_loss,
+                    finite_loss=finite_loss,
+                    active_mask=active_mask,
+                    base_loss_mask=base_loss_mask,
+                )
+                flat_weights = weight_mask.view(-1)
+                active_weights = flat_weights[active_mask]
             active_loss_weights = active_weights * finite_loss.to(
                 dtype=active_weights.dtype
             )
             loss_per_token[active_mask] = active_loss
-            valid_token_count = active_loss_weights.sum().clamp(min=1e-6)
+            local_ce_den = active_loss_weights.sum()
+            valid_token_count = local_ce_den.clamp(min=1e-6)
             local_ploss_sum = (active_loss * active_loss_weights).sum()
             loss = local_ploss_sum / valid_token_count
         else:
@@ -512,13 +625,73 @@ class DFlashTrainingModel(nn.Module):
             active_loss = torch.where(
                 finite_loss, active_loss, torch.zeros_like(active_loss)
             )
+            if self.per_position_loss_weight == "dpace":
+                weight_mask = self._dpace_weight_mask(
+                    per_token_ce=active_loss,
+                    finite_loss=finite_loss,
+                    active_mask=active_mask,
+                    base_loss_mask=base_loss_mask,
+                )
+                flat_weights = weight_mask.view(-1)
+                active_weights = flat_weights[active_mask]
             active_loss_weights = active_weights * finite_loss.to(
                 dtype=active_weights.dtype
             )
             loss_per_token[active_mask] = active_loss
-            valid_token_count = active_loss_weights.sum().clamp(min=1e-6)
+            local_ce_den = active_loss_weights.sum()
+            valid_token_count = local_ce_den.clamp(min=1e-6)
             local_ploss_sum = (active_loss * active_loss_weights).sum()
             loss = local_ploss_sum / valid_token_count
+
+        ce_loss = loss
+        lk_loss = local_ploss_sum.new_zeros(())
+        if self.lk_loss_alpha > 0 and active_targets.numel() > 0:
+            if active_target_hidden is None:
+                raise ValueError(
+                    "DFlash LK loss requires target_last_hidden_states. "
+                    "Enable dflash_aux_plus_last hidden-state collection."
+                )
+            lk_mask = finite_loss & torch.isfinite(active_target_hidden).all(dim=-1)
+            if lk_mask.any():
+                if self.loss_mode in {"restricted_ce", "sampled_ce"}:
+                    draft_logits = F.linear(active_hidden[lk_mask], lm_head_weight)
+                else:
+                    draft_logits = active_logits[lk_mask]
+                target_logits = F.linear(active_target_hidden[lk_mask], lm_head_weight)
+                temperature = self.lk_temperature
+                draft_probs = torch.softmax(draft_logits.float() / temperature, dim=-1)
+                target_probs = torch.softmax(
+                    target_logits.float() / temperature, dim=-1
+                )
+                if self.lk_loss_type == "adaptive_hybrid":
+                    per_token_lk_loss, lk_diagnostics = adaptive_hybrid_acceptance_loss(
+                        draft_probs=draft_probs,
+                        target_acceptance_probs=target_probs,
+                        target_kl_probs=target_probs,
+                        position_mask=torch.ones(
+                            draft_probs.shape[:-1], dtype=torch.bool, device=device
+                        ),
+                        eta=self.lk_hybrid_eta,
+                    )
+                    lk_diagnostic_count = lk_mask.float().sum()
+                    lk_acceptance_sum = (
+                        lk_diagnostics["acceptance"] * lk_diagnostic_count
+                    )
+                    lk_kl_weight_sum = lk_diagnostics["kl_weight"] * lk_diagnostic_count
+                    lk_forward_kl_sum = (
+                        lk_diagnostics["forward_kl"] * lk_diagnostic_count
+                    )
+                    lk_tv_sum = lk_diagnostics["tv"] * lk_diagnostic_count
+                else:
+                    per_token_lk_loss = negative_log_acceptance_loss(
+                        draft_probs,
+                        target_probs,
+                    )
+                lk_weights = active_loss_weights[lk_mask]
+                local_lk_sum = (per_token_lk_loss * lk_weights).sum()
+                local_lk_den = lk_weights.sum()
+                lk_loss = local_lk_sum / local_lk_den.clamp(min=1e-6)
+        loss = (ce_loss * self.ce_loss_alpha) + (lk_loss * self.lk_loss_alpha)
 
         auxiliary_metrics: dict[str, torch.Tensor] = {}
         if active_targets.numel() > 0:
@@ -687,6 +860,15 @@ class DFlashTrainingModel(nn.Module):
                 "weighted_token_count": flat_weights.sum().float(),
                 "simulated_accept_length_sum": simulated_accept_length_sum,
                 "simulated_accept_block_count": simulated_accept_block_count,
+                "ce_loss_sum": local_ploss_sum,
+                "ce_weighted_token_count": local_ce_den,
+                "lk_loss_sum": local_lk_sum,
+                "lk_weighted_token_count": local_lk_den,
+                "lk_diagnostic_token_count": lk_diagnostic_count,
+                "lk_acceptance_sum": lk_acceptance_sum,
+                "lk_kl_weight_sum": lk_kl_weight_sum,
+                "lk_forward_kl_sum": lk_forward_kl_sum,
+                "lk_tv_sum": lk_tv_sum,
                 "sanitized_rows": sanitized_rows,
                 "masked_rows": masked_rows,
                 "loss_sum_per_position": loss_sum_per_position,
@@ -1151,6 +1333,15 @@ class DFlashTrainerBackend:
             sampled_ce_negatives=int(
                 training_cfg.get("dflash_sampled_ce_negatives", 0)
             ),
+            ce_loss_alpha=float(training_cfg.get("dflash_ce_loss_alpha", 1.0)),
+            lk_loss_alpha=float(training_cfg.get("dflash_lk_loss_alpha", 0.0)),
+            per_position_loss_weight=str(
+                training_cfg.get("dflash_per_position_loss_weight", "fixed_exp_decay")
+            ),
+            dpace_alpha=float(training_cfg.get("dflash_dpace_alpha", 0.5)),
+            lk_temperature=float(training_cfg.get("lk_temperature", 1.0)),
+            lk_loss_type=str(training_cfg.get("dflash_lk_loss_type", "alpha")),
+            lk_hybrid_eta=float(training_cfg.get("dflash_lk_hybrid_eta", 3.0)),
         ), drafter_config
 
     def _build_target_lm_head(self, target_model_path: str, target_hf_config=None):
@@ -1196,7 +1387,7 @@ class DFlashTrainerBackend:
         return target_lm_head
 
     def preprocess_individual_items(self, items, device, model_config):
-        res = {"ids": [], "h_states": [], "masks": []}
+        res = {"ids": [], "h_states": [], "masks": [], "target_last_h_states": []}
         max_window = int(
             self.config.rollout.drafter.training.get("dflash_max_window", 512)
         )
@@ -1215,9 +1406,10 @@ class DFlashTrainerBackend:
 
         for item in items:
             layout = item.get("hidden_states_layout")
-            if layout not in (None, "dflash_aux"):
+            if layout not in (None, "dflash_aux", "dflash_aux_plus_last"):
                 raise ValueError(
-                    f"DFlash expected hidden_states_layout='dflash_aux', got {layout!r}. "
+                    "DFlash expected hidden_states_layout='dflash_aux' or "
+                    f"'dflash_aux_plus_last', got {layout!r}. "
                     "This usually means EAGLE3 aux+last hidden states were routed into DFlash training."
                 )
             ids = item["input_ids"].to(device, non_blocking=True)
@@ -1231,7 +1423,17 @@ class DFlashTrainerBackend:
                     f"DFlash expected at least {expected_hidden_dim} hidden dims "
                     f"({num_context_layers} context layers of size {h_dim}), got {full_h.size(-1)}"
                 )
-            if layout == "dflash_aux" and full_h.size(-1) != expected_hidden_dim:
+            target_last_h = None
+            if layout == "dflash_aux_plus_last":
+                expected_with_last = expected_hidden_dim + h_dim
+                if full_h.size(-1) != expected_with_last:
+                    raise ValueError(
+                        "DFlash hidden_states_layout='dflash_aux_plus_last' expected "
+                        f"exactly {expected_with_last} hidden dims, got {full_h.size(-1)}"
+                    )
+                target_last_h = full_h[..., expected_hidden_dim:expected_with_last]
+                full_h = full_h[..., :expected_hidden_dim]
+            elif layout == "dflash_aux" and full_h.size(-1) != expected_hidden_dim:
                 raise ValueError(
                     f"DFlash hidden_states_layout='dflash_aux' expected exactly {expected_hidden_dim} hidden dims "
                     f"({num_context_layers} context layers of size {h_dim}), got {full_h.size(-1)}"
@@ -1272,6 +1474,10 @@ class DFlashTrainerBackend:
             res["ids"].append(ids[start:end])
             res["h_states"].append(full_h[start:end, :expected_hidden_dim])
             res["masks"].append(item_loss_mask[start:end])
+            if target_last_h is not None:
+                res["target_last_h_states"].append(target_last_h[start:end])
+            else:
+                res["target_last_h_states"].append(None)
         return res
 
     def compute_loss(self, model, batch, _current_pad_size):
@@ -1294,6 +1500,7 @@ class DFlashTrainerBackend:
             hidden_states_list=hidden_states_list,
             loss_mask=batch["loss_mask"],
             lm_head_weight=self.target_lm_head.fc.weight,
+            target_last_hidden_states=batch.get("target_last_hidden_states"),
         )
         local_num_tokens = count_pp.sum().to(loss.device, dtype=loss.dtype)
         return {

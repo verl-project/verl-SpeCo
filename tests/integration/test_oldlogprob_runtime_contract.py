@@ -14,15 +14,19 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from verl_speco.integration import oldlogprob_runtime
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
+    OLD_LOGPROB_TARGET_LOGZ_TEMPERATURE_KEY,
+    _compute_oldlogprob_target_logz,
     _find_layers_and_final_norm,
     _install_oldlogprob_fsdp_batch_postprocess_patch,
+    _put_oldlogprob_hidden_refs,
     _select_and_merge_concatenated_hidden,
     _to_cpu_transfer_tensor,
     oldlogprob_hidden_runtime_enabled,
@@ -335,3 +339,57 @@ def test_veomni_batch_postprocess_keeps_router_replay_output() -> None:
     assert result["model_output"][OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY] == [
         "hidden-ref"
     ]
+
+
+def test_oldlogprob_target_logz_is_temperature_aware() -> None:
+    torch = pytest.importorskip("torch")
+    logits = torch.tensor([[[1.0, 2.0, 3.0], [0.0, 1.0, 2.0]]])
+    micro_batch = {OLD_LOGPROB_TARGET_LOGZ_TEMPERATURE_KEY: 0.5}
+
+    actual = _compute_oldlogprob_target_logz({"logits": logits}, micro_batch)
+
+    torch.testing.assert_close(
+        actual,
+        torch.logsumexp(logits.float() / 0.5, dim=-1, keepdim=True),
+    )
+
+
+def test_oldlogprob_target_logz_is_disabled_without_temperature() -> None:
+    torch = pytest.importorskip("torch")
+    logits = torch.randn(1, 2, 4)
+
+    assert _compute_oldlogprob_target_logz({"logits": logits}, {}) is None
+
+
+def test_oldlogprob_object_ref_payload_keeps_fp32_target_logz(monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    fake_ray = ModuleType("ray")
+    fake_ray.put = lambda value: value
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setattr(oldlogprob_runtime, "_BATCH_POSTPROCESS_PATCHED", True)
+    monkeypatch.setattr(oldlogprob_runtime, "_POSTPROCESS_PATCHED", True)
+    hidden = torch.randn(1, 2, 4, dtype=torch.bfloat16)
+    target_logz = torch.tensor([[[2.25], [3.5]]], dtype=torch.float32)
+    micro_batch = {
+        "speco_oldlogprob_collect_mask": torch.tensor([True]),
+        "speco_oldlogprob_hidden_position_mask": torch.tensor([[True, True]]),
+        "speco_oldlogprob_owner_rank": torch.tensor([0]),
+        "speco_oldlogprob_hidden_object_ref": True,
+    }
+
+    result = _put_oldlogprob_hidden_refs(
+        {
+            "speco_oldlogprob_hidden_states": hidden,
+            "speco_oldlogprob_target_logz": target_logz,
+            "speco_oldlogprob_sp_size": 1,
+            "speco_oldlogprob_sp_rank": 0,
+        },
+        micro_batch,
+    )
+
+    payload = result["speco_oldlogprob_hidden_chunk_refs"][0]
+    assert payload["hidden_states"].dtype == torch.bfloat16
+    assert payload["target_logz"].dtype == torch.float32
+    torch.testing.assert_close(
+        payload["target_logz"].reshape(-1), target_logz.reshape(-1)
+    )
