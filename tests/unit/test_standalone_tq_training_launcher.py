@@ -24,10 +24,12 @@ from verl_speco.standalone_tq_training_launcher import (
     _preflight_input_file,
     _producer_max_samples,
     _target_final_layer_id,
+    _tq_backend_overrides,
     build_pipeline_commands,
     resolve_pipeline_config,
     run_pipeline,
     start_ray_session,
+    validate_tq_backend,
 )
 import verl_speco.tq_owner as tq_owner
 
@@ -182,6 +184,9 @@ def test_preflight_accepts_verl_prompt_parquet(monkeypatch, tmp_path) -> None:
 def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
     args = [
         *_training_args(),
+        "speco.draft_training.runtime_backend=ray",
+        "speco.draft_training.num_gpus_per_node=8",
+        "speco.draft_training.num_nodes=1",
         "actor_rollout_ref.rollout.drafter.training.feature_store.type=torch_shard",
         "actor_rollout_ref.rollout.drafter.training.transfer_queue.run_id=user-value",
     ]
@@ -211,6 +216,11 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
     ]
     assert any(item.endswith("feature_store.type=tq") for item in commands.consumer)
     assert not any("run_id=user-value" in item for item in commands.consumer)
+    assert not any("runtime_backend" in item for item in commands.consumer_overrides)
+    assert not any("num_gpus_per_node" in item for item in commands.consumer_overrides)
+    assert not any("num_nodes" in item for item in commands.consumer_overrides)
+    assert "speco.draft_training.nproc_per_node=8" in commands.consumer_overrides
+    assert "speco.draft_training.nnodes=1" in commands.consumer_overrides
     assert any(f"run_id={config.run_id}" in item for item in commands.consumer)
     expected_contract = " ".join(commands.consumer)
     assert "expected_feature.algorithm=DSPARK" in expected_contract
@@ -230,7 +240,8 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
         "vllm_endpoints=[http://127.0.0.1:8000/v1]" in item
         for item in commands.producer
     )
-    assert any("max_samples=40" in item for item in commands.producer)
+    # 10 steps * default batch_size_per_gpu=4 * 8 GPUs * 1 node.
+    assert any("max_samples=320" in item for item in commands.producer)
 
 
 def test_pipeline_commands_pass_all_external_vllm_endpoints_to_producer() -> None:
@@ -258,6 +269,15 @@ def test_pipeline_commands_forward_producer_tuning_overrides() -> None:
         "speco.standalone_tq_producer.max_inflight_requests=32",
         "speco.standalone_tq_producer.per_endpoint_concurrency=8",
         "speco.standalone_tq_producer.max_feature_length=384",
+        "speco.standalone_tq_producer.max_consecutive_errors=0",
+        "speco.standalone_tq_producer.max_consecutive_feature_drops=5",
+        "speco.standalone_tq_producer.on_error=raise",
+        "speco.standalone_tq_producer.parser_strict_roles=true",
+        "speco.standalone_tq_producer.min_supervised_tokens=3",
+        "speco.standalone_tq_producer.on_truncated_supervision=drop",
+        "speco.standalone_tq_producer.trust_remote_code=true",
+        "speco.standalone_tq_producer.render_boundary.enabled=true",
+        "speco.standalone_tq_producer.render_boundary.timeout=45",
     ]
     config = resolve_pipeline_config(args, environ={})
 
@@ -268,15 +288,57 @@ def test_pipeline_commands_forward_producer_tuning_overrides() -> None:
         python_executable="python",
     )
 
-    assert (
-        "speco.standalone_tq_producer.max_inflight_requests=32"
-        in commands.producer
+    for override in (
+        "speco.standalone_tq_producer.max_inflight_requests=32",
+        "speco.standalone_tq_producer.per_endpoint_concurrency=8",
+        "speco.standalone_tq_producer.max_feature_length=384",
+        "speco.standalone_tq_producer.max_consecutive_errors=0",
+        "speco.standalone_tq_producer.max_consecutive_feature_drops=5",
+        "speco.standalone_tq_producer.on_error=raise",
+        "speco.standalone_tq_producer.parser_strict_roles=true",
+        "speco.standalone_tq_producer.min_supervised_tokens=3",
+        "speco.standalone_tq_producer.on_truncated_supervision=drop",
+        "speco.standalone_tq_producer.trust_remote_code=true",
+        "speco.standalone_tq_producer.render_boundary.enabled=true",
+        "speco.standalone_tq_producer.render_boundary.timeout=45",
+    ):
+        assert override in commands.producer
+
+
+def test_pipeline_commands_ignore_launcher_owned_producer_overrides() -> None:
+    args = [
+        *_training_args(),
+        "speco.standalone_tq_producer.input_path=/evil.jsonl",
+        "speco.standalone_tq_producer.max_samples=999",
+    ]
+    config = resolve_pipeline_config(args, environ={})
+
+    commands = build_pipeline_commands(
+        config,
+        args,
+        ray_address="127.0.0.1:6379",
+        python_executable="python",
     )
-    assert (
-        "speco.standalone_tq_producer.per_endpoint_concurrency=8"
-        in commands.producer
-    )
-    assert "speco.standalone_tq_producer.max_feature_length=384" in commands.producer
+
+    assert "speco.standalone_tq_producer.input_path=/data/train.jsonl" in commands.producer
+    assert "speco.standalone_tq_producer.input_path=/evil.jsonl" not in commands.producer
+    assert "speco.standalone_tq_producer.max_samples=999" not in commands.producer
+
+
+def test_pipeline_commands_reject_unknown_producer_override() -> None:
+    args = [
+        *_training_args(),
+        "speco.standalone_tq_producer.on_eror=skip",
+    ]
+    config = resolve_pipeline_config(args, environ={})
+
+    with pytest.raises(ValueError, match="Unknown Producer override"):
+        build_pipeline_commands(
+            config,
+            args,
+            ray_address="127.0.0.1:6379",
+            python_executable="python",
+        )
 
 
 class _FakeRuntimeContext:
@@ -417,3 +479,126 @@ def test_owner_writes_internal_ready_file(monkeypatch, tmp_path) -> None:
 
     assert tq_owner.run_owner(config, stop_event=stop_event) == 0
     assert ready_file.is_file()
+
+
+def test_validate_tq_backend_ignores_non_mooncake_backend() -> None:
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("SimpleStorage must not probe a Mooncake master")
+
+    validate_tq_backend({}, connect=_unexpected)
+    validate_tq_backend({"SPECO_TQ_STORAGE_BACKEND": "SimpleStorage"}, connect=_unexpected)
+
+
+def test_validate_tq_backend_skips_when_auto_init_enabled() -> None:
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("auto_init=true lets TransferQueue start the master")
+
+    validate_tq_backend(
+        {
+            "SPECO_TQ_STORAGE_BACKEND": "MooncakeStore",
+            "SPECO_TQ_MOONCAKE_AUTO_INIT": "true",
+        },
+        connect=_unexpected,
+    )
+
+
+def test_validate_tq_backend_accepts_reachable_master() -> None:
+    probed: list[tuple[str, int]] = []
+
+    class _Connection:
+        def close(self) -> None:
+            probed.append(("closed", 0))
+
+    def connect(address, *, timeout):
+        probed.append(address)
+        return _Connection()
+
+    validate_tq_backend(
+        {
+            "SPECO_TQ_STORAGE_BACKEND": "MooncakeStore",
+            "SPECO_TQ_MOONCAKE_MASTER": "mooncake-host:50051",
+        },
+        connect=connect,
+    )
+    assert probed[0] == ("mooncake-host", 50051)
+
+
+def test_validate_tq_backend_fails_fast_when_master_unreachable() -> None:
+    def connect(address, *, timeout):
+        raise OSError("connection refused")
+
+    with pytest.raises(RuntimeError, match="no mooncake_master is reachable"):
+        validate_tq_backend(
+            {"SPECO_TQ_STORAGE_BACKEND": "MooncakeStore"},
+            connect=connect,
+        )
+
+
+def test_validate_tq_backend_rejects_malformed_master_address() -> None:
+    with pytest.raises(RuntimeError, match="host:port"):
+        validate_tq_backend(
+            {
+                "SPECO_TQ_STORAGE_BACKEND": "MooncakeStore",
+                "SPECO_TQ_MOONCAKE_MASTER": "no-port",
+            },
+            connect=lambda *args, **kwargs: None,
+        )
+
+
+@pytest.mark.parametrize("backend", ["Mooncake", "mooncakestore", "MoonCakeStore", ""])
+def test_validate_tq_backend_rejects_unknown_backend(backend) -> None:
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("unknown backends must not be probed")
+
+    with pytest.raises(RuntimeError, match="Unsupported SPECO_TQ_STORAGE_BACKEND"):
+        validate_tq_backend(
+            {"SPECO_TQ_STORAGE_BACKEND": backend}, connect=_unexpected
+        )
+
+
+@pytest.mark.parametrize("backend", ["Mooncake", "mooncakestore", "MoonCakeStore", ""])
+def test_tq_backend_overrides_reject_unknown_backend(backend) -> None:
+    with pytest.raises(RuntimeError, match="Unsupported SPECO_TQ_STORAGE_BACKEND"):
+        _tq_backend_overrides({"SPECO_TQ_STORAGE_BACKEND": backend})
+
+
+def test_tq_backend_overrides_accept_explicit_simple_storage() -> None:
+    overrides = _tq_backend_overrides({"SPECO_TQ_STORAGE_BACKEND": "SimpleStorage"})
+    assert any("backend.storage_backend=SimpleStorage" in item for item in overrides)
+
+
+def test_tq_backend_overrides_accept_mooncake_store() -> None:
+    overrides = _tq_backend_overrides(
+        {"SPECO_TQ_STORAGE_BACKEND": "MooncakeStore"}
+    )
+    assert any("backend.storage_backend=MooncakeStore" in item for item in overrides)
+
+
+def test_validate_tq_backend_skips_probe_when_disabled() -> None:
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("the precheck must be skipped when disabled")
+
+    validate_tq_backend(
+        {
+            "SPECO_TQ_STORAGE_BACKEND": "MooncakeStore",
+            "SPECO_TQ_MOONCAKE_SKIP_PRECHECK": "true",
+        },
+        connect=_unexpected,
+    )
+
+
+def test_pipeline_commands_use_provided_env_for_backend() -> None:
+    config = resolve_pipeline_config(_training_args(), environ={})
+
+    commands = build_pipeline_commands(
+        config,
+        _training_args(),
+        ray_address="127.0.0.1:6379",
+        python_executable="python",
+        env={"SPECO_TQ_STORAGE_BACKEND": "MooncakeStore"},
+    )
+
+    assert any("storage_backend=MooncakeStore" in item for item in commands.consumer)
+    assert not any("storage_backend=SimpleStorage" in item for item in commands.consumer)
+
+

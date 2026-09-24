@@ -41,7 +41,7 @@ def main(config):
     log_resolved_config(config)
     result = run_standalone_draft_training(config)
     if result.get("rank", 0) == 0:
-        logger.warning("Standalone SPECO draft training finished: %s", result)
+        logger.info("Standalone SPECO draft training finished: %s", result)
 
 
 if __name__ == "__main__":

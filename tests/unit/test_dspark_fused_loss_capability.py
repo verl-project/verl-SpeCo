@@ -11,21 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Hydra config package for SPECO."""
-
 from __future__ import annotations
 
-from typing import Any
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from verl_speco.ops.dspark_fused_loss import fused_loss_capability
 
 
-def config_int(config: Any, key: str, default: int) -> int:
-    """Resolve an integer config value, defaulting only when absent or ``None``.
+def test_fused_loss_capability_rejects_cpu_with_reason() -> None:
+    capability = fused_loss_capability(torch.device("cpu"))
 
-    Unlike ``config.get(key, default) or default`` this keeps an explicit ``0``,
-    which several knobs use to mean "fail on the first bad row".
-    """
-    value = config.get(key)
-    return default if value is None else int(value)
-
-
-__all__ = ["config_int"]
+    assert capability.available is False
+    assert capability.backend is None
+    assert capability.reason == "unsupported device type 'cpu'"

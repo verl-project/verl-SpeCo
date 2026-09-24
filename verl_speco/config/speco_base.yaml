@@ -56,11 +56,45 @@ speco:
     # Zero means one input-file pass. The unified launcher sets this to the
     # exact number of samples required by max_steps and the global batch size.
     max_samples: 0
+    # When true the Producer buffers the input file once and queues records in
+    # a per-epoch permutation seeded with shuffle_seed + epoch, matching the
+    # speculators rng.permutation(seed, epoch) recipe. Deterministic across
+    # restarts so resumed runs replay the same per-epoch order.
+    shuffle: false
+    shuffle_seed: 42
     pending_poll_interval_seconds: 0.5
+    # After publishing EOS the producer waits until the consumer clears every
+    # published sample before closing the remote client. Bound that wait with
+    # SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS (default 1800; 0 disables).
     owner_ready_timeout_seconds: 120
     max_sequence_length: 8192
     max_feature_length: 512
     generation_max_tokens: 511
+    # Per endpoint: log the first three successful HTTP requests, then every N.
+    # Zero disables successful-request logs; failures are always logged.
+    vllm_success_log_interval: 100
+    # Server-side differential rendering for the assistant loss boundary.
+    # Requires a vLLM /render endpoint at the first vllm_endpoints entry.
+    render_boundary:
+      enabled: false
+      # Per-request timeout for the tokenizer-only /render call.
+      timeout: 10
+    # Bad-row policy while scanning the input file: skip drops and counts an
+    # unparseable row, raise aborts; max_consecutive_errors is the breaker.
+    on_error: skip
+    max_consecutive_errors: 20
+    # Samples that fail to produce a training payload (misaligned or NaN/Inf
+    # hidden states, or filtered after target generation) are replaced while
+    # max_samples > 0; abort after this many consecutive replacements without a
+    # successful feature conversion instead of requesting replacements forever.
+    max_consecutive_feature_drops: 20
+    # Tolerant role cleaning for ShareGPT rows (unknown roles map to assistant,
+    # order-violating turns are dropped instead of aborting the run).
+    parser_strict_roles: false
+    # Filter rows whose feature window leaves too few supervised tokens.
+    min_supervised_tokens: 1
+    # drop|keep when the feature window cuts the supervised response.
+    on_truncated_supervision: keep
 
 actor_rollout_ref:
   rollout:
@@ -125,7 +159,41 @@ actor_rollout_ref:
         save_full_drafter_checkpoint: true
         sample_last_n_steps: 20
         train_batches_per_cycle: 4
+        # Drafter parallelism: "fsdp2" or "ddp"; null inherits actor.strategy
+        # (normally fsdp2). Prefer this over actor.strategy: upstream only
+        # accepts fsdp/fsdp2/megatron/veomni for the main actor, so the
+        # drafter's DDP must not go through actor.strategy.
+        strategy: null
+        # FSDP2 shard dimension. null keeps the training mesh as-is (online
+        # co-train shards over the replica's SP size). The standalone loop
+        # defaults null to 1 (replicate, no sharding); >1 shards over that many
+        # ranks and -1 shards over all of them.
+        fsdp_shard_size: null
+        # DDP (strategy=ddp) graph traversal for unused parameters. Off by
+        # default: it is only needed when a trainable param can miss a gradient.
+        ddp_find_unused_parameters: false
         lr: 1e-5
+        # Optimizer for drafter training. "adamw" keeps the historical single
+        # AdamW over all trainable params. "muon" applies Muon to 2D hidden
+        # weight matrices and AdamW to the rest (norms, biases, embeddings,
+        # and output heads), mirroring speculators.train.optimizers. Muon needs
+        # fsdp2 or ddp: FSDP1 shards parameters to 1D and is rejected.
+        optimizer: adamw
+        weight_decay: 1e-2
+        # AdamW (running-momentum) betas for the non-Muon parameter group.
+        adamw_betas: [0.9, 0.95]
+        # Muon-only options (ignored when optimizer=adamw).
+        # null uses the same lr as AdamW, matching speculators; set an explicit
+        # value to override (muon_adjust_lr_fn rescales the update to AdamW RMS).
+        muon_lr: null
+        muon_momentum: 0.95
+        muon_nesterov: true
+        muon_weight_decay: 0.1
+        muon_ns_steps: 5
+        muon_adjust_lr_fn: match_rms_adamw
+        # Extra parameter-name substrings kept on AdamW even when 2D, on top of
+        # the built-in defaults (embeddings, lm_head, codebook, markov_w1/w2).
+        muon_adamw_name_hints: null
         lr_warmup_steps: 0
         # Supported standalone drafter scheduler types:
         # constant, cosine, linear, global_cosine.
@@ -142,6 +210,11 @@ actor_rollout_ref:
         logits_coverage_mask_min_ratio: 0.1
         logits_coverage_mask_require_top1: false
         ttt_length: 1
+        # Group similar-length samples into a batch to cut padding. Off by
+        # default because batch composition changes the loss trajectory.
+        group_by_length: false
+        # Samples per grouping megabatch, as a multiple of batch_size_per_gpu.
+        group_by_length_megabatch: 8
         vocab_mapping_path: null
         dflash_block_size: 16
         dflash_num_anchors: 512
@@ -162,6 +235,7 @@ actor_rollout_ref:
         dspark_loss_decay_gamma: 7.0
         dspark_hard_sample_ratio: 0.0
         dspark_hidden_size: null
+        dspark_intermediate_size: null
         dspark_num_target_layers: 5
         dspark_num_hidden_layers: 5
         dspark_mask_token_id: null
@@ -178,6 +252,9 @@ actor_rollout_ref:
         # DeepSpec Qwen3 fixed-K default. Confidence BCE is unsupported on MRV2
         # and must not implicitly reduce the distribution-matching objective.
         dspark_l1_loss_alpha: 0.9
+        # auto | fused | eager. Fused uses the native CUDA/Ascend Triton kernel.
+        dspark_distribution_loss_impl: auto
+        # Only used by the eager fallback/reference implementation.
         dspark_l1_chunk_size: 0
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
@@ -253,6 +330,12 @@ actor_rollout_ref:
           train_on: last_assistant
           min_sample_step: null
           max_sample_step: null
+          # Read-side filtering for stored feature samples: skip/raise on a
+          # corrupt sample, minimum supervised tokens, and alignment validation.
+          on_error: skip
+          max_consecutive_errors: 20
+          min_supervised_tokens: 1
+          strict_token_alignment: warn
         # TransferQueue transport for standalone drafter training. The owner,
         # vLLM Producer, and every torchrun Consumer rank share this connection
         # configuration. Default off; requires TransferQueue==0.1.10.
@@ -286,3 +369,15 @@ actor_rollout_ref:
             SimpleStorage:
               total_storage_size: 100000
               num_data_storage_units: 8
+            MooncakeStore:
+              # auto_init=false requires an external mooncake_master reachable
+              # at master_server_address; the standalone launcher probes it and
+              # fails fast otherwise. Set SPECO_TQ_MOONCAKE_AUTO_INIT=true to let
+              # TransferQueue start (and own) the master instead.
+              auto_init: false
+              metadata_server: P2PHANDSHAKE
+              master_server_address: 127.0.0.1:50051
+              local_hostname: ""
+              protocol: tcp
+              global_segment_size: 4294967296
+              local_buffer_size: 2147483648

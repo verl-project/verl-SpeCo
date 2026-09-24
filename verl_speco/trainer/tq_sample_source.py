@@ -37,6 +37,9 @@ class TQLocalBatch:
     local_samples: list[DraftFeatureSample]
     global_keys: list[str] | None
     global_sequence_nos: list[int] | None = None
+    command_wait_seconds: float = 0.0
+    tq_get_seconds: float = 0.0
+    cycle_started_at: float = 0.0
 
 
 def build_assignments(
@@ -71,6 +74,7 @@ class TQFeatureDataLoader:
         world_size: int,
         poll_interval_seconds: float = 0.5,
         drop_last: bool = True,
+        scheduled_commands: Any | None = None,
     ):
         self.store = store
         self.batch_size = int(batch_size)
@@ -78,6 +82,7 @@ class TQFeatureDataLoader:
         self.world_size = int(world_size)
         self.poll_interval_seconds = max(float(poll_interval_seconds), 0.01)
         self.drop_last = bool(drop_last)
+        self.scheduled_commands = scheduled_commands
         if self.batch_size <= 0:
             raise ValueError("TQ Consumer batch_size_per_gpu must be positive")
         if self.world_size <= 0 or not (0 <= self.rank < self.world_size):
@@ -99,7 +104,9 @@ class TQFeatureDataLoader:
         global_batch_size = self.batch_size * self.world_size
         owner_ready = False
         while True:
+            cycle_started_at = time.perf_counter()
             command: dict[str, Any] | None = None
+            command_wait_seconds = 0.0
             if self.rank == 0:
                 try:
                     if not owner_ready:
@@ -107,41 +114,39 @@ class TQFeatureDataLoader:
                         if not owner_ready:
                             time.sleep(self.poll_interval_seconds)
                             continue
-                    ready = self.store.list_ready()
-                    if len(ready) >= global_batch_size:
-                        selected = ready[:global_batch_size]
-                        assignments = build_assignments(
-                            selected,
-                            batch_size=self.batch_size,
-                            world_size=self.world_size,
+                    if self.scheduled_commands is not None:
+                        command_wait_started = time.perf_counter()
+                        command = self.scheduled_commands.get(block=True)
+                        command_wait_seconds = (
+                            time.perf_counter() - command_wait_started
                         )
-                        command = {
-                            "kind": "batch",
-                            "global_keys": [entry.key for entry in selected],
-                            "global_sequence_nos": [
-                                int(entry.tag["sequence_no"]) for entry in selected
-                            ],
-                            "assignments": [
-                                [_entry_to_wire(entry) for entry in rank_entries]
-                                for rank_entries in assignments
-                            ],
-                        }
+                        if command.get("kind") == "stop":
+                            pass
+                        elif command.get("kind") != "batch":
+                            raise RuntimeError(
+                                f"Unsupported scheduled TQ command: {command!r}"
+                            )
                     else:
-                        eos = self.store.read_eos()
-                        if eos is not None:
-                            tail_keys = [entry.key for entry in ready]
-                            if tail_keys:
-                                logger.info(
-                                    "Dropping %s TQ tail samples after EOS because one "
-                                    "global batch requires %s",
-                                    len(tail_keys),
-                                    global_batch_size,
-                                )
-                                self.store.clear_many(tail_keys)
-                            command = {"kind": "stop"}
+                        ready = self.store.list_ready()
+                        if len(ready) >= global_batch_size:
+                            selected = ready[:global_batch_size]
+                            command = self._batch_command(selected)
                         else:
-                            time.sleep(self.poll_interval_seconds)
-                            continue
+                            eos = self.store.read_eos()
+                            if eos is not None:
+                                tail_keys = [entry.key for entry in ready]
+                                if tail_keys:
+                                    logger.info(
+                                        "Dropping %s TQ tail samples after EOS because one "
+                                        "global batch requires %s",
+                                        len(tail_keys),
+                                        global_batch_size,
+                                    )
+                                    self.store.clear_many(tail_keys)
+                                command = {"kind": "stop"}
+                            else:
+                                time.sleep(self.poll_interval_seconds)
+                                continue
                 except BaseException as exc:  # noqa: BLE001
                     command = {
                         "kind": "error",
@@ -164,7 +169,9 @@ class TQFeatureDataLoader:
             local_entries = [
                 _entry_from_wire(item) for item in wire_assignments[self.rank]
             ]
+            tq_get_started = time.perf_counter()
             samples = self.store.get_many(local_entries)
+            tq_get_seconds = time.perf_counter() - tq_get_started
             global_keys = (
                 [str(key) for key in command.get("global_keys", [])]
                 if self.rank == 0
@@ -180,7 +187,28 @@ class TQFeatureDataLoader:
                 local_samples=samples,
                 global_keys=global_keys,
                 global_sequence_nos=global_sequence_nos,
+                command_wait_seconds=command_wait_seconds,
+                tq_get_seconds=tq_get_seconds,
+                cycle_started_at=cycle_started_at,
             )
+
+    def _batch_command(self, selected: Sequence[ReadyEntry]) -> dict[str, Any]:
+        assignments = build_assignments(
+            selected,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+        )
+        return {
+            "kind": "batch",
+            "global_keys": [entry.key for entry in selected],
+            "global_sequence_nos": [
+                int(entry.tag["sequence_no"]) for entry in selected
+            ],
+            "assignments": [
+                [_entry_to_wire(entry) for entry in rank_entries]
+                for rank_entries in assignments
+            ],
+        }
 
     def clear_completed_batch(self, global_keys: Sequence[str] | None) -> None:
         if self.rank != 0:

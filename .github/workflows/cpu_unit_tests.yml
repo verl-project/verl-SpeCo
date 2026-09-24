@@ -62,3 +62,177 @@ jobs:
           tests/examples
           tests/integration
           -q
+
+  drafter-parallelism:
+    name: Drafter parallelism tests (torch CPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out verl-SpeCo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check out supported upstream verl
+        run: |
+          set -euo pipefail
+          verl_ref="$(awk -F= '/^VERL_BASE_BRANCH=/{print $2}' REQUIRED_VERL.txt)"
+          mkdir -p .ci
+          git clone --filter=blob:none https://github.com/verl-project/verl .ci/upstream-verl
+          git -C .ci/upstream-verl checkout "${verl_ref}"
+
+      - name: Install CPU torch, upstream runtime deps and test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r ci/requirements-ci.txt
+          python -m pip install ray peft tensordict transformers numpy pydantic
+
+      - name: Run drafter parallelism tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/.ci/upstream-verl
+          VERL_SPECO_UPSTREAM_ROOT: ${{ github.workspace }}/.ci/upstream-verl
+        run: >-
+          python -m pytest
+          tests/unit/test_fsdp_shard_size.py
+          tests/integration/test_drafter_ddp_distributed.py
+          -q
+
+  data-preprocessing:
+    name: Data preprocessing tests (torch CPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out verl-SpeCo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CPU torch and test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r ci/requirements-ci.txt
+          python -m pip install transformers pydantic numpy
+
+      - name: Run data preprocessing tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: >-
+          python -m pytest
+          tests/unit/test_draft_feature_loader_filters.py
+          tests/unit/test_parser_role_cleanup.py
+          tests/unit/test_producer_input_tolerance.py
+          tests/unit/test_render_boundary.py
+          tests/unit/test_tq_producer.py
+          tests/unit/test_standalone_tq_training_launcher.py
+          -q
+
+  drafter-models:
+    name: Drafter model/checkpoint tests (torch CPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out verl-SpeCo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check out supported upstream verl
+        run: |
+          set -euo pipefail
+          verl_ref="$(awk -F= '/^VERL_BASE_BRANCH=/{print $2}' REQUIRED_VERL.txt)"
+          mkdir -p .ci
+          git clone --filter=blob:none https://github.com/verl-project/verl .ci/upstream-verl
+          git -C .ci/upstream-verl checkout "${verl_ref}"
+
+      - name: Install CPU torch, upstream runtime deps and test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r ci/requirements-ci.txt
+          python -m pip install ray peft tensordict transformers numpy pydantic
+
+      - name: Run drafter model/checkpoint tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/.ci/upstream-verl
+          VERL_SPECO_UPSTREAM_ROOT: ${{ github.workspace }}/.ci/upstream-verl
+        run: >-
+          python -m pytest
+          tests/unit/test_target_feature_replay.py
+          tests/integration/test_drafter_checkpoint.py
+          tests/integration/test_dspark_trainer_backend.py
+          --deselect "tests/integration/test_dspark_trainer_backend.py::test_dspark_checkpoint_preserves_source_config_and_vllm_weight_names"
+          -q
+
+  tq-backend:
+    name: TQ backend tests (torch CPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out verl-SpeCo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CPU torch, transformers and test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r ci/requirements-ci.txt
+          python -m pip install transformers pydantic numpy
+
+      - name: Run TQ producer and launcher tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: >-
+          python -m pytest
+          tests/unit/test_tq_producer.py
+          tests/unit/test_standalone_tq_training_launcher.py
+          -q
+
+  drafter-optimizer:
+    name: Drafter optimizer tests (torch CPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out verl-SpeCo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CPU torch and test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r ci/requirements-ci.txt
+
+      - name: Run drafter optimizer tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest tests/unit/test_drafter_optimizers.py -q

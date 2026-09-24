@@ -108,3 +108,30 @@ def test_pool_retry_fails_over_to_another_endpoint(monkeypatch) -> None:
     assert pool._states[0].inflight == pool._states[1].inflight == 0
     assert pool._states[0].requests == 0
     assert pool._states[1].requests == 1
+
+
+def test_success_logging_is_rate_limited_per_endpoint_counter() -> None:
+    pool = VllmFeatureClientPool(
+        [VllmEndpoint("http://vllm:8000/v1", 1)],
+        model="target",
+        max_inflight_requests=1,
+        request_timeout=10,
+        success_log_interval=100,
+    )
+
+    assert [count for count in range(1, 202) if pool._should_log_success(count)] == [
+        1,
+        2,
+        3,
+        100,
+        200,
+    ]
+
+    disabled = VllmFeatureClientPool(
+        [VllmEndpoint("http://vllm:8000/v1", 1)],
+        model="target",
+        max_inflight_requests=1,
+        request_timeout=10,
+        success_log_interval=0,
+    )
+    assert disabled._should_log_success(1) is False

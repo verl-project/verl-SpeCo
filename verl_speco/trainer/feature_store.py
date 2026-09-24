@@ -798,6 +798,9 @@ class JsonlTokenReplayFeatureStore:
         for key in ("id", "hash", "primary_id", "finish_reason"):
             if key in payload:
                 metadata[key] = payload[key]
+        # The dataclass defaults ``algorithm`` to EAGLE3; remember whether the
+        # row actually declared one so replay does not warn on the default.
+        metadata["declared_algorithm"] = payload.get("algorithm") is not None
         return DraftReplaySample(
             algorithm=str(payload.get("algorithm", "EAGLE3")),
             input_ids=input_ids,

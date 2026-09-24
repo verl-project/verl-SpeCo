@@ -17,12 +17,26 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 import torch
+
+from verl_speco.data.parse import clean_conversation_roles
+
+logger = logging.getLogger(__name__)
+
+
+class SampleFilteredError(ValueError):
+    """A parsed sample is valid JSON but must not be trained on.
+
+    Raised for rows whose feature window leaves too few supervised tokens or
+    cuts the supervised response. Callers skip the row and pull the next input
+    instead of aborting the Producer.
+    """
 
 
 @dataclass(frozen=True)
@@ -62,74 +76,132 @@ class GenerationRequest:
     source_metadata: dict[str, Any]
 
 
-def iter_input_records(path: str | os.PathLike[str]) -> Iterator[InputRecord]:
-    """Yield strict prompt/response records from one JSONL or Parquet file."""
+def iter_input_records(
+    path: str | os.PathLike[str],
+    *,
+    on_error: str = "skip",
+    max_consecutive_errors: int = 20,
+    parser_strict_roles: bool = False,
+) -> Iterator[InputRecord]:
+    """Yield prompt/response records from one JSONL or Parquet file.
+
+    Args:
+        path: Input file.
+        on_error: ``skip`` drops an unparseable JSON line or malformed record,
+            warns, and counts it; ``raise`` aborts on the first failure.
+        max_consecutive_errors: In ``skip`` mode, escalate to a hard error after
+            this many consecutive skipped rows (circuit breaker).
+        parser_strict_roles: Disable tolerant role cleaning.
+    """
+    if on_error not in {"skip", "raise"}:
+        raise ValueError(f"on_error must be 'skip' or 'raise', got {on_error!r}")
+    if max_consecutive_errors < 0:
+        raise ValueError("max_consecutive_errors must be >= 0")
 
     input_path = Path(path)
     if not input_path.is_file():
         raise FileNotFoundError(f"Producer input file not found: {input_path}")
 
-    sequence_no = 0
-    for location, payload in _iter_payloads(input_path):
-        if not isinstance(payload, dict):
+    state = {"consecutive": 0, "skipped": 0}
+
+    def handle_error(location: str, error: Exception) -> None:
+        if on_error == "raise":
             raise ValueError(
-                f"Producer input at {location} must be a JSON-style object"
-            )
-        prompt_value, response = _prompt_response_from_payload(payload, location)
-        prompt = _normalize_prompt(prompt_value, location)
-        if response is not None and (not isinstance(response, str) or not response):
-            raise ValueError(
-                f"Producer input at {location} field 'response' must be a non-empty "
-                "string when present"
-            )
-        sample_id = payload.get("sample_id") or _extra_info_index(payload)
-        if sample_id is None:
-            sample_id = f"train-{sequence_no:06d}"
-        if not isinstance(sample_id, str) or not sample_id:
-            raise ValueError(f"Producer input at {location} has invalid sample_id")
-        source_metadata = {
-            key: value
-            for key, value in payload.items()
-            if key
-            not in {"prompt", "response", "conversation", "conversations", "sample_id"}
-        }
-        yield InputRecord(
-            sequence_no=sequence_no,
-            sample_id=sample_id,
-            prompt=prompt,
-            response=response,
-            source_metadata=source_metadata,
+                f"Producer input at {location} is invalid: {error}"
+            ) from error
+        state["consecutive"] += 1
+        state["skipped"] += 1
+        logger.warning(
+            "Skipping invalid Producer input at %s (consecutive: %d/%d): %s",
+            location,
+            state["consecutive"],
+            max_consecutive_errors,
+            error,
         )
+        if state["consecutive"] > max_consecutive_errors:
+            raise RuntimeError(
+                f"Exceeded max_consecutive_errors={max_consecutive_errors} while "
+                f"reading {input_path} (last: {location}): {error}"
+            ) from error
+
+    sequence_no = 0
+    for location, payload in _iter_payloads(input_path, handle_error):
+        try:
+            record = _record_from_payload(
+                payload, location, sequence_no, parser_strict_roles
+            )
+        except Exception as error:  # noqa: BLE001 - policy decides skip vs raise
+            handle_error(location, error)
+            continue
+        state["consecutive"] = 0
+        yield record
         sequence_no += 1
 
 
+def _record_from_payload(
+    payload: Any,
+    location: str,
+    sequence_no: int,
+    parser_strict_roles: bool,
+) -> InputRecord:
+    if not isinstance(payload, dict):
+        raise ValueError("Producer input must be a JSON-style object")
+    prompt_value, response = _prompt_response_from_payload(
+        payload, location, strict_roles=parser_strict_roles
+    )
+    prompt = _normalize_prompt(prompt_value, location)
+    if response is not None and (not isinstance(response, str) or not response):
+        raise ValueError("field 'response' must be a non-empty string when present")
+    sample_id = payload.get("sample_id") or _extra_info_index(payload)
+    if sample_id is None:
+        sample_id = f"train-{sequence_no:06d}"
+    if not isinstance(sample_id, str) or not sample_id:
+        raise ValueError("has invalid sample_id")
+    source_metadata = {
+        key: value
+        for key, value in payload.items()
+        if key
+        not in {"prompt", "response", "conversation", "conversations", "sample_id"}
+    }
+    return InputRecord(
+        sequence_no=sequence_no,
+        sample_id=sample_id,
+        prompt=prompt,
+        response=response,
+        source_metadata=source_metadata,
+    )
+
+
 def _prompt_response_from_payload(
-    payload: Mapping[str, Any], location: str
+    payload: Mapping[str, Any],
+    location: str,
+    *,
+    strict_roles: bool = False,
 ) -> tuple[Any, Any]:
     """Normalize supported row schemas to Producer ``prompt``/``response``."""
 
     if "prompt" in payload:
         return payload.get("prompt"), payload.get("response")
 
-    conversation = payload.get("conversation")
-    if conversation is not None:
+    for key, role_key, content_key in (
+        ("conversation", "role", "content"),
+        ("conversations", "from", "value"),
+    ):
+        value = payload.get(key)
+        if value is None:
+            continue
         messages = _normalize_conversation_messages(
-            conversation,
+            value,
             location,
-            role_key="role",
-            content_key="content",
+            role_key=role_key,
+            content_key=content_key,
         )
-        return _split_final_assistant(messages)
-
-    conversations = payload.get("conversations")
-    if conversations is not None:
-        messages = _normalize_conversation_messages(
-            conversations,
-            location,
-            role_key="from",
-            content_key="value",
+        cleaned, stats = clean_conversation_roles(
+            [dict(message) for message in messages], strict=strict_roles
         )
-        return _split_final_assistant(messages)
+        if stats["mapped_roles"] or stats["dropped_role_turns"]:
+            logger.info("Producer role cleanup at %s: %s", location, stats)
+        return _split_final_assistant(tuple(cleaned))
 
     return None, payload.get("response")
 
@@ -218,11 +290,14 @@ def _extra_info_index(payload: Mapping[str, Any]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _iter_payloads(input_path: Path) -> Iterator[tuple[str, Any]]:
+def _iter_payloads(
+    input_path: Path,
+    on_error: Any = None,
+) -> Iterator[tuple[str, Any]]:
     if _is_parquet(input_path):
         yield from _iter_parquet_payloads(input_path)
         return
-    yield from _iter_jsonl_payloads(input_path)
+    yield from _iter_jsonl_payloads(input_path, on_error)
 
 
 def _is_parquet(input_path: Path) -> bool:
@@ -232,19 +307,25 @@ def _is_parquet(input_path: Path) -> bool:
         return input_file.read(4) == b"PAR1"
 
 
-def _iter_jsonl_payloads(input_path: Path) -> Iterator[tuple[str, Any]]:
+def _iter_jsonl_payloads(
+    input_path: Path,
+    on_error: Any = None,
+) -> Iterator[tuple[str, Any]]:
     try:
         with input_path.open("r", encoding="utf-8") as input_file:
             for line_number, line in enumerate(input_file, start=1):
                 if not line.strip():
                     continue
+                location = f"{input_path}:{line_number}"
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        f"Invalid JSON object at {input_path}:{line_number}: {exc.msg}"
-                    ) from exc
-                yield f"{input_path}:{line_number}", payload
+                    error = ValueError(f"Invalid JSON object at {location}: {exc.msg}")
+                    if on_error is None:
+                        raise error from exc
+                    on_error(location, error)
+                    continue
+                yield location, payload
     except UnicodeDecodeError as exc:
         raise ValueError(
             f"Producer input {input_path} is not UTF-8 JSONL or a Parquet file"
@@ -266,6 +347,84 @@ def _iter_parquet_payloads(input_path: Path) -> Iterator[tuple[str, Any]]:
         for payload in batch.to_pylist():
             row_number += 1
             yield f"{input_path}:row {row_number}", payload
+
+
+def build_render_fn(endpoint: str, *, timeout: float = 10.0) -> Any:
+    """Build a ``render_fn(messages, add_generation_prompt=...)`` for vLLM /render."""
+    from verl_speco.data.render_boundary import render_conversation
+
+    def render_fn(
+        messages: list[dict],
+        *,
+        add_generation_prompt: bool,
+        tools: list[dict] | None = None,
+        max_length: int | None = None,
+    ) -> list[int]:
+        return render_conversation(
+            endpoint,
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+            truncate_prompt_tokens=max_length,
+            timeout=timeout,
+        )
+
+    return render_fn
+
+
+def tokenize_record_with_render_boundary(
+    record: InputRecord,
+    tokenizer: Any,
+    config: Mapping[str, Any] | Any,
+    render_fn: Any,
+) -> TokenizedRequest:
+    """Tokenize a chat row with a server-side render-boundary loss mask.
+
+    Uses differential rendering (speculators-style) instead of assuming the
+    response starts immediately after the generation prompt. Falls back to the
+    local tokenizer path for string prompts, which have no chat messages to
+    render.
+    """
+    if record.response is None:
+        raise ValueError(
+            f"Producer sample {record.sample_id!r} has no response; prepare it for "
+            "target-model generation instead"
+        )
+    if isinstance(record.prompt, str):
+        return tokenize_record(record, tokenizer, config)
+
+    from verl_speco.data.render_boundary import boundary_from_renders
+
+    messages = list(record.prompt)
+    max_length = int(_config_value(config, "max_sequence_length", 0) or 0) or None
+    prompt_ids = render_fn(messages, add_generation_prompt=True, max_length=max_length)
+    full_ids = render_fn(
+        [*messages, {"role": "assistant", "content": record.response}],
+        add_generation_prompt=False,
+        max_length=max_length,
+    )
+    history_ids = None
+    if full_ids[: len(prompt_ids)] != prompt_ids:
+        # The history render only feeds the fallback path for templates whose
+        # generation-prompt render is not a prefix of the full render; skip the
+        # third round-trip when the prompt render already extends into the full
+        # one.
+        history_ids = render_fn(
+            messages, add_generation_prompt=False, max_length=max_length
+        )
+    boundary = boundary_from_renders(prompt_ids, full_ids, history_ids)
+    if len(full_ids) <= boundary:
+        raise ValueError(
+            f"Producer sample {record.sample_id!r} produced no response tokens"
+        )
+    return _build_tokenized_request(
+        sequence_no=record.sequence_no,
+        sample_id=record.sample_id,
+        prompt_length=boundary,
+        full_ids=full_ids,
+        source_metadata=record.source_metadata,
+        config=config,
+    )
 
 
 def build_loss_mask(input_ids: torch.Tensor, prompt_length: int) -> torch.Tensor:
@@ -533,6 +692,36 @@ def _build_tokenized_request(
         raise ValueError("max_feature_length must be 0 or at least 2")
     if max_feature_length > 1:
         feature_end = min(feature_start + max_feature_length, feature_end)
+
+    # A feature window that leaves too little supervision, or that cuts the
+    # supervised response, is filtered instead of trained on.
+    window_mask = loss_mask[feature_start:feature_end]
+    supervised_tokens = int(window_mask.sum().item())
+    min_supervised = int(_config_value(config, "min_supervised_tokens", 1) or 0)
+    if supervised_tokens < min_supervised:
+        raise SampleFilteredError(
+            f"Producer sample {sample_id!r} has {supervised_tokens} supervised "
+            f"tokens in its feature window, below min_supervised_tokens="
+            f"{min_supervised}"
+        )
+    if feature_end < int(input_ids.numel()) and bool(loss_mask[feature_end - 1].item()):
+        on_truncated = str(
+            _config_value(config, "on_truncated_supervision", "keep") or "keep"
+        )
+        if on_truncated not in {"keep", "drop"}:
+            raise ValueError(
+                "on_truncated_supervision must be 'keep' or 'drop', got "
+                f"{on_truncated!r}"
+            )
+        message = (
+            f"Producer sample {sample_id!r} has its supervised response cut by the "
+            f"feature window at {feature_end} "
+            f"(full_sequence_length={int(input_ids.numel())})"
+        )
+        if on_truncated == "drop":
+            raise SampleFilteredError(message)
+        logger.warning("%s; keeping it (on_truncated_supervision=keep)", message)
+
     request_prompt_token_ids = (
         list(vllm_prompt_token_ids)
         if vllm_prompt_token_ids is not None
@@ -597,9 +786,11 @@ __all__ = [
     "InputRecord",
     "TokenizedRequest",
     "build_loss_mask",
+    "build_render_fn",
     "finalize_generated_request",
     "iter_input_records",
     "prepare_generation_request",
     "prepare_generated_prefill_request",
     "tokenize_record",
+    "tokenize_record_with_render_boundary",
 ]

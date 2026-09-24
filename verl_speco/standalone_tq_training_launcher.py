@@ -28,7 +28,9 @@ import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -39,6 +41,12 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 import uuid
 
+from omegaconf import OmegaConf
+
+from verl_speco.draft_train_launcher import (
+    normalize_training_args,
+    resolve_launch_config,
+)
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
@@ -84,21 +92,27 @@ _NNODES_KEYS = (
 _TQ_PREFIX = "actor_rollout_ref.rollout.drafter.training.transfer_queue"
 _FEATURE_STORE_PREFIX = "actor_rollout_ref.rollout.drafter.training.feature_store"
 _PRODUCER_PREFIX = "speco.standalone_tq_producer"
-_PRODUCER_TUNING_KEYS = frozenset(
+_RUNTIME_BACKEND_KEY = "speco.draft_training.runtime_backend"
+# Every user override under this prefix is forwarded to the Producer, except the
+# fields the unified launcher computes and sets itself (paths, identities,
+# endpoints, and the sample budget). Forwarding the whole prefix keeps newly
+# added Producer knobs usable through the launcher without extending an
+# allow-list for each one.
+_PRODUCER_LAUNCHER_OWNED_KEYS = frozenset(
     {
-        f"{_PRODUCER_PREFIX}.request_timeout",
-        f"{_PRODUCER_PREFIX}.max_inflight_requests",
-        f"{_PRODUCER_PREFIX}.per_endpoint_concurrency",
-        f"{_PRODUCER_PREFIX}.input_queue_size",
-        f"{_PRODUCER_PREFIX}.publish_queue_size",
-        f"{_PRODUCER_PREFIX}.max_pending_samples",
-        f"{_PRODUCER_PREFIX}.pending_poll_interval_seconds",
-        f"{_PRODUCER_PREFIX}.max_sequence_length",
-        f"{_PRODUCER_PREFIX}.max_feature_length",
-        f"{_PRODUCER_PREFIX}.generation_max_tokens",
-        _PRODUCER_HIDDEN_DTYPE_KEY,
+        f"{_PRODUCER_PREFIX}.input_path",
+        f"{_PRODUCER_PREFIX}.resume_checkpoint_path",
+        f"{_PRODUCER_PREFIX}.tokenizer_path",
+        f"{_PRODUCER_PREFIX}.tokenizer_fingerprint",
+        f"{_PRODUCER_PREFIX}.target_model_id",
+        f"{_PRODUCER_PREFIX}.target_model_revision",
+        f"{_PRODUCER_PREFIX}.target_layer_ids",
+        f"{_PRODUCER_PREFIX}.vllm_endpoints",
+        f"{_PRODUCER_PREFIX}.vllm_model",
+        f"{_PRODUCER_PREFIX}.max_samples",
     }
 )
+_PRODUCER_CONFIG_PATH = Path(__file__).with_name("config") / "speco_base.yaml"
 _INTERNAL_OVERRIDE_KEYS = frozenset(
     {
         f"{_FEATURE_STORE_PREFIX}.type",
@@ -121,6 +135,7 @@ _INTERNAL_OVERRIDE_KEYS = frozenset(
         f"{_TQ_PREFIX}.expected_feature.target_layer_ids",
         f"{_TQ_PREFIX}.expected_feature.hidden_states_layout",
         f"{_TQ_PREFIX}.expected_feature.hidden_dtype",
+        _RUNTIME_BACKEND_KEY,
     }
 )
 
@@ -130,6 +145,9 @@ _DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = "0.4"
 _VLLM_HIDDEN_STATES_DIR = "__SPECO_HIDDEN_STATES_DIR__"
 _TQ_NAMESPACE = "speco-drafter"
 _TQ_PARTITION = "speco_drafter_features"
+_TQ_STORAGE_BACKENDS = ("SimpleStorage", "MooncakeStore")
+_MOONCAKE_MASTER_DEFAULT = "127.0.0.1:50051"
+_MOONCAKE_AUTO_INIT_DEFAULT = False
 
 
 @dataclass(frozen=True)
@@ -150,6 +168,8 @@ class PipelineCommands:
     owner: list[str]
     producer: list[str]
     consumer: list[str]
+    producer_overrides: tuple[str, ...]
+    consumer_overrides: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -166,6 +186,37 @@ def _split_override(item: str) -> tuple[str, str] | None:
         return None
     key, value = item.split("=", 1)
     return key, value
+
+
+def _is_forwarded_producer_override(key: str) -> bool:
+    """Whether a key selects an option under the Producer config prefix."""
+
+    return key.startswith(f"{_PRODUCER_PREFIX}.")
+
+
+@lru_cache(maxsize=1)
+def _producer_config_keys() -> frozenset[str]:
+    """Every override path the Producer accepts, taken from its config schema.
+
+    Includes intermediate nodes so a nested override such as
+    ``render_boundary`` or a leaf such as ``render_boundary.enabled`` both
+    validate.
+    """
+
+    node: Any = OmegaConf.load(_PRODUCER_CONFIG_PATH)
+    for part in _PRODUCER_PREFIX.split("."):
+        node = node[part]
+    keys: set[str] = set()
+
+    def walk(path: str, value: Any) -> None:
+        keys.add(path)
+        items = getattr(value, "items", None)
+        if callable(items):
+            for key, child in items():
+                walk(f"{path}.{key}", child)
+
+    walk(_PRODUCER_PREFIX, node)
+    return frozenset(keys)
 
 
 def _find_override(overrides: Sequence[str], key: str) -> str | None:
@@ -394,6 +445,22 @@ def start_ray_session(
     return RaySession(module=ray_runtime, address=address)
 
 
+def _validate_runtime_backend_topology(
+    runtime_backend: str, training_args: Sequence[str]
+) -> None:
+    """Reject multi-node Ray jobs until external-cluster ownership is supported."""
+
+    if runtime_backend != "ray":
+        return
+    nnodes = _positive_int_override(training_args, _NNODES_KEYS, default=1)
+    if nnodes != 1:
+        raise ValueError(
+            "Standalone Ray backend currently requires "
+            "speco.draft_training.nnodes=1 because the launcher starts a "
+            "task-local single-node Ray runtime"
+        )
+
+
 def _hydra_list(values: Sequence[Any]) -> str:
     return "[" + ",".join(str(value) for value in values) + "]"
 
@@ -410,14 +477,126 @@ def _replace_internal_overrides(
     return [*cleaned, *internal]
 
 
+def _env_flag(env: Mapping[str, str], name: str, default: bool = False) -> bool:
+    raw = env.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_tq_backend(env: Mapping[str, str]) -> str:
+    """Return the selected TQ storage backend, rejecting unknown values.
+
+    A typo or case mismatch must not silently fall back to the in-memory
+    ``SimpleStorage`` backend when a remote store was intended.
+    """
+    backend = str(env.get("SPECO_TQ_STORAGE_BACKEND", "SimpleStorage")).strip()
+    if backend not in _TQ_STORAGE_BACKENDS:
+        raise RuntimeError(
+            f"Unsupported SPECO_TQ_STORAGE_BACKEND={backend!r}; expected one of "
+            f"{list(_TQ_STORAGE_BACKENDS)}."
+        )
+    return backend
+
+
+def _mooncake_master_address(env: Mapping[str, str]) -> tuple[str, int]:
+    raw = str(env.get("SPECO_TQ_MOONCAKE_MASTER", _MOONCAKE_MASTER_DEFAULT)).strip()
+    host, _, port = raw.rpartition(":")
+    if not host or not port.isdigit():
+        raise RuntimeError(f"SPECO_TQ_MOONCAKE_MASTER must be host:port, got {raw!r}")
+    return host, int(port)
+
+
+def validate_tq_backend(
+    env: Mapping[str, str],
+    *,
+    connect: Callable[..., Any] | None = None,
+    timeout: float = 2.0,
+) -> None:
+    """Fail fast when the selected TQ transport cannot possibly work.
+
+    ``MooncakeStore`` with ``auto_init=false`` needs an external
+    ``mooncake_master``; TransferQueue only starts one itself when auto-init is
+    on. Probe the master address up front so the pipeline raises an actionable
+    error instead of failing deep inside the owner.
+    """
+    backend = _resolve_tq_backend(env)
+    if backend != "MooncakeStore":
+        return
+    if _env_flag(env, "SPECO_TQ_MOONCAKE_AUTO_INIT", _MOONCAKE_AUTO_INIT_DEFAULT):
+        return
+    if _env_flag(env, "SPECO_TQ_MOONCAKE_SKIP_PRECHECK", False):
+        # Multi-node setups may not be able to reach the master from the
+        # launcher host even though the training workers can.
+        return
+    host, port = _mooncake_master_address(env)
+    probe = connect if connect is not None else socket.create_connection
+    try:
+        probe((host, port), timeout=timeout).close()
+    except OSError as exc:
+        raise RuntimeError(
+            "MooncakeStore backend selected with SPECO_TQ_MOONCAKE_AUTO_INIT=false, "
+            f"but no mooncake_master is reachable at {host}:{port} ({exc}). Start "
+            "mooncake_master there, or set SPECO_TQ_MOONCAKE_AUTO_INIT=true to let "
+            "TransferQueue start one."
+        ) from exc
+
+
+def _tq_backend_overrides(env: Mapping[str, str]) -> list[str]:
+    """Internal TQ storage-backend overrides.
+
+    Transport backend selection is not exposed through the Hydra CLI. It
+    defaults to the in-memory ``SimpleStorage``; set
+    ``SPECO_TQ_STORAGE_BACKEND=MooncakeStore`` to use a Mooncake store
+    (``SPECO_TQ_MOONCAKE_*`` tune its client configuration).
+    """
+    backend = _resolve_tq_backend(env)
+
+    def _env(name: str, default: str) -> str:
+        return str(env.get(name, default)).strip()
+
+    if backend == "MooncakeStore":
+        auto_init = _env_flag(
+            env, "SPECO_TQ_MOONCAKE_AUTO_INIT", _MOONCAKE_AUTO_INIT_DEFAULT
+        )
+        return [
+            f"{_TQ_PREFIX}.backend.storage_backend=MooncakeStore",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.auto_init={str(auto_init).lower()}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.metadata_server="
+            f"{_env('SPECO_TQ_MOONCAKE_METADATA_SERVER', 'P2PHANDSHAKE')}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.master_server_address="
+            f"{_env('SPECO_TQ_MOONCAKE_MASTER', _MOONCAKE_MASTER_DEFAULT)}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.local_hostname="
+            f"{_env('SPECO_TQ_MOONCAKE_LOCAL_HOSTNAME', '')}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.protocol="
+            f"{_env('SPECO_TQ_MOONCAKE_PROTOCOL', 'tcp')}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.global_segment_size="
+            f"{_env('SPECO_TQ_MOONCAKE_GLOBAL_SEGMENT_BYTES', str(4 * 1024**3))}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.local_buffer_size="
+            f"{_env('SPECO_TQ_MOONCAKE_LOCAL_BUFFER_BYTES', str(2 * 1024**3))}",
+        ]
+    return [
+        f"{_TQ_PREFIX}.backend.storage_backend=SimpleStorage",
+        f"{_TQ_PREFIX}.backend.SimpleStorage.total_storage_size=17179869184",
+        f"{_TQ_PREFIX}.backend.SimpleStorage.num_data_storage_units=8",
+    ]
+
+
 def build_pipeline_commands(
     config: PipelineConfig,
     training_args: Sequence[str],
     *,
     ray_address: str,
     python_executable: str = sys.executable,
+    env: Mapping[str, str] | None = None,
 ) -> PipelineCommands:
-    """Build the internal commands without exposing transport options."""
+    """Build the internal commands without exposing transport options.
+
+    ``env`` selects the TQ storage backend (defaults to ``os.environ``); pass
+    the same mapping to :func:`run_pipeline` so backend selection and master
+    validation read one source.
+    """
+    backend_env = os.environ if env is None else env
 
     drafter_path = _strip_quotes(_find_override(training_args, _DRAFTER_PATH_KEY) or "")
     _, resume_metadata = load_standalone_resume(
@@ -436,9 +615,7 @@ def build_pipeline_commands(
         f"{_TQ_PREFIX}.partition_id={_TQ_PARTITION}",
         f"{_TQ_PREFIX}.run_id={config.run_id}",
         f"{_TQ_PREFIX}.drop_last=true",
-        f"{_TQ_PREFIX}.backend.storage_backend=SimpleStorage",
-        f"{_TQ_PREFIX}.backend.SimpleStorage.total_storage_size=17179869184",
-        f"{_TQ_PREFIX}.backend.SimpleStorage.num_data_storage_units=8",
+        *_tq_backend_overrides(backend_env),
     ]
     parsed_endpoint = urlparse(config.vllm_endpoints[0])
     vllm_port = parsed_endpoint.port or (
@@ -496,16 +673,22 @@ def build_pipeline_commands(
         "verl_speco.tq_owner",
         *tq_overrides,
     ]
-    producer_tuning_overrides = [
-        item
-        for item in training_args
-        if (parsed := _split_override(item)) is not None
-        and parsed[0] in _PRODUCER_TUNING_KEYS
-    ]
-    producer = [
-        python_executable,
-        "-m",
-        "verl_speco.standalone_tq_producer",
+    producer_tuning_overrides = []
+    for item in training_args:
+        parsed = _split_override(item)
+        if parsed is None or not _is_forwarded_producer_override(parsed[0]):
+            continue
+        key = parsed[0]
+        if key in _PRODUCER_LAUNCHER_OWNED_KEYS:
+            # The launcher computes these and sets them on the Producer command.
+            continue
+        if key not in _producer_config_keys():
+            raise ValueError(
+                f"Unknown Producer override {key!r}; it is not defined under "
+                f"{_PRODUCER_PREFIX} in speco_base.yaml"
+            )
+        producer_tuning_overrides.append(item)
+    producer_overrides = [
         f"{_ALGORITHM_KEY}={config.algorithm}",
         *tq_overrides,
         *producer_tuning_overrides,
@@ -568,11 +751,27 @@ def build_pipeline_commands(
         consumer_internal.append(
             f"{algorithm_layer_ids_key}={_hydra_list(config.target_layer_ids)}"
         )
+    # The subprocess path normally passes through draft_train_launcher, which
+    # removes user-facing aliases such as num_gpus_per_node before Hydra sees
+    # them. Ray composes Hydra directly, so apply the exact same normalization.
+    launch_config = resolve_launch_config(list(training_args))
+    normalized_training_args = normalize_training_args(
+        list(training_args), launch_config
+    )
+    consumer_overrides = _replace_internal_overrides(
+        normalized_training_args, consumer_internal
+    )
+    producer = [
+        python_executable,
+        "-m",
+        "verl_speco.standalone_tq_producer",
+        *producer_overrides,
+    ]
     consumer = [
         python_executable,
         "-m",
         "verl_speco.draft_train_launcher",
-        *_replace_internal_overrides(training_args, consumer_internal),
+        *consumer_overrides,
     ]
     return PipelineCommands(
         vllm=vllm,
@@ -580,6 +779,8 @@ def build_pipeline_commands(
         owner=owner,
         producer=producer,
         consumer=consumer,
+        producer_overrides=tuple(producer_overrides),
+        consumer_overrides=tuple(consumer_overrides),
     )
 
 
@@ -661,6 +862,7 @@ def run_pipeline(
     # torchrun ranks created by the Consumer launcher) to the control plane
     # created above instead of allowing a stale inherited value to win.
     base_env["RAY_ADDRESS"] = ray_address
+    validate_tq_backend(base_env)
     owner: subprocess.Popen[Any] | None = None
     producer: subprocess.Popen[Any] | None = None
     consumer: subprocess.Popen[Any] | None = None
@@ -776,11 +978,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--python-executable", default=sys.executable)
+    parser.add_argument(
+        "--runtime-backend",
+        choices=("subprocess", "ray"),
+        default=None,
+        help="Override speco.draft_training.runtime_backend.",
+    )
     args, training_args = parser.parse_known_args(argv)
     logging.basicConfig(level=logging.INFO)
+    runtime_backend = (
+        args.runtime_backend
+        or _strip_quotes(
+            _find_override(training_args, _RUNTIME_BACKEND_KEY) or "ray"
+        ).lower()
+    )
+    if runtime_backend not in {"subprocess", "ray"}:
+        parser.error(f"{_RUNTIME_BACKEND_KEY} must be either subprocess or ray")
 
     try:
         config = resolve_pipeline_config(training_args)
+        _validate_runtime_backend_topology(runtime_backend, training_args)
         if args.dry_run:
             commands = build_pipeline_commands(
                 config,
@@ -813,6 +1030,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 python_executable=args.python_executable,
             )
             logger.info("Using task-local Ray control plane at %s", ray_session.address)
+            if runtime_backend == "ray":
+                from verl_speco.standalone_ray_runtime import run_ray_pipeline
+
+                return run_ray_pipeline(
+                    commands,
+                    ray_module=ray_session.module,
+                    ray_address=ray_session.address,
+                )
             return run_pipeline(commands, ray_address=ray_session.address)
         finally:
             ray_session.close()
