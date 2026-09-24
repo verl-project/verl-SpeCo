@@ -52,6 +52,7 @@ from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY,
     OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY,
     OLD_LOGPROB_OWNER_RANK_KEY,
+    OLD_LOGPROB_TARGET_LOGZ_TEMPERATURE_KEY,
     OLD_LOGPROB_TIMING_KEY,
 )
 from verl_speco.integration.oldlogprob_layer_ids import (
@@ -1149,6 +1150,30 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             or "forward_hook"
         )
 
+    def _speco_oldlogprob_target_logz_temperature(self) -> float | None:
+        drafter_cfg = self._speco_drafter_config()
+        algorithm = str(
+            _get_nested(drafter_cfg, ("speculative_algorithm",), "") or ""
+        ).upper()
+        if algorithm != "EAGLE3":
+            return None
+        training_cfg = self._speco_drafter_training_config()
+        capture_value = training_cfg.get("capture_target_logz", None)
+        capture_enabled = (
+            float(training_cfg.get("eagle3_lk_loss_alpha", 0.0) or 0.0) > 0
+            if capture_value is None
+            else self._speco_bool_config(capture_value)
+        )
+        if not capture_enabled:
+            return None
+        temperature = float(training_cfg.get("lk_temperature", 1.0) or 1.0)
+        if not (0.0 < temperature < float("inf")):
+            raise ValueError(
+                "actor_rollout_ref.rollout.drafter.training.lk_temperature must "
+                f"be finite and positive for target_logz capture, got {temperature!r}"
+            )
+        return temperature
+
     def _speco_oldlogprob_hidden_layout(self) -> str:
         drafter_cfg = self._speco_drafter_config()
         algorithm = _get_nested(drafter_cfg, ("speculative_algorithm",), "")
@@ -1786,7 +1811,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ).upper()
         if (
             algorithm == "DSPARK"
-            and float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
+            and (
+                float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
+                or float(training_cfg.get("dspark_lk_loss_alpha", 0.0) or 0.0) > 0
+            )
+        ) or (
+            algorithm == "DFLASH"
+            and float(training_cfg.get("dflash_lk_loss_alpha", 0.0) or 0.0) > 0
         ):
             return None
         if not bool(training_cfg.get("target_lm_head_row_restricted_sync", True)):
@@ -2459,6 +2490,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "speco_oldlogprob_sp_disabled",
                 not bool(_user_seq_parallel),
             )
+            target_logz_temperature = self._speco_oldlogprob_target_logz_temperature()
+            if target_logz_temperature is not None:
+                tu.assign_non_tensor_data(
+                    batch_td,
+                    OLD_LOGPROB_TARGET_LOGZ_TEMPERATURE_KEY,
+                    target_logz_temperature,
+                )
 
             self._speco_last_oldlogprob_prepare_elapsed_sec = (
                 time.perf_counter() - prepare_started

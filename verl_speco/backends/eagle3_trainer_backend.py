@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import math
 import os
 from typing import Any, Optional, cast
 
@@ -21,6 +22,12 @@ from torch.nn import functional as F
 from transformers import AutoConfig
 
 from verl.utils.device import get_device_id, get_device_name
+from verl_speco.backends.lk_loss import (
+    adaptive_diagnostics_to_rows,
+    adaptive_hybrid_acceptance_loss,
+    full_vocab_subset_probs,
+    negative_log_acceptance_loss,
+)
 from verl_speco.backends.lr_scheduler import build_drafter_lr_scheduler
 from verl_speco.backends.optimizers import build_drafter_optimizer
 from verl_speco.models.auto import (
@@ -857,6 +864,7 @@ class Eagle3TrainerBackend:
             "position_ids": [],
             "last_h_states": [],
             "target_logprobs": [],
+            "target_logz": [],
         }
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
         h_dim = getattr(model_config, "target_hidden_size", model_config.hidden_size)
@@ -958,6 +966,14 @@ class Eagle3TrainerBackend:
             res["position_ids"].append(item_position_ids[start:end])
             if not use_logits:
                 res["last_h_states"].append(last_h_states[start:end])
+                target_logz_item = item.get("target_logz")
+                res["target_logz"].append(
+                    target_logz_item.to(device, dtype=torch.float32, non_blocking=True)[
+                        start:end
+                    ]
+                    if torch.is_tensor(target_logz_item)
+                    else None
+                )
             res["masks"].append(item_loss_mask[start:end])
             target_logprobs_item = None
             if use_logits and item.get("target_logprobs") is not None:
@@ -976,11 +992,48 @@ class Eagle3TrainerBackend:
         input_ids = batch["input_ids"]
         hidden_states = batch["hidden_states"]
         last_hidden_states = batch.get("last_hidden_states", None)
+        target_logz = batch.get("target_logz", None)
         attention_mask = batch["attention_mask"]
         loss_mask = batch["loss_mask"]
         position_ids = batch["position_ids"]
         use_logits = self.config.rollout.drafter.training.use_logits
         use_sparse_restricted_ce = bool(use_logits)
+        ce_loss_alpha = float(
+            self.config.rollout.drafter.training.get("eagle3_ce_loss_alpha", 1.0)
+        )
+        lk_loss_alpha = float(
+            self.config.rollout.drafter.training.get("eagle3_lk_loss_alpha", 0.0)
+        )
+        lk_loss_type = str(
+            self.config.rollout.drafter.training.get("eagle3_lk_loss_type", "alpha")
+        ).lower()
+        if lk_loss_type not in {"alpha", "adaptive_hybrid"}:
+            raise ValueError(
+                "eagle3_lk_loss_type must be 'alpha' or 'adaptive_hybrid', "
+                f"got {lk_loss_type!r}"
+            )
+        lk_hybrid_eta = float(
+            self.config.rollout.drafter.training.get("eagle3_lk_hybrid_eta", 3.0)
+        )
+        if not math.isfinite(lk_hybrid_eta) or lk_hybrid_eta < 0:
+            raise ValueError(
+                "eagle3_lk_hybrid_eta must be finite and non-negative, "
+                f"got {lk_hybrid_eta!r}"
+            )
+        lk_temperature = float(
+            self.config.rollout.drafter.training.get("lk_temperature", 1.0)
+        )
+        if not math.isfinite(lk_temperature) or lk_temperature <= 0:
+            raise ValueError(
+                f"lk_temperature must be finite and positive, got {lk_temperature!r}"
+            )
+        if use_sparse_restricted_ce and lk_loss_alpha > 0:
+            raise ValueError("EAGLE3 LK loss requires use_logits=False")
+        if lk_loss_alpha > 0 and not torch.is_tensor(target_logz):
+            raise ValueError(
+                "EAGLE3 LK loss requires actor-side target_logz collected from "
+                "the old-logprob forward"
+            )
         logits_sparse_min_intersection = int(
             self.config.rollout.drafter.training.get(
                 "logits_sparse_min_intersection", 1
@@ -1079,6 +1132,13 @@ class Eagle3TrainerBackend:
                     unpad_dim=0,
                     padding_size=_current_pad_size,
                 ).unsqueeze(0)
+                if torch.is_tensor(target_logz):
+                    target_logz = gather_outputs_and_unpad(
+                        target_logz.squeeze(0),
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=_current_pad_size,
+                    ).unsqueeze(0)
                 with torch.no_grad():
                     target_scores = self.target_model(last_hidden_states)
         else:
@@ -1126,6 +1186,7 @@ class Eagle3TrainerBackend:
             loss_mask = loss_mask.to(target_device)
 
         target_p_padded = None
+        target_lk_p_padded = None
         target_position_mask_padded = None
         target_topk_logprobs_padded = None
         sparse_loss_mask_padded = None
@@ -1148,6 +1209,8 @@ class Eagle3TrainerBackend:
                 raise ValueError("target_scores is required when use_logits=False")
             if target_scores.device != target_device:
                 target_scores = target_scores.to(target_device)
+            if torch.is_tensor(target_logz) and target_logz.device != target_device:
+                target_logz = target_logz.to(target_device)
             target_p_padded, target_position_mask_padded = (
                 self._compute_target_p_padded(
                     target_scores=target_scores,
@@ -1156,6 +1219,15 @@ class Eagle3TrainerBackend:
                     length=length,
                 )
             )
+            if lk_loss_alpha > 0:
+                target_lk_p_padded = self._compute_target_acceptance_p_padded(
+                    target_scores=target_scores,
+                    target_logz=cast(torch.Tensor, target_logz),
+                    t2d=draft_model.t2d,
+                    loss_mask=loss_mask,
+                    length=length,
+                    temperature=lk_temperature,
+                )
             # Clean up large tensors to free memory
             del target_scores
 
@@ -1190,6 +1262,18 @@ class Eagle3TrainerBackend:
             count_per_position = torch.zeros(
                 length, device=input_ids.device, dtype=torch.float32
             )
+        adaptive_lk_step_stats: list[tuple[int, dict[str, torch.Tensor]]] = []
+        adaptive_telemetry_interval = int(
+            self.config.rollout.drafter.training.get(
+                "eagle3_lk_telemetry_interval_steps", 20
+            )
+            or 0
+        )
+        adaptive_call = int(getattr(self, "_adaptive_lk_compute_calls", 0)) + 1
+        self._adaptive_lk_compute_calls = adaptive_call
+        log_adaptive_telemetry = adaptive_telemetry_interval > 0 and (
+            adaptive_call == 1 or adaptive_call % adaptive_telemetry_interval == 0
+        )
         sparse_base_tokens = torch.tensor(
             0.0, device=input_ids.device, dtype=torch.float32
         )
@@ -1255,13 +1339,49 @@ class Eagle3TrainerBackend:
                 sparse_hit_mass_sum += sparse_stats["hit_mass_sum"].to(
                     device=input_ids.device
                 )
+                per_token_ploss = per_token_ploss * ce_loss_alpha
             else:
                 target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
-                per_token_ploss, valid_position = _masked_soft_cross_entropy(
+                per_token_ce_loss, valid_position = _masked_soft_cross_entropy(
                     logits=logits,
                     target_p=target_p,
                     position_mask=position_mask,
                 )
+                per_token_ploss = per_token_ce_loss * ce_loss_alpha
+                if lk_loss_alpha > 0:
+                    target_lk_p = target_lk_p_padded[
+                        :, idx : idx + seq_length, :
+                    ].contiguous()
+                    draft_lk_p = torch.softmax(logits.float() / lk_temperature, dim=-1)
+                    if lk_loss_type == "adaptive_hybrid":
+                        target_lk_mass = target_lk_p.sum(dim=-1, keepdim=True)
+                        target_kl_p = target_lk_p / target_lk_mass.clamp_min(
+                            torch.finfo(torch.float32).tiny
+                        )
+                        per_token_lk_loss, lk_diagnostics = (
+                            adaptive_hybrid_acceptance_loss(
+                                draft_probs=draft_lk_p,
+                                target_acceptance_probs=target_lk_p,
+                                target_kl_probs=target_kl_p,
+                                position_mask=valid_position,
+                                eta=lk_hybrid_eta,
+                            )
+                        )
+                        if log_adaptive_telemetry:
+                            adaptive_lk_step_stats.append((idx, lk_diagnostics))
+                    else:
+                        per_token_lk_loss = negative_log_acceptance_loss(
+                            draft_lk_p,
+                            target_lk_p,
+                        )
+                        per_token_lk_loss = torch.where(
+                            valid_position,
+                            per_token_lk_loss,
+                            torch.zeros_like(per_token_lk_loss),
+                        )
+                    per_token_ploss = per_token_ploss + (
+                        per_token_lk_loss * lk_loss_alpha
+                    )
                 target_top1 = target_p.argmax(dim=-1)
             if diagnostics_enabled and (
                 base_valid_position.any()
@@ -1376,6 +1496,27 @@ class Eagle3TrainerBackend:
                 int(total_local_tokens.detach().cpu().item()),
                 quality_step_stats,
             )
+        if adaptive_lk_step_stats:
+            diagnostic_rows = adaptive_diagnostics_to_rows(
+                [diagnostics for _idx, diagnostics in adaptive_lk_step_stats]
+            )
+            formatted_stats = [
+                {
+                    "step": idx,
+                    "acceptance": round(row[0], 6),
+                    "kl_weight": round(row[1], 6),
+                    "forward_kl": round(row[2], 6),
+                    "tv": round(row[3], 6),
+                }
+                for (idx, _diagnostics), row in zip(
+                    adaptive_lk_step_stats, diagnostic_rows, strict=False
+                )
+            ]
+            logger.warning(
+                "[drafter adaptive hybrid lk] eta=%.6f per_step=%s",
+                lk_hybrid_eta,
+                formatted_stats,
+            )
 
         result = {
             "total_local_vloss": torch.tensor(0.0, device=input_ids.device),
@@ -1423,6 +1564,67 @@ class Eagle3TrainerBackend:
             )
 
             return target_p_padded, position_mask_padded
+
+    def _compute_target_acceptance_p_padded(
+        self,
+        target_scores,
+        target_logz,
+        t2d,
+        loss_mask,
+        length,
+        temperature=1.0,
+    ):
+        with torch.no_grad():
+            loss_mask = loss_mask.to(device=target_scores.device)
+            t2d = t2d.to(device=target_scores.device, dtype=torch.bool)
+            if target_scores.size(-1) == t2d.numel():
+                target_subset_scores = target_scores[..., t2d]
+            elif target_scores.size(-1) == int(t2d.sum().detach().item()):
+                target_subset_scores = target_scores
+            else:
+                raise ValueError(
+                    "EAGLE3 target score vocab size mismatch for LK loss: "
+                    f"target_scores={target_scores.size(-1)}, target_vocab={t2d.numel()}"
+                )
+            finite_target_mask = torch.isfinite(target_subset_scores).any(dim=-1)
+            finite_target_mask &= torch.isfinite(target_logz)
+            finite_target_mask &= loss_mask.to(dtype=torch.bool)
+            safe_scores = torch.where(
+                torch.isfinite(target_subset_scores),
+                target_subset_scores.float(),
+                torch.full_like(
+                    target_subset_scores.float(), torch.finfo(torch.float32).min
+                ),
+            )
+            safe_scores = torch.where(
+                finite_target_mask.unsqueeze(-1),
+                safe_scores,
+                torch.zeros_like(safe_scores),
+            )
+            safe_logz = torch.where(
+                finite_target_mask,
+                target_logz.float(),
+                torch.full_like(
+                    target_logz.float(), math.log(max(int(safe_scores.size(-1)), 1))
+                ),
+            )
+            target_probs = full_vocab_subset_probs(
+                safe_scores,
+                safe_logz,
+                temperature=float(temperature),
+            )
+            target_probs = torch.where(
+                finite_target_mask.unsqueeze(-1),
+                target_probs,
+                torch.zeros_like(target_probs),
+            )
+            target_probs = F.pad(
+                target_probs,
+                pad=(0, 0, 0, length),
+                mode="constant",
+                value=0.0,
+            )
+            return target_probs.detach()
 
     def _compute_target_p(self, target_scores, t2d, loss_mask):
         loss_mask = loss_mask.to(device=target_scores.device)

@@ -49,6 +49,7 @@ class DraftFeatureSample:
     last_hidden_states: torch.Tensor | None = None
     target: torch.Tensor | None = None
     target_logprobs: torch.Tensor | None = None
+    target_logz: torch.Tensor | None = None
     position_ids: torch.Tensor | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -69,6 +70,7 @@ class DraftFeatureSample:
             last_hidden_states=payload.get("last_hidden_states", payload.get("target")),
             target=payload.get("target"),
             target_logprobs=payload.get("target_logprobs"),
+            target_logz=payload.get("target_logz"),
             position_ids=payload.get("position_ids"),
             metadata=dict(payload.get("metadata") or {}),
         )
@@ -108,6 +110,12 @@ class DraftFeatureSample:
             ):
                 target_logprobs_tensor = target_logprobs_tensor.squeeze(0)
             self.target_logprobs = target_logprobs_tensor
+        target_logz = self.target_logz
+        if torch.is_tensor(target_logz):
+            target_logz_tensor = cast(Any, target_logz)
+            while target_logz_tensor.dim() > 1 and target_logz_tensor.size(0) == 1:
+                target_logz_tensor = target_logz_tensor.squeeze(0)
+            self.target_logz = target_logz_tensor.float().reshape(-1)
         if self.input_ids.size(0) != self.loss_mask.size(0) and strict:
             raise ValueError(
                 "DraftFeatureSample input_ids/loss_mask length mismatch: "
@@ -168,6 +176,19 @@ class DraftFeatureSample:
                 "DraftFeatureSample.target_logprobs must have shape [rows, topk, 2], "
                 f"got {tuple(cast(Any, self.target_logprobs).shape)}"
             )
+        if self.target_logz is not None and not torch.is_tensor(self.target_logz):
+            raise TypeError(
+                "DraftFeatureSample.target_logz must be a tensor when provided"
+            )
+        if (
+            torch.is_tensor(self.target_logz)
+            and cast(Any, self.target_logz).dim() != 1
+            and strict
+        ):
+            raise ValueError(
+                "DraftFeatureSample.target_logz must have shape [rows], "
+                f"got {tuple(cast(Any, self.target_logz).shape)}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         self.validate(strict=False)
@@ -188,6 +209,10 @@ class DraftFeatureSample:
         if self.target_logprobs is not None:
             payload["target_logprobs"] = (
                 self.target_logprobs.detach().cpu().contiguous()
+            )
+        if self.target_logz is not None:
+            payload["target_logz"] = (
+                self.target_logz.detach().cpu().float().contiguous()
             )
         if self.position_ids is not None:
             payload["position_ids"] = (
@@ -212,6 +237,8 @@ class DraftFeatureSample:
             item["last_hidden_states"] = payload["target"]
         if "target_logprobs" in payload:
             item["target_logprobs"] = payload["target_logprobs"]
+        if "target_logz" in payload:
+            item["target_logz"] = payload["target_logz"]
         if "position_ids" in payload:
             item["position_ids"] = payload["position_ids"]
         for key, value in metadata.items():

@@ -54,6 +54,8 @@ OLD_LOGPROB_HIDDEN_CHUNK_META_KEY = "speco_oldlogprob_hidden_chunk_meta"
 OLD_LOGPROB_AUX_LAYER_IDS_KEY = "speco_oldlogprob_aux_layer_ids"
 OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY = "speco_oldlogprob_hidden_capture_impl"
 OLD_LOGPROB_HIDDEN_LAYOUT_KEY = "speco_oldlogprob_hidden_layout"
+OLD_LOGPROB_TARGET_LOGZ_KEY = "speco_oldlogprob_target_logz"
+OLD_LOGPROB_TARGET_LOGZ_TEMPERATURE_KEY = "speco_oldlogprob_target_logz_temperature"
 OLD_LOGPROB_TIMING_KEY = "speco_oldlogprob_timing"
 OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY = "speco_oldlogprob_selected_batch_indices"
 
@@ -133,6 +135,58 @@ def _tensor_key_present(container: Any, key: str) -> bool:
             return key in container
         except Exception:  # noqa: BLE001
             return False
+
+
+def _non_tensor_value(container: Any, key: str, default=None):
+    if isinstance(container, dict):
+        return container.get(key, default)
+    try:
+        from verl.utils import tensordict_utils as tu
+
+        return tu.get_non_tensor_data(data=container, key=key, default=default)
+    except Exception:  # noqa: BLE001
+        try:
+            return container.get(key, default)
+        except Exception:  # noqa: BLE001
+            return default
+
+
+def _model_output_logits(output: Any):
+    logits = getattr(output, "logits", None)
+    if logits is None and isinstance(output, dict):
+        logits = output.get("logits")
+    if logits is None and isinstance(output, (list, tuple)) and output:
+        logits = output[0]
+    return logits
+
+
+def _compute_oldlogprob_target_logz(output: Any, micro_batch: Any):
+    """Compute the actor full-vocabulary log partition when explicitly enabled."""
+
+    temperature = _non_tensor_value(
+        micro_batch, OLD_LOGPROB_TARGET_LOGZ_TEMPERATURE_KEY, None
+    )
+    if temperature is None:
+        return None
+    temperature = float(temperature)
+    if not (0.0 < temperature < float("inf")):
+        raise ValueError(
+            "SPECO target_logz temperature must be finite and positive, "
+            f"got {temperature!r}"
+        )
+    logits = _model_output_logits(output)
+    try:
+        import torch
+    except Exception:  # pragma: no cover - torch is required by the runtime
+        return None
+    if not torch.is_tensor(logits):
+        raise RuntimeError(
+            "SPECO exact EAGLE3 LK requested actor target_logz, but the old-logprob "
+            "model output does not expose full-vocabulary logits"
+        )
+    return torch.logsumexp(
+        cast(Any, logits).float() / temperature, dim=-1, keepdim=True
+    )
 
 
 def _resolve_hidden_state(hidden_states: Any, layer_id: int):
@@ -294,6 +348,7 @@ def _put_oldlogprob_hidden_refs(
         return hidden_output
 
     selected = hidden_output.get(OLD_LOGPROB_HIDDEN_STATES_KEY)
+    target_logz = hidden_output.get(OLD_LOGPROB_TARGET_LOGZ_KEY)
     sp_size = int(hidden_output.get("speco_oldlogprob_sp_size", 1) or 1)
     sp_rank = int(hidden_output.get("speco_oldlogprob_sp_rank", 0) or 0)
     if sp_size > 1 and sp_rank != 0:
@@ -317,6 +372,17 @@ def _put_oldlogprob_hidden_refs(
     else:
         selected_sparse = {}
         selected_tensor = cast(Any, selected)
+    target_logz_is_sparse = _is_sparse_selected(target_logz)
+    if target_logz is not None and target_logz_is_sparse != selected_is_sparse:
+        raise RuntimeError(
+            "SPECO old-logprob hidden/target_logz selection layouts do not match"
+        )
+    if (
+        target_logz is not None
+        and not target_logz_is_sparse
+        and not torch.is_tensor(target_logz)
+    ):
+        raise RuntimeError("SPECO old-logprob target_logz is not a tensor")
 
     copy_us = 0.0
     ray_put_us = 0.0
@@ -348,6 +414,15 @@ def _put_oldlogprob_hidden_refs(
                 else [selected_tensor]
             )
         )
+        target_logz_rows = (
+            []
+            if target_logz is None or target_logz_is_sparse
+            else (
+                list(cast(Any, target_logz).unbind(0))
+                if cast(Any, target_logz).dim() >= 3
+                else [cast(Any, target_logz)]
+            )
+        )
         if (
             not selected_is_sparse
             and selected_batch_indices is not None
@@ -369,9 +444,32 @@ def _put_oldlogprob_hidden_refs(
         owner_chunks: dict[int, list[dict[str, Any]]] = {}
         if selected_is_sparse:
             sparse_rows = selected_sparse["rows"]
+            sparse_target_logz = (
+                cast(dict[str, Any], target_logz)["rows"]
+                if target_logz_is_sparse
+                else None
+            )
+            if sparse_target_logz is not None:
+                target_sparse = cast(dict[str, Any], target_logz)
+                if not torch.equal(
+                    selected_sparse["batch_indices"], target_sparse["batch_indices"]
+                ) or not torch.equal(
+                    selected_sparse["row_indices"], target_sparse["row_indices"]
+                ):
+                    raise RuntimeError(
+                        "SPECO sparse hidden/target_logz row indices do not match"
+                    )
             copy_started = time.perf_counter()
             sparse_rows_cpu = (
                 sparse_rows.detach().to(device="cpu", copy=True).contiguous()
+            )
+            sparse_target_logz_cpu = (
+                sparse_target_logz.detach()
+                .float()
+                .to(device="cpu", copy=True)
+                .contiguous()
+                if sparse_target_logz is not None
+                else None
             )
             copy_us += (time.perf_counter() - copy_started) * 1_000_000.0
             sparse_batch_indices = (
@@ -443,6 +541,10 @@ def _put_oldlogprob_hidden_refs(
                     chunk["hidden"] = sparse_rows_cpu.index_select(
                         0, source_indices
                     ).contiguous()
+                    if sparse_target_logz_cpu is not None:
+                        chunk["target_logz"] = sparse_target_logz_cpu.index_select(
+                            0, source_indices
+                        ).contiguous()
                     owner_chunks.setdefault(owner, []).append(chunk)
         else:
             for row_idx, hidden in enumerate(rows):
@@ -465,6 +567,11 @@ def _put_oldlogprob_hidden_refs(
                     continue
 
                 hidden = hidden[:valid_rows]
+                target_logz_row = (
+                    target_logz_rows[row_idx][:valid_rows]
+                    if row_idx < len(target_logz_rows)
+                    else None
+                )
                 row_indices = None
                 if owner_mask_cpu is not None:
                     owner_mask_row = owner_mask_cpu[row_idx, :valid_rows]
@@ -475,6 +582,10 @@ def _put_oldlogprob_hidden_refs(
                         hidden = hidden.index_select(
                             0, row_indices.to(device=hidden.device)
                         )
+                        if target_logz_row is not None:
+                            target_logz_row = target_logz_row.index_select(
+                                0, row_indices.to(device=target_logz_row.device)
+                            )
                         row_indices = row_indices.to(dtype=torch.long)
 
                 copy_started = time.perf_counter()
@@ -489,6 +600,14 @@ def _put_oldlogprob_hidden_refs(
                     {
                         "batch_idx": int(batch_idx),
                         "hidden": hidden_cpu,
+                        "target_logz": (
+                            target_logz_row.detach()
+                            .float()
+                            .to(device="cpu", copy=True)
+                            .contiguous()
+                            if target_logz_row is not None
+                            else None
+                        ),
                         "valid_rows": int(valid_rows),
                         "row_indices": row_indices,
                     }
@@ -508,6 +627,13 @@ def _put_oldlogprob_hidden_refs(
             if not chunks:
                 continue
             tensors = [chunk["hidden"] for chunk in chunks]
+            target_logz_tensors = [chunk.get("target_logz") for chunk in chunks]
+            if any(value is None for value in target_logz_tensors) and any(
+                value is not None for value in target_logz_tensors
+            ):
+                raise RuntimeError(
+                    "SPECO old-logprob owner chunk has partial target_logz payloads"
+                )
             starts: list[int] = []
             lengths: list[int] = []
             sample_indices: list[int] = []
@@ -531,8 +657,22 @@ def _put_oldlogprob_hidden_refs(
                 if len(tensors) > 1
                 else tensors[0].contiguous()
             )
+            target_logz_chunk = (
+                torch.cat(cast(list[Any], target_logz_tensors), dim=0)
+                .float()
+                .contiguous()
+                if target_logz_tensors and target_logz_tensors[0] is not None
+                else None
+            )
             ray_put_started = time.perf_counter()
-            chunk_ref = ray.put(hidden_chunk)
+            chunk_ref = ray.put(
+                {
+                    "hidden_states": hidden_chunk,
+                    "target_logz": target_logz_chunk,
+                }
+                if target_logz_chunk is not None
+                else hidden_chunk
+            )
             ray_put_us += (time.perf_counter() - ray_put_started) * 1_000_000.0
             chunk_index = len(chunk_refs)
             chunk_refs.append(chunk_ref)
@@ -547,6 +687,11 @@ def _put_oldlogprob_hidden_refs(
                     "starts": starts,
                     "lengths": lengths,
                     "row_indices": row_indices_payload,
+                    "target_logz_shape": (
+                        tuple(target_logz_chunk.shape)
+                        if target_logz_chunk is not None
+                        else None
+                    ),
                 }
             )
             for sample_pos, batch_idx in enumerate(sample_indices):
@@ -570,6 +715,7 @@ def _put_oldlogprob_hidden_refs(
 
     updated = dict(hidden_output)
     updated.pop(OLD_LOGPROB_HIDDEN_STATES_KEY, None)
+    updated.pop(OLD_LOGPROB_TARGET_LOGZ_KEY, None)
     updated.pop(OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY, None)
     updated.pop("speco_oldlogprob_owner_mask", None)
     updated.pop("speco_oldlogprob_sp_group", None)
@@ -1654,6 +1800,18 @@ def _select_and_merge_concatenated_hidden(
     return _merge_sp_selected(context, merged_input)
 
 
+def _select_oldlogprob_target_logz(
+    context: dict[str, Any], output: Any, micro_batch: Any
+):
+    target_logz = _compute_oldlogprob_target_logz(output, micro_batch)
+    if target_logz is None:
+        return None
+    selected, _owner_mask = _select_and_merge_concatenated_hidden(
+        context, [target_logz]
+    )
+    return selected
+
+
 def _unwrap_module(module: Any):
     current = module
     seen = set()
@@ -1841,7 +1999,9 @@ def _install_oldlogprob_hidden_hooks(
     engine._speco_oldlogprob_hidden_context = context
 
 
-def _consume_oldlogprob_hidden_capture(engine: Any):
+def _consume_oldlogprob_hidden_capture(
+    engine: Any, model_output: Any = None, micro_batch: Any = None
+):
     import torch
 
     context = getattr(engine, "_speco_oldlogprob_hidden_context", None)
@@ -1888,6 +2048,13 @@ def _consume_oldlogprob_hidden_capture(engine: Any):
             hidden_parts,
             already_selected=True,
         )
+        target_logz = (
+            _select_oldlogprob_target_logz(
+                context, output=model_output, micro_batch=micro_batch
+            )
+            if micro_batch is not None
+            else None
+        )
         if _is_sparse_sp_non_source_context(context):
             return {}
         if selected is None:
@@ -1898,7 +2065,7 @@ def _consume_oldlogprob_hidden_capture(engine: Any):
                 len(context.get("local_positions", []) or []),
             )
             return {}
-        output = {
+        payload = {
             OLD_LOGPROB_HIDDEN_STATES_KEY: selected,
             OLD_LOGPROB_TIMING_KEY: _timing_tensor_from_context(
                 context, _selected_device(selected)
@@ -1908,28 +2075,30 @@ def _consume_oldlogprob_hidden_capture(engine: Any):
             "speco_oldlogprob_sp_size": int(context.get("sp_size", 1) or 1),
             "speco_oldlogprob_sp_rank": int(context.get("sp_rank", 0) or 0),
         }
+        if target_logz is not None:
+            payload[OLD_LOGPROB_TARGET_LOGZ_KEY] = target_logz
         if context.get("compact_selected"):
-            output[OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY] = torch.tensor(
+            payload[OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY] = torch.tensor(
                 context.get("selected_batch_indices", []),
                 dtype=torch.long,
                 device=_selected_device(selected),
             )
-        return output
+        return payload
     finally:
         _cleanup_oldlogprob_hidden_capture(engine)
 
 
 def _select_oldlogprob_hidden_states(
-    engine: Any, output: Any, output_args: dict[str, Any], micro_batch: Any
+    engine: Any, model_output: Any, output_args: dict[str, Any], micro_batch: Any
 ):
     if not _tensor_key_present(micro_batch, OLD_LOGPROB_COLLECT_MASK_KEY):
         return {}
 
     import torch
 
-    hidden_states = getattr(output, "hidden_states", None)
-    if hidden_states is None and isinstance(output, dict):
-        hidden_states = output.get("hidden_states")
+    hidden_states = getattr(model_output, "hidden_states", None)
+    if hidden_states is None and isinstance(model_output, dict):
+        hidden_states = model_output.get("hidden_states")
     if hidden_states is None:
         return {}
 
@@ -1952,11 +2121,14 @@ def _select_oldlogprob_hidden_states(
     selected, owner_mask = _select_and_merge_concatenated_hidden(
         context, selected_hidden_list
     )
+    target_logz = _select_oldlogprob_target_logz(
+        context, output=model_output, micro_batch=micro_batch
+    )
     if _is_sparse_sp_non_source_context(context):
         return {}
     if selected is None:
         return {}
-    output = {
+    payload = {
         OLD_LOGPROB_HIDDEN_STATES_KEY: selected,
         OLD_LOGPROB_TIMING_KEY: _timing_tensor_from_context(
             context, _selected_device(selected)
@@ -1966,13 +2138,15 @@ def _select_oldlogprob_hidden_states(
         "speco_oldlogprob_sp_size": int(context.get("sp_size", 1) or 1),
         "speco_oldlogprob_sp_rank": int(context.get("sp_rank", 0) or 0),
     }
+    if target_logz is not None:
+        payload[OLD_LOGPROB_TARGET_LOGZ_KEY] = target_logz
     if context.get("compact_selected"):
-        output[OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY] = torch.tensor(
+        payload[OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY] = torch.tensor(
             context.get("selected_batch_indices", []),
             dtype=torch.long,
             device=_selected_device(selected),
         )
-    return output
+    return payload
 
 
 def install_oldlogprob_hidden_runtime_patch(
@@ -2068,7 +2242,9 @@ def install_oldlogprob_hidden_runtime_patch(
                 if _tensor_key_present(micro_batch, OLD_LOGPROB_COLLECT_MASK_KEY):
                     capture_impl = _oldlogprob_capture_impl(micro_batch)
                     if capture_impl == "forward_hook":
-                        hidden_output = _consume_oldlogprob_hidden_capture(self)
+                        hidden_output = _consume_oldlogprob_hidden_capture(
+                            self, model_output=output, micro_batch=micro_batch
+                        )
                     elif capture_impl == "output_hidden_states":
                         hidden_output = _select_oldlogprob_hidden_states(
                             self, output, output_args, micro_batch

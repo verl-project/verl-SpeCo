@@ -713,6 +713,40 @@ def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(
     assert config["draft_sample_method"] == "probabilistic"
 
 
+def test_vllm_stable_config_can_select_probabilistic_draft_sampling(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint",
+        lambda: False,
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+
+    config = build_vllm_speculative_config_from_drafter(
+        _drafter(
+            speculative_algorithm="DSPARK",
+            model_path=str(model_path),
+            rollout={"spec_steps": 3, "spec_verify_tokens": 16},
+            vllm={"draft_sample_method": "probabilistic"},
+        )
+    )
+
+    assert config["method"] == "dspark"
+    assert config["draft_sample_method"] == "probabilistic"
+
+
+def test_vllm_rejects_unknown_draft_sample_method() -> None:
+    with pytest.raises(ValueError, match="draft_sample_method"):
+        build_vllm_speculative_config_from_drafter(
+            _drafter(vllm={"draft_sample_method": "beam"})
+        )
+
+
 def test_vllm_dflash_validator_rejects_dspark_when_algorithm_is_dflash(
     tmp_path,
 ) -> None:
