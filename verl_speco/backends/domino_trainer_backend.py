@@ -51,12 +51,12 @@ from verl_speco.backends.dflash_trainer_backend import (
     DFlashTrainerBackend,
     DFlashTrainingModel,
     _block_acceptance_counts,
-    _create_dflash_dense_attention_mask,
-    _create_dflash_mask_mod,
+    _resolve_sliding_windows,
+    build_dflash_attention_masks,
+    _document_boundary_validity,
 )
 from verl_speco.backends.lr_scheduler import _RESUME_OPTIMIZER_STEPS_KEY
 from verl_speco.models.dflash import resolve_rope_theta
-from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
 from verl_speco.models.domino import DominoConfig, DominoDraftModel
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 
@@ -129,7 +129,11 @@ class DominoTrainingModel(DFlashTrainingModel):
 
     # --- shifted-label anchor sampling / label building (DSpark alignment) ---
     def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
+        self,
+        seq_len: int,
+        loss_mask: torch.Tensor,
+        device: torch.device,
+        document_ids: torch.Tensor | None = None,
     ):
         bsz = loss_mask.shape[0]
         num_candidates = max(seq_len - 1, 0)
@@ -145,12 +149,21 @@ class DominoTrainingModel(DFlashTrainingModel):
         valid = (loss_mask[:, :num_candidates] > 0.5) & (
             loss_mask[:, 1 : num_candidates + 1] > 0.5
         )
-        valid_counts = valid.sum(dim=1)
         indices = (
             self._cached_arange("domino_anchor_indices", num_candidates, device)
             .unsqueeze(0)
             .expand(bsz, -1)
         )
+        if document_ids is not None:
+            valid = _document_boundary_validity(
+                valid,
+                indices=indices,
+                document_ids=document_ids,
+                block_size=self.block_size,
+                seq_len=seq_len,
+                label_shift=1,
+            )
+        valid_counts = valid.sum(dim=1)
         masked_indices = torch.where(valid, indices, seq_len + 1)
         random_vals = torch.rand(bsz, num_candidates, device=device)
         random_vals = torch.where(valid, random_vals, 2.0)
@@ -213,7 +226,14 @@ class DominoTrainingModel(DFlashTrainingModel):
         )
         return target_ids, prev_token_ids, eval_mask, label_indices
 
-    def forward(self, input_ids, hidden_states_list, loss_mask, lm_head_weight):
+    def forward(
+        self,
+        input_ids,
+        hidden_states_list,
+        loss_mask,
+        lm_head_weight,
+        document_ids=None,
+    ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         self._curriculum_step += 1
@@ -221,7 +241,7 @@ class DominoTrainingModel(DFlashTrainingModel):
 
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
+            seq_len, loss_mask, device, document_ids=document_ids
         )
         n_blocks = anchor_positions.shape[1]
         noise_embedding = self._create_noise_embed(
@@ -230,28 +250,15 @@ class DominoTrainingModel(DFlashTrainingModel):
         context_position_ids, draft_position_ids = self._create_position_ids(
             anchor_positions, seq_len
         )
-        draft_len = n_blocks * self.block_size
-
-        block_mask = None
-        dense_attention_mask = None
-        if device.type == "cuda":
-            block_mask = compile_friendly_create_block_mask(
-                mask_mod=_create_dflash_mask_mod(
-                    anchor_positions, block_keep_mask, seq_len, self.block_size
-                ),
-                B=bsz,
-                H=None,
-                Q_LEN=draft_len,
-                KV_LEN=seq_len + draft_len,
-                device=device,
-            )
-        else:
-            dense_attention_mask = _create_dflash_dense_attention_mask(
-                anchor_positions,
-                block_keep_mask,
-                seq_len,
-                self.block_size,
-            )
+        block_mask, dense_attention_mask = build_dflash_attention_masks(
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            ctx_len=seq_len,
+            block_size=self.block_size,
+            device=device,
+            windows=_resolve_sliding_windows(self.draft_model.config),
+            document_ids=document_ids,
+        )
 
         draft_hidden = self.draft_model(
             draft_input_ids=None,

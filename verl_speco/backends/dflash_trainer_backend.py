@@ -89,11 +89,15 @@ def _create_dflash_mask_mod(
     block_keep_mask: torch.Tensor,
     ctx_len: int,
     block_size: int,
+    sliding_window: int | None = None,
+    document_ids: torch.Tensor | None = None,
 ):
     """Create DFlash block attention mask.
 
     A query block can attend to context tokens before its anchor and draft
-    tokens inside the same block. Different sampled blocks are isolated.
+    tokens inside the same block. Different sampled blocks are isolated. When
+    ``sliding_window`` is set, context attention is capped to that many tokens
+    before the anchor. ``document_ids`` additionally isolates packed documents.
     """
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
@@ -101,6 +105,20 @@ def _create_dflash_mask_mod(
         anchor_pos = anchor_positions[b, q_block_id]
         is_context = kv_idx < ctx_len
         mask_context = is_context & (kv_idx < anchor_pos)
+        if sliding_window is not None:
+            mask_context = mask_context & (kv_idx >= anchor_pos - sliding_window)
+        if document_ids is not None:
+            # document_ids covers the context only; draft keys never read it, so
+            # clamp the lookup to keep the draft half of KV in range.
+            kv_ctx_idx = (
+                min(kv_idx, ctx_len - 1)
+                if isinstance(kv_idx, int)
+                else kv_idx.clamp(max=ctx_len - 1)
+            )
+            doc = document_ids[b, kv_ctx_idx]
+            mask_context = (
+                mask_context & (doc >= 0) & (doc == document_ids[b, anchor_pos])
+            )
         is_draft = kv_idx >= ctx_len
         kv_block_id = (kv_idx - ctx_len) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
@@ -117,12 +135,15 @@ def _create_dflash_dense_attention_mask(
     block_keep_mask: torch.Tensor,
     ctx_len: int,
     block_size: int,
+    sliding_window: int | None = None,
+    document_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Build the dense equivalent of the DFlash/DSpark training block mask.
+    """Dense equivalent of :func:`_create_dflash_mask_mod` for SDPA devices.
 
-    PyTorch FlexAttention is currently used only on CUDA. Other devices use
-    SDPA and therefore need an explicit boolean mask with ``True`` entries for
-    keys that are visible to each draft query.
+    PyTorch FlexAttention is only used on CUDA, so other devices need an
+    explicit boolean mask with ``True`` entries for each visible key. See
+    :func:`_create_dflash_mask_mod` for the ``sliding_window``/``document_ids``
+    semantics.
     """
 
     bsz, num_blocks = anchor_positions.shape
@@ -136,6 +157,18 @@ def _create_dflash_dense_attention_mask(
 
     context_indices = torch.arange(ctx_len, device=device)
     context_allowed = context_indices.view(1, 1, ctx_len) < query_anchors.unsqueeze(-1)
+    if sliding_window is not None:
+        context_allowed = context_allowed & (
+            context_indices.view(1, 1, ctx_len)
+            >= (query_anchors - sliding_window).unsqueeze(-1)
+        )
+    if document_ids is not None:
+        query_docs = torch.gather(document_ids, 1, query_anchors)
+        context_allowed = (
+            context_allowed
+            & (document_ids.unsqueeze(1) == query_docs.unsqueeze(-1))
+            & (document_ids.unsqueeze(1) >= 0)
+        )
 
     draft_block_ids = torch.arange(draft_len, device=device) // block_size
     draft_allowed = (
@@ -152,6 +185,122 @@ def _create_dflash_dense_attention_mask(
     )
     allowed = torch.where(query_valid.unsqueeze(-1), allowed, safe_self)
     return allowed.unsqueeze(1)
+
+
+def _resolve_sliding_windows(config) -> list[int | None]:
+    """Return the per-layer sliding window (``None`` disables it for that layer)."""
+
+    num_layers = int(getattr(config, "num_hidden_layers", 1))
+    window = getattr(config, "sliding_window", None)
+    if not bool(getattr(config, "use_sliding_window", False)) or window is None:
+        return [None] * num_layers
+    window = int(window)
+    layer_types = getattr(config, "layer_types", None)
+    if not layer_types or len(layer_types) != num_layers:
+        return [window] * num_layers
+    return [
+        window if str(layer_type) == "sliding_attention" else None
+        for layer_type in layer_types
+    ]
+
+
+def _sliding_window_config(window, num_layers: int) -> dict:
+    """Draft-config kwargs for an all-sliding fallback backbone."""
+
+    if window is None:
+        return {}
+    return {
+        "sliding_window": int(window),
+        "use_sliding_window": True,
+        "layer_types": ["sliding_attention"] * int(num_layers),
+    }
+
+
+def build_dflash_attention_masks(
+    *,
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    ctx_len: int,
+    block_size: int,
+    device: torch.device,
+    windows: list[int | None],
+    document_ids: torch.Tensor | None = None,
+):
+    """Build the attention masks shared by the DFlash-family training models.
+
+    Returns ``(block_mask, dense_attention_mask)``. When all layers share one
+    window the two entries are single mask objects; mixed layer types yield
+    per-layer lists so :meth:`DFlashDraftModel.forward` can index them.
+    """
+    bsz, num_blocks = anchor_positions.shape
+    draft_len = num_blocks * block_size
+
+    def build(window: int | None):
+        if device.type == "cuda":
+            block_mask = compile_friendly_create_block_mask(
+                mask_mod=_create_dflash_mask_mod(
+                    anchor_positions,
+                    block_keep_mask,
+                    ctx_len,
+                    block_size,
+                    sliding_window=window,
+                    document_ids=document_ids,
+                ),
+                B=bsz,
+                H=None,
+                Q_LEN=draft_len,
+                KV_LEN=ctx_len + draft_len,
+                device=device,
+            )
+            return block_mask, None
+        dense_mask = _create_dflash_dense_attention_mask(
+            anchor_positions,
+            block_keep_mask,
+            ctx_len,
+            block_size,
+            sliding_window=window,
+            document_ids=document_ids,
+        )
+        return None, dense_mask
+
+    unique_windows: list[int | None] = []
+    for window in windows:
+        if window not in unique_windows:
+            unique_windows.append(window)
+    cache = {window: build(window) for window in unique_windows}
+    if len(unique_windows) == 1:
+        return cache[unique_windows[0]]
+    block_masks = [cache[window][0] for window in windows]
+    dense_masks = [cache[window][1] for window in windows]
+    return block_masks, dense_masks
+
+
+def _document_boundary_validity(
+    valid: torch.Tensor,
+    *,
+    indices: torch.Tensor,
+    document_ids: torch.Tensor,
+    block_size: int,
+    seq_len: int,
+    label_shift: int = 0,
+) -> torch.Tensor:
+    """Drop candidate anchors whose labels would cross a document boundary.
+
+    ``indices`` holds candidate anchor positions as ``[B, N]`` and
+    ``document_ids`` the per-token document id (``-1`` marks packing padding). A
+    candidate stays valid only when its whole label span shares one non-negative
+    document id, so an anchored draft never crosses a packing boundary.
+
+    ``label_shift`` selects the label layout: DFlash keeps same-position blocks
+    whose last label sits at ``anchor + block_size - 1`` (``label_shift=0``),
+    while DSpark/DOMINO use next-token shifted labels ending at ``anchor +
+    block_size`` (``label_shift=1``).
+    """
+
+    docs = document_ids[:, : indices.shape[1]]
+    window_tail = (indices + block_size - 1 + label_shift).clamp(max=seq_len - 1)
+    tail_docs = torch.gather(document_ids, 1, window_tail)
+    return valid & (docs >= 0) & (docs == tail_docs)
 
 
 class DFlashTrainingModel(nn.Module):
@@ -252,7 +401,11 @@ class DFlashTrainingModel(nn.Module):
         return cached
 
     def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
+        self,
+        seq_len: int,
+        loss_mask: torch.Tensor,
+        device: torch.device,
+        document_ids: torch.Tensor | None = None,
     ):
         bsz = loss_mask.shape[0]
         max_anchor = max(seq_len - self.block_size, 0)
@@ -266,12 +419,20 @@ class DFlashTrainingModel(nn.Module):
             return anchors, keep_mask
 
         valid = loss_mask[:, : max_anchor + 1] > 0.5
-        valid_counts = valid.sum(dim=1)
         indices = (
             self._cached_arange("anchor_indices", max_anchor + 1, device)
             .unsqueeze(0)
             .expand(bsz, -1)
         )
+        if document_ids is not None:
+            valid = _document_boundary_validity(
+                valid,
+                indices=indices,
+                document_ids=document_ids,
+                block_size=self.block_size,
+                seq_len=seq_len,
+            )
+        valid_counts = valid.sum(dim=1)
         masked_indices = torch.where(valid, indices, seq_len + 1)
         random_vals = torch.rand(bsz, max_anchor + 1, device=device)
         random_vals = torch.where(valid, random_vals, 2.0)
@@ -378,12 +539,13 @@ class DFlashTrainingModel(nn.Module):
         hidden_states_list: list[torch.Tensor],
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
+        document_ids: torch.Tensor | None = None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
+            seq_len, loss_mask, device, document_ids=document_ids
         )
         n_blocks = anchor_positions.shape[1]
         noise_embedding = self._create_noise_embed(
@@ -392,28 +554,16 @@ class DFlashTrainingModel(nn.Module):
         context_position_ids, draft_position_ids = self._create_position_ids(
             anchor_positions, seq_len
         )
-        draft_len = n_blocks * self.block_size
 
-        block_mask = None
-        dense_attention_mask = None
-        if device.type == "cuda":
-            block_mask = compile_friendly_create_block_mask(
-                mask_mod=_create_dflash_mask_mod(
-                    anchor_positions, block_keep_mask, seq_len, self.block_size
-                ),
-                B=bsz,
-                H=None,
-                Q_LEN=draft_len,
-                KV_LEN=seq_len + draft_len,
-                device=device,
-            )
-        else:
-            dense_attention_mask = _create_dflash_dense_attention_mask(
-                anchor_positions,
-                block_keep_mask,
-                seq_len,
-                self.block_size,
-            )
+        block_mask, dense_attention_mask = build_dflash_attention_masks(
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            ctx_len=seq_len,
+            block_size=self.block_size,
+            device=device,
+            windows=_resolve_sliding_windows(self.draft_model.config),
+            document_ids=document_ids,
+        )
 
         draft_hidden = self.draft_model(
             draft_input_ids=None,
@@ -796,12 +946,13 @@ class DFlashTrainerBackend:
             target_layer_ids = build_target_layer_ids(
                 num_context_layers, target_num_hidden_layers
             )
+        num_hidden_layers = int(training_cfg.get("dflash_num_hidden_layers", 1))
         return DFlashConfig(
             hidden_size=hidden_size,
             intermediate_size=int(
                 getattr(target_text_config, "intermediate_size", hidden_size * 4)
             ),
-            num_hidden_layers=int(training_cfg.get("dflash_num_hidden_layers", 1)),
+            num_hidden_layers=num_hidden_layers,
             num_attention_heads=int(getattr(target_text_config, "num_attention_heads")),
             num_key_value_heads=int(
                 getattr(
@@ -823,6 +974,9 @@ class DFlashTrainerBackend:
             target_num_hidden_layers=target_num_hidden_layers,
             target_layer_ids=target_layer_ids,
             mask_token_id=mask_token_id,
+            **_sliding_window_config(
+                training_cfg.get("dflash_sliding_window", None), num_hidden_layers
+            ),
             architectures=["DFlashDraftModel"],
         )
 
@@ -1294,6 +1448,7 @@ class DFlashTrainerBackend:
             hidden_states_list=hidden_states_list,
             loss_mask=batch["loss_mask"],
             lm_head_weight=self.target_lm_head.fc.weight,
+            document_ids=batch.get("document_ids"),
         )
         local_num_tokens = count_pp.sum().to(loss.device, dtype=loss.dtype)
         return {

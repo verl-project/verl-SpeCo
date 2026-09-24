@@ -578,6 +578,60 @@ def test_from_dspark_dict_normalizes_transformer_layer_config() -> None:
     assert config.block_size == 8
 
 
+def test_from_dspark_dict_lifts_nested_sliding_window() -> None:
+    config = DSparkConfig.from_dspark_dict(
+        {
+            "architectures": ["Qwen3DSparkModel"],
+            "transformer_layer_config": {
+                "model_type": "qwen3",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 128,
+                "head_dim": 16,
+                "sliding_window": 128,
+                "use_sliding_window": True,
+                "layer_types": ["sliding_attention", "full_attention"],
+            },
+            "block_size": 8,
+            "num_anchors": 512,
+            "markov_rank": 256,
+        }
+    )
+
+    assert config.sliding_window == 128
+    assert config.use_sliding_window is True
+    assert config.layer_types == ["sliding_attention", "full_attention"]
+    # The nested SWA config must reach the per-layer mask builder unchanged.
+    assert dflash_backend._resolve_sliding_windows(config) == [128, None]
+
+
+def test_from_dspark_dict_defaults_to_full_attention_without_nested_swa() -> None:
+    config = DSparkConfig.from_dspark_dict(
+        {
+            "architectures": ["Qwen3DSparkModel"],
+            "transformer_layer_config": {
+                "model_type": "qwen3",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 128,
+                "head_dim": 16,
+            },
+            "block_size": 8,
+            "num_anchors": 512,
+            "markov_rank": 256,
+        }
+    )
+
+    assert config.use_sliding_window is False
+    assert dflash_backend._resolve_sliding_windows(config) == [None, None]
+
+
 def test_dspark_fallback_prefers_dspark_intermediate_size() -> None:
     from types import SimpleNamespace
 
