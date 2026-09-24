@@ -22,6 +22,8 @@ actors that own the HTTP server and rollout adapter.
 from __future__ import annotations
 
 import asyncio
+import base64
+import dataclasses
 import functools
 import hashlib
 import inspect
@@ -29,7 +31,6 @@ import json
 import logging
 import os
 import time
-import dataclasses
 from typing import Any, Optional, cast
 
 # The DFlash2 checkpoint contract and IPC allocator helpers live with the vLLM
@@ -42,6 +43,7 @@ from verl_speco.integration.sglang_adapter import (
     DRAFTER_RAW_TOP_LOGPROBS_PARAM,
     DRAFTER_RETURN_LAST_HIDDEN_PARAM,
     SGLANG_EAGLE_UPDATE_WEIGHTS_PATCH,
+    SGLANG_FLASHINFER_PLAN_ABI_PATCH,
     SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCH,
     SGLANG_NPU_EAGLE_TARGET_SAMPLING_PATCH,
     SGLANG_QWEN3_ROPE_COMPAT_PATCH,
@@ -109,9 +111,34 @@ _HIDDEN_STATE_WINDOW_END_PARAM = "_verl_hidden_state_window_end"
 _HIDDEN_STATE_WINDOW_START_OFFSET_PARAM = "_verl_hidden_state_window_start_offset"
 _HIDDEN_STATE_WINDOW_MIN_ROWS_PARAM = "_verl_hidden_state_window_min_rows"
 _VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS"
+_SPECO_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
 
 _SERVER_ARGS_PATCHED = False
 _SGLANG_REPLICA_PATCHED = False
+
+
+def _sglang_spec_decode_extra_fields(meta_info: Any) -> dict[str, float]:
+    """Map SGLang request counters onto SpeCo's backend-neutral transport."""
+
+    if not isinstance(meta_info, dict):
+        return {}
+    try:
+        verification_steps = float(meta_info.get("spec_verify_ct", 0) or 0)
+        accepted_drafts = float(
+            meta_info.get(
+                "spec_num_correct_drafts",
+                meta_info.get("spec_accepted_drafts", 0),
+            )
+            or 0
+        )
+    except (TypeError, ValueError, OverflowError):
+        return {}
+    if verification_steps <= 0:
+        return {}
+    return {
+        f"{_SPECO_SPEC_DECODE_EXTRA_PREFIX}_drafts": verification_steps,
+        f"{_SPECO_SPEC_DECODE_EXTRA_PREFIX}_accepted_tokens": max(accepted_drafts, 0.0),
+    }
 
 
 def _record_field_names(cls: Any) -> frozenset[str]:
@@ -136,6 +163,133 @@ def _record_field_names(cls: Any) -> frozenset[str]:
     if dataclasses.is_dataclass(cls):
         return frozenset(field.name for field in dataclasses.fields(cls))
     return frozenset()
+
+
+def _install_verl_server_args_fields_compat(upstream_module: Any) -> None:
+    """Teach older verl launch code how to inspect current SGLang records."""
+    dataclasses_module = getattr(upstream_module, "dataclasses", None)
+    server_args = getattr(upstream_module, "ServerArgs", None)
+    if dataclasses_module is None or server_args is None:
+        return
+    try:
+        dataclasses_module.fields(server_args)
+        return
+    except TypeError:
+        field_names = _record_field_names(server_args)
+    if not field_names:
+        return
+
+    class _DataclassesCompatProxy:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(dataclasses_module, name)
+
+        @staticmethod
+        def fields(class_or_instance: Any) -> Any:
+            candidate = (
+                class_or_instance
+                if isinstance(class_or_instance, type)
+                else type(class_or_instance)
+            )
+            if candidate is server_args:
+                return tuple(
+                    type("RecordField", (), {"name": name}) for name in field_names
+                )
+            return dataclasses_module.fields(class_or_instance)
+
+    upstream_module.dataclasses = _DataclassesCompatProxy()
+
+
+def _install_verl_launch_subprocesses_compat() -> None:
+    """Expose current SGLang's Engine launcher in the shape older verl expects."""
+    import importlib
+
+    http_server = importlib.import_module("sglang.srt.entrypoints.http_server")
+
+    if callable(getattr(http_server, "_launch_subprocesses", None)):
+        return
+    engine = getattr(http_server, "Engine", None)
+    launcher = getattr(engine, "_launch_subprocesses", None)
+    if not callable(launcher):
+        return
+
+    def _launch_subprocesses(*args, **kwargs):
+        try:
+            bound = inspect.signature(launcher).bind_partial(*args, **kwargs)
+            server_args = bound.arguments.get("server_args")
+        except (TypeError, ValueError):
+            server_args = kwargs.get("server_args")
+        drafter_cfg = _load_env_drafter_config()
+        if drafter_cfg and server_args is not None:
+            overrides = _server_args_overrides_from_drafter(
+                drafter_cfg, set(_record_field_names(type(server_args)))
+            )
+            for key, value in overrides.items():
+                if key == "custom_weight_loader":
+                    current = list(getattr(server_args, key, None) or [])
+                    value = current + [item for item in value if item not in current]
+                try:
+                    setattr(server_args, key, value)
+                except (AttributeError, TypeError) as exc:
+                    raise RuntimeError(
+                        "SPECO could not apply SGLang ServerArgs override "
+                        f"{key}={value!r} before scheduler launch"
+                    ) from exc
+
+            requested_algorithm = str(
+                drafter_cfg.get("speculative_algorithm", "") or ""
+            ).upper()
+            actual_algorithm = str(
+                getattr(server_args, "speculative_algorithm", "") or ""
+            ).upper()
+            logger.warning(
+                "[speco sglang launch] requested_algorithm=%s "
+                "server_args_algorithm=%s draft_model=%s "
+                "draft_attention_backend=%s prefill_attention_backend=%s "
+                "decode_attention_backend=%s server_args_type=%s resolution_finished=%s",
+                requested_algorithm,
+                actual_algorithm or None,
+                getattr(server_args, "speculative_draft_model_path", None),
+                getattr(server_args, "speculative_draft_attention_backend", None),
+                getattr(server_args, "prefill_attention_backend", None),
+                getattr(server_args, "decode_attention_backend", None),
+                type(server_args).__name__,
+                bool(getattr(server_args, "_resolution_finished", False)),
+            )
+            expected_algorithm = (
+                "DFLASH" if requested_algorithm == "DFLASH2" else requested_algorithm
+            )
+            if expected_algorithm and actual_algorithm != expected_algorithm:
+                raise RuntimeError(
+                    "SPECO SGLang speculative configuration was lost before "
+                    "scheduler launch: "
+                    f"requested_algorithm={requested_algorithm!r}, "
+                    f"server_args_algorithm={actual_algorithm or None!r}, "
+                    f"supported_fields={sorted(_record_field_names(type(server_args)))}"
+                )
+
+        kwargs.setdefault(
+            "init_tokenizer_manager_func",
+            getattr(engine, "init_tokenizer_manager_func", None)
+            or http_server.init_tokenizer_manager,
+        )
+        kwargs.setdefault(
+            "run_scheduler_process_func",
+            getattr(engine, "run_scheduler_process_func", None)
+            or http_server.run_scheduler_process,
+        )
+        kwargs.setdefault(
+            "run_detokenizer_process_func",
+            getattr(engine, "run_detokenizer_process_func", None)
+            or http_server.run_detokenizer_process,
+        )
+        result = launcher(*args, **kwargs)
+        if len(result) >= 4 and hasattr(result[3], "scheduler_infos"):
+            scheduler_infos = result[3].scheduler_infos
+            scheduler_info = scheduler_infos[0] if scheduler_infos else {}
+            return result[:2] + (scheduler_info,) + result[2:]
+        return result
+
+    http_server._launch_subprocesses = _launch_subprocesses
 
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
@@ -722,6 +876,49 @@ def _validate_sglang_dflash2_block_size(
         )
 
 
+def _validate_sglang_dspark_config(drafter_cfg: dict[str, Any]) -> int:
+    """Check the SpeCo gamma against the local SGLang DSpark checkpoint."""
+    model_path = drafter_cfg.get("model_path")
+    if not model_path:
+        raise ValueError("SGLang DSpark requires drafter.model_path")
+    gamma = _positive_int_or_none(
+        (drafter_cfg.get("rollout") or {}).get("spec_verify_tokens")
+    )
+    if gamma is None:
+        raise ValueError("SGLang DSpark requires positive rollout.spec_verify_tokens")
+
+    config_path = os.path.join(os.fspath(model_path), "config.json")
+    if os.path.isfile(config_path):
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+        architectures = config.get("architectures") or []
+        if isinstance(architectures, str):
+            architectures = [architectures]
+        if not (
+            any("dspark" in str(name).lower() for name in architectures)
+            or config.get("dspark_config") is not None
+            or config.get("markov_head_type") is not None
+        ):
+            raise ValueError(
+                f"SGLang DSpark requires a DSpark checkpoint: {config_path}"
+            )
+        if config.get("sample_from_anchor", True) is not True:
+            raise ValueError(
+                "SGLang DSpark requires sample_from_anchor=true for SpeCo training"
+            )
+        block_size = (
+            config.get("dspark_block_size")
+            or (config.get("dflash_config") or {}).get("block_size")
+            or config.get("block_size")
+        )
+        if block_size is not None and gamma != int(block_size):
+            raise ValueError(
+                "SGLang DSpark requires rollout.spec_verify_tokens to equal the "
+                f"checkpoint block_size: got {gamma}, expected {block_size}"
+            )
+    return gamma
+
+
 def _server_args_overrides_from_drafter(
     drafter_cfg: dict[str, Any], supported_fields: set[str]
 ) -> dict[str, Any]:
@@ -803,7 +1000,12 @@ def _server_args_overrides_from_drafter(
         "enable_weights_cpu_backup": True,
         "enable_draft_weights_cpu_backup": True,
     }
-
+    if algorithm == "DSPARK":
+        # SPECO counts the gamma drafted positions; SGLang also counts the
+        # target's bonus-token verification slot.
+        overrides["speculative_num_draft_tokens"] = (
+            _validate_sglang_dspark_config(drafter_cfg) + 1
+        )
     cuda_graph_max_bs = rollout_cfg.get("cuda_graph_max_bs")
     if cuda_graph_max_bs is not None:
         overrides["cuda_graph_max_bs"] = cuda_graph_max_bs
@@ -850,6 +1052,8 @@ def _default_sglang_verl_patches(drafter_cfg: dict[str, Any]) -> set[str]:
 
     if drafter_cfg.get("enable"):
         patches.add(SGLANG_EAGLE_UPDATE_WEIGHTS_PATCH)
+    if str(drafter_cfg.get("speculative_algorithm", "")).upper() == "DSPARK":
+        patches.add(SGLANG_FLASHINFER_PLAN_ABI_PATCH)
     if drafter_cfg.get("enable") and drafter_cfg.get("enable_drafter_training"):
         training_cfg = drafter_cfg.get("training") or {}
         if training_cfg.get("collect_hidden_states_from_sgl"):
@@ -954,7 +1158,7 @@ def _is_sglang_draft_model(model) -> bool:
         any(
             token in str(name).lower()
             for name in names
-            for token in ("eagle", "dflash")
+            for token in ("eagle", "dflash", "dspark")
         )
         or getattr(config, "draft_vocab_size", None) is not None
     )
@@ -974,6 +1178,34 @@ def speco_sglang_draft_weight_loader(model, named_tensors):
     if not _is_sglang_draft_model(model):
         return
     return model.load_weights(named_tensors)
+
+
+def _sglang_draft_param_name(name: str, algorithm: str) -> str:
+    """Translate trainer parameter names to the SGLang draft namespace."""
+
+    translated = name
+    strip_prefixes = (
+        "module.",
+        "_orig_mod.",
+        "draft_model.",
+        "model.draft_model.",
+    )
+    if algorithm in {"DFLASH", "DFLASH2", "DSPARK"}:
+        strip_prefixes = (*strip_prefixes, "model.")
+    changed = True
+    while changed:
+        changed = False
+        for prefix in strip_prefixes:
+            if translated.startswith(prefix):
+                translated = translated[len(prefix) :]
+                changed = True
+    if "midlayer." in translated:
+        translated = translated.replace("midlayer.", "layers.0.")
+    if algorithm in {"DFLASH", "DFLASH2"}:
+        from verl_speco.integration.vllm_runtime import _dflash2_engine_param_name
+
+        translated = _dflash2_engine_param_name(translated)
+    return translated
 
 
 @functools.lru_cache(maxsize=1)
@@ -1095,7 +1327,9 @@ async def _sgl_update_weights_with_route(
     ):
         if value is not None and field in request_fields:
             setattr(update_weights_request, field, value)
-    result = await engine.update_weights_from_tensor(update_weights_request)
+    result = await _sgl_http_update_weights_from_tensor(
+        engine, update_weights_request, request_fields=request_fields
+    )
     if isinstance(result, dict):
         success = result.get("success")
         status = str(result.get("status", "")).lower()
@@ -1117,6 +1351,51 @@ async def _sgl_update_weights_with_route(
     return result
 
 
+async def _sgl_http_update_weights_from_tensor(
+    engine, update_weights_request, *, request_fields: frozenset[str]
+):
+    """Preserve SGLang's failed-update message and optional route fields."""
+
+    get_session = getattr(engine, "_get_session", None)
+    server_args = getattr(engine, "server_args", None)
+    if not callable(get_session) or server_args is None:
+        return await engine.update_weights_from_tensor(update_weights_request)
+
+    payload = {
+        "serialized_named_tensors": [
+            base64.b64encode(value).decode("utf-8")
+            for value in update_weights_request.serialized_named_tensors
+        ],
+        "load_format": update_weights_request.load_format,
+        "flush_cache": update_weights_request.flush_cache,
+    }
+    for field in (
+        "abort_all_requests",
+        "disable_draft_model",
+        "disable_target_model",
+        "weight_version",
+        "torch_empty_cache",
+    ):
+        if field in request_fields:
+            payload[field] = getattr(update_weights_request, field)
+
+    url = f"http://{server_args.host}:{server_args.port}/update_weights_from_tensor"
+    async with get_session() as session:
+        async with session.post(url, json=payload) as response:
+            try:
+                result = await response.json()
+            except Exception:  # noqa: BLE001
+                result = {"message": await response.text()}
+            if response.status >= 400:
+                return {
+                    "success": False,
+                    "message": result.get("message")
+                    or result.get("detail")
+                    or f"HTTP {response.status}",
+                }
+            return result
+
+
 def _supports_sglang_custom_weight_loader() -> bool:
     try:
         from sglang.srt.server_args import ServerArgs
@@ -1124,6 +1403,17 @@ def _supports_sglang_custom_weight_loader() -> bool:
         return "custom_weight_loader" in _record_field_names(ServerArgs)
     except Exception:  # noqa: BLE001
         return False
+
+
+def _sglang_route_load_format(disable_field: str, route_marker: str) -> str | None:
+    """Use a marker only when this SGLang request cannot route natively."""
+    from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
+
+    if disable_field in _record_field_names(UpdateWeightsFromTensorReqInput):
+        return None
+    if _supports_sglang_custom_weight_loader():
+        return route_marker
+    return None
 
 
 def _speculative_weight_sync_guard_disabled() -> bool:
@@ -1228,9 +1518,9 @@ async def speco_update_target_weights(
                 device_mesh=self.device_mesh,
                 disable_draft_model=True,
                 disable_target_model=False,
-                load_format=SPECO_TARGET_WEIGHT_LOADER
-                if _supports_sglang_custom_weight_loader()
-                else None,
+                load_format=_sglang_route_load_format(
+                    "disable_draft_model", SPECO_TARGET_WEIGHT_LOADER
+                ),
                 stage_cpu_tensors_to_device=False,
                 flush_cache=not engine_has_flush_cache,
                 abort_all_requests=False,
@@ -1290,19 +1580,11 @@ async def speco_update_draft_weights(
             if flush_before and engine_has_flush_cache:
                 await _maybe_call_sglang_engine_method(self._engine, "flush_cache")
 
-        # DFlash2 keeps the selector codebooks in nn.Embedding modules on the
-        # trainer while SGLang's draft holds them as bare parameters; SGLang's
-        # load_weights silently drops unresolved names, so rename here (the
-        # SGLang publish path otherwise forwards trainer names verbatim).
-        from verl_speco.integration.vllm_runtime import (
-            _dflash2_engine_param_name,
-            _ipc_safe_allocator,
-        )
+        from verl_speco.integration.vllm_runtime import _ipc_safe_allocator
 
-        # The rename only rewrites the two DFlash2 codebook suffixes, so it is a
-        # no-op for every other drafter family.
+        algorithm = str(drafter_cfg.get("speculative_algorithm", "") or "").upper()
         named_weights = (
-            (_dflash2_engine_param_name(name), tensor)
+            (_sglang_draft_param_name(name, algorithm), tensor)
             for name, tensor in weights.items()
         )
 
@@ -1322,9 +1604,9 @@ async def speco_update_draft_weights(
                     device_mesh=self.device_mesh,
                     disable_draft_model=False,
                     disable_target_model=True,
-                    load_format=SPECO_DRAFT_WEIGHT_LOADER
-                    if _supports_sglang_custom_weight_loader()
-                    else None,
+                    load_format=_sglang_route_load_format(
+                        "disable_target_model", SPECO_DRAFT_WEIGHT_LOADER
+                    ),
                     stage_cpu_tensors_to_device=True,
                     flush_cache=bool(flush_after and not engine_has_flush_cache),
                     abort_all_requests=False,
@@ -1394,7 +1676,12 @@ class _SpecoSGLangHttpServerMixin:
         self._drafter_collection_tokens = 0
         self._speco_collection_skip_log_keys = set()
         self._speco_hidden_missing_log_keys = set()
-        return await cast(Any, super()).launch_server(*args, **kwargs)
+        upstream_launch_server = cast(Any, super()).launch_server
+        upstream_module = inspect.getmodule(upstream_launch_server)
+        if upstream_module is not None:
+            _install_verl_server_args_fields_compat(upstream_module)
+        _install_verl_launch_subprocesses_compat()
+        return await upstream_launch_server(*args, **kwargs)
 
     def _speco_drafter_cfg(self) -> dict[str, Any]:
         cached_cfg = getattr(self, "_speco_drafter_config", None)
@@ -1660,11 +1947,7 @@ class _SpecoSGLangHttpServerMixin:
         drafter_cfg = self._speco_drafter_cfg()
         training_cfg = drafter_cfg.get("training") or {}
         uses_dflash_aux_hidden = _drafter_uses_dflash_aux_hidden(drafter_cfg)
-        if not bool(
-            drafter_cfg.get("enable")
-            and drafter_cfg.get("enable_drafter_training")
-            and training_cfg.get("collect_hidden_states_from_sgl")
-        ):
+        if not bool(drafter_cfg.get("enable")):
             return await cast(Any, super()).generate(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(sampling_params),
@@ -1672,6 +1955,10 @@ class _SpecoSGLangHttpServerMixin:
                 image_data=image_data,
                 video_data=video_data,
             )
+        collect_hidden_states = bool(
+            drafter_cfg.get("enable_drafter_training")
+            and training_cfg.get("collect_hidden_states_from_sgl")
+        )
 
         original_sampling_params = sampling_params
         request_global_steps = original_sampling_params.get("_verl_global_steps")
@@ -1685,13 +1972,17 @@ class _SpecoSGLangHttpServerMixin:
             if request_global_steps is not None
             else self.global_steps
         )
-        collection_plan = _plan_sglang_drafter_collection(
-            global_step=collection_global_steps,
-            drafter_cfg=drafter_cfg,
-            validation=skip_drafter_collection,
+        collection_plan = (
+            _plan_sglang_drafter_collection(
+                global_step=collection_global_steps,
+                drafter_cfg=drafter_cfg,
+                validation=skip_drafter_collection,
+            )
+            if collect_hidden_states
+            else None
         )
         self._speco_last_collection_plan = collection_plan
-        if not collection_plan.collect:
+        if collection_plan is not None and not collection_plan.collect:
             self._speco_log_collection_skip_once(
                 {
                     "source_disabled": "hidden_collection_disabled",
@@ -1703,13 +1994,6 @@ class _SpecoSGLangHttpServerMixin:
                 prompt_len=len(prompt_ids),
                 max_new_tokens=None,
                 hidden_window_plan=None,
-            )
-            return await cast(Any, super()).generate(
-                prompt_ids,
-                self._speco_strip_internal_sampling_params(original_sampling_params),
-                request_id,
-                image_data=image_data,
-                video_data=video_data,
             )
 
         sampling_params = self._speco_strip_internal_sampling_params(
@@ -1750,14 +2034,21 @@ class _SpecoSGLangHttpServerMixin:
 
         should_collect = False
         hidden_window_plan = {"mode": "front", "estimated_rows": 0, "min_rows": 0}
-        should_collect, hidden_window_plan, _ = self._speco_request_hidden_state_params(
-            sampling_params,
-            prompt_len=len(prompt_ids),
-            request_id=request_id,
-            collection_global_steps=collection_global_steps,
-            max_new_tokens=max_new_tokens,
-        )
-        if not should_collect:
+        if collection_plan is not None and collection_plan.collect:
+            should_collect, hidden_window_plan, _ = (
+                self._speco_request_hidden_state_params(
+                    sampling_params,
+                    prompt_len=len(prompt_ids),
+                    request_id=request_id,
+                    collection_global_steps=collection_global_steps,
+                    max_new_tokens=max_new_tokens,
+                )
+            )
+        if (
+            collection_plan is not None
+            and collection_plan.collect
+            and not should_collect
+        ):
             self._speco_log_collection_skip_once(
                 getattr(self, "_speco_last_collection_skip_reason", "unknown"),
                 collection_global_steps=collection_global_steps,
@@ -1766,14 +2057,8 @@ class _SpecoSGLangHttpServerMixin:
                 max_new_tokens=max_new_tokens,
                 hidden_window_plan=hidden_window_plan,
             )
-            return await cast(Any, super()).generate(
-                prompt_ids,
-                self._speco_strip_internal_sampling_params(original_sampling_params),
-                request_id,
-                image_data=image_data,
-                video_data=video_data,
-            )
-        request["return_hidden_states"] = True
+        if should_collect:
+            request["return_hidden_states"] = True
 
         generate_request = GenerateReqInput(**request)
         if self.model_config.lora_rank > 0:
@@ -2285,6 +2570,7 @@ class _SpecoSGLangHttpServerMixin:
                 "global_steps": collection_global_steps,
                 "drafter_sample": drafter_sample,
             }
+            extra_fields.update(_sglang_spec_decode_extra_fields(meta_info))
             output = TokenOutput(
                 token_ids=token_ids,
                 log_probs=log_probs,
@@ -2294,12 +2580,14 @@ class _SpecoSGLangHttpServerMixin:
             )
             return output
 
+        extra_fields = {"global_steps": collection_global_steps}
+        extra_fields.update(_sglang_spec_decode_extra_fields(meta_info))
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
             stop_reason=finish_reason,
-            extra_fields={"global_steps": collection_global_steps},
+            extra_fields=extra_fields,
         )
 
 
@@ -2442,9 +2730,28 @@ def _build_speco_replica_class(upstream_module):
     return SpecoSGLangReplica
 
 
+def _sglang_server_args_needs_fields_compat(server_args_cls: Any = None) -> bool:
+    """Whether upstream verl must be taught to inspect SGLang records."""
+
+    if server_args_cls is None:
+        try:
+            from sglang.srt.server_args import ServerArgs
+        except Exception:  # noqa: BLE001
+            return False
+        server_args_cls = ServerArgs
+    return not dataclasses.is_dataclass(server_args_cls) and bool(
+        _record_field_names(server_args_cls)
+    )
+
+
 def should_install_sglang_base_compat_runtime(config: Any) -> bool:
     rollout_name = _get_nested(config, ("actor_rollout_ref", "rollout", "name"), None)
-    return rollout_name == "sglang" and sglang_needs_qwen3_rope_compat_patch()
+    if rollout_name != "sglang":
+        return False
+    return (
+        sglang_needs_qwen3_rope_compat_patch()
+        or _sglang_server_args_needs_fields_compat()
+    )
 
 
 def install_upstream_sglang_runtime_bridge(*, base_compat_only: bool = False) -> bool:

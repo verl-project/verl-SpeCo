@@ -957,11 +957,20 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 item_loss_mask[:] = 1.0
 
-            if not (ids.size(0) == full_h.size(0) == item_loss_mask.size(0)):
+            input_rows = ids.size(0)
+            hidden_rows = full_h.size(0)
+            mask_rows = item_loss_mask.size(0)
+            if input_rows == mask_rows == hidden_rows + 1:
+                # Collected hidden row p represents input token p and supervises
+                # token p + 1. The trailing token therefore has no matching
+                # context hidden row for DSpark's same-position training input.
+                ids = ids[:-1]
+                item_loss_mask = item_loss_mask[:-1]
+            elif not (input_rows == hidden_rows == mask_rows):
                 raise ValueError(
                     "DSpark input/hidden/mask row mismatch: "
-                    f"input_rows={ids.size(0)}, hidden_rows={full_h.size(0)}, "
-                    f"mask_rows={item_loss_mask.size(0)}"
+                    f"input_rows={input_rows}, hidden_rows={hidden_rows}, "
+                    f"mask_rows={mask_rows}"
                 )
             nonzero = torch.nonzero(item_loss_mask)
             if nonzero.numel() > 0:

@@ -31,6 +31,23 @@ SGLANG_QWEN3_ROPE_COMPAT_PATCH = "qwen3_rope_compat"
 SGLANG_EAGLE_UPDATE_WEIGHTS_PATCH = "eagle_update_weights"
 SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCH = "hidden_states_tensor_output"
 SGLANG_NPU_EAGLE_TARGET_SAMPLING_PATCH = "npu_eagle_target_sampling"
+SGLANG_FLASHINFER_PLAN_ABI_PATCH = "flashinfer_plan_abi"
+
+
+def _call_flashinfer_plan_with_abi_compat(plan, *args, on_legacy_abi=None):
+    """Retry the pre-uniform-q-len FlashInfer plan ABI when detected exactly."""
+
+    try:
+        return plan(*args)
+    except TypeError as exc:
+        if not (
+            len(args) == 20
+            and "Expected 19 but got 20 arguments" in str(exc)
+        ):
+            raise
+        if on_legacy_abi is not None:
+            on_legacy_abi()
+        return plan(*args[:-1])
 
 
 def speco_step_matches_interval(

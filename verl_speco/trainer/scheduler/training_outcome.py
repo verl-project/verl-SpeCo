@@ -179,6 +179,14 @@ class TrainingOutcome:
                 len(publish_leaders) == 1 and publish_leaders[0].snapshot_ready
             ),
         }
+        for key in ("drafter/optimizer_steps_total", "drafter/current_lr"):
+            values = [
+                value
+                for result in normalized_results
+                if (value := _metric_float(result.get(key))) is not None
+            ]
+            if values:
+                metrics[key] = max(values)
         for key in (
             "timing_s/drafter_prepare_batch",
             "timing_s/drafter_forward_loss",

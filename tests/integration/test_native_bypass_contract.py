@@ -15,10 +15,10 @@
 
 When speculative drafting is disabled, ``verl_speco.main`` must fall through to
 verl's native ``run_ppo`` so the actor -> rollout weight-sync path matches
-upstream verl exactly.  SPECO's task runner, runtime bridge and weight-sync
-compat extension stay unloaded.  ``SpecoTaskRunner.run`` additionally refuses a
-drafter-disabled config so accidental reuse of the SPECO runner can never
-change the no-drafter reward distribution.
+upstream verl exactly. SGLang may use a launch-only compatibility runner;
+drafter and weight-sync extensions stay unloaded. ``SpecoTaskRunner.run``
+additionally refuses a drafter-disabled config so accidental reuse of the
+SPECO runner can never change the no-drafter reward distribution.
 """
 
 from __future__ import annotations
@@ -29,15 +29,16 @@ omegaconf = pytest.importorskip("omegaconf", reason="bypass contract needs omega
 OmegaConf = omegaconf.OmegaConf
 
 
-def _config(*, enable=False, training=False) -> object:
+def _config(*, enable=False, training=False, rollout_name=None) -> object:
     return OmegaConf.create(
         {
             "actor_rollout_ref": {
                 "rollout": {
+                    "name": rollout_name,
                     "drafter": {
                         "enable": enable,
                         "enable_drafter_training": training,
-                    }
+                    },
                 }
             },
         }
@@ -96,9 +97,7 @@ def _patch_verl_entry(monkeypatch) -> list:
     monkeypatch.setattr(main_ppo, "run_ppo", fake_run_ppo)
     monkeypatch.setattr(device, "auto_set_device", lambda config: None)
     monkeypatch.setattr(compat, "check_compatible_verl", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        main_ppo, "migrate_legacy_reward_impl", None, raising=False
-    )
+    monkeypatch.setattr(main_ppo, "migrate_legacy_reward_impl", None, raising=False)
     # Drop any cached SPECO task-runner module so the no-drafter dispatch can
     # prove the bypass never imports it.  monkeypatch restores the originals.
     for mod in list(sys.modules):
@@ -142,9 +141,50 @@ def test_run_uses_speco_task_runner_when_drafter_enabled(monkeypatch) -> None:
     assert task_runner_class is not None
     from verl_speco.integration.task_runner import SpecoTaskRunner
 
-    assert (
-        getattr(task_runner_class, "__ray_actor_class__", None) is SpecoTaskRunner
+    assert getattr(task_runner_class, "__ray_actor_class__", None) is SpecoTaskRunner
+
+
+def test_run_uses_launch_compat_runner_for_native_sglang(monkeypatch) -> None:
+    pytest.importorskip("verl", reason="dispatch contract needs verl")
+    pytest.importorskip("ray", reason="dispatch contract needs ray")
+
+    from verl_speco.main import run
+
+    calls = _patch_verl_entry(monkeypatch)
+    run(_config(rollout_name="sglang"))
+
+    assert len(calls) == 1
+    task_runner_class = calls[0]
+    from verl_speco.integration.native_sglang_compat import (
+        NativeSGLangCompatTaskRunner,
     )
+
+    assert (
+        getattr(task_runner_class, "__ray_actor_class__", None)
+        is NativeSGLangCompatTaskRunner
+    )
+
+
+def test_native_sglang_runner_installs_bridge_before_upstream(monkeypatch) -> None:
+    pytest.importorskip("verl", reason="dispatch contract needs verl")
+
+    from verl_speco.integration import native_sglang_compat
+
+    events = []
+    monkeypatch.setattr(
+        native_sglang_compat,
+        "install_native_sglang_compat",
+        lambda config: events.append("compat"),
+    )
+    monkeypatch.setattr(
+        native_sglang_compat._TaskRunnerBase,
+        "run",
+        lambda self, config: events.append("upstream") or "native-result",
+    )
+    runner = object.__new__(native_sglang_compat.NativeSGLangCompatTaskRunner)
+
+    assert runner.run(object()) == "native-result"
+    assert events == ["compat", "upstream"]
 
 
 def test_run_bypass_propagates_training_without_rollout_error(monkeypatch) -> None:
@@ -178,9 +218,7 @@ def test_run_bypass_strips_speco_overlay_before_native_run(monkeypatch) -> None:
     monkeypatch.setattr(main_ppo, "run_ppo", fake_run_ppo)
     monkeypatch.setattr(device, "auto_set_device", lambda config: None)
     monkeypatch.setattr(compat, "check_compatible_verl", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        main_ppo, "migrate_legacy_reward_impl", None, raising=False
-    )
+    monkeypatch.setattr(main_ppo, "migrate_legacy_reward_impl", None, raising=False)
 
     from verl_speco.main import run
 

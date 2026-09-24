@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,9 +25,77 @@ dspark_models = pytest.importorskip("verl_speco.models.dspark")
 dflash_backend = pytest.importorskip("verl_speco.backends.dflash_trainer_backend")
 
 DSparkTrainingModel = dspark_backend.DSparkTrainingModel
+DSparkTrainerBackend = dspark_backend.DSparkTrainerBackend
 DSparkConfig = dspark_models.DSparkConfig
 DSparkDraftModel = dspark_models.DSparkDraftModel
 create_dense_attention_mask = dflash_backend._create_dflash_dense_attention_mask
+
+
+def _dspark_backend_for_preprocess() -> DSparkTrainerBackend:
+    config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(training={"dspark_max_window": 512})
+        )
+    )
+    return DSparkTrainerBackend(config, target_model_config=None)
+
+
+def test_dspark_preprocess_drops_only_unpaired_trailing_token() -> None:
+    backend = _dspark_backend_for_preprocess()
+    model_config = SimpleNamespace(
+        hidden_size=2,
+        target_hidden_size=2,
+        num_context_layers=2,
+        pad_token_id=0,
+    )
+    hidden = torch.arange(30, dtype=torch.float32).reshape(5, 6)
+
+    result = backend.preprocess_individual_items(
+        [
+            {
+                "input_ids": torch.tensor([10, 11, 12, 13, 14, 15]),
+                "hidden_states": hidden,
+                "hidden_states_layout": "dflash_aux_plus_last",
+                "loss_mask": torch.tensor([0, 1, 1, 1, 1, 1]),
+            }
+        ],
+        torch.device("cpu"),
+        model_config,
+    )
+
+    assert result["ids"][0].tolist() == [10, 11, 12, 13, 14]
+    assert result["masks"][0].tolist() == [0, 1, 1, 1, 1]
+    assert torch.equal(result["h_states"][0], hidden[:, :4].to(torch.bfloat16))
+    assert torch.equal(
+        result["target_last_h_states"][0], hidden[:, 4:].to(torch.bfloat16)
+    )
+
+
+def test_dspark_preprocess_rejects_other_row_mismatches() -> None:
+    backend = _dspark_backend_for_preprocess()
+    model_config = SimpleNamespace(
+        hidden_size=2,
+        target_hidden_size=2,
+        num_context_layers=2,
+        pad_token_id=0,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"input_rows=7, hidden_rows=5, mask_rows=7",
+    ):
+        backend.preprocess_individual_items(
+            [
+                {
+                    "input_ids": torch.arange(7),
+                    "hidden_states": torch.zeros(5, 4),
+                    "hidden_states_layout": "dflash_aux",
+                    "loss_mask": torch.ones(7),
+                }
+            ],
+            torch.device("cpu"),
+            model_config,
+        )
 
 
 def test_dspark_fallback_config_uses_native_qwen_mrv2_architecture() -> None:
