@@ -1502,13 +1502,11 @@ class DrafterBaseTrainer:
         if (
             getattr(self.backend, "model_type", None) == "dspark"
             and "confidence_head." in name
-            and os.getenv("VLLM_USE_V2_MODEL_RUNNER", "").lower()
-            in {"1", "true", "yes"}
         ):
-            # The supported MRV2 runtime has no confidence-head contract, and
-            # the current trainer rejects positive confidence loss. A head
-            # inherited from an older checkpoint is frozen and must not enter
-            # the native fixed-K online update payload.
+            # The current trainer rejects positive confidence loss and freezes
+            # any confidence head inherited from an older checkpoint.  It is
+            # therefore unchanged by training and must not enter an online
+            # update payload, regardless of the selected vLLM model runner.
             return True
         if name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
             # Most backends seed the draft embedding from the target and freeze it,
@@ -3001,6 +2999,10 @@ class DrafterBaseTrainer:
             getattr(model_config, "pad_token_id", self.pad_token_id)
             or self.pad_token_id
         )
+        # Block drafters consume token ids and target hidden states at the same
+        # positions.  Next-token drafters need one additional input row after
+        # the hidden-state window.
+        input_hidden_row_delta = 0 if self._is_block_drafter_backend() else 1
         for i in range(batch_size):
             expected_hidden_rows = max(input_seq_length - 1, 0)
             raw_positions_item_for_alignment = None
@@ -3121,14 +3123,20 @@ class DrafterBaseTrainer:
                 max_hidden_rows = min(
                     selected_hidden_row_end,
                     hidden_seq_length,
-                    max(input_seq_length - hidden_position_start - 1, 0),
+                    max(
+                        input_seq_length
+                        - hidden_position_start
+                        - input_hidden_row_delta,
+                        0,
+                    ),
                 )
                 hidden_start = 0
                 hidden_feature_length = max_hidden_rows
                 hidden_end = hidden_feature_length
                 feature_start = hidden_position_start
                 feature_end = min(
-                    input_seq_length, feature_start + hidden_feature_length + 1
+                    input_seq_length,
+                    feature_start + hidden_feature_length + input_hidden_row_delta,
                 )
             else:
                 if hidden_position_start is None:
@@ -3140,11 +3148,16 @@ class DrafterBaseTrainer:
                 feature_start = min(max(hidden_position_start, 0), input_seq_length)
                 hidden_start = 0
                 hidden_feature_length = min(
-                    hidden_seq_length, max(input_seq_length - feature_start - 1, 0)
+                    hidden_seq_length,
+                    max(
+                        input_seq_length - feature_start - input_hidden_row_delta,
+                        0,
+                    ),
                 )
                 hidden_end = hidden_feature_length
                 feature_end = min(
-                    input_seq_length, feature_start + hidden_feature_length + 1
+                    input_seq_length,
+                    feature_start + hidden_feature_length + input_hidden_row_delta,
                 )
 
             target_logprobs_position_start = None
@@ -3187,11 +3200,14 @@ class DrafterBaseTrainer:
                 if hidden_feature_length <= 0:
                     hidden_feature_length = 0
                     hidden_end = hidden_start
-                    feature_end = feature_start + 1
+                    feature_end = feature_start + input_hidden_row_delta
                 else:
                     hidden_end = hidden_start + hidden_feature_length
                     feature_end = min(
-                        input_seq_length, feature_start + hidden_feature_length + 1
+                        input_seq_length,
+                        feature_start
+                        + hidden_feature_length
+                        + input_hidden_row_delta,
                     )
 
             input_feature_length = feature_end - feature_start

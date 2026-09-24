@@ -1492,7 +1492,7 @@ class SpecoWorker(Worker):
                         data_stats["eligible_step_counts"],
                         data_stats["sample_last_n_steps"],
                         data_stats["batch_size"],
-                        self.train_steps_per_trigger,
+                        max_batches,
                     )
                 for _ in range(max_batches):
                     result["attempted_steps"] += 1
