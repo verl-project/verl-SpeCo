@@ -87,6 +87,7 @@ class ProducerStats:
     failed_count: int = 0
     dropped_count: int = 0
     filtered_count: int = 0
+    request_failed_count: int = 0
     pending_bytes: int = 0
 
 
@@ -219,7 +220,18 @@ async def publish_one(
     )
 
 
-def validate_producer_config(config: Any) -> None:
+def _read_on_missing_response(producer_cfg: Any) -> str:
+    """Return the validated ``on_missing_response`` policy ('skip'|'generate')."""
+    value = str(producer_cfg.get("on_missing_response", "skip") or "skip").lower()
+    if value not in {"skip", "generate"}:
+        raise ValueError(
+            "standalone_tq_producer.on_missing_response must be 'skip' or "
+            f"'generate', got {value!r}"
+        )
+    return value
+
+
+def validate_producer_config(config: Any) -> str:
     producer_cfg, training_cfg, tq_cfg = _config_sections(config)
     required = (
         "input_path",
@@ -285,6 +297,7 @@ def validate_producer_config(config: Any) -> None:
         )
     if int(producer_cfg.get("vllm_success_log_interval", 100)) < 0:
         raise ValueError("vllm_success_log_interval must be non-negative")
+    return _read_on_missing_response(producer_cfg)
 
 
 def _should_log_sample_progress(count: int) -> bool:
@@ -364,7 +377,7 @@ async def run_producer(
 ) -> ProducerStats:
     """Run the bounded input -> vLLM -> TQ pipeline and publish EOS on success."""
 
-    validate_producer_config(config)
+    on_missing_response = validate_producer_config(config)
     producer_cfg, drafter_cfg, tq_cfg = _config_sections(config)
     run_id = str(tq_cfg["run_id"])
     stats = ProducerStats()
@@ -516,6 +529,19 @@ async def run_producer(
         last_published_at = time.monotonic()
         producer_started_at = last_published_at
         max_samples = int(producer_cfg.get("max_samples", 0) or 0)
+        # validate_producer_config already parsed the policy; surface it so the
+        # (default) skip behaviour is not silent.
+        if on_missing_response == "skip":
+            logger.warning(
+                "Standalone TQ Producer will skip prompt-only rows "
+                "(on_missing_response=skip); set on_missing_response=generate to "
+                "teacher-target them instead"
+            )
+        else:
+            logger.info(
+                "Standalone TQ Producer will generate responses for prompt-only "
+                "rows (on_missing_response=generate)"
+            )
 
         def mark_stage(worker: str, stage: str, sample_id: str = "") -> None:
             stages[worker] = (stage, time.monotonic(), sample_id)
@@ -537,13 +563,16 @@ async def run_producer(
                 )[:3]
                 logger.info(
                     "Standalone TQ Producer heartbeat state=%s inputs=%s "
-                    "published=%s dropped=%s input_rate=%.2f/s publish_rate=%.2f/s "
-                    "input_queue=%s/%s publish_queue=%s/%s pending_bytes=%s "
-                    "seconds_since_publish=%.0f stages=%s oldest=%s",
+                    "published=%s filtered=%s dropped=%s request_failed=%s "
+                    "input_rate=%.2f/s "
+                    "publish_rate=%.2f/s input_queue=%s/%s publish_queue=%s/%s "
+                    "pending_bytes=%s seconds_since_publish=%.0f stages=%s oldest=%s",
                     get_runtime_state() if get_runtime_state is not None else "running",
                     stats.input_count,
                     stats.published_count,
+                    stats.filtered_count,
                     stats.dropped_count,
+                    stats.request_failed_count,
                     (stats.input_count - last_inputs) / elapsed,
                     (stats.published_count - last_published) / elapsed,
                     input_queue.qsize(),
@@ -612,6 +641,12 @@ async def run_producer(
                     )
                     try:
                         if record.response is None:
+                            if on_missing_response == "skip":
+                                raise SampleFilteredError(
+                                    f"Producer sample {record.sample_id!r} has no "
+                                    "assistant response; skipping "
+                                    "(on_missing_response=skip)"
+                                )
                             request = prepare_generation_request(
                                 record, tokenizer, producer_cfg
                             )
@@ -723,12 +758,76 @@ async def run_producer(
             )
             stages.pop("input", None)
 
+        consecutive_replacements = 0
+
+        async def next_replacement(
+            *, cause: BaseException | None = None
+        ) -> TokenizedRequest | GenerationRequest | None:
+            """Count a dropped sample and return the next replacement request.
+
+            Enforces the consecutive-replacement circuit breaker so a systemic
+            outage (a persistently failing endpoint, or every sample filtered
+            after generation) aborts instead of looping forever over
+            replacements. Returns None in unbounded mode (max_samples <= 0).
+            """
+            nonlocal consecutive_replacements
+            consecutive_replacements += 1
+            if (
+                max_samples > 0
+                and consecutive_replacements > max_consecutive_feature_drops
+            ):
+                message = (
+                    "Standalone TQ Producer exceeded "
+                    f"max_consecutive_feature_drops={max_consecutive_feature_drops} "
+                    "consecutive replacements without a successful feature "
+                    "conversion; aborting instead of requesting replacement "
+                    "samples forever"
+                )
+                if cause is not None:
+                    raise RuntimeError(message) from cause
+                raise RuntimeError(message)
+            if max_samples <= 0:
+                return None
+            replacement = await next_request_async()
+            # Bounded-mode generators never terminate, so this guard is only
+            # defensive; in unbounded mode we returned None above.
+            if replacement is _INPUT_DONE:
+                return None
+            logger.info(
+                "Standalone TQ Producer requesting replacement sample "
+                "sequence_no=%s sample_id=%s",
+                replacement.sequence_no,
+                replacement.sample_id,
+            )
+            return replacement
+
+        def account_request_failure(
+            request: Any, exc: BaseException, *, stage: str
+        ) -> None:
+            """Count and log a sample dropped after a terminal vLLM request failure.
+
+            The client pool already retries transient errors with endpoint
+            failover; reaching here means those retries were exhausted. Dropping
+            the sample keeps the producer (and therefore training) alive instead
+            of tearing down the whole run over one unrecoverable request.
+            """
+            stats.request_failed_count += 1
+            sample_timings.pop(int(request.sequence_no), None)
+            logger.error(
+                "Standalone TQ Producer dropped sample after vLLM %s failure "
+                "sequence_no=%s sample_id=%s failed=%s",
+                stage,
+                request.sequence_no,
+                request.sample_id,
+                stats.request_failed_count,
+                exc_info=exc,
+            )
+
         async def request_worker() -> None:
-            nonlocal peak_pending_bytes, peak_publish_queue
+            nonlocal peak_pending_bytes, peak_publish_queue, consecutive_replacements
             current = asyncio.current_task()
             worker = current.get_name() if current is not None else "request-unknown"
             replacement_request = None
-            consecutive_replacements = 0
             while True:
                 if replacement_request is None:
                     mark_stage(worker, "input_queue_get")
@@ -779,7 +878,13 @@ async def run_producer(
                 if isinstance(request, GenerationRequest):
                     mark_stage(worker, "vllm_generate", request.sample_id)
                     generate_started = time.monotonic()
-                    generated = await pool.generate(request)
+                    try:
+                        generated = await pool.generate(request)
+                    except Exception as exc:  # noqa: BLE001 - keep the producer alive
+                        timing["generate"] = time.monotonic() - generate_started
+                        account_request_failure(request, exc, stage="generate")
+                        replacement_request = await next_replacement(cause=exc)
+                        continue
                     timing["generate"] = time.monotonic() - generate_started
                     try:
                         try:
@@ -790,49 +895,32 @@ async def run_producer(
                             )
                         except SampleFilteredError as exc:
                             stats.filtered_count += 1
-                            consecutive_replacements += 1
+                            sample_timings.pop(int(request.sequence_no), None)
                             logger.warning(
                                 "Standalone TQ Producer filtered generated sample "
-                                "sequence_no=%s sample_id=%s filtered=%s "
-                                "consecutive=%s/%s reason=%s",
+                                "sequence_no=%s sample_id=%s filtered=%s reason=%s",
                                 request.sequence_no,
                                 request.sample_id,
                                 stats.filtered_count,
-                                consecutive_replacements,
-                                max_consecutive_feature_drops,
                                 exc,
                             )
-                            if (
-                                max_samples > 0
-                                and consecutive_replacements
-                                > max_consecutive_feature_drops
-                            ):
-                                raise RuntimeError(
-                                    "Standalone TQ Producer exceeded "
-                                    "max_consecutive_feature_drops="
-                                    f"{max_consecutive_feature_drops} without a "
-                                    "successful feature conversion; aborting "
-                                    "instead of requesting replacement samples "
-                                    "forever"
-                                ) from exc
-                            if max_samples > 0:
-                                replacement_request = await next_request_async()
-                            sample_timings.pop(int(request.sequence_no), None)
+                            replacement_request = await next_replacement(cause=exc)
                             continue
                     finally:
                         # The generation request may still produce a prompt-only
                         # connector file. It is not the training payload; the
                         # following full-sequence prefill produces that payload.
                         await asyncio.to_thread(delete_temporary_result, generated)
-                    mark_stage(worker, "vllm_prefill", request.sample_id)
-                    prefill_started = time.monotonic()
+                mark_stage(worker, "vllm_prefill", request.sample_id)
+                prefill_started = time.monotonic()
+                try:
                     raw = await pool.prefill(request)
+                except Exception as exc:  # noqa: BLE001 - keep the producer alive
                     timing["prefill"] = time.monotonic() - prefill_started
-                else:
-                    mark_stage(worker, "vllm_prefill", request.sample_id)
-                    prefill_started = time.monotonic()
-                    raw = await pool.prefill(request)
-                    timing["prefill"] = time.monotonic() - prefill_started
+                    account_request_failure(request, exc, stage="prefill")
+                    replacement_request = await next_replacement(cause=exc)
+                    continue
+                timing["prefill"] = time.monotonic() - prefill_started
                 stats.pending_bytes += int(raw.byte_size)
                 peak_pending_bytes = max(peak_pending_bytes, stats.pending_bytes)
                 try:
@@ -854,45 +942,22 @@ async def run_producer(
                         timing["conversion"] = time.monotonic() - conversion_started
                 except HiddenStateAlignmentError as exc:
                     stats.dropped_count += 1
-                    consecutive_replacements += 1
                     stats.pending_bytes = max(
                         stats.pending_bytes - int(raw.byte_size), 0
                     )
                     await asyncio.to_thread(delete_temporary_result, raw)
+                    sample_timings.pop(int(request.sequence_no), None)
                     logger.warning(
                         "Standalone TQ Producer dropped misaligned sample "
-                        "sequence_no=%s sample_id=%s dropped=%s consecutive=%s/%s "
-                        "reason=%s",
+                        "sequence_no=%s sample_id=%s dropped=%s reason=%s",
                         request.sequence_no,
                         request.sample_id,
                         stats.dropped_count,
-                        consecutive_replacements,
-                        max_consecutive_feature_drops,
                         exc,
                     )
-                    if (
-                        max_samples > 0
-                        and consecutive_replacements > max_consecutive_feature_drops
-                    ):
-                        raise RuntimeError(
-                            "Standalone TQ Producer exceeded "
-                            "max_consecutive_feature_drops="
-                            f"{max_consecutive_feature_drops} without a successful "
-                            "feature conversion; aborting instead of requesting "
-                            "replacement samples forever"
-                        ) from exc
-                    if max_samples > 0:
-                        replacement_request = await next_request_async()
-                        logger.info(
-                            "Standalone TQ Producer replacing dropped sample "
-                            "with sequence_no=%s sample_id=%s",
-                            replacement_request.sequence_no,
-                            replacement_request.sample_id,
-                        )
-                    sample_timings.pop(int(request.sequence_no), None)
+                    replacement_request = await next_replacement(cause=exc)
                     continue
-                # A successful feature conversion resets the consecutive-replacement
-                # circuit breaker (feature drops and filtered generations).
+                # A successful feature conversion resets the replacement breaker.
                 consecutive_replacements = 0
                 mark_stage(worker, "publish_queue_put", request.sample_id)
                 timing["publish_queue_started"] = time.monotonic()
@@ -1196,11 +1261,13 @@ async def run_producer(
         await asyncio.to_thread(transport.put_sample, eos_key, eos_fields, tag=eos_tag)
         completed = True
         logger.info(
-            "Standalone TQ Producer completed inputs=%s published=%s dropped=%s "
-            "failed=%s elapsed=%.3fs average_rate=%.2f/s",
+            "Standalone TQ Producer completed inputs=%s published=%s filtered=%s "
+            "dropped=%s request_failed=%s failed=%s elapsed=%.3fs average_rate=%.2f/s",
             stats.input_count,
             stats.published_count,
+            stats.filtered_count,
             stats.dropped_count,
+            stats.request_failed_count,
             stats.failed_count,
             time.monotonic() - producer_started_at,
             stats.published_count / max(time.monotonic() - producer_started_at, 1e-9),
