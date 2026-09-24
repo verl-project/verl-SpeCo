@@ -62,6 +62,18 @@ class _FakeTQLoader:
             raise self.error
 
 
+class _TransientClearTQLoader(_FakeTQLoader):
+    def __init__(self, failures: int):
+        super().__init__()
+        self.failures_remaining = failures
+
+    def clear_completed_batch(self, keys):
+        self.clear_calls.append(keys)
+        if self.failures_remaining > 0:
+            self.failures_remaining -= 1
+            raise RuntimeError("clear failed")
+
+
 class _FakeTQStore:
     def __init__(self, error: BaseException | None = None):
         self.error = error
@@ -84,8 +96,29 @@ def test_tq_completed_batch_is_cleared_once_on_rank_zero() -> None:
     assert loader.clear_calls == [["k0", "k1"]]
 
 
-def test_tq_clear_failure_is_reported_and_not_retried() -> None:
+def test_tq_clear_retries_transient_failure(monkeypatch) -> None:
+    loader = _TransientClearTQLoader(failures=2)
+    delays = []
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.time.sleep", delays.append
+    )
+
+    _clear_tq_batch_across_ranks(
+        loader,
+        ["k0", "k1"],
+        rank=0,
+        device=torch.device("cpu"),
+    )
+
+    assert loader.clear_calls == [["k0", "k1"]] * 3
+    assert delays == [0.5, 1.0]
+
+
+def test_tq_clear_failure_is_reported_after_three_attempts(monkeypatch) -> None:
     loader = _FakeTQLoader(RuntimeError("clear failed"))
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.time.sleep", lambda _: None
+    )
     with pytest.raises(RuntimeError, match="failed to clear"):
         _clear_tq_batch_across_ranks(
             loader,
@@ -93,7 +126,7 @@ def test_tq_clear_failure_is_reported_and_not_retried() -> None:
             rank=0,
             device=torch.device("cpu"),
         )
-    assert loader.clear_calls == [["k0", "k1"]]
+    assert loader.clear_calls == [["k0", "k1"]] * 3
 
 
 def test_tq_store_connection_failure_is_reported() -> None:
@@ -323,7 +356,7 @@ def test_standalone_dspark_checkpoint_preserves_source_runtime_config(tmp_path):
     training_config = {
         "model_type": "dspark",
         "architectures": ["DSparkDraftModel"],
-        "target_layer_ids": [1, 9, 17],
+        "target_layer_ids": [0, 8, 16],
         "mask_token_id": 151669,
         "markov_head_type": "vanilla",
         "markov_rank": 256,
@@ -414,7 +447,7 @@ def test_standalone_domino_checkpoint_exports_dflash_projector_config(tmp_path):
     training_config = {
         "model_type": "domino",
         "architectures": ["DominoDraftModel"],
-        "target_layer_ids": [2, 10, 18],
+        "target_layer_ids": [1, 9, 17],
         "mask_token_id": 151669,
         "num_context_layers": 3,
         "block_size": 16,
@@ -474,7 +507,7 @@ def test_standalone_dflash_checkpoint_preserves_source_runtime_config(tmp_path):
     training_config = {
         "model_type": "dflash",
         "architectures": ["DFlashDraftModel"],
-        "target_layer_ids": [2, 10, 18],
+        "target_layer_ids": [1, 9, 17],
         "mask_token_id": 151669,
         "num_context_layers": 3,
     }
@@ -519,7 +552,7 @@ def test_standalone_block_checkpoint_uses_target_model_type_without_source_confi
     training_config = {
         "model_type": "dspark",
         "architectures": ["DSparkDraftModel"],
-        "target_layer_ids": [1, 9, 17],
+        "target_layer_ids": [0, 8, 16],
         "markov_head_type": "vanilla",
         "head_dim": 80,
         "rope_theta": 10000.0,
@@ -657,7 +690,7 @@ def test_next_batch_across_ranks_stops_for_remote_rank_failure(monkeypatch):
         )
 
 
-def test_standalone_dflash_checkpoint_rejects_layer_zero_runtime_alias(tmp_path):
+def test_standalone_dflash_checkpoint_rejects_negative_decoder_layer_id(tmp_path):
     checkpoint_dir = tmp_path / "draft_step_5"
     checkpoint_dir.mkdir()
     source_dir = tmp_path / "source_dflash"
@@ -670,7 +703,7 @@ def test_standalone_dflash_checkpoint_rejects_layer_zero_runtime_alias(tmp_path)
     training_config = {
         "model_type": "dflash",
         "architectures": ["DFlashDraftModel"],
-        "target_layer_ids": [0, 9, 17],
+        "target_layer_ids": [-1, 9, 17],
         "mask_token_id": 151669,
         "num_context_layers": 3,
     }
@@ -678,7 +711,7 @@ def test_standalone_dflash_checkpoint_rejects_layer_zero_runtime_alias(tmp_path)
     config_path.write_text(json.dumps(training_config), encoding="utf-8")
     trainer = _export_trainer("dflash", str(source_dir))
 
-    with pytest.raises(ValueError, match="each training layer id must be at least 1"):
+    with pytest.raises(ValueError, match="decoder layer id must be non-negative"):
         _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
 
     # Validate before writing either the runtime config or a training-config copy.

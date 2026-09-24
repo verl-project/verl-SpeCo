@@ -76,6 +76,7 @@ _PUBLISH_DONE = object()
 _FEATURE_CONVERSION_WORKERS = 8
 _HEARTBEAT_INTERVAL_SECONDS = 60.0
 _PERF_WINDOW_SAMPLES = 100
+_CLEANUP_MAX_ATTEMPTS = 3
 
 
 @dataclass
@@ -139,24 +140,13 @@ async def publish_one(
     )
     transport_seconds = 0.0
     retry_wait_seconds = 0.0
+    published_attempt = 0
     for attempt in range(1, max_attempts + 1):
         transport_started = time.monotonic()
         try:
             await loop.run_in_executor(
                 executor,
                 partial(_put_sample_sync, transport, key, fields, tag),
-            )
-            transport_seconds += time.monotonic() - transport_started
-            cleanup_seconds = await loop.run_in_executor(
-                executor, partial(_cleanup_result_sync, result)
-            )
-            return (
-                key,
-                encode_seconds,
-                transport_seconds,
-                cleanup_seconds,
-                attempt,
-                retry_wait_seconds,
             )
         except Exception as exc:
             transport_seconds += time.monotonic() - transport_started
@@ -176,7 +166,56 @@ async def publish_one(
             retry_wait_started = time.monotonic()
             await asyncio.sleep(delay)
             retry_wait_seconds += time.monotonic() - retry_wait_started
-    raise AssertionError("unreachable")
+        else:
+            transport_seconds += time.monotonic() - transport_started
+            published_attempt = attempt
+            break
+
+    if published_attempt <= 0:
+        raise AssertionError("unreachable")
+
+    # Publishing and cleanup are separate commit points. Once put_sample has
+    # succeeded, a cleanup failure must never cause the sample to be published
+    # again: the Consumer may already have consumed and cleared its key.
+    cleanup_started = time.monotonic()
+    for cleanup_attempt in range(1, _CLEANUP_MAX_ATTEMPTS + 1):
+        try:
+            await loop.run_in_executor(executor, partial(_cleanup_result_sync, result))
+            break
+        except Exception as exc:  # noqa: BLE001
+            if cleanup_attempt >= _CLEANUP_MAX_ATTEMPTS:
+                logger.warning(
+                    "Standalone TQ Producer temporary cleanup failed; ignoring "
+                    "sample_id=%s sequence_no=%s path=%s attempts=%s error=%r",
+                    result.request.sample_id,
+                    result.request.sequence_no,
+                    result.raw.temporary_path,
+                    cleanup_attempt,
+                    exc,
+                )
+                break
+            delay = retry_backoff_seconds * (2 ** (cleanup_attempt - 1))
+            logger.warning(
+                "Standalone TQ Producer temporary cleanup retry sample_id=%s "
+                "sequence_no=%s path=%s attempt=%s/%s retry_in=%.3fs error=%r",
+                result.request.sample_id,
+                result.request.sequence_no,
+                result.raw.temporary_path,
+                cleanup_attempt,
+                _CLEANUP_MAX_ATTEMPTS,
+                delay,
+                exc,
+            )
+            await asyncio.sleep(delay)
+    cleanup_seconds = time.monotonic() - cleanup_started
+    return (
+        key,
+        encode_seconds,
+        transport_seconds,
+        cleanup_seconds,
+        published_attempt,
+        retry_wait_seconds,
+    )
 
 
 def validate_producer_config(config: Any) -> None:
@@ -201,6 +240,12 @@ def validate_producer_config(config: Any) -> None:
     if not isinstance(target_layer_ids, list) or not target_layer_ids:
         raise ValueError(
             "standalone_tq_producer.target_layer_ids must be a non-empty list"
+        )
+    vllm_aux_layer_ids = producer_cfg.get("vllm_aux_hidden_state_layer_ids")
+    if not isinstance(vllm_aux_layer_ids, list) or not vllm_aux_layer_ids:
+        raise ValueError(
+            "standalone_tq_producer.vllm_aux_hidden_state_layer_ids must be a "
+            "non-empty list"
         )
     algorithm = str(training_cfg.get("speculative_algorithm", "") or "").strip()
     if not algorithm:
@@ -408,6 +453,9 @@ async def run_producer(
         feature_contract = FeatureContract(
             algorithm=algorithm,
             target_layer_ids=[int(value) for value in producer_cfg["target_layer_ids"]],
+            vllm_aux_hidden_state_layer_ids=[
+                int(value) for value in producer_cfg["vllm_aux_hidden_state_layer_ids"]
+            ],
             hidden_states_layout=resolve_drafter_hidden_states_layout(
                 algorithm, drafter_cfg
             ),

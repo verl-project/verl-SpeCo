@@ -66,6 +66,7 @@ def _config(input_path: Path) -> dict[str, Any]:
                 "target_model_id": "/target",
                 "target_model_revision": "rev-a",
                 "target_layer_ids": [2, 8],
+                "vllm_aux_hidden_state_layer_ids": [3, 9],
                 "hidden_dtype": "float32",
                 "trust_remote_code": False,
                 "vllm_endpoints": ["http://vllm:8000/v1"],
@@ -432,6 +433,47 @@ def test_run_producer_retries_transient_publish_failure(
     assert transport.sample_put_attempts == 3
     assert sum("publish retry" in record.getMessage() for record in caplog.records) == 2
     assert all(not path.exists() for path in pool.paths)
+    assert any(tag.get("status") == "eos" for tag in transport.records.values())
+
+
+def test_run_producer_does_not_republish_when_temporary_cleanup_fails(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    import verl_speco.standalone_tq_producer as producer_module
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    producer = config["speco"]["standalone_tq_producer"]
+    producer["max_samples"] = 1
+    producer["publish_workers"] = 1
+    producer["publish_retry_backoff_seconds"] = 0
+    transport = _TransientFailureTransport(failures=0)
+    pool = _Pool(tmp_path)
+    cleanup_calls = 0
+
+    def fail_cleanup(raw):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        raise PermissionError(raw.temporary_path)
+
+    monkeypatch.setattr(producer_module, "delete_temporary_result", fail_cleanup)
+    with caplog.at_level("WARNING", logger="verl_speco.standalone_tq_producer"):
+        stats = asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
+    assert stats.published_count == 1
+    assert transport.sample_put_attempts == 1
+    assert cleanup_calls == 3
+    assert any(
+        "cleanup failed; ignoring" in record.getMessage() for record in caplog.records
+    )
     assert any(tag.get("status") == "eos" for tag in transport.records.values())
 
 

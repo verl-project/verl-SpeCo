@@ -47,6 +47,8 @@ class FeatureContract:
     """Explicit inputs for converting one vLLM payload into a training sample."""
 
     algorithm: str
+    # Existing training-side IDs. Legacy/cotrain callers keep their established
+    # interpretation; standalone uses canonical decoder-layer indices here.
     target_layer_ids: list[int]
     hidden_states_layout: str
     dtype: torch.dtype
@@ -58,6 +60,9 @@ class FeatureContract:
     source: str = "standalone_tq_producer"
     require_full_alignment: bool = False
     target_num_hidden_layers: int | None = None
+    # Standalone-only vLLM output_hidden_states indices. None preserves the
+    # legacy/cotrain behavior of interpreting target_layer_ids directly.
+    vllm_aux_hidden_state_layer_ids: list[int] | None = None
 
 
 @dataclass
@@ -466,8 +471,13 @@ def feature_from_vllm_payload(
     algorithm = str(feature_config.algorithm).strip().upper()
     if algorithm not in {"EAGLE3", "DFLASH", "DSPARK"}:
         raise ValueError(f"Unsupported vLLM feature algorithm {algorithm!r}")
-    target_layer_ids = [int(layer_id) for layer_id in feature_config.target_layer_ids]
-    if not target_layer_ids:
+    configured_vllm_ids = (
+        feature_config.vllm_aux_hidden_state_layer_ids
+        if feature_config.vllm_aux_hidden_state_layer_ids is not None
+        else feature_config.target_layer_ids
+    )
+    vllm_aux_layer_ids = [int(layer_id) for layer_id in configured_vllm_ids]
+    if not vllm_aux_layer_ids:
         raise ValueError("FeatureContract.target_layer_ids must not be empty")
     hidden_layout = str(feature_config.hidden_states_layout)
     if hidden_layout not in {
@@ -490,14 +500,14 @@ def feature_from_vllm_payload(
     final_reused_from_aux = bool(
         include_final
         and final_layer_id is not None
-        and final_layer_id in target_layer_ids
+        and final_layer_id in vllm_aux_layer_ids
     )
     final_source_index = (
-        target_layer_ids.index(final_layer_id)
+        vllm_aux_layer_ids.index(final_layer_id)
         if final_layer_id is not None and final_reused_from_aux
-        else len(target_layer_ids)
+        else len(vllm_aux_layer_ids)
     )
-    required_layers = len(target_layer_ids) + (
+    required_layers = len(vllm_aux_layer_ids) + (
         1 if include_final and not final_reused_from_aux else 0
     )
     if int(hidden.size(1)) < required_layers:
@@ -539,7 +549,7 @@ def feature_from_vllm_payload(
             )
 
     selected = hidden.index_select(0, relative_positions).to(dtype=feature_config.dtype)
-    aux_hidden = selected[:, : len(target_layer_ids), :].flatten(1)
+    aux_hidden = selected[:, : len(vllm_aux_layer_ids), :].flatten(1)
     if include_final:
         if final_norm is None:
             raise ValueError("vLLM plus_last features require the target final norm")
@@ -569,7 +579,9 @@ def feature_from_vllm_payload(
             "target_revision": feature_config.target_model_revision,
             "target_config_fingerprint": feature_config.target_config_fingerprint,
             "tokenizer_fingerprint": feature_config.tokenizer_fingerprint,
-            "target_layer_ids": target_layer_ids,
+            "target_layer_ids": [
+                int(layer_id) for layer_id in feature_config.target_layer_ids
+            ],
             "vllm_hidden_layers": int(hidden.size(1)),
             "final_hidden_layer_id": final_layer_id,
             "final_hidden_source_index": final_source_index if include_final else None,
@@ -587,6 +599,8 @@ def feature_from_vllm_payload(
             "use_logits": feature_config.use_logits,
         }
     )
+    if feature_config.vllm_aux_hidden_state_layer_ids is not None:
+        metadata["vllm_aux_hidden_state_layer_ids"] = vllm_aux_layer_ids
     if include_final:
         metadata["last_hidden_state_norm"] = "target_final_norm"
     return DraftFeatureSample(

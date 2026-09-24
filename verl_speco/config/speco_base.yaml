@@ -41,7 +41,12 @@ speco:
     tokenizer_fingerprint: null
     target_model_id: null
     target_model_revision: null
+    # Canonical decoder-layer indices consumed by the drafter. The unified
+    # launcher derives this from vllm_aux_hidden_state_layer_ids.
     target_layer_ids: null
+    # IDs passed to vLLM output_hidden_states. For DSpark/DFlash/Domino the
+    # launcher subtracts one to produce target_layer_ids.
+    vllm_aux_hidden_state_layer_ids: null
     hidden_dtype: bfloat16
     trust_remote_code: false
     vllm_endpoints:

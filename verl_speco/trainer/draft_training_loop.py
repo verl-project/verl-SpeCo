@@ -53,6 +53,8 @@ from verl_speco.trainer.tq_sample_source import TQFeatureDataLoader, TQLocalBatc
 logger = logging.getLogger(__name__)
 
 _TQ_GET_MAX_SYNC_INTERVAL_STEPS = 50
+_TQ_CLEAR_MAX_ATTEMPTS = 3
+_TQ_CLEAR_RETRY_BACKOFF_SECONDS = 0.5
 
 
 def _should_log_batch_progress(attempted_batches: int) -> bool:
@@ -970,10 +972,10 @@ def _rewrite_standalone_block_runtime_config(
             else None
         )
     )
-    training_aux_layer_ids: list[int] | None = None
+    training_decoder_layer_ids: list[int] | None = None
     if training_target_layer_ids is not None:
         try:
-            training_aux_layer_ids = [
+            training_decoder_layer_ids = [
                 int(layer_id) for layer_id in training_target_layer_ids
             ]
         except (TypeError, ValueError):
@@ -982,11 +984,11 @@ def _rewrite_standalone_block_runtime_config(
                 training_target_layer_ids,
             )
         else:
-            if any(layer_id < 1 for layer_id in training_aux_layer_ids):
+            if any(layer_id < 0 for layer_id in training_decoder_layer_ids):
                 raise ValueError(
                     "Cannot export standalone DFlash runtime config with "
-                    f"target_layer_ids={training_aux_layer_ids}: each training layer id "
-                    "must be at least 1."
+                    f"target_layer_ids={training_decoder_layer_ids}: each decoder "
+                    "layer id must be non-negative."
                 )
 
     training_config_path = os.path.join(checkpoint_path, "speco_training_config.json")
@@ -1025,13 +1027,14 @@ def _rewrite_standalone_block_runtime_config(
             training_config.get("projector_type", "domino") or "domino"
         )
 
-    if training_aux_layer_ids is not None:
-        # Training captures these transformer layer outputs verbatim.  vLLM
-        # requires its DFlash target aliases to be one less than the EAGLE aux
-        # ids, so preserve the training ids as aux ids and shift only the
-        # runtime-facing aliases.
-        runtime_target_layer_ids = [layer_id - 1 for layer_id in training_aux_layer_ids]
-        runtime_config["eagle_aux_hidden_state_layer_ids"] = training_aux_layer_ids
+    if training_decoder_layer_ids is not None:
+        # Training and runtime configs use zero-based decoder-layer indices.
+        # vLLM's EAGLE auxiliary alias addresses layer outputs, so it is the
+        # same capture plan shifted by one.
+        runtime_target_layer_ids = list(training_decoder_layer_ids)
+        runtime_config["eagle_aux_hidden_state_layer_ids"] = [
+            layer_id + 1 for layer_id in training_decoder_layer_ids
+        ]
         runtime_config["target_layer_ids"] = runtime_target_layer_ids
         dflash_config["target_layer_ids"] = runtime_target_layer_ids
         if variant_child_key:
@@ -1300,10 +1303,32 @@ def _clear_tq_batch_across_ranks(
 
     local_error: BaseException | None = None
     if rank == 0:
-        try:
-            loader.clear_completed_batch(global_keys)
-        except BaseException as exc:  # noqa: BLE001
-            local_error = exc
+        cleared = False
+        for attempt in range(1, _TQ_CLEAR_MAX_ATTEMPTS + 1):
+            try:
+                loader.clear_completed_batch(global_keys)
+                cleared = True
+                break
+            except BaseException as exc:  # noqa: BLE001
+                local_error = exc
+                if attempt >= _TQ_CLEAR_MAX_ATTEMPTS:
+                    break
+                delay = _TQ_CLEAR_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    "TQ Consumer clear retry attempt=%s/%s retry_in=%.3fs "
+                    "keys=%s error=%r",
+                    attempt,
+                    _TQ_CLEAR_MAX_ATTEMPTS,
+                    delay,
+                    len(global_keys or []),
+                    exc,
+                )
+                time.sleep(delay)
+        else:
+            raise AssertionError("unreachable")
+        # A later attempt succeeded, so do not report an earlier transient error.
+        if cleared:
+            local_error = None
     failed = torch.tensor(
         1 if local_error is not None else 0,
         dtype=torch.int32,

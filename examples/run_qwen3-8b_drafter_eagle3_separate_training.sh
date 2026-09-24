@@ -23,7 +23,7 @@ set -x
 # no pre-initialized drafter directory is required. Set model_path only when
 # loading an existing drafter checkpoint/config is desired.
 #
-# The vLLM hidden-state layer IDs must be EAGLE3_TARGET_LAYER_IDS followed by
+# The vLLM hidden-state layer IDs must be the auxiliary IDs below followed by
 # the target model's final layer.  For Qwen3-8B the default is:
 #   [1,9,17,25,33,36]
 # The EAGLE3 drafter config must have the same number (five) of aux states.
@@ -45,7 +45,7 @@ export SPECO_STANDALONE_LOG_LEVEL=${SPECO_STANDALONE_LOG_LEVEL:-INFO}
 
 # These IDs must equal the auxiliary prefix of VLLM_HIDDEN_STATE_LAYER_IDS in
 # run_qwen3-8b_drafter_hidden_state_vllm.sh.  Do not include the final layer.
-EAGLE3_TARGET_LAYER_IDS=${EAGLE3_TARGET_LAYER_IDS:-'[1,9,17,25,33]'}
+VLLM_AUX_HIDDEN_STATE_LAYER_IDS=${VLLM_AUX_HIDDEN_STATE_LAYER_IDS:-'[1,9,17,25,33]'}
 
 # Producer throughput and bounded queues.
 VLLM_REQUEST_TIMEOUT=${VLLM_REQUEST_TIMEOUT:-120}
@@ -160,8 +160,7 @@ PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher
     actor_rollout_ref.rollout.drafter.training.lr_decay_steps=${LR_DECAY_STEPS} \
     actor_rollout_ref.rollout.drafter.training.min_lr_ratio=${MIN_LR_RATIO} \
     actor_rollout_ref.rollout.drafter.training.use_logits=false \
-    actor_rollout_ref.rollout.drafter.training.eagle3_target_layer_ids=${EAGLE3_TARGET_LAYER_IDS} \
-    speco.standalone_tq_producer.target_layer_ids=${EAGLE3_TARGET_LAYER_IDS} \
+    speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids=${VLLM_AUX_HIDDEN_STATE_LAYER_IDS} \
     speco.standalone_tq_producer.request_timeout=${VLLM_REQUEST_TIMEOUT} \
     speco.standalone_tq_producer.max_inflight_requests=${VLLM_MAX_INFLIGHT_REQUESTS} \
     speco.standalone_tq_producer.per_endpoint_concurrency=${VLLM_PER_ENDPOINT_CONCURRENCY} \

@@ -80,8 +80,8 @@ MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
 PARAM_OFFLOAD=${PARAM_OFFLOAD:-true}
 OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-true}
 
-# DSpark architecture, sampling and losses. TARGET_LAYER_IDS must match the
-# auxiliary layers exposed by both hidden-state vLLM services.
+# DSpark architecture, sampling and losses. These are vLLM hidden-state output
+# IDs; the launcher converts them to zero-based DSpark decoder-layer IDs.
 DSPARK_BLOCK_SIZE=${DSPARK_BLOCK_SIZE:-7}
 DSPARK_NUM_ANCHORS=${DSPARK_NUM_ANCHORS:-32}
 # Optional trainer-side crop. Zero keeps the full feature sequence.
@@ -91,7 +91,7 @@ DSPARK_SAMPLED_CE_NEGATIVES=${DSPARK_SAMPLED_CE_NEGATIVES:-0}
 DSPARK_LOSS_DECAY_GAMMA=${DSPARK_LOSS_DECAY_GAMMA:-7}
 DSPARK_NUM_TARGET_LAYERS=${DSPARK_NUM_TARGET_LAYERS:-5}
 DSPARK_NUM_HIDDEN_LAYERS=${DSPARK_NUM_HIDDEN_LAYERS:-5}
-DSPARK_TARGET_LAYER_IDS=${DSPARK_TARGET_LAYER_IDS:-'[1,9,17,25,33]'}
+VLLM_AUX_HIDDEN_STATE_LAYER_IDS=${VLLM_AUX_HIDDEN_STATE_LAYER_IDS:-'[1,9,17,25,33]'}
 DSPARK_MARKOV_RANK=${DSPARK_MARKOV_RANK:-256}
 DSPARK_MARKOV_HEAD_TYPE=${DSPARK_MARKOV_HEAD_TYPE:-vanilla}
 DSPARK_CE_LOSS_ALPHA=${DSPARK_CE_LOSS_ALPHA:-0.1}
@@ -156,7 +156,7 @@ PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher
     actor_rollout_ref.rollout.drafter.training.dspark_loss_decay_gamma=${DSPARK_LOSS_DECAY_GAMMA} \
     actor_rollout_ref.rollout.drafter.training.dspark_num_target_layers=${DSPARK_NUM_TARGET_LAYERS} \
     actor_rollout_ref.rollout.drafter.training.dspark_num_hidden_layers=${DSPARK_NUM_HIDDEN_LAYERS} \
-    actor_rollout_ref.rollout.drafter.training.dspark_target_layer_ids=${DSPARK_TARGET_LAYER_IDS} \
+    speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids=${VLLM_AUX_HIDDEN_STATE_LAYER_IDS} \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_rank=${DSPARK_MARKOV_RANK} \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_head_type=${DSPARK_MARKOV_HEAD_TYPE} \
     actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=${DSPARK_CE_LOSS_ALPHA} \

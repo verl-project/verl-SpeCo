@@ -708,6 +708,9 @@ def test_from_dspark_dict_lifts_released_aux_layer_ids_into_serving_config(
     # verbatim rather than shifted or replaced by the spaced fallback.
     assert config.target_layer_ids == [2, 10, 20, 30, 37]
 
+    # The standalone launcher owns its decoder-index conversion without
+    # changing the shared checkpoint-loader semantics above.
+    config.target_layer_ids = [1, 9, 19, 29, 36]
     checkpoint_dir = tmp_path / "draft_step_10"
     checkpoint_dir.mkdir()
     (checkpoint_dir / "config.json").write_text(

@@ -289,6 +289,7 @@ def test_vllm_final_norm_matches_target_forward(
         contract = FeatureContract(
             algorithm=algorithm,
             target_layer_ids=[0],
+            vllm_aux_hidden_state_layer_ids=[1],
             hidden_states_layout=layout,
             dtype=dtype,
             target_model_id=str(tmp_path),
@@ -337,7 +338,8 @@ def test_plus_last_reuses_final_layer_when_it_is_already_an_aux_layer():
     )
     contract = FeatureContract(
         algorithm="DSPARK",
-        target_layer_ids=[1, 2],
+        target_layer_ids=[0, 1],
+        vllm_aux_hidden_state_layer_ids=[1, 2],
         hidden_states_layout="dflash_aux_plus_last",
         dtype=torch.float32,
         target_model_id="target",
