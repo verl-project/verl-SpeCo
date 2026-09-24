@@ -25,6 +25,7 @@ from verl_speco.standalone_tq_training_launcher import (
     _producer_max_samples,
     _target_final_layer_id,
     _tq_backend_overrides,
+    _vllm_capture_layer_ids,
     build_pipeline_commands,
     resolve_pipeline_config,
     run_pipeline,
@@ -51,7 +52,8 @@ def test_pipeline_config_derives_transport_identity_from_training_args() -> None
     assert config.model_path == "/models/Qwen3-8B"
     assert config.tokenizer_path == "/models/Qwen3-8B"
     assert config.algorithm == "DSPARK"
-    assert config.target_layer_ids == (1, 9, 17, 25, 33)
+    assert config.vllm_aux_hidden_state_layer_ids == (1, 9, 17, 25, 33)
+    assert config.target_layer_ids == (0, 8, 16, 24, 32)
     assert config.vllm_endpoints == ("http://127.0.0.1:8000/v1",)
     assert config.run_id.startswith("dspark-")
 
@@ -80,19 +82,21 @@ def test_pipeline_config_reads_non_dspark_algorithm_from_training_args() -> None
 
     assert config.algorithm == "DFLASH"
     assert config.target_layer_ids == (2, 10, 20)
+    assert config.vllm_aux_hidden_state_layer_ids == (3, 11, 21)
     assert config.run_id.startswith("dflash-")
 
 
-def test_pipeline_config_prefers_generic_producer_layer_ids() -> None:
+def test_pipeline_config_validates_vllm_ids_against_training_ids() -> None:
     args = [
         *_training_args(),
-        "speco.standalone_tq_producer.target_layer_ids=[3,11,21]",
+        "speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids=[2,10,18]",
         "actor_rollout_ref.rollout.drafter.training.dspark_target_layer_ids=[1,9,17]",
     ]
 
     config = resolve_pipeline_config(args, environ={})
 
-    assert config.target_layer_ids == (3, 11, 21)
+    assert config.vllm_aux_hidden_state_layer_ids == (2, 10, 18)
+    assert config.target_layer_ids == (1, 9, 17)
 
 
 def test_pipeline_config_accepts_one_hydra_list_train_file() -> None:
@@ -139,6 +143,55 @@ def test_target_final_layer_id_uses_local_model_config(tmp_path) -> None:
     )
 
     assert _target_final_layer_id(str(tmp_path), (2, 10, 20)) == 48
+
+
+def test_vllm_capture_layer_ids_appends_missing_final_output() -> None:
+    assert _vllm_capture_layer_ids((1, 9, 17, 25, 33), 36) == [
+        1,
+        9,
+        17,
+        25,
+        33,
+        36,
+    ]
+
+
+def test_vllm_capture_layer_ids_does_not_duplicate_selected_final_output() -> None:
+    assert _vllm_capture_layer_ids((1, 9, 17, 25, 36), 36) == [
+        1,
+        9,
+        17,
+        25,
+        36,
+    ]
+
+
+def test_pipeline_commands_do_not_request_selected_final_output_twice(tmp_path) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps({"num_hidden_layers": 36}), encoding="utf-8"
+    )
+    args = [
+        item.replace("/models/Qwen3-8B", str(tmp_path)) for item in _training_args()
+    ]
+    args.append(
+        "speco.standalone_tq_producer."
+        "vllm_aux_hidden_state_layer_ids=[1,9,17,25,36]"
+    )
+    config = resolve_pipeline_config(args, environ={})
+
+    commands = build_pipeline_commands(
+        config,
+        args,
+        ray_address="127.0.0.1:6379",
+        python_executable="python",
+    )
+
+    assert commands.vllm is not None
+    spec_index = commands.vllm.index("--speculative-config") + 1
+    speculative_config = json.loads(commands.vllm[spec_index])
+    assert speculative_config["draft_model_config"]["hf_config"][
+        "eagle_aux_hidden_state_layer_ids"
+    ] == [1, 9, 17, 25, 36]
 
 
 def test_pipeline_config_rejects_multiple_train_files() -> None:
@@ -230,7 +283,7 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
         "expected_feature.tokenizer_fingerprint=tokenizer-path-sha256-"
         in expected_contract
     )
-    assert "expected_feature.target_layer_ids=[1,9,17,25,33]" in expected_contract
+    assert "expected_feature.target_layer_ids=[0,8,16,24,32]" in expected_contract
     assert (
         "expected_feature.hidden_states_layout=dflash_aux_plus_last"
         in expected_contract

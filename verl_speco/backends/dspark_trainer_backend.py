@@ -1051,9 +1051,16 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
 
     def preprocess_individual_items(self, items, device, model_config):
         res = {"ids": [], "h_states": [], "masks": [], "target_last_h_states": []}
-        max_window = int(
-            self.config.rollout.drafter.training.get("dspark_max_window", 512)
+        raw_max_window = self.config.rollout.drafter.training.get("dspark_max_window")
+        max_window = (
+            None
+            if raw_max_window is None or str(raw_max_window).strip() == ""
+            else int(raw_max_window)
         )
+        if max_window is not None and max_window < 0:
+            raise ValueError("dspark_max_window must be non-negative")
+        if max_window == 0:
+            max_window = None
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
         h_dim = int(
             getattr(model_config, "target_hidden_size", model_config.hidden_size)
@@ -1123,17 +1130,20 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                     f"input_rows={ids.size(0)}, hidden_rows={full_h.size(0)}, "
                     f"mask_rows={item_loss_mask.size(0)}"
                 )
-            nonzero = torch.nonzero(item_loss_mask)
-            if nonzero.numel() > 0:
-                r_start = nonzero[0, 0]
-                start = torch.clamp(
-                    r_start - (max_window // 2),
-                    min=0,
-                    max=max(0, ids.size(0) - max_window),
-                ).item()
-                end = min(start + max_window, ids.size(0))
+            if max_window is None:
+                start, end = 0, ids.size(0)
             else:
-                start, end = max(0, ids.size(0) - max_window), ids.size(0)
+                nonzero = torch.nonzero(item_loss_mask)
+                if nonzero.numel() > 0:
+                    r_start = nonzero[0, 0]
+                    start = torch.clamp(
+                        r_start - (max_window // 2),
+                        min=0,
+                        max=max(0, ids.size(0) - max_window),
+                    ).item()
+                    end = min(start + max_window, ids.size(0))
+                else:
+                    start, end = max(0, ids.size(0) - max_window), ids.size(0)
 
             res["ids"].append(ids[start:end])
             res["h_states"].append(full_h[start:end, :expected_hidden_dim])

@@ -41,7 +41,13 @@ speco:
     tokenizer_fingerprint: null
     target_model_id: null
     target_model_revision: null
+    # Canonical decoder-layer indices consumed by the drafter. The unified
+    # launcher derives this from vllm_aux_hidden_state_layer_ids.
     target_layer_ids: null
+    # IDs passed to vLLM output_hidden_states. For DSpark/DFlash/Domino the
+    # launcher subtracts one to produce target_layer_ids; EAGLE3 keeps these
+    # IDs unchanged because its config already uses vLLM output IDs.
+    vllm_aux_hidden_state_layer_ids: null
     hidden_dtype: bfloat16
     trust_remote_code: false
     vllm_endpoints:
@@ -52,6 +58,13 @@ speco:
     per_endpoint_concurrency: 4
     input_queue_size: 32
     publish_queue_size: 16
+    # Dedicated blocking TransferQueue writers. Feature conversion keeps its
+    # own executor so network stalls cannot starve hidden-state conversion.
+    publish_workers: 4
+    # Total TransferQueue put attempts per sample. Retries use exponential
+    # backoff and keep the temporary hidden-state result until one succeeds.
+    publish_max_attempts: 3
+    publish_retry_backoff_seconds: 0.5
     max_pending_samples: 1024
     # Zero means one input-file pass. The unified launcher sets this to the
     # exact number of samples required by max_steps and the global batch size.
@@ -240,7 +253,9 @@ actor_rollout_ref:
         dspark_num_hidden_layers: 5
         dspark_mask_token_id: null
         dspark_target_layer_ids: null
-        dspark_max_window: 512
+        # Optional trainer-side sequence crop. Zero/null keeps every row supplied
+        # by the feature producer; set a positive integer to enable the crop.
+        dspark_max_window: 0
         dspark_loss_mode: full_vocab
         dspark_sampled_ce_negatives: 0
         dspark_markov_rank: 256

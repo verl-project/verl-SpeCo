@@ -50,6 +50,7 @@ from verl_speco.draft_train_launcher import (
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
+from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.trainer.standalone_resume import load_standalone_resume
 
 
@@ -63,11 +64,15 @@ _TOKENIZER_PATH_KEY = (
     "actor_rollout_ref.rollout.drafter.training.feature_store.tokenizer_path"
 )
 _PRODUCER_TARGET_LAYER_IDS_KEY = "speco.standalone_tq_producer.target_layer_ids"
+_PRODUCER_VLLM_AUX_LAYER_IDS_KEY = (
+    "speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids"
+)
 _PRODUCER_HIDDEN_DTYPE_KEY = "speco.standalone_tq_producer.hidden_dtype"
 _DSPARK_L1_LOSS_ALPHA_KEY = (
     "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha"
 )
 _ALGORITHM_TARGET_LAYER_IDS_KEYS = {
+    "EAGLE3": "actor_rollout_ref.rollout.drafter.training.eagle3_target_layer_ids",
     "DFLASH": "actor_rollout_ref.rollout.drafter.training.dflash_target_layer_ids",
     "DSPARK": "actor_rollout_ref.rollout.drafter.training.dspark_target_layer_ids",
     "DOMINO": "actor_rollout_ref.rollout.drafter.training.domino_target_layer_ids",
@@ -107,6 +112,7 @@ _PRODUCER_LAUNCHER_OWNED_KEYS = frozenset(
         f"{_PRODUCER_PREFIX}.target_model_id",
         f"{_PRODUCER_PREFIX}.target_model_revision",
         f"{_PRODUCER_PREFIX}.target_layer_ids",
+        f"{_PRODUCER_PREFIX}.vllm_aux_hidden_state_layer_ids",
         f"{_PRODUCER_PREFIX}.vllm_endpoints",
         f"{_PRODUCER_PREFIX}.vllm_model",
         f"{_PRODUCER_PREFIX}.max_samples",
@@ -139,7 +145,9 @@ _INTERNAL_OVERRIDE_KEYS = frozenset(
     }
 )
 
-_DEFAULT_TARGET_LAYER_IDS = (1, 9, 17, 25, 33)
+# These are the output IDs passed verbatim to vLLM serve. DFlash-family
+# training IDs are derived from them by subtracting one.
+_DEFAULT_VLLM_AUX_LAYER_IDS = (1, 9, 17, 25, 33)
 _DEFAULT_VLLM_ENDPOINT = "http://127.0.0.1:8000/v1"
 _DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = "0.4"
 _VLLM_HIDDEN_STATES_DIR = "__SPECO_HIDDEN_STATES_DIR__"
@@ -157,6 +165,7 @@ class PipelineConfig:
     tokenizer_path: str
     algorithm: str
     target_layer_ids: tuple[int, ...]
+    vllm_aux_hidden_state_layer_ids: tuple[int, ...]
     vllm_endpoints: tuple[str, ...]
     run_id: str
 
@@ -256,9 +265,11 @@ def _single_train_file(value: str | None) -> str:
     return text
 
 
-def _parse_layer_ids(value: str | None, *, config_key: str) -> tuple[int, ...]:
+def _parse_layer_ids(
+    value: str | None, *, config_key: str, default: tuple[int, ...] | None = None
+) -> tuple[int, ...] | None:
     if value is None or _strip_quotes(value).lower() in {"", "null", "none"}:
-        return _DEFAULT_TARGET_LAYER_IDS
+        return default
     text = _strip_quotes(value)
     if not (text.startswith("[") and text.endswith("]")):
         raise ValueError(f"{config_key} must be a Hydra integer list")
@@ -271,19 +282,53 @@ def _parse_layer_ids(value: str | None, *, config_key: str) -> tuple[int, ...]:
     return result
 
 
-def _resolve_target_layer_ids(
+def _resolve_layer_ids(
     training_args: Sequence[str], algorithm: str
-) -> tuple[int, ...]:
-    """Resolve Producer layers without making the launcher DSpark-specific."""
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Resolve vLLM output IDs and canonical drafter decoder-layer IDs."""
 
+    raw_vllm = _find_override(training_args, _PRODUCER_VLLM_AUX_LAYER_IDS_KEY)
+    raw_producer_target = _find_override(training_args, _PRODUCER_TARGET_LAYER_IDS_KEY)
     algorithm_key = _ALGORITHM_TARGET_LAYER_IDS_KEYS.get(algorithm)
-    candidate_keys = (
-        (_PRODUCER_TARGET_LAYER_IDS_KEY, algorithm_key)
+    raw_algorithm_target = (
+        _find_override(training_args, algorithm_key)
         if algorithm_key is not None
-        else (_PRODUCER_TARGET_LAYER_IDS_KEY,)
+        else None
     )
-    raw = _find_first_override(training_args, candidate_keys)
-    return _parse_layer_ids(raw, config_key=candidate_keys[0])
+    vllm_ids = _parse_layer_ids(
+        raw_vllm,
+        config_key=_PRODUCER_VLLM_AUX_LAYER_IDS_KEY,
+        default=None,
+    )
+    producer_target_ids = _parse_layer_ids(
+        raw_producer_target,
+        config_key=_PRODUCER_TARGET_LAYER_IDS_KEY,
+        default=None,
+    )
+    algorithm_target_ids = _parse_layer_ids(
+        raw_algorithm_target,
+        config_key=algorithm_key or _PRODUCER_TARGET_LAYER_IDS_KEY,
+        default=None,
+    )
+    if (
+        producer_target_ids is not None
+        and algorithm_target_ids is not None
+        and producer_target_ids != algorithm_target_ids
+    ):
+        raise ValueError(
+            f"{_PRODUCER_TARGET_LAYER_IDS_KEY}={list(producer_target_ids)} does "
+            f"not match {algorithm_key}={list(algorithm_target_ids)}"
+        )
+    target_ids = (
+        producer_target_ids if producer_target_ids is not None else algorithm_target_ids
+    )
+    normalized_target_ids, normalized_vllm_ids = normalize_standalone_layer_ids(
+        algorithm,
+        target_ids,
+        vllm_ids,
+        default_vllm_ids=_DEFAULT_VLLM_AUX_LAYER_IDS,
+    )
+    return normalized_vllm_ids, normalized_target_ids
 
 
 def _parse_vllm_endpoints(env: Mapping[str, str]) -> tuple[str, ...]:
@@ -373,9 +418,20 @@ def _target_final_layer_id(model_path: str, target_layer_ids: Sequence[int]) -> 
             if candidate is not None and int(candidate) > 0:
                 return int(candidate)
         raise ValueError(f"Target model config has no num_hidden_layers: {config_path}")
-    # Keep dry-run and model-registry IDs usable. The formal Qwen3-4B/8B
-    # defaults select layer 33 and use transformer output 36 as the final state.
+    # Keep dry-run and model-registry IDs usable. The configured Qwen3-4B/8B
+    # vLLM outputs end at 33 and use transformer output 36 as the final state.
     return max(int(layer_id) for layer_id in target_layer_ids) + 3
+
+
+def _vllm_capture_layer_ids(
+    target_layer_ids: Sequence[int], final_layer_id: int
+) -> list[int]:
+    """Build the vLLM capture plan without requesting the final output twice."""
+
+    capture_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
+    if int(final_layer_id) not in capture_layer_ids:
+        capture_layer_ids.append(int(final_layer_id))
+    return capture_layer_ids
 
 
 def resolve_pipeline_config(
@@ -396,7 +452,7 @@ def resolve_pipeline_config(
     ).upper()
     if not algorithm:
         raise ValueError(f"{_ALGORITHM_KEY} must not be empty")
-    target_layer_ids = _resolve_target_layer_ids(training_args, algorithm)
+    vllm_aux_layer_ids, target_layer_ids = _resolve_layer_ids(training_args, algorithm)
     endpoints = _parse_vllm_endpoints(env)
     return PipelineConfig(
         input_path=input_path,
@@ -404,6 +460,7 @@ def resolve_pipeline_config(
         tokenizer_path=tokenizer_path,
         algorithm=algorithm,
         target_layer_ids=target_layer_ids,
+        vllm_aux_hidden_state_layer_ids=vllm_aux_layer_ids,
         vllm_endpoints=endpoints,
         run_id=f"{algorithm.lower()}-{uuid.uuid4().hex}",
     )
@@ -624,17 +681,17 @@ def build_pipeline_commands(
     # extract_hidden_states uses the model's layer-output convention. Qwen3-4B/8B
     # have 36 transformer layers; the default DSpark auxiliary selection ends at
     # 33 and requests the final layer output as 36.
-    final_layer_id = _target_final_layer_id(config.model_path, config.target_layer_ids)
+    final_layer_id = _target_final_layer_id(
+        config.model_path, config.vllm_aux_hidden_state_layer_ids
+    )
+    capture_layer_ids = _vllm_capture_layer_ids(
+        config.vllm_aux_hidden_state_layer_ids, final_layer_id
+    )
     speculative_config = {
         "method": "extract_hidden_states",
         "num_speculative_tokens": 1,
         "draft_model_config": {
-            "hf_config": {
-                "eagle_aux_hidden_state_layer_ids": [
-                    *config.target_layer_ids,
-                    final_layer_id,
-                ]
-            }
+            "hf_config": {"eagle_aux_hidden_state_layer_ids": capture_layer_ids}
         },
     }
     kv_transfer_config = {
@@ -703,6 +760,8 @@ def build_pipeline_commands(
         + _stable_path_identity("target", config.model_path),
         "speco.standalone_tq_producer.target_layer_ids="
         + _hydra_list(config.target_layer_ids),
+        "speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids="
+        + _hydra_list(config.vllm_aux_hidden_state_layer_ids),
         "speco.standalone_tq_producer.vllm_endpoints="
         + _hydra_list(config.vllm_endpoints),
         f"speco.standalone_tq_producer.vllm_model={config.model_path}",

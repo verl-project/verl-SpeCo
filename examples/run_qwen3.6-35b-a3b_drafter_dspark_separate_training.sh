@@ -35,9 +35,9 @@ cd "${repo_root}"
 # prefill. Set SPECO_VLLM_ENDPOINTS to reuse an already-running target service
 # instead of starting one.
 #
-# DSPARK_TARGET_LAYER_IDS below must match the aux layers served by vLLM; the
-# training-side list holds only the aux layers (the appended final layer is used
-# as the verifier's last hidden state).
+# VLLM_AUX_HIDDEN_STATE_LAYER_IDS must match the aux layers served by vLLM. The
+# training-side list holds only the aux layers; the appended final layer is used
+# as the verifier's last hidden state.
 
 project_name=${PROJECT_NAME:-verl_dspark_drafter}
 exp_name=${EXP_NAME:-qwen3_6_35b_a3b_dspark_separate_training}
@@ -106,7 +106,7 @@ MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
 PARAM_OFFLOAD=${PARAM_OFFLOAD:-true}
 OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-true}
 
-# DSpark architecture, sampling and losses. TARGET_LAYER_IDS must match the
+# DSpark architecture, sampling and losses. VLLM auxiliary IDs must match the
 # auxiliary layers exposed by the hidden-state vLLM service. For Qwen3.6-35B-A3B
 # (40 layers) this is the RedHatAI 5-aux-layer recipe, with final layer 40
 # appended by the vLLM service.
@@ -118,7 +118,7 @@ DSPARK_SAMPLED_CE_NEGATIVES=${DSPARK_SAMPLED_CE_NEGATIVES:-0}
 DSPARK_LOSS_DECAY_GAMMA=${DSPARK_LOSS_DECAY_GAMMA:-7}
 DSPARK_NUM_TARGET_LAYERS=${DSPARK_NUM_TARGET_LAYERS:-5}
 DSPARK_NUM_HIDDEN_LAYERS=${DSPARK_NUM_HIDDEN_LAYERS:-5}
-DSPARK_TARGET_LAYER_IDS=${DSPARK_TARGET_LAYER_IDS:-'[2,10,20,30,37]'}
+VLLM_AUX_HIDDEN_STATE_LAYER_IDS=${VLLM_AUX_HIDDEN_STATE_LAYER_IDS:-'[2,10,20,30,37]'}
 DSPARK_MASK_TOKEN_ID=${DSPARK_MASK_TOKEN_ID:-248077}
 DSPARK_MARKOV_RANK=${DSPARK_MARKOV_RANK:-256}
 DSPARK_MARKOV_HEAD_TYPE=${DSPARK_MARKOV_HEAD_TYPE:-vanilla}
@@ -215,7 +215,7 @@ PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher
     actor_rollout_ref.rollout.drafter.training.dspark_num_target_layers=${DSPARK_NUM_TARGET_LAYERS} \
     actor_rollout_ref.rollout.drafter.training.dspark_num_hidden_layers=${DSPARK_NUM_HIDDEN_LAYERS} \
     actor_rollout_ref.rollout.drafter.training.dspark_intermediate_size=${DSPARK_INTERMEDIATE_SIZE} \
-    actor_rollout_ref.rollout.drafter.training.dspark_target_layer_ids=${DSPARK_TARGET_LAYER_IDS} \
+    speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids=${VLLM_AUX_HIDDEN_STATE_LAYER_IDS} \
     actor_rollout_ref.rollout.drafter.training.dspark_mask_token_id=${DSPARK_MASK_TOKEN_ID} \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_rank=${DSPARK_MARKOV_RANK} \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_head_type=${DSPARK_MARKOV_HEAD_TYPE} \

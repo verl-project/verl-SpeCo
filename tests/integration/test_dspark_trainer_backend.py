@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,7 +27,62 @@ dflash_backend = pytest.importorskip("verl_speco.backends.dflash_trainer_backend
 DSparkTrainingModel = dspark_backend.DSparkTrainingModel
 DSparkConfig = dspark_models.DSparkConfig
 DSparkDraftModel = dspark_models.DSparkDraftModel
+DSparkTrainerBackend = dspark_backend.DSparkTrainerBackend
 create_dense_attention_mask = dflash_backend._create_dflash_dense_attention_mask
+
+
+def _preprocess_backend(max_window):
+    backend = object.__new__(DSparkTrainerBackend)
+    backend.config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(
+                training={"dspark_max_window": max_window}
+            )
+        )
+    )
+    return backend
+
+
+def _preprocess_item(rows: int = 8):
+    return {
+        "input_ids": torch.arange(rows),
+        "hidden_states": torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4),
+        "loss_mask": torch.tensor([0, 0, *([1] * (rows - 2))], dtype=torch.float32),
+        "hidden_states_layout": "dflash_aux",
+    }
+
+
+def _preprocess_model_config():
+    return SimpleNamespace(
+        pad_token_id=0,
+        hidden_size=2,
+        target_hidden_size=2,
+        num_context_layers=2,
+        num_target_layers=2,
+    )
+
+
+@pytest.mark.parametrize("max_window", [None, 0])
+def test_dspark_preprocess_keeps_full_sequence_when_max_window_is_disabled(
+    max_window,
+):
+    result = _preprocess_backend(max_window).preprocess_individual_items(
+        [_preprocess_item()], torch.device("cpu"), _preprocess_model_config()
+    )
+
+    assert result["ids"][0].tolist() == list(range(8))
+    assert result["h_states"][0].shape == (8, 4)
+    assert result["masks"][0].shape == (8,)
+
+
+def test_dspark_preprocess_crops_only_when_max_window_is_set():
+    result = _preprocess_backend(4).preprocess_individual_items(
+        [_preprocess_item()], torch.device("cpu"), _preprocess_model_config()
+    )
+
+    assert result["ids"][0].numel() == 4
+    assert result["h_states"][0].shape == (4, 4)
+    assert result["masks"][0].shape == (4,)
 
 
 def test_dspark_fallback_config_uses_native_qwen_mrv2_architecture() -> None:
@@ -660,14 +716,19 @@ def test_from_dspark_dict_lifts_released_aux_layer_ids_into_serving_config(
     source_dir = tmp_path / "source_dspark"
     source_dir.mkdir()
     (source_dir / "config.json").write_text(
-        json.dumps({"model_type": "qwen3", "architectures": ["Qwen3DSparkModel"]}),
+        json.dumps(released_config),
         encoding="utf-8",
     )
     trainer = SimpleNamespace(
         backend=SimpleNamespace(model_type="dspark"),
         config=SimpleNamespace(
             rollout=SimpleNamespace(
-                drafter=SimpleNamespace(model_path=str(source_dir))
+                drafter=SimpleNamespace(
+                    model_path=str(source_dir),
+                    training={
+                        "dspark_target_layer_ids": [1, 9, 19, 29, 36]
+                    },
+                )
             )
         ),
     )
@@ -677,8 +738,12 @@ def test_from_dspark_dict_lifts_released_aux_layer_ids_into_serving_config(
     runtime_config = json.loads(
         (checkpoint_dir / "config.json").read_text(encoding="utf-8")
     )
+    saved_training_config = json.loads(
+        (checkpoint_dir / "speco_training_config.json").read_text(encoding="utf-8")
+    )
     # vLLM reads ``eagle_aux_hidden_state_layer_ids`` directly; the z-lab
     # ``target_layer_ids`` aliases are one less and vLLM adds the +1 back.
     assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [2, 10, 20, 30, 37]
     assert runtime_config["target_layer_ids"] == [1, 9, 19, 29, 36]
     assert runtime_config["dflash_config"]["target_layer_ids"] == [1, 9, 19, 29, 36]
+    assert saved_training_config["target_layer_ids"] == [1, 9, 19, 29, 36]

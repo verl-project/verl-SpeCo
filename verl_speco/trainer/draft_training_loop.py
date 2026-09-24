@@ -32,6 +32,7 @@ from verl.utils.device import get_device_name, get_torch_device
 
 from verl_speco.backends.factory import build_trainer_backend
 from verl_speco.config import config_int
+from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.trainer.base_trainer import (
     DrafterBaseTrainer,
     resolve_drafter_strategy,
@@ -53,6 +54,8 @@ from verl_speco.trainer.tq_sample_source import TQFeatureDataLoader, TQLocalBatc
 logger = logging.getLogger(__name__)
 
 _TQ_GET_MAX_SYNC_INTERVAL_STEPS = 50
+_TQ_CLEAR_MAX_ATTEMPTS = 3
+_TQ_CLEAR_RETRY_BACKOFF_SECONDS = 0.5
 
 
 def _should_log_batch_progress(attempted_batches: int) -> bool:
@@ -139,6 +142,10 @@ async def _run_standalone_draft_training_async(
         data_parallel_process_group=None,
         backend=backend,
     )
+    # Fail in the main thread before the first batch when a resumed checkpoint
+    # declares another layer-ID convention. The export path repeats this check
+    # while rewriting the runtime config, but only on the writer thread.
+    _assert_standalone_layer_migration(trainer, getattr(backend, "model_type", None))
     max_steps = int(training_cfg.get("max_steps", training_cfg.get("step", 1000)) or 0)
     save_interval = int(training_cfg.get("save_interval_steps", 0) or 0)
     successful_steps = 0
@@ -345,6 +352,7 @@ async def _run_standalone_draft_training_async(
             sample_source = feature_producer
         sample_iterator = iter(sample_source)
         while max_steps <= 0 or optimizer_step < max_steps:
+            _raise_standalone_export_error(trainer)
             current_stage = "load_next_batch"
             loaded_batch = _next_batch_across_ranks(
                 sample_iterator,
@@ -561,6 +569,9 @@ async def _run_standalone_draft_training_async(
                     last_saved_step = optimizer_step
                 _barrier()
             current_stage = "load_next_batch"
+        # Catch an export failure reported after the last in-loop check, before
+        # the final save can succeed and end the run as a silent partial export.
+        _raise_standalone_export_error(trainer)
         final_save = bool(training_cfg.get("save_final_checkpoint", True))
         if final_save and successful_steps > 0 and optimizer_step != last_saved_step:
             current_stage = "save_final_checkpoint"
@@ -771,13 +782,25 @@ def _finalize_standalone_checkpoint(
         )
         return
 
-    _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
-    _save_resume_sidecar(
-        checkpoint_path,
-        consumed_snapshot,
-        step=step,
-        input_path=input_path,
-    )
+    # This callback runs on the checkpoint writer thread, where concurrent.futures
+    # only logs a raise. Record it so the training loop can fail from the main
+    # thread instead of finishing with an unmigrated runtime config.
+    try:
+        _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
+        _save_resume_sidecar(
+            checkpoint_path,
+            consumed_snapshot,
+            step=step,
+            input_path=input_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "[standalone] checkpoint export failed step=%s path=%s",
+            step,
+            checkpoint_path,
+        )
+        if getattr(trainer, "_standalone_export_error", None) is None:
+            setattr(trainer, "_standalone_export_error", exc)
 
 
 def _save_resume_sidecar(
@@ -903,6 +926,122 @@ _VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
     ),
 }
 
+_STANDALONE_TRAINING_LAYER_KEYS = {
+    "dflash": "dflash_target_layer_ids",
+    "dflash2": "dflash2_target_layer_ids",
+    "dspark": "dspark_target_layer_ids",
+    "domino": "domino_target_layer_ids",
+}
+
+
+def _standalone_training_layer_ids(
+    trainer: DrafterBaseTrainer, backend_type: str
+) -> list[int] | None:
+    drafter_cfg = getattr(
+        getattr(getattr(trainer, "config", None), "rollout", None), "drafter", None
+    )
+    training_cfg = getattr(drafter_cfg, "training", None)
+    key = _STANDALONE_TRAINING_LAYER_KEYS.get(backend_type)
+    if training_cfg is None or key is None:
+        return None
+    value = (
+        training_cfg.get(key, None)
+        if hasattr(training_cfg, "get")
+        else getattr(training_cfg, key, None)
+    )
+    if value is None:
+        return None
+    layer_ids = [int(layer_id) for layer_id in value]
+    if not layer_ids or any(layer_id < 0 for layer_id in layer_ids):
+        raise ValueError(
+            f"Invalid standalone {key}={layer_ids}: expected non-negative "
+            "decoder-layer IDs"
+        )
+    return layer_ids
+
+
+def _source_vllm_aux_layer_ids(
+    source_config: dict[str, Any] | None,
+) -> list[int] | None:
+    if source_config is None:
+        return None
+    for key in (
+        "aux_hidden_state_layer_ids",
+        "eagle_aux_hidden_state_layer_ids",
+    ):
+        value = source_config.get(key)
+        if value is not None:
+            return [int(layer_id) for layer_id in value]
+    return None
+
+
+def _source_target_layer_ids(
+    source_config: dict[str, Any], backend_type: str
+) -> list[int] | None:
+    """Read the layer IDs a source drafter config declares as decoder indices."""
+
+    candidates = [source_config]
+    for child_key in ("dflash_config", f"{backend_type}_config"):
+        child = source_config.get(child_key)
+        if isinstance(child, dict):
+            candidates.append(child)
+    for candidate in candidates:
+        value = candidate.get("target_layer_ids")
+        if value is not None:
+            return [int(layer_id) for layer_id in value]
+    return None
+
+
+def _assert_standalone_layer_migration(
+    trainer: DrafterBaseTrainer, backend_type: str | None
+) -> None:
+    """Reject a resumed checkpoint whose layer IDs use another convention.
+
+    The checkpoint export path performs the same comparison while rewriting the
+    runtime config, but that runs on the async checkpoint writer thread where a
+    raise cannot reach the training loop.  Running the check up front keeps the
+    failure in the main thread, before the run spends any GPU time.
+    """
+
+    if backend_type is None:
+        return
+    launcher_layer_ids = _standalone_training_layer_ids(trainer, backend_type)
+    if launcher_layer_ids is None:
+        return
+    source_config = _load_source_drafter_config(trainer)
+    if source_config is None:
+        return
+    _, expected_vllm_ids = normalize_standalone_layer_ids(
+        backend_type, launcher_layer_ids, None
+    )
+    source_vllm_ids = _source_vllm_aux_layer_ids(source_config)
+    if source_vllm_ids is not None:
+        if source_vllm_ids != list(expected_vllm_ids):
+            raise ValueError(
+                "Standalone layer-ID migration mismatch: source checkpoint "
+                f"vLLM IDs are {source_vllm_ids}, but launcher decoder IDs "
+                f"{launcher_layer_ids} imply {list(expected_vllm_ids)}"
+            )
+        return
+    source_target_ids = _source_target_layer_ids(source_config, backend_type)
+    if source_target_ids is not None and source_target_ids != launcher_layer_ids:
+        raise ValueError(
+            "Cannot safely migrate standalone checkpoint target_layer_ids "
+            f"{source_target_ids}: source config has no explicit vLLM auxiliary "
+            f"IDs and launcher expects {launcher_layer_ids}"
+        )
+
+
+def _raise_standalone_export_error(trainer: DrafterBaseTrainer) -> None:
+    """Re-raise a checkpoint export failure captured on the writer thread."""
+
+    error = getattr(trainer, "_standalone_export_error", None)
+    if error is not None:
+        raise RuntimeError(
+            "Standalone checkpoint export failed; the writer thread logged the "
+            "underlying traceback"
+        ) from error
+
 
 def _rewrite_standalone_block_runtime_config(
     trainer: DrafterBaseTrainer,
@@ -953,6 +1092,7 @@ def _rewrite_standalone_block_runtime_config(
     variant_child_key, variant_alias_keys = _VARIANT_RUNTIME_ALIASES.get(
         backend_type, (None, ())
     )
+    source_runtime_config = _load_source_drafter_config(trainer)
     training_dflash_config = training_config.get("dflash_config")
     training_variant_config = (
         training_config.get(variant_child_key) if variant_child_key else None
@@ -970,10 +1110,43 @@ def _rewrite_standalone_block_runtime_config(
             else None
         )
     )
-    training_aux_layer_ids: list[int] | None = None
+    launcher_target_layer_ids = _standalone_training_layer_ids(trainer, backend_type)
+    if launcher_target_layer_ids is not None:
+        expected_vllm_ids = [layer_id + 1 for layer_id in launcher_target_layer_ids]
+        source_vllm_ids = _source_vllm_aux_layer_ids(source_runtime_config)
+        saved_layer_ids = (
+            [int(layer_id) for layer_id in training_target_layer_ids]
+            if training_target_layer_ids is not None
+            else None
+        )
+        if source_vllm_ids is not None:
+            if source_vllm_ids != expected_vllm_ids:
+                raise ValueError(
+                    "Standalone layer-ID migration mismatch: source checkpoint "
+                    f"vLLM IDs are {source_vllm_ids}, but launcher decoder IDs "
+                    f"{launcher_target_layer_ids} imply {expected_vllm_ids}"
+                )
+        elif saved_layer_ids not in (None, launcher_target_layer_ids):
+            raise ValueError(
+                "Cannot safely migrate standalone checkpoint target_layer_ids "
+                f"{saved_layer_ids}: source config has no explicit vLLM auxiliary "
+                f"IDs and launcher expects {launcher_target_layer_ids}"
+            )
+        # save_pretrained may have serialized a released speculators config whose
+        # target_layer_ids were copied verbatim from output-index aux IDs. The
+        # standalone launcher's decoder IDs are authoritative for this run.
+        training_target_layer_ids = launcher_target_layer_ids
+        training_config["target_layer_ids"] = list(launcher_target_layer_ids)
+        if isinstance(training_dflash_config, dict):
+            training_dflash_config["target_layer_ids"] = list(launcher_target_layer_ids)
+        if isinstance(training_variant_config, dict):
+            training_variant_config["target_layer_ids"] = list(
+                launcher_target_layer_ids
+            )
+    training_decoder_layer_ids: list[int] | None = None
     if training_target_layer_ids is not None:
         try:
-            training_aux_layer_ids = [
+            training_decoder_layer_ids = [
                 int(layer_id) for layer_id in training_target_layer_ids
             ]
         except (TypeError, ValueError):
@@ -982,11 +1155,11 @@ def _rewrite_standalone_block_runtime_config(
                 training_target_layer_ids,
             )
         else:
-            if any(layer_id < 1 for layer_id in training_aux_layer_ids):
+            if any(layer_id < 0 for layer_id in training_decoder_layer_ids):
                 raise ValueError(
                     "Cannot export standalone DFlash runtime config with "
-                    f"target_layer_ids={training_aux_layer_ids}: each training layer id "
-                    "must be at least 1."
+                    f"target_layer_ids={training_decoder_layer_ids}: each decoder "
+                    "layer id must be non-negative."
                 )
 
     training_config_path = os.path.join(checkpoint_path, "speco_training_config.json")
@@ -1000,7 +1173,7 @@ def _rewrite_standalone_block_runtime_config(
             exc,
         )
 
-    runtime_config = _load_source_drafter_config(trainer)
+    runtime_config = source_runtime_config
     if runtime_config is None:
         runtime_config = deepcopy(training_config)
         logger.warning(
@@ -1025,13 +1198,14 @@ def _rewrite_standalone_block_runtime_config(
             training_config.get("projector_type", "domino") or "domino"
         )
 
-    if training_aux_layer_ids is not None:
-        # Training captures these transformer layer outputs verbatim.  vLLM
-        # requires its DFlash target aliases to be one less than the EAGLE aux
-        # ids, so preserve the training ids as aux ids and shift only the
-        # runtime-facing aliases.
-        runtime_target_layer_ids = [layer_id - 1 for layer_id in training_aux_layer_ids]
-        runtime_config["eagle_aux_hidden_state_layer_ids"] = training_aux_layer_ids
+    if training_decoder_layer_ids is not None:
+        # Training and runtime configs use zero-based decoder-layer indices.
+        # vLLM's EAGLE auxiliary alias addresses layer outputs, so it is the
+        # same capture plan shifted by one.
+        runtime_target_layer_ids = list(training_decoder_layer_ids)
+        runtime_config["eagle_aux_hidden_state_layer_ids"] = [
+            layer_id + 1 for layer_id in training_decoder_layer_ids
+        ]
         runtime_config["target_layer_ids"] = runtime_target_layer_ids
         dflash_config["target_layer_ids"] = runtime_target_layer_ids
         if variant_child_key:
@@ -1300,10 +1474,32 @@ def _clear_tq_batch_across_ranks(
 
     local_error: BaseException | None = None
     if rank == 0:
-        try:
-            loader.clear_completed_batch(global_keys)
-        except BaseException as exc:  # noqa: BLE001
-            local_error = exc
+        cleared = False
+        for attempt in range(1, _TQ_CLEAR_MAX_ATTEMPTS + 1):
+            try:
+                loader.clear_completed_batch(global_keys)
+                cleared = True
+                break
+            except BaseException as exc:  # noqa: BLE001
+                local_error = exc
+                if attempt >= _TQ_CLEAR_MAX_ATTEMPTS:
+                    break
+                delay = _TQ_CLEAR_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    "TQ Consumer clear retry attempt=%s/%s retry_in=%.3fs "
+                    "keys=%s error=%r",
+                    attempt,
+                    _TQ_CLEAR_MAX_ATTEMPTS,
+                    delay,
+                    len(global_keys or []),
+                    exc,
+                )
+                time.sleep(delay)
+        else:
+            raise AssertionError("unreachable")
+        # A later attempt succeeded, so do not report an earlier transient error.
+        if cleared:
+            local_error = None
     failed = torch.tensor(
         1 if local_error is not None else 0,
         dtype=torch.int32,

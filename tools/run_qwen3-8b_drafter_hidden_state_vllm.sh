@@ -35,9 +35,11 @@ VLLM_HOST=${VLLM_HOST:-127.0.0.1}
 VLLM_BASE_PORT=${VLLM_BASE_PORT:-8000}
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.8}
 VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-256}
-# Auxiliary training layers followed by the target model's final hidden-state
-# layer. Keep the auxiliary prefix aligned with DSPARK_TARGET_LAYER_IDS in the
-# standalone training script. DSpark L1 loss consumes the final entry.
+# vLLM output IDs: auxiliary training outputs followed by the target model's
+# final hidden-state output. Keep the auxiliary prefix exactly aligned with
+# VLLM_AUX_HIDDEN_STATE_LAYER_IDS in the standalone training script; matching
+# only the number of layers cannot detect a shifted capture plan. DSpark L1
+# loss consumes the final entry.
 VLLM_HIDDEN_STATE_LAYER_IDS=${VLLM_HIDDEN_STATE_LAYER_IDS:-'[1,9,17,25,33,36]'}
 HIDDEN_STATES_DIR=${HIDDEN_STATES_DIR:-/tmp/speco-vllm-hidden-states}
 

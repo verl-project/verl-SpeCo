@@ -289,6 +289,7 @@ def test_vllm_final_norm_matches_target_forward(
         contract = FeatureContract(
             algorithm=algorithm,
             target_layer_ids=[0],
+            vllm_aux_hidden_state_layer_ids=[1],
             hidden_states_layout=layout,
             dtype=dtype,
             target_model_id=str(tmp_path),
@@ -318,6 +319,47 @@ def test_vllm_final_norm_matches_target_forward(
             replace(contract, hidden_states_layout="dflash_aux", algorithm="DFLASH"),
         )
         torch.testing.assert_close(aux_only.hidden_states, raw[:, 0], rtol=0, atol=0)
+
+
+def test_plus_last_reuses_final_layer_when_it_is_already_an_aux_layer():
+    rows = 4
+    hidden_size = 3
+    token_ids = torch.arange(rows)
+    raw = torch.arange(rows * 2 * hidden_size, dtype=torch.float32).reshape(
+        rows, 2, hidden_size
+    )
+    request = DraftReplaySample(
+        input_ids=token_ids,
+        loss_mask=torch.ones(rows),
+        attention_mask=torch.ones(rows),
+        position_ids=torch.arange(rows),
+        feature_positions=torch.arange(rows),
+        draft_position_ids=torch.arange(1, rows + 1),
+    )
+    contract = FeatureContract(
+        algorithm="DSPARK",
+        target_layer_ids=[0, 1],
+        vllm_aux_hidden_state_layer_ids=[1, 2],
+        hidden_states_layout="dflash_aux_plus_last",
+        dtype=torch.float32,
+        target_model_id="target",
+        target_model_revision=None,
+        tokenizer_fingerprint="test",
+        target_num_hidden_layers=2,
+    )
+
+    feature = feature_from_vllm_payload(
+        {"token_ids": token_ids, "hidden_states": raw},
+        request,
+        contract,
+        final_norm=torch.nn.Identity(),
+    )
+
+    assert feature.hidden_states.shape == (rows, hidden_size * 3)
+    torch.testing.assert_close(feature.hidden_states[:, : hidden_size * 2], raw.flatten(1))
+    torch.testing.assert_close(feature.hidden_states[:, hidden_size * 2 :], raw[:, 1])
+    assert feature.metadata["final_hidden_source_index"] == 1
+    assert feature.metadata["final_hidden_reused_from_aux"] is True
 
 
 def test_final_norm_loader_requires_checkpoint_weight(tmp_path):
