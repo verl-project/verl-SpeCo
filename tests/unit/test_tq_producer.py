@@ -436,6 +436,71 @@ def test_run_producer_retries_transient_publish_failure(
     assert any(tag.get("status") == "eos" for tag in transport.records.values())
 
 
+def test_direct_producer_derives_vllm_ids_from_target_ids(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    producer = config["speco"]["standalone_tq_producer"]
+    producer.pop("vllm_aux_hidden_state_layer_ids")
+    producer["max_samples"] = 1
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=_Transport(),
+            tokenizer=_Tokenizer(),
+            client_pool=_Pool(tmp_path),
+        )
+    )
+
+    assert stats.published_count == 1
+
+
+def test_direct_producer_derives_target_ids_from_vllm_ids(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    producer = config["speco"]["standalone_tq_producer"]
+    producer.pop("target_layer_ids")
+    producer["max_samples"] = 1
+    transport = _Transport()
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=_Pool(tmp_path),
+        )
+    )
+
+    assert stats.published_count == 1
+    sample_key, sample_tag = next(
+        (key, tag)
+        for key, tag in transport.records.items()
+        if tag.get("record_type") == "sample"
+    )
+    sample = decode_sample(
+        sample_key,
+        sample_tag,
+        transport.payloads[sample_key],
+        {"run_id": "run-a"},
+    )
+    assert sample.metadata["target_layer_ids"] == [2, 8]
+
+
+def test_direct_producer_rejects_mismatched_layer_ids(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"][
+        "vllm_aux_hidden_state_layer_ids"
+    ] = [3]
+
+    with pytest.raises(ValueError, match="algorithm convention"):
+        validate_producer_config(config)
+
+
 def test_run_producer_does_not_republish_when_temporary_cleanup_fails(
     tmp_path: Path, monkeypatch, caplog
 ) -> None:

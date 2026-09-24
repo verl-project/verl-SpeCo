@@ -708,9 +708,6 @@ def test_from_dspark_dict_lifts_released_aux_layer_ids_into_serving_config(
     # verbatim rather than shifted or replaced by the spaced fallback.
     assert config.target_layer_ids == [2, 10, 20, 30, 37]
 
-    # The standalone launcher owns its decoder-index conversion without
-    # changing the shared checkpoint-loader semantics above.
-    config.target_layer_ids = [1, 9, 19, 29, 36]
     checkpoint_dir = tmp_path / "draft_step_10"
     checkpoint_dir.mkdir()
     (checkpoint_dir / "config.json").write_text(
@@ -719,14 +716,19 @@ def test_from_dspark_dict_lifts_released_aux_layer_ids_into_serving_config(
     source_dir = tmp_path / "source_dspark"
     source_dir.mkdir()
     (source_dir / "config.json").write_text(
-        json.dumps({"model_type": "qwen3", "architectures": ["Qwen3DSparkModel"]}),
+        json.dumps(released_config),
         encoding="utf-8",
     )
     trainer = SimpleNamespace(
         backend=SimpleNamespace(model_type="dspark"),
         config=SimpleNamespace(
             rollout=SimpleNamespace(
-                drafter=SimpleNamespace(model_path=str(source_dir))
+                drafter=SimpleNamespace(
+                    model_path=str(source_dir),
+                    training={
+                        "dspark_target_layer_ids": [1, 9, 19, 29, 36]
+                    },
+                )
             )
         ),
     )
@@ -736,8 +738,12 @@ def test_from_dspark_dict_lifts_released_aux_layer_ids_into_serving_config(
     runtime_config = json.loads(
         (checkpoint_dir / "config.json").read_text(encoding="utf-8")
     )
+    saved_training_config = json.loads(
+        (checkpoint_dir / "speco_training_config.json").read_text(encoding="utf-8")
+    )
     # vLLM reads ``eagle_aux_hidden_state_layer_ids`` directly; the z-lab
     # ``target_layer_ids`` aliases are one less and vLLM adds the +1 back.
     assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [2, 10, 20, 30, 37]
     assert runtime_config["target_layer_ids"] == [1, 9, 19, 29, 36]
     assert runtime_config["dflash_config"]["target_layer_ids"] == [1, 9, 19, 29, 36]
+    assert saved_training_config["target_layer_ids"] == [1, 9, 19, 29, 36]

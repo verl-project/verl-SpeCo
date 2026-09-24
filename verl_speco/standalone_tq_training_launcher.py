@@ -50,6 +50,7 @@ from verl_speco.draft_train_launcher import (
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
+from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.trainer.standalone_resume import load_standalone_resume
 
 
@@ -144,6 +145,8 @@ _INTERNAL_OVERRIDE_KEYS = frozenset(
     }
 )
 
+# These are the output IDs passed verbatim to vLLM serve. DFlash-family
+# training IDs are derived from them by subtracting one.
 _DEFAULT_VLLM_AUX_LAYER_IDS = (1, 9, 17, 25, 33)
 _DEFAULT_VLLM_ENDPOINT = "http://127.0.0.1:8000/v1"
 _DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = "0.4"
@@ -285,12 +288,9 @@ def _resolve_layer_ids(
     """Resolve vLLM output IDs and canonical drafter decoder-layer IDs."""
 
     raw_vllm = _find_override(training_args, _PRODUCER_VLLM_AUX_LAYER_IDS_KEY)
-    # Keep the old Producer-only spelling as a compatibility input. The
-    # launcher still rewrites target_layer_ids to canonical training IDs.
-    if raw_vllm is None:
-        raw_vllm = _find_override(training_args, _PRODUCER_TARGET_LAYER_IDS_KEY)
+    raw_producer_target = _find_override(training_args, _PRODUCER_TARGET_LAYER_IDS_KEY)
     algorithm_key = _ALGORITHM_TARGET_LAYER_IDS_KEYS.get(algorithm)
-    raw_target = (
+    raw_algorithm_target = (
         _find_override(training_args, algorithm_key)
         if algorithm_key is not None
         else None
@@ -300,36 +300,35 @@ def _resolve_layer_ids(
         config_key=_PRODUCER_VLLM_AUX_LAYER_IDS_KEY,
         default=None,
     )
-    target_ids = _parse_layer_ids(
-        raw_target,
+    producer_target_ids = _parse_layer_ids(
+        raw_producer_target,
+        config_key=_PRODUCER_TARGET_LAYER_IDS_KEY,
+        default=None,
+    )
+    algorithm_target_ids = _parse_layer_ids(
+        raw_algorithm_target,
         config_key=algorithm_key or _PRODUCER_TARGET_LAYER_IDS_KEY,
         default=None,
     )
-    uses_decoder_indices = algorithm in {"DFLASH", "DSPARK", "DOMINO"}
-    if vllm_ids is None and target_ids is None:
-        vllm_ids = _DEFAULT_VLLM_AUX_LAYER_IDS
-    if vllm_ids is None:
-        assert target_ids is not None
-        vllm_ids = (
-            tuple(value + 1 for value in target_ids)
-            if uses_decoder_indices
-            else target_ids
+    if (
+        producer_target_ids is not None
+        and algorithm_target_ids is not None
+        and producer_target_ids != algorithm_target_ids
+    ):
+        raise ValueError(
+            f"{_PRODUCER_TARGET_LAYER_IDS_KEY}={list(producer_target_ids)} does "
+            f"not match {algorithm_key}={list(algorithm_target_ids)}"
         )
-    derived_target_ids = (
-        tuple(value - 1 for value in vllm_ids) if uses_decoder_indices else vllm_ids
+    target_ids = (
+        producer_target_ids if producer_target_ids is not None else algorithm_target_ids
     )
-    if uses_decoder_indices and any(value < 1 for value in vllm_ids):
-        raise ValueError(
-            f"{_PRODUCER_VLLM_AUX_LAYER_IDS_KEY} must contain positive vLLM "
-            "output IDs because decoder-layer IDs are obtained by subtracting 1"
-        )
-    if target_ids is not None and target_ids != derived_target_ids:
-        raise ValueError(
-            f"{algorithm_key}={list(target_ids)} does not match "
-            f"{_PRODUCER_VLLM_AUX_LAYER_IDS_KEY}={list(vllm_ids)}; expected "
-            f"training IDs {list(derived_target_ids)}"
-        )
-    return vllm_ids, derived_target_ids
+    normalized_target_ids, normalized_vllm_ids = normalize_standalone_layer_ids(
+        algorithm,
+        target_ids,
+        vllm_ids,
+        default_vllm_ids=_DEFAULT_VLLM_AUX_LAYER_IDS,
+    )
+    return normalized_vllm_ids, normalized_target_ids
 
 
 def _parse_vllm_endpoints(env: Mapping[str, str]) -> tuple[str, ...]:
@@ -419,8 +418,8 @@ def _target_final_layer_id(model_path: str, target_layer_ids: Sequence[int]) -> 
             if candidate is not None and int(candidate) > 0:
                 return int(candidate)
         raise ValueError(f"Target model config has no num_hidden_layers: {config_path}")
-    # Keep dry-run and model-registry IDs usable. The formal Qwen3-4B/8B
-    # defaults select layer 33 and use transformer output 36 as the final state.
+    # Keep dry-run and model-registry IDs usable. The configured Qwen3-4B/8B
+    # vLLM outputs end at 33 and use transformer output 36 as the final state.
     return max(int(layer_id) for layer_id in target_layer_ids) + 3
 
 

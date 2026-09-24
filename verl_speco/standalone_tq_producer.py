@@ -50,6 +50,7 @@ from verl_speco.producer.vllm_feature_client import (
     VllmFeatureClientPool,
     delete_temporary_result,
 )
+from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.trainer.feature_store import DraftFeatureSample
 from verl_speco.trainer.standalone_resume import load_standalone_resume
 from verl_speco.trainer.target_feature_replay import (
@@ -236,20 +237,14 @@ def validate_producer_config(config: Any) -> None:
         raise ValueError(
             "standalone_tq_producer.vllm_endpoints must be a non-empty list"
         )
-    target_layer_ids = producer_cfg.get("target_layer_ids")
-    if not isinstance(target_layer_ids, list) or not target_layer_ids:
-        raise ValueError(
-            "standalone_tq_producer.target_layer_ids must be a non-empty list"
-        )
-    vllm_aux_layer_ids = producer_cfg.get("vllm_aux_hidden_state_layer_ids")
-    if not isinstance(vllm_aux_layer_ids, list) or not vllm_aux_layer_ids:
-        raise ValueError(
-            "standalone_tq_producer.vllm_aux_hidden_state_layer_ids must be a "
-            "non-empty list"
-        )
     algorithm = str(training_cfg.get("speculative_algorithm", "") or "").strip()
     if not algorithm:
         raise ValueError("drafter.speculative_algorithm must not be empty")
+    normalize_standalone_layer_ids(
+        algorithm,
+        producer_cfg.get("target_layer_ids"),
+        producer_cfg.get("vllm_aux_hidden_state_layer_ids"),
+    )
     if bool(training_cfg.get("use_logits", False)):
         raise ValueError("Standalone TQ Producer does not support use_logits=true")
     if int(tq_cfg.get("schema_version", 0)) != PROTOCOL_SCHEMA_VERSION:
@@ -450,12 +445,15 @@ async def run_producer(
         logger.info("Standalone TQ Producer vLLM client pool started")
 
         algorithm = str(drafter_cfg["speculative_algorithm"]).strip().upper()
+        target_layer_ids, vllm_aux_layer_ids = normalize_standalone_layer_ids(
+            algorithm,
+            producer_cfg.get("target_layer_ids"),
+            producer_cfg.get("vllm_aux_hidden_state_layer_ids"),
+        )
         feature_contract = FeatureContract(
             algorithm=algorithm,
-            target_layer_ids=[int(value) for value in producer_cfg["target_layer_ids"]],
-            vllm_aux_hidden_state_layer_ids=[
-                int(value) for value in producer_cfg["vllm_aux_hidden_state_layer_ids"]
-            ],
+            target_layer_ids=list(target_layer_ids),
+            vllm_aux_hidden_state_layer_ids=list(vllm_aux_layer_ids),
             hidden_states_layout=resolve_drafter_hidden_states_layout(
                 algorithm, drafter_cfg
             ),

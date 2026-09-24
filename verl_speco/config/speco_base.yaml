@@ -45,7 +45,8 @@ speco:
     # launcher derives this from vllm_aux_hidden_state_layer_ids.
     target_layer_ids: null
     # IDs passed to vLLM output_hidden_states. For DSpark/DFlash/Domino the
-    # launcher subtracts one to produce target_layer_ids.
+    # launcher subtracts one to produce target_layer_ids; EAGLE3 keeps these
+    # IDs unchanged because its config already uses vLLM output IDs.
     vllm_aux_hidden_state_layer_ids: null
     hidden_dtype: bfloat16
     trust_remote_code: false

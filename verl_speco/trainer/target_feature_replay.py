@@ -549,6 +549,9 @@ def feature_from_vllm_payload(
             )
 
     selected = hidden.index_select(0, relative_positions).to(dtype=feature_config.dtype)
+    # Layer-ID normalization changes which vLLM outputs are requested, not the
+    # number or order of returned auxiliary tensors, so the target-side count
+    # remains the correct split point here.
     aux_hidden = selected[:, : len(vllm_aux_layer_ids), :].flatten(1)
     if include_final:
         if final_norm is None:

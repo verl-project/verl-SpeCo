@@ -905,6 +905,54 @@ _VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
     ),
 }
 
+_STANDALONE_TRAINING_LAYER_KEYS = {
+    "dflash": "dflash_target_layer_ids",
+    "dflash2": "dflash2_target_layer_ids",
+    "dspark": "dspark_target_layer_ids",
+    "domino": "domino_target_layer_ids",
+}
+
+
+def _standalone_training_layer_ids(
+    trainer: DrafterBaseTrainer, backend_type: str
+) -> list[int] | None:
+    drafter_cfg = getattr(
+        getattr(getattr(trainer, "config", None), "rollout", None), "drafter", None
+    )
+    training_cfg = getattr(drafter_cfg, "training", None)
+    key = _STANDALONE_TRAINING_LAYER_KEYS.get(backend_type)
+    if training_cfg is None or key is None:
+        return None
+    value = (
+        training_cfg.get(key, None)
+        if hasattr(training_cfg, "get")
+        else getattr(training_cfg, key, None)
+    )
+    if value is None:
+        return None
+    layer_ids = [int(layer_id) for layer_id in value]
+    if not layer_ids or any(layer_id < 0 for layer_id in layer_ids):
+        raise ValueError(
+            f"Invalid standalone {key}={layer_ids}: expected non-negative "
+            "decoder-layer IDs"
+        )
+    return layer_ids
+
+
+def _source_vllm_aux_layer_ids(
+    source_config: dict[str, Any] | None,
+) -> list[int] | None:
+    if source_config is None:
+        return None
+    for key in (
+        "aux_hidden_state_layer_ids",
+        "eagle_aux_hidden_state_layer_ids",
+    ):
+        value = source_config.get(key)
+        if value is not None:
+            return [int(layer_id) for layer_id in value]
+    return None
+
 
 def _rewrite_standalone_block_runtime_config(
     trainer: DrafterBaseTrainer,
@@ -955,6 +1003,7 @@ def _rewrite_standalone_block_runtime_config(
     variant_child_key, variant_alias_keys = _VARIANT_RUNTIME_ALIASES.get(
         backend_type, (None, ())
     )
+    source_runtime_config = _load_source_drafter_config(trainer)
     training_dflash_config = training_config.get("dflash_config")
     training_variant_config = (
         training_config.get(variant_child_key) if variant_child_key else None
@@ -972,6 +1021,39 @@ def _rewrite_standalone_block_runtime_config(
             else None
         )
     )
+    launcher_target_layer_ids = _standalone_training_layer_ids(trainer, backend_type)
+    if launcher_target_layer_ids is not None:
+        expected_vllm_ids = [layer_id + 1 for layer_id in launcher_target_layer_ids]
+        source_vllm_ids = _source_vllm_aux_layer_ids(source_runtime_config)
+        saved_layer_ids = (
+            [int(layer_id) for layer_id in training_target_layer_ids]
+            if training_target_layer_ids is not None
+            else None
+        )
+        if source_vllm_ids is not None:
+            if source_vllm_ids != expected_vllm_ids:
+                raise ValueError(
+                    "Standalone layer-ID migration mismatch: source checkpoint "
+                    f"vLLM IDs are {source_vllm_ids}, but launcher decoder IDs "
+                    f"{launcher_target_layer_ids} imply {expected_vllm_ids}"
+                )
+        elif saved_layer_ids not in (None, launcher_target_layer_ids):
+            raise ValueError(
+                "Cannot safely migrate standalone checkpoint target_layer_ids "
+                f"{saved_layer_ids}: source config has no explicit vLLM auxiliary "
+                f"IDs and launcher expects {launcher_target_layer_ids}"
+            )
+        # save_pretrained may have serialized a released speculators config whose
+        # target_layer_ids were copied verbatim from output-index aux IDs. The
+        # standalone launcher's decoder IDs are authoritative for this run.
+        training_target_layer_ids = launcher_target_layer_ids
+        training_config["target_layer_ids"] = list(launcher_target_layer_ids)
+        if isinstance(training_dflash_config, dict):
+            training_dflash_config["target_layer_ids"] = list(launcher_target_layer_ids)
+        if isinstance(training_variant_config, dict):
+            training_variant_config["target_layer_ids"] = list(
+                launcher_target_layer_ids
+            )
     training_decoder_layer_ids: list[int] | None = None
     if training_target_layer_ids is not None:
         try:
@@ -1002,7 +1084,7 @@ def _rewrite_standalone_block_runtime_config(
             exc,
         )
 
-    runtime_config = _load_source_drafter_config(trainer)
+    runtime_config = source_runtime_config
     if runtime_config is None:
         runtime_config = deepcopy(training_config)
         logger.warning(
