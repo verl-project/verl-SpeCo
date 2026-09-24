@@ -32,6 +32,7 @@ from verl.utils.device import get_device_name, get_torch_device
 
 from verl_speco.backends.factory import build_trainer_backend
 from verl_speco.config import config_int
+from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.trainer.base_trainer import (
     DrafterBaseTrainer,
     resolve_drafter_strategy,
@@ -141,6 +142,10 @@ async def _run_standalone_draft_training_async(
         data_parallel_process_group=None,
         backend=backend,
     )
+    # Fail in the main thread before the first batch when a resumed checkpoint
+    # declares another layer-ID convention. The export path repeats this check
+    # while rewriting the runtime config, but only on the writer thread.
+    _assert_standalone_layer_migration(trainer, getattr(backend, "model_type", None))
     max_steps = int(training_cfg.get("max_steps", training_cfg.get("step", 1000)) or 0)
     save_interval = int(training_cfg.get("save_interval_steps", 0) or 0)
     successful_steps = 0
@@ -347,6 +352,7 @@ async def _run_standalone_draft_training_async(
             sample_source = feature_producer
         sample_iterator = iter(sample_source)
         while max_steps <= 0 or optimizer_step < max_steps:
+            _raise_standalone_export_error(trainer)
             current_stage = "load_next_batch"
             loaded_batch = _next_batch_across_ranks(
                 sample_iterator,
@@ -563,6 +569,9 @@ async def _run_standalone_draft_training_async(
                     last_saved_step = optimizer_step
                 _barrier()
             current_stage = "load_next_batch"
+        # Catch an export failure reported after the last in-loop check, before
+        # the final save can succeed and end the run as a silent partial export.
+        _raise_standalone_export_error(trainer)
         final_save = bool(training_cfg.get("save_final_checkpoint", True))
         if final_save and successful_steps > 0 and optimizer_step != last_saved_step:
             current_stage = "save_final_checkpoint"
@@ -773,13 +782,25 @@ def _finalize_standalone_checkpoint(
         )
         return
 
-    _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
-    _save_resume_sidecar(
-        checkpoint_path,
-        consumed_snapshot,
-        step=step,
-        input_path=input_path,
-    )
+    # This callback runs on the checkpoint writer thread, where concurrent.futures
+    # only logs a raise. Record it so the training loop can fail from the main
+    # thread instead of finishing with an unmigrated runtime config.
+    try:
+        _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
+        _save_resume_sidecar(
+            checkpoint_path,
+            consumed_snapshot,
+            step=step,
+            input_path=input_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "[standalone] checkpoint export failed step=%s path=%s",
+            step,
+            checkpoint_path,
+        )
+        if getattr(trainer, "_standalone_export_error", None) is None:
+            setattr(trainer, "_standalone_export_error", exc)
 
 
 def _save_resume_sidecar(
@@ -952,6 +973,74 @@ def _source_vllm_aux_layer_ids(
         if value is not None:
             return [int(layer_id) for layer_id in value]
     return None
+
+
+def _source_target_layer_ids(
+    source_config: dict[str, Any], backend_type: str
+) -> list[int] | None:
+    """Read the layer IDs a source drafter config declares as decoder indices."""
+
+    candidates = [source_config]
+    for child_key in ("dflash_config", f"{backend_type}_config"):
+        child = source_config.get(child_key)
+        if isinstance(child, dict):
+            candidates.append(child)
+    for candidate in candidates:
+        value = candidate.get("target_layer_ids")
+        if value is not None:
+            return [int(layer_id) for layer_id in value]
+    return None
+
+
+def _assert_standalone_layer_migration(
+    trainer: DrafterBaseTrainer, backend_type: str | None
+) -> None:
+    """Reject a resumed checkpoint whose layer IDs use another convention.
+
+    The checkpoint export path performs the same comparison while rewriting the
+    runtime config, but that runs on the async checkpoint writer thread where a
+    raise cannot reach the training loop.  Running the check up front keeps the
+    failure in the main thread, before the run spends any GPU time.
+    """
+
+    if backend_type is None:
+        return
+    launcher_layer_ids = _standalone_training_layer_ids(trainer, backend_type)
+    if launcher_layer_ids is None:
+        return
+    source_config = _load_source_drafter_config(trainer)
+    if source_config is None:
+        return
+    _, expected_vllm_ids = normalize_standalone_layer_ids(
+        backend_type, launcher_layer_ids, None
+    )
+    source_vllm_ids = _source_vllm_aux_layer_ids(source_config)
+    if source_vllm_ids is not None:
+        if source_vllm_ids != list(expected_vllm_ids):
+            raise ValueError(
+                "Standalone layer-ID migration mismatch: source checkpoint "
+                f"vLLM IDs are {source_vllm_ids}, but launcher decoder IDs "
+                f"{launcher_layer_ids} imply {list(expected_vllm_ids)}"
+            )
+        return
+    source_target_ids = _source_target_layer_ids(source_config, backend_type)
+    if source_target_ids is not None and source_target_ids != launcher_layer_ids:
+        raise ValueError(
+            "Cannot safely migrate standalone checkpoint target_layer_ids "
+            f"{source_target_ids}: source config has no explicit vLLM auxiliary "
+            f"IDs and launcher expects {launcher_layer_ids}"
+        )
+
+
+def _raise_standalone_export_error(trainer: DrafterBaseTrainer) -> None:
+    """Re-raise a checkpoint export failure captured on the writer thread."""
+
+    error = getattr(trainer, "_standalone_export_error", None)
+    if error is not None:
+        raise RuntimeError(
+            "Standalone checkpoint export failed; the writer thread logged the "
+            "underlying traceback"
+        ) from error
 
 
 def _rewrite_standalone_block_runtime_config(

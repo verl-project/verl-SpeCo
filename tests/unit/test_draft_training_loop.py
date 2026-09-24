@@ -24,12 +24,15 @@ torch = pytest.importorskip("torch")
 from omegaconf import OmegaConf  # noqa: E402
 
 from verl_speco.trainer.draft_training_loop import (  # noqa: E402
+    _assert_standalone_layer_migration,
     _build_backend,
     _clear_tq_batch_across_ranks,
     _connect_tq_store_across_ranks,
     _contains_replay_samples,
+    _finalize_standalone_checkpoint,
     _is_out_of_memory_error,
     _next_batch_across_ranks,
+    _raise_standalone_export_error,
     _rewrite_standalone_block_runtime_config,
     _save_standalone_checkpoint,
     _should_log_batch_progress,
@@ -717,3 +720,96 @@ def test_standalone_dflash_checkpoint_rejects_negative_decoder_layer_id(tmp_path
     # Validate before writing either the runtime config or a training-config copy.
     assert json.loads(config_path.read_text(encoding="utf-8")) == training_config
     assert not (checkpoint_dir / "speco_training_config.json").exists()
+
+
+def _migration_trainer(model_type: str, model_path, target_layer_ids=None):
+    """Trainer stand-in carrying the launcher-provided decoder layer IDs."""
+    training = (
+        {}
+        if target_layer_ids is None
+        else {f"{model_type}_target_layer_ids": target_layer_ids}
+    )
+    return SimpleNamespace(
+        backend=SimpleNamespace(model_type=model_type),
+        config=SimpleNamespace(
+            rollout=SimpleNamespace(
+                drafter=SimpleNamespace(model_path=model_path, training=training)
+            )
+        ),
+    )
+
+
+def _write_drafter_config(directory, config) -> str:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    return str(directory)
+
+
+def test_standalone_layer_migration_accepts_consistent_source_config(tmp_path) -> None:
+    matching = _write_drafter_config(
+        tmp_path / "matching", {"aux_hidden_state_layer_ids": [2, 10, 18]}
+    )
+    # Launcher decoder IDs [1, 9, 17] imply vLLM output IDs [2, 10, 18].
+    _assert_standalone_layer_migration(
+        _migration_trainer("dspark", matching, [1, 9, 17]), "dspark"
+    )
+
+    # A source config that declares no layer IDs cannot conflict either.
+    silent = _write_drafter_config(tmp_path / "silent", {"model_type": "dspark"})
+    _assert_standalone_layer_migration(
+        _migration_trainer("dspark", silent, [1, 9, 17]), "dspark"
+    )
+
+    # No launcher IDs and no source config are both no-ops.
+    _assert_standalone_layer_migration(_migration_trainer("dspark", matching), "dspark")
+    _assert_standalone_layer_migration(
+        _migration_trainer("dspark", None, [1, 9, 17]), "dspark"
+    )
+
+
+def test_standalone_layer_migration_rejects_mismatched_vllm_ids(tmp_path) -> None:
+    source = _write_drafter_config(
+        tmp_path / "flipped", {"eagle_aux_hidden_state_layer_ids": [1, 9, 17]}
+    )
+
+    with pytest.raises(ValueError, match="migration mismatch"):
+        _assert_standalone_layer_migration(
+            _migration_trainer("dspark", source, [1, 9, 17]), "dspark"
+        )
+
+
+def test_standalone_layer_migration_rejects_mismatched_decoder_ids(tmp_path) -> None:
+    source = _write_drafter_config(
+        tmp_path / "decoder", {"dflash_config": {"target_layer_ids": [0, 8, 16]}}
+    )
+
+    with pytest.raises(ValueError, match="Cannot safely migrate"):
+        _assert_standalone_layer_migration(
+            _migration_trainer("dspark", source, [1, 9, 17]), "dspark"
+        )
+
+
+def test_standalone_checkpoint_export_error_surfaces_in_main_thread(
+    monkeypatch, tmp_path
+) -> None:
+    trainer = _migration_trainer("dspark", None)
+    completed = Future()
+    completed.set_result({"saved": True, "path": str(tmp_path)})
+
+    def fail_export(*args, **kwargs):
+        raise ValueError("layer-ID migration mismatch")
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop._rewrite_standalone_block_runtime_config",
+        fail_export,
+    )
+
+    # The writer-thread callback must not raise; it records the failure instead.
+    _finalize_standalone_checkpoint(
+        trainer, str(tmp_path / "draft_step_5"), completed, step=5
+    )
+
+    assert isinstance(trainer._standalone_export_error, ValueError)
+    with pytest.raises(RuntimeError, match="checkpoint export failed") as exc_info:
+        _raise_standalone_export_error(trainer)
+    assert isinstance(exc_info.value.__cause__, ValueError)
