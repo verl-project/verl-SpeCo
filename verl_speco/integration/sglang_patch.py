@@ -27,6 +27,9 @@ from typing import Any, Callable, Iterable, TypeGuard, cast
 import torch
 import sglang.srt.entrypoints.engine
 from sglang.srt.utils import MultiprocessingSerializer
+from verl_speco.integration.sglang_adapter import (
+    _call_flashinfer_plan_with_abi_compat,
+)
 
 try:
     import triton
@@ -81,6 +84,8 @@ _SGLANG_RAW_TOP_LOGPROBS_REQUEST_GATE_PATCHED = False
 _SGLANG_QWEN3_ROPE_COMPAT_PATCHED = False
 _SGLANG_SCHEDULER_PROCESS_PATCHED = False
 _SGLANG_EAGLE_LEGACY_ALIGNMENT_PATCHED = False
+_SGLANG_FLASHINFER_PLAN_ABI_PATCHED = False
+_SGLANG_FLASHINFER_PLAN_ABI_FALLBACK_LOGGED = False
 _SGLANG_DRAFTER_DECOUPLED_FORWARD_LOG_COUNT = 0
 _SGLANG_DRAFTER_DECOUPLED_REPLAY_LOG_COUNT = 0
 _SGLANG_LAST_HIDDEN_LOGPROB_CHECK_LOG_COUNT = 0
@@ -89,11 +94,13 @@ _SGLANG_LAST_HIDDEN_FILTER_DEBUG_LOG_COUNT = 0
 _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
 _SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME = "qwen3_rope_compat"
+_SGLANG_FLASHINFER_PLAN_ABI_PATCH_NAME = "flashinfer_plan_abi"
 _SGLANG_PATCH_NAMES = {
     "eagle_update_weights",
     "npu_eagle_target_sampling",
     "hidden_states_tensor_output",
     _SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME,
+    _SGLANG_FLASHINFER_PLAN_ABI_PATCH_NAME,
 }
 _VERL_DRAFTER_HIDDEN_WINDOW_PARAM = "_verl_drafter_hidden_state_window"
 _VERL_HIDDEN_STATE_FRONT_TOKENS_PARAM = "_verl_hidden_state_front_tokens_per_sample"
@@ -145,6 +152,55 @@ _VERL_TARGET_LOGPROBS_SOURCE_METADATA_KEY = "target_logprobs_source"
 _VERL_RAW_TOPK_LOGPROB_CHECK_METADATA_KEY = "raw_topk_logprob_check"
 _VERL_TARGET_LOGPROBS_SOURCE_RAW_HIDDEN_METADATA = "raw_hidden_metadata"
 _SGLANG_PATCH_SELECTION_FROM_ENV = object()
+
+
+class _FlashInferPlanCompatProxy:
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+    def plan(self, *args):
+        def log_fallback_once():
+            global _SGLANG_FLASHINFER_PLAN_ABI_FALLBACK_LOGGED
+            if not _SGLANG_FLASHINFER_PLAN_ABI_FALLBACK_LOGGED:
+                logger.warning(
+                    "[speco sglang flashinfer compat] retrying legacy 19-argument "
+                    "prefill plan ABI without uniform_q_len"
+                )
+                _SGLANG_FLASHINFER_PLAN_ABI_FALLBACK_LOGGED = True
+
+        return _call_flashinfer_plan_with_abi_compat(
+            self._wrapped.plan, *args, on_legacy_abi=log_fallback_once
+        )
+
+
+def patch_sglang_flashinfer_plan_abi() -> None:
+    """Keep SGLang's fast path compatible with FlashInfer before uniform_q_len."""
+
+    global _SGLANG_FLASHINFER_PLAN_ABI_PATCHED
+    if _SGLANG_FLASHINFER_PLAN_ABI_PATCHED:
+        return
+
+    module = importlib.import_module("sglang.srt.layers.attention.flashinfer_backend")
+    original = module.fast_prefill_plan
+    if getattr(original, "_verl_flashinfer_plan_abi_compat", False):
+        _SGLANG_FLASHINFER_PLAN_ABI_PATCHED = True
+        return
+
+    @wraps(original)
+    def patched_fast_prefill_plan(self, *args, **kwargs):
+        cached_module = self._cached_module
+        self._cached_module = _FlashInferPlanCompatProxy(cached_module)
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            self._cached_module = cached_module
+
+    patched_fast_prefill_plan._verl_flashinfer_plan_abi_compat = True
+    module.fast_prefill_plan = patched_fast_prefill_plan
+    _SGLANG_FLASHINFER_PLAN_ABI_PATCHED = True
 
 
 def enable_sglang_original_logprob_return() -> None:
@@ -608,6 +664,94 @@ def _make_verl_eagle_update_weights_patch(original_update_weights):
     return patched_update_weights_from_tensor
 
 
+def _patch_spec_worker_weight_update(worker_cls: type) -> bool:
+    original_update_weights = vars(worker_cls).get(
+        "update_weights_from_tensor",
+        _default_spec_worker_update_weights_from_tensor,
+    )
+    if getattr(original_update_weights, "_verl_patched_eagle_update_weights", False):
+        return False
+    setattr(
+        worker_cls,
+        "update_weights_from_tensor",
+        _make_verl_eagle_update_weights_patch(original_update_weights),
+    )
+    return True
+
+
+def _patch_sglang_scheduler_weight_update_dispatch() -> bool:
+    """Consume draft route markers before SGLang's target-biased dispatcher."""
+
+    try:
+        module = importlib.import_module(
+            "sglang.srt.managers.scheduler_components.weight_updater"
+        )
+    except Exception:
+        return False
+    manager_cls = getattr(module, "SchedulerWeightUpdaterManager", None)
+    original_update = getattr(manager_cls, "update_weights_from_tensor", None)
+    if original_update is None:
+        return False
+    if getattr(original_update, "_verl_patched_spec_worker_dispatch", False):
+        return False
+
+    @wraps(original_update)
+    def patched_update_weights_from_tensor(self, recv_req):
+        _, draft_weight_loader = _get_route_markers()
+        if (
+            draft_weight_loader is not None
+            and getattr(recv_req, "load_format", None) == draft_weight_loader
+        ):
+            with self._observe_weight_load("tensor"):
+                scheduler = getattr(self, "scheduler", None)
+                draft_worker = getattr(self, "draft_worker", None) or getattr(
+                    scheduler, "draft_worker", None
+                )
+                if draft_worker is None and scheduler is not None:
+                    model_worker = getattr(scheduler, "model_worker", None)
+                    if model_worker is not getattr(self, "tp_worker", None):
+                        draft_worker = model_worker
+                if draft_worker is None:
+                    spec_algorithm = getattr(scheduler, "spec_algorithm", None)
+                    server_args = getattr(scheduler, "server_args", None)
+                    success, message = (
+                        False,
+                        "SGLang speculative draft worker is missing "
+                        f"(scheduler_spec_algorithm={spec_algorithm!s}, "
+                        "server_args_algorithm="
+                        f"{getattr(server_args, 'speculative_algorithm', None)!s}, "
+                        "manager_draft_worker="
+                        f"{type(getattr(self, 'draft_worker', None)).__name__}, "
+                        "scheduler_draft_worker="
+                        f"{type(getattr(scheduler, 'draft_worker', None)).__name__}, "
+                        "scheduler_model_worker="
+                        f"{type(getattr(scheduler, 'model_worker', None)).__name__}, "
+                        f"target_worker={type(getattr(self, 'tp_worker', None)).__name__}).",
+                    )
+                else:
+                    success, message = _make_verl_eagle_update_weights_patch(
+                        _default_spec_worker_update_weights_from_tensor
+                    )(draft_worker, recv_req)
+                if success:
+                    self.flush_cache_after_weight_update(recv_req)
+                    self.record_weight_version_after_update(recv_req.weight_version)
+                else:
+                    logger.error(message)
+                torch.distributed.barrier(group=self.tp_cpu_group)
+                return module.UpdateWeightsFromTensorReqOutput(
+                    success=success, message=message
+                )
+
+        draft_worker = getattr(self, "draft_worker", None)
+        if draft_worker is not None:
+            _patch_spec_worker_weight_update(type(draft_worker))
+        return original_update(self, recv_req)
+
+    setattr(patched_update_weights_from_tensor, "_verl_patched_spec_worker_dispatch", True)
+    manager_cls.update_weights_from_tensor = patched_update_weights_from_tensor
+    return True
+
+
 def patch_sglang_eagle_update_weights_from_tensor() -> None:
     """Patch SGLang speculative workers so target-only and draft-only sync skip the wrong side early.
 
@@ -617,9 +761,6 @@ def patch_sglang_eagle_update_weights_from_tensor() -> None:
     underneath the same routing wrapper.
     """
     global _SGLANG_EAGLE_UPDATE_PATCHED
-    if _SGLANG_EAGLE_UPDATE_PATCHED:
-        return
-
     patched_classes = []
     eagle_modules = (
         "sglang.srt.speculative.eagle_worker",
@@ -657,18 +798,17 @@ def patch_sglang_eagle_update_weights_from_tensor() -> None:
             ):
                 continue
 
-            setattr(
-                cls,
-                "update_weights_from_tensor",
-                _make_verl_eagle_update_weights_patch(original_update_weights),
-            )
-            patched_classes.append(f"{module_name}.{class_name}")
+            if _patch_spec_worker_weight_update(cls):
+                patched_classes.append(f"{module_name}.{class_name}")
 
-    if patched_classes:
+    scheduler_dispatch_patched = _patch_sglang_scheduler_weight_update_dispatch()
+
+    if patched_classes or scheduler_dispatch_patched:
         _SGLANG_EAGLE_UPDATE_PATCHED = True
         logger.info(
-            "Patched SGLang speculative routed weight update for %s",
-            ", ".join(patched_classes),
+            "Patched SGLang speculative routed weight update for %s%s",
+            ", ".join(patched_classes) or "late-bound workers",
+            " and scheduler dispatch" if scheduler_dispatch_patched else "",
         )
 
 
@@ -6283,6 +6423,7 @@ def _apply_selected_sglang_patches(
 
     patchers = (
         (_SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME, patch_sglang_qwen3_rope_compat),
+        (_SGLANG_FLASHINFER_PLAN_ABI_PATCH_NAME, patch_sglang_flashinfer_plan_abi),
         ("eagle_update_weights", patch_sglang_eagle_update_weights_from_tensor),
         ("npu_eagle_target_sampling", patch_sglang_npu_eagle_target_sampling),
         ("hidden_states_tensor_output", patch_sglang_hidden_states_tensor_output),

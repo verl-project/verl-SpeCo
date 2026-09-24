@@ -64,7 +64,7 @@ faster end-to-end training without accuracy regression.
 | EAGLE3 | vLLM, SGLang | FSDP | Available |
 | DFlash | vLLM, SGLang | FSDP | Available |
 | DFlash2 | vLLM via DFlash, SGLang via DFLASH | FSDP | Available |
-| DSpark | vLLM | FSDP | Available |
+| DSpark | vLLM, SGLang | FSDP | SGLang adapter tested; GPU rollout unverified |
 | Domino | vLLM, SGLang via DFlash | FSDP | Available |
 | P-EAGLE | Not wired in this overlay | FSDP | Training only |
 
@@ -144,6 +144,14 @@ do not enable dynamic verification length. The Qwen checkpoint must declare
 `architectures=["Qwen3DSparkModel"]` and use `sample_from_anchor=true` (or omit
 it for the native default); the fixed verification length must not exceed the
 checkpoint's training `block_size`.
+
+For DSpark on this SGLang checkout, set `actor_rollout_ref.rollout.name=sglang`
+and `actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK` with a
+DSpark checkpoint in `drafter.model_path`. Keep `rollout.spec_steps=1` and
+`rollout.spec_topk=1`. Set `rollout.spec_verify_tokens` to the trained DSpark
+`block_size` (gamma); the adapter passes gamma + 1 to SGLang's
+`speculative_num_draft_tokens`. Collect training hidden states through
+`training.collect_hidden_states_from_old_logprob=true` as in the vLLM example.
 
 ### VeOmni Actor Compatibility
 

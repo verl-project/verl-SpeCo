@@ -192,6 +192,8 @@ def test_after_actor_update_requires_snapshot_only_from_publish_leader() -> None
             "successful_steps": 1,
             "attempted_steps": 1,
             "optimizer_step": 8,
+            "drafter/optimizer_steps_total": 8.0,
+            "drafter/current_lr": 2.5e-5,
             "publish_snapshot_cached": int(snapshot_ready),
             "is_publish_leader": is_publish_leader,
         }
@@ -214,6 +216,8 @@ def test_after_actor_update_requires_snapshot_only_from_publish_leader() -> None
     assert outcome.metrics["drafter/train_worker_results_consistent"] == 1
     assert outcome.metrics["drafter/train_publish_leader_count"] == 1
     assert outcome.metrics["drafter/train_publish_leader_snapshot_ready"] == 1
+    assert outcome.metrics["drafter/optimizer_steps_total"] == 8.0
+    assert outcome.metrics["drafter/current_lr"] == 2.5e-5
 
 
 def test_after_actor_update_allows_target_version_when_not_required() -> None:
