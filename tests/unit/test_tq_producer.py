@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -169,6 +170,42 @@ class _Transport:
         self.closed = True
 
 
+class _ConcurrentTransport(_Transport):
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self.active_puts = 0
+        self.max_active_puts = 0
+
+    def put_sample(self, key, fields, *, tag):
+        if tag.get("record_type") != "sample":
+            return super().put_sample(key, fields, tag=tag)
+        with self._lock:
+            self.active_puts += 1
+            self.max_active_puts = max(self.max_active_puts, self.active_puts)
+        try:
+            time.sleep(0.05)
+            return super().put_sample(key, fields, tag=tag)
+        finally:
+            with self._lock:
+                self.active_puts -= 1
+
+
+class _TransientFailureTransport(_Transport):
+    def __init__(self, failures: int):
+        super().__init__()
+        self.failures_remaining = failures
+        self.sample_put_attempts = 0
+
+    def put_sample(self, key, fields, *, tag):
+        if tag.get("record_type") == "sample":
+            self.sample_put_attempts += 1
+            if self.failures_remaining > 0:
+                self.failures_remaining -= 1
+                raise RuntimeError("transient put failure")
+        return super().put_sample(key, fields, tag=tag)
+
+
 class _Pool:
     def __init__(self, root: Path, *, close_error: BaseException | None = None):
         self.root = root
@@ -184,7 +221,7 @@ class _Pool:
 
     async def prefill(self, request: Any) -> RawVllmFeature:
         self.prefill_calls += 1
-        path = self.root / f"{request.sample_id}.safetensors"
+        path = self.root / f"{request.sample_id}-{request.sequence_no}.safetensors"
         path.write_bytes(b"temporary")
         self.paths.append(path)
         token_ids = torch.tensor(request.prompt_token_ids, dtype=torch.int64)
@@ -200,7 +237,7 @@ class _Pool:
 
     async def generate(self, request: Any) -> RawVllmFeature:
         self.generate_calls += 1
-        path = self.root / f"{request.sample_id}.safetensors"
+        path = self.root / f"{request.sample_id}-{request.sequence_no}.safetensors"
         path.write_bytes(b"temporary")
         self.paths.append(path)
         # ExampleHiddenStatesConnector excludes the final generated token because
@@ -318,6 +355,84 @@ def test_run_producer_publishes_samples_then_eos(
         sample.hidden_states[:, 4:], target_final_norm(raw[:, 2])
     )
     assert sample.metadata["last_hidden_state_norm"] == "target_final_norm"
+
+
+def test_run_producer_publishes_samples_concurrently(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["publish_workers"] = 2
+    transport = _ConcurrentTransport()
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=_Pool(tmp_path),
+        )
+    )
+
+    assert stats.published_count == 2
+    assert transport.max_active_puts == 2
+    assert any(tag.get("status") == "eos" for tag in transport.records.values())
+
+
+def test_run_producer_logs_perf_window_at_info(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    import verl_speco.standalone_tq_producer as producer_module
+
+    monkeypatch.setattr(producer_module, "_PERF_WINDOW_SAMPLES", 2)
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+
+    with caplog.at_level("INFO", logger="verl_speco.standalone_tq_producer"):
+        asyncio.run(
+            run_producer(
+                _config(input_path),
+                transport=_Transport(),
+                tokenizer=_Tokenizer(),
+                client_pool=_Pool(tmp_path),
+            )
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Producer perf samples=2" in message for message in messages)
+    assert any("perf middle samples:" in message for message in messages)
+    assert any("perf slowest e2e samples:" in message for message in messages)
+    assert any("perf slowest transport samples:" in message for message in messages)
+
+
+def test_run_producer_retries_transient_publish_failure(
+    tmp_path: Path, caplog
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    producer = config["speco"]["standalone_tq_producer"]
+    producer["max_samples"] = 1
+    producer["publish_workers"] = 1
+    producer["publish_max_attempts"] = 3
+    producer["publish_retry_backoff_seconds"] = 0
+    transport = _TransientFailureTransport(failures=2)
+    pool = _Pool(tmp_path)
+
+    with caplog.at_level("WARNING", logger="verl_speco.standalone_tq_producer"):
+        stats = asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
+    assert stats.published_count == 1
+    assert transport.sample_put_attempts == 3
+    assert sum("publish retry" in record.getMessage() for record in caplog.records) == 2
+    assert all(not path.exists() for path in pool.paths)
+    assert any(tag.get("status") == "eos" for tag in transport.records.values())
 
 
 @pytest.mark.parametrize("algorithm", ["DFLASH", "DSPARK"])

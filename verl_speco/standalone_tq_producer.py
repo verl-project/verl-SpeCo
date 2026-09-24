@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from collections import Counter
@@ -74,6 +75,7 @@ _INPUT_DONE = object()
 _PUBLISH_DONE = object()
 _FEATURE_CONVERSION_WORKERS = 8
 _HEARTBEAT_INTERVAL_SECONDS = 60.0
+_PERF_WINDOW_SAMPLES = 100
 
 
 @dataclass
@@ -92,17 +94,89 @@ class PreparedFeature:
     raw: RawVllmFeature
     sample: DraftFeatureSample
     metadata: SampleMetadata
+    timing: dict[str, float]
 
 
-async def publish_one(result: PreparedFeature, transport: Any) -> str:
-    """Publish one sample and delete its temporary file only after TQ succeeds."""
-
+def _encode_publish_payload(
+    result: PreparedFeature,
+) -> tuple[str, dict[str, torch.Tensor], dict[str, Any], float]:
+    encode_started = time.monotonic()
     key = make_sample_key(result.metadata)
     fields = encode_sample(result.sample, result.metadata)
     tag = make_ready_tag(result.metadata)
-    await asyncio.to_thread(transport.put_sample, key, fields, tag=tag)
+    encode_seconds = time.monotonic() - encode_started
+    return key, fields, tag, encode_seconds
+
+
+def _put_sample_sync(
+    transport: Any,
+    key: str,
+    fields: dict[str, torch.Tensor],
+    tag: dict[str, Any],
+) -> None:
+    transport.put_sample(key, fields, tag=tag)
+
+
+def _cleanup_result_sync(result: PreparedFeature) -> float:
+    cleanup_started = time.monotonic()
     delete_temporary_result(result.raw)
-    return key
+    return time.monotonic() - cleanup_started
+
+
+async def publish_one(
+    result: PreparedFeature,
+    transport: Any,
+    *,
+    executor: ThreadPoolExecutor | None = None,
+    max_attempts: int = 3,
+    retry_backoff_seconds: float = 0.5,
+) -> tuple[str, float, float, float, int, float]:
+    """Publish one sample with bounded retries without blocking the event loop."""
+
+    loop = asyncio.get_running_loop()
+    key, fields, tag, encode_seconds = await loop.run_in_executor(
+        executor, partial(_encode_publish_payload, result)
+    )
+    transport_seconds = 0.0
+    retry_wait_seconds = 0.0
+    for attempt in range(1, max_attempts + 1):
+        transport_started = time.monotonic()
+        try:
+            await loop.run_in_executor(
+                executor,
+                partial(_put_sample_sync, transport, key, fields, tag),
+            )
+            transport_seconds += time.monotonic() - transport_started
+            cleanup_seconds = await loop.run_in_executor(
+                executor, partial(_cleanup_result_sync, result)
+            )
+            return (
+                key,
+                encode_seconds,
+                transport_seconds,
+                cleanup_seconds,
+                attempt,
+                retry_wait_seconds,
+            )
+        except Exception as exc:
+            transport_seconds += time.monotonic() - transport_started
+            if attempt >= max_attempts:
+                raise
+            delay = retry_backoff_seconds * (2 ** (attempt - 1))
+            logger.warning(
+                "Standalone TQ Producer publish retry sample_id=%s sequence_no=%s "
+                "attempt=%s/%s retry_in=%.3fs error=%r",
+                result.request.sample_id,
+                result.request.sequence_no,
+                attempt,
+                max_attempts,
+                delay,
+                exc,
+            )
+            retry_wait_started = time.monotonic()
+            await asyncio.sleep(delay)
+            retry_wait_seconds += time.monotonic() - retry_wait_started
+    raise AssertionError("unreachable")
 
 
 def validate_producer_config(config: Any) -> None:
@@ -161,12 +235,81 @@ def validate_producer_config(config: Any) -> None:
     invalid = [name for name in positive_fields if int(producer_cfg.get(name, 0)) <= 0]
     if invalid:
         raise ValueError(f"standalone_tq_producer fields must be positive: {invalid}")
+    if int(producer_cfg.get("publish_workers", 4)) <= 0:
+        raise ValueError("standalone_tq_producer.publish_workers must be positive")
+    if int(producer_cfg.get("publish_max_attempts", 3)) <= 0:
+        raise ValueError("standalone_tq_producer.publish_max_attempts must be positive")
+    if float(producer_cfg.get("publish_retry_backoff_seconds", 0.5)) < 0:
+        raise ValueError(
+            "standalone_tq_producer.publish_retry_backoff_seconds must be non-negative"
+        )
     if int(producer_cfg.get("vllm_success_log_interval", 100)) < 0:
         raise ValueError("vllm_success_log_interval must be non-negative")
 
 
 def _should_log_sample_progress(count: int) -> bool:
     return count <= 3 or count % 50 == 0
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, math.ceil(percentile * len(ordered)) - 1))
+    return ordered[index]
+
+
+def _timing_value(timing: Mapping[str, float], name: str) -> float:
+    return max(float(timing.get(name, 0.0)), 0.0)
+
+
+def _tensor_bytes(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return int(value.numel() * value.element_size())
+    if isinstance(value, (list, tuple)):
+        return sum(_tensor_bytes(item) for item in value)
+    return 0
+
+
+def _sample_bytes(sample: DraftFeatureSample) -> int:
+    return sum(
+        _tensor_bytes(getattr(sample, name))
+        for name in (
+            "input_ids",
+            "loss_mask",
+            "hidden_states",
+            "last_hidden_states",
+            "target",
+            "target_logprobs",
+            "position_ids",
+        )
+    )
+
+
+def _format_perf_sample(row: Mapping[str, Any]) -> str:
+    timing = row["timing"]
+    return (
+        f"sample_id={row['sample_id']} sequence_no={row['sequence_no']} "
+        f"endpoint={row['endpoint']} prompt_tokens={row['prompt_tokens']} "
+        f"generated_tokens={row['generated_tokens']} hidden_state_mb={row['mb']:.2f} "
+        f"e2e={_timing_value(timing, 'e2e'):.3f}s "
+        f"input_prepare={_timing_value(timing, 'input_prepare'):.3f}s "
+        f"input_queue={_timing_value(timing, 'input_queue'):.3f}s "
+        f"scheduler_wait={_timing_value(timing, 'scheduler_wait'):.3f}s "
+        f"tq_capacity={_timing_value(timing, 'tq_capacity'):.3f}s "
+        f"generate={_timing_value(timing, 'generate'):.3f}s "
+        f"prefill={_timing_value(timing, 'prefill'):.3f}s "
+        f"feature_slot={_timing_value(timing, 'feature_slot'):.3f}s "
+        f"conversion={_timing_value(timing, 'conversion'):.3f}s "
+        f"publish_queue={_timing_value(timing, 'publish_queue'):.3f}s "
+        f"tq_encode={_timing_value(timing, 'tq_encode'):.3f}s "
+        f"tq_transport={_timing_value(timing, 'tq_transport'):.3f}s "
+        f"tq_attempts={int(_timing_value(timing, 'tq_attempts'))} "
+        f"tq_retry_wait={_timing_value(timing, 'tq_retry_wait'):.3f}s "
+        f"temp_cleanup={_timing_value(timing, 'temp_cleanup'):.3f}s "
+        f"active={_timing_value(timing, 'active'):.3f}s "
+        f"backpressure={_timing_value(timing, 'backpressure'):.3f}s"
+    )
 
 
 async def run_producer(
@@ -194,6 +337,7 @@ async def run_producer(
     completed = False
     pool = client_pool
     feature_executor: ThreadPoolExecutor | None = None
+    publish_executor: ThreadPoolExecutor | None = None
     try:
         logger.info(
             "Standalone TQ Producer starting run_id=%s input=%s endpoints=%s",
@@ -282,9 +426,29 @@ async def run_producer(
                 dtype=feature_contract.dtype,
                 trust_remote_code=bool(producer_cfg.get("trust_remote_code", False)),
             )
+            target_num_hidden_layers = getattr(
+                final_norm, "_speco_target_num_hidden_layers", None
+            )
+            if target_num_hidden_layers is not None:
+                feature_contract = replace(
+                    feature_contract,
+                    target_num_hidden_layers=int(target_num_hidden_layers),
+                )
         feature_executor = ThreadPoolExecutor(
             max_workers=_FEATURE_CONVERSION_WORKERS,
             thread_name_prefix="speco-feature",
+        )
+        publish_workers = int(producer_cfg.get("publish_workers", 4))
+        publish_executor = ThreadPoolExecutor(
+            max_workers=publish_workers,
+            thread_name_prefix="speco-publish",
+        )
+        logger.info(
+            "Standalone TQ Producer pipeline workers requests=%s features=%s "
+            "publishers=%s",
+            int(producer_cfg["max_inflight_requests"]),
+            _FEATURE_CONVERSION_WORKERS,
+            publish_workers,
         )
         feature_slots = asyncio.Semaphore(_FEATURE_CONVERSION_WORKERS)
         event_loop = asyncio.get_running_loop()
@@ -296,6 +460,13 @@ async def run_producer(
             maxsize=int(producer_cfg["publish_queue_size"])
         )
         stages: dict[str, tuple[str, float, str]] = {}
+        sample_timings: dict[int, dict[str, float]] = {}
+        perf_rows: list[dict[str, Any]] = []
+        perf_window_started = time.monotonic()
+        peak_publish_queue = 0
+        publish_inflight = 0
+        peak_publish_inflight = 0
+        peak_pending_bytes = 0
         last_published_at = time.monotonic()
         producer_started_at = last_published_at
         max_samples = int(producer_cfg.get("max_samples", 0) or 0)
@@ -462,6 +633,7 @@ async def run_producer(
         request_generation_lock = asyncio.Lock()
 
         def next_request() -> Any:
+            input_started = time.monotonic()
             try:
                 request = next(requests)
             except StopIteration:
@@ -469,6 +641,10 @@ async def run_producer(
                 # boundary used by ``asyncio.to_thread``; signal exhaustion
                 # with a sentinel instead.
                 return _INPUT_DONE
+            sample_timings[int(request.sequence_no)] = {
+                "e2e_started": input_started,
+                "input_prepare": time.monotonic() - input_started,
+            }
             stats.input_count += 1
             if _should_log_sample_progress(stats.input_count):
                 logger.info(
@@ -489,6 +665,9 @@ async def run_producer(
                 if request is _INPUT_DONE:
                     break
                 mark_stage("input", "input_queue_put", request.sample_id)
+                sample_timings[int(request.sequence_no)]["input_queue_started"] = (
+                    time.monotonic()
+                )
                 await input_queue.put(request)
                 initial_count += 1
             for _ in range(worker_count):
@@ -499,6 +678,7 @@ async def run_producer(
             stages.pop("input", None)
 
         async def request_worker() -> None:
+            nonlocal peak_pending_bytes, peak_publish_queue
             current = asyncio.current_task()
             worker = current.get_name() if current is not None else "request-unknown"
             replacement_request = None
@@ -511,18 +691,23 @@ async def run_producer(
                     request = replacement_request
                     replacement_request = None
                 if request is _INPUT_DONE:
-                    mark_stage(worker, "publish_queue_done")
-                    await publish_queue.put(_PUBLISH_DONE)
                     stages.pop(worker, None)
                     return
+                timing = sample_timings[int(request.sequence_no)]
+                now = time.monotonic()
+                input_queue_started = timing.pop("input_queue_started", now)
+                timing["input_queue"] = now - input_queue_started
                 if before_request is not None:
+                    scheduler_wait_started = time.monotonic()
                     if (
                         get_runtime_state is not None
                         and get_runtime_state() == "paused"
                     ):
                         mark_stage(worker, "scheduler_paused", request.sample_id)
                     await before_request()
+                    timing["scheduler_wait"] = time.monotonic() - scheduler_wait_started
                 mark_stage(worker, "tq_capacity", request.sample_id)
+                capacity_started = time.monotonic()
                 # The scheduled Ray path applies high/low-watermark control in
                 # the Driver. Keep legacy polling only for the subprocess path.
                 if before_request is None:
@@ -534,6 +719,7 @@ async def run_producer(
                             producer_cfg["pending_poll_interval_seconds"]
                         ),
                     )
+                timing["tq_capacity"] = time.monotonic() - capacity_started
                 if _should_log_sample_progress(int(request.sequence_no) + 1):
                     logger.info(
                         "Standalone TQ Producer requesting vLLM sequence_no=%s "
@@ -546,7 +732,9 @@ async def run_producer(
                     )
                 if isinstance(request, GenerationRequest):
                     mark_stage(worker, "vllm_generate", request.sample_id)
+                    generate_started = time.monotonic()
                     generated = await pool.generate(request)
+                    timing["generate"] = time.monotonic() - generate_started
                     try:
                         try:
                             request = prepare_generated_prefill_request(
@@ -583,6 +771,7 @@ async def run_producer(
                                 ) from exc
                             if max_samples > 0:
                                 replacement_request = await next_request_async()
+                            sample_timings.pop(int(request.sequence_no), None)
                             continue
                     finally:
                         # The generation request may still produce a prompt-only
@@ -590,14 +779,22 @@ async def run_producer(
                         # following full-sequence prefill produces that payload.
                         await asyncio.to_thread(delete_temporary_result, generated)
                     mark_stage(worker, "vllm_prefill", request.sample_id)
+                    prefill_started = time.monotonic()
                     raw = await pool.prefill(request)
+                    timing["prefill"] = time.monotonic() - prefill_started
                 else:
                     mark_stage(worker, "vllm_prefill", request.sample_id)
+                    prefill_started = time.monotonic()
                     raw = await pool.prefill(request)
+                    timing["prefill"] = time.monotonic() - prefill_started
                 stats.pending_bytes += int(raw.byte_size)
+                peak_pending_bytes = max(peak_pending_bytes, stats.pending_bytes)
                 try:
                     mark_stage(worker, "feature_conversion", request.sample_id)
+                    feature_slot_started = time.monotonic()
                     async with feature_slots:
+                        timing["feature_slot"] = time.monotonic() - feature_slot_started
+                        conversion_started = time.monotonic()
                         sample = await event_loop.run_in_executor(
                             feature_executor,
                             partial(
@@ -608,6 +805,7 @@ async def run_producer(
                                 final_norm=final_norm,
                             ),
                         )
+                        timing["conversion"] = time.monotonic() - conversion_started
                 except HiddenStateAlignmentError as exc:
                     stats.dropped_count += 1
                     consecutive_replacements += 1
@@ -645,11 +843,13 @@ async def run_producer(
                             replacement_request.sequence_no,
                             replacement_request.sample_id,
                         )
+                    sample_timings.pop(int(request.sequence_no), None)
                     continue
                 # A successful feature conversion resets the consecutive-replacement
                 # circuit breaker (feature drops and filtered generations).
                 consecutive_replacements = 0
                 mark_stage(worker, "publish_queue_put", request.sample_id)
+                timing["publish_queue_started"] = time.monotonic()
                 await publish_queue.put(
                     PreparedFeature(
                         request=request,
@@ -658,22 +858,200 @@ async def run_producer(
                         metadata=_sample_metadata(
                             request, sample, feature_contract, run_id, tq_cfg
                         ),
+                        timing=timing,
                     )
                 )
+                peak_publish_queue = max(peak_publish_queue, publish_queue.qsize())
+
+        def log_perf_window() -> None:
+            nonlocal perf_window_started, peak_publish_queue
+            nonlocal peak_publish_inflight, peak_pending_bytes
+            if len(perf_rows) < _PERF_WINDOW_SAMPLES:
+                return
+            now = time.monotonic()
+            window = max(now - perf_window_started, 1e-9)
+            timing_names = (
+                "e2e",
+                "input_prepare",
+                "input_queue",
+                "scheduler_wait",
+                "tq_capacity",
+                "generate",
+                "prefill",
+                "feature_slot",
+                "conversion",
+                "publish_queue",
+                "tq_encode",
+                "tq_transport",
+                "tq_retry_wait",
+                "temp_cleanup",
+                "active",
+                "backpressure",
+            )
+            averages = {
+                name: sum(_timing_value(row["timing"], name) for row in perf_rows)
+                / len(perf_rows)
+                for name in timing_names
+            }
+            e2e = [_timing_value(row["timing"], "e2e") for row in perf_rows]
+            transport_times = [
+                _timing_value(row["timing"], "tq_transport") for row in perf_rows
+            ]
+            total_mb = sum(float(row["mb"]) for row in perf_rows)
+            logger.info(
+                "Standalone TQ Producer perf samples=%s window=%.3fs rate=%.2f/s "
+                "e2e_avg=%.3fs e2e_p95=%.3fs e2e_max=%.3fs "
+                "input_prepare_avg=%.3fs input_queue_avg=%.3fs "
+                "scheduler_wait_avg=%.3fs tq_capacity_avg=%.3fs "
+                "generate_avg=%.3fs prefill_avg=%.3fs "
+                "feature_slot_avg=%.3fs conversion_avg=%.3fs "
+                "publish_queue_avg=%.3fs tq_encode_avg=%.3fs "
+                "tq_transport_avg=%.3fs tq_transport_p95=%.3fs "
+                "tq_transport_max=%.3fs temp_cleanup_avg=%.3fs "
+                "tq_retry_wait_avg=%.3fs tq_retried_samples=%s "
+                "active_avg=%.3fs backpressure_avg=%.3fs hidden_state_mb=%.2f "
+                "hidden_state_mb_per_second=%.2f tq_transport_mb_per_second=%.2f "
+                "prefill_tokens=%s prefill_tokens_per_second=%.2f "
+                "publish_queue_peak=%s "
+                "publish_inflight_peak=%s pending_mb_peak=%.2f",
+                len(perf_rows),
+                window,
+                len(perf_rows) / window,
+                sum(e2e) / len(e2e),
+                _percentile(e2e, 0.95),
+                max(e2e),
+                averages["input_prepare"],
+                averages["input_queue"],
+                averages["scheduler_wait"],
+                averages["tq_capacity"],
+                averages["generate"],
+                averages["prefill"],
+                averages["feature_slot"],
+                averages["conversion"],
+                averages["publish_queue"],
+                averages["tq_encode"],
+                averages["tq_transport"],
+                _percentile(transport_times, 0.95),
+                max(transport_times),
+                averages["temp_cleanup"],
+                averages["tq_retry_wait"],
+                sum(
+                    1
+                    for row in perf_rows
+                    if _timing_value(row["timing"], "tq_attempts") > 1
+                ),
+                averages["active"],
+                averages["backpressure"],
+                total_mb,
+                total_mb / window,
+                total_mb / max(sum(transport_times), 1e-9),
+                sum(int(row["prompt_tokens"]) for row in perf_rows),
+                sum(int(row["prompt_tokens"]) for row in perf_rows) / window,
+                peak_publish_queue,
+                peak_publish_inflight,
+                peak_pending_bytes / (1024 * 1024),
+            )
+            ordered_by_sequence = sorted(
+                perf_rows, key=lambda row: int(row["sequence_no"])
+            )
+            middle_index = max((len(ordered_by_sequence) // 2) - 1, 0)
+            middle = ordered_by_sequence[middle_index : middle_index + 2]
+            slowest_e2e = sorted(
+                perf_rows,
+                key=lambda row: _timing_value(row["timing"], "e2e"),
+                reverse=True,
+            )[:2]
+            slowest_transport = sorted(
+                perf_rows,
+                key=lambda row: _timing_value(row["timing"], "tq_transport"),
+                reverse=True,
+            )[:2]
+            logger.info(
+                "Standalone TQ Producer perf middle samples: %s",
+                " | ".join(_format_perf_sample(row) for row in middle),
+            )
+            logger.info(
+                "Standalone TQ Producer perf slowest e2e samples: %s",
+                " | ".join(_format_perf_sample(row) for row in slowest_e2e),
+            )
+            logger.info(
+                "Standalone TQ Producer perf slowest transport samples: %s",
+                " | ".join(_format_perf_sample(row) for row in slowest_transport),
+            )
+            perf_rows.clear()
+            perf_window_started = now
+            peak_publish_queue = publish_queue.qsize()
+            peak_publish_inflight = publish_inflight
+            peak_pending_bytes = stats.pending_bytes
 
         async def publish_results() -> None:
-            nonlocal last_published_at
-            finished_workers = 0
-            while finished_workers < worker_count:
-                mark_stage("publisher", "publish_queue_get")
+            nonlocal last_published_at, publish_inflight, peak_publish_inflight
+            current = asyncio.current_task()
+            worker = current.get_name() if current is not None else "publisher-unknown"
+            while True:
+                mark_stage(worker, "publish_queue_get")
                 result = await publish_queue.get()
                 if result is _PUBLISH_DONE:
-                    finished_workers += 1
-                    continue
-                mark_stage("publisher", "tq_put", result.request.sample_id)
+                    stages.pop(worker, None)
+                    return
+                result.timing["publish_queue"] = time.monotonic() - result.timing.pop(
+                    "publish_queue_started"
+                )
+                mark_stage(worker, "tq_put", result.request.sample_id)
                 put_started = time.monotonic()
-                await publish_one(result, transport)
+                publish_inflight += 1
+                peak_publish_inflight = max(peak_publish_inflight, publish_inflight)
+                try:
+                    (
+                        _,
+                        encode_seconds,
+                        transport_seconds,
+                        cleanup_seconds,
+                        attempts,
+                        retry_wait_seconds,
+                    ) = await publish_one(
+                        result,
+                        transport,
+                        executor=publish_executor,
+                        max_attempts=int(producer_cfg.get("publish_max_attempts", 3)),
+                        retry_backoff_seconds=float(
+                            producer_cfg.get("publish_retry_backoff_seconds", 0.5)
+                        ),
+                    )
+                finally:
+                    publish_inflight -= 1
                 put_elapsed = time.monotonic() - put_started
+                result.timing["tq_encode"] = encode_seconds
+                result.timing["tq_transport"] = transport_seconds
+                result.timing["tq_attempts"] = float(attempts)
+                result.timing["tq_retry_wait"] = retry_wait_seconds
+                result.timing["temp_cleanup"] = cleanup_seconds
+                result.timing["e2e"] = time.monotonic() - result.timing.pop(
+                    "e2e_started"
+                )
+                result.timing["active"] = sum(
+                    _timing_value(result.timing, name)
+                    for name in (
+                        "input_prepare",
+                        "generate",
+                        "prefill",
+                        "conversion",
+                        "tq_encode",
+                        "tq_transport",
+                        "temp_cleanup",
+                    )
+                )
+                result.timing["backpressure"] = sum(
+                    _timing_value(result.timing, name)
+                    for name in (
+                        "input_queue",
+                        "scheduler_wait",
+                        "tq_capacity",
+                        "feature_slot",
+                        "publish_queue",
+                        "tq_retry_wait",
+                    )
+                )
                 if put_elapsed >= 30:
                     logger.warning(
                         "Standalone TQ Producer slow TQ put sample_id=%s elapsed=%.1fs",
@@ -695,14 +1073,36 @@ async def run_producer(
                 stats.pending_bytes = max(
                     stats.pending_bytes - int(result.raw.byte_size), 0
                 )
-            stages.pop("publisher", None)
+                sample_timings.pop(int(result.request.sequence_no), None)
+                perf_rows.append(
+                    {
+                        "sample_id": result.request.sample_id,
+                        "sequence_no": result.request.sequence_no,
+                        "endpoint": result.raw.endpoint_url,
+                        "prompt_tokens": len(result.request.prompt_token_ids),
+                        "generated_tokens": len(result.raw.generated_token_ids),
+                        "mb": _sample_bytes(result.sample) / (1024 * 1024),
+                        "timing": result.timing,
+                    }
+                )
+                log_perf_window()
 
-        tasks = [asyncio.create_task(read_inputs(), name="input")]
-        tasks.extend(
+        request_tasks = [
             asyncio.create_task(request_worker(), name=f"request-{index}")
             for index in range(worker_count)
+        ]
+
+        async def finish_requests() -> None:
+            await asyncio.gather(*request_tasks)
+            for _ in range(publish_workers):
+                await publish_queue.put(_PUBLISH_DONE)
+
+        tasks = [asyncio.create_task(read_inputs(), name="input")]
+        tasks.append(asyncio.create_task(finish_requests(), name="request-coordinator"))
+        tasks.extend(
+            asyncio.create_task(publish_results(), name=f"publisher-{index}")
+            for index in range(publish_workers)
         )
-        tasks.append(asyncio.create_task(publish_results(), name="publisher"))
         heartbeat = asyncio.create_task(log_heartbeat(), name="producer-heartbeat")
         try:
             done, pending = await asyncio.wait(
@@ -768,6 +1168,8 @@ async def run_producer(
             finally:
                 if feature_executor is not None:
                     feature_executor.shutdown(wait=True)
+                if publish_executor is not None:
+                    publish_executor.shutdown(wait=True)
         finally:
             if connected:
                 if completed:

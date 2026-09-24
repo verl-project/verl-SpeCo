@@ -99,6 +99,9 @@ def test_standalone_tq_training_example_uses_unified_launcher() -> None:
     assert "speco.standalone_tq_producer.per_endpoint_concurrency=" in source
     assert "actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=" in source
     assert "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=" in source
+    assert "DSPARK_MAX_WINDOW=${DSPARK_MAX_WINDOW:-0}" in source
+    assert "DSPARK_MAX_WINDOW=${DSPARK_MAX_WINDOW:-512}" not in source
+    assert "training.dspark_max_window=${DSPARK_MAX_WINDOW}" in source
 
 
 def test_standalone_tq_hidden_state_vllm_uses_separate_devices() -> None:

@@ -57,6 +57,7 @@ class FeatureContract:
     target_config_fingerprint: str | None = None
     source: str = "standalone_tq_producer"
     require_full_alignment: bool = False
+    target_num_hidden_layers: int | None = None
 
 
 @dataclass
@@ -234,6 +235,12 @@ def load_vllm_final_norm(
     }
     norm.load_state_dict(state, strict=True, assign=True)
     norm = norm.to(device="cpu", dtype=dtype).eval().requires_grad_(False)
+    text_config = getattr(target_config, "text_config", target_config)
+    target_num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+    if target_num_hidden_layers is not None:
+        # Keep the public return type stable while making the already-loaded
+        # target depth available to standalone callers that build the capture plan.
+        norm._speco_target_num_hidden_layers = int(target_num_hidden_layers)
     logger.info("Loaded vLLM target final norm %s from %s", norm_name, model_path)
     return norm
 
@@ -475,7 +482,24 @@ def feature_from_vllm_payload(
         "eagle3_aux_plus_last",
         "dflash_aux_plus_last",
     }
-    required_layers = len(target_layer_ids) + (1 if include_final else 0)
+    final_layer_id = (
+        int(feature_config.target_num_hidden_layers)
+        if feature_config.target_num_hidden_layers is not None
+        else None
+    )
+    final_reused_from_aux = bool(
+        include_final
+        and final_layer_id is not None
+        and final_layer_id in target_layer_ids
+    )
+    final_source_index = (
+        target_layer_ids.index(final_layer_id)
+        if final_layer_id is not None and final_reused_from_aux
+        else len(target_layer_ids)
+    )
+    required_layers = len(target_layer_ids) + (
+        1 if include_final and not final_reused_from_aux else 0
+    )
     if int(hidden.size(1)) < required_layers:
         raise HiddenStateAlignmentError(
             "vLLM hidden_states layer count is too small: "
@@ -522,7 +546,7 @@ def feature_from_vllm_payload(
         # Auxiliary layers stay raw. Only the final supervision block goes
         # through the frozen target norm, exactly once, before storage/transport.
         with torch.no_grad():
-            final_hidden = final_norm(selected[:, required_layers - 1, :])
+            final_hidden = final_norm(selected[:, final_source_index, :])
         output_hidden = torch.cat([aux_hidden, final_hidden], dim=-1)
     else:
         output_hidden = aux_hidden
@@ -547,6 +571,9 @@ def feature_from_vllm_payload(
             "tokenizer_fingerprint": feature_config.tokenizer_fingerprint,
             "target_layer_ids": target_layer_ids,
             "vllm_hidden_layers": int(hidden.size(1)),
+            "final_hidden_layer_id": final_layer_id,
+            "final_hidden_source_index": final_source_index if include_final else None,
+            "final_hidden_reused_from_aux": final_reused_from_aux,
             "vllm_hidden_rows": int(hidden.size(0)),
             "vllm_hidden_position_offset": hidden_position_offset,
             "hidden_states_layout": hidden_layout,
@@ -1450,6 +1477,9 @@ class TargetFeatureReplayer:
                 use_logits=self.use_logits,
                 target_config_fingerprint=self.target_config_fingerprint,
                 source=source,
+                target_num_hidden_layers=getattr(
+                    self, "target_num_hidden_layers", None
+                ),
             ),
             final_norm=self.vllm_final_norm,
         )

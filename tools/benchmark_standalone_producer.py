@@ -31,7 +31,7 @@ import statistics
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -298,6 +298,14 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             dtype=feature_contract.dtype,
             trust_remote_code=args.trust_remote_code,
         )
+        target_num_hidden_layers = getattr(
+            real_norm, "_speco_target_num_hidden_layers", None
+        )
+        if target_num_hidden_layers is not None:
+            feature_contract = replace(
+                feature_contract,
+                target_num_hidden_layers=int(target_num_hidden_layers),
+            )
         await timings.add(final_norm_load=time.perf_counter() - norm_begin)
     identity_norm = nn.Identity()
 
