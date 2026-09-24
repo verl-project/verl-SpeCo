@@ -1187,6 +1187,25 @@ class DrafterBaseTrainer:
     def _build_draft_model(self):
         """build draft model"""
         logger.debug(f"[Rank {self.rollout_dp_rank}] Building drafter model...")
+        engine = self.config.rollout.drafter.training.get("engine", "fsdp")
+        if engine not in {"fsdp", "veomni"}:
+            raise ValueError(f"Unknown drafter training engine: {engine}")
+        if engine == "veomni" and self.backend.model_type != "peagle":
+            raise ValueError(
+                "VeOmni drafter currently supports the dense P-EAGLE wrapper"
+            )
+        if engine == "veomni" and (
+            self.fsdp_device_mesh is None
+            or self.use_native_dp_sp
+            or self.use_ulysses_sp
+        ):
+            raise ValueError(
+                "VeOmni drafter requires FSDP2 without sequence parallelism"
+            )
+        if engine == "veomni" and not self.config.rollout.drafter.training.get(
+            "standalone", False
+        ):
+            raise ValueError("VeOmni drafter requires dedicated standalone processes")
         # A. 实例化模型（委托给backend）
         pending_target_weight = self._pending_target_lm_head_weight
         if (
@@ -1207,8 +1226,12 @@ class DrafterBaseTrainer:
 
         # B. 获取全量状态用于 FSDP 初始化
 
-        # C. 模型并行包装
-        if (
+        # C. Model parallel wrapping
+        if engine == "veomni":
+            from verl_speco.trainer.veomni_drafter import wrap_veomni_drafter
+
+            self.model = wrap_veomni_drafter(raw_model, self.fsdp_device_mesh)
+        elif (
             self._drafter_strategy() == "ddp"
             and self._full_training_group() is not None
             and self._full_training_world_size() > 1
@@ -1517,7 +1540,9 @@ class DrafterBaseTrainer:
 
     def _get_pretrained_export_model(self):
         model = self.model.module if hasattr(self.model, "module") else self.model
-        if self._is_block_drafter_backend() and hasattr(model, "draft_model"):
+        if (
+            self._is_block_drafter_backend() or self.backend.model_type == "peagle"
+        ) and hasattr(model, "draft_model"):
             return model.draft_model, (
                 "draft_model.",
                 "module.draft_model.",
