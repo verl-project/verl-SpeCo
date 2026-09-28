@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import Future
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +24,7 @@ torch = pytest.importorskip("torch")
 
 from omegaconf import OmegaConf  # noqa: E402
 
+from verl_speco.trainer.base_trainer import DrafterBaseTrainer  # noqa: E402
 from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _assert_standalone_layer_migration,
     _build_backend,
@@ -237,6 +239,62 @@ def test_standalone_checkpoint_schedules_without_waiting():
     assert trainer._pending_full_checkpoint_future is trainer.future
 
 
+def test_standalone_base_writer_defers_completion_marker(monkeypatch, tmp_path) -> None:
+    checkpoint_dir = tmp_path / "draft_step_5"
+
+    class _ExportModel:
+        @staticmethod
+        def save_pretrained(path, *, state_dict, **kwargs):
+            del state_dict, kwargs
+            path = Path(path)
+            path.mkdir(parents=True, exist_ok=True)
+            (path / "config.json").write_text("{}", encoding="utf-8")
+            (path / "pytorch_model.bin").write_bytes(b"weights")
+
+    trainer = SimpleNamespace(
+        _pending_full_checkpoint_future=None,
+        _full_checkpoint_executor=None,
+        rank=0,
+        config=SimpleNamespace(
+            rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=None))
+        ),
+        optimizer_steps_total=5,
+        training_steps=5,
+        lr_scheduler=None,
+        optimizer=None,
+        _is_checkpoint_leader=lambda: True,
+        _get_pretrained_export_model=lambda: (_ExportModel(), None),
+        _get_pretrained_export_state_dict=lambda: {"weight": torch.ones(1)},
+        _infer_pretrained_save_kwargs=lambda: {},
+        _clear_existing_pretrained_weight_files=lambda path: None,
+        _copy_drafter_auxiliary_files=lambda path: None,
+        _atomic_json_dump=DrafterBaseTrainer._atomic_json_dump,
+    )
+    monkeypatch.setattr(
+        "verl_speco.trainer.base_trainer.release_checkpoint_host_memory",
+        lambda *args, **kwargs: {
+            "elapsed_sec": 0.0,
+            "files_advised": 0,
+            "files_failed": 0,
+        },
+    )
+
+    future = DrafterBaseTrainer._save_pretrained_checkpoint_async(
+        trainer,
+        str(checkpoint_dir),
+        5,
+        {"format": "torch_distributed_checkpoint"},
+        defer_completion=True,
+    )
+    future.result()
+    trainer._full_checkpoint_executor.shutdown(wait=True)
+
+    metadata = json.loads(
+        (checkpoint_dir / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert metadata["complete"] is False
+
+
 def test_standalone_checkpoint_waits_when_requested():
     trainer = _FakeTrainer()
     trainer.future.set_result(None)
@@ -293,9 +351,10 @@ def test_public_checkpoint_path_rewrites_dspark_runtime_config(tmp_path):
         )
 
         @staticmethod
-        def save_checkpoint(step: int, wait: bool):
+        def save_checkpoint(step: int, wait: bool, *, defer_completion: bool):
             assert step == 5
             assert wait is True
+            assert defer_completion is True
             return {"saved": True, "reason": "saved", "path": str(checkpoint_dir)}
 
     result = _save_standalone_checkpoint(_PublicCheckpointTrainer(), 5, wait=True)
@@ -334,9 +393,10 @@ def test_standalone_checkpoint_rewrites_runtime_config_after_save(tmp_path):
         )
 
         @staticmethod
-        def save_checkpoint(step: int, wait: bool):
+        def save_checkpoint(step: int, wait: bool, *, defer_completion: bool):
             assert step == 5
             assert wait is True
+            assert defer_completion is True
             events.append("save")
             return {"saved": True, "reason": "saved", "path": str(checkpoint_dir)}
 

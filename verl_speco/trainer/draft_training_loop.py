@@ -675,7 +675,7 @@ def _save_standalone_checkpoint(
     )
     save_checkpoint = getattr(trainer, "save_checkpoint", None)
     if callable(save_checkpoint):
-        result = save_checkpoint(int(step), wait=wait)
+        result = save_checkpoint(int(step), wait=wait, defer_completion=True)
         checkpoint_path = result.get("path")
         is_export_leader = result.get("reason") in {"saved", "scheduled"}
         if result.get("saved") and checkpoint_path and is_export_leader:
