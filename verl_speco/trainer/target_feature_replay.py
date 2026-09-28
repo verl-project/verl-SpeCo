@@ -270,7 +270,7 @@ def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
     if not lock_path.exists():
         return
     try:
-        import fcntl
+        fcntl: Any = __import__("fcntl")
     except ImportError:
         deadline = time.monotonic() + float(timeout)
         while lock_path.exists():

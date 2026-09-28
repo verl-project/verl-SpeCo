@@ -3215,9 +3215,7 @@ class DrafterBaseTrainer:
                     hidden_end = hidden_start + hidden_feature_length
                     feature_end = min(
                         input_seq_length,
-                        feature_start
-                        + hidden_feature_length
-                        + input_hidden_row_delta,
+                        feature_start + hidden_feature_length + input_hidden_row_delta,
                     )
 
             input_feature_length = feature_end - feature_start

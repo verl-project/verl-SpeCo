@@ -200,9 +200,9 @@ class DFlashTrainingModel(nn.Module):
         self.sampled_ce_negatives = max(int(sampled_ce_negatives), 0)
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.lk_loss_alpha = float(lk_loss_alpha)
-        self.per_position_loss_weight = str(
-            per_position_loss_weight or "fixed_exp_decay"
-        ).strip().lower()
+        self.per_position_loss_weight = (
+            str(per_position_loss_weight or "fixed_exp_decay").strip().lower()
+        )
         if self.per_position_loss_weight not in {"fixed_exp_decay", "dpace"}:
             raise ValueError(
                 "per_position_loss_weight must be 'fixed_exp_decay' or 'dpace', "
