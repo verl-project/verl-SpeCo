@@ -226,9 +226,14 @@ def load_vllm_final_norm(
         target_config = AutoConfig.from_pretrained(
             model_path, trust_remote_code=trust_remote_code
         )
+    # Multimodal / MoE targets (for example Qwen3.6) nest the text backbone under
+    # ``text_config``, while the top-level config only describes the wrapper and
+    # has no ``vocab_size``/``hidden_size``. Flat text configs have no nested
+    # ``text_config``, so they keep the previous behaviour.
+    text_config = getattr(target_config, "text_config", target_config)
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(
-            target_config,
+            text_config,
             trust_remote_code=trust_remote_code,
             attn_implementation="eager",
         )
@@ -240,7 +245,6 @@ def load_vllm_final_norm(
     }
     norm.load_state_dict(state, strict=True, assign=True)
     norm = norm.to(device="cpu", dtype=dtype).eval().requires_grad_(False)
-    text_config = getattr(target_config, "text_config", target_config)
     target_num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
     if target_num_hidden_layers is not None:
         # Keep the public return type stable while making the already-loaded

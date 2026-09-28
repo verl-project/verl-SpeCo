@@ -219,6 +219,43 @@ def test_vllm_payload_maps_suffix_hidden_rows_to_absolute_positions():
     )
 
 
+def test_vllm_final_norm_unwraps_nested_text_config(tmp_path):
+    """Qwen3.6-style targets expose the text backbone only through ``text_config``."""
+    transformers = pytest.importorskip("transformers")
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    if "qwen3_moe" not in CONFIG_MAPPING:
+        pytest.skip("Installed Transformers does not include qwen3_moe")
+    text_config = transformers.AutoConfig.for_model(
+        "qwen3_moe",
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=32,
+        rms_norm_eps=1e-5,
+        head_dim=4,
+        moe_intermediate_size=8,
+        num_experts=2,
+        num_experts_per_tok=1,
+    )
+    model = transformers.AutoModelForCausalLM.from_config(text_config).eval()
+    with torch.no_grad():
+        model.model.norm.weight.copy_(torch.linspace(0.5, 2.0, 8))
+    model.save_pretrained(tmp_path)
+
+    # Mimic a wrapper config: it carries the text backbone but none of its own
+    # architecture attributes, so building the top-level config must fail.
+    wrapper = SimpleNamespace(text_config=text_config)
+    norm = load_vllm_final_norm(
+        str(tmp_path), dtype=torch.float32, target_config=wrapper
+    )
+
+    torch.testing.assert_close(norm.weight, torch.linspace(0.5, 2.0, 8))
+    assert norm._speco_target_num_hidden_layers == 2
+
+
 @pytest.mark.parametrize("model_type", ["llama", "qwen2", "qwen3", "qwen3_moe"])
 @pytest.mark.parametrize("sharded", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
