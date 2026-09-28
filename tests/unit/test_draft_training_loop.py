@@ -36,6 +36,7 @@ from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _rewrite_standalone_block_runtime_config,
     _save_standalone_checkpoint,
     _should_log_batch_progress,
+    _sync_standalone_export_error,
 )
 from verl_speco.trainer.feature_store import DraftReplaySample  # noqa: E402
 
@@ -813,3 +814,45 @@ def test_standalone_checkpoint_export_error_surfaces_in_main_thread(
     with pytest.raises(RuntimeError, match="checkpoint export failed") as exc_info:
         _raise_standalone_export_error(trainer)
     assert isinstance(exc_info.value.__cause__, ValueError)
+
+
+def test_standalone_runtime_config_write_error_propagates(monkeypatch, tmp_path) -> None:
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps({"model_type": "dspark"}), encoding="utf-8"
+    )
+    trainer = _migration_trainer("dspark", None)
+
+    def fail_atomic_write(payload, output_path):
+        del payload, output_path
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.DrafterBaseTrainer._atomic_json_dump",
+        fail_atomic_write,
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+
+def test_standalone_checkpoint_export_error_stops_remote_ranks(monkeypatch) -> None:
+    trainer = SimpleNamespace()
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.dist.is_initialized", lambda: True
+    )
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.dist.get_world_size", lambda: 2
+    )
+
+    def fake_all_reduce(failed, op):
+        del op
+        failed[0] = 1
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.dist.all_reduce", fake_all_reduce
+    )
+
+    with pytest.raises(RuntimeError, match="failed on another rank"):
+        _sync_standalone_export_error(trainer, torch.device("cpu"))

@@ -352,7 +352,6 @@ async def _run_standalone_draft_training_async(
             sample_source = feature_producer
         sample_iterator = iter(sample_source)
         while max_steps <= 0 or optimizer_step < max_steps:
-            _raise_standalone_export_error(trainer)
             current_stage = "load_next_batch"
             loaded_batch = _next_batch_across_ranks(
                 sample_iterator,
@@ -542,6 +541,7 @@ async def _run_standalone_draft_training_async(
                 step_metrics.update(feature_producer.metrics())
             _log_standalone_step_metrics(step_metrics, rank=rank)
             if save_interval > 0 and optimizer_step % save_interval == 0:
+                _sync_standalone_export_error(trainer, trainer.runtime_device)
                 current_stage = "save_checkpoint"
                 checkpoint_started = time.perf_counter()
                 if rank == 0:
@@ -571,7 +571,7 @@ async def _run_standalone_draft_training_async(
             current_stage = "load_next_batch"
         # Catch an export failure reported after the last in-loop check, before
         # the final save can succeed and end the run as a silent partial export.
-        _raise_standalone_export_error(trainer)
+        _sync_standalone_export_error(trainer, trainer.runtime_device)
         final_save = bool(training_cfg.get("save_final_checkpoint", True))
         if final_save and successful_steps > 0 and optimizer_step != last_saved_step:
             current_stage = "save_final_checkpoint"
@@ -637,6 +637,10 @@ async def _run_standalone_draft_training_async(
             )
             dist.destroy_process_group()
         logger.info("[standalone rank=%s] cleanup complete", rank)
+        # cleanup_training waits for the pending full-checkpoint writer. Its
+        # standalone finalize callback may only report an export failure while
+        # that wait is completing, after the last check in the training loop.
+        _raise_standalone_export_error(trainer)
 
     return {
         "rank": rank,
@@ -1043,6 +1047,27 @@ def _raise_standalone_export_error(trainer: DrafterBaseTrainer) -> None:
         ) from error
 
 
+def _sync_standalone_export_error(
+    trainer: DrafterBaseTrainer, device: torch.device
+) -> None:
+    """Make a checkpoint export failure visible to every distributed rank."""
+
+    error = getattr(trainer, "_standalone_export_error", None)
+    if not dist.is_initialized() or dist.get_world_size() <= 1:
+        _raise_standalone_export_error(trainer)
+        return
+
+    failed = torch.tensor(
+        [1 if error is not None else 0], dtype=torch.int32, device=device
+    )
+    dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+    if not bool(failed.item()):
+        return
+    if error is not None:
+        _raise_standalone_export_error(trainer)
+    raise RuntimeError("Standalone checkpoint export failed on another rank")
+
+
 def _rewrite_standalone_block_runtime_config(
     trainer: DrafterBaseTrainer,
     checkpoint_path: str,
@@ -1211,14 +1236,7 @@ def _rewrite_standalone_block_runtime_config(
         if variant_child_key:
             variant_config["target_layer_ids"] = runtime_target_layer_ids
 
-    try:
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(runtime_config, f, indent=2, sort_keys=True)
-            f.write("\n")
-    except OSError as exc:
-        logger.warning(
-            "Failed to write standalone runtime config %s: %s", config_path, exc
-        )
+    DrafterBaseTrainer._atomic_json_dump(runtime_config, config_path)
 
 
 def _disable_standalone_sequence_parallel(draft_config) -> None:
