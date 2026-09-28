@@ -1821,6 +1821,8 @@ class DrafterBaseTrainer:
         checkpoint_path: str,
         step: int,
         optimizer_manifest: dict[str, Any],
+        *,
+        defer_completion: bool = False,
     ):
         if self._pending_full_checkpoint_future is not None:
             if not self._pending_full_checkpoint_future.done():
@@ -1893,7 +1895,7 @@ class DrafterBaseTrainer:
                         "step": step,
                         "format": "pretrained_drafter_checkpoint",
                         "serialization": "pytorch",
-                        "complete": True,
+                        "complete": not defer_completion,
                         "trainer_state": trainer_state,
                         "optimizer": optimizer_manifest,
                     },
@@ -1947,12 +1949,16 @@ class DrafterBaseTrainer:
         step: int,
         optimizer_manifest: dict[str, Any],
         is_final: bool = False,
+        *,
+        defer_completion: bool = False,
     ):
         """Asynchronously save a directly loadable drafter checkpoint.
 
         Args:
             step: Current training step
             is_final: Whether this is the final checkpoint during cleanup
+            defer_completion: Write metadata with ``complete=false`` so a caller
+                can publish it after additional checkpoint finalization.
 
         Returns:
             Future object for the background save, or None on non-leader ranks
@@ -1965,12 +1971,15 @@ class DrafterBaseTrainer:
             checkpoint_path,
             step,
             optimizer_manifest,
+            defer_completion=defer_completion,
         )
 
     def save_checkpoint(
         self,
         step: int,
         wait: bool = True,
+        *,
+        defer_completion: bool = False,
     ) -> dict[str, Any]:
         if not self.checkpoint_dir:
             return {"saved": False, "reason": "missing_checkpoint_dir"}
@@ -2044,6 +2053,7 @@ class DrafterBaseTrainer:
             future = self._save_checkpoint_async(
                 int(step),
                 optimizer_manifest,
+                defer_completion=defer_completion,
             )
             if wait and future is not None:
                 try:
