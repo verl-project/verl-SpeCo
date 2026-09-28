@@ -816,6 +816,92 @@ def test_standalone_checkpoint_export_error_surfaces_in_main_thread(
     assert isinstance(exc_info.value.__cause__, ValueError)
 
 
+def test_standalone_checkpoint_writer_error_surfaces_in_main_thread(
+    monkeypatch, tmp_path
+) -> None:
+    trainer = _migration_trainer("dspark", None)
+    completed = Future()
+    writer_error = OSError("disk full")
+    completed.set_exception(writer_error)
+    rewrite_called = False
+
+    def unexpected_rewrite(*args, **kwargs):
+        nonlocal rewrite_called
+        rewrite_called = True
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop._rewrite_standalone_block_runtime_config",
+        unexpected_rewrite,
+    )
+
+    _finalize_standalone_checkpoint(
+        trainer, str(tmp_path / "draft_step_5"), completed, step=5
+    )
+
+    assert rewrite_called is False
+    assert trainer._standalone_export_error is writer_error
+    with pytest.raises(RuntimeError, match="checkpoint export failed") as exc_info:
+        _raise_standalone_export_error(trainer)
+    assert exc_info.value.__cause__ is writer_error
+
+
+def test_standalone_checkpoint_finalize_controls_completion_marker(
+    monkeypatch, tmp_path
+) -> None:
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    metadata_path = checkpoint_dir / "metadata.json"
+    metadata_path.write_text(
+        json.dumps({"step": 5, "complete": True}), encoding="utf-8"
+    )
+    completed = Future()
+    completed.set_result(None)
+    states = []
+
+    def observe_incomplete(*args, **kwargs):
+        del args, kwargs
+        states.append(json.loads(metadata_path.read_text(encoding="utf-8"))["complete"])
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop._rewrite_standalone_block_runtime_config",
+        observe_incomplete,
+    )
+
+    _finalize_standalone_checkpoint(
+        SimpleNamespace(), str(checkpoint_dir), completed, step=5
+    )
+
+    assert states == [False]
+    assert json.loads(metadata_path.read_text(encoding="utf-8"))["complete"] is True
+
+
+def test_standalone_checkpoint_finalize_failure_stays_incomplete(
+    monkeypatch, tmp_path
+) -> None:
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    metadata_path = checkpoint_dir / "metadata.json"
+    metadata_path.write_text(
+        json.dumps({"step": 5, "complete": True}), encoding="utf-8"
+    )
+    trainer = SimpleNamespace()
+    completed = Future()
+    completed.set_result(None)
+
+    def fail_rewrite(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop._rewrite_standalone_block_runtime_config",
+        fail_rewrite,
+    )
+
+    _finalize_standalone_checkpoint(trainer, str(checkpoint_dir), completed, step=5)
+
+    assert json.loads(metadata_path.read_text(encoding="utf-8"))["complete"] is False
+    assert isinstance(trainer._standalone_export_error, OSError)
+
+
 def test_standalone_runtime_config_write_error_propagates(monkeypatch, tmp_path) -> None:
     checkpoint_dir = tmp_path / "draft_step_5"
     checkpoint_dir.mkdir()
@@ -837,6 +923,13 @@ def test_standalone_runtime_config_write_error_propagates(monkeypatch, tmp_path)
         _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
 
 
+def test_standalone_runtime_config_missing_after_writer_is_an_error(tmp_path) -> None:
+    trainer = _migration_trainer("dspark", None)
+
+    with pytest.raises(FileNotFoundError, match="missing"):
+        _rewrite_standalone_block_runtime_config(trainer, str(tmp_path))
+
+
 def test_standalone_checkpoint_export_error_stops_remote_ranks(monkeypatch) -> None:
     trainer = SimpleNamespace()
     monkeypatch.setattr(
@@ -856,3 +949,27 @@ def test_standalone_checkpoint_export_error_stops_remote_ranks(monkeypatch) -> N
 
     with pytest.raises(RuntimeError, match="failed on another rank"):
         _sync_standalone_export_error(trainer, torch.device("cpu"))
+
+
+def test_standalone_checkpoint_export_error_can_be_deferred_until_teardown(
+    monkeypatch,
+) -> None:
+    trainer = SimpleNamespace()
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.dist.is_initialized", lambda: True
+    )
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.dist.get_world_size", lambda: 2
+    )
+
+    def fake_all_reduce(failed, op):
+        del op
+        failed[0] = 1
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.dist.all_reduce", fake_all_reduce
+    )
+
+    assert _sync_standalone_export_error(
+        trainer, torch.device("cpu"), raise_on_error=False
+    )

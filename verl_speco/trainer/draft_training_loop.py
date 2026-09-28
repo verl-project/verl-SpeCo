@@ -627,6 +627,9 @@ async def _run_standalone_draft_training_async(
             store.close()
         logger.info("[standalone rank=%s] cleaning trainer resources", rank)
         await trainer.cleanup_training(clear_data=True)
+        final_export_failed = _sync_standalone_export_error(
+            trainer, trainer.runtime_device, raise_on_error=False
+        )
         if dist.is_initialized():
             logger.info(
                 "[standalone rank=%s] entering final process-group barrier", rank
@@ -640,7 +643,9 @@ async def _run_standalone_draft_training_async(
         # cleanup_training waits for the pending full-checkpoint writer. Its
         # standalone finalize callback may only report an export failure while
         # that wait is completing, after the last check in the training loop.
-        _raise_standalone_export_error(trainer)
+        if final_export_failed:
+            _raise_standalone_export_error(trainer)
+            raise RuntimeError("Standalone checkpoint export failed on another rank")
 
     return {
         "rank": rank,
@@ -675,10 +680,10 @@ def _save_standalone_checkpoint(
         is_export_leader = result.get("reason") in {"saved", "scheduled"}
         if result.get("saved") and checkpoint_path and is_export_leader:
             if wait:
-                _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
-                _save_resume_sidecar(
+                _finalize_standalone_checkpoint_files(
+                    trainer,
                     checkpoint_path,
-                    consumed_snapshot,
+                    consumed_snapshot=consumed_snapshot,
                     step=step,
                     input_path=input_path,
                 )
@@ -722,10 +727,10 @@ def _save_standalone_checkpoint(
     if future is not None and wait:
         future.result()
         trainer._pending_full_checkpoint_future = None
-        _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
-        _save_resume_sidecar(
+        _finalize_standalone_checkpoint_files(
+            trainer,
             checkpoint_path,
-            consumed_snapshot,
+            consumed_snapshot=consumed_snapshot,
             step=step,
             input_path=input_path,
         )
@@ -780,20 +785,32 @@ def _finalize_standalone_checkpoint(
 ) -> None:
     try:
         completed_future.result()
-    except Exception:
-        _rewrite_standalone_block_runtime_config(
-            trainer, checkpoint_path, completed_future
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "[standalone] checkpoint writer failed step=%s path=%s",
+            step,
+            checkpoint_path,
         )
+        try:
+            _set_standalone_checkpoint_complete(checkpoint_path, complete=False)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[standalone] failed to invalidate checkpoint step=%s path=%s",
+                step,
+                checkpoint_path,
+            )
+        if getattr(trainer, "_standalone_export_error", None) is None:
+            setattr(trainer, "_standalone_export_error", exc)
         return
 
     # This callback runs on the checkpoint writer thread, where concurrent.futures
     # only logs a raise. Record it so the training loop can fail from the main
     # thread instead of finishing with an unmigrated runtime config.
     try:
-        _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
-        _save_resume_sidecar(
+        _finalize_standalone_checkpoint_files(
+            trainer,
             checkpoint_path,
-            consumed_snapshot,
+            consumed_snapshot=consumed_snapshot,
             step=step,
             input_path=input_path,
         )
@@ -805,6 +822,51 @@ def _finalize_standalone_checkpoint(
         )
         if getattr(trainer, "_standalone_export_error", None) is None:
             setattr(trainer, "_standalone_export_error", exc)
+
+
+def _finalize_standalone_checkpoint_files(
+    trainer: DrafterBaseTrainer,
+    checkpoint_path: str,
+    *,
+    consumed_snapshot: torch.Tensor | None,
+    step: int | None,
+    input_path: str | None,
+) -> None:
+    """Commit standalone-only files before publishing a managed checkpoint."""
+
+    _set_standalone_checkpoint_complete(checkpoint_path, complete=False)
+    _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
+    _save_resume_sidecar(
+        checkpoint_path,
+        consumed_snapshot,
+        step=step,
+        input_path=input_path,
+    )
+    _set_standalone_checkpoint_complete(checkpoint_path, complete=True)
+
+
+def _set_standalone_checkpoint_complete(
+    checkpoint_path: str, *, complete: bool
+) -> None:
+    """Atomically publish or invalidate an existing managed checkpoint."""
+
+    metadata_path = os.path.join(checkpoint_path, "metadata.json")
+    if not os.path.exists(metadata_path):
+        return
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Cannot update standalone checkpoint metadata {metadata_path}: {exc}"
+        ) from exc
+    if not isinstance(metadata, dict):
+        raise TypeError(
+            f"Cannot update standalone checkpoint metadata {metadata_path}: "
+            "expected object"
+        )
+    metadata["complete"] = bool(complete)
+    DrafterBaseTrainer._atomic_json_dump(metadata, metadata_path)
 
 
 def _save_resume_sidecar(
@@ -1048,24 +1110,28 @@ def _raise_standalone_export_error(trainer: DrafterBaseTrainer) -> None:
 
 
 def _sync_standalone_export_error(
-    trainer: DrafterBaseTrainer, device: torch.device
-) -> None:
+    trainer: DrafterBaseTrainer,
+    device: torch.device,
+    *,
+    raise_on_error: bool = True,
+) -> bool:
     """Make a checkpoint export failure visible to every distributed rank."""
 
     error = getattr(trainer, "_standalone_export_error", None)
     if not dist.is_initialized() or dist.get_world_size() <= 1:
-        _raise_standalone_export_error(trainer)
-        return
+        failed = error is not None
+    else:
+        failed_tensor = torch.tensor(
+            [1 if error is not None else 0], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(failed_tensor, op=dist.ReduceOp.MAX)
+        failed = bool(failed_tensor.item())
 
-    failed = torch.tensor(
-        [1 if error is not None else 0], dtype=torch.int32, device=device
-    )
-    dist.all_reduce(failed, op=dist.ReduceOp.MAX)
-    if not bool(failed.item()):
-        return
-    if error is not None:
-        _raise_standalone_export_error(trainer)
-    raise RuntimeError("Standalone checkpoint export failed on another rank")
+    if failed and raise_on_error:
+        if error is not None:
+            _raise_standalone_export_error(trainer)
+        raise RuntimeError("Standalone checkpoint export failed on another rank")
+    return failed
 
 
 def _rewrite_standalone_block_runtime_config(
@@ -1095,24 +1161,21 @@ def _rewrite_standalone_block_runtime_config(
 
     config_path = os.path.join(checkpoint_path, "config.json")
     if not os.path.exists(config_path):
-        logger.warning(
-            "Cannot rewrite standalone runtime config: missing %s", config_path
+        raise FileNotFoundError(
+            f"Cannot rewrite standalone runtime config: missing {config_path}"
         )
-        return
 
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             training_config = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning(
-            "Cannot rewrite standalone runtime config %s: %s", config_path, exc
-        )
-        return
+        raise RuntimeError(
+            f"Cannot rewrite standalone runtime config {config_path}: {exc}"
+        ) from exc
     if not isinstance(training_config, dict):
-        logger.warning(
-            "Cannot rewrite standalone runtime config %s: expected object", config_path
+        raise TypeError(
+            f"Cannot rewrite standalone runtime config {config_path}: expected object"
         )
-        return
 
     variant_child_key, variant_alias_keys = _VARIANT_RUNTIME_ALIASES.get(
         backend_type, (None, ())
@@ -1188,15 +1251,7 @@ def _rewrite_standalone_block_runtime_config(
                 )
 
     training_config_path = os.path.join(checkpoint_path, "speco_training_config.json")
-    try:
-        with open(training_config_path, "w", encoding="utf-8") as f:
-            json.dump(training_config, f, indent=2, sort_keys=True)
-    except OSError as exc:
-        logger.warning(
-            "Failed to write standalone training config copy %s: %s",
-            training_config_path,
-            exc,
-        )
+    DrafterBaseTrainer._atomic_json_dump(training_config, training_config_path)
 
     runtime_config = source_runtime_config
     if runtime_config is None:
