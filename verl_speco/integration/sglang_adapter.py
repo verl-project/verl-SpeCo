@@ -40,10 +40,7 @@ def _call_flashinfer_plan_with_abi_compat(plan, *args, on_legacy_abi=None):
     try:
         return plan(*args)
     except TypeError as exc:
-        if not (
-            len(args) == 20
-            and "Expected 19 but got 20 arguments" in str(exc)
-        ):
+        if not (len(args) == 20 and "Expected 19 but got 20 arguments" in str(exc)):
             raise
         if on_legacy_abi is not None:
             on_legacy_abi()

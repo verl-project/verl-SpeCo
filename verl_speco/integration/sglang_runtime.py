@@ -171,8 +171,9 @@ def _install_verl_server_args_fields_compat(upstream_module: Any) -> None:
     server_args = getattr(upstream_module, "ServerArgs", None)
     if dataclasses_module is None or server_args is None:
         return
+    compat_dataclasses_module: Any = dataclasses_module
     try:
-        dataclasses_module.fields(server_args)
+        compat_dataclasses_module.fields(server_args)
         return
     except TypeError:
         field_names = _record_field_names(server_args)
@@ -181,7 +182,7 @@ def _install_verl_server_args_fields_compat(upstream_module: Any) -> None:
 
     class _DataclassesCompatProxy:
         def __getattr__(self, name: str) -> Any:
-            return getattr(dataclasses_module, name)
+            return getattr(compat_dataclasses_module, name)
 
         @staticmethod
         def fields(class_or_instance: Any) -> Any:
@@ -194,7 +195,7 @@ def _install_verl_server_args_fields_compat(upstream_module: Any) -> None:
                 return tuple(
                     type("RecordField", (), {"name": name}) for name in field_names
                 )
-            return dataclasses_module.fields(class_or_instance)
+            return compat_dataclasses_module.fields(class_or_instance)
 
     upstream_module.dataclasses = _DataclassesCompatProxy()
 
@@ -206,14 +207,16 @@ def _install_verl_launch_subprocesses_compat() -> None:
     http_server = importlib.import_module("sglang.srt.entrypoints.http_server")
 
     engine = getattr(http_server, "Engine", None)
-    launcher = getattr(engine, "_launch_subprocesses", None)
+    if engine is None:
+        return
+    engine_cls: Any = engine
+    launcher = getattr(engine_cls, "_launch_subprocesses", None)
     if not callable(launcher):
         return
 
-    if not getattr(engine, "_speco_patched_launch_subprocesses", False):
+    if not getattr(engine_cls, "_speco_patched_launch_subprocesses", False):
         original_launcher = launcher
 
-        @classmethod
         def speco_engine_launch_subprocesses(cls, *args, **kwargs):
             del cls
             try:
@@ -226,10 +229,14 @@ def _install_verl_launch_subprocesses_compat() -> None:
             _apply_drafter_config_at_scheduler_boundary(server_args)
             return original_launcher(*args, **kwargs)
 
-        engine._speco_original_launch_subprocesses = original_launcher
-        engine._launch_subprocesses = speco_engine_launch_subprocesses
-        engine._speco_patched_launch_subprocesses = True
-        launcher = getattr(engine, "_launch_subprocesses")
+        setattr(engine_cls, "_speco_original_launch_subprocesses", original_launcher)
+        setattr(
+            engine_cls,
+            "_launch_subprocesses",
+            classmethod(speco_engine_launch_subprocesses),
+        )
+        setattr(engine_cls, "_speco_patched_launch_subprocesses", True)
+        launcher = getattr(engine_cls, "_launch_subprocesses")
 
     if callable(getattr(http_server, "_launch_subprocesses", None)):
         return
@@ -237,17 +244,17 @@ def _install_verl_launch_subprocesses_compat() -> None:
     def _launch_subprocesses(*args, **kwargs):
         kwargs.setdefault(
             "init_tokenizer_manager_func",
-            getattr(engine, "init_tokenizer_manager_func", None)
+            getattr(engine_cls, "init_tokenizer_manager_func", None)
             or http_server.init_tokenizer_manager,
         )
         kwargs.setdefault(
             "run_scheduler_process_func",
-            getattr(engine, "run_scheduler_process_func", None)
+            getattr(engine_cls, "run_scheduler_process_func", None)
             or http_server.run_scheduler_process,
         )
         kwargs.setdefault(
             "run_detokenizer_process_func",
-            getattr(engine, "run_detokenizer_process_func", None)
+            getattr(engine_cls, "run_detokenizer_process_func", None)
             or http_server.run_detokenizer_process,
         )
         result = launcher(*args, **kwargs)
@@ -257,7 +264,7 @@ def _install_verl_launch_subprocesses_compat() -> None:
             return result[:2] + (scheduler_info,) + result[2:]
         return result
 
-    http_server._launch_subprocesses = _launch_subprocesses
+    setattr(http_server, "_launch_subprocesses", _launch_subprocesses)
 
 
 def _apply_drafter_config_at_scheduler_boundary(server_args: Any) -> None:
@@ -1207,7 +1214,7 @@ def _sglang_draft_param_name(name: str, algorithm: str) -> str:
     """Translate trainer parameter names to the SGLang draft namespace."""
 
     translated = name
-    strip_prefixes = (
+    strip_prefixes: tuple[str, ...] = (
         "module.",
         "_orig_mod.",
         "draft_model.",
@@ -1689,6 +1696,7 @@ class _SpecoSGLangHttpServerMixin:
     model_config: Any
     replica_rank: int
     tokenizer_manager: Any
+    _speco_last_collection_plan: CollectionPlan | None
     _speco_last_collection_skip_reason: str | None
 
     async def launch_server(self, *args, **kwargs):
@@ -2589,21 +2597,21 @@ class _SpecoSGLangHttpServerMixin:
                     hidden_states_raw_type=hidden_states_raw_type,
                     hidden_states_raw_len=hidden_states_raw_len,
                 )
-            extra_fields = {
+            sample_extra_fields: dict[str, Any] = {
                 "global_steps": collection_global_steps,
                 "drafter_sample": drafter_sample,
             }
-            extra_fields.update(_sglang_spec_decode_extra_fields(meta_info))
+            sample_extra_fields.update(_sglang_spec_decode_extra_fields(meta_info))
             output = TokenOutput(
                 token_ids=token_ids,
                 log_probs=log_probs,
                 routed_experts=routed_experts,
                 stop_reason=finish_reason,
-                extra_fields=extra_fields,
+                extra_fields=sample_extra_fields,
             )
             return output
 
-        extra_fields = {"global_steps": collection_global_steps}
+        extra_fields: dict[str, Any] = {"global_steps": collection_global_steps}
         extra_fields.update(_sglang_spec_decode_extra_fields(meta_info))
         return TokenOutput(
             token_ids=token_ids,

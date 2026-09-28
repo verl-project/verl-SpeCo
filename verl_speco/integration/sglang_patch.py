@@ -198,8 +198,8 @@ def patch_sglang_flashinfer_plan_abi() -> None:
         finally:
             self._cached_module = cached_module
 
-    patched_fast_prefill_plan._verl_flashinfer_plan_abi_compat = True
-    module.fast_prefill_plan = patched_fast_prefill_plan
+    setattr(patched_fast_prefill_plan, "_verl_flashinfer_plan_abi_compat", True)
+    setattr(module, "fast_prefill_plan", patched_fast_prefill_plan)
     _SGLANG_FLASHINFER_PLAN_ABI_PATCHED = True
 
 
@@ -689,6 +689,8 @@ def _patch_sglang_scheduler_weight_update_dispatch() -> bool:
     except Exception:
         return False
     manager_cls = getattr(module, "SchedulerWeightUpdaterManager", None)
+    if manager_cls is None:
+        return False
     original_update = getattr(manager_cls, "update_weights_from_tensor", None)
     if original_update is None:
         return False
@@ -747,8 +749,12 @@ def _patch_sglang_scheduler_weight_update_dispatch() -> bool:
             _patch_spec_worker_weight_update(type(draft_worker))
         return original_update(self, recv_req)
 
-    setattr(patched_update_weights_from_tensor, "_verl_patched_spec_worker_dispatch", True)
-    manager_cls.update_weights_from_tensor = patched_update_weights_from_tensor
+    setattr(
+        patched_update_weights_from_tensor, "_verl_patched_spec_worker_dispatch", True
+    )
+    setattr(
+        manager_cls, "update_weights_from_tensor", patched_update_weights_from_tensor
+    )
     return True
 
 
