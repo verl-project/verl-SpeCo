@@ -174,6 +174,8 @@ def test_sglang_weight_update_preserves_http_error_message_and_route_fields() ->
 def test_sglang_generate_exports_acceptance_stats_without_hidden_collection(
     monkeypatch, enable_drafter_training
 ) -> None:
+    # The lightweight CPU contract job intentionally runs without PyTorch.
+    monkeypatch.setattr(sglang_runtime, "torch", None)
     io_struct = types.ModuleType("sglang.srt.managers.io_struct")
 
     class GenerateReqInput:
@@ -248,7 +250,7 @@ def test_sglang_generate_exports_acceptance_stats_without_hidden_collection(
 
     output = asyncio.run(
         server.generate(
-            sglang_runtime.torch.tensor([1, 2]),
+            [1, 2],
             {"max_tokens": 3},
             "request-1",
         )
