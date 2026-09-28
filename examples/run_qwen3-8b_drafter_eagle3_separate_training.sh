@@ -23,7 +23,7 @@ set -x
 # no pre-initialized drafter directory is required. Set model_path only when
 # loading an existing drafter checkpoint/config is desired.
 #
-# The vLLM hidden-state layer IDs must be EAGLE3_TARGET_LAYER_IDS followed by
+# The vLLM hidden-state layer IDs must be the auxiliary IDs below followed by
 # the target model's final layer.  For Qwen3-8B the default is:
 #   [1,9,17,25,33,36]
 # The EAGLE3 drafter config must have the same number (five) of aux states.
@@ -45,7 +45,7 @@ export SPECO_STANDALONE_LOG_LEVEL=${SPECO_STANDALONE_LOG_LEVEL:-INFO}
 
 # These IDs must equal the auxiliary prefix of VLLM_HIDDEN_STATE_LAYER_IDS in
 # run_qwen3-8b_drafter_hidden_state_vllm.sh.  Do not include the final layer.
-EAGLE3_TARGET_LAYER_IDS=${EAGLE3_TARGET_LAYER_IDS:-'[1,9,17,25,33]'}
+VLLM_AUX_HIDDEN_STATE_LAYER_IDS=${VLLM_AUX_HIDDEN_STATE_LAYER_IDS:-'[1,9,17,25,33]'}
 
 # Producer throughput and bounded queues.
 VLLM_REQUEST_TIMEOUT=${VLLM_REQUEST_TIMEOUT:-120}
@@ -54,6 +54,9 @@ VLLM_PER_ENDPOINT_CONCURRENCY=${VLLM_PER_ENDPOINT_CONCURRENCY:-4}
 VLLM_SUCCESS_LOG_INTERVAL=${VLLM_SUCCESS_LOG_INTERVAL:-100}
 PRODUCER_INPUT_QUEUE_SIZE=${PRODUCER_INPUT_QUEUE_SIZE:-32}
 PRODUCER_PUBLISH_QUEUE_SIZE=${PRODUCER_PUBLISH_QUEUE_SIZE:-16}
+PRODUCER_PUBLISH_WORKERS=${PRODUCER_PUBLISH_WORKERS:-4}
+PRODUCER_PUBLISH_MAX_ATTEMPTS=${PRODUCER_PUBLISH_MAX_ATTEMPTS:-3}
+PRODUCER_PUBLISH_RETRY_BACKOFF_SECONDS=${PRODUCER_PUBLISH_RETRY_BACKOFF_SECONDS:-0.5}
 PRODUCER_MAX_PENDING_SAMPLES=${PRODUCER_MAX_PENDING_SAMPLES:-1024}
 PRODUCER_PENDING_POLL_INTERVAL=${PRODUCER_PENDING_POLL_INTERVAL:-0.5}
 PRODUCER_MAX_SEQUENCE_LENGTH=${PRODUCER_MAX_SEQUENCE_LENGTH:-8192}
@@ -157,14 +160,16 @@ PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher
     actor_rollout_ref.rollout.drafter.training.lr_decay_steps=${LR_DECAY_STEPS} \
     actor_rollout_ref.rollout.drafter.training.min_lr_ratio=${MIN_LR_RATIO} \
     actor_rollout_ref.rollout.drafter.training.use_logits=false \
-    actor_rollout_ref.rollout.drafter.training.eagle3_target_layer_ids=${EAGLE3_TARGET_LAYER_IDS} \
-    speco.standalone_tq_producer.target_layer_ids=${EAGLE3_TARGET_LAYER_IDS} \
+    speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids=${VLLM_AUX_HIDDEN_STATE_LAYER_IDS} \
     speco.standalone_tq_producer.request_timeout=${VLLM_REQUEST_TIMEOUT} \
     speco.standalone_tq_producer.max_inflight_requests=${VLLM_MAX_INFLIGHT_REQUESTS} \
     speco.standalone_tq_producer.per_endpoint_concurrency=${VLLM_PER_ENDPOINT_CONCURRENCY} \
     speco.standalone_tq_producer.vllm_success_log_interval=${VLLM_SUCCESS_LOG_INTERVAL} \
     speco.standalone_tq_producer.input_queue_size=${PRODUCER_INPUT_QUEUE_SIZE} \
     speco.standalone_tq_producer.publish_queue_size=${PRODUCER_PUBLISH_QUEUE_SIZE} \
+    speco.standalone_tq_producer.publish_workers=${PRODUCER_PUBLISH_WORKERS} \
+    speco.standalone_tq_producer.publish_max_attempts=${PRODUCER_PUBLISH_MAX_ATTEMPTS} \
+    speco.standalone_tq_producer.publish_retry_backoff_seconds=${PRODUCER_PUBLISH_RETRY_BACKOFF_SECONDS} \
     speco.standalone_tq_producer.max_pending_samples=${PRODUCER_MAX_PENDING_SAMPLES} \
     speco.standalone_tq_producer.pending_poll_interval_seconds=${PRODUCER_PENDING_POLL_INTERVAL} \
     speco.standalone_tq_producer.max_sequence_length=${PRODUCER_MAX_SEQUENCE_LENGTH} \

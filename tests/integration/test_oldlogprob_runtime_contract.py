@@ -25,8 +25,10 @@ from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_TARGET_LOGZ_TEMPERATURE_KEY,
     _compute_oldlogprob_target_logz,
     _find_layers_and_final_norm,
+    _hidden_state_capture_target,
     _install_oldlogprob_fsdp_batch_postprocess_patch,
     _put_oldlogprob_hidden_refs,
+    _resolve_hidden_state,
     _select_and_merge_concatenated_hidden,
     _to_cpu_transfer_tensor,
     oldlogprob_hidden_runtime_enabled,
@@ -135,6 +137,39 @@ def test_eagle3_oldlogprob_falls_back_to_default_three_layers() -> None:
     assert (
         eagle3_num_aux_hidden_states_from_config({"speculative_algorithm": "EAGLE3"})
         is None
+    )
+
+
+def test_eagle3_output_ids_select_same_physical_hidden_states_as_vllm() -> None:
+    torch = pytest.importorskip("torch")
+    hidden_states = tuple(torch.tensor([index]) for index in range(37))
+
+    selected = [
+        _resolve_hidden_state(hidden_states, layer_id, layer_id_space="output")
+        for layer_id in [2, 18, 33]
+    ]
+
+    assert [int(value.item()) for value in selected] == [2, 18, 33]
+    assert _hidden_state_capture_target(2, 36, layer_id_space="output") == (
+        "layer",
+        1,
+    )
+
+
+def test_decoder_ids_keep_hf_embedding_offset_for_dflash_and_eagle12() -> None:
+    torch = pytest.importorskip("torch")
+    hidden_states = tuple(torch.tensor([index]) for index in range(37))
+
+    assert int(
+        _resolve_hidden_state(hidden_states, 2, layer_id_space="decoder").item()
+    ) == 3
+    assert _hidden_state_capture_target(2, 36, layer_id_space="decoder") == (
+        "layer",
+        2,
+    )
+    assert _hidden_state_capture_target(35, 36, layer_id_space="decoder") == (
+        "final",
+        None,
     )
 
 
