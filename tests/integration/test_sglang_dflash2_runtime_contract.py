@@ -209,8 +209,12 @@ def test_sglang_generate_exports_acceptance_stats_without_hidden_collection(
         sys.modules, "verl.workers.rollout.sglang_rollout.utils", rollout_utils
     )
 
+    requests = []
+
     class TokenizerManager:
         def generate_request(self, request, _):
+            requests.append(request)
+
             async def responses():
                 yield {
                     "output_ids": [21, 22, 23],
@@ -253,9 +257,11 @@ def test_sglang_generate_exports_acceptance_stats_without_hidden_collection(
             [1, 2],
             {"max_tokens": 3},
             "request-1",
+            video_data=[{"video": "payload"}],
         )
     )
 
+    assert requests[0].video_data == [{"video": "payload"}]
     assert output.extra_fields == {
         "global_steps": 1,
         "_speco_vllm_spec_decode_drafts": 2.0,
@@ -456,7 +462,12 @@ def test_draft_model_detection_covers_the_dflash_family() -> None:
 
 def test_dspark_maps_gamma_to_sglang_verify_window(tmp_path) -> None:
     (tmp_path / "config.json").write_text(
-        json.dumps({"architectures": ["Qwen3DSparkModel"], "block_size": 7}),
+        json.dumps(
+            {
+                "architectures": ["Qwen3DSparkModel"],
+                "dspark_config": {"block_size": 7},
+            }
+        ),
         encoding="utf-8",
     )
     overrides = _server_args_overrides_from_drafter(
@@ -509,6 +520,7 @@ def test_flashinfer_plan_compat_preserves_unrelated_type_errors() -> None:
         ({"architectures": ["DFlashDraftModel"]}, "DSpark checkpoint"),
         ({"sample_from_anchor": False}, "sample_from_anchor=true"),
         ({"block_size": 8}, "checkpoint block_size"),
+        ({"dspark_config": {"block_size": 8}}, "checkpoint block_size"),
     ],
 )
 def test_dspark_rejects_incompatible_checkpoint(

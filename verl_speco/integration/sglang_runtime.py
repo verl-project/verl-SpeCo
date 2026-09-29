@@ -938,6 +938,7 @@ def _validate_sglang_dspark_config(drafter_cfg: dict[str, Any]) -> int:
             )
         block_size = (
             config.get("dspark_block_size")
+            or (config.get("dspark_config") or {}).get("block_size")
             or (config.get("dflash_config") or {}).get("block_size")
             or config.get("block_size")
         )
@@ -2059,6 +2060,7 @@ class _SpecoSGLangHttpServerMixin:
             "sampling_params": sampling_params,
             "return_logprob": return_logprob,
             "image_data": image_data,
+            "video_data": video_data,
         }
         if self.config.enable_rollout_routing_replay:
             request["return_routed_experts"] = True
