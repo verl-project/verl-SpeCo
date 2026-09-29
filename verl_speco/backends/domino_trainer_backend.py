@@ -233,16 +233,26 @@ class DominoTrainingModel(DFlashTrainingModel):
         loss_mask,
         lm_head_weight,
         document_ids=None,
+        label_ids=None,
+        label_mask=None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         self._curriculum_step += 1
         lambda_base = self._current_lambda_base()
 
+        if label_ids is None:
+            label_ids = input_ids
+        if label_mask is None:
+            label_mask = loss_mask
+        label_len = label_ids.shape[1]
+
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device, document_ids=document_ids
+            label_len, label_mask, device, document_ids=document_ids
         )
+        # Anchors must point at a real context row.
+        block_keep_mask = block_keep_mask & (anchor_positions < seq_len)
         n_blocks = anchor_positions.shape[1]
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
@@ -271,8 +281,8 @@ class DominoTrainingModel(DFlashTrainingModel):
         ).view(bsz, n_blocks, self.block_size, -1)
 
         target_ids, prev_token_ids, eval_mask, _ = self._build_label_tensors(
-            input_ids=input_ids,
-            loss_mask=loss_mask,
+            input_ids=label_ids,
+            loss_mask=label_mask,
             anchor_positions=anchor_positions,
             block_keep_mask=block_keep_mask,
         )

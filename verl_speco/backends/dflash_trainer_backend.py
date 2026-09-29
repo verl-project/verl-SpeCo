@@ -540,13 +540,23 @@ class DFlashTrainingModel(nn.Module):
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
         document_ids: torch.Tensor | None = None,
+        label_ids: torch.Tensor | None = None,
+        label_mask: torch.Tensor | None = None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
+        if label_ids is None:
+            label_ids = input_ids
+        if label_mask is None:
+            label_mask = loss_mask
+        label_len = label_ids.shape[1]
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device, document_ids=document_ids
+            label_len, label_mask, device, document_ids=document_ids
         )
+        # Anchors must point at a real context row (the hidden states may be one
+        # row shorter than the label sequence when a trailing label token exists).
+        block_keep_mask = block_keep_mask & (anchor_positions < seq_len)
         n_blocks = anchor_positions.shape[1]
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
@@ -578,10 +588,10 @@ class DFlashTrainingModel(nn.Module):
             "label_offsets", self.block_size, device, view_shape=(1, 1, -1)
         )
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
-        valid_label_mask = label_indices < seq_len
-        safe_label_indices = label_indices.clamp(max=seq_len - 1)
+        valid_label_mask = label_indices < label_len
+        safe_label_indices = label_indices.clamp(max=label_len - 1)
         target_ids = torch.gather(
-            input_ids.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
+            label_ids.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
         )
 
         weight_mask = (
@@ -593,7 +603,7 @@ class DFlashTrainingModel(nn.Module):
         )
         weight_mask = weight_mask * (pos_in_block > 0).float()
         original_loss_mask = torch.gather(
-            loss_mask.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
+            label_mask.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
         )
         weight_mask = weight_mask * original_loss_mask
         binary_eval_mask = weight_mask.view(-1)
@@ -869,6 +879,24 @@ class DFlashTrainingModel(nn.Module):
             acc_per_position,
             count_per_position,
             diagnostics,
+        )
+
+
+def _check_block_drafter_rows(
+    ids_rows: int, hidden_rows: int, mask_rows: int, algorithm: str
+) -> None:
+    """Validate block-drafter label/context row counts.
+
+    The online builder keeps one extra trailing token in ``input_ids`` /
+    ``loss_mask`` (the label for the last context row). Block drafters use the
+    hidden rows as the context window, so ``input_ids`` may be at most one row
+    longer than the hidden states; the label sequence is passed alongside the
+    context sequence.
+    """
+    if mask_rows != ids_rows or not (0 <= ids_rows - hidden_rows <= 1):
+        raise ValueError(
+            f"{algorithm} input/hidden/mask row mismatch: "
+            f"input_rows={ids_rows}, hidden_rows={hidden_rows}, mask_rows={mask_rows}"
         )
 
 
@@ -1405,12 +1433,12 @@ class DFlashTrainerBackend:
             else:
                 item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 item_loss_mask[:] = 1.0
-            if not (ids.size(0) == full_h.size(0) == item_loss_mask.size(0)):
-                raise ValueError(
-                    "DFlash input/hidden/mask row mismatch: "
-                    f"input_rows={ids.size(0)}, hidden_rows={full_h.size(0)}, "
-                    f"mask_rows={item_loss_mask.size(0)}"
-                )
+            _check_block_drafter_rows(
+                int(ids.size(0)),
+                int(full_h.size(0)),
+                int(item_loss_mask.size(0)),
+                "DFlash",
+            )
             nonzero = torch.nonzero(item_loss_mask)
             if nonzero.numel() > 0:
                 r_start = nonzero[0, 0]
@@ -1423,8 +1451,11 @@ class DFlashTrainerBackend:
             else:
                 start, end = max(0, ids.size(0) - max_window), ids.size(0)
 
+            # ``ids`` / ``item_loss_mask`` carry the (optional) trailing label
+            # token; the hidden context is one row shorter when it is present.
+            hidden_end = max(start, min(end, int(full_h.size(0))))
             res["ids"].append(ids[start:end])
-            res["h_states"].append(full_h[start:end, :expected_hidden_dim])
+            res["h_states"].append(full_h[start:hidden_end, :expected_hidden_dim])
             res["masks"].append(item_loss_mask[start:end])
         return res
 
@@ -1449,6 +1480,8 @@ class DFlashTrainerBackend:
             loss_mask=batch["loss_mask"],
             lm_head_weight=self.target_lm_head.fc.weight,
             document_ids=batch.get("document_ids"),
+            label_ids=batch.get("label_ids"),
+            label_mask=batch.get("label_mask"),
         )
         local_num_tokens = count_pp.sum().to(loss.device, dtype=loss.dtype)
         return {

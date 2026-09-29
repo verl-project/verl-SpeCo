@@ -3631,6 +3631,30 @@ class DrafterBaseTrainer:
                 )
             batch["loss_mask"] = batch["loss_mask"].masked_fill(bad_target_rows, 0.0)
 
+        if "label_mask" in batch:
+            # Block drafters weight the loss with the label sequence
+            # (``label_mask``), not the context ``loss_mask``; carry the
+            # bad-row masking above over to it.
+            label_mask = torch.nan_to_num(
+                batch["label_mask"].float(), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            label_mask = torch.where(
+                label_mask > 0,
+                torch.ones_like(label_mask),
+                torch.zeros_like(label_mask),
+            )
+            ctx_cols = min(int(batch["loss_mask"].size(1)), int(label_mask.size(1)))
+            label_mask[:, :ctx_cols] = (
+                label_mask[:, :ctx_cols] * batch["loss_mask"][:, :ctx_cols]
+            )
+            if ctx_cols > 0 and label_mask.size(1) > ctx_cols:
+                # The trailing label token is predicted from the last context row.
+                label_mask[:, ctx_cols:] = (
+                    label_mask[:, ctx_cols:]
+                    * batch["loss_mask"][:, ctx_cols - 1 : ctx_cols]
+                )
+            batch["label_mask"] = label_mask
+
         return batch
 
     def _alignment_debug_sample_index(self, step: int | None, stage: str) -> int:
@@ -4039,6 +4063,8 @@ class DrafterBaseTrainer:
         last_hidden_state_chunks = []
         target_logprob_chunks = []
         target_last_hidden_state_chunks = []
+        label_id_chunks = []
+        label_mask_chunks = []
 
         ids_list = preprocessed_lists["ids"]
         hidden_list = preprocessed_lists["h_states"]
@@ -4413,6 +4439,11 @@ class DrafterBaseTrainer:
                 position_id_chunks.append(item_position_ids[:train_seq_len])
             if self._is_block_drafter_backend():
                 loss_mask_chunks.append(item_loss_mask[:train_seq_len])
+                # Keep the trailing label token(s) that the context/hidden window
+                # cannot represent, so the drafter can still supervise them.
+                block_label_len = min(ids.size(0), item_loss_mask.size(0))
+                label_id_chunks.append(ids[:block_label_len])
+                label_mask_chunks.append(item_loss_mask[:block_label_len])
             elif uses_shifted_eagle_inputs:
                 loss_mask_chunks.append(item_loss_mask[2 : 2 + train_seq_len])
             else:
@@ -4443,6 +4474,8 @@ class DrafterBaseTrainer:
         if not input_id_chunks:
             return None
 
+        label_ids = None
+        label_mask = None
         packing_enabled = self._packing_enabled()
         document_ids = None
         if packing_enabled:
@@ -4492,6 +4525,25 @@ class DrafterBaseTrainer:
                 dtype=position_id_chunks[0].dtype,
                 device=dev,
             )
+            max_label_len = max(chunk.size(0) for chunk in label_id_chunks)
+            label_ids = torch.zeros(
+                len(label_id_chunks),
+                max_label_len,
+                dtype=input_id_chunks[0].dtype,
+                device=dev,
+            )
+            label_mask = torch.zeros(
+                len(label_mask_chunks),
+                max_label_len,
+                dtype=loss_mask_chunks[0].dtype,
+                device=dev,
+            )
+            for row_idx, (label_chunk, label_mask_chunk) in enumerate(
+                zip(label_id_chunks, label_mask_chunks)
+            ):
+                row_len = label_chunk.size(0)
+                label_ids[row_idx, :row_len] = label_chunk
+                label_mask[row_idx, :row_len] = label_mask_chunk
             attn_mask = torch.zeros_like(input_ids, dtype=torch.long, device=dev)
             for row_idx, (ids_chunk, mask_chunk, h_chunk, pos_chunk) in enumerate(
                 zip(
@@ -4567,6 +4619,9 @@ class DrafterBaseTrainer:
             "loss_mask": loss_mask,
             "position_ids": position_ids,
         }
+        if label_ids is not None:
+            batch["label_ids"] = label_ids
+            batch["label_mask"] = label_mask
         if self.backend.model_type == "eagle3":
             if use_logits:
                 batch["target_logprobs"] = target_logprobs
@@ -4587,6 +4642,9 @@ class DrafterBaseTrainer:
             batch["target_last_hidden_states"] = target_last_hidden_states
 
         batch = self._sanitize_training_batch(batch)
+        if label_ids is not None:
+            label_ids = batch["label_ids"]
+            label_mask = batch["label_mask"]
         input_ids = batch["input_ids"]
         attn_mask = batch["attention_mask"]
         base_h = batch["hidden_states"]
@@ -4687,6 +4745,9 @@ class DrafterBaseTrainer:
             "loss_mask": loss_mask,
             "position_ids": position_ids,
         }
+        if label_ids is not None:
+            batch["label_ids"] = label_ids
+            batch["label_mask"] = label_mask
 
         if self.backend.model_type == "eagle3":
             if use_logits:

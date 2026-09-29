@@ -25,6 +25,7 @@ from verl_speco.backends.dflash_trainer_backend import (
     DFlashTrainerBackend,
     DFlashTrainingModel,
     _block_acceptance_counts,
+    _check_block_drafter_rows,
     _resolve_sliding_windows,
     _sliding_window_config,
     build_dflash_attention_masks,
@@ -486,15 +487,25 @@ class DSparkTrainingModel(DFlashTrainingModel):
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
         document_ids: Optional[torch.Tensor] = None,
+        label_ids: Optional[torch.Tensor] = None,
+        label_mask: Optional[torch.Tensor] = None,
         target_last_hidden_states: Optional[torch.Tensor] = None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         self._debug_forward_count += 1
+        if label_ids is None:
+            label_ids = input_ids
+        if label_mask is None:
+            label_mask = loss_mask
+        label_len = label_ids.shape[1]
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device, document_ids=document_ids
+            label_len, label_mask, device, document_ids=document_ids
         )
+        # Anchors must point at a real context row (the hidden states may be one
+        # row shorter than the label sequence when a trailing label token exists).
+        block_keep_mask = block_keep_mask & (anchor_positions < seq_len)
         n_blocks = anchor_positions.shape[1]
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
@@ -524,8 +535,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
 
         target_ids, prev_token_ids, eval_mask, label_indices = (
             self._build_label_tensors(
-                input_ids=input_ids,
-                loss_mask=loss_mask,
+                input_ids=label_ids,
+                loss_mask=label_mask,
                 anchor_positions=anchor_positions,
                 block_keep_mask=block_keep_mask,
             )
@@ -1135,12 +1146,12 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 item_loss_mask[:] = 1.0
 
-            if not (ids.size(0) == full_h.size(0) == item_loss_mask.size(0)):
-                raise ValueError(
-                    "DSpark input/hidden/mask row mismatch: "
-                    f"input_rows={ids.size(0)}, hidden_rows={full_h.size(0)}, "
-                    f"mask_rows={item_loss_mask.size(0)}"
-                )
+            _check_block_drafter_rows(
+                int(ids.size(0)),
+                int(full_h.size(0)),
+                int(item_loss_mask.size(0)),
+                "DSpark",
+            )
             if max_window is None:
                 start, end = 0, ids.size(0)
             else:
@@ -1156,11 +1167,14 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 else:
                     start, end = max(0, ids.size(0) - max_window), ids.size(0)
 
+            # ``ids`` / ``item_loss_mask`` carry the (optional) trailing label
+            # token; the hidden context is one row shorter when it is present.
+            hidden_end = max(start, min(end, int(full_h.size(0))))
             res["ids"].append(ids[start:end])
-            res["h_states"].append(full_h[start:end, :expected_hidden_dim])
+            res["h_states"].append(full_h[start:hidden_end, :expected_hidden_dim])
             res["masks"].append(item_loss_mask[start:end])
             if target_last_h is not None:
-                res["target_last_h_states"].append(target_last_h[start:end])
+                res["target_last_h_states"].append(target_last_h[start:hidden_end])
             else:
                 res["target_last_h_states"].append(None)
         return res
@@ -1186,6 +1200,8 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             lm_head_weight=self.target_lm_head.fc.weight,
             target_last_hidden_states=batch.get("target_last_hidden_states"),
             document_ids=batch.get("document_ids"),
+            label_ids=batch.get("label_ids"),
+            label_mask=batch.get("label_mask"),
         )
         local_num_tokens = diagnostics.get("ce_weighted_token_count")
         if not torch.is_tensor(local_num_tokens):
