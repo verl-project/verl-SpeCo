@@ -117,6 +117,7 @@ class DrafterCollectionContext:
     source_enabled: bool = True
     validation: bool = False
     require_training_interval: bool = False
+    drafter_frozen: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,6 +146,7 @@ class CollectionPlan:
         "training_interval_not_reached": 5,
         "sample_rate_zero": 6,
         "collection_enabled": 7,
+        "drafter_frozen": 8,
     }
 
     def metrics(self) -> dict[str, float | int]:

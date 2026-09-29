@@ -263,6 +263,8 @@ class DrafterScheduler:
             return CollectionPlan(collect=False, reason="drafter_disabled", **common)
         if not context.source_enabled:
             return CollectionPlan(collect=False, reason="source_disabled", **common)
+        if context.drafter_frozen:
+            return CollectionPlan(collect=False, reason="drafter_frozen", **common)
         if context.validation:
             return CollectionPlan(collect=False, reason="validation", **common)
         if not collect_interval_matched:

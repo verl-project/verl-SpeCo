@@ -1013,6 +1013,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 require_training_interval=(
                     source is DrafterCollectionSource.OLD_LOGPROB
                 ),
+                drafter_frozen=bool(
+                    getattr(self, "_speco_drafter_frozen", False)
+                ),
             ),
             self._speco_drafter_schedule_config(),
         )

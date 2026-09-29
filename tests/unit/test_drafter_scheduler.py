@@ -162,6 +162,15 @@ def test_oldlogprob_collection_plan_preserves_training_interval_requirement() ->
             DrafterCollectionContext(
                 global_step=2,
                 source=DrafterCollectionSource.SGLANG,
+                drafter_frozen=True,
+            ),
+            DrafterScheduleConfig(collect_interval_steps=2),
+            "drafter_frozen",
+        ),
+        (
+            DrafterCollectionContext(
+                global_step=2,
+                source=DrafterCollectionSource.SGLANG,
                 validation=True,
             ),
             DrafterScheduleConfig(collect_interval_steps=2),
