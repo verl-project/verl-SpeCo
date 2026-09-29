@@ -1360,10 +1360,18 @@ def build_vllm_speculative_config_from_drafter(
             )
 
     vllm_cfg = drafter_cfg.get("vllm") or {}
+    draft_sample_method = (
+        str(vllm_cfg.get("draft_sample_method", "greedy") or "greedy").strip().lower()
+    )
+    if draft_sample_method not in {"greedy", "probabilistic"}:
+        raise ValueError(
+            "drafter.vllm.draft_sample_method must be 'greedy' or "
+            f"'probabilistic', got {draft_sample_method!r}"
+        )
     speculative_config: dict[str, Any] = {
         "method": method,
         "num_speculative_tokens": num_speculative_tokens,
-        "draft_sample_method": "greedy",
+        "draft_sample_method": draft_sample_method,
     }
     if spec_model_path is not None:
         speculative_config["model"] = spec_model_path
@@ -1386,9 +1394,9 @@ def build_vllm_speculative_config_from_drafter(
     if _should_force_eager(drafter_cfg):
         speculative_config["enforce_eager"] = True
 
-    # Keep draft sampling greedy by default. This preserves the NPU/vLLM-Ascend
-    # DFlash-family behavior where draft probabilities should not affect
-    # rejection sampling; native GPU DSpark can opt in through overrides.
+    # Keep draft sampling greedy by default. Probability-overlap objectives can
+    # opt into probabilistic proposals explicitly through the stable config key
+    # above (or through low-level speculative_config_overrides).
 
     overrides = vllm_cfg.get("speculative_config_overrides") or {}
     if not isinstance(overrides, dict):
@@ -3086,6 +3094,11 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         snapshot = getattr(self, "_speco_draft_level2_snapshot", None)
         if snapshot is None:
             return 0
+        snapshot_source = getattr(self, "_speco_draft_level2_snapshot_source", None)
+        if snapshot_source not in {"checkpoint", "online"}:
+            raise RuntimeError(
+                "Cannot restore the draft level-2 snapshot: weight source is unknown"
+            )
 
         snapshot_source = getattr(self, "_speco_draft_level2_snapshot_source", None)
         if snapshot_source not in {"checkpoint", "online"}:
@@ -3924,7 +3937,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         patch_verl_bucketed_weight_transfer_shm_reuse()
         patch_verl_bucketed_weight_transfer_npu_staging()
         is_npu = _speco_is_npu_vllm_worker(self)
-        # Diagnostic: check draft state BEFORE target sync
+        # Diagnostic: check draft state BEFORE target sync.
         self._speco_diag_draft_state("before_target_sync")
         try:
             with _speco_npu_target_staging(

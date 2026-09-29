@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
+torch = pytest.importorskip("torch")
 
 _speco_ray_trainer = pytest.importorskip(
     "verl_speco.trainer.speco_ray_trainer",
@@ -224,6 +225,24 @@ def test_oldlogprob_collection_accepts_supported_actor_backends(strategy: str) -
     assert trainer._speco_oldlogprob_collection_enabled() is True
 
 
+def test_oldlogprob_collection_rejects_megatron_eagle3_lk() -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_hidden_states_from_sgl": False,
+            "use_logits": False,
+            "old_logprob_hidden_capture_impl": "forward_hook",
+            "eagle3_lk_loss_alpha": 1.0,
+            "lk_temperature": 1.0,
+        }
+    )
+    trainer.config.actor_rollout_ref.actor.strategy = "megatron"
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "EAGLE3"
+
+    with pytest.raises(ValueError, match="Megatron old-logprob path.*target_logz"):
+        trainer._speco_oldlogprob_collection_enabled()
+
+
 def test_oldlogprob_collection_rejects_unknown_actor_backend() -> None:
     trainer = _trainer(
         {
@@ -402,6 +421,48 @@ def test_dspark_l1_oldlogprob_layout_collects_final_hidden() -> None:
     assert trainer._speco_oldlogprob_hidden_layout() == "dflash_aux_plus_last"
 
 
+def test_dspark_lk_oldlogprob_layout_collects_final_hidden() -> None:
+    trainer = _trainer(
+        {"dspark_l1_loss_alpha": 0.0, "dspark_lk_loss_alpha": 1.0}, step=1
+    )
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DSPARK"
+
+    assert trainer._speco_oldlogprob_hidden_layout() == "dflash_aux_plus_last"
+    assert trainer._speco_get_drafter_target_lm_head_row_selection() is None
+
+
+def test_dflash_lk_oldlogprob_layout_collects_final_hidden() -> None:
+    trainer = _trainer({"dflash_lk_loss_alpha": 1.0}, step=1)
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DFLASH"
+
+    assert trainer._speco_oldlogprob_hidden_layout() == "dflash_aux_plus_last"
+    assert trainer._speco_get_drafter_target_lm_head_row_selection() is None
+
+
+def test_eagle3_lk_uses_t2d_row_restricted_target_head_sync() -> None:
+    trainer = _trainer(
+        {
+            "use_logits": False,
+            "eagle3_lk_loss_alpha": 1.0,
+            "target_lm_head_row_restricted_sync": True,
+        },
+        step=1,
+    )
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "EAGLE3"
+    trainer.speco_get_drafter_target_lm_head_row_indices = lambda: [
+        {
+            "row_indices": torch.tensor([1, 3, 5]),
+            "source_vocab_size": 8,
+        }
+    ]
+
+    selection = trainer._speco_get_drafter_target_lm_head_row_selection()
+
+    assert selection["selected_rows"] == 3
+    assert selection["source_vocab_size"] == 8
+    torch.testing.assert_close(selection["row_indices"], torch.tensor([1, 3, 5]))
+
+
 def test_dspark_default_oldlogprob_layout_collects_final_hidden() -> None:
     trainer = _trainer({}, step=1)
     trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DSPARK"
@@ -522,8 +583,9 @@ def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:
     trainer._ray_get_if_needed = lambda value: waited.append(value) or value
     trainer._speco_get_published_drafter_weights = lambda: {"weights": 1}
     trainer._speco_actor_rollout_method = lambda name: (
-        lambda payload, global_steps=None: calls.append((name, payload, global_steps))
-        or ["new-ref"]
+        lambda payload, global_steps=None: (
+            calls.append((name, payload, global_steps)) or ["new-ref"]
+        )
     )
 
     metrics = trainer._speco_publish_drafter_weights(True)

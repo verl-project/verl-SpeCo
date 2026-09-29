@@ -205,6 +205,47 @@ class TrainingOutcome:
                 }.get(key, key)
                 metrics[metric_key] = max(values)
 
+        # Preserve drafter-quality metrics emitted by the backend across the
+        # scheduler boundary. These values are already reduced inside each
+        # trainer worker, so averaging participating workers matches the
+        # historical synchronous-training reporting contract.
+        block_drafter_quality_metric_keys = {
+            f"{prefix}/{metric_name}"
+            for prefix in ("dflash", "dspark")
+            for metric_name in (
+                "accuracy",
+                "ce_loss",
+                "l1_loss",
+                "lk_loss",
+                "top1_acc",
+                "top5_acc",
+                "lk/acceptance",
+                "lk/kl_weight",
+                "lk/forward_kl",
+                "lk/tv",
+            )
+        }
+        block_drafter_position_metric_prefixes = tuple(
+            f"{prefix}/{metric_name}/"
+            for prefix in ("dflash", "dspark")
+            for metric_name in ("accuracy_per_position", "loss_per_position")
+        )
+        for result in normalized_results:
+            for key in result:
+                if key in block_drafter_quality_metric_keys or any(
+                    key.startswith(prefix) and key.removeprefix(prefix).isdigit()
+                    for prefix in block_drafter_position_metric_prefixes
+                ):
+                    block_drafter_quality_metric_keys.add(key)
+        for key in sorted(block_drafter_quality_metric_keys):
+            values = [
+                value
+                for result in normalized_results
+                if (value := _metric_float(result.get(key))) is not None
+            ]
+            if values:
+                metrics[key] = sum(values) / len(values)
+
         metrics["timing_s/drafter_train_rpc"] = execution.elapsed_sec
         outcome_reason = (
             execution.reason if result_consistent else "worker_result_inconsistent"
