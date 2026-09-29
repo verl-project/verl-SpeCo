@@ -924,6 +924,16 @@ class DrafterBaseTrainer:
             "domino",
         }
 
+    def _packing_enabled(self) -> bool:
+        """Document-aware packing is opt-in for the block-drafter family."""
+
+        packing_cfg = self.config.rollout.drafter.training.get("packing", None)
+        return bool(
+            self._is_block_drafter_backend()
+            and packing_cfg is not None
+            and packing_cfg.get("enable", False)
+        )
+
     def _block_drafter_metric_prefix(self) -> str:
         model_type = str(getattr(self.backend, "model_type", "dflash") or "dflash")
         if model_type in {"dspark", "domino", "eagle3", "dflash2"}:
@@ -3823,6 +3833,184 @@ class DrafterBaseTrainer:
 
         return selected
 
+    def _pack_block_drafter_chunks(
+        self,
+        input_id_chunks: list[torch.Tensor],
+        loss_mask_chunks: list[torch.Tensor],
+        hidden_state_chunks: list[torch.Tensor],
+        position_id_chunks: list[torch.Tensor],
+        target_last_hidden_state_chunks: list[torch.Tensor],
+    ) -> (
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor | None,
+            int,
+        ]
+        | None
+    ):
+        """Concatenate per-sample chunks into one document-aware packed row.
+
+        Each document is padded up to a ``block_size`` multiple so an anchor
+        window never spans a document boundary. ``document_ids`` records the
+        originating document; padded positions get ``-1`` (the P-EAGLE padding
+        sentinel) so the attention mask excludes them.
+        """
+        packing_cfg = self.config.rollout.drafter.training.get("packing", {})
+        block_size = int(self._block_drafter_config_value("block_size", 16))
+        max_packed_len = int(packing_cfg.get("max_packed_len", 0) or 0)
+        dev = hidden_state_chunks[0].device
+
+        if target_last_hidden_state_chunks and len(
+            target_last_hidden_state_chunks
+        ) != len(input_id_chunks):
+            logger.warning(
+                "[dspark-trainer] dropping packed batch with partial "
+                "target_last_hidden_states: target_rows=%s batch_rows=%s",
+                len(target_last_hidden_state_chunks),
+                len(input_id_chunks),
+            )
+            return None
+
+        ids_out: list[torch.Tensor] = []
+        mask_out: list[torch.Tensor] = []
+        hidden_out: list[torch.Tensor] = []
+        position_out: list[torch.Tensor] = []
+        doc_out: list[torch.Tensor] = []
+        target_hidden_out: list[torch.Tensor] = []
+        total = 0
+        skipped = 0
+        for idx, (ids, mask, hidden, position) in enumerate(
+            zip(
+                input_id_chunks,
+                loss_mask_chunks,
+                hidden_state_chunks,
+                position_id_chunks,
+            )
+        ):
+            real_len = int(ids.size(0))
+            pad = (-real_len) % block_size
+            if max_packed_len and total + real_len + pad > max_packed_len:
+                skipped += 1
+                continue
+            if pad:
+                ids = torch.cat([ids, torch.zeros(pad, dtype=ids.dtype, device=dev)])
+                mask = torch.cat([mask, torch.zeros(pad, dtype=mask.dtype, device=dev)])
+                position = torch.cat(
+                    [position, torch.zeros(pad, dtype=position.dtype, device=dev)]
+                )
+                hidden = torch.cat(
+                    [
+                        hidden,
+                        torch.zeros(
+                            pad, hidden.size(-1), dtype=hidden.dtype, device=dev
+                        ),
+                    ]
+                )
+            ids_out.append(ids)
+            mask_out.append(mask)
+            hidden_out.append(hidden)
+            position_out.append(position)
+            doc_ids = torch.full(
+                (ids.size(0),), len(doc_out), dtype=torch.long, device=dev
+            )
+            if pad:
+                doc_ids[real_len:] = -1
+            doc_out.append(doc_ids)
+            if target_last_hidden_state_chunks:
+                target_hidden = target_last_hidden_state_chunks[idx]
+                if pad:
+                    target_hidden = torch.cat(
+                        [
+                            target_hidden,
+                            torch.zeros(
+                                pad,
+                                target_hidden.size(-1),
+                                dtype=target_hidden.dtype,
+                                device=dev,
+                            ),
+                        ]
+                    )
+                target_hidden_out.append(target_hidden)
+            total += int(ids.size(0))
+        if not ids_out:
+            return None
+        if skipped:
+            logger.warning(
+                "[%s] max_packed_len=%s skipped %s/%s packed samples",
+                self._block_drafter_metric_prefix(),
+                max_packed_len,
+                skipped,
+                len(input_id_chunks),
+            )
+
+        input_ids = torch.cat(ids_out).unsqueeze(0).contiguous()
+        return (
+            input_ids,
+            torch.cat(mask_out).unsqueeze(0).contiguous(),
+            torch.cat(hidden_out).unsqueeze(0).contiguous(),
+            torch.cat(position_out).unsqueeze(0).contiguous(),
+            torch.ones_like(input_ids, dtype=torch.long, device=dev),
+            torch.cat(doc_out).unsqueeze(0).contiguous(),
+            (
+                torch.cat(target_hidden_out).unsqueeze(0).contiguous()
+                if target_hidden_out
+                else None
+            ),
+            len(ids_out),
+        )
+
+    def _pack_block_drafter_batch(
+        self,
+        input_id_chunks: list[torch.Tensor],
+        loss_mask_chunks: list[torch.Tensor],
+        hidden_state_chunks: list[torch.Tensor],
+        position_id_chunks: list[torch.Tensor],
+        target_last_hidden_state_chunks: list[torch.Tensor],
+    ) -> tuple[dict[str, torch.Tensor], int] | None:
+        """Packing glue: pack the per-sample chunks into the training batch fields.
+
+        Returns ``(fields, num_packed)`` or ``None`` when the batch cannot be
+        packed. ``num_packed`` is the number of samples that survived the
+        ``max_packed_len`` budget. Only called when :meth:`_packing_enabled` is
+        true.
+        """
+
+        packed = self._pack_block_drafter_chunks(
+            input_id_chunks,
+            loss_mask_chunks,
+            hidden_state_chunks,
+            position_id_chunks,
+            target_last_hidden_state_chunks,
+        )
+        if packed is None:
+            return None
+        (
+            input_ids,
+            loss_mask,
+            base_h,
+            position_ids,
+            attn_mask,
+            document_ids,
+            target_last_hidden_states,
+            num_packed,
+        ) = packed
+        fields: dict[str, torch.Tensor] = {
+            "input_ids": input_ids,
+            "loss_mask": loss_mask,
+            "hidden_states": base_h,
+            "position_ids": position_ids,
+            "attention_mask": attn_mask,
+            "document_ids": document_ids,
+        }
+        if target_last_hidden_states is not None:
+            fields["target_last_hidden_states"] = target_last_hidden_states
+        return fields, num_packed
+
     def _prepare_training_batch(
         self,
         buffer_steps: int = 2,
@@ -4421,7 +4609,28 @@ class DrafterBaseTrainer:
         if not input_id_chunks:
             return None
 
-        if self._is_block_drafter_backend():
+        packing_enabled = self._packing_enabled()
+        document_ids = None
+        if packing_enabled:
+            packed = self._pack_block_drafter_batch(
+                input_id_chunks,
+                loss_mask_chunks,
+                hidden_state_chunks,
+                position_id_chunks,
+                target_last_hidden_state_chunks,
+            )
+            if packed is None:
+                return None
+            packed_fields, num_packed = packed
+            input_ids = packed_fields["input_ids"]
+            loss_mask = packed_fields["loss_mask"]
+            base_h = packed_fields["hidden_states"]
+            position_ids = packed_fields["position_ids"]
+            attn_mask = packed_fields["attention_mask"]
+            document_ids = packed_fields.get("document_ids")
+            target_last_hidden_states = packed_fields.get("target_last_hidden_states")
+            items_used = num_packed
+        elif self._is_block_drafter_backend():
             max_train_len = max(chunk.size(0) for chunk in input_id_chunks)
             hidden_dim = hidden_state_chunks[0].size(-1)
             input_ids = torch.zeros(
@@ -4685,6 +4894,8 @@ class DrafterBaseTrainer:
             and target_last_hidden_state_chunks
         ):
             batch["target_last_hidden_states"] = target_last_hidden_states
+        if document_ids is not None:
+            batch["document_ids"] = document_ids
         batch["_speco_pad_size"] = pad_size_for_batch
         batch["_speco_sample_count"] = items_used
         batch["_speco_sample_ids"] = tuple(used_sample_ids)

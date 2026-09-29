@@ -378,14 +378,24 @@ class DFlashDraftModel(PreTrainedModel):
         else:
             draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)
 
-        for layer in self.layers:
+        block_masks = block_mask if isinstance(block_mask, list) else None
+        dense_masks = (
+            dense_attention_mask if isinstance(dense_attention_mask, list) else None
+        )
+        for index, layer in enumerate(self.layers):
             draft_hidden = layer(
                 draft_hidden=draft_hidden,
                 context_hidden=context_feature,
                 draft_position_ids=draft_position_ids,
                 context_position_ids=context_position_ids,
-                block_mask=block_mask,
-                dense_attention_mask=dense_attention_mask,
+                block_mask=block_masks[index]
+                if block_masks is not None
+                else block_mask,
+                dense_attention_mask=(
+                    dense_masks[index]
+                    if dense_masks is not None
+                    else dense_attention_mask
+                ),
             )
         return self.norm(draft_hidden)
 

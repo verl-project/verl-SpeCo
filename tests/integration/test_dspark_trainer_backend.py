@@ -669,6 +669,60 @@ def test_from_dspark_dict_normalizes_transformer_layer_config() -> None:
     assert config.block_size == 8
 
 
+def test_from_dspark_dict_lifts_nested_sliding_window() -> None:
+    config = DSparkConfig.from_dspark_dict(
+        {
+            "architectures": ["Qwen3DSparkModel"],
+            "transformer_layer_config": {
+                "model_type": "qwen3",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 128,
+                "head_dim": 16,
+                "sliding_window": 128,
+                "use_sliding_window": True,
+                "layer_types": ["sliding_attention", "full_attention"],
+            },
+            "block_size": 8,
+            "num_anchors": 512,
+            "markov_rank": 256,
+        }
+    )
+
+    assert config.sliding_window == 128
+    assert config.use_sliding_window is True
+    assert config.layer_types == ["sliding_attention", "full_attention"]
+    # The nested SWA config must reach the per-layer mask builder unchanged.
+    assert dflash_backend._resolve_sliding_windows(config) == [128, None]
+
+
+def test_from_dspark_dict_defaults_to_full_attention_without_nested_swa() -> None:
+    config = DSparkConfig.from_dspark_dict(
+        {
+            "architectures": ["Qwen3DSparkModel"],
+            "transformer_layer_config": {
+                "model_type": "qwen3",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 128,
+                "head_dim": 16,
+            },
+            "block_size": 8,
+            "num_anchors": 512,
+            "markov_rank": 256,
+        }
+    )
+
+    assert config.use_sliding_window is False
+    assert dflash_backend._resolve_sliding_windows(config) == [None, None]
+
+
 def test_dspark_fallback_prefers_dspark_intermediate_size() -> None:
     from types import SimpleNamespace
 
@@ -1113,6 +1167,12 @@ def test_dspark_dpace_weights_only_ce_and_keeps_fixed_distribution_weights(
     captured_distribution_weights = []
     original_compute_distribution_losses = model._compute_distribution_losses_for_active
 
+    def fixed_anchor_positions(_seq_len, _loss_mask, device, **_kwargs):
+        return (
+            torch.tensor([[0, 2]], dtype=torch.long, device=device),
+            torch.ones((1, 2), dtype=torch.bool, device=device),
+        )
+
     def fixed_dpace_weights(*, base_loss_mask, **_kwargs):
         return base_loss_mask * 9.0
 
@@ -1120,6 +1180,7 @@ def test_dspark_dpace_weights_only_ce_and_keeps_fixed_distribution_weights(
         captured_distribution_weights.append(kwargs["active_weights"].detach().clone())
         return original_compute_distribution_losses(**kwargs)
 
+    monkeypatch.setattr(model, "_sample_anchor_positions", fixed_anchor_positions)
     monkeypatch.setattr(model, "_dpace_weight_mask", fixed_dpace_weights)
     monkeypatch.setattr(
         model,

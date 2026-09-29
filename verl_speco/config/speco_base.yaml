@@ -224,6 +224,12 @@ actor_rollout_ref:
         logits_coverage_mask_min_ratio: 0.1
         logits_coverage_mask_require_top1: false
         ttt_length: 1
+        # DFlash-family document-aware packing: concatenate the batch's samples
+        # into one row (each padded to a block_size multiple) and isolate them via
+        # document_ids. Disabled by default because it changes the batch.
+        packing:
+          enable: false
+          max_packed_len: 0
         # Group similar-length samples into a batch to cut padding. Off by
         # default because batch composition changes the loss trajectory.
         group_by_length: false
@@ -251,6 +257,7 @@ actor_rollout_ref:
         dflash_front_position_count: 0
         dflash_hard_sample_ratio: 0.0
         dflash_hidden_size: null
+        dflash_sliding_window: null
         dflash_num_target_layers: 5
         dflash_num_hidden_layers: 1
         dflash_mask_token_id: null
@@ -271,6 +278,7 @@ actor_rollout_ref:
         dspark_hard_sample_ratio: 0.0
         dspark_hidden_size: null
         dspark_intermediate_size: null
+        dspark_sliding_window: null
         dspark_num_target_layers: 5
         dspark_num_hidden_layers: 5
         dspark_mask_token_id: null

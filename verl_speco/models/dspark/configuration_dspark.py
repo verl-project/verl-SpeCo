@@ -42,6 +42,15 @@ _SPECULATOR_TRANSFORMER_KEYS = (
     "vocab_size",
 )
 
+# Sliding-window attention knobs live in the same nested config. Lift them too
+# so a checkpoint configured with SWA does not silently fall back to full
+# attention (mirrors ``convert_speculators_dflash2._SLIDING_WINDOW_KEYS``).
+_SPECULATOR_SLIDING_WINDOW_KEYS = (
+    "layer_types",
+    "sliding_window",
+    "use_sliding_window",
+)
+
 
 class DSparkConfig(DFlashConfig):
     """Configuration for the DSpark draft model.
@@ -112,7 +121,7 @@ class DSparkConfig(DFlashConfig):
         # so the released draft checkpoint matches the constructed model.
         transformer = internal_config.pop("transformer_layer_config", None)
         if isinstance(transformer, dict):
-            for key in _SPECULATOR_TRANSFORMER_KEYS:
+            for key in _SPECULATOR_TRANSFORMER_KEYS + _SPECULATOR_SLIDING_WINDOW_KEYS:
                 value = transformer.get(key)
                 if value is not None:
                     internal_config[key] = value
