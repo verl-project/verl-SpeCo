@@ -968,3 +968,51 @@ def test_check_block_drafter_rows_boundaries():
         _check_block_drafter_rows(6, 4, 6, "DSpark")
     with pytest.raises(ValueError):
         _check_block_drafter_rows(5, 4, 4, "DSpark")
+
+
+def test_block_drafter_label_mask_keeps_shorter_sample_tail():
+    """A mixed-length batch must gate each sample's tail label with its own
+    context length, not the batch-wide padded width."""
+    trainer = _label_packing_trainer()
+    batch = trainer.prepare_training_batch_from_samples(
+        [_feature_sample(5, 4), _feature_sample(6, 5)], step=0
+    )
+    assert batch is not None
+    # Short sample: 4 context rows + 1 trailing label; long: 5 + 1.
+    assert batch["input_ids"].size(1) == 5
+    assert batch["label_ids"].size(1) == 6
+    assert batch["label_mask"].size(1) == 6
+    # The shorter sample's tail lives at column 4, which is padding in the
+    # context loss mask because the longer sample sets the batch width.
+    assert float(batch["loss_mask"][0, 4]) == 0.0
+    assert float(batch["label_mask"][0, 4]) == 1.0
+    # Context columns still follow the context mask, and the longer sample's
+    # tail at column 5 remains supervised.
+    assert float(batch["label_mask"][0, 1]) == 1.0
+    assert float(batch["label_mask"][1, 5]) == 1.0
+
+
+def test_block_drafter_packing_rejects_trailing_label():
+    """Document-aware packing does not carry the trailing label token yet, so
+    the combination must fail closed instead of silently dropping it."""
+    trainer = _label_packing_trainer()
+    trainer.config.rollout.drafter.training["packing"] = {
+        "enable": True,
+        "max_packed_len": 0,
+    }
+    with pytest.raises(NotImplementedError, match="trailing drafter label token"):
+        trainer.prepare_training_batch_from_samples([_feature_sample(5, 4)], step=0)
+
+
+def test_block_drafter_packing_allows_equal_length_context():
+    """Equal-length (no trailing label) samples still pack normally."""
+    trainer = _label_packing_trainer()
+    trainer.config.rollout.drafter.training["packing"] = {
+        "enable": True,
+        "max_packed_len": 0,
+    }
+    batch = trainer.prepare_training_batch_from_samples([_feature_sample(4, 4)], step=0)
+    assert batch is not None
+    assert batch["input_ids"].size(1) >= 4
+    assert "document_ids" in batch
+    assert "label_ids" not in batch

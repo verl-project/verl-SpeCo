@@ -3600,6 +3600,14 @@ class DrafterBaseTrainer:
     ) -> dict[str, torch.Tensor]:
         clip_value = self._get_hidden_state_clip_value()
 
+        # Capture per-sample context lengths before bad-input masking zeroes
+        # rows in ``attention_mask``; label sequences may add one trailing row.
+        label_context_lengths = (
+            batch["attention_mask"].sum(dim=1).to(dtype=torch.long)
+            if "label_mask" in batch
+            else None
+        )
+
         loss_mask = torch.nan_to_num(
             batch["loss_mask"].float(), nan=0.0, posinf=0.0, neginf=0.0
         )
@@ -3632,9 +3640,8 @@ class DrafterBaseTrainer:
             batch["loss_mask"] = batch["loss_mask"].masked_fill(bad_target_rows, 0.0)
 
         if "label_mask" in batch:
-            # Block drafters weight the loss with the label sequence
-            # (``label_mask``), not the context ``loss_mask``; carry the
-            # bad-row masking above over to it.
+            # ``label_mask`` weights the drafter loss: gate context labels by
+            # their own column and tail labels by the last context row.
             label_mask = torch.nan_to_num(
                 batch["label_mask"].float(), nan=0.0, posinf=0.0, neginf=0.0
             )
@@ -3643,16 +3650,21 @@ class DrafterBaseTrainer:
                 torch.ones_like(label_mask),
                 torch.zeros_like(label_mask),
             )
-            ctx_cols = min(int(batch["loss_mask"].size(1)), int(label_mask.size(1)))
-            label_mask[:, :ctx_cols] = (
-                label_mask[:, :ctx_cols] * batch["loss_mask"][:, :ctx_cols]
-            )
-            if ctx_cols > 0 and label_mask.size(1) > ctx_cols:
-                # The trailing label token is predicted from the last context row.
-                label_mask[:, ctx_cols:] = (
-                    label_mask[:, ctx_cols:]
-                    * batch["loss_mask"][:, ctx_cols - 1 : ctx_cols]
+            context_loss_mask = batch["loss_mask"]
+            num_context_cols = int(context_loss_mask.size(1))
+            label_len = int(label_mask.size(1))
+            context_lengths = cast(torch.Tensor, label_context_lengths)
+            for row in range(label_mask.size(0)):
+                ctx_len = min(
+                    int(context_lengths[row].item()), num_context_cols, label_len
                 )
+                label_mask[row, :ctx_len] = (
+                    label_mask[row, :ctx_len] * context_loss_mask[row, :ctx_len]
+                )
+                if label_len > ctx_len:
+                    label_mask[row, ctx_len:] = (
+                        label_mask[row, ctx_len:] * context_loss_mask[row, ctx_len - 1]
+                    )
             batch["label_mask"] = label_mask
 
         return batch
@@ -4052,6 +4064,8 @@ class DrafterBaseTrainer:
         items_dropped_missing_target = 0
         packed_tokens_before_shift = 0
         packed_loss_tokens = 0
+        trailing_label_rows = 0
+        packing_enabled = self._packing_enabled()
 
         # Build training chunks inside each sample before packing. EAGLE3-style
         # models use next-token chunks, while DFlash keeps same-position blocks
@@ -4439,11 +4453,14 @@ class DrafterBaseTrainer:
                 position_id_chunks.append(item_position_ids[:train_seq_len])
             if self._is_block_drafter_backend():
                 loss_mask_chunks.append(item_loss_mask[:train_seq_len])
-                # Keep the trailing label token(s) that the context/hidden window
+                # Keep the trailing label token(s) that the context window
                 # cannot represent, so the drafter can still supervise them.
                 block_label_len = min(ids.size(0), item_loss_mask.size(0))
-                label_id_chunks.append(ids[:block_label_len])
-                label_mask_chunks.append(item_loss_mask[:block_label_len])
+                if block_label_len > train_seq_len:
+                    trailing_label_rows += 1
+                if not packing_enabled:
+                    label_id_chunks.append(ids[:block_label_len])
+                    label_mask_chunks.append(item_loss_mask[:block_label_len])
             elif uses_shifted_eagle_inputs:
                 loss_mask_chunks.append(item_loss_mask[2 : 2 + train_seq_len])
             else:
@@ -4476,9 +4493,16 @@ class DrafterBaseTrainer:
 
         label_ids = None
         label_mask = None
-        packing_enabled = self._packing_enabled()
         document_ids = None
         if packing_enabled:
+            # Packing carries context chunks only, so it cannot represent the
+            # trailing label token; refuse instead of dropping supervision.
+            if trailing_label_rows:
+                raise NotImplementedError(
+                    "Document-aware packing does not support the trailing drafter "
+                    f"label token ({trailing_label_rows} sample(s) carry one); disable "
+                    "rollout.drafter.training.packing.enable for block drafters."
+                )
             packed = self._pack_block_drafter_batch(
                 input_id_chunks,
                 loss_mask_chunks,
