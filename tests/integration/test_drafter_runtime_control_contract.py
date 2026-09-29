@@ -225,6 +225,24 @@ def test_oldlogprob_collection_accepts_supported_actor_backends(strategy: str) -
     assert trainer._speco_oldlogprob_collection_enabled() is True
 
 
+def test_oldlogprob_collection_rejects_megatron_eagle3_lk() -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_hidden_states_from_sgl": False,
+            "use_logits": False,
+            "old_logprob_hidden_capture_impl": "forward_hook",
+            "eagle3_lk_loss_alpha": 1.0,
+            "lk_temperature": 1.0,
+        }
+    )
+    trainer.config.actor_rollout_ref.actor.strategy = "megatron"
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "EAGLE3"
+
+    with pytest.raises(ValueError, match="Megatron old-logprob path.*target_logz"):
+        trainer._speco_oldlogprob_collection_enabled()
+
+
 def test_oldlogprob_collection_rejects_unknown_actor_backend() -> None:
     trainer = _trainer(
         {

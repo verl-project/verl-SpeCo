@@ -1070,6 +1070,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 f"got {strategy!r}"
             )
         if strategy == "megatron":
+            if self._speco_oldlogprob_target_logz_temperature() is not None:
+                raise ValueError(
+                    "EAGLE3 LK with actor.strategy=megatron is not supported: "
+                    "the Megatron old-logprob path does not produce target_logz"
+                )
             tp_size = int(
                 _get_nested(
                     self.config,

@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import json
+import math
 import os
 import glob
 import time
@@ -3022,7 +3023,15 @@ class DrafterBaseTrainer:
         # Block drafters consume token ids and target hidden states at the same
         # positions.  Next-token drafters need one additional input row after
         # the hidden-state window.
+        model_type = getattr(self.backend, "model_type", None)
         input_hidden_row_delta = 0 if self._is_block_drafter_backend() else 1
+        # DSpark keeps context tokens aligned one-to-one with hidden rows, but
+        # its labels are shifted by one token. Reserve the trailing token
+        # separately instead of exposing it as an extra context row.
+        shifted_block_labels = model_type == "dspark"
+        required_trailing_rows = max(
+            input_hidden_row_delta, 1 if shifted_block_labels else 0
+        )
         for i in range(batch_size):
             expected_hidden_rows = max(input_seq_length - 1, 0)
             raw_positions_item_for_alignment = None
@@ -3146,7 +3155,7 @@ class DrafterBaseTrainer:
                     max(
                         input_seq_length
                         - hidden_position_start
-                        - input_hidden_row_delta,
+                        - required_trailing_rows,
                         0,
                     ),
                 )
@@ -3170,7 +3179,7 @@ class DrafterBaseTrainer:
                 hidden_feature_length = min(
                     hidden_seq_length,
                     max(
-                        input_seq_length - feature_start - input_hidden_row_delta,
+                        input_seq_length - feature_start - required_trailing_rows,
                         0,
                     ),
                 )
@@ -3471,7 +3480,21 @@ class DrafterBaseTrainer:
                 "hidden_last_hidden_filter": batch.get("hidden_last_hidden_filter"),
                 "hidden_last_hidden_select": batch.get("hidden_last_hidden_select"),
                 "global_step": _batch_item_int(batch.get("global_step"), i),
+                "target_logz_temperature": (
+                    float(
+                        self.config.rollout.drafter.training.get("lk_temperature", 1.0)
+                    )
+                    if cpu_target_logz is not None
+                    else None
+                ),
             }
+            if shifted_block_labels:
+                data_item["next_token_ids"] = cpu_input_ids[
+                    i, feature_start + 1 : feature_end + 1
+                ]
+                data_item["next_token_loss_mask"] = full_loss_mask[
+                    feature_start + 1 : feature_end + 1
+                ]
 
             if alignment_debug_enabled():
                 sample_index = self._alignment_debug_sample_index(
@@ -3736,6 +3759,18 @@ class DrafterBaseTrainer:
                 )
             batch["loss_mask"] = batch["loss_mask"].masked_fill(bad_target_rows, 0.0)
 
+        if "next_token_loss_mask" in batch:
+            next_mask = torch.nan_to_num(
+                batch["next_token_loss_mask"].float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            next_mask = torch.where(
+                next_mask > 0, torch.ones_like(next_mask), torch.zeros_like(next_mask)
+            )
+            batch["next_token_loss_mask"] = next_mask * batch["loss_mask"]
+
         return batch
 
     def _alignment_debug_sample_index(self, step: int | None, stage: str) -> int:
@@ -3840,6 +3875,8 @@ class DrafterBaseTrainer:
         hidden_state_chunks: list[torch.Tensor],
         position_id_chunks: list[torch.Tensor],
         target_last_hidden_state_chunks: list[torch.Tensor],
+        next_token_id_chunks: list[torch.Tensor] | None = None,
+        next_token_loss_mask_chunks: list[torch.Tensor] | None = None,
     ) -> (
         tuple[
             torch.Tensor,
@@ -3848,6 +3885,8 @@ class DrafterBaseTrainer:
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
+            torch.Tensor | None,
+            torch.Tensor | None,
             torch.Tensor | None,
             int,
         ]
@@ -3875,6 +3914,17 @@ class DrafterBaseTrainer:
                 len(input_id_chunks),
             )
             return None
+        has_next_token_labels = bool(next_token_id_chunks)
+        if has_next_token_labels and (
+            next_token_loss_mask_chunks is None
+            or len(next_token_id_chunks or []) != len(input_id_chunks)
+            or len(next_token_loss_mask_chunks) != len(input_id_chunks)
+        ):
+            logger.warning(
+                "[%s] dropping packed batch with partial next-token labels",
+                self._block_drafter_metric_prefix(),
+            )
+            return None
 
         ids_out: list[torch.Tensor] = []
         mask_out: list[torch.Tensor] = []
@@ -3882,6 +3932,8 @@ class DrafterBaseTrainer:
         position_out: list[torch.Tensor] = []
         doc_out: list[torch.Tensor] = []
         target_hidden_out: list[torch.Tensor] = []
+        next_ids_out: list[torch.Tensor] = []
+        next_mask_out: list[torch.Tensor] = []
         total = 0
         skipped = 0
         for idx, (ids, mask, hidden, position) in enumerate(
@@ -3911,6 +3963,18 @@ class DrafterBaseTrainer:
                         ),
                     ]
                 )
+            if has_next_token_labels:
+                next_ids = cast(list[torch.Tensor], next_token_id_chunks)[idx]
+                next_mask = cast(list[torch.Tensor], next_token_loss_mask_chunks)[idx]
+                if pad:
+                    next_ids = torch.cat(
+                        [next_ids, torch.zeros(pad, dtype=next_ids.dtype, device=dev)]
+                    )
+                    next_mask = torch.cat(
+                        [next_mask, torch.zeros(pad, dtype=next_mask.dtype, device=dev)]
+                    )
+                next_ids_out.append(next_ids)
+                next_mask_out.append(next_mask)
             ids_out.append(ids)
             mask_out.append(mask)
             hidden_out.append(hidden)
@@ -3961,6 +4025,16 @@ class DrafterBaseTrainer:
                 if target_hidden_out
                 else None
             ),
+            (
+                torch.cat(next_ids_out).unsqueeze(0).contiguous()
+                if next_ids_out
+                else None
+            ),
+            (
+                torch.cat(next_mask_out).unsqueeze(0).contiguous()
+                if next_mask_out
+                else None
+            ),
             len(ids_out),
         )
 
@@ -3971,6 +4045,8 @@ class DrafterBaseTrainer:
         hidden_state_chunks: list[torch.Tensor],
         position_id_chunks: list[torch.Tensor],
         target_last_hidden_state_chunks: list[torch.Tensor],
+        next_token_id_chunks: list[torch.Tensor] | None = None,
+        next_token_loss_mask_chunks: list[torch.Tensor] | None = None,
     ) -> tuple[dict[str, torch.Tensor], int] | None:
         """Packing glue: pack the per-sample chunks into the training batch fields.
 
@@ -3986,6 +4062,8 @@ class DrafterBaseTrainer:
             hidden_state_chunks,
             position_id_chunks,
             target_last_hidden_state_chunks,
+            next_token_id_chunks,
+            next_token_loss_mask_chunks,
         )
         if packed is None:
             return None
@@ -3997,6 +4075,8 @@ class DrafterBaseTrainer:
             attn_mask,
             document_ids,
             target_last_hidden_states,
+            next_token_ids,
+            next_token_loss_mask,
             num_packed,
         ) = packed
         fields: dict[str, torch.Tensor] = {
@@ -4009,6 +4089,9 @@ class DrafterBaseTrainer:
         }
         if target_last_hidden_states is not None:
             fields["target_last_hidden_states"] = target_last_hidden_states
+        if next_token_ids is not None:
+            fields["next_token_ids"] = next_token_ids
+            fields["next_token_loss_mask"] = cast(torch.Tensor, next_token_loss_mask)
         return fields, num_packed
 
     def _prepare_training_batch(
@@ -4146,6 +4229,8 @@ class DrafterBaseTrainer:
         target_logz_chunks = []
         target_logprob_chunks = []
         target_last_hidden_state_chunks = []
+        next_token_id_chunks = []
+        next_token_loss_mask_chunks = []
 
         ids_list = preprocessed_lists["ids"]
         hidden_list = preprocessed_lists["h_states"]
@@ -4153,6 +4238,8 @@ class DrafterBaseTrainer:
         position_list = preprocessed_lists.get("position_ids")
         target_last_h_list = preprocessed_lists.get("target_last_h_states")
         target_logz_list = preprocessed_lists.get("target_logz")
+        next_token_ids_list = preprocessed_lists.get("next_token_ids")
+        next_token_masks_list = preprocessed_lists.get("next_token_masks")
         eagle3_exact_lk_enabled = (
             self.backend.model_type == "eagle3"
             and not use_logits
@@ -4161,6 +4248,9 @@ class DrafterBaseTrainer:
                 or 0.0
             )
             > 0
+        )
+        eagle3_lk_temperature = float(
+            self.config.rollout.drafter.training.get("lk_temperature", 1.0) or 1.0
         )
         block_distribution_loss_enabled = (
             self.backend.model_type == "dspark"
@@ -4201,13 +4291,36 @@ class DrafterBaseTrainer:
             if eagle3_exact_lk_enabled:
                 synced_step = getattr(self, "_target_lm_head_weight_step", None)
                 sample_step = source_item.get("global_step", source_item.get("step"))
-                if (
-                    synced_step is not None
-                    and sample_step is not None
-                    and int(sample_step) != int(synced_step)
+                if synced_step is None:
+                    raise ValueError(
+                        "EAGLE3 LK requires a synchronized target LM-head snapshot "
+                        "before consuming target_logz"
+                    )
+                if sample_step is None:
+                    raise ValueError(
+                        "EAGLE3 LK sample is missing the target snapshot global_step"
+                    )
+                if int(sample_step) != int(synced_step):
+                    raise ValueError(
+                        "EAGLE3 LK target snapshot mismatch: "
+                        f"sample_step={int(sample_step)} synced_step={int(synced_step)}"
+                    )
+                sample_temperature = source_item.get("target_logz_temperature")
+                if sample_temperature is None:
+                    raise ValueError(
+                        "EAGLE3 LK sample is missing target_logz_temperature"
+                    )
+                sample_temperature = float(sample_temperature)
+                if not math.isfinite(sample_temperature) or not math.isclose(
+                    sample_temperature,
+                    eagle3_lk_temperature,
+                    rel_tol=1e-6,
+                    abs_tol=1e-8,
                 ):
-                    items_dropped_missing_target += 1
-                    continue
+                    raise ValueError(
+                        "EAGLE3 LK target_logz temperature mismatch: "
+                        f"sample={sample_temperature!r} configured={eagle3_lk_temperature!r}"
+                    )
             target_last_h_states = (
                 target_last_h_list[item_idx]
                 if target_last_h_list is not None and item_idx < len(target_last_h_list)
@@ -4216,6 +4329,18 @@ class DrafterBaseTrainer:
             target_logz_item = (
                 target_logz_list[item_idx]
                 if target_logz_list is not None and item_idx < len(target_logz_list)
+                else None
+            )
+            next_token_ids_item = (
+                next_token_ids_list[item_idx]
+                if next_token_ids_list is not None
+                and item_idx < len(next_token_ids_list)
+                else None
+            )
+            next_token_mask_item = (
+                next_token_masks_list[item_idx]
+                if next_token_masks_list is not None
+                and item_idx < len(next_token_masks_list)
                 else None
             )
             seq_len_limits = [
@@ -4227,6 +4352,14 @@ class DrafterBaseTrainer:
             if torch.is_tensor(target_last_h_states):
                 target_last_h_states = cast(torch.Tensor, target_last_h_states)
                 seq_len_limits.append(target_last_h_states.size(0))
+            if torch.is_tensor(next_token_ids_item) and torch.is_tensor(
+                next_token_mask_item
+            ):
+                next_ids_tensor = cast(torch.Tensor, next_token_ids_item)
+                next_mask_tensor = cast(torch.Tensor, next_token_mask_item)
+                seq_len_limits.extend(
+                    [next_ids_tensor.size(0), next_mask_tensor.size(0)]
+                )
             seq_len = min(seq_len_limits)
             if seq_len < 1:
                 items_dropped_short += 1
@@ -4267,8 +4400,7 @@ class DrafterBaseTrainer:
                         max(cast(torch.Tensor, target_logz_item).size(0) - 1, 0)
                     )
                 elif eagle3_exact_lk_enabled:
-                    items_dropped_missing_target += 1
-                    continue
+                    raise ValueError("EAGLE3 LK sample is missing target_logz")
                 train_seq_len = min(train_seq_len_limits)
             elif self.backend.model_type == "peagle":
                 # P-EAGLE mirrors the reference target-wrapper shift: row p pairs
@@ -4577,6 +4709,15 @@ class DrafterBaseTrainer:
                 loss_mask_chunks.append(item_loss_mask[2 : 2 + train_seq_len])
             else:
                 loss_mask_chunks.append(item_loss_mask[1 : 1 + train_seq_len])
+            if torch.is_tensor(next_token_ids_item) and torch.is_tensor(
+                next_token_mask_item
+            ):
+                next_token_id_chunks.append(
+                    cast(torch.Tensor, next_token_ids_item)[:train_seq_len]
+                )
+                next_token_loss_mask_chunks.append(
+                    cast(torch.Tensor, next_token_mask_item)[:train_seq_len]
+                )
 
             if self.backend.model_type == "eagle3":
                 if use_logits:
@@ -4618,6 +4759,8 @@ class DrafterBaseTrainer:
                 hidden_state_chunks,
                 position_id_chunks,
                 target_last_hidden_state_chunks,
+                next_token_id_chunks,
+                next_token_loss_mask_chunks,
             )
             if packed is None:
                 return None
@@ -4629,6 +4772,8 @@ class DrafterBaseTrainer:
             attn_mask = packed_fields["attention_mask"]
             document_ids = packed_fields.get("document_ids")
             target_last_hidden_states = packed_fields.get("target_last_hidden_states")
+            next_token_ids = packed_fields.get("next_token_ids")
+            next_token_loss_mask = packed_fields.get("next_token_loss_mask")
             items_used = num_packed
         elif self._is_block_drafter_backend():
             max_train_len = max(chunk.size(0) for chunk in input_id_chunks)
@@ -4659,6 +4804,15 @@ class DrafterBaseTrainer:
                 device=dev,
             )
             attn_mask = torch.zeros_like(input_ids, dtype=torch.long, device=dev)
+            next_token_ids = None
+            next_token_loss_mask = None
+            if next_token_id_chunks:
+                if len(next_token_id_chunks) != len(input_id_chunks):
+                    raise ValueError(
+                        "Block drafter batch has partial next-token label tensors"
+                    )
+                next_token_ids = torch.zeros_like(input_ids)
+                next_token_loss_mask = torch.zeros_like(loss_mask)
             for row_idx, (ids_chunk, mask_chunk, h_chunk, pos_chunk) in enumerate(
                 zip(
                     input_id_chunks,
@@ -4673,6 +4827,11 @@ class DrafterBaseTrainer:
                 base_h[row_idx, :row_len] = h_chunk
                 position_ids[row_idx, :row_len] = pos_chunk
                 attn_mask[row_idx, :row_len] = 1
+                if next_token_ids is not None and next_token_loss_mask is not None:
+                    next_token_ids[row_idx, :row_len] = next_token_id_chunks[row_idx]
+                    cast(torch.Tensor, next_token_loss_mask)[row_idx, :row_len] = (
+                        next_token_loss_mask_chunks[row_idx]
+                    )
             target_last_hidden_states = None
             if target_last_hidden_state_chunks:
                 if len(target_last_hidden_state_chunks) != len(input_id_chunks):
@@ -4743,6 +4902,9 @@ class DrafterBaseTrainer:
             "loss_mask": loss_mask,
             "position_ids": position_ids,
         }
+        if self._is_block_drafter_backend() and next_token_ids is not None:
+            batch["next_token_ids"] = next_token_ids
+            batch["next_token_loss_mask"] = next_token_loss_mask
         if self.backend.model_type == "eagle3":
             if use_logits:
                 batch["target_logprobs"] = target_logprobs
@@ -4773,6 +4935,9 @@ class DrafterBaseTrainer:
         base_h = batch["hidden_states"]
         loss_mask = batch["loss_mask"]
         position_ids = batch["position_ids"]
+        if self._is_block_drafter_backend():
+            next_token_ids = batch.get("next_token_ids")
+            next_token_loss_mask = batch.get("next_token_loss_mask")
         if self.backend.model_type == "eagle3":
             if use_logits:
                 target_logprobs = batch["target_logprobs"]
@@ -4878,6 +5043,9 @@ class DrafterBaseTrainer:
             "loss_mask": loss_mask,
             "position_ids": position_ids,
         }
+        if self._is_block_drafter_backend() and next_token_ids is not None:
+            batch["next_token_ids"] = next_token_ids
+            batch["next_token_loss_mask"] = next_token_loss_mask
 
         if self.backend.model_type == "eagle3":
             if use_logits:

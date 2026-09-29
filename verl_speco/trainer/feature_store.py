@@ -51,6 +51,8 @@ class DraftFeatureSample:
     target_logprobs: torch.Tensor | None = None
     target_logz: torch.Tensor | None = None
     position_ids: torch.Tensor | None = None
+    next_token_ids: torch.Tensor | None = None
+    next_token_loss_mask: torch.Tensor | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -72,6 +74,8 @@ class DraftFeatureSample:
             target_logprobs=payload.get("target_logprobs"),
             target_logz=payload.get("target_logz"),
             position_ids=payload.get("position_ids"),
+            next_token_ids=payload.get("next_token_ids"),
+            next_token_loss_mask=payload.get("next_token_loss_mask"),
             metadata=dict(payload.get("metadata") or {}),
         )
         sample.validate(strict=strict)
@@ -97,6 +101,10 @@ class DraftFeatureSample:
             self.input_ids = self.input_ids.reshape(-1)
         if self.loss_mask.dim() > 1:
             self.loss_mask = self.loss_mask.reshape(-1)
+        for field_name in ("next_token_ids", "next_token_loss_mask"):
+            value = getattr(self, field_name)
+            if torch.is_tensor(value) and value.dim() > 1:
+                setattr(self, field_name, value.reshape(-1))
         position_ids = self.position_ids
         if torch.is_tensor(position_ids):
             position_ids_tensor = cast(Any, position_ids)
@@ -121,6 +129,18 @@ class DraftFeatureSample:
                 "DraftFeatureSample input_ids/loss_mask length mismatch: "
                 f"{self.input_ids.size(0)} vs {self.loss_mask.size(0)}"
             )
+        if strict:
+            for field_name in ("next_token_ids", "next_token_loss_mask"):
+                value = getattr(self, field_name)
+                if value is not None and not torch.is_tensor(value):
+                    raise TypeError(
+                        f"DraftFeatureSample.{field_name} must be a torch.Tensor when provided"
+                    )
+                if torch.is_tensor(value) and value.size(0) != self.input_ids.size(0):
+                    raise ValueError(
+                        f"DraftFeatureSample input_ids/{field_name} length mismatch: "
+                        f"{self.input_ids.size(0)} vs {value.size(0)}"
+                    )
         if (
             torch.is_tensor(self.position_ids)
             and cast(Any, self.position_ids).size(0) != self.input_ids.size(0)
@@ -218,6 +238,14 @@ class DraftFeatureSample:
             payload["position_ids"] = (
                 self.position_ids.detach().cpu().long().contiguous()
             )
+        if self.next_token_ids is not None:
+            payload["next_token_ids"] = (
+                self.next_token_ids.detach().cpu().long().contiguous()
+            )
+        if self.next_token_loss_mask is not None:
+            payload["next_token_loss_mask"] = (
+                self.next_token_loss_mask.detach().cpu().float().contiguous()
+            )
         return payload
 
     def to_training_item(self) -> dict[str, Any]:
@@ -241,6 +269,10 @@ class DraftFeatureSample:
             item["target_logz"] = payload["target_logz"]
         if "position_ids" in payload:
             item["position_ids"] = payload["position_ids"]
+        if "next_token_ids" in payload:
+            item["next_token_ids"] = payload["next_token_ids"]
+        if "next_token_loss_mask" in payload:
+            item["next_token_loss_mask"] = payload["next_token_loss_mask"]
         for key, value in metadata.items():
             item.setdefault(key, value)
         _populate_verl_alignment_fields(item, metadata)

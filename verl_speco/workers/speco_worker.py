@@ -662,6 +662,14 @@ class SpecoWorker(Worker):
             _config_str(model_cfg.get("path", None)) if model_cfg is not None else ""
         )
         algorithm = str(self.config.rollout.drafter.speculative_algorithm).upper()
+        next_token_ids = None
+        next_token_loss_mask = None
+        if algorithm == "DSPARK":
+            candidate_ids = full_input_ids[feature_start + 1 : feature_end + 1]
+            candidate_mask = full_loss_mask[feature_start + 1 : feature_end + 1]
+            if candidate_ids.numel() == input_ids.numel():
+                next_token_ids = candidate_ids
+                next_token_loss_mask = candidate_mask
         default_hidden_layout = resolve_drafter_hidden_states_layout(
             algorithm,
             self.config.rollout.drafter.training,
@@ -713,6 +721,8 @@ class SpecoWorker(Worker):
             target_logz=target_logz,
             target_logprobs=target_logprobs,
             position_ids=position_ids,
+            next_token_ids=next_token_ids,
+            next_token_loss_mask=next_token_loss_mask,
             metadata=metadata,
         )
         if collection_id is None:

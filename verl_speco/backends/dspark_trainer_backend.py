@@ -157,9 +157,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
         loss_mask: torch.Tensor,
         device: torch.device,
         document_ids: Optional[torch.Tensor] = None,
+        next_token_loss_mask: Optional[torch.Tensor] = None,
     ):
         bsz = loss_mask.shape[0]
-        num_candidates = max(seq_len - 1, 0)
+        uses_aligned_next_tokens = next_token_loss_mask is not None
+        num_candidates = max(seq_len if uses_aligned_next_tokens else seq_len - 1, 0)
         if num_candidates <= 0:
             anchors = torch.zeros(
                 bsz, self.num_anchors, dtype=torch.long, device=device
@@ -169,9 +171,15 @@ class DSparkTrainingModel(DFlashTrainingModel):
             )
             return anchors, keep_mask
 
-        valid = (loss_mask[:, :num_candidates] > 0.5) & (
-            loss_mask[:, 1 : num_candidates + 1] > 0.5
-        )
+        if uses_aligned_next_tokens:
+            aligned_next_mask = cast(torch.Tensor, next_token_loss_mask)
+            valid = (loss_mask[:, :num_candidates] > 0.5) & (
+                aligned_next_mask[:, :num_candidates] > 0.5
+            )
+        else:
+            valid = (loss_mask[:, :num_candidates] > 0.5) & (
+                loss_mask[:, 1 : num_candidates + 1] > 0.5
+            )
         indices = (
             self._cached_arange("dspark_anchor_indices", num_candidates, device)
             .unsqueeze(0)
@@ -186,7 +194,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 document_ids=document_ids,
                 block_size=self.block_size,
                 seq_len=seq_len,
-                label_shift=1,
+                label_shift=0 if uses_aligned_next_tokens else 1,
             )
         valid_counts = valid.sum(dim=1)
         masked_indices = torch.where(valid, indices, seq_len + 1)
@@ -219,6 +227,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
         loss_mask: torch.Tensor,
         anchor_positions: torch.Tensor,
         block_keep_mask: torch.Tensor,
+        next_token_ids: Optional[torch.Tensor] = None,
+        next_token_loss_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -230,18 +240,38 @@ class DSparkTrainingModel(DFlashTrainingModel):
             + 1
         )
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
-        valid_label_mask = label_indices < seq_len
-        safe_label_indices = label_indices.clamp(max=max(seq_len - 1, 0))
+        label_source = input_ids
+        label_mask_source = loss_mask
+        gather_indices = label_indices
+        if next_token_ids is not None:
+            if next_token_loss_mask is None:
+                raise ValueError("DSpark next_token_ids requires next_token_loss_mask")
+            if (
+                next_token_ids.shape != input_ids.shape
+                or next_token_loss_mask.shape != loss_mask.shape
+            ):
+                raise ValueError(
+                    "DSpark next-token labels must align with context rows: "
+                    f"input={tuple(input_ids.shape)} next_ids={tuple(next_token_ids.shape)} "
+                    f"mask={tuple(loss_mask.shape)} next_mask={tuple(next_token_loss_mask.shape)}"
+                )
+            label_source = next_token_ids
+            label_mask_source = next_token_loss_mask
+            gather_indices = label_indices - 1
+        valid_label_mask = gather_indices < label_source.size(1)
+        safe_label_indices = gather_indices.clamp(max=max(label_source.size(1) - 1, 0))
         safe_label_indices = torch.where(
             block_keep_mask.unsqueeze(-1),
             safe_label_indices,
             torch.zeros_like(safe_label_indices),
         )
         target_ids = torch.gather(
-            input_ids.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
+            label_source.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
         )
         target_loss_mask = torch.gather(
-            loss_mask.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
+            label_mask_source.unsqueeze(1).expand(-1, n_blocks, -1),
+            2,
+            safe_label_indices,
         )
         eval_mask = (
             valid_label_mask & (target_loss_mask > 0.5) & block_keep_mask.unsqueeze(-1)
@@ -568,13 +598,19 @@ class DSparkTrainingModel(DFlashTrainingModel):
         lm_head_weight: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
         document_ids: Optional[torch.Tensor] = None,
+        next_token_ids: Optional[torch.Tensor] = None,
+        next_token_loss_mask: Optional[torch.Tensor] = None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         self._debug_forward_count += 1
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device, document_ids=document_ids
+            seq_len,
+            loss_mask,
+            device,
+            document_ids=document_ids,
+            next_token_loss_mask=next_token_loss_mask,
         )
         n_blocks = anchor_positions.shape[1]
         noise_embedding = self._create_noise_embed(
@@ -609,6 +645,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 loss_mask=loss_mask,
                 anchor_positions=anchor_positions,
                 block_keep_mask=block_keep_mask,
+                next_token_ids=next_token_ids,
+                next_token_loss_mask=next_token_loss_mask,
             )
         )
         aligned_target_hidden = self._gather_aligned_target_hidden(
@@ -1219,7 +1257,14 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         ), drafter_config
 
     def preprocess_individual_items(self, items, device, model_config):
-        res = {"ids": [], "h_states": [], "masks": [], "target_last_h_states": []}
+        res = {
+            "ids": [],
+            "h_states": [],
+            "masks": [],
+            "target_last_h_states": [],
+            "next_token_ids": [],
+            "next_token_masks": [],
+        }
         raw_max_window = self.config.rollout.drafter.training.get("dspark_max_window")
         max_window = (
             None
@@ -1293,6 +1338,26 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 item_loss_mask[:] = 1.0
 
+            next_token_ids = item.get("next_token_ids")
+            next_token_mask = item.get("next_token_loss_mask")
+            if next_token_ids is not None or next_token_mask is not None:
+                if next_token_ids is None or next_token_mask is None:
+                    raise ValueError(
+                        "DSpark requires both next_token_ids and next_token_loss_mask"
+                    )
+                next_token_ids = next_token_ids.to(device, non_blocking=True)
+                next_token_mask = next_token_mask.to(
+                    device, dtype=torch.float32, non_blocking=True
+                )
+                if next_token_ids.size(0) != ids.size(0) or next_token_mask.size(
+                    0
+                ) != ids.size(0):
+                    raise ValueError(
+                        "DSpark next-token labels must match input rows: "
+                        f"input_rows={ids.size(0)}, next_ids={next_token_ids.size(0)}, "
+                        f"next_mask={next_token_mask.size(0)}"
+                    )
+
             if not (ids.size(0) == full_h.size(0) == item_loss_mask.size(0)):
                 raise ValueError(
                     "DSpark input/hidden/mask row mismatch: "
@@ -1317,6 +1382,12 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             res["ids"].append(ids[start:end])
             res["h_states"].append(full_h[start:end, :expected_hidden_dim])
             res["masks"].append(item_loss_mask[start:end])
+            res["next_token_ids"].append(
+                next_token_ids[start:end] if next_token_ids is not None else None
+            )
+            res["next_token_masks"].append(
+                next_token_mask[start:end] if next_token_mask is not None else None
+            )
             if target_last_h is not None:
                 res["target_last_h_states"].append(target_last_h[start:end])
             else:
@@ -1344,6 +1415,8 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             lm_head_weight=self.target_lm_head.fc.weight,
             target_last_hidden_states=batch.get("target_last_hidden_states"),
             document_ids=batch.get("document_ids"),
+            next_token_ids=batch.get("next_token_ids"),
+            next_token_loss_mask=batch.get("next_token_loss_mask"),
         )
         local_num_tokens = diagnostics.get("ce_weighted_token_count")
         if not torch.is_tensor(local_num_tokens):

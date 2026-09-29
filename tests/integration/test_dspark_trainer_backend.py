@@ -385,6 +385,29 @@ def test_dspark_label_and_prev_token_alignment():
     assert eval_mask.tolist() == [[[True, True, True, True]]]
 
 
+def test_dspark_aligned_next_token_labels_keep_the_trailing_token():
+    model = _small_dspark_training_model(block_size=2)
+    input_ids = torch.tensor([[10, 11]], dtype=torch.long)
+    next_token_ids = torch.tensor([[11, 12]], dtype=torch.long)
+    loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    anchor_positions = torch.tensor([[0]], dtype=torch.long)
+    block_keep_mask = torch.tensor([[True]])
+
+    target_ids, prev_token_ids, eval_mask, label_indices = model._build_label_tensors(
+        input_ids=input_ids,
+        loss_mask=loss_mask,
+        anchor_positions=anchor_positions,
+        block_keep_mask=block_keep_mask,
+        next_token_ids=next_token_ids,
+        next_token_loss_mask=loss_mask,
+    )
+
+    assert label_indices.tolist() == [[[1, 2]]]
+    assert target_ids.tolist() == [[[11, 12]]]
+    assert prev_token_ids.tolist() == [[[10, 11]]]
+    assert eval_mask.tolist() == [[[True, True]]]
+
+
 def test_dspark_target_hidden_gather_matches_reference_for_multiple_batches():
     model = _small_dspark_training_model(block_size=3)
     target_hidden = torch.arange(2 * 6 * 4, dtype=torch.float32).view(2, 6, 4)
