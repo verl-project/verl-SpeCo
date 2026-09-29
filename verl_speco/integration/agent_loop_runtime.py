@@ -26,6 +26,8 @@ logger = logging.getLogger(__file__)
 
 _PATCHED = False
 _DEFAULT_EXTRA_KEYS = {
+    "_speco_vllm_spec_decode_accepted_tokens",
+    "_speco_vllm_spec_decode_drafts",
     "turn_scores",
     "tool_rewards",
     "min_global_steps",

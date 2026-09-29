@@ -14,6 +14,15 @@ from types import SimpleNamespace
 from verl_speco.integration import agent_loop_runtime
 
 
+def test_agent_loop_preserves_spec_decode_metric_fields() -> None:
+    output = SimpleNamespace(extra_fields={})
+
+    agent_loop_runtime._speco_default_agent_loop_extra_fields(output)
+
+    assert output.extra_fields["_speco_vllm_spec_decode_drafts"] is None
+    assert output.extra_fields["_speco_vllm_spec_decode_accepted_tokens"] is None
+
+
 def test_agent_loop_patch_supports_release_v080_llm_server_client(monkeypatch) -> None:
     class AgentLoopWorker:
         async def generate_sequences(self, batch):
