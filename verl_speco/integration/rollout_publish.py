@@ -493,6 +493,7 @@ def _export_actor_lm_head_rows_direct(worker: Any, row_indices: Any) -> Optional
     if row_indices_cpu is None or int(row_indices_cpu.numel()) <= 0:
         return None
 
+    last_error: Exception | None = None
     for module in _actor_module_candidates(worker):
         selected_name, selected_weight = _select_lm_head_named_tensor(module)
         if selected_weight is None:
@@ -504,10 +505,16 @@ def _export_actor_lm_head_rows_direct(worker: Any, row_indices: Any) -> Optional
                 or int(row_indices_cpu.min().item()) < 0
             ):
                 continue
-            rows_on_device = row_indices_cpu.to(
-                device=selected_weight.device, dtype=torch.long
-            )
-            selected_rows = selected_weight.detach().index_select(0, rows_on_device)
+            if callable(getattr(selected_weight, "to_local", None)):
+                selected_rows = _materialize_veomni_lm_head_rows(
+                    selected_weight,
+                    row_indices_cpu,
+                )
+            else:
+                rows_on_device = row_indices_cpu.to(
+                    device=selected_weight.device, dtype=torch.long
+                )
+                selected_rows = selected_weight.detach().index_select(0, rows_on_device)
             if getattr(worker, "rank", None) != 0:
                 return {"_speco_non_owner_direct_sparse": True}
             weight = selected_rows.to(device="cpu", dtype=torch.bfloat16).contiguous()
@@ -529,10 +536,13 @@ def _export_actor_lm_head_rows_direct(worker: Any, row_indices: Any) -> Optional
                 "export_strategy": "direct_sparse",
             }
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "Direct sparse lm_head export failed for %s: %s", selected_name, exc
-            )
+            last_error = exc
             continue
+    if last_error is not None:
+        logger.warning(
+            "[actor lm_head export] direct_sparse_unavailable reason=%s",
+            last_error,
+        )
     return None
 
 
@@ -919,7 +929,7 @@ class DraftWeightPublishMixin:
         *,
         global_steps: int | None,
         publish_async: bool,
-    ) -> None:
+    ) -> dict[str, Any]:
         self._attach_update_draft_weights_to_rollout()
         materialize_ts = time.perf_counter()
         materialized_weights, used_ref = materialize_draft_weights_payload(weights)
@@ -955,6 +965,12 @@ class DraftWeightPublishMixin:
                     reclaim.get("memory_before"),
                     reclaim.get("memory_after"),
                 )
+        return {
+            "published": True,
+            "staged": False,
+            "published_version": global_steps,
+            "worker_rank": getattr(self, "rank", None),
+        }
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
     async def update_draft_weights(
@@ -963,7 +979,7 @@ class DraftWeightPublishMixin:
         if not drafter_rollout_enabled(self.config):
             return
 
-        await self._update_draft_weights_from_payload(
+        return await self._update_draft_weights_from_payload(
             weights, global_steps=global_steps, publish_async=False
         )
 
@@ -974,9 +990,76 @@ class DraftWeightPublishMixin:
         if not drafter_rollout_enabled(self.config):
             return
 
-        await self._update_draft_weights_from_payload(
+        return await self._update_draft_weights_from_payload(
             weights, global_steps=global_steps, publish_async=True
         )
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
+    async def stage_draft_weights_async(
+        self, weights: dict, global_steps: int | None = None
+    ):
+        if not drafter_rollout_enabled(self.config):
+            return {"staged": False, "reason": "drafter_disabled"}
+        previous_weights = getattr(self, "_speco_staged_draft_weights", None)
+        previous_used_ref = bool(
+            getattr(self, "_speco_staged_draft_weights_used_ref", False)
+        )
+        if previous_weights is not None and previous_used_ref:
+            release_draft_weights_payload(previous_weights)
+        weights, used_ref = materialize_draft_weights_payload(weights)
+        # Two-phase Bubble publication: materialize the immutable snapshot in
+        # actor-rollout workers, but do not mutate the live inference engine.
+        # The trainer commits this staged payload only at a generation boundary.
+        setattr(self, "_speco_staged_draft_weights", weights)
+        self._speco_staged_draft_version = global_steps
+        self._speco_staged_draft_weights_used_ref = used_ref
+        return {
+            "published": False,
+            "staged": True,
+            "staged_version": global_steps,
+            "worker_rank": getattr(self, "rank", None),
+        }
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
+    async def commit_staged_draft_weights(self, global_steps: int | None = None):
+        if not drafter_rollout_enabled(self.config):
+            return {"published": False, "reason": "drafter_disabled"}
+        weights = getattr(self, "_speco_staged_draft_weights", None)
+        staged_version = getattr(self, "_speco_staged_draft_version", None)
+        used_ref = bool(getattr(self, "_speco_staged_draft_weights_used_ref", False))
+        if weights is None:
+            return {
+                "published": False,
+                "reason": "no_staged_weights",
+                "worker_rank": getattr(self, "rank", None),
+            }
+        if global_steps is not None and staged_version != global_steps:
+            return {
+                "published": False,
+                "reason": "staged_version_mismatch",
+                "staged_version": staged_version,
+                "requested_version": global_steps,
+                "worker_rank": getattr(self, "rank", None),
+            }
+
+        self._attach_update_draft_weights_to_rollout()
+        try:
+            await self.rollout.update_draft_weights(
+                weights,
+                global_steps=staged_version,
+            )
+        finally:
+            setattr(self, "_speco_staged_draft_weights", None)
+            self._speco_staged_draft_version = None
+            self._speco_staged_draft_weights_used_ref = False
+            if used_ref:
+                release_draft_weights_payload(weights)
+        return {
+            "published": True,
+            "staged": True,
+            "published_version": staged_version,
+            "worker_rank": getattr(self, "rank", None),
+        }
 
     def _attach_update_draft_weights_to_rollout(self):
         backend = rollout_backend_name(getattr(self, "config", None))

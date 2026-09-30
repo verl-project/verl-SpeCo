@@ -167,6 +167,60 @@ def test_rollout_backend_and_drafter_gates_support_both_config_shapes() -> None:
     )
 
 
+def test_bubble_publish_stages_before_safe_point_commit() -> None:
+    class _Rollout:
+        def __init__(self):
+            self.updates = []
+
+        async def update_draft_weights(self, weights, *, global_steps=None):
+            self.updates.append((weights, global_steps))
+
+    class _Worker(rollout_publish.DraftWeightPublishMixin):
+        def _attach_update_draft_weights_to_rollout(self):
+            return None
+
+    worker = _Worker()
+    worker.config = {"rollout": {"drafter": {"enable": True}}}
+    worker.rollout = _Rollout()
+
+    stage_ack = asyncio.run(
+        worker.stage_draft_weights_async({"weight": 1}, global_steps=4)
+    )
+
+    assert stage_ack["staged"] is True
+    assert stage_ack["published"] is False
+    assert worker.rollout.updates == []
+
+    commit_ack = asyncio.run(worker.commit_staged_draft_weights(global_steps=4))
+
+    assert commit_ack["published"] is True
+    assert worker.rollout.updates == [({"weight": 1}, 4)]
+
+
+def test_legacy_async_publish_still_updates_rollout_directly() -> None:
+    class _Rollout:
+        def __init__(self):
+            self.updates = []
+
+        async def update_draft_weights(self, weights, *, global_steps=None):
+            self.updates.append((weights, global_steps))
+
+    class _Worker(rollout_publish.DraftWeightPublishMixin):
+        def _attach_update_draft_weights_to_rollout(self):
+            return None
+
+    worker = _Worker()
+    worker.config = {"rollout": {"drafter": {"enable": True}}}
+    worker.rollout = _Rollout()
+
+    ack = asyncio.run(
+        worker.update_draft_weights_async({"weight": 1}, global_steps=4)
+    )
+
+    assert ack["published"] is True
+    assert worker.rollout.updates == [({"weight": 1}, 4)]
+
+
 def test_explicit_disabled_drafter_wins_over_stale_runtime_env(monkeypatch) -> None:
     monkeypatch.setattr(
         "verl_speco.integration.sglang_runtime._load_env_drafter_config",
@@ -301,6 +355,38 @@ def test_veomni_lm_head_export_avoids_full_engine_state_dict(
     assert payload["export_strategy"] == expected_strategy
     assert payload["actor_backend"] == "veomni"
     assert tuple(payload["weight"].shape) == (expected_rows, 3)
+
+
+def test_dflash_lm_head_sparse_export_avoids_full_engine_state_dict() -> None:
+    torch = pytest.importorskip("torch")
+
+    class _Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = torch.nn.Linear(3, 6, bias=False)
+
+    class _Engine:
+        module = _Module()
+
+        @staticmethod
+        def get_per_tensor_param(**kwargs):
+            raise AssertionError("Sparse lm_head export must not enumerate full params")
+
+    worker = SimpleNamespace(
+        _is_actor=True,
+        rank=0,
+        config={"rollout": {"drafter": {"speculative_algorithm": "DFLASH"}}},
+        actor=SimpleNamespace(engine=_Engine()),
+    )
+
+    payload = rollout_publish.export_actor_lm_head_weight(
+        worker,
+        row_indices=[1, 4],
+    )
+
+    assert payload["export_strategy"] == "direct_sparse"
+    assert payload["selected_rows"] == 2
+    assert tuple(payload["weight"].shape) == (2, 3)
 
 
 def test_veomni_runtime_validation_checks_initialized_model_contract() -> None:
@@ -452,6 +538,39 @@ def test_mrv2_dspark_publish_excludes_frozen_confidence_head(monkeypatch) -> Non
     }
 
 
+def test_dspark_publish_excludes_untrained_confidence_head_without_mrv2_env(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    torch = pytest.importorskip("torch")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="publish state filtering needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(
+        model_type="dspark",
+        trains_draft_lm_head=False,
+        trains_draft_embeddings=False,
+        confidence_head_alpha=0.0,
+    )
+    trainer.training_device_mesh = None
+    trainer._frozen_param_names = []
+    trainer.model = SimpleNamespace(
+        state_dict=lambda: {
+            "draft_model.confidence_head.proj.weight": torch.ones(1, 2),
+            "draft_model.confidence_head.proj.bias": torch.ones(1),
+            "draft_model.markov_head.markov_w1.weight": torch.ones(2, 2),
+        }
+    )
+
+    assert set(trainer._get_trainable_state_dict()) == {
+        "draft_model.markov_head.markov_w1.weight"
+    }
+
+
 def test_target_lm_head_device_helper_handles_dflash_style_backend() -> None:
     base_trainer = pytest.importorskip(
         "verl_speco.trainer.base_trainer",
@@ -534,7 +653,6 @@ def test_idle_drafter_lifecycle_offloads_dspark_target_lm_head(
     if release_method == "cleanup_training":
         trainer._pending_checkpoint_future = None
         trainer._pending_full_checkpoint_future = None
-        trainer.skip_heavy_cleanup_after_drafter_training = False
         trainer._get_sp_group = lambda: None
         trainer._get_dp_group = lambda: None
         trainer.training_device_mesh = None

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import sys
 import types
@@ -23,6 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import verl_speco.integration.vllm_runtime as vllm_runtime
 
 from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
@@ -32,10 +34,13 @@ from verl_speco.integration.vllm_runtime import (
     SpecoVLLMWeightSyncCompatExtension,
     _SpecoVLLMHttpServerMixin,
     _describe_vllm_draft_logits,
+    _ensure_vllm_server_drafter_env,
     _invoke_bucket_received_callback,
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
     _record_vllm_spec_decode_scheduler_stats,
+    _rollout_idle_event_bus_name,
+    _rollout_idle_worker_id_for_replica,
     _speco_can_use_npu_target_staging,
     _speco_npu_target_staging,
     _speco_npu_target_staging_decision,
@@ -78,6 +83,155 @@ def test_vllm_speculative_config_maps_eagle3_contract() -> None:
         "model": "/models/drafter",
         "num_speculative_tokens": 3,
     }
+
+
+def test_vllm_rollout_idle_event_config_maps_replica_to_worker() -> None:
+    drafter_cfg = _drafter(
+        training={
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {
+                    "event_bus_name": "bubble-bus",
+                    "training_groups": [["worker-0", "worker-1"]],
+                },
+            }
+        }
+    )
+
+    assert _rollout_idle_event_bus_name(drafter_cfg) == "bubble-bus"
+    assert _rollout_idle_worker_id_for_replica(drafter_cfg, 1) == "worker-1"
+
+
+def test_vllm_server_restores_idle_event_config_from_server_config(monkeypatch) -> None:
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    drafter_cfg = _drafter(
+        training={
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {"event_bus_name": "bubble-bus"},
+            }
+        }
+    )
+
+    resolved, source = _ensure_vllm_server_drafter_env(
+        {"rollout": {"drafter": drafter_cfg}}
+    )
+
+    assert source == "server_config"
+    assert _rollout_idle_event_bus_name(resolved) == "bubble-bus"
+
+
+def test_vllm_server_uses_embedded_runtime_config_when_server_config_is_stale(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    stale_config = _drafter(training={"scheduler": {}})
+    runtime_config = _drafter(
+        training={
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {"event_bus_name": "runtime-bubble-bus"},
+            }
+        }
+    )
+
+    resolved, source = _ensure_vllm_server_drafter_env(
+        {"rollout": {"drafter": stale_config}},
+        json.dumps(runtime_config),
+    )
+
+    assert source == "server_class"
+    assert _rollout_idle_event_bus_name(resolved) == "runtime-bubble-bus"
+
+
+def test_vllm_idle_event_waits_for_all_replica_requests(monkeypatch) -> None:
+    gates = {"a": asyncio.Event(), "b": asyncio.Event()}
+
+    class _BaseServer:
+        async def generate(self, request_id):
+            await gates[request_id].wait()
+            return SimpleNamespace(extra_fields={})
+
+    class _Server(_SpecoVLLMHttpServerMixin, _BaseServer):
+        replica_rank = 0
+
+    events = []
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: _drafter())
+    monkeypatch.setattr(
+        vllm_runtime,
+        "_emit_rollout_idle_worker_event",
+        lambda **kwargs: events.append(kwargs["event_type"]) or True,
+    )
+    server = _Server()
+
+    async def scenario():
+        first = asyncio.create_task(server.generate("a"))
+        second = asyncio.create_task(server.generate("b"))
+        await asyncio.sleep(0)
+        assert events == ["GENERATION_STARTED"]
+        gates["a"].set()
+        await first
+        assert events == ["GENERATION_STARTED"]
+        gates["b"].set()
+        await second
+
+    asyncio.run(scenario())
+    assert events == ["GENERATION_STARTED", "WORKER_IDLE"]
+
+
+def test_vllm_failed_request_does_not_claim_memory_release(monkeypatch) -> None:
+    class _BaseServer:
+        async def generate(self, *args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("generation failed")
+
+    class _Server(_SpecoVLLMHttpServerMixin, _BaseServer):
+        replica_rank = 0
+
+    events = []
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: _drafter())
+    monkeypatch.setattr(
+        vllm_runtime,
+        "_emit_rollout_idle_worker_event",
+        lambda **kwargs: events.append(kwargs) or True,
+    )
+
+    with pytest.raises(RuntimeError, match="generation failed"):
+        asyncio.run(_Server().generate("request-0"))
+
+    assert events[-1]["event_type"] == "WORKER_IDLE"
+    assert events[-1]["memory_released"] is False
+    assert events[-1]["release_source"] == "runtime_request_failed"
+
+
+def test_vllm_runtime_idle_event_does_not_predict_deadline(monkeypatch) -> None:
+    payloads = []
+    monkeypatch.setattr(
+        vllm_runtime,
+        "emit_rollout_idle_event",
+        lambda _bus, payload: payloads.append(payload) or True,
+    )
+
+    emitted = vllm_runtime._emit_rollout_idle_worker_event(
+        drafter_cfg=_drafter(
+            training={
+                "scheduler": {
+                    "execution": {"strategy": "rollout_idle_worker"},
+                    "idle_worker": {
+                        "event_bus_name": "bubble-bus",
+                        "initial_batch_estimate_sec": 9.0,
+                    },
+                }
+            }
+        ),
+        replica_rank=0,
+        event_type="WORKER_IDLE",
+        memory_released=True,
+        release_source="runtime_request_complete",
+    )
+
+    assert emitted is True
+    assert payloads[-1]["must_be_ready_at"] is None
 
 
 def test_vllm_fresh_training_does_not_load_checkpoint_output_root() -> None:

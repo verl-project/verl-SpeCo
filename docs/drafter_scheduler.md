@@ -200,8 +200,9 @@ compute the number of training steps.
 ### 3. Add a Training Execution Strategy
 
 Examples include Bubble Time, rollout idle workers, asynchronous queues, or
-SFT co-training. ROLLOUT_IDLE_WORKER is reserved in the current enum but is
-not implemented yet.
+SFT co-training. ROLLOUT_IDLE_WORKER is implemented by the Bubble Time path;
+see [Bubble Time drafter training](bubble_time_drafter_training.md) for the
+quota lifecycle, writer selection, and rollout-version guard.
 
 1. Add or enable an enum value in DrafterExecutionStrategy in
    schedule_types.py, and update the strategy code in TrainingPlan.metrics().

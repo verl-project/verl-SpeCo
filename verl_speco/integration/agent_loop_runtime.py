@@ -37,6 +37,9 @@ _CURRENT_GLOBAL_STEPS = contextvars.ContextVar(
     "speco_current_global_steps", default=None
 )
 _CURRENT_VALIDATE = contextvars.ContextVar("speco_current_validate", default=False)
+_CURRENT_SKIP_DRAFTER_COLLECTION = contextvars.ContextVar(
+    "speco_current_skip_drafter_collection", default=False
+)
 SPECO_AGENT_LOOP_MANAGER_CLASS = (
     "verl_speco.integration.agent_loop_runtime.SpecoAgentLoopManager"
 )
@@ -102,21 +105,29 @@ def _sampling_params_with_speco_context(sampling_params: Any) -> Any:
     global_steps = _CURRENT_GLOBAL_STEPS.get()
     if global_steps is not None:
         patched.setdefault("_verl_global_steps", global_steps)
-    if bool(_CURRENT_VALIDATE.get()):
+    validate = bool(_CURRENT_VALIDATE.get())
+    skip_collection = bool(_CURRENT_SKIP_DRAFTER_COLLECTION.get())
+    if validate or skip_collection:
         patched["_verl_skip_drafter_collection"] = True
+        patched["_verl_skip_rollout_idle_event"] = validate
     return patched
 
 
 def _sampling_params_with_speco_step(
-    sampling_params: Any, *, global_steps: Any, validate: bool
+    sampling_params: Any,
+    *,
+    global_steps: Any,
+    validate: bool,
+    skip_drafter_collection: bool = False,
 ) -> Any:
     if not isinstance(sampling_params, dict):
         return sampling_params
     patched = dict(sampling_params)
     if global_steps is not None and global_steps != -1:
         patched["_verl_global_steps"] = global_steps
-    if validate:
+    if validate or skip_drafter_collection:
         patched["_verl_skip_drafter_collection"] = True
+        patched["_verl_skip_rollout_idle_event"] = bool(validate)
     return patched
 
 
@@ -148,15 +159,23 @@ def _speco_default_agent_loop_inputs(inputs: Any) -> Any:
     return inputs
 
 
-def _speco_context_from_batch(batch: Any) -> tuple[Any, Any]:
+def _speco_context_from_batch(batch: Any) -> tuple[Any, Any, Any]:
     meta_info = getattr(batch, "meta_info", None)
     meta_info = meta_info if isinstance(meta_info, dict) else {}
     global_steps_token = _CURRENT_GLOBAL_STEPS.set(meta_info.get("global_steps"))
     validate_token = _CURRENT_VALIDATE.set(bool(meta_info.get("validate", False)))
-    return global_steps_token, validate_token
+    skip_collection_token = _CURRENT_SKIP_DRAFTER_COLLECTION.set(
+        bool(meta_info.get("skip_drafter_collection", False))
+    )
+    return global_steps_token, validate_token, skip_collection_token
 
 
-def _speco_reset_context(global_steps_token: Any, validate_token: Any) -> None:
+def _speco_reset_context(
+    global_steps_token: Any,
+    validate_token: Any,
+    skip_collection_token: Any,
+) -> None:
+    _CURRENT_SKIP_DRAFTER_COLLECTION.reset(skip_collection_token)
     _CURRENT_VALIDATE.reset(validate_token)
     _CURRENT_GLOBAL_STEPS.reset(global_steps_token)
 
@@ -169,7 +188,9 @@ def _speco_worker_init(self, *args, **kwargs):
 
 
 async def _speco_worker_generate_sequences(self, batch):
-    global_steps_token, validate_token = _speco_context_from_batch(batch)
+    global_steps_token, validate_token, skip_collection_token = (
+        _speco_context_from_batch(batch)
+    )
     try:
         generate_sequences = _speco_parent_method(self, "generate_sequences")
         if not callable(generate_sequences):
@@ -182,7 +203,11 @@ async def _speco_worker_generate_sequences(self, batch):
         result = _ensure_extra_field_defaults(result)
         return result
     finally:
-        _speco_reset_context(global_steps_token, validate_token)
+        _speco_reset_context(
+            global_steps_token,
+            validate_token,
+            skip_collection_token,
+        )
 
 
 async def _speco_worker_run_agent_loop(
@@ -193,6 +218,7 @@ async def _speco_worker_run_agent_loop(
         sampling_params,
         global_steps=trajectory.get("step"),
         validate=bool(trajectory.get("validate", False)),
+        skip_drafter_collection=bool(trajectory.get("skip_drafter_collection", False)),
     )
     run_agent_loop = _speco_parent_method(self, "_run_agent_loop")
     if not callable(run_agent_loop):
@@ -441,12 +467,16 @@ def install_agent_loop_runtime_patch() -> bool:
             validate_token = _CURRENT_VALIDATE.set(
                 bool(meta_info.get("validate", False))
             )
+            skip_collection_token = _CURRENT_SKIP_DRAFTER_COLLECTION.set(
+                bool(meta_info.get("skip_drafter_collection", False))
+            )
             try:
                 result = generate_sequences(self, batch)
                 if inspect.isawaitable(result):
                     result = await result
                 return _ensure_extra_field_defaults(result)
             finally:
+                _CURRENT_SKIP_DRAFTER_COLLECTION.reset(skip_collection_token)
                 _CURRENT_VALIDATE.reset(validate_token)
                 _CURRENT_GLOBAL_STEPS.reset(global_steps_token)
 
@@ -464,6 +494,9 @@ def install_agent_loop_runtime_patch() -> bool:
                 sampling_params,
                 global_steps=trajectory.get("step"),
                 validate=bool(trajectory.get("validate", False)),
+                skip_drafter_collection=bool(
+                    trajectory.get("skip_drafter_collection", False)
+                ),
             )
             result = run_agent_loop(self, sampling_params, trajectory, *args, **kwargs)
             if inspect.isawaitable(result):

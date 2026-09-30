@@ -43,7 +43,6 @@ class CollectionOutcome:
         "collection_version_mismatch": 5,
         "collection_stage_failed": 6,
         "collection_id_mismatch": 7,
-        "collection_finalize_failed": 8,
     }
 
     def metrics(self) -> dict[str, float | int]:
@@ -118,22 +117,14 @@ class SyncCollectionStrategy:
             executor.abort(payload)
             raise
 
-        expected_nonempty_by_owner = {
-            str(owner): len(bucket)
-            for owner, bucket in enumerate(payload.buckets)
-            if bucket
+        expected_by_owner = {
+            str(owner): len(bucket) for owner, bucket in enumerate(payload.buckets)
         }
         staged_by_owner = {result.worker_id: result.staged_samples for result in staged}
         stage_ids = [result.worker_id for result in staged]
-        routing_complete = all(
-            staged_by_owner.get(owner) == expected
-            for owner, expected in expected_nonempty_by_owner.items()
-        ) and all(
-            result.worker_id in expected_nonempty_by_owner or result.staged_samples == 0
-            for result in staged
-        )
         stage_valid = (
             len(stage_ids) == len(set(stage_ids))
+            and set(stage_ids) == set(expected_by_owner)
             and all(
                 result.collection_id == plan.collection_id
                 and result.worker_incarnation
@@ -142,9 +133,35 @@ class SyncCollectionStrategy:
                 and result.reason == "collection_staged"
                 for result in staged
             )
-            and routing_complete
+            and staged_by_owner == expected_by_owner
         )
         if not stage_valid:
+            staged_summary = [
+                {
+                    "worker_id": result.worker_id,
+                    "reason": result.reason,
+                    "staged_samples": result.staged_samples,
+                    "source_global_step": result.source_global_step,
+                    "buffer_version_before": result.buffer_version_before,
+                    "buffer_version_after": result.buffer_version_after,
+                    "has_incarnation": bool(result.worker_incarnation),
+                }
+                for result in staged
+            ]
+            logger.warning(
+                "Drafter collection stage validation failed: collection_id=%s "
+                "expected_by_owner=%s staged_results=%s",
+                plan.collection_id,
+                expected_by_owner,
+                staged_summary,
+            )
+            print(
+                "[BubbleTime] collection_stage_validation_failed: "
+                f"collection_id={plan.collection_id} "
+                f"expected_by_owner={expected_by_owner} "
+                f"staged_results={staged_summary}",
+                flush=True,
+            )
             executor.abort(payload)
             return CollectionOutcome(
                 attempted=True,
@@ -224,8 +241,6 @@ class SyncCollectionStrategy:
                     "Failed to finalize committed drafter collection %s",
                     plan.collection_id,
                 )
-                executor.rollback(payload)
-                reason = "collection_finalize_failed"
         else:
             executor.rollback(payload)
         return CollectionOutcome(

@@ -109,6 +109,54 @@ class QueueScheduleContext:
     consumer_training: bool = False
 
 
+class RolloutWorkerEventType(str, Enum):
+    """Scheduler-visible rollout replica lifecycle events."""
+
+    GENERATION_STARTED = "generation_started"
+    WORKER_IDLE = "worker_idle"
+    WORKER_RECLAIM_REQUESTED = "worker_reclaim_requested"
+    WORKER_READY = "worker_ready"
+
+
+class IdleWindowConfidence(str, Enum):
+    """How strongly the runtime can prove that a rollout replica is idle."""
+
+    CONFIRMED = "confirmed"
+    SPECULATIVE = "speculative"
+
+
+@dataclass(frozen=True)
+class RolloutWorkerEvent:
+    """One rollout replica/owner event consumed by the idle-worker scheduler."""
+
+    event_type: RolloutWorkerEventType
+    worker_id: str
+    replica_rank: int
+    memory_released: bool = False
+    release_source: str = ""
+    # Legacy event producers are authoritative. Runtime adapters that only see
+    # an empty local request counter explicitly emit ``speculative``.
+    idle_confidence: IdleWindowConfidence = IdleWindowConfidence.CONFIRMED
+    must_be_ready_at: float | None = None
+    event_ts: float | None = None
+
+
+@dataclass(frozen=True)
+class AvailableTrainingResources:
+    """A complete training resource group selected from idle rollout workers."""
+
+    available: bool
+    reason: str
+    training_group_id: str = ""
+    worker_ids: tuple[str, ...] = ()
+    minimum_idle_window_sec: float = 0.0
+    idle_confidence: IdleWindowConfidence = IdleWindowConfidence.CONFIRMED
+    # Where the window came from.  ``runtime_deadline`` is a hard runtime
+    # boundary; bootstrap/historical windows are estimates protected by the
+    # rollout-training lease and cooperative reclaim.
+    idle_window_source: str = ""
+
+
 class DrafterCollectionSource(str, Enum):
     """Target-model feature source used by drafter collection."""
 
@@ -137,12 +185,90 @@ class DrafterScheduleConfig:
     min_trainable_batches: int = 1
     require_full_batch: bool = False
     sample_last_n_steps: int = 2
+    execution_strategy: DrafterExecutionStrategy = DrafterExecutionStrategy.SYNC
+    idle_worker_min_idle_window_sec: float | None = None
+    idle_worker_initial_batch_estimate_sec: float | None = None
+    idle_worker_deadline_guard_sec: float | None = None
+    idle_worker_require_memory_released: bool = True
+    # An estimated idle deadline is useful on backends that cannot expose
+    # worker lifecycle events, but it is best-effort only.  Set this to true
+    # when Bubble Time must fail closed unless the runtime has explicitly
+    # reported that the complete rollout worker group is idle.
+    idle_worker_require_runtime_idle_events: bool = False
+    idle_worker_drain_before_next_rollout: bool = True
+    idle_worker_full_collective_fallback: bool = False
+    # Retain a small amount of ready data, then stop creating newer target-head
+    # versions until the buffer has been consumed by Bubble training.
+    idle_worker_collection_target_batches: int | None = 2
+    # A replica-local writer receives all routed rollout samples.  Keep its
+    # default intake aligned with the synchronous two-worker collection run.
+    idle_worker_min_collect_samples_per_writer: int = 20
+    idle_worker_group_mode: str = "auto"
+    idle_worker_group_size: int | None = None
+    idle_worker_training_groups: tuple[tuple[str, ...], ...] = ()
+    idle_worker_speculative_window_multiplier: float = 1.5
+    idle_worker_max_publish_lag_steps: int = 2
+    idle_worker_max_pending_publish: int = 1
+    idle_worker_dynamic_batch_cap: bool = True
+    idle_worker_initial_dynamic_batches: int | None = None
+    idle_worker_gen_slowdown_threshold: float = 0.08
+    idle_worker_gen_slowdown_patience: int = 2
+    idle_worker_gen_slowdown_cooldown_steps: int = 2
+    gradient_accumulation_steps: int = 1
+    # Optional hybrid quota for Bubble Time.  Each configured training interval
+    # contributes ``target_steps`` optimizer steps once trainable data exists.
+    # Bubble execution repays the quota first. Optional critical-path fallback
+    # exists for compatibility, but production isolation keeps it disabled.
+    training_quota_enable: bool = False
+    training_quota_target_steps: int | None = 20
+    training_quota_max_debt_age_steps: int = 1
+    training_quota_max_completion_lag_steps: int = 3
+    training_quota_max_accumulated_debt: int = 20
+    training_quota_max_sync_topup_steps: int = 2
+    # ``interval`` is the strict Sync-equivalence mode: every eligible
+    # interval receives the full quota. ``adaptive`` keeps the exact same
+    # quota size and data-version semantics, but opens a new quota only when
+    # speculative-decoding quality drops or the maximum refresh age expires.
+    training_quota_trigger_mode: str = "interval"
+    training_quota_acceptance_drop_ratio: float = 0.03
+    training_quota_loss_increase_ratio: float = 0.10
+    training_quota_min_refresh_interval_steps: int = 2
+    training_quota_max_refresh_interval_steps: int = 10
+    # Critical-path completion is useful as a compatibility fallback, but it
+    # defeats Bubble Time's resource-isolation contract. Production Bubble
+    # configurations should leave this disabled.
+    training_quota_allow_critical_path_fallback: bool = True
 
     @classmethod
     def from_mapping(cls, config) -> "DrafterScheduleConfig":
         config = config or {}
         get = config.get if hasattr(config, "get") else lambda key, default: default
+        scheduler_cfg = get("scheduler", {}) or {}
+        scheduler_get = (
+            scheduler_cfg.get
+            if hasattr(scheduler_cfg, "get")
+            else lambda key, default: default
+        )
+        execution_cfg = scheduler_get("execution", {}) or {}
+        execution_get = (
+            execution_cfg.get
+            if hasattr(execution_cfg, "get")
+            else lambda key, default: default
+        )
+        idle_cfg = scheduler_get("idle_worker", {}) or {}
+        idle_get = (
+            idle_cfg.get if hasattr(idle_cfg, "get") else lambda key, default: default
+        )
+        training_quota_cfg = scheduler_get("training_quota", {}) or {}
+        training_quota_get = (
+            training_quota_cfg.get
+            if hasattr(training_quota_cfg, "get")
+            else lambda key, default: default
+        )
         train_batches = int(get("step", 100))
+        strategy_value = execution_get("strategy", get("execution_strategy", "sync"))
+        groups_value = idle_get("training_groups", ())
+        training_groups = _normalize_training_groups(groups_value)
         return cls(
             collect_interval_steps=get("collect_interval_steps", 1),
             training_interval_steps=get("training_interval_steps", 1),
@@ -166,11 +292,122 @@ class DrafterScheduleConfig:
             min_trainable_batches=int(get("min_trainable_batches", 1)),
             require_full_batch=bool(get("require_full_batch", False)),
             sample_last_n_steps=int(get("sample_last_n_steps", 2)),
+            execution_strategy=DrafterExecutionStrategy(strategy_value),
+            idle_worker_min_idle_window_sec=_optional_float(
+                idle_get("min_idle_window_sec", None)
+            ),
+            idle_worker_initial_batch_estimate_sec=_optional_float(
+                idle_get("initial_batch_estimate_sec", None)
+            ),
+            idle_worker_deadline_guard_sec=_optional_float(
+                idle_get("deadline_guard_sec", None)
+            ),
+            idle_worker_require_memory_released=bool(
+                idle_get("require_memory_released", True)
+            ),
+            idle_worker_require_runtime_idle_events=bool(
+                idle_get("require_runtime_idle_events", False)
+            ),
+            idle_worker_drain_before_next_rollout=bool(
+                idle_get("drain_before_next_rollout", True)
+            ),
+            idle_worker_full_collective_fallback=bool(
+                idle_get("full_collective_fallback", False)
+            ),
+            idle_worker_collection_target_batches=_optional_int(
+                idle_get("collection_target_batches", 2)
+            ),
+            idle_worker_min_collect_samples_per_writer=max(
+                int(idle_get("min_collect_samples_per_writer", 20) or 0), 0
+            ),
+            idle_worker_group_mode=str(idle_get("group_mode", "auto") or "auto")
+            .strip()
+            .lower(),
+            idle_worker_group_size=_optional_int(idle_get("group_size", None)),
+            idle_worker_training_groups=training_groups,
+            idle_worker_speculative_window_multiplier=max(
+                float(idle_get("speculative_window_multiplier", 1.5) or 1.5),
+                1.0,
+            ),
+            idle_worker_max_publish_lag_steps=max(
+                int(idle_get("max_publish_lag_steps", 2) or 0), 0
+            ),
+            idle_worker_max_pending_publish=max(
+                int(idle_get("max_pending_publish", 1) or 1), 1
+            ),
+            idle_worker_dynamic_batch_cap=bool(idle_get("dynamic_batch_cap", True)),
+            idle_worker_initial_dynamic_batches=_optional_int(
+                idle_get("initial_dynamic_batches", None)
+            ),
+            idle_worker_gen_slowdown_threshold=max(
+                float(idle_get("gen_slowdown_threshold", 0.08) or 0.0),
+                0.0,
+            ),
+            idle_worker_gen_slowdown_patience=max(
+                int(idle_get("gen_slowdown_patience", 2) or 1), 1
+            ),
+            idle_worker_gen_slowdown_cooldown_steps=max(
+                int(idle_get("gen_slowdown_cooldown_steps", 2) or 0), 0
+            ),
+            gradient_accumulation_steps=max(
+                int(get("gradient_accumulation_steps", 1) or 1), 1
+            ),
+            training_quota_enable=bool(training_quota_get("enable", False)),
+            training_quota_target_steps=_optional_int(
+                training_quota_get("target_steps", 20)
+            ),
+            training_quota_max_debt_age_steps=max(
+                int(training_quota_get("max_debt_age_steps", 1) or 0), 0
+            ),
+            training_quota_max_completion_lag_steps=max(
+                int(training_quota_get("max_completion_lag_steps", 3) or 0), 0
+            ),
+            training_quota_max_accumulated_debt=max(
+                int(training_quota_get("max_accumulated_debt", 20) or 0), 0
+            ),
+            training_quota_max_sync_topup_steps=max(
+                int(training_quota_get("max_sync_topup_steps", 2) or 0), 0
+            ),
+            training_quota_trigger_mode=str(
+                training_quota_get("trigger_mode", "interval") or "interval"
+            )
+            .strip()
+            .lower(),
+            training_quota_acceptance_drop_ratio=max(
+                float(training_quota_get("acceptance_drop_ratio", 0.03) or 0.0),
+                0.0,
+            ),
+            training_quota_loss_increase_ratio=max(
+                float(training_quota_get("loss_increase_ratio", 0.10) or 0.0),
+                0.0,
+            ),
+            training_quota_min_refresh_interval_steps=max(
+                int(training_quota_get("min_refresh_interval_steps", 2) or 0), 0
+            ),
+            training_quota_max_refresh_interval_steps=max(
+                int(training_quota_get("max_refresh_interval_steps", 10) or 0), 0
+            ),
+            training_quota_allow_critical_path_fallback=bool(
+                training_quota_get("allow_critical_path_fallback", True)
+            ),
         )
 
 
 def _optional_int(value: object) -> int | None:
     return None if value is None else _as_int(value)
+
+
+def _optional_float(value: object) -> float | None:
+    return None if value is None else _as_float(value)
+
+
+def _normalize_training_groups(value: object) -> tuple[tuple[str, ...], ...]:
+    if value is None:
+        return ()
+    groups: list[tuple[str, ...]] = []
+    for group in cast(Any, value):
+        groups.append(tuple(str(worker_id) for worker_id in group))
+    return tuple(groups)
 
 
 @dataclass(frozen=True)
@@ -213,6 +450,10 @@ class CollectionPlan:
         "training_interval_not_reached": 5,
         "sample_rate_zero": 6,
         "collection_enabled": 7,
+        "buffer_target_reached": 8,
+        "writer_state_migration_required": 9,
+        "training_quota_incomplete": 10,
+        "quality_refresh_not_due": 11,
         "producer_done": 8,
         "high_watermark_reached": 9,
         "low_watermark_reached": 10,
@@ -237,7 +478,30 @@ class CollectionPlan:
             "drafter/collection_plan_training_interval_matched": int(
                 self.training_interval_matched
             ),
+            "drafter/collection_plan_sample_rate": self.sample_rate,
+            "drafter/collection_plan_max_samples_per_replica": (
+                -1
+                if self.max_samples_per_replica is None
+                else self.max_samples_per_replica
+            ),
+            "drafter/collection_plan_max_tokens_per_replica": (
+                -1
+                if self.max_tokens_per_replica is None
+                else self.max_tokens_per_replica
+            ),
+            "drafter/collection_plan_window_tokens_per_sample": (
+                -1
+                if self.hidden_window_tokens_per_sample is None
+                else self.hidden_window_tokens_per_sample
+            ),
+            "drafter/collection_plan_window_min_rows": self.hidden_window_min_rows,
         }
+        try:
+            metrics["drafter/collection_plan_source_global_step"] = _as_int(
+                self.source_global_step
+            )
+        except (TypeError, ValueError):
+            pass
         return metrics
 
 
@@ -327,8 +591,7 @@ class TrainingDataStatus:
     worker_incarnation: str = ""
     worker_id: str = ""
     worker_snapshots: dict[str, dict[str, object]] | None = None
-    min_sample_step: int | None = None
-    max_sample_step: int | None = None
+    trainable_valid_tokens: int = 0
 
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "TrainingDataStatus":
@@ -354,16 +617,16 @@ class TrainingDataStatus:
             buffer_version=_as_int(value.get("buffer_version", 0)),
             worker_incarnation=str(value.get("worker_incarnation", "")),
             worker_id=str(value.get("worker_id", value.get("rank", ""))),
-            min_sample_step=_optional_int(value.get("min_sample_step")),
-            max_sample_step=_optional_int(value.get("max_sample_step")),
+            trainable_valid_tokens=_as_int(value.get("trainable_valid_tokens", 0)),
         )
 
-    def metrics(self) -> dict[str, int]:
+    def metrics(self) -> dict[str, int | float]:
         return {
             "drafter/data_current_step_samples": self.current_step_samples,
             "drafter/data_buffer_samples": self.buffer_samples,
             "drafter/data_trainable_samples": self.trainable_samples,
             "drafter/data_trainable_batches": self.trainable_batches,
+            "drafter/data_trainable_valid_tokens": self.trainable_valid_tokens,
             "drafter/data_partial_batch_available": int(self.partial_batch_available),
             "drafter/data_same_step_required": int(self.same_step_data_required),
             "drafter/data_target_version_consistent": int(
@@ -411,6 +674,27 @@ class TrainingPlan:
     data_filter_reason: str = ""
     plan_id: str = ""
     worker_snapshots: dict[str, dict[str, object]] | None = None
+    target_worker_ids: tuple[str, ...] = ()
+    training_group_id: str = ""
+    idle_window_sec: float | None = None
+    idle_usable_window_sec: float | None = None
+    idle_window_batches: int | None = None
+    idle_batch_estimate_sec: float | None = None
+    idle_startup_reserve_sec: float | None = None
+    idle_tail_reserve_sec: float | None = None
+    idle_reclaim_penalty_sec: float | None = None
+    idle_trainable_batches: int | None = None
+    idle_window_source: str = ""
+    idle_confidence: IdleWindowConfidence = IdleWindowConfidence.SPECULATIVE
+    gradient_accumulation_steps: int = 1
+    planned_optimizer_steps: int = 0
+    planned_valid_tokens: int = 0
+    retain_replay_session: bool = False
+    # A zero-progress full-collective fallback can seed exactly one
+    # replica-local writer with the synchronized model/optimizer state. Other
+    # ranks clean up normally, avoiding both the next cold start and all-rank
+    # training residency.
+    hot_bootstrap_worker_ids: tuple[str, ...] = ()
     data_source: DrafterTrainingDataSource = DrafterTrainingDataSource.LOCAL_BUFFER
     required_samples: int | None = None
     selected_keys: tuple[str, ...] = ()
@@ -431,8 +715,24 @@ class TrainingPlan:
         "inconsistent_target_version": 13,
         "inconsistent_data_version": 14,
         "worker_preflight_failed": 15,
-        "consumer_training": 16,
-        "insufficient_ready_samples": 17,
+        "no_idle_worker": 16,
+        "incomplete_training_group": 17,
+        "window_too_small": 18,
+        "missing_training_group_metadata": 19,
+        "target_lm_head_not_ready": 22,
+        "replica_local_unavailable": 23,
+        "idle_group_not_prewarmed": 24,
+        "writer_state_migration_required": 25,
+        "speculative_idle_unconfirmed": 26,
+        "quota_topup_training_ready": 27,
+        "quota_topup_lm_head_prefetch_pending": 28,
+        "quota_forced_completion_ready": 29,
+        "training_quota_publish_pending": 30,
+        "generation_slowdown_cooldown": 31,
+        "cold_writer_wait_for_runtime_deadline": 32,
+        "cold_writer_window_too_small": 33,
+        "consumer_training": 34,
+        "insufficient_ready_samples": 35,
     }
 
     def to_worker_payload(self) -> dict[str, object]:
@@ -455,12 +755,25 @@ class TrainingPlan:
             "data_filter_reason": self.data_filter_reason,
             "plan_id": self.plan_id,
             "worker_snapshots": self.worker_snapshots or {},
+            "target_worker_ids": self.target_worker_ids,
+            "training_group_id": self.training_group_id,
+            "idle_batch_estimate_sec": self.idle_batch_estimate_sec,
+            "idle_startup_reserve_sec": self.idle_startup_reserve_sec,
+            "idle_tail_reserve_sec": self.idle_tail_reserve_sec,
+            "idle_reclaim_penalty_sec": self.idle_reclaim_penalty_sec,
+            "idle_window_source": self.idle_window_source,
+            "idle_confidence": self.idle_confidence.value,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "planned_optimizer_steps": self.planned_optimizer_steps,
+            "planned_valid_tokens": self.planned_valid_tokens,
+            "retain_replay_session": self.retain_replay_session,
+            "hot_bootstrap_worker_ids": self.hot_bootstrap_worker_ids,
             "data_source": self.data_source.value,
             "required_samples": self.required_samples,
             "selected_keys": list(self.selected_keys),
         }
 
-    def metrics(self) -> dict[str, int]:
+    def metrics(self) -> dict[str, float | int]:
         """Return numeric observability fields accepted by metric backends."""
 
         strategy_code = {
@@ -468,13 +781,56 @@ class TrainingPlan:
             DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER: 1,
             DrafterExecutionStrategy.STANDALONE_ASYNC: 2,
         }[self.execution_strategy]
-        metrics = {
+        metrics: dict[str, float | int] = {
             "drafter/scheduler_used": 1,
             "drafter/schedule_launch": int(self.launch),
             "drafter/schedule_interval_matched": int(self.interval_matched),
             "drafter/schedule_strategy": strategy_code,
             "drafter/schedule_reason": self._REASON_CODES.get(self.reason, 0),
+            "drafter/schedule_max_batches": int(self.max_batches),
+            "drafter/schedule_publish_after_success": int(self.publish_after_success),
+            "drafter/schedule_min_batches": int(self.min_batches),
+            "drafter/schedule_require_full_batch": int(self.require_full_batch),
+            "drafter/schedule_sample_last_n_steps": int(self.sample_last_n_steps),
         }
+        if self.hot_bootstrap_worker_ids:
+            metrics["bubble/hot_bootstrap_workers"] = len(self.hot_bootstrap_worker_ids)
+        if self.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
+            metrics.update(
+                {
+                    "bubble/replay_session_retained": int(self.retain_replay_session),
+                    "bubble/planned_batches": int(self.max_batches),
+                    "bubble/idle_training_groups": int(bool(self.training_group_id)),
+                    "bubble/no_idle_worker": int(self.reason == "no_idle_worker"),
+                    "bubble/incomplete_training_group": int(
+                        self.reason == "incomplete_training_group"
+                    ),
+                    "bubble/skipped_incomplete_group": int(
+                        not self.launch and self.reason == "incomplete_training_group"
+                    ),
+                    "bubble/window_too_small": int(self.reason == "window_too_small"),
+                    "bubble/speculative_idle_unconfirmed": int(
+                        self.reason == "speculative_idle_unconfirmed"
+                    ),
+                    "bubble/idle_reclaim_penalty_active": int(
+                        bool(self.idle_reclaim_penalty_sec)
+                    ),
+                    "bubble/idle_reclaim_penalty_s": float(
+                        self.idle_reclaim_penalty_sec or 0.0
+                    ),
+                    "bubble/missing_training_group_metadata": int(
+                        self.reason == "missing_training_group_metadata"
+                    ),
+                }
+            )
+            if self.deadline_ts is not None:
+                metrics["bubble/deadline_ts"] = int(self.deadline_ts)
+        try:
+            metrics["drafter/schedule_source_global_step"] = _as_int(
+                self.source_global_step
+            )
+        except (TypeError, ValueError):
+            pass
         return metrics
 
 
@@ -510,6 +866,7 @@ class TrainingResult:
     data_version: int | None = None
     target_version: int | None = None
     is_publish_leader: bool = False
+    successful_valid_tokens: int = 0
 
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "TrainingResult":
@@ -533,4 +890,5 @@ class TrainingResult:
             data_version=_optional_int(value.get("data_version")),
             target_version=_optional_int(value.get("target_version")),
             is_publish_leader=bool(value.get("is_publish_leader", False)),
+            successful_valid_tokens=_as_int(value.get("successful_valid_tokens", 0)),
         )

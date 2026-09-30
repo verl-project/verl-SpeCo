@@ -163,6 +163,8 @@ actor_rollout_ref:
         step: 10
         batch_size_per_gpu: 4
         training_interval_steps: 5
+        min_trainable_batches: 1
+        require_full_batch: false
         publish_interval_steps: 0
         publish_async: false
         publish_dtype: null
@@ -172,7 +174,6 @@ actor_rollout_ref:
         draft_update_pause_generation: true
         draft_update_flush_before: true
         draft_update_flush_after: true
-        skip_heavy_cleanup_after_drafter_training: false
         # Keep trainer objects resident while releasing idle NPU HCCL memory.
         park_hccl_after_drafter_training: false
         save_full_drafter_checkpoint: true
@@ -410,3 +411,67 @@ actor_rollout_ref:
               protocol: tcp
               global_segment_size: 4294967296
               local_buffer_size: 2147483648
+        scheduler:
+          execution:
+            # sync | rollout_idle_worker
+            strategy: sync
+          # Optional hybrid Bubble quota. Each training interval creates one
+          # quality target after data becomes trainable. Bubble work repays it
+          # across real rollout-idle windows. ``training.step`` remains the
+          # per-idle-window cap; target_steps is the per-cycle optimizer target.
+          # Set target_steps=null only when intentionally reusing training.step.
+          training_quota:
+            enable: false
+            target_steps: 20
+            # interval: strict Bubble-vs-Sync equivalence experiment.
+            # adaptive: production mode; each selected refresh still executes
+            # all 20 optimizer steps on one immutable data version.
+            trigger_mode: adaptive
+            acceptance_drop_ratio: 0.03
+            loss_increase_ratio: 0.10
+            min_refresh_interval_steps: 2
+            # A forced refresh prevents a healthy accept-length signal from
+            # leaving the drafter permanently stale.
+            max_refresh_interval_steps: 10
+            # Age thresholds are also exported as observability metrics. They
+            # only permit serial assistance when the fallback below is enabled.
+            max_debt_age_steps: 1
+            # With critical-path fallback enabled, this is the hard completion
+            # deadline. Production mode leaves debt pending for later bubbles.
+            max_completion_lag_steps: 3
+            max_accumulated_debt: 20
+            # Used only when critical-path fallback is explicitly enabled.
+            max_sync_topup_steps: 2
+            # Production Bubble must not borrow PPO/rollout critical-path
+            # resources. Set true only for strict freshness experiments that
+            # explicitly accept Sync-like blocking completion.
+            allow_critical_path_fallback: false
+          idle_worker:
+            require_memory_released: true
+            drain_before_next_rollout: true
+            # Last-resort Bubble fallback. If every replica-local group is
+            # disabled (for example OOM during activation), allow the scheduler
+            # to require the full drafter collective to be idle. Disabled by
+            # default because it reduces Bubble granularity and can reintroduce
+            # rollout wake-up memory pressure.
+            full_collective_fallback: false
+            event_bus_name: null
+            event_poll_interval_sec: 0.05
+            # Runtime request completion is speculative until the replica
+            # manager closes assignment for the current generation epoch.
+            speculative_window_multiplier: 1.5
+            # Let asynchronous staging overlap later work, but bound how long
+            # rollout may keep serving an older drafter version.
+            max_publish_lag_steps: 2
+            max_pending_publish: 1
+            # Repeated per-token generation slowdown means the predicted idle
+            # window was unsafe. Pause new Bubble launches briefly instead of
+            # continuing to interfere at a one-batch cap.
+            gen_slowdown_patience: 2
+            gen_slowdown_cooldown_steps: 2
+            # Explicit training_groups wins.  With group_mode=auto, the
+            # scheduler forms stable collective groups from known rollout
+            # workers and only trains when a full group is idle.
+            group_mode: auto
+            group_size: null
+            training_groups: []

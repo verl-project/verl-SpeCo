@@ -38,6 +38,12 @@ from typing import Any, Iterable, cast
 from verl_speco.integration.verl_npu_vllm_compat import (
     install_verl_npu_vllm_import_compat,
 )
+from verl_speco.integration.rollout_idle_events import (
+    SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV,
+    acquire_rollout_resource_lease,
+    emit_rollout_idle_event,
+    release_rollout_resource_lease,
+)
 from verl_speco.trainer.checkpoint import trim_process_host_memory
 
 logger = logging.getLogger(__file__)
@@ -1122,6 +1128,159 @@ def _load_env_drafter_config() -> dict[str, Any]:
 
 def _vllm_drafter_env_payload(drafter_cfg: dict[str, Any]) -> dict[str, Any]:
     return dict(drafter_cfg)
+
+
+def _ensure_vllm_server_drafter_env(
+    config: Any,
+    embedded_config_json: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Restore the drafter config inside a remote vLLM HTTP-server process.
+
+    The Trainer mutates the idle-event bus name after Ray actors have started.
+    A vLLM HTTP server is another Ray process and does not reliably inherit that
+    late environment mutation.  Its local server config is therefore the
+    authoritative fallback for the runtime idle callback.
+    """
+
+    server_config = _drafter_config_from_config(config)
+    embedded_config: dict[str, Any] = {}
+    if embedded_config_json:
+        try:
+            loaded = json.loads(embedded_config_json)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Invalid embedded vLLM drafter runtime config") from exc
+        if isinstance(loaded, dict):
+            embedded_config = loaded
+    env_config = _load_env_drafter_config()
+    candidates = (
+        (server_config, "server_config"),
+        (embedded_config, "server_class"),
+        (env_config, "environment"),
+    )
+    for candidate, source in candidates:
+        configured_bus_name = _get_nested(
+            candidate,
+            ("training", "scheduler", "idle_worker", "event_bus_name"),
+            "",
+        )
+        if candidate and configured_bus_name:
+            os.environ[SPECO_DRAFTER_CONFIG_ENV] = json.dumps(
+                _vllm_drafter_env_payload(candidate), sort_keys=True
+            )
+            return candidate, source
+
+    env_bus_name = _rollout_idle_event_bus_name(env_config)
+    server_bus_name = _rollout_idle_event_bus_name(server_config)
+    if server_config and (not env_config or server_bus_name or not env_bus_name):
+        os.environ[SPECO_DRAFTER_CONFIG_ENV] = json.dumps(
+            _vllm_drafter_env_payload(server_config), sort_keys=True
+        )
+        return server_config, "server_config"
+    return env_config, "environment"
+
+
+def _rollout_idle_worker_config(drafter_cfg: dict[str, Any]) -> dict[str, Any]:
+    training_cfg = drafter_cfg.get("training") or {}
+    scheduler_cfg = training_cfg.get("scheduler") or {}
+    idle_cfg = scheduler_cfg.get("idle_worker") or {}
+    execution_cfg = scheduler_cfg.get("execution") or {}
+    strategy = str(execution_cfg.get("strategy", "sync") or "sync").strip().lower()
+    return dict(idle_cfg) if strategy == "rollout_idle_worker" else {}
+
+
+def _rollout_idle_event_bus_name(drafter_cfg: dict[str, Any]) -> str:
+    idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+    if not idle_cfg:
+        return ""
+    return str(
+        idle_cfg.get("event_bus_name")
+        or os.getenv(SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV)
+        or ""
+    )
+
+
+def _rollout_idle_worker_id_for_replica(
+    drafter_cfg: dict[str, Any],
+    replica_rank: int,
+) -> str:
+    idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+    flattened = [
+        str(worker_id)
+        for group in idle_cfg.get("training_groups") or []
+        for worker_id in group
+    ]
+    if 0 <= int(replica_rank) < len(flattened):
+        return flattened[int(replica_rank)]
+    return str(replica_rank)
+
+
+def _rollout_idle_worker_ids_for_replica(
+    drafter_cfg: dict[str, Any],
+    replica_rank: int,
+) -> tuple[str, ...]:
+    """Resolve the complete colocated training group owned by a replica."""
+
+    idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+    groups = idle_cfg.get("training_groups") or []
+    if 0 <= int(replica_rank) < len(groups):
+        group = tuple(str(worker_id) for worker_id in groups[int(replica_rank)] or ())
+        if group:
+            return group
+    return (_rollout_idle_worker_id_for_replica(drafter_cfg, replica_rank),)
+
+
+def _emit_rollout_idle_worker_event(
+    *,
+    drafter_cfg: dict[str, Any],
+    replica_rank: int,
+    event_type: str,
+    memory_released: bool = False,
+    release_source: str = "",
+    idle_confidence: str = "speculative",
+) -> bool:
+    bus_name = _rollout_idle_event_bus_name(drafter_cfg)
+    if not bus_name:
+        return False
+    event_ts = time.time()
+    # Runtime callbacks prove that a replica has released resources, but they
+    # cannot know when the next rollout request will reclaim them.  Leave the
+    # deadline unknown and let the scheduler admit work from observed history;
+    # reclaim remains the hard stop signal.
+    must_be_ready_at = None
+    worker_id = _rollout_idle_worker_id_for_replica(drafter_cfg, replica_rank)
+    deadline_source = "runtime_unknown"
+    emitted = emit_rollout_idle_event(
+        bus_name,
+        {
+            "event_type": event_type,
+            "worker_id": worker_id,
+            "replica_rank": int(replica_rank),
+            "memory_released": memory_released,
+            "release_source": release_source,
+            "idle_confidence": idle_confidence,
+            "must_be_ready_at": must_be_ready_at,
+            "event_ts": event_ts,
+        },
+    )
+    logger.warning(
+        "[BubbleTime] emit_rollout_idle_event runtime=vllm bus=%s type=%s "
+        "worker_id=%s replica_rank=%s memory_released=%s release_source=%s deadline_in_s=%s "
+        "deadline_source=%s emitted=%s",
+        bus_name,
+        event_type,
+        worker_id,
+        replica_rank,
+        memory_released,
+        release_source,
+        (
+            None
+            if must_be_ready_at is None
+            else round(max(must_be_ready_at - event_ts, 0.0), 3)
+        ),
+        deadline_source,
+        emitted,
+    )
+    return emitted
 
 
 def _rollout_name(config: Any) -> str | None:
@@ -2366,6 +2525,22 @@ class _SpecoVLLMHttpServerMixin:
         self._speco_initial_draft_weights_ready = False
         self._speco_initial_draft_weights_lock = None
         install_vllm_runtime_observability()
+        drafter_cfg, config_source = _ensure_vllm_server_drafter_env(
+            self.config,
+            getattr(type(self), "_speco_drafter_config_env", None),
+        )
+        idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+        logger.warning(
+            "[BubbleTime] vLLM idle hook ready: replica_rank=%s source=%s "
+            "strategy=%s event_bus=%s enabled=%s",
+            getattr(self, "replica_rank", 0),
+            config_source,
+            _get_nested(
+                drafter_cfg, ("training", "scheduler", "execution", "strategy"), "sync"
+            ),
+            _rollout_idle_event_bus_name(drafter_cfg),
+            bool(idle_cfg),
+        )
         _ensure_vllm_drafter_speculative_config_from_env(self.config)
         return await super().launch_server(*args, **kwargs)
 
@@ -2431,8 +2606,134 @@ class _SpecoVLLMHttpServerMixin:
             self._speco_initial_draft_weights_ready = True
 
     async def generate(self, *args, **kwargs):
+        import asyncio
+
         await self._speco_ensure_initial_draft_weights()
-        output = await super().generate(*args, **kwargs)
+        drafter_cfg = _load_env_drafter_config()
+        replica_rank = int(getattr(self, "replica_rank", 0) or 0)
+        lease_lock = getattr(self, "_speco_rollout_lease_lock", None)
+        if lease_lock is None:
+            lease_lock = asyncio.Lock()
+            self._speco_rollout_lease_lock = lease_lock
+        async with lease_lock:
+            active_requests = int(
+                getattr(self, "_speco_rollout_active_requests", 0) or 0
+            )
+            if active_requests == 0:
+                self._speco_rollout_release_verified = True
+                lease_workers = _rollout_idle_worker_ids_for_replica(
+                    drafter_cfg,
+                    replica_rank,
+                )
+                lease_acquired, lease_wait_s = await acquire_rollout_resource_lease(
+                    _rollout_idle_event_bus_name(drafter_cfg),
+                    worker_ids=lease_workers,
+                    event={
+                        "worker_id": _rollout_idle_worker_id_for_replica(
+                            drafter_cfg, replica_rank
+                        ),
+                        "replica_rank": replica_rank,
+                        "memory_released": False,
+                        "idle_confidence": "confirmed",
+                        "release_source": "runtime_request_started",
+                    },
+                )
+                self._speco_rollout_resource_lease_active = lease_acquired
+                self._speco_rollout_resource_lease_workers = lease_workers
+                if lease_acquired:
+                    logger.warning(
+                        "[BubbleTime] rollout_resource_lease_acquired "
+                        "runtime=vllm replica_rank=%s workers=%s wait_s=%.4f",
+                        replica_rank,
+                        lease_workers,
+                        lease_wait_s,
+                    )
+                else:
+                    logger.warning(
+                        "[BubbleTime] rollout_resource_lease_unavailable "
+                        "runtime=vllm replica_rank=%s workers=%s "
+                        "fallback=speculative_event",
+                        replica_rank,
+                        lease_workers,
+                    )
+                    _emit_rollout_idle_worker_event(
+                        drafter_cfg=drafter_cfg,
+                        replica_rank=replica_rank,
+                        event_type="GENERATION_STARTED",
+                    )
+            self._speco_rollout_active_requests = active_requests + 1
+        request_completed = False
+        try:
+            output = await super().generate(*args, **kwargs)
+            request_completed = True
+        finally:
+            if not request_completed:
+                self._speco_rollout_release_verified = False
+            async with lease_lock:
+                remaining_requests = max(
+                    int(getattr(self, "_speco_rollout_active_requests", 1) or 1) - 1,
+                    0,
+                )
+                self._speco_rollout_active_requests = remaining_requests
+                if remaining_requests == 0:
+                    release_verified = bool(
+                        getattr(self, "_speco_rollout_release_verified", False)
+                    )
+                    lease_active = bool(
+                        getattr(self, "_speco_rollout_resource_lease_active", False)
+                    )
+                    released = False
+                    if lease_active:
+                        released = await release_rollout_resource_lease(
+                            _rollout_idle_event_bus_name(drafter_cfg),
+                            worker_ids=tuple(
+                                getattr(
+                                    self,
+                                    "_speco_rollout_resource_lease_workers",
+                                    (),
+                                )
+                            ),
+                            event={
+                                "worker_id": _rollout_idle_worker_id_for_replica(
+                                    drafter_cfg, replica_rank
+                                ),
+                                "replica_rank": replica_rank,
+                                "memory_released": release_verified,
+                                "release_source": (
+                                    "runtime_request_finalized"
+                                    if release_verified
+                                    else "runtime_request_failed"
+                                ),
+                            },
+                        )
+                    if not released:
+                        if lease_active:
+                            logger.warning(
+                                "[BubbleTime] rollout_resource_lease_release_failed "
+                                "runtime=vllm replica_rank=%s workers=%s "
+                                "fallback=speculative_event",
+                                replica_rank,
+                                tuple(
+                                    getattr(
+                                        self,
+                                        "_speco_rollout_resource_lease_workers",
+                                        (),
+                                    )
+                                ),
+                            )
+                        _emit_rollout_idle_worker_event(
+                            drafter_cfg=drafter_cfg,
+                            replica_rank=replica_rank,
+                            event_type="WORKER_IDLE",
+                            memory_released=release_verified,
+                            release_source=(
+                                "runtime_request_finalized"
+                                if release_verified
+                                else "runtime_request_failed"
+                            ),
+                        )
+                    self._speco_rollout_resource_lease_active = False
+                    self._speco_rollout_release_verified = False
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
             self._speco_add_vllm_spec_decode_extra_fields(extra_fields)
@@ -2441,12 +2742,18 @@ class _SpecoVLLMHttpServerMixin:
 
 def _build_speco_vllm_http_server_class(upstream_module: Any):
     upstream_cls = upstream_module.vLLMHttpServer
+    drafter_config_env = os.getenv(SPECO_DRAFTER_CONFIG_ENV)
     if issubclass(upstream_cls, _SpecoVLLMHttpServerMixin):
+        if drafter_config_env:
+            upstream_cls._speco_drafter_config_env = drafter_config_env
         return upstream_cls
     return type(
         "SpecoVLLMHttpServer",
         (_SpecoVLLMHttpServerMixin, upstream_cls),
-        {"__module__": __name__},
+        {
+            "__module__": __name__,
+            "_speco_drafter_config_env": drafter_config_env,
+        },
     )
 
 
@@ -2456,6 +2763,7 @@ def install_upstream_vllm_runtime_bridge() -> bool:
     global _VLLM_REPLICA_PATCHED
     install_vllm_runtime_observability()
     if _VLLM_REPLICA_PATCHED:
+        logger.warning("[BubbleTime] vLLM runtime bridge already installed")
         return True
 
     try:
@@ -2464,11 +2772,19 @@ def install_upstream_vllm_runtime_bridge() -> bool:
         from verl.workers.rollout import replica as replica_module
         from verl.workers.rollout.vllm_rollout import vllm_async_server
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Unable to install SPECO vLLM runtime bridge: %s", exc)
+        logger.warning(
+            "[BubbleTime] unable to install SPECO vLLM runtime bridge: %s",
+            exc,
+            exc_info=True,
+        )
         return False
 
     upstream_replica = getattr(vllm_async_server, "vLLMReplica", None)
     if upstream_replica is None:
+        logger.warning(
+            "[BubbleTime] unable to install SPECO vLLM runtime bridge: "
+            "vLLMReplica not found"
+        )
         return False
 
     speco_http_server_cls = _build_speco_vllm_http_server_class(vllm_async_server)
@@ -2494,6 +2810,14 @@ def install_upstream_vllm_runtime_bridge() -> bool:
         registry._registry["vllm"] = lambda: SpecoVLLMReplica
     patch_vllm_server_adapter_update()
     _VLLM_REPLICA_PATCHED = True
+    logger.warning(
+        "[BubbleTime] installed SPECO vLLM runtime bridge: replica_cls=%s "
+        "server_cls=%s",
+        getattr(SpecoVLLMReplica, "__name__", type(SpecoVLLMReplica).__name__),
+        getattr(
+            speco_http_server_cls, "__name__", type(speco_http_server_cls).__name__
+        ),
+    )
     return True
 
 
@@ -2515,7 +2839,25 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     speculative_config = build_vllm_speculative_config_from_drafter(
         drafter_cfg, rollout_cfg=rollout_cfg
     )
-    install_upstream_vllm_runtime_bridge()
+    bridge_installed = install_upstream_vllm_runtime_bridge()
+    idle_bus_name = _get_nested(
+        drafter_cfg,
+        ("training", "scheduler", "idle_worker", "event_bus_name"),
+        "",
+    )
+    idle_strategy = _get_nested(
+        drafter_cfg,
+        ("training", "scheduler", "execution", "strategy"),
+        "",
+    )
+    logger.warning(
+        "[BubbleTime] configured vLLM SPECO runtime: bridge_installed=%s "
+        "idle_strategy=%s idle_event_bus=%s drafter_enabled=%s",
+        bridge_installed,
+        idle_strategy,
+        idle_bus_name or os.getenv(SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV) or "",
+        enabled,
+    )
 
     engine_kwargs = _ensure_nested_mapping(
         config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm")
@@ -3549,6 +3891,8 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         without retaining a second complete drafter on the rollout device.
         """
 
+        import os
+
         import torch
         from vllm.platforms import current_platform
 
@@ -3691,6 +4035,27 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             if is_eagle3:
                 loaded_params += self._speco_update_draft_weights(translated_bucket)
                 return
+
+            if os.environ.get("SPECO_DRAFT_WEIGHT_LOAD_DEBUG") == "1":
+                target_params = dict(inner_model.named_parameters())
+                start_index = len(requested_names) - len(translated_bucket)
+                for offset, (name, tensor) in enumerate(translated_bucket):
+                    target = target_params.get(name)
+                    logger.warning(
+                        "[speco draft ipc debug] tp_rank=%s index=%s name=%s "
+                        "source=(shape=%s dtype=%s device=%s contiguous=%s) "
+                        "target=(shape=%s dtype=%s device=%s)",
+                        getattr(self, "rank", getattr(self, "local_rank", "unknown")),
+                        start_index + offset,
+                        name,
+                        tuple(tensor.shape),
+                        tensor.dtype,
+                        tensor.device,
+                        tensor.is_contiguous(),
+                        tuple(target.shape) if target is not None else None,
+                        target.dtype if target is not None else None,
+                        target.device if target is not None else None,
+                    )
 
             bucket_loaded_names = inner_model.load_weights(iter(translated_bucket))
             loaded_names.update(

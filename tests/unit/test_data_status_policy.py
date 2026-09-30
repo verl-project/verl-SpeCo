@@ -56,6 +56,7 @@ def test_status_policy_aggregates_distributed_capacity_conservatively() -> None:
     assert result.oldest_sample_step == 2
     assert result.newest_sample_step == 5
     assert not result.data_version_consistent
+    assert result.trainable_valid_tokens == 0
     assert result.worker_snapshots == {
         "0": {
             "buffer_version": 7,
@@ -70,6 +71,21 @@ def test_status_policy_aggregates_distributed_capacity_conservatively() -> None:
             "trainable_samples": 8,
         },
     }
+
+
+def test_status_policy_uses_tokens_available_on_every_collective_rank() -> None:
+    result = ConservativeTrainingDataStatusPolicy().aggregate(
+        [
+            _status(trainable_valid_tokens=120),
+            _status(worker_id="1", trainable_valid_tokens=80),
+        ],
+        global_step=5,
+    )
+
+    assert result is not None
+    assert result.trainable_valid_tokens == 80
+    assert result.worker_snapshots["0"]["trainable_valid_tokens"] == 120
+    assert result.worker_snapshots["1"]["trainable_valid_tokens"] == 80
 
 
 def test_status_policy_marks_mismatched_target_versions_unknown() -> None:

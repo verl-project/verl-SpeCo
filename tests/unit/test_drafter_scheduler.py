@@ -13,6 +13,8 @@
 # limitations under the License.
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from verl_speco.trainer.scheduler import (
@@ -141,6 +143,182 @@ def test_oldlogprob_collection_plan_preserves_training_interval_requirement() ->
     assert plan.reason == "training_interval_not_reached"
 
 
+def test_bubble_collection_is_single_flight_until_quota_completes() -> None:
+    scheduler = DrafterScheduler()
+    config = DrafterScheduleConfig(
+        collect_interval_steps=2,
+        training_interval_steps=4,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        training_quota_enable=True,
+        training_quota_target_steps=20,
+    )
+    first = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=2,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+
+    scheduler.record_collection_outcome(
+        first,
+        SimpleNamespace(collected=True),
+        config,
+    )
+    assert scheduler._training_quota_debt_steps == 20
+    assert scheduler._training_quota_data_version == 2
+
+    same_step = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=2,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+    next_interval = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=4,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+
+    assert same_step.collect
+    assert not next_interval.collect
+    assert next_interval.reason == "training_quota_incomplete"
+    assert next_interval.metrics()["drafter/collection_plan_reason"] == 10
+
+    scheduler._training_quota_debt_steps = 0
+    scheduler._training_quota_oldest_cycle_step = None
+    scheduler._training_quota_data_version = None
+    awaiting_publish = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=2,
+            source=DrafterCollectionSource.OLD_LOGPROB,
+        ),
+        config,
+    )
+    assert not awaiting_publish.collect
+    assert awaiting_publish.reason == "training_quota_incomplete"
+
+    scheduler.record_training_quota_publish_completed()
+    next_cycle = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=4,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+    scheduler.record_collection_outcome(
+        next_cycle,
+        SimpleNamespace(collected=True),
+        config,
+    )
+
+    assert next_cycle.collect
+    assert scheduler._training_quota_last_cycle_step == 8
+    assert scheduler._training_quota_debt_steps == 20
+
+
+def test_adaptive_quota_keeps_full_target_but_skips_healthy_refresh() -> None:
+    scheduler = DrafterScheduler()
+    config = DrafterScheduleConfig(
+        collect_interval_steps=2,
+        training_interval_steps=4,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        training_quota_enable=True,
+        training_quota_target_steps=20,
+        training_quota_trigger_mode="adaptive",
+        training_quota_acceptance_drop_ratio=0.03,
+        training_quota_min_refresh_interval_steps=2,
+        training_quota_max_refresh_interval_steps=10,
+    )
+    first = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=2,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+    scheduler.record_collection_outcome(
+        first,
+        SimpleNamespace(collected=True),
+        config,
+    )
+
+    assert first.collect
+    assert scheduler._training_quota_debt_steps == 20
+
+    scheduler._training_quota_debt_steps = 0
+    scheduler._training_quota_data_version = None
+    scheduler.record_training_quota_publish_completed(global_step=4)
+    scheduler.record_step_metrics(
+        {"drafter/spec_decode/mean_acceptance_length": 3.5},
+        config,
+        global_step=5,
+    )
+    healthy = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=6,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+
+    assert not healthy.collect
+    assert healthy.reason == "quality_refresh_not_due"
+
+    scheduler.record_step_metrics(
+        {"drafter/spec_decode/mean_acceptance_length": 3.3},
+        config,
+        global_step=7,
+    )
+    degraded = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=8,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+
+    assert degraded.collect
+    assert degraded.reason == "collection_enabled"
+
+
+def test_adaptive_quota_forces_refresh_at_maximum_age() -> None:
+    scheduler = DrafterScheduler()
+    config = DrafterScheduleConfig(
+        collect_interval_steps=2,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        training_quota_enable=True,
+        training_quota_trigger_mode="adaptive",
+        training_quota_min_refresh_interval_steps=2,
+        training_quota_max_refresh_interval_steps=6,
+    )
+    scheduler._quality_last_publish_step = 4
+    scheduler._quality_acceptance_baseline = 3.5
+    scheduler._quality_latest_acceptance = 3.5
+
+    before_max_age = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=8,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+    at_max_age = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=10,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+
+    assert not before_max_age.collect
+    assert before_max_age.reason == "quality_refresh_not_due"
+    assert at_max_age.collect
+
+
 @pytest.mark.parametrize(
     ("context", "config", "reason"),
     [
@@ -209,21 +387,22 @@ def test_sync_plan_launches_for_current_step_samples() -> None:
     assert plan.interval_matched
     assert plan.execution_strategy is DrafterExecutionStrategy.SYNC
     assert plan.source_global_step == 5
-    assert plan.min_sample_step == 5
-    assert plan.max_sample_step == 5
-    assert plan.data_filter_reason == "current_step_only"
     assert plan.publish_after_success
     assert plan.data_source is DrafterTrainingDataSource.LOCAL_BUFFER
     assert plan.required_samples is None
     assert plan.to_worker_payload()["execution_strategy"] == "sync"
-    assert plan.to_worker_payload()["min_sample_step"] == 5
-    assert plan.to_worker_payload()["max_sample_step"] == 5
     assert plan.metrics() == {
         "drafter/scheduler_used": 1,
         "drafter/schedule_launch": 1,
         "drafter/schedule_interval_matched": 1,
         "drafter/schedule_strategy": 0,
         "drafter/schedule_reason": 10,
+        "drafter/schedule_max_batches": 100,
+        "drafter/schedule_publish_after_success": 1,
+        "drafter/schedule_min_batches": 1,
+        "drafter/schedule_require_full_batch": 0,
+        "drafter/schedule_sample_last_n_steps": 2,
+        "drafter/schedule_source_global_step": 5,
     }
 
 
@@ -239,12 +418,12 @@ def test_sync_plan_launches_for_current_step_samples() -> None:
         (
             _context(samples=0, oldlogprob_requested=True),
             DrafterScheduleConfig(training_interval_steps=5, use_data_buffer=True),
-            "no_current_step_oldlogprob_samples",
+            "no_trainable_batch",
         ),
         (
             _context(samples=0),
             DrafterScheduleConfig(training_interval_steps=5),
-            "no_current_step_samples",
+            "no_trainable_batch",
         ),
     ],
 )
@@ -256,79 +435,17 @@ def test_sync_plan_preserves_skip_conditions(context, config, reason) -> None:
 
 def test_sync_plan_preserves_data_buffer_fallback() -> None:
     plan = DrafterScheduler().plan_training(
-        _context(step=5, samples=0, trainable_batches=9),
+        _context(samples=0, trainable_batches=9),
         DrafterScheduleConfig(
             training_interval_steps=5,
             use_data_buffer=True,
             train_batches_per_trigger=9,
-            sample_last_n_steps=2,
         ),
     )
     assert plan.launch
     assert plan.reason == "training_ready"
     assert plan.max_batches == 9
-    assert plan.min_sample_step == 3
-    assert plan.max_sample_step == 5
-    assert plan.data_filter_reason == "recent_buffer_window"
     assert plan.publish_after_success
-
-
-def test_sync_plan_forces_current_step_when_worker_requires_same_step_data() -> None:
-    context = _context(step=7, samples=1, trainable_batches=2)
-    context = DrafterScheduleContext(
-        global_step=context.global_step,
-        training_mode=context.training_mode,
-        collected_samples_this_step=context.collected_samples_this_step,
-        oldlogprob_collection_requested=context.oldlogprob_collection_requested,
-        data_status=TrainingDataStatus(
-            **{
-                **context.data_status.__dict__,
-                "same_step_data_required": True,
-            }
-        ),
-    )
-
-    plan = DrafterScheduler().plan_training(
-        context,
-        DrafterScheduleConfig(
-            training_interval_steps=1,
-            use_data_buffer=True,
-            sample_last_n_steps=4,
-        ),
-    )
-
-    assert plan.launch
-    assert plan.min_sample_step == 7
-    assert plan.max_sample_step == 7
-    assert plan.data_filter_reason == "same_step_required"
-
-
-def test_oldlogprob_collection_does_not_fallback_to_old_buffer_data() -> None:
-    plan = DrafterScheduler().plan_training(
-        _context(samples=0, oldlogprob_requested=True, trainable_batches=4),
-        DrafterScheduleConfig(
-            training_interval_steps=5,
-            use_data_buffer=True,
-            train_batches_per_trigger=4,
-        ),
-    )
-
-    assert not plan.launch
-    assert plan.reason == "no_current_step_oldlogprob_samples"
-
-
-def test_training_without_data_buffer_requires_current_step_samples() -> None:
-    plan = DrafterScheduler().plan_training(
-        _context(samples=0, trainable_batches=4),
-        DrafterScheduleConfig(
-            training_interval_steps=5,
-            use_data_buffer=False,
-            train_batches_per_trigger=4,
-        ),
-    )
-
-    assert not plan.launch
-    assert plan.reason == "no_current_step_samples"
 
 
 def test_sync_plan_uses_configured_steps_when_pool_has_fewer_batches() -> None:
@@ -399,6 +516,31 @@ def test_publish_plan_honors_training_plan_publish_decision() -> None:
 
     assert not plan.publish
     assert plan.reason == "training_plan_publish_disabled"
+
+
+def test_idle_worker_publish_is_asynchronous() -> None:
+    training_plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=8,
+        max_batches=1,
+        publish_after_success=True,
+    )
+
+    plan = DrafterScheduler().plan_publish(
+        global_step=8,
+        drafter_trained=True,
+        config=DrafterScheduleConfig(
+            publish_interval_steps=1,
+            publish_async=False,
+        ),
+        training_plan=training_plan,
+    )
+
+    assert plan.publish
+    assert plan.asynchronous
 
 
 def test_budget_smaller_than_minimum_does_not_launch() -> None:

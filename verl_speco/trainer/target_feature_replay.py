@@ -270,7 +270,7 @@ def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
     if not lock_path.exists():
         return
     try:
-        import fcntl
+        import fcntl as fcntl_module
     except ImportError:
         deadline = time.monotonic() + float(timeout)
         while lock_path.exists():
@@ -278,8 +278,9 @@ def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
                 raise TimeoutError(
                     f"Timed out waiting for hidden-states lock: {lock_path}"
                 )
-            time.sleep(0.1)
+                time.sleep(0.1)
         return
+    fcntl = cast(Any, fcntl_module)
 
     fd = os.open(lock_path, os.O_RDONLY)
     try:

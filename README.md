@@ -13,6 +13,10 @@ training, and hot-update logic through `verl_speco`.
 - **Drafter Co-Training in the RL loop**: collects hidden states during rollout or
   old-logprob computation, trains a drafter periodically, and publishes updated
   drafter weights back to the rollout engine.
+- **Bubble Time drafter training**: can run drafter optimizer steps on rollout
+  idle workers, then publish the trained drafter back to all rollout replicas,
+  so the generation benefit is preserved while less drafter training time lands
+  on the critical path.
 - **Multiple drafter backends**: includes EAGLE-1, EAGLE-2, EAGLE3, DFlash,
   DSpark, Domino, and P-EAGLE trainer backends under `verl_speco.backends`.
 - **vLLM and SGLang integration**: supports EAGLE-1, EAGLE-2, EAGLE3, DFlash,
@@ -35,12 +39,15 @@ For the online drafter collection, training, and publish scheduling boundary,
 including how to add a new execution or collection strategy, see the
 [Drafter Scheduler guide](docs/drafter_scheduler.md).
 
+For the rollout-idle Bubble Time execution path, including the quota lifecycle,
+safe writer switching, key metrics, and recommended configuration, see
+[Bubble Time drafter training](docs/bubble_time_drafter_training.md).
+
 ## Performance Preview
 
-The current results focus on EAGLE3 with the vLLM rollout engine, where
-verl-SpeCo supports both GPU and NPU deployments. The figures below show a
-Qwen3-8B EAGLE3 run on vLLM-Ascend/NPU; DFlash support is available, and DFlash
-figures will be added in a later update.
+The current results cover both NPU EAGLE3 co-training and GPU DFlash Bubble
+Time training. Bubble Time uses rollout idle windows to repay drafter-training
+quota instead of reducing the requested drafter optimizer work.
 
 On Qwen3-8B with an EAGLE3 drafter on vLLM-Ascend/NPU, a 100-step run shows
 that co-training increases mean acceptance length over the fixed-drafter setting
@@ -54,6 +61,19 @@ faster end-to-end training without accuracy regression.
 | Step Time | Critic Reward |
 | --- | --- |
 | ![Qwen3-8B EAGLE3 step time on vLLM-Ascend](docs/assets/qwen3-8b_eagle3_npu_step.png) | ![Qwen3-8B EAGLE3 critic reward on vLLM-Ascend](docs/assets/qwen3-8b_eagle3_npu_critic-reward.png) |
+
+On a Qwen3-4B DFlash GPU run, Bubble Time kept the drafter training quota
+aligned with the synchronous path while moving most drafter work off the main
+critical path. Excluding checkpoint-save steps, the observed end-to-end step
+time improved by about 6.7% compared with synchronous drafter training, with
+similar speculative-decoding acceptance length.
+
+| Metric | Sync drafter training | Bubble Time | Change |
+| --- | ---: | ---: | ---: |
+| End-to-end step time, excluding checkpoint-save steps | 123.52 s | 115.23 s | 6.7% faster |
+| Drafter time on the critical path | 8.33 s | 2.08 s | 75.0% lower |
+| Generation time | 49.47 s | 47.43 s | 4.1% faster |
+| Mean acceptance length | 3.30 | 3.25 | Similar |
 
 ## Draft Model Support
 

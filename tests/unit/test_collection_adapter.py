@@ -66,6 +66,24 @@ def test_sglang_adapter_requires_replica_rank() -> None:
         )
 
 
+def test_sglang_adapter_can_route_all_replica_samples_to_writer_owner() -> None:
+    samples = [
+        {"replica_rank": 0, "value": "a"},
+        {"replica_rank": 1, "value": "b"},
+    ]
+
+    payload = DrafterScheduler().prepare_collection_payload(
+        source=DrafterCollectionSource.SGLANG,
+        samples=samples,
+        owners=[0, 0],
+        owner_count=2,
+        dispatch_bucket_count=2,
+        raw_samples=2,
+    )
+
+    assert payload.buckets == [samples, []]
+
+
 def test_collection_adapter_keeps_owner_buckets_when_dispatch_is_smaller() -> None:
     payload = DrafterScheduler().prepare_collection_payload(
         source=DrafterCollectionSource.SGLANG,

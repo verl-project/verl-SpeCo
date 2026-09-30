@@ -216,6 +216,106 @@ def test_after_actor_update_requires_snapshot_only_from_publish_leader() -> None
     assert outcome.metrics["drafter/train_publish_leader_snapshot_ready"] == 1
 
 
+def test_after_actor_update_accepts_partial_publish_plan_without_snapshot() -> None:
+    scheduler = DrafterScheduler()
+    scheduler._training_quota_debt_steps = 20
+    scheduler._training_quota_oldest_cycle_step = 4
+    plan = replace(
+        _training_plan(),
+        plan_id="partial-publish-plan",
+        max_batches=20,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        target_worker_ids=("0", "1"),
+        worker_snapshots={"0": {}, "1": {}},
+    )
+    runtime_state = DrafterRuntimeState()
+    runtime_state.submit(plan, started_at=0.0)
+    runtime_state.mark_running()
+
+    def result(worker_id: str):
+        return {
+            "trained": True,
+            "triggered": True,
+            "worker_id": worker_id,
+            "worker_incarnation": f"worker-{worker_id}",
+            "plan_id": plan.plan_id,
+            "source_global_step": plan.source_global_step,
+            "data_version": None,
+            "target_version": None,
+            "successful_steps": 13,
+            "attempted_steps": 13,
+            "optimizer_step": 13,
+            "publish_snapshot_cached": 0,
+            "is_publish_leader": worker_id == "0",
+            "reason": "trained",
+        }
+
+    scheduler.execute_training_plan = Mock(
+        return_value=ExecutionOutcome(
+            raw_results=[result("0"), result("1")],
+            elapsed_sec=9.0,
+        )
+    )
+
+    outcome = scheduler.on_after_actor_update(
+        AfterActorUpdateContext(plan, runtime_state)
+    )
+
+    assert outcome.training_execution.trained
+    assert outcome.training_execution.successful_steps == 13
+    assert outcome.metrics["drafter/train_worker_results_consistent"] == 1
+    assert outcome.metrics["drafter/train_publish_snapshot_required"] == 0
+    assert outcome.metrics["drafter/train_publish_snapshot_consistent"] == 1
+    assert scheduler._training_quota_debt_steps == 7
+
+
+def test_after_actor_update_rejects_completed_publish_plan_without_snapshot() -> None:
+    scheduler = DrafterScheduler()
+    plan = replace(
+        _training_plan(),
+        plan_id="completed-publish-plan",
+        max_batches=20,
+        worker_snapshots={"0": {}, "1": {}},
+    )
+    runtime_state = DrafterRuntimeState()
+    runtime_state.submit(plan, started_at=0.0)
+    runtime_state.mark_running()
+
+    def result(worker_id: str):
+        return {
+            "trained": True,
+            "triggered": True,
+            "worker_id": worker_id,
+            "worker_incarnation": f"worker-{worker_id}",
+            "plan_id": plan.plan_id,
+            "source_global_step": plan.source_global_step,
+            "data_version": None,
+            "target_version": None,
+            "successful_steps": 20,
+            "attempted_steps": 20,
+            "optimizer_step": 20,
+            "publish_snapshot_cached": 0,
+            "is_publish_leader": worker_id == "0",
+            "reason": "trained",
+        }
+
+    scheduler.execute_training_plan = Mock(
+        return_value=ExecutionOutcome(
+            raw_results=[result("0"), result("1")],
+            elapsed_sec=12.0,
+        )
+    )
+
+    outcome = scheduler.on_after_actor_update(
+        AfterActorUpdateContext(plan, runtime_state)
+    )
+
+    assert not outcome.training_execution.trained
+    assert outcome.training_execution.reason == "worker_result_inconsistent"
+    assert outcome.metrics["drafter/train_publish_snapshot_required"] == 1
+    assert outcome.metrics["drafter/train_publish_snapshot_consistent"] == 0
+
+
 def test_after_actor_update_allows_target_version_when_not_required() -> None:
     scheduler = DrafterScheduler()
     plan = replace(
