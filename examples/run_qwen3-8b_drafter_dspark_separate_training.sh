@@ -99,9 +99,13 @@ DSPARK_L1_LOSS_ALPHA=${DSPARK_L1_LOSS_ALPHA:-0.45}
 # auto selects the native CUDA/Ascend fused loss when its Triton backend is available.
 DSPARK_DISTRIBUTION_LOSS_IMPL=${DSPARK_DISTRIBUTION_LOSS_IMPL:-auto}
 DSPARK_L1_CHUNK_SIZE=${DSPARK_L1_CHUNK_SIZE:-0}
-# The current DSpark trainer rejects nonzero confidence loss because target
-# acceptance labels are not part of the standalone feature protocol yet.
-DSPARK_CONFIDENCE_LOSS_ALPHA=${DSPARK_CONFIDENCE_LOSS_ALPHA:-0.0}
+# Train the confidence head against the analytical acceptance rate
+# alpha = sum_v min(p_v, q_v) = 1 - TV. The standalone producer collects the
+# target final hidden state whenever either loss is enabled, so the head can be
+# trained from the same dflash_aux_plus_last feature protocol.
+DSPARK_CONFIDENCE_HEAD_ALPHA=${DSPARK_CONFIDENCE_HEAD_ALPHA:-1.0}
+DSPARK_CONFIDENCE_HEAD_WITH_MARKOV=${DSPARK_CONFIDENCE_HEAD_WITH_MARKOV:-true}
+DSPARK_CONFIDENCE_LOSS_ALPHA=${DSPARK_CONFIDENCE_LOSS_ALPHA:-1.0}
 DSPARK_DEBUG_LOG=${DSPARK_DEBUG_LOG:-false}
 DSPARK_DEBUG_LOG_FIRST_N=${DSPARK_DEBUG_LOG_FIRST_N:-2}
 DSPARK_DEBUG_LOG_INTERVAL=${DSPARK_DEBUG_LOG_INTERVAL:-100}
@@ -163,6 +167,8 @@ PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher
     actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=${DSPARK_L1_LOSS_ALPHA} \
     actor_rollout_ref.rollout.drafter.training.dspark_distribution_loss_impl=${DSPARK_DISTRIBUTION_LOSS_IMPL} \
     actor_rollout_ref.rollout.drafter.training.dspark_l1_chunk_size=${DSPARK_L1_CHUNK_SIZE} \
+    actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha=${DSPARK_CONFIDENCE_HEAD_ALPHA} \
+    actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_with_markov=${DSPARK_CONFIDENCE_HEAD_WITH_MARKOV} \
     actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=${DSPARK_CONFIDENCE_LOSS_ALPHA} \
     actor_rollout_ref.rollout.drafter.training.dspark_debug_log=${DSPARK_DEBUG_LOG} \
     actor_rollout_ref.rollout.drafter.training.dspark_debug_log_first_n=${DSPARK_DEBUG_LOG_FIRST_N} \

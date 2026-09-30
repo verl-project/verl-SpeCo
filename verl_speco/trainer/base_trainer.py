@@ -1000,11 +1000,24 @@ class DrafterBaseTrainer:
             metrics[f"{prefix}/l1_loss"] = (
                 sums.get(f"{prefix}/l1_loss_sum", 0.0) / l1_tokens
             )
+        confidence_tokens = sums.get(f"{prefix}/confidence_weighted_token_count", 0.0)
+        if confidence_tokens > 0:
+            metrics[f"{prefix}/confidence_loss"] = (
+                sums.get(f"{prefix}/confidence_loss_sum", 0.0) / confidence_tokens
+            )
+            metrics[f"{prefix}/confidence_accept_rate"] = (
+                sums.get(f"{prefix}/confidence_accept_rate_sum", 0.0)
+                / confidence_tokens
+            )
+            metrics[f"{prefix}/confidence_pred_mean"] = (
+                sums.get(f"{prefix}/confidence_pred_mean_sum", 0.0) / confidence_tokens
+            )
         for key in (
             f"{prefix}/valid_token_count",
             f"{prefix}/weighted_token_count",
             f"{prefix}/ce_weighted_token_count",
             f"{prefix}/l1_weighted_token_count",
+            f"{prefix}/confidence_weighted_token_count",
             f"{prefix}/quality_token_count",
             f"{prefix}/accepted_length_sum",
             f"{prefix}/scored_block_count",
@@ -1093,6 +1106,11 @@ class DrafterBaseTrainer:
             "ce_weighted_token_count": f"{prefix}/ce_weighted_token_count",
             "l1_loss_sum": f"{prefix}/l1_loss_sum",
             "l1_weighted_token_count": f"{prefix}/l1_weighted_token_count",
+            # DSpark confidence head.
+            "confidence_loss_sum": f"{prefix}/confidence_loss_sum",
+            "confidence_weighted_token_count": f"{prefix}/confidence_weighted_token_count",
+            "confidence_accept_rate_sum": f"{prefix}/confidence_accept_rate_sum",
+            "confidence_pred_mean_sum": f"{prefix}/confidence_pred_mean_sum",
             # DFlash2 candidate selector.
             "selector_loss": f"{prefix}/selector_loss",
             "selector_correct_count": f"{prefix}/selector_correct_count",
@@ -1450,10 +1468,9 @@ class DrafterBaseTrainer:
             and os.getenv("VLLM_USE_V2_MODEL_RUNNER", "").lower()
             in {"1", "true", "yes"}
         ):
-            # The supported MRV2 runtime has no confidence-head contract, and
-            # the current trainer rejects positive confidence loss. A head
-            # inherited from an older checkpoint is frozen and must not enter
-            # the native fixed-K online update payload.
+            # The supported MRV2 runtime has no confidence-head contract, so a
+            # head inherited from an older checkpoint (or trained for MRV1) is
+            # frozen and must not enter the native fixed-K online update payload.
             return True
         if name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
             # Most backends seed the draft embedding from the target and freeze it,
@@ -4085,10 +4102,16 @@ class DrafterBaseTrainer:
         mask_list = preprocessed_lists["masks"]
         position_list = preprocessed_lists.get("position_ids")
         target_last_h_list = preprocessed_lists.get("target_last_h_states")
-        dspark_l1_enabled = (
-            self.backend.model_type == "dspark"
-            and float(
+        dspark_target_hidden_enabled = self.backend.model_type == "dspark" and (
+            float(
                 self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.9)
+                or 0.0
+            )
+            > 0
+            or float(
+                self.config.rollout.drafter.training.get(
+                    "dspark_confidence_loss_alpha", 0.0
+                )
                 or 0.0
             )
             > 0
@@ -4121,7 +4144,9 @@ class DrafterBaseTrainer:
             if seq_len < 1:
                 items_dropped_short += 1
                 continue
-            if dspark_l1_enabled and not torch.is_tensor(target_last_h_states):
+            if dspark_target_hidden_enabled and not torch.is_tensor(
+                target_last_h_states
+            ):
                 items_dropped_missing_target += 1
                 continue
 
@@ -4482,7 +4507,7 @@ class DrafterBaseTrainer:
                 # Reference-shifted: last_hidden[p+1] scores x[p+2], the token
                 # after the drafted input token x[p+1] at row p.
                 last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
-            elif dspark_l1_enabled and torch.is_tensor(target_last_h_states):
+            elif dspark_target_hidden_enabled and torch.is_tensor(target_last_h_states):
                 target_last_h_states = cast(torch.Tensor, target_last_h_states)
                 target_last_hidden_state_chunks.append(
                     target_last_h_states[:train_seq_len]
