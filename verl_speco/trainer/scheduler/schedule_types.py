@@ -15,9 +15,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, ClassVar, cast
+
+from .adaptive_schedule import AcceptanceFeedback, AdaptiveScheduleConfig
 
 
 def _as_int(value: object) -> int:
@@ -137,6 +139,9 @@ class DrafterScheduleConfig:
     min_trainable_batches: int = 1
     require_full_batch: bool = False
     sample_last_n_steps: int = 2
+    adaptive_schedule: AdaptiveScheduleConfig = field(
+        default_factory=AdaptiveScheduleConfig
+    )
 
     @classmethod
     def from_mapping(cls, config) -> "DrafterScheduleConfig":
@@ -166,6 +171,9 @@ class DrafterScheduleConfig:
             min_trainable_batches=int(get("min_trainable_batches", 1)),
             require_full_batch=bool(get("require_full_batch", False)),
             sample_last_n_steps=int(get("sample_last_n_steps", 2)),
+            adaptive_schedule=AdaptiveScheduleConfig.from_mapping(
+                get("adaptive_schedule", None)
+            ),
         )
 
 
@@ -303,6 +311,7 @@ class DrafterScheduleContext:
     oldlogprob_collection_requested: bool
     data_status: TrainingDataStatus | None = None
     pending_training_count: int = 0
+    acceptance_feedback: AcceptanceFeedback | None = None
 
 
 @dataclass(frozen=True)

@@ -16,9 +16,11 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from types import MethodType
 from typing import Any, cast
 
@@ -72,6 +74,7 @@ from verl_speco.integration.vllm_runtime import (
 )
 from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
 from verl_speco.trainer.scheduler import (
+    AcceptanceFeedback,
     AfterActorUpdateContext,
     AfterWeightUpdateContext,
     BeforeActorUpdateContext,
@@ -100,6 +103,7 @@ SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC = (
     "drafter/spec_decode/mean_acceptance_length"
 )
 _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY = "_speco_vllm_spec_decode_drafts"
+_SPECO_VLLM_INVALID_FEEDBACK_KEY = "_speco_vllm_invalid_acceptance_feedback"
 _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY = "_speco_vllm_spec_decode_accepted_tokens"
 _SPECO_DRAFTER_TIMING_DEDUCTED_KEY = "_speco_drafter_timing_deducted_from_update_actor"
 _DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
@@ -275,7 +279,7 @@ def _speco_float_values(values: Any) -> list[float]:
         try:
             normalized.append(float(value))
         except (TypeError, ValueError):
-            continue
+            normalized.append(float("nan"))
     return normalized
 
 
@@ -299,6 +303,13 @@ def _speco_vllm_spec_decode_stats_from_batch(batch: Any) -> dict[str, float]:
     return {
         _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY: total_drafts,
         _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY: total_accepted_tokens,
+        _SPECO_VLLM_INVALID_FEEDBACK_KEY: float(
+            len(drafts) != len(accepted_tokens)
+            or not all(
+                math.isfinite(value) and value >= 0
+                for value in drafts + accepted_tokens
+            )
+        ),
     }
 
 
@@ -375,6 +386,7 @@ def _speco_merge_vllm_spec_decode_stats(
     totals = {
         _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY: 0.0,
         _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY: 0.0,
+        _SPECO_VLLM_INVALID_FEEDBACK_KEY: 0.0,
     }
     for key in totals:
         totals[key] = float((existing or {}).get(key, 0.0) or 0.0) + float(
@@ -988,6 +1000,33 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 self._speco_get_drafter_runtime_state().status
                 in {DrafterRuntimeStatus.SUBMITTED, DrafterRuntimeStatus.RUNNING}
             ),
+            acceptance_feedback=self._speco_acceptance_feedback(),
+        )
+
+    def _speco_acceptance_feedback(self) -> AcceptanceFeedback | None:
+        """Use only this training rollout's weighted, non-validation counts.
+
+        Use the same weighted mean acceptance length as the rollout metric.
+        Verification rounds supply the feedback sample count, not a rate denominator.
+        Backends without these counts retain their budget and capped warmup.
+        """
+        if getattr(self, "_speco_last_rollout_metrics_step", None) != self.global_steps:
+            return None
+        stats = getattr(self, "_speco_last_rollout_metrics", None) or {}
+        if stats.get(_SPECO_VLLM_INVALID_FEEDBACK_KEY, 0):
+            return None
+        rounds = _speco_metric_float(stats.get(_SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY))
+        accepted = _speco_metric_float(
+            stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY)
+        )
+        metrics = _speco_vllm_spec_decode_metrics_from_stats(stats)
+        length = metrics.get(SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC)
+        if rounds is None or accepted is None or length is None:
+            return None
+        return AcceptanceFeedback(
+            step=int(self.global_steps),
+            sample_count=rounds,
+            mean_acceptance_length=length,
         )
 
     def _speco_on_before_actor_update(self):
@@ -2691,7 +2730,47 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         # controlled by upstream VERL and can change independently.
         self._speco_wait_pending_drafter_publish()
         self._speco_save_drafter_checkpoint(wait=True)
-        return super()._save_checkpoint()
+        result = super()._save_checkpoint()
+        controller = self._speco_get_drafter_scheduler().configure_adaptive(
+            self._speco_drafter_schedule_config()
+        )
+        if controller is not None:
+            root = _get_nested(self.config, ("trainer", "default_local_dir"), None)
+            if root:
+                controller.save(
+                    Path(root)
+                    / f"global_step_{self.global_steps}"
+                    / "adaptive_schedule.json"
+                )
+        return result
+
+    def _load_checkpoint(self):
+        result = super()._load_checkpoint()
+        controller = self._speco_get_drafter_scheduler().configure_adaptive(
+            self._speco_drafter_schedule_config()
+        )
+        if controller is not None and self.global_steps > 0:
+            trainer_cfg = _get_nested(self.config, ("trainer",), None)
+            mode = _get_nested(trainer_cfg, ("resume_mode",), "disable")
+            folder = (
+                _get_nested(trainer_cfg, ("resume_from_path",), None)
+                if mode == "resume_path"
+                else None
+            )
+            if folder is None:
+                root = _get_nested(trainer_cfg, ("default_local_dir",), None)
+                folder = (
+                    Path(root) / f"global_step_{self.global_steps}" if root else None
+                )
+            restored = folder is not None and controller.restore(
+                Path(folder) / "adaptive_schedule.json"
+            )
+            if not restored:
+                logger.warning(
+                    "Adaptive schedule state missing or config changed; recalibrating at step %s",
+                    self.global_steps,
+                )
+        return result
 
     def _validate(self, *args, **kwargs):
         # Validation commonly drives KV usage to the configured limit. Ensure

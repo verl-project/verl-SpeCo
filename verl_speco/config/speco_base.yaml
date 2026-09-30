@@ -135,6 +135,21 @@ actor_rollout_ref:
         step: 10
         batch_size_per_gpu: 4
         training_interval_steps: 5
+        # Optional synchronous co-training policy; never freezes training.
+        adaptive_schedule:
+          enable: false
+          warmup_train_steps: 20
+          warmup_max_steps: 20
+          warmup_window_size: 5
+          warmup_min_improvement: 0.1
+          warmup_patience: 3
+          min_train_steps: 0
+          max_train_steps: 25
+          max_step_change: 20
+          ema_fast_alpha: 0.3
+          ema_slow_alpha: 0.05
+          trend_tolerance: 0.02
+          min_feedback_samples: 32
         publish_interval_steps: 0
         publish_async: false
         publish_dtype: null

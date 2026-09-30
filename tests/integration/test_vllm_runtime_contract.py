@@ -1056,6 +1056,17 @@ def test_trainer_keeps_public_acceptance_metric_name() -> None:
     assert '"drafter/spec_decode/mean_acceptance_length"' in trainer_source
 
 
+def test_vllm_length_stats_accumulate_rounds_and_accepted_tokens():
+    stats = _new_vllm_spec_decode_stats()
+    for rounds, accepted in ((1, 1), (99, 199)):
+        _record_vllm_spec_decode_scheduler_stats(stats, SimpleNamespace(
+            spec_decoding_stats=SimpleNamespace(
+                num_drafts=rounds, num_accepted_tokens=accepted,
+            )
+        ))
+    assert stats == {"drafts": 100, "accepted_tokens": 200}
+
+
 def test_trainer_drains_async_publish_before_checkpoint_and_validation() -> None:
     trainer_source = (
         Path(__file__).resolve().parents[2]
