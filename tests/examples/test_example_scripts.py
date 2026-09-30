@@ -25,6 +25,7 @@ PPO_EXAMPLES = [
     script
     for script in (ROOT / "examples").glob("*.sh")
     if not script.name.endswith("_separate_training.sh")
+    and "_eval" not in script.name
 ]
 
 
@@ -99,6 +100,14 @@ def test_standalone_tq_training_example_uses_unified_launcher() -> None:
     assert "speco.standalone_tq_producer.per_endpoint_concurrency=" in source
     assert "actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=" in source
     assert "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=" in source
+    assert (
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha="
+        in source
+    )
+    assert (
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha="
+        in source
+    )
     assert "DSPARK_MAX_WINDOW=${DSPARK_MAX_WINDOW:-0}" in source
     assert "DSPARK_MAX_WINDOW=${DSPARK_MAX_WINDOW:-512}" not in source
     assert "training.dspark_max_window=${DSPARK_MAX_WINDOW}" in source
@@ -106,6 +115,25 @@ def test_standalone_tq_training_example_uses_unified_launcher() -> None:
         "speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids=" in source
     )
     assert "training.dspark_target_layer_ids=" not in source
+
+
+def test_dspark_dynamic_npu_example_trains_and_serves_confidence_head() -> None:
+    source = (
+        ROOT
+        / "examples"
+        / "dynamic"
+        / "run_qwen3-8b_drafter_dspark_vllm_npu.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "dspark_confidence_head_alpha=1.0" in source
+    assert "dspark_confidence_loss_alpha=1.0" in source
+    assert "dspark_confidence_head_with_markov=True" in source
+    assert "speculative_config_overrides.method=dspark" in source
+    assert "additional_config.dynamic_spec_config.method=dspark" in source
+    assert "initial_verify_budget_per_req=5" in source
+    assert "budget_update_interval=50" in source
+    assert "budget_threshold=0.7" in source
+    assert "VLLM_USE_V2_MODEL_RUNNER=0" in source
 
 
 def test_standalone_tq_hidden_state_vllm_uses_separate_devices() -> None:
