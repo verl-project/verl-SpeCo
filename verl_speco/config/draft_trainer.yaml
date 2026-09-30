@@ -72,6 +72,21 @@ actor_rollout_ref:
           endpoint_cooldown: 5
           on_generate: delete
           require_arange_positions: true
+          # Consumer side of the vLLM hidden-state transfer. ``file`` reads the
+          # legacy safetensors path; ``mooncake`` reads the handle-based store
+          # written by hs_connectors.MooncakeHiddenStatesConnector.
+          # Keep in sync with the producer copy in speco_base.yaml.
+          hidden_states_store:
+            backend: file
+            mooncake:
+              local_hostname: ""
+              metadata_server: P2PHANDSHAKE
+              master_server_address: 127.0.0.1:50051
+              global_segment_size: 4294967296
+              local_buffer_size: 2147483648
+              protocol: tcp
+              device_name: ""
+              num_writer_threads: 8
           offline_generation:
             input_type: token_replay
             input_path: null

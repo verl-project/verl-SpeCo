@@ -1006,6 +1006,56 @@ def test_pool_close_failure_does_not_skip_transport_close(tmp_path: Path) -> Non
     assert pool.closed and transport.closed
 
 
+def test_hidden_state_store_closes_after_consumer_drain(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The hidden-state pool must close only after the TQ consumer drains.
+
+    Mooncake allocates objects across all of a process's registered segments
+    (allocation_strategy=random), so closing the producer's hidden-state store
+    before the drain can unmount a segment holding unconsumed TQ fields and
+    surface as batch_get_into error -704.
+    """
+
+    monkeypatch.setenv("SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS", "30")
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    order: list[str] = []
+
+    class _DrainingTransport(_Transport):
+        def list_samples(self):
+            order.append("list")
+            # Simulate the consumer fetching and clearing every sample.
+            self.records = {
+                key: tag
+                for key, tag in self.records.items()
+                if tag.get("record_type") != "sample"
+            }
+            return dict(self.records)
+
+    class _OrderedPool(_Pool):
+        async def close(self) -> None:
+            order.append("pool_close")
+            await super().close()
+
+    transport = _DrainingTransport()
+    pool = _OrderedPool(tmp_path)
+
+    stats = asyncio.run(
+        run_producer(
+            _config(input_path),
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    assert stats.published_count > 0
+    assert "pool_close" in order
+    # No TQ metadata read may happen after the hidden-state store closes.
+    assert "list" not in order[order.index("pool_close") + 1 :]
+
+
 def test_run_producer_errors_when_every_row_is_filtered(tmp_path: Path) -> None:
     input_path = tmp_path / "input.jsonl"
     _write_input(input_path)

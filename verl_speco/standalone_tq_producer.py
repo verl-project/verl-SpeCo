@@ -33,6 +33,10 @@ from verl_speco.integration import transferqueue_bridge as default_transport
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
+from verl_speco.producer.hidden_states_store import (
+    HiddenStatesStoreConfig,
+    build_hidden_states_store,
+)
 from verl_speco.producer.input_reader import (
     GenerationRequest,
     SampleFilteredError,
@@ -285,6 +289,11 @@ def validate_producer_config(config: Any) -> None:
         )
     if int(producer_cfg.get("vllm_success_log_interval", 100)) < 0:
         raise ValueError("vllm_success_log_interval must be non-negative")
+    store_cfg = producer_cfg.get("hidden_states_store")
+    if store_cfg:
+        # Raises on an unsupported backend before the pool is built, without
+        # constructing a throwaway store (the pool builds the real one).
+        HiddenStatesStoreConfig.from_mapping(store_cfg)
 
 
 def _should_log_sample_progress(count: int) -> bool:
@@ -439,6 +448,9 @@ async def run_producer(
                 request_timeout=float(producer_cfg["request_timeout"]),
                 success_log_interval=int(
                     producer_cfg.get("vllm_success_log_interval", 100)
+                ),
+                hidden_states_store=build_hidden_states_store(
+                    producer_cfg.get("hidden_states_store")
                 ),
             )
         await pool.start()
@@ -1208,34 +1220,36 @@ async def run_producer(
         return stats
     finally:
         try:
+            if feature_executor is not None:
+                feature_executor.shutdown(wait=True)
+            if publish_executor is not None:
+                publish_executor.shutdown(wait=True)
+            if connected and completed:
+                # Keep every producer-side segment mounted until the consumer
+                # has fetched and cleared all samples. Mooncake allocates
+                # objects across a process's registered segments
+                # (allocation_strategy=random by default), so closing the
+                # hidden-state store first can unmount a segment that still
+                # holds unconsumed TQ fields; the consumer then fails with
+                # batch_get_into error -704 (object not found).
+                await _drain_pending_samples(
+                    transport,
+                    run_id,
+                    timeout=float(
+                        os.environ.get(
+                            "SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS", "1800"
+                        )
+                        or 0
+                    ),
+                    poll_interval=float(producer_cfg["pending_poll_interval_seconds"]),
+                )
+        finally:
             try:
                 if pool is not None:
                     await pool.close()
             finally:
-                if feature_executor is not None:
-                    feature_executor.shutdown(wait=True)
-                if publish_executor is not None:
-                    publish_executor.shutdown(wait=True)
-        finally:
-            if connected:
-                if completed:
-                    # Closing a remote store client unmounts the producer's
-                    # segment; wait until the consumer has fetched and cleared
-                    # every sample before releasing it.
-                    await _drain_pending_samples(
-                        transport,
-                        run_id,
-                        timeout=float(
-                            os.environ.get(
-                                "SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS", "1800"
-                            )
-                            or 0
-                        ),
-                        poll_interval=float(
-                            producer_cfg["pending_poll_interval_seconds"]
-                        ),
-                    )
-                transport.close_transfer_queue_client()
+                if connected:
+                    transport.close_transfer_queue_client()
 
 
 async def _wait_for_owner_ready(

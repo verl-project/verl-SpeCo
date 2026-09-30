@@ -16,20 +16,25 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import threading
+from types import SimpleNamespace
 
 from omegaconf import OmegaConf
 import pytest
 
 from verl_speco.standalone_tq_training_launcher import (
+    _hidden_states_store_overrides,
     _preflight_input_file,
     _producer_max_samples,
+    _resolve_hidden_states_store,
     _target_final_layer_id,
     _tq_backend_overrides,
     _vllm_capture_layer_ids,
+    _vllm_kv_transfer_config,
     build_pipeline_commands,
     resolve_pipeline_config,
     run_pipeline,
     start_ray_session,
+    validate_hidden_states_store,
     validate_tq_backend,
 )
 import verl_speco.tq_owner as tq_owner
@@ -653,5 +658,126 @@ def test_pipeline_commands_use_provided_env_for_backend() -> None:
 
     assert any("storage_backend=MooncakeStore" in item for item in commands.consumer)
     assert not any("storage_backend=SimpleStorage" in item for item in commands.consumer)
+
+
+def test_resolve_hidden_states_store_defaults_to_file() -> None:
+    assert _resolve_hidden_states_store({}) == "file"
+
+
+@pytest.mark.parametrize("backend", ["grpc", "", "moon"])
+def test_resolve_hidden_states_store_rejects_unknown(backend) -> None:
+    with pytest.raises(RuntimeError, match="Unsupported SPECO_VLLM_HIDDEN_STATES_STORE"):
+        _resolve_hidden_states_store({"SPECO_VLLM_HIDDEN_STATES_STORE": backend})
+
+
+def test_vllm_kv_transfer_config_defaults_to_file_connector() -> None:
+    config = _vllm_kv_transfer_config({})
+
+    assert config["kv_connector"] == "ExampleHiddenStatesConnector"
+    assert "kv_connector_module_path" not in config
+    assert config["kv_connector_extra_config"]["use_synchronization_lock"] is True
+
+
+def test_vllm_kv_transfer_config_selects_mooncake_connector() -> None:
+    config = _vllm_kv_transfer_config(
+        {
+            "SPECO_VLLM_HIDDEN_STATES_STORE": "mooncake",
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_MASTER": "10.0.0.9:50051",
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_PROTOCOL": "rdma",
+        }
+    )
+
+    assert config["kv_connector"] == "SpecoMooncakeHiddenStatesConnector"
+    assert (
+        config["kv_connector_module_path"]
+        == "verl_speco.mooncake_hidden_states_connector"
+    )
+    mooncake = config["kv_connector_extra_config"]["mooncake"]
+    assert mooncake["master_server_address"] == "10.0.0.9:50051"
+    assert mooncake["protocol"] == "rdma"
+    assert mooncake["local_hostname"]
+
+
+def test_hidden_states_store_overrides_file_is_empty() -> None:
+    assert _hidden_states_store_overrides({}) == []
+
+
+def test_hidden_states_store_overrides_mooncake() -> None:
+    overrides = _hidden_states_store_overrides(
+        {
+            "SPECO_VLLM_HIDDEN_STATES_STORE": "mooncake",
+            "SPECO_TQ_MOONCAKE_MASTER": "1.2.3.4:50051",
+        }
+    )
+
+    assert any(item.endswith("hidden_states_store.backend=mooncake") for item in overrides)
+    assert any("mooncake.master_server_address=1.2.3.4:50051" in item for item in overrides)
+
+
+def test_validate_hidden_states_store_skips_file_backend() -> None:
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("file backend must not probe Mooncake")
+
+    validate_hidden_states_store({}, connect=_unexpected)
+
+
+def test_validate_hidden_states_store_probes_master() -> None:
+    calls = []
+
+    def _connect(address, timeout):
+        calls.append((address, timeout))
+        return SimpleNamespace(close=lambda: None)
+
+    validate_hidden_states_store(
+        {
+            "SPECO_VLLM_HIDDEN_STATES_STORE": "mooncake",
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_MASTER": "10.0.0.1:50051",
+        },
+        connect=_connect,
+    )
+
+    assert calls == [(("10.0.0.1", 50051), 2.0)]
+
+
+def test_validate_hidden_states_store_fails_fast_when_unreachable() -> None:
+    def _connect(address, timeout):
+        raise OSError("connection refused")
+
+    with pytest.raises(RuntimeError, match="no mooncake_master is reachable"):
+        validate_hidden_states_store(
+            {
+                "SPECO_VLLM_HIDDEN_STATES_STORE": "mooncake",
+                "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_MASTER": "10.0.0.1:50051",
+            },
+            connect=_connect,
+        )
+
+
+def test_pipeline_commands_select_mooncake_hidden_states_store() -> None:
+    env = {
+        "SPECO_VLLM_HIDDEN_STATES_STORE": "mooncake",
+        "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_MASTER": "10.0.0.7:50051",
+    }
+    config = resolve_pipeline_config(_training_args(), environ=env)
+
+    commands = build_pipeline_commands(
+        config,
+        _training_args(),
+        ray_address="127.0.0.1:6379",
+        python_executable="python",
+        env=env,
+    )
+
+    assert commands.vllm is not None
+    joined_vllm = " ".join(commands.vllm)
+    assert "SpecoMooncakeHiddenStatesConnector" in joined_vllm
+    assert "verl_speco.mooncake_hidden_states_connector" in joined_vllm
+    assert any(
+        "hidden_states_store.backend=mooncake" in item for item in commands.producer
+    )
+    assert any(
+        "mooncake.master_server_address=10.0.0.7:50051" in item
+        for item in commands.producer
+    )
 
 

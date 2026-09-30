@@ -17,14 +17,78 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import torch
+
 import verl_speco.producer.vllm_feature_client as client_module
+from verl_speco.producer.hidden_states_store import HiddenStatesStore
 from verl_speco.producer.vllm_feature_client import (
     RawVllmFeature,
     VllmEndpoint,
     VllmFeatureClientPool,
     VllmResponse,
+    delete_temporary_result,
+    load_hidden_state_result,
     request_generate,
 )
+
+
+class _RecordingStore(HiddenStatesStore):
+    backend = "mooncake"
+
+    def __init__(self) -> None:
+        self.loaded: list[str] = []
+        self.released: list[str] = []
+
+    def load(self, reference: str):
+        self.loaded.append(reference)
+        return {"hidden_states": torch.zeros(1, dtype=torch.bfloat16)}, 2
+
+    def release(self, reference: str) -> None:
+        self.released.append(reference)
+
+
+def test_request_generate_returns_store_handle() -> None:
+    class Completions:
+        async def create(self, **kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(prompt_token_ids=[1, 2], token_ids=[3, 4])
+                ],
+                kv_transfer_params={"handle": "hs-123"},
+            )
+
+    client = SimpleNamespace(completions=Completions())
+
+    response = asyncio.run(
+        request_generate(
+            VllmEndpoint("http://vllm:8000/v1", 1),
+            client,
+            [1, 2],
+            model="target",
+            max_tokens=8,
+            timeout=30,
+        )
+    )
+
+    assert response.handle == "hs-123"
+    assert response.hidden_states_path is None
+    assert response.reference == "hs-123"
+    assert response.is_handle is True
+
+
+def test_load_and_delete_route_handles_through_the_store() -> None:
+    store = _RecordingStore()
+    response = VllmResponse(None, "http://vllm:8000/v1", handle="hs-9")
+
+    raw = load_hidden_state_result(response, store)
+
+    assert raw.temporary_path == "hs-9"
+    assert raw.is_handle is True
+    assert raw.byte_size == 2
+    assert store.loaded == ["hs-9"]
+
+    delete_temporary_result(raw)
+    assert store.released == ["hs-9"]
 
 
 def test_request_generate_only_requests_generated_token_ids() -> None:
@@ -81,9 +145,9 @@ def test_pool_retry_fails_over_to_another_endpoint(monkeypatch) -> None:
     monkeypatch.setattr(
         client_module,
         "load_hidden_state_result",
-        lambda response: RawVllmFeature(
+        lambda response, store=None: RawVllmFeature(
             payload={},
-            temporary_path=response.hidden_states_path,
+            temporary_path=response.reference,
             endpoint_url=response.endpoint_url,
             byte_size=0,
         ),
