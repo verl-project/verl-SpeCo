@@ -302,36 +302,18 @@ actor_rollout_ref:
             SimpleStorage:
               total_storage_size: 100000
               num_data_storage_units: 8
-        # Drafter convergence freeze: stop drafter training once it no longer
-        # shortens rollout time. Policy training continues; the frozen drafter
-        # keeps serving speculative decoding in rollout. See
-        # drafter_convergence_freeze_design.md.
+        # Drafter convergence freeze: stop drafter training once a new drafter
+        # version no longer pays for its train+publish cost. Policy training
+        # continues; the frozen drafter keeps serving speculative decoding in
+        # rollout. See drafter_marginal_utility_freeze_rfc.md.
         drafter_convergence_freeze:
           enabled: false
-          # 冻结方法选择器:
-          #   legacy                -> 旧单指标 step tracker (gate_metric 三选一, 见下方旧键)
-          #   marginal_utility_v1   -> 按"成功发布的 drafter 版本"聚合的边际效用策略
-          #                            (见 drafter_marginal_utility_freeze_rfc.md)
-          # marginal_utility_v1 与 legacy 互不影响; 仅当 enabled=true 才构建。
-          method: legacy
-          gate_metric: rollout_throughput   # [legacy] 三选一: rollout_throughput | hard_tail | bimodal_low_fraction
-          #   bimodal_low_fraction: accept-length 分布低峰(Hard群体)占比->0 时冻(分布学收敛, ~step120)
-          window_steps: 30
-          slope_eps: 0.001                  # 相对斜率阈值 0.1%/step = 基本不涨
-          patience_steps: 10               # 连续达标步数(~1 个 drafter 训练周期)
-          throughput_floor: null            # null=不设下限; throughput恒低=drafter没用, 冻结本就正确
-          hard_tail_floor: 2.5             # gate_metric=hard_tail 时生效, 防恒1废物
-          low_fraction_floor: 0.05        # bimodal_low_fraction 门控: 低峰占比<=此值=Hard群体消失(对齐KDE回退阈值)
-          low_fraction_resume: 0.10       # 冻结后低峰占比回升到此值=policy漂移, 解冻重训
-          hysteresis: true                  # policy漂移致吞吐真跌时解冻重训
-          hysteresis_drop: 0.10             # 跌10% 且需持续, 才解冻重训
-          hysteresis_window: 5              # [legacy] 解冻判断的近几步均值窗口
-          hysteresis_patience: 3            # [legacy] 连续低于阈值步数, 满足即解冻
-
+          # 冻结方法: marginal_utility_v1 — 按"成功发布的 drafter 版本"聚合的
+          # 边际效用策略 (见 drafter_marginal_utility_freeze_rfc.md)。
+          # 旧单指标 legacy tracker 已移除, 配置 legacy 会在启动时报错。
+          method: marginal_utility_v1
           # ---------------------------------------------------------------- #
-          # method: marginal_utility_v1  (RFC drafter_marginal_utility_freeze)
-          # 旧 gate_* / window_steps / slope_eps / hysteresis_* 等键对该方法
-          # 全部无效; 以下子块才是 v1 的配置。默认 enabled=false, 且先 shadow。
+          # 默认 enabled=false, 且先 shadow; active 前完成标定。
           # ---------------------------------------------------------------- #
           mode: shadow                      # shadow(只报 would_freeze 不改变训练) | active(执行冻结)
           freeze_scope: soft               # soft(保留 feature 收集) | hard(连收集一起停)

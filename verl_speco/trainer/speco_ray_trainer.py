@@ -484,12 +484,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_oldlogprob_total_elapsed_sec = 0.0
         self._speco_last_collect_interval_matched = 0
         self._speco_last_collection_outcome = None
-        # Drafter convergence freeze state. ``_speco_drafter_frozen`` is the
-        # single gate that suppresses drafter training; it is updated each step
-        # by ``_speco_convergence_metrics`` from the tracker.
+        # ``_speco_drafter_frozen`` is the single gate that suppresses drafter
+        # training; it is driven by the marginal-utility freeze policy in
+        # active mode (``_speco_observe_rollout_evidence``).
         self._speco_drafter_frozen = False
-        self._speco_convergence_tracker = None  # built lazily in fit()
-        self._speco_last_convergence_step = None
         self._speco_last_request_accept_len_records: list[dict[str, Any]] = []
         # Marginal-utility freeze policy (method=marginal_utility_v1). Shadow
         # mode only logs would_freeze + metrics; active mode drives the same
@@ -1157,8 +1155,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         Mirrors the source repo's record pipeline but without the hard-sample
         collection dependency: builds ``_speco_last_request_accept_len_records``
-        directly from the rollout batch so ``_speco_convergence_metrics`` (and
-        the bimodal/hard_tail/throughput gates) have per-request data each step.
+        directly from the rollout batch so the freeze policy's evidence feed
+        (``_speco_observe_rollout_evidence``) has per-request data each step.
         """
         batch_size = self._speco_batch_size_from_request_stats(batch)
         if batch_size <= 0:
@@ -1202,120 +1200,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
 
     # ------------------------------------------------------------------ #
-    # Drafter convergence freeze
-    # ------------------------------------------------------------------ #
-    def _speco_init_convergence_tracker(self):
-        """Build the drafter convergence tracker from config, or ``None``."""
-        cfg = self._speco_drafter_training_config().get(
-            "drafter_convergence_freeze", {}
-        ) or {}
-        if not cfg.get("enabled", False):
-            return None
-        if str(cfg.get("method", "legacy")).strip().lower() != "legacy":
-            # marginal_utility_v1 has its own policy (``_speco_init_freeze_policy``)
-            # and must never run the legacy single-metric tracker alongside it.
-            return None
-        from verl_speco.trainer.accept_len_convergence import ConvergenceTracker
-
-        throughput_floor = cfg.get("throughput_floor", None)
-        return ConvergenceTracker(
-            gate_metric=cfg.get("gate_metric", "rollout_throughput"),
-            window=int(cfg.get("window_steps", 30)),
-            slope_eps=float(cfg.get("slope_eps", 0.001)),
-            patience=int(cfg.get("patience_steps", 10)),
-            throughput_floor=None if throughput_floor is None else float(throughput_floor),
-            hard_tail_floor=float(cfg.get("hard_tail_floor", 2.5)),
-            low_fraction_floor=float(cfg.get("low_fraction_floor", 0.05)),
-            low_fraction_resume=float(cfg.get("low_fraction_resume", 0.10)),
-            hysteresis=bool(cfg.get("hysteresis", True)),
-            hysteresis_drop=float(cfg.get("hysteresis_drop", 0.15)),
-            hysteresis_window=int(cfg.get("hysteresis_window", 5)),
-            hysteresis_patience=int(cfg.get("hysteresis_patience", 5)),
-        )
-
-    def _speco_convergence_metrics(self, data: dict) -> dict[str, float]:
-        """Feed one step's throughput + hard_tail to the tracker; report metrics.
-
-        Called from ``_speco_augment_log_data`` where ``data`` already carries
-        ``response_length/mean`` and ``timing_s/gen``. Updates at most once per
-        step and sets ``self._speco_drafter_frozen`` for the *next* step's gate
-        (one-step lag: step *k* training is decided from data through step *k-1*).
-        """
-        tracker = getattr(self, "_speco_convergence_tracker", None)
-        if tracker is None or not isinstance(data, dict):
-            return {}
-        if getattr(self, "_speco_last_convergence_step", None) == getattr(
-            self, "global_steps", None
-        ):
-            return {}
-
-        records = getattr(self, "_speco_last_request_accept_len_records", None) or []
-        accept_lens = [
-            parsed
-            for record in records
-            if (parsed := _speco_optional_float(record.get("mean_accept_len")))
-            is not None
-        ]
-        if not accept_lens:
-            # No rollout accept-length stats this step (e.g. before first rollout).
-            return {}
-
-        from verl_speco.trainer.accept_len_convergence import (
-            bimodal_metrics,
-            hard_tail_mean,
-            rollout_throughput,
-        )
-
-        hard_tail = hard_tail_mean(accept_lens)
-        count = len(accept_lens)
-        response_length_mean = _speco_optional_float(data.get("response_length/mean"))
-        gen_time = _speco_optional_float(data.get("timing_s/gen"))
-        throughput = rollout_throughput(count, response_length_mean, gen_time)
-        if throughput <= 0.0:
-            # Missing timing/length for this step; skip without advancing the gate.
-            return {}
-
-        bimo = bimodal_metrics(accept_lens)
-        metrics = tracker.update(
-            throughput,
-            hard_tail,
-            getattr(self, "global_steps", 0),
-            low_fraction=bimo["low_fraction"],
-        )
-        metrics["drafter/low_mean"] = float(bimo["low_mean"])
-        metrics["drafter/high_mean"] = float(bimo["high_mean"])
-        metrics["drafter/valley"] = (
-            float(bimo["valley"]) if bimo["valley"] is not None else 0.0
-        )
-        metrics["drafter/is_bimodal"] = float(bimo["is_bimodal"])
-        # Unweighted mean over per-request accept lengths (distinct from the
-        # token-weighted drafter/spec_decode/mean_acceptance_length).
-        metrics["drafter/request_mean_accept_len"] = (
-            float(sum(accept_lens)) / count if count else 0.0
-        )
-        metrics["drafter/request_accept_len_count"] = float(count)
-        if tracker.frozen != getattr(self, "_speco_drafter_frozen", False):
-            step_now = getattr(self, "global_steps", 0)
-            slope_now = metrics.get("drafter/gate_rel_slope")
-            if tracker.frozen:
-                print(
-                    f"[drafter convergence] FROZE at step {step_now} "
-                    f"(throughput={throughput:.1f}, hard_tail={hard_tail:.3f}, "
-                    f"low_fraction={bimo['low_fraction']:.3f}, slope={slope_now})",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[drafter convergence] UNFROZE at step {step_now} "
-                    f"(throughput={throughput:.1f}, low_fraction={bimo['low_fraction']:.3f}) "
-                    f"- drafter training resumes",
-                    flush=True,
-                )
-        self._speco_drafter_frozen = tracker.frozen
-        self._speco_last_convergence_step = getattr(self, "global_steps", None)
-        return metrics
-
-    # ------------------------------------------------------------------ #
     # Marginal-utility freeze policy (method=marginal_utility_v1)
     # ------------------------------------------------------------------ #
     def _speco_init_freeze_policy(self):
@@ -1329,8 +1213,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ) or {}
         if not cfg.get("enabled", False):
             return None
-        if str(cfg.get("method", "legacy")).strip().lower() != "marginal_utility_v1":
-            return None
+        method = str(cfg.get("method", "marginal_utility_v1")).strip().lower()
+        if method != "marginal_utility_v1":
+            raise ValueError(
+                f"drafter_convergence_freeze.method={method!r} is not supported: "
+                "the legacy single-metric tracker was removed "
+                "(use method=marginal_utility_v1)"
+            )
         from omegaconf import OmegaConf
 
         from verl_speco.trainer.drafter_freeze_policy import DrafterFreezePolicy
@@ -1381,7 +1270,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not cfg.get("enabled", False):
             problems.append("drafter_convergence_freeze.enabled must be true")
         if (
-            str(cfg.get("method", "legacy")).strip().lower()
+            str(cfg.get("method", "marginal_utility_v1")).strip().lower()
             != "marginal_utility_v1"
         ):
             problems.append(
@@ -3397,7 +3286,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             data.update(latest_rollout_metrics)
         data = _speco_move_drafter_timing_next_to_update_actor(data)
         if isinstance(data, dict):
-            data.update(self._speco_convergence_metrics(data))
             data.update(self._speco_freeze_metrics())
         if self._speco_bubble_profiler_enabled():
             data = inject_bubble_metrics(data)
@@ -3965,9 +3853,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         try:
             if self.is_drafter_training_enabled(self.config):
                 self._speco_activate_drafter_training_model_before_fit()
-                self._speco_convergence_tracker = (
-                    self._speco_init_convergence_tracker()
-                )
                 self._speco_freeze_policy = self._speco_init_freeze_policy()
                 self._speco_validate_freeze_branch_config()
                 with (
