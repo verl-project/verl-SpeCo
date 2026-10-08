@@ -240,6 +240,10 @@ actor_rollout_ref:
         group_by_length: false
         # Samples per grouping megabatch, as a multiple of batch_size_per_gpu.
         group_by_length_megabatch: 8
+        # Hard-label CE target source for backends that support it.
+        # labels keeps SpeCo's teacher-forced behavior; target_argmax matches
+        # speculators-style CE against the target model top-1 token.
+        ce_target_source: labels
         vocab_mapping_path: null
         dflash_block_size: 16
         dflash_num_anchors: 512
