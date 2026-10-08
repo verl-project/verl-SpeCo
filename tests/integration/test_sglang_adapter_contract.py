@@ -13,11 +13,13 @@
 # limitations under the License.
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from types import SimpleNamespace
 
 import pytest
+import verl_speco.integration.sglang_runtime as sglang_runtime
 
 from verl_speco.integration.sglang_adapter import (
     DFLASH_RETURN_AUX_HIDDEN_PARAM,
@@ -31,6 +33,8 @@ from verl_speco.integration.sglang_adapter import (
 )
 from verl_speco.integration.sglang_runtime import (
     _SpecoSGLangHttpServerMixin,
+    _rollout_idle_event_bus_name,
+    _rollout_idle_worker_id_for_replica,
     attach_update_draft_weights_to_rollout,
     speco_update_draft_weights,
 )
@@ -109,6 +113,141 @@ def test_sglang_patch_install_forwards_config_and_is_repeatable(monkeypatch) -> 
     assert install_calls[0]["target_weight_loader"] == "target.loader"
     assert install_calls[0]["draft_weight_loader"] == "draft.loader"
     assert install_calls[0]["patches"] == {"hidden_states_tensor_output"}
+
+
+def test_sglang_rollout_idle_event_config_maps_replica_to_worker() -> None:
+    drafter_cfg = {
+        "training": {
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {
+                    "event_bus_name": "bubble-bus",
+                    "training_groups": [["worker-0", "worker-1"]],
+                },
+            }
+        }
+    }
+
+    assert _rollout_idle_event_bus_name(drafter_cfg) == "bubble-bus"
+    assert _rollout_idle_worker_id_for_replica(drafter_cfg, 1) == "worker-1"
+
+
+def test_sglang_rollout_idle_event_config_ignores_sync_strategy() -> None:
+    drafter_cfg = {
+        "training": {
+            "scheduler": {
+                "execution": {"strategy": "sync"},
+                "idle_worker": {"event_bus_name": "bubble-bus"},
+            }
+        }
+    }
+
+    assert _rollout_idle_event_bus_name(drafter_cfg) == ""
+
+
+def test_sglang_idle_event_waits_for_all_replica_requests(monkeypatch) -> None:
+    server = _SpecoSGLangHttpServerMixin()
+    server.replica_rank = 0
+    server._speco_drafter_config = {
+        "training": {
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {"event_bus_name": "bubble-bus"},
+            }
+        }
+    }
+    events = []
+    gates = {"a": asyncio.Event(), "b": asyncio.Event()}
+
+    async def generate_request(*args, **kwargs):
+        del args, kwargs
+        request_id = current_request.pop(0)
+        await gates[request_id].wait()
+        return request_id
+
+    current_request = ["a", "b"]
+    server._speco_generate_request = generate_request
+    monkeypatch.setattr(
+        sglang_runtime,
+        "_emit_rollout_idle_worker_event",
+        lambda **kwargs: events.append(kwargs["event_type"]) or True,
+    )
+
+    async def scenario():
+        first = asyncio.create_task(server.generate(None, {}, "a"))
+        second = asyncio.create_task(server.generate(None, {}, "b"))
+        await asyncio.sleep(0)
+        assert events == ["GENERATION_STARTED"]
+        gates["a"].set()
+        await first
+        assert events == ["GENERATION_STARTED"]
+        gates["b"].set()
+        await second
+
+    asyncio.run(scenario())
+    assert events == ["GENERATION_STARTED", "WORKER_IDLE"]
+
+
+def test_sglang_failed_request_does_not_claim_memory_release(monkeypatch) -> None:
+    server = _SpecoSGLangHttpServerMixin()
+    server.replica_rank = 0
+    server._speco_drafter_config = {
+        "training": {
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {"event_bus_name": "bubble-bus"},
+            }
+        }
+    }
+    events = []
+
+    async def fail_request(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("generation failed")
+
+    server._speco_generate_request = fail_request
+    monkeypatch.setattr(
+        sglang_runtime,
+        "_emit_rollout_idle_worker_event",
+        lambda **kwargs: events.append(kwargs) or True,
+    )
+
+    with pytest.raises(RuntimeError, match="generation failed"):
+        asyncio.run(server.generate(None, {}, "request-0"))
+
+    assert events[-1]["event_type"] == "WORKER_IDLE"
+    assert events[-1]["memory_released"] is False
+    assert events[-1]["release_source"] == "runtime_request_failed"
+
+
+def test_sglang_runtime_idle_event_does_not_predict_deadline(monkeypatch) -> None:
+    payloads = []
+    monkeypatch.setattr(
+        sglang_runtime,
+        "emit_rollout_idle_event",
+        lambda _bus, payload: payloads.append(payload) or True,
+    )
+
+    emitted = sglang_runtime._emit_rollout_idle_worker_event(
+        drafter_cfg={
+            "training": {
+                "scheduler": {
+                    "execution": {"strategy": "rollout_idle_worker"},
+                    "idle_worker": {
+                        "event_bus_name": "bubble-bus",
+                        "initial_batch_estimate_sec": 9.0,
+                    },
+                }
+            }
+        },
+        replica_rank=0,
+        event_type="WORKER_IDLE",
+        memory_released=True,
+        release_source="runtime_request_complete",
+    )
+
+    assert emitted is True
+    assert payloads[-1]["must_be_ready_at"] is None
 
 
 def test_dflash_hidden_collection_requests_aux_hidden_without_raw_topk(

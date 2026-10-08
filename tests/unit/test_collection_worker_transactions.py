@@ -3,16 +3,18 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import deque
 from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
-from verl_speco.trainer.data_buffer import DataBuffer
-from verl_speco.workers.speco_worker import SpecoWorker
+from verl_speco.trainer.data_buffer import DataBuffer  # noqa: E402
+from verl_speco.workers import speco_worker  # noqa: E402
+from verl_speco.workers.speco_worker import SpecoWorker  # noqa: E402
 
 
 def _worker() -> SpecoWorker:
@@ -27,9 +29,7 @@ def _worker() -> SpecoWorker:
     )
     worker.config = SimpleNamespace(
         rollout=SimpleNamespace(
-            drafter=SimpleNamespace(
-                training={"collection_stage_ttl_sec": 1.0}
-            )
+            drafter=SimpleNamespace(training={"collection_stage_ttl_sec": 1.0})
         )
     )
     worker._staged_rollout_features = {}
@@ -65,53 +65,58 @@ def test_expired_collection_stages_are_removed() -> None:
     assert set(worker._staged_rollout_features) == {"active"}
 
 
-class _FeatureWriter:
-    def __init__(self) -> None:
-        self.written = []
-        self.flushed = []
+def test_data_buffer_reservation_is_versioned_and_consume_once() -> None:
+    buffer = DataBuffer(max_size=8)
+    buffer.update_rl_step(4)
+    step_three = {"value": "old", "target_version": 3}
+    step_four_a = {"value": "new-a", "target_version": 4}
+    step_four_b = {"value": "new-b", "target_version": 4}
+    for sample in (step_three, step_four_a, step_four_b):
+        buffer.add_batch(sample)
 
-    def write_many(self, samples) -> None:
-        self.written.extend(samples)
+    reserved = buffer.reserve("plan-4", target_version=4, max_samples=2)
 
-    def flush_on_step(self, global_step, interval_steps) -> None:
-        self.flushed.append((global_step, interval_steps))
-
-
-def _collect_only_worker() -> tuple[SpecoWorker, _FeatureWriter]:
-    worker = _worker()
-    worker.config.rollout.drafter.training.update(
-        {"mode": "collect_only", "feature_store": {"flush_interval_steps": 1}}
+    assert reserved == [step_four_a, step_four_b]
+    assert buffer.get_available_data(target_version=4) == []
+    assert (
+        buffer.get_available_data(target_version=4, reservation_id="plan-4") == reserved
     )
-    writer = _FeatureWriter()
-    worker.feature_writer = writer
-    worker.last_global_step = 4
-    worker._get_feature_writer = lambda: writer
-    return worker, writer
+    assert buffer.consume("plan-4", [step_four_a]) == 1
+    assert buffer.release_reservation("plan-4") == 1
+    assert buffer.get_available_data(target_version=4) == [step_four_b]
 
 
-def test_collect_only_rollback_discards_unpublished_feature_samples() -> None:
-    worker, writer = _collect_only_worker()
-    worker._collection_commit_journals["collection-4"] = {
-        **worker._snapshot_collection_buffer(),
-        "feature_store_samples": ["sample-a"],
-    }
+def test_collection_ref_resolution_awaits_without_ray_get(monkeypatch) -> None:
+    class AwaitableRef:
+        def __init__(self, value):
+            self.value = value
 
-    worker.rollback_rollout_features([{"collection_id": "collection-4"}])
+        def __await__(self):
+            async def _resolve():
+                return self.value
 
-    assert writer.written == []
-    assert writer.flushed == []
-    assert "collection-4" not in worker._collection_commit_journals
+            return _resolve().__await__()
 
+    monkeypatch.setattr(speco_worker.ray, "ObjectRef", AwaitableRef)
+    monkeypatch.setattr(
+        speco_worker.ray,
+        "get",
+        lambda _: pytest.fail("collection ref resolution must not call ray.get"),
+    )
+    hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
 
-def test_collect_only_finalize_publishes_staged_feature_samples() -> None:
-    worker, writer = _collect_only_worker()
-    worker._collection_commit_journals["collection-4"] = {
-        **worker._snapshot_collection_buffer(),
-        "feature_store_samples": ["sample-a"],
-    }
+    resolved = asyncio.run(
+        speco_worker._resolve_hidden_state_chunks(
+            [
+                {
+                    "ref": AwaitableRef(hidden),
+                    "chunk_start": 0,
+                    "chunk_length": 2,
+                    "chunk_row_indices": [0, 1],
+                }
+            ],
+            expected_rows=2,
+        )
+    )
 
-    worker.finalize_rollout_features([{"collection_id": "collection-4"}])
-
-    assert writer.written == ["sample-a"]
-    assert writer.flushed == [(4, 1)]
-    assert "collection-4" not in worker._collection_commit_journals
+    assert torch.equal(resolved, hidden.unsqueeze(0))

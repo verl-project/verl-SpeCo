@@ -34,8 +34,9 @@ class ConservativeTrainingDataStatusPolicy:
         data_version_consistent = all(
             s.data_version_consistent for s in statuses
         ) and all(version == data_versions[0] for version in data_versions)
-        worker_snapshots: dict[str, dict[str, object]] = {
-            s.worker_id: {
+        worker_snapshots: dict[str, dict[str, object]] = {}
+        for s in statuses:
+            snapshot: dict[str, object] = {
                 "buffer_version": s.buffer_version,
                 "data_version": (
                     s.data_version
@@ -44,11 +45,10 @@ class ConservativeTrainingDataStatusPolicy:
                 ),
                 "worker_incarnation": s.worker_incarnation,
                 "trainable_samples": s.trainable_samples,
-                "min_sample_step": s.min_sample_step,
-                "max_sample_step": s.max_sample_step,
             }
-            for s in statuses
-        }
+            if s.trainable_valid_tokens:
+                snapshot["trainable_valid_tokens"] = s.trainable_valid_tokens
+            worker_snapshots[s.worker_id] = snapshot
         return TrainingDataStatus(
             current_step=_as_int(global_step),
             current_step_samples=min(s.current_step_samples for s in statuses),
@@ -75,12 +75,5 @@ class ConservativeTrainingDataStatusPolicy:
             data_version_consistent=data_version_consistent,
             buffer_version=min(s.buffer_version for s in statuses),
             worker_snapshots=worker_snapshots,
-            min_sample_step=min(
-                (s.min_sample_step for s in statuses if s.min_sample_step is not None),
-                default=None,
-            ),
-            max_sample_step=max(
-                (s.max_sample_step for s in statuses if s.max_sample_step is not None),
-                default=None,
-            ),
+            trainable_valid_tokens=min(s.trainable_valid_tokens for s in statuses),
         )

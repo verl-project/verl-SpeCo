@@ -22,6 +22,7 @@ from verl_speco.trainer.scheduler.training_outcome import TrainingOutcome
 class BeforeActorUpdateContext:
     schedule_context: DrafterScheduleContext
     config: DrafterScheduleConfig
+    allow_quota_topup: bool = True
 
 
 @dataclass(frozen=True)

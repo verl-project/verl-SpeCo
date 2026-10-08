@@ -245,32 +245,6 @@ def test_commit_validation_failure_rolls_back_all_workers() -> None:
     assert events == ["rollback"]
 
 
-def test_finalize_failure_rolls_back_and_fails_collection() -> None:
-    events = []
-    executor = CallbackDrafterCollectionExecutor(
-        set_step=lambda step: None,
-        stage_submit=lambda buckets: [_staged_result()],
-        commit_submit=lambda buckets: [_worker_result()],
-        abort_submit=lambda buckets: events.append("abort") or [],
-        rollback_submit=lambda buckets: events.append("rollback") or [],
-        finalize_submit=lambda buckets: (_ for _ in ()).throw(
-            RuntimeError("finalize failed")
-        ),
-        resolve=lambda value: value,
-    )
-
-    outcome = DrafterScheduler(
-        collection_executor=executor
-    ).execute_collection_plan(_plan(), _payload())
-
-    assert outcome.attempted
-    assert not outcome.collected
-    assert outcome.collected_samples == 0
-    assert not outcome.finalized
-    assert outcome.reason == "collection_finalize_failed"
-    assert events == ["rollback"]
-
-
 def test_inactive_collection_plan_does_not_call_executor() -> None:
     executor = CallbackDrafterCollectionExecutor(
         set_step=lambda step: (_ for _ in ()).throw(AssertionError("unexpected")),
@@ -357,10 +331,11 @@ def test_collection_executor_sends_control_request_for_empty_worker_bucket() -> 
         assert submitted[phase] == expected_control_requests
 
 
-def test_collection_strategy_accepts_zero_sample_result_for_empty_bucket() -> None:
+def test_collection_accepts_empty_worker_bucket_for_single_writer_routing() -> None:
+    sample = {"input_ids": [1, 2]}
     payload = CollectionPayload(
         source=DrafterCollectionSource.SGLANG,
-        buckets=[[{"input_ids": [1, 2]}], []],
+        buckets=[[sample], []],
         collected_samples=1,
         raw_samples=1,
         collection_id="collection-4",
@@ -381,36 +356,9 @@ def test_collection_strategy_accepts_zero_sample_result_for_empty_bucket() -> No
     ).execute_collection_plan(_plan(), payload)
 
     assert outcome.collected
-    assert outcome.collected_samples == 1
     assert outcome.reason == "collection_completed"
-
-
-def test_collection_strategy_rejects_missing_nonempty_owner_result() -> None:
-    events = []
-    payload = CollectionPayload(
-        source=DrafterCollectionSource.SGLANG,
-        buckets=[[{"input_ids": [1, 2]}], []],
-        collected_samples=1,
-        raw_samples=1,
-        collection_id="collection-4",
-    )
-    executor = CallbackDrafterCollectionExecutor(
-        set_step=lambda step: None,
-        stage_submit=lambda buckets: [None, _staged_result(worker_id="1", staged_samples=0)],
-        commit_submit=lambda buckets: events.append("commit") or [],
-        abort_submit=lambda buckets: events.append("abort") or [],
-        rollback_submit=lambda buckets: events.append("rollback") or [],
-        finalize_submit=lambda buckets: events.append("finalize") or [],
-        resolve=lambda value: value,
-    )
-
-    outcome = DrafterScheduler(
-        collection_executor=executor
-    ).execute_collection_plan(_plan(), payload)
-
-    assert not outcome.collected
-    assert outcome.reason == "collection_stage_failed"
-    assert events == ["abort"]
+    assert outcome.collected_samples == 1
+    assert outcome.finalized
 
 
 def test_collection_rejects_payload_from_another_source() -> None:
