@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import inspect
 import json
 import logging
@@ -270,7 +271,7 @@ def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
     if not lock_path.exists():
         return
     try:
-        import fcntl
+        fcntl: Any = importlib.import_module("fcntl")
     except ImportError:
         deadline = time.monotonic() + float(timeout)
         while lock_path.exists():

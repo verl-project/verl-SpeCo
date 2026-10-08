@@ -250,6 +250,81 @@ def test_patch_skips_native_support_and_non_workers(sglang_patch, spec_workers) 
     assert dflash_cls.update_weights_from_tensor is patched
 
 
+def test_scheduler_dispatch_patches_a_late_loaded_dspark_worker(
+    monkeypatch, sglang_patch
+) -> None:
+    scheduler_components = types.ModuleType(
+        "sglang.srt.managers.scheduler_components"
+    )
+    weight_updater = types.ModuleType(
+        "sglang.srt.managers.scheduler_components.weight_updater"
+    )
+
+    class SchedulerWeightUpdaterManager:
+        def __init__(self, draft_worker):
+            # The manager can hold a stale None across SGLang lifecycle changes;
+            # the owning scheduler remains the source of truth.
+            self.draft_worker = None
+            self.scheduler = types.SimpleNamespace(
+                draft_worker=draft_worker,
+                model_worker=draft_worker,
+                spec_algorithm="DSPARK",
+            )
+            self.tp_worker = types.SimpleNamespace()
+            self.tp_cpu_group = object()
+
+        def _observe_weight_load(self, _kind):
+            class Context:
+                def __enter__(self):
+                    return None
+
+                def __exit__(self, *args):
+                    return False
+
+            return Context()
+
+        def flush_cache_after_weight_update(self, recv_req):
+            pass
+
+        def record_weight_version_after_update(self, weight_version):
+            pass
+
+        def update_weights_from_tensor(self, recv_req):
+            return self.draft_worker.update_weights_from_tensor(recv_req)
+
+    weight_updater.SchedulerWeightUpdaterManager = SchedulerWeightUpdaterManager
+    weight_updater.UpdateWeightsFromTensorReqOutput = lambda **kwargs: types.SimpleNamespace(
+        **kwargs
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.managers.scheduler_components",
+        scheduler_components,
+    )
+    monkeypatch.setitem(sys.modules, weight_updater.__name__, weight_updater)
+    monkeypatch.setattr(sglang_patch.torch.distributed, "barrier", lambda **kwargs: None)
+
+    # This worker was not importable during the initial startup scan.
+    late_dspark_cls = _spec_worker_class("DSparkWorkerV2")
+    sglang_patch._SGLANG_EAGLE_UPDATE_PATCHED = True
+    sglang_patch.patch_sglang_eagle_update_weights_from_tensor()
+
+    worker = late_dspark_cls()
+    manager = SchedulerWeightUpdaterManager(worker)
+    result = manager.update_weights_from_tensor(
+        _request(
+            [("markov_head.weight", 9)],
+            load_format=DRAFT_LOADER,
+            weight_version=None,
+        )
+    )
+
+    assert result.success
+    assert worker.draft_model_runner.model.weights == {"markov_head.weight": 9}
+    assert worker.target_worker.model_runner.model.weights == {}
+    assert worker.draft_model_runner.weight_updater.load_formats == [None]
+
+
 def test_runner_update_prefers_the_runner_level_method(sglang_patch) -> None:
     calls = []
     runner = types.SimpleNamespace(
