@@ -125,6 +125,9 @@ class DFlashConfig(PretrainedConfig):
         target_num_hidden_layers: int = 36,
         target_layer_ids: Optional[list[int]] = None,
         mask_token_id: int = 151669,
+        sliding_window: Optional[int] = None,
+        use_sliding_window: bool = False,
+        layer_types: Optional[list[str]] = None,
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
@@ -151,6 +154,24 @@ class DFlashConfig(PretrainedConfig):
         self.target_num_hidden_layers = target_num_hidden_layers
         self.target_layer_ids = target_layer_ids
         self.mask_token_id = mask_token_id
+        self.sliding_window = (
+            int(sliding_window) if sliding_window is not None else None
+        )
+        if self.sliding_window is not None and self.sliding_window <= 0:
+            raise ValueError(
+                f"sliding_window must be positive, got {self.sliding_window}"
+            )
+        self.use_sliding_window = bool(use_sliding_window) and (
+            self.sliding_window is not None
+        )
+        if layer_types is not None:
+            layer_types = [str(layer_type) for layer_type in layer_types]
+            if len(layer_types) != int(num_hidden_layers):
+                raise ValueError(
+                    f"layer_types has {len(layer_types)} entries but "
+                    f"num_hidden_layers={num_hidden_layers}"
+                )
+        self.layer_types = layer_types
 
     @classmethod
     def from_dflash_pretrained(cls, model_path: str):

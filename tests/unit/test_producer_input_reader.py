@@ -209,9 +209,10 @@ def test_prefilled_response_limits_vllm_prefix_after_selecting_training_window()
     assert prepared.prompt_token_ids == [0, 1, 2, 3, 4, 5]
 
 
-def test_prefilled_response_rejects_prompt_prefix_beyond_vllm_limit() -> None:
+def test_prefilled_response_filters_prompt_prefix_beyond_vllm_limit() -> None:
+    # Over-length samples are data-filtered (skipped upstream), not fatal.
     with pytest.raises(
-        ValueError,
+        input_reader.SampleFilteredError,
         match=r"vLLM prefill of 13 tokens.*max_sequence_length=8",
     ):
         input_reader._build_tokenized_request(

@@ -97,13 +97,19 @@ speco:
     on_error: skip
     max_consecutive_errors: 20
     # Samples that fail to produce a training payload (misaligned or NaN/Inf
-    # hidden states, or filtered after target generation) are replaced while
-    # max_samples > 0; abort after this many consecutive replacements without a
-    # successful feature conversion instead of requesting replacements forever.
+    # hidden states, filtered after target generation, or a terminal vLLM
+    # request failure) are replaced while max_samples > 0; abort after this many
+    # consecutive replacements without a successful feature conversion instead
+    # of requesting replacements forever.
     max_consecutive_feature_drops: 20
     # Tolerant role cleaning for ShareGPT rows (unknown roles map to assistant,
     # order-violating turns are dropped instead of aborting the run).
     parser_strict_roles: false
+    # skip|generate for rows without an assistant response. Offline training
+    # cannot teacher-force them, so skip drops them (counts as filtered data)
+    # instead of asking the 35B target to generate (very slow). Use generate to
+    # restore the old fallback behaviour.
+    on_missing_response: skip
     # Filter rows whose feature window leaves too few supervised tokens.
     min_supervised_tokens: 1
     # drop|keep when the feature window cuts the supervised response.
@@ -223,6 +229,12 @@ actor_rollout_ref:
         logits_coverage_mask_min_ratio: 0.1
         logits_coverage_mask_require_top1: false
         ttt_length: 1
+        # DFlash-family document-aware packing: concatenate the batch's samples
+        # into one row (each padded to a block_size multiple) and isolate them via
+        # document_ids. Disabled by default because it changes the batch.
+        packing:
+          enable: false
+          max_packed_len: 0
         # Group similar-length samples into a batch to cut padding. Off by
         # default because batch composition changes the loss trajectory.
         group_by_length: false
@@ -236,6 +248,7 @@ actor_rollout_ref:
         dflash_front_position_count: 0
         dflash_hard_sample_ratio: 0.0
         dflash_hidden_size: null
+        dflash_sliding_window: null
         dflash_num_target_layers: 5
         dflash_num_hidden_layers: 1
         dflash_mask_token_id: null
@@ -249,6 +262,7 @@ actor_rollout_ref:
         dspark_hard_sample_ratio: 0.0
         dspark_hidden_size: null
         dspark_intermediate_size: null
+        dspark_sliding_window: null
         dspark_num_target_layers: 5
         dspark_num_hidden_layers: 5
         dspark_mask_token_id: null
