@@ -42,6 +42,7 @@ def test_producer_actor_reuses_existing_producer_and_supports_stop(monkeypatch) 
         assert set(kwargs) == {
             "before_request",
             "on_published",
+            "on_metrics",
             "get_runtime_state",
         }
         started.set()
@@ -99,6 +100,32 @@ def test_producer_actor_coalesces_publish_notifications_as_cumulative_total(
     assert events.items == [
         {"kind": "samples_published", "published_total": 3}
     ]
+
+
+def test_producer_actor_delivers_partial_metrics_when_stopped(monkeypatch):
+    started = asyncio.Event()
+    events = []
+
+    async def fake_run_producer(config, **kwargs):
+        try:
+            await kwargs["on_published"](0)
+            started.set()
+            await asyncio.Event().wait()
+        finally:
+            await kwargs["on_metrics"](1, {"producer/sample_total_time": 2.0})
+
+    monkeypatch.setitem(sys.modules, "verl_speco.standalone_tq_producer",
+                        SimpleNamespace(run_producer=fake_run_producer))
+    actor = StandaloneProducerActor({"producer": True}, SimpleNamespace(put=events.append))
+
+    async def exercise():
+        await actor.start()
+        await started.wait()
+        await actor.stop()
+
+    asyncio.run(exercise())
+    assert {"kind": "producer_metrics", "published_total": 1,
+            "metrics": {"producer/sample_total_time": 2.0}} in events
 
 
 def test_ray_backend_rejects_multi_node_local_runtime() -> None:
@@ -179,7 +206,10 @@ class _Queue:
     def put(self, value):
         pass
 
-    def get(self, *, block, timeout):
+    def get(self, *, block, timeout=None):
+        if not block:
+            from queue import Empty
+            raise Empty
         raise AssertionError("event queue should not be read in this test")
 
 
@@ -213,7 +243,7 @@ class _RecordingQueue(_Queue):
     def put(self, value):
         self.items.append(value)
 
-    def get(self, *, block, timeout):
+    def get(self, *, block, timeout=None):
         if not self.items:
             from queue import Empty
 
@@ -269,6 +299,51 @@ def test_scheduler_executes_one_complete_standalone_batch(monkeypatch) -> None:
         f"sample-{index}" for index in range(4)
     ]
     assert commands.items[-1] == {"kind": "stop"}
+
+
+def test_driver_logs_producer_snapshot_and_drains_final_training_metrics(monkeypatch):
+    store = _ReadyStore()
+    commands = _RecordingQueue()
+    events = _RecordingQueue(events=[
+        {"kind": "producer_metrics", "published_total": 100,
+         "metrics": {"producer/samples_per_second": 2.0}},
+        {"kind": "training_completed", "keys": [f"sample-{i}" for i in range(4)],
+         "successful": True},
+        {"kind": "training_metrics", "step": 17, "metrics": {"dspark/loss": 0.5}},
+    ], on_event=lambda event: store.ready.clear()
+        if event["kind"] == "training_completed" else None)
+
+    class MetricsRay(_FlowRay):
+        def wait(self, refs, num_returns, timeout=0):
+            self.wait_calls += 1
+            if self.wait_calls <= 2:
+                return [], list(refs)
+            producer = next(ref for ref in refs if ref.name == "producer")
+            return [producer], [ref for ref in refs if ref != producer]
+
+    queues = iter((commands, events))
+    calls = []
+    module = "verl_speco.standalone_ray_runtime."
+    monkeypatch.setattr(module + "compose_runtime_config", lambda _: _runtime_config())
+    monkeypatch.setattr(module + "_build_standalone_tracking", lambda *a, **k: ["tracker"])
+    monkeypatch.setattr(module + "_log_producer_tracking_metrics",
+                        lambda trackers, metrics, **k: calls.append(("producer", dict(metrics), k)))
+    monkeypatch.setattr(module + "_log_standalone_tracking_metrics",
+                        lambda trackers, metrics, **k: calls.append(("train", dict(metrics), k)))
+    monkeypatch.setattr(module + "_finish_standalone_tracking",
+                        lambda trackers, **k: calls.append(("finish", trackers)))
+    trainer = StandaloneRayTrainer(
+        _commands(), ray_module=MetricsRay(_ProducerHandle()),
+        worker_group_factory=lambda *a, **k: _WorkerGroup(),
+        queue_factory=lambda: next(queues), feature_store_factory=lambda _: store,
+    )
+    assert trainer.run() == 0
+    assert calls == [
+        ("producer", {"producer/samples_per_second": 2.0, "tq/ready_samples": 4.0},
+         {"published_total": 100}),
+        ("train", {"dspark/loss": 0.5}, {"step": 17}),
+        ("finish", ["tracker"]),
+    ]
 
 
 _CONFIG = None

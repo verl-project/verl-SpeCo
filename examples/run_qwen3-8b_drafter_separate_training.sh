@@ -15,6 +15,7 @@ set -x
 
 project_name='verl_grpo_example_eagle3_drafter'
 exp_name='qwen3_8b_eagle3_separate_drafter_vllm_gpu'
+TRAIN_LOGGERS=${TRAIN_LOGGERS:-'["console","swanlab"]'}
 
 gen_tp=2
 train_sp=1
@@ -141,5 +142,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.draft_train_launcher \
     actor_rollout_ref.rollout.drafter.training.feature_store.max_sample_step=${feature_store_max_sample_step} \
     actor_rollout_ref.rollout.drafter.training.feature_store.shuffle=True \
     actor_rollout_ref.rollout.drafter.training.feature_store.repeat=True \
+    trainer.logger="${TRAIN_LOGGERS}" \
+    trainer.project_name=${project_name} \
+    trainer.experiment_name=${exp_name}_train \
     actor_rollout_ref.rollout.drafter.training.feature_store.strict_schema=True $@
 fi

@@ -44,6 +44,7 @@ from verl_speco.producer.input_reader import (
     tokenize_record,
     tokenize_record_with_render_boundary,
 )
+from verl_speco.producer.metrics import producer_window_metrics
 from verl_speco.producer.vllm_feature_client import (
     RawVllmFeature,
     VllmEndpoint,
@@ -373,6 +374,7 @@ async def run_producer(
     client_pool: Any | None = None,
     before_request: Any | None = None,
     on_published: Any | None = None,
+    on_metrics: Any | None = None,
     get_runtime_state: Any | None = None,
 ) -> ProducerStats:
     """Run the bounded input -> vLLM -> TQ pipeline and publish EOS on success."""
@@ -961,6 +963,7 @@ async def run_producer(
                 consecutive_replacements = 0
                 mark_stage(worker, "publish_queue_put", request.sample_id)
                 timing["publish_queue_started"] = time.monotonic()
+                enqueue_started = time.monotonic()
                 await publish_queue.put(
                     PreparedFeature(
                         request=request,
@@ -972,15 +975,17 @@ async def run_producer(
                         timing=timing,
                     )
                 )
+                timing["publish_queue_wait"] = time.monotonic() - enqueue_started
                 peak_publish_queue = max(peak_publish_queue, publish_queue.qsize())
 
-        def log_perf_window() -> None:
+        def log_perf_window(*, force: bool = False) -> dict[str, float] | None:
             nonlocal perf_window_started, peak_publish_queue
             nonlocal peak_publish_inflight, peak_pending_bytes
-            if len(perf_rows) < _PERF_WINDOW_SAMPLES:
-                return
+            if not perf_rows or (not force and len(perf_rows) < _PERF_WINDOW_SAMPLES):
+                return None
             now = time.monotonic()
             window = max(now - perf_window_started, 1e-9)
+            tracking_metrics = producer_window_metrics(perf_rows, window)
             timing_names = (
                 "e2e",
                 "input_prepare",
@@ -1094,6 +1099,7 @@ async def run_producer(
             peak_publish_queue = publish_queue.qsize()
             peak_publish_inflight = publish_inflight
             peak_pending_bytes = stats.pending_bytes
+            return tracking_metrics
 
         async def publish_results() -> None:
             nonlocal last_published_at, publish_inflight, peak_publish_inflight
@@ -1170,8 +1176,6 @@ async def run_producer(
                         put_elapsed,
                     )
                 stats.published_count += 1
-                if on_published is not None:
-                    await on_published(result.request.sequence_no)
                 last_published_at = time.monotonic()
                 if _should_log_sample_progress(stats.published_count):
                     logger.info(
@@ -1196,7 +1200,12 @@ async def run_producer(
                         "timing": result.timing,
                     }
                 )
-                log_perf_window()
+                window_metrics = log_perf_window()
+                published_total = stats.published_count
+                if window_metrics is not None and on_metrics is not None:
+                    await on_metrics(published_total, window_metrics)
+                if on_published is not None:
+                    await on_published(result.request.sequence_no)
 
         request_tasks = [
             asyncio.create_task(request_worker(), name=f"request-{index}")
@@ -1246,6 +1255,15 @@ async def run_producer(
                 raise failure_error
             await asyncio.gather(*pending)
         finally:
+            # Stop publishers before flushing so cancellation cannot race with
+            # late appends or leave request tasks writing into a closed client.
+            for task in [*tasks, *request_tasks]:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, *request_tasks, return_exceptions=True)
+            window_metrics = log_perf_window(force=True)
+            if window_metrics is not None and on_metrics is not None:
+                await on_metrics(stats.published_count, window_metrics)
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
 

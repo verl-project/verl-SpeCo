@@ -422,6 +422,69 @@ def test_run_producer_logs_perf_window_at_info(
     assert any("perf slowest transport samples:" in message for message in messages)
 
 
+@pytest.mark.parametrize("count", [37, 100, 137, 200])
+def test_producer_emits_complete_and_final_partial_metric_windows(tmp_path, count):
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = count
+    windows = []
+
+    async def on_metrics(total, metrics):
+        windows.append((total, metrics))
+
+    stats = asyncio.run(run_producer(
+        config, transport=_Transport(), tokenizer=_Tokenizer(),
+        client_pool=_Pool(tmp_path), before_request=lambda: asyncio.sleep(0),
+        on_metrics=on_metrics,
+    ))
+    expected = list(range(100, count + 1, 100))
+    if count % 100:
+        expected.append(count)
+    assert stats.published_count == count
+    assert [total for total, _ in windows] == expected
+    for _, metrics in windows:
+        assert metrics["producer/samples_per_second"] > 0
+        assert "producer/generation_time" not in metrics
+        assert metrics["producer/other_time"] >= 0
+
+
+def test_producer_cancellation_flushes_partial_window(tmp_path):
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    producer_cfg = config["speco"]["standalone_tq_producer"]
+    producer_cfg.update(max_samples=100, publish_workers=1)
+    windows = []
+
+    async def exercise():
+        ready = asyncio.Event()
+        published = 0
+
+        async def on_published(sequence_no):
+            nonlocal published
+            published += 1
+            if published == 37:
+                ready.set()
+                await asyncio.Event().wait()
+
+        async def on_metrics(total, metrics):
+            windows.append((total, metrics))
+
+        task = asyncio.create_task(run_producer(
+            config, transport=_Transport(), tokenizer=_Tokenizer(),
+            client_pool=_Pool(tmp_path), before_request=lambda: asyncio.sleep(0),
+            on_published=on_published, on_metrics=on_metrics,
+        ))
+        await asyncio.wait_for(ready.wait(), timeout=10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    assert [total for total, _ in windows] == [37]
+
+
 def test_run_producer_retries_transient_publish_failure(
     tmp_path: Path, caplog
 ) -> None:
