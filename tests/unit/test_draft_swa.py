@@ -319,6 +319,56 @@ def test_dflash_training_forward_accepts_document_ids() -> None:
     assert torch.isfinite(result[0])
 
 
+def test_dflash_trailing_label_token_is_supervised() -> None:
+    """DFlash must supervise the final label token that has no context row."""
+    config = DFlashConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=16,
+        num_target_layers=4,
+        num_context_layers=1,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1],
+        mask_token_id=15,
+    )
+    model = DFlashTrainingModel(
+        draft_model=DFlashDraftModel(config),
+        block_size=2,
+        num_anchors=2,
+    )
+    model.eval()
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def _capture(**kwargs):
+        captured["targets"] = kwargs["active_targets"].detach().clone()
+        return None, {}
+
+    model._auxiliary_loss = _capture  # type: ignore[assignment]
+
+    context_rows, label_rows = 2, 3
+    input_ids = torch.tensor([[10, 11]], dtype=torch.long)
+    label_ids = torch.tensor([[10, 11, 12]], dtype=torch.long)
+    model(
+        input_ids=input_ids,
+        hidden_states_list=[torch.randn(1, context_rows, 8)],
+        loss_mask=torch.ones(1, context_rows),
+        lm_head_weight=torch.randn(config.vocab_size, 8),
+        label_ids=label_ids,
+        label_mask=torch.ones(1, label_rows),
+    )
+
+    # 12 is the trailing label (index 2) predicted from context row 1; it is not
+    # present in input_ids, so it can only be supervised via the label sequence.
+    assert "targets" in captured
+    assert 12 in captured["targets"].tolist()
+
+
 class _RecordingLayer(nn.Module):
     def __init__(self):
         super().__init__()

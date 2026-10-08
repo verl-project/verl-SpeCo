@@ -329,6 +329,82 @@ def test_block_drafter_rejects_invalid_lk_configuration(kwargs, message):
         _small_dspark_training_model(**kwargs)
 
 
+def _tiny_dspark_training_model() -> DSparkTrainingModel:
+    config = DSparkConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vocab_size=32,
+        num_target_layers=4,
+        num_context_layers=2,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1, 3],
+        mask_token_id=31,
+        markov_rank=4,
+        enable_confidence_head=True,
+    )
+    model = DSparkTrainingModel(
+        draft_model=DSparkDraftModel(config),
+        block_size=2,
+        num_anchors=2,
+        confidence_head_alpha=0.0,
+        l1_loss_alpha=0.0,
+        ce_loss_alpha=1.0,
+    )
+    model.eval()
+    return model
+
+
+def test_dspark_trailing_label_token_remains_supervised():
+    model = _tiny_dspark_training_model()
+    # context rows = 2, label rows = 3: the last label token only exists as a
+    # label (the hidden states are one row shorter).
+    context_rows, label_rows = 2, 3
+    label_ids = torch.tensor([[10, 11, 12]])
+    label_mask = torch.tensor([[0.0, 1.0, 1.0]])
+
+    anchors, keep = model._sample_anchor_positions(
+        label_rows, label_mask, torch.device("cpu")
+    )
+    kept = anchors[keep]
+    assert kept.numel() >= 1, "a two-token response must keep a valid anchor"
+    assert bool((kept < context_rows).all())
+
+    targets, _prev, eval_mask, label_indices = model._build_label_tensors(
+        input_ids=label_ids,
+        loss_mask=label_mask,
+        anchor_positions=torch.tensor([[1]]),
+        block_keep_mask=torch.ones(1, 1, dtype=torch.bool),
+    )
+    assert label_indices[0, 0, 0].item() == context_rows
+    assert targets[0, 0, 0].item() == 12
+    assert bool(eval_mask[0, 0, 0])
+
+
+def test_dspark_forward_accepts_trailing_label_sequence():
+    model = _tiny_dspark_training_model()
+    out = model(
+        input_ids=torch.tensor([[10, 11]]),
+        hidden_states_list=[torch.randn(1, 2, 8), torch.randn(1, 2, 8)],
+        loss_mask=torch.tensor([[0.0, 1.0]]),
+        lm_head_weight=torch.randn(32, 8),
+        label_ids=torch.tensor([[10, 11, 12]]),
+        label_mask=torch.tensor([[0.0, 1.0, 1.0]]),
+    )
+    assert torch.isfinite(out[0].detach())
+    # Backward compatible: no label sequence falls back to input_ids/loss_mask.
+    out_legacy = model(
+        input_ids=torch.tensor([[10, 11, 12, 13]]),
+        hidden_states_list=[torch.randn(1, 4, 8), torch.randn(1, 4, 8)],
+        loss_mask=torch.ones(1, 4),
+        lm_head_weight=torch.randn(32, 8),
+    )
+    assert torch.isfinite(out_legacy[0].detach())
+
+
 def test_dspark_untrained_confidence_head_is_kept_but_excluded_from_optimizer():
     config = DSparkConfig(
         hidden_size=8,
@@ -1231,3 +1307,142 @@ def test_dspark_dpace_weights_only_ce_and_keeps_fixed_distribution_weights(
     torch.testing.assert_close(
         captured_distribution_weights[0], expected_fixed_weights
     )
+
+
+def _label_packing_trainer():
+    from collections import deque
+
+    from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend
+    from verl_speco.trainer.base_trainer import DrafterBaseTrainer
+
+    trainer = object.__new__(DrafterBaseTrainer)
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(training={"dspark_l1_loss_alpha": 0.0})
+        )
+    )
+    backend = object.__new__(DSparkTrainerBackend)
+    backend.config = trainer.config
+    trainer.backend = backend
+    trainer.model = torch.nn.Linear(1, 1)
+    trainer.model_config = SimpleNamespace(
+        pad_token_id=0, hidden_size=8, target_hidden_size=8, num_context_layers=2
+    )
+    trainer.collected_data = deque(maxlen=64)
+    trainer.current_rl_step = 0
+    trainer.batch_size = 4
+    trainer.training_steps = 0
+    trainer.use_data_buffer = False
+    trainer.data_buffer = None
+    trainer._current_pad_size = 0
+    trainer.rank = 0
+    trainer.use_ulysses_sp = False
+    trainer.ulysses_sequence_parallel_size = 1
+    trainer.training_device_mesh = None
+    trainer.training_process_group = None
+    trainer.training_group_world_size = 1
+    trainer.dp_group_world_size = 1
+    trainer.pad_token_id = 0
+    return trainer
+
+
+def _feature_sample(label_rows, hidden_rows, *, nan_hidden_row=None):
+    from verl_speco.trainer.feature_store import DraftFeatureSample
+
+    hidden = torch.randn(hidden_rows, 16)
+    if nan_hidden_row is not None:
+        hidden[nan_hidden_row] = float("nan")
+    return DraftFeatureSample(
+        algorithm="DSPARK",
+        input_ids=torch.arange(1, label_rows + 1),
+        loss_mask=torch.ones(label_rows),
+        hidden_states=hidden,
+        metadata={"hidden_states_layout": "dflash_aux", "global_step": 0},
+    )
+
+
+def test_block_drafter_label_packing_keeps_trailing_token():
+    trainer = _label_packing_trainer()
+    batch = trainer.prepare_training_batch_from_samples([_feature_sample(5, 4)], step=0)
+    assert batch is not None
+    assert "label_ids" in batch and "label_mask" in batch
+    assert batch["input_ids"].size(1) == 4
+    assert batch["label_ids"].size(1) == 5
+    assert batch["label_mask"].size(1) == 5
+    assert bool((batch["label_ids"][0, :4] == batch["input_ids"][0]).all())
+
+
+def test_block_drafter_label_packing_standalone_equal_lengths():
+    trainer = _label_packing_trainer()
+    batch = trainer.prepare_training_batch_from_samples([_feature_sample(4, 4)], step=0)
+    assert batch is not None
+    assert batch["label_ids"].size(1) == batch["input_ids"].size(1) == 4
+
+
+def test_block_drafter_label_mask_is_sanitized_for_bad_hidden_rows():
+    trainer = _label_packing_trainer()
+    batch = trainer.prepare_training_batch_from_samples(
+        [_feature_sample(5, 4, nan_hidden_row=1)], step=0
+    )
+    assert batch is not None
+    assert float(batch["loss_mask"][0, 1]) == 0.0
+    assert float(batch["label_mask"][0, 1]) == 0.0
+
+
+def test_check_block_drafter_rows_boundaries():
+    from verl_speco.backends.dflash_trainer_backend import _check_block_drafter_rows
+
+    _check_block_drafter_rows(4, 4, 4, "DSpark")
+    _check_block_drafter_rows(5, 4, 5, "DSpark")
+    with pytest.raises(ValueError):
+        _check_block_drafter_rows(6, 4, 6, "DSpark")
+    with pytest.raises(ValueError):
+        _check_block_drafter_rows(5, 4, 4, "DSpark")
+
+
+def test_block_drafter_label_mask_keeps_shorter_sample_tail():
+    """A mixed-length batch must gate each sample's tail label with its own
+    context length, not the batch-wide padded width."""
+    trainer = _label_packing_trainer()
+    batch = trainer.prepare_training_batch_from_samples(
+        [_feature_sample(5, 4), _feature_sample(6, 5)], step=0
+    )
+    assert batch is not None
+    # Short sample: 4 context rows + 1 trailing label; long: 5 + 1.
+    assert batch["input_ids"].size(1) == 5
+    assert batch["label_ids"].size(1) == 6
+    assert batch["label_mask"].size(1) == 6
+    # The shorter sample's tail lives at column 4, which is padding in the
+    # context loss mask because the longer sample sets the batch width.
+    assert float(batch["loss_mask"][0, 4]) == 0.0
+    assert float(batch["label_mask"][0, 4]) == 1.0
+    # Context columns still follow the context mask, and the longer sample's
+    # tail at column 5 remains supervised.
+    assert float(batch["label_mask"][0, 1]) == 1.0
+    assert float(batch["label_mask"][1, 5]) == 1.0
+
+
+def test_block_drafter_packing_rejects_trailing_label():
+    """Document-aware packing does not carry the trailing label token yet, so
+    the combination must fail closed instead of silently dropping it."""
+    trainer = _label_packing_trainer()
+    trainer.config.rollout.drafter.training["packing"] = {
+        "enable": True,
+        "max_packed_len": 0,
+    }
+    with pytest.raises(NotImplementedError, match="trailing drafter label token"):
+        trainer.prepare_training_batch_from_samples([_feature_sample(5, 4)], step=0)
+
+
+def test_block_drafter_packing_allows_equal_length_context():
+    """Equal-length (no trailing label) samples still pack normally."""
+    trainer = _label_packing_trainer()
+    trainer.config.rollout.drafter.training["packing"] = {
+        "enable": True,
+        "max_packed_len": 0,
+    }
+    batch = trainer.prepare_training_batch_from_samples([_feature_sample(4, 4)], step=0)
+    assert batch is not None
+    assert batch["input_ids"].size(1) >= 4
+    assert "document_ids" in batch
+    assert "label_ids" not in batch

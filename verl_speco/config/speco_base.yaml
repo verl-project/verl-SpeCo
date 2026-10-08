@@ -97,13 +97,19 @@ speco:
     on_error: skip
     max_consecutive_errors: 20
     # Samples that fail to produce a training payload (misaligned or NaN/Inf
-    # hidden states, or filtered after target generation) are replaced while
-    # max_samples > 0; abort after this many consecutive replacements without a
-    # successful feature conversion instead of requesting replacements forever.
+    # hidden states, filtered after target generation, or a terminal vLLM
+    # request failure) are replaced while max_samples > 0; abort after this many
+    # consecutive replacements without a successful feature conversion instead
+    # of requesting replacements forever.
     max_consecutive_feature_drops: 20
     # Tolerant role cleaning for ShareGPT rows (unknown roles map to assistant,
     # order-violating turns are dropped instead of aborting the run).
     parser_strict_roles: false
+    # skip|generate for rows without an assistant response. Offline training
+    # cannot teacher-force them, so skip drops them (counts as filtered data)
+    # instead of asking the 35B target to generate (very slow). Use generate to
+    # restore the old fallback behaviour.
+    on_missing_response: skip
     # Filter rows whose feature window leaves too few supervised tokens.
     min_supervised_tokens: 1
     # drop|keep when the feature window cuts the supervised response.
