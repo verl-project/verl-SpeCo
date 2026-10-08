@@ -121,9 +121,6 @@ _SPECO_VLLM_REQUEST_DRAFT_TOKENS_KEY = "_speco_vllm_request_draft_tokens"
 # Meta-info markers carried by fixed paired-probe batches (RFC sec. 6).
 _SPECO_FREEZE_PROBE_META_KEY = "_speco_freeze_probe"
 _SPECO_FREEZE_PROBE_MAX_TOKENS_META_KEY = "_speco_freeze_probe_max_tokens"
-_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH_ENV = (
-    "VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH"
-)
 _DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
 
 _DRAFTER_CHECKPOINT_PATH_PLACEHOLDERS = {
@@ -490,8 +487,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_drafter_frozen = False
         self._speco_last_request_accept_len_records: list[dict[str, Any]] = []
         # Marginal-utility freeze policy (method=marginal_utility_v1). Shadow
-        # mode only logs would_freeze + metrics; active mode drives the same
-        # ``_speco_drafter_frozen`` gate the legacy tracker sets.
+        # mode only logs would_freeze + metrics; active mode drives the
+        # ``_speco_drafter_frozen`` gate that stops both drafter training and
+        # hidden-state collection (accept-length / PPO old_log_prob stay on).
         self._speco_freeze_policy = None  # built lazily in fit()
         self._speco_freeze_policy_active = False
         self._speco_last_freeze_decision = None
@@ -1011,9 +1009,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 require_training_interval=(
                     source is DrafterCollectionSource.OLD_LOGPROB
                 ),
-                drafter_frozen=bool(
-                    getattr(self, "_speco_drafter_frozen", False)
-                ),
+                # Active freeze stops hidden-state feature collection (the
+                # drafter no longer trains); accept-length and PPO old_log_prob
+                # stay ungated. Shadow never sets _speco_drafter_frozen.
+                drafter_frozen=self._speco_drafter_frozen,
             ),
             self._speco_drafter_schedule_config(),
         )
@@ -1064,29 +1063,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_has_collected_drafter_samples_this_step(self) -> bool:
         return int(getattr(self, "_speco_last_collected_samples", 0) or 0) > 0
 
-    def _speco_should_attempt_drafter_train_this_step(self) -> bool:
-        """Gate for drafter training this step, honoring the convergence freeze.
-
-        When ``_speco_drafter_frozen`` is set (by the convergence tracker), the
-        drafter is skipped entirely -- no training, no lm-head sync, no publish
-        (cascade freeze). Otherwise the normal interval / collected-samples /
-        data-buffer conditions apply.
-        """
-        if getattr(self, "_speco_drafter_frozen", False):
-            return False
-        if self._speco_drafter_training_mode() == "collect_only":
-            return False
-        if not self._speco_should_train_drafter_this_step():
-            return False
-        if self._speco_has_collected_drafter_samples_this_step():
-            return True
-        training_cfg = self._speco_drafter_training_config()
-        if self._speco_oldlogprob_collection_requested():
-            return False
-        return bool(training_cfg.get("use_data_buffer", False))
-
     # ------------------------------------------------------------------ #
-    # Per-request accept-length records (feed the convergence freeze gate)
+    # Per-request accept-length records (feed the freeze policy evidence)
     # ------------------------------------------------------------------ #
     def _speco_batch_size_from_request_stats(self, batch: Any) -> int:
         non_tensor_batch = getattr(batch, "non_tensor_batch", None)
@@ -1174,30 +1152,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 }
             )
         self._speco_last_request_accept_len_records = records
-        self._speco_dump_request_accept_len_records(records)
-
-    def _speco_dump_request_accept_len_records(
-        self, records: list[dict[str, Any]]
-    ) -> None:
-        """Append one JSON line per step when the hist-log env var is set."""
-        if not records:
-            return
-        path = os.getenv(_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH_ENV)
-        if not path:
-            return
-        payload = {
-            "step": int(getattr(self, "global_steps", 0) or 0),
-            "timestamp": time.time(),
-            "count": len(records),
-            "records": records,
-        }
-        try:
-            with open(path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        except OSError as exc:
-            logger.warning(
-                "Failed to write request accept-len hist log to %s: %s", path, exc
-            )
 
     # ------------------------------------------------------------------ #
     # Marginal-utility freeze policy (method=marginal_utility_v1)
@@ -3420,18 +3374,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     if freeze_policy is not None
                     else 0
                 )
-                freeze_decision = self._speco_observe_rollout_evidence(
+                self._speco_observe_rollout_evidence(
                     gen_batch_output,
                     serving_version,
                     generation_seconds=generation_elapsed,
                 )
-                # Hard freeze (active only) also stops feature collection; soft
-                # freeze and shadow mode keep collecting unchanged.
-                collection_allowed = not (
-                    self._speco_freeze_policy_active
-                    and freeze_decision is not None
-                    and not freeze_decision.should_collect
-                )
+                # Active freeze stops hidden-state collection here and in the
+                # scheduler plan; shadow mode keeps collecting. Accept-length
+                # evidence above is ungated and keeps feeding drift detection.
+                collection_allowed = not self._speco_drafter_frozen
                 if collection_allowed:
                     collected = self._speco_collect_generation_samples(
                         gen_batch_output

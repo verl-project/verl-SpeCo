@@ -2479,25 +2479,6 @@ def patch_vllm_request_acceptance_stats() -> bool:
 
 
 def patch_vllm_dflash_config_aliases() -> bool:
-    """Let vLLM 0.23 consume SPECO DFlash top-level target layer ids."""
-
-    global _VLLM_DFLASH_CONFIG_ALIASES_PATCHED
-    if _VLLM_DFLASH_CONFIG_ALIASES_PATCHED:
-        return True
-    try:
-        from vllm.transformers_utils.configs.eagle import EAGLEConfig
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Unable to install vLLM DFlash config alias patch: %s", exc)
-        return False
-
-    current = getattr(EAGLEConfig, "__init__", None)
-    if not callable(current):
-        return False
-    if getattr(current, "_speco_dflash_config_aliases", False):
-        _VLLM_DFLASH_CONFIG_ALIASES_PATCHED = True
-        return True
-
-def patch_vllm_dflash_config_aliases() -> bool:
     """Let vLLM consume SPECO DFlash top-level target layer ids."""
 
     global _VLLM_DFLASH_CONFIG_ALIASES_PATCHED

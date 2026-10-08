@@ -327,7 +327,6 @@ class FreezeEvidence:
 class FreezeDecision:
     state: FreezeState
     should_train: bool
-    should_collect: bool
     should_probe: bool
     transitioned: bool
     reason: str
@@ -451,8 +450,6 @@ class _PolicyConfig:
     low_fraction_accelerator: float = 0.10
     missing_evidence_opportunities: int = 3
     max_frozen_opportunities: int = 12
-    # enforcement scope
-    freeze_scope: str = "soft"
     bootstrap_seed: int = 20260915
 
     @staticmethod
@@ -506,7 +503,6 @@ class _PolicyConfig:
                 f(resume, "missing_evidence_opportunities", 3)
             ),
             max_frozen_opportunities=int(f(resume, "max_frozen_opportunities", 12)),
-            freeze_scope=str(raw.get("freeze_scope", "soft") if raw else "soft"),
             bootstrap_seed=int(f(probe, "seed", 20260915)),
         )
 
@@ -537,7 +533,6 @@ class _PolicyConfig:
             "resume_drop_all": self.resume_drop_all,
             "resume_drop_hard": self.resume_drop_hard,
             "resume_patience_opportunities": self.resume_patience_opportunities,
-            "freeze_scope": self.freeze_scope,
             "spec_verify_tokens": self.spec_verify_tokens,
         }
 
@@ -1888,14 +1883,10 @@ class DrafterFreezePolicy:
     ) -> FreezeDecision:
         self._last_reason = reason
         frozen = self.state == FreezeState.FROZEN
-        should_collect = True
-        if frozen:
-            should_collect = self.cfg.freeze_scope != "hard"
         metrics = self._metrics(reason)
         return FreezeDecision(
             state=self.state,
             should_train=not frozen,
-            should_collect=should_collect,
             should_probe=False,
             transitioned=bool(transitioned),
             reason=reason,

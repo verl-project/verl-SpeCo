@@ -315,8 +315,9 @@ actor_rollout_ref:
           # ---------------------------------------------------------------- #
           # 默认 enabled=false, 且先 shadow; active 前完成标定。
           # ---------------------------------------------------------------- #
-          mode: shadow                      # shadow(只报 would_freeze 不改变训练) | active(执行冻结)
-          freeze_scope: soft               # soft(保留 feature 收集) | hard(连收集一起停)
+          # active 冻结: 停 drafter 训练 + 停 hidden states 采集; per-step
+          # accept-length 与 PPO old_log_prob 照常(漂移检测/主训练需要)。
+          mode: shadow                      # shadow(只报 would_freeze, 不改变训练/采集) | active(执行冻结)
           # 冻结生效点分叉 checkpoint (freeze_transition_branch_checkpoint_design.md):
           # active 模式首次 LEARNING -> FROZEN 时, 在 actor 更新完成后的既有
           # checkpoint 安全点自动保存一次完整 global_step_S (含 drafter draft_step_S
@@ -330,7 +331,6 @@ actor_rollout_ref:
             fail_on_error: true
           spec_verify_tokens: null         # 非空时额外上报 q_*_normalized; 在线判据不依赖它
           observation:
-            source: online                 # online | probe | hybrid (Phase 1 仅 online)
             min_requests_per_version: 256  # 单版本窗有效所需最小请求数, 不足则 fail-open
             min_rollout_steps_per_version: 2
             trim_fraction: 0.05            # Q_all 两端各裁 5%
@@ -346,12 +346,10 @@ actor_rollout_ref:
             freeze_guard_drop_all: 0.02    # 当前相对近期最好 Q_all 回撤 UCB 上限
             freeze_guard_drop_hard: 0.03
           noise:
-            mode: empirical_split_window   # same-version 偶/奇 step 伪增益
             quantile: 0.95
             min_pseudo_samples: 20         # 不足时只用 practical ε, 不臆造噪声
           economics:
             enabled: false                 # Phase 1 只上报 ROI, 不参与冻结
-            horizon: next_update_opportunity
             cost_margin: 1.0
             cost_window_updates: 3
           probe:
