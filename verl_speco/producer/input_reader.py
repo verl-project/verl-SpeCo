@@ -729,7 +729,10 @@ def _build_tokenized_request(
     )
     max_sequence_length = int(_config_value(config, "max_sequence_length", 0) or 0)
     if max_sequence_length > 0 and len(request_prompt_token_ids) > max_sequence_length:
-        raise ValueError(
+        # A sample whose vLLM prefill would exceed the configured cap can never
+        # be served; treat it as filtered data (skipped upstream) rather than a
+        # fatal error that tears down the whole producer.
+        raise SampleFilteredError(
             f"Producer sample {sample_id!r} requires a vLLM prefill of "
             f"{len(request_prompt_token_ids)} tokens after selecting its training "
             f"window, exceeding max_sequence_length={max_sequence_length} "

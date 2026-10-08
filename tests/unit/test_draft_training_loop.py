@@ -28,11 +28,14 @@ from verl_speco.trainer.base_trainer import DrafterBaseTrainer  # noqa: E402
 from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _assert_standalone_layer_migration,
     _build_backend,
+    _build_standalone_tracking,
     _clear_tq_batch_across_ranks,
     _connect_tq_store_across_ranks,
     _contains_replay_samples,
     _finalize_standalone_checkpoint,
+    _finish_standalone_tracking,
     _is_out_of_memory_error,
+    _log_standalone_tracking_metrics,
     _next_batch_across_ranks,
     _raise_standalone_export_error,
     _rewrite_standalone_block_runtime_config,
@@ -202,6 +205,84 @@ def test_contains_replay_samples_detects_draft_replay_sample():
 
     assert _contains_replay_samples([sample])
     assert not _contains_replay_samples([{"input_ids": [1, 2]}])
+
+
+def test_standalone_tracking_enables_requested_backends_on_rank_zero(monkeypatch):
+    import verl.utils.tracking as tracking_module
+
+    created = []
+
+    class _FakeTracking:
+        supported_backend = ("wandb", "tensorboard", "console")
+
+        def __init__(self, project_name, experiment_name, default_backend):
+            created.append((project_name, experiment_name, list(default_backend)))
+
+    monkeypatch.setattr(tracking_module, "Tracking", _FakeTracking)
+    config = OmegaConf.create(
+        {
+            "trainer": {
+                "logger": ["console", "tensorboard", "wandb", "bogus", "tensorboard"],
+                "project_name": "proj",
+                "experiment_name": "exp",
+            }
+        }
+    )
+
+    tracker = _build_standalone_tracking(config, rank=0)
+    assert len(tracker) == 2
+    assert all(isinstance(item, _FakeTracking) for item in tracker)
+    # one tracker per supported backend; console/unsupported filtered, duplicates dropped.
+    assert created == [("proj", "exp", ["tensorboard"]), ("proj", "exp", ["wandb"])]
+    assert _build_standalone_tracking(config, rank=1) == []
+
+    console_only = OmegaConf.create({"trainer": {"logger": ["console"]}})
+    assert _build_standalone_tracking(console_only, rank=0) == []
+    unsupported_only = OmegaConf.create({"trainer": {"logger": ["bogus"]}})
+    assert _build_standalone_tracking(unsupported_only, rank=0) == []
+
+
+def test_standalone_tracking_isolates_a_failing_backend(monkeypatch):
+    import verl.utils.tracking as tracking_module
+
+    class _FlakyTracking:
+        supported_backend = ("wandb", "tensorboard", "console")
+
+        def __init__(self, project_name, experiment_name, default_backend):
+            if list(default_backend) == ["wandb"]:
+                raise RuntimeError("wandb unavailable")
+
+    monkeypatch.setattr(tracking_module, "Tracking", _FlakyTracking)
+    config = OmegaConf.create({"trainer": {"logger": ["tensorboard", "wandb"]}})
+
+    trackers = _build_standalone_tracking(config, rank=0)
+    # tensorboard still initializes even though wandb raised.
+    assert len(trackers) == 1
+
+
+def test_finish_standalone_tracking_swallows_backend_errors():
+    class _Boom:
+        def finish(self):
+            raise RuntimeError("boom")
+
+    class _Ok:
+        def __init__(self):
+            self.finished = False
+
+        def finish(self):
+            self.finished = True
+
+    ok = _Ok()
+    _finish_standalone_tracking([ok, _Boom()], rank=0)
+    assert ok.finished
+
+
+def test_log_standalone_tracking_metrics_swallows_backend_errors():
+    class _Boom:
+        def log(self, **kwargs):
+            raise RuntimeError("boom")
+
+    _log_standalone_tracking_metrics([_Boom()], {"loss": 1.0}, step=1)
 
 
 @pytest.mark.parametrize(
