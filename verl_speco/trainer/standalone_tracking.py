@@ -233,7 +233,31 @@ def _select_standalone_tracking_metrics(metrics: dict[str, float]) -> dict[str, 
 def _finish_standalone_tracking(trackers: list[Any], *, rank: int) -> None:
     for tracking in trackers:
         try:
-            tracking.finish()
+            finish = getattr(tracking, "finish", None)
+            if callable(finish):
+                finish()
+                continue
+            # verl release/v0.8.0 only finalizes backends in __del__().
+            # Close them explicitly and remove successful entries so object
+            # destruction cannot finalize the same backend a second time.
+            backends = getattr(tracking, "logger", {})
+            for name, backend in list(backends.items()):
+                backend_finish = getattr(backend, "finish", None)
+                if not callable(backend_finish):
+                    continue
+                try:
+                    if name in {"wandb", "vemlp_wandb"}:
+                        backend_finish(exit_code=0)
+                    else:
+                        backend_finish()
+                except Exception:
+                    logger.exception(
+                        "[standalone rank=%s] failed to finalize tracking backend=%s",
+                        rank,
+                        name,
+                    )
+                else:
+                    backends.pop(name, None)
         except Exception:
             logger.exception(
                 "[standalone rank=%s] failed to finalize a tracking backend", rank

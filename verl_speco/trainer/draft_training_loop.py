@@ -1420,7 +1420,7 @@ def _standalone_step_metrics(
     }
     prefix = _block_metric_prefix(trainer)
     if prefix is not None:
-        anchor_offset = 1 if prefix == "dflash" else 0
+        anchor_offset = 1 if prefix in {"dflash", "dflash2"} else 0
         losses = _position_metric_series(raw_metrics, prefix, "loss_per_position")
         accuracies = _position_metric_series(
             raw_metrics, prefix, "accuracy_per_position"
