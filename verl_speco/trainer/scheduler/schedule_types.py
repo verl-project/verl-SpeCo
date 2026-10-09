@@ -183,6 +183,7 @@ class DrafterCollectionContext:
     source_enabled: bool = True
     validation: bool = False
     require_training_interval: bool = False
+    drafter_frozen: bool = False
 
 
 @dataclass(frozen=True)
@@ -218,6 +219,7 @@ class CollectionPlan:
         "low_watermark_reached": 10,
         "watermark_hysteresis_paused": 11,
         "watermark_hysteresis_running": 12,
+        "drafter_frozen": 13,
     }
 
     def metrics(self) -> dict[str, float | int]:
@@ -433,6 +435,7 @@ class TrainingPlan:
         "worker_preflight_failed": 15,
         "consumer_training": 16,
         "insufficient_ready_samples": 17,
+        "drafter_convergence_frozen": 18,
     }
 
     def to_worker_payload(self) -> dict[str, object]:

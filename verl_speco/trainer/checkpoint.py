@@ -479,3 +479,205 @@ def log_drafter_checkpoint_step(
     step_text = str(step) if step is not None else "unknown"
     logger.info("%s from %s (drafter_step=%s)", action, model_path, step_text)
     return step
+
+
+# --------------------------------------------------------------------------- #
+# Freeze-transition branch checkpoint manifest
+#   See freeze_transition_branch_checkpoint_design.md sec. 5.4/7. The manifest
+#   lives inside ``global_step_S/`` and only records fork semantics (it never
+#   copies model state). ``complete=true`` is committed atomically as the LAST
+#   step, so a torn temp file can never be mistaken for a valid fork point.
+# --------------------------------------------------------------------------- #
+FREEZE_BRANCH_MANIFEST_NAME = "freeze_branch_manifest.json"
+FREEZE_POLICY_SIDECAR_NAME = "speco_drafter_freeze_state.json"
+FREEZE_BRANCH_FORMAT_VERSION = 1
+
+
+class FreezeBranchManifestError(ValueError):
+    """Raised when a freeze branch checkpoint manifest is missing or invalid."""
+
+
+def freeze_branch_manifest_path(
+    checkpoint_folder: Union[str, os.PathLike],
+) -> str:
+    return os.path.join(os.fspath(checkpoint_folder), FREEZE_BRANCH_MANIFEST_NAME)
+
+
+def freeze_policy_sidecar_path(
+    checkpoint_folder: Union[str, os.PathLike],
+) -> str:
+    """Versioned freeze-policy sidecar carried inside a ``global_step_S`` folder."""
+    return os.path.join(os.fspath(checkpoint_folder), FREEZE_POLICY_SIDECAR_NAME)
+
+
+def atomic_write_json(
+    path: Union[str, os.PathLike],
+    payload: dict[str, Any],
+) -> str:
+    """Write JSON to ``path`` atomically (tmp file + ``os.replace``)."""
+    target = os.fspath(path)
+    directory = os.path.dirname(target) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{target}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+    return target
+
+
+def write_freeze_branch_manifest(
+    checkpoint_folder: Union[str, os.PathLike],
+    manifest: dict[str, Any],
+) -> str:
+    """Atomically commit a freeze-branch manifest.
+
+    ``complete`` must already be ``True``: the manifest is the final write
+    after model/drafter/sidecar state landed, and a non-complete manifest is
+    never recognized as a fork point.
+    """
+    if not isinstance(manifest, dict) or manifest.get("complete") is not True:
+        raise FreezeBranchManifestError(
+            "freeze branch manifest must be a JSON object with complete=true"
+        )
+    if int(manifest.get("format_version", -1)) != FREEZE_BRANCH_FORMAT_VERSION:
+        raise FreezeBranchManifestError(
+            f"unsupported freeze branch manifest format_version: "
+            f"{manifest.get('format_version')!r}"
+        )
+    path = freeze_branch_manifest_path(checkpoint_folder)
+    return atomic_write_json(path, manifest)
+
+
+def read_freeze_branch_manifest(
+    checkpoint_folder: Union[str, os.PathLike],
+) -> dict[str, Any]:
+    """Strictly read a committed freeze-branch manifest.
+
+    Raises :class:`FreezeBranchManifestError` when the manifest is missing,
+    unreadable, not an object, or ``complete`` is not ``True``.
+    """
+    path = freeze_branch_manifest_path(checkpoint_folder)
+    if not os.path.isfile(path):
+        raise FreezeBranchManifestError(
+            f"freeze branch manifest not found: {path}"
+        )
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FreezeBranchManifestError(
+            f"invalid freeze branch manifest {path}: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise FreezeBranchManifestError(
+            f"invalid freeze branch manifest {path}: expected a JSON object"
+        )
+    if manifest.get("complete") is not True:
+        raise FreezeBranchManifestError(
+            f"freeze branch manifest {path} is not complete"
+        )
+    if int(manifest.get("format_version", -1)) != FREEZE_BRANCH_FORMAT_VERSION:
+        raise FreezeBranchManifestError(
+            f"freeze branch manifest {path} has unsupported format_version "
+            f"{manifest.get('format_version')!r}"
+        )
+    return manifest
+
+
+def validate_freeze_branch_checkpoint(
+    checkpoint_folder: Union[str, os.PathLike],
+    *,
+    drafter_root: Optional[Union[str, os.PathLike]] = None,
+    step: Optional[int] = None,
+) -> dict[str, Any]:
+    """Fail-closed validation of a just-saved freeze branch checkpoint.
+
+    Checks that the actor directory, dataloader state (``data.pt``), the
+    versioned freeze-policy sidecar, a complete ``draft_step_S`` drafter
+    checkpoint, and a committed ``complete=true`` branch manifest are all
+    present together. Returns the parsed manifest; raises
+    :class:`FreezeBranchManifestError` listing every problem found.
+    """
+    folder = os.fspath(checkpoint_folder)
+    problems: list[str] = []
+
+    if not os.path.isdir(folder):
+        raise FreezeBranchManifestError(
+            f"freeze branch checkpoint folder does not exist: {folder}"
+        )
+
+    try:
+        manifest = read_freeze_branch_manifest(folder)
+    except FreezeBranchManifestError as exc:
+        problems.append(str(exc))
+        manifest = None
+
+    if not os.path.isdir(os.path.join(folder, "actor")):
+        problems.append(f"missing actor checkpoint directory under {folder}")
+    if not os.path.isfile(os.path.join(folder, "data.pt")):
+        problems.append(f"missing dataloader state data.pt under {folder}")
+
+    sidecar = freeze_policy_sidecar_path(folder)
+    if not os.path.isfile(sidecar):
+        problems.append(f"missing freeze policy sidecar {sidecar}")
+
+    if step is None and manifest is not None:
+        step = manifest.get("checkpoint_step")
+    if step is not None:
+        try:
+            step_int = int(step)
+        except (TypeError, ValueError):
+            problems.append(f"invalid checkpoint step {step!r}")
+            step_int = None
+        if step_int is not None and drafter_root:
+            draft_dir = os.path.join(
+                os.fspath(drafter_root), f"draft_step_{step_int}"
+            )
+            if not is_pretrained_drafter_checkpoint(draft_dir):
+                problems.append(
+                    f"missing or incomplete drafter checkpoint {draft_dir}"
+                )
+            elif get_drafter_checkpoint_step(draft_dir) != step_int:
+                problems.append(
+                    f"drafter checkpoint step mismatch in {draft_dir} "
+                    f"(expected {step_int})"
+                )
+    elif not drafter_root:
+        problems.append("drafter checkpoint root not provided for validation")
+
+    if manifest is not None:
+        for key in (
+            "trigger_step",
+            "checkpoint_step",
+            "drafter_version",
+            "freeze_reason",
+            "freeze_mode_at_save",
+            "compare_from_step",
+        ):
+            if key not in manifest:
+                problems.append(f"manifest missing key {key!r}")
+        if step is not None:
+            trigger_step = manifest.get("trigger_step")
+            checkpoint_step = manifest.get("checkpoint_step")
+            if int(trigger_step) != int(step) or int(checkpoint_step) != int(step):
+                problems.append(
+                    "manifest step mismatch: "
+                    f"trigger_step={trigger_step} checkpoint_step="
+                    f"{checkpoint_step} expected {step}"
+                )
+
+    if problems:
+        raise FreezeBranchManifestError(
+            "freeze branch checkpoint validation failed: " + "; ".join(problems)
+        )
+    return manifest

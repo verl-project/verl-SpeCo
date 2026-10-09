@@ -426,3 +426,74 @@ actor_rollout_ref:
               protocol: tcp
               global_segment_size: 4294967296
               local_buffer_size: 2147483648
+
+        # Drafter convergence freeze: stop drafter training once a new drafter
+        # version no longer pays for its train+publish cost. Policy training
+        # continues; the frozen drafter keeps serving speculative decoding in
+        # rollout. See drafter_marginal_utility_freeze_rfc.md.
+        drafter_convergence_freeze:
+          enabled: false
+          # 冻结方法: marginal_utility_v1 — 按"成功发布的 drafter 版本"聚合的
+          # 边际效用策略 (见 drafter_marginal_utility_freeze_rfc.md)。
+          # 旧单指标 legacy tracker 已移除, 配置 legacy 会在启动时报错。
+          method: marginal_utility_v1
+          # ---------------------------------------------------------------- #
+          # 默认 enabled=false, 且先 shadow; active 前完成标定。
+          # ---------------------------------------------------------------- #
+          # active 冻结: 停 drafter 训练 + 停 hidden states 采集; per-step
+          # accept-length 与 PPO old_log_prob 照常(漂移检测/主训练需要)。
+          mode: shadow                      # shadow(只报 would_freeze, 不改变训练/采集) | active(执行冻结)
+          # 冻结生效点分叉 checkpoint (freeze_transition_branch_checkpoint_design.md):
+          # active 模式首次 LEARNING -> FROZEN 时, 在 actor 更新完成后的既有
+          # checkpoint 安全点自动保存一次完整 global_step_S (含 drafter draft_step_S
+          # 与 freeze sidecar) 并原子提交 freeze_branch_manifest.json, 作为
+          # active/shadow 两个分支共同父节点。仅支持 marginal_utility_v1 +
+          # mode=active; 第一版只允许 once=true / fail_on_error=true (失败即停)。
+          # 恢复分叉时两个分支都必须保持 enabled=false。
+          branch_checkpoint:
+            enabled: false
+            once: true
+            fail_on_error: true
+          spec_verify_tokens: null         # 非空时额外上报 q_*_normalized; 在线判据不依赖它
+          observation:
+            min_requests_per_version: 256  # 单版本窗有效所需最小请求数, 不足则 fail-open
+            min_rollout_steps_per_version: 2
+            trim_fraction: 0.05            # Q_all 两端各裁 5%
+            hard_quantile: 0.10            # Q_hard = 最差 10% 请求的条件均值
+          gain:
+            window_updates: 3              # 最近 W 次"真实有效更新"
+            patience_updates: 3            # 连续 M 次候选才冻结
+            confidence_level: 0.95
+            bootstrap_samples: 300         # 在线 block-bootstrap 次数(按 rollout-step)
+            practical_gain_all: 0.005      # shadow 初值, active 前需按噪声/系统收益标定
+            practical_gain_hard: 0.005
+            growth_epsilon: 0.005          # LCB(gain) 超过它才算"曾显著增长"
+            freeze_guard_drop_all: 0.02    # 当前相对近期最好 Q_all 回撤 UCB 上限
+            freeze_guard_drop_hard: 0.03
+          noise:
+            quantile: 0.95
+            min_pseudo_samples: 20         # 不足时只用 practical ε, 不臆造噪声
+          economics:
+            enabled: false                 # Phase 1 只上报 ROI, 不参与冻结
+            cost_margin: 1.0
+            cost_window_updates: 3
+          probe:
+            # 固定 paired probe (RFC sec. 6): 同一 target checkpoint / 同一固定
+            # prompt 集 / greedy, 在第 N 次成功发布前后各生成一轮, 按请求配对做
+            # paired bootstrap。probe 只在冻结策略存在时由 trainer 执行。
+            enabled: false
+            interval_updates: 3            # 每 N 次成功发布做一次 paired probe
+            prompts_file: null             # null=取 train_files 的前 prompt_count 条
+            prompt_count: 256              # 固定 prompt 池大小(强制取文件前 N 行, 不 shuffle)
+            batch_size: 64                 # 每臂逐批生成 chunk 大小; 全池 prompt_count 行按序分批跑完
+            max_new_tokens: 2048           # 两臂 greedy 生成长度上限(省成本)
+            min_coverage: 0.8              # timing 对覆盖率低于此值=证据不完整
+            min_timing_pairs: 16           # timing 对数低于此值=证据不完整
+            seed: 20260915                 # 同时作为 bootstrap 可复现种子
+          resume:
+            drop_all: 0.05                 # 相对冻结锚点退化 LCB 超此 -> 恢复
+            drop_hard: 0.05
+            patience_opportunities: 3
+            low_fraction_accelerator: 0.10 # low_fraction 回升 + hard 超噪 -> 恢复耐心降一档
+            missing_evidence_opportunities: 3  # 连续缺证据 fail-open 恢复
+            max_frozen_opportunities: 12   # 安全阀: 定期强制 probe(监控用)
