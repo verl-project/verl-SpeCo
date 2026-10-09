@@ -21,12 +21,17 @@ import pytest
 from verl_speco.integration import oldlogprob_runtime
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
+    OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
+    _assign_worker_payload,
+    _extract_oldlogprob_non_tensor_model_output,
     _find_layers_and_final_norm,
     _hidden_state_capture_target,
     _install_oldlogprob_fsdp_batch_postprocess_patch,
+    _megatron_pp_exchange_tag,
     _resolve_hidden_state,
     _select_and_merge_concatenated_hidden,
     _to_cpu_transfer_tensor,
+    _worker_payload_rows,
     oldlogprob_hidden_runtime_enabled,
 )
 from verl_speco.integration.oldlogprob_layer_ids import (
@@ -46,7 +51,9 @@ def test_fsdp2_runtime_install_does_not_import_veomni(monkeypatch) -> None:
         raise AssertionError(f"unexpected backend import: {name}")
 
     monkeypatch.setattr(oldlogprob_runtime, "_PATCHED", True)
-    monkeypatch.setattr(oldlogprob_runtime.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(
+        oldlogprob_runtime.importlib, "import_module", fake_import_module
+    )
     monkeypatch.setattr(
         oldlogprob_runtime,
         "_install_oldlogprob_fsdp_batch_postprocess_patch",
@@ -110,6 +117,95 @@ def test_oldlogprob_collection_can_be_enabled_from_worker_environment() -> None:
     assert oldlogprob_hidden_runtime_enabled({}, drafter_env="{invalid") is False
 
 
+def test_megatron_pp_exchange_tag_separates_parallel_groups() -> None:
+    class FakeMPU:
+        def __init__(self, *, cp_rank: int, dp_rank: int) -> None:
+            self.cp_rank = cp_rank
+            self.dp_rank = dp_rank
+
+        def get_context_parallel_rank(self) -> int:
+            return self.cp_rank
+
+        def get_data_parallel_rank(self) -> int:
+            return self.dp_rank
+
+    cp0_dp0 = FakeMPU(cp_rank=0, dp_rank=0)
+    cp1_dp0 = FakeMPU(cp_rank=1, dp_rank=0)
+    cp0_dp1 = FakeMPU(cp_rank=0, dp_rank=1)
+
+    # PP peers share a tag; distinct CP/DP groups do not collide.
+    assert _megatron_pp_exchange_tag(cp0_dp0, tp_rank=0, sp_size=1) == "fbb_dp0_cp0"
+    assert _megatron_pp_exchange_tag(cp1_dp0, tp_rank=0, sp_size=1) == "fbb_dp0_cp1"
+    assert _megatron_pp_exchange_tag(cp0_dp1, tp_rank=0, sp_size=1) == "fbb_dp1_cp0"
+    assert _megatron_pp_exchange_tag(cp0_dp0, tp_rank=0, sp_size=2) == "fbb_dp0_cp0_tp0"
+    assert _megatron_pp_exchange_tag(cp0_dp0, tp_rank=1, sp_size=2) == "fbb_dp0_cp0_tp1"
+
+
+def test_chunk_only_oldlogprob_output_advances_fallback_batch_offset() -> None:
+    """Chunk-only FSDP2 output must not remap every micro-batch to sample 0."""
+    outputs = [
+        {
+            "model_output": {
+                OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY: ["chunk-0"],
+                OLD_LOGPROB_HIDDEN_CHUNK_META_KEY: [{"sample_indices": [0, 1]}],
+            }
+        },
+        {
+            "model_output": {
+                OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY: ["chunk-1"],
+                OLD_LOGPROB_HIDDEN_CHUNK_META_KEY: [{"sample_indices": [0, 1]}],
+            }
+        },
+    ]
+
+    extracted = _extract_oldlogprob_non_tensor_model_output(outputs)
+
+    assert extracted[OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY] == ["chunk-0", "chunk-1"]
+    assert extracted[OLD_LOGPROB_HIDDEN_CHUNK_META_KEY] == [
+        {"sample_indices": [0, 1]},
+        {"sample_indices": [2, 3]},
+    ]
+
+
+def test_worker_payload_rows_preserve_per_sample_and_worker_payloads() -> None:
+    assert _worker_payload_rows(
+        ["sample-0", "sample-1"], batch_size=2, per_sample=True
+    ) == ["sample-0", "sample-1"]
+    assert _worker_payload_rows(["chunk-0"], batch_size=2, per_sample=False) == [
+        ["chunk-0"],
+        [],
+    ]
+
+
+def test_worker_chunk_payload_survives_actor_dp_tensordict_concat() -> None:
+    torch = pytest.importorskip("torch")
+    TensorDict = pytest.importorskip("tensordict").TensorDict
+    from verl.utils import tensordict_utils as tu
+
+    worker_outputs = []
+    for rank in range(2):
+        output = TensorDict(
+            {"log_probs": torch.zeros(2, 1)},
+            batch_size=[2],
+        )
+        _assign_worker_payload(
+            output,
+            OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
+            [f"rank-{rank}-chunk"],
+            per_sample=False,
+        )
+        worker_outputs.append(output)
+
+    gathered = TensorDict.cat(worker_outputs, dim=0)
+
+    assert tu.get(gathered, OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY) == [
+        ["rank-0-chunk"],
+        [],
+        ["rank-1-chunk"],
+        [],
+    ]
+
+
 def test_eagle3_oldlogprob_accepts_three_explicit_aux_layers() -> None:
     drafter_cfg = {
         "speculative_algorithm": "EAGLE3",
@@ -156,9 +252,10 @@ def test_decoder_ids_keep_hf_embedding_offset_for_dflash_and_eagle12() -> None:
     torch = pytest.importorskip("torch")
     hidden_states = tuple(torch.tensor([index]) for index in range(37))
 
-    assert int(
-        _resolve_hidden_state(hidden_states, 2, layer_id_space="decoder").item()
-    ) == 3
+    assert (
+        int(_resolve_hidden_state(hidden_states, 2, layer_id_space="decoder").item())
+        == 3
+    )
     assert _hidden_state_capture_target(2, 36, layer_id_space="decoder") == (
         "layer",
         2,
@@ -367,6 +464,4 @@ def test_veomni_batch_postprocess_keeps_router_replay_output() -> None:
     )
 
     assert result["model_output"]["routed_experts"] == "routes"
-    assert result["model_output"][OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY] == [
-        "hidden-ref"
-    ]
+    assert result["model_output"][OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY] == ["hidden-ref"]

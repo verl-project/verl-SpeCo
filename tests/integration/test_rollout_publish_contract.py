@@ -17,6 +17,7 @@ import asyncio
 from inspect import getsource
 from types import SimpleNamespace
 
+from omegaconf import OmegaConf
 import pytest
 
 from verl_speco.integration import rollout_publish
@@ -26,12 +27,89 @@ class _FakeObjectRef:
     pass
 
 
+def test_actor_hccl_groups_include_world_and_engine_meshes() -> None:
+    world_group = object()
+    fsdp_group = object()
+    dp_group = object()
+    sp_group = object()
+
+    class _Mesh:
+        def __init__(self, groups, names):
+            self._groups = groups
+            self.mesh_dim_names = names
+            self.ndim = len(names)
+
+        def get_group(self, name=None):
+            return self._groups[0] if name is None else self._groups[name]
+
+    engine = SimpleNamespace(
+        device_mesh=_Mesh([fsdp_group], ["fsdp"]),
+        ulysses_device_mesh=_Mesh({"dp": dp_group, "sp": sp_group}, ["dp", "sp"]),
+    )
+    worker = SimpleNamespace(actor=SimpleNamespace(engine=engine))
+    dist = SimpleNamespace(group=SimpleNamespace(WORLD=world_group))
+
+    assert rollout_publish._actor_hccl_process_groups(worker, dist) == [
+        world_group,
+        fsdp_group,
+        dp_group,
+        sp_group,
+    ]
+
+
+@pytest.mark.parametrize("use_omegaconf", [False, True])
+def test_upstream_rollout_init_temporarily_hides_speco_drafter_config(
+    use_omegaconf: bool,
+) -> None:
+    config = {"rollout": {"name": "vllm", "drafter": {"enable": True}}}
+    worker = SimpleNamespace(
+        config=OmegaConf.create(config) if use_omegaconf else config
+    )
+
+    with rollout_publish._without_speco_drafter_rollout_config(worker):
+        rollout = worker.config.rollout if use_omegaconf else worker.config["rollout"]
+        assert "drafter" not in rollout
+        assert rollout["name"] == "vllm"
+
+    rollout = worker.config.rollout if use_omegaconf else worker.config["rollout"]
+    assert rollout["drafter"]["enable"] is True
+
+
 class _FakeRay:
     ObjectRef = _FakeObjectRef
 
     @staticmethod
     def get(value):
         return {"resolved": value}
+
+
+@pytest.mark.parametrize("use_omegaconf", [False, True])
+def test_vllm_replica_config_excludes_speco_drafter(use_omegaconf: bool) -> None:
+    config = {"name": "vllm", "drafter": {"enable": True}}
+    value = OmegaConf.create(config) if use_omegaconf else config
+    from verl_speco.integration.vllm_runtime import _rollout_config_without_drafter
+
+    result = _rollout_config_without_drafter(value)
+    assert "drafter" not in result
+    assert result["name"] == "vllm"
+    assert "drafter" in value
+
+
+def test_v1_agent_loop_config_excludes_speco_drafter() -> None:
+    pytest.importorskip("ray")
+    from verl_speco.integration.task_runner import SpecoTaskRunner
+
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {"name": "vllm", "drafter": {"enable": True}}
+            }
+        }
+    )
+    agent_config = SpecoTaskRunner._v1_agent_loop_config(config)
+
+    assert "drafter" not in agent_config.actor_rollout_ref.rollout
+    assert config.actor_rollout_ref.rollout.drafter.enable is True
 
 
 def test_materialize_direct_and_object_ref_payloads(monkeypatch) -> None:
@@ -422,6 +500,45 @@ def test_publish_state_filter_excludes_block_drafter_embedding() -> None:
     assert set(trainer._get_trainable_state_dict()) == {"draft_model.fc.weight"}
 
 
+def test_fsdp2_publish_collective_excludes_frozen_params_before_gather(
+    monkeypatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    state_dict_api = pytest.importorskip("torch.distributed.checkpoint.state_dict")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="FSDP2 publish snapshot needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    observed = {}
+
+    def fake_get_model_state_dict(model, *, options):
+        observed["model"] = model
+        observed["options"] = options
+        return {"draft_model.fc.weight": torch.ones(2, 2)}
+
+    monkeypatch.setattr(base_trainer.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        state_dict_api, "get_model_state_dict", fake_get_model_state_dict
+    )
+
+    model = SimpleNamespace()
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(
+        model_type="dspark", trains_draft_lm_head=False, trains_draft_embeddings=False
+    )
+    trainer.training_device_mesh = object()
+    trainer._frozen_param_names = []
+    trainer.model = model
+
+    assert set(trainer._get_trainable_state_dict()) == {"draft_model.fc.weight"}
+    assert observed["model"] is model
+    assert observed["options"].full_state_dict is True
+    assert observed["options"].cpu_offload is True
+    assert observed["options"].ignore_frozen_params is True
+
+
 def test_mrv2_dspark_publish_excludes_frozen_confidence_head(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     torch = pytest.importorskip("torch")
@@ -527,6 +644,9 @@ def test_idle_drafter_lifecycle_offloads_dspark_target_lm_head(
     )
     trainer.model = None
     trainer.optimizer = None
+    trainer.config = SimpleNamespace(actor=SimpleNamespace(strategy="fsdp"))
+    trainer.park_hccl_after_drafter_training = False
+    trainer.buffer_version = 0
     trainer._training_active = True
     trainer._training_initialized = True
     monkeypatch.setattr(base_trainer, "device_name", "cpu")
@@ -550,7 +670,7 @@ def test_idle_drafter_lifecycle_offloads_dspark_target_lm_head(
     assert head.devices == ["cpu"]
 
 
-def test_drafter_state_is_offloaded_after_training_and_warmup() -> None:
+def test_drafter_state_is_offloaded_after_training() -> None:
     base_trainer = pytest.importorskip(
         "verl_speco.trainer.base_trainer",
         reason="target lm_head cleanup contract needs the trainer dependency stack",
@@ -563,9 +683,10 @@ def test_drafter_state_is_offloaded_after_training_and_warmup() -> None:
     assert '_move_target_lm_head("cpu")' in getsource(
         DrafterBaseTrainer.release_training_memory_after_activation
     )
-    assert "self._offload_optimizer_state_to_cpu()" in getsource(
-        DrafterBaseTrainer.cleanup_training
-    )
+    cleanup_source = getsource(DrafterBaseTrainer.cleanup_training)
+    assert "self.is_offload_param" in cleanup_source
+    assert "self.is_offload_optimizer" in cleanup_source
+    assert "self._offload_optimizer_state_to_cpu()" in cleanup_source
     assert "self._offload_optimizer_state_to_cpu()" in getsource(
         DrafterBaseTrainer.release_training_memory_after_activation
     )
@@ -583,6 +704,17 @@ def test_drafter_full_shard_mesh_reuses_default_process_group() -> None:
     assert 'getattr(DeviceMesh, "from_group", None)' in source
     assert "dist.group.WORLD" in source
     assert 'mesh._flatten(mesh_dim_name="fsdp")' in source
+
+
+def test_drafter_full_shard_mesh_can_be_enabled_for_fsdp2() -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="drafter mesh contract needs the trainer dependency stack",
+    )
+    source = getsource(base_trainer.DrafterBaseTrainer._use_flattened_drafter_fsdp_mesh)
+
+    assert "use_full_shard_fsdp_mesh" in source
+    assert "force_full_shard" in source
 
 
 def test_target_lm_head_sync_can_defer_device_apply() -> None:

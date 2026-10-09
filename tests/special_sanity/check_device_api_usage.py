@@ -31,6 +31,9 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl_speco/ops/dspark_fused_loss.py",
     "verl_speco/trainer/base_trainer.py",
     "verl_speco/trainer/draft_training_loop.py",
+    # The V1 adapter passes the configured runtime device through to upstream
+    # V1 Ray workers and is therefore an explicit verl runtime boundary.
+    "verl_speco/trainer/v1/speco_mixin.py",
     "verl_speco/workers/speco_worker.py",
 ]
 

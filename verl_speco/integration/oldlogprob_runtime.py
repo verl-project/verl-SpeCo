@@ -29,10 +29,13 @@ import time
 from functools import wraps
 from typing import Any, cast
 
+from verl_speco.integration.drafter_config_env import (
+    SPECO_DRAFTER_CONFIG_ENV,
+    get_drafter_config_env,
+)
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-SPECO_SGLANG_DRAFTER_CONFIG_ENV = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
 
 OLD_LOGPROB_COLLECT_MASK_KEY = "speco_oldlogprob_collect_mask"
 OLD_LOGPROB_HIDDEN_POSITIONS_KEY = "speco_oldlogprob_hidden_positions"
@@ -72,6 +75,56 @@ _BATCH_POSTPROCESS_PATCHED_MODULES: set[str] = set()
 _POSTPROCESS_PATCHED = False
 
 
+def _worker_payload_rows(value: Any, *, batch_size: int, per_sample: bool) -> list[Any]:
+    """Represent worker-local metadata on the TensorDict batch dimension.
+
+    Verl concatenates the outputs from every actor DP rank with
+    ``TensorDict.cat``. Scalar ``NonTensorData`` is metadata, so that concat
+    keeps only one rank's value. A ``NonTensorStack`` survives the gather, but
+    worker-level chunk payloads must occupy only the first local row to avoid
+    duplicating the same ObjectRefs for every sample.
+    """
+
+    batch_size = max(int(batch_size), 0)
+    if batch_size == 0:
+        return []
+    if per_sample and isinstance(value, (list, tuple)) and len(value) == batch_size:
+        return list(value)
+    return [value, *([] for _ in range(batch_size - 1))]
+
+
+def _assign_worker_payload(
+    tensor_dict: Any,
+    key: str,
+    value: Any,
+    *,
+    per_sample: bool,
+) -> None:
+    """Attach worker output so Verl's actor-DP gather preserves every rank."""
+
+    from verl.utils import tensordict_utils as tu
+
+    batch_size = int(tensor_dict.batch_size[0]) if tensor_dict.batch_size else 0
+    if batch_size <= 0:
+        tu.assign_non_tensor_data(tensor_dict, key, value)
+        return
+    rows = _worker_payload_rows(
+        value,
+        batch_size=batch_size,
+        per_sample=per_sample,
+    )
+    assign_stack = getattr(tu, "assign_non_tensor_stack", None)
+    if callable(assign_stack):
+        assign_stack(tensor_dict, key, rows)
+        return
+
+    # Compatibility with older Verl releases whose helper predates
+    # ``assign_non_tensor_stack``.
+    from tensordict.tensorclass import NonTensorData, NonTensorStack
+
+    tensor_dict[key] = NonTensorStack.from_list([NonTensorData(item) for item in rows])
+
+
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
     current = config
     for key in path:
@@ -85,7 +138,7 @@ def _get_nested(config: Any, path: tuple[str, ...], default=None):
 
 
 def _load_drafter_env(raw: str | None = None) -> dict[str, Any]:
-    raw = raw if raw is not None else os.getenv(SPECO_SGLANG_DRAFTER_CONFIG_ENV, "")
+    raw = raw if raw is not None else get_drafter_config_env()
     if not raw:
         return {}
     try:
@@ -93,7 +146,7 @@ def _load_drafter_env(raw: str | None = None) -> dict[str, Any]:
     except json.JSONDecodeError:
         logger.warning(
             "Invalid %s while checking old-logprob hidden runtime",
-            SPECO_SGLANG_DRAFTER_CONFIG_ENV,
+            SPECO_DRAFTER_CONFIG_ENV,
         )
         return {}
     return value if isinstance(value, dict) else {}
@@ -662,10 +715,27 @@ def _install_oldlogprob_training_worker_postprocess_patch() -> bool:
 
         final_output = postprocess_output(self, output, *args, **kwargs)
         if speco_non_tensor and final_output is not None:
-            from verl.utils import tensordict_utils as tu
-
             for key, value in speco_non_tensor.items():
-                tu.assign_non_tensor_data(final_output, key, value)
+                if key in (
+                    OLD_LOGPROB_HIDDEN_REFS_KEY,
+                    OLD_LOGPROB_HIDDEN_REF_META_KEY,
+                    OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
+                    OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
+                ):
+                    _assign_worker_payload(
+                        final_output,
+                        key,
+                        value,
+                        per_sample=key
+                        in (
+                            OLD_LOGPROB_HIDDEN_REFS_KEY,
+                            OLD_LOGPROB_HIDDEN_REF_META_KEY,
+                        ),
+                    )
+                else:
+                    from verl.utils import tensordict_utils as tu
+
+                    tu.assign_non_tensor_data(final_output, key, value)
         if speco_tensor and final_output is not None:
             from verl.utils import tensordict_utils as tu
 
@@ -885,6 +955,33 @@ def _remap_chunk_meta_sample_indices(
     return remapped
 
 
+def _non_tensor_output_sample_count(model_output: dict[str, Any]) -> int:
+    """Infer a micro-batch size when FSDP returns chunk refs only.
+
+    The FSDP2 path may omit per-sample ``hidden_refs`` and retain only compact
+    chunk metadata.  Treating that output as an empty micro-batch leaves the
+    fallback offset unchanged, so later chunks are remapped onto earlier
+    samples.  ``sample_indices`` are local micro-batch indices and therefore
+    provide an exact upper bound for the number of represented samples.
+    """
+    hidden_refs = model_output.get(OLD_LOGPROB_HIDDEN_REFS_KEY)
+    if isinstance(hidden_refs, (list, tuple)):
+        return len(hidden_refs)
+
+    largest_index = -1
+    chunk_meta = model_output.get(OLD_LOGPROB_HIDDEN_CHUNK_META_KEY)
+    meta_values = chunk_meta if isinstance(chunk_meta, (list, tuple)) else [chunk_meta]
+    for meta in meta_values:
+        if not isinstance(meta, dict):
+            continue
+        for sample_idx in meta.get("sample_indices") or []:
+            try:
+                largest_index = max(largest_index, int(sample_idx))
+            except (TypeError, ValueError):
+                continue
+    return largest_index + 1
+
+
 def _extract_oldlogprob_non_tensor_model_output(
     output_lst: list[dict[str, Any]],
     indices: Any = None,
@@ -901,11 +998,15 @@ def _extract_oldlogprob_non_tensor_model_output(
         model_output = output.get("model_output") if isinstance(output, dict) else None
         if not isinstance(model_output, dict):
             continue
-        hidden_refs = model_output.get(OLD_LOGPROB_HIDDEN_REFS_KEY)
-        sample_count = len(hidden_refs) if isinstance(hidden_refs, (list, tuple)) else 0
+        sample_count = _non_tensor_output_sample_count(model_output)
         index_map = _micro_batch_index_map(
             indices, micro_batch_idx, batch_offset, sample_count
         )
+        # ``indices`` is the source of truth when Verl split/reordered the
+        # batch.  It also covers chunk-ref-only output where there are no
+        # per-sample refs to count.
+        if index_map:
+            sample_count = len(index_map)
         for key in tuple(extracted):
             if key not in model_output:
                 continue
@@ -2603,6 +2704,25 @@ def _speco_pp_exchange_dir() -> str:
     return os.path.join(tempfile.gettempdir(), "speco_pp_exchange")
 
 
+def _megatron_pp_exchange_tag(mpu: Any, *, tp_rank: int, sp_size: int) -> str:
+    """Return a node-local file namespace for one Megatron model-parallel group.
+
+    PP stages in the same TP/CP/DP coordinate must exchange the same files,
+    while independent context/data-parallel groups must never share paths.
+    In particular, CP ranks execute the same PP schedule concurrently, so
+    omitting the CP rank lets them race on the same ``.tmp`` file.
+    """
+
+    get_cp_rank = getattr(mpu, "get_context_parallel_rank", None)
+    get_dp_rank = getattr(mpu, "get_data_parallel_rank", None)
+    cp_rank = int(get_cp_rank()) if callable(get_cp_rank) else 0
+    dp_rank = int(get_dp_rank()) if callable(get_dp_rank) else 0
+    axes = [f"dp{dp_rank}", f"cp{cp_rank}"]
+    if int(sp_size) > 1:
+        axes.append(f"tp{int(tp_rank)}")
+    return "fbb_" + "_".join(axes)
+
+
 def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) -> None:
     """Post-schedule: exchange captures across PP stages via Ray object store
     + temp files (completely avoids HCCL dist communication).
@@ -2649,8 +2769,9 @@ def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) 
     # Use a unique temp dir per engine instance
     tmp_dir = _speco_pp_exchange_dir()
     os.makedirs(tmp_dir, exist_ok=True)
-    # Tag includes tp_rank when SP=True (each TP rank has different captures).
-    tag = f"fbb_tp{tp_rank}" if sp_size > 1 else "fbb"
+    # Namespace by every non-PP model-parallel coordinate. PP stages within one
+    # group intentionally share files; independent CP/DP groups must not.
+    tag = _megatron_pp_exchange_tag(mpu, tp_rank=tp_rank, sp_size=sp_size)
 
     if not is_last_stage and is_io_rank:
         # Non-last stage: pickle CPU captures directly to a file (no ray.put/get

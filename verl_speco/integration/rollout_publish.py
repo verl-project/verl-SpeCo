@@ -18,7 +18,10 @@ from __future__ import annotations
 import logging
 import os
 import time
+from contextlib import contextmanager
 from typing import Any, Optional, cast
+
+from omegaconf import OmegaConf, open_dict
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -57,6 +60,43 @@ def _get_nested(config: Any, path: tuple[str, ...], default=None):
         else:
             current = getattr(current, key, default)
     return current
+
+
+@contextmanager
+def _without_speco_drafter_rollout_config(worker: Any):
+    """Hide SPECO-only rollout config while VERL builds its upstream dataclass."""
+    worker_config = getattr(worker, "config", None)
+    if worker_config is None:
+        yield
+        return
+    rollout_config = (
+        cast(Any, worker_config).get("rollout")
+        if hasattr(worker_config, "get")
+        else getattr(worker_config, "rollout", None)
+    )
+    if rollout_config is None or not hasattr(rollout_config, "get"):
+        yield
+        return
+
+    missing = object()
+    drafter_config = rollout_config.get("drafter", missing)
+    if drafter_config is missing:
+        yield
+        return
+
+    if OmegaConf.is_config(rollout_config):
+        with open_dict(rollout_config):
+            del rollout_config["drafter"]
+    else:
+        del rollout_config["drafter"]
+    try:
+        yield
+    finally:
+        if OmegaConf.is_config(rollout_config):
+            with open_dict(rollout_config):
+                rollout_config["drafter"] = drafter_config
+        else:
+            rollout_config["drafter"] = drafter_config
 
 
 def rollout_backend_name(config: Any) -> Optional[str]:
@@ -227,17 +267,20 @@ def install_sglang_runtime_for_worker(worker: Any) -> None:
     """Install SPECO SGLang runtime hooks inside an actor-rollout worker process."""
 
     try:
+        from verl_speco.integration.drafter_config_env import (
+            get_drafter_config_env,
+            set_drafter_config_env,
+        )
         from verl_speco.integration.sglang_runtime import (
-            SPECO_SGLANG_DRAFTER_CONFIG_ENV,
             patch_sglang_server_adapter_update,
         )
     except Exception:  # noqa: BLE001
         return
 
-    drafter_env = getattr(type(worker), "_speco_sglang_drafter_config_env", None)
+    drafter_env = getattr(type(worker), "_speco_drafter_config_env", None)
     if drafter_env:
-        os.environ[SPECO_SGLANG_DRAFTER_CONFIG_ENV] = drafter_env
-    if os.getenv(SPECO_SGLANG_DRAFTER_CONFIG_ENV):
+        set_drafter_config_env(drafter_env)
+    if get_drafter_config_env():
         patch_sglang_server_adapter_update()
 
 
@@ -277,9 +320,7 @@ def install_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
     except Exception:  # noqa: BLE001
         return
 
-    drafter_env = (
-        getattr(type(worker), "_speco_sglang_drafter_config_env", None) or None
-    )
+    drafter_env = getattr(type(worker), "_speco_drafter_config_env", None) or None
     if not oldlogprob_hidden_runtime_enabled(
         getattr(worker, "config", None), drafter_env=drafter_env
     ):
@@ -319,9 +360,7 @@ def validate_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
             "SPECO could not import the VeOmni hidden-state validator"
         ) from exc
 
-    drafter_env = (
-        getattr(type(worker), "_speco_sglang_drafter_config_env", None) or None
-    )
+    drafter_env = getattr(type(worker), "_speco_drafter_config_env", None) or None
     if not oldlogprob_hidden_runtime_enabled(config, drafter_env=drafter_env):
         return
 
@@ -434,6 +473,105 @@ def _actor_module_candidates(worker: Any) -> list[Any]:
         seen.add(ident)
         deduped.append(candidate)
     return deduped
+
+
+def _append_unique_process_group(groups: list[Any], group: Any) -> None:
+    if group is None:
+        return
+    if all(group is not existing for existing in groups):
+        groups.append(group)
+
+
+def _append_device_mesh_groups(groups: list[Any], mesh: Any) -> None:
+    if mesh is None:
+        return
+    mesh_ndim = int(getattr(mesh, "ndim", 1))
+    if mesh_ndim == 1:
+        _append_unique_process_group(groups, mesh.get_group())
+        return
+    mesh_dim_names = getattr(mesh, "mesh_dim_names", None)
+    if mesh_dim_names is None:
+        return
+    for mesh_dim in mesh_dim_names:
+        _append_unique_process_group(groups, mesh.get_group(mesh_dim))
+
+
+def _actor_hccl_process_groups(worker: Any, dist_module: Any) -> list[Any]:
+    """Return actor groups that retain HCCL streams while the actor is idle."""
+
+    groups: list[Any] = []
+    group_namespace = getattr(dist_module, "group", None)
+    _append_unique_process_group(groups, getattr(group_namespace, "WORLD", None))
+
+    actor = getattr(worker, "actor", None)
+    engine = getattr(actor, "engine", None) if actor is not None else None
+    for root in (worker, actor, engine):
+        if root is None:
+            continue
+        for attr_name in (
+            "device_mesh",
+            "fsdp_device_mesh",
+            "ulysses_device_mesh",
+            "data_parallel_device_mesh",
+        ):
+            _append_device_mesh_groups(groups, getattr(root, attr_name, None))
+    return groups
+
+
+def _park_actor_hccl_for_drafter(worker: Any) -> dict[str, Any]:
+    """Release idle actor communicators so a colocated drafter can train."""
+
+    torch = _torch_module()
+    dist = torch.distributed
+    if not dist.is_initialized():
+        return {
+            "parked": False,
+            "reason": "distributed_not_initialized",
+            "groups": 0,
+        }
+
+    groups = _actor_hccl_process_groups(worker, dist)
+    non_group_member = getattr(
+        getattr(dist, "GroupMember", None), "NON_GROUP_MEMBER", None
+    )
+    groups = [group for group in groups if group is not non_group_member]
+    npu_device = torch.device("npu")
+    group_backends = []
+    for group in groups:
+        get_backend = getattr(group, "_get_backend", None)
+        if not callable(get_backend):
+            return {
+                "parked": False,
+                "reason": "backend_unavailable",
+                "groups": 0,
+            }
+        backend = get_backend(npu_device)
+        delete_store_key = getattr(backend, "_delete_tcpstore_key", None)
+        abort_hccl = getattr(backend, "abort_hccl_comm", None)
+        if not callable(delete_store_key) or not callable(abort_hccl):
+            return {
+                "parked": False,
+                "reason": "hccl_park_unsupported",
+                "groups": 0,
+            }
+        group_backends.append((delete_store_key, abort_hccl))
+
+    world_group = getattr(getattr(dist, "group", None), "WORLD", None)
+    if world_group is not None and dist.get_world_size(group=world_group) > 1:
+        dist.barrier(group=world_group)
+    device_module = getattr(torch, "npu", None)
+    if device_module is not None and hasattr(device_module, "synchronize"):
+        device_module.synchronize()
+
+    for delete_store_key, abort_hccl in group_backends:
+        delete_store_key()
+        abort_hccl("speco actor idle during drafter training")
+
+    if device_module is not None and hasattr(device_module, "synchronize"):
+        device_module.synchronize()
+    if device_module is not None and hasattr(device_module, "empty_cache"):
+        device_module.empty_cache()
+    return {"parked": True, "reason": "parked", "groups": len(groups)}
 
 
 def _select_lm_head_named_tensor(module: Any) -> tuple[str | None, Any | None]:
@@ -893,7 +1031,11 @@ class DraftWeightPublishMixin:
     def init_model(self, *args, **kwargs):
         install_rollout_runtime_for_worker(self)
         install_oldlogprob_hidden_runtime_for_worker(self)
-        result = super().init_model(*args, **kwargs)
+        # VERL 0.10 materializes ``RolloutConfig`` here. Its dataclass does not
+        # accept SPECO's nested ``drafter`` extension, which is restored as soon
+        # as the upstream initialization finishes.
+        with _without_speco_drafter_rollout_config(self):
+            result = super().init_model(*args, **kwargs)
         validate_oldlogprob_hidden_runtime_for_worker(self)
         return result
 
@@ -908,6 +1050,39 @@ class DraftWeightPublishMixin:
             row_indices=row_indices,
             keep_model_on_device=keep_model_on_device,
         )
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
+    def park_actor_hccl_for_drafter(self):
+        training_cfg = _get_nested(
+            self.config, ("rollout", "drafter", "training"), None
+        ) or _get_nested(
+            self.config,
+            ("actor_rollout_ref", "rollout", "drafter", "training"),
+            {},
+        )
+        enabled = bool(
+            _get_nested(
+                training_cfg,
+                ("park_actor_hccl_during_drafter_training",),
+                _get_nested(training_cfg, ("park_hccl_after_drafter_training",), False),
+            )
+        )
+        if not enabled:
+            return {"parked": False, "reason": "disabled", "groups": 0}
+
+        started_at = time.perf_counter()
+        result = _park_actor_hccl_for_drafter(self)
+        result["elapsed_sec"] = time.perf_counter() - started_at
+        logger.warning(
+            "[speco timing] actor_hccl_park_s=%.3f rank=%s groups=%s "
+            "parked=%s reason=%s",
+            result["elapsed_sec"],
+            getattr(self, "rank", -1),
+            result.get("groups", 0),
+            int(bool(result.get("parked", False))),
+            result.get("reason"),
+        )
+        return result
 
     @staticmethod
     def _materialize_draft_weights_payload(weights):

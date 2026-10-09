@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import re
 import sys
 import types
@@ -23,6 +25,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+import verl_speco.integration.vllm_runtime as vllm_runtime
 
 from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
@@ -36,6 +40,7 @@ from verl_speco.integration.vllm_runtime import (
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
     _record_vllm_spec_decode_scheduler_stats,
+    _record_vllm_worker_spec_decode_output,
     _speco_can_use_npu_target_staging,
     _speco_npu_target_staging,
     _speco_npu_target_staging_decision,
@@ -49,6 +54,7 @@ from verl_speco.integration.vllm_runtime import (
     patch_transformers_attention_layer_type_constants,
     patch_verl_bucketed_weight_transfer_npu_staging,
     patch_verl_bucketed_weight_transfer_shm_reuse,
+    patch_vllm_dspark_draft_load_config,
     patch_vllm_dspark_registry_aliases,
     patch_vllm_dspark_runtime,
     speco_vllm_update_draft_weights,
@@ -100,6 +106,21 @@ def test_vllm_worker_extension_constructs_without_wake_up_fallback() -> None:
     extension = SpecoVLLMColocateWorkerExtension()
 
     assert isinstance(extension, SpecoVLLMColocateWorkerExtension)
+
+
+def test_vllm_worker_extension_installs_dspark_loader_before_construction(
+    monkeypatch,
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        vllm_runtime,
+        "patch_vllm_dspark_draft_load_config",
+        lambda: calls.append("draft_load") or True,
+    )
+
+    SpecoVLLMColocateWorkerExtension()
+
+    assert calls == ["draft_load"]
 
 
 def test_vllm_initial_drafter_initialization_is_serialized() -> None:
@@ -214,6 +235,19 @@ def test_vllm_level1_wake_keeps_online_draft_revision(monkeypatch) -> None:
     assert extension._speco_restore_draft_for_wake(["weights"]) == (None, 0)
     assert extension._speco_draft_runtime_revision == 3
     assert reload_calls == []
+
+
+def test_vllm_wake_refreshes_block_table_device_pointers() -> None:
+    extension = SpecoVLLMColocateWorkerExtension()
+    calls = []
+    extension.model_runner = SimpleNamespace(
+        block_tables=SimpleNamespace(
+            init_block_table_layout_tensors=lambda: calls.append("refresh")
+        )
+    )
+
+    assert extension._speco_refresh_vllm_block_table_pointers(["kv_cache"])
+    assert calls == ["refresh"]
 
 
 def test_vllm_level2_wake_restores_matching_online_revision() -> None:
@@ -499,6 +533,7 @@ def test_vllm_speculative_config_maps_dspark_to_native_gpu_contract(
 
     assert config == {
         "draft_sample_method": "greedy",
+        "draft_load_config": {"load_format": "auto"},
         "method": "dspark",
         "model": str(model_path),
         "num_speculative_tokens": 16,
@@ -564,6 +599,7 @@ def test_vllm_speculative_config_keeps_native_dspark_on_npu_mrv2(
 
     assert config == {
         "draft_sample_method": "greedy",
+        "draft_load_config": {"load_format": "auto"},
         "method": "dspark",
         "model": str(model_path),
         "num_speculative_tokens": 5,
@@ -682,6 +718,58 @@ def test_vllm_mrv2_skips_legacy_dspark_runtime_and_registry_alias(
 
     assert patch_vllm_dspark_runtime() is False
     assert patch_vllm_dspark_registry_aliases() is False
+
+
+def test_vllm_dspark_loads_draft_checkpoint_without_changing_target_policy() -> None:
+    target_load_config = SimpleNamespace(load_format="dummy")
+    draft_load_config = SimpleNamespace(load_format="auto")
+    observed_load_configs = []
+
+    def upstream_load_dspark_model(target_model, vllm_config):
+        observed_load_configs.append(vllm_config.load_config)
+        return target_model
+
+    utils_module = SimpleNamespace(load_dspark_model=upstream_load_dspark_model)
+    speculator_module = SimpleNamespace(load_dspark_model=upstream_load_dspark_model)
+    vllm_config = SimpleNamespace(
+        load_config=target_load_config,
+        speculative_config=SimpleNamespace(
+            draft_load_config=draft_load_config,
+        ),
+    )
+    target_model = object()
+
+    assert patch_vllm_dspark_draft_load_config(utils_module, speculator_module) is True
+    assert (
+        speculator_module.load_dspark_model(target_model, vllm_config) is target_model
+    )
+    assert observed_load_configs == [draft_load_config]
+    assert vllm_config.load_config is target_load_config
+    assert utils_module.load_dspark_model is speculator_module.load_dspark_model
+
+
+def test_vllm_dspark_restores_target_load_policy_when_draft_load_fails() -> None:
+    target_load_config = SimpleNamespace(load_format="dummy")
+    draft_load_config = SimpleNamespace(load_format="auto")
+
+    def upstream_load_dspark_model(_target_model, vllm_config):
+        assert vllm_config.load_config is draft_load_config
+        raise RuntimeError("draft checkpoint failed")
+
+    utils_module = SimpleNamespace(load_dspark_model=upstream_load_dspark_model)
+    speculator_module = SimpleNamespace(load_dspark_model=upstream_load_dspark_model)
+    vllm_config = SimpleNamespace(
+        load_config=target_load_config,
+        speculative_config=SimpleNamespace(
+            draft_load_config=draft_load_config,
+        ),
+    )
+
+    patch_vllm_dspark_draft_load_config(utils_module, speculator_module)
+    with pytest.raises(RuntimeError, match="draft checkpoint failed"):
+        speculator_module.load_dspark_model(object(), vllm_config)
+
+    assert vllm_config.load_config is target_load_config
 
 
 def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(
@@ -855,19 +943,27 @@ def test_vllm_ascend_dspark_runtime_detector_rejects_old_full_block_layout(
     assert _vllm_ascend_has_dspark_pr11153_k_query_runtime() is False
 
 
-def test_vllm_runtime_injects_native_config_and_worker_extension(monkeypatch) -> None:
+@pytest.mark.parametrize("runtime_payload", ["invalid json", "[]", "null"])
+def test_vllm_runtime_injects_native_config_and_worker_extension(
+    monkeypatch, tmp_path, runtime_payload
+) -> None:
+    monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, runtime_payload)
+    monkeypatch.delenv("VERL_SPECO_SGLANG_DRAFTER_CONFIG", raising=False)
     monkeypatch.setattr(
         "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
         lambda: True,
     )
     config = {
+        "trainer": {"default_local_dir": str(tmp_path)},
         "actor_rollout_ref": {
             "rollout": {
                 "name": "vllm",
                 "drafter": _drafter(),
-                "engine_kwargs": {"vllm": {}},
+                "engine_kwargs": {
+                    "vllm": {"additional_config": {"existing_option": 1}}
+                },
             }
-        }
+        },
     }
 
     configure_vllm_runtime_from_config(config)
@@ -875,6 +971,207 @@ def test_vllm_runtime_injects_native_config_and_worker_extension(monkeypatch) ->
     engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
     assert engine_kwargs["speculative_config"]["method"] == "eagle3"
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
+    assert engine_kwargs["additional_config"]["existing_option"] == 1
+    assert (
+        vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
+        not in engine_kwargs["additional_config"]
+    )
+    sidecar_dir = vllm_runtime._vllm_spec_decode_sidecar_dir()
+    assert sidecar_dir is not None
+    assert sidecar_dir.startswith(str(tmp_path / ".spec_decode_stats"))
+    assert "/run-" in sidecar_dir.replace("\\", "/")
+
+    # Reconfiguration in the same driver process must reuse its run-scoped
+    # directory rather than splitting counters between two locations.
+    configure_vllm_runtime_from_config(config)
+    assert vllm_runtime._vllm_spec_decode_sidecar_dir() == sidecar_dir
+
+
+def test_vllm_runtime_installs_replica_bridge_without_drafter(monkeypatch) -> None:
+    bridge_calls: list[bool] = []
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: bridge_calls.append(True) or True,
+    )
+    config = {
+        "actor_rollout_ref": {"rollout": {"name": "vllm", "drafter": {"enable": False}}}
+    }
+
+    assert configure_vllm_runtime_from_config(config) == {}
+    assert bridge_calls == [True]
+    engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
+    assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
+
+
+def test_vllm_runtime_strips_speculative_config_from_struct_mode_without_drafter(
+    monkeypatch,
+) -> None:
+    omegaconf = pytest.importorskip("omegaconf")
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    config = omegaconf.OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {
+                    "name": "vllm",
+                    "drafter": {"enable": False},
+                    "engine_kwargs": {
+                        "vllm": {"speculative_config": {"method": "eagle3"}}
+                    },
+                }
+            }
+        }
+    )
+    omegaconf.OmegaConf.set_struct(config, True)
+
+    configure_vllm_runtime_from_config(config)
+
+    engine_kwargs = config.actor_rollout_ref.rollout.engine_kwargs.vllm
+    assert "speculative_config" not in engine_kwargs
+    assert engine_kwargs.worker_extension_cls == SPECO_VLLM_WORKER_EXTENSION_CLS
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_vllm_server_bridge_strips_legacy_acceptance_sidecar_key(
+    monkeypatch, structured
+) -> None:
+    monkeypatch.setenv(
+        "VERL_SPECO_DRAFTER_CONFIG",
+        json.dumps(_drafter(), sort_keys=True),
+    )
+    rollout_cfg = {
+        "engine_kwargs": {
+            "vllm": {
+                "additional_config": {
+                    vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY: "/tmp/stats"
+                }
+            }
+        }
+    }
+
+    if structured:
+        from omegaconf import OmegaConf
+
+        rollout_cfg = OmegaConf.create(rollout_cfg)
+        OmegaConf.set_struct(rollout_cfg, True)
+
+    vllm_runtime._ensure_vllm_drafter_speculative_config_from_env(rollout_cfg)
+
+    assert (
+        vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
+        not in rollout_cfg["engine_kwargs"]["vllm"]["additional_config"]
+    )
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_vllm_server_does_not_revive_stale_drafter_env_when_disabled(
+    monkeypatch, structured
+) -> None:
+    monkeypatch.setenv(
+        "VERL_SPECO_DRAFTER_CONFIG",
+        json.dumps(_drafter(), sort_keys=True),
+    )
+    rollout_cfg = {
+        "drafter": {"enable": False},
+        "engine_kwargs": {"vllm": {"speculative_config": {"model": "/stale"}}},
+    }
+
+    if structured:
+        from omegaconf import OmegaConf
+
+        rollout_cfg = OmegaConf.create(rollout_cfg)
+        OmegaConf.set_struct(rollout_cfg, True)
+
+    vllm_runtime._ensure_vllm_drafter_speculative_config_from_env(rollout_cfg)
+
+    assert "speculative_config" not in rollout_cfg["engine_kwargs"]["vllm"]
+    assert "VERL_SPECO_DRAFTER_CONFIG" not in os.environ
+
+
+def test_vllm_server_does_not_revive_stale_drafter_env_when_nested_disabled(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "VERL_SPECO_DRAFTER_CONFIG",
+        json.dumps(_drafter(), sort_keys=True),
+    )
+    rollout_cfg = {"actor_rollout_ref": {"rollout": {"drafter": {"enable": False}}}}
+
+    vllm_runtime._ensure_vllm_drafter_speculative_config_from_env(rollout_cfg)
+
+    assert "engine_kwargs" not in rollout_cfg
+    assert "VERL_SPECO_DRAFTER_CONFIG" not in os.environ
+
+
+def test_vllm_http_actor_installs_import_guard_before_deserialization(
+    monkeypatch,
+) -> None:
+    sidecar_dir = "/tmp/speco-acceptance/run-test"
+    drafter_env = json.dumps(
+        {
+            "enable": True,
+            "_speco_acceptance_stats_dir": sidecar_dir,
+        }
+    )
+    monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, drafter_env)
+    captured = {}
+
+    class FakeRemoteActorClass:
+        def options(self, **options):
+            captured["options"] = options
+            return "configured"
+
+    class FakeRay:
+        @staticmethod
+        def remote(actor_cls):
+            captured["actor_cls"] = actor_cls
+            return FakeRemoteActorClass()
+
+    class Server:
+        pass
+
+    actor_class = vllm_runtime._remote_speco_vllm_http_server(FakeRay, Server)
+    assert (
+        actor_class.options(
+            name="server",
+            runtime_env={"env_vars": {"EXISTING": "1"}},
+        )
+        == "configured"
+    )
+    assert captured["actor_cls"] is Server
+    assert captured["options"]["name"] == "server"
+    runtime_env = captured["options"]["runtime_env"]
+    setup_hook_path = (
+        "verl_speco.integration.verl_npu_vllm_compat."
+        "install_verl_npu_vllm_worker_process_compat"
+    )
+    assert runtime_env["env_vars"] == {
+        "EXISTING": "1",
+        "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR": setup_hook_path,
+        vllm_runtime.SPECO_DRAFTER_CONFIG_ENV: drafter_env,
+    }
+    assert runtime_env["worker_process_setup_hook"] == setup_hook_path
+    assert json.loads(json.dumps(runtime_env)) == runtime_env
+
+
+def test_vllm_http_actor_does_not_forward_drafter_without_sidecar(monkeypatch) -> None:
+    monkeypatch.setenv(
+        vllm_runtime.SPECO_DRAFTER_CONFIG_ENV,
+        json.dumps({"enable": True}),
+    )
+    captured = {}
+
+    class FakeRemoteActorClass:
+        def options(self, **options):
+            captured.update(options)
+            return self
+
+    vllm_runtime._SpecoVLLMHttpServerActorClass(FakeRemoteActorClass()).options()
+    assert (
+        vllm_runtime.SPECO_DRAFTER_CONFIG_ENV not in captured["runtime_env"]["env_vars"]
+    )
 
 
 def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(
@@ -949,6 +1246,7 @@ def test_vllm_runtime_injects_native_dspark_on_npu_mrv2(monkeypatch, tmp_path) -
     engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
     assert engine_kwargs["speculative_config"] == {
         "draft_sample_method": "greedy",
+        "draft_load_config": {"load_format": "auto"},
         "method": "dspark",
         "model": str(model_path),
         "num_speculative_tokens": 5,
@@ -989,6 +1287,50 @@ def test_vllm_mrv2_rejects_final_engine_speculative_override(
 
     with pytest.raises(ValueError, match="final speculative config"):
         configure_vllm_runtime_from_config(config)
+
+
+def test_vllm_mrv2_resume_uses_serialized_checkpoint_over_stale_env(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    source_model = tmp_path / "source-drafter"
+    resumed_model = tmp_path / "draft_step_1"
+    for model_path in (source_model, resumed_model):
+        model_path.mkdir()
+        (model_path / "config.json").write_text(
+            '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}'
+        )
+
+    stale_drafter = _drafter(
+        speculative_algorithm="DSPARK",
+        model_path=str(source_model),
+        rollout={"spec_verify_tokens": 5},
+    )
+    monkeypatch.setenv(
+        "VERL_SPECO_DRAFTER_CONFIG", json.dumps(stale_drafter, sort_keys=True)
+    )
+    rollout_cfg = {
+        "engine_kwargs": {
+            "vllm": {
+                "speculative_config": {
+                    "draft_sample_method": "greedy",
+                    "draft_load_config": {"load_format": "auto"},
+                    "method": "dspark",
+                    "model": str(resumed_model),
+                    "num_speculative_tokens": 5,
+                }
+            }
+        },
+    }
+
+    vllm_runtime._ensure_vllm_drafter_speculative_config_from_env(rollout_cfg)
+
+    assert rollout_cfg["engine_kwargs"]["vllm"]["speculative_config"]["model"] == str(
+        resumed_model
+    )
 
 
 def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None:
@@ -1034,15 +1376,266 @@ def test_import_compat_runs_before_vllm_worker_extension_import() -> None:
 def test_vllm_acceptance_stats_keep_stable_transport_keys() -> None:
     stats = _new_vllm_spec_decode_stats()
     scheduler_stats = SimpleNamespace(
-        spec_decoding_stats=SimpleNamespace(num_drafts=4, num_accepted_tokens=7)
+        spec_decoding_stats=SimpleNamespace(
+            num_drafts=4, num_draft_tokens=24, num_accepted_tokens=7
+        )
     )
 
     _record_vllm_spec_decode_scheduler_stats(stats, scheduler_stats)
 
     assert _vllm_spec_decode_stats_to_metrics(stats) == {
+        "spec_num_draft_tokens": 24.0,
+        "spec_num_accepted_tokens": 7.0,
+        "spec_num_verify_steps": 4.0,
         f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_drafts": 4.0,
         f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_accepted_tokens": 7.0,
     }
+
+
+def test_vllm_http_server_transports_final_request_acceptance_stats() -> None:
+    class Engine:
+        def generate(self, *args, **kwargs):
+            del args, kwargs
+
+            async def outputs():
+                yield SimpleNamespace(
+                    metrics=SimpleNamespace(
+                        request_spec_decode_stats=SimpleNamespace(
+                            num_verify_steps=4,
+                            num_draft_tokens=28,
+                            num_accepted_tokens=9,
+                        )
+                    )
+                )
+
+            return outputs()
+
+    class Upstream:
+        async def generate(self, *args, **kwargs):
+            async for _ in self.engine.generate(
+                request_id=kwargs["request_id"], prompt="prompt", sampling_params={}
+            ):
+                pass
+            return SimpleNamespace(extra_fields={"global_steps": 1})
+
+    class Server(_SpecoVLLMHttpServerMixin, Upstream):
+        pass
+
+    server = Server()
+    server.engine = Engine()
+    output = asyncio.run(Server.generate(server, request_id="request-1"))
+
+    assert output.extra_fields == {
+        "global_steps": 1,
+        "spec_num_draft_tokens": 28.0,
+        "spec_num_accepted_tokens": 9.0,
+        "spec_num_verify_steps": 4.0,
+        f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_drafts": 4.0,
+        f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_accepted_tokens": 9.0,
+    }
+    assert server._speco_vllm_request_spec_decode_stats == {}
+
+
+def test_vllm_worker_output_records_acceptance_once_per_tp_group(monkeypatch) -> None:
+    recorded = []
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._record_vllm_spec_decode_acceptance",
+        lambda worker, **values: recorded.append((worker.local_rank, values)),
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={"a": [1, 2, 3], "b": [4, 5]},
+        num_invalid_spec_tokens={"b": 1},
+    )
+    runner_output = SimpleNamespace(
+        sampled_token_ids=[[8, 9, 10], [11]],
+        req_id_to_index={"a": 0, "b": 1},
+    )
+
+    _record_vllm_worker_spec_decode_output(
+        SimpleNamespace(local_rank=1), scheduler_output, runner_output
+    )
+    assert recorded == []
+    _record_vllm_worker_spec_decode_output(
+        SimpleNamespace(local_rank=0), scheduler_output, runner_output
+    )
+    assert [item[1]["num_accepted_tokens"] for item in recorded] == [2, 0]
+    assert [item[1]["num_draft_tokens"] for item in recorded] == [3, 2]
+
+
+def test_vllm_acceptance_sidecar_is_independent_of_log_stats(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv(
+        vllm_runtime.SPECO_DRAFTER_CONFIG_ENV,
+        json.dumps(
+            {
+                vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY: str(tmp_path),
+            }
+        ),
+    )
+    runtime = SimpleNamespace(log_stats=False)
+
+    vllm_runtime._record_vllm_worker_spec_decode_output(
+        runtime,
+        SimpleNamespace(scheduled_spec_decode_tokens={"request-0": [1, 2, 3, 4]}),
+        SimpleNamespace(
+            req_id_to_index={"request-0": 0}, sampled_token_ids=[[1, 2, 3, 4]]
+        ),
+    )
+
+    assert vllm_runtime.read_vllm_spec_decode_sidecar_totals(str(tmp_path)) == {
+        "drafts": 1.0,
+        "accepted_tokens": 3.0,
+        "draft_tokens": 4.0,
+    }
+
+
+@pytest.mark.parametrize("split_sampling", [False, True])
+@pytest.mark.parametrize("async_output", [False, True])
+def test_vllm_worker_execution_boundary_to_trainer_metric(
+    monkeypatch, tmp_path, split_sampling, async_output
+):
+    """Exercise extension MRO, split sampling, deferred D2H and real sidecar IO."""
+    from verl_speco.trainer.v1.speco_mixin import SpecoV1Mixin
+
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    monkeypatch.delenv("VERL_SPECO_SGLANG_DRAFTER_CONFIG", raising=False)
+    stats_dir = tmp_path / ".spec_decode_stats"
+    resolved = SimpleNamespace(
+        req_id_to_index={"a": 0, "b": 1, "prefill": 2},
+        sampled_token_ids=[[7, 8, 9], [10], []],
+    )
+
+    class Deferred:
+        calls = 0
+
+        def get_output(self):
+            self.calls += 1
+            assert self.calls == 1
+            return resolved
+
+    # Mirror WorkerWrapperBase: append the extension to the worker's bases.
+    class Base:
+        pass
+
+    class Worker(Base):
+        def execute_model(self, scheduler_output):
+            return None if split_sampling else self.output
+
+        def sample_tokens(self, grammar_output):
+            return self.output
+
+    Worker.__bases__ += (SpecoVLLMColocateWorkerExtension,)
+    worker = Worker()
+    worker.rank = 0
+    worker.log_stats = False
+    worker.vllm_config = SimpleNamespace(
+        additional_config={
+            vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY: str(stats_dir)
+        },
+        parallel_config=SimpleNamespace(world_size=2, tensor_parallel_size=2),
+    )
+    worker.output = Deferred() if async_output else resolved
+    scheduled = SimpleNamespace(
+        scheduled_spec_decode_tokens={"a": [1, 2, 3], "b": [4, 5], "prefill": [6, 7]},
+        num_invalid_spec_tokens={"b": 1},
+    )
+    output = worker.execute_model(scheduled)
+    if split_sampling:
+        assert output is None
+        assert not stats_dir.exists()
+        output = worker.sample_tokens(None)
+    assert output is worker.output
+    if async_output:
+        assert output.calls == 0  # No eager synchronization by the observer.
+        assert not stats_dir.exists()
+        # A following forward may mutate/reuse state before D2H completes.
+        scheduled.scheduled_spec_decode_tokens.clear()
+        assert output.get_output() is resolved
+
+    assert vllm_runtime.read_vllm_spec_decode_sidecar_totals(str(stats_dir)) == {
+        "drafts": 2.0,
+        "accepted_tokens": 2.0,
+        "draft_tokens": 4.0,
+    }
+    # Verify all rows (not just the first/every 32nd) were flushed. Never add
+    # legacy Scheduler counters on top of the worker source.
+    (stats_dir / "engine-legacy.counters").write_text("100 100 100\n", encoding="ascii")
+    trainer = SpecoV1Mixin.__new__(SpecoV1Mixin)
+    trainer.config = SimpleNamespace(
+        trainer=SimpleNamespace(default_local_dir=str(tmp_path))
+    )
+    assert trainer._speco_v1_spec_decode_sidecar_metrics() == {
+        "drafter/spec_decode/mean_acceptance_length": 2.0,
+    }
+    assert trainer._speco_v1_spec_decode_sidecar_metrics() == {}
+
+
+def test_vllm_worker_acceptance_uses_executor_output_rank(monkeypatch):
+    recorded = []
+    monkeypatch.setattr(
+        vllm_runtime,
+        "_record_vllm_spec_decode_acceptance",
+        lambda *a, **kw: recorded.append(kw),
+    )
+    output = SimpleNamespace(req_id_to_index={"a": 0}, sampled_token_ids=[[1, 2]])
+    scheduled = SimpleNamespace(scheduled_spec_decode_tokens={"a": [3, 4]})
+    parallel = SimpleNamespace(world_size=4, tensor_parallel_size=2)
+    for rank in range(4):
+        worker = SimpleNamespace(
+            rank=rank,
+            local_rank=rank,
+            vllm_config=SimpleNamespace(parallel_config=parallel),
+        )
+        vllm_runtime._record_vllm_worker_spec_decode_output(worker, scheduled, output)
+    assert len(recorded) == 1
+
+
+def test_vllm_http_server_transports_stats_with_positional_request_id() -> None:
+    """verl 0.9 calls server.generate with request_id in positional slot 3."""
+
+    class Engine:
+        def generate(self, *args, **kwargs):
+            del args, kwargs
+
+            async def outputs():
+                yield SimpleNamespace(
+                    metrics=SimpleNamespace(
+                        request_spec_decode_stats=SimpleNamespace(
+                            num_verify_steps=3,
+                            num_draft_tokens=21,
+                            num_accepted_tokens=5,
+                        )
+                    )
+                )
+
+            return outputs()
+
+    class Upstream:
+        async def generate(self, prompt_ids, sampling_params, request_id, **kwargs):
+            del prompt_ids, sampling_params, kwargs
+            async for _ in self.engine.generate(
+                request_id=request_id, prompt="prompt", sampling_params={}
+            ):
+                pass
+            return SimpleNamespace(extra_fields={"global_steps": 1})
+
+    class Server(_SpecoVLLMHttpServerMixin, Upstream):
+        pass
+
+    server = Server()
+    server.engine = Engine()
+    output = asyncio.run(Server.generate(server, [1], {}, "request-1"))
+
+    assert output.extra_fields == {
+        "global_steps": 1,
+        "spec_num_draft_tokens": 21.0,
+        "spec_num_accepted_tokens": 5.0,
+        "spec_num_verify_steps": 3.0,
+        f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_drafts": 3.0,
+        f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_accepted_tokens": 5.0,
+    }
+    assert server._speco_vllm_request_spec_decode_stats == {}
 
 
 def test_trainer_keeps_public_acceptance_metric_name() -> None:
@@ -1068,9 +1661,9 @@ def test_trainer_drains_async_publish_before_checkpoint_and_validation() -> None
     )[0]
     validate_source = trainer_source.split("    def _validate(", 1)[1]
 
-    assert save_source.index("_speco_wait_pending_drafter_publish()") < save_source.index(
-        "_speco_save_drafter_checkpoint(wait=True)"
-    )
+    assert save_source.index(
+        "_speco_wait_pending_drafter_publish()"
+    ) < save_source.index("_speco_save_drafter_checkpoint(wait=True)")
     assert validate_source.index(
         "_speco_wait_pending_drafter_publish()"
     ) < validate_source.index("super()._validate(")
@@ -1140,6 +1733,86 @@ def test_vllm_failed_draft_update_does_not_resume_generation(monkeypatch) -> Non
     assert calls == ["abort_all_requests"]
 
 
+def test_vllm_draft_update_pauses_flushes_and_resumes_after_commit(monkeypatch) -> None:
+    from contextlib import nullcontext
+
+    import verl_speco.integration.vllm_runtime as runtime
+
+    calls = []
+
+    async def call_server(_adapter, method_name, *args, **kwargs):
+        calls.append((method_name, args, kwargs))
+
+    async def finish_update():
+        calls.append(("finish_update", (), {}))
+
+    async def execute_method(method_name, **kwargs):
+        calls.append((method_name, (), kwargs))
+        return finish_update()
+
+    class Sender:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        async def async_send_weights(self, weights):
+            del weights
+            calls.append(("send_weights", (), {}))
+
+    sender_module = types.ModuleType(
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+    )
+    sender_module.BucketedWeightSender = Sender
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer",
+        sender_module,
+    )
+    monkeypatch.setattr(runtime, "_maybe_call_vllm_server_method", call_server)
+    monkeypatch.setattr(
+        runtime,
+        "_load_env_drafter_config",
+        lambda: {
+            "training": {
+                "draft_update_pause_generation": True,
+                "draft_update_flush_before": True,
+                "draft_update_flush_after": True,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        runtime, "_resolve_vllm_draft_update_use_shm", lambda *args: False
+    )
+    monkeypatch.setattr(
+        runtime, "patch_verl_bucketed_weight_transfer_shm_reuse", lambda: False
+    )
+    monkeypatch.setattr(runtime, "_ipc_safe_allocator", lambda enabled: nullcontext())
+    adapter = SimpleNamespace(
+        rollout_rank=0,
+        replica_rank=0,
+        zmq_handle="ipc:///tmp/weights",
+        config=SimpleNamespace(
+            checkpoint_engine=SimpleNamespace(update_weights_bucket_megabytes=1)
+        ),
+        _execute_method=execute_method,
+    )
+
+    asyncio.run(
+        speco_vllm_update_draft_weights(adapter, {"weight": object()}, global_steps=9)
+    )
+
+    assert [name for name, *_ in calls] == [
+        "abort_all_requests",
+        "update_draft_weights_from_ipc",
+        "send_weights",
+        "finish_update",
+        "clear_kv_cache",
+        "set_global_steps",
+        "resume_generation",
+    ]
+    assert calls[0][2] == {"reset_prefix_cache": True}
+    assert calls[-2][1] == (9,)
+
+
 @pytest.mark.parametrize("registers_confidence_head", [True, False])
 def test_vllm_draft_ipc_streams_buckets_without_cloning(
     monkeypatch, caplog, registers_confidence_head
@@ -1153,7 +1826,9 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(
             self.value = value
 
         def detach(self):
-            raise AssertionError("streamed draft updates must not detach bucket tensors")
+            raise AssertionError(
+                "streamed draft updates must not detach bucket tensors"
+            )
 
         def clone(self):
             raise AssertionError("streamed draft updates must not clone bucket tensors")
@@ -1177,9 +1852,7 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(
             for name, _ in materialized:
                 if name not in self.param_names:
                     raise KeyError(name)
-            self.loaded.append(
-                [(name, tensor.value) for name, tensor in materialized]
-            )
+            self.loaded.append([(name, tensor.value) for name, tensor in materialized])
             return {name for name, _ in materialized}
 
         def _build_fused_kv_buffers(self):
@@ -1350,6 +2023,36 @@ def test_vllm_fullgraph_metadata_refresh_preserves_captured_storage() -> None:
     assert inner._k_norm_weights[1] is old_norm_1
     assert inner._k_norm_weights[0].value == 4.0
     assert inner._k_norm_weights[1].value == 4.5
+
+
+def test_vllm_fullgraph_metadata_refresh_supports_inference_buffers() -> None:
+    torch = pytest.importorskip("torch")
+
+    with torch.inference_mode():
+        old_kv = torch.zeros((2, 3))
+        old_norm = [torch.zeros((2, 3))]
+    inner = SimpleNamespace(
+        _fused_kv_weight=old_kv,
+        _fused_kv_bias=None,
+        _k_norm_weights=old_norm,
+    )
+
+    def rebuild() -> None:
+        with torch.inference_mode():
+            inner._fused_kv_weight = torch.full((2, 3), 3.0)
+            inner._fused_kv_bias = None
+            inner._k_norm_weights = [torch.full((2, 3), 4.0)]
+
+    inner._build_fused_kv_buffers = rebuild
+
+    SpecoVLLMColocateWorkerExtension._speco_rebuild_draft_metadata_buffers(
+        SimpleNamespace(model=inner)
+    )
+
+    assert inner._fused_kv_weight is old_kv
+    assert inner._k_norm_weights is old_norm
+    assert torch.allclose(old_kv, torch.full((2, 3), 3.0))
+    assert torch.allclose(old_norm[0], torch.full((2, 3), 4.0))
 
 
 def test_vllm_fullgraph_metadata_refresh_rejects_sequence_length_change() -> None:

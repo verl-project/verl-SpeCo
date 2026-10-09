@@ -386,6 +386,7 @@ class SpecoWorker(Worker):
         if self._training_group_initialized:
             return
 
+        group_init_started = time.perf_counter()
         self._ensure_process_group_initialized()
         if not dist.is_initialized():
             return
@@ -448,6 +449,13 @@ class SpecoWorker(Worker):
             is_collect=True,
         )
         self._training_group_initialized = True
+        logger.warning(
+            "[speco timing] drafter_hccl_group_init_s=%.3f rank=%s sp=%s dp=%s",
+            time.perf_counter() - group_init_started,
+            self.rank,
+            self.training_group_world_size,
+            self.dp_group_world_size,
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -542,6 +550,15 @@ class SpecoWorker(Worker):
         self.feature_writer_path = path
         return self.feature_writer
 
+    def _feature_store_checkpoint_configured(self) -> bool:
+        feature_store_cfg = self.config.rollout.drafter.training.get(
+            "feature_store", None
+        )
+        return bool(
+            feature_store_cfg is not None
+            and _config_str(feature_store_cfg.get("path", None))
+        )
+
     def _build_rollout_loss_mask(
         self, batch: dict, input_ids: torch.Tensor
     ) -> torch.Tensor:
@@ -583,6 +600,11 @@ class SpecoWorker(Worker):
         *,
         collection_id: Optional[str] = None,
     ) -> bool:
+        # Collection RPCs execute on every tensor-parallel member.  They must all
+        # acknowledge the sample for the transaction to succeed, but feature-store
+        # shards are replica-owned: only the drafter group leader may persist them.
+        if not self.is_drafter_group_leader:
+            return True
         writer = self._get_feature_writer()
         if writer is None:
             logger.warning(
@@ -631,6 +653,7 @@ class SpecoWorker(Worker):
         )
         metadata = {
             "source": batch.get("hidden_target_logprobs_source", "rl_rollout"),
+            "collection_id": str(collection_id) if collection_id is not None else None,
             "global_step": batch.get("global_step", self.last_global_step),
             "target_model_path": target_model_path,
             "drafter_model_path": _config_str(
@@ -1025,6 +1048,12 @@ class SpecoWorker(Worker):
                 "input_ids": sample["input_ids"],
                 "prompts": sample["prompts"],
                 "responses": sample["responses"],
+                # Preserve the immutable collection transaction in the
+                # trainer buffer.  DataBuffer's mutable ``step`` is used for
+                # retention, while this source version is used to validate a
+                # distributed training plan.
+                "collection_id": collection_id,
+                "collection_source_global_step": int(self.last_global_step or 0),
             }
             for key in (
                 "hidden_position_start",
@@ -1149,6 +1178,55 @@ class SpecoWorker(Worker):
                 result,
             )
         return result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_feature_store_checkpoint_state(self, global_step: int):
+        """Persist the Feature Store manifest cursor at an actor checkpoint boundary."""
+
+        if not self._feature_store_checkpoint_configured():
+            return {"saved": False, "reason": "feature_store_disabled"}
+        if not self.in_drafter_train_group:
+            return {"saved": False, "reason": "not_in_training_group"}
+        if not self.is_drafter_group_leader:
+            return {"saved": False, "reason": "not_feature_store_leader"}
+        if global_step is None:
+            return {"saved": False, "reason": "missing_global_step"}
+        writer = self._get_feature_writer()
+        if writer is None:
+            return {"saved": False, "reason": "feature_store_unavailable"}
+        return {
+            "saved": True,
+            "global_step": int(global_step),
+            "worker_id": str(self.replica_rank),
+            "cursor": writer.checkpoint_state(),
+        }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def restore_feature_store_checkpoint_state(self, state: dict[str, Any]):
+        """Fail closed if the resumed Feature Store no longer has the saved prefix."""
+
+        if not self._feature_store_checkpoint_configured():
+            return {"restored": False, "reason": "feature_store_disabled"}
+        if not self.in_drafter_train_group:
+            return {"restored": False, "reason": "not_in_training_group"}
+        if not self.is_drafter_group_leader:
+            return {"restored": False, "reason": "not_feature_store_leader"}
+        if not isinstance(state, dict):
+            raise TypeError("Feature-store checkpoint payload must be a mapping")
+        cursor = state.get("cursor", state)
+        if not isinstance(cursor, dict):
+            raise ValueError("Feature-store checkpoint cursor must be a mapping")
+        writer = self._get_feature_writer()
+        if writer is None:
+            raise RuntimeError(
+                "Feature-store checkpoint configured but writer is unavailable"
+            )
+        restored = writer.restore_checkpoint_state(cursor)
+        return {
+            "restored": True,
+            "worker_id": str(self.replica_rank),
+            "cursor": restored,
+        }
 
     @register(
         dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_TARGET_SYNC_MESH),
@@ -1424,6 +1502,13 @@ class SpecoWorker(Worker):
             self.trainer.clear_pending_publish_state_dict()
             try:
                 train_loop_ts = time.time()
+                logger.debug(
+                    "[DrafterTiming replica=%s rank=%s] phase=training_loop_start step=%s max_batches=%s",
+                    self.replica_rank,
+                    self.rank,
+                    self.last_global_step,
+                    max_batches,
+                )
                 self.trainer.reset_training_metrics()
                 for _ in range(max_batches):
                     result["attempted_steps"] += 1
@@ -1436,9 +1521,23 @@ class SpecoWorker(Worker):
                         result["successful_steps"] += 1
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
                 result.update(self.trainer.get_training_metrics())
+                logger.debug(
+                    "[DrafterTiming replica=%s rank=%s] phase=training_loop_done elapsed_s=%.3f successful_steps=%s optimizer_step=%s",
+                    self.replica_rank,
+                    self.rank,
+                    result["training_loop_elapsed_sec"],
+                    result["successful_steps"],
+                    self.trainer.optimizer_steps_total,
+                )
                 if result["successful_steps"] > 0:
                     if prepare_publish:
                         snapshot_ts = time.time()
+                        logger.debug(
+                            "[DrafterTiming replica=%s rank=%s] phase=publish_snapshot_call_start step=%s",
+                            self.replica_rank,
+                            self.rank,
+                            self.last_global_step,
+                        )
                         cached = self.trainer.prepare_model_state_dict_for_publish(
                             self.last_global_step
                         )
@@ -1451,6 +1550,13 @@ class SpecoWorker(Worker):
                                 "timing_s/drafter_publish_snapshot",
                                 result["publish_snapshot_elapsed_sec"],
                             )
+                        logger.debug(
+                            "[DrafterTiming replica=%s rank=%s] phase=publish_snapshot_call_done elapsed_s=%.3f cached=%s",
+                            self.replica_rank,
+                            self.rank,
+                            result["publish_snapshot_elapsed_sec"],
+                            result["publish_snapshot_cached"],
+                        )
                     else:
                         self.trainer.clear_pending_publish_state_dict()
                 else:
@@ -1458,10 +1564,29 @@ class SpecoWorker(Worker):
                 result.update(self.trainer.get_training_metrics())
             finally:
                 cleanup_ts = time.time()
-                await self.trainer.cleanup_training(
-                    clear_data=result["successful_steps"] > 0
+                logger.debug(
+                    "[DrafterTiming replica=%s rank=%s] phase=cleanup_call_start",
+                    self.replica_rank,
+                    self.rank,
                 )
+                try:
+                    await self.trainer.cleanup_training(
+                        clear_data=result["successful_steps"] > 0
+                    )
+                except Exception:
+                    logger.exception(
+                        "[DrafterTiming replica=%s rank=%s] phase=cleanup_call_failed",
+                        self.replica_rank,
+                        self.rank,
+                    )
+                    raise
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
+                logger.debug(
+                    "[DrafterTiming replica=%s rank=%s] phase=cleanup_call_done elapsed_s=%.3f",
+                    self.replica_rank,
+                    self.rank,
+                    result["cleanup_elapsed_sec"],
+                )
 
             result["trained"] = result["successful_steps"] > 0
             result["reason"] = "trained" if result["trained"] else "no_trainable_batch"

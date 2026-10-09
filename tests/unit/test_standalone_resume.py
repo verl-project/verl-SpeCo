@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("torch")
+
 from verl_speco.trainer.standalone_resume import (
     load_standalone_resume,
     save_standalone_resume,

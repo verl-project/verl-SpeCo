@@ -27,13 +27,33 @@ class ConservativeTrainingDataStatusPolicy:
             ),
             default=None,
         )
+        # A worker with no trainable samples has no data version to compare.
+        # Treating its ``None`` as a real version made a freshly collected
+        # colocated batch look inconsistent whenever collection was routed to
+        # only a subset of workers.  Capacity is still aggregated
+        # conservatively below (``min(trainable_batches)``), so an empty
+        # worker will correctly produce ``no_trainable_batch`` instead of
+        # incorrectly producing ``inconsistent_data_version``.
+        versioned_statuses = [
+            s
+            for s in statuses
+            if s.trainable_samples > 0
+            or s.data_version is not None
+            or s.newest_sample_step is not None
+        ]
         data_versions = [
             s.data_version if s.data_version is not None else s.newest_sample_step
-            for s in statuses
+            for s in versioned_statuses
         ]
         data_version_consistent = all(
-            s.data_version_consistent for s in statuses
-        ) and all(version == data_versions[0] for version in data_versions)
+            s.data_version_consistent for s in versioned_statuses
+        ) and (
+            not data_versions
+            or all(version == data_versions[0] for version in data_versions)
+        )
+        common_data_version = (
+            data_versions[0] if data_version_consistent and data_versions else None
+        )
         worker_snapshots: dict[str, dict[str, object]] = {
             s.worker_id: {
                 "buffer_version": s.buffer_version,
@@ -42,6 +62,7 @@ class ConservativeTrainingDataStatusPolicy:
                     if s.data_version is not None
                     else s.newest_sample_step
                 ),
+                "collection_source_steps": list(s.collection_source_steps),
                 "worker_incarnation": s.worker_incarnation,
                 "trainable_samples": s.trainable_samples,
                 "min_sample_step": s.min_sample_step,
@@ -71,8 +92,17 @@ class ConservativeTrainingDataStatusPolicy:
                 statuses[0].target_version if target_version_consistent else None
             ),
             target_version_consistent=target_version_consistent,
-            data_version=newest_sample_step,
+            data_version=common_data_version,
             data_version_consistent=data_version_consistent,
+            collection_source_steps=tuple(
+                sorted(
+                    {
+                        step
+                        for status in statuses
+                        for step in status.collection_source_steps
+                    }
+                )
+            ),
             buffer_version=min(s.buffer_version for s in statuses),
             worker_snapshots=worker_snapshots,
             min_sample_step=min(

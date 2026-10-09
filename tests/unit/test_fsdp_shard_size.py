@@ -24,7 +24,9 @@ from omegaconf import OmegaConf  # noqa: E402
 from verl_speco.trainer.base_trainer import DrafterBaseTrainer  # noqa: E402
 
 
-def _trainer(actor_fsdp=None, training=None, actor_strategy="fsdp2") -> DrafterBaseTrainer:
+def _trainer(
+    actor_fsdp=None, training=None, actor_strategy="fsdp2"
+) -> DrafterBaseTrainer:
     trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
     trainer.config = SimpleNamespace(
         actor=OmegaConf.create(
@@ -51,13 +53,17 @@ def test_shard_size_from_actor_fsdp_config() -> None:
 
 
 def test_shard_size_falls_back_to_drafter_training() -> None:
-    trainer = _trainer(actor_fsdp={"fsdp_shard_size": None}, training={"fsdp_shard_size": 1})
+    trainer = _trainer(
+        actor_fsdp={"fsdp_shard_size": None}, training={"fsdp_shard_size": 1}
+    )
     assert trainer._resolve_fsdp_shard_size() == 1
 
 
 def test_shard_size_defaults_to_none() -> None:
     assert _trainer()._resolve_fsdp_shard_size() is None
-    assert _trainer(actor_fsdp={"fsdp_shard_size": -1})._resolve_fsdp_shard_size() is None
+    assert (
+        _trainer(actor_fsdp={"fsdp_shard_size": -1})._resolve_fsdp_shard_size() is None
+    )
 
 
 def test_standalone_default_replicates_but_preserves_explicit() -> None:
@@ -80,8 +86,13 @@ def test_standalone_default_replicates_but_preserves_explicit() -> None:
 
 def test_unset_or_full_shard_keeps_mesh() -> None:
     mesh = _fake_mesh(4)
-    assert _trainer(training={"fsdp_shard_size": None})._shard_sized_fsdp_mesh(mesh) is mesh
-    assert _trainer(training={"fsdp_shard_size": 4})._shard_sized_fsdp_mesh(mesh) is mesh
+    assert (
+        _trainer(training={"fsdp_shard_size": None})._shard_sized_fsdp_mesh(mesh)
+        is mesh
+    )
+    assert (
+        _trainer(training={"fsdp_shard_size": 4})._shard_sized_fsdp_mesh(mesh) is mesh
+    )
 
 
 def test_non_divisible_shard_size_raises() -> None:
@@ -134,6 +145,57 @@ def test_ddp_state_dict_avoids_fsdp2_helper(monkeypatch) -> None:
     assert set(trainer._get_full_export_state_dict()) == set(inner.state_dict())
 
 
+def test_ddp_build_moves_model_before_wrapping_with_non_null_mesh(monkeypatch) -> None:
+    import verl_speco.trainer.base_trainer as base_trainer
+
+    trainer = _trainer(training={"strategy": "ddp"})
+    trainer.config.rollout.drafter = OmegaConf.create({"training": {"strategy": "ddp"}})
+    trainer.rollout_dp_rank = 0
+    trainer._pending_target_lm_head_weight = None
+    trainer.fsdp_device_mesh = object()
+    trainer.runtime_device = torch.device("cpu")
+    trainer.pad_token_id = 0
+    model = torch.nn.Linear(2, 2)
+    calls = []
+
+    def move_to_device(device):
+        calls.append(("move", device))
+        return model
+
+    def wrap_ddp(raw_model, **kwargs):
+        assert raw_model is model
+        calls.append(("wrap", kwargs["process_group"]))
+        return raw_model
+
+    group = object()
+    trainer.backend = SimpleNamespace(
+        model_type="dspark",
+        build_model=lambda: (model, SimpleNamespace(pad_token_id=0)),
+        setup_optimizer=lambda *args: object(),
+        setup_scheduler=lambda *args: None,
+    )
+    monkeypatch.setattr(model, "to", move_to_device)
+    monkeypatch.setattr(base_trainer.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        base_trainer.torch.nn.parallel, "DistributedDataParallel", wrap_ddp
+    )
+    monkeypatch.setattr(trainer, "_full_training_group", lambda: group)
+    monkeypatch.setattr(trainer, "_full_training_world_size", lambda: 2)
+    monkeypatch.setattr(
+        trainer,
+        "_prepare_training_config",
+        lambda config: OmegaConf.create(
+            {"resume_trainer_state_from_checkpoint": False}
+        ),
+    )
+    monkeypatch.setattr(trainer, "_apply_pending_target_lm_head_weight", lambda: None)
+
+    trainer._build_draft_model()
+
+    assert calls == [("move", trainer.runtime_device), ("wrap", group)]
+    assert trainer.model is model
+
+
 def test_full_state_dict_uses_fsdp_when_distributed(monkeypatch) -> None:
     import verl_speco.trainer.base_trainer as base_trainer
 
@@ -161,7 +223,12 @@ def test_drafter_strategy_prefers_drafter_specific_setting() -> None:
 
 
 def test_drafter_strategy_falls_back_to_actor_strategy() -> None:
-    assert _trainer(actor_strategy="veomni", training={"strategy": None})._drafter_strategy() == "veomni"
+    assert (
+        _trainer(
+            actor_strategy="veomni", training={"strategy": None}
+        )._drafter_strategy()
+        == "veomni"
+    )
     assert _trainer(actor_strategy="fsdp2")._drafter_strategy() == "fsdp2"
 
 
@@ -212,11 +279,16 @@ def test_npu_veomni_helpers_follow_drafter_strategy(monkeypatch) -> None:
     assert not ddp._use_flattened_drafter_fsdp_mesh()
     assert not ddp._use_blocking_npu_optimizer_offload()
     assert not ddp._should_park_drafter_hccl()
+    ddp.config.rollout.drafter.training.use_full_shard_fsdp_mesh = True
+    assert not ddp._use_flattened_drafter_fsdp_mesh()
+
+    fsdp2 = _npu_trainer("fsdp2")
+    assert not fsdp2._use_flattened_drafter_fsdp_mesh()
+    assert fsdp2._should_park_drafter_hccl()
+    fsdp2.config.rollout.drafter.training.use_full_shard_fsdp_mesh = True
+    assert fsdp2._use_flattened_drafter_fsdp_mesh()
 
     veomni = _npu_trainer("veomni")
     assert veomni._use_flattened_drafter_fsdp_mesh()
     assert veomni._use_blocking_npu_optimizer_offload()
     assert veomni._should_park_drafter_hccl()
-
-
-

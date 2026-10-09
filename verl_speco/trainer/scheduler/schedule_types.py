@@ -323,6 +323,7 @@ class TrainingDataStatus:
     target_version_consistent: bool = True
     data_version: int | None = None
     data_version_consistent: bool = True
+    collection_source_steps: tuple[int, ...] = ()
     buffer_version: int = 0
     worker_incarnation: str = ""
     worker_id: str = ""
@@ -332,6 +333,11 @@ class TrainingDataStatus:
 
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "TrainingDataStatus":
+        collection_steps = value.get("collection_source_steps")
+        if collection_steps is None:
+            collection_steps = []
+        if not isinstance(collection_steps, (list, tuple)):
+            raise TypeError("collection_source_steps must be a list or tuple")
         return cls(
             current_step=_as_int(value.get("current_step", 0)),
             current_step_samples=_as_int(value.get("current_step_samples", 0)),
@@ -351,6 +357,9 @@ class TrainingDataStatus:
                 value.get("data_version", value.get("newest_sample_step"))
             ),
             data_version_consistent=bool(value.get("data_version_consistent", True)),
+            collection_source_steps=tuple(
+                _as_int(step) for step in collection_steps if step is not None
+            ),
             buffer_version=_as_int(value.get("buffer_version", 0)),
             worker_incarnation=str(value.get("worker_incarnation", "")),
             worker_id=str(value.get("worker_id", value.get("rank", ""))),
@@ -370,6 +379,9 @@ class TrainingDataStatus:
                 self.target_version_consistent
             ),
             "drafter/data_version_consistent": int(self.data_version_consistent),
+            "drafter/data_collection_source_versions": len(
+                self.collection_source_steps
+            ),
         }
 
 

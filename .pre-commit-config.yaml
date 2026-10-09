@@ -57,7 +57,7 @@ repos:
 
       - id: validate-structure
         name: Validate test structure
-        entry: python tests/special_sanity/validate_structure.py --impl-root verl_speco --tests-root tests --allow-dirs compat config examples heavy integration unit special_sanity
+        entry: python tests/special_sanity/validate_structure.py --impl-root verl_speco --tests-root tests --allow-dirs compat config examples heavy integration unit v1 special_sanity
         language: python
         pass_filenames: false
 
