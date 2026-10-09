@@ -1013,7 +1013,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 # Active freeze stops hidden-state feature collection (the
                 # drafter no longer trains); accept-length and PPO old_log_prob
                 # stay ungated. Shadow never sets _speco_drafter_frozen.
-                drafter_frozen=self._speco_drafter_frozen,
+                drafter_frozen=getattr(self, "_speco_drafter_frozen", False),
             ),
             self._speco_drafter_schedule_config(),
         )
@@ -3400,7 +3400,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 # Active freeze stops hidden-state collection here and in the
                 # scheduler plan; shadow mode keeps collecting. Accept-length
                 # evidence above is ungated and keeps feeding drift detection.
-                collection_allowed = not self._speco_drafter_frozen
+                collection_allowed = not getattr(
+                    self, "_speco_drafter_frozen", False
+                )
                 if collection_allowed:
                     collected = self._speco_collect_generation_samples(
                         gen_batch_output
