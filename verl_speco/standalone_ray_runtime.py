@@ -38,6 +38,14 @@ from verl_speco.standalone_tq_training_launcher import (
     _wait_for_owner_ready,
     _wait_for_vllm_ready,
     _vllm_is_ready,
+    validate_hidden_states_store,
+    validate_tq_backend,
+)
+from verl_speco.trainer.standalone_tracking import (
+    _build_standalone_tracking,
+    _finish_standalone_tracking,
+    _log_producer_tracking_metrics,
+    _log_standalone_tracking_metrics,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,6 +119,20 @@ class StandaloneProducerActor:
         self._notification_wakeup = asyncio.Event()
         self._notification_task: asyncio.Task[None] | None = None
         self._notification_batch_size = _producer_notification_batch_size(config)
+        self._metrics_pending: list[dict[str, Any]] = []
+
+    async def _on_metrics(
+        self, published_total: int, metrics: dict[str, float]
+    ) -> None:
+        if self._events is not None:
+            self._metrics_pending.append(
+                {
+                    "kind": "producer_metrics",
+                    "published_total": published_total,
+                    "metrics": dict(metrics),
+                }
+            )
+            self._notification_wakeup.set()
 
     async def _before_request(self) -> None:
         await self._run_gate.wait()
@@ -132,6 +154,12 @@ class StandaloneProducerActor:
             return
 
         while True:
+            if self._metrics_pending:
+                # Keep the snapshot until delivery succeeds. The producer's
+                # publish tasks only append scalars; queue RPCs run here.
+                await asyncio.to_thread(events.put, self._metrics_pending[0])
+                self._metrics_pending.pop(0)
+                continue
             pending = self._published_total - self._notified_published_total
             if pending <= 0:
                 if self._notification_finishing:
@@ -189,17 +217,18 @@ class StandaloneProducerActor:
                 self.config,
                 before_request=self._before_request,
                 on_published=self._on_published,
+                on_metrics=self._on_metrics,
                 get_runtime_state=lambda: (
                     "running" if self._run_gate.is_set() else "paused"
                 ),
             )
         except BaseException:
             if self._notification_task is not None:
-                self._notification_task.cancel()
-                try:
-                    await self._notification_task
-                except asyncio.CancelledError:
-                    pass
+                # run_producer flushes its partial window before cancellation
+                # reaches here; deliver it before returning from stop().
+                self._notification_finishing = True
+                self._notification_wakeup.set()
+                await self._notification_task
             raise
         self._notification_finishing = True
         self._notification_wakeup.set()
@@ -216,6 +245,7 @@ class StandaloneProducerActor:
         self._notification_finishing = False
         self._notification_wakeup.clear()
         self._notification_task = None
+        self._metrics_pending.clear()
         self._task = asyncio.create_task(self._run_producer())
         return {"started": True}
 
@@ -409,6 +439,34 @@ class StandaloneRayTrainer:
         tail_dropped = 0
         completed_steps = 0
         last_published_total = 0
+        trackers: list[Any] = []
+
+        def log_tracking_event(event: dict[str, Any]) -> None:
+            nonlocal tq_list_count, tq_list_seconds
+            if event.get("kind") == "training_metrics":
+                _log_standalone_tracking_metrics(
+                    trackers,
+                    event["metrics"],
+                    step=int(event["step"]),
+                )
+            elif event.get("kind") == "producer_metrics":
+                metrics = dict(event["metrics"])
+                # An actual metadata snapshot, not the scheduler's ready_hint.
+                # Includes assigned samples until the Consumer clears them.
+                started = time.monotonic()
+                try:
+                    metrics["tq/ready_samples"] = float(len(store.list_ready()))
+                except Exception:
+                    logger.exception("Failed to sample TQ size for Producer metrics")
+                finally:
+                    tq_list_count += 1
+                    tq_list_seconds += time.monotonic() - started
+                _log_producer_tracking_metrics(
+                    trackers,
+                    metrics,
+                    published_total=int(event["published_total"]),
+                )
+
         world_size = int(
             self.consumer_config.speco.draft_training.nproc_per_node
         ) * int(self.consumer_config.speco.draft_training.nnodes)
@@ -573,6 +631,7 @@ class StandaloneRayTrainer:
             return False
 
         try:
+            trackers = _build_standalone_tracking(self.consumer_config, rank=0)
             finished = reconcile_and_schedule("initialization")
             while not finished:
                 wait_refs = list(consumer_refs)
@@ -636,6 +695,9 @@ class StandaloneRayTrainer:
                         )
                     continue
                 kind = event.get("kind")
+                if kind in {"training_metrics", "producer_metrics"}:
+                    log_tracking_event(event)
+                    continue
                 if kind == "samples_published":
                     published_total = int(event.get("published_total", 0))
                     if published_total <= last_published_total:
@@ -730,12 +792,24 @@ class StandaloneRayTrainer:
             )
             raise
         finally:
-            store.close()
             if producer_ref is not None:
                 try:
                     self.ray.get(producer.stop.remote())
                 except Exception:  # noqa: BLE001
                     logger.exception("Failed to stop standalone Producer actor")
+            # Producer.stop() waits for the partial-window notification; workers
+            # already awaited on normal completion may have final metric events.
+            try:
+                while True:
+                    try:
+                        event = self.events_queue.get(block=False)
+                    except Empty:
+                        break
+                    if event.get("kind") in {"training_metrics", "producer_metrics"}:
+                        log_tracking_event(event)
+            finally:
+                _finish_standalone_tracking(trackers, rank=0)
+                store.close()
 
 
 def run_ray_actors(
@@ -767,6 +841,11 @@ def run_ray_pipeline(
 
     base_env = dict(os.environ if environ is None else environ)
     base_env["RAY_ADDRESS"] = ray_address
+    # Mirror the subprocess path: fail fast when the selected TQ transport or
+    # handle-based store points at an unreachable Mooncake master. This is the
+    # default runtime mode.
+    validate_tq_backend(base_env)
+    validate_hidden_states_store(base_env)
     owner = None
     vllm = None
     hidden_states_temp = None

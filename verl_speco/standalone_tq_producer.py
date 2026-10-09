@@ -33,6 +33,10 @@ from verl_speco.integration import transferqueue_bridge as default_transport
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
+from verl_speco.producer.hidden_states_store import (
+    HiddenStatesStoreConfig,
+    build_hidden_states_store,
+)
 from verl_speco.producer.input_reader import (
     GenerationRequest,
     SampleFilteredError,
@@ -44,6 +48,7 @@ from verl_speco.producer.input_reader import (
     tokenize_record,
     tokenize_record_with_render_boundary,
 )
+from verl_speco.producer.metrics import producer_window_metrics
 from verl_speco.producer.vllm_feature_client import (
     RawVllmFeature,
     VllmEndpoint,
@@ -124,6 +129,24 @@ def _cleanup_result_sync(result: PreparedFeature) -> float:
     cleanup_started = time.monotonic()
     delete_temporary_result(result.raw)
     return time.monotonic() - cleanup_started
+
+
+async def _delete_result_best_effort(result: RawVllmFeature) -> None:
+    """Best-effort cleanup for call sites without a retry policy.
+
+    ``HiddenStatesStore.release`` propagates deletion failures so the publish
+    cleanup loop can retry them; drop/filter paths must not abort on a
+    transient store error.
+    """
+    try:
+        await asyncio.to_thread(delete_temporary_result, result)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not break the producer
+        logger.warning(
+            "Standalone TQ Producer best-effort temporary cleanup failed; "
+            "ignoring path=%s error=%r",
+            result.temporary_path,
+            exc,
+        )
 
 
 async def publish_one(
@@ -297,6 +320,11 @@ def validate_producer_config(config: Any) -> str:
         )
     if int(producer_cfg.get("vllm_success_log_interval", 100)) < 0:
         raise ValueError("vllm_success_log_interval must be non-negative")
+    store_cfg = producer_cfg.get("hidden_states_store")
+    if store_cfg:
+        # Raises on an unsupported backend before the pool is built, without
+        # constructing a throwaway store (the pool builds the real one).
+        HiddenStatesStoreConfig.from_mapping(store_cfg)
     return _read_on_missing_response(producer_cfg)
 
 
@@ -373,6 +401,7 @@ async def run_producer(
     client_pool: Any | None = None,
     before_request: Any | None = None,
     on_published: Any | None = None,
+    on_metrics: Any | None = None,
     get_runtime_state: Any | None = None,
 ) -> ProducerStats:
     """Run the bounded input -> vLLM -> TQ pipeline and publish EOS on success."""
@@ -452,6 +481,9 @@ async def run_producer(
                 request_timeout=float(producer_cfg["request_timeout"]),
                 success_log_interval=int(
                     producer_cfg.get("vllm_success_log_interval", 100)
+                ),
+                hidden_states_store=build_hidden_states_store(
+                    producer_cfg.get("hidden_states_store")
                 ),
             )
         await pool.start()
@@ -910,7 +942,7 @@ async def run_producer(
                         # The generation request may still produce a prompt-only
                         # connector file. It is not the training payload; the
                         # following full-sequence prefill produces that payload.
-                        await asyncio.to_thread(delete_temporary_result, generated)
+                        await _delete_result_best_effort(generated)
                 mark_stage(worker, "vllm_prefill", request.sample_id)
                 prefill_started = time.monotonic()
                 try:
@@ -945,7 +977,7 @@ async def run_producer(
                     stats.pending_bytes = max(
                         stats.pending_bytes - int(raw.byte_size), 0
                     )
-                    await asyncio.to_thread(delete_temporary_result, raw)
+                    await _delete_result_best_effort(raw)
                     sample_timings.pop(int(request.sequence_no), None)
                     logger.warning(
                         "Standalone TQ Producer dropped misaligned sample "
@@ -961,6 +993,7 @@ async def run_producer(
                 consecutive_replacements = 0
                 mark_stage(worker, "publish_queue_put", request.sample_id)
                 timing["publish_queue_started"] = time.monotonic()
+                enqueue_started = time.monotonic()
                 await publish_queue.put(
                     PreparedFeature(
                         request=request,
@@ -972,15 +1005,17 @@ async def run_producer(
                         timing=timing,
                     )
                 )
+                timing["publish_queue_wait"] = time.monotonic() - enqueue_started
                 peak_publish_queue = max(peak_publish_queue, publish_queue.qsize())
 
-        def log_perf_window() -> None:
+        def log_perf_window(*, force: bool = False) -> dict[str, float] | None:
             nonlocal perf_window_started, peak_publish_queue
             nonlocal peak_publish_inflight, peak_pending_bytes
-            if len(perf_rows) < _PERF_WINDOW_SAMPLES:
-                return
+            if not perf_rows or (not force and len(perf_rows) < _PERF_WINDOW_SAMPLES):
+                return None
             now = time.monotonic()
             window = max(now - perf_window_started, 1e-9)
+            tracking_metrics = producer_window_metrics(perf_rows, window)
             timing_names = (
                 "e2e",
                 "input_prepare",
@@ -1094,6 +1129,7 @@ async def run_producer(
             peak_publish_queue = publish_queue.qsize()
             peak_publish_inflight = publish_inflight
             peak_pending_bytes = stats.pending_bytes
+            return tracking_metrics
 
         async def publish_results() -> None:
             nonlocal last_published_at, publish_inflight, peak_publish_inflight
@@ -1170,8 +1206,6 @@ async def run_producer(
                         put_elapsed,
                     )
                 stats.published_count += 1
-                if on_published is not None:
-                    await on_published(result.request.sequence_no)
                 last_published_at = time.monotonic()
                 if _should_log_sample_progress(stats.published_count):
                     logger.info(
@@ -1196,7 +1230,12 @@ async def run_producer(
                         "timing": result.timing,
                     }
                 )
-                log_perf_window()
+                window_metrics = log_perf_window()
+                published_total = stats.published_count
+                if window_metrics is not None and on_metrics is not None:
+                    await on_metrics(published_total, window_metrics)
+                if on_published is not None:
+                    await on_published(result.request.sequence_no)
 
         request_tasks = [
             asyncio.create_task(request_worker(), name=f"request-{index}")
@@ -1246,6 +1285,15 @@ async def run_producer(
                 raise failure_error
             await asyncio.gather(*pending)
         finally:
+            # Stop publishers before flushing so cancellation cannot race with
+            # late appends or leave request tasks writing into a closed client.
+            for task in [*tasks, *request_tasks]:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, *request_tasks, return_exceptions=True)
+            window_metrics = log_perf_window(force=True)
+            if window_metrics is not None and on_metrics is not None:
+                await on_metrics(stats.published_count, window_metrics)
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
 
@@ -1275,34 +1323,36 @@ async def run_producer(
         return stats
     finally:
         try:
+            if feature_executor is not None:
+                feature_executor.shutdown(wait=True)
+            if publish_executor is not None:
+                publish_executor.shutdown(wait=True)
+            if connected and completed:
+                # Keep every producer-side segment mounted until the consumer
+                # has fetched and cleared all samples. Mooncake allocates
+                # objects across a process's registered segments
+                # (allocation_strategy=random by default), so closing the
+                # hidden-state store first can unmount a segment that still
+                # holds unconsumed TQ fields; the consumer then fails with
+                # batch_get_into error -704 (object not found).
+                await _drain_pending_samples(
+                    transport,
+                    run_id,
+                    timeout=float(
+                        os.environ.get(
+                            "SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS", "1800"
+                        )
+                        or 0
+                    ),
+                    poll_interval=float(producer_cfg["pending_poll_interval_seconds"]),
+                )
+        finally:
             try:
                 if pool is not None:
                     await pool.close()
             finally:
-                if feature_executor is not None:
-                    feature_executor.shutdown(wait=True)
-                if publish_executor is not None:
-                    publish_executor.shutdown(wait=True)
-        finally:
-            if connected:
-                if completed:
-                    # Closing a remote store client unmounts the producer's
-                    # segment; wait until the consumer has fetched and cleared
-                    # every sample before releasing it.
-                    await _drain_pending_samples(
-                        transport,
-                        run_id,
-                        timeout=float(
-                            os.environ.get(
-                                "SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS", "1800"
-                            )
-                            or 0
-                        ),
-                        poll_interval=float(
-                            producer_cfg["pending_poll_interval_seconds"]
-                        ),
-                    )
-                transport.close_transfer_queue_client()
+                if connected:
+                    transport.close_transfer_queue_client()
 
 
 async def _wait_for_owner_ready(
