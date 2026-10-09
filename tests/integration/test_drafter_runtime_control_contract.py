@@ -25,6 +25,68 @@ _speco_ray_trainer = pytest.importorskip(
 SpecoRayPPOTrainer = _speco_ray_trainer.SpecoRayPPOTrainer
 
 
+def test_adaptive_feedback_uses_only_current_step_weighted_counts():
+    trainer = _trainer({}, step=8)
+    prefix = _speco_ray_trainer.SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX
+    for rounds, accepted in ((1, 1), (99, 199)):
+        trainer._speco_store_rollout_metrics(SimpleNamespace(non_tensor_batch={
+            f"{prefix}_drafts": [rounds],
+            f"{prefix}_accepted_tokens": [accepted],
+        }))
+    feedback = trainer._speco_drafter_schedule_context().acceptance_feedback
+    assert feedback.step == 8
+    assert feedback.sample_count == 100
+    assert feedback.mean_acceptance_length == 3.0
+    from verl_speco.trainer.scheduler import AdaptiveScheduleConfig
+
+    assert feedback.valid(AdaptiveScheduleConfig())
+    trainer.global_steps = 9
+    assert trainer._speco_acceptance_feedback() is None
+
+
+def test_adaptive_warmup_relaxes_trainer_collection_interval():
+    from verl_speco.trainer.scheduler import DrafterCollectionSource
+
+    trainer = _trainer({
+        "collect_hidden_states_from_old_logprob": True,
+        "collect_interval_steps": 5,
+        "training_interval_steps": 5,
+        "adaptive_schedule": {"enable": True, "warmup_max_steps": 3},
+    })
+    assert trainer._speco_plan_drafter_collection(DrafterCollectionSource.OLD_LOGPROB).collect
+    trainer.global_steps = 4
+    assert not trainer._speco_plan_drafter_collection(DrafterCollectionSource.OLD_LOGPROB).collect
+
+
+@pytest.mark.parametrize("accepted", [None, ["bad"], [-1], [float("nan")]])
+def test_adaptive_feedback_rejects_missing_or_corrupt_token_counts(accepted):
+    trainer = _trainer({}, step=1)
+    prefix = _speco_ray_trainer.SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX
+    trainer._speco_store_rollout_metrics(SimpleNamespace(non_tensor_batch={
+        f"{prefix}_drafts": [100], f"{prefix}_accepted_tokens": accepted,
+    }))
+    assert trainer._speco_acceptance_feedback() is None
+
+
+def test_adaptive_checkpoint_round_trip_through_trainer_hooks(tmp_path, monkeypatch):
+    cfg = {"adaptive_schedule": {"enable": True}}
+    trainer = _trainer(cfg, step=7)
+    trainer.config.trainer = SimpleNamespace(default_local_dir=str(tmp_path), resume_mode="auto")
+    trainer._speco_wait_pending_drafter_publish = lambda: 0
+    trainer._speco_save_drafter_checkpoint = lambda **kwargs: None
+    monkeypatch.setattr(_speco_ray_trainer.RayPPOTrainer, "_save_checkpoint", lambda self: None)
+    monkeypatch.setattr(_speco_ray_trainer.RayPPOTrainer, "_load_checkpoint", lambda self: None)
+    controller = trainer._speco_get_drafter_scheduler().configure_adaptive(trainer._speco_drafter_schedule_config())
+    controller.state.budget = 17
+    controller.state.warmup_ended_after = 6
+    trainer._save_checkpoint()
+    assert (tmp_path / "global_step_7" / "adaptive_schedule.json").is_file()
+    resumed = _trainer(cfg, step=7)
+    resumed.config.trainer = trainer.config.trainer
+    resumed._load_checkpoint()
+    assert resumed._speco_get_drafter_scheduler().adaptive_controller.state == controller.state
+
+
 class _FakeOldLogProbBatch:
     non_tensor_batch = {}
 
