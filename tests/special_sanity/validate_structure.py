@@ -26,7 +26,7 @@ python check_tests_structure.py
 python check_tests_structure.py \
     --impl-root verl_speco \
     --tests-root tests \
-    --allow-dirs compat config examples heavy integration unit special_sanity
+    --allow-dirs compat config examples heavy integration unit v1 special_sanity
 """
 
 from __future__ import annotations
@@ -93,6 +93,7 @@ def main() -> None:
             "heavy",
             "integration",
             "unit",
+            "v1",
             "special_sanity",
         ],
         help="Extra top-level test folders that are exempt from the rule",

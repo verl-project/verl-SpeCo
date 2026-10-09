@@ -159,7 +159,7 @@ class SpecoTaskRunner(_TaskRunnerBase):
             {
                 "__module__": __name__,
                 "__doc__": raw_worker_cls.__doc__,
-                "_speco_sglang_drafter_config_env": _serialize_drafter_config(config),
+                "_speco_drafter_config_env": _serialize_drafter_config(config),
             },
         )
         for role, role_worker_cls in list(self.role_worker_mapping.items()):
@@ -174,12 +174,17 @@ class SpecoTaskRunner(_TaskRunnerBase):
         from verl_speco.integration.compat import check_compatible_verl
 
         check_compatible_verl()
-        if _VERL_TASK_RUNNER_API == "0.9" and bool(config.trainer.get("use_v1", False)):
-            raise RuntimeError(
-                "verl-SpeCo extends the legacy RayPPOTrainer on release/v0.9.0; "
-                "set trainer.use_v1=false. The V1 trainer does not expose the "
-                "online drafter training and atomic weight-publish hooks yet."
-            )
+        trainer_config = getattr(config, "trainer", None)
+        use_v1 = (
+            trainer_config.get("use_v1", False)
+            if hasattr(trainer_config, "get")
+            else getattr(trainer_config, "use_v1", False)
+        )
+        if _VERL_TASK_RUNNER_API == "0.9" and bool(use_v1):
+            # Install this in the task-runner process before V1 creates its
+            # LLMServerManager and Ray workers, just as the legacy path does.
+            _install_vllm_import_compat_for_task_runner(config)
+            return self._run_with_v1_trainer(config)
         if not _drafter_rollout_enabled(config):
             # The no-drafter path must reach verl through the entry-level bypass
             # in ``verl_speco.main`` so SPECO runtime/compat patches stay
@@ -193,6 +198,97 @@ class SpecoTaskRunner(_TaskRunnerBase):
         # runner process before LLMServerManager imports verl's vLLM adapter.
         _install_vllm_import_compat_for_task_runner(config)
         return self._run_with_speco_trainer(config)
+
+    @staticmethod
+    def _v1_agent_loop_config(config):
+        """Return the upstream-facing V1 agent-loop config without SPECO extensions."""
+        from omegaconf import OmegaConf, open_dict
+
+        agent_config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
+        rollout = agent_config.actor_rollout_ref.rollout
+        if "drafter" in rollout:
+            with open_dict(rollout):
+                del rollout["drafter"]
+        return agent_config
+
+    def _run_with_v1_trainer(self, config):
+        """Run SPECO through verl's native V1 TransferQueue trainer.
+
+        V1 owns dataset construction, workers, replay-buffer sampling, and
+        checkpoint lifecycle.  The SPECO adapter is selected by mode and does
+        not replace the V1 agent-loop manager; this is important for a later
+        Uni-Agent integration.
+        """
+        if _VERL_TASK_RUNNER_API != "0.9":
+            raise RuntimeError("trainer.use_v1 requires verl release/v0.9.0")
+
+        import transfer_queue as tq
+        from pprint import pprint
+
+        from verl.trainer.ppo.v1 import AgentLoopManagerTQ
+        from verl.utils.import_utils import load_class_from_fqn
+        from verl_speco.integration.agent_loop_runtime import (
+            install_agent_loop_runtime_patch,
+        )
+        from verl_speco.trainer.v1.factory import get_speco_v1_trainer_cls
+
+        OmegaConf.resolve(config)
+        mode = str(config.trainer.v1.get("trainer_mode", "sync"))
+        trainer_cls = get_speco_v1_trainer_cls(mode)
+        config.transfer_queue.enable = True
+        pprint(OmegaConf.to_container(config, resolve=True))
+
+        logger.info("Initializing SPECO V1 TransferQueue")
+        tq.init(config.transfer_queue)
+        logger.info("Initialized SPECO V1 TransferQueue")
+        succeeded = False
+        trainer = None
+        try:
+            trainer = trainer_cls(config=config)
+            trainer.init()
+            manager_fqn = config.actor_rollout_ref.rollout.get("agent", {}).get(
+                "agent_loop_manager_class"
+            )
+            manager_cls = (
+                load_class_from_fqn(manager_fqn, "AgentLoopManager")
+                if manager_fqn
+                else AgentLoopManagerTQ
+            )
+            # V1 constructs agent-loop actors directly rather than through the
+            # legacy trainer.  Install the request-context and drain bridge
+            # before Ray snapshots their method table.
+            if _drafter_rollout_enabled(config):
+                install_agent_loop_runtime_patch()
+            manager = manager_cls.create(
+                config=self._v1_agent_loop_config(config),
+                llm_client=trainer.get_llm_client(),
+                teacher_client=trainer.get_teacher_client(),
+                reward_loop_worker_handles=trainer.get_reward_handles(),
+            )
+            logger.info(
+                "SPECO V1 trainer=%s manager=%s",
+                type(trainer).__name__,
+                type(manager).__name__,
+            )
+            # Keep drafter activation and the first real async decode outside
+            # trainer.fit(), so step 1 measures training work rather than lazy
+            # runtime initialization. The warmup batch remains normal step-1
+            # data in TransferQueue and is not regenerated or discarded.
+            trainer.prepare_for_fit(manager)
+            trainer.fit(manager)
+            logger.info("Completed SPECO V1 trainer fit")
+            succeeded = True
+        finally:
+            try:
+                tracking = getattr(trainer, "logger", None)
+                if tracking is not None:
+                    logger.info("Finishing SPECO V1 tracking")
+                    tracking.finish(exit_code=0 if succeeded else 1)
+                    logger.info("Finished SPECO V1 tracking")
+            finally:
+                logger.info("Closing SPECO V1 TransferQueue")
+                tq.close()
+                logger.info("Closed SPECO V1 TransferQueue")
 
     def _run_with_speco_trainer(self, config):
         from verl.utils.dataset.rl_dataset import collate_fn

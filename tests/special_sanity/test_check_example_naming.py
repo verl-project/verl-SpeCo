@@ -43,6 +43,17 @@ def test_npu_suffix_passes():
     assert _violations("run_qwen3-8b_drafter_eagle3_vllm_npu.sh") == []
 
 
+def test_async_v1_trainer_modes_pass():
+    assert (
+        _violations("run_qwen3-8b_drafter_dspark_colocate_async_vllm_npu.sh")
+        == []
+    )
+    assert (
+        _violations("run_qwen3-8b_drafter_dspark_separate_async_vllm_npu.sh")
+        == []
+    )
+
+
 def test_actor_backend_with_multiple_tokens_passes():
     assert (
         _violations(

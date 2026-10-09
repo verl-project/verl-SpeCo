@@ -416,6 +416,7 @@ def test_standalone_base_writer_defers_completion_marker(monkeypatch, tmp_path) 
         _is_checkpoint_leader=lambda: True,
         _get_pretrained_export_model=lambda: (_ExportModel(), None),
         _get_pretrained_export_state_dict=lambda: {"weight": torch.ones(1)},
+        _speco_checkpoint_buffer_state=lambda: None,
         _infer_pretrained_save_kwargs=lambda: {},
         _clear_existing_pretrained_weight_files=lambda path: None,
         _copy_drafter_auxiliary_files=lambda path: None,

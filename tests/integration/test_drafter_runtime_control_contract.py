@@ -17,6 +17,10 @@ from types import SimpleNamespace
 
 import pytest
 
+torch = pytest.importorskip("torch")
+
+from verl_speco.trainer.scheduler import CallbackDrafterWorkerExecutor
+
 
 _speco_ray_trainer = pytest.importorskip(
     "verl_speco.trainer.speco_ray_trainer",
@@ -71,7 +75,21 @@ def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
         )
     )
     trainer._pending_drafter_publish_refs = None
+    trainer._pending_target_lm_head_sync = None
     trainer._speco_last_collected_samples = 0
+    trainer._speco_get_drafter_scheduler().bind_worker_executor(
+        CallbackDrafterWorkerExecutor(
+            submit=lambda payload: [],
+            resolve=lambda value: value,
+            inspect_data=lambda last_n, full_batch: (
+                trainer.speco_get_drafter_training_data_status(last_n, full_batch)
+            ),
+            prepare=trainer._speco_prepare_drafter_training_rpc,
+            activate=lambda: [],
+            preflight=lambda payload: [],
+            abort_preflight=lambda plan_id: [],
+        )
+    )
     trainer._ray_get_if_needed = lambda value: value
     trainer.speco_get_drafter_training_data_status = lambda *args: [
         {
@@ -90,6 +108,44 @@ def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
         }
     ]
     return trainer
+
+
+def test_oldlogprob_collection_uses_collect_interval_with_data_buffer() -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "use_data_buffer": True,
+            "collect_interval_steps": 1,
+            "training_interval_steps": 100,
+        }
+    )
+    trainer._speco_online_enabled = lambda: True
+
+    plan = trainer._speco_plan_drafter_collection(
+        _speco_ray_trainer.DrafterCollectionSource.OLD_LOGPROB
+    )
+
+    assert plan.collect is True
+    assert plan.reason == "collection_enabled"
+
+
+def test_oldlogprob_collection_without_data_buffer_keeps_training_gate() -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "use_data_buffer": False,
+            "collect_interval_steps": 1,
+            "training_interval_steps": 100,
+        }
+    )
+    trainer._speco_online_enabled = lambda: True
+
+    plan = trainer._speco_plan_drafter_collection(
+        _speco_ray_trainer.DrafterCollectionSource.OLD_LOGPROB
+    )
+
+    assert plan.collect is False
+    assert plan.reason == "training_interval_not_reached"
 
 
 def _no_drafter_trainer(*, calculate_entropy=Ellipsis) -> SpecoRayPPOTrainer:
@@ -177,9 +233,10 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
     trainer._speco_set_drafter_global_step = lambda **kwargs: events.append(
         "set_global_step"
     )
-    trainer._speco_sync_target_lm_head_weight = lambda plan: events.append(
-        "sync_target_lm_head"
-    ) or {"drafter/target_lm_head_synced": 1}
+    trainer._speco_start_target_lm_head_weight_sync = lambda plan: (
+        events.append("sync_target_lm_head")
+        or ({"drafter/target_lm_head_synced": 1}, None)
+    )
     trainer._update_actor = lambda *args, **kwargs: events.append(
         "update_actor"
     ) or SimpleNamespace(meta_info={"metrics": {}})
@@ -206,7 +263,7 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
     assert output.meta_info["metrics"]["drafter/trained"] == 1
     assert output.meta_info["metrics"]["drafter/scheduler_used"] == 1
     assert output.meta_info["metrics"]["drafter/schedule_strategy"] == 0
-    assert output.meta_info["metrics"]["drafter/schedule_reason"] == 3
+    assert output.meta_info["metrics"]["drafter/schedule_launch"] == 1
 
 
 @pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "veomni"])
@@ -234,7 +291,7 @@ def test_oldlogprob_collection_rejects_unknown_actor_backend() -> None:
     )
     trainer.config.actor_rollout_ref.actor.strategy = "unknown"
 
-    with pytest.raises(ValueError, match="fsdp/fsdp2/veomni"):
+    with pytest.raises(ValueError, match="fsdp/fsdp2/megatron/veomni"):
         trainer._speco_oldlogprob_collection_enabled()
 
 
@@ -443,7 +500,7 @@ def test_target_head_sync_defers_for_all_lm_head_drafters(
     }
     received = []
     trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
-    trainer._speco_actor_rollout_method = lambda name: lambda rows: [payload]
+    trainer._speco_actor_rollout_method = lambda name: lambda rows, **kwargs: [payload]
     trainer._speco_build_drafter_target_lm_head_sync_args = (
         lambda value: (value, trainer.global_steps, 1)
     )
@@ -471,7 +528,7 @@ def test_target_head_transfer_waits_after_actor_update() -> None:
     resolved = []
     trainer._ray_get_if_needed = lambda value: resolved.append(value) or value
     trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
-    trainer._speco_actor_rollout_method = lambda name: lambda rows: [payload]
+    trainer._speco_actor_rollout_method = lambda name: lambda rows, **kwargs: [payload]
     trainer._speco_build_drafter_target_lm_head_sync_args = (
         lambda value: (value, trainer.global_steps, 1)
     )
@@ -514,6 +571,85 @@ def test_target_head_worker_dispatch_is_nonblocking() -> None:
     assert attrs["blocking"] is False
 
 
+def test_legacy_skip_compat_does_not_require_recipe_v1_fields() -> None:
+    from omegaconf import OmegaConf
+
+    trainer = SpecoRayPPOTrainer.__new__(SpecoRayPPOTrainer)
+    trainer.config = OmegaConf.create({"trainer": {"use_v1": False}})
+
+    trainer._speco_ensure_legacy_skip_config()
+
+    assert trainer.config.trainer.v1.trainer_mode == "sync"
+
+
+def test_legacy_skip_compat_leaves_v1_config_untouched() -> None:
+    from omegaconf import OmegaConf
+
+    trainer = SpecoRayPPOTrainer.__new__(SpecoRayPPOTrainer)
+    trainer.config = OmegaConf.create(
+        {"trainer": {"use_v1": True, "v1": {"trainer_mode": "separate_async"}}}
+    )
+
+    trainer._speco_ensure_legacy_skip_config()
+
+    assert trainer.config.trainer.v1.trainer_mode == "separate_async"
+
+
+def test_sync_publish_failure_restores_last_committed_drafter_payload() -> None:
+    trainer = _trainer({"publish_interval_steps": 1}, step=8)
+    trainer._speco_last_published_drafter_payload = {"weights": "old"}
+    trainer._speco_last_published_drafter_step = 7
+    calls = []
+
+    def update(payload, global_steps=None):
+        calls.append((payload, global_steps))
+        return "new-ref" if payload["weights"] == "new" else "rollback-ref"
+
+    trainer._speco_actor_rollout_method = lambda _name: update
+
+    def resolve(value):
+        if value == "new-ref":
+            raise RuntimeError("injected replica failure")
+        return value
+
+    trainer._ray_get_if_needed = resolve
+
+    with pytest.raises(RuntimeError, match="injected replica failure"):
+        trainer._speco_update_rollout_drafter_weights(
+            {"weights": "new"}, global_step=8, asynchronous=False
+        )
+
+    assert calls == [({"weights": "new"}, 8), ({"weights": "old"}, 7)]
+
+
+def test_async_publish_failure_restores_last_committed_drafter_payload() -> None:
+    trainer = _trainer({"publish_interval_steps": 1}, step=8)
+    trainer._speco_last_published_drafter_payload = {"weights": "old"}
+    trainer._speco_last_published_drafter_step = 7
+    calls = []
+
+    def update(payload, global_steps=None):
+        calls.append((payload, global_steps))
+        return "new-ref" if payload["weights"] == "new" else "rollback-ref"
+
+    trainer._speco_actor_rollout_method = lambda _name: update
+
+    def resolve(value):
+        if value == "new-ref":
+            raise RuntimeError("injected async replica failure")
+        return value
+
+    trainer._ray_get_if_needed = resolve
+    trainer._speco_update_rollout_drafter_weights(
+        {"weights": "new"}, global_step=8, asynchronous=True
+    )
+
+    with pytest.raises(RuntimeError, match="injected async replica failure"):
+        trainer._speco_wait_pending_drafter_publish_rpc()
+
+    assert calls == [({"weights": "new"}, 8), ({"weights": "old"}, 7)]
+
+
 def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:
     calls: list[tuple[str, object, int]] = []
     waited: list[object] = []
@@ -531,7 +667,8 @@ def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:
     assert waited == [["old-ref"]]
     assert calls == [("update_draft_weights_async", {"weights": 1}, 10)]
     assert trainer._pending_drafter_publish_refs == ["new-ref"]
-    assert metrics == {"drafter/publish_attempted": 1, "drafter/published": 1}
+    assert metrics["drafter/publish_attempted"] == 1
+    assert metrics["drafter/published"] == 1
 
 
 def test_disabled_or_untrained_drafter_does_not_publish() -> None:
@@ -608,3 +745,91 @@ def test_actor_checkpoint_failure_preserves_previous_drafter(monkeypatch) -> Non
         ("drafter", {"wait": True}),
         ("actor", {}),
     ]
+
+
+def _oldlogprob_collect_plan_trainer() -> SpecoRayPPOTrainer:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_interval_steps": 1,
+            "training_interval_steps": 1,
+            "hidden_state_window_tokens_per_sample": 2,
+        }
+    )
+    trainer._speco_oldlogprob_collection_enabled = lambda: True
+    trainer._speco_plan_drafter_collection = lambda source: SimpleNamespace(
+        collect=True,
+        sample_rate=1.0,
+        max_samples_per_replica=None,
+        max_tokens_per_replica=None,
+        collection_id="response-mask-contract",
+    )
+    trainer._speco_log_drafter_collection_plan = lambda plan: None
+    trainer._speco_owner_bucket_count = lambda: 1
+    trainer._speco_dispatch_bucket_count = lambda: None
+    return trainer
+
+
+def _oldlogprob_batch(response_mask: list[int]) -> SimpleNamespace:
+    return SimpleNamespace(
+        batch={
+            "prompts": torch.tensor([[11, 12]]),
+            "responses": torch.tensor([[21, 22, 23]]),
+            "attention_mask": torch.ones((1, 5), dtype=torch.long),
+            "response_mask": torch.tensor([response_mask], dtype=torch.long),
+        }
+    )
+
+
+def test_oldlogprob_collect_plan_honors_response_mask_before_window_selection() -> None:
+    trainer = _oldlogprob_collect_plan_trainer()
+
+    plan = trainer._speco_build_oldlogprob_collect_plan(
+        _oldlogprob_batch([1, 1, 0])
+    )
+
+    assert plan is None
+    assert trainer._speco_last_oldlogprob_candidate_samples == 0
+    assert trainer._speco_last_oldlogprob_short_response_skipped == 1
+
+
+def test_oldlogprob_collect_plan_tracks_short_response_skip_metric_state() -> None:
+    trainer = _oldlogprob_collect_plan_trainer()
+
+    plan = trainer._speco_build_oldlogprob_collect_plan(
+        _oldlogprob_batch([1, 1, 1])
+    )
+
+    assert plan is not None
+    assert plan["response_lens"] == [3]
+    assert plan["selected_count"] == 1
+    assert trainer._speco_last_oldlogprob_short_response_skipped == 0
+
+
+def test_oldlogprob_collection_omits_masked_response_token_from_payload() -> None:
+    trainer = _oldlogprob_collect_plan_trainer()
+    batch = SimpleNamespace(
+        batch={
+            "prompts": torch.tensor([[11, 12]]),
+            "responses": torch.tensor([[21, 22, 23, 24]]),
+            "attention_mask": torch.ones((1, 6), dtype=torch.long),
+            "response_mask": torch.tensor([[1, 1, 1, 0]], dtype=torch.long),
+        }
+    )
+    collect_plan = trainer._speco_build_oldlogprob_collect_plan(batch)
+    assert collect_plan is not None
+    captured = {}
+    trainer._speco_execute_collection = lambda plan, payload: (
+        captured.setdefault("payload", payload)
+        or SimpleNamespace(collected_samples=1)
+    )
+    output = {
+        _speco_ray_trainer.OLD_LOGPROB_HIDDEN_STATES_KEY: torch.arange(
+            6, dtype=torch.float32
+        ).reshape(1, 3, 2)
+    }
+
+    assert trainer._speco_collect_oldlogprob_features(batch, collect_plan, output) == 1
+    sample = captured["payload"].buckets[0][0]
+    assert sample["responses"].tolist() == [[21, 22, 23]]
+    assert sample["input_ids"].tolist() == [[11, 12, 21, 22, 23]]

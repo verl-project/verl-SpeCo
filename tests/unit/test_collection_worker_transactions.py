@@ -34,6 +34,8 @@ def _worker() -> SpecoWorker:
     )
     worker._staged_rollout_features = {}
     worker._collection_commit_journals = {}
+    worker.replica_rank = 0
+    worker.worker_incarnation = "worker-0"
     return worker
 
 
@@ -87,6 +89,16 @@ def _collect_only_worker() -> tuple[SpecoWorker, _FeatureWriter]:
     worker.last_global_step = 4
     worker._get_feature_writer = lambda: writer
     return worker, writer
+
+
+def test_collect_only_non_leader_acknowledges_without_writing() -> None:
+    worker, writer = _collect_only_worker()
+    worker.is_drafter_group_leader = False
+
+    stored = worker._write_rollout_feature_sample({}, None, None)
+
+    assert stored is True
+    assert writer.written == []
 
 
 def test_collect_only_rollback_discards_unpublished_feature_samples() -> None:

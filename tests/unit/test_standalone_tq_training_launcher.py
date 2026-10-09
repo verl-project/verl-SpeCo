@@ -21,6 +21,8 @@ from types import SimpleNamespace
 from omegaconf import OmegaConf
 import pytest
 
+pytest.importorskip("torch")
+
 from verl_speco.standalone_tq_training_launcher import (
     _hidden_states_store_overrides,
     _preflight_input_file,

@@ -32,6 +32,13 @@ import time
 import dataclasses
 from typing import Any, Optional, cast
 
+from verl_speco.integration.drafter_config_env import (
+    SPECO_DRAFTER_CONFIG_ENV,
+    clear_drafter_config_env,
+    get_drafter_config_env,
+    set_drafter_config_env,
+)
+
 # The DFlash2 checkpoint contract and IPC allocator helpers live with the vLLM
 # runtime; they are engine-agnostic, but that module runs import-time patches
 # (transformers constants, NPU import compat), so this module imports them
@@ -90,7 +97,6 @@ def _plan_sglang_drafter_collection(
     )
 
 
-SPECO_SGLANG_DRAFTER_CONFIG_ENV = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
 SPECO_SGLANG_RUNTIME_PATCHED_ENV = "VERL_SPECO_SGLANG_RUNTIME_PATCHED"
 SPECO_TARGET_WEIGHT_LOADER = (
     "verl_speco.integration.sglang_runtime.speco_sglang_target_weight_loader"
@@ -188,13 +194,13 @@ def _is_npu_runtime() -> bool:
 
 
 def _load_env_drafter_config() -> dict[str, Any]:
-    raw = os.getenv(SPECO_SGLANG_DRAFTER_CONFIG_ENV)
+    raw = get_drafter_config_env()
     if not raw:
         return {}
     try:
         loaded = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid {SPECO_SGLANG_DRAFTER_CONFIG_ENV}: {exc}") from exc
+        raise RuntimeError(f"Invalid {SPECO_DRAFTER_CONFIG_ENV}: {exc}") from exc
     return loaded if isinstance(loaded, dict) else {}
 
 
@@ -209,15 +215,15 @@ def configure_sglang_runtime_from_config(config: Any) -> dict[str, Any]:
     )
     enabled = bool(drafter.get("enable"))
     if not enabled:
-        os.environ.pop(SPECO_SGLANG_DRAFTER_CONFIG_ENV, None)
+        clear_drafter_config_env()
         return {}
 
-    os.environ[SPECO_SGLANG_DRAFTER_CONFIG_ENV] = json.dumps(drafter, sort_keys=True)
+    set_drafter_config_env(json.dumps(drafter, sort_keys=True))
     return drafter
 
 
 def clear_sglang_runtime_config() -> None:
-    os.environ.pop(SPECO_SGLANG_DRAFTER_CONFIG_ENV, None)
+    clear_drafter_config_env()
 
 
 def _drafter_collects_hidden_from_sgl(drafter_cfg: dict[str, Any]) -> bool:
@@ -2359,7 +2365,7 @@ def _build_speco_replica_class(upstream_module):
                     0 + self.replica_rank * replica_world_size
                 ) % self.gpus_per_node
 
-            drafter_env = os.getenv(SPECO_SGLANG_DRAFTER_CONFIG_ENV, "")
+            drafter_env = get_drafter_config_env()
             for node_rank in range(self.nnodes):
                 node_cuda_visible_devices_set = worker_cuda_visible_devices[
                     node_rank * self.gpus_per_replica_node : (node_rank + 1)
@@ -2388,7 +2394,7 @@ def _build_speco_replica_class(upstream_module):
 
                 env_vars = {f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1"}
                 if drafter_env:
-                    env_vars[SPECO_SGLANG_DRAFTER_CONFIG_ENV] = drafter_env
+                    env_vars[SPECO_DRAFTER_CONFIG_ENV] = drafter_env
                 server = self.server_class.options(
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id,
@@ -2453,7 +2459,7 @@ def install_upstream_sglang_runtime_bridge(*, base_compat_only: bool = False) ->
     global _SGLANG_REPLICA_PATCHED
     if _SGLANG_REPLICA_PATCHED:
         return True
-    if not base_compat_only and not os.getenv(SPECO_SGLANG_DRAFTER_CONFIG_ENV):
+    if not base_compat_only and not get_drafter_config_env():
         return False
 
     try:

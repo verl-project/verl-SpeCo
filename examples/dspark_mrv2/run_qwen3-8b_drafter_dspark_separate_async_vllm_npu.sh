@@ -1,7 +1,8 @@
+#!/usr/bin/env bash
+# MRV2 baseline parameters, with V1 separate-async 8-trainer/8-rollout enabled.
+set -euo pipefail
 set -x
 
-# vLLM V1 engine + native MRV2 model runner. MRV2 exposes method=dspark
-# directly; the MRV1 DFlash registry/runtime aliases must not be installed.
 export VLLM_USE_V1=1
 export VLLM_USE_V2_MODEL_RUNNER=1
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
@@ -20,18 +21,15 @@ export SPECO_JEMALLOC_RECLAIM_MODE="${SPECO_JEMALLOC_RECLAIM_MODE:-purge}"
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
 
-# Native fixed-K MRV2 does not consume the confidence head. All parameters not
-# listed as MRV2-specific below intentionally match the repository's original
-# run_qwen3-8b_drafter_dspark_vllm_npu.sh example.
 project_name='verl_grpo_example_dspark_drafter'
-exp_name='qwen3_8b_dspark_mrv2_drafter_vllm_npu'
-
+exp_name='qwen3_8b_dspark_mrv2_separate_async_vllm_npu'
 gen_tp=2
 train_sp=4
-ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-16}
+ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-16}
 spec_verify_tokens=${SPECO_DSPARK_VERIFY_TOKENS:-7}
+rollout_max_model_len=${SPECO_ROLLOUT_MAX_MODEL_LEN:-9216}
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint
@@ -39,10 +37,9 @@ TRAIN_FILE=/path/to/train_file
 TEST_FILE=/path/to/test_file
 DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter
 
-
-PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
+PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_v1_trainer \
     algorithm.adv_estimator=grpo \
-    transfer_queue.enable=False \
+    transfer_queue.enable=True \
     ray_kwargs.ray_init.num_cpus=${ray_num_cpus} \
     +ray_kwargs.ray_init._system_config.prestart_worker_first_driver=false \
     +ray_kwargs.ray_init._system_config.num_workers_soft_limit=${ray_worker_soft_limit} \
@@ -51,6 +48,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     data.train_batch_size=64 \
     data.max_prompt_length=512 \
     data.max_response_length=8192 \
+    actor_rollout_ref.rollout.max_model_len=${rollout_max_model_len} \
     data.filter_overlong_prompts=False \
     data.filter_overlong_prompts_workers=256 \
     data.val_batch_size=null \
@@ -77,6 +75,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.n_gpus_per_node=16 \
+    actor_rollout_ref.rollout.nnodes=1 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_capture_sizes="[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.max_cudagraph_capture_size=512 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode="FULL_DECODE_ONLY" \
@@ -93,6 +93,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.rollout.drafter.enable=True \
     actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
+    actor_rollout_ref.rollout.drafter.training.use_data_buffer=True \
+    actor_rollout_ref.rollout.drafter.training.data_buffer_max_size=1024 \
     actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH} \
     actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK \
     actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True \
@@ -129,6 +131,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.load_format="auto" \
     actor_rollout_ref.actor.strategy=fsdp2 \
     algorithm.use_kl_in_reward=False \
+    trainer.v1.trainer_mode=separate_async \
+    trainer.v1.separate_async.parameter_sync_step=4 \
     trainer.val_before_train=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console"]' \

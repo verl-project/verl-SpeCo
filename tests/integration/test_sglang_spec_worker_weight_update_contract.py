@@ -207,6 +207,7 @@ def test_unrouted_publish_updates_draft_then_target(
     sglang_patch._target_weight_loader = None
     sglang_patch._draft_weight_loader = None
     monkeypatch.delenv("VERL_SPECO_SGLANG_DRAFTER_CONFIG")
+    monkeypatch.delenv("VERL_SPECO_DRAFTER_CONFIG", raising=False)
     sglang_patch.patch_sglang_eagle_update_weights_from_tensor()
     worker = spec_workers[0]()
     ok, _ = worker.update_weights_from_tensor(_request([("c", 3)]))

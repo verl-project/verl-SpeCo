@@ -542,6 +542,15 @@ class SpecoWorker(Worker):
         self.feature_writer_path = path
         return self.feature_writer
 
+    def _feature_store_checkpoint_configured(self) -> bool:
+        feature_store_cfg = self.config.rollout.drafter.training.get(
+            "feature_store", None
+        )
+        return bool(
+            feature_store_cfg is not None
+            and _config_str(feature_store_cfg.get("path", None))
+        )
+
     def _build_rollout_loss_mask(
         self, batch: dict, input_ids: torch.Tensor
     ) -> torch.Tensor:
@@ -583,6 +592,11 @@ class SpecoWorker(Worker):
         *,
         collection_id: Optional[str] = None,
     ) -> bool:
+        # Collection RPCs execute on every tensor-parallel member.  They must all
+        # acknowledge the sample for the transaction to succeed, but feature-store
+        # shards are replica-owned: only the drafter group leader may persist them.
+        if not self.is_drafter_group_leader:
+            return True
         writer = self._get_feature_writer()
         if writer is None:
             logger.warning(
@@ -631,6 +645,7 @@ class SpecoWorker(Worker):
         )
         metadata = {
             "source": batch.get("hidden_target_logprobs_source", "rl_rollout"),
+            "collection_id": str(collection_id) if collection_id is not None else None,
             "global_step": batch.get("global_step", self.last_global_step),
             "target_model_path": target_model_path,
             "drafter_model_path": _config_str(
@@ -1149,6 +1164,55 @@ class SpecoWorker(Worker):
                 result,
             )
         return result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_feature_store_checkpoint_state(self, global_step: int):
+        """Persist the Feature Store manifest cursor at an actor checkpoint boundary."""
+
+        if not self._feature_store_checkpoint_configured():
+            return {"saved": False, "reason": "feature_store_disabled"}
+        if not self.in_drafter_train_group:
+            return {"saved": False, "reason": "not_in_training_group"}
+        if not self.is_drafter_group_leader:
+            return {"saved": False, "reason": "not_feature_store_leader"}
+        if global_step is None:
+            return {"saved": False, "reason": "missing_global_step"}
+        writer = self._get_feature_writer()
+        if writer is None:
+            return {"saved": False, "reason": "feature_store_unavailable"}
+        return {
+            "saved": True,
+            "global_step": int(global_step),
+            "worker_id": str(self.replica_rank),
+            "cursor": writer.checkpoint_state(),
+        }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def restore_feature_store_checkpoint_state(self, state: dict[str, Any]):
+        """Fail closed if the resumed Feature Store no longer has the saved prefix."""
+
+        if not self._feature_store_checkpoint_configured():
+            return {"restored": False, "reason": "feature_store_disabled"}
+        if not self.in_drafter_train_group:
+            return {"restored": False, "reason": "not_in_training_group"}
+        if not self.is_drafter_group_leader:
+            return {"restored": False, "reason": "not_feature_store_leader"}
+        if not isinstance(state, dict):
+            raise TypeError("Feature-store checkpoint payload must be a mapping")
+        cursor = state.get("cursor", state)
+        if not isinstance(cursor, dict):
+            raise ValueError("Feature-store checkpoint cursor must be a mapping")
+        writer = self._get_feature_writer()
+        if writer is None:
+            raise RuntimeError(
+                "Feature-store checkpoint configured but writer is unavailable"
+            )
+        restored = writer.restore_checkpoint_state(cursor)
+        return {
+            "restored": True,
+            "worker_id": str(self.replica_rank),
+            "cursor": restored,
+        }
 
     @register(
         dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_TARGET_SYNC_MESH),
