@@ -164,6 +164,7 @@ def _small_dspark_training_model(
     l1_chunk_size: int = 0,
     loss_mode: str = "full_vocab",
     distribution_loss_impl: str = "auto",
+    ce_target_source: str = "labels",
 ):
     config = DSparkConfig(
         hidden_size=8,
@@ -192,6 +193,7 @@ def _small_dspark_training_model(
         l1_loss_alpha=l1_loss_alpha,
         l1_chunk_size=l1_chunk_size,
         distribution_loss_impl=distribution_loss_impl,
+        ce_target_source=ce_target_source,
     )
 
 
@@ -680,6 +682,159 @@ def test_dspark_l1_reuses_only_full_vocab_ce_log_probs(
         for parameter in model.parameters()
         if parameter.requires_grad
     )
+
+
+def test_dspark_restricted_ce_vocab_uses_label_targets(monkeypatch):
+    model = _small_dspark_training_model(
+        block_size=2,
+        loss_mode="restricted_ce",
+        distribution_loss_impl="eager",
+    )
+
+    def fixed_anchors(_seq_len, _loss_mask, device, **_kwargs):
+        return (
+            torch.tensor([[1, 2]], dtype=torch.long, device=device),
+            torch.tensor([[True, True]], dtype=torch.bool, device=device),
+        )
+
+    captured_targets = []
+    original_build_restricted_vocab = model._build_restricted_vocab
+
+    def capture_restricted_vocab(input_ids, active_targets, vocab_size):
+        captured_targets.append(active_targets.detach().cpu().clone())
+        return original_build_restricted_vocab(input_ids, active_targets, vocab_size)
+
+    monkeypatch.setattr(model, "_sample_anchor_positions", fixed_anchors)
+    monkeypatch.setattr(
+        model, "_build_restricted_vocab", capture_restricted_vocab
+    )
+
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    hidden_states = [torch.randn(1, 5, 8), torch.randn(1, 5, 8)]
+    target_last_hidden_states = torch.zeros(1, 5, 8)
+    target_last_hidden_states[0, 1, 0] = 1.0
+    target_last_hidden_states[0, 2, 1] = 1.0
+    target_last_hidden_states[0, 3, 2] = 1.0
+    lm_head_weight = torch.zeros(32, 8)
+    lm_head_weight[7, 0] = 10.0
+    lm_head_weight[8, 1] = 10.0
+    lm_head_weight[9, 2] = 10.0
+
+    loss, *_rest, diagnostics = model(
+        input_ids=input_ids,
+        hidden_states_list=hidden_states,
+        loss_mask=loss_mask,
+        lm_head_weight=lm_head_weight,
+        target_last_hidden_states=target_last_hidden_states,
+    )
+
+    assert torch.isfinite(loss)
+    assert diagnostics["ce_weighted_token_count"].item() > 0
+    assert len(captured_targets) == 1
+    assert captured_targets[0].tolist() == [3, 4, 4, 5]
+
+
+@pytest.mark.parametrize(
+    "loss_mode",
+    ["restricted_ce", "sampled_ce"],
+)
+def test_dspark_target_argmax_ce_rejects_restricted_modes(loss_mode):
+    model = _small_dspark_training_model(
+        block_size=2,
+        loss_mode=loss_mode,
+        ce_target_source="target_argmax",
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    hidden_states = [torch.randn(1, 5, 8), torch.randn(1, 5, 8)]
+    target_last_hidden_states = torch.randn(1, 5, 8)
+    lm_head_weight = torch.randn(32, 8)
+
+    with pytest.raises(ValueError, match="dspark_loss_mode='full_vocab'"):
+        model(
+            input_ids=input_ids,
+            hidden_states_list=hidden_states,
+            loss_mask=loss_mask,
+            lm_head_weight=lm_head_weight,
+            target_last_hidden_states=target_last_hidden_states,
+        )
+
+
+def test_dspark_target_argmax_ce_rejects_l1_chunking():
+    model = _small_dspark_training_model(
+        block_size=2,
+        l1_chunk_size=2,
+        ce_target_source="target_argmax",
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    hidden_states = [torch.randn(1, 5, 8), torch.randn(1, 5, 8)]
+    target_last_hidden_states = torch.randn(1, 5, 8)
+    lm_head_weight = torch.randn(32, 8)
+
+    with pytest.raises(ValueError, match="dspark_l1_chunk_size=0"):
+        model(
+            input_ids=input_ids,
+            hidden_states_list=hidden_states,
+            loss_mask=loss_mask,
+            lm_head_weight=lm_head_weight,
+            target_last_hidden_states=target_last_hidden_states,
+        )
+
+
+def test_dspark_target_argmax_ce_reuses_target_logits_for_l1(monkeypatch):
+    model = _small_dspark_training_model(
+        block_size=2,
+        l1_loss_alpha=0.5,
+        ce_target_source="target_argmax",
+        distribution_loss_impl="eager",
+    )
+    captured_target_logits = []
+    original_compute_l1 = model._compute_l1_loss_for_active
+
+    def capture_compute_l1(**kwargs):
+        captured_target_logits.append(kwargs.get("active_target_logits"))
+        return original_compute_l1(**kwargs)
+
+    monkeypatch.setattr(model, "_compute_l1_loss_for_active", capture_compute_l1)
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    hidden_states = [torch.randn(1, 5, 8), torch.randn(1, 5, 8)]
+    target_last_hidden_states = torch.randn(1, 5, 8)
+    lm_head_weight = torch.randn(32, 8)
+
+    loss, *_rest, diagnostics = model(
+        input_ids=input_ids,
+        hidden_states_list=hidden_states,
+        loss_mask=loss_mask,
+        lm_head_weight=lm_head_weight,
+        target_last_hidden_states=target_last_hidden_states,
+    )
+
+    assert torch.isfinite(loss)
+    assert diagnostics["l1_weighted_token_count"].item() > 0
+    assert len(captured_target_logits) == 1
+    assert captured_target_logits[0] is not None
+
+
+def test_dspark_target_argmax_ce_requires_target_hidden_states():
+    model = _small_dspark_training_model(
+        block_size=2,
+        ce_target_source="target_argmax",
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    hidden_states = [torch.randn(1, 5, 8), torch.randn(1, 5, 8)]
+    lm_head_weight = torch.randn(32, 8)
+
+    with pytest.raises(ValueError, match="target_argmax CE requires"):
+        model(
+            input_ids=input_ids,
+            hidden_states_list=hidden_states,
+            loss_mask=loss_mask,
+            lm_head_weight=lm_head_weight,
+        )
 
 
 def test_from_dspark_dict_normalizes_transformer_layer_config() -> None:
