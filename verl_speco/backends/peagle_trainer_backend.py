@@ -283,6 +283,7 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
         self.vocab_size = draft_config.vocab_size
 
         checkpoint_has_vocab_mapping = False
+        checkpoint_has_embedding = False
         if spec_model_path and os.path.exists(
             os.path.join(spec_model_path, "config.json")
         ):
@@ -297,11 +298,13 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
             if isinstance(loaded, tuple):
                 drafter_module, loading_info = loaded
                 missing_keys = set(loading_info.get("missing_keys", []))
+                checkpoint_has_embedding = "embed_tokens.weight" not in missing_keys
                 checkpoint_has_vocab_mapping = not {"t2d", "d2t"}.intersection(
                     missing_keys
                 )
             else:
                 drafter_module = loaded
+                checkpoint_has_embedding = True
                 checkpoint_has_vocab_mapping = self._has_valid_vocab_mapping(
                     drafter_module
                 )
@@ -325,9 +328,9 @@ class PEagleTrainerBackend(Eagle3TrainerBackend):
                 )
         self._validate_vocab_mapping(drafter_module)
 
-        # P-EAGLE trains the draft embeddings (speculators sets embed_requires_grad=True),
-        # so seed them from the target but do NOT freeze.
-        drafter_module.load_embedding(self.config.model.path)
+        # Seed a new embedding; a resumed draft must retain its trained values.
+        if not checkpoint_has_embedding:
+            drafter_module.load_embedding(self.config.model.path)
 
         target_device = (
             torch.device(f"{device_name}:{get_device_id()}")
