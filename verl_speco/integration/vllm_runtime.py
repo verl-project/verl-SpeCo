@@ -1294,6 +1294,68 @@ def assert_lossless_vllm_speculative_config(config: Any, *, allow_lossy: bool) -
         )
 
 
+def _dspark_dynamic_spec_config_from_rollout(
+    rollout_cfg: Any,
+) -> dict[str, Any] | None:
+    """Return the validated DSpark dynamic-spec config, or ``None`` if unused.
+
+    The dynamic (confidence-threshold) verify-budget path added by
+    vllm-ascend#13216 is registered under the native ``dspark`` method on the V1
+    model runner, rather than the legacy Ascend ``dflash`` alias used by static
+    DSpark. It is opt-in through
+    ``rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config``.
+    """
+
+    dynamic_config = _get_nested(
+        rollout_cfg,
+        (
+            "engine_kwargs",
+            "vllm",
+            "additional_config",
+            "dynamic_spec_config",
+        ),
+        None,
+    )
+    if dynamic_config is None:
+        return None
+    dynamic_config = _plain_container(dynamic_config)
+    if not isinstance(dynamic_config, dict):
+        raise TypeError(
+            "rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config "
+            "must be a mapping"
+        )
+    method = dynamic_config.get("method")
+    if method is None or str(method).strip() == "":
+        return None
+    if str(method).strip().lower() != "dspark":
+        raise ValueError(
+            "vLLM-Ascend dynamic speculative decoding currently supports only "
+            "dynamic_spec_config.method=dspark"
+        )
+    method_params = dynamic_config.get("method_params") or {}
+    if not isinstance(method_params, dict):
+        raise TypeError("dynamic_spec_config.method_params must be a mapping")
+    for key in ("initial_verify_budget_per_req", "budget_update_interval"):
+        value = method_params.get(key)
+        if value is not None and _positive_int_or_none(value) is None:
+            raise ValueError(
+                f"dynamic_spec_config.method_params.{key} must be positive"
+            )
+    threshold = method_params.get("budget_threshold")
+    if threshold is not None:
+        try:
+            threshold_value = float(threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "dynamic_spec_config.method_params.budget_threshold must be a number"
+            ) from exc
+        if not 0.0 <= threshold_value <= 1.0:
+            raise ValueError(
+                "dynamic_spec_config.method_params.budget_threshold must be in [0, 1]"
+            )
+    return dynamic_config
+
+
 def build_vllm_speculative_config_from_drafter(
     drafter_cfg: dict[str, Any],
     rollout_cfg: Any = None,
@@ -1304,7 +1366,18 @@ def build_vllm_speculative_config_from_drafter(
         return {}
 
     algorithm = _drafter_algorithm(drafter_cfg)
+    dynamic_spec_config = _dspark_dynamic_spec_config_from_rollout(rollout_cfg)
+    if dynamic_spec_config is not None and algorithm != "DSPARK":
+        raise ValueError(
+            "dynamic_spec_config.method=dspark requires "
+            "drafter.speculative_algorithm=DSPARK"
+        )
     method = _speculative_method_from_drafter(drafter_cfg)
+    if dynamic_spec_config is not None:
+        # Static DSpark keeps the legacy Ascend dflash alias for older runtimes.
+        # The dynamic pipeline added by vllm-ascend#13216 is registered under the
+        # native dspark method and consumes confidence-head outputs.
+        method = "dspark"
     spec_model_path = _first_present(
         drafter_cfg.get("model_path"),
         drafter_cfg.get("checkpoint_path"),
@@ -1337,6 +1410,19 @@ def build_vllm_speculative_config_from_drafter(
                 algorithm=algorithm,
                 config=drafter_checkpoint_config,
                 num_speculative_tokens=num_speculative_tokens,
+            )
+        if dynamic_spec_config is not None and not _dspark_confidence_head_enabled(
+            drafter_checkpoint_config
+        ):
+            # The dynamic verify budget is driven by the confidence head; an
+            # engine started from a checkpoint that does not declare one cannot
+            # consume the trained head and would silently ignore the budget.
+            raise ValueError(
+                "dynamic_spec_config.method=dspark requires a drafter checkpoint "
+                "that declares a confidence head (enable_confidence_head=true or "
+                f"confidence_head_alpha>0); got model_path={spec_model_path}. Train "
+                "and export the confidence head first (see "
+                "examples/dynamic/run_qwen3-8b_drafter_dspark_vllm_npu.sh)."
             )
         if algorithm == "DFLASH2":
             _assert_vllm_supports_dflash2()
@@ -1397,6 +1483,10 @@ def build_vllm_speculative_config_from_drafter(
         )
     canonical_speculative_config = dict(speculative_config)
     speculative_config.update(_plain_container(overrides))
+    if dynamic_spec_config is not None and speculative_config.get("method") != "dspark":
+        raise ValueError(
+            "dynamic_spec_config.method=dspark requires speculative_config.method=dspark"
+        )
     if (
         algorithm == "DSPARK"
         and _is_vllm_ascend_runtime_hint()
@@ -1744,6 +1834,27 @@ def _patch_vllm_dspark_parallel_token() -> bool:
     return True
 
 
+def _dspark_confidence_head_enabled(hf_config: Any) -> bool:
+    """Return whether a DSpark checkpoint declares a confidence head.
+
+    The engine must register the head exactly when the checkpoint carries one,
+    so a hot-published head is loaded and a head-less checkpoint does not get a
+    phantom parameter. Older checkpoints may only record ``confidence_head_alpha``.
+    """
+
+    if hf_config is None:
+        return False
+    enabled = _get_nested(hf_config, ("enable_confidence_head",), None)
+    if enabled is not None:
+        resolved = _bool_or_none(enabled)
+        return bool(resolved)
+    alpha = _get_nested(hf_config, ("confidence_head_alpha",), None)
+    try:
+        return alpha is not None and float(alpha) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
 def _patch_vllm_dspark_qwen3_heads() -> bool:
     try:
         import torch
@@ -1768,8 +1879,12 @@ def _patch_vllm_dspark_qwen3_heads() -> bool:
                     config, "markov_rank", getattr(config, "dspark_markov_rank", 256)
                 )
             )
+            self.with_markov = bool(
+                getattr(config, "confidence_head_with_markov", True)
+            )
+            input_dim = int(config.hidden_size) + (rank if self.with_markov else 0)
             self.proj = ReplicatedLinear(
-                config.hidden_size + rank,
+                input_dim,
                 1,
                 bias=True,
                 params_dtype=torch.float32,
@@ -1777,8 +1892,16 @@ def _patch_vllm_dspark_qwen3_heads() -> bool:
                 prefix=f"{prefix}.proj",
             )
 
-        def forward(self, hidden_states: Any, markov_embeds: Any) -> Any:
-            x = torch.cat([hidden_states, markov_embeds], dim=-1)
+        def forward(self, hidden_states: Any, markov_embeds: Any = None) -> Any:
+            if self.with_markov:
+                if markov_embeds is None:
+                    raise ValueError(
+                        "DSpark confidence head expects Markov embeddings when "
+                        "confidence_head_with_markov=True"
+                    )
+                x = torch.cat([hidden_states, markov_embeds], dim=-1)
+            else:
+                x = hidden_states
             confidence, _ = self.proj(x.float())
             return confidence.squeeze(-1)
 
@@ -1836,7 +1959,13 @@ def _patch_vllm_dspark_qwen3_heads() -> bool:
                 self.markov_head = DSparkMarkovHead(
                     vllm_config, prefix=f"{prefix}.markov_head"
                 )
-            if not hasattr(self, "confidence_head"):
+            # Register the confidence head only for checkpoints that declare it,
+            # matching the training-side topology so hot-published weights load
+            # with the right shape. The markov-less topology is offline-only and
+            # is rejected for online training by the trainer backend.
+            if _dspark_confidence_head_enabled(hf_config) and not hasattr(
+                self, "confidence_head"
+            ):
                 self.confidence_head = DSparkConfidenceHead(
                     vllm_config, prefix=f"{prefix}.confidence_head"
                 )

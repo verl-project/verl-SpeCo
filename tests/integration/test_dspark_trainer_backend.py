@@ -31,6 +31,17 @@ DSparkTrainerBackend = dspark_backend.DSparkTrainerBackend
 create_dense_attention_mask = dflash_backend._create_dflash_dense_attention_mask
 
 
+def _load_saved_state(output_dir):
+    """Load a saved drafter state dict from either serialization backend."""
+
+    bin_path = output_dir / "pytorch_model.bin"
+    if bin_path.exists():
+        return torch.load(bin_path, map_location="cpu", weights_only=True)
+    from safetensors.torch import load_file
+
+    return load_file(str(output_dir / "model.safetensors"))
+
+
 def _preprocess_backend(max_window):
     backend = object.__new__(DSparkTrainerBackend)
     backend.config = SimpleNamespace(
@@ -131,10 +142,18 @@ def test_dspark_checkpoint_preserves_source_config_and_vllm_weight_names(
     (source_dir / "config.json").write_text(json.dumps(source_config), encoding="utf-8")
     config = DSparkConfig.from_dspark_pretrained(str(source_dir))
     config.num_anchors = 99
+    config.enable_confidence_head = True
+    config.confidence_head_alpha = 1.0
 
     model = DSparkDraftModel(config)
     state_keys = set(model.state_dict())
-    assert {"fc.weight", "hidden_norm.weight", "norm.weight"}.issubset(state_keys)
+    assert {
+        "fc.weight",
+        "hidden_norm.weight",
+        "norm.weight",
+        "confidence_head.proj.weight",
+        "confidence_head.proj.bias",
+    }.issubset(state_keys)
     assert not {
         "context_proj.weight",
         "context_norm.weight",
@@ -144,13 +163,22 @@ def test_dspark_checkpoint_preserves_source_config_and_vllm_weight_names(
     assert config.model_type == "dspark"
     model.save_pretrained(output_dir, safe_serialization=False)
     saved_config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
-    saved_state = torch.load(
-        output_dir / "pytorch_model.bin", map_location="cpu", weights_only=True
-    )
-    for key, value in source_config.items():
+    saved_state = _load_saved_state(output_dir)
+    json_source_config = json.loads(json.dumps(source_config))
+    for key, value in json_source_config.items():
+        if key == "confidence_head_alpha":
+            continue
         assert saved_config[key] == value
-    assert saved_config["enable_confidence_head"] is False
-    assert {"fc.weight", "hidden_norm.weight", "norm.weight"}.issubset(saved_state)
+    # The source checkpoint predates the confidence head; the live topology wins.
+    assert saved_config["enable_confidence_head"] is True
+    assert saved_config["confidence_head_alpha"] == pytest.approx(1.0)
+    assert {
+        "fc.weight",
+        "hidden_norm.weight",
+        "norm.weight",
+        "confidence_head.proj.weight",
+        "confidence_head.proj.bias",
+    }.issubset(saved_state)
 
     reloaded = DSparkConfig.from_dspark_pretrained(str(output_dir))
     assert reloaded.model_type == "dspark"
@@ -164,6 +192,8 @@ def _small_dspark_training_model(
     l1_chunk_size: int = 0,
     loss_mode: str = "full_vocab",
     distribution_loss_impl: str = "auto",
+    enable_confidence_head: bool = False,
+    confidence_head_alpha: float = 0.0,
 ):
     config = DSparkConfig(
         hidden_size=8,
@@ -182,6 +212,7 @@ def _small_dspark_training_model(
         num_anchors=2,
         markov_rank=4,
         markov_head_type="vanilla",
+        enable_confidence_head=enable_confidence_head,
     )
     draft_model = DSparkDraftModel(config)
     return DSparkTrainingModel(
@@ -192,6 +223,7 @@ def _small_dspark_training_model(
         l1_loss_alpha=l1_loss_alpha,
         l1_chunk_size=l1_chunk_size,
         distribution_loss_impl=distribution_loss_impl,
+        confidence_head_alpha=confidence_head_alpha,
     )
 
 
@@ -254,15 +286,25 @@ def test_dspark_fused_l1_honors_chunk_size(monkeypatch):
     monkeypatch.setattr(
         dspark_backend, "fused_total_variation", eager_total_variation
     )
-    l1_sum, l1_den = model._compute_fused_l1_loss_for_active(
+    (
+        l1_sum,
+        l1_den,
+        conf_sum,
+        conf_den,
+        _accept_sum,
+        _pred_sum,
+    ) = model._compute_distribution_losses_for_active(
         active_hidden=active_hidden,
         active_prev_tokens=active_prev_tokens,
         active_target_hidden=active_target_hidden,
         active_weights=active_weights,
         lm_head_weight=lm_head_weight,
+        use_fused=True,
         active_draft_logits=active_draft_logits,
     )
 
+    assert conf_sum.item() == 0.0
+    assert conf_den.item() == 0.0
     assert chunk_rows == [2, 2, 1]
     assert l1_sum.ndim == 0
     assert l1_den == pytest.approx(float(active_weights.sum()))
@@ -285,12 +327,20 @@ def test_dspark_fused_l1_honors_chunk_size(monkeypatch):
     assert active_draft_logits.grad is not None
 
     chunk_rows.clear()
-    recomputed_sum, recomputed_den = model._compute_fused_l1_loss_for_active(
+    (
+        recomputed_sum,
+        recomputed_den,
+        _conf_sum,
+        _conf_den,
+        _accept_sum,
+        _pred_sum,
+    ) = model._compute_distribution_losses_for_active(
         active_hidden=active_hidden,
         active_prev_tokens=active_prev_tokens,
         active_target_hidden=active_target_hidden,
         active_weights=active_weights,
         lm_head_weight=lm_head_weight,
+        use_fused=True,
         active_draft_logits=None,
     )
     assert chunk_rows == [2, 2, 1]
@@ -408,6 +458,431 @@ def test_dspark_untrained_confidence_head_is_kept_but_excluded_from_optimizer():
     assert optimizer_parameter_ids.isdisjoint(
         id(parameter) for parameter in confidence_head.parameters()
     )
+
+
+def test_dspark_confidence_loss_without_a_head_is_rejected():
+    config = DSparkConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vocab_size=32,
+        num_target_layers=4,
+        num_context_layers=2,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1, 3],
+        mask_token_id=31,
+        markov_rank=4,
+        enable_confidence_head=False,
+    )
+
+    with pytest.raises(ValueError, match="confidence head"):
+        DSparkTrainingModel(
+            draft_model=DSparkDraftModel(config),
+            confidence_head_alpha=0.5,
+        )
+
+
+def test_dspark_confidence_head_trains_against_acceptance_rate():
+    model = _small_dspark_training_model(
+        block_size=2,
+        l1_loss_alpha=0.0,
+        enable_confidence_head=True,
+        confidence_head_alpha=0.5,
+    )
+    confidence_head = model.draft_model.confidence_head
+    assert confidence_head is not None
+    assert all(parameter.requires_grad for parameter in confidence_head.parameters())
+
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    hidden_states = [torch.randn(1, 5, 8), torch.randn(1, 5, 8)]
+    target_last_hidden_states = torch.randn(1, 5, 8)
+    lm_head_weight = torch.randn(32, 8)
+
+    loss, *_rest, diagnostics = model(
+        input_ids=input_ids,
+        hidden_states_list=hidden_states,
+        loss_mask=loss_mask,
+        lm_head_weight=lm_head_weight,
+        target_last_hidden_states=target_last_hidden_states,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert diagnostics["confidence_weighted_token_count"].item() > 0
+    assert diagnostics["confidence_loss_sum"].item() >= 0
+    accept_rate = (
+        diagnostics["confidence_accept_rate_sum"]
+        / diagnostics["confidence_weighted_token_count"]
+    )
+    assert 0.0 <= float(accept_rate) <= 1.0
+    assert any(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in confidence_head.parameters()
+    )
+
+
+def test_dspark_confidence_loss_uses_target_last_hidden_states_without_l1():
+    model = _small_dspark_training_model(
+        block_size=2,
+        l1_loss_alpha=0.0,
+        enable_confidence_head=True,
+        confidence_head_alpha=0.5,
+    )
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+    hidden_states = [torch.randn(1, 5, 8), torch.randn(1, 5, 8)]
+
+    with pytest.raises(ValueError, match="target_last_hidden_states"):
+        model(
+            input_ids=input_ids,
+            hidden_states_list=hidden_states,
+            loss_mask=loss_mask,
+            lm_head_weight=torch.randn(32, 8),
+            target_last_hidden_states=None,
+        )
+
+
+def _confidence_backend(
+    training: dict, dynamic_spec: dict | None = None
+) -> DSparkTrainerBackend:
+    backend = DSparkTrainerBackend.__new__(DSparkTrainerBackend)
+    rollout = SimpleNamespace(drafter=SimpleNamespace(training=training))
+    if dynamic_spec is not None:
+        rollout.engine_kwargs = SimpleNamespace(
+            vllm=SimpleNamespace(
+                additional_config=SimpleNamespace(dynamic_spec_config=dynamic_spec)
+            )
+        )
+    backend.config = SimpleNamespace(rollout=rollout)
+    return backend
+
+
+def _confidence_config(enable_confidence_head: bool = False) -> DSparkConfig:
+    return DSparkConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vocab_size=32,
+        num_target_layers=4,
+        num_context_layers=2,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1, 3],
+        mask_token_id=31,
+        markov_rank=4,
+        enable_confidence_head=enable_confidence_head,
+    )
+
+
+def test_dspark_training_config_enables_confidence_topology():
+    backend = _confidence_backend(
+        {
+            "dspark_confidence_head_alpha": 1.0,
+            "dspark_confidence_loss_alpha": 1.0,
+            "dspark_confidence_head_with_markov": True,
+        }
+    )
+    normalized = backend._normalize_dflash_config(
+        _confidence_config(enable_confidence_head=False),
+        SimpleNamespace(hidden_size=8, num_hidden_layers=4),
+        normalized_state=None,
+        spec_model_path="",
+    )
+
+    assert normalized.enable_confidence_head is True
+    assert normalized.confidence_head_alpha == pytest.approx(1.0)
+    assert normalized.confidence_head_with_markov is True
+    assert DSparkDraftModel(normalized).confidence_head is not None
+
+
+@pytest.mark.parametrize(
+    ("confidence_input_dim", "expected_with_markov"),
+    [(8, False), (12, True)],
+)
+def test_dspark_checkpoint_infers_confidence_topology(
+    confidence_input_dim, expected_with_markov
+):
+    # Topology inference is independent of the served/offline split; markov-less
+    # heads are only loadable offline, so use the offline training mode here.
+    backend = _confidence_backend({"mode": "offline"})
+    normalized_state = {
+        "confidence_head.proj.weight": torch.ones(1, confidence_input_dim),
+        "confidence_head.proj.bias": torch.ones(1),
+    }
+
+    normalized = backend._normalize_dflash_config(
+        _confidence_config(enable_confidence_head=False),
+        SimpleNamespace(hidden_size=8, num_hidden_layers=4),
+        normalized_state=normalized_state,
+        spec_model_path="checkpoint",
+    )
+
+    assert normalized.enable_confidence_head is True
+    assert normalized.confidence_head_with_markov is expected_with_markov
+
+
+def test_dspark_checkpoint_rejects_partial_confidence_head():
+    backend = _confidence_backend({})
+
+    with pytest.raises(ValueError, match="must contain both"):
+        backend._normalize_dflash_config(
+            _confidence_config(enable_confidence_head=False),
+            SimpleNamespace(hidden_size=8, num_hidden_layers=4),
+            normalized_state={"confidence_head.proj.weight": torch.ones(1, 12)},
+            spec_model_path="checkpoint",
+        )
+
+
+def test_dspark_dynamic_serving_rejects_markov_less_confidence_head():
+    backend = _confidence_backend(
+        {
+            "dspark_confidence_head_alpha": 1.0,
+            "dspark_confidence_loss_alpha": 1.0,
+            "dspark_confidence_head_with_markov": False,
+            "mode": "online",
+        },
+        dynamic_spec={"method": "dspark"},
+    )
+
+    with pytest.raises(ValueError, match="dspark_confidence_head_with_markov=True"):
+        backend._normalize_dflash_config(
+            _confidence_config(enable_confidence_head=False),
+            SimpleNamespace(hidden_size=8, num_hidden_layers=4),
+            normalized_state=None,
+            spec_model_path="",
+        )
+
+
+def test_dspark_static_online_allows_markov_less_confidence_head():
+    # Static serving follows the checkpoint topology, so a markov-less head is
+    # fine outside the confidence-thresholded dynamic verify-budget path.
+    backend = _confidence_backend(
+        {
+            "dspark_confidence_head_alpha": 1.0,
+            "dspark_confidence_loss_alpha": 1.0,
+            "dspark_confidence_head_with_markov": False,
+            "mode": "online",
+        }
+    )
+    normalized = backend._normalize_dflash_config(
+        _confidence_config(enable_confidence_head=False),
+        SimpleNamespace(hidden_size=8, num_hidden_layers=4),
+        normalized_state=None,
+        spec_model_path="",
+    )
+
+    assert normalized.enable_confidence_head is True
+    assert normalized.confidence_head_with_markov is False
+
+
+def test_dspark_offline_allows_markov_less_confidence_head():
+    backend = _confidence_backend(
+        {
+            "dspark_confidence_head_alpha": 1.0,
+            "dspark_confidence_loss_alpha": 1.0,
+            "dspark_confidence_head_with_markov": False,
+            "mode": "offline",
+        }
+    )
+    normalized = backend._normalize_dflash_config(
+        _confidence_config(enable_confidence_head=False),
+        SimpleNamespace(hidden_size=8, num_hidden_layers=4),
+        normalized_state=None,
+        spec_model_path="",
+    )
+
+    assert normalized.enable_confidence_head is True
+    assert normalized.confidence_head_with_markov is False
+    model = DSparkDraftModel(normalized)
+    assert model.confidence_head is not None
+    # Markov-less head consumes the draft hidden only, not the Markov embedding.
+    assert model.confidence_head.proj.in_features == normalized.hidden_size
+
+
+def test_dspark_dynamic_serving_rejects_markov_less_checkpoint_head():
+    backend = _confidence_backend({"mode": "online"}, dynamic_spec={"method": "dspark"})
+    normalized_state = {
+        "confidence_head.proj.weight": torch.ones(1, 8),
+        "confidence_head.proj.bias": torch.ones(1),
+    }
+
+    with pytest.raises(ValueError, match="dspark_confidence_head_with_markov=True"):
+        backend._normalize_dflash_config(
+            _confidence_config(enable_confidence_head=False),
+            SimpleNamespace(hidden_size=8, num_hidden_layers=4),
+            normalized_state=normalized_state,
+            spec_model_path="checkpoint",
+        )
+
+
+def test_dspark_fresh_online_confidence_head_warns(caplog):
+    import logging
+
+    backend = _confidence_backend(
+        {
+            "dspark_confidence_head_alpha": 1.0,
+            "dspark_confidence_loss_alpha": 1.0,
+            "mode": "online",
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger=dspark_backend.logger.name):
+        normalized = backend._normalize_dflash_config(
+            _confidence_config(enable_confidence_head=False),
+            SimpleNamespace(hidden_size=8, num_hidden_layers=4),
+            normalized_state=None,
+            spec_model_path="",
+        )
+
+    assert normalized.enable_confidence_head is True
+    assert any("fresh confidence head" in message for message in caplog.messages)
+
+
+def test_dspark_collect_only_fresh_head_does_not_warn(caplog):
+    import logging
+
+    backend = _confidence_backend(
+        {
+            "dspark_confidence_head_alpha": 1.0,
+            "dspark_confidence_loss_alpha": 1.0,
+            "mode": "collect_only",
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger=dspark_backend.logger.name):
+        normalized = backend._normalize_dflash_config(
+            _confidence_config(enable_confidence_head=False),
+            SimpleNamespace(hidden_size=8, num_hidden_layers=4),
+            normalized_state=None,
+            spec_model_path="",
+        )
+
+    assert normalized.enable_confidence_head is True
+    assert not any("fresh confidence head" in message for message in caplog.messages)
+
+
+def test_dspark_confidence_target_is_one_minus_total_variation():
+    model = _small_dspark_training_model(
+        block_size=2,
+        l1_loss_alpha=1.0,
+        enable_confidence_head=True,
+        confidence_head_alpha=1.0,
+    )
+    confidence_head = model.draft_model.confidence_head
+    assert confidence_head is not None
+    with torch.no_grad():
+        confidence_head.proj.weight.zero_()
+        confidence_head.proj.bias.fill_(0.4)
+
+    active_hidden = torch.randn(3, 8)
+    active_prev_tokens = torch.tensor([1, 2, 3], dtype=torch.long)
+    active_target_hidden = torch.randn(3, 8)
+    active_weights = torch.tensor([1.0, 0.5, 0.25])
+    lm_head_weight = torch.randn(32, 8)
+
+    draft_logits = torch.nn.functional.linear(active_hidden, lm_head_weight)
+    markov_bias = model._markov_bias_for_active(
+        active_hidden=active_hidden,
+        active_prev_tokens=active_prev_tokens,
+        restricted_vocab=None,
+    )
+    if markov_bias is not None:
+        draft_logits = draft_logits + markov_bias
+    target_logits = torch.nn.functional.linear(active_target_hidden, lm_head_weight)
+    l1_per_token = (
+        (
+            torch.softmax(draft_logits.float(), dim=-1)
+            - torch.softmax(target_logits.float(), dim=-1)
+        )
+        .abs()
+        .sum(dim=-1)
+    )
+    acceptance_target = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
+    expected_confidence = torch.nn.functional.binary_cross_entropy_with_logits(
+        torch.full_like(acceptance_target, 0.4),
+        acceptance_target,
+        reduction="none",
+    )
+
+    (
+        l1_sum,
+        l1_den,
+        confidence_sum,
+        confidence_den,
+        _accept_sum,
+        _pred_sum,
+    ) = model._compute_distribution_losses_for_active(
+        active_hidden=active_hidden,
+        active_prev_tokens=active_prev_tokens,
+        active_target_hidden=active_target_hidden,
+        active_weights=active_weights,
+        lm_head_weight=lm_head_weight,
+    )
+
+    assert l1_sum.detach().item() == pytest.approx(
+        (l1_per_token * active_weights).sum().item()
+    )
+    assert l1_den.detach().item() == pytest.approx(active_weights.sum().item())
+    assert confidence_sum.detach().item() == pytest.approx(
+        (expected_confidence * active_weights).sum().item()
+    )
+    assert confidence_den.detach().item() == pytest.approx(active_weights.sum().item())
+
+
+def test_dspark_confidence_only_batch_includes_target_last_hidden_states():
+    base_trainer = pytest.importorskip("verl_speco.trainer.base_trainer")
+
+    seq_len = 5
+    ids = torch.arange(seq_len, dtype=torch.long)
+    aux_hidden = torch.randn(seq_len, 16)
+    target_last_hidden = torch.randn(seq_len, 8)
+    loss_mask = torch.ones(seq_len, dtype=torch.float32)
+
+    class _FakeBackend:
+        model_type = "dspark"
+
+        def preprocess_individual_items(self, items, device, model_config):
+            del items, device, model_config
+            return {
+                "ids": [ids],
+                "h_states": [aux_hidden],
+                "masks": [loss_mask],
+                "target_last_h_states": [target_last_hidden],
+            }
+
+    trainer = object.__new__(base_trainer.DrafterBaseTrainer)
+    trainer.backend = _FakeBackend()
+    trainer.batch_size = 1
+    trainer.current_rl_step = 0
+    trainer.training_steps = 0
+    trainer.use_data_buffer = False
+    trainer.collected_data = [{"step": 0, "hidden_states": aux_hidden}]
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(
+                training={
+                    "dspark_l1_loss_alpha": 0.0,
+                    "dspark_confidence_loss_alpha": 1.0,
+                }
+            )
+        )
+    )
+    trainer.use_ulysses_sp = False
+    trainer.rank = 0
+    trainer.model_config = None
+    trainer.model = torch.nn.Linear(2, 2)
+
+    batch = trainer._prepare_training_batch()
+
+    assert batch is not None
+    assert "target_last_hidden_states" in batch
+    assert torch.equal(batch["target_last_hidden_states"][0], target_last_hidden)
 
 
 def test_dspark_label_and_prev_token_alignment():
@@ -645,13 +1120,17 @@ def test_dspark_l1_reuses_only_full_vocab_ce_log_probs(
         loss_mode=loss_mode,
     )
     captured_log_probs = []
-    original_compute_l1 = model._compute_l1_loss_for_active
+    original_compute_distribution_losses = model._compute_distribution_losses_for_active
 
-    def capture_compute_l1(**kwargs):
+    def capture_compute_distribution_losses(**kwargs):
         captured_log_probs.append(kwargs.get("active_draft_log_probs"))
-        return original_compute_l1(**kwargs)
+        return original_compute_distribution_losses(**kwargs)
 
-    monkeypatch.setattr(model, "_compute_l1_loss_for_active", capture_compute_l1)
+    monkeypatch.setattr(
+        model,
+        "_compute_distribution_losses_for_active",
+        capture_compute_distribution_losses,
+    )
     input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
     loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
     hidden_states = [torch.randn(1, 5, 8), torch.randn(1, 5, 8)]
