@@ -22,6 +22,7 @@ from transformers import AutoConfig
 
 from verl.utils.device import get_device_id, get_device_name
 from verl_speco.backends.lr_scheduler import build_drafter_lr_scheduler
+from verl_speco.backends.optimizers import build_drafter_optimizer
 from verl_speco.models.auto import (
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
@@ -645,14 +646,7 @@ class Eagle3TrainerBackend:
         return "eagle3"
 
     def setup_optimizer(self, drafter_model, drafter_train_config):
-        trainable_params = [p for p in drafter_model.parameters() if p.requires_grad]
-
-        return torch.optim.AdamW(
-            trainable_params,
-            lr=drafter_train_config.lr,
-            betas=(0.9, 0.95),
-            weight_decay=drafter_train_config.get("weight_decay", 1e-2),
-        )
+        return build_drafter_optimizer(drafter_model, drafter_train_config)
 
     def setup_scheduler(self, optimizer, train_cfg):
         return build_drafter_lr_scheduler(optimizer, train_cfg)

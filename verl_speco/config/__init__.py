@@ -12,3 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Hydra config package for SPECO."""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+def config_int(config: Any, key: str, default: int) -> int:
+    """Resolve an integer config value, defaulting only when absent or ``None``.
+
+    Unlike ``config.get(key, default) or default`` this keeps an explicit ``0``,
+    which several knobs use to mean "fail on the first bad row".
+    """
+    value = config.get(key)
+    return default if value is None else int(value)
+
+
+__all__ = ["config_int"]

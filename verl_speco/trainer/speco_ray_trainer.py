@@ -39,6 +39,7 @@ from verl_speco.integration.agent_loop_runtime import (
 )
 from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
 from verl_speco.integration.oldlogprob_runtime import (
+    OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY,
     OLD_LOGPROB_AUX_LAYER_IDS_KEY,
     OLD_LOGPROB_COLLECT_MASK_KEY,
     OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
@@ -2170,6 +2171,23 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             algorithm, self._speco_drafter_training_config()
         )
 
+    def _speco_oldlogprob_aux_layer_id_space(self) -> str:
+        algorithm = (
+            str(
+                _get_nested(
+                    self._speco_drafter_config(),
+                    ("speculative_algorithm",),
+                    "EAGLE3",
+                )
+                or "EAGLE3"
+            )
+            .strip()
+            .upper()
+        )
+        # EAGLE3 config IDs are the same output IDs passed to vLLM serve.
+        # DFlash-family and EAGLE1/2 IDs remain decoder-layer indices.
+        return "output" if algorithm == "EAGLE3" else "decoder"
+
     @staticmethod
     def _speco_oldlogprob_window_train_rows(training_cfg) -> int:
         window_rows = training_cfg.get("hidden_state_window_tokens_per_sample")
@@ -3477,6 +3495,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 batch_td,
                 OLD_LOGPROB_AUX_LAYER_IDS_KEY,
                 self._speco_oldlogprob_aux_layer_ids(),
+            )
+            tu.assign_non_tensor_data(
+                batch_td,
+                OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY,
+                self._speco_oldlogprob_aux_layer_id_space(),
             )
             tu.assign_non_tensor_data(
                 batch_td,

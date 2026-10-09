@@ -33,6 +33,12 @@ from torch import nn
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_oldlogprob_aux_layer_ids,
 )
+from verl_speco.producer.hidden_states_store import (
+    FILE_BACKEND,
+    MOONCAKE_BACKEND,
+    HiddenStatesStore,
+    build_hidden_states_store,
+)
 from verl_speco.trainer.feature_store import DraftFeatureSample, DraftReplaySample
 
 logger = logging.getLogger(__name__)
@@ -47,6 +53,8 @@ class FeatureContract:
     """Explicit inputs for converting one vLLM payload into a training sample."""
 
     algorithm: str
+    # Existing training-side IDs. Legacy/cotrain callers keep their established
+    # interpretation; standalone uses canonical decoder-layer indices here.
     target_layer_ids: list[int]
     hidden_states_layout: str
     dtype: torch.dtype
@@ -57,6 +65,10 @@ class FeatureContract:
     target_config_fingerprint: str | None = None
     source: str = "standalone_tq_producer"
     require_full_alignment: bool = False
+    target_num_hidden_layers: int | None = None
+    # Standalone-only vLLM output_hidden_states indices. None preserves the
+    # legacy/cotrain behavior of interpreting target_layer_ids directly.
+    vllm_aux_hidden_state_layer_ids: list[int] | None = None
 
 
 @dataclass
@@ -220,9 +232,14 @@ def load_vllm_final_norm(
         target_config = AutoConfig.from_pretrained(
             model_path, trust_remote_code=trust_remote_code
         )
+    # Multimodal / MoE targets (for example Qwen3.6) nest the text backbone under
+    # ``text_config``, while the top-level config only describes the wrapper and
+    # has no ``vocab_size``/``hidden_size``. Flat text configs have no nested
+    # ``text_config``, so they keep the previous behaviour.
+    text_config = getattr(target_config, "text_config", target_config)
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(
-            target_config,
+            text_config,
             trust_remote_code=trust_remote_code,
             attn_implementation="eager",
         )
@@ -234,6 +251,11 @@ def load_vllm_final_norm(
     }
     norm.load_state_dict(state, strict=True, assign=True)
     norm = norm.to(device="cpu", dtype=dtype).eval().requires_grad_(False)
+    target_num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+    if target_num_hidden_layers is not None:
+        # Keep the public return type stable while making the already-loaded
+        # target depth available to standalone callers that build the capture plan.
+        norm._speco_target_num_hidden_layers = int(target_num_hidden_layers)
     logger.info("Loaded vLLM target final norm %s from %s", norm_name, model_path)
     return norm
 
@@ -248,43 +270,6 @@ def _load_json_config(path: Any) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
-
-
-def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
-    if not lock_path.exists():
-        return
-    try:
-        import fcntl
-    except ImportError:
-        deadline = time.monotonic() + float(timeout)
-        while lock_path.exists():
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for hidden-states lock: {lock_path}"
-                )
-            time.sleep(0.1)
-        return
-
-    fd = os.open(lock_path, os.O_RDONLY)
-    try:
-        deadline = time.monotonic() + float(timeout)
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"Timed out waiting for hidden-states lock: {lock_path}"
-                    ) from None
-                time.sleep(0.1)
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-    try:
-        lock_path.unlink()
-    except OSError:
-        pass
 
 
 class BoundedReplayCache:
@@ -449,12 +434,23 @@ def feature_from_vllm_payload(
             "vLLM hidden_states must have shape [seq, layers, hidden], "
             f"got {tuple(hidden.shape)}"
         )
+    if torch.is_floating_point(hidden) and not bool(
+        torch.isfinite(hidden).all().item()
+    ):
+        raise HiddenStateAlignmentError(
+            "vLLM hidden_states contain NaN/Inf; refusing to train on them"
+        )
 
     algorithm = str(feature_config.algorithm).strip().upper()
     if algorithm not in {"EAGLE3", "DFLASH", "DSPARK"}:
         raise ValueError(f"Unsupported vLLM feature algorithm {algorithm!r}")
-    target_layer_ids = [int(layer_id) for layer_id in feature_config.target_layer_ids]
-    if not target_layer_ids:
+    configured_vllm_ids = (
+        feature_config.vllm_aux_hidden_state_layer_ids
+        if feature_config.vllm_aux_hidden_state_layer_ids is not None
+        else feature_config.target_layer_ids
+    )
+    vllm_aux_layer_ids = [int(layer_id) for layer_id in configured_vllm_ids]
+    if not vllm_aux_layer_ids:
         raise ValueError("FeatureContract.target_layer_ids must not be empty")
     hidden_layout = str(feature_config.hidden_states_layout)
     if hidden_layout not in {
@@ -469,7 +465,24 @@ def feature_from_vllm_payload(
         "eagle3_aux_plus_last",
         "dflash_aux_plus_last",
     }
-    required_layers = len(target_layer_ids) + (1 if include_final else 0)
+    final_layer_id = (
+        int(feature_config.target_num_hidden_layers)
+        if feature_config.target_num_hidden_layers is not None
+        else None
+    )
+    final_reused_from_aux = bool(
+        include_final
+        and final_layer_id is not None
+        and final_layer_id in vllm_aux_layer_ids
+    )
+    final_source_index = (
+        vllm_aux_layer_ids.index(final_layer_id)
+        if final_layer_id is not None and final_reused_from_aux
+        else len(vllm_aux_layer_ids)
+    )
+    required_layers = len(vllm_aux_layer_ids) + (
+        1 if include_final and not final_reused_from_aux else 0
+    )
     if int(hidden.size(1)) < required_layers:
         raise HiddenStateAlignmentError(
             "vLLM hidden_states layer count is too small: "
@@ -509,14 +522,17 @@ def feature_from_vllm_payload(
             )
 
     selected = hidden.index_select(0, relative_positions).to(dtype=feature_config.dtype)
-    aux_hidden = selected[:, : len(target_layer_ids), :].flatten(1)
+    # Layer-ID normalization changes which vLLM outputs are requested, not the
+    # number or order of returned auxiliary tensors, so the target-side count
+    # remains the correct split point here.
+    aux_hidden = selected[:, : len(vllm_aux_layer_ids), :].flatten(1)
     if include_final:
         if final_norm is None:
             raise ValueError("vLLM plus_last features require the target final norm")
         # Auxiliary layers stay raw. Only the final supervision block goes
         # through the frozen target norm, exactly once, before storage/transport.
         with torch.no_grad():
-            final_hidden = final_norm(selected[:, required_layers - 1, :])
+            final_hidden = final_norm(selected[:, final_source_index, :])
         output_hidden = torch.cat([aux_hidden, final_hidden], dim=-1)
     else:
         output_hidden = aux_hidden
@@ -539,8 +555,13 @@ def feature_from_vllm_payload(
             "target_revision": feature_config.target_model_revision,
             "target_config_fingerprint": feature_config.target_config_fingerprint,
             "tokenizer_fingerprint": feature_config.tokenizer_fingerprint,
-            "target_layer_ids": target_layer_ids,
+            "target_layer_ids": [
+                int(layer_id) for layer_id in feature_config.target_layer_ids
+            ],
             "vllm_hidden_layers": int(hidden.size(1)),
+            "final_hidden_layer_id": final_layer_id,
+            "final_hidden_source_index": final_source_index if include_final else None,
+            "final_hidden_reused_from_aux": final_reused_from_aux,
             "vllm_hidden_rows": int(hidden.size(0)),
             "vllm_hidden_position_offset": hidden_position_offset,
             "hidden_states_layout": hidden_layout,
@@ -554,6 +575,8 @@ def feature_from_vllm_payload(
             "use_logits": feature_config.use_logits,
         }
     )
+    if feature_config.vllm_aux_hidden_state_layer_ids is not None:
+        metadata["vllm_aux_hidden_state_layer_ids"] = vllm_aux_layer_ids
     if include_final:
         metadata["last_hidden_state_norm"] = "target_final_norm"
     return DraftFeatureSample(
@@ -625,6 +648,9 @@ class TargetFeatureReplayer:
         )
         self.vllm_endpoints = _normalize_vllm_endpoints(self.replay_cfg)
         self.vllm_endpoint = self.vllm_endpoints[0]
+        self.vllm_hidden_states_store: HiddenStatesStore = build_hidden_states_store(
+            _config_value(self.replay_cfg, "hidden_states_store", None)
+        )
         self.vllm_model = _config_value(self.replay_cfg, "vllm_model", None)
         self.vllm_timeout = float(
             _config_value(self.replay_cfg, "request_timeout", 120.0) or 120.0
@@ -1076,7 +1102,7 @@ class TargetFeatureReplayer:
         feature_positions = sample.feature_positions.detach().cpu().long()
         feature_end = int(feature_positions[-1].item()) + 1
         prompt_ids = sample.input_ids[:feature_end].detach().cpu().long().tolist()
-        hidden_payload = self._request_vllm_hidden_states(prompt_ids)
+        hidden_payload, reference = self._request_vllm_hidden_states(prompt_ids)
         try:
             feature = self._feature_from_vllm_payload(
                 sample,
@@ -1085,12 +1111,13 @@ class TargetFeatureReplayer:
                 source="token_replay_vllm_file",
             )
         finally:
-            path = hidden_payload.get("_path")
-            if self.vllm_on_generate == "delete" and path:
+            if self.vllm_on_generate == "delete" and reference:
                 try:
-                    Path(os.fspath(path)).unlink(missing_ok=True)
-                except OSError:
-                    logger.warning("Failed to delete vLLM hidden-states file %s", path)
+                    self.vllm_hidden_states_store.release(reference)
+                except Exception:  # noqa: BLE001 - cleanup must not break replay
+                    logger.warning(
+                        "Failed to release vLLM hidden-states reference %s", reference
+                    )
         return feature
 
     def _validate_vllm_positions(self, sample: DraftReplaySample) -> None:
@@ -1292,7 +1319,9 @@ class TargetFeatureReplayer:
             f"{self.vllm_max_retries + 1} attempts: {last_error}"
         ) from last_error
 
-    def _request_vllm_hidden_states(self, prompt_ids: list[int]) -> dict[str, Any]:
+    def _request_vllm_hidden_states(
+        self, prompt_ids: list[int]
+    ) -> tuple[dict[str, Any], str]:
         last_error: Exception | None = None
         started = time.perf_counter()
         request_index = self.vllm_requests + 1
@@ -1322,9 +1351,16 @@ class TargetFeatureReplayer:
                     extra_body={"return_token_ids": True},
                     timeout=self.vllm_timeout,
                 )
-                path = self._extract_hidden_states_path(response, prompt_ids)
-                payload = self._load_vllm_hidden_states(path)
-                payload["_path"] = path
+                path, handle = self._extract_transfer_reference(response, prompt_ids)
+                expected_backend = MOONCAKE_BACKEND if handle else FILE_BACKEND
+                if self.vllm_hidden_states_store.backend != expected_backend:
+                    raise ValueError(
+                        f"vLLM returned a {expected_backend} reference but target "
+                        f"replay uses the {self.vllm_hidden_states_store.backend} "
+                        "hidden-state store"
+                    )
+                reference = handle or path
+                payload = self._load_vllm_hidden_states(reference)
                 with self._metrics_lock:
                     self.vllm_requests += 1
                     self.vllm_request_seconds += time.perf_counter() - started
@@ -1342,16 +1378,17 @@ class TargetFeatureReplayer:
                     )
                     logger.info(
                         "[target replay rank=%s] vLLM request completed request=%s "
-                        "attempt=%s endpoint=%s path=%s hidden_shape=%s elapsed=%.3fs",
+                        "attempt=%s endpoint=%s reference=%s hidden_shape=%s "
+                        "elapsed=%.3fs",
                         self.rank,
                         request_index,
                         attempt + 1,
                         state.url,
-                        path,
+                        reference,
                         hidden_shape,
                         time.perf_counter() - attempt_started,
                     )
-                return payload
+                return payload, reference
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 attempted_endpoints.add(state.index)
@@ -1382,7 +1419,9 @@ class TargetFeatureReplayer:
             f"{self.vllm_max_retries + 1} attempts: {last_error}"
         ) from last_error
 
-    def _extract_hidden_states_path(self, response: Any, prompt_ids: list[int]) -> str:
+    def _extract_transfer_reference(
+        self, response: Any, prompt_ids: list[int]
+    ) -> tuple[str, str | None]:
         choices = getattr(response, "choices", None) or []
         if choices:
             prompt_token_ids = getattr(choices[0], "prompt_token_ids", None)
@@ -1394,22 +1433,16 @@ class TargetFeatureReplayer:
         if kv_transfer_params is None:
             raise ValueError("vLLM response missing kv_transfer_params")
         path = kv_transfer_params.get("hidden_states_path")
-        if not path:
-            raise ValueError("vLLM response missing hidden_states_path")
-        return os.fspath(path)
+        handle = kv_transfer_params.get("handle")
+        if not path and not handle:
+            raise ValueError("vLLM response missing hidden_states_path/handle")
+        if path and handle:
+            raise ValueError("vLLM response has both hidden_states_path and handle")
+        return (os.fspath(path) if path else "", str(handle) if handle else None)
 
-    def _load_vllm_hidden_states(self, path: str) -> dict[str, Any]:
-        try:
-            from safetensors.torch import load_file
-        except ImportError as exc:
-            raise RuntimeError("vLLM hidden-state replay requires safetensors") from exc
-        file_path = Path(path)
-        lock_path = Path(f"{path}.lock")
-        if lock_path.exists():
-            _wait_for_lock(lock_path)
-        if not file_path.exists():
-            raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
-        return dict(load_file(str(file_path), device="cpu"))
+    def _load_vllm_hidden_states(self, reference: str) -> dict[str, Any]:
+        payload, _ = self.vllm_hidden_states_store.load(reference)
+        return payload
 
     def _feature_from_vllm_payload(
         self,
@@ -1444,6 +1477,9 @@ class TargetFeatureReplayer:
                 use_logits=self.use_logits,
                 target_config_fingerprint=self.target_config_fingerprint,
                 source=source,
+                target_num_hidden_layers=getattr(
+                    self, "target_num_hidden_layers", None
+                ),
             ),
             final_norm=self.vllm_final_norm,
         )

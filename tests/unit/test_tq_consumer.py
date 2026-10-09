@@ -236,6 +236,44 @@ def test_eos_drops_incomplete_global_tail() -> None:
     assert store.clear_calls == [[entry.key]]
 
 
+def test_scheduled_loader_uses_driver_selected_keys_without_listing() -> None:
+    entries = [_entry(0), _entry(1)]
+    store = _FakeStore(entries, eos=False)
+
+    class Commands:
+        def __init__(self):
+            self.values = [
+                {
+                    "kind": "batch",
+                    "global_keys": [entry.key for entry in entries],
+                    "global_sequence_nos": [0, 1],
+                    "assignments": [
+                        [{"key": entry.key, "tag": entry.tag} for entry in entries]
+                    ],
+                },
+                {"kind": "stop"},
+            ]
+
+        def get(self, *, block):
+            assert block is True
+            return self.values.pop(0)
+
+    store.list_ready = lambda: pytest.fail("scheduled Consumer must not list TQ")
+    loader = TQFeatureDataLoader(
+        store,
+        batch_size=2,
+        rank=0,
+        world_size=1,
+        scheduled_commands=Commands(),
+    )
+
+    batches = list(loader)
+
+    assert len(batches) == 1
+    assert batches[0].global_keys == [entry.key for entry in entries]
+    assert store.get_calls == [[entry.key for entry in entries]]
+
+
 def test_rank0_discovery_failure_is_raised_without_clearing() -> None:
     store = _FakeStore([_entry(0)])
 

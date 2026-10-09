@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,7 +27,62 @@ dflash_backend = pytest.importorskip("verl_speco.backends.dflash_trainer_backend
 DSparkTrainingModel = dspark_backend.DSparkTrainingModel
 DSparkConfig = dspark_models.DSparkConfig
 DSparkDraftModel = dspark_models.DSparkDraftModel
+DSparkTrainerBackend = dspark_backend.DSparkTrainerBackend
 create_dense_attention_mask = dflash_backend._create_dflash_dense_attention_mask
+
+
+def _preprocess_backend(max_window):
+    backend = object.__new__(DSparkTrainerBackend)
+    backend.config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(
+                training={"dspark_max_window": max_window}
+            )
+        )
+    )
+    return backend
+
+
+def _preprocess_item(rows: int = 8):
+    return {
+        "input_ids": torch.arange(rows),
+        "hidden_states": torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4),
+        "loss_mask": torch.tensor([0, 0, *([1] * (rows - 2))], dtype=torch.float32),
+        "hidden_states_layout": "dflash_aux",
+    }
+
+
+def _preprocess_model_config():
+    return SimpleNamespace(
+        pad_token_id=0,
+        hidden_size=2,
+        target_hidden_size=2,
+        num_context_layers=2,
+        num_target_layers=2,
+    )
+
+
+@pytest.mark.parametrize("max_window", [None, 0])
+def test_dspark_preprocess_keeps_full_sequence_when_max_window_is_disabled(
+    max_window,
+):
+    result = _preprocess_backend(max_window).preprocess_individual_items(
+        [_preprocess_item()], torch.device("cpu"), _preprocess_model_config()
+    )
+
+    assert result["ids"][0].tolist() == list(range(8))
+    assert result["h_states"][0].shape == (8, 4)
+    assert result["masks"][0].shape == (8,)
+
+
+def test_dspark_preprocess_crops_only_when_max_window_is_set():
+    result = _preprocess_backend(4).preprocess_individual_items(
+        [_preprocess_item()], torch.device("cpu"), _preprocess_model_config()
+    )
+
+    assert result["ids"][0].numel() == 4
+    assert result["h_states"][0].shape == (4, 4)
+    assert result["masks"][0].shape == (4,)
 
 
 def test_dspark_fallback_config_uses_native_qwen_mrv2_architecture() -> None:
@@ -240,6 +296,82 @@ def test_dspark_fused_l1_honors_chunk_size(monkeypatch):
     assert chunk_rows == [2, 2, 1]
     assert recomputed_sum.ndim == 0
     assert recomputed_den == pytest.approx(float(active_weights.sum()))
+
+
+def _tiny_dspark_training_model() -> DSparkTrainingModel:
+    config = DSparkConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vocab_size=32,
+        num_target_layers=4,
+        num_context_layers=2,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1, 3],
+        mask_token_id=31,
+        markov_rank=4,
+        enable_confidence_head=True,
+    )
+    model = DSparkTrainingModel(
+        draft_model=DSparkDraftModel(config),
+        block_size=2,
+        num_anchors=2,
+        confidence_head_alpha=0.0,
+        l1_loss_alpha=0.0,
+        ce_loss_alpha=1.0,
+    )
+    model.eval()
+    return model
+
+
+def test_dspark_trailing_label_token_remains_supervised():
+    model = _tiny_dspark_training_model()
+    # context rows = 2, label rows = 3: the last label token only exists as a
+    # label (the hidden states are one row shorter).
+    context_rows, label_rows = 2, 3
+    label_ids = torch.tensor([[10, 11, 12]])
+    label_mask = torch.tensor([[0.0, 1.0, 1.0]])
+
+    anchors, keep = model._sample_anchor_positions(
+        label_rows, label_mask, torch.device("cpu")
+    )
+    kept = anchors[keep]
+    assert kept.numel() >= 1, "a two-token response must keep a valid anchor"
+    assert bool((kept < context_rows).all())
+
+    targets, _prev, eval_mask, label_indices = model._build_label_tensors(
+        input_ids=label_ids,
+        loss_mask=label_mask,
+        anchor_positions=torch.tensor([[1]]),
+        block_keep_mask=torch.ones(1, 1, dtype=torch.bool),
+    )
+    assert label_indices[0, 0, 0].item() == context_rows
+    assert targets[0, 0, 0].item() == 12
+    assert bool(eval_mask[0, 0, 0])
+
+
+def test_dspark_forward_accepts_trailing_label_sequence():
+    model = _tiny_dspark_training_model()
+    out = model(
+        input_ids=torch.tensor([[10, 11]]),
+        hidden_states_list=[torch.randn(1, 2, 8), torch.randn(1, 2, 8)],
+        loss_mask=torch.tensor([[0.0, 1.0]]),
+        lm_head_weight=torch.randn(32, 8),
+        label_ids=torch.tensor([[10, 11, 12]]),
+        label_mask=torch.tensor([[0.0, 1.0, 1.0]]),
+    )
+    assert torch.isfinite(out[0].detach())
+    # Backward compatible: no label sequence falls back to input_ids/loss_mask.
+    out_legacy = model(
+        input_ids=torch.tensor([[10, 11, 12, 13]]),
+        hidden_states_list=[torch.randn(1, 4, 8), torch.randn(1, 4, 8)],
+        loss_mask=torch.ones(1, 4),
+        lm_head_weight=torch.randn(32, 8),
+    )
+    assert torch.isfinite(out_legacy[0].detach())
 
 
 def test_dspark_untrained_confidence_head_is_kept_but_excluded_from_optimizer():
@@ -548,3 +680,339 @@ def test_dspark_l1_reuses_only_full_vocab_ce_log_probs(
         for parameter in model.parameters()
         if parameter.requires_grad
     )
+
+
+def test_from_dspark_dict_normalizes_transformer_layer_config() -> None:
+    config = DSparkConfig.from_dspark_dict(
+        {
+            "architectures": ["Qwen3DSparkModel"],
+            "transformer_layer_config": {
+                "model_type": "qwen3",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 128,
+                "head_dim": 16,
+            },
+            "block_size": 8,
+            "num_anchors": 512,
+            "markov_rank": 256,
+        }
+    )
+    assert config.hidden_size == 64
+    assert config.intermediate_size == 128
+    assert config.num_hidden_layers == 2
+    assert config.num_attention_heads == 4
+    assert config.num_key_value_heads == 2
+    assert config.vocab_size == 128
+    assert config.block_size == 8
+
+
+def test_from_dspark_dict_lifts_nested_sliding_window() -> None:
+    config = DSparkConfig.from_dspark_dict(
+        {
+            "architectures": ["Qwen3DSparkModel"],
+            "transformer_layer_config": {
+                "model_type": "qwen3",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 128,
+                "head_dim": 16,
+                "sliding_window": 128,
+                "use_sliding_window": True,
+                "layer_types": ["sliding_attention", "full_attention"],
+            },
+            "block_size": 8,
+            "num_anchors": 512,
+            "markov_rank": 256,
+        }
+    )
+
+    assert config.sliding_window == 128
+    assert config.use_sliding_window is True
+    assert config.layer_types == ["sliding_attention", "full_attention"]
+    # The nested SWA config must reach the per-layer mask builder unchanged.
+    assert dflash_backend._resolve_sliding_windows(config) == [128, None]
+
+
+def test_from_dspark_dict_defaults_to_full_attention_without_nested_swa() -> None:
+    config = DSparkConfig.from_dspark_dict(
+        {
+            "architectures": ["Qwen3DSparkModel"],
+            "transformer_layer_config": {
+                "model_type": "qwen3",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 128,
+                "head_dim": 16,
+            },
+            "block_size": 8,
+            "num_anchors": 512,
+            "markov_rank": 256,
+        }
+    )
+
+    assert config.use_sliding_window is False
+    assert dflash_backend._resolve_sliding_windows(config) == [None, None]
+
+
+def test_dspark_fallback_prefers_dspark_intermediate_size() -> None:
+    from types import SimpleNamespace
+
+    from omegaconf import OmegaConf
+
+    backend = dspark_backend.DSparkTrainerBackend.__new__(
+        dspark_backend.DSparkTrainerBackend
+    )
+    backend.config = OmegaConf.create(
+        {
+            "actor": {"fsdp_config": {}},
+            "rollout": {
+                "drafter": {"training": {"dspark_intermediate_size": 6144}}
+            },
+        }
+    )
+    target = SimpleNamespace(
+        hidden_size=2048,
+        num_hidden_layers=40,
+        num_attention_heads=16,
+        num_key_value_heads=4,
+        vocab_size=151936,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=32768,
+        head_dim=None,
+        rope_theta=10000.0,
+    )
+
+    selected = backend._build_fallback_config(target)
+    assert selected.intermediate_size == 6144
+
+    backend.config.rollout.drafter.training.dspark_intermediate_size = None
+    defaulted = backend._build_fallback_config(target)
+    # MoE targets have no dense intermediate_size, so hidden_size * 4 is used.
+    assert defaulted.intermediate_size == 2048 * 4
+
+
+def test_from_dspark_dict_lifts_released_aux_layer_ids_into_serving_config(
+    tmp_path,
+) -> None:
+    from types import SimpleNamespace
+
+    from verl_speco.trainer.draft_training_loop import (
+        _rewrite_standalone_block_runtime_config,
+    )
+
+    # Mirrors the released RedHatAI/Qwen3.6-35B-A3B-speculator.dspark config
+    # (40-layer target): the architecture is nested and the context layers live
+    # under ``aux_hidden_state_layer_ids``.
+    released_config = {
+        "architectures": ["Qwen3DSparkModel"],
+        "speculators_model_type": "dspark",
+        "transformer_layer_config": {
+            "model_type": "qwen3",
+            "hidden_size": 2048,
+            "intermediate_size": 6144,
+            "num_hidden_layers": 5,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "vocab_size": 151936,
+            "head_dim": 128,
+        },
+        "aux_hidden_state_layer_ids": [2, 10, 20, 30, 37],
+        "block_size": 8,
+        "num_anchors": 512,
+        "markov_rank": 256,
+    }
+
+    config = DSparkConfig.from_dspark_dict(released_config)
+    # ``aux_hidden_state_layer_ids`` uses the same EAGLE ``output_hidden_states``
+    # indexing as SpeCo's training-side ``target_layer_ids``, so it must be kept
+    # verbatim rather than shifted or replaced by the spaced fallback.
+    assert config.target_layer_ids == [2, 10, 20, 30, 37]
+
+    checkpoint_dir = tmp_path / "draft_step_10"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps(config.to_dict()), encoding="utf-8"
+    )
+    source_dir = tmp_path / "source_dspark"
+    source_dir.mkdir()
+    (source_dir / "config.json").write_text(
+        json.dumps(released_config),
+        encoding="utf-8",
+    )
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="dspark"),
+        config=SimpleNamespace(
+            rollout=SimpleNamespace(
+                drafter=SimpleNamespace(
+                    model_path=str(source_dir),
+                    training={
+                        "dspark_target_layer_ids": [1, 9, 19, 29, 36]
+                    },
+                )
+            )
+        ),
+    )
+
+    _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    runtime_config = json.loads(
+        (checkpoint_dir / "config.json").read_text(encoding="utf-8")
+    )
+    saved_training_config = json.loads(
+        (checkpoint_dir / "speco_training_config.json").read_text(encoding="utf-8")
+    )
+    # vLLM reads ``eagle_aux_hidden_state_layer_ids`` directly; the z-lab
+    # ``target_layer_ids`` aliases are one less and vLLM adds the +1 back.
+    assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [2, 10, 20, 30, 37]
+    assert runtime_config["target_layer_ids"] == [1, 9, 19, 29, 36]
+    assert runtime_config["dflash_config"]["target_layer_ids"] == [1, 9, 19, 29, 36]
+    assert saved_training_config["target_layer_ids"] == [1, 9, 19, 29, 36]
+
+
+def _label_packing_trainer():
+    from collections import deque
+
+    from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend
+    from verl_speco.trainer.base_trainer import DrafterBaseTrainer
+
+    trainer = object.__new__(DrafterBaseTrainer)
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(training={"dspark_l1_loss_alpha": 0.0})
+        )
+    )
+    backend = object.__new__(DSparkTrainerBackend)
+    backend.config = trainer.config
+    trainer.backend = backend
+    trainer.model = torch.nn.Linear(1, 1)
+    trainer.model_config = SimpleNamespace(
+        pad_token_id=0, hidden_size=8, target_hidden_size=8, num_context_layers=2
+    )
+    trainer.collected_data = deque(maxlen=64)
+    trainer.current_rl_step = 0
+    trainer.batch_size = 4
+    trainer.training_steps = 0
+    trainer.use_data_buffer = False
+    trainer.data_buffer = None
+    trainer._current_pad_size = 0
+    trainer.rank = 0
+    trainer.use_ulysses_sp = False
+    trainer.ulysses_sequence_parallel_size = 1
+    trainer.training_device_mesh = None
+    trainer.training_process_group = None
+    trainer.training_group_world_size = 1
+    trainer.dp_group_world_size = 1
+    trainer.pad_token_id = 0
+    return trainer
+
+
+def _feature_sample(label_rows, hidden_rows, *, nan_hidden_row=None):
+    from verl_speco.trainer.feature_store import DraftFeatureSample
+
+    hidden = torch.randn(hidden_rows, 16)
+    if nan_hidden_row is not None:
+        hidden[nan_hidden_row] = float("nan")
+    return DraftFeatureSample(
+        algorithm="DSPARK",
+        input_ids=torch.arange(1, label_rows + 1),
+        loss_mask=torch.ones(label_rows),
+        hidden_states=hidden,
+        metadata={"hidden_states_layout": "dflash_aux", "global_step": 0},
+    )
+
+
+def test_block_drafter_label_packing_keeps_trailing_token():
+    trainer = _label_packing_trainer()
+    batch = trainer.prepare_training_batch_from_samples([_feature_sample(5, 4)], step=0)
+    assert batch is not None
+    assert "label_ids" in batch and "label_mask" in batch
+    assert batch["input_ids"].size(1) == 4
+    assert batch["label_ids"].size(1) == 5
+    assert batch["label_mask"].size(1) == 5
+    assert bool((batch["label_ids"][0, :4] == batch["input_ids"][0]).all())
+
+
+def test_block_drafter_label_packing_standalone_equal_lengths():
+    trainer = _label_packing_trainer()
+    batch = trainer.prepare_training_batch_from_samples([_feature_sample(4, 4)], step=0)
+    assert batch is not None
+    assert batch["label_ids"].size(1) == batch["input_ids"].size(1) == 4
+
+
+def test_block_drafter_label_mask_is_sanitized_for_bad_hidden_rows():
+    trainer = _label_packing_trainer()
+    batch = trainer.prepare_training_batch_from_samples(
+        [_feature_sample(5, 4, nan_hidden_row=1)], step=0
+    )
+    assert batch is not None
+    assert float(batch["loss_mask"][0, 1]) == 0.0
+    assert float(batch["label_mask"][0, 1]) == 0.0
+
+
+def test_check_block_drafter_rows_boundaries():
+    from verl_speco.backends.dflash_trainer_backend import _check_block_drafter_rows
+
+    _check_block_drafter_rows(4, 4, 4, "DSpark")
+    _check_block_drafter_rows(5, 4, 5, "DSpark")
+    with pytest.raises(ValueError):
+        _check_block_drafter_rows(6, 4, 6, "DSpark")
+    with pytest.raises(ValueError):
+        _check_block_drafter_rows(5, 4, 4, "DSpark")
+
+
+def test_block_drafter_label_mask_keeps_shorter_sample_tail():
+    """A mixed-length batch must gate each sample's tail label with its own
+    context length, not the batch-wide padded width."""
+    trainer = _label_packing_trainer()
+    batch = trainer.prepare_training_batch_from_samples(
+        [_feature_sample(5, 4), _feature_sample(6, 5)], step=0
+    )
+    assert batch is not None
+    # Short sample: 4 context rows + 1 trailing label; long: 5 + 1.
+    assert batch["input_ids"].size(1) == 5
+    assert batch["label_ids"].size(1) == 6
+    assert batch["label_mask"].size(1) == 6
+    # The shorter sample's tail lives at column 4, which is padding in the
+    # context loss mask because the longer sample sets the batch width.
+    assert float(batch["loss_mask"][0, 4]) == 0.0
+    assert float(batch["label_mask"][0, 4]) == 1.0
+    # Context columns still follow the context mask, and the longer sample's
+    # tail at column 5 remains supervised.
+    assert float(batch["label_mask"][0, 1]) == 1.0
+    assert float(batch["label_mask"][1, 5]) == 1.0
+
+
+def test_block_drafter_packing_rejects_trailing_label():
+    """Document-aware packing does not carry the trailing label token yet, so
+    the combination must fail closed instead of silently dropping it."""
+    trainer = _label_packing_trainer()
+    trainer.config.rollout.drafter.training["packing"] = {
+        "enable": True,
+        "max_packed_len": 0,
+    }
+    with pytest.raises(NotImplementedError, match="trailing drafter label token"):
+        trainer.prepare_training_batch_from_samples([_feature_sample(5, 4)], step=0)
+
+
+def test_block_drafter_packing_allows_equal_length_context():
+    """Equal-length (no trailing label) samples still pack normally."""
+    trainer = _label_packing_trainer()
+    trainer.config.rollout.drafter.training["packing"] = {
+        "enable": True,
+        "max_packed_len": 0,
+    }
+    batch = trainer.prepare_training_batch_from_samples([_feature_sample(4, 4)], step=0)
+    assert batch is not None
+    assert batch["input_ids"].size(1) >= 4
+    assert "document_ids" in batch
+    assert "label_ids" not in batch

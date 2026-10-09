@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -23,10 +25,21 @@ import pytest
 import torch
 
 from verl_speco.producer.vllm_feature_client import RawVllmFeature
-from verl_speco.standalone_tq_producer import run_producer, validate_producer_config
+from verl_speco.standalone_tq_producer import (
+    _drain_pending_samples,
+    run_producer,
+    validate_producer_config,
+)
 from verl_speco.trainer.standalone_resume import save_standalone_resume
 from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION
 from verl_speco.transport.drafter_sample_protocol import decode_sample
+
+
+@pytest.fixture(autouse=True)
+def _disable_consumer_drain(monkeypatch):
+    # Unit tests use a fake transport whose consumer never clears samples.
+    # Skip the post-run drain wait; the drain logic has dedicated tests below.
+    monkeypatch.setenv("SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS", "0")
 
 
 @pytest.fixture(autouse=True)
@@ -53,6 +66,7 @@ def _config(input_path: Path) -> dict[str, Any]:
                 "target_model_id": "/target",
                 "target_model_revision": "rev-a",
                 "target_layer_ids": [2, 8],
+                "vllm_aux_hidden_state_layer_ids": [3, 9],
                 "hidden_dtype": "float32",
                 "trust_remote_code": False,
                 "vllm_endpoints": ["http://vllm:8000/v1"],
@@ -157,6 +171,42 @@ class _Transport:
         self.closed = True
 
 
+class _ConcurrentTransport(_Transport):
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self.active_puts = 0
+        self.max_active_puts = 0
+
+    def put_sample(self, key, fields, *, tag):
+        if tag.get("record_type") != "sample":
+            return super().put_sample(key, fields, tag=tag)
+        with self._lock:
+            self.active_puts += 1
+            self.max_active_puts = max(self.max_active_puts, self.active_puts)
+        try:
+            time.sleep(0.05)
+            return super().put_sample(key, fields, tag=tag)
+        finally:
+            with self._lock:
+                self.active_puts -= 1
+
+
+class _TransientFailureTransport(_Transport):
+    def __init__(self, failures: int):
+        super().__init__()
+        self.failures_remaining = failures
+        self.sample_put_attempts = 0
+
+    def put_sample(self, key, fields, *, tag):
+        if tag.get("record_type") == "sample":
+            self.sample_put_attempts += 1
+            if self.failures_remaining > 0:
+                self.failures_remaining -= 1
+                raise RuntimeError("transient put failure")
+        return super().put_sample(key, fields, tag=tag)
+
+
 class _Pool:
     def __init__(self, root: Path, *, close_error: BaseException | None = None):
         self.root = root
@@ -172,7 +222,7 @@ class _Pool:
 
     async def prefill(self, request: Any) -> RawVllmFeature:
         self.prefill_calls += 1
-        path = self.root / f"{request.sample_id}.safetensors"
+        path = self.root / f"{request.sample_id}-{request.sequence_no}.safetensors"
         path.write_bytes(b"temporary")
         self.paths.append(path)
         token_ids = torch.tensor(request.prompt_token_ids, dtype=torch.int64)
@@ -188,7 +238,7 @@ class _Pool:
 
     async def generate(self, request: Any) -> RawVllmFeature:
         self.generate_calls += 1
-        path = self.root / f"{request.sample_id}.safetensors"
+        path = self.root / f"{request.sample_id}-{request.sequence_no}.safetensors"
         path.write_bytes(b"temporary")
         self.paths.append(path)
         # ExampleHiddenStatesConnector excludes the final generated token because
@@ -221,6 +271,39 @@ class _OneMisalignedPool(_Pool):
         if self.misaligned_remaining:
             self.misaligned_remaining -= 1
             raw.payload["hidden_states"] = raw.payload["hidden_states"][-1:]
+        return raw
+
+
+class _OneFailingPrefillPool(_Pool):
+    def __init__(self, root: Path):
+        super().__init__(root)
+        self.fail_remaining = 1
+
+    async def prefill(self, request: Any) -> RawVllmFeature:
+        if self.fail_remaining:
+            self.fail_remaining -= 1
+            raise RuntimeError("vLLM request failed after 4 attempts")
+        return await super().prefill(request)
+
+
+class _AlwaysFailingPrefillPool(_Pool):
+    async def prefill(self, request: Any) -> RawVllmFeature:
+        raise RuntimeError("vLLM request failed after 4 attempts")
+
+
+class _AlwaysMisalignedPool(_Pool):
+    async def prefill(self, request: Any) -> RawVllmFeature:
+        raw = await super().prefill(request)
+        raw.payload["hidden_states"] = raw.payload["hidden_states"][-1:]
+        return raw
+
+
+class _NanHiddenStatePool(_Pool):
+    async def prefill(self, request: Any) -> RawVllmFeature:
+        raw = await super().prefill(request)
+        raw.payload["hidden_states"] = torch.full_like(
+            raw.payload["hidden_states"], float("nan")
+        )
         return raw
 
 
@@ -290,6 +373,190 @@ def test_run_producer_publishes_samples_then_eos(
         sample.hidden_states[:, 4:], target_final_norm(raw[:, 2])
     )
     assert sample.metadata["last_hidden_state_norm"] == "target_final_norm"
+
+
+def test_run_producer_publishes_samples_concurrently(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["publish_workers"] = 2
+    transport = _ConcurrentTransport()
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=_Pool(tmp_path),
+        )
+    )
+
+    assert stats.published_count == 2
+    assert transport.max_active_puts == 2
+    assert any(tag.get("status") == "eos" for tag in transport.records.values())
+
+
+def test_run_producer_logs_perf_window_at_info(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    import verl_speco.standalone_tq_producer as producer_module
+
+    monkeypatch.setattr(producer_module, "_PERF_WINDOW_SAMPLES", 2)
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+
+    with caplog.at_level("INFO", logger="verl_speco.standalone_tq_producer"):
+        asyncio.run(
+            run_producer(
+                _config(input_path),
+                transport=_Transport(),
+                tokenizer=_Tokenizer(),
+                client_pool=_Pool(tmp_path),
+            )
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Producer perf samples=2" in message for message in messages)
+    assert any("perf middle samples:" in message for message in messages)
+    assert any("perf slowest e2e samples:" in message for message in messages)
+    assert any("perf slowest transport samples:" in message for message in messages)
+
+
+def test_run_producer_retries_transient_publish_failure(
+    tmp_path: Path, caplog
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    producer = config["speco"]["standalone_tq_producer"]
+    producer["max_samples"] = 1
+    producer["publish_workers"] = 1
+    producer["publish_max_attempts"] = 3
+    producer["publish_retry_backoff_seconds"] = 0
+    transport = _TransientFailureTransport(failures=2)
+    pool = _Pool(tmp_path)
+
+    with caplog.at_level("WARNING", logger="verl_speco.standalone_tq_producer"):
+        stats = asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
+    assert stats.published_count == 1
+    assert transport.sample_put_attempts == 3
+    assert sum("publish retry" in record.getMessage() for record in caplog.records) == 2
+    assert all(not path.exists() for path in pool.paths)
+    assert any(tag.get("status") == "eos" for tag in transport.records.values())
+
+
+def test_direct_producer_derives_vllm_ids_from_target_ids(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    producer = config["speco"]["standalone_tq_producer"]
+    producer.pop("vllm_aux_hidden_state_layer_ids")
+    producer["max_samples"] = 1
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=_Transport(),
+            tokenizer=_Tokenizer(),
+            client_pool=_Pool(tmp_path),
+        )
+    )
+
+    assert stats.published_count == 1
+
+
+def test_direct_producer_derives_target_ids_from_vllm_ids(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    producer = config["speco"]["standalone_tq_producer"]
+    producer.pop("target_layer_ids")
+    producer["max_samples"] = 1
+    transport = _Transport()
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=_Pool(tmp_path),
+        )
+    )
+
+    assert stats.published_count == 1
+    sample_key, sample_tag = next(
+        (key, tag)
+        for key, tag in transport.records.items()
+        if tag.get("record_type") == "sample"
+    )
+    sample = decode_sample(
+        sample_key,
+        sample_tag,
+        transport.payloads[sample_key],
+        {"run_id": "run-a"},
+    )
+    assert sample.metadata["target_layer_ids"] == [2, 8]
+
+
+def test_direct_producer_rejects_mismatched_layer_ids(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"][
+        "vllm_aux_hidden_state_layer_ids"
+    ] = [3]
+
+    with pytest.raises(ValueError, match="algorithm convention"):
+        validate_producer_config(config)
+
+
+def test_run_producer_does_not_republish_when_temporary_cleanup_fails(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    import verl_speco.standalone_tq_producer as producer_module
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    producer = config["speco"]["standalone_tq_producer"]
+    producer["max_samples"] = 1
+    producer["publish_workers"] = 1
+    producer["publish_retry_backoff_seconds"] = 0
+    transport = _TransientFailureTransport(failures=0)
+    pool = _Pool(tmp_path)
+    cleanup_calls = 0
+
+    def fail_cleanup(raw):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        raise PermissionError(raw.temporary_path)
+
+    monkeypatch.setattr(producer_module, "delete_temporary_result", fail_cleanup)
+    with caplog.at_level("WARNING", logger="verl_speco.standalone_tq_producer"):
+        stats = asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
+    assert stats.published_count == 1
+    assert transport.sample_put_attempts == 1
+    assert cleanup_calls == 3
+    assert any(
+        "cleanup failed; ignoring" in record.getMessage() for record in caplog.records
+    )
+    assert any(tag.get("status") == "eos" for tag in transport.records.values())
 
 
 @pytest.mark.parametrize("algorithm", ["DFLASH", "DSPARK"])
@@ -395,6 +662,47 @@ def test_run_producer_skips_consumed_sequences_before_vllm(tmp_path: Path) -> No
     assert sequence_nos == [1, 2]
 
 
+def test_run_producer_resumes_after_a_fully_consumed_epoch(tmp_path: Path) -> None:
+    """A resume whose first pass is entirely consumed must advance epochs.
+
+    Regression: the zero-production guard used to fire before ``epoch += 1``,
+    so a checkpoint that had consumed a whole input epoch could never resume.
+    """
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    checkpoint_path = tmp_path / "draft_step_2"
+    save_standalone_resume(
+        checkpoint_path,
+        [0, 1],
+        optimizer_step=2,
+        input_path=input_path,
+    )
+    config = _config(input_path)
+    producer_cfg = config["speco"]["standalone_tq_producer"]
+    producer_cfg["resume_checkpoint_path"] = str(checkpoint_path)
+    producer_cfg["max_samples"] = 2
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    sequence_nos = sorted(
+        int(tag["sequence_no"])
+        for tag in transport.records.values()
+        if tag.get("record_type") == "sample"
+    )
+    assert stats.published_count == 2
+    assert sequence_nos == [2, 3]
+    assert pool.closed and transport.closed
+
+
 def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) -> None:
     input_path = tmp_path / "dapo.jsonl"
     input_path.write_text(
@@ -410,10 +718,12 @@ def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) ->
     )
     transport = _Transport()
     pool = _Pool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["on_missing_response"] = "generate"
 
     stats = asyncio.run(
         run_producer(
-            _config(input_path),
+            config,
             transport=transport,
             tokenizer=_ChatTokenizer(),
             client_pool=pool,
@@ -432,6 +742,173 @@ def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) ->
     fields = transport.payloads[sample_keys[0]]
     assert fields["sample__input_ids"].tolist() == [10, 11]
     assert fields["sample__loss_mask"].tolist() == [0.0, 1.0]
+
+
+def test_run_producer_skips_rows_without_response_by_default(tmp_path: Path) -> None:
+    """Prompt-only rows are filtered (not generated) unless opted in."""
+
+    input_path = tmp_path / "prompt_only.jsonl"
+    input_path.write_text(
+        json.dumps({"prompt": [{"role": "user", "content": "Q3"}]}) + "\n",
+        encoding="utf-8",
+    )
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+
+    stats = asyncio.run(
+        run_producer(
+            _config(input_path),
+            transport=transport,
+            tokenizer=_ChatTokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    assert stats.filtered_count == 1
+    assert stats.published_count == 0
+    assert pool.generate_calls == 0
+    assert pool.closed and transport.closed
+
+
+def test_run_producer_rejects_invalid_on_missing_response(tmp_path: Path) -> None:
+    """A bad on_missing_response must fail at startup, not mid-run."""
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["on_missing_response"] = "bogus"
+
+    with pytest.raises(ValueError, match="on_missing_response"):
+        asyncio.run(
+            run_producer(
+                config,
+                transport=_Transport(),
+                tokenizer=_Tokenizer(),
+                client_pool=_Pool(tmp_path),
+            )
+        )
+
+
+def test_run_producer_bounds_consecutive_generated_filters(tmp_path: Path) -> None:
+    """A target that always generates untrainable samples must abort, not loop."""
+
+    input_path = tmp_path / "dapo.jsonl"
+    input_path.write_text(
+        json.dumps({"prompt": [{"role": "user", "content": "Q3"}]}) + "\n",
+        encoding="utf-8",
+    )
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["on_missing_response"] = "generate"
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+    config["speco"]["standalone_tq_producer"]["max_inflight_requests"] = 1
+    # No generated completion can reach this many supervised tokens, so every
+    # generated sample is filtered after generation and replaced.
+    config["speco"]["standalone_tq_producer"]["min_supervised_tokens"] = 99
+    config["speco"]["standalone_tq_producer"]["max_consecutive_feature_drops"] = 2
+
+    with pytest.raises(RuntimeError, match="max_consecutive_feature_drops=2"):
+        asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_ChatTokenizer(),
+                client_pool=pool,
+            )
+        )
+
+    assert pool.closed and transport.closed
+
+
+def test_run_producer_renders_off_the_event_loop(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The synchronous /render calls must not run on the event-loop thread."""
+
+    import verl_speco.standalone_tq_producer as producer_module
+
+    input_path = tmp_path / "chat.jsonl"
+    input_path.write_text(
+        json.dumps(
+            {
+                "sample_id": "chat-1",
+                "prompt": [{"role": "user", "content": "Q1"}],
+                "response": "A1",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    render_threads: list[int] = []
+
+    def fake_render(messages, *, add_generation_prompt, max_length=None):
+        render_threads.append(threading.get_ident())
+        if add_generation_prompt:
+            return [1, 2, 3]
+        if len(messages) > 1:
+            return [1, 2, 3, 4, 5]
+        return [1, 2, 3]
+
+    def fake_build_render_fn(endpoint, *, timeout):
+        return fake_render
+
+    monkeypatch.setattr(producer_module, "build_render_fn", fake_build_render_fn)
+
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["render_boundary"] = {"enabled": True}
+    main_thread = threading.main_thread().ident
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    assert stats.published_count == 1
+    assert render_threads
+    assert all(ident != main_thread for ident in render_threads)
+
+
+def test_run_producer_misaligned_drop_survives_cleanup_failure(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """A store deletion failure on the drop path must not abort the producer."""
+
+    import verl_speco.standalone_tq_producer as producer_module
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _OneMisalignedPool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+
+    def fail_cleanup(raw):
+        raise RuntimeError("store delete failed")
+
+    monkeypatch.setattr(producer_module, "delete_temporary_result", fail_cleanup)
+    with caplog.at_level("WARNING", logger="verl_speco.standalone_tq_producer"):
+        stats = asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
+    assert stats.dropped_count == 1
+    assert stats.published_count == 2
+    assert any(
+        "best-effort temporary cleanup failed" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_run_producer_replaces_misaligned_sample_before_eos(
@@ -466,6 +943,235 @@ def test_run_producer_replaces_misaligned_sample_before_eos(
     assert eos["total_samples"] == 2
     assert all(not path.exists() for path in pool.paths)
     assert pool.closed and transport.closed
+
+
+def test_run_producer_replaces_sample_after_terminal_request_failure(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _OneFailingPrefillPool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    sample_tags = [
+        tag
+        for tag in transport.records.values()
+        if tag.get("record_type") == "sample"
+    ]
+    eos = next(tag for tag in transport.records.values() if tag.get("status") == "eos")
+    assert stats.input_count == 3
+    assert stats.published_count == 2
+    assert stats.request_failed_count == 1
+    assert stats.failed_count == 0
+    assert len(sample_tags) == 2
+    assert eos["total_samples"] == 2
+    assert all(not path.exists() for path in pool.paths)
+    assert pool.closed and transport.closed
+    assert "dropped sample after vLLM prefill failure" in caplog.text
+
+
+def test_run_producer_bounds_consecutive_terminal_request_failures(
+    tmp_path: Path,
+) -> None:
+    """A persistently failing endpoint must abort, not replace samples forever."""
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _AlwaysFailingPrefillPool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+    config["speco"]["standalone_tq_producer"]["max_inflight_requests"] = 1
+    config["speco"]["standalone_tq_producer"]["max_consecutive_feature_drops"] = 2
+
+    with pytest.raises(RuntimeError, match="max_consecutive_feature_drops=2"):
+        asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
+    assert pool.closed and transport.closed
+
+
+def test_run_producer_transient_request_failure_resets_breaker(
+    tmp_path: Path,
+) -> None:
+    """One terminal request failure followed by success must not trip the breaker."""
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _OneFailingPrefillPool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+    config["speco"]["standalone_tq_producer"]["max_inflight_requests"] = 1
+    config["speco"]["standalone_tq_producer"]["max_consecutive_feature_drops"] = 1
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    assert stats.request_failed_count == 1
+    assert stats.published_count == 2
+    assert pool.closed and transport.closed
+
+
+def test_run_producer_filters_over_length_sample_without_aborting(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+    config = _config(input_path)
+    # Any sample whose vLLM prefill would exceed this cap must be skipped
+    # instead of aborting the producer.
+    config["speco"]["standalone_tq_producer"]["max_sequence_length"] = 2
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    assert stats.filtered_count == 2
+    assert stats.published_count == 0
+    assert stats.failed_count == 0
+    assert pool.prefill_calls == 0
+    assert pool.closed and transport.closed
+    assert "exceeding max_sequence_length=2" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "pool_factory", [_AlwaysMisalignedPool, _NanHiddenStatePool]
+)
+def test_run_producer_bounds_consecutive_feature_drops(
+    tmp_path: Path, pool_factory: type[_Pool]
+) -> None:
+    """A persistently broken endpoint must abort, not replace samples forever."""
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = pool_factory(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+    config["speco"]["standalone_tq_producer"]["max_inflight_requests"] = 1
+    config["speco"]["standalone_tq_producer"]["max_consecutive_feature_drops"] = 2
+
+    with pytest.raises(RuntimeError, match="max_consecutive_feature_drops=2"):
+        asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
+    assert pool.closed and transport.closed
+
+
+def test_run_producer_feature_drop_limit_zero_fails_on_first_drop(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+    config["speco"]["standalone_tq_producer"]["max_inflight_requests"] = 1
+    config["speco"]["standalone_tq_producer"]["max_consecutive_feature_drops"] = 0
+
+    with pytest.raises(RuntimeError, match="max_consecutive_feature_drops=0"):
+        asyncio.run(
+            run_producer(
+                config,
+                transport=_Transport(),
+                tokenizer=_Tokenizer(),
+                client_pool=_OneMisalignedPool(tmp_path),
+            )
+        )
+
+
+def test_run_producer_transient_feature_drop_resets_breaker(
+    tmp_path: Path,
+) -> None:
+    """A drop below the bound must not abort once a later conversion succeeds."""
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _OneMisalignedPool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+    config["speco"]["standalone_tq_producer"]["max_inflight_requests"] = 1
+    config["speco"]["standalone_tq_producer"]["max_consecutive_feature_drops"] = 1
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    assert stats.dropped_count == 1
+    assert stats.published_count == 2
+
+
+def test_run_producer_logs_error_when_nothing_is_published(
+    tmp_path: Path, caplog
+) -> None:
+    """A single pass that drops every sample must be visible, not silent."""
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _AlwaysMisalignedPool(tmp_path)
+    config = _config(input_path)
+    # max_samples<=0 means one pass; a single worker avoids the fake pool's
+    # per-sample-id temporary-file race.
+    config["speco"]["standalone_tq_producer"]["max_inflight_requests"] = 1
+
+    with caplog.at_level("ERROR", logger="verl_speco.standalone_tq_producer"):
+        stats = asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
+    assert stats.published_count == 0
+    assert stats.dropped_count == 2
+    assert "published no samples" in caplog.text
 
 
 def test_run_producer_put_failure_keeps_temporary_file_and_omits_eos(
@@ -521,3 +1227,183 @@ def test_pool_close_failure_does_not_skip_transport_close(tmp_path: Path) -> Non
         )
 
     assert pool.closed and transport.closed
+
+
+def test_hidden_state_store_closes_after_consumer_drain(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The hidden-state pool must close only after the TQ consumer drains.
+
+    Mooncake allocates objects across all of a process's registered segments
+    (allocation_strategy=random), so closing the producer's hidden-state store
+    before the drain can unmount a segment holding unconsumed TQ fields and
+    surface as batch_get_into error -704.
+    """
+
+    monkeypatch.setenv("SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS", "30")
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    order: list[str] = []
+
+    class _DrainingTransport(_Transport):
+        def list_samples(self):
+            order.append("list")
+            # Simulate the consumer fetching and clearing every sample.
+            self.records = {
+                key: tag
+                for key, tag in self.records.items()
+                if tag.get("record_type") != "sample"
+            }
+            return dict(self.records)
+
+    class _OrderedPool(_Pool):
+        async def close(self) -> None:
+            order.append("pool_close")
+            await super().close()
+
+    transport = _DrainingTransport()
+    pool = _OrderedPool(tmp_path)
+
+    stats = asyncio.run(
+        run_producer(
+            _config(input_path),
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    assert stats.published_count > 0
+    assert "pool_close" in order
+    # No TQ metadata read may happen after the hidden-state store closes.
+    assert "list" not in order[order.index("pool_close") + 1 :]
+
+
+def test_run_producer_errors_when_every_row_is_filtered(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+    # No feature window can reach this many supervised tokens, so every row is
+    # filtered (SampleFilteredError) and no request is produced.
+    config["speco"]["standalone_tq_producer"]["min_supervised_tokens"] = 99
+
+    with pytest.raises(ValueError, match="filtered every newly considered sample"):
+        asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
+
+def test_config_int_preserves_explicit_zero() -> None:
+    from verl_speco.config import config_int
+
+    assert config_int({"max_consecutive_errors": 0}, "max_consecutive_errors", 20) == 0
+    assert config_int({}, "max_consecutive_errors", 20) == 20
+    assert (
+        config_int({"max_consecutive_errors": None}, "max_consecutive_errors", 20) == 20
+    )
+    assert (
+        config_int({"max_consecutive_errors": "7"}, "max_consecutive_errors", 20) == 7
+    )
+
+
+def test_run_producer_preserves_explicit_zero_max_consecutive_errors(
+    tmp_path: Path,
+) -> None:
+    """An explicit ``max_consecutive_errors=0`` must fail on the first bad row.
+
+    Regression: ``config.get(key, 20) or 20`` silently turned ``0`` into ``20``,
+    so the circuit breaker never fired for the documented "fail fast" setting.
+    """
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_text(
+        json.dumps({"sample_id": "sample-1", "prompt": "Q1: ", "response": "A1"})
+        + "\n"
+        + "{not valid json\n",
+        encoding="utf-8",
+    )
+    config = _config(input_path)
+    producer_cfg = config["speco"]["standalone_tq_producer"]
+    producer_cfg["on_error"] = "skip"
+    producer_cfg["max_consecutive_errors"] = 0
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+
+    with pytest.raises(RuntimeError, match="max_consecutive_errors=0"):
+        asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
+
+def _ready_tag(sequence_no: int = 0) -> dict[str, Any]:
+    return {
+        "record_type": "sample",
+        "status": "ready",
+        "schema_version": PROTOCOL_SCHEMA_VERSION,
+        "run_id": "run-a",
+        "sample_id": f"sample-{sequence_no}",
+        "sequence_no": sequence_no,
+    }
+
+
+def test_drain_pending_samples_returns_after_consumer_clears() -> None:
+    class _DrainTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def list_samples(self) -> dict[str, dict[str, Any]]:
+            self.calls += 1
+            # Emulate a consumer that acks the batch on its third poll.
+            if self.calls >= 3:
+                return {}
+            return {"sample:0": _ready_tag()}
+
+    transport = _DrainTransport()
+    asyncio.run(
+        _drain_pending_samples(
+            transport, "run-a", timeout=5.0, poll_interval=0.0
+        )
+    )
+    assert transport.calls >= 3
+
+
+def test_drain_pending_samples_times_out_without_failing() -> None:
+    class _StuckTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def list_samples(self) -> dict[str, dict[str, Any]]:
+            self.calls += 1
+            return {"sample:0": _ready_tag()}
+
+    transport = _StuckTransport()
+    asyncio.run(
+        _drain_pending_samples(
+            transport, "run-a", timeout=0.05, poll_interval=0.0
+        )
+    )
+    assert transport.calls >= 1
+
+
+def test_drain_pending_samples_disabled_with_zero_timeout() -> None:
+    class _UnexpectedTransport:
+        def list_samples(self) -> dict[str, dict[str, Any]]:
+            raise AssertionError("drain must not poll when disabled")
+
+    asyncio.run(
+        _drain_pending_samples(
+            _UnexpectedTransport(), "run-a", timeout=0.0, poll_interval=0.0
+        )
+    )

@@ -28,7 +28,9 @@ import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -39,9 +41,17 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 import uuid
 
+from omegaconf import OmegaConf
+
+from verl_speco.draft_train_launcher import (
+    normalize_training_args,
+    resolve_launch_config,
+)
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
+from verl_speco.producer.hidden_states_store import _local_ip
+from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.trainer.standalone_resume import load_standalone_resume
 
 
@@ -55,11 +65,15 @@ _TOKENIZER_PATH_KEY = (
     "actor_rollout_ref.rollout.drafter.training.feature_store.tokenizer_path"
 )
 _PRODUCER_TARGET_LAYER_IDS_KEY = "speco.standalone_tq_producer.target_layer_ids"
+_PRODUCER_VLLM_AUX_LAYER_IDS_KEY = (
+    "speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids"
+)
 _PRODUCER_HIDDEN_DTYPE_KEY = "speco.standalone_tq_producer.hidden_dtype"
 _DSPARK_L1_LOSS_ALPHA_KEY = (
     "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha"
 )
 _ALGORITHM_TARGET_LAYER_IDS_KEYS = {
+    "EAGLE3": "actor_rollout_ref.rollout.drafter.training.eagle3_target_layer_ids",
     "DFLASH": "actor_rollout_ref.rollout.drafter.training.dflash_target_layer_ids",
     "DSPARK": "actor_rollout_ref.rollout.drafter.training.dspark_target_layer_ids",
     "DOMINO": "actor_rollout_ref.rollout.drafter.training.domino_target_layer_ids",
@@ -84,21 +98,28 @@ _NNODES_KEYS = (
 _TQ_PREFIX = "actor_rollout_ref.rollout.drafter.training.transfer_queue"
 _FEATURE_STORE_PREFIX = "actor_rollout_ref.rollout.drafter.training.feature_store"
 _PRODUCER_PREFIX = "speco.standalone_tq_producer"
-_PRODUCER_TUNING_KEYS = frozenset(
+_RUNTIME_BACKEND_KEY = "speco.draft_training.runtime_backend"
+# Every user override under this prefix is forwarded to the Producer, except the
+# fields the unified launcher computes and sets itself (paths, identities,
+# endpoints, and the sample budget). Forwarding the whole prefix keeps newly
+# added Producer knobs usable through the launcher without extending an
+# allow-list for each one.
+_PRODUCER_LAUNCHER_OWNED_KEYS = frozenset(
     {
-        f"{_PRODUCER_PREFIX}.request_timeout",
-        f"{_PRODUCER_PREFIX}.max_inflight_requests",
-        f"{_PRODUCER_PREFIX}.per_endpoint_concurrency",
-        f"{_PRODUCER_PREFIX}.input_queue_size",
-        f"{_PRODUCER_PREFIX}.publish_queue_size",
-        f"{_PRODUCER_PREFIX}.max_pending_samples",
-        f"{_PRODUCER_PREFIX}.pending_poll_interval_seconds",
-        f"{_PRODUCER_PREFIX}.max_sequence_length",
-        f"{_PRODUCER_PREFIX}.max_feature_length",
-        f"{_PRODUCER_PREFIX}.generation_max_tokens",
-        _PRODUCER_HIDDEN_DTYPE_KEY,
+        f"{_PRODUCER_PREFIX}.input_path",
+        f"{_PRODUCER_PREFIX}.resume_checkpoint_path",
+        f"{_PRODUCER_PREFIX}.tokenizer_path",
+        f"{_PRODUCER_PREFIX}.tokenizer_fingerprint",
+        f"{_PRODUCER_PREFIX}.target_model_id",
+        f"{_PRODUCER_PREFIX}.target_model_revision",
+        f"{_PRODUCER_PREFIX}.target_layer_ids",
+        f"{_PRODUCER_PREFIX}.vllm_aux_hidden_state_layer_ids",
+        f"{_PRODUCER_PREFIX}.vllm_endpoints",
+        f"{_PRODUCER_PREFIX}.vllm_model",
+        f"{_PRODUCER_PREFIX}.max_samples",
     }
 )
+_PRODUCER_CONFIG_PATH = Path(__file__).with_name("config") / "speco_base.yaml"
 _INTERNAL_OVERRIDE_KEYS = frozenset(
     {
         f"{_FEATURE_STORE_PREFIX}.type",
@@ -121,15 +142,23 @@ _INTERNAL_OVERRIDE_KEYS = frozenset(
         f"{_TQ_PREFIX}.expected_feature.target_layer_ids",
         f"{_TQ_PREFIX}.expected_feature.hidden_states_layout",
         f"{_TQ_PREFIX}.expected_feature.hidden_dtype",
+        _RUNTIME_BACKEND_KEY,
     }
 )
 
-_DEFAULT_TARGET_LAYER_IDS = (1, 9, 17, 25, 33)
+# These are the output IDs passed verbatim to vLLM serve. DFlash-family
+# training IDs are derived from them by subtracting one.
+_DEFAULT_VLLM_AUX_LAYER_IDS = (1, 9, 17, 25, 33)
 _DEFAULT_VLLM_ENDPOINT = "http://127.0.0.1:8000/v1"
 _DEFAULT_VLLM_GPU_MEMORY_UTILIZATION = "0.4"
 _VLLM_HIDDEN_STATES_DIR = "__SPECO_HIDDEN_STATES_DIR__"
 _TQ_NAMESPACE = "speco-drafter"
 _TQ_PARTITION = "speco_drafter_features"
+_TQ_STORAGE_BACKENDS = ("SimpleStorage", "MooncakeStore")
+_HS_STORES = ("file", "mooncake")
+_HS_STORE_ENV = "SPECO_VLLM_HIDDEN_STATES_STORE"
+_MOONCAKE_MASTER_DEFAULT = "127.0.0.1:50051"
+_MOONCAKE_AUTO_INIT_DEFAULT = False
 
 
 @dataclass(frozen=True)
@@ -139,6 +168,7 @@ class PipelineConfig:
     tokenizer_path: str
     algorithm: str
     target_layer_ids: tuple[int, ...]
+    vllm_aux_hidden_state_layer_ids: tuple[int, ...]
     vllm_endpoints: tuple[str, ...]
     run_id: str
 
@@ -150,6 +180,8 @@ class PipelineCommands:
     owner: list[str]
     producer: list[str]
     consumer: list[str]
+    producer_overrides: tuple[str, ...]
+    consumer_overrides: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -166,6 +198,37 @@ def _split_override(item: str) -> tuple[str, str] | None:
         return None
     key, value = item.split("=", 1)
     return key, value
+
+
+def _is_forwarded_producer_override(key: str) -> bool:
+    """Whether a key selects an option under the Producer config prefix."""
+
+    return key.startswith(f"{_PRODUCER_PREFIX}.")
+
+
+@lru_cache(maxsize=1)
+def _producer_config_keys() -> frozenset[str]:
+    """Every override path the Producer accepts, taken from its config schema.
+
+    Includes intermediate nodes so a nested override such as
+    ``render_boundary`` or a leaf such as ``render_boundary.enabled`` both
+    validate.
+    """
+
+    node: Any = OmegaConf.load(_PRODUCER_CONFIG_PATH)
+    for part in _PRODUCER_PREFIX.split("."):
+        node = node[part]
+    keys: set[str] = set()
+
+    def walk(path: str, value: Any) -> None:
+        keys.add(path)
+        items = getattr(value, "items", None)
+        if callable(items):
+            for key, child in items():
+                walk(f"{path}.{key}", child)
+
+    walk(_PRODUCER_PREFIX, node)
+    return frozenset(keys)
 
 
 def _find_override(overrides: Sequence[str], key: str) -> str | None:
@@ -205,9 +268,11 @@ def _single_train_file(value: str | None) -> str:
     return text
 
 
-def _parse_layer_ids(value: str | None, *, config_key: str) -> tuple[int, ...]:
+def _parse_layer_ids(
+    value: str | None, *, config_key: str, default: tuple[int, ...] | None = None
+) -> tuple[int, ...] | None:
     if value is None or _strip_quotes(value).lower() in {"", "null", "none"}:
-        return _DEFAULT_TARGET_LAYER_IDS
+        return default
     text = _strip_quotes(value)
     if not (text.startswith("[") and text.endswith("]")):
         raise ValueError(f"{config_key} must be a Hydra integer list")
@@ -220,19 +285,53 @@ def _parse_layer_ids(value: str | None, *, config_key: str) -> tuple[int, ...]:
     return result
 
 
-def _resolve_target_layer_ids(
+def _resolve_layer_ids(
     training_args: Sequence[str], algorithm: str
-) -> tuple[int, ...]:
-    """Resolve Producer layers without making the launcher DSpark-specific."""
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Resolve vLLM output IDs and canonical drafter decoder-layer IDs."""
 
+    raw_vllm = _find_override(training_args, _PRODUCER_VLLM_AUX_LAYER_IDS_KEY)
+    raw_producer_target = _find_override(training_args, _PRODUCER_TARGET_LAYER_IDS_KEY)
     algorithm_key = _ALGORITHM_TARGET_LAYER_IDS_KEYS.get(algorithm)
-    candidate_keys = (
-        (_PRODUCER_TARGET_LAYER_IDS_KEY, algorithm_key)
+    raw_algorithm_target = (
+        _find_override(training_args, algorithm_key)
         if algorithm_key is not None
-        else (_PRODUCER_TARGET_LAYER_IDS_KEY,)
+        else None
     )
-    raw = _find_first_override(training_args, candidate_keys)
-    return _parse_layer_ids(raw, config_key=candidate_keys[0])
+    vllm_ids = _parse_layer_ids(
+        raw_vllm,
+        config_key=_PRODUCER_VLLM_AUX_LAYER_IDS_KEY,
+        default=None,
+    )
+    producer_target_ids = _parse_layer_ids(
+        raw_producer_target,
+        config_key=_PRODUCER_TARGET_LAYER_IDS_KEY,
+        default=None,
+    )
+    algorithm_target_ids = _parse_layer_ids(
+        raw_algorithm_target,
+        config_key=algorithm_key or _PRODUCER_TARGET_LAYER_IDS_KEY,
+        default=None,
+    )
+    if (
+        producer_target_ids is not None
+        and algorithm_target_ids is not None
+        and producer_target_ids != algorithm_target_ids
+    ):
+        raise ValueError(
+            f"{_PRODUCER_TARGET_LAYER_IDS_KEY}={list(producer_target_ids)} does "
+            f"not match {algorithm_key}={list(algorithm_target_ids)}"
+        )
+    target_ids = (
+        producer_target_ids if producer_target_ids is not None else algorithm_target_ids
+    )
+    normalized_target_ids, normalized_vllm_ids = normalize_standalone_layer_ids(
+        algorithm,
+        target_ids,
+        vllm_ids,
+        default_vllm_ids=_DEFAULT_VLLM_AUX_LAYER_IDS,
+    )
+    return normalized_vllm_ids, normalized_target_ids
 
 
 def _parse_vllm_endpoints(env: Mapping[str, str]) -> tuple[str, ...]:
@@ -322,9 +421,20 @@ def _target_final_layer_id(model_path: str, target_layer_ids: Sequence[int]) -> 
             if candidate is not None and int(candidate) > 0:
                 return int(candidate)
         raise ValueError(f"Target model config has no num_hidden_layers: {config_path}")
-    # Keep dry-run and model-registry IDs usable. The formal Qwen3-4B/8B
-    # defaults select layer 33 and use transformer output 36 as the final state.
+    # Keep dry-run and model-registry IDs usable. The configured Qwen3-4B/8B
+    # vLLM outputs end at 33 and use transformer output 36 as the final state.
     return max(int(layer_id) for layer_id in target_layer_ids) + 3
+
+
+def _vllm_capture_layer_ids(
+    target_layer_ids: Sequence[int], final_layer_id: int
+) -> list[int]:
+    """Build the vLLM capture plan without requesting the final output twice."""
+
+    capture_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
+    if int(final_layer_id) not in capture_layer_ids:
+        capture_layer_ids.append(int(final_layer_id))
+    return capture_layer_ids
 
 
 def resolve_pipeline_config(
@@ -345,7 +455,7 @@ def resolve_pipeline_config(
     ).upper()
     if not algorithm:
         raise ValueError(f"{_ALGORITHM_KEY} must not be empty")
-    target_layer_ids = _resolve_target_layer_ids(training_args, algorithm)
+    vllm_aux_layer_ids, target_layer_ids = _resolve_layer_ids(training_args, algorithm)
     endpoints = _parse_vllm_endpoints(env)
     return PipelineConfig(
         input_path=input_path,
@@ -353,6 +463,7 @@ def resolve_pipeline_config(
         tokenizer_path=tokenizer_path,
         algorithm=algorithm,
         target_layer_ids=target_layer_ids,
+        vllm_aux_hidden_state_layer_ids=vllm_aux_layer_ids,
         vllm_endpoints=endpoints,
         run_id=f"{algorithm.lower()}-{uuid.uuid4().hex}",
     )
@@ -394,6 +505,22 @@ def start_ray_session(
     return RaySession(module=ray_runtime, address=address)
 
 
+def _validate_runtime_backend_topology(
+    runtime_backend: str, training_args: Sequence[str]
+) -> None:
+    """Reject multi-node Ray jobs until external-cluster ownership is supported."""
+
+    if runtime_backend != "ray":
+        return
+    nnodes = _positive_int_override(training_args, _NNODES_KEYS, default=1)
+    if nnodes != 1:
+        raise ValueError(
+            "Standalone Ray backend currently requires "
+            "speco.draft_training.nnodes=1 because the launcher starts a "
+            "task-local single-node Ray runtime"
+        )
+
+
 def _hydra_list(values: Sequence[Any]) -> str:
     return "[" + ",".join(str(value) for value in values) + "]"
 
@@ -410,14 +537,276 @@ def _replace_internal_overrides(
     return [*cleaned, *internal]
 
 
+def _env_flag(env: Mapping[str, str], name: str, default: bool = False) -> bool:
+    raw = env.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env(env: Mapping[str, str], name: str, default: str = "") -> str:
+    """Return ``env[name]`` stripped, or ``default`` when it is unset."""
+    value = env.get(name)
+    return default if value is None else str(value).strip()
+
+
+def _resolve_tq_backend(env: Mapping[str, str]) -> str:
+    """Return the selected TQ storage backend, rejecting unknown values.
+
+    A typo or case mismatch must not silently fall back to the in-memory
+    ``SimpleStorage`` backend when a remote store was intended.
+    """
+    backend = str(env.get("SPECO_TQ_STORAGE_BACKEND", "SimpleStorage")).strip()
+    if backend not in _TQ_STORAGE_BACKENDS:
+        raise RuntimeError(
+            f"Unsupported SPECO_TQ_STORAGE_BACKEND={backend!r}; expected one of "
+            f"{list(_TQ_STORAGE_BACKENDS)}."
+        )
+    return backend
+
+
+def _mooncake_master_address(env: Mapping[str, str]) -> tuple[str, int]:
+    raw = str(env.get("SPECO_TQ_MOONCAKE_MASTER", _MOONCAKE_MASTER_DEFAULT)).strip()
+    host, _, port = raw.rpartition(":")
+    if not host or not port.isdigit():
+        raise RuntimeError(f"SPECO_TQ_MOONCAKE_MASTER must be host:port, got {raw!r}")
+    return host, int(port)
+
+
+def validate_tq_backend(
+    env: Mapping[str, str],
+    *,
+    connect: Callable[..., Any] | None = None,
+    timeout: float = 2.0,
+) -> None:
+    """Fail fast when the selected TQ transport cannot possibly work.
+
+    ``MooncakeStore`` with ``auto_init=false`` needs an external
+    ``mooncake_master``; TransferQueue only starts one itself when auto-init is
+    on. Probe the master address up front so the pipeline raises an actionable
+    error instead of failing deep inside the owner.
+    """
+    backend = _resolve_tq_backend(env)
+    if backend != "MooncakeStore":
+        return
+    if _env_flag(env, "SPECO_TQ_MOONCAKE_AUTO_INIT", _MOONCAKE_AUTO_INIT_DEFAULT):
+        return
+    if _env_flag(env, "SPECO_TQ_MOONCAKE_SKIP_PRECHECK", False):
+        # Multi-node setups may not be able to reach the master from the
+        # launcher host even though the training workers can.
+        return
+    host, port = _mooncake_master_address(env)
+    probe = connect if connect is not None else socket.create_connection
+    try:
+        probe((host, port), timeout=timeout).close()
+    except OSError as exc:
+        raise RuntimeError(
+            "MooncakeStore backend selected with SPECO_TQ_MOONCAKE_AUTO_INIT=false, "
+            f"but no mooncake_master is reachable at {host}:{port} ({exc}). Start "
+            "mooncake_master there, or set SPECO_TQ_MOONCAKE_AUTO_INIT=true to let "
+            "TransferQueue start one."
+        ) from exc
+
+
+def _tq_backend_overrides(env: Mapping[str, str]) -> list[str]:
+    """Internal TQ storage-backend overrides.
+
+    Transport backend selection is not exposed through the Hydra CLI. It
+    defaults to the in-memory ``SimpleStorage``; set
+    ``SPECO_TQ_STORAGE_BACKEND=MooncakeStore`` to use a Mooncake store
+    (``SPECO_TQ_MOONCAKE_*`` tune its client configuration).
+    """
+    backend = _resolve_tq_backend(env)
+
+    if backend == "MooncakeStore":
+        auto_init = _env_flag(
+            env, "SPECO_TQ_MOONCAKE_AUTO_INIT", _MOONCAKE_AUTO_INIT_DEFAULT
+        )
+        return [
+            f"{_TQ_PREFIX}.backend.storage_backend=MooncakeStore",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.auto_init={str(auto_init).lower()}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.metadata_server="
+            f"{_env(env, 'SPECO_TQ_MOONCAKE_METADATA_SERVER', 'P2PHANDSHAKE')}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.master_server_address="
+            f"{_env(env, 'SPECO_TQ_MOONCAKE_MASTER', _MOONCAKE_MASTER_DEFAULT)}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.local_hostname="
+            f"{_env(env, 'SPECO_TQ_MOONCAKE_LOCAL_HOSTNAME', '')}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.protocol="
+            f"{_env(env, 'SPECO_TQ_MOONCAKE_PROTOCOL', 'tcp')}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.global_segment_size="
+            f"{_env(env, 'SPECO_TQ_MOONCAKE_GLOBAL_SEGMENT_BYTES', str(4 * 1024**3))}",
+            f"{_TQ_PREFIX}.backend.MooncakeStore.local_buffer_size="
+            f"{_env(env, 'SPECO_TQ_MOONCAKE_LOCAL_BUFFER_BYTES', str(2 * 1024**3))}",
+        ]
+    return [
+        f"{_TQ_PREFIX}.backend.storage_backend=SimpleStorage",
+        f"{_TQ_PREFIX}.backend.SimpleStorage.total_storage_size=17179869184",
+        f"{_TQ_PREFIX}.backend.SimpleStorage.num_data_storage_units=8",
+    ]
+
+
+def _resolve_hidden_states_store(env: Mapping[str, str]) -> str:
+    """Return the selected hidden-state transfer backend.
+
+    ``file`` keeps the legacy safetensors connector; ``mooncake`` swaps in the
+    out-of-tree handle-based connector from ``hs_connectors``.
+    """
+    backend = str(env.get(_HS_STORE_ENV, "file")).strip().lower()
+    if backend not in _HS_STORES:
+        raise RuntimeError(
+            f"Unsupported {_HS_STORE_ENV}={backend!r}; expected one of "
+            f"{list(_HS_STORES)}."
+        )
+    return backend
+
+
+def _hidden_states_mooncake_settings(env: Mapping[str, str]) -> dict[str, Any]:
+    """Resolve Mooncake settings, falling back to the TQ Mooncake variables."""
+
+    def pick(name: str, fallback: str, default: str) -> str:
+        return _env(env, name) or _env(env, fallback) or default
+
+    def pick_int(name: str, fallback: str, default: int) -> int:
+        raw = pick(name, fallback, str(default))
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{name} (or {fallback}) must be an integer, got {raw!r}"
+            ) from exc
+
+    local_hostname = (
+        pick(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_LOCAL_HOSTNAME",
+            "SPECO_TQ_MOONCAKE_LOCAL_HOSTNAME",
+            "",
+        )
+        or _local_ip()
+    )
+    return {
+        "local_hostname": local_hostname,
+        "metadata_server": pick(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_METADATA_SERVER",
+            "SPECO_TQ_MOONCAKE_METADATA_SERVER",
+            "P2PHANDSHAKE",
+        ),
+        "master_server_address": pick(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_MASTER",
+            "SPECO_TQ_MOONCAKE_MASTER",
+            _MOONCAKE_MASTER_DEFAULT,
+        ),
+        "global_segment_size": pick_int(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_GLOBAL_SEGMENT_BYTES",
+            "SPECO_TQ_MOONCAKE_GLOBAL_SEGMENT_BYTES",
+            4 * 1024**3,
+        ),
+        "local_buffer_size": pick_int(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_LOCAL_BUFFER_BYTES",
+            "SPECO_TQ_MOONCAKE_LOCAL_BUFFER_BYTES",
+            2 * 1024**3,
+        ),
+        "protocol": pick(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_PROTOCOL",
+            "SPECO_TQ_MOONCAKE_PROTOCOL",
+            "tcp",
+        ),
+        "device_name": pick(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_DEVICE_NAME",
+            "SPECO_TQ_MOONCAKE_DEVICE_NAME",
+            "",
+        ),
+        "num_writer_threads": pick_int(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_WRITER_THREADS",
+            "SPECO_TQ_MOONCAKE_WRITER_THREADS",
+            8,
+        ),
+    }
+
+
+def _vllm_kv_transfer_config(env: Mapping[str, str]) -> dict[str, Any]:
+    """Build the vLLM ``--kv-transfer-config`` for the selected backend."""
+    if _resolve_hidden_states_store(env) == "mooncake":
+        return {
+            "kv_connector": "SpecoMooncakeHiddenStatesConnector",
+            "kv_connector_module_path": "verl_speco.mooncake_hidden_states_connector",
+            "kv_role": "kv_producer",
+            "kv_connector_extra_config": {
+                "mooncake": _hidden_states_mooncake_settings(env),
+            },
+        }
+    return {
+        "kv_connector": "ExampleHiddenStatesConnector",
+        "kv_role": "kv_producer",
+        "kv_connector_extra_config": {
+            "shared_storage_path": _VLLM_HIDDEN_STATES_DIR,
+            "use_synchronization_lock": True,
+        },
+    }
+
+
+def _hidden_states_store_overrides(env: Mapping[str, str]) -> list[str]:
+    """Producer-side overrides that select the consumer store backend."""
+    if _resolve_hidden_states_store(env) != "mooncake":
+        return []
+    settings = _hidden_states_mooncake_settings(env)
+    prefix = f"{_PRODUCER_PREFIX}.hidden_states_store"
+    return [
+        f"{prefix}.backend=mooncake",
+        f"{prefix}.mooncake.local_hostname={settings['local_hostname']}",
+        f"{prefix}.mooncake.metadata_server={settings['metadata_server']}",
+        f"{prefix}.mooncake.master_server_address={settings['master_server_address']}",
+        f"{prefix}.mooncake.global_segment_size={settings['global_segment_size']}",
+        f"{prefix}.mooncake.local_buffer_size={settings['local_buffer_size']}",
+        f"{prefix}.mooncake.protocol={settings['protocol']}",
+        f"{prefix}.mooncake.device_name={settings['device_name']}",
+        f"{prefix}.mooncake.num_writer_threads={settings['num_writer_threads']}",
+    ]
+
+
+def validate_hidden_states_store(
+    env: Mapping[str, str],
+    *,
+    connect: Callable[..., Any] | None = None,
+    timeout: float = 2.0,
+) -> None:
+    """Fail fast when the handle-based store cannot reach its Mooncake master."""
+    if _resolve_hidden_states_store(env) != "mooncake":
+        return
+    if _env_flag(env, "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_SKIP_PRECHECK", False):
+        return
+    raw = str(_hidden_states_mooncake_settings(env)["master_server_address"])
+    host, _, port = raw.rpartition(":")
+    host = host.strip("[]")
+    if not host or not port.isdigit():
+        raise RuntimeError(
+            f"hidden-states Mooncake master address must be host:port, got {raw!r}"
+        )
+    probe = connect if connect is not None else socket.create_connection
+    try:
+        probe((host, int(port)), timeout=timeout).close()
+    except OSError as exc:
+        raise RuntimeError(
+            "hidden-states Mooncake store selected, but no mooncake_master is "
+            f"reachable at {host}:{port} ({exc}). Start mooncake_master there, or "
+            "set SPECO_VLLM_HIDDEN_STATES_MOONCAKE_SKIP_PRECHECK=true."
+        ) from exc
+
+
 def build_pipeline_commands(
     config: PipelineConfig,
     training_args: Sequence[str],
     *,
     ray_address: str,
     python_executable: str = sys.executable,
+    env: Mapping[str, str] | None = None,
 ) -> PipelineCommands:
-    """Build the internal commands without exposing transport options."""
+    """Build the internal commands without exposing transport options.
+
+    ``env`` selects the TQ storage backend (defaults to ``os.environ``); pass
+    the same mapping to :func:`run_pipeline` so backend selection and master
+    validation read one source.
+    """
+    backend_env = os.environ if env is None else env
 
     drafter_path = _strip_quotes(_find_override(training_args, _DRAFTER_PATH_KEY) or "")
     _, resume_metadata = load_standalone_resume(
@@ -436,9 +825,7 @@ def build_pipeline_commands(
         f"{_TQ_PREFIX}.partition_id={_TQ_PARTITION}",
         f"{_TQ_PREFIX}.run_id={config.run_id}",
         f"{_TQ_PREFIX}.drop_last=true",
-        f"{_TQ_PREFIX}.backend.storage_backend=SimpleStorage",
-        f"{_TQ_PREFIX}.backend.SimpleStorage.total_storage_size=17179869184",
-        f"{_TQ_PREFIX}.backend.SimpleStorage.num_data_storage_units=8",
+        *_tq_backend_overrides(backend_env),
     ]
     parsed_endpoint = urlparse(config.vllm_endpoints[0])
     vllm_port = parsed_endpoint.port or (
@@ -447,27 +834,20 @@ def build_pipeline_commands(
     # extract_hidden_states uses the model's layer-output convention. Qwen3-4B/8B
     # have 36 transformer layers; the default DSpark auxiliary selection ends at
     # 33 and requests the final layer output as 36.
-    final_layer_id = _target_final_layer_id(config.model_path, config.target_layer_ids)
+    final_layer_id = _target_final_layer_id(
+        config.model_path, config.vllm_aux_hidden_state_layer_ids
+    )
+    capture_layer_ids = _vllm_capture_layer_ids(
+        config.vllm_aux_hidden_state_layer_ids, final_layer_id
+    )
     speculative_config = {
         "method": "extract_hidden_states",
         "num_speculative_tokens": 1,
         "draft_model_config": {
-            "hf_config": {
-                "eagle_aux_hidden_state_layer_ids": [
-                    *config.target_layer_ids,
-                    final_layer_id,
-                ]
-            }
+            "hf_config": {"eagle_aux_hidden_state_layer_ids": capture_layer_ids}
         },
     }
-    kv_transfer_config = {
-        "kv_connector": "ExampleHiddenStatesConnector",
-        "kv_role": "kv_producer",
-        "kv_connector_extra_config": {
-            "shared_storage_path": _VLLM_HIDDEN_STATES_DIR,
-            "use_synchronization_lock": True,
-        },
-    }
+    kv_transfer_config = _vllm_kv_transfer_config(backend_env)
     vllm = None
     if len(config.vllm_endpoints) == 1 and parsed_endpoint.hostname in {
         "127.0.0.1",
@@ -496,16 +876,22 @@ def build_pipeline_commands(
         "verl_speco.tq_owner",
         *tq_overrides,
     ]
-    producer_tuning_overrides = [
-        item
-        for item in training_args
-        if (parsed := _split_override(item)) is not None
-        and parsed[0] in _PRODUCER_TUNING_KEYS
-    ]
-    producer = [
-        python_executable,
-        "-m",
-        "verl_speco.standalone_tq_producer",
+    producer_tuning_overrides = []
+    for item in training_args:
+        parsed = _split_override(item)
+        if parsed is None or not _is_forwarded_producer_override(parsed[0]):
+            continue
+        key = parsed[0]
+        if key in _PRODUCER_LAUNCHER_OWNED_KEYS:
+            # The launcher computes these and sets them on the Producer command.
+            continue
+        if key not in _producer_config_keys():
+            raise ValueError(
+                f"Unknown Producer override {key!r}; it is not defined under "
+                f"{_PRODUCER_PREFIX} in speco_base.yaml"
+            )
+        producer_tuning_overrides.append(item)
+    producer_overrides = [
         f"{_ALGORITHM_KEY}={config.algorithm}",
         *tq_overrides,
         *producer_tuning_overrides,
@@ -520,6 +906,8 @@ def build_pipeline_commands(
         + _stable_path_identity("target", config.model_path),
         "speco.standalone_tq_producer.target_layer_ids="
         + _hydra_list(config.target_layer_ids),
+        "speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids="
+        + _hydra_list(config.vllm_aux_hidden_state_layer_ids),
         "speco.standalone_tq_producer.vllm_endpoints="
         + _hydra_list(config.vllm_endpoints),
         f"speco.standalone_tq_producer.vllm_model={config.model_path}",
@@ -530,6 +918,7 @@ def build_pipeline_commands(
                 resumed_optimizer_step=resumed_optimizer_step,
             )
         ),
+        *_hidden_states_store_overrides(backend_env),
     ]
     consumer_internal = [
         f"{_FEATURE_STORE_PREFIX}.type=tq",
@@ -568,11 +957,27 @@ def build_pipeline_commands(
         consumer_internal.append(
             f"{algorithm_layer_ids_key}={_hydra_list(config.target_layer_ids)}"
         )
+    # The subprocess path normally passes through draft_train_launcher, which
+    # removes user-facing aliases such as num_gpus_per_node before Hydra sees
+    # them. Ray composes Hydra directly, so apply the exact same normalization.
+    launch_config = resolve_launch_config(list(training_args))
+    normalized_training_args = normalize_training_args(
+        list(training_args), launch_config
+    )
+    consumer_overrides = _replace_internal_overrides(
+        normalized_training_args, consumer_internal
+    )
+    producer = [
+        python_executable,
+        "-m",
+        "verl_speco.standalone_tq_producer",
+        *producer_overrides,
+    ]
     consumer = [
         python_executable,
         "-m",
         "verl_speco.draft_train_launcher",
-        *_replace_internal_overrides(training_args, consumer_internal),
+        *consumer_overrides,
     ]
     return PipelineCommands(
         vllm=vllm,
@@ -580,6 +985,8 @@ def build_pipeline_commands(
         owner=owner,
         producer=producer,
         consumer=consumer,
+        producer_overrides=tuple(producer_overrides),
+        consumer_overrides=tuple(consumer_overrides),
     )
 
 
@@ -661,6 +1068,8 @@ def run_pipeline(
     # torchrun ranks created by the Consumer launcher) to the control plane
     # created above instead of allowing a stale inherited value to win.
     base_env["RAY_ADDRESS"] = ray_address
+    validate_tq_backend(base_env)
+    validate_hidden_states_store(base_env)
     owner: subprocess.Popen[Any] | None = None
     producer: subprocess.Popen[Any] | None = None
     consumer: subprocess.Popen[Any] | None = None
@@ -776,11 +1185,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--python-executable", default=sys.executable)
+    parser.add_argument(
+        "--runtime-backend",
+        choices=("subprocess", "ray"),
+        default=None,
+        help="Override speco.draft_training.runtime_backend.",
+    )
     args, training_args = parser.parse_known_args(argv)
     logging.basicConfig(level=logging.INFO)
+    runtime_backend = (
+        args.runtime_backend
+        or _strip_quotes(
+            _find_override(training_args, _RUNTIME_BACKEND_KEY) or "ray"
+        ).lower()
+    )
+    if runtime_backend not in {"subprocess", "ray"}:
+        parser.error(f"{_RUNTIME_BACKEND_KEY} must be either subprocess or ray")
 
     try:
         config = resolve_pipeline_config(training_args)
+        _validate_runtime_backend_topology(runtime_backend, training_args)
         if args.dry_run:
             commands = build_pipeline_commands(
                 config,
@@ -813,6 +1237,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 python_executable=args.python_executable,
             )
             logger.info("Using task-local Ray control plane at %s", ray_session.address)
+            if runtime_backend == "ray":
+                from verl_speco.standalone_ray_runtime import run_ray_pipeline
+
+                return run_ray_pipeline(
+                    commands,
+                    ray_module=ray_session.module,
+                    ray_address=ray_session.address,
+                )
             return run_pipeline(commands, ray_address=ray_session.address)
         finally:
             ray_session.close()
