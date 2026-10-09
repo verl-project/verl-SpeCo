@@ -1154,7 +1154,6 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             )
             if max_window is None:
                 start, end = 0, ids.size(0)
-
             else:
                 nonzero = torch.nonzero(item_loss_mask)
                 if nonzero.numel() > 0:
