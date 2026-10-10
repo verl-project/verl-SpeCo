@@ -57,6 +57,9 @@ OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY = "speco_oldlogprob_hidden_capture_impl"
 OLD_LOGPROB_HIDDEN_LAYOUT_KEY = "speco_oldlogprob_hidden_layout"
 OLD_LOGPROB_TIMING_KEY = "speco_oldlogprob_timing"
 OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY = "speco_oldlogprob_selected_batch_indices"
+# Original batch index of each sample, used to restore sample order after
+# dynamic micro-batching may reorder samples within a training step.
+OLD_LOGPROB_SAMPLE_INDICES_KEY = "speco_oldlogprob_sample_indices"
 
 _TIMING_SELECT_US = 0
 _TIMING_SP_MERGE_US = 1

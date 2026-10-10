@@ -1,0 +1,76 @@
+# SFT Co-Train Hydra 配置
+
+# 继承 verl 的 sft_trainer_engine + speco_base（所有算法参数）
+defaults:
+  - sft_trainer_engine
+  - speco_base
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+# 实验类型：cotrain（SFT + drafter 联训）或 sft_only（纯 SFT）
+experiment_type: cotrain
+
+# ========== 清空 verl 继承的默认值，让 run_sft_co_train.py 的脚本常量作为 fallback ==========
+# CLI 传入时仍以 CLI 为准；未传入时使用脚本中的常量
+model:
+  path: null
+
+data:
+  train_files: null
+  val_files: null
+  train_batch_size: null
+  micro_batch_size_per_gpu: null
+  max_token_len_per_gpu: null
+  train_max_samples: null
+  num_workers: null
+
+trainer:
+  total_training_steps: null
+  total_epochs: null
+  n_gpus_per_node: null
+  nnodes: null
+  resume_mode: null
+  save_freq: null
+  test_freq: null
+  project_name: null
+  experiment_name: null
+  default_local_dir: null
+
+speco:
+  mode: sft
+  sft_specific:
+    enable_drafter_training: true
+    drafter_train_interval: 5
+    max_samples_per_step: 200
+    hidden_layer_id: -1
+    publish_during_sft: false
+    checkpoint_save_dir: null
+
+# SFT 专属的 drafter 训练参数覆盖（speco_base.yaml 默认值的补充）
+actor_rollout_ref:
+  rollout:
+    drafter:
+      enable: true
+      enable_drafter_training: true
+      speculative_algorithm: EAGLE3  # 默认算法，可被 CLI 覆盖
+      training:
+        collect_hidden_states_from_old_logprob: true
+        use_data_buffer: true
+        data_buffer_max_size: 50000
+        sample_last_n_steps: 10
+        # Cross-step hidden reuse is disabled: old buffered hidden states were
+        # produced by an older actor lm_head. Reconstructing target logits with
+        # the current (updated) head yields head_vN(hidden_vM) != head_vM(hidden_vM),
+        # silently corrupting drafter supervision. Keep same-step only.
+        allow_cross_step_hidden: false
+        skip_heavy_cleanup_after_drafter_training: true
+        lr: 2e-5
+        lr_warmup_steps: 0
+        lr_scheduler_type: constant
+        total_training_steps: 10
+        step: 10
+        use_logits: false
+        target_lm_head_row_restricted_sync: true

@@ -1044,6 +1044,7 @@ class SpecoWorker(Worker):
                 "hidden_last_hidden_filter",
                 "hidden_last_hidden_select",
                 "hidden_states_layout",
+                "target_layer_ids",
                 "target_logprobs_position_start",
                 "target_logprobs_position_end",
                 "global_step",
@@ -1089,6 +1090,102 @@ class SpecoWorker(Worker):
             result["collected"] = False
             result["reason"] = "samples_rejected"
         return result
+
+    # [SFT-CoTrain] SFT 专用特征收集方法（PPO 使用 stage/commit 两阶段接口）
+    # 对照旧仓库 golden: verl-SpeCo-main/verl_speco/workers/speco_worker.py:883-971
+    @register(
+        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
+    )
+    def collect_rollout_features(self, samples: list[dict]):
+        # [SFT-VERIFY] 验证数据收集
+        logger.warning(
+            f"[SFT-VERIFY] Rank={self.rank}: received {len(samples)} samples, trainer_exists={self.trainer is not None}, in_drafter_train_group={self.in_drafter_train_group}"
+        )
+        if not samples:
+            return
+        valid_count = 0
+        for sample in samples:
+            if not sample:
+                continue
+            valid_count += 1
+            batch = {
+                "input_ids": sample["input_ids"],
+            }
+
+            # [SFT-VERIFY] 从 loss_mask 反推出 prompts/responses
+            # collect_online_data (base_trainer.py) 依赖 prompts/responses 来构建 full_loss_mask
+            # SFT 模式没有 prompts/responses 字段，需要从 loss_mask 推导
+            if "loss_mask" in sample and sample["loss_mask"] is not None:
+                lm = sample["loss_mask"].flatten()  # (seq_len,)
+                response_positions = torch.nonzero(lm > 0, as_tuple=False).flatten()
+                if response_positions.numel() > 0:
+                    prompt_len = int(response_positions[0].item())
+                    batch["prompts"] = sample["input_ids"][:, :prompt_len]
+                    batch["responses"] = sample["input_ids"][:, prompt_len:]
+                else:
+                    # 没有 response token，使用空 response
+                    batch["prompts"] = sample["input_ids"]
+                    batch["responses"] = torch.zeros(
+                        1, 0, dtype=sample["input_ids"].dtype
+                    )
+                batch["loss_mask"] = sample["loss_mask"]
+            # 只在值有效时才添加（SFT 模式下可能没有这些字段）
+            if "prompts" in sample and sample["prompts"] is not None:
+                batch["prompts"] = sample["prompts"]
+            if "responses" in sample and sample["responses"] is not None:
+                batch["responses"] = sample["responses"]
+            for key in (
+                "hidden_position_start",
+                "hidden_position_end",
+                "hidden_positions",
+                "hidden_prefix_cache_rows",
+                "hidden_window_start",
+                "hidden_window_end",
+                "hidden_lm_head_fingerprint",
+                "hidden_last_hidden_logprob_check",
+                "hidden_target_logprobs_source",
+                "hidden_raw_topk_logprob_check",
+                "hidden_raw_target_logprobs",
+                "hidden_raw_target_logprobs_positions",
+                "hidden_raw_target_logprobs_position_start",
+                "hidden_raw_target_logprobs_position_end",
+                "hidden_last_hidden_filter",
+                "hidden_last_hidden_select",
+                "hidden_states_layout",
+                "target_layer_ids",
+                "target_logprobs_position_start",
+                "target_logprobs_position_end",
+                "global_step",
+            ):
+                if key in sample:
+                    batch[key] = sample[key]
+            hidden = sample.get("hidden_states")
+            if hidden is None:
+                hidden_chunks = sample.get("hidden_states_ref_chunks")
+                if hidden_chunks:
+                    expected_rows = None
+                    hidden_positions = batch.get("hidden_positions")
+                    if torch.is_tensor(hidden_positions):
+                        hidden_positions = cast(torch.Tensor, hidden_positions)
+                        expected_rows = int(hidden_positions.numel())
+                    hidden = _resolve_hidden_state_chunks(
+                        hidden_chunks, expected_rows=expected_rows
+                    )
+                else:
+                    hidden = _resolve_ray_object_ref(sample.get("hidden_states_ref"))
+            target_logprobs = sample.get("target_logprobs")
+            if target_logprobs is None:
+                target_logprobs = _resolve_ray_object_ref(
+                    sample.get("target_logprobs_ref")
+                )
+            if hidden is None:
+                continue
+            self._store_rollout_sample(
+                batch=batch,
+                hidden_states=hidden,
+                target_logprobs=target_logprobs,
+            )
+        self._flush_rollout_features_for_step()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_global_step(self, global_step: int):

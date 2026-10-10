@@ -3979,8 +3979,24 @@ class DrafterBaseTrainer:
         min_items_for_batch = 1
 
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
+        # [SFT-CoTrain] 允许跨 step 复用 hidden。
+        # WARNING: 当 use_logits=False（使用 last_hidden 重建主模型 logits）时，
+        # 跨 step 复用会导致旧 hidden 用新版本的 lm_head 重建，产生
+        # head_vN(hidden_vM) != head_vM(hidden_vM)，监督信号静默错配。
+        # 除非同时保存了采集时的 logits 或对应版本的 head，否则必须保持 False。
+        allow_cross_step_hidden = bool(
+            self.config.rollout.drafter.training.get("allow_cross_step_hidden", False)
+        )
+        # DSpark 在 dspark_l1_loss_alpha > 0 时同样使用 last_hidden + 当前 lm_head
+        # 重建主模型预测概率，存在与 EAGLE3 相同的 head/hidden 版本错配风险。
+        dspark_uses_last_hidden = (
+            self.backend.model_type == "dspark"
+            and float(self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.0)) > 0
+        )
         same_step_target_head_required = (
-            self.backend.model_type == "eagle3" and not use_logits
+            (self.backend.model_type == "eagle3" or dspark_uses_last_hidden)
+            and not use_logits
+            and not allow_cross_step_hidden
         )
 
         # Determine data source: DataBuffer (cross-step) or collected_data (current step only).
@@ -4968,7 +4984,14 @@ class DrafterBaseTrainer:
 
         current_step = int(self.current_rl_step)
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
-        same_step_data_required = self.backend.model_type == "eagle3" and not use_logits
+        dspark_uses_last_hidden = (
+            self.backend.model_type == "dspark"
+            and float(self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.0)) > 0
+        )
+        same_step_data_required = (
+            (self.backend.model_type == "eagle3" or dspark_uses_last_hidden)
+            and not use_logits
+        )
         current_step_data = [
             item
             for item in self.collected_data
@@ -5734,7 +5757,14 @@ class DrafterBaseTrainer:
         if self.skip_heavy_cleanup_after_drafter_training:
             if clear_data:
                 self.collected_data.clear()
-                self.data_buffer.clear()
+                # [SFT-CoTrain] SFT 跨 step 复用 hidden 时保留 data_buffer
+                allow_cross = bool(
+                    self.config.rollout.drafter.training.get(
+                        "allow_cross_step_hidden", False
+                    )
+                )
+                if not allow_cross:
+                    self.data_buffer.clear()
                 self._mark_buffer_changed()
             self._training_initialized = False
             self._training_active = False
