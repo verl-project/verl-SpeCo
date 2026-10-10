@@ -340,17 +340,23 @@ def _write_input(path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("preserve", [None, False, True])
 def test_run_producer_publishes_samples_then_eos(
-    tmp_path: Path, target_final_norm
+    tmp_path: Path, target_final_norm, preserve
 ) -> None:
     input_path = tmp_path / "input.jsonl"
     _write_input(input_path)
     transport = _Transport()
     pool = _Pool(tmp_path)
+    config = _config(input_path)
+    if preserve is not None:
+        config["actor_rollout_ref"]["rollout"]["drafter"]["training"][
+            "preserve_prompt_hidden_states"
+        ] = preserve
 
     stats = asyncio.run(
         run_producer(
-            _config(input_path),
+            config,
             transport=transport,
             tokenizer=_Tokenizer(),
             client_pool=pool,
@@ -378,9 +384,9 @@ def test_run_producer_publishes_samples_then_eos(
     assert all(not path.exists() for path in pool.paths)
     assert pool.started and pool.closed and transport.closed
     first_fields = transport.payloads[sorted(sample_keys)[0]]
-    assert tuple(first_fields["sample__hidden_states"].shape) == (3, 6)
-    # The existing response feature window starts at prompt_length - 1 = 1.
-    raw = torch.arange(24, dtype=torch.float32).reshape(4, 3, 2)[1:]
+    start = 1 if preserve is False else 0
+    assert tuple(first_fields["sample__hidden_states"].shape) == (4 - start, 6)
+    raw = torch.arange(24, dtype=torch.float32).reshape(4, 3, 2)[start:]
     torch.testing.assert_close(
         first_fields["sample__hidden_states"][:, :4], raw[:, :2].flatten(1)
     )
@@ -645,8 +651,9 @@ def test_run_producer_does_not_republish_when_temporary_cleanup_fails(
 
 
 @pytest.mark.parametrize("algorithm", ["DFLASH", "DSPARK"])
+@pytest.mark.parametrize("preserve", [None, False, True])
 def test_aux_only_producer_does_not_load_or_apply_final_norm(
-    tmp_path, monkeypatch, algorithm
+    tmp_path, monkeypatch, algorithm, preserve
 ):
     def unexpected_load(*args, **kwargs):
         raise AssertionError("aux-only features must not load a target final norm")
@@ -660,6 +667,8 @@ def test_aux_only_producer_does_not_load_or_apply_final_norm(
     drafter = config["actor_rollout_ref"]["rollout"]["drafter"]
     drafter["speculative_algorithm"] = algorithm
     drafter["training"]["dspark_l1_loss_alpha"] = 0.0
+    if preserve is not None:
+        drafter["training"]["preserve_prompt_hidden_states"] = preserve
     transport = _Transport()
     asyncio.run(
         run_producer(
@@ -680,7 +689,8 @@ def test_aux_only_producer_does_not_load_or_apply_final_norm(
         transport.payloads[sample_key],
         {"run_id": "run-a"},
     )
-    raw_aux = torch.arange(24, dtype=torch.float32).reshape(4, 3, 2)[1:, :2].flatten(1)
+    start = 1 if preserve is False else 0
+    raw_aux = torch.arange(24, dtype=torch.float32).reshape(4, 3, 2)[start:, :2].flatten(1)
     torch.testing.assert_close(sample.hidden_states, raw_aux)
 
 
@@ -788,7 +798,10 @@ def test_run_producer_resumes_after_a_fully_consumed_epoch(tmp_path: Path) -> No
     assert pool.closed and transport.closed
 
 
-def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) -> None:
+@pytest.mark.parametrize("preserve", [None, False, True])
+def test_run_producer_generates_response_for_verl_chat_prompt(
+    tmp_path: Path, preserve
+) -> None:
     input_path = tmp_path / "dapo.jsonl"
     input_path.write_text(
         json.dumps(
@@ -805,6 +818,10 @@ def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) ->
     pool = _Pool(tmp_path)
     config = _config(input_path)
     config["speco"]["standalone_tq_producer"]["on_missing_response"] = "generate"
+    if preserve is not None:
+        config["actor_rollout_ref"]["rollout"]["drafter"]["training"][
+            "preserve_prompt_hidden_states"
+        ] = preserve
 
     stats = asyncio.run(
         run_producer(
@@ -825,8 +842,10 @@ def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) ->
     assert pool.prefill_calls == 1
     assert len(sample_keys) == 1
     fields = transport.payloads[sample_keys[0]]
-    assert fields["sample__input_ids"].tolist() == [10, 11]
-    assert fields["sample__loss_mask"].tolist() == [0.0, 1.0]
+    expected_ids = [10, 11] if preserve is False else [9, 10, 11]
+    expected_mask = [0.0, 1.0] if preserve is False else [0.0, 0.0, 1.0]
+    assert fields["sample__input_ids"].tolist() == expected_ids
+    assert fields["sample__loss_mask"].tolist() == expected_mask
 
 
 def test_run_producer_skips_rows_without_response_by_default(tmp_path: Path) -> None:
