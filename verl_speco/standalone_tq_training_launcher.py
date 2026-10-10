@@ -231,11 +231,15 @@ def _producer_config_keys() -> frozenset[str]:
     return frozenset(keys)
 
 
-def _find_override(overrides: Sequence[str], key: str) -> str | None:
+def _find_override(
+    overrides: Sequence[str], key: str, *, normalize_key: bool = False
+) -> str | None:
     for item in reversed(overrides):
         parsed = _split_override(item)
-        if parsed is not None and parsed[0] == key:
-            return parsed[1]
+        if parsed is not None:
+            candidate = parsed[0].lstrip("+") if normalize_key else parsed[0]
+            if candidate == key:
+                return parsed[1]
     return None
 
 
@@ -893,6 +897,24 @@ def build_pipeline_commands(
         producer_tuning_overrides.append(item)
     producer_overrides = [
         f"{_ALGORITHM_KEY}={config.algorithm}",
+        "actor_rollout_ref.rollout.drafter.training.dflash_block_size="
+        + (
+            _find_override(
+                training_args,
+                "actor_rollout_ref.rollout.drafter.training.dflash_block_size",
+                normalize_key=True,
+            )
+            or "16"
+        ),
+        "actor_rollout_ref.rollout.drafter.training.preserve_prompt_hidden_states="
+        + (
+            _find_override(
+                training_args,
+                "actor_rollout_ref.rollout.drafter.training.preserve_prompt_hidden_states",
+                normalize_key=True,
+            )
+            or "true"
+        ),
         *tq_overrides,
         *producer_tuning_overrides,
         f"speco.standalone_tq_producer.input_path={config.input_path}",

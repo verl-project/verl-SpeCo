@@ -327,6 +327,32 @@ def _tiny_dspark_training_model() -> DSparkTrainingModel:
     return model
 
 
+@pytest.mark.parametrize("response_rows,expected", [(1, False), (2, True)])
+def test_dspark_minimum_response_supervision(response_rows, expected):
+    model = _tiny_dspark_training_model()
+    mask = torch.tensor([[0.0, 0.0] + [1.0] * response_rows])
+    anchors, keep = model._sample_anchor_positions(mask.size(1), mask, mask.device)
+    assert bool(keep.any()) is expected
+    ids = torch.arange(mask.size(1)).unsqueeze(0)
+    _, _, eval_mask, _ = model._build_label_tensors(
+        input_ids=ids, loss_mask=mask, anchor_positions=anchors, block_keep_mask=keep
+    )
+    assert bool(eval_mask.any()) is expected
+
+
+@pytest.mark.parametrize("response_rows,expected", [(1, False), (3, False), (4, True)])
+def test_dflash_minimum_response_block(response_rows, expected):
+    draft = torch.nn.Identity()
+    draft.config = SimpleNamespace()
+    model = dflash_backend.DFlashTrainingModel(draft, block_size=4, num_anchors=2)
+    mask = torch.tensor([[0.0, 0.0] + [1.0] * response_rows])
+    anchors, keep = model._sample_anchor_positions(mask.size(1), mask, mask.device)
+    assert bool(keep.any()) is expected
+    if expected:
+        # The anchor itself is unscored; later positions must have supervision.
+        assert bool(mask[0, int(anchors[keep][0]) + 1 :].any())
+
+
 def test_dspark_trailing_label_token_remains_supervised():
     model = _tiny_dspark_training_model()
     # context rows = 2, label rows = 3: the last label token only exists as a
