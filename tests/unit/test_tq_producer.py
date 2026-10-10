@@ -111,6 +111,7 @@ def _config(input_path: Path) -> dict[str, Any]:
                 "drafter": {
                     "speculative_algorithm": "DSPARK",
                     "training": {
+                        "dflash_block_size": 2,
                         "use_logits": False,
                         "dspark_l1_loss_alpha": 0.9,
                         "transfer_queue": {
@@ -129,6 +130,21 @@ def _config(input_path: Path) -> dict[str, Any]:
             }
         },
     }
+
+
+@pytest.mark.parametrize("algorithm,minimum", [("DSPARK", 2), ("DFLASH", 4)])
+def test_producer_rejects_response_budget_without_training_anchor(algorithm, minimum):
+    config = _config(Path("unused.jsonl"))
+    drafter = config["actor_rollout_ref"]["rollout"]["drafter"]
+    drafter["speculative_algorithm"] = algorithm
+    drafter["training"]["dflash_block_size"] = 4
+    producer = config["speco"]["standalone_tq_producer"]
+    producer["max_feature_length"] = minimum - 1
+    with pytest.raises(ValueError, match=f"at least {minimum}"):
+        validate_producer_config(config)
+    for budget in (0, minimum):
+        producer["max_feature_length"] = budget
+        validate_producer_config(config)
 
 
 class _Tokenizer:
@@ -265,7 +281,7 @@ class _Pool:
         self.paths.append(path)
         # ExampleHiddenStatesConnector excludes the final generated token because
         # it was never consumed by a model forward pass.
-        token_ids = torch.tensor([*request.prompt_token_ids, 11], dtype=torch.int64)
+        token_ids = torch.tensor([*request.prompt_token_ids, 11, 12], dtype=torch.int64)
         hidden = torch.arange(token_ids.numel() * 3 * 2, dtype=torch.float32).reshape(
             token_ids.numel(), 3, 2
         )
@@ -274,7 +290,7 @@ class _Pool:
             temporary_path=str(path),
             endpoint_url="http://vllm:8000/v1",
             byte_size=path.stat().st_size,
-            generated_token_ids=(11, 12),
+            generated_token_ids=(11, 12, 13),
         )
 
     async def close(self) -> None:
@@ -842,8 +858,8 @@ def test_run_producer_generates_response_for_verl_chat_prompt(
     assert pool.prefill_calls == 1
     assert len(sample_keys) == 1
     fields = transport.payloads[sample_keys[0]]
-    expected_ids = [10, 11] if preserve is False else [9, 10, 11]
-    expected_mask = [0.0, 1.0] if preserve is False else [0.0, 0.0, 1.0]
+    expected_ids = [10, 11, 12] if preserve is False else [9, 10, 11, 12]
+    expected_mask = [0.0, 1.0, 1.0] if preserve is False else [0.0, 0.0, 1.0, 1.0]
     assert fields["sample__input_ids"].tolist() == expected_ids
     assert fields["sample__loss_mask"].tolist() == expected_mask
 

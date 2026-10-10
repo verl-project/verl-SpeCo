@@ -23,7 +23,7 @@ import pytest
 from verl_speco.producer import input_reader
 
 
-@pytest.mark.parametrize("response_budget", [0, 1, 3])
+@pytest.mark.parametrize("response_budget", [0, 2, 3])
 def test_prompt_context_does_not_consume_response_feature_budget(response_budget):
     request = input_reader._build_tokenized_request(
         sequence_no=0,
@@ -31,7 +31,11 @@ def test_prompt_context_does_not_consume_response_feature_budget(response_budget
         prompt_length=10,
         full_ids=list(range(15)),
         source_metadata={},
-        config={"preserve_prompt_context": True, "max_feature_length": response_budget},
+        config={
+            "preserve_prompt_context": True,
+            "max_feature_length": response_budget,
+            "min_response_feature_rows": 2,
+        },
     )
     end = 15 if response_budget == 0 else 10 + response_budget
     assert request.feature_positions.tolist() == list(range(end))
@@ -84,6 +88,43 @@ def test_legacy_feature_window_keeps_prompt_anchor_budget():
         config={"max_feature_length": 3},
     )
     assert request.feature_positions.tolist() == [9, 10, 11]
+
+
+@pytest.mark.parametrize("minimum", [2, 4, 16])
+@pytest.mark.parametrize("preserve", [False, True])
+def test_short_response_filtered_even_with_unlimited_feature_budget(minimum, preserve):
+    with pytest.raises(input_reader.SampleFilteredError):
+        input_reader._build_tokenized_request(
+            sequence_no=0,
+            sample_id="short-response",
+            prompt_length=10,
+            full_ids=list(range(10 + minimum - 1)),
+            source_metadata={},
+            config={
+                "preserve_prompt_context": preserve,
+                "response_feature_budget": True,
+                "min_response_feature_rows": minimum,
+                "max_feature_length": 0,
+            },
+        )
+
+
+@pytest.mark.parametrize("minimum", [2, 4, 16])
+def test_minimum_response_length_is_retained(minimum):
+    request = input_reader._build_tokenized_request(
+        sequence_no=0,
+        sample_id="minimum-response",
+        prompt_length=10,
+        full_ids=list(range(10 + minimum)),
+        source_metadata={},
+        config={
+            "preserve_prompt_context": True,
+            "response_feature_budget": True,
+            "min_response_feature_rows": minimum,
+            "max_feature_length": minimum,
+        },
+    )
+    assert request.feature_positions.numel() == 10 + minimum
 
 
 def test_prompt_context_preserves_generated_hidden_row_limit():

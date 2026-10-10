@@ -696,6 +696,11 @@ def _build_tokenized_request(
     max_feature_length = int(_config_value(config, "max_feature_length", 0) or 0)
     if max_feature_length == 1 and not response_feature_budget:
         raise ValueError("max_feature_length must be 0 or at least 2")
+    min_response_rows = int(_config_value(config, "min_response_feature_rows", 1))
+    if response_feature_budget and 0 < max_feature_length < min_response_rows:
+        raise ValueError(
+            f"max_feature_length must be 0 or at least {min_response_rows}"
+        )
     if response_feature_budget and max_feature_length > 0:
         # Prompt rows are context, not part of the response feature budget.
         feature_end = min(prompt_length + max_feature_length, feature_end)
@@ -705,8 +710,14 @@ def _build_tokenized_request(
     # A feature window that leaves too little supervision, or that cuts the
     # supervised response, is filtered instead of trained on.
     window_mask = loss_mask[feature_start:feature_end]
+    response_block_size = int(_config_value(config, "response_block_size", 0) or 0)
+    if response_block_size and window_mask.numel() <= response_block_size:
+        raise SampleFilteredError(
+            "Feature window is too short for a DFlash training anchor"
+        )
     supervised_tokens = int(window_mask.sum().item())
     min_supervised = int(_config_value(config, "min_supervised_tokens", 1) or 0)
+    min_supervised = max(min_supervised, min_response_rows)
     if supervised_tokens < min_supervised:
         raise SampleFilteredError(
             f"Producer sample {sample_id!r} has {supervised_tokens} supervised "

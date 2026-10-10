@@ -82,6 +82,8 @@ speco:
     owner_ready_timeout_seconds: 120
     max_sequence_length: 8192
     # Standalone DFlash/DSpark: response feature rows, excluding prompt context.
+    # Finite budgets must allow at least 2 rows for DSpark, or dflash_block_size
+    # rows for DFlash. Actual samples below these minima are filtered.
     # Other algorithms: total feature-window rows, including the prompt anchor.
     # Zero disables this limit.
     max_feature_length: 512

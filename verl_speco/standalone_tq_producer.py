@@ -254,6 +254,18 @@ def _read_on_missing_response(producer_cfg: Any) -> str:
     return value
 
 
+def _minimum_response_feature_rows(training_cfg: Mapping[str, Any]) -> int:
+    algorithm = str(training_cfg.get("speculative_algorithm", "")).strip().upper()
+    if algorithm == "DSPARK":
+        return 2
+    if algorithm == "DFLASH":
+        block_size = int(training_cfg.get("dflash_block_size", 16))
+        if block_size < 2:
+            raise ValueError("dflash_block_size must be at least 2 for training")
+        return block_size
+    return 1
+
+
 def validate_producer_config(config: Any) -> str:
     producer_cfg, training_cfg, tq_cfg = _config_sections(config)
     required = (
@@ -275,6 +287,13 @@ def validate_producer_config(config: Any) -> str:
     algorithm = str(training_cfg.get("speculative_algorithm", "") or "").strip()
     if not algorithm:
         raise ValueError("drafter.speculative_algorithm must not be empty")
+    minimum_rows = _minimum_response_feature_rows(training_cfg)
+    budget = int(producer_cfg.get("max_feature_length", 0) or 0)
+    if 0 < budget < minimum_rows:
+        raise ValueError(
+            f"{algorithm} max_feature_length must be 0 or at least {minimum_rows}; "
+            f"got {budget}"
+        )
     normalize_standalone_layer_ids(
         algorithm,
         producer_cfg.get("target_layer_ids"),
@@ -493,6 +512,12 @@ async def run_producer(
         # Only standalone DFlash/DSpark use a response-only feature budget.
         producer_cfg = dict(producer_cfg)
         producer_cfg["response_feature_budget"] = algorithm in {"DFLASH", "DSPARK"}
+        producer_cfg["min_response_feature_rows"] = _minimum_response_feature_rows(
+            drafter_cfg
+        )
+        producer_cfg["response_block_size"] = (
+            producer_cfg["min_response_feature_rows"] if algorithm == "DFLASH" else 0
+        )
         producer_cfg["preserve_prompt_context"] = producer_cfg[
             "response_feature_budget"
         ] and bool(drafter_cfg.get("preserve_prompt_hidden_states", True))
