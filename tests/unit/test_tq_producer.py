@@ -26,6 +26,7 @@ import torch
 
 from verl_speco.producer.vllm_feature_client import RawVllmFeature
 from verl_speco.standalone_tq_producer import (
+    _apply_direct_producer_defaults,
     _drain_pending_samples,
     run_producer,
     validate_producer_config,
@@ -33,6 +34,27 @@ from verl_speco.standalone_tq_producer import (
 from verl_speco.trainer.standalone_resume import save_standalone_resume
 from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION
 from verl_speco.transport.drafter_sample_protocol import decode_sample
+
+
+@pytest.mark.parametrize("preserve", [None, False, True])
+@pytest.mark.parametrize("prefix", ["", "++"])
+def test_direct_producer_prompt_context_default_and_override(preserve, prefix):
+    from omegaconf import OmegaConf
+
+    key = "actor_rollout_ref.rollout.drafter.training.preserve_prompt_hidden_states"
+    base = OmegaConf.load(
+        Path(__file__).resolve().parents[2] / "verl_speco/config/speco_base.yaml"
+    )
+    assert OmegaConf.select(base, key) is False
+    config = OmegaConf.merge(base)
+    overrides = ["speco.standalone_tq_producer.max_feature_length=3"]
+    if preserve is not None:
+        OmegaConf.update(config, key, preserve)
+        overrides.append(f"{prefix}{key}={str(preserve).lower()}")
+    _apply_direct_producer_defaults(config, overrides)
+    expected = True if preserve is None else preserve
+    assert OmegaConf.select(config, key) is expected
+    assert OmegaConf.select(base, key) is False
 
 
 @pytest.fixture(autouse=True)

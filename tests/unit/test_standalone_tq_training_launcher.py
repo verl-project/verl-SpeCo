@@ -63,6 +63,20 @@ def test_pipeline_config_derives_transport_identity_from_training_args() -> None
     assert config.run_id.startswith("dspark-")
 
 
+@pytest.mark.parametrize("override", [None, "false", "true"])
+def test_pipeline_forwards_prompt_hidden_state_option_to_producer(override):
+    key = "actor_rollout_ref.rollout.drafter.training.preserve_prompt_hidden_states"
+    args = _training_args()
+    if override is not None:
+        args.append(f"{key}={override}")
+    config = resolve_pipeline_config(args, environ={})
+    commands = build_pipeline_commands(
+        config, args, ray_address="10.0.0.1:6379", python_executable="python"
+    )
+    expected = override if override is not None else "true"
+    assert f"{key}={expected}" in commands.producer_overrides
+
+
 def test_producer_max_samples_uses_remaining_total_steps() -> None:
     args = [
         *_training_args(),

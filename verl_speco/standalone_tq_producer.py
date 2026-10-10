@@ -490,6 +490,12 @@ async def run_producer(
         logger.info("Standalone TQ Producer vLLM client pool started")
 
         algorithm = str(drafter_cfg["speculative_algorithm"]).strip().upper()
+        # Only standalone DFlash/DSpark use a response-only feature budget.
+        producer_cfg = dict(producer_cfg)
+        producer_cfg["response_feature_budget"] = algorithm in {"DFLASH", "DSPARK"}
+        producer_cfg["preserve_prompt_context"] = producer_cfg[
+            "response_feature_budget"
+        ] and bool(drafter_cfg.get("preserve_prompt_hidden_states", True))
         target_layer_ids, vllm_aux_layer_ids = normalize_standalone_layer_ids(
             algorithm,
             producer_cfg.get("target_layer_ids"),
@@ -1519,7 +1525,20 @@ def _parse_dtype(value: Any) -> torch.dtype:
     return dtype
 
 
+def _apply_direct_producer_defaults(config: Any, overrides: list[str]) -> None:
+    from omegaconf import OmegaConf
+
+    key = "actor_rollout_ref.rollout.drafter.training.preserve_prompt_hidden_states"
+    # The direct entrypoint inherits cotrain defaults, but standalone retains
+    # prompt context unless the user explicitly overrides this option.
+    if not any(item.split("=", 1)[0].lstrip("+") == key for item in overrides):
+        OmegaConf.update(config, key, True)
+
+
 def _hydra_main(config: Any) -> None:
+    from hydra.core.hydra_config import HydraConfig
+
+    _apply_direct_producer_defaults(config, HydraConfig.get().overrides.task)
     logging.basicConfig(level=logging.INFO)
     asyncio.run(run_producer(config))
 

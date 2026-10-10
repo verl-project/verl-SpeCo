@@ -893,6 +893,14 @@ def build_pipeline_commands(
         producer_tuning_overrides.append(item)
     producer_overrides = [
         f"{_ALGORITHM_KEY}={config.algorithm}",
+        "actor_rollout_ref.rollout.drafter.training.preserve_prompt_hidden_states="
+        + (
+            _find_override(
+                training_args,
+                "actor_rollout_ref.rollout.drafter.training.preserve_prompt_hidden_states",
+            )
+            or "true"
+        ),
         *tq_overrides,
         *producer_tuning_overrides,
         f"speco.standalone_tq_producer.input_path={config.input_path}",

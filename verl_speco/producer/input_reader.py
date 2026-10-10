@@ -683,14 +683,23 @@ def _build_tokenized_request(
     loss_mask = build_loss_mask(input_ids, prompt_length)
     position_ids = torch.arange(int(input_ids.numel()), dtype=torch.int64)
 
-    feature_start = max(prompt_length - 1, 0)
+    preserve_prompt_context = bool(
+        _config_value(config, "preserve_prompt_context", False)
+    )
+    response_feature_budget = bool(
+        _config_value(config, "response_feature_budget", preserve_prompt_context)
+    )
+    feature_start = 0 if preserve_prompt_context else max(prompt_length - 1, 0)
     feature_end = int(input_ids.numel())
     if feature_end_limit is not None:
         feature_end = min(feature_end, int(feature_end_limit))
     max_feature_length = int(_config_value(config, "max_feature_length", 0) or 0)
-    if max_feature_length == 1:
+    if max_feature_length == 1 and not response_feature_budget:
         raise ValueError("max_feature_length must be 0 or at least 2")
-    if max_feature_length > 1:
+    if response_feature_budget and max_feature_length > 0:
+        # Prompt rows are context, not part of the response feature budget.
+        feature_end = min(prompt_length + max_feature_length, feature_end)
+    elif max_feature_length > 1:
         feature_end = min(feature_start + max_feature_length, feature_end)
 
     # A feature window that leaves too little supervision, or that cuts the

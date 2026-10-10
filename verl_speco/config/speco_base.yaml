@@ -81,6 +81,9 @@ speco:
     # SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS (default 1800; 0 disables).
     owner_ready_timeout_seconds: 120
     max_sequence_length: 8192
+    # Standalone DFlash/DSpark: response feature rows, excluding prompt context.
+    # Other algorithms: total feature-window rows, including the prompt anchor.
+    # Zero disables this limit.
     max_feature_length: 512
     generation_max_tokens: 511
     # Per endpoint: log the first three successful HTTP requests, then every N.
@@ -158,6 +161,9 @@ actor_rollout_ref:
 
       training:
         mode: online
+        # Consumed by the standalone DFlash/DSpark producer only.
+        # Cotrain collection keeps its existing behavior.
+        preserve_prompt_hidden_states: false
         collect_hidden_states_from_sgl: false
         collect_hidden_states_from_old_logprob: false
         # SGLang does not apply the target final norm to captured aux states.
