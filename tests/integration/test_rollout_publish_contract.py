@@ -422,7 +422,7 @@ def test_publish_state_filter_excludes_block_drafter_embedding() -> None:
     assert set(trainer._get_trainable_state_dict()) == {"draft_model.fc.weight"}
 
 
-def test_mrv2_dspark_publish_excludes_frozen_confidence_head(monkeypatch) -> None:
+def test_mrv2_dspark_publish_includes_confidence_head(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     torch = pytest.importorskip("torch")
     base_trainer = pytest.importorskip(
@@ -447,8 +447,12 @@ def test_mrv2_dspark_publish_excludes_frozen_confidence_head(monkeypatch) -> Non
         }
     )
 
+    # MRV2 (vllm-ascend#15098) now registers and consumes the confidence head,
+    # so it must enter the online update payload instead of being frozen.
     assert set(trainer._get_trainable_state_dict()) == {
-        "draft_model.markov_head.markov_w1.weight"
+        "draft_model.markov_head.markov_w1.weight",
+        "draft_model.confidence_head.proj.weight",
+        "draft_model.confidence_head.proj.bias",
     }
 
 

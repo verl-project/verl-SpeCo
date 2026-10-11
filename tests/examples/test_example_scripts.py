@@ -206,12 +206,16 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     mrv2 = _launch_assignments(mrv2_source)
     added_keys = {
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling",
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.weight_nz_mode",
+        "+actor_rollout_ref.rollout.drafter.vllm.speculative_config_overrides.enable_adaptive_verification",
         "actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha",
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_with_markov",
     }
     changed_keys = {
         "data.filter_overlong_prompts",
         "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens",
         "actor_rollout_ref.rollout.drafter.training.publish_async",
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha",
     }
 
     assert set(mrv2) - set(baseline) == added_keys
@@ -259,7 +263,11 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     assert "data.filter_overlong_prompts=False" in mrv2_source
     assert "data.filter_overlong_prompts=True" not in mrv2_source
     assert "data.filter_overlong_prompts_workers=256" in mrv2_source
-    assert "dspark_confidence_head_alpha=0.0" in mrv2_source
+    assert "dspark_confidence_head_alpha=1.0" in mrv2_source
+    assert "dspark_confidence_loss_alpha=1.0" in mrv2_source
+    assert "dspark_confidence_head_with_markov=True" in mrv2_source
+    assert "enable_adaptive_verification=True" in mrv2_source
+    assert "additional_config.weight_nz_mode=0" in mrv2_source
     assert "dynamic_spec" not in mrv2_source
     assert "SPECO MRV2 run directory" not in mrv2_source
     assert "tee -a" not in mrv2_source

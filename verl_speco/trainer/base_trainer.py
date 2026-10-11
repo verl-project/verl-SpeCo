@@ -1476,16 +1476,6 @@ class DrafterBaseTrainer:
 
         if any(frozen_name in name for frozen_name in self._frozen_param_names):
             return True
-        if (
-            getattr(self.backend, "model_type", None) == "dspark"
-            and "confidence_head." in name
-            and os.getenv("VLLM_USE_V2_MODEL_RUNNER", "").lower()
-            in {"1", "true", "yes"}
-        ):
-            # The supported MRV2 runtime has no confidence-head contract, so a
-            # head inherited from an older checkpoint (or trained for MRV1) is
-            # frozen and must not enter the native fixed-K online update payload.
-            return True
         if name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
             # Most backends seed the draft embedding from the target and freeze it,
             # so the engine already holds the same rows. Backends that fine-tune it
