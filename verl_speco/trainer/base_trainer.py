@@ -327,6 +327,23 @@ def _batch_item_float(value: Any, index: int = 0) -> float | None:
         return None
 
 
+def _batch_item_value(value: Any, index: int = 0) -> Any:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return None
+        flat = value.detach().view(-1).cpu()
+        index = min(max(int(index), 0), flat.numel() - 1)
+        return flat[index].item()
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        index = min(max(int(index), 0), len(value) - 1)
+        return value[index]
+    return value
+
+
 def _tensor_sum_int(tensor: torch.Tensor) -> int:
     return int(tensor.detach().float().sum().cpu().item())
 
@@ -3364,6 +3381,25 @@ class DrafterBaseTrainer:
                 else None,
                 "_verl_accept_len": accept_len,
                 "_verl_accept_rate": accept_rate,
+                "_verl_request_mean_accept_len": _batch_item_float(
+                    batch.get("_verl_request_mean_accept_len"),
+                    i,
+                ),
+                "_speco_vllm_request_id": _batch_item_value(
+                    batch.get("_speco_vllm_request_id"), i
+                ),
+                "_speco_vllm_request_elapsed_sec": _batch_item_float(
+                    batch.get("_speco_vllm_request_elapsed_sec"),
+                    i,
+                ),
+                "_verl_is_hard": bool(
+                    _batch_item_int(batch.get("_verl_is_hard"), i) or 0
+                ),
+                "_verl_hard_score": _batch_item_float(batch.get("_verl_hard_score"), i),
+                "_speco_vllm_request_completion_index": _batch_item_int(
+                    batch.get("_speco_vllm_request_completion_index"),
+                    i,
+                ),
                 "_verl_input_seq_length": input_seq_length,
                 "hidden_lm_head_fingerprint": batch.get("hidden_lm_head_fingerprint"),
                 "hidden_last_hidden_logprob_check": batch.get(
@@ -3713,6 +3749,7 @@ class DrafterBaseTrainer:
         explicit_score = self._item_float(
             item,
             (
+                "_verl_hard_score",
                 "_verl_dflash_hard_score",
                 "dflash_hard_score",
                 "_verl_sample_loss",
@@ -3755,6 +3792,35 @@ class DrafterBaseTrainer:
         )
         if not self._is_block_drafter_backend() or hard_ratio <= 0:
             return rng.sample(available_data, batch_size)
+
+        if self._block_drafter_metric_prefix() == "dspark":
+            # Collection controls which requests reach each worker. Enforce the
+            # same ratio again when building optimizer micro-batches so a small
+            # buffer (10 items here) does not turn the configured ratio into a
+            # noisy binomial draw. Fractional quotas are accumulated across
+            # optimizer steps; e.g. ratio=.1 and batch=4 produces exactly eight
+            # hard draws over twenty updates instead of rounding every batch to
+            # zero. Either ratio being zero takes the baseline path above.
+            optimizer_step = max(int(getattr(self, "optimizer_steps_total", 0)), 0)
+            previous_target = int(optimizer_step * batch_size * hard_ratio + 0.5)
+            next_target = int((optimizer_step + 1) * batch_size * hard_ratio + 0.5)
+            hard_count = min(batch_size, max(0, next_target - previous_target))
+
+            hard_pool = [item for item in available_data if item.get("_verl_is_hard") is True]
+            normal_pool = [item for item in available_data if item.get("_verl_is_hard") is not True]
+            if not hard_pool or not normal_pool:
+                return rng.sample(available_data, batch_size)
+
+            actual_hard = min(hard_count, len(hard_pool))
+            actual_normal = min(batch_size - actual_hard, len(normal_pool))
+            selected = rng.sample(hard_pool, actual_hard)
+            selected.extend(rng.sample(normal_pool, actual_normal))
+            if len(selected) < batch_size:
+                selected_ids = {id(item) for item in selected}
+                remainder = [item for item in available_data if id(item) not in selected_ids]
+                selected.extend(rng.sample(remainder, batch_size - len(selected)))
+            rng.shuffle(selected)
+            return selected
 
         hard_count = min(batch_size, max(0, round(batch_size * hard_ratio)))
         scored: list[tuple[float, float, dict[str, Any]]] = []
