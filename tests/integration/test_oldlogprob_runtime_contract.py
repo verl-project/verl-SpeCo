@@ -421,8 +421,9 @@ def test_row_refs_survive_dynamic_batch_and_dp_concat(monkeypatch):
 
 def test_pp_whole_refs_survive_postprocess_dp_concat_and_row_reordering(monkeypatch):
     import importlib
-    import ray
-    import torch
+    ray = pytest.importorskip("ray")
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("tensordict")
     from tensordict import TensorDict
     from verl.utils import tensordict_utils as tu
     from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
@@ -478,8 +479,8 @@ def test_pp_whole_refs_survive_postprocess_dp_concat_and_row_reordering(monkeypa
 
 
 def test_hidden_export_preserves_source_owner_and_hidden_slices(monkeypatch):
-    import ray
-    import torch
+    ray = pytest.importorskip("ray")
+    torch = pytest.importorskip("torch")
     runtime = oldlogprob_runtime
     monkeypatch.setattr(runtime, "_BATCH_POSTPROCESS_PATCHED", True)
     monkeypatch.setattr(runtime, "_POSTPROCESS_PATCHED", True)
