@@ -461,11 +461,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._drafter_scheduler = DrafterScheduler()
         self._drafter_runtime_state = DrafterRuntimeState()
         self._pending_drafter_publish_refs = None
-        # Version the freeze policy will stage for the in-flight async
-        # publish, plus a completion wait carried into its observe call when
-        # the wait lands before the publish is staged (deferred probe path).
-        self._speco_pending_async_publish_version = None
-        self._speco_publish_completion_wait = None
         self._pending_drafter_checkpoint_refs = []
         self._pending_target_lm_head_sync = None
         self._speco_last_raw_drafter_samples = 0
@@ -1168,11 +1163,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         The policy object is mode-agnostic: shadow vs active is enforced here
         in the trainer (shadow never sets ``_speco_drafter_frozen``).
         """
-        cfg = self._speco_drafter_training_config().get(
-            "drafter_convergence_freeze", {}
-        ) or {}
+        training_cfg = self._speco_drafter_training_config()
+        cfg = training_cfg.get("drafter_convergence_freeze", {}) or {}
         if not cfg.get("enabled", False):
             return None
+        economics = cfg.get("economics", {}) or {}
+        # shortcut: reject async ROI gating until completion waits are attributed correctly.
+        if training_cfg.get("publish_async", False) and economics.get("enabled", False):
+            raise ValueError(
+                "publish_async=true with drafter_convergence_freeze.economics.enabled=true "
+                "is not supported while async publish completion-cost accounting is pending; "
+                "set publish_async=false or economics.enabled=false"
+            )
         method = str(cfg.get("method", "marginal_utility_v1")).strip().lower()
         if method != "marginal_utility_v1":
             raise ValueError(
@@ -1686,15 +1688,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_freeze_publish_cost_seconds(
         metrics: dict[str, Any],
     ) -> float | None:
-        # NOTE: ``timing_s/drafter_publish_wait_pending`` is deliberately NOT
-        # summed here. With publish_async=true it measures the completion wait
-        # of the PREVIOUS publish's weight-load RPC; attributing it to this
-        # update would double count it and inflate the next update's cost.
-        # ``_speco_attribute_async_publish_wait`` already folds that wait into
-        # the update that caused it (amend-or-carry). For synchronous
-        # publishes the real load time sits in ``update_weights`` instead.
         cost = 0.0
         for key in (
+            "timing_s/drafter_publish_wait_pending",
             "timing_s/drafter_publish_fetch_snapshot",
             "timing_s/drafter_publish_update_weights",
         ):
@@ -1726,26 +1722,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         cost = update_cost_seconds
         if cost is None:
             cost = self._speco_freeze_publish_cost_seconds(publish_metrics)
-        # Deferred probe path: an async publish's completion wait can land
-        # (probe after-arm) BEFORE this observe. It is part of this update's
-        # critical path -- fold it in when it was carried for the version this
-        # observe is about to stage; a stale carry is dropped loudly, never
-        # attributed to a different update.
-        carried = getattr(self, "_speco_publish_completion_wait", None)
-        if carried is not None:
-            observed_version = int(policy.drafter_version) + 1
-            if carried[0] == observed_version:
-                cost = (cost or 0.0) + float(carried[1])
-                self._speco_publish_completion_wait = None
-            else:
-                logger.warning(
-                    "[drafter freeze] dropping async publish wait %.3fs: "
-                    "carried for v%s but the observed publish stages v%s",
-                    carried[1],
-                    carried[0],
-                    observed_version,
-                )
-                self._speco_publish_completion_wait = None
 
         from verl_speco.trainer.drafter_freeze_policy import FreezeEvidence
 
@@ -3202,39 +3178,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return 0
         pending_refs = self._pending_drafter_publish_refs
         self._pending_drafter_publish_refs = None
-        wait_started = time.perf_counter()
         self._ray_get_if_needed(pending_refs)
-        self._speco_attribute_async_publish_wait(
-            time.perf_counter() - wait_started
-        )
         return len(pending_refs) if isinstance(pending_refs, (list, tuple)) else 1
-
-    def _speco_attribute_async_publish_wait(self, wait_seconds: float) -> None:
-        """Fold the async publish-completion wait into the causing update.
-
-        With publish_async=true the weight-load RPC is only submitted at
-        publish time; the real completion wait surfaces here (next generation
-        entry, checkpoint save, or the next publish's wait funnel). That wait
-        is part of the SAME update's critical path, so the freeze economics
-        gate must see it in C_update; leaving it out underestimates cost and
-        overestimates ROI. Two timings exist: the publish is already staged ->
-        amend its staged cost; the wait happens before the observe (deferred
-        probe path) -> carry it into the observe call for the same version.
-        A version mismatch never attributes the wait to a different update.
-        """
-        version = getattr(self, "_speco_pending_async_publish_version", None)
-        self._speco_pending_async_publish_version = None
-        if version is None or wait_seconds <= 0.0:
-            return
-        policy = getattr(self, "_speco_freeze_policy", None)
-        if policy is None:
-            return
-        if policy.amend_pending_update_cost(version, wait_seconds):
-            return
-        self._speco_publish_completion_wait = (
-            int(version),
-            float(wait_seconds),
-        )
 
     def _speco_wait_pending_drafter_publish(self) -> int:
         scheduler = self._speco_get_drafter_scheduler()
@@ -3257,14 +3202,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         if asynchronous:
             self._pending_drafter_publish_refs = update_result
-            freeze_policy = getattr(self, "_speco_freeze_policy", None)
-            # The version the freeze policy will assign when this publish is
-            # observed (clock + 1); its completion wait is attributed to it.
-            self._speco_pending_async_publish_version = (
-                int(freeze_policy.drafter_version) + 1
-                if freeze_policy is not None
-                else None
-            )
         else:
             self._ray_get_if_needed(update_result)
 

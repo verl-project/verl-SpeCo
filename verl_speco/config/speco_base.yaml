@@ -180,6 +180,7 @@ actor_rollout_ref:
         batch_size_per_gpu: 4
         training_interval_steps: 5
         publish_interval_steps: 0
+        # Async publish with freeze economics.enabled=true is rejected pending cost accounting.
         publish_async: false
         publish_dtype: null
         publish_param_name_patterns: null

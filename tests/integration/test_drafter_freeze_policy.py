@@ -315,58 +315,6 @@ class TestDriftResume(unittest.TestCase):
         self.assertEqual(restored.state, FreezeState.RECOVERING)
         self.assertIn(d.reason, ("resume_quality_drift", "resume_hard_drift"))
 
-class TestAsyncPublishCostAttribution(unittest.TestCase):
-    """publish_async: the real completion wait lands after the submit; it must
-    be folded into the SAME update's staged cost, never a later update's."""
-    def test_amend_folds_wait_into_same_update(self):
-        sim = Simulator(make_config())
-        sim.rollout(3.0)
-        sim.publish(cost=10.0)  # stages pending v1 with cost 10
-        p = sim.policy
-        self.assertEqual(p._pending_next_version, 1)
-        self.assertTrue(p.amend_pending_update_cost(1, 2.5))
-        self.assertAlmostEqual(p._pending_cost, 12.5)
-        self.assertAlmostEqual(p._costs[-1], 12.5)
-        # Wrong version / double attribution refused:
-        self.assertFalse(p.amend_pending_update_cost(2, 1.0))
-        self.assertFalse(p.amend_pending_update_cost(0, 1.0))
-        self.assertAlmostEqual(p._costs[-1], 12.5)
-        # The finalized window carries the amended cost:
-        sim.rollout(3.1, n=1, version=1)  # first v1 evidence closes v0
-        self.assertEqual(p.drafter_version, 1)
-        closed = p.versions[-1]
-        self.assertEqual(closed.version, 0)
-        self.assertAlmostEqual(closed.cost_seconds, 12.5)
-    def test_amend_none_cost_does_not_fabricate_entry(self):
-        sim = Simulator(make_config())
-        sim.rollout(3.0)
-        sim.publish(cost=None)  # cost unknown for this update
-        p = sim.policy
-        n_costs = len(p._costs)
-        self.assertTrue(p.amend_pending_update_cost(1, 2.0))  # version matches
-        self.assertEqual(len(p._costs), n_costs)   # no phantom entry
-        self.assertIsNone(p._pending_cost)         # unknown stays unknown
-    def test_pending_cost_index_round_trip(self):
-        sim = Simulator(make_config())
-        sim.rollout(3.0)
-        sim.publish(cost=10.0)
-        restored = DrafterFreezePolicy(make_config())
-        restored.load_state_dict(sim.policy.state_dict())
-        self.assertEqual(restored._pending_cost_index, len(restored._costs) - 1)
-        self.assertTrue(restored.amend_pending_update_cost(1, 1.5))
-        self.assertAlmostEqual(restored._costs[-1], 11.5)
-    def test_resolved_pending_rejects_amend(self):
-        # Once the closing evidence finalized the update, a late wait must NOT
-        # be folded into it (and never into the next update).
-        sim = Simulator(make_config())
-        sim.rollout(3.0)
-        sim.publish(cost=10.0)
-        sim.rollout(3.1, n=1, version=1)  # closes v0, pending resolved
-        p = sim.policy
-        self.assertIsNone(p._pending_next_version)
-        self.assertFalse(p.amend_pending_update_cost(1, 2.5))
-        self.assertAlmostEqual(p._costs[-1], 10.0)
-
 class TestEventOrderInvariance(unittest.TestCase):
     MEANS = [3.0, 3.7, 4.4, 4.7, 4.72, 4.73, 4.735, 4.74]
     def _order_a(self, spv, seed=5):

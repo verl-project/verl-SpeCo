@@ -569,11 +569,6 @@ class DrafterFreezePolicy:
         self.valid_update_count = 0
         self._pending_next_version: Optional[int] = None
         self._pending_cost: Optional[float] = None
-        # Index of the staged pending publish's entry inside ``_costs`` (the
-        # entry survives only while the publish is pending); None when the
-        # staged publish carried no cost, so an async completion wait can
-        # never amend an earlier update's cost entry.
-        self._pending_cost_index: Optional[int] = None
         self.dropped_late_rollouts = 0
 
         # Windows / evidence.
@@ -657,7 +652,6 @@ class DrafterFreezePolicy:
             "open_version": self._open_version,
             "pending_next_version": self._pending_next_version,
             "pending_cost": self._pending_cost,
-            "pending_cost_index": self._pending_cost_index,
             "dropped_late_rollouts": self.dropped_late_rollouts,
             "windows": raw_windows,
             "versions": [v.to_dict() for v in self.versions],
@@ -712,16 +706,6 @@ class DrafterFreezePolicy:
         self._open_version = int(state.get("open_version", self.drafter_version))
         self._pending_next_version = state.get("pending_next_version", None)
         self._pending_cost = state.get("pending_cost", None)
-        pending_cost_index = state.get("pending_cost_index", None)
-        # Older checkpoints predate the index; and an index without a staged
-        # pending publish is meaningless. Sanitize to None in both cases.
-        if (
-            self._pending_next_version is None
-            or pending_cost_index is None
-            or not isinstance(pending_cost_index, int)
-        ):
-            pending_cost_index = None
-        self._pending_cost_index = pending_cost_index
         self.dropped_late_rollouts = int(state.get("dropped_late_rollouts", 0))
         self._windows = {}
         for version, raw in (state.get("windows", {}) or {}).items():
@@ -806,7 +790,6 @@ class DrafterFreezePolicy:
             )
             self._pending_next_version = None
             self._pending_cost = None
-            self._pending_cost_index = None
             win = self._windows.setdefault(
                 self._open_version,
                 _Window(self._open_version, opened_step=ev.global_step),
@@ -825,7 +808,6 @@ class DrafterFreezePolicy:
             )
             self._pending_next_version = None
             self._pending_cost = None
-            self._pending_cost_index = None
         else:
             # Ordinary accumulation. Late evidence for an already-finalized
             # window is dropped rather than folded into a closed version.
@@ -881,14 +863,11 @@ class DrafterFreezePolicy:
             if ev.update_cost_seconds is not None and ev.update_cost_seconds >= 0
             else None
         )
-        pending_cost_index: Optional[int] = None
         if cost is not None:
             self._costs.append(cost)
             cap = max(self.cfg.cost_window_updates, 1) * 4
             if len(self._costs) > cap:
                 self._costs = self._costs[-cap:]
-            # Staged AFTER the trim: the just-appended entry sits at len-1.
-            pending_cost_index = len(self._costs) - 1
             self.cumulative_cost_seconds += cost
 
         self._ingest_probe(ev.probe, new_version)
@@ -902,37 +881,7 @@ class DrafterFreezePolicy:
             )
         self._pending_next_version = new_version
         self._pending_cost = cost
-        self._pending_cost_index = pending_cost_index
         return self._decision(transitioned=False, reason=self._last_reason)
-
-    def amend_pending_update_cost(
-        self, version: int, extra_seconds: float
-    ) -> bool:
-        """Fold a deferred async publish-completion wait into its update.
-
-        With ``publish_async=true`` the weight-load RPC is only submitted at
-        publish time; the real completion wait surfaces later (next generation
-        entry, checkpoint save, or the next publish's wait funnel). That wait
-        is part of the SAME update's critical path, so the economics gate must
-        see it in ``C_update`` -- omitting it underestimates cost and
-        overestimates ROI.
-
-        Returns True when the staged pending publish IS ``version`` (the wait
-        was folded into its staged cost and its ``_costs`` entry). Returns
-        False otherwise -- e.g. the publish has not been observed yet (the
-        deferred probe path waits before observing), in which case the caller
-        carries the wait into the observe call instead. The wait is therefore
-        never smeared onto a later update.
-        """
-        if extra_seconds <= 0.0 or self._pending_next_version != int(version):
-            return False
-        if self._pending_cost is not None:
-            self._pending_cost += float(extra_seconds)
-            self.cumulative_cost_seconds += float(extra_seconds)
-        index = self._pending_cost_index
-        if index is not None and 0 <= index < len(self._costs):
-            self._costs[index] += float(extra_seconds)
-        return True
 
     def _advance_version(
         self, new_version: int, cost: Optional[float], ev: FreezeEvidence
