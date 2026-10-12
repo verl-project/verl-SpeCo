@@ -636,7 +636,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_checkpoint_saved_step = None
         self._speco_pending_request_accept_len_payloads = []
         self._speco_last_request_accept_len_var = 0.0
-        self._speco_last_oldlogprob_hidden_refs_len = None
         self._speco_last_oldlogprob_skipped_missing_hidden = 0
 
     def attach_speco_worker_group(self, worker_group):
@@ -2748,46 +2747,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     flush=True,
                 )
 
-    def _speco_oldlogprob_collectable_window(self, batch_size: int) -> int:
-        """Largest row prefix of the batch whose hidden states are consumable.
-
-        The hidden-capture transport keeps side-channel refs for only one
-        logprob DP shard (dp rank 0) after cross-shard concatenation, so only
-        the first ``ceil(batch_size / logprob_dp_size)`` rows of the merged
-        batch carry consumable hidden states.
-        """
-        batch_size = max(int(batch_size), 0)
-        training_cfg = self._speco_drafter_training_config()
-        override = int(training_cfg.get("dspark_hard_collect_window_size", 0) or 0)
-        if override > 0:
-            return max(1, min(batch_size, override))
-
-        worker_group = getattr(self, "actor_rollout_wg", None)
-        world_size = int(getattr(worker_group, "world_size", 0) or 0)
-        if world_size > 0:
-            sp_size = int(
-                _get_nested(
-                    self.config,
-                    ("actor_rollout_ref", "actor", "ulysses_sequence_parallel_size"),
-                    1,
-                )
-                or 1
-            )
-            dp_size = max(world_size // max(sp_size, 1), 1)
-            return max(1, math.ceil(batch_size / dp_size))
-
-        cached_refs_len = getattr(self, "_speco_last_oldlogprob_hidden_refs_len", None)
-        if cached_refs_len:
-            return max(1, min(batch_size, int(cached_refs_len)))
-
-        logger.debug(
-            "[speco hard] cannot derive the old-logprob collectable window "
-            "(no worker-group world size or observed hidden refs); "
-            "falling back to the full batch size %s",
-            batch_size,
-        )
-        return batch_size
-
     def _speco_build_oldlogprob_collect_plan(
         self, batch: DataProto
     ) -> dict[str, Any] | None:
@@ -2868,9 +2827,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         # The transport now retains every DP shard. The window is a logical
         # collection budget, never a physical prefix of the actor batch.
         usable_window_size = batch_size
-        collection_limit = int(training_cfg.get("dspark_collect_samples_per_step", 80))
-        if collection_limit <= 0:
-            raise ValueError("dspark_collect_samples_per_step must be positive")
+        capacity_per_owner = max_per_owner
+        if max_tokens_per_owner is not None:
+            capacity_per_owner = min(capacity_per_owner, max_tokens_per_owner // hidden_rows)
+        algorithm = str(
+            _get_nested(self._speco_drafter_config(), ("speculative_algorithm",), "") or ""
+        ).strip().upper()
+        if algorithm == "DSPARK" or hard_enabled:
+            collection_limit = int(training_cfg.get("dspark_collect_samples_per_step", 80))
+            if collection_limit <= 0:
+                raise ValueError("dspark_collect_samples_per_step must be positive")
+        else:
+            collection_limit = capacity_per_owner * owner_count
         for name, ratio in (
             ("candidate", hard_candidate_ratio),
             ("sample", hard_sample_ratio),
@@ -2984,9 +2952,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         break
             return added
 
-        capacity_per_owner = max_per_owner
-        if max_tokens_per_owner is not None:
-            capacity_per_owner = min(capacity_per_owner, max_tokens_per_owner // hidden_rows)
         total_capacity = min(collection_limit, len(candidates), capacity_per_owner * owner_count)
         hard_added = 0
         target_hard = 0
@@ -2994,7 +2959,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         hard_shortfall = 0
         normal_shortfall = 0
         if not hard_enabled:
-            # Preserve baseline order; only impose the shared collection budget.
             normal_added = add_round_robin(candidates)
         else:
             hard_candidates, labeled_hard_count = partition_hard_candidates(
@@ -3205,11 +3169,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         hidden_refs = self._speco_flatten_non_tensor_rows(
             tu.get(output, OLD_LOGPROB_HIDDEN_REFS_KEY)
         )
-        if isinstance(hidden_refs, (list, tuple)) and hidden_refs:
-            # Cache the observed refs length so the collectable-window
-            # derivation can fall back to it when the worker-group world
-            # size is unavailable.
-            self._speco_last_oldlogprob_hidden_refs_len = len(hidden_refs)
         hidden_ref_meta = self._speco_flatten_non_tensor_rows(
             tu.get(output, OLD_LOGPROB_HIDDEN_REF_META_KEY)
         )
@@ -4199,9 +4158,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     serving_version,
                     generation_seconds=generation_elapsed,
                 )
-                self._speco_log_request_accept_len_variance_from_batch(
-                    gen_batch_output, source="rollout"
-                )
+                try:
+                    self._speco_log_request_accept_len_variance_from_batch(
+                        gen_batch_output, source="rollout"
+                    )
+                except RuntimeError as exc:
+                    logger.warning("[speco request accept len] skipped rollout diagnostics: %s", exc)
                 # Active freeze stops hidden-state collection here and in the
                 # scheduler plan; shadow mode keeps collecting. Accept-length
                 # evidence above is ungated and keeps feeding drift detection.

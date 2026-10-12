@@ -3029,42 +3029,45 @@ class _SpecoVLLMHttpServerMixin:
             self._speco_initial_draft_weights_ready = True
 
     async def generate(self, *args, **kwargs):
-        await self._speco_ensure_initial_draft_weights()
         request_id = _vllm_generate_request_id(args, kwargs)
-        output = await super().generate(*args, **kwargs)
-        extra_fields = getattr(output, "extra_fields", None)
-        if isinstance(extra_fields, dict):
-            extra_fields.setdefault(
-                f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_id",
-                str(request_id) if request_id is not None else None,
-            )
-            for suffix in (
-                "verify_rounds",
-                "draft_tokens",
-                "accepted_tokens",
-                "invalid_spec_tokens",
-                "completion_index",
-                "elapsed_sec",
-            ):
+        try:
+            await self._speco_ensure_initial_draft_weights()
+            output = await super().generate(*args, **kwargs)
+            extra_fields = getattr(output, "extra_fields", None)
+            if isinstance(extra_fields, dict):
                 extra_fields.setdefault(
-                    f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_{suffix}", None
+                    f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_id",
+                    str(request_id) if request_id is not None else None,
                 )
-            extra_fields.setdefault("_verl_request_mean_accept_len", None)
-            self._speco_add_vllm_spec_decode_extra_fields(extra_fields)
-            self._speco_add_vllm_request_accept_extra_fields(output, extra_fields)
-            summaries, completion_order = _pop_vllm_request_stats_for_rollout_output(
-                request_id
-            )
-            if summaries:
-                proxy_output = SimpleNamespace(
-                    request_id=request_id,
-                    _speco_vllm_request_accept_stats=summaries,
-                    _speco_vllm_request_completion_order=completion_order,
+                for suffix in (
+                    "verify_rounds",
+                    "draft_tokens",
+                    "accepted_tokens",
+                    "invalid_spec_tokens",
+                    "completion_index",
+                    "elapsed_sec",
+                ):
+                    extra_fields.setdefault(
+                        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_{suffix}", None
+                    )
+                extra_fields.setdefault("_verl_request_mean_accept_len", None)
+                self._speco_add_vllm_spec_decode_extra_fields(extra_fields)
+                self._speco_add_vllm_request_accept_extra_fields(output, extra_fields)
+                summaries, completion_order = _pop_vllm_request_stats_for_rollout_output(
+                    request_id
                 )
-                extra_fields.update(
-                    _vllm_request_accept_stats_to_scalar_extra_fields(proxy_output)
-                )
-        return output
+                if summaries:
+                    proxy_output = SimpleNamespace(
+                        request_id=request_id,
+                        _speco_vllm_request_accept_stats=summaries,
+                        _speco_vllm_request_completion_order=completion_order,
+                    )
+                    extra_fields.update(
+                        _vllm_request_accept_stats_to_scalar_extra_fields(proxy_output)
+                    )
+            return output
+        finally:
+            _pop_vllm_request_stats_for_rollout_output(request_id)
 
 
 def _build_speco_vllm_http_server_class(upstream_module: Any):

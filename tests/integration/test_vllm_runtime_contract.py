@@ -177,6 +177,88 @@ def test_vllm_generate_initializes_once_and_preserves_request_stats(keyword_requ
     assert events == ["speco_ensure_draft_initialized", "merge-request-1", "merge-request-2"]
 
 
+@pytest.mark.parametrize("failure_mode", ["upstream_error", "metadata_error", "no_extra_fields", "invalid_extra_fields"])
+def test_vllm_generate_cleans_only_current_request_stats(failure_mode) -> None:
+    request_id = f"cleanup-{failure_mode}"
+    other_request_id = f"other-{failure_mode}"
+    summaries = {request_id: {"verify_rounds": 4, "draft_tokens": 28, "accepted_tokens": 12}}
+    other_summaries = {other_request_id: {"verify_rounds": 2, "accepted_tokens": 6}}
+    output = SimpleNamespace(extra_fields=[] if failure_mode == "invalid_extra_fields" else {})
+    if failure_mode == "no_extra_fields":
+        output = SimpleNamespace()
+
+    class UpstreamServer:
+        async def generate(self, *args, **kwargs):
+            _stage_vllm_request_stats_for_rollout_output(request_id, summaries, [request_id])
+            if failure_mode == "upstream_error":
+                raise RuntimeError("upstream generation failed")
+            return output
+
+    class Server(_SpecoVLLMHttpServerMixin, UpstreamServer):
+        def _speco_add_vllm_spec_decode_extra_fields(self, extra_fields):
+            if failure_mode == "metadata_error":
+                raise RuntimeError("metadata conversion failed")
+
+    _stage_vllm_request_stats_for_rollout_output(other_request_id, other_summaries, [other_request_id])
+    try:
+        if failure_mode in ("upstream_error", "metadata_error"):
+            expected_error = "upstream generation failed" if failure_mode == "upstream_error" else "metadata conversion failed"
+            with pytest.raises(RuntimeError, match=expected_error):
+                asyncio.run(Server().generate(request_id=request_id))
+        else:
+            assert asyncio.run(Server().generate(request_id=request_id)) is output
+        assert _pop_vllm_request_stats_for_rollout_output(request_id) == ({}, [])
+        assert _pop_vllm_request_stats_for_rollout_output(other_request_id) == (other_summaries, [other_request_id])
+    finally:
+        _pop_vllm_request_stats_for_rollout_output(request_id)
+        _pop_vllm_request_stats_for_rollout_output(other_request_id)
+
+
+def test_vllm_generate_cancellation_preserves_concurrent_request_stats() -> None:
+    async def run_requests():
+        staged = {request_id: asyncio.Event() for request_id in ("cancelled-request", "active-request")}
+        release = asyncio.Event()
+
+        class UpstreamServer:
+            async def generate(self, *args, **kwargs):
+                request_id = _vllm_generate_request_id(args, kwargs)
+                _stage_vllm_request_stats_for_rollout_output(
+                    request_id,
+                    {request_id: {"verify_rounds": 4, "draft_tokens": 28, "accepted_tokens": 12}},
+                    [request_id],
+                )
+                staged[request_id].set()
+                await release.wait()
+                return SimpleNamespace(extra_fields={})
+
+        class Server(_SpecoVLLMHttpServerMixin, UpstreamServer):
+            pass
+
+        server = Server()
+        cancelled_task = asyncio.create_task(server.generate(request_id="cancelled-request"))
+        active_task = asyncio.create_task(server.generate(request_id="active-request"))
+        try:
+            await asyncio.gather(*(event.wait() for event in staged.values()))
+            cancelled_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled_task
+            assert _pop_vllm_request_stats_for_rollout_output("cancelled-request") == ({}, [])
+            release.set()
+            output = await active_task
+            assert output.extra_fields["_speco_vllm_request_id"] == "active-request"
+            assert output.extra_fields["_verl_request_mean_accept_len"] == 4.0
+            assert _pop_vllm_request_stats_for_rollout_output("active-request") == ({}, [])
+        finally:
+            release.set()
+            cancelled_task.cancel()
+            active_task.cancel()
+            await asyncio.gather(cancelled_task, active_task, return_exceptions=True)
+            _pop_vllm_request_stats_for_rollout_output("cancelled-request")
+            _pop_vllm_request_stats_for_rollout_output("active-request")
+
+    asyncio.run(run_requests())
+
+
 @pytest.mark.parametrize("stats_transport", ["staged", "output"])
 @pytest.mark.parametrize("unscored_first", [False, True])
 def test_vllm_generate_preserves_unscored_request_ids_and_transport_keys(
