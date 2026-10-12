@@ -1707,16 +1707,19 @@ patch_transformers_attention_layer_type_constants()
 install_verl_npu_vllm_import_compat()
 
 
-# Drafter params that some DSpark runtimes do not wire into inference.  vLLM's
-# GPU-native Qwen3DSparkForCausalLM.load_weights() carries
-# ``skip_substrs = ["mask_embedding", "confidence_head"]`` and its served
-# Qwen3DSparkModel never registers the confidence head, so publishing a trained
-# drafter's confidence-head weights into it raises on the unknown module.
+# Drafter params that a served DSpark model may not expose.  A served
+# Qwen3DSparkModel registers the confidence head only when the drafter config
+# declares one (``enable_confidence_head=true``) and the checkpoint carries
+# ``confidence_head.proj.{weight,bias}``; vLLM's load_weights() keeps and loads
+# the head when the checkpoint includes it, and drops it otherwise.  Publishing
+# a trained head into a served model that does not register it raises on the
+# unknown module.
 #
-# This is a *candidate* list, not an unconditional skip: other DSpark backends
-# (vllm-ascend is adding confidence-head support) do register these, and dropping
-# a published tensor there would silently stall that head at its initial values.
-# Callers must additionally confirm the resolved model lacks the parameter.
+# This is a *candidate* list, not an unconditional skip: a backend that DOES
+# register the parameter (current vLLM/vllm-ascend do register the confidence
+# head, vllm-ascend#13216/#15098) must keep receiving the published tensors, or
+# the head would silently stall at its initial values.  Callers must
+# additionally confirm the resolved model lacks the parameter before skipping.
 _DSPARK_INFERENCE_ONLY_SKIPPED = ("confidence_head",)
 
 
