@@ -20,9 +20,17 @@ export SPECO_JEMALLOC_RECLAIM_MODE="${SPECO_JEMALLOC_RECLAIM_MODE:-purge}"
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
 
-# MRV2 (vllm-ascend#15098) consumes the confidence head for adaptive
-# verification. This job co-trains and publishes the confidence head, matching
-# the V1 dynamic example but on the native MRV2 runner (async scheduling kept).
+# DSpark confidence-head co-train + confidence-thresholded dynamic verification
+# on the native MRV2 runner (vllm-ascend#15098; the verify budget is consumed in
+# the worker, so async scheduling is fine and left enabled).
+#
+# V1-runner alternative (older vllm-ascend builds with vllm-ascend#13216): set
+# VLLM_USE_V2_MODEL_RUNNER=0, opt in with
+# `rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method=dspark`
+# plus method_params.{initial_verify_budget_per_req,budget_update_interval,
+# budget_threshold}, and disable async scheduling (`async_scheduling=False`) --
+# the V1 budget consumer `take_draft_token_ids()` is only called when async is
+# off. DRAFTER_PATH must already contain confidence_head.proj.{weight,bias}.
 project_name='verl_grpo_example_dspark_drafter'
 exp_name='qwen3_8b_dspark_mrv2_drafter_vllm_npu'
 

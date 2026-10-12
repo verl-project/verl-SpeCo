@@ -1422,7 +1422,7 @@ def build_vllm_speculative_config_from_drafter(
                 "that declares a confidence head (enable_confidence_head=true or "
                 f"confidence_head_alpha>0); got model_path={spec_model_path}. Train "
                 "and export the confidence head first (see "
-                "examples/dynamic/run_qwen3-8b_drafter_dspark_vllm_npu.sh)."
+                "examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_vllm_npu.sh)."
             )
         if algorithm == "DFLASH2":
             _assert_vllm_supports_dflash2()

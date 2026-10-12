@@ -117,25 +117,6 @@ def test_standalone_tq_training_example_uses_unified_launcher() -> None:
     assert "training.dspark_target_layer_ids=" not in source
 
 
-def test_dspark_dynamic_npu_example_trains_and_serves_confidence_head() -> None:
-    source = (
-        ROOT
-        / "examples"
-        / "dynamic"
-        / "run_qwen3-8b_drafter_dspark_vllm_npu.sh"
-    ).read_text(encoding="utf-8")
-
-    assert "dspark_confidence_head_alpha=1.0" in source
-    assert "dspark_confidence_loss_alpha=1.0" in source
-    assert "dspark_confidence_head_with_markov=True" in source
-    assert "speculative_config_overrides.method=dspark" in source
-    assert "additional_config.dynamic_spec_config.method=dspark" in source
-    assert "initial_verify_budget_per_req=5" in source
-    assert "budget_update_interval=50" in source
-    assert "budget_threshold=0.7" in source
-    assert "VLLM_USE_V2_MODEL_RUNNER=0" in source
-
-
 def test_standalone_tq_hidden_state_vllm_uses_separate_devices() -> None:
     source = (
         ROOT / "tools" / "run_qwen3-8b_drafter_hidden_state_vllm.sh"
@@ -268,7 +249,9 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     assert "dspark_confidence_head_with_markov=True" in mrv2_source
     assert "enable_adaptive_verification=True" in mrv2_source
     assert "additional_config.weight_nz_mode=0" in mrv2_source
-    assert "dynamic_spec" not in mrv2_source
+    # The V1 dynamic-verify mechanism must not be *configured* on the MRV2 recipe
+    # (a header comment may still describe it as the V1 alternative).
+    assert not any("dynamic_spec" in key for key in mrv2)
     assert "SPECO MRV2 run directory" not in mrv2_source
     assert "tee -a" not in mrv2_source
     assert "MODEL_PATH=/path/to/model" in mrv2_source

@@ -402,10 +402,14 @@ static serving and offline training (`...training.mode=offline`) may be
 markov-less. The exported `config.json` always records the live topology, so a
 head added while fine-tuning an older checkpoint survives a reload. Enabling
 vLLM-Ascend's confidence-thresholded dynamic verify budget is
-opt-in through
+opt-in: on the V1 runner through
 `rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method=dspark`
-on the V1 runner (`VLLM_USE_V2_MODEL_RUNNER=0`, requires vllm-ascend#13216); see
-`examples/dynamic/run_qwen3-8b_drafter_dspark_vllm_npu.sh`.
+(`VLLM_USE_V2_MODEL_RUNNER=0`, requires vllm-ascend#13216, and
+`async_scheduling=False` — the V1 budget consumer is only called when async is
+off), or on the MRV2 runner through
+`rollout.drafter.vllm.speculative_config_overrides.enable_adaptive_verification=true`
+(vllm-ascend#15098, async-compatible); see
+`examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_vllm_npu.sh`.
 
 Domino and P-EAGLE are training-time families with no engine-level speculative
 method of their own (engines serve Domino as a DFlash projector sub-mode, and
