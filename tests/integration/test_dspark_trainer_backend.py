@@ -1141,17 +1141,20 @@ def test_dspark_ce_only_target_argmax_feature_batch_reaches_model():
         "DSPARK", training_cfg
     )
     assert sample.metadata["hidden_states_layout"] == "dflash_aux_plus_last"
-    sample.last_hidden_states = torch.randn(5, 8)
+    target_hidden = torch.randn(5, 8, dtype=torch.bfloat16)
+    sample.hidden_states = torch.cat(
+        [sample.hidden_states.to(torch.bfloat16), target_hidden], dim=-1
+    )
     batch = trainer.prepare_training_batch_from_samples([sample], step=0)
     assert batch is not None
     torch.testing.assert_close(
-        batch["target_last_hidden_states"][0, :5], sample.last_hidden_states
+        batch["target_last_hidden_states"][0, :5], target_hidden
     )
     model = _small_dspark_training_model(
         block_size=2, l1_loss_alpha=0.0, ce_target_source="target_argmax"
-    )
+    ).to(dtype=torch.bfloat16)
     trainer.backend.target_lm_head = SimpleNamespace(
-        fc=SimpleNamespace(weight=torch.randn(32, 8))
+        fc=SimpleNamespace(weight=torch.randn(32, 8, dtype=torch.bfloat16))
     )
     result = trainer.backend.compute_loss(model, batch, 0)
     assert torch.isfinite(result["total_local_ploss"])
