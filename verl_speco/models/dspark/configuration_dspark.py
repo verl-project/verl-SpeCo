@@ -71,6 +71,7 @@ class DSparkConfig(DFlashConfig):
         enable_confidence_head: Optional[bool] = None,
         confidence_head_alpha: float = 0.0,
         confidence_head_with_markov: bool = True,
+        confidence_detach_backbone: bool = False,
         ce_loss_alpha: float = 0.1,
         l1_loss_alpha: float = 0.9,
         loss_decay_gamma: float = 7.0,
@@ -94,6 +95,7 @@ class DSparkConfig(DFlashConfig):
             else self.confidence_head_alpha > 0.0
         )
         self.confidence_head_with_markov = bool(confidence_head_with_markov)
+        self.confidence_detach_backbone = bool(confidence_detach_backbone)
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
         self.loss_decay_gamma = float(loss_decay_gamma)

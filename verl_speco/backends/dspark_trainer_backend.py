@@ -1152,6 +1152,9 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 )
             drafter_config.enable_confidence_head = True
             drafter_config.confidence_head_with_markov = confidence_with_markov
+            drafter_config.confidence_detach_backbone = bool(
+                training_cfg.get("dspark_confidence_detach_backbone", False)
+            )
             drafter_config.confidence_head_alpha = max(
                 float(getattr(drafter_config, "confidence_head_alpha", 0.0)),
                 training_head_alpha,
@@ -1159,8 +1162,10 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             )
             logger.info(
                 "[dspark-trainer] confidence head enabled "
-                "(with_markov=%s head_alpha=%.4f loss_alpha=%.4f checkpoint_has_head=%s)",
+                "(with_markov=%s detach_backbone=%s head_alpha=%.4f loss_alpha=%.4f "
+                "checkpoint_has_head=%s)",
                 confidence_with_markov,
+                drafter_config.confidence_detach_backbone,
                 training_head_alpha,
                 training_loss_alpha,
                 checkpoint_has_head,

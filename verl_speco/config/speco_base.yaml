@@ -293,6 +293,9 @@ actor_rollout_ref:
         dspark_confidence_head_alpha: 0.0
         dspark_confidence_loss_alpha: 0.0
         dspark_confidence_head_with_markov: true
+        # When true the confidence loss does not backpropagate into the shared
+        # draft backbone/Markov features: only the confidence head is trained.
+        dspark_confidence_detach_backbone: false
         dspark_ce_loss_alpha: 0.1
         # DeepSpec Qwen3 fixed-K default. Confidence BCE is unsupported on MRV2
         # and must not implicitly reduce the distribution-matching objective.
