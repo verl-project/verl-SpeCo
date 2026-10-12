@@ -1130,6 +1130,34 @@ def test_block_drafter_label_packing_standalone_equal_lengths():
     assert batch["label_ids"].size(1) == batch["input_ids"].size(1) == 4
 
 
+def test_dspark_ce_only_target_argmax_feature_batch_reaches_model():
+    from verl_speco.integration.oldlogprob_layer_ids import resolve_drafter_hidden_states_layout
+
+    trainer = _label_packing_trainer()
+    training_cfg = trainer.config.rollout.drafter.training
+    training_cfg["ce_target_source"] = "target_argmax"
+    sample = _feature_sample(5, 5)
+    sample.metadata["hidden_states_layout"] = resolve_drafter_hidden_states_layout(
+        "DSPARK", training_cfg
+    )
+    assert sample.metadata["hidden_states_layout"] == "dflash_aux_plus_last"
+    sample.last_hidden_states = torch.randn(5, 8)
+    batch = trainer.prepare_training_batch_from_samples([sample], step=0)
+    assert batch is not None
+    torch.testing.assert_close(
+        batch["target_last_hidden_states"][0, :5], sample.last_hidden_states
+    )
+    model = _small_dspark_training_model(
+        block_size=2, l1_loss_alpha=0.0, ce_target_source="target_argmax"
+    )
+    trainer.backend.target_lm_head = SimpleNamespace(
+        fc=SimpleNamespace(weight=torch.randn(32, 8))
+    )
+    result = trainer.backend.compute_loss(model, batch, 0)
+    assert torch.isfinite(result["total_local_ploss"])
+    assert result["local_num_tokens"].item() > 0
+
+
 def test_block_drafter_label_mask_is_sanitized_for_bad_hidden_rows():
     trainer = _label_packing_trainer()
     batch = trainer.prepare_training_batch_from_samples(
