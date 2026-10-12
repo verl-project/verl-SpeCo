@@ -2680,11 +2680,7 @@ def install_vllm_spec_decode_acceptance_logging() -> bool:
     scheduler_patched = patch_vllm_spec_decode_acceptance_logging()
     request_acceptance_patched = patch_vllm_request_acceptance_stats()
     engine_core_patched = patch_vllm_engine_core_entrypoint()
-    return (
-        scheduler_patched
-        or request_acceptance_patched
-        or engine_core_patched
-    )
+    return scheduler_patched or request_acceptance_patched or engine_core_patched
 
 
 def install_vllm_runtime_observability() -> bool:
@@ -2802,9 +2798,7 @@ def _vllm_request_accept_stats_to_extra_fields(output: Any) -> dict[str, Any]:
         return {}
     ordered_ids = _ordered_request_ids_from_summaries(
         summaries,
-        completion_order=getattr(
-            output, "_speco_vllm_request_completion_order", None
-        ),
+        completion_order=getattr(output, "_speco_vllm_request_completion_order", None),
         preferred_request_id=getattr(output, "request_id", None),
     )
     return _vllm_request_accept_fields_from_summaries(summaries, ordered_ids)
@@ -2822,9 +2816,7 @@ def _vllm_staged_request_accept_stats_to_extra_fields(
     using the request id of this ``generate()`` call.
     """
     request_id = _vllm_generate_request_id(args, kwargs)
-    summaries, completion_order = _pop_vllm_request_stats_for_rollout_output(
-        request_id
-    )
+    summaries, completion_order = _pop_vllm_request_stats_for_rollout_output(request_id)
     if not summaries:
         return {}
     ordered_ids = _ordered_request_ids_from_summaries(
@@ -2855,6 +2847,7 @@ def _vllm_request_accept_stats_to_scalar_extra_fields(output: Any) -> dict[str, 
         else:
             scalar_fields[key] = value
     return scalar_fields
+
 
 def _build_speco_vllm_stat_logger(server: Any):
     from vllm.v1.metrics.loggers import StatLoggerBase

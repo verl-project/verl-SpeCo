@@ -568,9 +568,7 @@ def read_freeze_branch_manifest(
     """
     path = freeze_branch_manifest_path(checkpoint_folder)
     if not os.path.isfile(path):
-        raise FreezeBranchManifestError(
-            f"freeze branch manifest not found: {path}"
-        )
+        raise FreezeBranchManifestError(f"freeze branch manifest not found: {path}")
     try:
         with open(path, "r", encoding="utf-8") as handle:
             manifest = json.load(handle)
@@ -640,13 +638,9 @@ def validate_freeze_branch_checkpoint(
             problems.append(f"invalid checkpoint step {step!r}")
             step_int = None
         if step_int is not None and drafter_root:
-            draft_dir = os.path.join(
-                os.fspath(drafter_root), f"draft_step_{step_int}"
-            )
+            draft_dir = os.path.join(os.fspath(drafter_root), f"draft_step_{step_int}")
             if not is_pretrained_drafter_checkpoint(draft_dir):
-                problems.append(
-                    f"missing or incomplete drafter checkpoint {draft_dir}"
-                )
+                problems.append(f"missing or incomplete drafter checkpoint {draft_dir}")
             elif get_drafter_checkpoint_step(draft_dir) != step_int:
                 problems.append(
                     f"drafter checkpoint step mismatch in {draft_dir} "
@@ -669,7 +663,12 @@ def validate_freeze_branch_checkpoint(
         if step is not None:
             trigger_step = manifest.get("trigger_step")
             checkpoint_step = manifest.get("checkpoint_step")
-            if int(trigger_step) != int(step) or int(checkpoint_step) != int(step):
+            if (
+                trigger_step is None
+                or checkpoint_step is None
+                or int(trigger_step) != int(step)
+                or int(checkpoint_step) != int(step)
+            ):
                 problems.append(
                     "manifest step mismatch: "
                     f"trigger_step={trigger_step} checkpoint_step="
@@ -680,4 +679,5 @@ def validate_freeze_branch_checkpoint(
         raise FreezeBranchManifestError(
             "freeze branch checkpoint validation failed: " + "; ".join(problems)
         )
+    assert manifest is not None
     return manifest

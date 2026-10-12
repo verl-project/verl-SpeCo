@@ -116,7 +116,9 @@ def bottom_tail_mean(values: Sequence[float], quantile: float = 0.10) -> float:
     return statistics.fmean(ordered[:m])
 
 
-def _plain_quality(values: Sequence[float], trim: float, tau: float) -> dict[str, float]:
+def _plain_quality(
+    values: Sequence[float], trim: float, tau: float
+) -> dict[str, float]:
     n = len(values)
     if n == 0:
         return {"n": 0, "q_all": 0.0, "q_hard": 0.0, "mean": 0.0, "median": 0.0}
@@ -175,8 +177,8 @@ class ProbeComparison:
     """
 
     request_ids: Sequence[str]
-    accept_before: Sequence[float]
-    accept_after: Sequence[float]
+    accept_before: Sequence[Optional[float]]
+    accept_after: Sequence[Optional[float]]
     tokens_before: Optional[Sequence[float]] = None
     seconds_before: Optional[Sequence[float]] = None
     tokens_after: Optional[Sequence[float]] = None
@@ -212,7 +214,12 @@ class ProbeComparison:
                 continue
             before_f, after_f = float(before), float(after)
             out.append(
-                (rid, before_f, after_f, (after_f - before_f) / max(abs(before_f), _EPS))
+                (
+                    rid,
+                    before_f,
+                    after_f,
+                    (after_f - before_f) / max(abs(before_f), _EPS),
+                )
             )
         return out
 
@@ -330,7 +337,7 @@ class FreezeDecision:
     should_probe: bool
     transitioned: bool
     reason: str
-    metrics: Mapping[str, float]
+    metrics: Mapping[str, Optional[float]]
     drafter_version: int
     update_opportunity_id: int
     valid_update_count: int
@@ -493,12 +500,8 @@ class _PolicyConfig:
             probe_min_timing_pairs=int(f(probe, "min_timing_pairs", 16)),
             resume_drop_all=float(f(resume, "drop_all", 0.05)),
             resume_drop_hard=float(f(resume, "drop_hard", 0.05)),
-            resume_patience_opportunities=int(
-                f(resume, "patience_opportunities", 3)
-            ),
-            low_fraction_accelerator=float(
-                f(resume, "low_fraction_accelerator", 0.10)
-            ),
+            resume_patience_opportunities=int(f(resume, "patience_opportunities", 3)),
+            low_fraction_accelerator=float(f(resume, "low_fraction_accelerator", 0.10)),
             missing_evidence_opportunities=int(
                 f(resume, "missing_evidence_opportunities", 3)
             ),
@@ -687,7 +690,7 @@ class DrafterFreezePolicy:
             # meaningless. Fail safe by rebuilding calibration state from
             # scratch while keeping the *current* config (RFC 12.4).
             raw = self._config_raw
-            self.__init__(config=raw)
+            type(self).__init__(self, config=raw)
             self._last_transition = {
                 "event": "drafter_freeze_transition",
                 "to": FreezeState.CALIBRATING.value,
@@ -727,9 +730,7 @@ class DrafterFreezePolicy:
             VersionEvidence.from_dict(v) for v in state.get("versions", [])
         ]
         self._gains = [dict(g) for g in state.get("gains", [])]
-        self._consecutive_valid_gains = int(
-            state.get("consecutive_valid_gains", 0)
-        )
+        self._consecutive_valid_gains = int(state.get("consecutive_valid_gains", 0))
         self._growth_seen_all = bool(state.get("growth_seen_all", False))
         self._growth_seen_hard = bool(state.get("growth_seen_hard", False))
         self._pseudo_noise_all = [float(v) for v in state.get("pseudo_noise_all", [])]
@@ -745,9 +746,7 @@ class DrafterFreezePolicy:
         self._anchor = VersionEvidence.from_dict(anchor) if anchor else None
         self._anchor_low_fraction = state.get("anchor_low_fraction", None)
         self._costs = [float(v) for v in state.get("costs", [])]
-        self.cumulative_cost_seconds = float(
-            state.get("cumulative_cost_seconds", 0.0)
-        )
+        self.cumulative_cost_seconds = float(state.get("cumulative_cost_seconds", 0.0))
         self.cumulative_saved_seconds_estimate = float(
             state.get("cumulative_saved_seconds_estimate", 0.0)
         )
@@ -780,6 +779,7 @@ class DrafterFreezePolicy:
         pending = self._pending_next_version
         transitioned = False
         reason = self._last_reason
+        win: Optional[_Window]
 
         if pending is not None and serving >= pending:
             # The new version is already serving and the publishing step had
@@ -795,7 +795,9 @@ class DrafterFreezePolicy:
                 _Window(self._open_version, opened_step=ev.global_step),
             )
             self._append_step(win, lens, ev)
-        elif pending is not None and serving == self._open_version and serving < pending:
+        elif (
+            pending is not None and serving == self._open_version and serving < pending
+        ):
             # The publishing step's own evidence still carries the OLD serving
             # version: it is the final observation of that window -- ingest it,
             # then close and open the published version.
@@ -875,10 +877,11 @@ class DrafterFreezePolicy:
         self.drafter_version = new_version
         # An unresolved staged version (publish without any intervening new
         # rollout, unusual): flush it before staging the next one.
-        if self._pending_next_version is not None and new_version > self._pending_next_version:
-            self._advance_version(
-                self._pending_next_version, self._pending_cost, ev
-            )
+        if (
+            self._pending_next_version is not None
+            and new_version > self._pending_next_version
+        ):
+            self._advance_version(self._pending_next_version, self._pending_cost, ev)
         self._pending_next_version = new_version
         self._pending_cost = cost
         return self._decision(transitioned=False, reason=self._last_reason)
@@ -887,13 +890,9 @@ class DrafterFreezePolicy:
         self, new_version: int, cost: Optional[float], ev: FreezeEvidence
     ) -> tuple[bool, str]:
         """Close the served window, open ``new_version``, run the state machine."""
-        closed = self._finalize_window(
-            self._open_version, ev.global_step, cost=cost
-        )
+        closed = self._finalize_window(self._open_version, ev.global_step, cost=cost)
         self._open_version = new_version
-        self._windows[new_version] = _Window(
-            new_version, opened_step=ev.global_step
-        )
+        self._windows[new_version] = _Window(new_version, opened_step=ev.global_step)
 
         if self.state in (FreezeState.FROZEN, FreezeState.RECOVERING):
             # A real update after freeze/recovery completes the recovery once a
@@ -1049,7 +1048,10 @@ class DrafterFreezePolicy:
         recent = self._gains[-self.cfg.window_updates :]
         if len(recent) < self.cfg.window_updates:
             return []
-        last_version = int(recent[-1]["version"])
+        version = recent[-1]["version"]
+        if version is None:
+            return []
+        last_version = int(version)
         first_version = last_version - self.cfg.window_updates
         return list(range(first_version, last_version + 1))
 
@@ -1106,22 +1108,20 @@ class DrafterFreezePolicy:
         # paired probe covering this advance predicts the next update's ROI
         # (RFC sec. 8.3); the online quality evidence above never substitutes.
         probe_stats = (
-            self._fresh_probe_stats(new_version)
-            if self.cfg.economics_enabled
-            else None
+            self._fresh_probe_stats(new_version) if self.cfg.economics_enabled else None
         )
         probe_roi = self._probe_roi(probe_stats) if probe_stats else None
         roi_ucb = probe_roi["roi_ucb95"] if probe_roi is not None else None
         economics_missing = self.cfg.economics_enabled and probe_roi is None
         economic_ok = True
         if self.cfg.economics_enabled:
-            economic_ok = (
-                probe_roi is not None and roi_ucb <= self.cfg.cost_margin
-            )
+            economic_ok = roi_ucb is not None and roi_ucb <= self.cfg.cost_margin
 
         gain_all_flat = ucb_all is not None and ucb_all <= eps_all
         gain_hard_flat = ucb_hard is not None and ucb_hard <= eps_hard
-        stable_all = drop_all_b is not None and drop_all_b <= self.cfg.freeze_guard_drop_all
+        stable_all = (
+            drop_all_b is not None and drop_all_b <= self.cfg.freeze_guard_drop_all
+        )
         stable_hard = (
             drop_hard_b is not None and drop_hard_b <= self.cfg.freeze_guard_drop_hard
         )
@@ -1137,15 +1137,14 @@ class DrafterFreezePolicy:
             and economic_ok
         )
         no_response_candidate = (
-            (not growth_seen)
-            and gain_all_flat
-            and gain_hard_flat
-            and economic_ok
+            (not growth_seen) and gain_all_flat and gain_hard_flat and economic_ok
         )
 
         candidate = normal_candidate or no_response_candidate
-        kind = "plateau" if normal_candidate else (
-            "no_response" if no_response_candidate else None
+        kind = (
+            "plateau"
+            if normal_candidate
+            else ("no_response" if no_response_candidate else None)
         )
 
         # Choose the most informative blocking reason when not a candidate.
@@ -1216,9 +1215,7 @@ class DrafterFreezePolicy:
                 "gain_speed_ucb95": ucb_speed,
                 "roi_next": probe_roi["roi"] if probe_roi else None,
                 "roi_next_ucb95": roi_ucb,
-                "benefit_next_seconds": (
-                    probe_roi["benefit"] if probe_roi else None
-                ),
+                "benefit_next_seconds": (probe_roi["benefit"] if probe_roi else None),
                 "benefit_next_ucb95_seconds": (
                     probe_roi["benefit_ucb95"] if probe_roi else None
                 ),
@@ -1260,9 +1257,7 @@ class DrafterFreezePolicy:
             self._open_version, _Window(self._open_version, opened_step=-1)
         )
 
-    def _evaluate_drift_when_frozen(
-        self, ev: FreezeEvidence
-    ) -> tuple[bool, str]:
+    def _evaluate_drift_when_frozen(self, ev: FreezeEvidence) -> tuple[bool, str]:
         if not ev.opportunity_this_step:
             return False, "frozen_stable"
         self._frozen_opportunities += 1
@@ -1304,9 +1299,7 @@ class DrafterFreezePolicy:
         # missing streak would be reset on every empty observation. An
         # opportunity is blind only when THIS observation carried no fresh
         # accept-length data.
-        fresh_requests = sum(
-            1 for value in ev.request_accept_lens if value is not None
-        )
+        fresh_requests = sum(1 for value in ev.request_accept_lens if value is not None)
         if self._anchor is None or fresh_requests == 0:
             self._missing_streak += 1
             if self._missing_streak >= self.cfg.missing_evidence_opportunities:
@@ -1325,12 +1318,17 @@ class DrafterFreezePolicy:
             # does not accumulate either.
             return False, "frozen_stable"
 
-        steps_map = {
+        candidate_windows = {
             self._anchor.version: self._windows.get(self._anchor.version),
             self._open_version: win,
         }
-        steps_map = {k: v for k, v in steps_map.items() if v is not None}
-        if not self._bootstrap_available(steps_map) or self._anchor.version == self._open_version:
+        steps_map: dict[int, _Window] = {
+            k: v for k, v in candidate_windows.items() if v is not None
+        }
+        if (
+            not self._bootstrap_available(steps_map)
+            or self._anchor.version == self._open_version
+        ):
             # Anchor window steps were pruned: cannot test drift, fail open.
             if self._anchor.version not in self._windows:
                 self._transition(
@@ -1348,15 +1346,12 @@ class DrafterFreezePolicy:
         accelerated = self._low_fraction_accelerated(low_fraction_now)
         required = max(
             1,
-            self.cfg.resume_patience_opportunities
-            - (1 if accelerated else 0),
+            self.cfg.resume_patience_opportunities - (1 if accelerated else 0),
         )
 
         drift_all = d_all is not None and d_all > self.cfg.resume_drop_all
         drift_hard = d_hard is not None and d_hard > self.cfg.resume_drop_hard
-        hard_noise = (
-            d_hard is not None and d_hard > self.cfg.practical_gain_hard
-        )
+        hard_noise = d_hard is not None and d_hard > self.cfg.practical_gain_hard
 
         if accelerated and hard_noise and not drift_all:
             drift_hard = True  # low-fraction tail alarm + real hard regression
@@ -1396,11 +1391,9 @@ class DrafterFreezePolicy:
         retain: set[int] = set()
         retain.add(self._open_version)
         recent = self._gains[-(self.cfg.window_updates + 1) :]
-        if recent:
+        if recent and recent[-1]["version"] is not None:
             last = int(recent[-1]["version"])
-            for version in range(
-                last - self.cfg.window_updates - 1, last + 1
-            ):
+            for version in range(last - self.cfg.window_updates - 1, last + 1):
                 retain.add(version)
         if self._anchor is not None:
             retain.add(self._anchor.version)
@@ -1412,9 +1405,7 @@ class DrafterFreezePolicy:
             if version != self._open_version and version not in retain:
                 # Keep a zeroed placeholder? Drop raw steps but keep the window
                 # key only if a VersionEvidence summary exists.
-                if self.versions and any(
-                    e.version == version for e in self.versions
-                ):
+                if self.versions and any(e.version == version for e in self.versions):
                     self._windows[version].steps = []
                 else:
                     del self._windows[version]
@@ -1436,9 +1427,7 @@ class DrafterFreezePolicy:
         # Deterministic per (decision point): reproducible regardless of how
         # many times observe() is called (RFC 7.2 / 17.4).
         base = (
-            self.cfg.bootstrap_seed
-            + 1_000_003 * (self.drafter_version + 1)
-            + 97 * tag
+            self.cfg.bootstrap_seed + 1_000_003 * (self.drafter_version + 1) + 97 * tag
         )
         return random.Random(base)
 
@@ -1551,9 +1540,7 @@ class DrafterFreezePolicy:
             return (q_anchor - q_cur) / q_anchor
 
         tag = (7 if upper else 8) * (11 if key == "q_all" else 22)
-        point, lcb, ucb = self._bootstrap_bounds(
-            [anchor_v, cur_v], statistic, tag=tag
-        )
+        point, lcb, ucb = self._bootstrap_bounds([anchor_v, cur_v], statistic, tag=tag)
         return ucb if upper else lcb
 
     def _drift_bound(self, steps_map, key, *, upper):
@@ -1574,9 +1561,7 @@ class DrafterFreezePolicy:
         interval = max(1, self.cfg.probe_interval_updates)
         return int(after_version) >= 1 and int(after_version) % interval == 0
 
-    def _ingest_probe(
-        self, probe: Optional[ProbeComparison], new_version: int
-    ) -> None:
+    def _ingest_probe(self, probe: Optional[ProbeComparison], new_version: int) -> None:
         """Attach a probe returned by the executor to the version it compares."""
         if probe is None:
             return
@@ -1628,9 +1613,7 @@ class DrafterFreezePolicy:
             return None, None, None
         b = max(2, int(self.cfg.bootstrap_samples))
         rng = random.Random(
-            self.cfg.bootstrap_seed
-            + 1_000_003 * (int(version_key) + 1)
-            + 97 * tag
+            self.cfg.bootstrap_seed + 1_000_003 * (int(version_key) + 1) + 97 * tag
         )
         samples: list[float] = []
         for _ in range(b):
@@ -1698,9 +1681,7 @@ class DrafterFreezePolicy:
             sec_per_token_before = (
                 total_sec_b / total_tok_b if total_tok_b > 0 else None
             )
-            sec_per_token_after = (
-                total_sec_a / total_tok_a if total_tok_a > 0 else None
-            )
+            sec_per_token_after = total_sec_a / total_tok_a if total_tok_a > 0 else None
 
         return {
             "version_before": probe.version_before,
@@ -1752,9 +1733,7 @@ class DrafterFreezePolicy:
             return None
         return stats
 
-    def _probe_roi(
-        self, stats: Optional[dict[str, Any]]
-    ) -> Optional[dict[str, float]]:
+    def _probe_roi(self, stats: Optional[dict[str, Any]]) -> Optional[dict[str, float]]:
         """B_next/ROI point + UCB from one probe summary and current horizon."""
         if stats is None:
             return None
@@ -1824,9 +1803,7 @@ class DrafterFreezePolicy:
             return horizon_tokens, None, None, None
         delta_sec_per_token = float(statistics.median(deltas))
         benefit_seconds = (
-            horizon_tokens * delta_sec_per_token
-            if horizon_tokens is not None
-            else None
+            horizon_tokens * delta_sec_per_token if horizon_tokens is not None else None
         )
         roi = (
             benefit_seconds / cost
@@ -1878,12 +1855,14 @@ class DrafterFreezePolicy:
     def last_transition(self) -> Optional[Mapping[str, Any]]:
         return self._last_transition
 
-    def _live_quality(self) -> dict[str, float]:
+    def _live_quality(self) -> dict[str, Optional[float]]:
         """Quality of the serving (open) window, else of the last closed one."""
         win = self._windows.get(self._open_version)
         if win is not None and win.steps:
             lens = win.pooled_lens()
-            q = _plain_quality(lens, self.cfg.trim_fraction, self.cfg.hard_quantile)
+            q: dict[str, Optional[float]] = dict(
+                _plain_quality(lens, self.cfg.trim_fraction, self.cfg.hard_quantile)
+            )
             tokens, seconds = win.total_tokens(), win.total_seconds()
             q["q_speed"] = self._speed(tokens, seconds)
             q["low_fraction"] = win.latest_low_fraction()
@@ -1908,9 +1887,7 @@ class DrafterFreezePolicy:
         denom = max(k - 1.0, _EPS)
         return max(0.0, min(1.0, (value - 1.0) / denom))
 
-    def _decision(
-        self, *, transitioned: bool, reason: str
-    ) -> FreezeDecision:
+    def _decision(self, *, transitioned: bool, reason: str) -> FreezeDecision:
         self._last_reason = reason
         frozen = self.state == FreezeState.FROZEN
         metrics = self._metrics(reason)
@@ -2013,22 +1990,16 @@ class DrafterFreezePolicy:
         m["drafter/probe_completed"] = float(self.probe_completed)
         m["drafter/probe_incomplete"] = float(self.probe_incomplete)
         m["drafter/probe_wall_seconds_total"] = (
-            self.probe_wall_seconds_total
-            if self.probe_wall_seconds_total > 0
-            else None
+            self.probe_wall_seconds_total if self.probe_wall_seconds_total > 0 else None
         )
         if stats is None:
             m["drafter/economics_gate_ready"] = 0.0
             return
 
         after = stats.get("version_after")
-        m["drafter/probe_drafter_version"] = (
-            float(after) if after is not None else None
-        )
+        m["drafter/probe_drafter_version"] = float(after) if after is not None else None
         m["drafter/probe_age_updates"] = (
-            float(self.drafter_version - int(after))
-            if after is not None
-            else None
+            float(self.drafter_version - int(after)) if after is not None else None
         )
         m["drafter/probe_request_count"] = float(stats["request_count"])
         m["drafter/probe_accept_pair_count"] = float(stats["accept_pairs"])
@@ -2041,12 +2012,8 @@ class DrafterFreezePolicy:
         m["drafter/probe_gain_hard"] = stats.get("gain_hard")
         m["drafter/probe_gain_hard_ucb95"] = stats.get("gain_hard_ucb95")
         m["drafter/probe_gain_hard_lcb95"] = stats.get("gain_hard_lcb95")
-        m["drafter/probe_sec_per_token_before"] = stats.get(
-            "sec_per_token_before"
-        )
-        m["drafter/probe_sec_per_token_after"] = stats.get(
-            "sec_per_token_after"
-        )
+        m["drafter/probe_sec_per_token_before"] = stats.get("sec_per_token_before")
+        m["drafter/probe_sec_per_token_after"] = stats.get("sec_per_token_after")
 
         # Gate view: only a probe that is complete AND fresh for the current
         # version contributes ROI metrics (RFC 8.3).
@@ -2057,9 +2024,7 @@ class DrafterFreezePolicy:
             m["drafter/probe_delta_sec_per_token"] = roi["delta_sec_per_token"]
             m["drafter/probe_delta_sec_per_token_ucb95"] = roi["delta_ucb95"]
             m["drafter/predicted_benefit_next_seconds"] = roi["benefit"]
-            m["drafter/predicted_benefit_next_ucb95_seconds"] = (
-                roi["benefit_ucb95"]
-            )
+            m["drafter/predicted_benefit_next_ucb95_seconds"] = roi["benefit_ucb95"]
             m["drafter/roi_next"] = roi["roi"]
             m["drafter/roi_next_ucb95"] = roi["roi_ucb95"]
 

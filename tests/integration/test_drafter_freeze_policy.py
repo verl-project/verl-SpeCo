@@ -470,6 +470,16 @@ class TestEconomicsAndProbe(unittest.TestCase):
         self.assertEqual(tuple(round(g, 6) for g in gains), (0.5, 0.0, 0.2))
 
 class TestPairedProbeBootstrap(unittest.TestCase):
+    def test_missing_accept_values_keep_only_complete_pairs(self):
+        probe = ProbeComparison(
+            request_ids=["a", "b", "c"],
+            accept_before=[None, 2.0, 4.0],
+            accept_after=[3.0, None, 5.0],
+        )
+        self.assertEqual(probe.accept_pairs(), [("c", 4.0, 5.0, 0.25)])
+        self.assertEqual(probe.paired_relative_gains(), [0.25])
+        restored = ProbeComparison.from_dict(probe.to_dict())
+        self.assertEqual(restored.accept_pairs(), probe.accept_pairs())
     def test_probe_due_cadence(self):
         p = DrafterFreezePolicy(economics_config())
         self.assertEqual([v for v in range(1, 10) if p.probe_due(v)], [3, 6, 9])

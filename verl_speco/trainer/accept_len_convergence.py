@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Bimodal accept-length detection ("hard sample" low peak).
 
 Pure-Python Gaussian KDE used by the marginal-utility freeze policy
@@ -19,9 +32,9 @@ __all__ = [
     "bimodal_metrics",
 ]
 
-_GRID_POINTS = 128          # KDE density grid resolution
-_PEAK_HEIGHT_MIN = 0.10     # candidate peak height >= 10% of the tallest peak
-_PEAK_SPACING_MIN = 0.5     # peaks must be > 0.5 accept-length apart
+_GRID_POINTS = 128  # KDE density grid resolution
+_PEAK_HEIGHT_MIN = 0.10  # candidate peak height >= 10% of the tallest peak
+_PEAK_SPACING_MIN = 0.5  # peaks must be > 0.5 accept-length apart
 _LOW_PEAK_FRACTION_MIN = 0.05  # else the distribution is treated as unimodal
 
 
@@ -41,7 +54,9 @@ def _silverman_bandwidth(values: list[float]) -> float:
     return 0.9 * robust_scale * n ** (-0.2)
 
 
-def _kde_density(values: list[float], x_grid: list[float], bandwidth: float) -> list[float]:
+def _kde_density(
+    values: list[float], x_grid: list[float], bandwidth: float
+) -> list[float]:
     """Gaussian KDE of ``values`` evaluated on ``x_grid`` (pure Python)."""
     n = len(values)
     inv_h = 1.0 / bandwidth

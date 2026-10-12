@@ -466,9 +466,7 @@ class DrafterScheduler:
         # prepare RPCs that exist only to feed drafter training. The post-actor
         # frozen replacement in the trainer remains as defense in depth.
         if getattr(context, "drafter_frozen", False) and plan.launch:
-            plan = replace(
-                plan, launch=False, reason="drafter_convergence_frozen"
-            )
+            plan = replace(plan, launch=False, reason="drafter_convergence_frozen")
         metrics: dict[str, Any] = dict(plan.metrics())
         metrics.update(self.prepare_training_execution(plan))
         return SchedulerEventOutcome(

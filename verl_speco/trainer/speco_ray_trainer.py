@@ -1195,9 +1195,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return policy
 
     def _speco_freeze_branch_config(self) -> dict[str, Any]:
-        cfg = self._speco_drafter_training_config().get(
-            "drafter_convergence_freeze", {}
-        ) or {}
+        cfg = (
+            self._speco_drafter_training_config().get("drafter_convergence_freeze", {})
+            or {}
+        )
         branch = cfg.get("branch_checkpoint", {}) or {}
         # self.config holds raw OmegaConf nodes: DictConfig is NOT a dict
         # subclass (it extends MutableMapping), so normalize to a plain dict
@@ -1225,9 +1226,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         branch = self._speco_freeze_branch_config()
         if not bool(branch.get("enabled", False)):
             return
-        cfg = self._speco_drafter_training_config().get(
-            "drafter_convergence_freeze", {}
-        ) or {}
+        cfg = (
+            self._speco_drafter_training_config().get("drafter_convergence_freeze", {})
+            or {}
+        )
         problems: list[str] = []
         if not cfg.get("enabled", False):
             problems.append("drafter_convergence_freeze.enabled must be true")
@@ -1244,9 +1246,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if bool(branch.get("once", True)) is not True:
             problems.append("only branch_checkpoint.once=true is supported")
         if bool(branch.get("fail_on_error", True)) is not True:
-            problems.append(
-                "only branch_checkpoint.fail_on_error=true is supported"
-            )
+            problems.append("only branch_checkpoint.fail_on_error=true is supported")
         if problems:
             raise ValueError(
                 "invalid freeze branch_checkpoint config: " + "; ".join(problems)
@@ -1262,9 +1262,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         local_dir = getattr(self, "default_local_dir", None)
         if local_dir:
             return str(local_dir)
-        local_dir = _get_nested(
-            self.config, ("trainer", "default_local_dir"), None
-        )
+        local_dir = _get_nested(self.config, ("trainer", "default_local_dir"), None)
         return str(local_dir) if local_dir else None
 
     def _speco_freeze_state_resume_path(self) -> tuple[str | None, str | None]:
@@ -1303,9 +1301,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 find_latest_ckpt_path,
             )
 
-            resume_folder = find_latest_ckpt_path(
-                os.path.abspath(os.fspath(root))
-            )
+            resume_folder = find_latest_ckpt_path(os.path.abspath(os.fspath(root)))
             if not resume_folder:
                 return None, None
         else:
@@ -1313,21 +1309,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not resume_folder:
             return None, None
         return (
-            os.path.join(
-                str(resume_folder), self._speco_freeze_state_sidecar
-            ),
+            os.path.join(str(resume_folder), self._speco_freeze_state_sidecar),
             str(resume_folder),
         )
 
     def _speco_freeze_load_state(self, policy) -> None:
         path, resume_folder = self._speco_freeze_state_resume_path()
-        if not path:
+        if not path or resume_folder is None:
             return
         from verl_speco.trainer.checkpoint import freeze_branch_manifest_path
 
-        has_fork_manifest = os.path.exists(
-            freeze_branch_manifest_path(resume_folder)
-        )
+        has_fork_manifest = os.path.exists(freeze_branch_manifest_path(resume_folder))
         if not os.path.exists(path):
             if has_fork_manifest:
                 # A committed fork point is only complete with its policy
@@ -1382,9 +1374,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         expected_version = int(manifest["drafter_version"])
         problems: list[str] = []
         if policy.state.value != "FROZEN":
-            problems.append(
-                f"state={policy.state.value!r} (expected FROZEN)"
-            )
+            problems.append(f"state={policy.state.value!r} (expected FROZEN)")
         if int(policy.drafter_version) != expected_version:
             problems.append(
                 f"drafter_version={int(policy.drafter_version)} "
@@ -1506,9 +1496,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         step = int(getattr(self, "global_steps", 0) or 0)
         local_dir = self._speco_default_local_dir()
         target_folder = (
-            os.path.join(local_dir, f"global_step_{step}")
-            if local_dir
-            else None
+            os.path.join(local_dir, f"global_step_{step}") if local_dir else None
         )
         try:
             if step != int(request["trigger_step"]):
@@ -1516,10 +1504,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "freeze branch checkpoint requested at step "
                     f"{request['trigger_step']} but consumed at step {step}"
                 )
-            if not local_dir:
+            if not local_dir or target_folder is None:
                 raise RuntimeError(
-                    "freeze branch checkpoint requires "
-                    "trainer.default_local_dir"
+                    "freeze branch checkpoint requires trainer.default_local_dir"
                 )
             # Full chain: wait async publish, save drafter draft_step_S, then
             # actor/critic/dataloader; on success the policy sidecar is
@@ -1641,7 +1628,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ]
 
         meta_info = getattr(output, "meta_info", None)
-        output_metrics = meta_info.get("metrics", {}) if isinstance(meta_info, dict) else {}
+        output_metrics = (
+            meta_info.get("metrics", {}) if isinstance(meta_info, dict) else {}
+        )
         response_length_mean = _speco_optional_float(
             output_metrics.get("response_length/mean")
         )
@@ -1741,9 +1730,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     # Fixed paired probe execution (RFC sec. 6)
     # ------------------------------------------------------------------ #
     def _speco_freeze_probe_config(self) -> dict[str, Any]:
-        cfg = self._speco_drafter_training_config().get(
-            "drafter_convergence_freeze", {}
-        ) or {}
+        cfg = (
+            self._speco_drafter_training_config().get("drafter_convergence_freeze", {})
+            or {}
+        )
         probe = cfg.get("probe", {}) or {}
         # Raw Hydra configs are DictConfig nodes (NOT dict subclasses); without
         # normalization the isinstance gate below silently returns {} and the
@@ -1923,9 +1913,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         rows: list[dict[str, Any]] = []
         wall_seconds = 0.0
         for chunk in self._speco_freeze_probe_pool_data():
-            gen_batch_padded, pad_size = (
-                self._speco_build_freeze_probe_gen_batch(chunk)
-            )
+            gen_batch_padded, pad_size = self._speco_build_freeze_probe_gen_batch(chunk)
             started = time.perf_counter()
             output_padded = self._speco_rollout_generation_target().generate_sequences(
                 gen_batch_padded
@@ -2081,9 +2069,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             BeforeActorUpdateContext(
                 schedule_context=self._speco_drafter_schedule_context(),
                 config=self._speco_drafter_schedule_config(),
-                drafter_frozen=bool(
-                    getattr(self, "_speco_drafter_frozen", False)
-                ),
+                drafter_frozen=bool(getattr(self, "_speco_drafter_frozen", False)),
             )
         )
 
@@ -3474,13 +3460,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 # Active freeze stops hidden-state collection here and in the
                 # scheduler plan; shadow mode keeps collecting. Accept-length
                 # evidence above is ungated and keeps feeding drift detection.
-                collection_allowed = not getattr(
-                    self, "_speco_drafter_frozen", False
-                )
+                collection_allowed = not getattr(self, "_speco_drafter_frozen", False)
                 if collection_allowed:
-                    collected = self._speco_collect_generation_samples(
-                        gen_batch_output
-                    )
+                    collected = self._speco_collect_generation_samples(gen_batch_output)
                     if collected:
                         meta_info = getattr(gen_batch_output, "meta_info", None)
                         if isinstance(meta_info, dict):
@@ -3744,8 +3726,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 ),
             )
             if pending_drafter_publish["ready"]:
-                pending_drafter_publish["train_cost_seconds"] = (
-                    _speco_optional_float(metrics.get("timing_s/drafter"))
+                pending_drafter_publish["train_cost_seconds"] = _speco_optional_float(
+                    metrics.get("timing_s/drafter")
                 )
             known_drafter_timing = 0.0
             for key in (
@@ -3777,9 +3759,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 # still serves drafter v, flush the pending publish (v+1), then
                 # run the after-arm -- same prompts, greedy, same engine.
                 policy = getattr(self, "_speco_freeze_policy", None)
-                run_probe = (
-                    policy is not None
-                    and policy.probe_due(int(policy.drafter_version) + 1)
+                run_probe = policy is not None and policy.probe_due(
+                    int(policy.drafter_version) + 1
                 )
                 before_arm = None
                 probe_error = None
@@ -3821,9 +3802,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 train_cost = _speco_optional_float(
                     pending_drafter_publish.get("train_cost_seconds")
                 )
-                publish_cost = self._speco_freeze_publish_cost_seconds(
-                    publish_metrics
-                )
+                publish_cost = self._speco_freeze_publish_cost_seconds(publish_metrics)
                 total_cost = (
                     (train_cost or 0.0) + (publish_cost or 0.0)
                     if train_cost is not None or publish_cost is not None

@@ -117,13 +117,17 @@ def test_validate_happy_path(tmp_path) -> None:
 @pytest.mark.parametrize(
     "damage",
     ["no_manifest", "no_actor", "no_data", "no_sidecar", "no_drafter",
-     "drafter_incomplete", "drafter_step_mismatch", "manifest_step_mismatch"])
+     "drafter_incomplete", "drafter_step_mismatch", "manifest_step_mismatch",
+     "null_trigger_step", "null_checkpoint_step"])
 def test_validate_fails_closed_on_damage(tmp_path, damage) -> None:
     folder, drafter_root = _make_layout(tmp_path, damage=damage)
     if damage != "no_sidecar":
         atomic_write_json(freeze_policy_sidecar_path(folder), {"state": "FROZEN"})
     if damage == "manifest_step_mismatch":
         write_freeze_branch_manifest(folder, _manifest(trigger_step=55))
+    elif damage.startswith("null_"):
+        atomic_write_json(freeze_branch_manifest_path(folder),
+                          _manifest(**{damage.removeprefix("null_"): None}))
     elif damage != "no_manifest":
         write_freeze_branch_manifest(folder, _manifest())
     with pytest.raises(FreezeBranchManifestError):
