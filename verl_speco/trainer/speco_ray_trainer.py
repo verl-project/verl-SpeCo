@@ -461,6 +461,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._drafter_scheduler = DrafterScheduler()
         self._drafter_runtime_state = DrafterRuntimeState()
         self._pending_drafter_publish_refs = None
+        # Version the freeze policy will stage for the in-flight async
+        # publish, plus a completion wait carried into its observe call when
+        # the wait lands before the publish is staged (deferred probe path).
+        self._speco_pending_async_publish_version = None
+        self._speco_publish_completion_wait = None
         self._pending_drafter_checkpoint_refs = []
         self._pending_target_lm_head_sync = None
         self._speco_last_raw_drafter_samples = 0
@@ -1260,41 +1265,85 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         return str(local_dir) if local_dir else None
 
-    def _speco_freeze_state_path(self) -> str | None:
-        root = self._speco_default_local_dir()
-        if not root:
-            return None
-        return os.path.join(root, self._speco_freeze_state_sidecar)
+    def _speco_freeze_state_resume_path(self) -> tuple[str | None, str | None]:
+        """Sidecar matching the checkpoint verl actually restores.
 
-    def _speco_freeze_state_resume_path(self) -> str | None:
-        """Versioned sidecar carried inside an explicit ``resume_from_path``.
+        Returns ``(sidecar_path, resume_folder)``; both are ``None`` when no
+        policy state must be loaded.
 
-        Lets an active/shadow branch launched with its own (empty)
-        ``default_local_dir`` restore the policy state from the shared fork
-        ``global_step_S`` folder.
+        * ``disable`` (new training): never load. A stale sidecar left in the
+          output directory from an earlier run must not be inherited, or a
+          fresh run could start FROZEN and skip drafter training.
+        * ``auto``: resolve the same checkpoint the base trainer restores --
+          the tracker-selected latest ``global_step_S`` under
+          ``default_local_dir`` -- and read the sidecar committed inside it.
+          No resolvable checkpoint means the base trainer starts from scratch,
+          so the policy must start fresh too; a stale sidecar is NOT a valid
+          state source.
+        * ``resume_path``: only the sidecar carried inside the explicitly
+          chosen ``resume_from_path`` folder. A sidecar in the output
+          directory never overrides the user's choice.
         """
         trainer_cfg = _get_nested(self.config, ("trainer",), None)
         resume_mode = str(
             _get_nested(trainer_cfg, ("resume_mode",), "disable") or "disable"
         )
-        if resume_mode != "resume_path":
-            return None
-        folder = _get_nested(trainer_cfg, ("resume_from_path",), None)
-        if not folder:
-            return None
-        return os.path.join(str(folder), self._speco_freeze_state_sidecar)
+        if resume_mode == "disable":
+            return None, None
+        if resume_mode == "resume_path":
+            folder = _get_nested(trainer_cfg, ("resume_from_path",), None)
+            resume_folder = str(folder) if folder else None
+        elif resume_mode == "auto":
+            root = self._speco_default_local_dir()
+            if not root:
+                return None, None
+            from verl.utils.checkpoint.checkpoint_manager import (
+                find_latest_ckpt_path,
+            )
+
+            resume_folder = find_latest_ckpt_path(
+                os.path.abspath(os.fspath(root))
+            )
+            if not resume_folder:
+                return None, None
+        else:
+            return None, None
+        if not resume_folder:
+            return None, None
+        return (
+            os.path.join(
+                str(resume_folder), self._speco_freeze_state_sidecar
+            ),
+            str(resume_folder),
+        )
 
     def _speco_freeze_load_state(self, policy) -> None:
-        path = self._speco_freeze_state_path()
-        resume_folder = None
-        if not path or not os.path.exists(path):
-            # Fresh branch output dir: fall back to the sidecar persisted
-            # inside the resumed fork checkpoint folder.
-            resume_path = self._speco_freeze_state_resume_path()
-            if resume_path and os.path.exists(resume_path):
-                path = resume_path
-                resume_folder = os.path.dirname(resume_path)
-        if not path or not os.path.exists(path):
+        path, resume_folder = self._speco_freeze_state_resume_path()
+        if not path:
+            return
+        from verl_speco.trainer.checkpoint import freeze_branch_manifest_path
+
+        has_fork_manifest = os.path.exists(
+            freeze_branch_manifest_path(resume_folder)
+        )
+        if not os.path.exists(path):
+            if has_fork_manifest:
+                # A committed fork point is only complete with its policy
+                # state: fail closed rather than silently train the branch.
+                raise RuntimeError(
+                    f"committed freeze branch checkpoint {resume_folder} is "
+                    f"missing its policy state sidecar ({path}); the fork "
+                    "point is incomplete, refusing to resume"
+                )
+            # Checkpoints written before per-checkpoint freeze state (or by
+            # runs with the feature disabled) carry no sidecar: say so
+            # explicitly instead of silently rebinding stale state.
+            logger.warning(
+                "[drafter freeze] no policy state sidecar in resumed "
+                "checkpoint %s; freeze policy starts fresh (compatibility "
+                "downgrade, not a full state restore)",
+                resume_folder,
+            )
             return
         with open(path, "r", encoding="utf-8") as handle:
             policy.load_state_dict(json.load(handle))
@@ -1303,7 +1352,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             f"(version={policy.drafter_version}, state={policy.state.value})",
             flush=True,
         )
-        if resume_folder is not None:
+        if has_fork_manifest:
+            # Fork-specific validation ONLY when a fork manifest exists; a
+            # plain checkpoint never triggers fork semantics.
             self._speco_freeze_assert_matches_fork_manifest(policy, resume_folder)
 
     def _speco_freeze_assert_matches_fork_manifest(
@@ -1344,22 +1395,26 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
 
     def _speco_freeze_save_state(self) -> None:
+        """Write policy state before the base save commits the latest tracker.
+
+        An interrupted model save may leave an uncommitted folder; auto-resume
+        selects only the checkpoint named by the tracker.
+        """
         policy = getattr(self, "_speco_freeze_policy", None)
-        path = self._speco_freeze_state_path()
-        if policy is None or not path:
+        local_dir = self._speco_default_local_dir()
+        if policy is None or not local_dir:
             return
-        try:
-            directory = os.path.dirname(path)
-            if directory:
-                os.makedirs(directory, exist_ok=True)
-            tmp_path = f"{path}.tmp.{os.getpid()}"
-            with open(tmp_path, "w", encoding="utf-8") as handle:
-                json.dump(policy.state_dict(), handle)
-            os.replace(tmp_path, path)
-        except Exception:  # noqa: BLE001 - checkpoints must not fail over telemetry
-            logger.exception(
-                "[drafter freeze] failed to persist policy state to %s", path
-            )
+        folder = os.path.join(
+            local_dir,
+            f"global_step_{int(getattr(self, 'global_steps', 0) or 0)}",
+        )
+        os.makedirs(folder, exist_ok=True)
+        from verl_speco.trainer.checkpoint import (
+            atomic_write_json,
+            freeze_policy_sidecar_path,
+        )
+
+        atomic_write_json(freeze_policy_sidecar_path(folder), policy.state_dict())
 
     def _speco_freeze_emit_transition(self, decision) -> None:
         if decision is None or not decision.transitioned:
@@ -1464,13 +1519,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "freeze branch checkpoint requires "
                     "trainer.default_local_dir"
                 )
-            # Full chain: wait async publish, persist root freeze sidecar,
-            # save drafter draft_step_S, then actor/critic/dataloader.
+            # Full chain: wait async publish, save drafter draft_step_S, then
+            # actor/critic/dataloader; on success the policy sidecar is
+            # committed inside global_step_S as well.
             self._save_checkpoint()
 
             # Persist the freeze policy state INSIDE the fork folder so the
             # branch checkpoint is self-contained; written before the
-            # manifest, which is the last (atomic) commit.
+            # manifest, which is the last (atomic) commit. This is redundant
+            # with the sidecar committed by _save_checkpoint by design: the
+            # fork contract requires the sidecar unconditionally (also when
+            # the save was deduplicated), and validation below enforces it.
             policy = getattr(self, "_speco_freeze_policy", None)
             if policy is not None:
                 atomic_write_json(
@@ -1627,9 +1686,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_freeze_publish_cost_seconds(
         metrics: dict[str, Any],
     ) -> float | None:
+        # NOTE: ``timing_s/drafter_publish_wait_pending`` is deliberately NOT
+        # summed here. With publish_async=true it measures the completion wait
+        # of the PREVIOUS publish's weight-load RPC; attributing it to this
+        # update would double count it and inflate the next update's cost.
+        # ``_speco_attribute_async_publish_wait`` already folds that wait into
+        # the update that caused it (amend-or-carry). For synchronous
+        # publishes the real load time sits in ``update_weights`` instead.
         cost = 0.0
         for key in (
-            "timing_s/drafter_publish_wait_pending",
             "timing_s/drafter_publish_fetch_snapshot",
             "timing_s/drafter_publish_update_weights",
         ):
@@ -1661,6 +1726,26 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         cost = update_cost_seconds
         if cost is None:
             cost = self._speco_freeze_publish_cost_seconds(publish_metrics)
+        # Deferred probe path: an async publish's completion wait can land
+        # (probe after-arm) BEFORE this observe. It is part of this update's
+        # critical path -- fold it in when it was carried for the version this
+        # observe is about to stage; a stale carry is dropped loudly, never
+        # attributed to a different update.
+        carried = getattr(self, "_speco_publish_completion_wait", None)
+        if carried is not None:
+            observed_version = int(policy.drafter_version) + 1
+            if carried[0] == observed_version:
+                cost = (cost or 0.0) + float(carried[1])
+                self._speco_publish_completion_wait = None
+            else:
+                logger.warning(
+                    "[drafter freeze] dropping async publish wait %.3fs: "
+                    "carried for v%s but the observed publish stages v%s",
+                    carried[1],
+                    carried[0],
+                    observed_version,
+                )
+                self._speco_publish_completion_wait = None
 
         from verl_speco.trainer.drafter_freeze_policy import FreezeEvidence
 
@@ -1684,7 +1769,20 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "drafter_convergence_freeze", {}
         ) or {}
         probe = cfg.get("probe", {}) or {}
-        return probe if isinstance(probe, dict) else {}
+        # Raw Hydra configs are DictConfig nodes (NOT dict subclasses); without
+        # normalization the isinstance gate below silently returns {} and the
+        # executor falls back to default prompts/token counts while the policy
+        # still schedules probes. Normalize like _speco_freeze_branch_config.
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(probe):
+            probe = OmegaConf.to_container(probe, resolve=True)
+        if not isinstance(probe, dict):
+            raise TypeError(
+                "drafter_convergence_freeze.probe must resolve to a mapping, "
+                f"got {type(probe).__name__}"
+            )
+        return probe
 
     def _speco_freeze_probe_pool_data(self) -> list[dict[str, Any]]:
         """Fixed ordered prompt pool as collated chunks (built once).
@@ -3104,8 +3202,39 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return 0
         pending_refs = self._pending_drafter_publish_refs
         self._pending_drafter_publish_refs = None
+        wait_started = time.perf_counter()
         self._ray_get_if_needed(pending_refs)
+        self._speco_attribute_async_publish_wait(
+            time.perf_counter() - wait_started
+        )
         return len(pending_refs) if isinstance(pending_refs, (list, tuple)) else 1
+
+    def _speco_attribute_async_publish_wait(self, wait_seconds: float) -> None:
+        """Fold the async publish-completion wait into the causing update.
+
+        With publish_async=true the weight-load RPC is only submitted at
+        publish time; the real completion wait surfaces here (next generation
+        entry, checkpoint save, or the next publish's wait funnel). That wait
+        is part of the SAME update's critical path, so the freeze economics
+        gate must see it in C_update; leaving it out underestimates cost and
+        overestimates ROI. Two timings exist: the publish is already staged ->
+        amend its staged cost; the wait happens before the observe (deferred
+        probe path) -> carry it into the observe call for the same version.
+        A version mismatch never attributes the wait to a different update.
+        """
+        version = getattr(self, "_speco_pending_async_publish_version", None)
+        self._speco_pending_async_publish_version = None
+        if version is None or wait_seconds <= 0.0:
+            return
+        policy = getattr(self, "_speco_freeze_policy", None)
+        if policy is None:
+            return
+        if policy.amend_pending_update_cost(version, wait_seconds):
+            return
+        self._speco_publish_completion_wait = (
+            int(version),
+            float(wait_seconds),
+        )
 
     def _speco_wait_pending_drafter_publish(self) -> int:
         scheduler = self._speco_get_drafter_scheduler()
@@ -3128,6 +3257,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         if asynchronous:
             self._pending_drafter_publish_refs = update_result
+            freeze_policy = getattr(self, "_speco_freeze_policy", None)
+            # The version the freeze policy will assign when this publish is
+            # observed (clock + 1); its completion wait is attributed to it.
+            self._speco_pending_async_publish_version = (
+                int(freeze_policy.drafter_version) + 1
+                if freeze_policy is not None
+                else None
+            )
         else:
             self._ray_get_if_needed(update_result)
 
@@ -3874,8 +4011,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         # with the normal next-generation barrier by design: save/test order is
         # controlled by upstream VERL and can change independently.
         self._speco_wait_pending_drafter_publish()
-        self._speco_freeze_save_state()
         self._speco_save_drafter_checkpoint(wait=True)
+        # The base save advances the latest-checkpoint tracker before returning.
+        # Persist policy first and propagate failures so a committed checkpoint
+        # cannot be missing its policy state.
+        self._speco_freeze_save_state()
         result = super()._save_checkpoint()
         self._speco_last_checkpoint_saved_step = self.global_steps
         return result

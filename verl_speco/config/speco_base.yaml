@@ -496,4 +496,4 @@ actor_rollout_ref:
             patience_opportunities: 3
             low_fraction_accelerator: 0.10 # low_fraction 回升 + hard 超噪 -> 恢复耐心降一档
             missing_evidence_opportunities: 3  # 连续缺证据 fail-open 恢复
-            max_frozen_opportunities: 12   # 安全阀: 定期强制 probe(监控用)
+            max_frozen_opportunities: 12   # 预留字段, 当前未生效(周期强制 probe 未实现, 勿依赖其触发任何行为)

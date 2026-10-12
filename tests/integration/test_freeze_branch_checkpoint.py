@@ -355,15 +355,16 @@ def _fork_folder(tmp_path, *, sidecar, manifest=True):
             encoding="utf-8")
     return parent
 
-def _resume_trainer(tmp_path, parent):
+def _resume_trainer(tmp_path, parent=None, *, resume_mode="resume_path"):
     branch = tmp_path / "branch"
     branch.mkdir()
     t = _bare_trainer(branch, active=False)
     t.default_local_dir = str(branch)
+    trainer_ns = {"default_local_dir": str(branch), "resume_mode": resume_mode}
+    if resume_mode == "resume_path":
+        trainer_ns["resume_from_path"] = str(parent) if parent is not None else None
     t.config = SimpleNamespace(
-        trainer=SimpleNamespace(
-            default_local_dir=str(branch), resume_mode="resume_path",
-            resume_from_path=str(parent)),
+        trainer=SimpleNamespace(**trainer_ns),
         actor_rollout_ref=SimpleNamespace(
             rollout=SimpleNamespace(drafter=SimpleNamespace())))
     return t
@@ -371,19 +372,194 @@ def _resume_trainer(tmp_path, parent):
 
 @_trainer_skip
 def test_freeze_state_loads_from_resume_fork_folder(tmp_path) -> None:
-    """Fresh branch output dir restores the sidecar carried by the shared
-    resume_from_path global_step_S; its own sidecar then takes precedence."""
+    """resume_path restores ONLY the sidecar carried inside the shared
+    resume_from_path global_step_S; the fresh branch output dir contributes
+    nothing."""
     parent = _fork_folder(tmp_path, sidecar={"state": "FROZEN", "drafter_version": 9})
     t = _resume_trainer(tmp_path, parent)
     policy = _StubPolicy(_decision(), version=0)
     t._speco_freeze_load_state(policy)
     assert policy.saved_states == [{"state": "FROZEN", "drafter_version": 9}]
 
+
+@_trainer_skip
+def test_freeze_state_resume_path_ignores_stale_output_sidecar(tmp_path) -> None:
+    """A stale/divergent sidecar in the branch output dir must never override
+    the state carried by the explicitly chosen resume_from_path checkpoint."""
+    parent = _fork_folder(tmp_path, sidecar={"state": "FROZEN", "drafter_version": 9})
+    t = _resume_trainer(tmp_path, parent)
     (tmp_path / "branch" / FREEZE_POLICY_SIDECAR_NAME).write_text(
         json.dumps({"state": "LEARNING", "drafter_version": 3}), encoding="utf-8")
-    p2 = _StubPolicy(_decision(), version=0)
-    t._speco_freeze_load_state(p2)
-    assert p2.saved_states == [{"state": "LEARNING", "drafter_version": 3}]
+    policy = _StubPolicy(_decision(), version=0)
+    t._speco_freeze_load_state(policy)
+    assert policy.saved_states == [{"state": "FROZEN", "drafter_version": 9}]
+
+
+@_trainer_skip
+def test_freeze_state_disable_mode_ignores_stale_sidecar(tmp_path) -> None:
+    """Fresh training (resume_mode=disable) must not inherit a stale FROZEN
+    sidecar left behind in the output directory."""
+    t = _resume_trainer(tmp_path, resume_mode="disable")
+    (tmp_path / "branch" / FREEZE_POLICY_SIDECAR_NAME).write_text(
+        json.dumps({"state": "FROZEN", "drafter_version": 7}), encoding="utf-8")
+    policy = _StubPolicy(_decision(), version=0)
+    t._speco_freeze_load_state(policy)
+    assert policy.saved_states == []  # nothing restored
+    assert policy.drafter_version == 0
+
+
+@_trainer_skip
+def test_freeze_state_auto_mode_resolves_tracked_checkpoint(tmp_path) -> None:
+    """auto resume restores the sidecar committed INSIDE the checkpoint verl
+    actually restores (the tracker-selected latest global_step_S); a stale
+    root sidecar from an interrupted later save attempt is never consulted."""
+    t = _resume_trainer(tmp_path, resume_mode="auto")
+    branch = tmp_path / "branch"
+    folder = branch / "global_step_5"
+    folder.mkdir()
+    (folder / FREEZE_POLICY_SIDECAR_NAME).write_text(
+        json.dumps({"state": "FROZEN", "drafter_version": 5}), encoding="utf-8")
+    (branch / "latest_checkpointed_iteration.txt").write_text("5", encoding="utf-8")
+    # Stale newer state left at the root by an interrupted save of step 9:
+    (branch / FREEZE_POLICY_SIDECAR_NAME).write_text(
+        json.dumps({"state": "FROZEN", "drafter_version": 9}), encoding="utf-8")
+    policy = _StubPolicy(_decision(), version=0)
+    t._speco_freeze_load_state(policy)
+    assert policy.saved_states == [{"state": "FROZEN", "drafter_version": 5}]
+
+
+@_trainer_skip
+def test_freeze_state_auto_mode_without_checkpoint_loads_nothing(tmp_path) -> None:
+    """No tracker / no checkpoint folder -> the base trainer starts from
+    scratch, so the freeze policy must start fresh too; a stale root sidecar
+    is NOT a valid state source (review repro: AUTO_WITH_NO_CHECKPOINT)."""
+    t = _resume_trainer(tmp_path, resume_mode="auto")
+    (tmp_path / "branch" / FREEZE_POLICY_SIDECAR_NAME).write_text(
+        json.dumps({"state": "FROZEN", "drafter_version": 7}), encoding="utf-8")
+    policy = _StubPolicy(_decision(), version=0)
+    t._speco_freeze_load_state(policy)
+    assert policy.saved_states == []  # nothing restored
+    assert policy.drafter_version == 0
+
+
+@_trainer_skip
+def test_freeze_state_resume_path_normal_checkpoint_restores(tmp_path) -> None:
+    """An explicit resume from a NORMAL checkpoint (sidecar but no fork
+    manifest) restores the committed policy state without any fork-specific
+    FROZEN validation -- non-frozen states are perfectly valid here."""
+    folder = tmp_path / "parent" / "global_step_40"
+    folder.mkdir(parents=True)
+    (folder / FREEZE_POLICY_SIDECAR_NAME).write_text(
+        json.dumps({"state": "LEARNING", "drafter_version": 11}), encoding="utf-8")
+    t = _resume_trainer(tmp_path, folder)
+    policy = _StubPolicy(_decision(), version=0)
+    t._speco_freeze_load_state(policy)
+    assert policy.saved_states == [{"state": "LEARNING", "drafter_version": 11}]
+
+
+@_trainer_skip
+def test_freeze_state_checkpoint_without_sidecar_downgrades(tmp_path, caplog) -> None:
+    """Historical checkpoints predate per-checkpoint freeze state: no sidecar
+    -> explicit compatibility downgrade (fresh policy + loud warning), never
+    a silent rebind of stale state."""
+    import logging
+
+    folder = tmp_path / "parent" / "global_step_40"
+    folder.mkdir(parents=True)
+    t = _resume_trainer(tmp_path, folder)
+    policy = _StubPolicy(_decision(), version=0)
+    with caplog.at_level(logging.WARNING):
+        t._speco_freeze_load_state(policy)  # must not raise
+    assert policy.saved_states == []
+    assert "no policy state sidecar" in caplog.text
+
+
+@_trainer_skip
+def test_freeze_state_fork_checkpoint_missing_sidecar_fails(tmp_path) -> None:
+    """A committed fork point (manifest present) without its policy sidecar
+    is incomplete: fail closed instead of silently resuming with a fresh
+    policy and training the supposedly-frozen branch."""
+    parent = tmp_path / "parent" / "global_step_56"
+    parent.mkdir(parents=True)
+    (parent / FREEZE_BRANCH_MANIFEST_NAME).write_text(
+        json.dumps(_manifest(drafter_version=9, freeze_reason="plateau_confirmed")),
+        encoding="utf-8")
+    t = _resume_trainer(tmp_path, parent)
+    with pytest.raises(RuntimeError, match="missing its policy state sidecar"):
+        t._speco_freeze_load_state(_StubPolicy(_decision(), version=0))
+
+
+@_trainer_skip
+def test_periodic_checkpoint_carries_policy_sidecar(tmp_path, monkeypatch) -> None:
+    """Every ordinary checkpoint carries the policy sidecar committed into the
+    same global_step_S folder; no root sidecar is written anymore."""
+    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+    t = _bare_trainer(tmp_path, step=7)
+    _attach_plain_config(t, tmp_path, _training_cfg(_freeze_cfg()))
+    t._speco_freeze_policy = _StubPolicy(_decision(), version=8)
+    t._speco_wait_pending_drafter_publish = lambda: None
+    t._speco_save_drafter_checkpoint = lambda wait=True: None
+
+    def fake_save(self):
+        # The base save commits the tracker; policy must already be present.
+        assert (tmp_path / "global_step_7" / FREEZE_POLICY_SIDECAR_NAME).exists()
+
+    monkeypatch.setattr(RayPPOTrainer, "_save_checkpoint", fake_save)
+    t._save_checkpoint()
+    sidecar = tmp_path / "global_step_7" / FREEZE_POLICY_SIDECAR_NAME
+    assert json.loads(sidecar.read_text(encoding="utf-8")) == {
+        "state": "FROZEN", "drafter_version": 8}
+    assert not (tmp_path / FREEZE_POLICY_SIDECAR_NAME).exists()  # no root sidecar
+
+
+@_trainer_skip
+def test_failed_checkpoint_preserves_previous_tracker(tmp_path, monkeypatch) -> None:
+    """A failed model save leaves its folder uncommitted and preserves resume."""
+    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+    t = _bare_trainer(tmp_path, step=7)
+    _attach_plain_config(t, tmp_path, _training_cfg(_freeze_cfg()))
+    t._speco_freeze_policy = _StubPolicy(_decision(), version=8)
+    t._speco_wait_pending_drafter_publish = lambda: None
+    t._speco_save_drafter_checkpoint = lambda wait=True: None
+
+    tracker = tmp_path / "latest_checkpointed_iteration.txt"
+    tracker.write_text("6", encoding="utf-8")
+
+    def failing_save(self):
+        (tmp_path / "global_step_7").mkdir(exist_ok=True)
+        raise RuntimeError("actor save boom")
+
+    monkeypatch.setattr(RayPPOTrainer, "_save_checkpoint", failing_save)
+    with pytest.raises(RuntimeError, match="actor save boom"):
+        t._save_checkpoint()
+    assert (tmp_path / "global_step_7" / FREEZE_POLICY_SIDECAR_NAME).exists()
+    assert tracker.read_text(encoding="utf-8") == "6"
+    assert not (tmp_path / FREEZE_POLICY_SIDECAR_NAME).exists()
+
+
+@_trainer_skip
+def test_policy_save_failure_prevents_checkpoint_commit(tmp_path, monkeypatch):
+    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+    from verl_speco.trainer import checkpoint
+
+    t = _bare_trainer(tmp_path, step=7)
+    _attach_plain_config(t, tmp_path, _training_cfg(_freeze_cfg()))
+    t._speco_freeze_policy = _StubPolicy(_decision(), version=8)
+    t._speco_wait_pending_drafter_publish = lambda: None
+    t._speco_save_drafter_checkpoint = lambda wait=True: None
+
+    def fail_write(*args, **kwargs):
+        raise OSError("policy save boom")
+
+    def unexpected_commit(self):
+        pytest.fail("base checkpoint must not commit after policy save failure")
+
+    monkeypatch.setattr(checkpoint, "atomic_write_json", fail_write)
+    monkeypatch.setattr(RayPPOTrainer, "_save_checkpoint", unexpected_commit)
+    with pytest.raises(OSError, match="policy save boom"):
+        t._save_checkpoint()
 
 
 @_trainer_skip
@@ -391,12 +567,11 @@ def test_freeze_state_loads_from_resume_fork_folder(tmp_path) -> None:
     ("manifest", "sidecar", "match"),
     [(True, {"state": "CALIBRATING", "drafter_version": 9}, "failed to restore"),
      (True, {"state": "FROZEN", "drafter_version": 0}, "failed to restore"),
-     (True, {"state": "LEARNING", "drafter_version": 8}, "failed to restore"),
-     (False, {"state": "FROZEN", "drafter_version": 9}, "not a committed freeze")])
+     (True, {"state": "LEARNING", "drafter_version": 8}, "failed to restore")])
 def test_freeze_resume_failfast(tmp_path, manifest, sidecar, match) -> None:
-    """First 3 rows: committed fork must restore FROZEN at the manifest
-    version; a silent reset aborts startup. Last: sidecar without a committed
-    manifest is not a fork point and also fails fast."""
+    """A committed fork must restore FROZEN at the manifest version; a silent
+    reset aborts startup. (Without a manifest the checkpoint is a NORMAL one:
+    its sidecar is restored as-is -- covered by the resume_path test above.)"""
     parent = _fork_folder(tmp_path, sidecar=sidecar, manifest=manifest)
     t = _resume_trainer(tmp_path, parent)
     with pytest.raises(RuntimeError, match=match):

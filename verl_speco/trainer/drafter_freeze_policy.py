@@ -569,6 +569,11 @@ class DrafterFreezePolicy:
         self.valid_update_count = 0
         self._pending_next_version: Optional[int] = None
         self._pending_cost: Optional[float] = None
+        # Index of the staged pending publish's entry inside ``_costs`` (the
+        # entry survives only while the publish is pending); None when the
+        # staged publish carried no cost, so an async completion wait can
+        # never amend an earlier update's cost entry.
+        self._pending_cost_index: Optional[int] = None
         self.dropped_late_rollouts = 0
 
         # Windows / evidence.
@@ -652,6 +657,7 @@ class DrafterFreezePolicy:
             "open_version": self._open_version,
             "pending_next_version": self._pending_next_version,
             "pending_cost": self._pending_cost,
+            "pending_cost_index": self._pending_cost_index,
             "dropped_late_rollouts": self.dropped_late_rollouts,
             "windows": raw_windows,
             "versions": [v.to_dict() for v in self.versions],
@@ -706,6 +712,16 @@ class DrafterFreezePolicy:
         self._open_version = int(state.get("open_version", self.drafter_version))
         self._pending_next_version = state.get("pending_next_version", None)
         self._pending_cost = state.get("pending_cost", None)
+        pending_cost_index = state.get("pending_cost_index", None)
+        # Older checkpoints predate the index; and an index without a staged
+        # pending publish is meaningless. Sanitize to None in both cases.
+        if (
+            self._pending_next_version is None
+            or pending_cost_index is None
+            or not isinstance(pending_cost_index, int)
+        ):
+            pending_cost_index = None
+        self._pending_cost_index = pending_cost_index
         self.dropped_late_rollouts = int(state.get("dropped_late_rollouts", 0))
         self._windows = {}
         for version, raw in (state.get("windows", {}) or {}).items():
@@ -790,6 +806,7 @@ class DrafterFreezePolicy:
             )
             self._pending_next_version = None
             self._pending_cost = None
+            self._pending_cost_index = None
             win = self._windows.setdefault(
                 self._open_version,
                 _Window(self._open_version, opened_step=ev.global_step),
@@ -808,6 +825,7 @@ class DrafterFreezePolicy:
             )
             self._pending_next_version = None
             self._pending_cost = None
+            self._pending_cost_index = None
         else:
             # Ordinary accumulation. Late evidence for an already-finalized
             # window is dropped rather than folded into a closed version.
@@ -863,11 +881,14 @@ class DrafterFreezePolicy:
             if ev.update_cost_seconds is not None and ev.update_cost_seconds >= 0
             else None
         )
+        pending_cost_index: Optional[int] = None
         if cost is not None:
             self._costs.append(cost)
             cap = max(self.cfg.cost_window_updates, 1) * 4
             if len(self._costs) > cap:
                 self._costs = self._costs[-cap:]
+            # Staged AFTER the trim: the just-appended entry sits at len-1.
+            pending_cost_index = len(self._costs) - 1
             self.cumulative_cost_seconds += cost
 
         self._ingest_probe(ev.probe, new_version)
@@ -881,7 +902,37 @@ class DrafterFreezePolicy:
             )
         self._pending_next_version = new_version
         self._pending_cost = cost
+        self._pending_cost_index = pending_cost_index
         return self._decision(transitioned=False, reason=self._last_reason)
+
+    def amend_pending_update_cost(
+        self, version: int, extra_seconds: float
+    ) -> bool:
+        """Fold a deferred async publish-completion wait into its update.
+
+        With ``publish_async=true`` the weight-load RPC is only submitted at
+        publish time; the real completion wait surfaces later (next generation
+        entry, checkpoint save, or the next publish's wait funnel). That wait
+        is part of the SAME update's critical path, so the economics gate must
+        see it in ``C_update`` -- omitting it underestimates cost and
+        overestimates ROI.
+
+        Returns True when the staged pending publish IS ``version`` (the wait
+        was folded into its staged cost and its ``_costs`` entry). Returns
+        False otherwise -- e.g. the publish has not been observed yet (the
+        deferred probe path waits before observing), in which case the caller
+        carries the wait into the observe call instead. The wait is therefore
+        never smeared onto a later update.
+        """
+        if extra_seconds <= 0.0 or self._pending_next_version != int(version):
+            return False
+        if self._pending_cost is not None:
+            self._pending_cost += float(extra_seconds)
+            self.cumulative_cost_seconds += float(extra_seconds)
+        index = self._pending_cost_index
+        if index is not None and 0 <= index < len(self._costs):
+            self._costs[index] += float(extra_seconds)
+        return True
 
     def _advance_version(
         self, new_version: int, cost: Optional[float], ev: FreezeEvidence
@@ -1086,9 +1137,6 @@ class DrafterFreezePolicy:
                 FreezeState.LEARNING, "learning", ev, closed=closed
             )
 
-        point_all = self._median_gain("g_all")
-        point_hard = self._median_gain("g_hard")
-        point_speed = self._median_gain("g_speed")
         ucb_all = self._aggregate_gain_bound(versions, "q_all", upper=True)
         ucb_hard = self._aggregate_gain_bound(versions, "q_hard", upper=True)
         ucb_speed = self._aggregate_gain_bound(versions, "q_speed", upper=True)
@@ -1275,15 +1323,42 @@ class DrafterFreezePolicy:
         if avoided is not None:
             self.cumulative_saved_seconds_estimate += avoided
 
-        # Optional safety valve: periodic forced probe (monitoring only).
-        should_probe = (
-            self.cfg.probe_enabled
-            and self._frozen_opportunities % max(1, self.cfg.max_frozen_opportunities)
-            == 0
-        )
-
         win = self._current_frozen_window()
-        if not self._window_valid(win) or self._anchor is None:
+        # Drift is judged on bounded RECENT rollout steps, not on everything
+        # observed since the freeze: an append-only window lets a long
+        # healthy history dilute a fresh regression (and raw accept-length
+        # lists plus bootstrap cost would grow unbounded while frozen). The
+        # bound reuses existing config -- at least the window-validity floor
+        # and at least one full resume-decision cycle of opportunities. The
+        # anchor (its VersionEvidence summary and retained window) is
+        # independent of this rotation.
+        keep_steps = max(
+            self.cfg.min_rollout_steps_per_version,
+            self.cfg.resume_patience_opportunities,
+        )
+        # ...but never starve the observation floor: when steps carry few
+        # requests, a pure step-count bound could leave the window below
+        # min_requests_per_version forever and disable drift detection. Keep
+        # enough of the most recent steps to stay above the floor whenever
+        # that much fresh data has actually arrived.
+        total_requests = sum(len(s.accept_lens) for s in win.steps)
+        while len(win.steps) > keep_steps:
+            oldest = len(win.steps[0].accept_lens)
+            if total_requests - oldest < self.cfg.min_requests_per_version:
+                break
+            del win.steps[0]
+            total_requests -= oldest
+        # Observability is judged PER OPPORTUNITY, not from the cumulative
+        # frozen window: once that window crossed the sample threshold it
+        # stays valid forever, so window validity alone masks later outages
+        # (e.g. the accept-stats pipe going silent post-freeze) and the
+        # missing streak would be reset on every empty observation. An
+        # opportunity is blind only when THIS observation carried no fresh
+        # accept-length data.
+        fresh_requests = sum(
+            1 for value in ev.request_accept_lens if value is not None
+        )
+        if self._anchor is None or fresh_requests == 0:
             self._missing_streak += 1
             if self._missing_streak >= self.cfg.missing_evidence_opportunities:
                 self._transition(
@@ -1294,6 +1369,12 @@ class DrafterFreezePolicy:
                 return True, "resume_missing_observability"
             return False, "frozen_stable"
         self._missing_streak = 0
+        if not self._window_valid(win):
+            # Fresh data arrived (observable), but the recent window is below
+            # the observation floor (min requests / min steps): a handful of
+            # requests must not arm the drift machinery, so the resume streak
+            # does not accumulate either.
+            return False, "frozen_stable"
 
         steps_map = {
             self._anchor.version: self._windows.get(self._anchor.version),

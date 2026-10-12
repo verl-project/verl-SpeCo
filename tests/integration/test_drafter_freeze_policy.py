@@ -225,6 +225,147 @@ class TestDriftResume(unittest.TestCase):
                          (FreezeState.RECOVERING, "resume_missing_observability"))
         d = sim.cycle(4.05)  # fresh update + observed window completes recovery
         self.assertEqual((sim.policy.state, d.should_train), (FreezeState.LEARNING, True))
+    def test_missing_evidence_after_window_filled_still_resumes(self):
+        # The cumulative frozen window is already valid; window validity alone
+        # would mask a later observability outage. Blindness must be judged on
+        # the CURRENT opportunity's fresh data (review finding: five empty
+        # observations post-freeze left the streak pinned at 0).
+        sim, _ = self._frozen_sim()
+        d = sim.rollout(4.74)  # healthy post-freeze evidence fills window V
+        self.assertEqual(d.state, FreezeState.FROZEN)
+        self.assertEqual(sim.policy._missing_streak, 0)
+        sim.empty_rollout()
+        self.assertEqual(sim.policy.state, FreezeState.FROZEN)  # streak 1
+        d = sim.empty_rollout()                                    # streak 2
+        self.assertEqual((sim.policy.state, d.reason),
+                         (FreezeState.RECOVERING, "resume_missing_observability"))
+    def test_fresh_observation_resets_missing_streak(self):
+        sim, _ = self._frozen_sim()
+        sim.rollout(4.74)       # valid cumulative window
+        sim.empty_rollout()     # streak 1
+        sim.rollout(4.74, n=1)  # fresh data this opportunity -> streak reset
+        sim.empty_rollout()     # streak 1 again: counter was not cumulative
+        self.assertEqual(sim.policy.state, FreezeState.FROZEN)
+        d = sim.empty_rollout()  # streak 2 -> recover
+        self.assertEqual(d.reason, "resume_missing_observability")
+    def test_tiny_fresh_observations_are_observable_but_not_drift(self):
+        # Review finding: fresh data must reset the missing counter, but the
+        # drift judgement keeps its own minimum-sample floor -- a handful of
+        # requests must not arm resume_quality_drift (3 requests once thawed
+        # the drafter below a 256-request floor).
+        sim, _ = self._frozen_sim()
+        sim.per_step = 1  # one request per step -> far below min_requests=50
+        for _ in range(5):
+            sim.rollout(1.5)  # terrible quality, but tiny
+            self.assertEqual(sim.policy.state, FreezeState.FROZEN)
+        self.assertEqual(sim.policy._missing_streak, 0)  # fresh: observable
+        self.assertEqual(sim.policy._resume_streak, 0)   # insufficient: no arming
+    def test_long_healthy_then_degradation_resumes_bounded_window(self):
+        # Review finding: the frozen window must be bounded to recent steps;
+        # an append-only window lets a long healthy history dilute a fresh
+        # regression (200 healthy batches once masked five 15%-drop
+        # opportunities entirely).
+        sim, _ = self._frozen_sim()
+        keep = max(sim.policy.cfg.min_rollout_steps_per_version,
+                   sim.policy.cfg.resume_patience_opportunities)
+        for _ in range(30):  # long healthy plateau at the frozen quality
+            d = sim.rollout(4.74)
+            self.assertEqual(d.state, FreezeState.FROZEN)
+        win = sim.policy._current_frozen_window()
+        self.assertLessEqual(len(win.steps), keep)  # bounded recent window
+        d = sim.rollout(4.0)   # ~15% below anchor 4.735: streak 1
+        self.assertEqual(sim.policy.state, FreezeState.FROZEN)
+        d = sim.rollout(4.0)   # patience 2 -> recover
+        self.assertEqual(sim.policy.state, FreezeState.RECOVERING)
+        self.assertIn(d.reason, ("resume_quality_drift", "resume_hard_drift"))
+    def test_window_bound_respects_request_floor(self):
+        # The step-count bound must not starve the request floor: with small
+        # per-step batches a pure step bound would leave the window below
+        # min_requests forever and silently disable drift detection (real
+        # config: min_requests=256, steps often carry far fewer).
+        sim, _ = self._frozen_sim()
+        sim.per_step = 10  # 5 steps needed to cross min_requests=50
+        for _ in range(10):
+            d = sim.rollout(4.74)
+            self.assertEqual(d.state, FreezeState.FROZEN)
+        win = sim.policy._current_frozen_window()
+        n_req = sum(len(s.accept_lens) for s in win.steps)
+        self.assertGreaterEqual(n_req, 50)      # floor preserved
+        self.assertLessEqual(len(win.steps), 9)  # still bounded
+        for _ in range(3):
+            sim.rollout(4.0)  # ~15% below anchor
+            if sim.policy.state == FreezeState.RECOVERING:
+                break
+        self.assertEqual(sim.policy.state, FreezeState.RECOVERING)
+    def test_bounded_window_round_trip_keeps_drift_detection(self):
+        # The bounded frozen window and the independent anchor survive
+        # save/load; drift detection after a resume behaves identically.
+        sim, _ = self._frozen_sim()
+        for _ in range(10):
+            sim.rollout(4.74)
+        restored = DrafterFreezePolicy(make_config())
+        restored.load_state_dict(sim.policy.state_dict())
+        keep = max(sim.policy.cfg.min_rollout_steps_per_version,
+                   sim.policy.cfg.resume_patience_opportunities)
+        self.assertLessEqual(len(restored._current_frozen_window().steps), keep)
+        self.assertIsNotNone(restored._anchor)  # anchor independent of rotation
+        sim.policy = restored
+        sim.rollout(4.0)
+        d = sim.rollout(4.0)
+        self.assertEqual(restored.state, FreezeState.RECOVERING)
+        self.assertIn(d.reason, ("resume_quality_drift", "resume_hard_drift"))
+
+class TestAsyncPublishCostAttribution(unittest.TestCase):
+    """publish_async: the real completion wait lands after the submit; it must
+    be folded into the SAME update's staged cost, never a later update's."""
+    def test_amend_folds_wait_into_same_update(self):
+        sim = Simulator(make_config())
+        sim.rollout(3.0)
+        sim.publish(cost=10.0)  # stages pending v1 with cost 10
+        p = sim.policy
+        self.assertEqual(p._pending_next_version, 1)
+        self.assertTrue(p.amend_pending_update_cost(1, 2.5))
+        self.assertAlmostEqual(p._pending_cost, 12.5)
+        self.assertAlmostEqual(p._costs[-1], 12.5)
+        # Wrong version / double attribution refused:
+        self.assertFalse(p.amend_pending_update_cost(2, 1.0))
+        self.assertFalse(p.amend_pending_update_cost(0, 1.0))
+        self.assertAlmostEqual(p._costs[-1], 12.5)
+        # The finalized window carries the amended cost:
+        sim.rollout(3.1, n=1, version=1)  # first v1 evidence closes v0
+        self.assertEqual(p.drafter_version, 1)
+        closed = p.versions[-1]
+        self.assertEqual(closed.version, 0)
+        self.assertAlmostEqual(closed.cost_seconds, 12.5)
+    def test_amend_none_cost_does_not_fabricate_entry(self):
+        sim = Simulator(make_config())
+        sim.rollout(3.0)
+        sim.publish(cost=None)  # cost unknown for this update
+        p = sim.policy
+        n_costs = len(p._costs)
+        self.assertTrue(p.amend_pending_update_cost(1, 2.0))  # version matches
+        self.assertEqual(len(p._costs), n_costs)   # no phantom entry
+        self.assertIsNone(p._pending_cost)         # unknown stays unknown
+    def test_pending_cost_index_round_trip(self):
+        sim = Simulator(make_config())
+        sim.rollout(3.0)
+        sim.publish(cost=10.0)
+        restored = DrafterFreezePolicy(make_config())
+        restored.load_state_dict(sim.policy.state_dict())
+        self.assertEqual(restored._pending_cost_index, len(restored._costs) - 1)
+        self.assertTrue(restored.amend_pending_update_cost(1, 1.5))
+        self.assertAlmostEqual(restored._costs[-1], 11.5)
+    def test_resolved_pending_rejects_amend(self):
+        # Once the closing evidence finalized the update, a late wait must NOT
+        # be folded into it (and never into the next update).
+        sim = Simulator(make_config())
+        sim.rollout(3.0)
+        sim.publish(cost=10.0)
+        sim.rollout(3.1, n=1, version=1)  # closes v0, pending resolved
+        p = sim.policy
+        self.assertIsNone(p._pending_next_version)
+        self.assertFalse(p.amend_pending_update_cost(1, 2.5))
+        self.assertAlmostEqual(p._costs[-1], 10.0)
 
 class TestEventOrderInvariance(unittest.TestCase):
     MEANS = [3.0, 3.7, 4.4, 4.7, 4.72, 4.73, 4.735, 4.74]
