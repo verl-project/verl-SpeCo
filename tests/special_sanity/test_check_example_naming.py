@@ -43,6 +43,10 @@ def test_npu_suffix_passes():
     assert _violations("run_qwen3-8b_drafter_eagle3_vllm_npu.sh") == []
 
 
+def test_rocm_suffix_passes():
+    assert _violations("run_qwen3-8b_drafter_dflash_sglang_rocm.sh") == []
+
+
 def test_actor_backend_with_multiple_tokens_passes():
     assert (
         _violations(
