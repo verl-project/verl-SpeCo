@@ -21,7 +21,7 @@ CKPTS_DIR=${CKPTS_DIR:-/dev/shm/verl_speco_ckpt}
 # ROCm + Ray GPU isolation. Set ONLY CUDA_VISIBLE_DEVICES (no HIP var, no NOSET flags):
 #  - Ray 2.56's AMD accelerator manager (amd_gpu.py) uses CUDA_VISIBLE_DEVICES as its
 #    keyword when HIP_VISIBLE_DEVICES is unset, so this mask restricts Ray's pool to
-#    exactly these 4 GPUs and Ray becomes fully CUDA-native.
+#    exactly these GPUs and Ray becomes fully CUDA-native.
 #  - With NOSET off, Ray assigns each worker a single physical GPU and rewrites that
 #    worker's CUDA_VISIBLE_DEVICES to just that id (torch sees 1 device, ordinal 0).
 #    verl's Worker sees is_ray_noset_visible_devices=False and SKIPS set_device(local_rank),
@@ -71,9 +71,10 @@ python3 -m verl_speco.main \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.name=sglang \
+    actor_rollout_ref.rollout.calculate_log_probs=False \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.log_level=info \
-    +actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=aiter \
-    +actor_rollout_ref.rollout.engine_kwargs.sglang.disable_custom_all_reduce=True \
+    ++actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=aiter \
+    ++actor_rollout_ref.rollout.engine_kwargs.sglang.disable_custom_all_reduce=True \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \

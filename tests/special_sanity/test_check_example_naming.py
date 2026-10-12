@@ -43,6 +43,10 @@ def test_npu_suffix_passes():
     assert _violations("run_qwen3-8b_drafter_eagle3_vllm_npu.sh") == []
 
 
+def test_rocm_suffix_passes():
+    assert _violations("run_qwen3-8b_drafter_dflash_sglang_rocm.sh") == []
+
+
 def test_async_v1_trainer_modes_pass():
     assert (
         _violations("run_qwen3-8b_drafter_dspark_colocate_async_vllm_npu.sh")

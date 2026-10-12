@@ -1,0 +1,22 @@
+# AMD ROCm (MI300X / MI355X) runtime image.
+#
+# The base is verl's official ROCm image (see verl docs/amd_tutorial/amd_quick_start.rst).
+# It already ships ROCm torch, verl, and both rollout engines (SGLang and vLLM), so a
+# single image serves both; pick the engine at runtime with actor_rollout_ref.rollout.name.
+#
+# Build from the repo root:
+#   docker build -f docker/rocm/Dockerfile.rocm -t verl-speco:rocm .
+ARG BASE_IMAGE=amdagi/verl-dev:rocm7.14_torch2.12_release_0724
+FROM ${BASE_IMAGE}
+
+COPY . /workspace/verl-SpeCo
+WORKDIR /workspace/verl-SpeCo
+# --no-deps keeps the base image's ROCm torch / sglang / vllm / verl untouched.
+RUN pip install --no-cache-dir --no-deps -e . \
+    && python -c "import torch, verl, verl_speco; \
+assert torch.version.hip, 'expected a ROCm torch build'; \
+print('torch', torch.__version__, 'hip', torch.version.hip); \
+print('verl', verl.__version__, verl.__file__); \
+print('verl_speco', verl_speco.__version__)"
+
+CMD ["/bin/bash"]
