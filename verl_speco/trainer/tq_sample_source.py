@@ -16,15 +16,22 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from collections import deque
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterator, Sequence
+from functools import partial
+from queue import Empty
+from typing import Any
 
+import torch
 import torch.distributed as dist
 
+from verl_speco.standalone_ray_runtime import get_queue
 from verl_speco.trainer.feature_store import DraftFeatureSample
 from verl_speco.trainer.tq_feature_store import ReadyEntry, TQFeatureStore
-
+from verl_speco.trainer.tq_retry import retry_io
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +47,7 @@ class TQLocalBatch:
     command_wait_seconds: float = 0.0
     tq_get_seconds: float = 0.0
     cycle_started_at: float = 0.0
+    plan_id: int | None = None
 
 
 def build_assignments(
@@ -75,6 +83,10 @@ class TQFeatureDataLoader:
         poll_interval_seconds: float = 0.5,
         drop_last: bool = True,
         scheduled_commands: Any | None = None,
+        process_group: Any | None = None,
+        stop_event: threading.Event | None = None,
+        io_retry_max_attempts: int = 3,
+        io_timeout_seconds: float = 30.0,
     ):
         self.store = store
         self.batch_size = int(batch_size)
@@ -83,6 +95,12 @@ class TQFeatureDataLoader:
         self.poll_interval_seconds = max(float(poll_interval_seconds), 0.01)
         self.drop_last = bool(drop_last)
         self.scheduled_commands = scheduled_commands
+        self.process_group = process_group
+        self.stop_event = stop_event
+        self.io_retry_max_attempts = io_retry_max_attempts
+        self.io_timeout_seconds = io_timeout_seconds
+        if io_retry_max_attempts < 1 or io_timeout_seconds <= 0:
+            raise ValueError("TQ retry attempts and I/O timeout must be positive")
         if self.batch_size <= 0:
             raise ValueError("TQ Consumer batch_size_per_gpu must be positive")
         if self.world_size <= 0 or not (0 <= self.rank < self.world_size):
@@ -103,30 +121,59 @@ class TQFeatureDataLoader:
         self.store.connect()
         global_batch_size = self.batch_size * self.world_size
         owner_ready = False
+        last_plan_id = -1
+        cycle_started_at = time.perf_counter()
+        command_wait_seconds = 0.0
         while True:
-            cycle_started_at = time.perf_counter()
             command: dict[str, Any] | None = None
-            command_wait_seconds = 0.0
             if self.rank == 0:
                 try:
                     if not owner_ready:
-                        owner_ready = self.store.owner_ready()
-                        if not owner_ready:
+                        owner_ready = retry_io(
+                            self.store.owner_ready,
+                            name="TQ owner readiness list",
+                            attempts=self.io_retry_max_attempts,
+                            stop=self.stop_event,
+                        )
+                        if not owner_ready and not (
+                            self.stop_event is not None and self.stop_event.is_set()
+                        ):
                             time.sleep(self.poll_interval_seconds)
-                            continue
-                    if self.scheduled_commands is not None:
+                            if self.stop_event is None:
+                                continue
+                            command = {"kind": "wait"}
+                    if command is None and self.scheduled_commands is not None:
                         command_wait_started = time.perf_counter()
-                        command = self.scheduled_commands.get(block=True)
-                        command_wait_seconds = (
+                        if self.stop_event is None:
+                            command = self.scheduled_commands.get(block=True)
+                        else:
+                            if not self.stop_event.is_set():
+                                try:
+                                    command = get_queue(
+                                        self.scheduled_commands,
+                                        rpc_timeout=self.io_timeout_seconds,
+                                    )
+                                except Empty:
+                                    # Other ranks must not spend the entire
+                                    # producer idle period in one timed Gloo
+                                    # broadcast. This is control traffic only.
+                                    command = {"kind": "wait"}
+                            if command is None:
+                                command = {"kind": "stop"}
+                        command_wait_seconds += (
                             time.perf_counter() - command_wait_started
                         )
+                        plan_id = command.get("plan_id")
+                        if plan_id is not None and int(plan_id) <= last_plan_id:
+                            # Queue put may have succeeded before a response timeout.
+                            continue
                         if command.get("kind") == "stop":
                             pass
-                        elif command.get("kind") != "batch":
+                        elif command.get("kind") not in {"batch", "wait"}:
                             raise RuntimeError(
                                 f"Unsupported scheduled TQ command: {command!r}"
                             )
-                    else:
+                    elif command is None:
                         ready = self.store.list_ready()
                         if len(ready) >= global_batch_size:
                             selected = ready[:global_batch_size]
@@ -154,12 +201,27 @@ class TQFeatureDataLoader:
                     }
 
             command = self._broadcast_command(command)
+            if command.get("kind") == "wait":
+                stop_event = self.stop_event
+                stopped = torch.tensor(
+                    int(stop_event is not None and stop_event.is_set()),
+                    dtype=torch.int32,
+                )
+                if self.world_size > 1:
+                    dist.all_reduce(
+                        stopped, op=dist.ReduceOp.MAX, group=self.process_group
+                    )
+                if stopped.item():
+                    return
+                continue
             if command.get("kind") == "error":
                 raise RuntimeError(str(command.get("message") or "TQ discovery failed"))
             if command.get("kind") == "stop":
                 return
             if command.get("kind") != "batch":
                 raise RuntimeError(f"Unsupported TQ loader command: {command!r}")
+            if command.get("plan_id") is not None:
+                last_plan_id = int(command["plan_id"])
             wire_assignments = command.get("assignments")
             if (
                 not isinstance(wire_assignments, list)
@@ -170,7 +232,12 @@ class TQFeatureDataLoader:
                 _entry_from_wire(item) for item in wire_assignments[self.rank]
             ]
             tq_get_started = time.perf_counter()
-            samples = self.store.get_many(local_entries)
+            samples = retry_io(
+                partial(self.store.get_many, local_entries),
+                name="TQ get",
+                attempts=self.io_retry_max_attempts,
+                stop=self.stop_event,
+            )
             tq_get_seconds = time.perf_counter() - tq_get_started
             global_keys = (
                 [str(key) for key in command.get("global_keys", [])]
@@ -190,7 +257,10 @@ class TQFeatureDataLoader:
                 command_wait_seconds=command_wait_seconds,
                 tq_get_seconds=tq_get_seconds,
                 cycle_started_at=cycle_started_at,
+                plan_id=command.get("plan_id"),
             )
+            cycle_started_at = time.perf_counter()
+            command_wait_seconds = 0.0
 
     def _batch_command(self, selected: Sequence[ReadyEntry]) -> dict[str, Any]:
         assignments = build_assignments(
@@ -225,7 +295,10 @@ class TQFeatureDataLoader:
                 raise RuntimeError("rank 0 did not create a TQ loader command")
             return command
         payload: list[Any] = [command if self.rank == 0 else None]
-        dist.broadcast_object_list(payload, src=0)
+        if self.process_group is None:
+            dist.broadcast_object_list(payload, src=0)
+        else:
+            dist.broadcast_object_list(payload, src=0, group=self.process_group)
         received = payload[0]
         if not isinstance(received, dict):
             raise RuntimeError("TQ loader broadcast did not contain a command mapping")
@@ -244,4 +317,118 @@ def _entry_from_wire(value: Any) -> ReadyEntry:
     return ReadyEntry(key=str(value["key"]), tag=dict(value["tag"]))
 
 
-__all__ = ["TQFeatureDataLoader", "TQLocalBatch", "build_assignments"]
+class TQPrefetchIterator:
+    """One fetch thread per rank, bounded payloads, separate CPU collectives.
+
+    Each fetch occupies a slot before next(source). The main thread taking a
+    batch frees a slot. EOS/errors live outside the payload buffer so shutdown
+    does not depend on a consumer draining a full queue.
+    """
+
+    def __init__(
+        self, loader: TQFeatureDataLoader, depth: int, *, close_timeout: float = 180.0
+    ):
+        if depth < 1:
+            raise ValueError("prefetch depth must be positive")
+        self.loader = loader
+        self.depth = depth
+        self.close_timeout = close_timeout
+        self.stop = loader.stop_event = threading.Event()
+        self._condition = threading.Condition()
+        self._batches: deque[TQLocalBatch] = deque()
+        self._done = False
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run, name=f"tq-prefetch-{loader.rank}", daemon=True
+        )
+        self._thread.start()
+
+    def _sync(self, values: list[int]) -> list[int]:
+        if self.loader.world_size > 1:
+            if self.loader.process_group is None:
+                raise RuntimeError(
+                    "Distributed prefetch requires its own Gloo process group"
+                )
+            state = torch.tensor(values, dtype=torch.int32)
+            dist.all_reduce(
+                state, op=dist.ReduceOp.MAX, group=self.loader.process_group
+            )
+            return state.tolist()
+        return values
+
+    def _run(self) -> None:
+        source = iter(self.loader)
+        try:
+            while True:
+                with self._condition:
+                    self._condition.wait_for(
+                        lambda: self.stop.is_set() or len(self._batches) < self.depth
+                    )
+                if self._sync([int(self.stop.is_set())])[0]:
+                    return
+                batch = None
+                error = None
+                exhausted = False
+                try:
+                    batch = next(source)
+                except StopIteration:
+                    exhausted = True
+                except BaseException as exc:  # noqa: BLE001 - deliver thread failures to every rank
+                    error = exc
+                failed, ended = self._sync([int(error is not None), int(exhausted)])
+                if failed:
+                    raise RuntimeError(
+                        f"TQ prefetch failed on rank={self.loader.rank}"
+                    ) from error
+                if ended:
+                    return
+                if batch is None:
+                    raise RuntimeError("TQ prefetch returned no batch without EOS")
+                with self._condition:
+                    self._batches.append(batch)
+                    self._condition.notify_all()
+        except BaseException as exc:  # noqa: BLE001 - surface worker failures in the main thread
+            with self._condition:
+                self._error = exc
+        finally:
+            try:
+                close = getattr(source, "close", None)
+                if close is not None:
+                    close()
+            finally:
+                with self._condition:
+                    self._done = True
+                    self._condition.notify_all()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> TQLocalBatch:
+        with self._condition:
+            self._condition.wait_for(lambda: bool(self._batches) or self._done)
+            if self._batches:
+                batch = self._batches.popleft()
+                self._condition.notify_all()
+                return batch
+            if self._error is not None:
+                raise self._error
+            raise StopIteration
+
+    def close(self) -> None:
+        self.stop.set()
+        with self._condition:
+            self._condition.notify_all()
+        self._thread.join(timeout=self.close_timeout)
+        if self._thread.is_alive():
+            raise RuntimeError(
+                "TQ prefetch thread did not stop before its shutdown deadline"
+            )
+        self._batches.clear()
+
+
+__all__ = [
+    "TQFeatureDataLoader",
+    "TQLocalBatch",
+    "TQPrefetchIterator",
+    "build_assignments",
+]

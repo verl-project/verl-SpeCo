@@ -1119,32 +1119,36 @@ class DrafterBaseTrainer:
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
             "loss_mode_id": f"{prefix}/loss_mode_id",
         }
-        for source_key, metric_key in scalar_keys.items():
-            value = diagnostics.get(source_key)
-            if not torch.is_tensor(value):
-                continue
-            value = cast(torch.Tensor, value)
-            reduced = self._reduce_training_metric(value.reshape(()))
-            self._training_metric_sums[metric_key] = self._training_metric_sums.get(
-                metric_key, 0.0
-            ) + float(reduced.cpu().item())
-
         vector_keys = {
             "loss_sum_per_position": f"{prefix}/loss_sum_per_position",
             "correct_per_position": f"{prefix}/correct_per_position",
             "count_per_position": f"{prefix}/count_per_position",
         }
+        metric_keys: list[str] = []
+        values: list[torch.Tensor] = []
+        for source_key, metric_key in scalar_keys.items():
+            value = diagnostics.get(source_key)
+            if not isinstance(value, torch.Tensor):
+                continue
+            metric_keys.append(metric_key)
+            values.append(value.detach().float().reshape(1))
+
         for source_key, metric_prefix in vector_keys.items():
             value = diagnostics.get(source_key)
-            if not torch.is_tensor(value):
+            if not isinstance(value, torch.Tensor):
                 continue
-            value = cast(torch.Tensor, value)
-            reduced = self._reduce_training_metric(value)
-            for idx, item in enumerate(reduced.detach().cpu().tolist()):
-                metric_key = f"{metric_prefix}/{idx}"
-                self._training_metric_sums[metric_key] = self._training_metric_sums.get(
-                    metric_key, 0.0
-                ) + float(item)
+            metric_keys.extend(f"{metric_prefix}/{idx}" for idx in range(value.numel()))
+            values.append(value.detach().float().reshape(-1))
+
+        if not metric_keys:
+            return
+        # Keep the same group/reduction semantics, but batch all diagnostics
+        # into one reduction call and one device-to-host transfer per step.
+        reduced = self._reduce_training_metric(torch.cat(values)).cpu().tolist()
+        for metric_key, item in zip(metric_keys, reduced, strict=True):
+            self._training_metric_sums[metric_key] = self._training_metric_sums.get(
+                metric_key, 0.0
+            ) + float(item)
 
     def _get_sp_group(self):
         if self._has_mesh_dim("sp"):

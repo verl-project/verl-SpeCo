@@ -415,6 +415,11 @@ actor_rollout_ref:
           connect_timeout_seconds: 120
           poll_interval_seconds: 0.5
           drop_last: true
+          # Scheduled Ray Consumer: 0 keeps serial loading, k prefetches k batches.
+          consumer_prefetch_batches: 0
+          io_retry_max_attempts: 3
+          io_timeout_seconds: 30
+          prefetch_collective_timeout_seconds: 180
           controller:
             polling_mode: true
           backend:

@@ -11,35 +11,35 @@ loop without changing its numerical path.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
 import logging
 import os
 import subprocess
 import tempfile
 import time
+from dataclasses import asdict
+from itertools import islice
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from verl_speco.config import prefetch_depth
+from verl_speco.standalone_tq_training_launcher import (
+    _VLLM_HIDDEN_STATES_DIR,
+    PipelineCommands,
+    _stop_process,
+    _vllm_is_ready,
+    _wait_for_owner_ready,
+    _wait_for_vllm_ready,
+    validate_hidden_states_store,
+    validate_tq_backend,
+)
 from verl_speco.trainer.scheduler import (
     CallbackStandaloneCollectionExecutor,
     CallbackStandaloneTrainingExecutor,
-    DrafterRuntimeState,
-    DrafterRuntimeStatus,
     DrafterScheduler,
     QueueScheduleConfig,
     QueueScheduleContext,
     QueueStatus,
-)
-
-from verl_speco.standalone_tq_training_launcher import (
-    PipelineCommands,
-    _VLLM_HIDDEN_STATES_DIR,
-    _stop_process,
-    _wait_for_owner_ready,
-    _wait_for_vllm_ready,
-    _vllm_is_ready,
-    validate_hidden_states_store,
-    validate_tq_backend,
+    StandaloneQueueState,
 )
 from verl_speco.trainer.standalone_tracking import (
     _build_standalone_tracking,
@@ -47,11 +47,50 @@ from verl_speco.trainer.standalone_tracking import (
     _log_producer_tracking_metrics,
     _log_standalone_tracking_metrics,
 )
+from verl_speco.trainer.tq_retry import retry_io
 
 logger = logging.getLogger(__name__)
 _SCHEDULER_INFO_INTERVAL_STEPS = 50
 _PRODUCER_NOTIFICATION_MAX_BATCH = 32
 _PRODUCER_NOTIFICATION_MAX_DELAY_SECONDS = 0.2
+
+
+def put_queue(queue: Any, item: Any, *, timeout: float = 30.0) -> None:
+    """Bound the Ray RPC too: Queue.put(timeout) only bounds queue capacity.
+
+    Callers retry the same ID/cumulative event, making ambiguous delivery safe.
+    Local queues keep their usual API for tests and single-process adapters.
+    """
+    actor = getattr(queue, "actor", None)
+    if actor is None:
+        queue.put(item)
+        return
+    import ray
+
+    ref = actor.put.remote(item, timeout)
+    try:
+        ray.get(ref, timeout=timeout + 5)
+    except ray.exceptions.GetTimeoutError:
+        ray.cancel(ref, force=False)
+        raise
+
+
+def get_queue(queue: Any, *, timeout: float = 0.5, rpc_timeout: float = 30.0) -> Any:
+    actor = getattr(queue, "actor", None)
+    if actor is None:
+        return queue.get(block=True, timeout=timeout)
+    import ray
+
+    ref = actor.get.remote(timeout)
+    try:
+        return ray.get(ref, timeout=rpc_timeout + 5)
+    except ray.exceptions.GetTimeoutError:
+        ray.cancel(ref, force=False)
+        # A timed-out get may already have removed an item. Do not issue a new
+        # get and silently skip that plan; terminate with its keys uncleared.
+        raise RuntimeError(
+            "Ray queue receive RPC did not respond to its deadline"
+        ) from None
 
 
 def _configure_driver_logging() -> None:
@@ -157,7 +196,11 @@ class StandaloneProducerActor:
             if self._metrics_pending:
                 # Keep the snapshot until delivery succeeds. The producer's
                 # publish tasks only append scalars; queue RPCs run here.
-                await asyncio.to_thread(events.put, self._metrics_pending[0])
+                await asyncio.to_thread(
+                    retry_io,
+                    lambda: put_queue(events, self._metrics_pending[0]),
+                    name="Producer metrics event",
+                )
                 self._metrics_pending.pop(0)
                 continue
             pending = self._published_total - self._notified_published_total
@@ -190,12 +233,14 @@ class StandaloneProducerActor:
                 continue
 
             published_total = self._published_total
+            published_event = {
+                "kind": "samples_published",
+                "published_total": published_total,
+            }
             await asyncio.to_thread(
-                events.put,
-                {
-                    "kind": "samples_published",
-                    "published_total": published_total,
-                },
+                retry_io,
+                lambda event=published_event: put_queue(events, event),
+                name="Producer publication event",
             )
             self._notified_published_total = published_total
             self._notification_pending_since = (
@@ -315,6 +360,7 @@ def build_consumer_worker_group(
 
     RayClassWithInitArgs, RayResourcePool, RayWorkerGroup = _ray_controller_types()
     from verl.utils.device import get_device_name
+
     from verl_speco.workers.standalone_drafter_worker import StandaloneDrafterWorker
 
     draft_training = config.speco.draft_training
@@ -426,13 +472,23 @@ class StandaloneRayTrainer:
         )
         store.connect()
         scheduler = DrafterScheduler()
-        runtime_state = DrafterRuntimeState()
+        depth = prefetch_depth(tq_cfg)
+        io_attempts = int(tq_cfg.get("io_retry_max_attempts", 3))
+        plans = StandaloneQueueState(depth + 1, config.global_batch_size)
+        max_steps = int(training_cfg.get("max_steps", training_cfg.get("step", 0)) or 0)
+        # The restored optimizer step is known only after Consumer activation.
+        consumer_ready = not (depth or max_steps > 0)
+        initial_optimizer_step = 0
         producer_done = False
         producer_paused = False
         consumer_stop_requested = False
         pipeline_started = time.monotonic()
         initial_list_started = time.monotonic()
-        ready_hint = len(store.list_ready())
+        initial_ready = retry_io(
+            store.list_ready, name="TQ scheduler list", attempts=io_attempts
+        )
+        plans.refresh(initial_ready)
+        ready_hint = len(initial_ready)
         tq_list_count = 1
         tq_list_seconds = time.monotonic() - initial_list_started
         producer_pause_count = 0
@@ -451,8 +507,8 @@ class StandaloneRayTrainer:
                 )
             elif event.get("kind") == "producer_metrics":
                 metrics = dict(event["metrics"])
-                # An actual metadata snapshot, not the scheduler's ready_hint.
-                # Includes assigned samples until the Consumer clears them.
+                # Low-frequency producer statistics keep an actual TQ snapshot.
+                # This query does not refresh selection caches or watermarks.
                 started = time.monotonic()
                 try:
                     metrics["tq/ready_samples"] = float(len(store.list_ready()))
@@ -479,6 +535,7 @@ class StandaloneRayTrainer:
             )
             command = {
                 "kind": "batch",
+                "plan_id": plans.pending[-1].plan_id,
                 "global_keys": list(plan.selected_keys),
                 "global_sequence_nos": [
                     int(entry.tag["sequence_no"]) for entry in selected_entries
@@ -491,7 +548,15 @@ class StandaloneRayTrainer:
                     for rank_entries in assignments
                 ],
             }
-            self.commands_queue.put(command)
+            retry_io(
+                lambda: put_queue(
+                    self.commands_queue,
+                    command,
+                    timeout=float(tq_cfg.get("io_timeout_seconds", 30)),
+                ),
+                name="Ray training command",
+                attempts=io_attempts,
+            )
             return command
 
         scheduler.bind_standalone_collection_executor(
@@ -505,7 +570,10 @@ class StandaloneRayTrainer:
         scheduler.bind_standalone_training_executor(
             CallbackStandaloneTrainingExecutor(
                 submit=submit_training_command,
-                stop=lambda: self.commands_queue.put({"kind": "stop"}),
+                stop=lambda: retry_io(
+                    lambda: put_queue(self.commands_queue, {"kind": "stop"}),
+                    name="Consumer stop command",
+                ),
             )
         )
         logger.info(
@@ -527,104 +595,104 @@ class StandaloneRayTrainer:
                 config=config,
                 producer_done=producer_done,
                 producer_paused=producer_paused,
-                consumer_training=runtime_state.status
-                in {DrafterRuntimeStatus.SUBMITTED, DrafterRuntimeStatus.RUNNING},
+                consumer_training=bool(plans.pending),
+                consumer_ready=consumer_ready,
+                outstanding_batches=len(plans.pending),
+                max_outstanding_batches=plans.capacity,
+                remaining_steps=(
+                    max(0, max_steps - initial_optimizer_step - completed_steps)
+                    if max_steps > 0
+                    else None
+                ),
             )
 
         def reconcile_and_schedule(trigger: str) -> bool:
-            nonlocal ready_hint, producer_paused, consumer_stop_requested
+            nonlocal producer_paused, consumer_stop_requested
             nonlocal tq_list_count, tq_list_seconds, producer_pause_count, tail_dropped
-            hint_before = ready_hint
-            list_started = time.monotonic()
-            ready = store.list_ready()
-            list_elapsed = time.monotonic() - list_started
-            tq_list_count += 1
-            tq_list_seconds += list_elapsed
-            ready_hint = len(ready)
-            logger.debug(
-                "Standalone scheduler TQ reconciled trigger=%s ready_hint=%s "
-                "actual_ready=%s delta=%s elapsed=%.3fs",
-                trigger,
-                hint_before,
-                ready_hint,
-                ready_hint - hint_before,
-                list_elapsed,
-            )
-            collection = scheduler.plan_queue_collection(context(ready_hint))
+            refreshed = False
+
+            def refresh():
+                nonlocal refreshed, tq_list_count, tq_list_seconds
+                started = time.monotonic()
+                try:
+                    entries = retry_io(
+                        store.list_ready, name="TQ scheduler list", attempts=io_attempts
+                    )
+                    plans.refresh(entries)
+                finally:
+                    tq_list_count += 1
+                    tq_list_seconds += time.monotonic() - started
+                refreshed = True
+
+            collection = scheduler.plan_queue_collection(context(max(0, ready_hint)))
             collection_outcome = scheduler.execute_standalone_collection_plan(
                 collection,
                 producer_paused=producer_paused,
                 producer_done=producer_done,
             )
             producer_paused = collection_outcome.producer_paused
-            if collection_outcome.changed and producer_paused:
-                producer_pause_count += 1
+            if collection_outcome.changed:
+                producer_pause_count += int(producer_paused)
                 logger.info(
-                    "Standalone scheduler producer paused reason=%s ready=%s "
-                    "high_watermark=%s",
-                    collection.reason,
+                    "Standalone producer %s ready_hint=%s",
+                    "paused" if producer_paused else "resumed",
                     ready_hint,
-                    config.high_watermark_samples,
-                )
-            elif collection_outcome.changed and not producer_paused:
-                logger.info(
-                    "Standalone scheduler producer resumed reason=%s ready=%s "
-                    "low_watermark=%s",
-                    collection.reason,
-                    ready_hint,
-                    config.low_watermark_samples,
                 )
 
-            training = scheduler.plan_queue_training(
-                context(ready_hint),
-                selected_keys=tuple(
-                    entry.key for entry in ready[: config.global_batch_size]
-                ),
-            )
-            if training.launch:
-                selected = ready[: config.global_batch_size]
+            while True:
+                training = scheduler.plan_queue_training(
+                    context(len(plans.ready)),
+                    selected_keys=tuple(
+                        entry.key
+                        for entry in islice(plans.ready, config.global_batch_size)
+                    ),
+                )
+                if not training.launch:
+                    if (
+                        training.reason == "insufficient_ready_samples"
+                        and not refreshed
+                    ):
+                        refresh()
+                        continue
+                    break
                 if not consumer_refs:
                     raise RuntimeError(
-                        "Standalone Consumer exited before the Scheduler could "
-                        "submit the next TrainingPlan"
+                        "Standalone Consumer exited before the Scheduler could submit the next TrainingPlan"
                     )
-                training_outcome = scheduler.execute_standalone_training_plan(
+                pending, selected = plans.reserve()
+                scheduler.execute_standalone_training_plan(
                     training,
-                    runtime_state=runtime_state,
+                    runtime_state=pending.runtime,
                     selected_entries=selected,
                 )
-                sequence_nos = [int(entry.tag["sequence_no"]) for entry in selected]
                 logger.debug(
-                    "Standalone scheduler training dispatched step=%s "
-                    "batch_samples=%s ready_before=%s producer_state=%s "
-                    "sequence_range=%s-%s",
-                    completed_steps + 1,
-                    training_outcome.assigned_samples,
-                    ready_hint,
-                    "paused"
-                    if producer_paused
-                    else "done"
-                    if producer_done
-                    else "running",
-                    min(sequence_nos),
-                    max(sequence_nos),
+                    "Standalone dispatched plan=%s outstanding=%s cached_samples=%s trigger=%s",
+                    pending.plan_id,
+                    len(plans.pending),
+                    len(plans.ready),
+                    trigger,
                 )
-            if (
-                producer_done
-                and runtime_state.status
-                not in {DrafterRuntimeStatus.SUBMITTED, DrafterRuntimeStatus.RUNNING}
-                and ready_hint < config.global_batch_size
-            ):
-                if ready:
-                    tail_dropped += len(ready)
-                    logger.info(
-                        "Standalone scheduler dropping incomplete tail "
-                        "tail_samples=%s required_batch_size=%s",
-                        len(ready),
-                        config.global_batch_size,
+
+            if scheduler.queue_budget_exhausted(context(len(plans.ready))):
+                scheduler.stop_standalone_consumer()
+                consumer_stop_requested = True
+                return True
+            if producer_done and not plans.pending and consumer_ready:
+                # Consumer clear has succeeded for every completed plan. Verify
+                # the tail once, even if a publication notification was delayed.
+                if not refreshed:
+                    refresh()
+                if len(plans.ready) >= config.global_batch_size:
+                    return reconcile_and_schedule("final_batch_ready")
+                if plans.ready:
+                    keys = [entry.key for entry in plans.ready]
+                    retry_io(
+                        lambda: store.clear_many(keys),
+                        name="TQ tail clear",
+                        attempts=io_attempts,
                     )
-                    store.clear_many([entry.key for entry in ready])
-                    ready_hint = 0
+                    tail_dropped += len(keys)
+                    plans.ready.clear()
                 scheduler.stop_standalone_consumer()
                 consumer_stop_requested = True
                 return True
@@ -650,11 +718,8 @@ class StandaloneRayTrainer:
                     try:
                         result = self.ray.get(ref)
                     except Exception as error:
-                        if ref != producer_ref and runtime_state.status in {
-                            DrafterRuntimeStatus.SUBMITTED,
-                            DrafterRuntimeStatus.RUNNING,
-                        }:
-                            runtime_state.mark_failed(error)
+                        if ref != producer_ref and plans.pending:
+                            plans.pending[0].runtime.mark_failed(error)
                         raise
                     if ref == producer_ref:
                         producer_ref = None
@@ -667,7 +732,6 @@ class StandaloneRayTrainer:
                         continue
                     if not consumer_stop_requested:
                         results = result if isinstance(result, list) else [result]
-                        max_steps = int(training_cfg.get("max_steps", 0) or 0)
                         expected_completion = (
                             bool(results)
                             and max_steps > 0
@@ -686,7 +750,7 @@ class StandaloneRayTrainer:
                     consumer_refs.remove(ref)
                     continue
                 try:
-                    event = self.events_queue.get(block=True, timeout=1.0)
+                    event = get_queue(self.events_queue, timeout=1.0)
                 except Empty:
                     if not wait_refs:
                         raise RuntimeError(
@@ -698,74 +762,45 @@ class StandaloneRayTrainer:
                 if kind in {"training_metrics", "producer_metrics"}:
                     log_tracking_event(event)
                     continue
-                if kind == "samples_published":
+                if kind == "consumer_ready":
+                    initial_optimizer_step = int(event["initial_optimizer_step"])
+                    consumer_ready = True
+                    finished = reconcile_and_schedule("consumer_ready")
+                elif kind == "samples_published":
                     published_total = int(event.get("published_total", 0))
                     if published_total <= last_published_total:
                         continue
+                    # initial_ready was captured before producer.start(). Keep
+                    # event counts independent of subsequent list snapshots.
                     ready_hint += published_total - last_published_total
                     last_published_total = published_total
-                    consumer_training = runtime_state.status in {
-                        DrafterRuntimeStatus.SUBMITTED,
-                        DrafterRuntimeStatus.RUNNING,
-                    }
-                    if (
-                        not consumer_training and ready_hint >= config.global_batch_size
-                    ) or (
-                        not producer_paused
-                        and ready_hint >= config.high_watermark_samples
-                    ):
-                        trigger = (
-                            "batch_ready" if not consumer_training else "high_watermark"
-                        )
-                        finished = reconcile_and_schedule(trigger)
+                    finished = reconcile_and_schedule("samples_published")
                 elif kind == "training_completed":
+                    pending = plans.completion(
+                        event.get("plan_id"), event.get("keys", ())
+                    )
+                    if pending is None:
+                        continue
                     training_outcome = scheduler.complete_standalone_training(
-                        runtime_state=runtime_state,
+                        runtime_state=pending.runtime,
                         completed_keys=event.get("keys", ()),
                         successful=bool(event.get("successful", False)),
                     )
-                    consumed = training_outcome.assigned_samples
+                    plans.release(pending)
                     completed_steps += 1
-                    ready_hint = max(0, ready_hint - consumed)
-                    logger.debug(
-                        "Standalone scheduler training completed step=%s consumed=%s "
-                        "ready_hint=%s producer_state=%s",
-                        completed_steps,
-                        consumed,
-                        ready_hint,
-                        "paused"
-                        if producer_paused
-                        else "done"
-                        if producer_done
-                        else "running",
-                    )
+                    # Do not clamp the accumulator: late publication events
+                    # must cancel the earlier subtraction exactly once.
+                    ready_hint -= training_outcome.assigned_samples
                     if completed_steps % _SCHEDULER_INFO_INTERVAL_STEPS == 0:
                         logger.info(
-                            "Standalone scheduler summary step=%s ready_hint=%s "
-                            "producer_state=%s tq_list_count=%s "
-                            "tq_list_time=%.3fs producer_pauses=%s",
+                            "Standalone scheduler step=%s outstanding=%s ready_hint=%s tq_list_count=%s tq_list_time=%.3fs",
                             completed_steps,
+                            len(plans.pending),
                             ready_hint,
-                            (
-                                "paused"
-                                if producer_paused
-                                else "done"
-                                if producer_done
-                                else "running"
-                            ),
                             tq_list_count,
                             tq_list_seconds,
-                            producer_pause_count,
                         )
-                    if (
-                        ready_hint >= config.global_batch_size
-                        or (
-                            producer_paused
-                            and ready_hint <= config.low_watermark_samples
-                        )
-                        or producer_done
-                    ):
-                        finished = reconcile_and_schedule("training_completed")
+                    finished = reconcile_and_schedule("training_completed")
             if finished:
                 for ref in consumer_refs:
                     self.ray.get(ref)
@@ -785,8 +820,7 @@ class StandaloneRayTrainer:
                 "Standalone pipeline failed producer_state=%s consumer_training=%s "
                 "ready_hint=%s completed_steps=%s",
                 "paused" if producer_paused else "done" if producer_done else "running",
-                runtime_state.status
-                in {DrafterRuntimeStatus.SUBMITTED, DrafterRuntimeStatus.RUNNING},
+                bool(plans.pending),
                 ready_hint,
                 completed_steps,
             )
