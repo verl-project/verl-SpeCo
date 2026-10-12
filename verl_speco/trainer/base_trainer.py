@@ -960,6 +960,18 @@ class DrafterBaseTrainer:
             if key.startswith("timing_s/drafter_"):
                 metrics[key] = value
         prefix = self._block_drafter_metric_prefix()
+        if f"{prefix}/loss" in sums:
+            metrics[f"{prefix}/loss"] = sums[f"{prefix}/loss"] / steps
+        selector_weight = sums.get(f"{prefix}/selector_weight_count", 0.0)
+        if selector_weight > 0:
+            metrics[f"{prefix}/selector_loss"] = (
+                sums[f"{prefix}/selector_loss_sum"] / selector_weight
+            )
+        selector_tokens = sums.get(f"{prefix}/selector_token_count", 0.0)
+        if selector_tokens > 0:
+            metrics[f"{prefix}/selector_accuracy"] = (
+                sums.get(f"{prefix}/selector_correct_count", 0.0) / selector_tokens
+            )
         correct = sums.get(f"{prefix}/correct_count", 0.0)
         eval_tokens = sums.get(f"{prefix}/eval_token_count", 0.0)
         if eval_tokens > 0:
@@ -1095,6 +1107,8 @@ class DrafterBaseTrainer:
             "l1_weighted_token_count": f"{prefix}/l1_weighted_token_count",
             # DFlash2 candidate selector.
             "selector_loss": f"{prefix}/selector_loss",
+            "selector_loss_sum": f"{prefix}/selector_loss_sum",
+            "selector_weight_count": f"{prefix}/selector_weight_count",
             "selector_correct_count": f"{prefix}/selector_correct_count",
             "selector_base_correct_count": f"{prefix}/selector_base_correct_count",
             "selector_token_count": f"{prefix}/selector_token_count",
@@ -5285,6 +5299,19 @@ class DrafterBaseTrainer:
                 f"tokens={float(global_tokens.detach().float().item())}"
             )
             return False
+
+        if self.backend.model_type in {
+            "eagle3",
+            "dflash",
+            "dspark",
+            "dflash2",
+        } and getattr(self.backend, "enable_standalone_training_metrics", False):
+            # Log the actual globally reduced optimization objective, including
+            # the backend's CE/L1 weights and token normalization.
+            loss_key = f"{self.backend.model_type}/loss"
+            self._training_metric_sums[loss_key] = self._training_metric_sums.get(
+                loss_key, 0.0
+            ) + float(loss.detach().float().item())
 
         # Backward on this rank's local loss sums: the metric all-reduce above is
         # outside the autograd graph, so each rank's backward carries only its own

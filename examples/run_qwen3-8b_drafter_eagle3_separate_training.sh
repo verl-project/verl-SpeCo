@@ -30,6 +30,7 @@ set -x
 
 project_name=${PROJECT_NAME:-verl_eagle3_drafter}
 exp_name=${EXP_NAME:-qwen3_8b_eagle3_separate_training}
+TRAIN_LOGGERS=${TRAIN_LOGGERS:-'["console","swanlab"]'}
 
 draft_train_gpus_per_node=${TRAIN_GPUS:-2}
 MODEL_PATH=${MODEL_PATH:-/path/to/Qwen3-4B}
@@ -176,5 +177,6 @@ PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher
     speco.standalone_tq_producer.max_feature_length=${PRODUCER_MAX_FEATURE_LENGTH} \
     speco.standalone_tq_producer.generation_max_tokens=${PRODUCER_GENERATION_MAX_TOKENS} \
     trainer.project_name=${project_name} \
+    trainer.logger="${TRAIN_LOGGERS}" \
     trainer.experiment_name=${exp_name} \
     "$@"

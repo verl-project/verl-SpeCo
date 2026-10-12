@@ -26,6 +26,7 @@ import torch
 
 from verl_speco.producer.vllm_feature_client import RawVllmFeature
 from verl_speco.standalone_tq_producer import (
+    _apply_direct_producer_defaults,
     _drain_pending_samples,
     run_producer,
     validate_producer_config,
@@ -33,6 +34,27 @@ from verl_speco.standalone_tq_producer import (
 from verl_speco.trainer.standalone_resume import save_standalone_resume
 from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION
 from verl_speco.transport.drafter_sample_protocol import decode_sample
+
+
+@pytest.mark.parametrize("preserve", [None, False, True])
+@pytest.mark.parametrize("prefix", ["", "++"])
+def test_direct_producer_prompt_context_default_and_override(preserve, prefix):
+    from omegaconf import OmegaConf
+
+    key = "actor_rollout_ref.rollout.drafter.training.preserve_prompt_hidden_states"
+    base = OmegaConf.load(
+        Path(__file__).resolve().parents[2] / "verl_speco/config/speco_base.yaml"
+    )
+    assert OmegaConf.select(base, key) is False
+    config = OmegaConf.merge(base)
+    overrides = ["speco.standalone_tq_producer.max_feature_length=3"]
+    if preserve is not None:
+        OmegaConf.update(config, key, preserve)
+        overrides.append(f"{prefix}{key}={str(preserve).lower()}")
+    _apply_direct_producer_defaults(config, overrides)
+    expected = True if preserve is None else preserve
+    assert OmegaConf.select(config, key) is expected
+    assert OmegaConf.select(base, key) is False
 
 
 @pytest.fixture(autouse=True)
@@ -89,6 +111,7 @@ def _config(input_path: Path) -> dict[str, Any]:
                 "drafter": {
                     "speculative_algorithm": "DSPARK",
                     "training": {
+                        "dflash_block_size": 2,
                         "use_logits": False,
                         "dspark_l1_loss_alpha": 0.9,
                         "transfer_queue": {
@@ -107,6 +130,21 @@ def _config(input_path: Path) -> dict[str, Any]:
             }
         },
     }
+
+
+@pytest.mark.parametrize("algorithm,minimum", [("DSPARK", 2), ("DFLASH", 4)])
+def test_producer_rejects_response_budget_without_training_anchor(algorithm, minimum):
+    config = _config(Path("unused.jsonl"))
+    drafter = config["actor_rollout_ref"]["rollout"]["drafter"]
+    drafter["speculative_algorithm"] = algorithm
+    drafter["training"]["dflash_block_size"] = 4
+    producer = config["speco"]["standalone_tq_producer"]
+    producer["max_feature_length"] = minimum - 1
+    with pytest.raises(ValueError, match=f"at least {minimum}"):
+        validate_producer_config(config)
+    for budget in (0, minimum):
+        producer["max_feature_length"] = budget
+        validate_producer_config(config)
 
 
 class _Tokenizer:
@@ -243,7 +281,7 @@ class _Pool:
         self.paths.append(path)
         # ExampleHiddenStatesConnector excludes the final generated token because
         # it was never consumed by a model forward pass.
-        token_ids = torch.tensor([*request.prompt_token_ids, 11], dtype=torch.int64)
+        token_ids = torch.tensor([*request.prompt_token_ids, 11, 12], dtype=torch.int64)
         hidden = torch.arange(token_ids.numel() * 3 * 2, dtype=torch.float32).reshape(
             token_ids.numel(), 3, 2
         )
@@ -252,7 +290,7 @@ class _Pool:
             temporary_path=str(path),
             endpoint_url="http://vllm:8000/v1",
             byte_size=path.stat().st_size,
-            generated_token_ids=(11, 12),
+            generated_token_ids=(11, 12, 13),
         )
 
     async def close(self) -> None:
@@ -318,17 +356,23 @@ def _write_input(path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("preserve", [None, False, True])
 def test_run_producer_publishes_samples_then_eos(
-    tmp_path: Path, target_final_norm
+    tmp_path: Path, target_final_norm, preserve
 ) -> None:
     input_path = tmp_path / "input.jsonl"
     _write_input(input_path)
     transport = _Transport()
     pool = _Pool(tmp_path)
+    config = _config(input_path)
+    if preserve is not None:
+        config["actor_rollout_ref"]["rollout"]["drafter"]["training"][
+            "preserve_prompt_hidden_states"
+        ] = preserve
 
     stats = asyncio.run(
         run_producer(
-            _config(input_path),
+            config,
             transport=transport,
             tokenizer=_Tokenizer(),
             client_pool=pool,
@@ -356,9 +400,9 @@ def test_run_producer_publishes_samples_then_eos(
     assert all(not path.exists() for path in pool.paths)
     assert pool.started and pool.closed and transport.closed
     first_fields = transport.payloads[sorted(sample_keys)[0]]
-    assert tuple(first_fields["sample__hidden_states"].shape) == (3, 6)
-    # The existing response feature window starts at prompt_length - 1 = 1.
-    raw = torch.arange(24, dtype=torch.float32).reshape(4, 3, 2)[1:]
+    start = 1 if preserve is False else 0
+    assert tuple(first_fields["sample__hidden_states"].shape) == (4 - start, 6)
+    raw = torch.arange(24, dtype=torch.float32).reshape(4, 3, 2)[start:]
     torch.testing.assert_close(
         first_fields["sample__hidden_states"][:, :4], raw[:, :2].flatten(1)
     )
@@ -420,6 +464,69 @@ def test_run_producer_logs_perf_window_at_info(
     assert any("perf middle samples:" in message for message in messages)
     assert any("perf slowest e2e samples:" in message for message in messages)
     assert any("perf slowest transport samples:" in message for message in messages)
+
+
+@pytest.mark.parametrize("count", [37, 100, 137, 200])
+def test_producer_emits_complete_and_final_partial_metric_windows(tmp_path, count):
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = count
+    windows = []
+
+    async def on_metrics(total, metrics):
+        windows.append((total, metrics))
+
+    stats = asyncio.run(run_producer(
+        config, transport=_Transport(), tokenizer=_Tokenizer(),
+        client_pool=_Pool(tmp_path), before_request=lambda: asyncio.sleep(0),
+        on_metrics=on_metrics,
+    ))
+    expected = list(range(100, count + 1, 100))
+    if count % 100:
+        expected.append(count)
+    assert stats.published_count == count
+    assert [total for total, _ in windows] == expected
+    for _, metrics in windows:
+        assert metrics["producer/samples_per_second"] > 0
+        assert "producer/generation_time" not in metrics
+        assert metrics["producer/other_time"] >= 0
+
+
+def test_producer_cancellation_flushes_partial_window(tmp_path):
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    producer_cfg = config["speco"]["standalone_tq_producer"]
+    producer_cfg.update(max_samples=100, publish_workers=1)
+    windows = []
+
+    async def exercise():
+        ready = asyncio.Event()
+        published = 0
+
+        async def on_published(sequence_no):
+            nonlocal published
+            published += 1
+            if published == 37:
+                ready.set()
+                await asyncio.Event().wait()
+
+        async def on_metrics(total, metrics):
+            windows.append((total, metrics))
+
+        task = asyncio.create_task(run_producer(
+            config, transport=_Transport(), tokenizer=_Tokenizer(),
+            client_pool=_Pool(tmp_path), before_request=lambda: asyncio.sleep(0),
+            on_published=on_published, on_metrics=on_metrics,
+        ))
+        await asyncio.wait_for(ready.wait(), timeout=10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    assert [total for total, _ in windows] == [37]
 
 
 def test_run_producer_retries_transient_publish_failure(
@@ -560,8 +667,9 @@ def test_run_producer_does_not_republish_when_temporary_cleanup_fails(
 
 
 @pytest.mark.parametrize("algorithm", ["DFLASH", "DSPARK"])
+@pytest.mark.parametrize("preserve", [None, False, True])
 def test_aux_only_producer_does_not_load_or_apply_final_norm(
-    tmp_path, monkeypatch, algorithm
+    tmp_path, monkeypatch, algorithm, preserve
 ):
     def unexpected_load(*args, **kwargs):
         raise AssertionError("aux-only features must not load a target final norm")
@@ -575,6 +683,8 @@ def test_aux_only_producer_does_not_load_or_apply_final_norm(
     drafter = config["actor_rollout_ref"]["rollout"]["drafter"]
     drafter["speculative_algorithm"] = algorithm
     drafter["training"]["dspark_l1_loss_alpha"] = 0.0
+    if preserve is not None:
+        drafter["training"]["preserve_prompt_hidden_states"] = preserve
     transport = _Transport()
     asyncio.run(
         run_producer(
@@ -595,7 +705,8 @@ def test_aux_only_producer_does_not_load_or_apply_final_norm(
         transport.payloads[sample_key],
         {"run_id": "run-a"},
     )
-    raw_aux = torch.arange(24, dtype=torch.float32).reshape(4, 3, 2)[1:, :2].flatten(1)
+    start = 1 if preserve is False else 0
+    raw_aux = torch.arange(24, dtype=torch.float32).reshape(4, 3, 2)[start:, :2].flatten(1)
     torch.testing.assert_close(sample.hidden_states, raw_aux)
 
 
@@ -703,7 +814,10 @@ def test_run_producer_resumes_after_a_fully_consumed_epoch(tmp_path: Path) -> No
     assert pool.closed and transport.closed
 
 
-def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) -> None:
+@pytest.mark.parametrize("preserve", [None, False, True])
+def test_run_producer_generates_response_for_verl_chat_prompt(
+    tmp_path: Path, preserve
+) -> None:
     input_path = tmp_path / "dapo.jsonl"
     input_path.write_text(
         json.dumps(
@@ -720,6 +834,10 @@ def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) ->
     pool = _Pool(tmp_path)
     config = _config(input_path)
     config["speco"]["standalone_tq_producer"]["on_missing_response"] = "generate"
+    if preserve is not None:
+        config["actor_rollout_ref"]["rollout"]["drafter"]["training"][
+            "preserve_prompt_hidden_states"
+        ] = preserve
 
     stats = asyncio.run(
         run_producer(
@@ -740,8 +858,10 @@ def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) ->
     assert pool.prefill_calls == 1
     assert len(sample_keys) == 1
     fields = transport.payloads[sample_keys[0]]
-    assert fields["sample__input_ids"].tolist() == [10, 11]
-    assert fields["sample__loss_mask"].tolist() == [0.0, 1.0]
+    expected_ids = [10, 11, 12] if preserve is False else [9, 10, 11, 12]
+    expected_mask = [0.0, 1.0, 1.0] if preserve is False else [0.0, 0.0, 1.0, 1.0]
+    assert fields["sample__input_ids"].tolist() == expected_ids
+    assert fields["sample__loss_mask"].tolist() == expected_mask
 
 
 def test_run_producer_skips_rows_without_response_by_default(tmp_path: Path) -> None:
@@ -873,6 +993,42 @@ def test_run_producer_renders_off_the_event_loop(
     assert stats.published_count == 1
     assert render_threads
     assert all(ident != main_thread for ident in render_threads)
+
+
+def test_run_producer_misaligned_drop_survives_cleanup_failure(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """A store deletion failure on the drop path must not abort the producer."""
+
+    import verl_speco.standalone_tq_producer as producer_module
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _OneMisalignedPool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+
+    def fail_cleanup(raw):
+        raise RuntimeError("store delete failed")
+
+    monkeypatch.setattr(producer_module, "delete_temporary_result", fail_cleanup)
+    with caplog.at_level("WARNING", logger="verl_speco.standalone_tq_producer"):
+        stats = asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
+    assert stats.dropped_count == 1
+    assert stats.published_count == 2
+    assert any(
+        "best-effort temporary cleanup failed" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_run_producer_replaces_misaligned_sample_before_eos(
@@ -1191,6 +1347,56 @@ def test_pool_close_failure_does_not_skip_transport_close(tmp_path: Path) -> Non
         )
 
     assert pool.closed and transport.closed
+
+
+def test_hidden_state_store_closes_after_consumer_drain(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The hidden-state pool must close only after the TQ consumer drains.
+
+    Mooncake allocates objects across all of a process's registered segments
+    (allocation_strategy=random), so closing the producer's hidden-state store
+    before the drain can unmount a segment holding unconsumed TQ fields and
+    surface as batch_get_into error -704.
+    """
+
+    monkeypatch.setenv("SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS", "30")
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    order: list[str] = []
+
+    class _DrainingTransport(_Transport):
+        def list_samples(self):
+            order.append("list")
+            # Simulate the consumer fetching and clearing every sample.
+            self.records = {
+                key: tag
+                for key, tag in self.records.items()
+                if tag.get("record_type") != "sample"
+            }
+            return dict(self.records)
+
+    class _OrderedPool(_Pool):
+        async def close(self) -> None:
+            order.append("pool_close")
+            await super().close()
+
+    transport = _DrainingTransport()
+    pool = _OrderedPool(tmp_path)
+
+    stats = asyncio.run(
+        run_producer(
+            _config(input_path),
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    assert stats.published_count > 0
+    assert "pool_close" in order
+    # No TQ metadata read may happen after the hidden-state store closes.
+    assert "list" not in order[order.index("pool_close") + 1 :]
 
 
 def test_run_producer_errors_when_every_row_is_filtered(tmp_path: Path) -> None:

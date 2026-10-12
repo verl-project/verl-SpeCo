@@ -33,6 +33,12 @@ from torch import nn
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_oldlogprob_aux_layer_ids,
 )
+from verl_speco.producer.hidden_states_store import (
+    FILE_BACKEND,
+    MOONCAKE_BACKEND,
+    HiddenStatesStore,
+    build_hidden_states_store,
+)
 from verl_speco.trainer.feature_store import DraftFeatureSample, DraftReplaySample
 
 logger = logging.getLogger(__name__)
@@ -264,43 +270,6 @@ def _load_json_config(path: Any) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
-
-
-def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
-    if not lock_path.exists():
-        return
-    try:
-        import fcntl
-    except ImportError:
-        deadline = time.monotonic() + float(timeout)
-        while lock_path.exists():
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for hidden-states lock: {lock_path}"
-                )
-            time.sleep(0.1)
-        return
-
-    fd = os.open(lock_path, os.O_RDONLY)
-    try:
-        deadline = time.monotonic() + float(timeout)
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"Timed out waiting for hidden-states lock: {lock_path}"
-                    ) from None
-                time.sleep(0.1)
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-    try:
-        lock_path.unlink()
-    except OSError:
-        pass
 
 
 class BoundedReplayCache:
@@ -679,6 +648,9 @@ class TargetFeatureReplayer:
         )
         self.vllm_endpoints = _normalize_vllm_endpoints(self.replay_cfg)
         self.vllm_endpoint = self.vllm_endpoints[0]
+        self.vllm_hidden_states_store: HiddenStatesStore = build_hidden_states_store(
+            _config_value(self.replay_cfg, "hidden_states_store", None)
+        )
         self.vllm_model = _config_value(self.replay_cfg, "vllm_model", None)
         self.vllm_timeout = float(
             _config_value(self.replay_cfg, "request_timeout", 120.0) or 120.0
@@ -1130,7 +1102,7 @@ class TargetFeatureReplayer:
         feature_positions = sample.feature_positions.detach().cpu().long()
         feature_end = int(feature_positions[-1].item()) + 1
         prompt_ids = sample.input_ids[:feature_end].detach().cpu().long().tolist()
-        hidden_payload = self._request_vllm_hidden_states(prompt_ids)
+        hidden_payload, reference = self._request_vllm_hidden_states(prompt_ids)
         try:
             feature = self._feature_from_vllm_payload(
                 sample,
@@ -1139,12 +1111,13 @@ class TargetFeatureReplayer:
                 source="token_replay_vllm_file",
             )
         finally:
-            path = hidden_payload.get("_path")
-            if self.vllm_on_generate == "delete" and path:
+            if self.vllm_on_generate == "delete" and reference:
                 try:
-                    Path(os.fspath(path)).unlink(missing_ok=True)
-                except OSError:
-                    logger.warning("Failed to delete vLLM hidden-states file %s", path)
+                    self.vllm_hidden_states_store.release(reference)
+                except Exception:  # noqa: BLE001 - cleanup must not break replay
+                    logger.warning(
+                        "Failed to release vLLM hidden-states reference %s", reference
+                    )
         return feature
 
     def _validate_vllm_positions(self, sample: DraftReplaySample) -> None:
@@ -1346,7 +1319,9 @@ class TargetFeatureReplayer:
             f"{self.vllm_max_retries + 1} attempts: {last_error}"
         ) from last_error
 
-    def _request_vllm_hidden_states(self, prompt_ids: list[int]) -> dict[str, Any]:
+    def _request_vllm_hidden_states(
+        self, prompt_ids: list[int]
+    ) -> tuple[dict[str, Any], str]:
         last_error: Exception | None = None
         started = time.perf_counter()
         request_index = self.vllm_requests + 1
@@ -1376,9 +1351,16 @@ class TargetFeatureReplayer:
                     extra_body={"return_token_ids": True},
                     timeout=self.vllm_timeout,
                 )
-                path = self._extract_hidden_states_path(response, prompt_ids)
-                payload = self._load_vllm_hidden_states(path)
-                payload["_path"] = path
+                path, handle = self._extract_transfer_reference(response, prompt_ids)
+                expected_backend = MOONCAKE_BACKEND if handle else FILE_BACKEND
+                if self.vllm_hidden_states_store.backend != expected_backend:
+                    raise ValueError(
+                        f"vLLM returned a {expected_backend} reference but target "
+                        f"replay uses the {self.vllm_hidden_states_store.backend} "
+                        "hidden-state store"
+                    )
+                reference = handle or path
+                payload = self._load_vllm_hidden_states(reference)
                 with self._metrics_lock:
                     self.vllm_requests += 1
                     self.vllm_request_seconds += time.perf_counter() - started
@@ -1396,16 +1378,17 @@ class TargetFeatureReplayer:
                     )
                     logger.info(
                         "[target replay rank=%s] vLLM request completed request=%s "
-                        "attempt=%s endpoint=%s path=%s hidden_shape=%s elapsed=%.3fs",
+                        "attempt=%s endpoint=%s reference=%s hidden_shape=%s "
+                        "elapsed=%.3fs",
                         self.rank,
                         request_index,
                         attempt + 1,
                         state.url,
-                        path,
+                        reference,
                         hidden_shape,
                         time.perf_counter() - attempt_started,
                     )
-                return payload
+                return payload, reference
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 attempted_endpoints.add(state.index)
@@ -1436,7 +1419,9 @@ class TargetFeatureReplayer:
             f"{self.vllm_max_retries + 1} attempts: {last_error}"
         ) from last_error
 
-    def _extract_hidden_states_path(self, response: Any, prompt_ids: list[int]) -> str:
+    def _extract_transfer_reference(
+        self, response: Any, prompt_ids: list[int]
+    ) -> tuple[str, str | None]:
         choices = getattr(response, "choices", None) or []
         if choices:
             prompt_token_ids = getattr(choices[0], "prompt_token_ids", None)
@@ -1448,22 +1433,16 @@ class TargetFeatureReplayer:
         if kv_transfer_params is None:
             raise ValueError("vLLM response missing kv_transfer_params")
         path = kv_transfer_params.get("hidden_states_path")
-        if not path:
-            raise ValueError("vLLM response missing hidden_states_path")
-        return os.fspath(path)
+        handle = kv_transfer_params.get("handle")
+        if not path and not handle:
+            raise ValueError("vLLM response missing hidden_states_path/handle")
+        if path and handle:
+            raise ValueError("vLLM response has both hidden_states_path and handle")
+        return (os.fspath(path) if path else "", str(handle) if handle else None)
 
-    def _load_vllm_hidden_states(self, path: str) -> dict[str, Any]:
-        try:
-            from safetensors.torch import load_file
-        except ImportError as exc:
-            raise RuntimeError("vLLM hidden-state replay requires safetensors") from exc
-        file_path = Path(path)
-        lock_path = Path(f"{path}.lock")
-        if lock_path.exists():
-            _wait_for_lock(lock_path)
-        if not file_path.exists():
-            raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
-        return dict(load_file(str(file_path), device="cpu"))
+    def _load_vllm_hidden_states(self, reference: str) -> dict[str, Any]:
+        payload, _ = self.vllm_hidden_states_store.load(reference)
+        return payload
 
     def _feature_from_vllm_payload(
         self,

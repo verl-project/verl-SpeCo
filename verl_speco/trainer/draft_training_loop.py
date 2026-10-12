@@ -49,6 +49,12 @@ from verl_speco.trainer.standalone_resume import (
     load_standalone_resume,
     save_standalone_resume,
 )
+from verl_speco.trainer.standalone_tracking import (
+    _build_standalone_tracking,
+    _finish_standalone_tracking,
+    _log_standalone_tracking_metrics,
+    _select_standalone_tracking_metrics,
+)
 from verl_speco.trainer.tq_sample_source import TQFeatureDataLoader, TQLocalBatch
 
 logger = logging.getLogger(__name__)
@@ -71,109 +77,6 @@ def _is_out_of_memory_error(error: BaseException) -> bool:
 
 def _contains_replay_samples(samples: list[Any]) -> bool:
     return any(isinstance(sample, DraftReplaySample) for sample in samples)
-
-
-_CONSOLE_TRACKING_BACKEND = "console"
-
-
-def _cfg_get(cfg: Any, name: str, default: Any = None) -> Any:
-    """Read ``name`` from a mapping, an object, or a None-shaped config section."""
-    if cfg is None:
-        return default
-    if isinstance(cfg, dict):
-        return cfg.get(name, default)
-    return getattr(cfg, name, default)
-
-
-def _standalone_tracking_backends(config: Any) -> list[str]:
-    """Normalized, de-duplicated, non-console ``trainer.logger`` backends."""
-    backends = _cfg_get(_cfg_get(config, "trainer"), "logger")
-    if backends is None:
-        return []
-    if isinstance(backends, str):
-        backends = [backends]
-    unique = dict.fromkeys(
-        backend
-        for backend in (str(backend).strip().lower() for backend in backends)
-        if backend and backend != _CONSOLE_TRACKING_BACKEND
-    )
-    return list(unique)
-
-
-def _build_standalone_tracking(config: Any, *, rank: int) -> list[Any]:
-    """Build one tracker per requested backend on rank 0 (e.g. TensorBoard, W&B).
-
-    The console logger is handled by the training loop itself; console entries
-    are dropped and unsupported ones are logged and ignored. Each backend is
-    initialized independently, so one failing backend (e.g. W&B without
-    credentials) never disables the others.
-    """
-    if rank != 0:
-        return []
-    requested = _standalone_tracking_backends(config)
-    if not requested:
-        return []
-    try:
-        from verl.utils.tracking import Tracking
-    except Exception:
-        logger.exception("[standalone rank=%s] tracking backend is unavailable", rank)
-        return []
-    supported = [
-        backend for backend in requested if backend in Tracking.supported_backend
-    ]
-    unsupported = [
-        backend for backend in requested if backend not in Tracking.supported_backend
-    ]
-    if unsupported:
-        logger.warning(
-            "[standalone rank=%s] ignoring unsupported tracking backends=%s",
-            rank,
-            unsupported,
-        )
-    trainer_cfg = _cfg_get(config, "trainer")
-    project_name = str(_cfg_get(trainer_cfg, "project_name") or "verl_dspark_drafter")
-    experiment_name = str(
-        _cfg_get(trainer_cfg, "experiment_name") or "standalone_draft"
-    )
-    trackers: list[Any] = []
-    for backend in supported:
-        try:
-            trackers.append(
-                Tracking(
-                    project_name=project_name,
-                    experiment_name=experiment_name,
-                    default_backend=[backend],
-                )
-            )
-        except Exception:
-            logger.exception(
-                "[standalone rank=%s] failed to initialize tracking backend=%s",
-                rank,
-                backend,
-            )
-    return trackers
-
-
-def _log_standalone_tracking_metrics(
-    trackers: list[Any], metrics: dict[str, float], *, step: int
-) -> None:
-    for tracking in trackers:
-        try:
-            tracking.log(data=dict(metrics), step=int(step))
-        except Exception:
-            logger.exception(
-                "[standalone] failed to write tracking metrics at step=%s", step
-            )
-
-
-def _finish_standalone_tracking(trackers: list[Any], *, rank: int) -> None:
-    for tracking in trackers:
-        try:
-            tracking.finish()
-        except Exception:
-            logger.exception(
-                "[standalone rank=%s] failed to finalize a tracking backend", rank
-            )
 
 
 def run_standalone_draft_training(config) -> dict[str, Any]:
@@ -265,7 +168,10 @@ async def _run_standalone_draft_training_async(
     feature_producer = None
     current_stage = "activate_training_model"
     try:
-        standalone_trackers = _build_standalone_tracking(config, rank=rank)
+        # Scheduled Ray training delegates tracking to its Driver, which also
+        # receives Producer windows. Subprocess/file training logs locally.
+        if training_events is None:
+            standalone_trackers = _build_standalone_tracking(config, rank=rank)
         stage_started = time.perf_counter()
         logger.info(
             "[standalone rank=%s] activating drafter model algorithm=%s",
@@ -645,9 +551,21 @@ async def _run_standalone_draft_training_async(
             if feature_producer is not None:
                 step_metrics.update(feature_producer.metrics())
             _log_standalone_step_metrics(step_metrics, rank=rank)
-            _log_standalone_tracking_metrics(
-                standalone_trackers, step_metrics, step=optimizer_step
-            )
+            tracking_metrics = _select_standalone_tracking_metrics(step_metrics)
+            if training_events is not None and rank == 0:
+                training_events.put(
+                    {
+                        "kind": "training_metrics",
+                        "step": optimizer_step,
+                        "metrics": tracking_metrics,
+                    }
+                )
+            else:
+                _log_standalone_tracking_metrics(
+                    standalone_trackers,
+                    tracking_metrics,
+                    step=optimizer_step,
+                )
             if save_interval > 0 and optimizer_step % save_interval == 0:
                 _sync_standalone_export_error(trainer, trainer.runtime_device)
                 current_stage = "save_checkpoint"
@@ -1441,7 +1359,7 @@ def _build_training_device_mesh(draft_config, world_size: int) -> DeviceMesh | N
 
 def _block_metric_prefix(trainer: DrafterBaseTrainer) -> str | None:
     model_type = str(getattr(getattr(trainer, "backend", None), "model_type", "") or "")
-    if model_type in {"dflash", "dspark", "eagle3"}:
+    if model_type in {"dflash", "dspark", "eagle3", "dflash2"}:
         return model_type
     return None
 
@@ -1502,7 +1420,7 @@ def _standalone_step_metrics(
     }
     prefix = _block_metric_prefix(trainer)
     if prefix is not None:
-        anchor_offset = 1 if prefix == "dflash" else 0
+        anchor_offset = 1 if prefix in {"dflash", "dflash2"} else 0
         losses = _position_metric_series(raw_metrics, prefix, "loss_per_position")
         accuracies = _position_metric_series(
             raw_metrics, prefix, "accuracy_per_position"
