@@ -3806,18 +3806,24 @@ class DrafterBaseTrainer:
             next_target = int((optimizer_step + 1) * batch_size * hard_ratio + 0.5)
             hard_count = min(batch_size, max(0, next_target - previous_target))
 
-            hard_pool = [item for item in available_data if item.get("_verl_is_hard") is True]
-            normal_pool = [item for item in available_data if item.get("_verl_is_hard") is not True]
+            hard_pool = [
+                item for item in available_data if item.get("_verl_is_hard") is True
+            ]
+            normal_pool = [
+                item for item in available_data if item.get("_verl_is_hard") is not True
+            ]
             if not hard_pool or not normal_pool:
                 return rng.sample(available_data, batch_size)
 
             actual_hard = min(hard_count, len(hard_pool))
             actual_normal = min(batch_size - actual_hard, len(normal_pool))
-            selected = rng.sample(hard_pool, actual_hard)
+            selected: list[dict[str, Any]] = rng.sample(hard_pool, actual_hard)
             selected.extend(rng.sample(normal_pool, actual_normal))
             if len(selected) < batch_size:
                 selected_ids = {id(item) for item in selected}
-                remainder = [item for item in available_data if id(item) not in selected_ids]
+                remainder = [
+                    item for item in available_data if id(item) not in selected_ids
+                ]
                 selected.extend(rng.sample(remainder, batch_size - len(selected)))
             rng.shuffle(selected)
             return selected
@@ -3829,7 +3835,7 @@ class DrafterBaseTrainer:
             if score is not None:
                 scored.append((score, rng.random(), item))
 
-        selected: list[dict[str, Any]] = []
+        selected = []
         if hard_count > 0 and scored:
             scored.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
             hard_pool_size = min(len(scored), max(hard_count, hard_count * 4))

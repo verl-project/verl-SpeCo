@@ -3053,8 +3053,8 @@ class _SpecoVLLMHttpServerMixin:
                 extra_fields.setdefault("_verl_request_mean_accept_len", None)
                 self._speco_add_vllm_spec_decode_extra_fields(extra_fields)
                 self._speco_add_vllm_request_accept_extra_fields(output, extra_fields)
-                summaries, completion_order = _pop_vllm_request_stats_for_rollout_output(
-                    request_id
+                summaries, completion_order = (
+                    _pop_vllm_request_stats_for_rollout_output(request_id)
                 )
                 if summaries:
                     proxy_output = SimpleNamespace(

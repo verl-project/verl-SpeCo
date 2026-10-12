@@ -2821,20 +2821,35 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             for batch_idx in range(batch_size)
         ]
 
-        hard_sample_ratio = float(training_cfg.get("dspark_hard_sample_ratio", 0.0) or 0.0)
-        hard_candidate_ratio = float(training_cfg.get("dspark_hard_candidate_ratio", 0.0) or 0.0)
+        hard_sample_ratio = float(
+            training_cfg.get("dspark_hard_sample_ratio", 0.0) or 0.0
+        )
+        hard_candidate_ratio = float(
+            training_cfg.get("dspark_hard_candidate_ratio", 0.0) or 0.0
+        )
         hard_enabled = hard_sample_ratio > 0.0 and hard_candidate_ratio > 0.0
         # The transport now retains every DP shard. The window is a logical
         # collection budget, never a physical prefix of the actor batch.
         usable_window_size = batch_size
         capacity_per_owner = max_per_owner
         if max_tokens_per_owner is not None:
-            capacity_per_owner = min(capacity_per_owner, max_tokens_per_owner // hidden_rows)
-        algorithm = str(
-            _get_nested(self._speco_drafter_config(), ("speculative_algorithm",), "") or ""
-        ).strip().upper()
+            capacity_per_owner = min(
+                capacity_per_owner, max_tokens_per_owner // hidden_rows
+            )
+        algorithm = (
+            str(
+                _get_nested(
+                    self._speco_drafter_config(), ("speculative_algorithm",), ""
+                )
+                or ""
+            )
+            .strip()
+            .upper()
+        )
         if algorithm == "DSPARK" or hard_enabled:
-            collection_limit = int(training_cfg.get("dspark_collect_samples_per_step", 80))
+            collection_limit = int(
+                training_cfg.get("dspark_collect_samples_per_step", 80)
+            )
             if collection_limit <= 0:
                 raise ValueError("dspark_collect_samples_per_step must be positive")
         else:
@@ -2845,7 +2860,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ):
             if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
                 raise ValueError(f"Invalid hard {name} ratio: {ratio}")
-        shortage_policy = training_cfg.get("dspark_hard_shortfall_policy", "fill_normal")
+        shortage_policy = training_cfg.get(
+            "dspark_hard_shortfall_policy", "fill_normal"
+        )
         if shortage_policy not in ("fill_normal", "strict"):
             raise ValueError(f"Invalid hard shortfall policy: {shortage_policy}")
 
@@ -2952,7 +2969,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         break
             return added
 
-        total_capacity = min(collection_limit, len(candidates), capacity_per_owner * owner_count)
+        total_capacity = min(
+            collection_limit, len(candidates), capacity_per_owner * owner_count
+        )
         hard_added = 0
         target_hard = 0
         labeled_hard_count = 0
@@ -2969,12 +2988,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 is_hard[candidate["batch_idx"]] = True
             hard_pool = sorted(hard_candidates, key=lambda row: row["hash"])
             normal_pool = sorted(
-                (
-                    row
-                    for row in candidates
-                    if not bool(is_hard[row["batch_idx"]])
+                (row for row in candidates if not bool(is_hard[row["batch_idx"]])),
+                key=lambda row: self._speco_hash_fraction(
+                    f"{row['sample_key']}:normal"
                 ),
-                key=lambda row: self._speco_hash_fraction(f"{row['sample_key']}:normal"),
             )
             target_hard = round(total_capacity * hard_sample_ratio)
             actual_hard = min(target_hard, len(hard_pool))
@@ -2989,14 +3006,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             # If normals are also exhausted, retain a smaller UNIQUE set and
             # report the shortfall; do not silently exceed the hard quota.
             first_owner = int(self.global_steps) % owner_count
-            hard_added = add_round_robin(hard_pool[:actual_hard], start_owner=first_owner)
+            hard_added = add_round_robin(
+                hard_pool[:actual_hard], start_owner=first_owner
+            )
             normal_added = add_round_robin(
-                normal_pool[:normal_quota], start_owner=(first_owner + hard_added) % owner_count
+                normal_pool[:normal_quota],
+                start_owner=(first_owner + hard_added) % owner_count,
             )
 
         selected_indices = collect_mask.nonzero(as_tuple=False).flatten().tolist()
-        hard_counts = [int((collect_mask & is_hard & (owner_rank == owner)).sum()) for owner in range(owner_count)]
-        normal_counts = [owner_counts[owner] - hard_counts[owner] for owner in range(owner_count)]
+        hard_counts = [
+            int((collect_mask & is_hard & (owner_rank == owner)).sum())
+            for owner in range(owner_count)
+        ]
+        normal_counts = [
+            owner_counts[owner] - hard_counts[owner] for owner in range(owner_count)
+        ]
         selection_metrics = {
             "eligible_rows": len(candidates),
             "scored_rows": len(scored_candidates),
@@ -3017,7 +3042,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             selection_metrics[f"hard_count_owner_{owner}"] = hard_counts[owner]
             selection_metrics[f"normal_count_owner_{owner}"] = normal_counts[owner]
         self._speco_last_hard_selection_metrics = {
-            f"drafter/selection/{key}": value for key, value in selection_metrics.items()
+            f"drafter/selection/{key}": value
+            for key, value in selection_metrics.items()
         }
         selection_hash = hashlib.sha256(
             ",".join(map(str, selected_indices)).encode()
@@ -3125,22 +3151,25 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             whole_metas = self._speco_flatten_non_tensor_rows(
                 tu.get(output, OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY)
             )
-            if (
-                not isinstance(whole_metas, (list, tuple))
-                or len(whole_metas) != len(whole_refs)
+            if not isinstance(whole_metas, (list, tuple)) or len(whole_metas) != len(
+                whole_refs
             ):
-                raise RuntimeError("SPECO whole hidden refs and metadata are not row-aligned")
+                raise RuntimeError(
+                    "SPECO whole hidden refs and metadata are not row-aligned"
+                )
             unique_refs = list(
                 dict.fromkeys(ref for ref in whole_refs if ref is not None)
             )
             states_by_ref = dict(zip(unique_refs, ray.get(unique_refs), strict=True))
-            hidden_rows = []
+            hidden_rows: list[torch.Tensor | None] = []
             for ref, meta in zip(whole_refs, whole_metas, strict=True):
                 if ref is None:
                     hidden_rows.append(None)
                     continue
                 if not isinstance(meta, dict) or "row_index" not in meta:
-                    raise RuntimeError("SPECO whole hidden metadata is missing a row index")
+                    raise RuntimeError(
+                        "SPECO whole hidden metadata is missing a row index"
+                    )
                 row_index = int(meta["row_index"])
                 hidden = states_by_ref[ref]
                 if (
@@ -3319,10 +3348,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if isinstance(ref_meta, dict):
                 source_index = ref_meta.get("source_batch_index")
                 if source_index is not None and int(source_index) != batch_idx:
-                    raise RuntimeError(f"SPECO hidden row mismatch: {source_index} != {batch_idx}")
-                if ref_meta.get("owner") is not None and int(ref_meta["owner"]) != int(owner_rank[batch_idx]):
+                    raise RuntimeError(
+                        f"SPECO hidden row mismatch: {source_index} != {batch_idx}"
+                    )
+                if ref_meta.get("owner") is not None and int(ref_meta["owner"]) != int(
+                    owner_rank[batch_idx]
+                ):
                     raise RuntimeError("SPECO hidden owner mismatch")
-                if not ref_chunks and hidden_ref is not None and "chunk_start" in ref_meta:
+                if (
+                    not ref_chunks
+                    and hidden_ref is not None
+                    and "chunk_start" in ref_meta
+                ):
                     ref_chunks = [{"ref": hidden_ref, **ref_meta}]
             hidden = hidden_rows[batch_idx] if batch_idx < len(hidden_rows) else None
             if ref_chunks:
@@ -3412,9 +3449,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 ):
                     elapsed_sec = request_elapsed_secs[batch_idx]
                     if elapsed_sec is not None:
-                        sample[_SPECO_VLLM_REQUEST_ELAPSED_SEC_KEY] = float(
-                            elapsed_sec
-                        )
+                        sample[_SPECO_VLLM_REQUEST_ELAPSED_SEC_KEY] = float(elapsed_sec)
             if ref_chunks:
                 sample["hidden_states_ref_chunks"] = ref_chunks
             elif hidden_ref is None:
@@ -3441,10 +3476,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         if not hasattr(self, "_speco_last_hard_selection_metrics"):
             self._speco_last_hard_selection_metrics = {}
-        self._speco_last_hard_selection_metrics.update({
-            "drafter/selection/payload_total": collected,
-            "drafter/selection/payload_missing": missing_hidden_samples,
-        })
+        self._speco_last_hard_selection_metrics.update(
+            {
+                "drafter/selection/payload_total": collected,
+                "drafter/selection/payload_missing": missing_hidden_samples,
+            }
+        )
         if missing_hidden_samples:
             raise RuntimeError(
                 f"SPECO hidden payload incomplete: planned={planned_samples} collected={collected}"
@@ -4163,7 +4200,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         gen_batch_output, source="rollout"
                     )
                 except RuntimeError as exc:
-                    logger.warning("[speco request accept len] skipped rollout diagnostics: %s", exc)
+                    logger.warning(
+                        "[speco request accept len] skipped rollout diagnostics: %s",
+                        exc,
+                    )
                 # Active freeze stops hidden-state collection here and in the
                 # scheduler plan; shadow mode keeps collecting. Accept-length
                 # evidence above is ungated and keeps feeding drift detection.
@@ -4249,7 +4289,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             tu.assign_non_tensor(
                 batch_td, calculate_entropy=calculate_entropy, compute_loss=False
             )
-            batch_td[OLD_LOGPROB_SOURCE_BATCH_INDICES_KEY] = torch.arange(len(batch), dtype=torch.long)
+            batch_td[OLD_LOGPROB_SOURCE_BATCH_INDICES_KEY] = torch.arange(
+                len(batch), dtype=torch.long
+            )
             batch_td[OLD_LOGPROB_COLLECT_MASK_KEY] = collect_plan["collect_mask"]
             batch_td[OLD_LOGPROB_HIDDEN_POSITIONS_KEY] = collect_plan[
                 "hidden_positions"
