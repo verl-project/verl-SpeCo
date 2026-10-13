@@ -31,7 +31,7 @@ import statistics
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -273,6 +273,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     feature_contract = FeatureContract(
         algorithm=algorithm,
         target_layer_ids=target_layer_ids,
+        vllm_aux_hidden_state_layer_ids=target_layer_ids,
         hidden_states_layout=layout,
         dtype=_dtype(args.hidden_dtype),
         target_model_id=args.target_model_path,
@@ -298,6 +299,14 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             dtype=feature_contract.dtype,
             trust_remote_code=args.trust_remote_code,
         )
+        target_num_hidden_layers = getattr(
+            real_norm, "_speco_target_num_hidden_layers", None
+        )
+        if target_num_hidden_layers is not None:
+            feature_contract = replace(
+                feature_contract,
+                target_num_hidden_layers=int(target_num_hidden_layers),
+            )
         await timings.add(final_norm_load=time.perf_counter() - norm_begin)
     identity_norm = nn.Identity()
 
@@ -490,6 +499,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             "algorithm": algorithm,
             "hidden_states_layout": layout,
             "target_layer_ids": target_layer_ids,
+            "vllm_aux_hidden_state_layer_ids": target_layer_ids,
             "norm_mode": args.norm_mode,
             "max_samples": args.max_samples,
             "max_inflight_requests": args.max_inflight_requests,

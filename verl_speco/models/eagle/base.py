@@ -64,6 +64,51 @@ def load_checkpoint(model_path: str, key: str) -> torch.Tensor:
         return state_dict[key]
 
 
+_EMBEDDING_KEY_CANDIDATES = (
+    "model.language_model.embed_tokens.weight",
+    "language_model.model.embed_tokens.weight",
+    "model.text_model.embed_tokens.weight",
+    "model.embed_tokens.weight",
+)
+
+
+def resolve_embedding_key(
+    model_path: str, preferred: str = "model.embed_tokens.weight"
+) -> str:
+    """Return the embedding weight key that exists in ``model_path``.
+
+    Multimodal / MoE targets (e.g. Qwen3.5/3.6 MoE) nest the text embedding
+    under ``model.language_model`` instead of ``model.embed_tokens``. Fall back
+    to a unique ``*.embed_tokens.weight`` entry so the drafter can initialize
+    its frozen embedding from these checkpoints.
+    """
+    if not os.path.exists(model_path):
+        model_path = snapshot_download(repo_id=model_path)
+
+    keys: list[str] = []
+    index_paths = glob.glob(os.path.join(model_path, "*.index.json"))
+    if len(index_paths) == 1:
+        with open(index_paths[0], "r") as handle:
+            keys = list(json.load(handle).get("weight_map", {}).keys())
+    else:
+        safetensors_path = os.path.join(model_path, "model.safetensors")
+        if os.path.exists(safetensors_path):
+            with safe_open(safetensors_path, framework="pt") as handle:
+                keys = list(handle.keys())
+
+    if not keys:
+        return preferred
+    if preferred in keys:
+        return preferred
+    for candidate in _EMBEDDING_KEY_CANDIDATES:
+        if candidate in keys:
+            return candidate
+    matches = [key for key in keys if key.endswith(".embed_tokens.weight")]
+    if len(matches) == 1:
+        return matches[0]
+    return preferred
+
+
 class DraftModel(PreTrainedModel):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -122,6 +167,7 @@ class DraftModel(PreTrainedModel):
             model_path (str): Path to the target model. Can be either a Hugging Face
             repository ID or a local directory path containing the model files.
         """
+        embedding_key = resolve_embedding_key(model_path, embedding_key)
         emb_tokens = load_checkpoint(model_path, embedding_key)
         self.embed_tokens.weight.copy_(emb_tokens)
 

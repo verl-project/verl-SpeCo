@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
@@ -123,3 +125,83 @@ class DrafterRuntimeState:
             raise RuntimeError(
                 f"Expected drafter runtime {expected.name}, got {self.status.name}"
             )
+
+
+@dataclass
+class PendingStandalonePlan:
+    """Metadata and execution state of one dispatched standalone global batch."""
+
+    plan_id: int
+    keys: tuple[str, ...]
+    runtime: DrafterRuntimeState
+
+
+class StandaloneQueueState:
+    """Confirmed keys, reservations and FIFO plans; contains no transport calls."""
+
+    def __init__(self, capacity: int, batch_size: int):
+        if capacity < 1 or batch_size < 1:
+            raise ValueError("Standalone plan capacity and batch size must be positive")
+        self.capacity = capacity
+        self.batch_size = batch_size
+        self.ready: deque[Any] = deque()
+        self.pending: deque[PendingStandalonePlan] = deque()
+        self.reserved: set[str] = set()
+        self.next_id = 0
+        self.completed_id = -1
+        self.last_completed_keys: tuple[str, ...] = ()
+
+    @property
+    def has_capacity(self) -> bool:
+        return len(self.pending) < self.capacity
+
+    def refresh(self, entries: Sequence[Any]) -> None:
+        # Successful clear removes completed keys before refresh. The snapshot
+        # replaces this cache, never accumulates duplicate entries across lists.
+        unique = {
+            entry.key: entry for entry in entries if entry.key not in self.reserved
+        }
+        self.ready = deque(
+            sorted(
+                unique.values(),
+                key=lambda entry: (int(entry.tag["sequence_no"]), entry.key),
+            )
+        )
+
+    def reserve(self) -> tuple[PendingStandalonePlan, list[Any]]:
+        if not self.has_capacity or len(self.ready) < self.batch_size:
+            raise RuntimeError(
+                "Cannot reserve an incomplete batch or exceed plan capacity"
+            )
+        entries = [self.ready.popleft() for _ in range(self.batch_size)]
+        keys = tuple(entry.key for entry in entries)
+        pending = PendingStandalonePlan(self.next_id, keys, DrafterRuntimeState())
+        self.next_id += 1
+        self.pending.append(pending)
+        self.reserved.update(keys)
+        return pending, entries
+
+    def completion(
+        self, plan_id: int | None, keys: Sequence[str]
+    ) -> PendingStandalonePlan | None:
+        actual = tuple(keys)
+        if plan_id is not None and plan_id <= self.completed_id:
+            if plan_id == self.completed_id and actual != self.last_completed_keys:
+                raise RuntimeError("Conflicting duplicate TQ completion keys")
+            return None
+        if not self.pending:
+            raise RuntimeError("TQ completion without an outstanding plan")
+        pending = self.pending[0]
+        if (
+            plan_id is not None and plan_id != pending.plan_id
+        ) or actual != pending.keys:
+            raise RuntimeError("TQ completion does not match the FIFO plan")
+        return pending
+
+    def release(self, pending: PendingStandalonePlan) -> None:
+        if not self.pending or self.pending[0] is not pending:
+            raise RuntimeError("TQ plans must complete in FIFO order")
+        self.pending.popleft()
+        self.reserved.difference_update(pending.keys)
+        self.completed_id = pending.plan_id
+        self.last_completed_keys = pending.keys

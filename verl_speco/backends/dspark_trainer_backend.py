@@ -25,11 +25,13 @@ from verl_speco.backends.dflash_trainer_backend import (
     DFlashTrainerBackend,
     DFlashTrainingModel,
     _block_acceptance_counts,
-    _create_dflash_dense_attention_mask,
-    _create_dflash_mask_mod,
+    _check_block_drafter_rows,
+    _resolve_sliding_windows,
+    _sliding_window_config,
+    build_dflash_attention_masks,
+    _document_boundary_validity,
 )
 from verl_speco.models.dflash import resolve_rope_theta
-from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
 from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
 from verl_speco.ops.dspark_fused_loss import (
     fused_label_cross_entropy,
@@ -41,6 +43,10 @@ from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+_CE_TARGET_SOURCE_LABELS = "labels"
+_CE_TARGET_SOURCE_TARGET_ARGMAX = "target_argmax"
+_CE_TARGET_SOURCES = {_CE_TARGET_SOURCE_LABELS, _CE_TARGET_SOURCE_TARGET_ARGMAX}
 
 
 class DSparkTrainingModel(DFlashTrainingModel):
@@ -55,6 +61,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
     - every supervised position, including position 0, contributes to CE.
     """
 
+    draft_model: DSparkDraftModel
+
     def __init__(
         self,
         draft_model: DSparkDraftModel,
@@ -68,6 +76,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         confidence_head_alpha: float = 0.0,
         l1_chunk_size: int = 0,
         distribution_loss_impl: str = "auto",
+        ce_target_source: str = _CE_TARGET_SOURCE_LABELS,
         debug_log: bool = False,
         debug_log_first_n: int = 2,
         debug_log_interval: int = 100,
@@ -90,6 +99,14 @@ class DSparkTrainingModel(DFlashTrainingModel):
         if self.distribution_loss_impl not in {"auto", "fused", "eager"}:
             raise ValueError(
                 "distribution_loss_impl must be one of: auto, fused, eager"
+            )
+        self.ce_target_source = str(
+            ce_target_source or _CE_TARGET_SOURCE_LABELS
+        ).lower()
+        if self.ce_target_source not in _CE_TARGET_SOURCES:
+            raise ValueError(
+                "ce_target_source must be one of: "
+                f"{', '.join(sorted(_CE_TARGET_SOURCES))}"
             )
         self._logged_distribution_loss_backend: Optional[str] = None
         self._distribution_loss_by_device: dict[str, bool] = {}
@@ -133,7 +150,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
         return use_fused
 
     def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
+        self,
+        seq_len: int,
+        loss_mask: torch.Tensor,
+        device: torch.device,
+        document_ids: Optional[torch.Tensor] = None,
     ):
         bsz = loss_mask.shape[0]
         num_candidates = max(seq_len - 1, 0)
@@ -149,12 +170,23 @@ class DSparkTrainingModel(DFlashTrainingModel):
         valid = (loss_mask[:, :num_candidates] > 0.5) & (
             loss_mask[:, 1 : num_candidates + 1] > 0.5
         )
-        valid_counts = valid.sum(dim=1)
         indices = (
             self._cached_arange("dspark_anchor_indices", num_candidates, device)
             .unsqueeze(0)
             .expand(bsz, -1)
         )
+        if document_ids is not None:
+            # Keep the whole anchor window inside one document so a block never
+            # spans a packing boundary.
+            valid = _document_boundary_validity(
+                valid,
+                indices=indices,
+                document_ids=document_ids,
+                block_size=self.block_size,
+                seq_len=seq_len,
+                label_shift=1,
+            )
+        valid_counts = valid.sum(dim=1)
         masked_indices = torch.where(valid, indices, seq_len + 1)
         random_vals = torch.rand(bsz, num_candidates, device=device)
         random_vals = torch.where(valid, random_vals, 2.0)
@@ -312,6 +344,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_weights: torch.Tensor,
         lm_head_weight: torch.Tensor,
         active_draft_log_probs: Optional[torch.Tensor] = None,
+        active_target_logits: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if active_hidden.numel() == 0:
             zero = active_weights.new_zeros(())
@@ -328,6 +361,13 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     f"{expected_shape}, got {tuple(active_draft_log_probs.shape)}"
                 )
         chunk_size = self.l1_chunk_size if self.l1_chunk_size > 0 else active_count
+        if active_target_logits is not None:
+            expected_shape = (active_count, int(lm_head_weight.size(0)))
+            if tuple(active_target_logits.shape) != expected_shape:
+                raise ValueError(
+                    "DSpark precomputed target logits must have shape "
+                    f"{expected_shape}, got {tuple(active_target_logits.shape)}"
+                )
         for start in range(0, active_count, chunk_size):
             end = min(start + chunk_size, active_count)
             hidden_chunk = active_hidden[start:end]
@@ -347,7 +387,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 draft_probs = torch.softmax(draft_logits.float(), dim=-1)
             else:
                 draft_probs = active_draft_log_probs[start:end].exp()
-            target_logits = F.linear(target_hidden_chunk, lm_head_weight)
+            target_logits = (
+                active_target_logits[start:end]
+                if active_target_logits is not None
+                else F.linear(target_hidden_chunk, lm_head_weight)
+            )
             target_probs = torch.softmax(target_logits.float(), dim=-1)
             l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
             l1_sum = l1_sum + (l1_dist * weights_chunk).sum()
@@ -362,6 +406,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_weights: torch.Tensor,
         lm_head_weight: torch.Tensor,
         active_draft_logits: Optional[torch.Tensor] = None,
+        active_target_logits: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if active_hidden.numel() == 0:
             zero = active_weights.new_zeros((), dtype=torch.float32)
@@ -373,6 +418,13 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 raise ValueError(
                     "DSpark precomputed draft logits must have shape "
                     f"{expected_shape}, got {tuple(active_draft_logits.shape)}"
+                )
+        if active_target_logits is not None:
+            expected_shape = (active_count, int(lm_head_weight.size(0)))
+            if tuple(active_target_logits.shape) != expected_shape:
+                raise ValueError(
+                    "DSpark precomputed target logits must have shape "
+                    f"{expected_shape}, got {tuple(active_target_logits.shape)}"
                 )
 
         l1_sum = active_weights.new_zeros((), dtype=torch.float32)
@@ -394,8 +446,10 @@ class DSparkTrainingModel(DFlashTrainingModel):
             else:
                 draft_logits = active_draft_logits[start:end]
             with torch.no_grad():
-                target_logits = F.linear(
-                    active_target_hidden[start:end], lm_head_weight
+                target_logits = (
+                    active_target_logits[start:end]
+                    if active_target_logits is not None
+                    else F.linear(active_target_hidden[start:end], lm_head_weight)
                 )
             l1_per_token = 2.0 * fused_total_variation(draft_logits, target_logits)
             weights_chunk = active_weights[start:end].float()
@@ -467,15 +521,26 @@ class DSparkTrainingModel(DFlashTrainingModel):
         hidden_states_list: list[torch.Tensor],
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
+        document_ids: Optional[torch.Tensor] = None,
+        label_ids: Optional[torch.Tensor] = None,
+        label_mask: Optional[torch.Tensor] = None,
         target_last_hidden_states: Optional[torch.Tensor] = None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         self._debug_forward_count += 1
+        if label_ids is None:
+            label_ids = input_ids
+        if label_mask is None:
+            label_mask = loss_mask
+        label_len = label_ids.shape[1]
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
+            label_len, label_mask, device, document_ids=document_ids
         )
+        # Anchors must point at a real context row (the hidden states may be one
+        # row shorter than the label sequence when a trailing label token exists).
+        block_keep_mask = block_keep_mask & (anchor_positions < seq_len)
         n_blocks = anchor_positions.shape[1]
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
@@ -483,28 +548,15 @@ class DSparkTrainingModel(DFlashTrainingModel):
         context_position_ids, draft_position_ids = self._create_position_ids(
             anchor_positions, seq_len
         )
-        draft_len = n_blocks * self.block_size
-
-        block_mask = None
-        dense_attention_mask = None
-        if device.type == "cuda":
-            block_mask = compile_friendly_create_block_mask(
-                mask_mod=_create_dflash_mask_mod(
-                    anchor_positions, block_keep_mask, seq_len, self.block_size
-                ),
-                B=bsz,
-                H=None,
-                Q_LEN=draft_len,
-                KV_LEN=seq_len + draft_len,
-                device=device,
-            )
-        else:
-            dense_attention_mask = _create_dflash_dense_attention_mask(
-                anchor_positions,
-                block_keep_mask,
-                seq_len,
-                self.block_size,
-            )
+        block_mask, dense_attention_mask = build_dflash_attention_masks(
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            ctx_len=seq_len,
+            block_size=self.block_size,
+            device=device,
+            windows=_resolve_sliding_windows(self.draft_model.config),
+            document_ids=document_ids,
+        )
 
         draft_hidden = self.draft_model(
             draft_input_ids=None,
@@ -518,8 +570,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
 
         target_ids, prev_token_ids, eval_mask, label_indices = (
             self._build_label_tensors(
-                input_ids=input_ids,
-                loss_mask=loss_mask,
+                input_ids=label_ids,
+                loss_mask=label_mask,
                 anchor_positions=anchor_positions,
                 block_keep_mask=block_keep_mask,
             )
@@ -569,9 +621,31 @@ class DSparkTrainingModel(DFlashTrainingModel):
         if active_targets.numel() == 0:
             loss = flat_weights.sum() * 0.0
         else:
+            ce_targets = active_targets
+            active_target_logits = None
+            if self.ce_target_source == _CE_TARGET_SOURCE_TARGET_ARGMAX:
+                if self.loss_mode != "full_vocab":
+                    raise ValueError(
+                        "DSpark target_argmax CE currently requires "
+                        "dspark_loss_mode='full_vocab'"
+                    )
+                if self.l1_chunk_size > 0:
+                    raise ValueError(
+                        "DSpark target_argmax CE currently requires "
+                        "dspark_l1_chunk_size=0"
+                    )
+                if active_target_hidden is None:
+                    raise ValueError(
+                        "DSpark target_argmax CE requires target_last_hidden_states"
+                    )
+                with torch.no_grad():
+                    active_target_logits = F.linear(
+                        active_target_hidden, lm_head_weight
+                    )
+                    ce_targets = active_target_logits.argmax(dim=-1)
             if self.loss_mode in {"restricted_ce", "sampled_ce"}:
                 restricted_vocab = self._build_restricted_vocab(
-                    input_ids, active_targets, int(lm_head_weight.shape[0])
+                    input_ids, ce_targets, int(lm_head_weight.shape[0])
                 )
                 restricted_weight = lm_head_weight.index_select(0, restricted_vocab)
                 active_logits = F.linear(active_hidden, restricted_weight)
@@ -582,7 +656,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 )
                 if markov_bias is not None:
                     active_logits = active_logits + markov_bias
-                active_ce_targets = torch.searchsorted(restricted_vocab, active_targets)
+                active_ce_targets = torch.searchsorted(restricted_vocab, ce_targets)
                 active_loss = (
                     fused_label_cross_entropy(active_logits, active_ce_targets)
                     if use_fused_loss
@@ -600,13 +674,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 if markov_bias is not None:
                     active_logits = active_logits + markov_bias
                 if use_fused_loss:
-                    active_loss = fused_label_cross_entropy(
-                        active_logits, active_targets
-                    )
+                    active_loss = fused_label_cross_entropy(active_logits, ce_targets)
                 else:
                     active_log_probs = F.log_softmax(active_logits.float(), dim=-1)
                     active_loss = F.nll_loss(
-                        active_log_probs, active_targets, reduction="none"
+                        active_log_probs, ce_targets, reduction="none"
                     )
 
             finite_loss = torch.isfinite(active_loss)
@@ -662,6 +734,15 @@ class DSparkTrainingModel(DFlashTrainingModel):
                                 active_weights=l1_weights,
                                 lm_head_weight=lm_head_weight,
                                 active_draft_logits=reusable_draft_logits,
+                                active_target_logits=(
+                                    active_target_logits
+                                    if all_l1_rows
+                                    else (
+                                        active_target_logits[l1_mask]
+                                        if active_target_logits is not None
+                                        else None
+                                    )
+                                ),
                             )
                         )
                     else:
@@ -683,6 +764,15 @@ class DSparkTrainingModel(DFlashTrainingModel):
                             active_weights=l1_weights,
                             lm_head_weight=lm_head_weight,
                             active_draft_log_probs=reusable_draft_log_probs,
+                            active_target_logits=(
+                                active_target_logits
+                                if all_l1_rows
+                                else (
+                                    active_target_logits[l1_mask]
+                                    if active_target_logits is not None
+                                    else None
+                                )
+                            ),
                         )
                 l1_loss = local_l1_sum / local_l1_den.clamp(min=1e-6)
             else:
@@ -902,19 +992,29 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             target_layer_ids = build_target_layer_ids(
                 num_context_layers, target_num_hidden_layers
             )
+        intermediate_size_cfg = self._training_value(
+            training_cfg, "dspark_intermediate_size", "dflash_intermediate_size", None
+        )
+        intermediate_size = int(
+            intermediate_size_cfg
+            if intermediate_size_cfg is not None
+            else getattr(target_text_config, "intermediate_size", hidden_size * 4)
+        )
+        num_hidden_layers = int(
+            self._training_value(
+                training_cfg,
+                "dspark_num_hidden_layers",
+                "dflash_num_hidden_layers",
+                1,
+            )
+        )
+        sliding_window = self._training_value(
+            training_cfg, "dspark_sliding_window", "dflash_sliding_window", None
+        )
         return DSparkConfig(
             hidden_size=hidden_size,
-            intermediate_size=int(
-                getattr(target_text_config, "intermediate_size", hidden_size * 4)
-            ),
-            num_hidden_layers=int(
-                self._training_value(
-                    training_cfg,
-                    "dspark_num_hidden_layers",
-                    "dflash_num_hidden_layers",
-                    1,
-                )
-            ),
+            intermediate_size=intermediate_size,
+            num_hidden_layers=num_hidden_layers,
             num_attention_heads=int(getattr(target_text_config, "num_attention_heads")),
             num_key_value_heads=int(
                 getattr(
@@ -950,6 +1050,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             ),
             ce_loss_alpha=float(training_cfg.get("dspark_ce_loss_alpha", 0.1)),
             l1_loss_alpha=float(training_cfg.get("dspark_l1_loss_alpha", 0.9)),
+            **_sliding_window_config(sliding_window, num_hidden_layers),
         )
 
     def build_model(self):
@@ -1038,6 +1139,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             distribution_loss_impl=str(
                 training_cfg.get("dspark_distribution_loss_impl", "auto")
             ),
+            ce_target_source=str(training_cfg.get("ce_target_source", "labels")),
             debug_log=bool(training_cfg.get("dspark_debug_log", False)),
             debug_log_first_n=int(training_cfg.get("dspark_debug_log_first_n", 2)),
             debug_log_interval=int(training_cfg.get("dspark_debug_log_interval", 100)),
@@ -1045,9 +1147,16 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
 
     def preprocess_individual_items(self, items, device, model_config):
         res = {"ids": [], "h_states": [], "masks": [], "target_last_h_states": []}
-        max_window = int(
-            self.config.rollout.drafter.training.get("dspark_max_window", 512)
+        raw_max_window = self.config.rollout.drafter.training.get("dspark_max_window")
+        max_window = (
+            None
+            if raw_max_window is None or str(raw_max_window).strip() == ""
+            else int(raw_max_window)
         )
+        if max_window is not None and max_window < 0:
+            raise ValueError("dspark_max_window must be non-negative")
+        if max_window == 0:
+            max_window = None
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
         h_dim = int(
             getattr(model_config, "target_hidden_size", model_config.hidden_size)
@@ -1111,29 +1220,35 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 item_loss_mask[:] = 1.0
 
-            if not (ids.size(0) == full_h.size(0) == item_loss_mask.size(0)):
-                raise ValueError(
-                    "DSpark input/hidden/mask row mismatch: "
-                    f"input_rows={ids.size(0)}, hidden_rows={full_h.size(0)}, "
-                    f"mask_rows={item_loss_mask.size(0)}"
-                )
-            nonzero = torch.nonzero(item_loss_mask)
-            if nonzero.numel() > 0:
-                r_start = nonzero[0, 0]
-                start = torch.clamp(
-                    r_start - (max_window // 2),
-                    min=0,
-                    max=max(0, ids.size(0) - max_window),
-                ).item()
-                end = min(start + max_window, ids.size(0))
+            _check_block_drafter_rows(
+                int(ids.size(0)),
+                int(full_h.size(0)),
+                int(item_loss_mask.size(0)),
+                "DSpark",
+            )
+            if max_window is None:
+                start, end = 0, ids.size(0)
             else:
-                start, end = max(0, ids.size(0) - max_window), ids.size(0)
+                nonzero = torch.nonzero(item_loss_mask)
+                if nonzero.numel() > 0:
+                    r_start = nonzero[0, 0]
+                    start = torch.clamp(
+                        r_start - (max_window // 2),
+                        min=0,
+                        max=max(0, ids.size(0) - max_window),
+                    ).item()
+                    end = min(start + max_window, ids.size(0))
+                else:
+                    start, end = max(0, ids.size(0) - max_window), ids.size(0)
 
+            # ``ids`` / ``item_loss_mask`` carry the (optional) trailing label
+            # token; the hidden context is one row shorter when it is present.
+            hidden_end = max(start, min(end, int(full_h.size(0))))
             res["ids"].append(ids[start:end])
-            res["h_states"].append(full_h[start:end, :expected_hidden_dim])
+            res["h_states"].append(full_h[start:hidden_end, :expected_hidden_dim])
             res["masks"].append(item_loss_mask[start:end])
             if target_last_h is not None:
-                res["target_last_h_states"].append(target_last_h[start:end])
+                res["target_last_h_states"].append(target_last_h[start:hidden_end])
             else:
                 res["target_last_h_states"].append(None)
         return res
@@ -1158,6 +1273,9 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             loss_mask=batch["loss_mask"],
             lm_head_weight=self.target_lm_head.fc.weight,
             target_last_hidden_states=batch.get("target_last_hidden_states"),
+            document_ids=batch.get("document_ids"),
+            label_ids=batch.get("label_ids"),
+            label_mask=batch.get("label_mask"),
         )
         local_num_tokens = diagnostics.get("ce_weighted_token_count")
         if not torch.is_tensor(local_num_tokens):
