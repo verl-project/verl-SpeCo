@@ -206,15 +206,17 @@ one run.
 runner, container, verl release, Qwen3-8B snapshot, pretrained DSpark snapshot,
 and DAPO-Math-17k prompt Parquet as the NPU vLLM cotrain workflow. Inputs override
 the shared `SPECO_TARGET_MODEL`, `SPECO_DSPARK_DRAFT_MODEL`, and `SPECO_TRAIN_FILE`
-repository/environment variables. Defaults are five optimizer steps and batch
-size two per training device (global batch four, no gradient accumulation).
+repository/environment variables. Defaults are two optimizer steps and batch
+size one per training device (global batch two, no gradient accumulation).
 
 The workflow calls `ci/run_dspark_standalone_training.sh`. It starts the existing
 hidden-state vLLM script on NPUs 0,1 with TP=2, block size 128, prefix caching
 disabled, chunked prefill disabled, and piecewise graph capture sizes [1,2,4,8].
 `SPECO_STANDALONE_COMPILATION_CONFIG` can override the compilation JSON for a
 different vLLM build when running the shell runner directly. The initial DSpark
-backend determines the auxiliary layer plan; CI uses the same plan on both sides.
+checkpoint determines the auxiliary layer plan by directly calling the formal
+trainer's existing source-field readers: explicit output IDs take precedence over decoder IDs.
+CI uses the same plan on both sides.
 The existing standalone DSpark example trains on NPUs 2,3. Prompt-only rows use
 `on_missing_response=generate`: generate a response, then prefill the complete
 sequence to extract hidden states. File transfer and TQ SimpleStorage are used;

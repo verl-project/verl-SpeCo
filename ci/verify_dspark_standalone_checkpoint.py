@@ -37,6 +37,32 @@ def changed_parameters(before: dict, current: dict) -> list[str]:
     return changed
 
 
+def validate_checkpoint_keys(saved_keys, model_keys, required_keys):
+    missing = set(required_keys) - set(saved_keys)
+    # Public DSpark checkpoints may include the target output head. The backend
+    # deliberately loads its frozen target head from the target model instead.
+    unexpected = set(saved_keys) - set(model_keys) - {"lm_head.weight"}
+    if missing or unexpected:
+        raise ValueError(f"Incomplete checkpoint load: missing={sorted(missing)}, unexpected={sorted(unexpected)}")
+
+
+def resolve_checkpoint_layer_ids(source_config, algorithm, *, fallback_target_ids=None):
+    """Reuse formal training readers without changing production modules."""
+    from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
+    from verl_speco.trainer.draft_training_loop import (
+        _source_target_layer_ids,
+        _source_vllm_aux_layer_ids,
+    )
+
+    output_ids = _source_vllm_aux_layer_ids(source_config)
+    if output_ids is not None:
+        return normalize_standalone_layer_ids(algorithm, None, output_ids)
+    target_ids = _source_target_layer_ids(source_config, algorithm.lower())
+    return normalize_standalone_layer_ids(
+        algorithm, target_ids if target_ids is not None else fallback_target_ids, None
+    )
+
+
 def build_backend(target: str, checkpoint: str):
     import torch
     import torch_npu  # noqa: F401 - register NPU before importing the backend
@@ -62,12 +88,15 @@ def build_backend(target: str, checkpoint: str):
     state = backend._normalize_draft_state_dict(backend._load_draft_state_dict(checkpoint))
     parameters = dict(model.draft_model.named_parameters())
     required = {name for name, param in parameters.items() if param.requires_grad}
-    missing = required - state.keys()
-    unexpected = state.keys() - model.draft_model.state_dict().keys()
-    if missing or unexpected:
-        raise ValueError(f"Incomplete checkpoint load: missing={sorted(missing)}, unexpected={sorted(unexpected)}")
+    model_state = model.draft_model.state_dict()
+    validate_checkpoint_keys(state, model_state, required)
     for name, tensor in state.items():
-        expected = model.draft_model.state_dict()[name]
+        if name == "lm_head.weight" and name not in model_state:
+            expected_head = backend.target_lm_head.fc.weight
+            if tensor.shape != expected_head.shape or not torch.isfinite(tensor).all():
+                raise ValueError("Invalid optional checkpoint lm_head.weight")
+            continue
+        expected = model_state[name]
         if tensor.shape != expected.shape:
             raise ValueError(f"Shape mismatch for {name}: {tensor.shape} != {expected.shape}")
         if not torch.isfinite(tensor).all():
@@ -99,9 +128,10 @@ def fingerprints(model):
 
 def prepare(args):
     backend, model, config = build_backend(args.target, args.initial)
-    from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
-
-    target_ids, aux_ids = normalize_standalone_layer_ids("DSPARK", config.target_layer_ids, None)
+    source_config = json.loads((Path(args.initial) / "config.json").read_text(encoding="utf-8"))
+    target_ids, aux_ids = resolve_checkpoint_layer_ids(
+        source_config, "DSPARK", fallback_target_ids=config.target_layer_ids
+    )
     final_id = int(config.target_num_hidden_layers)
     if any(layer >= final_id for layer in target_ids):
         raise ValueError("Drafter capture plan exceeds target depth")
@@ -166,7 +196,9 @@ def verify(args):
         "target_last_hidden_states": torch.randn(1, rows, hdim, device=device, dtype=torch.bfloat16),
         "loss_mask": torch.ones(1, rows, device=device),
     }
-    with torch.no_grad():
+    # Match the trainer's mixed-precision context: cross_entropy runs in FP32,
+    # matching the FP32 loss accumulator used by the backend's indexed writes.
+    with torch.no_grad(), torch.amp.autocast(device_type="npu", dtype=torch.bfloat16):
         result = backend.compute_loss(model, batch, 0)
     count = float(result["local_num_tokens"].item())
     if count <= 0:

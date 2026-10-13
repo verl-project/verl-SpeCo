@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 : "${SPECO_TARGET_MODEL:?set SPECO_TARGET_MODEL}"
 : "${SPECO_DSPARK_DRAFT_MODEL:?set SPECO_DSPARK_DRAFT_MODEL}"
 : "${SPECO_TRAIN_FILE:?set SPECO_TRAIN_FILE}"
-steps=${SPECO_STANDALONE_STEPS:-5}
+steps=${SPECO_STANDALONE_STEPS:-2}
 [[ "$steps" =~ ^[1-9][0-9]*$ ]] || { echo 'steps must be a positive integer' >&2; exit 2; }
 test -d "$SPECO_TARGET_MODEL"
 test -d "$SPECO_DSPARK_DRAFT_MODEL"
@@ -45,7 +45,7 @@ python ci/verify_dspark_standalone_checkpoint.py prepare \
   --baseline "$run_dir/baseline.json" --layer-env "$run_dir/layers.env"
 source "$run_dir/layers.env"
 compilation_config=${SPECO_STANDALONE_COMPILATION_CONFIG:-'{"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1,2,4,8]}'}
-printf 'target=%q\ndrafter=%q\ntrain_file=%q\nsteps=%q\nbatch_size_per_gpu=2\nvllm_devices=0,1\ntrain_devices=2,3\ncompilation_config=%q\n' \
+printf 'target=%q\ndrafter=%q\ntrain_file=%q\nsteps=%q\nbatch_size_per_gpu=1\nvllm_devices=0,1\ntrain_devices=2,3\ncompilation_config=%q\n' \
   "$SPECO_TARGET_MODEL" "$SPECO_DSPARK_DRAFT_MODEL" "$SPECO_TRAIN_FILE" "$steps" "$compilation_config" \
   >"$run_dir/settings.env"
 vllm_pid=''
@@ -84,7 +84,7 @@ done
 
 MODEL_PATH="$SPECO_TARGET_MODEL" DRAFTER_PATH="$SPECO_DSPARK_DRAFT_MODEL" \
 TRAIN_FILE="$SPECO_TRAIN_FILE" DEVICE_ENV=ASCEND_RT_VISIBLE_DEVICES \
-TRAIN_DEVICES=2,3 TRAIN_GPUS=2 MAX_STEPS="$steps" BATCH_SIZE_PER_GPU=2 \
+TRAIN_DEVICES=2,3 TRAIN_GPUS=2 MAX_STEPS="$steps" BATCH_SIZE_PER_GPU=1 \
 SAVE_INTERVAL_STEPS="$steps" SAVE_FINAL_CHECKPOINT=true \
 DRAFT_CKPTS_DIR="$run_dir/checkpoints" TRAIN_LOGGERS='["console"]' \
 LEARNING_RATE=1e-5 DSPARK_BLOCK_SIZE=7 DSPARK_NUM_ANCHORS=8 DSPARK_MAX_WINDOW=64 \

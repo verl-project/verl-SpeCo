@@ -15,9 +15,9 @@ on:
         description: Prompt Parquet path; defaults to the cotrain dataset
         type: string
       steps:
-        description: Optimizer steps (batch size 2 per training device)
+        description: Optimizer steps (batch size 1 per training device)
         type: string
-        default: "5"
+        default: "2"
         required: true
 
 permissions:
