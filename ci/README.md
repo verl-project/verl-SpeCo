@@ -1,11 +1,12 @@
 # CI layers
 
-The repository uses six workflow layers:
+The repository uses seven test workflow layers:
 
 - `cpu_unit_tests.yml`: required PR checks without installing this repository or using accelerator runtimes.
 - `gpu_vllm_unit_tests.yml`: scheduled/manual vLLM example-script runs on GPU.
 - `gpu_sglang_unit_tests.yml`: scheduled/manual SGLang example-script runs on GPU.
 - `gpu_drafter_training_smoke.yml`: scheduled/manual standalone drafter training smoke tests on GPU.
+- `npu_dspark_standalone_training.yml`: manual pretrained DSpark standalone training and checkpoint verification on NPU.
 - `npu_vllm_unit_tests.yml`: PR, push, scheduled, and manual vLLM example-script runs on NPU.
 - `npu_sglang_unit_tests.yml`: PR, push, scheduled, and manual SGLang example-script runs on NPU.
 
@@ -199,3 +200,38 @@ To test the hardware workflows on GitHub, open Actions and choose one of:
 Run the selected workflow without inputs after preparing the default paths
 above. Fill the manual inputs only when you want to override the defaults for
 one run.
+# DSpark standalone NPU training
+
+`npu_dspark_standalone_training.yml` is a manual workflow using the same NPU
+runner, container, verl release, Qwen3-8B snapshot, pretrained DSpark snapshot,
+and DAPO-Math-17k prompt Parquet as the NPU vLLM cotrain workflow. Inputs override
+the shared `SPECO_TARGET_MODEL`, `SPECO_DSPARK_DRAFT_MODEL`, and `SPECO_TRAIN_FILE`
+repository/environment variables. Defaults are five optimizer steps and batch
+size two per training device (global batch four, no gradient accumulation).
+
+The workflow calls `ci/run_dspark_standalone_training.sh`. It starts the existing
+hidden-state vLLM script on NPUs 0,1 with TP=2, block size 128, prefix caching
+disabled, chunked prefill disabled, and piecewise graph capture sizes [1,2,4,8].
+`SPECO_STANDALONE_COMPILATION_CONFIG` can override the compilation JSON for a
+different vLLM build when running the shell runner directly. The initial DSpark
+backend determines the auxiliary layer plan; CI uses the same plan on both sides.
+The existing standalone DSpark example trains on NPUs 2,3. Prompt-only rows use
+`on_missing_response=generate`: generate a response, then prefill the complete
+sequence to extract hidden states. File transfer and TQ SimpleStorage are used;
+no Mooncake service is required. TransferQueue 0.1.10 is installed by the workflow.
+
+Only the final step is saved to reduce checkpoint I/O. A separate verifier checks
+checkpoint completeness, actual optimizer step count, finite logged training
+losses, changed trainable parameter fingerprints, and strict coverage of saved
+trainable weights through the backend loader. It reloads the checkpoint in a new
+process and runs a synthetic small training forward on one NPU. This checks
+backend compatibility, not vLLM checkpoint serving, quality improvements, or full
+optimizer-state resume. Starting from the public drafter tests pretrained-weight
+fine-tuning; random initialization is not covered.
+
+Every run gets a fresh output directory under `runner.temp`. Logs, layer settings,
+baseline fingerprints and the verification report are uploaded even on failure;
+model weights are not uploaded. The shell runner cleans up only its own vLLM
+process group. Hardware workflows sharing the same physical host must be
+scheduled without overlapping device allocations; workflow concurrency only
+serializes this workflow on the same ref.

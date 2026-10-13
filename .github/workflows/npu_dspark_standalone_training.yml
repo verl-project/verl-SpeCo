@@ -1,0 +1,82 @@
+name: npu_dspark_standalone_training
+
+run-name: NPU DSpark standalone training (${{ github.ref_name }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_model:
+        description: Target model path; defaults to the cotrain model
+        type: string
+      draft_model:
+        description: Pretrained DSpark path; defaults to the cotrain drafter
+        type: string
+      train_file:
+        description: Prompt Parquet path; defaults to the cotrain dataset
+        type: string
+      steps:
+        description: Optimizer steps (batch size 2 per training device)
+        type: string
+        default: "5"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npu-dspark-standalone-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  training:
+    runs-on: [linux-aarch64-a2-8]
+    container:
+      image: swr.cn-north-4.myhuaweicloud.com/mindspeed/verl0.8.0_vllm_910b_speco:v1
+      options: --shm-size 16g
+    environment: speco-npu-ci
+    timeout-minutes: 180
+    env:
+      HF_ENDPOINT: https://hf-mirror.com
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+      PYTHONPATH: /usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/cann-9.0.0/python/site-packages:${{ github.workspace }}
+      SPECO_TARGET_MODEL: ${{ inputs.target_model || vars.SPECO_TARGET_MODEL || '/root/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218' }}
+      SPECO_DSPARK_DRAFT_MODEL: ${{ inputs.draft_model || vars.SPECO_DSPARK_DRAFT_MODEL || '/root/.cache/huggingface/hub/models--deepseek-ai--dspark_qwen3_8b_block7/snapshots/03326e5043815da1f81b109078b2889737c26017' }}
+      SPECO_TRAIN_FILE: ${{ inputs.train_file || vars.SPECO_TRAIN_FILE || '/root/.cache/huggingface/hub/datasets--BytedTsinghua-SIA--DAPO-Math-17k/snapshots/65877096c24ffa7abc4e4fa5edb95cf3413a5674/data/dapo-math-17k.parquet' }}
+      SPECO_STANDALONE_STEPS: ${{ inputs.steps }}
+      SPECO_STANDALONE_RUN_DIR: ${{ runner.temp }}/dspark-standalone-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: verl-project/verl
+          ref: release/v0.8.0
+          path: upstream-verl
+      - name: Install current checkouts
+        run: |
+          python -m pip install uv
+          uv pip install --system --no-deps -e upstream-verl -e .
+          uv pip install --system TransferQueue==0.1.10
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import verl
+          import verl_speco
+          from packaging.version import Version
+          root = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          assert root / 'upstream-verl' in Path(verl.__file__).resolve().parents
+          assert root in Path(verl_speco.__file__).resolve().parents
+          assert Version(verl.__version__).base_version == '0.8.0'
+          PY
+      - name: Run standalone training and verify checkpoint
+        run: bash ci/run_dspark_standalone_training.sh
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dspark-standalone-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.SPECO_STANDALONE_RUN_DIR }}/*.log
+            ${{ env.SPECO_STANDALONE_RUN_DIR }}/*.json
+            ${{ env.SPECO_STANDALONE_RUN_DIR }}/*.env
+          if-no-files-found: warn
+          retention-days: 7
