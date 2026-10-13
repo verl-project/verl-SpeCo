@@ -53,9 +53,9 @@ jobs:
           path: upstream-verl
       - name: Install current checkouts
         run: |
-          python -m pip install uv
-          uv pip install --system --no-deps -e upstream-verl -e .
-          uv pip install --system TransferQueue==0.1.10
+          python -m pip install --no-deps -e upstream-verl
+          python -m pip install --no-deps -e .
+          python -m pip install --no-deps TransferQueue==0.1.10
           python - <<'PY'
           import os
           from pathlib import Path

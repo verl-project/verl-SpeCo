@@ -220,7 +220,9 @@ CI uses the same plan on both sides.
 The existing standalone DSpark example trains on NPUs 2,3. Prompt-only rows use
 `on_missing_response=generate`: generate a response, then prefill the complete
 sequence to extract hidden states. File transfer and TQ SimpleStorage are used;
-no Mooncake service is required. TransferQueue 0.1.10 is installed by the workflow.
+no Mooncake service is required. TransferQueue 0.1.10 is installed with
+`--no-deps`, retaining the container's existing dependency versions. Both editable
+checkouts use the same pip installation commands as the NPU cotrain workflow.
 
 Only the final step is saved to reduce checkpoint I/O. A separate verifier checks
 checkpoint completeness, actual optimizer step count, finite logged training
