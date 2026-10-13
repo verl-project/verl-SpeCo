@@ -111,6 +111,26 @@ def test_pipeline_prompt_hidden_option_last_override_wins(
     assert f"{key}={last_value}" in commands.producer_overrides
 
 
+@pytest.mark.parametrize("prefix", ["", "+", "++"])
+@pytest.mark.parametrize("source", ["target_argmax", "TARGET_ARGMAX"])
+def test_ce_only_target_argmax_expected_layout(prefix, source):
+    key = "actor_rollout_ref.rollout.drafter.training.ce_target_source"
+    args = _training_args() + [
+        "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=0",
+        f"{prefix}{key}={source}",
+    ]
+    commands = build_pipeline_commands(
+        resolve_pipeline_config(args, environ={}),
+        args,
+        ray_address="10.0.0.1:6379",
+        python_executable="python",
+    )
+    assert any(
+        item.endswith("expected_feature.hidden_states_layout=dflash_aux_plus_last")
+        for item in commands.consumer_overrides
+    )
+
+
 def test_producer_max_samples_uses_remaining_total_steps() -> None:
     args = [
         *_training_args(),

@@ -21,6 +21,10 @@ resolve_drafter_hidden_states_layout = _module.resolve_drafter_hidden_states_lay
     [
         (0.0, "labels", "dflash_aux"),
         (0.0, "target_argmax", "dflash_aux_plus_last"),
+        (0.0, "TARGET_ARGMAX", "dflash_aux_plus_last"),
+        (0.0, "Target_Argmax", "dflash_aux_plus_last"),
+        (0.0, "LABELS", "dflash_aux"),
+        (0.0, None, "dflash_aux"),
         (0.9, "labels", "dflash_aux_plus_last"),
         (0.9, "target_argmax", "dflash_aux_plus_last"),
     ],

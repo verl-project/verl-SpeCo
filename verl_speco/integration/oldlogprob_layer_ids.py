@@ -88,7 +88,10 @@ def resolve_drafter_hidden_states_layout(algorithm: Any, training_cfg: Any) -> s
         return "eagle3_aux_plus_last"
     if algorithm == "DSPARK" and (
         float(_get_nested(training_cfg, ("dspark_l1_loss_alpha",), 0.9) or 0.0) > 0
-        or _get_nested(training_cfg, ("ce_target_source",), "labels") == "target_argmax"
+        or str(
+            _get_nested(training_cfg, ("ce_target_source",), "labels") or "labels"
+        ).lower()
+        == "target_argmax"
     ):
         return "dflash_aux_plus_last"
     return "dflash_aux"

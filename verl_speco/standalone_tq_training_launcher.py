@@ -963,6 +963,7 @@ def build_pipeline_commands(
                 _find_override(
                     training_args,
                     "actor_rollout_ref.rollout.drafter.training.ce_target_source",
+                    normalize_key=True,
                 )
                 or "labels"
             ),
