@@ -107,6 +107,10 @@ class QueueScheduleContext:
     producer_done: bool = False
     producer_paused: bool = False
     consumer_training: bool = False
+    consumer_ready: bool = True
+    outstanding_batches: int = 0
+    max_outstanding_batches: int = 1
+    remaining_steps: int | None = None
 
 
 class DrafterCollectionSource(str, Enum):
@@ -434,6 +438,9 @@ class TrainingPlan:
         "inconsistent_data_version": 14,
         "worker_preflight_failed": 15,
         "consumer_training": 16,
+        "consumer_initializing": 18,
+        "outstanding_capacity_reached": 19,
+        "training_budget_reserved": 20,
         "insufficient_ready_samples": 17,
         "drafter_convergence_frozen": 18,
     }

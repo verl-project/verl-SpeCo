@@ -265,6 +265,10 @@ actor_rollout_ref:
         group_by_length: false
         # Samples per grouping megabatch, as a multiple of batch_size_per_gpu.
         group_by_length_megabatch: 8
+        # Hard-label CE target source for backends that support it.
+        # labels keeps SpeCo's teacher-forced behavior; target_argmax matches
+        # speculators-style CE against the target model top-1 token.
+        ce_target_source: labels
         vocab_mapping_path: null
         dflash_block_size: 16
         dflash_num_anchors: 512
@@ -416,6 +420,11 @@ actor_rollout_ref:
           connect_timeout_seconds: 120
           poll_interval_seconds: 0.5
           drop_last: true
+          # Scheduled Ray Consumer: 0 keeps serial loading, k prefetches k batches.
+          consumer_prefetch_batches: 0
+          io_retry_max_attempts: 3
+          io_timeout_seconds: 30
+          prefetch_collective_timeout_seconds: 180
           controller:
             polling_mode: true
           backend:

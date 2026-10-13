@@ -11,7 +11,11 @@ Code outside this package should import scheduling contracts from here instead
 of depending on trigger, budget, or execution implementation modules.
 """
 
-from .drafter_runtime_state import DrafterRuntimeState, DrafterRuntimeStatus
+from .drafter_runtime_state import (
+    DrafterRuntimeState,
+    DrafterRuntimeStatus,
+    StandaloneQueueState,
+)
 from .drafter_scheduler import DrafterScheduler, step_matches_interval
 from .schedule_types import (
     CollectionPlan,
@@ -81,6 +85,7 @@ __all__ = [
     "DrafterExecutionStrategy",
     "DrafterRuntimeState",
     "DrafterRuntimeStatus",
+    "StandaloneQueueState",
     "DrafterScheduleConfig",
     "DrafterScheduleContext",
     "DrafterTrainingDataSource",

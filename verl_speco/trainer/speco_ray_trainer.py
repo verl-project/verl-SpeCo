@@ -2878,7 +2878,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ).upper()
         if (
             algorithm == "DSPARK"
-            and float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
+            and resolve_drafter_hidden_states_layout(algorithm, training_cfg)
+            == "dflash_aux_plus_last"
         ):
             return None
         if not bool(training_cfg.get("target_lm_head_row_restricted_sync", True)):

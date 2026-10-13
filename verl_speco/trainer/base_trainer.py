@@ -53,6 +53,9 @@ from verl.utils.ulysses import (
 )
 from verl_speco.trainer.checkpoint import release_checkpoint_host_memory
 from verl_speco.trainer.feature_store import DraftFeatureSample
+from verl_speco.integration.oldlogprob_layer_ids import (
+    resolve_drafter_hidden_states_layout,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -1119,32 +1122,36 @@ class DrafterBaseTrainer:
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
             "loss_mode_id": f"{prefix}/loss_mode_id",
         }
-        for source_key, metric_key in scalar_keys.items():
-            value = diagnostics.get(source_key)
-            if not torch.is_tensor(value):
-                continue
-            value = cast(torch.Tensor, value)
-            reduced = self._reduce_training_metric(value.reshape(()))
-            self._training_metric_sums[metric_key] = self._training_metric_sums.get(
-                metric_key, 0.0
-            ) + float(reduced.cpu().item())
-
         vector_keys = {
             "loss_sum_per_position": f"{prefix}/loss_sum_per_position",
             "correct_per_position": f"{prefix}/correct_per_position",
             "count_per_position": f"{prefix}/count_per_position",
         }
+        metric_keys: list[str] = []
+        values: list[torch.Tensor] = []
+        for source_key, metric_key in scalar_keys.items():
+            value = diagnostics.get(source_key)
+            if not isinstance(value, torch.Tensor):
+                continue
+            metric_keys.append(metric_key)
+            values.append(value.detach().float().reshape(1))
+
         for source_key, metric_prefix in vector_keys.items():
             value = diagnostics.get(source_key)
-            if not torch.is_tensor(value):
+            if not isinstance(value, torch.Tensor):
                 continue
-            value = cast(torch.Tensor, value)
-            reduced = self._reduce_training_metric(value)
-            for idx, item in enumerate(reduced.detach().cpu().tolist()):
-                metric_key = f"{metric_prefix}/{idx}"
-                self._training_metric_sums[metric_key] = self._training_metric_sums.get(
-                    metric_key, 0.0
-                ) + float(item)
+            metric_keys.extend(f"{metric_prefix}/{idx}" for idx in range(value.numel()))
+            values.append(value.detach().float().reshape(-1))
+
+        if not metric_keys:
+            return
+        # Keep the same group/reduction semantics, but batch all diagnostics
+        # into one reduction call and one device-to-host transfer per step.
+        reduced = self._reduce_training_metric(torch.cat(values)).cpu().tolist()
+        for metric_key, item in zip(metric_keys, reduced, strict=True):
+            self._training_metric_sums[metric_key] = self._training_metric_sums.get(
+                metric_key, 0.0
+            ) + float(item)
 
     def _get_sp_group(self):
         if self._has_mesh_dim("sp"):
@@ -4099,13 +4106,12 @@ class DrafterBaseTrainer:
         mask_list = preprocessed_lists["masks"]
         position_list = preprocessed_lists.get("position_ids")
         target_last_h_list = preprocessed_lists.get("target_last_h_states")
-        dspark_l1_enabled = (
+        dspark_target_hidden_required = (
             self.backend.model_type == "dspark"
-            and float(
-                self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.9)
-                or 0.0
+            and resolve_drafter_hidden_states_layout(
+                "DSPARK", self.config.rollout.drafter.training
             )
-            > 0
+            == "dflash_aux_plus_last"
         )
         if position_list is None:
             position_list = [
@@ -4135,7 +4141,9 @@ class DrafterBaseTrainer:
             if seq_len < 1:
                 items_dropped_short += 1
                 continue
-            if dspark_l1_enabled and not torch.is_tensor(target_last_h_states):
+            if dspark_target_hidden_required and not torch.is_tensor(
+                target_last_h_states
+            ):
                 items_dropped_missing_target += 1
                 continue
 
@@ -4496,7 +4504,9 @@ class DrafterBaseTrainer:
                 # Reference-shifted: last_hidden[p+1] scores x[p+2], the token
                 # after the drafted input token x[p+1] at row p.
                 last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
-            elif dspark_l1_enabled and torch.is_tensor(target_last_h_states):
+            elif dspark_target_hidden_required and torch.is_tensor(
+                target_last_h_states
+            ):
                 target_last_h_states = cast(torch.Tensor, target_last_h_states)
                 target_last_hidden_state_chunks.append(
                     target_last_h_states[:train_seq_len]

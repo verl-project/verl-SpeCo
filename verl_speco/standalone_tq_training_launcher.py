@@ -957,7 +957,17 @@ def build_pipeline_commands(
     )
     hidden_layout = resolve_drafter_hidden_states_layout(
         config.algorithm,
-        {"dspark_l1_loss_alpha": dspark_l1_loss_alpha},
+        {
+            "dspark_l1_loss_alpha": dspark_l1_loss_alpha,
+            "ce_target_source": _strip_quotes(
+                _find_override(
+                    training_args,
+                    "actor_rollout_ref.rollout.drafter.training.ce_target_source",
+                    normalize_key=True,
+                )
+                or "labels"
+            ),
+        },
     )
     consumer_internal.extend(
         [

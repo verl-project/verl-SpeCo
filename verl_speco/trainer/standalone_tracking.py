@@ -200,7 +200,11 @@ def _select_standalone_tracking_metrics(metrics: dict[str, float]) -> dict[str, 
         f"{prefix}/top1_acc",
         "train/lr",
         "perf/step_time",
-        "perf/consumer_wait_time",
+        "perf/loader_plan_wait_time",
+        "perf/batch_ready_wait_time",
+        "perf/loader_tq_get_time",
+        "perf/batch_prepare_time",
+        "perf/batch_finalize_time",
         "perf/train_time",
     )
     if prefix == "dspark":
@@ -216,16 +220,18 @@ def _select_standalone_tracking_metrics(metrics: dict[str, float]) -> dict[str, 
         for key in keys
         if key in metrics and math.isfinite(float(metrics[key]))
     }
+    wait_metric = "perf/batch_ready_wait_time"
     if all(
-        key in selected
-        for key in ("perf/step_time", "perf/consumer_wait_time", "perf/train_time")
+        key in selected for key in ("perf/step_time", wait_metric, "perf/train_time")
     ):
         # All three are rank-zero wall times for the same Consumer cycle.
         selected["perf/other_time"] = max(
             0.0,
             selected["perf/step_time"]
-            - selected["perf/consumer_wait_time"]
-            - selected["perf/train_time"],
+            - selected[wait_metric]
+            - selected["perf/train_time"]
+            - selected.get("perf/batch_prepare_time", 0.0)
+            - selected.get("perf/batch_finalize_time", 0.0),
         )
     return selected
 

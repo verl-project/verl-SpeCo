@@ -301,17 +301,182 @@ def test_scheduler_executes_one_complete_standalone_batch(monkeypatch) -> None:
     assert commands.items[-1] == {"kind": "stop"}
 
 
-def test_driver_logs_producer_snapshot_and_drains_final_training_metrics(monkeypatch):
+@pytest.mark.parametrize("depth", [0, 1, 2])
+def test_scheduler_prefills_capacity_and_uses_cached_keys(monkeypatch, depth):
+    import copy
+
+    config = copy.deepcopy(_runtime_config())
+    monkeypatch.setattr(sys.modules[__name__], "_CONFIG", config)
+    config.actor_rollout_ref.rollout.drafter.training.transfer_queue = {"consumer_prefetch_batches": depth}
+    # deepcopy preserves the fixture's get closure, so bind it to this object.
+    training = config.actor_rollout_ref.rollout.drafter.training
+    training.get = lambda key, default=None: getattr(training, key, default)
+    store = _ReadyStore()
+    store.ready = [SimpleNamespace(key=f"sample-{i}", tag={"sequence_no": i}) for i in range(12)]
+    list_calls = []
+    original_list = store.list_ready
+    store.list_ready = lambda: (list_calls.append(1), original_list())[1]
+    commands = _RecordingQueue()
+
+    def on_event(event):
+        if event["kind"] == "training_completed":
+            if depth == 0:
+                # No later plan is submitted until this batch completes.
+                assert sum(c["kind"] == "batch" for c in commands.items) == event["plan_id"] + 1
+            if event["plan_id"] == 0:
+                assert sum(c["kind"] == "batch" for c in commands.items) == depth + 1
+                assert len(list_calls) == 1  # all initial plans use one snapshot
+            keys = set(event["keys"])
+            store.ready = [e for e in store.ready if e.key not in keys]
+
+    events = _RecordingQueue(events=[
+        {"kind": "consumer_ready", "initial_optimizer_step": 0},
+        *[{"kind": "training_completed", "plan_id": i,
+           "keys": [f"sample-{j}" for j in range(i * 4, (i + 1) * 4)], "successful": True}
+          for i in range(3)],
+    ], on_event=on_event)
+
+    class EventRay(_FakeRay):
+        def wait(self, refs, **kwargs):
+            if events.items:
+                return [], list(refs)
+            return super().wait(refs, **kwargs)
+
+    queues = iter((commands, events))
+    monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
+    trainer = StandaloneRayTrainer(
+        _commands(), ray_module=EventRay(_ProducerHandle()),
+        worker_group_factory=lambda *a, **k: _WorkerGroup(), queue_factory=lambda: next(queues),
+        feature_store_factory=lambda _: store,
+    )
+    assert trainer.run() == 0
+    batches = [c for c in commands.items if c["kind"] == "batch"]
+    assert [c["plan_id"] for c in batches] == [0, 1, 2]
+    assert len({key for c in batches for key in c["global_keys"]}) == 12
+
+
+@pytest.mark.parametrize("initial_step", [8, 9])
+@pytest.mark.parametrize("depth", [0, 1, 2])
+def test_scheduler_respects_restored_remaining_budget(monkeypatch, initial_step, depth):
+    import copy
+
+    config = copy.deepcopy(_runtime_config())
+    monkeypatch.setattr(sys.modules[__name__], "_CONFIG", config)
+    training = config.actor_rollout_ref.rollout.drafter.training
+    training.transfer_queue = {"consumer_prefetch_batches": depth}
+    training.max_steps = 9
+    training.get = lambda key, default=None: getattr(training, key, default)
     store = _ReadyStore()
     commands = _RecordingQueue()
+    event_items = [{"kind": "consumer_ready", "initial_optimizer_step": initial_step}]
+    if initial_step < 9:
+        event_items.append({"kind": "training_completed", "plan_id": 0,
+                            "keys": [f"sample-{i}" for i in range(4)], "successful": True})
+    events = _RecordingQueue(events=event_items)
+
+    class WaitingRay(_FakeRay):
+        def wait(self, refs, **kwargs):
+            return [], list(refs)
+
+    queues = iter((commands, events))
+    producer = _ProducerHandle()
+    monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
+    trainer = StandaloneRayTrainer(
+        _commands(), ray_module=WaitingRay(producer), worker_group_factory=lambda *a, **k: _WorkerGroup(),
+        queue_factory=lambda: next(queues), feature_store_factory=lambda _: store,
+    )
+    assert trainer.run() == 0
+    assert sum(c["kind"] == "batch" for c in commands.items) == 9 - initial_step
+    assert commands.items[-1] == {"kind": "stop"}
+    assert producer.stopped
+
+
+def test_fast_producer_watermarks_and_duplicate_events_do_not_block_training(monkeypatch):
+    import copy
+
+    config = copy.deepcopy(_runtime_config())
+    monkeypatch.setattr(sys.modules[__name__], "_CONFIG", config)
+    training = config.actor_rollout_ref.rollout.drafter.training
+    training.transfer_queue = {"consumer_prefetch_batches": 1}
+    training.get = lambda key, default=None: getattr(training, key, default)
+    store = _ReadyStore()
+    store.ready.clear()
+    calls = []
+    original_list = store.list_ready
+    store.list_ready = lambda: (calls.append(1), original_list())[1]
+    commands = _RecordingQueue()
+    published = 0
+    list_count_before_full_publication = None
+
+    def on_event(event):
+        nonlocal published, list_count_before_full_publication
+        if event["kind"] == "samples_published":
+            total = event["published_total"]
+            if total == 24:
+                if list_count_before_full_publication is None:
+                    list_count_before_full_publication = len(calls)
+                else:
+                    assert len(calls) == list_count_before_full_publication
+            store.ready.extend(SimpleNamespace(key=f"sample-{i}", tag={"sequence_no": i})
+                               for i in range(published, total))
+            published = total
+        elif event["kind"] == "training_completed":
+            keys = set(event["keys"])
+            store.ready = [e for e in store.ready if e.key not in keys]
+
+    completions = [{"kind": "training_completed", "plan_id": i,
+                    "keys": [f"sample-{j}" for j in range(i * 4, (i + 1) * 4)], "successful": True}
+                   for i in range(6)]
+    events = _RecordingQueue(events=[
+        {"kind": "consumer_ready", "initial_optimizer_step": 0},
+        {"kind": "samples_published", "published_total": 12},
+        {"kind": "samples_published", "published_total": 24},
+        {"kind": "samples_published", "published_total": 24},
+        completions[0], completions[0], *completions[1:],
+    ], on_event=on_event)
+    producer = _ProducerHandle()
+    actions = []
+    producer.pause = _RemoteMethod(lambda: (actions.append("pause"), _Ref("pause"))[1])
+    producer.resume = _RemoteMethod(lambda: (actions.append("resume"), _Ref("resume"))[1])
+
+    class EventRay(_FakeRay):
+        def wait(self, refs, **kwargs):
+            if events.items:
+                return [], list(refs)
+            return super().wait(refs, **kwargs)
+
+    queues = iter((commands, events))
+    monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
+    trainer = StandaloneRayTrainer(
+        _commands(), ray_module=EventRay(producer), worker_group_factory=lambda *a, **k: _WorkerGroup(),
+        queue_factory=lambda: next(queues), feature_store_factory=lambda _: store,
+    )
+    assert trainer.run() == 0
+    assert actions == ["pause", "resume"]
+    assert [c["plan_id"] for c in commands.items if c["kind"] == "batch"] == list(range(6))
+
+
+def test_driver_logs_producer_snapshot_and_drains_final_metrics(monkeypatch):
+    store = _ReadyStore()
+    list_calls = []
+    original_list = store.list_ready
+    store.list_ready = lambda: (list_calls.append(1), original_list())[1]
+    commands = _RecordingQueue()
+    def on_event(event):
+        if event["kind"] == "producer_metrics":
+            # One initialization list before this low-frequency metric snapshot.
+            assert len(list_calls) == 1
+        elif event["kind"] == "training_completed":
+            assert len(list_calls) == 2
+            store.ready.clear()
+
     events = _RecordingQueue(events=[
         {"kind": "producer_metrics", "published_total": 100,
          "metrics": {"producer/samples_per_second": 2.0}},
         {"kind": "training_completed", "keys": [f"sample-{i}" for i in range(4)],
          "successful": True},
         {"kind": "training_metrics", "step": 17, "metrics": {"dspark/loss": 0.5}},
-    ], on_event=lambda event: store.ready.clear()
-        if event["kind"] == "training_completed" else None)
+    ], on_event=on_event)
 
     class MetricsRay(_FlowRay):
         def wait(self, refs, num_returns, timeout=0):
@@ -497,6 +662,47 @@ def test_trainer_rejects_unexpected_early_consumer_exit(monkeypatch) -> None:
         trainer.run()
 
     assert producer.stopped is True
+
+
+def test_step_budget_survives_consumer_exit_before_completion_event(monkeypatch):
+    import copy
+
+    config = copy.deepcopy(_runtime_config())
+    monkeypatch.setattr(sys.modules[__name__], "_CONFIG", config)
+    training = config.actor_rollout_ref.rollout.drafter.training
+    training.step = 1
+    training.get = lambda key, default=None: getattr(training, key, default)
+    events = _RecordingQueue(events=[
+        {"kind": "consumer_ready", "initial_optimizer_step": 0},
+        {"kind": "training_completed", "plan_id": 0,
+         "keys": [f"sample-{i}" for i in range(4)], "successful": True},
+    ])
+    commands = _RecordingQueue()
+
+    class FinishedConsumerRay(_FakeRay):
+        calls = 0
+
+        def wait(self, refs, **kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                consumer = next(r for r in refs if r.name.startswith("consumer"))
+                return [consumer], [r for r in refs if r != consumer]
+            return [], list(refs)
+
+        def get(self, ref):
+            if ref.name.startswith("consumer"):
+                return {"optimizer_steps_total": 1}
+            return super().get(ref)
+
+    queues = iter((commands, events))
+    monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
+    trainer = StandaloneRayTrainer(
+        _commands(), ray_module=FinishedConsumerRay(_ProducerHandle()),
+        worker_group_factory=lambda *a, **k: _WorkerGroup(),
+        queue_factory=lambda: next(queues), feature_store_factory=lambda _: _ReadyStore(),
+    )
+    assert trainer.run() == 0
+    assert [c["kind"] for c in commands.items] == ["batch", "stop"]
 
 
 def test_trainer_propagates_consumer_error_and_stops_producer(monkeypatch) -> None:
