@@ -114,7 +114,6 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.publish_async=False \
     actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu=10 \
     actor_rollout_ref.rollout.drafter.training.sample_last_n_steps=10 \
-    actor_rollout_ref.rollout.drafter.training.train_batches_per_cycle=10 \
     actor_rollout_ref.rollout.drafter.training.publish_dtype=bf16 \
     actor_rollout_ref.rollout.drafter.training.draft_update_weights_bucket_megabytes=512 \
     actor_rollout_ref.rollout.drafter.training.draft_update_pause_generation=True \

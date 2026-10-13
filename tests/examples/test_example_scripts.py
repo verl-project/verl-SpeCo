@@ -175,7 +175,6 @@ def test_original_npu_dspark_example_keeps_repository_mrv1_contract() -> None:
         "training_interval_steps": "10",
         "batch_size_per_gpu": "10",
         "sample_last_n_steps": "10",
-        "train_batches_per_cycle": "10",
     }
     for key, value in expected_training.items():
         assert assignments[training_prefix + key] == value
@@ -200,7 +199,6 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
         "actor_rollout_ref.rollout.drafter.training.dspark_hard_sample_ratio",
         "actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu",
         "actor_rollout_ref.rollout.drafter.training.sample_last_n_steps",
-        "actor_rollout_ref.rollout.drafter.training.train_batches_per_cycle",
     }
     changed_keys = {
         "data.filter_overlong_prompts",
