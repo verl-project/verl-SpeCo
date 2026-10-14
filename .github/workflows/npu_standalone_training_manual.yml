@@ -1,0 +1,80 @@
+name: npu_standalone_training_manual
+run-name: NPU standalone EAGLE training (${{ github.ref_name }})
+on:
+  workflow_dispatch:
+    inputs:
+      target_model:
+        description: Target model path in the runner cache
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: npu-standalone-manual-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  smoke:
+    name: NPU standalone EAGLE optimizer smoke
+    runs-on: [linux-aarch64-a2-8]
+    container:
+      image: swr.cn-north-4.myhuaweicloud.com/mindspeed/verl0.8.0_vllm_910b_speco:v1
+      options: --shm-size 16g
+    timeout-minutes: 60
+    environment: speco-npu-ci
+    env:
+      PYTHONPATH: /usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/cann-9.0.0/python/site-packages:${{ github.workspace }}
+    steps:
+      - name: Check out verl-SpeCo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: true
+
+      - name: Check out supported verl release
+        uses: actions/checkout@v4
+        with:
+          repository: verl-project/verl
+          ref: release/v0.8.0
+          path: upstream-verl
+          clean: true
+
+      - name: Install supported verl and current verl-SpeCo checkouts
+        run: |
+          command -v uv >/dev/null || python -m pip install uv
+          uv pip install --system --no-deps -e upstream-verl
+          uv pip install --system --no-deps -e .
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          import verl
+          import verl_speco
+          from packaging.version import Version
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          verl_checkout = workspace / "upstream-verl"
+          verl_package = Path(verl.__file__).resolve()
+          package = Path(verl_speco.__file__).resolve()
+          print("verl imported from", verl_package, "version", verl.__version__)
+          print("verl_speco imported from", package)
+          assert verl_checkout in verl_package.parents, (
+              f"expected verl from release/v0.8.0 checkout, got {verl_package}"
+          )
+          assert Version(verl.__version__).base_version == "0.8.0", (
+              f"expected verl 0.8.0 base version, got {verl.__version__}"
+          )
+          assert workspace in package.parents, (
+              f"expected verl_speco from PR workspace {workspace}, got {package}"
+          )
+          PY
+
+      - name: Verify NPU runtime
+        run: python -c "import torch, torch_npu; assert torch.npu.is_available()"
+
+      - name: Standalone EAGLE drafter optimizer smoke
+        env:
+          ASCEND_RT_VISIBLE_DEVICES: "0"
+          TARGET_MODEL: ${{ inputs.target_model }}
+        run: |
+          python tests/special_standalone/eagle1_gpu_smoke.py --device npu --target "${TARGET_MODEL}" --algorithm EAGLE1 --steps 3
+          python tests/special_standalone/eagle1_gpu_smoke.py --device npu --target "${TARGET_MODEL}" --algorithm EAGLE2 --steps 3

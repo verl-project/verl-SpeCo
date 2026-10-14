@@ -44,6 +44,10 @@ from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+_CE_TARGET_SOURCE_LABELS = "labels"
+_CE_TARGET_SOURCE_TARGET_ARGMAX = "target_argmax"
+_CE_TARGET_SOURCES = {_CE_TARGET_SOURCE_LABELS, _CE_TARGET_SOURCE_TARGET_ARGMAX}
+
 
 def _nested_get(config: Any, path: tuple[str, ...], default: Any = None) -> Any:
     """Read a nested config value from a mapping or attribute chain."""
@@ -86,6 +90,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         confidence_head_alpha: float = 0.0,
         l1_chunk_size: int = 0,
         distribution_loss_impl: str = "auto",
+        ce_target_source: str = _CE_TARGET_SOURCE_LABELS,
         debug_log: bool = False,
         debug_log_first_n: int = 2,
         debug_log_interval: int = 100,
@@ -108,6 +113,14 @@ class DSparkTrainingModel(DFlashTrainingModel):
         if self.distribution_loss_impl not in {"auto", "fused", "eager"}:
             raise ValueError(
                 "distribution_loss_impl must be one of: auto, fused, eager"
+            )
+        self.ce_target_source = str(
+            ce_target_source or _CE_TARGET_SOURCE_LABELS
+        ).lower()
+        if self.ce_target_source not in _CE_TARGET_SOURCES:
+            raise ValueError(
+                "ce_target_source must be one of: "
+                f"{', '.join(sorted(_CE_TARGET_SOURCES))}"
             )
         self._logged_distribution_loss_backend: Optional[str] = None
         self._distribution_loss_by_device: dict[str, bool] = {}
@@ -355,6 +368,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         use_fused: bool = False,
         active_draft_logits: Optional[torch.Tensor] = None,
         active_draft_log_probs: Optional[torch.Tensor] = None,
+        active_target_logits: Optional[torch.Tensor] = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -376,6 +390,9 @@ class DSparkTrainingModel(DFlashTrainingModel):
         the shared draft hidden/Markov features, the draft backbone. Both losses
         share the same per-chunk draft/target distributions, so the draft
         full-vocab forward is not repeated when both are enabled.
+
+        ``active_target_logits`` may carry the verifier logits already computed
+        for target-argmax CE, avoiding a second target LM-head projection.
         """
         if active_hidden.numel() == 0:
             zero = active_weights.new_zeros(())
@@ -398,6 +415,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         for name, tensor in (
             ("draft log probabilities", active_draft_log_probs),
             ("draft logits", active_draft_logits),
+            ("target logits", active_target_logits),
         ):
             if tensor is not None and tuple(tensor.shape) != expected_shape:
                 raise ValueError(
@@ -434,7 +452,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 )
 
             with torch.no_grad():
-                target_logits = F.linear(target_hidden_chunk, lm_head_weight)
+                target_logits = (
+                    active_target_logits[start:end]
+                    if active_target_logits is not None
+                    else F.linear(target_hidden_chunk, lm_head_weight)
+                )
                 if not use_fused:
                     target_probs = torch.softmax(target_logits.float(), dim=-1)
 
@@ -682,9 +704,31 @@ class DSparkTrainingModel(DFlashTrainingModel):
         if active_targets.numel() == 0:
             loss = flat_weights.sum() * 0.0
         else:
+            ce_targets = active_targets
+            active_target_logits = None
+            if self.ce_target_source == _CE_TARGET_SOURCE_TARGET_ARGMAX:
+                if self.loss_mode != "full_vocab":
+                    raise ValueError(
+                        "DSpark target_argmax CE currently requires "
+                        "dspark_loss_mode='full_vocab'"
+                    )
+                if self.l1_chunk_size > 0:
+                    raise ValueError(
+                        "DSpark target_argmax CE currently requires "
+                        "dspark_l1_chunk_size=0"
+                    )
+                if active_target_hidden is None:
+                    raise ValueError(
+                        "DSpark target_argmax CE requires target_last_hidden_states"
+                    )
+                with torch.no_grad():
+                    active_target_logits = F.linear(
+                        active_target_hidden, lm_head_weight
+                    )
+                    ce_targets = active_target_logits.argmax(dim=-1)
             if self.loss_mode in {"restricted_ce", "sampled_ce"}:
                 restricted_vocab = self._build_restricted_vocab(
-                    input_ids, active_targets, int(lm_head_weight.shape[0])
+                    input_ids, ce_targets, int(lm_head_weight.shape[0])
                 )
                 restricted_weight = lm_head_weight.index_select(0, restricted_vocab)
                 active_logits = F.linear(active_hidden, restricted_weight)
@@ -695,7 +739,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 )
                 if markov_bias is not None:
                     active_logits = active_logits + markov_bias
-                active_ce_targets = torch.searchsorted(restricted_vocab, active_targets)
+                active_ce_targets = torch.searchsorted(restricted_vocab, ce_targets)
                 active_loss = (
                     fused_label_cross_entropy(active_logits, active_ce_targets)
                     if use_fused_loss
@@ -713,13 +757,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 if markov_bias is not None:
                     active_logits = active_logits + markov_bias
                 if use_fused_loss:
-                    active_loss = fused_label_cross_entropy(
-                        active_logits, active_targets
-                    )
+                    active_loss = fused_label_cross_entropy(active_logits, ce_targets)
                 else:
                     active_log_probs = F.log_softmax(active_logits.float(), dim=-1)
                     active_loss = F.nll_loss(
-                        active_log_probs, active_targets, reduction="none"
+                        active_log_probs, ce_targets, reduction="none"
                     )
 
             finite_loss = torch.isfinite(active_loss)
@@ -803,6 +845,15 @@ class DSparkTrainingModel(DFlashTrainingModel):
                         use_fused=use_fused_loss,
                         active_draft_logits=reusable_draft_logits,
                         active_draft_log_probs=reusable_draft_log_probs,
+                        active_target_logits=(
+                            active_target_logits
+                            if all_rows
+                            else (
+                                active_target_logits[distribution_mask]
+                                if active_target_logits is not None
+                                else None
+                            )
+                        ),
                     )
                 l1_loss = local_l1_sum / local_l1_den.clamp(min=1e-6)
                 confidence_loss = local_conf_sum / local_conf_den.clamp(min=1e-6)
@@ -1364,6 +1415,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             distribution_loss_impl=str(
                 training_cfg.get("dspark_distribution_loss_impl", "auto")
             ),
+            ce_target_source=str(training_cfg.get("ce_target_source", "labels")),
             debug_log=bool(training_cfg.get("dspark_debug_log", False)),
             debug_log_first_n=int(training_cfg.get("dspark_debug_log_first_n", 2)),
             debug_log_interval=int(training_cfg.get("dspark_debug_log_interval", 100)),

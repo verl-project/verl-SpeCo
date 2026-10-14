@@ -34,6 +34,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 SPECO_SGLANG_DRAFTER_CONFIG_ENV = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
 
+OLD_LOGPROB_SOURCE_BATCH_INDICES_KEY = "speco_oldlogprob_source_batch_indices"
 OLD_LOGPROB_COLLECT_MASK_KEY = "speco_oldlogprob_collect_mask"
 OLD_LOGPROB_HIDDEN_POSITIONS_KEY = "speco_oldlogprob_hidden_positions"
 OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY = "speco_oldlogprob_hidden_position_mask"
@@ -572,6 +573,12 @@ def _put_oldlogprob_hidden_refs(
             )
             for sample_pos, batch_idx in enumerate(sample_indices):
                 refs[batch_idx] = chunk_ref
+                source_indices = micro_batch.get(OLD_LOGPROB_SOURCE_BATCH_INDICES_KEY)
+                if source_indices is not None:
+                    metas[batch_idx]["source_batch_index"] = int(
+                        source_indices[batch_idx].item()
+                    )
+                metas[batch_idx]["owner"] = int(owner)
                 metas[batch_idx]["chunk_index"] = chunk_index
                 metas[batch_idx]["chunk_start"] = starts[sample_pos]
                 metas[batch_idx]["chunk_length"] = lengths[sample_pos]
@@ -664,8 +671,48 @@ def _install_oldlogprob_training_worker_postprocess_patch() -> bool:
         if speco_non_tensor and final_output is not None:
             from verl.utils import tensordict_utils as tu
 
+            whole_ref = speco_non_tensor.get(OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY)
+            if whole_ref is not None:
+                whole_meta = speco_non_tensor.get(OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY)
+                row_count = int(final_output.batch_size[0])
+                if (
+                    not isinstance(whole_meta, dict)
+                    or whole_meta.get("num_samples") != row_count
+                ):
+                    raise RuntimeError(
+                        "SPECO whole hidden metadata has invalid row count"
+                    )
+                speco_non_tensor[OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY] = [
+                    whole_ref
+                ] * row_count
+                speco_non_tensor[OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY] = [
+                    {**whole_meta, "row_index": row_index}
+                    for row_index in range(row_count)
+                ]
             for key, value in speco_non_tensor.items():
-                tu.assign_non_tensor_data(final_output, key, value)
+                if key in (
+                    OLD_LOGPROB_HIDDEN_REFS_KEY,
+                    OLD_LOGPROB_HIDDEN_REF_META_KEY,
+                    OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY,
+                    OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY,
+                ):
+                    # Based on repository fix 91d6a55: row-aligned fields survive
+                    # native TensorDict DP concatenation and dynamic-batch restore.
+                    if (
+                        not isinstance(value, (list, tuple))
+                        or len(value) != final_output.batch_size[0]
+                    ):
+                        raise RuntimeError(
+                            f"SPECO row-aligned hidden metadata has invalid size: {key}"
+                        )
+                    tu.assign_non_tensor_stack(final_output, key, list(value))
+                elif key not in (
+                    OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
+                    OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
+                ):
+                    # Chunk descriptors are reconstructed from row-aligned refs
+                    # and metadata, avoiding worker-local chunk/sample indices.
+                    tu.assign_non_tensor_data(final_output, key, value)
         if speco_tensor and final_output is not None:
             from verl.utils import tensordict_utils as tu
 

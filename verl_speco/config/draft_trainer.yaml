@@ -40,6 +40,9 @@ actor_rollout_ref:
       enable_drafter_training: true
       training:
         mode: offline
+        # Retain prompt context in standalone DFlash/DSpark feature samples.
+        # Explicit feature/sequence/training-window limits still apply.
+        preserve_prompt_hidden_states: true
         max_steps: 1000
         save_interval_steps: 100
         save_final_checkpoint: true

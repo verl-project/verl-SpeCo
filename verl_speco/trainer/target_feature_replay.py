@@ -31,6 +31,7 @@ import torch
 from torch import nn
 
 from verl_speco.integration.oldlogprob_layer_ids import (
+    resolve_drafter_hidden_states_layout,
     resolve_oldlogprob_aux_layer_ids,
 )
 from verl_speco.producer.hidden_states_store import (
@@ -705,16 +706,8 @@ class TargetFeatureReplayer:
                 "Token replay could not resolve target auxiliary layer ids"
             )
         self.target_layer_ids = [int(layer_id) for layer_id in layer_ids]
-        dspark_l1_enabled = (
-            self.algorithm == "DSPARK"
-            and float(self.training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
-        )
-        self.hidden_layout = (
-            "dflash_aux_plus_last"
-            if dspark_l1_enabled
-            else "dflash_aux"
-            if self.algorithm in {"DFLASH", "DSPARK"}
-            else "eagle3_aux_plus_last"
+        self.hidden_layout = resolve_drafter_hidden_states_layout(
+            self.algorithm, self.training_cfg
         )
         self.vllm_final_norm = None
         if self.backend == "vllm_file" and self.hidden_layout.endswith("_plus_last"):

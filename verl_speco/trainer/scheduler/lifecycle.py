@@ -22,6 +22,10 @@ from verl_speco.trainer.scheduler.training_outcome import TrainingOutcome
 class BeforeActorUpdateContext:
     schedule_context: DrafterScheduleContext
     config: DrafterScheduleConfig
+    # Marginal-utility/legacy freeze gate, evaluated in the trainer immediately
+    # before this context is built. True -> plan is forced to launch=False
+    # before any worker prepare RPC (notably the target lm-head sync).
+    drafter_frozen: bool = False
 
 
 @dataclass(frozen=True)

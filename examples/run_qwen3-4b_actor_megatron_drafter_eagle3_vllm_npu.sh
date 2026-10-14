@@ -43,11 +43,11 @@ if (( ppo_gpus_per_node % (actor_tp * actor_pp) != 0 )); then
     exit 2
 fi
 
-MODEL_PATH=/path/to/model
-CKPTS_DIR=/path/to/checkpoint
-TRAIN_FILE=/path/to/train_file
-TEST_FILE=/path/to/test_file
-DRAFTER_PATH=/path/to/drafter
+MODEL_PATH=${MODEL_PATH:-/path/to/model}
+CKPTS_DIR=${CKPTS_DIR:-/path/to/checkpoint}
+TRAIN_FILE=${TRAIN_FILE:-/path/to/train_file}
+TEST_FILE=${TEST_FILE:-/path/to/test_file}
+DRAFTER_PATH=${DRAFTER_PATH:-/path/to/drafter}
 
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \

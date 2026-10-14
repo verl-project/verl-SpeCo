@@ -72,12 +72,12 @@ concurrency:
 env:
   SPECO_DEFAULT_MODEL_ROOT: ${{ vars.SPECO_MODEL_ROOT || '/home/runner/models' }}
   SPECO_DEFAULT_DATA_ROOT: ${{ vars.SPECO_DATA_ROOT || '/home/runner/models/hf_data' }}
-  SPECO_DEFAULT_TARGET_MODEL: ${{ vars.SPECO_TARGET_MODEL || '/home/runner/models/Qwen/Qwen2.5-0.5B-Instruct' }}
-  SPECO_DEFAULT_EAGLE3_DRAFT_MODEL: ${{ vars.SPECO_EAGLE3_DRAFT_MODEL || '/home/runner/models/speco/eagle3-drafter' }}
-  SPECO_DEFAULT_DFLASH_DRAFT_MODEL: ${{ vars.SPECO_DFLASH_DRAFT_MODEL || '/home/runner/models/speco/dflash-drafter' }}
-  SPECO_DEFAULT_DSPARK_DRAFT_MODEL: ${{ vars.SPECO_DSPARK_DRAFT_MODEL || '/home/runner/models/speco/dspark-drafter' }}
-  SPECO_DEFAULT_TRAIN_FILE: ${{ vars.SPECO_TRAIN_FILE || '/home/runner/models/hf_data/gsm8k/train.parquet' }}
-  SPECO_DEFAULT_TEST_FILE: ${{ vars.SPECO_TEST_FILE || '/home/runner/models/hf_data/gsm8k/test.parquet' }}
+  SPECO_DEFAULT_TARGET_MODEL: ${{ vars.SPECO_TARGET_MODEL || '/root/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218' }}
+  SPECO_DEFAULT_EAGLE3_DRAFT_MODEL: ${{ vars.SPECO_EAGLE3_DRAFT_MODEL || '/root/.cache/huggingface/hub/models--AngelSlim--Qwen3-8B_eagle3/snapshots/9629dfce7a4a10564dd48d3e5485c3976095653c' }}
+  SPECO_DEFAULT_DFLASH_DRAFT_MODEL: ${{ vars.SPECO_DFLASH_DRAFT_MODEL || '/root/.cache/huggingface/hub/models--z-lab--Qwen3-8B-DFlash-b16/snapshots/9b41424b7109f9c5413454f481b09a82b85333f4' }}
+  SPECO_DEFAULT_DSPARK_DRAFT_MODEL: ${{ vars.SPECO_DSPARK_DRAFT_MODEL || '/root/.cache/huggingface/hub/models--deepseek-ai--dspark_qwen3_8b_block7/snapshots/03326e5043815da1f81b109078b2889737c26017' }}
+  SPECO_DEFAULT_TRAIN_FILE: ${{ vars.SPECO_TRAIN_FILE || '/root/.cache/huggingface/hub/datasets--BytedTsinghua-SIA--DAPO-Math-17k/snapshots/65877096c24ffa7abc4e4fa5edb95cf3413a5674/data/dapo-math-17k.parquet' }}
+  SPECO_DEFAULT_TEST_FILE: ${{ vars.SPECO_TEST_FILE || '/root/.cache/huggingface/hub/datasets--BytedTsinghua-SIA--AIME-2024/snapshots/aa49075e24ad594b79fdf0bdcefa735c2181be67/data/aime-2024.parquet' }}
   SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '1' }}
   SPECO_DEFAULT_TENSOR_PARALLEL_SIZE: ${{ vars.SPECO_TENSOR_PARALLEL_SIZE || '1' }}
   SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE: ${{ vars.SPECO_SEQUENCE_PARALLEL_SIZE || '1' }}
@@ -99,6 +99,20 @@ jobs:
       - name: Check out verl-SpeCo
         uses: actions/checkout@v4
 
+      - name: Check out supported verl release
+        uses: actions/checkout@v4
+        with:
+          repository: verl-project/verl
+          ref: release/v0.8.0
+          path: upstream-verl
+      - name: Install and verify current source checkouts
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v uv >/dev/null || python -m pip install uv
+          uv pip install --system --no-deps -e upstream-verl -e .
+          python ci/verify_checkouts.py
+
       - name: Verify NPU runtime
         run: |
           npu-smi info
@@ -119,6 +133,7 @@ jobs:
           SPECO_DSPARK_DRAFT_MODEL: ${{ inputs.dspark_draft_model || env.SPECO_DEFAULT_DSPARK_DRAFT_MODEL }}
           SPECO_TRAIN_FILE: ${{ inputs.train_file || env.SPECO_DEFAULT_TRAIN_FILE }}
           SPECO_TEST_FILE: ${{ inputs.test_file || env.SPECO_DEFAULT_TEST_FILE }}
+          SPECO_CI_RESULT_PATH: ${{ runner.temp }}/speco-ci-${{ matrix.drafter }}.json
           SPECO_CKPT_DIR: ${{ vars.SPECO_CKPT_DIR || runner.temp }}
           SPECO_ACCELERATOR_COUNT: ${{ inputs.accelerator_count || env.SPECO_DEFAULT_ACCELERATOR_COUNT }}
           SPECO_TENSOR_PARALLEL_SIZE: ${{ inputs.tensor_parallel_size || env.SPECO_DEFAULT_TENSOR_PARALLEL_SIZE }}
@@ -130,3 +145,14 @@ jobs:
           SPECO_DATALOADER_NUM_WORKERS: ${{ github.event_name == 'pull_request' && '0' || vars.SPECO_DATALOADER_NUM_WORKERS }}
           SPECO_EXTRA_HYDRA_ARGS: ${{ inputs.extra_hydra_args || vars.SPECO_EXTRA_HYDRA_ARGS }}
         run: bash ci/run_example_test.sh npu sglang "${{ matrix.drafter }}"
+
+      - name: Upload CI result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu_sglang_unit_tests-${{ matrix.drafter }}-result
+          path: |
+            ${{ runner.temp }}/speco-ci-${{ matrix.drafter }}.json
+            ${{ runner.temp }}/speco-ci-${{ matrix.drafter }}.json.log
+            ${{ runner.temp }}/speco-ci-${{ matrix.drafter }}.json.timing.json
+          if-no-files-found: warn

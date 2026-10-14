@@ -110,7 +110,7 @@ def test_tq_clear_retries_transient_failure(monkeypatch) -> None:
     loader = _TransientClearTQLoader(failures=2)
     delays = []
     monkeypatch.setattr(
-        "verl_speco.trainer.draft_training_loop.time.sleep", delays.append
+        "verl_speco.trainer.tq_retry.time.sleep", delays.append
     )
 
     _clear_tq_batch_across_ranks(
@@ -127,7 +127,7 @@ def test_tq_clear_retries_transient_failure(monkeypatch) -> None:
 def test_tq_clear_failure_is_reported_after_three_attempts(monkeypatch) -> None:
     loader = _FakeTQLoader(RuntimeError("clear failed"))
     monkeypatch.setattr(
-        "verl_speco.trainer.draft_training_loop.time.sleep", lambda _: None
+        "verl_speco.trainer.tq_retry.time.sleep", lambda _: None
     )
     with pytest.raises(RuntimeError, match="failed to clear"):
         _clear_tq_batch_across_ranks(
@@ -137,6 +137,25 @@ def test_tq_clear_failure_is_reported_after_three_attempts(monkeypatch) -> None:
             device=torch.device("cpu"),
         )
     assert loader.clear_calls == [["k0", "k1"]] * 3
+
+
+def test_tq_completion_retry_does_not_repeat_successful_clear(monkeypatch) -> None:
+    loader = _FakeTQLoader()
+    events = []
+    monkeypatch.setattr("verl_speco.trainer.tq_retry.time.sleep", lambda _: None)
+
+    def put(event):
+        events.append(event)
+        if len(events) == 1:
+            raise ConnectionError("temporary event failure")
+
+    event = {"kind": "training_completed", "plan_id": 1}
+    _clear_tq_batch_across_ranks(
+        loader, ["k0"], rank=0, device=torch.device("cpu"),
+        training_events=SimpleNamespace(put=put), completion_event=event,
+    )
+    assert loader.clear_calls == [["k0"]]
+    assert events == [event, event]
 
 
 def test_tq_store_connection_failure_is_reported() -> None:
@@ -194,6 +213,16 @@ def test_is_out_of_memory_error_matches_npu_oom_message():
     assert not _is_out_of_memory_error(RuntimeError("bad batch"))
 
 
+def test_prefetch_tracking_subtracts_foreground_wait_not_background_wait():
+    selected = _select_standalone_tracking_metrics({
+        "dspark/loss": 0.5, "perf/step_time": 0.9,
+        "perf/loader_plan_wait_time": 10.0, "perf/batch_ready_wait_time": 0.03,
+        "perf/train_time": 0.65,
+    })
+    assert selected["perf/batch_ready_wait_time"] == 0.03
+    assert selected["perf/other_time"] == pytest.approx(0.22)
+
+
 def test_contains_replay_samples_detects_draft_replay_sample():
     sample = DraftReplaySample(
         input_ids=torch.arange(4),
@@ -213,16 +242,17 @@ def test_standalone_dspark_tracking_keeps_only_core_metrics():
         "dspark/loss": 0.7, "dspark/ce_loss": 2.5, "dspark/l1_loss": 1.0,
         "dspark/top1_acc": 0.6, "dspark/mean_acceptance_length": 2.0,
         "train/lr": 1e-6, "perf/step_time": 10.0,
-        "perf/consumer_wait_time": 3.0, "perf/train_time": 5.0,
+        "perf/loader_plan_wait_time": 30.0, "perf/batch_ready_wait_time": 3.0,
+        "perf/train_time": 5.0,
         "train/ploss_0": 2.5, "dspark/valid_token_count": 42.0,
-        "perf/tq_get_time": 1.0,
+        "perf/loader_tq_get_time": 1.0,
     }
     selected = _select_standalone_tracking_metrics(metrics)
-    assert len(selected) == 10
+    assert len(selected) == 12
     assert selected["dspark/loss"] == 0.7
     assert selected["perf/other_time"] == 2.0
     assert "train/ploss_0" not in selected
-    assert "perf/tq_get_time" not in selected
+    assert selected["perf/loader_tq_get_time"] == 1.0
     assert "perf/other_time" not in metrics
 
 
@@ -261,7 +291,7 @@ def test_standalone_core_metrics_for_each_backend(prefix):
         f"{prefix}/loss": 1.0, f"{prefix}/top1_acc": 0.5,
         f"{prefix}/mean_acceptance_length": 2.0,
         "train/simulated_acc_len": 1.8, "train/lr": 1e-6,
-        "perf/step_time": 10.0, "perf/consumer_wait_time": 3.0,
+        "perf/step_time": 10.0, "perf/batch_ready_wait_time": 3.0,
         "perf/train_time": 5.0, "train/ploss_0": 1.0,
         f"{prefix}/count_per_position/0": 100.0,
         "dflash2/selector_loss": 0.4, "dflash2/selector_accuracy": 0.6,

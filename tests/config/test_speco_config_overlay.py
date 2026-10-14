@@ -86,6 +86,8 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.training.resume_trainer_state_from_checkpoint is True
     assert drafter.training.eagle1_num_hidden_layers == 1
     assert drafter.training.mode == "online"
+    assert drafter.training.preserve_prompt_hidden_states is False
+    assert standalone_training.preserve_prompt_hidden_states is True
     assert drafter.training.feature_store.type == "torch_shard"
     assert "target_feature_replay" not in drafter.training
     assert standalone_training.target_feature_replay.cache.enabled is False

@@ -13,9 +13,11 @@
 # limitations under the License.
 """SPECO adapter for the legacy RayPPOTrainer in verl 0.8 and 0.9."""
 
+import dataclasses
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from contextlib import contextmanager
@@ -38,6 +40,7 @@ from verl_speco.integration.agent_loop_runtime import (
 from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY,
+    OLD_LOGPROB_SOURCE_BATCH_INDICES_KEY,
     OLD_LOGPROB_AUX_LAYER_IDS_KEY,
     OLD_LOGPROB_COLLECT_MASK_KEY,
     OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
@@ -60,7 +63,10 @@ from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
     resolve_oldlogprob_aux_layer_ids,
 )
-from verl_speco.integration.sglang_adapter import pop_drafter_samples
+from verl_speco.integration.sglang_adapter import (
+    pop_drafter_samples,
+    speco_step_matches_interval,
+)
 from verl_speco.integration.sglang_runtime import (
     clear_sglang_runtime_config,
     configure_sglang_runtime_from_config,
@@ -72,6 +78,7 @@ from verl_speco.integration.vllm_runtime import (
     configure_vllm_runtime_from_config,
 )
 from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
+from verl_speco.trainer.hard_sample_selection import partition_hard_candidates
 from verl_speco.trainer.scheduler import (
     AfterActorUpdateContext,
     AfterWeightUpdateContext,
@@ -89,6 +96,7 @@ from verl_speco.trainer.scheduler import (
     DrafterScheduleConfig,
     DrafterScheduleContext,
     DrafterScheduler,
+    step_matches_interval,
     TrainingPlan,
 )
 from verl_speco.workers import SpecoWorker
@@ -102,7 +110,27 @@ SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC = (
 )
 _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY = "_speco_vllm_spec_decode_drafts"
 _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY = "_speco_vllm_spec_decode_accepted_tokens"
+_SPECO_VLLM_REQUEST_VERIFY_ROUNDS_KEY = "_speco_vllm_request_verify_rounds"
+_SPECO_VLLM_REQUEST_ACCEPTED_TOKENS_KEY = "_speco_vllm_request_accepted_tokens"
+_SPECO_VLLM_REQUEST_DRAFT_TOKENS_KEY = "_speco_vllm_request_draft_tokens"
+_SPECO_VLLM_REQUEST_INVALID_TOKENS_KEY = "_speco_vllm_request_invalid_spec_tokens"
+_SPECO_VLLM_REQUEST_COMPLETION_INDEX_KEY = "_speco_vllm_request_completion_index"
+_SPECO_VLLM_REQUEST_ELAPSED_SEC_KEY = "_speco_vllm_request_elapsed_sec"
+_SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY = "_verl_request_mean_accept_len"
+_SPECO_VLLM_REQUEST_IS_HARD_KEY = "_verl_is_hard"
+_SPECO_VLLM_REQUEST_HARD_SCORE_KEY = "_verl_hard_score"
+_SPECO_VLLM_REQUEST_ID_KEY = "_speco_vllm_request_id"
 _SPECO_DRAFTER_TIMING_DEDUCTED_KEY = "_speco_drafter_timing_deducted_from_update_actor"
+# Meta-info markers carried by fixed paired-probe batches (RFC sec. 6).
+_SPECO_FREEZE_PROBE_META_KEY = "_speco_freeze_probe"
+_SPECO_FREEZE_PROBE_MAX_TOKENS_META_KEY = "_speco_freeze_probe_max_tokens"
+_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH_ENV = (
+    "VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH"
+)
+_SPECO_REQUEST_ACCEPT_LEN_HIST_PRINT_ENV = "VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_PRINT"
+_SPECO_REQUEST_ACCEPT_LEN_HIST_BIN_WIDTH_ENV = (
+    "VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_BIN_WIDTH"
+)
 _DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
 
 _DRAFTER_CHECKPOINT_PATH_PLACEHOLDERS = {
@@ -112,7 +140,18 @@ _DRAFTER_CHECKPOINT_PATH_PLACEHOLDERS = {
     "None",
     "/path/to/drafter/checkpoint",
 }
-_POLICY_MODEL_NON_TENSOR_KEYS = {"multi_modal_inputs", "pad_token_id"}
+_POLICY_MODEL_NON_TENSOR_KEYS = {
+    "multi_modal_inputs",
+    "pad_token_id",
+    "_speco_vllm_request_id",
+    "_speco_vllm_request_verify_rounds",
+    "_speco_vllm_request_accepted_tokens",
+    "_speco_vllm_request_draft_tokens",
+    "_speco_vllm_request_invalid_spec_tokens",
+    "_speco_vllm_request_completion_index",
+    "_speco_vllm_request_elapsed_sec",
+    "_verl_request_mean_accept_len",
+}
 
 
 def _select_policy_model_batch(batch: DataProto) -> DataProto:
@@ -177,6 +216,48 @@ def _speco_ref_meta_row_count(meta: Any, default: int = 0) -> int:
         return int(meta.get("chunk_length", meta.get("rows", default)) or 0)
     except (TypeError, ValueError):
         return int(default)
+
+
+def _speco_optional_float(value: Any) -> float | None:
+    """Coerce to a finite float, or ``None`` (filters NaN/Inf unlike metric_float)."""
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            return None
+        value = value.detach().cpu().item()
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _speco_sequence_values(value: Any, size: int) -> list[Any]:
+    """Normalize a per-request field into a length-``size`` list (None-padded)."""
+    if value is None:
+        return [None for _ in range(size)]
+    if torch.is_tensor(value):
+        value = value.detach().cpu().tolist()
+    elif hasattr(value, "tolist") and not isinstance(value, (str, bytes, bytearray)):
+        value = value.tolist()
+    if not isinstance(value, (list, tuple)):
+        value = [value]
+    return [value[index] if index < len(value) else None for index in range(size)]
+
+
+def _speco_request_cell_float(value: Any) -> float | None:
+    """Coerce one non_tensor_batch cell to float, unwrapping nested lists.
+
+    Agent-loop object-array cells hold the server's per-completion lists
+    (e.g. ``[2.0]`` for n=1); drill into singleton lists before delegating
+    to the regular finite-float coercion.
+    """
+    while isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        value = value[0]
+    return _speco_optional_float(value)
 
 
 def _speco_metric_float(value: Any) -> float | None:
@@ -278,6 +359,115 @@ def _speco_float_values(values: Any) -> list[float]:
         except (TypeError, ValueError):
             continue
     return normalized
+
+
+def _speco_diag_enabled(name: str, default: str = "1") -> bool:
+    value = os.getenv(name, default)
+    if value is None:
+        return False
+    return str(value).strip().lower() not in {"0", "false", "off", "no", "n", ""}
+
+
+def _speco_append_jsonl_batch(path: str | None, payloads: list[dict[str, Any]]) -> None:
+    if not path:
+        return
+    if not payloads:
+        return
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as file:
+            file.write(
+                "".join(
+                    json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n"
+                    for payload in payloads
+                )
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to append SPECO diagnostic log %s: %s", path, exc)
+
+
+def _speco_accept_len_quantile(sorted_values: list[float], q: float) -> float | None:
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    position = (len(sorted_values) - 1) * q
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return sorted_values[lower]
+    weight = position - lower
+    return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+
+
+def _speco_accept_len_hist_bin_width() -> float:
+    value = _speco_optional_float(
+        os.getenv(_SPECO_REQUEST_ACCEPT_LEN_HIST_BIN_WIDTH_ENV, "0.1")
+    )
+    return value if value is not None and value > 0 else 0.1
+
+
+def _speco_accept_len_histogram(
+    values: list[float], *, bin_width: float
+) -> list[dict[str, Any]]:
+    counts: dict[int, int] = {}
+    for value in values:
+        index = math.floor(value / bin_width)
+        counts[index] = counts.get(index, 0) + 1
+    return [
+        {
+            "left": round(index * bin_width, 6),
+            "right": round((index + 1) * bin_width, 6),
+            "center": round((index + 0.5) * bin_width, 6),
+            "count": count,
+        }
+        for index, count in sorted(counts.items())
+    ]
+
+
+def _speco_request_accept_len_step_payload(
+    *,
+    step: int,
+    source: str,
+    records: list[dict[str, Any]],
+    accept_len_var: float,
+) -> dict[str, Any] | None:
+    values = [
+        float(record["mean_accept_len"])
+        for record in records
+        if _speco_optional_float(record.get("mean_accept_len")) is not None
+    ]
+    if not values:
+        return None
+    sorted_values = sorted(values)
+    bin_width = _speco_accept_len_hist_bin_width()
+    mean_accept_len = sum(values) / len(values)
+    p50 = cast(float, _speco_accept_len_quantile(sorted_values, 0.50))
+    p90 = cast(float, _speco_accept_len_quantile(sorted_values, 0.90))
+    p95 = cast(float, _speco_accept_len_quantile(sorted_values, 0.95))
+    return {
+        "step": int(step),
+        "source": source,
+        "count": len(values),
+        "accept_lens": [round(value, 6) for value in values],
+        "summary": {
+            "min": round(sorted_values[0], 6),
+            "max": round(sorted_values[-1], 6),
+            "mean": round(mean_accept_len, 6),
+            "p50": round(p50, 6),
+            "p90": round(p90, 6),
+            "p95": round(p95, 6),
+            "var": round(float(accept_len_var), 6),
+        },
+        "histogram": {
+            "bin_width": round(bin_width, 6),
+            "x": "mean_accept_len",
+            "y": "request_count",
+            "bins": _speco_accept_len_histogram(values, bin_width=bin_width),
+        },
+    }
 
 
 def _speco_vllm_spec_decode_stats_from_batch(batch: Any) -> dict[str, float]:
@@ -421,6 +611,32 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_oldlogprob_total_elapsed_sec = 0.0
         self._speco_last_collect_interval_matched = 0
         self._speco_last_collection_outcome = None
+        # ``_speco_drafter_frozen`` is the single gate that suppresses drafter
+        # training; it is driven by the marginal-utility freeze policy in
+        # active mode (``_speco_observe_rollout_evidence``).
+        self._speco_drafter_frozen = False
+        self._speco_last_request_accept_len_records: list[dict[str, Any]] = []
+        # Marginal-utility freeze policy (method=marginal_utility_v1). Shadow
+        # mode only logs would_freeze + metrics; active mode drives the
+        # ``_speco_drafter_frozen`` gate that stops both drafter training and
+        # hidden-state collection (accept-length / PPO old_log_prob stay on).
+        self._speco_freeze_policy = None  # built lazily in fit()
+        self._speco_freeze_policy_active = False
+        self._speco_last_freeze_decision = None
+        self._speco_freeze_state_sidecar = "speco_drafter_freeze_state.json"
+        # Freeze-transition fork checkpoint
+        # (freeze_transition_branch_checkpoint_design.md). The request is
+        # recorded in the generate hook (intent only, no I/O) and consumed at
+        # the post-actor-update extension point, never inside the rollout
+        # callback. ``once`` semantics: at most one fork per run.
+        self._speco_freeze_branch_save_pending = None
+        self._speco_freeze_branch_saved = False
+        # Coalesces an event save and the base loop's periodic save landing on
+        # the same step: the full save chain runs at most once per global step.
+        self._speco_last_checkpoint_saved_step = None
+        self._speco_pending_request_accept_len_payloads = []
+        self._speco_last_request_accept_len_var = 0.0
+        self._speco_last_oldlogprob_skipped_missing_hidden = 0
 
     def attach_speco_worker_group(self, worker_group):
         self.drafter_wg = worker_group
@@ -926,6 +1142,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 require_training_interval=(
                     source is DrafterCollectionSource.OLD_LOGPROB
                 ),
+                # Active freeze stops hidden-state feature collection (the
+                # drafter no longer trains); accept-length and PPO old_log_prob
+                # stay ungated. Shadow never sets _speco_drafter_frozen.
+                drafter_frozen=getattr(self, "_speco_drafter_frozen", False),
             ),
             self._speco_drafter_schedule_config(),
         )
@@ -967,8 +1187,1000 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._drafter_runtime_state = runtime_state
         return runtime_state
 
+    def _speco_should_train_drafter_this_step(self) -> bool:
+        training_cfg = self._speco_drafter_training_config()
+        return speco_step_matches_interval(
+            self.global_steps, training_cfg.get("training_interval_steps", 1)
+        )
+
+    def _speco_has_collected_drafter_samples_this_step(self) -> bool:
+        return int(getattr(self, "_speco_last_collected_samples", 0) or 0) > 0
+
+    # ------------------------------------------------------------------ #
+    # Per-request accept-length records (feed the freeze policy evidence)
+    # ------------------------------------------------------------------ #
+    def _speco_batch_size_from_request_stats(self, batch: Any) -> int:
+        non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            return 0
+        for key in (
+            _SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY,
+            _SPECO_VLLM_REQUEST_VERIFY_ROUNDS_KEY,
+            _SPECO_VLLM_REQUEST_ACCEPTED_TOKENS_KEY,
+            _SPECO_VLLM_REQUEST_ID_KEY,
+        ):
+            values = non_tensor_batch.get(key)
+            if values is None or isinstance(values, (str, bytes)):
+                continue
+            try:
+                return len(values)
+            except TypeError:
+                tolist = getattr(values, "tolist", None)
+                if callable(tolist):
+                    try:
+                        return len(tolist())
+                    except TypeError:
+                        continue
+        return 0
+
+    def _speco_freeze_request_accept_lengths(
+        self, batch: Any, batch_size: int
+    ) -> list[float | None]:
+        """Per-request mean accept length from the rollout non_tensor_batch.
+
+        Agent-loop batches wrap each trajectory's extra fields in object-array
+        cells, and the vLLM server emits per-completion values as lists (n>=1),
+        so cells arrive shaped like ``[[2.0], [1.5], ...]``. Unwrap singleton
+        (or arbitrarily nested) lists before float coercion.
+        """
+        non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            return [None for _ in range(batch_size)]
+
+        explicit = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY),
+            batch_size,
+        )
+        result = [_speco_request_cell_float(value) for value in explicit]
+        if any(value is not None for value in result):
+            return result
+
+        rounds = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_VERIFY_ROUNDS_KEY), batch_size
+        )
+        accepted = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_ACCEPTED_TOKENS_KEY), batch_size
+        )
+        for index, (round_value, accepted_value) in enumerate(
+            zip(rounds, accepted, strict=False)
+        ):
+            verify_rounds = _speco_request_cell_float(round_value)
+            accepted_tokens = _speco_request_cell_float(accepted_value)
+            if verify_rounds is None or verify_rounds <= 0 or accepted_tokens is None:
+                continue
+            result[index] = 1.0 + accepted_tokens / verify_rounds
+        return result
+
+    def _speco_populate_request_accept_len_records(self, batch: Any) -> None:
+        """Store this step's per-request accept lengths for the freeze gate.
+
+        Mirrors the source repo's record pipeline but without the hard-sample
+        collection dependency: builds ``_speco_last_request_accept_len_records``
+        directly from the rollout batch so the freeze policy's evidence feed
+        (``_speco_observe_rollout_evidence``) has per-request data each step.
+        """
+        batch_size = self._speco_batch_size_from_request_stats(batch)
+        if batch_size <= 0:
+            self._speco_last_request_accept_len_records = []
+            return
+        accept_lens = self._speco_freeze_request_accept_lengths(batch, batch_size)
+        records = []
+        for batch_idx, mean_accept_len in enumerate(accept_lens):
+            if mean_accept_len is None:
+                continue
+            records.append(
+                {
+                    "batch_idx": batch_idx,
+                    "mean_accept_len": round(float(mean_accept_len), 6),
+                }
+            )
+        self._speco_last_request_accept_len_records = records
+
+    # ------------------------------------------------------------------ #
+    # Marginal-utility freeze policy (method=marginal_utility_v1)
+    # ------------------------------------------------------------------ #
+    def _speco_init_freeze_policy(self):
+        """Build the version-clock freeze policy from config, or ``None``.
+
+        The policy object is mode-agnostic: shadow vs active is enforced here
+        in the trainer (shadow never sets ``_speco_drafter_frozen``).
+        """
+        training_cfg = self._speco_drafter_training_config()
+        cfg = training_cfg.get("drafter_convergence_freeze", {}) or {}
+        if not cfg.get("enabled", False):
+            return None
+        economics = cfg.get("economics", {}) or {}
+        # shortcut: reject async ROI gating until completion waits are attributed correctly.
+        if training_cfg.get("publish_async", False) and economics.get("enabled", False):
+            raise ValueError(
+                "publish_async=true with drafter_convergence_freeze.economics.enabled=true "
+                "is not supported while async publish completion-cost accounting is pending; "
+                "set publish_async=false or economics.enabled=false"
+            )
+        method = str(cfg.get("method", "marginal_utility_v1")).strip().lower()
+        if method != "marginal_utility_v1":
+            raise ValueError(
+                f"drafter_convergence_freeze.method={method!r} is not supported: "
+                "the legacy single-metric tracker was removed "
+                "(use method=marginal_utility_v1)"
+            )
+        from omegaconf import OmegaConf
+
+        from verl_speco.trainer.drafter_freeze_policy import DrafterFreezePolicy
+
+        raw = OmegaConf.to_container(cfg, resolve=True)
+        policy = DrafterFreezePolicy(config=raw)
+        self._speco_freeze_policy_active = (
+            str(raw.get("mode", "shadow")).strip().lower() == "active"
+        )
+        self._speco_freeze_load_state(policy)
+        return policy
+
+    def _speco_freeze_branch_config(self) -> dict[str, Any]:
+        cfg = (
+            self._speco_drafter_training_config().get("drafter_convergence_freeze", {})
+            or {}
+        )
+        branch = cfg.get("branch_checkpoint", {}) or {}
+        # self.config holds raw OmegaConf nodes: DictConfig is NOT a dict
+        # subclass (it extends MutableMapping), so normalize to a plain dict
+        # before the isinstance gate below. Fail closed: if normalization
+        # (including interpolation resolution) fails, let it raise at startup
+        # rather than silently returning {} and disabling the whole feature.
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(branch):
+            branch = OmegaConf.to_container(branch, resolve=True)
+        if not isinstance(branch, dict):
+            raise TypeError(
+                "drafter_convergence_freeze.branch_checkpoint must resolve to a "
+                f"mapping, got {type(branch).__name__}"
+            )
+        return branch
+
+    def _speco_validate_freeze_branch_config(self) -> None:
+        """Fail fast on unsupported branch_checkpoint combinations.
+
+        The first version supports exactly one mode: a single automatic fork
+        checkpoint on the first active ``-> FROZEN`` transition, failing
+        closed. See freeze_transition_branch_checkpoint_design.md sec. 5.1.
+        """
+        branch = self._speco_freeze_branch_config()
+        if not bool(branch.get("enabled", False)):
+            return
+        cfg = (
+            self._speco_drafter_training_config().get("drafter_convergence_freeze", {})
+            or {}
+        )
+        problems: list[str] = []
+        if not cfg.get("enabled", False):
+            problems.append("drafter_convergence_freeze.enabled must be true")
+        if (
+            str(cfg.get("method", "marginal_utility_v1")).strip().lower()
+            != "marginal_utility_v1"
+        ):
+            problems.append(
+                "branch_checkpoint requires method=marginal_utility_v1 "
+                "(a state-transition FreezeDecision)"
+            )
+        if str(cfg.get("mode", "shadow")).strip().lower() != "active":
+            problems.append("branch_checkpoint requires mode=active")
+        if bool(branch.get("once", True)) is not True:
+            problems.append("only branch_checkpoint.once=true is supported")
+        if bool(branch.get("fail_on_error", True)) is not True:
+            problems.append("only branch_checkpoint.fail_on_error=true is supported")
+        if problems:
+            raise ValueError(
+                "invalid freeze branch_checkpoint config: " + "; ".join(problems)
+            )
+
+    def _speco_default_local_dir(self) -> str | None:
+        """Resolve the training output root.
+
+        Base verl ``RayPPOTrainer`` does NOT set ``self.default_local_dir``;
+        it reads ``self.config.trainer.default_local_dir`` at save points.
+        Support both (the attr takes precedence when present).
+        """
+        local_dir = getattr(self, "default_local_dir", None)
+        if local_dir:
+            return str(local_dir)
+        local_dir = _get_nested(self.config, ("trainer", "default_local_dir"), None)
+        return str(local_dir) if local_dir else None
+
+    def _speco_freeze_state_resume_path(self) -> tuple[str | None, str | None]:
+        """Sidecar matching the checkpoint verl actually restores.
+
+        Returns ``(sidecar_path, resume_folder)``; both are ``None`` when no
+        policy state must be loaded.
+
+        * ``disable`` (new training): never load. A stale sidecar left in the
+          output directory from an earlier run must not be inherited, or a
+          fresh run could start FROZEN and skip drafter training.
+        * ``auto``: resolve the same checkpoint the base trainer restores --
+          the tracker-selected latest ``global_step_S`` under
+          ``default_local_dir`` -- and read the sidecar committed inside it.
+          No resolvable checkpoint means the base trainer starts from scratch,
+          so the policy must start fresh too; a stale sidecar is NOT a valid
+          state source.
+        * ``resume_path``: only the sidecar carried inside the explicitly
+          chosen ``resume_from_path`` folder. A sidecar in the output
+          directory never overrides the user's choice.
+        """
+        trainer_cfg = _get_nested(self.config, ("trainer",), None)
+        resume_mode = str(
+            _get_nested(trainer_cfg, ("resume_mode",), "disable") or "disable"
+        )
+        if resume_mode == "disable":
+            return None, None
+        if resume_mode == "resume_path":
+            folder = _get_nested(trainer_cfg, ("resume_from_path",), None)
+            resume_folder = str(folder) if folder else None
+        elif resume_mode == "auto":
+            root = self._speco_default_local_dir()
+            if not root:
+                return None, None
+            from verl.utils.checkpoint.checkpoint_manager import (
+                find_latest_ckpt_path,
+            )
+
+            resume_folder = find_latest_ckpt_path(os.path.abspath(os.fspath(root)))
+            if not resume_folder:
+                return None, None
+        else:
+            return None, None
+        if not resume_folder:
+            return None, None
+        return (
+            os.path.join(str(resume_folder), self._speco_freeze_state_sidecar),
+            str(resume_folder),
+        )
+
+    def _speco_freeze_load_state(self, policy) -> None:
+        path, resume_folder = self._speco_freeze_state_resume_path()
+        if not path or resume_folder is None:
+            return
+        from verl_speco.trainer.checkpoint import freeze_branch_manifest_path
+
+        has_fork_manifest = os.path.exists(freeze_branch_manifest_path(resume_folder))
+        if not os.path.exists(path):
+            if has_fork_manifest:
+                # A committed fork point is only complete with its policy
+                # state: fail closed rather than silently train the branch.
+                raise RuntimeError(
+                    f"committed freeze branch checkpoint {resume_folder} is "
+                    f"missing its policy state sidecar ({path}); the fork "
+                    "point is incomplete, refusing to resume"
+                )
+            # Checkpoints written before per-checkpoint freeze state (or by
+            # runs with the feature disabled) carry no sidecar: say so
+            # explicitly instead of silently rebinding stale state.
+            logger.warning(
+                "[drafter freeze] no policy state sidecar in resumed "
+                "checkpoint %s; freeze policy starts fresh (compatibility "
+                "downgrade, not a full state restore)",
+                resume_folder,
+            )
+            return
+        with open(path, "r", encoding="utf-8") as handle:
+            policy.load_state_dict(json.load(handle))
+        print(
+            f"[drafter freeze] restored policy state from {path} "
+            f"(version={policy.drafter_version}, state={policy.state.value})",
+            flush=True,
+        )
+        if has_fork_manifest:
+            # Fork-specific validation ONLY when a fork manifest exists; a
+            # plain checkpoint never triggers fork semantics.
+            self._speco_freeze_assert_matches_fork_manifest(policy, resume_folder)
+
+    def _speco_freeze_assert_matches_fork_manifest(
+        self, policy, resume_folder: str
+    ) -> None:
+        """Fail fast when a forked branch did not restore the frozen state.
+
+        After resuming from a committed freeze branch checkpoint, the policy
+        MUST still be FROZEN at the manifest's drafter_version. A mismatch
+        means a fingerprinted freeze parameter drifted (e.g. an omitted
+        override silently reset the policy to CALIBRATING); continuing would
+        silently train the "frozen" branch, so abort startup.
+        """
+        from verl_speco.trainer.checkpoint import read_freeze_branch_manifest
+
+        try:
+            manifest = read_freeze_branch_manifest(resume_folder)
+        except Exception as exc:  # noqa: BLE001 - no committed fork point
+            raise RuntimeError(
+                f"resume folder {resume_folder} is not a committed freeze "
+                f"branch checkpoint: {exc}"
+            ) from exc
+        expected_version = int(manifest["drafter_version"])
+        problems: list[str] = []
+        if policy.state.value != "FROZEN":
+            problems.append(f"state={policy.state.value!r} (expected FROZEN)")
+        if int(policy.drafter_version) != expected_version:
+            problems.append(
+                f"drafter_version={int(policy.drafter_version)} "
+                f"(expected {expected_version})"
+            )
+        if problems:
+            raise RuntimeError(
+                "freeze branch resume failed to restore the frozen policy "
+                f"state from {resume_folder}: " + "; ".join(problems)
+            )
+
+    def _speco_freeze_save_state(self) -> None:
+        """Write policy state before the base save commits the latest tracker.
+
+        An interrupted model save may leave an uncommitted folder; auto-resume
+        selects only the checkpoint named by the tracker.
+        """
+        policy = getattr(self, "_speco_freeze_policy", None)
+        local_dir = self._speco_default_local_dir()
+        if policy is None or not local_dir:
+            return
+        folder = os.path.join(
+            local_dir,
+            f"global_step_{int(getattr(self, 'global_steps', 0) or 0)}",
+        )
+        os.makedirs(folder, exist_ok=True)
+        from verl_speco.trainer.checkpoint import (
+            atomic_write_json,
+            freeze_policy_sidecar_path,
+        )
+
+        atomic_write_json(freeze_policy_sidecar_path(folder), policy.state_dict())
+
+    def _speco_freeze_emit_transition(self, decision) -> None:
+        if decision is None or not decision.transitioned:
+            return
+        payload = {
+            "event": "drafter_freeze_transition",
+            "step": int(getattr(self, "global_steps", 0) or 0),
+            "state": decision.state.value,
+            "reason": decision.reason,
+            "drafter_version": int(decision.drafter_version),
+            "update_opportunity_id": int(decision.update_opportunity_id),
+            "mode": "active" if self._speco_freeze_policy_active else "shadow",
+        }
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+    def _speco_record_freeze_branch_request(self, decision) -> None:
+        """Record (intent only, no I/O) the first active transition into FROZEN.
+
+        Consumed later by :meth:`_speco_maybe_save_freeze_branch_checkpoint`
+        at the post-actor-update safe point. Must never do I/O itself: it runs
+        inside the generate hook (design sec. 4.2).
+        """
+        if self._speco_freeze_branch_saved:
+            return
+        if self._speco_freeze_branch_save_pending is not None:
+            return
+        branch_cfg = self._speco_freeze_branch_config()
+        if not bool(branch_cfg.get("enabled", False)):
+            return
+        if not self._speco_freeze_policy_active or decision is None:
+            return
+
+        from verl_speco.trainer.drafter_freeze_policy import FreezeState
+
+        if not decision.transitioned or decision.state != FreezeState.FROZEN:
+            return
+
+        request = {
+            "trigger_step": int(getattr(self, "global_steps", 0) or 0),
+            "reason": str(decision.reason),
+            "drafter_version": int(decision.drafter_version),
+            "update_opportunity_id": int(decision.update_opportunity_id),
+        }
+        self._speco_freeze_branch_save_pending = request
+        print(
+            json.dumps(
+                {
+                    "event": "freeze_branch_checkpoint_requested",
+                    "step": request["trigger_step"],
+                    "reason": request["reason"],
+                    "drafter_version": request["drafter_version"],
+                    "update_opportunity_id": request["update_opportunity_id"],
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
+    def _speco_maybe_save_freeze_branch_checkpoint(self) -> None:
+        """Consume a pending fork request using the full checkpoint chain.
+
+        Called from the patched ``_update_actor`` after the actor update (and
+        after the frozen step skipped its drafter train/publish), at the same
+        ordering point the base loop uses for periodic saves
+        (post-update_actor, pre-``checkpoint_manager.update_weights``,
+        pre-next-rollout). Never call this from the generate or tracking-log
+        hooks. Fails closed: on any error the failure event is emitted and the
+        exception propagates; pending is retained and success is not marked.
+        """
+        request = getattr(self, "_speco_freeze_branch_save_pending", None)
+        if request is None or getattr(self, "_speco_freeze_branch_saved", False):
+            return
+        branch_cfg = self._speco_freeze_branch_config()
+        if not bool(branch_cfg.get("enabled", False)):
+            # Feature was disabled after the request was recorded: drop intent.
+            self._speco_freeze_branch_save_pending = None
+            return
+
+        from verl_speco.trainer.checkpoint import (
+            FREEZE_BRANCH_FORMAT_VERSION,
+            atomic_write_json,
+            freeze_policy_sidecar_path,
+            validate_freeze_branch_checkpoint,
+            write_freeze_branch_manifest,
+        )
+
+        step = int(getattr(self, "global_steps", 0) or 0)
+        local_dir = self._speco_default_local_dir()
+        target_folder = (
+            os.path.join(local_dir, f"global_step_{step}") if local_dir else None
+        )
+        try:
+            if step != int(request["trigger_step"]):
+                raise RuntimeError(
+                    "freeze branch checkpoint requested at step "
+                    f"{request['trigger_step']} but consumed at step {step}"
+                )
+            if not local_dir or target_folder is None:
+                raise RuntimeError(
+                    "freeze branch checkpoint requires trainer.default_local_dir"
+                )
+            # Full chain: wait async publish, save drafter draft_step_S, then
+            # actor/critic/dataloader; on success the policy sidecar is
+            # committed inside global_step_S as well.
+            self._save_checkpoint()
+
+            # Persist the freeze policy state INSIDE the fork folder so the
+            # branch checkpoint is self-contained; written before the
+            # manifest, which is the last (atomic) commit. This is redundant
+            # with the sidecar committed by _save_checkpoint by design: the
+            # fork contract requires the sidecar unconditionally (also when
+            # the save was deduplicated), and validation below enforces it.
+            policy = getattr(self, "_speco_freeze_policy", None)
+            if policy is not None:
+                atomic_write_json(
+                    freeze_policy_sidecar_path(target_folder),
+                    policy.state_dict(),
+                )
+
+            manifest = {
+                "format_version": FREEZE_BRANCH_FORMAT_VERSION,
+                "complete": True,
+                "trigger_step": step,
+                "checkpoint_step": step,
+                "drafter_version": int(request["drafter_version"]),
+                "update_opportunity_id": int(request["update_opportunity_id"]),
+                "freeze_reason": request["reason"],
+                "freeze_mode_at_save": (
+                    "active" if self._speco_freeze_policy_active else "shadow"
+                ),
+                "compare_from_step": step + 1,
+            }
+            write_freeze_branch_manifest(target_folder, manifest)
+            drafter_root = self._speco_ensure_drafter_checkpoint_path()
+            validate_freeze_branch_checkpoint(
+                target_folder,
+                drafter_root=drafter_root,
+                step=step,
+            )
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {
+                        "event": "freeze_branch_checkpoint_failed",
+                        "step": step,
+                        "path": target_folder,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            if bool(branch_cfg.get("fail_on_error", True)):
+                raise
+            return
+
+        self._speco_freeze_branch_saved = True
+        self._speco_freeze_branch_save_pending = None
+        print(
+            json.dumps(
+                {
+                    "event": "freeze_branch_checkpoint_saved",
+                    "step": step,
+                    "path": target_folder,
+                    "drafter_version": int(request["drafter_version"]),
+                    "freeze_reason": request["reason"],
+                    "compare_from_step": step + 1,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
+    @staticmethod
+    def _speco_rollout_response_tokens(output: Any) -> int | None:
+        """Read the actual response-token count before Tracking.log exists."""
+        batch = getattr(output, "batch", None)
+        if batch is None:
+            return None
+        response_mask = batch.get("response_mask", None)
+        if torch.is_tensor(response_mask):
+            return int(response_mask.detach().sum().item())
+        responses = batch.get("responses", None)
+        attention_mask = batch.get("attention_mask", None)
+        prompts = batch.get("prompts", None)
+        if not (
+            torch.is_tensor(responses)
+            and torch.is_tensor(attention_mask)
+            and torch.is_tensor(prompts)
+        ):
+            return None
+        start = int(prompts.shape[-1])
+        width = int(responses.shape[-1])
+        return int(attention_mask[..., start : start + width].detach().sum().item())
+
+    def _speco_observe_rollout_evidence(
+        self,
+        output: Any,
+        serving_version: int,
+        *,
+        generation_seconds: float | None = None,
+    ):
+        """Feed one rollout step's per-request evidence to the freeze policy.
+
+        Runs inside the generate hook (post-generation, pre update_actor), so
+        evidence precedes the inline publish event; under deferred publish the
+        previous step's publish has already been observed by the time the
+        tagged ``serving_version`` arrives (see policy event-order handling).
+        """
+        policy = getattr(self, "_speco_freeze_policy", None)
+        if policy is None:
+            return None
+        records = getattr(self, "_speco_last_request_accept_len_records", None) or []
+        accept_lens = [
+            float(record["mean_accept_len"])
+            for record in records
+            if isinstance(record, dict) and record.get("mean_accept_len") is not None
+        ]
+
+        meta_info = getattr(output, "meta_info", None)
+        output_metrics = (
+            meta_info.get("metrics", {}) if isinstance(meta_info, dict) else {}
+        )
+        response_length_mean = _speco_optional_float(
+            output_metrics.get("response_length/mean")
+        )
+        gen_time = _speco_optional_float(generation_seconds)
+        if gen_time is None:
+            gen_time = _speco_optional_float(output_metrics.get("timing_s/gen"))
+        response_tokens = self._speco_rollout_response_tokens(output)
+        if response_tokens is None:
+            response_tokens = (
+                int(len(accept_lens) * response_length_mean)
+                if response_length_mean is not None
+                else 0
+            )
+
+        low_fraction = None
+        if accept_lens:
+            from verl_speco.trainer.accept_len_convergence import bimodal_metrics
+
+            low_fraction = float(bimodal_metrics(accept_lens)["low_fraction"])
+
+        from verl_speco.trainer.drafter_freeze_policy import FreezeEvidence
+
+        evidence = FreezeEvidence(
+            global_step=int(getattr(self, "global_steps", 0) or 0),
+            drafter_version=int(serving_version),
+            request_accept_lens=accept_lens,
+            response_tokens=response_tokens,
+            generation_seconds=float(gen_time or 0.0),
+            opportunity_this_step=bool(self._speco_should_train_drafter_this_step()),
+            low_fraction=low_fraction,
+        )
+        decision = policy.observe(evidence)
+        self._speco_last_freeze_decision = decision
+        if self._speco_freeze_policy_active:
+            # Same gate the legacy tracker drives; read by the train attempt
+            # gate and by update_actor's frozen-plan replacement this step.
+            self._speco_drafter_frozen = not bool(decision.should_train)
+        self._speco_freeze_emit_transition(decision)
+        # Intent only (no I/O): consumed at the post-actor-update safe point.
+        self._speco_record_freeze_branch_request(decision)
+        return decision
+
+    @staticmethod
+    def _speco_freeze_publish_cost_seconds(
+        metrics: dict[str, Any],
+    ) -> float | None:
+        cost = 0.0
+        for key in (
+            "timing_s/drafter_publish_wait_pending",
+            "timing_s/drafter_publish_fetch_snapshot",
+            "timing_s/drafter_publish_update_weights",
+        ):
+            value = _speco_optional_float(metrics.get(key))
+            if value is not None:
+                cost += value
+        return cost if cost > 0.0 else None
+
+    def _speco_freeze_observe_publish(
+        self,
+        publish_metrics: dict[str, Any],
+        *,
+        update_cost_seconds: float | None = None,
+        probe=None,
+    ) -> None:
+        """Record a successful train+publish as one real version-clock update.
+
+        Failed attempts (``drafter/published`` != 1) never reach the policy, so
+        a failed train/publish can never be counted as a zero-gain update.
+        ``probe`` is the fixed paired :class:`ProbeComparison` around this exact
+        publish (RFC sec. 6); absent on probe-skipped/failed publishes, where
+        the economics gate fails open.
+        """
+        policy = getattr(self, "_speco_freeze_policy", None)
+        if policy is None or not isinstance(publish_metrics, dict):
+            return
+        if int(publish_metrics.get("drafter/published", 0) or 0) != 1:
+            return
+        cost = update_cost_seconds
+        if cost is None:
+            cost = self._speco_freeze_publish_cost_seconds(publish_metrics)
+
+        from verl_speco.trainer.drafter_freeze_policy import FreezeEvidence
+
+        evidence = FreezeEvidence(
+            global_step=int(getattr(self, "global_steps", 0) or 0),
+            drafter_version=int(policy.drafter_version) + 1,
+            publish_completed=True,
+            update_succeeded=True,
+            publish_succeeded=True,
+            update_cost_seconds=cost,
+            probe=probe,
+        )
+        decision = policy.observe(evidence)
+        self._speco_last_freeze_decision = decision
+
+    # ------------------------------------------------------------------ #
+    # Fixed paired probe execution (RFC sec. 6)
+    # ------------------------------------------------------------------ #
+    def _speco_freeze_probe_config(self) -> dict[str, Any]:
+        cfg = (
+            self._speco_drafter_training_config().get("drafter_convergence_freeze", {})
+            or {}
+        )
+        probe = cfg.get("probe", {}) or {}
+        # Raw Hydra configs are DictConfig nodes (NOT dict subclasses); without
+        # normalization the isinstance gate below silently returns {} and the
+        # executor falls back to default prompts/token counts while the policy
+        # still schedules probes. Normalize like _speco_freeze_branch_config.
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(probe):
+            probe = OmegaConf.to_container(probe, resolve=True)
+        if not isinstance(probe, dict):
+            raise TypeError(
+                "drafter_convergence_freeze.probe must resolve to a mapping, "
+                f"got {type(probe).__name__}"
+            )
+        return probe
+
+    def _speco_freeze_probe_pool_data(self) -> list[dict[str, Any]]:
+        """Fixed ordered prompt pool as collated chunks (built once).
+
+        Same prompts in the same order for every probe/arm: pairing is by row
+        position. Defaults to the first ``probe.prompt_count`` TRAINING rows
+        (selection is forced sequential even when the training data config
+        shuffles). Rows are collated in ``probe.batch_size`` chunks and each
+        arm generates one chunk at a time. Set ``probe.prompts_file`` to a
+        parquet to use a dedicated probe pool.
+        """
+        cached = getattr(self, "_speco_freeze_probe_pool_cache", None)
+        if cached is not None:
+            return cached
+        import copy
+
+        import numpy as np
+        from torchdata.stateful_dataloader import StatefulDataLoader
+
+        from verl.trainer.ppo.utils import create_rl_dataset
+        from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+
+        probe_cfg = self._speco_freeze_probe_config()
+        prompt_count = int(probe_cfg.get("prompt_count", 256))
+        batch_size = int(probe_cfg.get("batch_size", 64))
+        prompts_file = probe_cfg.get("prompts_file", None)
+        files = prompts_file if prompts_file else self.config.data.train_files
+        # Never let the training config's shuffle turn max_samples into a
+        # random subset: the probe pool must be identical across runs/arms.
+        data_cfg = copy.deepcopy(self.config.data)
+        data_cfg.shuffle = False
+        dataset = create_rl_dataset(
+            files,
+            data_cfg,
+            self.tokenizer,
+            self.processor,
+            max_samples=prompt_count,
+        )
+        loader = StatefulDataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=0,
+            shuffle=False,
+            drop_last=False,
+            collate_fn=default_collate_fn,
+        )
+        chunks: list[dict[str, Any]] = []
+        remaining = prompt_count
+        row_offset = 0
+        for batch in loader:
+            if remaining <= 0:
+                break
+            chunk = dict(batch)
+            first_value = next(iter(chunk.values()))
+            n_rows = min(len(first_value), remaining)
+            if n_rows != len(first_value):
+                chunk = {key: value[:n_rows] for key, value in chunk.items()}
+            # Stable uids double as deterministic pair ids across arms/runs.
+            chunk["uid"] = np.array(
+                [
+                    f"speco-freeze-probe-{i:04d}"
+                    for i in range(row_offset, row_offset + n_rows)
+                ],
+                dtype=object,
+            )
+            chunks.append(chunk)
+            row_offset += n_rows
+            remaining -= n_rows
+        if not chunks:
+            raise RuntimeError("freeze probe pool is empty")
+        print(
+            f"[drafter freeze] fixed probe pool ready: {row_offset} prompts "
+            f"in {len(chunks)} chunk(s) of <= {batch_size} "
+            f"from {prompts_file or 'train_files'}",
+            flush=True,
+        )
+        self._speco_freeze_probe_pool_cache = chunks
+        return chunks
+
+    def _speco_build_freeze_probe_gen_batch(self, data: dict[str, Any]):
+        from verl.protocol import pad_dataproto_to_divisor
+
+        batch = DataProto.from_single_dict(data)
+        gen_batch = self._get_gen_batch(batch)
+        probe_cfg = self._speco_freeze_probe_config()
+        max_new_tokens = int(probe_cfg.get("max_new_tokens", 2048))
+        gen_batch.meta_info = {
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "recompute_log_prob": False,
+            "do_sample": False,
+            "validate": True,
+            "global_steps": int(getattr(self, "global_steps", 0) or 0),
+            _SPECO_FREEZE_PROBE_META_KEY: True,
+            _SPECO_FREEZE_PROBE_MAX_TOKENS_META_KEY: max_new_tokens,
+        }
+        size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
+        return pad_dataproto_to_divisor(gen_batch, size_divisor)
+
+    def _speco_freeze_probe_rows(self, output: Any) -> list[dict[str, Any]]:
+        """Per-request accept length / generated tokens / wall seconds."""
+        non_tensor_batch = getattr(output, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            raise RuntimeError("freeze probe output has no non_tensor_batch")
+        batch_size = self._speco_batch_size_from_request_stats(output)
+        if batch_size <= 0:
+            raise RuntimeError("freeze probe output carries no per-request stats")
+
+        accept_lens = self._speco_freeze_request_accept_lengths(output, batch_size)
+        rounds = [
+            _speco_request_cell_float(value)
+            for value in _speco_sequence_values(
+                non_tensor_batch.get(_SPECO_VLLM_REQUEST_VERIFY_ROUNDS_KEY),
+                batch_size,
+            )
+        ]
+        accepted = [
+            _speco_request_cell_float(value)
+            for value in _speco_sequence_values(
+                non_tensor_batch.get(_SPECO_VLLM_REQUEST_ACCEPTED_TOKENS_KEY),
+                batch_size,
+            )
+        ]
+        elapsed = [
+            _speco_request_cell_float(value)
+            for value in _speco_sequence_values(
+                non_tensor_batch.get(_SPECO_VLLM_REQUEST_ELAPSED_SEC_KEY),
+                batch_size,
+            )
+        ]
+        uids = [
+            str(value) if value is not None else f"speco-freeze-probe-{i:04d}"
+            for i, value in enumerate(
+                _speco_sequence_values(non_tensor_batch.get("uid"), batch_size)
+            )
+        ]
+        rows: list[dict[str, Any]] = []
+        for i in range(batch_size):
+            verify_rounds = rounds[i]
+            accepted_tokens = accepted[i]
+            tokens = (
+                verify_rounds + accepted_tokens
+                if verify_rounds is not None
+                and verify_rounds > 0
+                and accepted_tokens is not None
+                else None
+            )
+            seconds = elapsed[i]
+            rows.append(
+                {
+                    "uid": uids[i],
+                    "accept": accept_lens[i],
+                    "tokens": tokens,
+                    "seconds": seconds if seconds is not None and seconds > 0 else None,
+                }
+            )
+        return rows
+
+    def _speco_run_freeze_probe_arm(self) -> tuple[list[dict[str, Any]], float]:
+        from verl.protocol import unpad_dataproto
+
+        rows: list[dict[str, Any]] = []
+        wall_seconds = 0.0
+        for chunk in self._speco_freeze_probe_pool_data():
+            gen_batch_padded, pad_size = self._speco_build_freeze_probe_gen_batch(chunk)
+            started = time.perf_counter()
+            output_padded = self._speco_rollout_generation_target().generate_sequences(
+                gen_batch_padded
+            )
+            wall_seconds += time.perf_counter() - started
+            output = unpad_dataproto(output_padded, pad_size=pad_size)
+            rows.extend(self._speco_freeze_probe_rows(output))
+        # Re-stamp global pair ids: pairing downstream is by row position, so
+        # labels must be unique even if an engine path dropped per-request uids.
+        for i, row in enumerate(rows):
+            row["uid"] = f"speco-freeze-probe-{i:04d}"
+        return rows, wall_seconds
+
+    def _speco_build_freeze_probe_comparison(
+        self,
+        before_arm: tuple[list[dict[str, Any]], float],
+        after_arm: tuple[list[dict[str, Any]], float],
+        *,
+        version_before: int,
+    ):
+        from verl_speco.trainer.drafter_freeze_policy import ProbeComparison
+
+        before_rows, before_wall = before_arm
+        after_rows, after_wall = after_arm
+        n_pairs = min(len(before_rows), len(after_rows))
+        if n_pairs <= 0:
+            raise RuntimeError("freeze probe arms produced no aligned rows")
+        if len(before_rows) != len(after_rows):
+            logger.warning(
+                "[drafter freeze] probe arm size mismatch: before=%d after=%d; "
+                "using first %d rows",
+                len(before_rows),
+                len(after_rows),
+                n_pairs,
+            )
+        ids: list[str] = []
+        accept_before: list[float | None] = []
+        accept_after: list[float | None] = []
+        tokens_before, seconds_before = [], []
+        tokens_after, seconds_after = [], []
+        for i in range(n_pairs):
+            row_b, row_a = before_rows[i], after_rows[i]
+            ids.append(row_b["uid"])
+            accept_before.append(row_b["accept"])
+            accept_after.append(row_a["accept"])
+            tokens_before.append(row_b["tokens"])
+            seconds_before.append(row_b["seconds"])
+            tokens_after.append(row_a["tokens"])
+            seconds_after.append(row_a["seconds"])
+        return ProbeComparison(
+            request_ids=ids,
+            accept_before=accept_before,
+            accept_after=accept_after,
+            tokens_before=tokens_before,
+            seconds_before=seconds_before,
+            tokens_after=tokens_after,
+            seconds_after=seconds_after,
+            version_before=int(version_before),
+            version_after=int(version_before) + 1,
+            global_step=int(getattr(self, "global_steps", 0) or 0),
+            wall_seconds=float(before_wall + after_wall),
+        )
+
+    def _speco_freeze_log_probe(self, probe, probe_error: str | None) -> None:
+        policy = getattr(self, "_speco_freeze_policy", None)
+        if policy is None:
+            return
+        stats = getattr(policy, "_latest_probe_stats", None)
+        payload: dict[str, Any] = {
+            "event": "drafter_freeze_probe",
+            "step": int(getattr(self, "global_steps", 0) or 0),
+            "mode": "active" if self._speco_freeze_policy_active else "shadow",
+        }
+        if probe_error:
+            payload["error"] = probe_error
+        if probe is not None:
+            payload["wall_seconds"] = round(float(probe.wall_seconds or 0.0), 3)
+        if isinstance(stats, dict):
+            for key in (
+                "version_after",
+                "request_count",
+                "accept_pairs",
+                "timing_pairs",
+                "coverage",
+                "gain_all",
+                "gain_hard",
+                "delta_sec_per_token",
+                "delta_ucb95",
+                "sec_per_token_before",
+                "sec_per_token_after",
+            ):
+                value = stats.get(key)
+                if isinstance(value, float):
+                    payload[key] = round(value, 6)
+                elif value is not None:
+                    payload[key] = value
+            roi = policy._probe_roi(stats)
+            if roi is not None:
+                payload["roi_next"] = round(roi["roi"], 6)
+                payload["roi_next_ucb95"] = round(roi["roi_ucb95"], 6)
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+    def _speco_freeze_metrics(self) -> dict[str, float]:
+        """Flat metrics for Tracking.log; shadow decisions are report-only."""
+        policy = getattr(self, "_speco_freeze_policy", None)
+        decision = getattr(self, "_speco_last_freeze_decision", None)
+        if policy is None or decision is None:
+            return {}
+        metrics = {
+            str(key): float(value)
+            for key, value in decision.metrics.items()
+            if value is not None
+        }
+        metrics["drafter/freeze_shadow_mode"] = (
+            0.0 if self._speco_freeze_policy_active else 1.0
+        )
+        metrics["drafter/freeze_would_freeze"] = float(decision.would_freeze)
+        metrics["drafter/freeze_active_enforced"] = float(
+            self._speco_freeze_policy_active
+            and getattr(self, "_speco_drafter_frozen", False)
+        )
+        metrics["drafter/dropped_late_rollouts"] = float(
+            getattr(policy, "dropped_late_rollouts", 0)
+        )
+        return metrics
+
     def _speco_drafter_schedule_config(self) -> DrafterScheduleConfig:
         return DrafterScheduleConfig.from_mapping(self._speco_drafter_training_config())
+
+    def _speco_should_log_request_accept_len_variance(self) -> bool:
+        training_cfg = self._speco_drafter_training_config()
+        interval_steps = training_cfg.get(
+            "request_accept_len_variance_interval_steps", 1
+        )
+        return step_matches_interval(self.global_steps, interval_steps)
 
     def _speco_drafter_training_mode(self) -> str:
         training_cfg = self._speco_drafter_training_config()
@@ -996,6 +2208,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             BeforeActorUpdateContext(
                 schedule_context=self._speco_drafter_schedule_context(),
                 config=self._speco_drafter_schedule_config(),
+                drafter_frozen=bool(getattr(self, "_speco_drafter_frozen", False)),
             )
         )
 
@@ -1306,6 +2519,234 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             inclusive_max + 1
         )
 
+    def _speco_request_accept_lengths(
+        self, batch: DataProto, batch_size: int
+    ) -> list[float | None]:
+        non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            return [None for _ in range(batch_size)]
+
+        explicit = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY),
+            batch_size,
+        )
+        result = [_speco_optional_float(value) for value in explicit]
+        if any(value is not None for value in result):
+            return result
+
+        rounds = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_VERIFY_ROUNDS_KEY), batch_size
+        )
+        accepted = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_ACCEPTED_TOKENS_KEY), batch_size
+        )
+        for index, (round_value, accepted_value) in enumerate(
+            zip(rounds, accepted, strict=False)
+        ):
+            verify_rounds = _speco_optional_float(round_value)
+            accepted_tokens = _speco_optional_float(accepted_value)
+            if verify_rounds is None or verify_rounds <= 0 or accepted_tokens is None:
+                continue
+            result[index] = 1.0 + accepted_tokens / verify_rounds
+        return result
+
+    def _speco_request_ids(
+        self,
+        batch: DataProto,
+        batch_size: int,
+        *,
+        require: bool = False,
+        required_mask: list[bool] | None = None,
+    ) -> list[str]:
+        non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            if require:
+                raise RuntimeError(
+                    "SPECO request acceptance stats require a non-tensor request id field"
+                )
+            return [str(index) for index in range(batch_size)]
+        if require and _SPECO_VLLM_REQUEST_ID_KEY not in non_tensor_batch:
+            raise RuntimeError(
+                f"SPECO request acceptance stats missing {_SPECO_VLLM_REQUEST_ID_KEY}"
+            )
+        request_ids = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_ID_KEY), batch_size
+        )
+        if require and any(
+            value is None and (required_mask is None or required_mask[index])
+            for index, value in enumerate(request_ids)
+        ):
+            raise RuntimeError(
+                "SPECO request acceptance stats contain a missing request id"
+            )
+        present_ids = [str(value) for value in request_ids if value is not None]
+        if require and len(set(present_ids)) != len(present_ids):
+            raise RuntimeError(
+                "SPECO request acceptance stats contain duplicate request ids"
+            )
+        return [
+            str(value) if value is not None else str(index)
+            for index, value in enumerate(request_ids)
+        ]
+
+    def _speco_request_completion_indices(
+        self, batch: DataProto, batch_size: int
+    ) -> list[int | None]:
+        non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            return [None for _ in range(batch_size)]
+        values = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_COMPLETION_INDEX_KEY),
+            batch_size,
+        )
+        indices = []
+        for value in values:
+            parsed = _speco_optional_float(value)
+            indices.append(int(parsed) if parsed is not None else None)
+        return indices
+
+    def _speco_request_elapsed_secs(
+        self, batch: DataProto, batch_size: int
+    ) -> list[float | None]:
+        non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            return [None for _ in range(batch_size)]
+        values = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_ELAPSED_SEC_KEY),
+            batch_size,
+        )
+        return [_speco_optional_float(value) for value in values]
+
+    def _speco_log_request_accept_len_variance_from_batch(
+        self, batch: DataProto, *, source: str
+    ) -> bool:
+        batch_size = self._speco_batch_size_from_request_stats(batch)
+        if batch_size <= 0:
+            return False
+
+        request_accept_lens = self._speco_request_accept_lengths(batch, batch_size)
+        if not any(value is not None for value in request_accept_lens):
+            return False
+        request_ids = self._speco_request_ids(
+            batch,
+            batch_size,
+            require=True,
+            required_mask=[value is not None for value in request_accept_lens],
+        )
+        request_completion_indices = self._speco_request_completion_indices(
+            batch, batch_size
+        )
+        request_elapsed_secs = self._speco_request_elapsed_secs(batch, batch_size)
+        candidates = [
+            {
+                "batch_idx": batch_idx,
+                "request_id": request_ids[batch_idx],
+                "mean_accept_len": request_accept_lens[batch_idx],
+                "completion_index": request_completion_indices[batch_idx],
+                "elapsed_sec": request_elapsed_secs[batch_idx],
+            }
+            for batch_idx in range(batch_size)
+        ]
+        marker = torch.zeros(batch_size, dtype=torch.bool)
+        records, accept_len_var = self._speco_log_request_accept_lens(
+            candidates=candidates,
+            is_hard=marker,
+            collect_mask=marker,
+        )
+        payload = _speco_request_accept_len_step_payload(
+            step=self.global_steps,
+            source=source,
+            records=records,
+            accept_len_var=accept_len_var,
+        )
+        if payload:
+            self._speco_pending_request_accept_len_payloads.append(payload)
+        return bool(records)
+
+    def _speco_log_request_accept_lens(
+        self,
+        *,
+        candidates: list[dict[str, Any]],
+        is_hard: torch.Tensor,
+        collect_mask: torch.Tensor,
+    ) -> tuple[list[dict[str, Any]], float]:
+        records = []
+        for candidate in candidates:
+            mean_accept_len = candidate.get("mean_accept_len")
+            if mean_accept_len is None:
+                continue
+            batch_idx = int(candidate["batch_idx"])
+            elapsed_sec = _speco_optional_float(candidate.get("elapsed_sec"))
+            records.append(
+                {
+                    "completion_index": candidate.get("completion_index"),
+                    "batch_idx": batch_idx,
+                    "request_id": str(candidate.get("request_id")),
+                    "mean_accept_len": round(float(mean_accept_len), 6),
+                    "elapsed_sec": (
+                        round(elapsed_sec, 6) if elapsed_sec is not None else None
+                    ),
+                    "is_hard": bool(is_hard[batch_idx].item()),
+                    "collected": bool(collect_mask[batch_idx].item()),
+                }
+            )
+        records.sort(
+            key=lambda item: (
+                item["completion_index"] is None,
+                item["completion_index"]
+                if item["completion_index"] is not None
+                else item["batch_idx"],
+                item["batch_idx"],
+            )
+        )
+        accept_lens = [
+            parsed
+            for record in records
+            if (parsed := _speco_optional_float(record.get("mean_accept_len")))
+            is not None
+        ]
+        if accept_lens:
+            mean_accept_len = sum(accept_lens) / len(accept_lens)
+            accept_len_var = sum(
+                (value - mean_accept_len) ** 2 for value in accept_lens
+            ) / len(accept_lens)
+        else:
+            accept_len_var = 0.0
+        self._speco_last_request_accept_len_records = records
+        self._speco_last_request_accept_len_var = accept_len_var
+        return records, accept_len_var
+
+    def _speco_flush_request_accept_len_payloads(self) -> None:
+        payloads = self._speco_pending_request_accept_len_payloads
+        if not payloads:
+            return
+        self._speco_pending_request_accept_len_payloads = []
+        path = os.getenv(
+            _SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH_ENV,
+            "/tmp/speco_vllm_request_accept_len_hist.jsonl",
+        )
+        _speco_append_jsonl_batch(path, payloads)
+        if _speco_diag_enabled(_SPECO_REQUEST_ACCEPT_LEN_HIST_PRINT_ENV, "0"):
+            for payload in payloads:
+                print(
+                    "[speco request accept len hist] %s"
+                    % json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+                    flush=True,
+                )
+        if self._speco_should_log_request_accept_len_variance():
+            for payload in payloads:
+                print(
+                    "[speco request accept len] step=%s requests=%s "
+                    "request_accept_len_var=%.3f source=%s"
+                    % (
+                        payload["step"],
+                        payload["count"],
+                        payload["summary"]["var"],
+                        payload["source"],
+                    ),
+                    flush=True,
+                )
+
     def _speco_build_oldlogprob_collect_plan(
         self, batch: DataProto
     ) -> dict[str, Any] | None:
@@ -1338,7 +2779,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         collect_mask = torch.zeros(batch_size, dtype=torch.bool)
         hidden_positions = torch.zeros(batch_size, hidden_rows, dtype=torch.long)
         hidden_position_mask = torch.zeros(batch_size, hidden_rows, dtype=torch.bool)
-        owner_rank = torch.zeros(batch_size, dtype=torch.long)
+        owner_rank = torch.full((batch_size,), -1, dtype=torch.long)
 
         owner_count = self._speco_owner_bucket_count()
         if owner_count is None:
@@ -1357,8 +2798,77 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         prompt_lens: list[int] = []
         response_lens: list[int] = []
+        request_accept_lens = self._speco_request_accept_lengths(batch, batch_size)
+        require_request_ids = any(value is not None for value in request_accept_lens)
+        request_ids = self._speco_request_ids(
+            batch,
+            batch_size,
+            require=require_request_ids,
+            required_mask=[value is not None for value in request_accept_lens],
+        )
+        request_completion_indices = self._speco_request_completion_indices(
+            batch, batch_size
+        )
+        request_elapsed_secs = self._speco_request_elapsed_secs(batch, batch_size)
+        all_request_accept_len_candidates = [
+            {
+                "batch_idx": batch_idx,
+                "request_id": request_ids[batch_idx],
+                "mean_accept_len": request_accept_lens[batch_idx],
+                "completion_index": request_completion_indices[batch_idx],
+                "elapsed_sec": request_elapsed_secs[batch_idx],
+            }
+            for batch_idx in range(batch_size)
+        ]
+
+        hard_sample_ratio = float(
+            training_cfg.get("dspark_hard_sample_ratio", 0.0) or 0.0
+        )
+        hard_candidate_ratio = float(
+            training_cfg.get("dspark_hard_candidate_ratio", 0.0) or 0.0
+        )
+        hard_enabled = hard_sample_ratio > 0.0 and hard_candidate_ratio > 0.0
+        # The transport now retains every DP shard. The window is a logical
+        # collection budget, never a physical prefix of the actor batch.
+        usable_window_size = batch_size
+        capacity_per_owner = max_per_owner
+        if max_tokens_per_owner is not None:
+            capacity_per_owner = min(
+                capacity_per_owner, max_tokens_per_owner // hidden_rows
+            )
+        algorithm = (
+            str(
+                _get_nested(
+                    self._speco_drafter_config(), ("speculative_algorithm",), ""
+                )
+                or ""
+            )
+            .strip()
+            .upper()
+        )
+        if algorithm == "DSPARK" or hard_enabled:
+            collection_limit = int(
+                training_cfg.get("dspark_collect_samples_per_step", 80)
+            )
+            if collection_limit <= 0:
+                raise ValueError("dspark_collect_samples_per_step must be positive")
+        else:
+            collection_limit = capacity_per_owner * owner_count
+        for name, ratio in (
+            ("candidate", hard_candidate_ratio),
+            ("sample", hard_sample_ratio),
+        ):
+            if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
+                raise ValueError(f"Invalid hard {name} ratio: {ratio}")
+        shortage_policy = training_cfg.get(
+            "dspark_hard_shortfall_policy", "fill_normal"
+        )
+        if shortage_policy not in ("fill_normal", "strict"):
+            raise ValueError(f"Invalid hard shortfall policy: {shortage_policy}")
+
         candidate_count = 0
         selected_count = 0
+        candidates: list[dict[str, Any]] = []
         for batch_idx in range(batch_size):
             prompt_len = int(
                 attention_mask[batch_idx, :prompt_width].detach().sum().item()
@@ -1380,22 +2890,59 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 and self._speco_hash_fraction(sample_key) >= sample_rate
             ):
                 continue
-            owner = selected_count % owner_count
+            candidates.append(
+                {
+                    "batch_idx": batch_idx,
+                    "prompt_len": prompt_len,
+                    "response_len": response_len,
+                    "sample_key": sample_key,
+                    "request_id": request_ids[batch_idx],
+                    "mean_accept_len": request_accept_lens[batch_idx],
+                    "completion_index": request_completion_indices[batch_idx],
+                    "elapsed_sec": request_elapsed_secs[batch_idx],
+                    "hash": self._speco_hash_fraction(
+                        f"{step_key}:{request_ids[batch_idx]}:{batch_idx}:hard"
+                    ),
+                }
+            )
+
+        scored_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["mean_accept_len"] is not None
+        ]
+
+        is_hard = torch.zeros(batch_size, dtype=torch.bool)
+        hard_score = torch.zeros(batch_size, dtype=torch.float32)
+        mean_accept_len_tensor = torch.full(
+            (batch_size,), float("nan"), dtype=torch.float32
+        )
+        for index, mean_accept_len in enumerate(request_accept_lens):
+            if mean_accept_len is not None:
+                mean_accept_len_tensor[index] = float(mean_accept_len)
+                hard_score[index] = float(-mean_accept_len)
+
+        def owner_has_capacity(owner: int) -> bool:
             if owner_counts[owner] >= max_per_owner:
-                continue
-            if (
-                max_tokens_per_owner is not None
-                and owner_token_counts[owner] + hidden_rows > max_tokens_per_owner
-            ):
-                continue
-            max_start_offset = max(response_len - hidden_rows, 0)
+                return False
+            return (
+                max_tokens_per_owner is None
+                or owner_token_counts[owner] + hidden_rows <= max_tokens_per_owner
+            )
+
+        def add_candidate(candidate: dict[str, Any], owner: int) -> bool:
+            nonlocal selected_count
+            if selected_count >= total_capacity or not owner_has_capacity(owner):
+                return False
+            batch_idx = int(candidate["batch_idx"])
+            max_start_offset = max(int(candidate["response_len"]) - hidden_rows, 0)
             if window_mode == "random":
                 random_offset = self._speco_hash_int(
-                    f"{sample_key}:window", max_start_offset
+                    f"{candidate['sample_key']}:window", max_start_offset
                 )
             else:
                 random_offset = 0
-            start = max(prompt_len - 1, 0) + random_offset
+            start = max(int(candidate["prompt_len"]) - 1, 0) + random_offset
             positions = torch.arange(start, start + hidden_rows, dtype=torch.long)
             collect_mask[batch_idx] = True
             hidden_positions[batch_idx, :] = positions
@@ -1404,6 +2951,114 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             owner_counts[owner] += 1
             owner_token_counts[owner] += hidden_rows
             selected_count += 1
+            return True
+
+        def add_round_robin(
+            items: list[dict[str, Any]], *, start_owner: int = 0
+        ) -> int:
+            added = 0
+            next_owner = start_owner
+            for candidate in items:
+                if bool(collect_mask[int(candidate["batch_idx"])].item()):
+                    continue
+                for offset in range(owner_count):
+                    owner = (next_owner + offset) % owner_count
+                    if add_candidate(candidate, owner):
+                        added += 1
+                        next_owner = (owner + 1) % owner_count
+                        break
+            return added
+
+        total_capacity = min(
+            collection_limit, len(candidates), capacity_per_owner * owner_count
+        )
+        hard_added = 0
+        target_hard = 0
+        labeled_hard_count = 0
+        hard_shortfall = 0
+        normal_shortfall = 0
+        if not hard_enabled:
+            normal_added = add_round_robin(candidates)
+        else:
+            hard_candidates, labeled_hard_count = partition_hard_candidates(
+                scored_candidates,
+                candidate_ratio=hard_candidate_ratio,
+            )
+            for candidate in hard_candidates:
+                is_hard[candidate["batch_idx"]] = True
+            hard_pool = sorted(hard_candidates, key=lambda row: row["hash"])
+            normal_pool = sorted(
+                (row for row in candidates if not bool(is_hard[row["batch_idx"]])),
+                key=lambda row: self._speco_hash_fraction(
+                    f"{row['sample_key']}:normal"
+                ),
+            )
+            target_hard = round(total_capacity * hard_sample_ratio)
+            actual_hard = min(target_hard, len(hard_pool))
+            hard_shortfall = target_hard - actual_hard
+            normal_quota = total_capacity - actual_hard
+            normal_shortfall = max(normal_quota - len(normal_pool), 0)
+            if shortage_policy == "strict" and (hard_shortfall or normal_shortfall):
+                raise RuntimeError(
+                    f"SPECO unique collection quota unavailable: hard_shortfall={hard_shortfall} "
+                    f"normal_shortfall={normal_shortfall}"
+                )
+            # If normals are also exhausted, retain a smaller UNIQUE set and
+            # report the shortfall; do not silently exceed the hard quota.
+            first_owner = int(self.global_steps) % owner_count
+            hard_added = add_round_robin(
+                hard_pool[:actual_hard], start_owner=first_owner
+            )
+            normal_added = add_round_robin(
+                normal_pool[:normal_quota],
+                start_owner=(first_owner + hard_added) % owner_count,
+            )
+
+        selected_indices = collect_mask.nonzero(as_tuple=False).flatten().tolist()
+        hard_counts = [
+            int((collect_mask & is_hard & (owner_rank == owner)).sum())
+            for owner in range(owner_count)
+        ]
+        normal_counts = [
+            owner_counts[owner] - hard_counts[owner] for owner in range(owner_count)
+        ]
+        selection_metrics = {
+            "eligible_rows": len(candidates),
+            "scored_rows": len(scored_candidates),
+            "candidate_hard_count": labeled_hard_count,
+            "target_hard": target_hard,
+            "selected_hard_total": hard_added,
+            "selected_hard_unique": hard_added,
+            "selected_normal_total": normal_added,
+            "hard_shortfall": hard_shortfall,
+            "normal_shortfall": normal_shortfall,
+            "duplicate_hard_count": 0,
+            "selected_total": selected_count,
+            "selected_unique": len(selected_indices),
+            "collection_shortfall": collection_limit - selected_count,
+            "actual_hard_ratio": hard_added / selected_count if selected_count else 0.0,
+        }
+        for owner in range(owner_count):
+            selection_metrics[f"hard_count_owner_{owner}"] = hard_counts[owner]
+            selection_metrics[f"normal_count_owner_{owner}"] = normal_counts[owner]
+        self._speco_last_hard_selection_metrics = {
+            f"drafter/selection/{key}": value
+            for key, value in selection_metrics.items()
+        }
+        selection_hash = hashlib.sha256(
+            ",".join(map(str, selected_indices)).encode()
+        ).hexdigest()
+        print(
+            f"[speco hard selection] step={self.global_steps} "
+            f"metrics={selection_metrics} selected_source_indices_hash={selection_hash}",
+            flush=True,
+        )
+
+        self._speco_log_request_accept_lens(
+            candidates=all_request_accept_len_candidates,
+            is_hard=is_hard,
+            collect_mask=collect_mask,
+        )
 
         self._speco_last_raw_drafter_samples = candidate_count
         self._speco_last_oldlogprob_candidate_samples = candidate_count
@@ -1424,6 +3079,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "candidate_count": candidate_count,
             "owner_token_counts": owner_token_counts,
             "window_mode": window_mode,
+            "hard_enabled": hard_enabled,
+            "usable_window_size": usable_window_size,
+            "selection_metrics": selection_metrics,
+            "selected_source_indices_hash": selection_hash,
+            "request_ids": request_ids,
+            "request_mean_accept_len": mean_accept_len_tensor,
+            "request_is_hard": is_hard,
+            "request_hard_score": hard_score,
+            "request_completion_indices": request_completion_indices,
+            "request_elapsed_secs": request_elapsed_secs,
         }
 
     @staticmethod
@@ -1475,6 +3140,51 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return tensor.float().cpu()
         return tensor.reshape(-1, tensor.shape[-1]).float().sum(dim=0).cpu()
 
+    def _speco_materialize_oldlogprob_whole_refs(
+        self, output: Any
+    ) -> list[torch.Tensor | None]:
+        """Materialize row-aligned PP captures once per DP-shard ObjectRef."""
+        whole_refs = self._speco_flatten_non_tensor_rows(
+            tu.get(output, OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY)
+        )
+        if isinstance(whole_refs, (list, tuple)):
+            whole_metas = self._speco_flatten_non_tensor_rows(
+                tu.get(output, OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY)
+            )
+            if not isinstance(whole_metas, (list, tuple)) or len(whole_metas) != len(
+                whole_refs
+            ):
+                raise RuntimeError(
+                    "SPECO whole hidden refs and metadata are not row-aligned"
+                )
+            unique_refs = list(
+                dict.fromkeys(ref for ref in whole_refs if ref is not None)
+            )
+            states_by_ref = dict(zip(unique_refs, ray.get(unique_refs), strict=True))
+            hidden_rows: list[torch.Tensor | None] = []
+            for ref, meta in zip(whole_refs, whole_metas, strict=True):
+                if ref is None:
+                    hidden_rows.append(None)
+                    continue
+                if not isinstance(meta, dict) or "row_index" not in meta:
+                    raise RuntimeError(
+                        "SPECO whole hidden metadata is missing a row index"
+                    )
+                row_index = int(meta["row_index"])
+                hidden = states_by_ref[ref]
+                if (
+                    not torch.is_tensor(hidden)
+                    or hidden.dim() < 1
+                    or not 0 <= row_index < hidden.size(0)
+                ):
+                    raise RuntimeError("SPECO whole hidden row index is out of bounds")
+                hidden_rows.append(hidden[row_index])
+        else:
+            hidden_rows = self._speco_tensor_rows(ray.get(whole_refs))
+        tu.assign_non_tensor_data(output, OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY, None)
+        tu.assign_non_tensor_data(output, OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY, None)
+        return hidden_rows
+
     def _speco_collect_oldlogprob_features(
         self,
         batch: DataProto,
@@ -1483,6 +3193,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     ) -> int:
         if not collect_plan:
             return 0
+        hard_sampling_enabled = bool(collect_plan.get("hard_enabled", False))
         hidden_states = tu.get(output, OLD_LOGPROB_HIDDEN_STATES_KEY)
         hidden_refs = self._speco_flatten_non_tensor_rows(
             tu.get(output, OLD_LOGPROB_HIDDEN_REFS_KEY)
@@ -1502,29 +3213,21 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         # the Ray object store; the rest of this function treats it as an
         # inline tensor.
         whole_ref = tu.get(output, OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY)
+        hidden_rows = []
         if hidden_states is None and whole_ref is not None:
-            import ray as _ray
-
-            hidden_states = _ray.get(whole_ref)
-            # Drop every reference to the ObjectRef (local var + the copy held
-            # inside the output TensorDict) so Ray can free the big tensor from
-            # the object store as soon as this materialization completes,
-            # instead of waiting for the whole step output to be GC'd.
+            hidden_rows = self._speco_materialize_oldlogprob_whole_refs(output)
             del whole_ref
-            try:
-                tu.assign_non_tensor_data(
-                    output, OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY, None
-                )
-                tu.assign_non_tensor_data(
-                    output, OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY, None
-                )
-            except Exception:
-                pass
-        if hidden_states is None and hidden_refs is None and chunk_refs is None:
-            return 0
-        hidden_rows = self._speco_tensor_rows(hidden_states)
+        if (
+            hidden_states is None
+            and not hidden_rows
+            and hidden_refs is None
+            and chunk_refs is None
+        ):
+            raise RuntimeError("SPECO planned collection returned no hidden payload")
+        if not hidden_rows:
+            hidden_rows = self._speco_tensor_rows(hidden_states)
         if not hidden_rows and not hidden_refs and not chunk_refs:
-            return 0
+            raise RuntimeError("SPECO planned collection returned empty hidden payload")
         timing = self._speco_sum_timing_rows(tu.get(output, OLD_LOGPROB_TIMING_KEY))
         if timing is not None and int(timing.numel()) >= 2:
             self._speco_last_oldlogprob_select_elapsed_sec = (
@@ -1555,8 +3258,33 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         response_lens = collect_plan["response_lens"]
         samples: list[dict[str, Any]] = []
         owners: list[int] = []
+        request_mean_accept_len = collect_plan.get("request_mean_accept_len")
+        request_is_hard = collect_plan.get("request_is_hard")
+        request_hard_score = collect_plan.get("request_hard_score")
+        request_completion_indices = collect_plan.get("request_completion_indices")
+        request_elapsed_secs = collect_plan.get("request_elapsed_secs")
+        request_ids = collect_plan.get("request_ids")
+        request_mean_accept_len_tensor = (
+            cast(torch.Tensor, request_mean_accept_len)
+            if torch.is_tensor(request_mean_accept_len)
+            else None
+        )
+        request_is_hard_tensor = (
+            cast(torch.Tensor, request_is_hard)
+            if torch.is_tensor(request_is_hard)
+            else None
+        )
+        request_hard_score_tensor = (
+            cast(torch.Tensor, request_hard_score)
+            if torch.is_tensor(request_hard_score)
+            else None
+        )
         collected_rows = 0
         payload_bytes = 0
+        planned_samples = int(collect_plan["selected_count"])
+        skipped_empty_positions = 0
+        skipped_missing_hidden = 0
+        skipped_empty_hidden = 0
         sample_ref_chunks: dict[int, list[dict[str, Any]]] = {}
         if isinstance(chunk_refs, (list, tuple)) and isinstance(
             chunk_meta, (list, tuple)
@@ -1612,10 +3340,27 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             valid_positions = hidden_positions[batch_idx].reshape(-1)
             valid_rows = int(valid_positions.numel())
             if valid_rows <= 0:
+                skipped_empty_positions += 1
                 continue
             hidden_ref = self._speco_sequence_item(hidden_refs, batch_idx)
             ref_meta = self._speco_sequence_item(hidden_ref_meta, batch_idx)
             ref_chunks = sample_ref_chunks.get(batch_idx)
+            if isinstance(ref_meta, dict):
+                source_index = ref_meta.get("source_batch_index")
+                if source_index is not None and int(source_index) != batch_idx:
+                    raise RuntimeError(
+                        f"SPECO hidden row mismatch: {source_index} != {batch_idx}"
+                    )
+                if ref_meta.get("owner") is not None and int(ref_meta["owner"]) != int(
+                    owner_rank[batch_idx]
+                ):
+                    raise RuntimeError("SPECO hidden owner mismatch")
+                if (
+                    not ref_chunks
+                    and hidden_ref is not None
+                    and "chunk_start" in ref_meta
+                ):
+                    ref_chunks = [{"ref": hidden_ref, **ref_meta}]
             hidden = hidden_rows[batch_idx] if batch_idx < len(hidden_rows) else None
             if ref_chunks:
                 collected_rows += sum(
@@ -1629,9 +3374,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
             elif hidden_ref is None:
                 if hidden is None:
+                    skipped_missing_hidden += 1
                     continue
                 hidden = hidden[:valid_rows].contiguous()
                 if hidden.numel() == 0:
+                    skipped_empty_hidden += 1
                     continue
                 collected_rows += int(hidden.size(0))
                 payload_bytes += int(hidden.numel()) * int(hidden.element_size())
@@ -1662,6 +3409,47 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "global_step": self.global_steps,
                 "replica_rank": owner,
             }
+            if hard_sampling_enabled:
+                if isinstance(request_ids, (list, tuple)) and batch_idx < len(
+                    request_ids
+                ):
+                    sample[_SPECO_VLLM_REQUEST_ID_KEY] = str(request_ids[batch_idx])
+                if request_mean_accept_len_tensor is not None and batch_idx < int(
+                    request_mean_accept_len_tensor.numel()
+                ):
+                    mean_accept_len = float(
+                        request_mean_accept_len_tensor[batch_idx].item()
+                    )
+                    if math.isfinite(mean_accept_len):
+                        sample[_SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY] = (
+                            mean_accept_len
+                        )
+                if request_is_hard_tensor is not None and batch_idx < int(
+                    request_is_hard_tensor.numel()
+                ):
+                    sample[_SPECO_VLLM_REQUEST_IS_HARD_KEY] = bool(
+                        request_is_hard_tensor[batch_idx].item()
+                    )
+                if request_hard_score_tensor is not None and batch_idx < int(
+                    request_hard_score_tensor.numel()
+                ):
+                    sample[_SPECO_VLLM_REQUEST_HARD_SCORE_KEY] = float(
+                        request_hard_score_tensor[batch_idx].item()
+                    )
+                if isinstance(
+                    request_completion_indices, (list, tuple)
+                ) and batch_idx < len(request_completion_indices):
+                    completion_index = request_completion_indices[batch_idx]
+                    if completion_index is not None:
+                        sample[_SPECO_VLLM_REQUEST_COMPLETION_INDEX_KEY] = int(
+                            completion_index
+                        )
+                if isinstance(request_elapsed_secs, (list, tuple)) and batch_idx < len(
+                    request_elapsed_secs
+                ):
+                    elapsed_sec = request_elapsed_secs[batch_idx]
+                    if elapsed_sec is not None:
+                        sample[_SPECO_VLLM_REQUEST_ELAPSED_SEC_KEY] = float(elapsed_sec)
             if ref_chunks:
                 sample["hidden_states_ref_chunks"] = ref_chunks
             elif hidden_ref is None:
@@ -1674,6 +3462,30 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             owners.append(owner)
 
         collected = len(samples)
+        self._speco_last_oldlogprob_skipped_missing_hidden = skipped_missing_hidden
+        missing_hidden_samples = max(planned_samples - collected, 0)
+        logger.info(
+            "[speco oldlogprob payload] step=%s planned=%s payload=%s "
+            "skip_empty_positions=%s skip_missing_hidden=%s skip_empty_hidden=%s",
+            self.global_steps,
+            planned_samples,
+            collected,
+            skipped_empty_positions,
+            skipped_missing_hidden,
+            skipped_empty_hidden,
+        )
+        if not hasattr(self, "_speco_last_hard_selection_metrics"):
+            self._speco_last_hard_selection_metrics = {}
+        self._speco_last_hard_selection_metrics.update(
+            {
+                "drafter/selection/payload_total": collected,
+                "drafter/selection/payload_missing": missing_hidden_samples,
+            }
+        )
+        if missing_hidden_samples:
+            raise RuntimeError(
+                f"SPECO hidden payload incomplete: planned={planned_samples} collected={collected}"
+            )
         if collected <= 0:
             return 0
         dispatch_bucket_count = self._speco_dispatch_bucket_count()
@@ -1804,7 +3616,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ).upper()
         if (
             algorithm == "DSPARK"
-            and float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
+            and resolve_drafter_hidden_states_layout(algorithm, training_cfg)
+            == "dflash_aux_plus_last"
         ):
             return None
         if not bool(training_cfg.get("target_lm_head_row_restricted_sync", True)):
@@ -2078,12 +3891,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 training_plan.source_global_step,
             )
             raise
+        if getattr(self, "_speco_ci_result", None) is not None:
+            self._speco_ci_result.record_workers(outcome.raw_results)
+            self._speco_ci_result.record_metrics(outcome.metrics)
         return outcome.trained, dict(outcome.metrics)
 
     def _speco_activate_drafter_training_model_before_fit(self) -> None:
         if not self.is_drafter_training_enabled(self.config):
             return
-        self._speco_get_drafter_scheduler().activate_training_workers()
+        results = self._speco_get_drafter_scheduler().activate_training_workers()
+        if getattr(self, "_speco_ci_result", None) is not None:
+            self._speco_ci_result.record_workers(results)
 
     def _speco_wait_pending_drafter_publish_rpc(self) -> int:
         if not self._pending_drafter_publish_refs:
@@ -2138,7 +3956,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if after_weight_update
             else scheduler.on_safe_point(context)
         )
-        return dict(event.metrics or {})
+        metrics = dict(event.metrics or {})
+        if getattr(self, "_speco_ci_result", None) is not None:
+            self._speco_ci_result.record_metrics(metrics)
+        return metrics
 
     def _speco_update_output_metrics(self, output: Any, metrics: dict[str, Any]):
         if not metrics:
@@ -2211,6 +4032,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             gen_batch_output = original_generate_sequences(*args, **kwargs)
             if not _speco_is_validation_generation(args, kwargs, gen_batch_output):
                 self._speco_store_rollout_metrics(gen_batch_output)
+                self._speco_populate_request_accept_len_records(gen_batch_output)
             return gen_batch_output
 
         rollout_generation_target.generate_sequences = MethodType(
@@ -2241,7 +4063,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ):
             data = dict(data)
             data.update(latest_rollout_metrics)
+        if (
+            getattr(self, "_speco_ci_result", None) is not None
+            and isinstance(data, dict)
+            and "training/global_step" in data
+        ):
+            self._speco_ci_result.record_metrics(
+                {"training/global_step": data["training/global_step"]}
+            )
         data = _speco_move_drafter_timing_next_to_update_actor(data)
+        if isinstance(data, dict):
+            data.update(self._speco_freeze_metrics())
         if self._speco_bubble_profiler_enabled():
             data = inject_bubble_metrics(data)
         return data
@@ -2352,23 +4184,55 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "drafter_trained": False,
             "actor_output": None,
             "training_plan": None,
+            "train_cost_seconds": None,
         }
 
         def generate_sequences_with_speco(manager_self, *args, **kwargs):
             self._speco_wait_pending_drafter_publish()
+            generation_started = time.perf_counter()
             gen_batch_output = original_generate_sequences(*args, **kwargs)
+            generation_elapsed = time.perf_counter() - generation_started
             is_validation_generation = _speco_is_validation_generation(
                 args, kwargs, gen_batch_output
             )
             if not is_validation_generation:
                 self._speco_store_rollout_metrics(gen_batch_output)
-                collected = self._speco_collect_generation_samples(gen_batch_output)
-                if collected:
-                    meta_info = getattr(gen_batch_output, "meta_info", None)
-                    if isinstance(meta_info, dict):
-                        meta_info.setdefault("metrics", {})[
-                            "drafter/collected_samples"
-                        ] = collected
+                self._speco_populate_request_accept_len_records(gen_batch_output)
+                # Version that actually served THIS generation. Read after the
+                # call: an inline publish lands later (in update_actor), while a
+                # deferred publish lands inside this call before generation.
+                freeze_policy = getattr(self, "_speco_freeze_policy", None)
+                serving_version = (
+                    int(freeze_policy.drafter_version)
+                    if freeze_policy is not None
+                    else 0
+                )
+                self._speco_observe_rollout_evidence(
+                    gen_batch_output,
+                    serving_version,
+                    generation_seconds=generation_elapsed,
+                )
+                try:
+                    self._speco_log_request_accept_len_variance_from_batch(
+                        gen_batch_output, source="rollout"
+                    )
+                except RuntimeError as exc:
+                    logger.warning(
+                        "[speco request accept len] skipped rollout diagnostics: %s",
+                        exc,
+                    )
+                # Active freeze stops hidden-state collection here and in the
+                # scheduler plan; shadow mode keeps collecting. Accept-length
+                # evidence above is ungated and keeps feeding drift detection.
+                collection_allowed = not getattr(self, "_speco_drafter_frozen", False)
+                if collection_allowed:
+                    collected = self._speco_collect_generation_samples(gen_batch_output)
+                    if collected:
+                        meta_info = getattr(gen_batch_output, "meta_info", None)
+                        if isinstance(meta_info, dict):
+                            meta_info.setdefault("metrics", {})[
+                                "drafter/collected_samples"
+                            ] = collected
             return gen_batch_output
 
         def compute_old_log_prob_with_speco(trainer_self, batch: DataProto):
@@ -2380,6 +4244,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 return original_compute_old_log_prob(batch)
 
             oldlogprob_started = time.perf_counter()
+            self._speco_last_hard_selection_metrics = {}
             self._speco_last_oldlogprob_candidate_samples = 0
             self._speco_last_oldlogprob_planned_samples = 0
             self._speco_last_oldlogprob_collected_samples = 0
@@ -2441,6 +4306,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             tu.assign_non_tensor(
                 batch_td, calculate_entropy=calculate_entropy, compute_loss=False
             )
+            batch_td[OLD_LOGPROB_SOURCE_BATCH_INDICES_KEY] = torch.arange(
+                len(batch), dtype=torch.long
+            )
             batch_td[OLD_LOGPROB_COLLECT_MASK_KEY] = collect_plan["collect_mask"]
             batch_td[OLD_LOGPROB_HIDDEN_POSITIONS_KEY] = collect_plan[
                 "hidden_positions"
@@ -2449,6 +4317,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "hidden_position_mask"
             ]
             batch_td[OLD_LOGPROB_OWNER_RANK_KEY] = collect_plan["owner_rank"]
+            if collect_plan.get("hard_enabled"):
+                batch_td[_SPECO_VLLM_REQUEST_IS_HARD_KEY] = collect_plan[
+                    "request_is_hard"
+                ]
+                batch_td[_SPECO_VLLM_REQUEST_HARD_SCORE_KEY] = collect_plan[
+                    "request_hard_score"
+                ]
+                batch_td[_SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY] = collect_plan[
+                    "request_mean_accept_len"
+                ]
             tu.assign_non_tensor_data(
                 batch_td,
                 OLD_LOGPROB_AUX_LAYER_IDS_KEY,
@@ -2539,6 +4417,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     getattr(self, "_speco_last_collect_interval_matched", 0)
                 ),
             }
+            metrics.update(getattr(self, "_speco_last_hard_selection_metrics", {}))
             collection_plan = getattr(self, "_speco_last_collection_plan", None)
             if isinstance(collection_plan, CollectionPlan):
                 metrics.update(collection_plan.metrics())
@@ -2566,6 +4445,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     self._speco_finish_target_lm_head_weight_sync(
                         pending_target_lm_head_sync
                     )
+                )
+            if getattr(self, "_speco_drafter_frozen", False):
+                training_plan = dataclasses.replace(
+                    training_plan, launch=False, reason="drafter_convergence_frozen"
                 )
             if training_plan.launch:
                 drafter_trained, train_metrics = self._speco_train_drafter(
@@ -2597,6 +4480,34 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             metrics["timing_s/drafter"] = max(
                 0.0, time.perf_counter() - update_actor_started - actor_elapsed
             )
+            # Successful publish = one real version-clock update (inline path);
+            # cost is total drafter train+publish time spent at this opportunity.
+            # Fixed paired probes only run around the deferred (update_weights)
+            # flush, where a constant-target before-arm is possible; here the
+            # gate simply fails open and this is logged once.
+            inline_policy = getattr(self, "_speco_freeze_policy", None)
+            if (
+                inline_policy is not None
+                and drafter_trained
+                and inline_policy.probe_due(int(inline_policy.drafter_version) + 1)
+                and not getattr(self, "_speco_freeze_probe_inline_warned", False)
+            ):
+                self._speco_freeze_probe_inline_warned = True
+                logger.warning(
+                    "[drafter freeze] probe is due but the inline publish path "
+                    "cannot run a fixed paired probe (no constant-target "
+                    "before-arm); economics gate fails open this publish"
+                )
+            self._speco_freeze_observe_publish(
+                metrics,
+                update_cost_seconds=_speco_optional_float(
+                    metrics.get("timing_s/drafter")
+                ),
+            )
+            if pending_drafter_publish["ready"]:
+                pending_drafter_publish["train_cost_seconds"] = _speco_optional_float(
+                    metrics.get("timing_s/drafter")
+                )
             known_drafter_timing = 0.0
             for key in (
                 "timing_s/drafter_sync_target_lm_head",
@@ -2612,16 +4523,81 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 0.0,
                 metrics["timing_s/drafter"] - known_drafter_timing,
             )
+            # Event checkpoint at the same safety point the base loop uses for
+            # periodic saves (actor update done, drafter frozen/trained for
+            # this step, next rollout not started). A coinciding periodic save
+            # in the base loop coalesces to a no-op via _save_checkpoint.
+            self._speco_maybe_save_freeze_branch_checkpoint()
+            self._speco_flush_request_accept_len_payloads()
             return self._speco_update_output_metrics(actor_output, metrics)
 
         def update_weights_with_speco(manager_self, *args, **kwargs):
             result = original_checkpoint_update_weights(*args, **kwargs)
             if pending_drafter_publish["ready"]:
+                # Fixed paired probe (RFC sec. 6): the target checkpoint is
+                # constant from here on. Run the before-arm while the engine
+                # still serves drafter v, flush the pending publish (v+1), then
+                # run the after-arm -- same prompts, greedy, same engine.
+                policy = getattr(self, "_speco_freeze_policy", None)
+                run_probe = policy is not None and policy.probe_due(
+                    int(policy.drafter_version) + 1
+                )
+                before_arm = None
+                probe_error = None
+                if run_probe:
+                    try:
+                        before_arm = self._speco_run_freeze_probe_arm()
+                    except Exception:  # noqa: BLE001 - probe never blocks training
+                        run_probe = False
+                        probe_error = "before_arm_failed"
+                        logger.exception(
+                            "[drafter freeze] probe before-arm failed; "
+                            "publishing without paired probe (fail-open)"
+                        )
                 publish_metrics = self._speco_publish_drafter_weights(
                     pending_drafter_publish["drafter_trained"],
                     pending_drafter_publish["training_plan"],
                     after_weight_update=True,
                 )
+                probe = None
+                if run_probe and before_arm is not None:
+                    try:
+                        after_arm = self._speco_run_freeze_probe_arm()
+                        version_before = int(policy.drafter_version)
+                        probe = self._speco_build_freeze_probe_comparison(
+                            before_arm,
+                            after_arm,
+                            version_before=version_before,
+                        )
+                    except Exception:  # noqa: BLE001 - probe never blocks training
+                        probe_error = "after_arm_failed"
+                        logger.exception(
+                            "[drafter freeze] probe after-arm failed; "
+                            "publishing without paired probe (fail-open)"
+                        )
+                if probe is not None:
+                    publish_metrics["timing_s/drafter_probe"] = round(
+                        float(probe.wall_seconds or 0.0), 4
+                    )
+                train_cost = _speco_optional_float(
+                    pending_drafter_publish.get("train_cost_seconds")
+                )
+                publish_cost = self._speco_freeze_publish_cost_seconds(publish_metrics)
+                total_cost = (
+                    (train_cost or 0.0) + (publish_cost or 0.0)
+                    if train_cost is not None or publish_cost is not None
+                    else None
+                )
+                # Deferred path: the publish completes at the next weight
+                # update; carry the previous step's training cost so C_update
+                # remains the full train+publish critical path.
+                self._speco_freeze_observe_publish(
+                    publish_metrics,
+                    update_cost_seconds=total_cost,
+                    probe=probe,
+                )
+                if run_probe:
+                    self._speco_freeze_log_probe(probe, probe_error)
                 self._speco_update_output_metrics(
                     pending_drafter_publish["actor_output"], publish_metrics
                 )
@@ -2629,6 +4605,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 pending_drafter_publish["drafter_trained"] = False
                 pending_drafter_publish["actor_output"] = None
                 pending_drafter_publish["training_plan"] = None
+                pending_drafter_publish["train_cost_seconds"] = None
             return result
 
         rollout_generation_target.generate_sequences = MethodType(
@@ -2682,9 +4659,30 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return drafter_enabled and training_enabled
 
     def fit(self):
+        result_path = os.getenv("SPECO_CI_RESULT_PATH")
+        if not result_path:
+            return self._speco_fit_impl()
+        from verl_speco.integration.ci_result import CIResult
+
+        self._speco_ci_result = CIResult(self.is_drafter_training_enabled(self.config))
+        try:
+            result = self._speco_fit_impl()
+            self._speco_ci_result.data["completed"] = True
+            return result
+        except BaseException as error:
+            self._speco_ci_result.data["errors"].append(
+                {"type": type(error).__name__, "message": str(error)}
+            )
+            raise
+        finally:
+            self._speco_ci_result.write(result_path)
+
+    def _speco_fit_impl(self):
         try:
             if self.is_drafter_training_enabled(self.config):
                 self._speco_activate_drafter_training_model_before_fit()
+                self._speco_freeze_policy = self._speco_init_freeze_policy()
+                self._speco_validate_freeze_branch_config()
                 with (
                     self._speco_tracking_metrics_hook(),
                     self._speco_online_fit_hooks(),
@@ -2708,13 +4706,34 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_wait_pending_drafter_checkpoint()
 
     def _save_checkpoint(self):
+        # A freeze-branch event save runs inside the patched _update_actor,
+        # immediately before the base loop reaches its own periodic save point.
+        # When both land on the same step the full chain must run exactly
+        # once; the second call (base loop, or a repeated event request)
+        # becomes a no-op.
+        if (
+            getattr(self, "_speco_last_checkpoint_saved_step", None)
+            == self.global_steps
+        ):
+            logger.info(
+                "[speco] checkpoint for global_step=%s already saved this "
+                "step; skipping duplicate save",
+                self.global_steps,
+            )
+            return None
         # A checkpoint boundary must not retain an async publish payload or let
         # draft loading overlap actor/drafter serialization. This is redundant
         # with the normal next-generation barrier by design: save/test order is
         # controlled by upstream VERL and can change independently.
         self._speco_wait_pending_drafter_publish()
         self._speco_save_drafter_checkpoint(wait=True)
-        return super()._save_checkpoint()
+        # The base save advances the latest-checkpoint tracker before returning.
+        # Persist policy first and propagate failures so a committed checkpoint
+        # cannot be missing its policy state.
+        self._speco_freeze_save_state()
+        result = super()._save_checkpoint()
+        self._speco_last_checkpoint_saved_step = self.global_steps
+        return result
 
     def _validate(self, *args, **kwargs):
         # Validation commonly drives KV usage to the configured limit. Ensure

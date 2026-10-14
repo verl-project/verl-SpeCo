@@ -79,6 +79,43 @@ class _FakeRay:
         self.shutdown_calls += 1
 
 
+def test_bounded_call_cancels_on_client_loop_before_retry(monkeypatch):
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever)
+    thread.start()
+    cancelled = threading.Event()
+    calls = []
+
+    async def get(**kwargs):
+        calls.append(kwargs)
+        assert asyncio.get_running_loop() is loop
+        if len(calls) == 1:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        return {"ok": True}
+
+    monkeypatch.setattr(bridge, "tq", SimpleNamespace(
+        get_client=lambda: SimpleNamespace(_loop=loop), async_kv_batch_get=get,
+    ))
+    monkeypatch.setattr(bridge, "_state", {"config": {"io_timeout_seconds": 0.02}})
+    try:
+        with pytest.raises(TimeoutError):
+            bridge._bounded_kv_call("kv_batch_get", keys=["k"], partition_id="p")
+        assert cancelled.is_set()
+        assert bridge._bounded_kv_call("kv_batch_get", keys=["k"], partition_id="p") == {"ok": True}
+        assert len(calls) == 2
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+
 @pytest.fixture
 def fake_runtime(monkeypatch):
     fake_tq = _FakeTQ()
