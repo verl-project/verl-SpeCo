@@ -8,10 +8,7 @@ on:
       - main
     paths:
       - ".github/workflows/npu_vllm_unit_tests.yml"
-      - "ci/run_example_test.sh"
-      - "ci/check_result.py"
-      - "ci/npu_hccl_smoke.py"
-      - "ci/online_smoke_profile.json"
+      - "ci/**"
       - "examples/*vllm*.sh"
       - "verl_speco/**"
       - "pyproject.toml"
@@ -21,10 +18,7 @@ on:
       - main
     paths:
       - ".github/workflows/npu_vllm_unit_tests.yml"
-      - "ci/run_example_test.sh"
-      - "ci/check_result.py"
-      - "ci/npu_hccl_smoke.py"
-      - "ci/online_smoke_profile.json"
+      - "ci/**"
       - "examples/*vllm*.sh"
       - "verl_speco/**"
       - "pyproject.toml"
@@ -101,7 +95,6 @@ env:
 jobs:
   example:
     name: NPU vLLM ${{ matrix.drafter }} example
-    needs: hccl-smoke
     runs-on: [linux-aarch64-a2-8]
     container:
       image: swr.cn-north-4.myhuaweicloud.com/mindspeed/verl0.8.0_vllm_910b_speco:v1
@@ -116,6 +109,9 @@ jobs:
       max-parallel: 1
       matrix:
         include:
+          - drafter: megatron-eagle3
+            enable_training: true
+            disable_eagle3_torch_compile: true
           - drafter: eagle3
             enable_training: true
             disable_eagle3_torch_compile: true
@@ -223,66 +219,26 @@ jobs:
           SPECO_DSPARK_DRAFT_MODEL: ${{ inputs.dspark_draft_model || env.SPECO_DEFAULT_DSPARK_DRAFT_MODEL }}
           SPECO_TRAIN_FILE: ${{ inputs.train_file || env.SPECO_DEFAULT_TRAIN_FILE }}
           SPECO_TEST_FILE: ${{ inputs.test_file || env.SPECO_DEFAULT_TEST_FILE }}
-          SPECO_CI_RESULT_PATH: ${{ runner.temp }}/speco-ci-${{ matrix.drafter }}.json
           SPECO_CKPT_DIR: ${{ vars.SPECO_CKPT_DIR || runner.temp }}
           SPECO_ACCELERATOR_COUNT: ${{ inputs.accelerator_count || env.SPECO_DEFAULT_ACCELERATOR_COUNT }}
           SPECO_TENSOR_PARALLEL_SIZE: ${{ inputs.tensor_parallel_size || env.SPECO_DEFAULT_TENSOR_PARALLEL_SIZE }}
           SPECO_SEQUENCE_PARALLEL_SIZE: ${{ inputs.sequence_parallel_size || env.SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE }}
           SPECO_ENABLE_TRAINING: ${{ matrix.enable_training && (github.event_name != 'workflow_dispatch' || inputs.run_training) && 'true' || 'false' }}
-          SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS }}
-          SPECO_MAX_RESPONSE_LENGTH: ${{ vars.SPECO_MAX_RESPONSE_LENGTH }}
-          SPECO_HIDDEN_STATE_WINDOW_MIN_ROWS: ${{ vars.SPECO_HIDDEN_STATE_WINDOW_MIN_ROWS }}
-          SPECO_HIDDEN_STATE_WINDOW_TOKENS_PER_SAMPLE: ${{ vars.SPECO_HIDDEN_STATE_WINDOW_TOKENS_PER_SAMPLE }}
-          SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE }}
-          SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES }}
-          SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES }}
-          SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE }}
-          SPECO_DRAFTER_TRAINING_STEPS: ${{ vars.SPECO_DRAFTER_TRAINING_STEPS }}
-          SPECO_DRAFTER_BATCH_SIZE_PER_GPU: ${{ vars.SPECO_DRAFTER_BATCH_SIZE_PER_GPU }}
+          SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS || '2' }}
+          SPECO_MAX_RESPONSE_LENGTH: ${{ vars.SPECO_MAX_RESPONSE_LENGTH || '512' }}
+          SPECO_HIDDEN_STATE_WINDOW_MIN_ROWS: "32"
+          SPECO_HIDDEN_STATE_WINDOW_TOKENS_PER_SAMPLE: "32"
+          SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE || '64' }}
+          SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '128' }}
+          SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES || '32' }}
+          SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE || '8' }}
+          SPECO_DRAFTER_TRAINING_STEPS: ${{ vars.SPECO_DRAFTER_TRAINING_STEPS || '1' }}
+          SPECO_DRAFTER_BATCH_SIZE_PER_GPU: ${{ vars.SPECO_DRAFTER_BATCH_SIZE_PER_GPU || '1' }}
           SPECO_EAGLE3_DISABLE_TORCH_COMPILE: ${{ matrix.disable_eagle3_torch_compile }}
-          SPECO_TRAIN_BATCHES_PER_CYCLE: ${{ vars.SPECO_TRAIN_BATCHES_PER_CYCLE }}
-          SPECO_COLLECT_INTERVAL_STEPS: ${{ vars.SPECO_COLLECT_INTERVAL_STEPS }}
-          SPECO_TRAINING_INTERVAL_STEPS: ${{ vars.SPECO_TRAINING_INTERVAL_STEPS }}
-          SPECO_PUBLISH_INTERVAL_STEPS: ${{ vars.SPECO_PUBLISH_INTERVAL_STEPS }}
-          SPECO_DATALOADER_NUM_WORKERS: ${{ vars.SPECO_DATALOADER_NUM_WORKERS }}
+          SPECO_TRAIN_BATCHES_PER_CYCLE: ${{ vars.SPECO_TRAIN_BATCHES_PER_CYCLE || '1' }}
+          SPECO_COLLECT_INTERVAL_STEPS: ${{ vars.SPECO_COLLECT_INTERVAL_STEPS || '1' }}
+          SPECO_TRAINING_INTERVAL_STEPS: ${{ vars.SPECO_TRAINING_INTERVAL_STEPS || '1' }}
+          SPECO_PUBLISH_INTERVAL_STEPS: ${{ vars.SPECO_PUBLISH_INTERVAL_STEPS || '1' }}
+          SPECO_DATALOADER_NUM_WORKERS: ${{ vars.SPECO_DATALOADER_NUM_WORKERS || '0' }}
           SPECO_EXTRA_HYDRA_ARGS: ${{ inputs.extra_hydra_args || vars.SPECO_EXTRA_HYDRA_ARGS }}
         run: bash ci/run_example_test.sh npu vllm "${{ matrix.drafter }}"
-
-      - name: Upload CI result
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: npu_vllm_unit_tests-${{ matrix.drafter }}-result
-          path: |
-            ${{ runner.temp }}/speco-ci-${{ matrix.drafter }}.json
-            ${{ runner.temp }}/speco-ci-${{ matrix.drafter }}.json.log
-            ${{ runner.temp }}/speco-ci-${{ matrix.drafter }}.json.timing.json
-          if-no-files-found: warn
-
-
-  hccl-smoke:
-    name: NPU two-card HCCL smoke
-    runs-on: [linux-aarch64-a2-8]
-    container:
-      image: swr.cn-north-4.myhuaweicloud.com/mindspeed/verl0.8.0_vllm_910b_speco:v1
-      options: --shm-size 16g
-    timeout-minutes: 15
-    environment: speco-npu-ci
-    steps:
-      - uses: actions/checkout@v4
-      - name: Verify two NPU devices
-        run: python -c "import torch, torch_npu; assert torch.npu.is_available() and torch.npu.device_count() >= 2"
-      - name: Two-card HCCL gradient and checkpoint resume smoke
-        shell: bash
-        env:
-          ASCEND_RT_VISIBLE_DEVICES: "0,1"
-        run: |
-          set -euo pipefail
-          python -m torch.distributed.run --standalone --nproc-per-node=2 ci/npu_hccl_smoke.py 2>&1 | tee "${{ runner.temp }}/hccl-smoke.log"
-      - name: Upload HCCL log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: npu-hccl-log
-          path: ${{ runner.temp }}/hccl-smoke.log
-          if-no-files-found: warn

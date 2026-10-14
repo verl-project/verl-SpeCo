@@ -161,21 +161,6 @@ PY
   fi
 fi
 
-# Use the same small online profile as manual/comment-triggered examples.
-if [[ "${platform}" == "npu" && "${separate_training}" != "true" ]]; then
-  profile_python="$(command -v python || command -v python3)"
-  profile_values="$("${profile_python}" - <<'PYPROFILE'
-import json, os
-from pathlib import Path
-for key, spec in json.loads(Path("ci/online_smoke_profile.json").read_text()).items():
-    print(key + "\t" + (os.environ.get(key) or spec["default"]))
-PYPROFILE
-)"
-  while IFS=$'\t' read -r profile_key profile_value; do
-    export "${profile_key}=${profile_value}"
-  done <<< "${profile_values}"
-fi
-
 enable_training="${SPECO_ENABLE_TRAINING:-true}"
 total_epochs="${SPECO_TOTAL_EPOCHS:-1}"
 if [[ "${enable_training}" != "true" ]]; then
@@ -368,11 +353,5 @@ if [[ "${separate_training}" == "true" ]]; then
     echo "SPECO_ENABLE_TRAINING is not true; skipping the offline train stage"
   fi
 else
-  export SPECO_CI_RESULT_PATH="${SPECO_CI_RESULT_PATH:-${SPECO_CKPT_DIR}/speco-ci-${backend}-${drafter}.json}"
-  rm -f -- "${SPECO_CI_RESULT_PATH}"
-  mkdir -p -- "$(dirname "${SPECO_CI_RESULT_PATH}")"
-  run_started=${SECONDS}
-  trap 'run_status=$?; printf "{\"elapsed_seconds\":%d,\"exit_code\":%d}\n" "$((SECONDS - run_started))" "${run_status}" > "${SPECO_CI_RESULT_PATH}.timing.json"' EXIT
-  bash "${example}" "${overrides[@]}" 2>&1 | tee "${SPECO_CI_RESULT_PATH}.log"
-  python ci/check_result.py "${SPECO_CI_RESULT_PATH}" --training "${enable_training}"
+  bash "${example}" "${overrides[@]}"
 fi

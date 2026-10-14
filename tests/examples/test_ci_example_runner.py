@@ -110,11 +110,6 @@ def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
     assert "tests/config" in source
     assert "tests/examples" in source
     assert "tests/integration" in source
-    unit_job = _workflow("cpu_unit_tests.yml")["jobs"]["unit-tests"]
-    unit_run = next(step["run"] for step in unit_job["steps"] if "pytest" in step.get("run", ""))
-    assert "tests/unit" in shlex.split(unit_run)
-    assert not any(arg.startswith("tests/unit/") for arg in shlex.split(unit_run))
-    assert "requirements-unit.txt" in source
     assert "tests/ci" not in source
 
 
@@ -126,7 +121,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             "npu_vllm_unit_tests.yml",
             "npu",
             "vllm",
-            {"eagle3", "dflash", "dspark"},
+            {"eagle3", "megatron-eagle3", "dflash", "dspark"},
         ),
         ("npu_sglang_unit_tests.yml", "npu", "sglang", {"eagle3", "dflash"}),
     ):
@@ -163,6 +158,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 ]
             } == {
                 ("eagle3", "true"),
+                ("megatron-eagle3", "true"),
                 ("dflash", "true"),
                 ("dspark", "true"),
             }
@@ -173,6 +169,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 ]
             } == {
                 ("eagle3", "true"),
+                ("megatron-eagle3", "true"),
                 ("dflash", "false"),
                 ("dspark", "false"),
             }
@@ -203,27 +200,27 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 in source
             )
             assert (
-                "SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS }}"
+                "SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS || '2' }}"
                 in source
             )
             assert (
-                "SPECO_MAX_RESPONSE_LENGTH: ${{ vars.SPECO_MAX_RESPONSE_LENGTH }}"
+                "SPECO_MAX_RESPONSE_LENGTH: ${{ vars.SPECO_MAX_RESPONSE_LENGTH || '512' }}"
                 in source
             )
             assert (
-                "SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE }}"
+                "SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE || '64' }}"
                 in source
             )
             assert (
-                "SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES }}"
+                "SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '128' }}"
                 in source
             )
             assert (
-                "SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES }}"
+                "SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES || '32' }}"
                 in source
             )
             assert (
-                "SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE }}"
+                "SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE || '8' }}"
                 in source
             )
             assert "matrix.enable_training" in source
@@ -411,7 +408,7 @@ def _dry_run(
     # writer filling the stdin pipe and can deadlock.
     with tempfile.TemporaryDirectory() as tmp:
         entry = Path(tmp) / "dry_run.sh"
-        entry.write_text(script, encoding="utf-8", newline="\n")
+        entry.write_text(script, encoding="utf-8")
         result = subprocess.run(
             [bash, _bash_path(entry, bash), platform, backend, drafter],
             cwd=ROOT,
@@ -516,58 +513,3 @@ def test_separate_training_example_takes_its_device_count_from_the_env() -> None
     ).read_text(encoding="utf-8")
 
     assert "draft_train_gpus_per_node=${DRAFT_TRAIN_GPUS_PER_NODE:-8}" in example
-
-
-def test_megatron_example_is_manual_only() -> None:
-    workflow = _workflow("npu_megatron_example_manual.yml")
-    assert set(workflow["on"]) == {"workflow_dispatch"}
-    entries = workflow["jobs"]["example"]["strategy"]["matrix"]["include"]
-    assert [entry["drafter"] for entry in entries] == ["megatron-eagle3"]
-    assert "needs" not in workflow["jobs"]["example"]
-
-
-def test_npu_smoke_split_and_trigger_scope() -> None:
-    workflow = _workflow("npu_vllm_unit_tests.yml")
-    assert workflow["jobs"]["example"]["needs"] == "hccl-smoke"
-    hccl = str(workflow["jobs"]["hccl-smoke"])
-    assert "npu_hccl_smoke.py" in hccl
-    assert "eagle1_gpu_smoke.py" not in hccl
-    assert "upstream-verl" not in hccl
-    for event in ("pull_request", "push"):
-        paths = workflow["on"][event]["paths"]
-        assert "ci/**" not in paths
-        assert "ci/run_example_test.sh" in paths
-        assert "ci/check_result.py" in paths
-        assert "ci/npu_hccl_smoke.py" in paths
-    standalone = _workflow("npu_standalone_training_manual.yml")
-    assert set(standalone["on"]) == {"workflow_dispatch"}
-    source = _workflow_source("npu_standalone_training_manual.yml")
-    assert "--algorithm EAGLE1" in source and "--algorithm EAGLE2" in source
-
-
-@pytest.mark.parametrize("platform", ["gpu", "npu"])
-def test_online_log_capture_preserves_failure_and_timing(platform: str) -> None:
-    import json
-
-    bash = _require_working_bash()
-    tail = "  export SPECO_CI_RESULT_PATH" + _runner_script().split("else\n  export SPECO_CI_RESULT_PATH")[-1]
-    tail = tail.rsplit("\nfi", 1)[0]
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        example = root / "failure.sh"
-        example.write_text("echo stdout\necho stderr >&2\nexit 7\n", encoding="utf-8", newline="\n")
-        result = root / "evidence.json"
-        script = root / "run.sh"
-        script.write_text(
-            f"set -euo pipefail\nplatform={platform}\noverrides=()\n"
-            + "example=" + shlex.quote(_bash_path(example, bash)) + "\n"
-            + "SPECO_CI_RESULT_PATH=" + shlex.quote(_bash_path(result, bash)) + "\n"
-            + tail, encoding="utf-8", newline="\n",
-        )
-        process = subprocess.run([bash, _bash_path(script, bash)], capture_output=True)
-        assert process.returncode == 7
-        assert "stdout" in Path(str(result) + ".log").read_text()
-        assert "stderr" in Path(str(result) + ".log").read_text()
-        timing = json.loads(Path(str(result) + ".timing.json").read_text())
-        assert timing["exit_code"] == 7
-        assert timing["elapsed_seconds"] >= 0

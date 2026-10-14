@@ -32,10 +32,10 @@ ppo_gpus_per_node=8
 # environment instead, which is what a smaller box (or CI) needs.
 draft_train_gpus_per_node=${DRAFT_TRAIN_GPUS_PER_NODE:-8}
 
-MODEL_PATH=${MODEL_PATH:-/path/to/model}
-CKPTS_DIR=${CKPTS_DIR:-/path/to/checkpoint}
-TRAIN_FILE=${TRAIN_FILE:-/path/to/train_file}
-TEST_FILE=${TEST_FILE:-/path/to/test_file}
+MODEL_PATH=/path/to/model
+CKPTS_DIR=/path/to/checkpoint
+TRAIN_FILE=/path/to/train_file
+TEST_FILE=/path/to/test_file
 
 case "${DRAFT_ALGO}" in
   domino)
@@ -77,8 +77,8 @@ esac
 
 project_name="verl_grpo_example_${DRAFT_ALGO}_drafter"
 exp_name="qwen3_8b_${DRAFT_ALGO}_separate_drafter_vllm_gpu"
-FEATURE_STORE_DIR=${FEATURE_STORE_DIR:-/path/to/speco/${DRAFT_ALGO}_features}
-DRAFT_CKPTS_DIR=${DRAFT_CKPTS_DIR:-/path/to/speco/${DRAFT_ALGO}_draft_ckpts}
+FEATURE_STORE_DIR=/path/to/speco/${DRAFT_ALGO}_features
+DRAFT_CKPTS_DIR=/path/to/speco/${DRAFT_ALGO}_draft_ckpts
 
 if [ "${RUN_STAGE}" = "both" ] || [ "${RUN_STAGE}" = "collect" ]; then
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
