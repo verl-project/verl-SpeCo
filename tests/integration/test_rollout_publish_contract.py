@@ -533,6 +533,8 @@ def test_idle_drafter_lifecycle_offloads_dspark_target_lm_head(
     trainer.optimizer = None
     trainer._training_active = True
     trainer._training_initialized = True
+    trainer.buffer_version = 0
+    trainer.park_hccl_after_drafter_training = False
     monkeypatch.setattr(base_trainer, "device_name", "cpu")
 
     if release_method == "cleanup_training":
