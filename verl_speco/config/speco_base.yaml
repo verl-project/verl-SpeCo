@@ -322,6 +322,11 @@ actor_rollout_ref:
         # When true the confidence loss does not backpropagate into the shared
         # draft backbone/Markov features: only the confidence head is trained.
         dspark_confidence_detach_backbone: false
+        # Acceptance target the confidence head regresses to. "greedy" (the
+        # serving default) proposes argmax(p_draft) with a one-hot draft, so the
+        # target is p_target[argmax(p_draft)]; "probabilistic" samples the draft
+        # softmax, so the target is sum_v min(p_draft_v, p_target_v) = 1 - TV.
+        dspark_confidence_target_mode: greedy
         dspark_ce_loss_alpha: 0.1
         # DeepSpec Qwen3 fixed-K default. Confidence BCE is unsupported on MRV2
         # and must not implicitly reduce the distribution-matching objective.

@@ -379,7 +379,10 @@ example `0.2`) and the head is created automatically from the target's final
 hidden state; `dspark_confidence_head_with_markov` keeps the Markov previous-token
 embedding in the head input (default `true`). A positive value on either
 `dspark_confidence_head_alpha` or `dspark_confidence_loss_alpha` enables the head,
-while only `dspark_confidence_loss_alpha` weights its BCE term. Training the
+while only `dspark_confidence_loss_alpha` weights its BCE term. The BCE target
+tracks the served proposal mode via `dspark_confidence_target_mode`: `greedy`
+(the serving default, one-hot draft) targets `p_target[argmax(p_draft)]`, while
+`probabilistic` targets `1 - TV = sum_v min(p_draft_v, p_target_v)`. Training the
 confidence head requires the target's final hidden state, so the DSpark hidden
 state collection switches to `dflash_aux_plus_last` whenever either it or the L1
 loss is enabled. The standalone scripts expose `DSPARK_CONFIDENCE_HEAD_ALPHA`,

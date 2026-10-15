@@ -131,6 +131,54 @@ def test_ce_only_target_argmax_expected_layout(prefix, source):
     )
 
 
+def test_confidence_only_expected_layout_matches_producer():
+    # A confidence-only configuration (l1=0, confidence>0, ce_target_source=
+    # labels) still needs the target's final hidden state. The Consumer must
+    # therefore expect dflash_aux_plus_last AND the Producer must be told the
+    # same loss settings; otherwise the two layouts disagree and the feature
+    # contract rejects the samples.
+    from verl_speco.integration.oldlogprob_layer_ids import (
+        resolve_drafter_hidden_states_layout,
+    )
+
+    l1_key = "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha"
+    confidence_key = (
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha"
+    )
+    ce_key = "actor_rollout_ref.rollout.drafter.training.ce_target_source"
+    args = _training_args() + [
+        f"+{l1_key}=0",
+        f"+{confidence_key}=1.0",
+        f"+{ce_key}=labels",
+    ]
+    commands = build_pipeline_commands(
+        resolve_pipeline_config(args, environ={}),
+        args,
+        ray_address="10.0.0.1:6379",
+        python_executable="python",
+    )
+
+    assert any(
+        item.endswith("expected_feature.hidden_states_layout=dflash_aux_plus_last")
+        for item in commands.consumer_overrides
+    )
+
+    producer_cfg: dict[str, str] = {}
+    for item in commands.producer_overrides:
+        if "=" in item:
+            key, value = item.split("=", 1)
+            producer_cfg[key.lstrip("+")] = value
+    producer_layout = resolve_drafter_hidden_states_layout(
+        "DSPARK",
+        {
+            "dspark_l1_loss_alpha": float(producer_cfg[l1_key]),
+            "dspark_confidence_loss_alpha": float(producer_cfg[confidence_key]),
+            "ce_target_source": producer_cfg[ce_key],
+        },
+    )
+    assert producer_layout == "dflash_aux_plus_last"
+
+
 def test_producer_max_samples_uses_remaining_total_steps() -> None:
     args = [
         *_training_args(),

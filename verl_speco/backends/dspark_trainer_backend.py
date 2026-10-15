@@ -91,6 +91,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         l1_chunk_size: int = 0,
         distribution_loss_impl: str = "auto",
         ce_target_source: str = _CE_TARGET_SOURCE_LABELS,
+        confidence_target_mode: str = "greedy",
         debug_log: bool = False,
         debug_log_first_n: int = 2,
         debug_log_interval: int = 100,
@@ -121,6 +122,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
             raise ValueError(
                 "ce_target_source must be one of: "
                 f"{', '.join(sorted(_CE_TARGET_SOURCES))}"
+            )
+        self.confidence_target_mode = str(confidence_target_mode or "greedy").lower()
+        if self.confidence_target_mode not in {"greedy", "probabilistic"}:
+            raise ValueError(
+                "dspark_confidence_target_mode must be one of: greedy, probabilistic"
             )
         self._logged_distribution_loss_backend: Optional[str] = None
         self._distribution_loss_by_device: dict[str, bool] = {}
@@ -473,7 +479,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     with torch.no_grad():
                         tv = fused_total_variation(draft_logits, target_logits)
                 l1_dist = 2.0 * tv
-                acceptance_target = (1.0 - tv).clamp(0.0, 1.0).detach()
+                probabilistic_target = (1.0 - tv).clamp(0.0, 1.0)
             else:
                 if draft_probs is None:
                     if draft_logits is None:
@@ -489,12 +495,33 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     # building an autograd graph for the eager L1 distance.
                     with torch.no_grad():
                         l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
-                acceptance_target = (1.0 - 0.5 * l1_dist).clamp(0.0, 1.0).detach()
+                probabilistic_target = (1.0 - 0.5 * l1_dist).clamp(0.0, 1.0)
 
             if l1_enabled:
                 l1_sum = l1_sum + (l1_dist * weights_chunk).sum()
 
             if confidence_enabled:
+                # The head must predict the acceptance the *served* proposal
+                # mode yields. 'probabilistic' drafting samples the draft
+                # softmax, so acceptance = sum_v min(p_draft, p_target) = 1-TV.
+                # 'greedy' drafting (the serving default) proposes
+                # argmax(p_draft) and the rejection sampler treats the draft as
+                # one-hot, so acceptance collapses to p_target[argmax(p_draft)].
+                if self.confidence_target_mode == "greedy":
+                    if draft_probs is None:
+                        if draft_logits is None:
+                            raise RuntimeError(
+                                "DSpark greedy confidence target requires draft logits"
+                            )
+                        draft_probs = torch.softmax(draft_logits.float(), dim=-1)
+                    if target_probs is None:
+                        target_probs = torch.softmax(target_logits.float(), dim=-1)
+                    draft_argmax = draft_probs.argmax(dim=-1, keepdim=True)
+                    acceptance_target = (
+                        target_probs.gather(-1, draft_argmax).squeeze(-1).detach()
+                    )
+                else:
+                    acceptance_target = probabilistic_target.detach()
                 confidence_logits = self.draft_model.predict_confidence(
                     hidden_chunk, prev_token_ids=prev_chunk
                 )
@@ -1416,6 +1443,9 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 training_cfg.get("dspark_distribution_loss_impl", "auto")
             ),
             ce_target_source=str(training_cfg.get("ce_target_source", "labels")),
+            confidence_target_mode=str(
+                training_cfg.get("dspark_confidence_target_mode", "greedy")
+            ),
             debug_log=bool(training_cfg.get("dspark_debug_log", False)),
             debug_log_first_n=int(training_cfg.get("dspark_debug_log_first_n", 2)),
             debug_log_interval=int(training_cfg.get("dspark_debug_log_interval", 100)),
