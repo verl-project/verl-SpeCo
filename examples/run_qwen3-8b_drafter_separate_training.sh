@@ -26,13 +26,13 @@ ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
 feature_store_min_sample_step=${SPECO_FEATURE_STORE_MIN_SAMPLE_STEP:-3}
 feature_store_max_sample_step=${SPECO_FEATURE_STORE_MAX_SAMPLE_STEP:-5}
 
-MODEL_PATH=/path/to/model
-CKPTS_DIR=/path/to/checkpoint
-TRAIN_FILE=/path/to/train_file
-TEST_FILE=/path/to/test_file
-DRAFTER_PATH=/path/to/vllm-compatible-eagle3-drafter
-FEATURE_STORE_DIR=/path/to/speco/eagle3_features
-DRAFT_CKPTS_DIR=/path/to/speco/eagle3_draft_ckpts
+MODEL_PATH=${MODEL_PATH:-/path/to/model}
+CKPTS_DIR=${CKPTS_DIR:-/path/to/checkpoint}
+TRAIN_FILE=${TRAIN_FILE:-/path/to/train_file}
+TEST_FILE=${TEST_FILE:-/path/to/test_file}
+DRAFTER_PATH=${DRAFTER_PATH:-/path/to/vllm-compatible-eagle3-drafter}
+FEATURE_STORE_DIR=${FEATURE_STORE_DIR:-/path/to/speco/eagle3_features}
+DRAFT_CKPTS_DIR=${DRAFT_CKPTS_DIR:-/path/to/speco/eagle3_draft_ckpts}
 
 RUN_STAGE=${RUN_STAGE:-both}
 

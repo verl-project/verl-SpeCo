@@ -330,6 +330,23 @@ def _batch_item_float(value: Any, index: int = 0) -> float | None:
         return None
 
 
+def _batch_item_value(value: Any, index: int = 0) -> Any:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return None
+        flat = value.detach().view(-1).cpu()
+        index = min(max(int(index), 0), flat.numel() - 1)
+        return flat[index].item()
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        index = min(max(int(index), 0), len(value) - 1)
+        return value[index]
+    return value
+
+
 def _tensor_sum_int(tensor: torch.Tensor) -> int:
     return int(tensor.detach().float().sum().cpu().item())
 
@@ -2155,6 +2172,7 @@ class DrafterBaseTrainer:
     async def activate_training_model(self) -> bool:
         # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态
         start_ts = time.time()
+        self.last_activation_error = None
         activation_stage = "enter"
         try:
             logger.debug(
@@ -2219,6 +2237,7 @@ class DrafterBaseTrainer:
             return True
 
         except Exception as e:
+            self.last_activation_error = {"type": type(e).__name__, "message": str(e)}
             logger.error(
                 f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] "
                 f"activate_training_model failed stage={activation_stage}: {e}"
@@ -3371,6 +3390,25 @@ class DrafterBaseTrainer:
                 else None,
                 "_verl_accept_len": accept_len,
                 "_verl_accept_rate": accept_rate,
+                "_verl_request_mean_accept_len": _batch_item_float(
+                    batch.get("_verl_request_mean_accept_len"),
+                    i,
+                ),
+                "_speco_vllm_request_id": _batch_item_value(
+                    batch.get("_speco_vllm_request_id"), i
+                ),
+                "_speco_vllm_request_elapsed_sec": _batch_item_float(
+                    batch.get("_speco_vllm_request_elapsed_sec"),
+                    i,
+                ),
+                "_verl_is_hard": bool(
+                    _batch_item_int(batch.get("_verl_is_hard"), i) or 0
+                ),
+                "_verl_hard_score": _batch_item_float(batch.get("_verl_hard_score"), i),
+                "_speco_vllm_request_completion_index": _batch_item_int(
+                    batch.get("_speco_vllm_request_completion_index"),
+                    i,
+                ),
                 "_verl_input_seq_length": input_seq_length,
                 "hidden_lm_head_fingerprint": batch.get("hidden_lm_head_fingerprint"),
                 "hidden_last_hidden_logprob_check": batch.get(
@@ -3720,6 +3758,7 @@ class DrafterBaseTrainer:
         explicit_score = self._item_float(
             item,
             (
+                "_verl_hard_score",
                 "_verl_dflash_hard_score",
                 "dflash_hard_score",
                 "_verl_sample_loss",
@@ -3763,6 +3802,41 @@ class DrafterBaseTrainer:
         if not self._is_block_drafter_backend() or hard_ratio <= 0:
             return rng.sample(available_data, batch_size)
 
+        if self._block_drafter_metric_prefix() == "dspark":
+            # Collection controls which requests reach each worker. Enforce the
+            # same ratio again when building optimizer micro-batches so a small
+            # buffer (10 items here) does not turn the configured ratio into a
+            # noisy binomial draw. Fractional quotas are accumulated across
+            # optimizer steps; e.g. ratio=.1 and batch=4 produces exactly eight
+            # hard draws over twenty updates instead of rounding every batch to
+            # zero. Either ratio being zero takes the baseline path above.
+            optimizer_step = max(int(getattr(self, "optimizer_steps_total", 0)), 0)
+            previous_target = int(optimizer_step * batch_size * hard_ratio + 0.5)
+            next_target = int((optimizer_step + 1) * batch_size * hard_ratio + 0.5)
+            hard_count = min(batch_size, max(0, next_target - previous_target))
+
+            hard_pool = [
+                item for item in available_data if item.get("_verl_is_hard") is True
+            ]
+            normal_pool = [
+                item for item in available_data if item.get("_verl_is_hard") is not True
+            ]
+            if not hard_pool or not normal_pool:
+                return rng.sample(available_data, batch_size)
+
+            actual_hard = min(hard_count, len(hard_pool))
+            actual_normal = min(batch_size - actual_hard, len(normal_pool))
+            selected: list[dict[str, Any]] = rng.sample(hard_pool, actual_hard)
+            selected.extend(rng.sample(normal_pool, actual_normal))
+            if len(selected) < batch_size:
+                selected_ids = {id(item) for item in selected}
+                remainder = [
+                    item for item in available_data if id(item) not in selected_ids
+                ]
+                selected.extend(rng.sample(remainder, batch_size - len(selected)))
+            rng.shuffle(selected)
+            return selected
+
         hard_count = min(batch_size, max(0, round(batch_size * hard_ratio)))
         scored: list[tuple[float, float, dict[str, Any]]] = []
         for item in available_data:
@@ -3770,7 +3844,7 @@ class DrafterBaseTrainer:
             if score is not None:
                 scored.append((score, rng.random(), item))
 
-        selected: list[dict[str, Any]] = []
+        selected = []
         if hard_count > 0 and scored:
             scored.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
             hard_pool_size = min(len(scored), max(hard_count, hard_count * 4))
@@ -5126,6 +5200,7 @@ class DrafterBaseTrainer:
         min_sample_step: Optional[int] = None,
         max_sample_step: Optional[int] = None,
     ) -> bool:
+        self.last_training_error = None
         try:
             with torch.enable_grad():
                 return await self._training_step_impl(
@@ -5134,6 +5209,11 @@ class DrafterBaseTrainer:
                     max_sample_step=max_sample_step,
                 )
         except Exception as e:  # noqa: BLE001
+            self.last_training_error = {
+                "type": type(e).__name__,
+                "message": str(e),
+                "step": step,
+            }
             logger.exception(f"Training step {step} failed with error: {e}")
             return False
 

@@ -33,6 +33,7 @@ import threading
 import time
 import types
 from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 from typing import Any, Iterable, cast
 
 from verl_speco.integration.verl_npu_vllm_compat import (
@@ -56,15 +57,14 @@ SPECO_VLLM_SPEC_DECODE_LOG_INTERVAL_ENV = (
 )
 SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
 
+SPECO_VLLM_DRAFT_DIAG_ENV = "VERL_SPECO_VLLM_DRAFT_DIAG"
+SPECO_VLLM_NPU_STAGING_ENV = "VERL_SPECO_VLLM_NPU_STAGING"
+SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES = 64 << 20
 SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX = "_speco_vllm_request"
 SPECO_VLLM_REQUEST_STATS_TRACE_HEADER = "x-speco-vllm-request-accept-stats"
 _SPECO_VLLM_REQUEST_OUTPUT_STATS_BY_ID: dict[
     str, tuple[dict[str, dict[str, Any]], list[str]]
 ] = {}
-
-SPECO_VLLM_DRAFT_DIAG_ENV = "VERL_SPECO_VLLM_DRAFT_DIAG"
-SPECO_VLLM_NPU_STAGING_ENV = "VERL_SPECO_VLLM_NPU_STAGING"
-SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES = 64 << 20
 
 _VLLM_REPLICA_PATCHED = False
 _VLLM_DFLASH_CONFIG_ALIASES_PATCHED = False
@@ -2077,6 +2077,8 @@ def _record_vllm_request_acceptance_stats(
         return
     draft_tokens = _int_or_zero(num_draft_tokens)
     accepted_tokens = _int_or_zero(num_accepted_tokens)
+    if isinstance(num_invalid_spec_tokens, dict):
+        num_invalid_spec_tokens = num_invalid_spec_tokens.get(str(request_id), 0)
     invalid_tokens = _int_or_zero(num_invalid_spec_tokens)
     if draft_tokens <= 0 and accepted_tokens <= 0 and invalid_tokens <= 0:
         return
@@ -2095,7 +2097,7 @@ def _record_vllm_request_acceptance_stats(
         },
     )
     item["verify_rounds"] += 1
-    item["draft_tokens"] += draft_tokens
+    item["draft_tokens"] += max(draft_tokens - invalid_tokens, 0)
     item["accepted_tokens"] += accepted_tokens
     item["invalid_spec_tokens"] += invalid_tokens
     item["last_update_sec"] = now
@@ -2691,12 +2693,14 @@ def install_vllm_runtime_observability() -> bool:
     dspark_registry_patched = patch_vllm_dspark_registry_aliases()
     dspark_runtime_patched = patch_vllm_dspark_runtime()
     acceptance_patched = install_vllm_spec_decode_acceptance_logging()
+    request_acceptance_patched = patch_vllm_request_acceptance_stats()
     worker_proc_patched = patch_vllm_worker_proc_entrypoint()
     return (
         dflash_config_patched
         or dspark_registry_patched
         or dspark_runtime_patched
         or acceptance_patched
+        or request_acceptance_patched
         or worker_proc_patched
     )
 
@@ -2928,7 +2932,7 @@ class _SpecoVLLMHttpServerMixin:
     def _speco_add_vllm_request_accept_extra_fields(
         self, output: Any, extra_fields: dict[str, Any]
     ) -> None:
-        extra_fields.update(_vllm_request_accept_stats_to_extra_fields(output))
+        extra_fields.update(_vllm_request_accept_stats_to_scalar_extra_fields(output))
 
     def _speco_add_staged_request_accept_extra_fields(
         self,
@@ -3019,16 +3023,45 @@ class _SpecoVLLMHttpServerMixin:
             self._speco_initial_draft_weights_ready = True
 
     async def generate(self, *args, **kwargs):
-        await self._speco_ensure_initial_draft_weights()
-        output = await super().generate(*args, **kwargs)
-        extra_fields = getattr(output, "extra_fields", None)
-        if isinstance(extra_fields, dict):
-            self._speco_add_vllm_spec_decode_extra_fields(extra_fields)
-            self._speco_add_vllm_request_accept_extra_fields(output, extra_fields)
-            self._speco_add_staged_request_accept_extra_fields(
-                args, kwargs, extra_fields
-            )
-        return output
+        request_id = _vllm_generate_request_id(args, kwargs)
+        try:
+            await self._speco_ensure_initial_draft_weights()
+            output = await super().generate(*args, **kwargs)
+            extra_fields = getattr(output, "extra_fields", None)
+            if isinstance(extra_fields, dict):
+                extra_fields.setdefault(
+                    f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_id",
+                    str(request_id) if request_id is not None else None,
+                )
+                for suffix in (
+                    "verify_rounds",
+                    "draft_tokens",
+                    "accepted_tokens",
+                    "invalid_spec_tokens",
+                    "completion_index",
+                    "elapsed_sec",
+                ):
+                    extra_fields.setdefault(
+                        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_{suffix}", None
+                    )
+                extra_fields.setdefault("_verl_request_mean_accept_len", None)
+                self._speco_add_vllm_spec_decode_extra_fields(extra_fields)
+                self._speco_add_vllm_request_accept_extra_fields(output, extra_fields)
+                summaries, completion_order = (
+                    _pop_vllm_request_stats_for_rollout_output(request_id)
+                )
+                if summaries:
+                    proxy_output = SimpleNamespace(
+                        request_id=request_id,
+                        _speco_vllm_request_accept_stats=summaries,
+                        _speco_vllm_request_completion_order=completion_order,
+                    )
+                    extra_fields.update(
+                        _vllm_request_accept_stats_to_scalar_extra_fields(proxy_output)
+                    )
+            return output
+        finally:
+            _pop_vllm_request_stats_for_rollout_output(request_id)
 
 
 def _build_speco_vllm_http_server_class(upstream_module: Any):

@@ -40,6 +40,7 @@ from verl_speco.integration.agent_loop_runtime import (
 from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY,
+    OLD_LOGPROB_SOURCE_BATCH_INDICES_KEY,
     OLD_LOGPROB_AUX_LAYER_IDS_KEY,
     OLD_LOGPROB_COLLECT_MASK_KEY,
     OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
@@ -77,6 +78,7 @@ from verl_speco.integration.vllm_runtime import (
     configure_vllm_runtime_from_config,
 )
 from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
+from verl_speco.trainer.hard_sample_selection import partition_hard_candidates
 from verl_speco.trainer.scheduler import (
     AfterActorUpdateContext,
     AfterWeightUpdateContext,
@@ -94,6 +96,7 @@ from verl_speco.trainer.scheduler import (
     DrafterScheduleConfig,
     DrafterScheduleContext,
     DrafterScheduler,
+    step_matches_interval,
     TrainingPlan,
 )
 from verl_speco.workers import SpecoWorker
@@ -107,21 +110,27 @@ SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC = (
 )
 _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY = "_speco_vllm_spec_decode_drafts"
 _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY = "_speco_vllm_spec_decode_accepted_tokens"
-_SPECO_DRAFTER_TIMING_DEDUCTED_KEY = "_speco_drafter_timing_deducted_from_update_actor"
-
-# Per-request speculative acceptance stats (populated on the rollout
-# non_tensor_batch by verl_speco.integration.vllm_runtime). Used by the drafter
-# convergence freeze gate (bimodal_low_fraction / hard_tail) and reported as
-# diagnostics. See accept_len_convergence.py.
 _SPECO_VLLM_REQUEST_VERIFY_ROUNDS_KEY = "_speco_vllm_request_verify_rounds"
 _SPECO_VLLM_REQUEST_ACCEPTED_TOKENS_KEY = "_speco_vllm_request_accepted_tokens"
-_SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY = "_verl_request_mean_accept_len"
-_SPECO_VLLM_REQUEST_ID_KEY = "_speco_vllm_request_id"
-_SPECO_VLLM_REQUEST_ELAPSED_SEC_KEY = "_speco_vllm_request_elapsed_sec"
 _SPECO_VLLM_REQUEST_DRAFT_TOKENS_KEY = "_speco_vllm_request_draft_tokens"
+_SPECO_VLLM_REQUEST_INVALID_TOKENS_KEY = "_speco_vllm_request_invalid_spec_tokens"
+_SPECO_VLLM_REQUEST_COMPLETION_INDEX_KEY = "_speco_vllm_request_completion_index"
+_SPECO_VLLM_REQUEST_ELAPSED_SEC_KEY = "_speco_vllm_request_elapsed_sec"
+_SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY = "_verl_request_mean_accept_len"
+_SPECO_VLLM_REQUEST_IS_HARD_KEY = "_verl_is_hard"
+_SPECO_VLLM_REQUEST_HARD_SCORE_KEY = "_verl_hard_score"
+_SPECO_VLLM_REQUEST_ID_KEY = "_speco_vllm_request_id"
+_SPECO_DRAFTER_TIMING_DEDUCTED_KEY = "_speco_drafter_timing_deducted_from_update_actor"
 # Meta-info markers carried by fixed paired-probe batches (RFC sec. 6).
 _SPECO_FREEZE_PROBE_META_KEY = "_speco_freeze_probe"
 _SPECO_FREEZE_PROBE_MAX_TOKENS_META_KEY = "_speco_freeze_probe_max_tokens"
+_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH_ENV = (
+    "VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH"
+)
+_SPECO_REQUEST_ACCEPT_LEN_HIST_PRINT_ENV = "VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_PRINT"
+_SPECO_REQUEST_ACCEPT_LEN_HIST_BIN_WIDTH_ENV = (
+    "VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_BIN_WIDTH"
+)
 _DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
 
 _DRAFTER_CHECKPOINT_PATH_PLACEHOLDERS = {
@@ -131,7 +140,18 @@ _DRAFTER_CHECKPOINT_PATH_PLACEHOLDERS = {
     "None",
     "/path/to/drafter/checkpoint",
 }
-_POLICY_MODEL_NON_TENSOR_KEYS = {"multi_modal_inputs", "pad_token_id"}
+_POLICY_MODEL_NON_TENSOR_KEYS = {
+    "multi_modal_inputs",
+    "pad_token_id",
+    "_speco_vllm_request_id",
+    "_speco_vllm_request_verify_rounds",
+    "_speco_vllm_request_accepted_tokens",
+    "_speco_vllm_request_draft_tokens",
+    "_speco_vllm_request_invalid_spec_tokens",
+    "_speco_vllm_request_completion_index",
+    "_speco_vllm_request_elapsed_sec",
+    "_verl_request_mean_accept_len",
+}
 
 
 def _select_policy_model_batch(batch: DataProto) -> DataProto:
@@ -341,6 +361,115 @@ def _speco_float_values(values: Any) -> list[float]:
     return normalized
 
 
+def _speco_diag_enabled(name: str, default: str = "1") -> bool:
+    value = os.getenv(name, default)
+    if value is None:
+        return False
+    return str(value).strip().lower() not in {"0", "false", "off", "no", "n", ""}
+
+
+def _speco_append_jsonl_batch(path: str | None, payloads: list[dict[str, Any]]) -> None:
+    if not path:
+        return
+    if not payloads:
+        return
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as file:
+            file.write(
+                "".join(
+                    json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n"
+                    for payload in payloads
+                )
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to append SPECO diagnostic log %s: %s", path, exc)
+
+
+def _speco_accept_len_quantile(sorted_values: list[float], q: float) -> float | None:
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    position = (len(sorted_values) - 1) * q
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return sorted_values[lower]
+    weight = position - lower
+    return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+
+
+def _speco_accept_len_hist_bin_width() -> float:
+    value = _speco_optional_float(
+        os.getenv(_SPECO_REQUEST_ACCEPT_LEN_HIST_BIN_WIDTH_ENV, "0.1")
+    )
+    return value if value is not None and value > 0 else 0.1
+
+
+def _speco_accept_len_histogram(
+    values: list[float], *, bin_width: float
+) -> list[dict[str, Any]]:
+    counts: dict[int, int] = {}
+    for value in values:
+        index = math.floor(value / bin_width)
+        counts[index] = counts.get(index, 0) + 1
+    return [
+        {
+            "left": round(index * bin_width, 6),
+            "right": round((index + 1) * bin_width, 6),
+            "center": round((index + 0.5) * bin_width, 6),
+            "count": count,
+        }
+        for index, count in sorted(counts.items())
+    ]
+
+
+def _speco_request_accept_len_step_payload(
+    *,
+    step: int,
+    source: str,
+    records: list[dict[str, Any]],
+    accept_len_var: float,
+) -> dict[str, Any] | None:
+    values = [
+        float(record["mean_accept_len"])
+        for record in records
+        if _speco_optional_float(record.get("mean_accept_len")) is not None
+    ]
+    if not values:
+        return None
+    sorted_values = sorted(values)
+    bin_width = _speco_accept_len_hist_bin_width()
+    mean_accept_len = sum(values) / len(values)
+    p50 = cast(float, _speco_accept_len_quantile(sorted_values, 0.50))
+    p90 = cast(float, _speco_accept_len_quantile(sorted_values, 0.90))
+    p95 = cast(float, _speco_accept_len_quantile(sorted_values, 0.95))
+    return {
+        "step": int(step),
+        "source": source,
+        "count": len(values),
+        "accept_lens": [round(value, 6) for value in values],
+        "summary": {
+            "min": round(sorted_values[0], 6),
+            "max": round(sorted_values[-1], 6),
+            "mean": round(mean_accept_len, 6),
+            "p50": round(p50, 6),
+            "p90": round(p90, 6),
+            "p95": round(p95, 6),
+            "var": round(float(accept_len_var), 6),
+        },
+        "histogram": {
+            "bin_width": round(bin_width, 6),
+            "x": "mean_accept_len",
+            "y": "request_count",
+            "bins": _speco_accept_len_histogram(values, bin_width=bin_width),
+        },
+    }
+
+
 def _speco_vllm_spec_decode_stats_from_batch(batch: Any) -> dict[str, float]:
     non_tensor_batch = getattr(batch, "non_tensor_batch", None)
     if not isinstance(non_tensor_batch, dict):
@@ -505,6 +634,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         # Coalesces an event save and the base loop's periodic save landing on
         # the same step: the full save chain runs at most once per global step.
         self._speco_last_checkpoint_saved_step = None
+        self._speco_pending_request_accept_len_payloads = []
+        self._speco_last_request_accept_len_var = 0.0
+        self._speco_last_oldlogprob_skipped_missing_hidden = 0
 
     def attach_speco_worker_group(self, worker_group):
         self.drafter_wg = worker_group
@@ -1091,7 +1223,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         continue
         return 0
 
-    def _speco_request_accept_lengths(
+    def _speco_freeze_request_accept_lengths(
         self, batch: Any, batch_size: int
     ) -> list[float | None]:
         """Per-request mean accept length from the rollout non_tensor_batch.
@@ -1141,7 +1273,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if batch_size <= 0:
             self._speco_last_request_accept_len_records = []
             return
-        accept_lens = self._speco_request_accept_lengths(batch, batch_size)
+        accept_lens = self._speco_freeze_request_accept_lengths(batch, batch_size)
         records = []
         for batch_idx, mean_accept_len in enumerate(accept_lens):
             if mean_accept_len is None:
@@ -1857,7 +1989,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if batch_size <= 0:
             raise RuntimeError("freeze probe output carries no per-request stats")
 
-        accept_lens = self._speco_request_accept_lengths(output, batch_size)
+        accept_lens = self._speco_freeze_request_accept_lengths(output, batch_size)
         rounds = [
             _speco_request_cell_float(value)
             for value in _speco_sequence_values(
@@ -2042,6 +2174,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_drafter_schedule_config(self) -> DrafterScheduleConfig:
         return DrafterScheduleConfig.from_mapping(self._speco_drafter_training_config())
+
+    def _speco_should_log_request_accept_len_variance(self) -> bool:
+        training_cfg = self._speco_drafter_training_config()
+        interval_steps = training_cfg.get(
+            "request_accept_len_variance_interval_steps", 1
+        )
+        return step_matches_interval(self.global_steps, interval_steps)
 
     def _speco_drafter_training_mode(self) -> str:
         training_cfg = self._speco_drafter_training_config()
@@ -2380,6 +2519,234 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             inclusive_max + 1
         )
 
+    def _speco_request_accept_lengths(
+        self, batch: DataProto, batch_size: int
+    ) -> list[float | None]:
+        non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            return [None for _ in range(batch_size)]
+
+        explicit = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY),
+            batch_size,
+        )
+        result = [_speco_optional_float(value) for value in explicit]
+        if any(value is not None for value in result):
+            return result
+
+        rounds = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_VERIFY_ROUNDS_KEY), batch_size
+        )
+        accepted = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_ACCEPTED_TOKENS_KEY), batch_size
+        )
+        for index, (round_value, accepted_value) in enumerate(
+            zip(rounds, accepted, strict=False)
+        ):
+            verify_rounds = _speco_optional_float(round_value)
+            accepted_tokens = _speco_optional_float(accepted_value)
+            if verify_rounds is None or verify_rounds <= 0 or accepted_tokens is None:
+                continue
+            result[index] = 1.0 + accepted_tokens / verify_rounds
+        return result
+
+    def _speco_request_ids(
+        self,
+        batch: DataProto,
+        batch_size: int,
+        *,
+        require: bool = False,
+        required_mask: list[bool] | None = None,
+    ) -> list[str]:
+        non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            if require:
+                raise RuntimeError(
+                    "SPECO request acceptance stats require a non-tensor request id field"
+                )
+            return [str(index) for index in range(batch_size)]
+        if require and _SPECO_VLLM_REQUEST_ID_KEY not in non_tensor_batch:
+            raise RuntimeError(
+                f"SPECO request acceptance stats missing {_SPECO_VLLM_REQUEST_ID_KEY}"
+            )
+        request_ids = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_ID_KEY), batch_size
+        )
+        if require and any(
+            value is None and (required_mask is None or required_mask[index])
+            for index, value in enumerate(request_ids)
+        ):
+            raise RuntimeError(
+                "SPECO request acceptance stats contain a missing request id"
+            )
+        present_ids = [str(value) for value in request_ids if value is not None]
+        if require and len(set(present_ids)) != len(present_ids):
+            raise RuntimeError(
+                "SPECO request acceptance stats contain duplicate request ids"
+            )
+        return [
+            str(value) if value is not None else str(index)
+            for index, value in enumerate(request_ids)
+        ]
+
+    def _speco_request_completion_indices(
+        self, batch: DataProto, batch_size: int
+    ) -> list[int | None]:
+        non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            return [None for _ in range(batch_size)]
+        values = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_COMPLETION_INDEX_KEY),
+            batch_size,
+        )
+        indices = []
+        for value in values:
+            parsed = _speco_optional_float(value)
+            indices.append(int(parsed) if parsed is not None else None)
+        return indices
+
+    def _speco_request_elapsed_secs(
+        self, batch: DataProto, batch_size: int
+    ) -> list[float | None]:
+        non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            return [None for _ in range(batch_size)]
+        values = _speco_sequence_values(
+            non_tensor_batch.get(_SPECO_VLLM_REQUEST_ELAPSED_SEC_KEY),
+            batch_size,
+        )
+        return [_speco_optional_float(value) for value in values]
+
+    def _speco_log_request_accept_len_variance_from_batch(
+        self, batch: DataProto, *, source: str
+    ) -> bool:
+        batch_size = self._speco_batch_size_from_request_stats(batch)
+        if batch_size <= 0:
+            return False
+
+        request_accept_lens = self._speco_request_accept_lengths(batch, batch_size)
+        if not any(value is not None for value in request_accept_lens):
+            return False
+        request_ids = self._speco_request_ids(
+            batch,
+            batch_size,
+            require=True,
+            required_mask=[value is not None for value in request_accept_lens],
+        )
+        request_completion_indices = self._speco_request_completion_indices(
+            batch, batch_size
+        )
+        request_elapsed_secs = self._speco_request_elapsed_secs(batch, batch_size)
+        candidates = [
+            {
+                "batch_idx": batch_idx,
+                "request_id": request_ids[batch_idx],
+                "mean_accept_len": request_accept_lens[batch_idx],
+                "completion_index": request_completion_indices[batch_idx],
+                "elapsed_sec": request_elapsed_secs[batch_idx],
+            }
+            for batch_idx in range(batch_size)
+        ]
+        marker = torch.zeros(batch_size, dtype=torch.bool)
+        records, accept_len_var = self._speco_log_request_accept_lens(
+            candidates=candidates,
+            is_hard=marker,
+            collect_mask=marker,
+        )
+        payload = _speco_request_accept_len_step_payload(
+            step=self.global_steps,
+            source=source,
+            records=records,
+            accept_len_var=accept_len_var,
+        )
+        if payload:
+            self._speco_pending_request_accept_len_payloads.append(payload)
+        return bool(records)
+
+    def _speco_log_request_accept_lens(
+        self,
+        *,
+        candidates: list[dict[str, Any]],
+        is_hard: torch.Tensor,
+        collect_mask: torch.Tensor,
+    ) -> tuple[list[dict[str, Any]], float]:
+        records = []
+        for candidate in candidates:
+            mean_accept_len = candidate.get("mean_accept_len")
+            if mean_accept_len is None:
+                continue
+            batch_idx = int(candidate["batch_idx"])
+            elapsed_sec = _speco_optional_float(candidate.get("elapsed_sec"))
+            records.append(
+                {
+                    "completion_index": candidate.get("completion_index"),
+                    "batch_idx": batch_idx,
+                    "request_id": str(candidate.get("request_id")),
+                    "mean_accept_len": round(float(mean_accept_len), 6),
+                    "elapsed_sec": (
+                        round(elapsed_sec, 6) if elapsed_sec is not None else None
+                    ),
+                    "is_hard": bool(is_hard[batch_idx].item()),
+                    "collected": bool(collect_mask[batch_idx].item()),
+                }
+            )
+        records.sort(
+            key=lambda item: (
+                item["completion_index"] is None,
+                item["completion_index"]
+                if item["completion_index"] is not None
+                else item["batch_idx"],
+                item["batch_idx"],
+            )
+        )
+        accept_lens = [
+            parsed
+            for record in records
+            if (parsed := _speco_optional_float(record.get("mean_accept_len")))
+            is not None
+        ]
+        if accept_lens:
+            mean_accept_len = sum(accept_lens) / len(accept_lens)
+            accept_len_var = sum(
+                (value - mean_accept_len) ** 2 for value in accept_lens
+            ) / len(accept_lens)
+        else:
+            accept_len_var = 0.0
+        self._speco_last_request_accept_len_records = records
+        self._speco_last_request_accept_len_var = accept_len_var
+        return records, accept_len_var
+
+    def _speco_flush_request_accept_len_payloads(self) -> None:
+        payloads = self._speco_pending_request_accept_len_payloads
+        if not payloads:
+            return
+        self._speco_pending_request_accept_len_payloads = []
+        path = os.getenv(
+            _SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH_ENV,
+            "/tmp/speco_vllm_request_accept_len_hist.jsonl",
+        )
+        _speco_append_jsonl_batch(path, payloads)
+        if _speco_diag_enabled(_SPECO_REQUEST_ACCEPT_LEN_HIST_PRINT_ENV, "0"):
+            for payload in payloads:
+                print(
+                    "[speco request accept len hist] %s"
+                    % json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+                    flush=True,
+                )
+        if self._speco_should_log_request_accept_len_variance():
+            for payload in payloads:
+                print(
+                    "[speco request accept len] step=%s requests=%s "
+                    "request_accept_len_var=%.3f source=%s"
+                    % (
+                        payload["step"],
+                        payload["count"],
+                        payload["summary"]["var"],
+                        payload["source"],
+                    ),
+                    flush=True,
+                )
+
     def _speco_build_oldlogprob_collect_plan(
         self, batch: DataProto
     ) -> dict[str, Any] | None:
@@ -2412,7 +2779,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         collect_mask = torch.zeros(batch_size, dtype=torch.bool)
         hidden_positions = torch.zeros(batch_size, hidden_rows, dtype=torch.long)
         hidden_position_mask = torch.zeros(batch_size, hidden_rows, dtype=torch.bool)
-        owner_rank = torch.zeros(batch_size, dtype=torch.long)
+        owner_rank = torch.full((batch_size,), -1, dtype=torch.long)
 
         owner_count = self._speco_owner_bucket_count()
         if owner_count is None:
@@ -2431,8 +2798,77 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         prompt_lens: list[int] = []
         response_lens: list[int] = []
+        request_accept_lens = self._speco_request_accept_lengths(batch, batch_size)
+        require_request_ids = any(value is not None for value in request_accept_lens)
+        request_ids = self._speco_request_ids(
+            batch,
+            batch_size,
+            require=require_request_ids,
+            required_mask=[value is not None for value in request_accept_lens],
+        )
+        request_completion_indices = self._speco_request_completion_indices(
+            batch, batch_size
+        )
+        request_elapsed_secs = self._speco_request_elapsed_secs(batch, batch_size)
+        all_request_accept_len_candidates = [
+            {
+                "batch_idx": batch_idx,
+                "request_id": request_ids[batch_idx],
+                "mean_accept_len": request_accept_lens[batch_idx],
+                "completion_index": request_completion_indices[batch_idx],
+                "elapsed_sec": request_elapsed_secs[batch_idx],
+            }
+            for batch_idx in range(batch_size)
+        ]
+
+        hard_sample_ratio = float(
+            training_cfg.get("dspark_hard_sample_ratio", 0.0) or 0.0
+        )
+        hard_candidate_ratio = float(
+            training_cfg.get("dspark_hard_candidate_ratio", 0.0) or 0.0
+        )
+        hard_enabled = hard_sample_ratio > 0.0 and hard_candidate_ratio > 0.0
+        # The transport now retains every DP shard. The window is a logical
+        # collection budget, never a physical prefix of the actor batch.
+        usable_window_size = batch_size
+        capacity_per_owner = max_per_owner
+        if max_tokens_per_owner is not None:
+            capacity_per_owner = min(
+                capacity_per_owner, max_tokens_per_owner // hidden_rows
+            )
+        algorithm = (
+            str(
+                _get_nested(
+                    self._speco_drafter_config(), ("speculative_algorithm",), ""
+                )
+                or ""
+            )
+            .strip()
+            .upper()
+        )
+        if algorithm == "DSPARK" or hard_enabled:
+            collection_limit = int(
+                training_cfg.get("dspark_collect_samples_per_step", 80)
+            )
+            if collection_limit <= 0:
+                raise ValueError("dspark_collect_samples_per_step must be positive")
+        else:
+            collection_limit = capacity_per_owner * owner_count
+        for name, ratio in (
+            ("candidate", hard_candidate_ratio),
+            ("sample", hard_sample_ratio),
+        ):
+            if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
+                raise ValueError(f"Invalid hard {name} ratio: {ratio}")
+        shortage_policy = training_cfg.get(
+            "dspark_hard_shortfall_policy", "fill_normal"
+        )
+        if shortage_policy not in ("fill_normal", "strict"):
+            raise ValueError(f"Invalid hard shortfall policy: {shortage_policy}")
+
         candidate_count = 0
         selected_count = 0
+        candidates: list[dict[str, Any]] = []
         for batch_idx in range(batch_size):
             prompt_len = int(
                 attention_mask[batch_idx, :prompt_width].detach().sum().item()
@@ -2454,22 +2890,59 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 and self._speco_hash_fraction(sample_key) >= sample_rate
             ):
                 continue
-            owner = selected_count % owner_count
+            candidates.append(
+                {
+                    "batch_idx": batch_idx,
+                    "prompt_len": prompt_len,
+                    "response_len": response_len,
+                    "sample_key": sample_key,
+                    "request_id": request_ids[batch_idx],
+                    "mean_accept_len": request_accept_lens[batch_idx],
+                    "completion_index": request_completion_indices[batch_idx],
+                    "elapsed_sec": request_elapsed_secs[batch_idx],
+                    "hash": self._speco_hash_fraction(
+                        f"{step_key}:{request_ids[batch_idx]}:{batch_idx}:hard"
+                    ),
+                }
+            )
+
+        scored_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["mean_accept_len"] is not None
+        ]
+
+        is_hard = torch.zeros(batch_size, dtype=torch.bool)
+        hard_score = torch.zeros(batch_size, dtype=torch.float32)
+        mean_accept_len_tensor = torch.full(
+            (batch_size,), float("nan"), dtype=torch.float32
+        )
+        for index, mean_accept_len in enumerate(request_accept_lens):
+            if mean_accept_len is not None:
+                mean_accept_len_tensor[index] = float(mean_accept_len)
+                hard_score[index] = float(-mean_accept_len)
+
+        def owner_has_capacity(owner: int) -> bool:
             if owner_counts[owner] >= max_per_owner:
-                continue
-            if (
-                max_tokens_per_owner is not None
-                and owner_token_counts[owner] + hidden_rows > max_tokens_per_owner
-            ):
-                continue
-            max_start_offset = max(response_len - hidden_rows, 0)
+                return False
+            return (
+                max_tokens_per_owner is None
+                or owner_token_counts[owner] + hidden_rows <= max_tokens_per_owner
+            )
+
+        def add_candidate(candidate: dict[str, Any], owner: int) -> bool:
+            nonlocal selected_count
+            if selected_count >= total_capacity or not owner_has_capacity(owner):
+                return False
+            batch_idx = int(candidate["batch_idx"])
+            max_start_offset = max(int(candidate["response_len"]) - hidden_rows, 0)
             if window_mode == "random":
                 random_offset = self._speco_hash_int(
-                    f"{sample_key}:window", max_start_offset
+                    f"{candidate['sample_key']}:window", max_start_offset
                 )
             else:
                 random_offset = 0
-            start = max(prompt_len - 1, 0) + random_offset
+            start = max(int(candidate["prompt_len"]) - 1, 0) + random_offset
             positions = torch.arange(start, start + hidden_rows, dtype=torch.long)
             collect_mask[batch_idx] = True
             hidden_positions[batch_idx, :] = positions
@@ -2478,6 +2951,114 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             owner_counts[owner] += 1
             owner_token_counts[owner] += hidden_rows
             selected_count += 1
+            return True
+
+        def add_round_robin(
+            items: list[dict[str, Any]], *, start_owner: int = 0
+        ) -> int:
+            added = 0
+            next_owner = start_owner
+            for candidate in items:
+                if bool(collect_mask[int(candidate["batch_idx"])].item()):
+                    continue
+                for offset in range(owner_count):
+                    owner = (next_owner + offset) % owner_count
+                    if add_candidate(candidate, owner):
+                        added += 1
+                        next_owner = (owner + 1) % owner_count
+                        break
+            return added
+
+        total_capacity = min(
+            collection_limit, len(candidates), capacity_per_owner * owner_count
+        )
+        hard_added = 0
+        target_hard = 0
+        labeled_hard_count = 0
+        hard_shortfall = 0
+        normal_shortfall = 0
+        if not hard_enabled:
+            normal_added = add_round_robin(candidates)
+        else:
+            hard_candidates, labeled_hard_count = partition_hard_candidates(
+                scored_candidates,
+                candidate_ratio=hard_candidate_ratio,
+            )
+            for candidate in hard_candidates:
+                is_hard[candidate["batch_idx"]] = True
+            hard_pool = sorted(hard_candidates, key=lambda row: row["hash"])
+            normal_pool = sorted(
+                (row for row in candidates if not bool(is_hard[row["batch_idx"]])),
+                key=lambda row: self._speco_hash_fraction(
+                    f"{row['sample_key']}:normal"
+                ),
+            )
+            target_hard = round(total_capacity * hard_sample_ratio)
+            actual_hard = min(target_hard, len(hard_pool))
+            hard_shortfall = target_hard - actual_hard
+            normal_quota = total_capacity - actual_hard
+            normal_shortfall = max(normal_quota - len(normal_pool), 0)
+            if shortage_policy == "strict" and (hard_shortfall or normal_shortfall):
+                raise RuntimeError(
+                    f"SPECO unique collection quota unavailable: hard_shortfall={hard_shortfall} "
+                    f"normal_shortfall={normal_shortfall}"
+                )
+            # If normals are also exhausted, retain a smaller UNIQUE set and
+            # report the shortfall; do not silently exceed the hard quota.
+            first_owner = int(self.global_steps) % owner_count
+            hard_added = add_round_robin(
+                hard_pool[:actual_hard], start_owner=first_owner
+            )
+            normal_added = add_round_robin(
+                normal_pool[:normal_quota],
+                start_owner=(first_owner + hard_added) % owner_count,
+            )
+
+        selected_indices = collect_mask.nonzero(as_tuple=False).flatten().tolist()
+        hard_counts = [
+            int((collect_mask & is_hard & (owner_rank == owner)).sum())
+            for owner in range(owner_count)
+        ]
+        normal_counts = [
+            owner_counts[owner] - hard_counts[owner] for owner in range(owner_count)
+        ]
+        selection_metrics = {
+            "eligible_rows": len(candidates),
+            "scored_rows": len(scored_candidates),
+            "candidate_hard_count": labeled_hard_count,
+            "target_hard": target_hard,
+            "selected_hard_total": hard_added,
+            "selected_hard_unique": hard_added,
+            "selected_normal_total": normal_added,
+            "hard_shortfall": hard_shortfall,
+            "normal_shortfall": normal_shortfall,
+            "duplicate_hard_count": 0,
+            "selected_total": selected_count,
+            "selected_unique": len(selected_indices),
+            "collection_shortfall": collection_limit - selected_count,
+            "actual_hard_ratio": hard_added / selected_count if selected_count else 0.0,
+        }
+        for owner in range(owner_count):
+            selection_metrics[f"hard_count_owner_{owner}"] = hard_counts[owner]
+            selection_metrics[f"normal_count_owner_{owner}"] = normal_counts[owner]
+        self._speco_last_hard_selection_metrics = {
+            f"drafter/selection/{key}": value
+            for key, value in selection_metrics.items()
+        }
+        selection_hash = hashlib.sha256(
+            ",".join(map(str, selected_indices)).encode()
+        ).hexdigest()
+        print(
+            f"[speco hard selection] step={self.global_steps} "
+            f"metrics={selection_metrics} selected_source_indices_hash={selection_hash}",
+            flush=True,
+        )
+
+        self._speco_log_request_accept_lens(
+            candidates=all_request_accept_len_candidates,
+            is_hard=is_hard,
+            collect_mask=collect_mask,
+        )
 
         self._speco_last_raw_drafter_samples = candidate_count
         self._speco_last_oldlogprob_candidate_samples = candidate_count
@@ -2498,6 +3079,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "candidate_count": candidate_count,
             "owner_token_counts": owner_token_counts,
             "window_mode": window_mode,
+            "hard_enabled": hard_enabled,
+            "usable_window_size": usable_window_size,
+            "selection_metrics": selection_metrics,
+            "selected_source_indices_hash": selection_hash,
+            "request_ids": request_ids,
+            "request_mean_accept_len": mean_accept_len_tensor,
+            "request_is_hard": is_hard,
+            "request_hard_score": hard_score,
+            "request_completion_indices": request_completion_indices,
+            "request_elapsed_secs": request_elapsed_secs,
         }
 
     @staticmethod
@@ -2549,6 +3140,51 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return tensor.float().cpu()
         return tensor.reshape(-1, tensor.shape[-1]).float().sum(dim=0).cpu()
 
+    def _speco_materialize_oldlogprob_whole_refs(
+        self, output: Any
+    ) -> list[torch.Tensor | None]:
+        """Materialize row-aligned PP captures once per DP-shard ObjectRef."""
+        whole_refs = self._speco_flatten_non_tensor_rows(
+            tu.get(output, OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY)
+        )
+        if isinstance(whole_refs, (list, tuple)):
+            whole_metas = self._speco_flatten_non_tensor_rows(
+                tu.get(output, OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY)
+            )
+            if not isinstance(whole_metas, (list, tuple)) or len(whole_metas) != len(
+                whole_refs
+            ):
+                raise RuntimeError(
+                    "SPECO whole hidden refs and metadata are not row-aligned"
+                )
+            unique_refs = list(
+                dict.fromkeys(ref for ref in whole_refs if ref is not None)
+            )
+            states_by_ref = dict(zip(unique_refs, ray.get(unique_refs), strict=True))
+            hidden_rows: list[torch.Tensor | None] = []
+            for ref, meta in zip(whole_refs, whole_metas, strict=True):
+                if ref is None:
+                    hidden_rows.append(None)
+                    continue
+                if not isinstance(meta, dict) or "row_index" not in meta:
+                    raise RuntimeError(
+                        "SPECO whole hidden metadata is missing a row index"
+                    )
+                row_index = int(meta["row_index"])
+                hidden = states_by_ref[ref]
+                if (
+                    not torch.is_tensor(hidden)
+                    or hidden.dim() < 1
+                    or not 0 <= row_index < hidden.size(0)
+                ):
+                    raise RuntimeError("SPECO whole hidden row index is out of bounds")
+                hidden_rows.append(hidden[row_index])
+        else:
+            hidden_rows = self._speco_tensor_rows(ray.get(whole_refs))
+        tu.assign_non_tensor_data(output, OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY, None)
+        tu.assign_non_tensor_data(output, OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY, None)
+        return hidden_rows
+
     def _speco_collect_oldlogprob_features(
         self,
         batch: DataProto,
@@ -2557,6 +3193,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     ) -> int:
         if not collect_plan:
             return 0
+        hard_sampling_enabled = bool(collect_plan.get("hard_enabled", False))
         hidden_states = tu.get(output, OLD_LOGPROB_HIDDEN_STATES_KEY)
         hidden_refs = self._speco_flatten_non_tensor_rows(
             tu.get(output, OLD_LOGPROB_HIDDEN_REFS_KEY)
@@ -2576,29 +3213,21 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         # the Ray object store; the rest of this function treats it as an
         # inline tensor.
         whole_ref = tu.get(output, OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY)
+        hidden_rows = []
         if hidden_states is None and whole_ref is not None:
-            import ray as _ray
-
-            hidden_states = _ray.get(whole_ref)
-            # Drop every reference to the ObjectRef (local var + the copy held
-            # inside the output TensorDict) so Ray can free the big tensor from
-            # the object store as soon as this materialization completes,
-            # instead of waiting for the whole step output to be GC'd.
+            hidden_rows = self._speco_materialize_oldlogprob_whole_refs(output)
             del whole_ref
-            try:
-                tu.assign_non_tensor_data(
-                    output, OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY, None
-                )
-                tu.assign_non_tensor_data(
-                    output, OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY, None
-                )
-            except Exception:
-                pass
-        if hidden_states is None and hidden_refs is None and chunk_refs is None:
-            return 0
-        hidden_rows = self._speco_tensor_rows(hidden_states)
+        if (
+            hidden_states is None
+            and not hidden_rows
+            and hidden_refs is None
+            and chunk_refs is None
+        ):
+            raise RuntimeError("SPECO planned collection returned no hidden payload")
+        if not hidden_rows:
+            hidden_rows = self._speco_tensor_rows(hidden_states)
         if not hidden_rows and not hidden_refs and not chunk_refs:
-            return 0
+            raise RuntimeError("SPECO planned collection returned empty hidden payload")
         timing = self._speco_sum_timing_rows(tu.get(output, OLD_LOGPROB_TIMING_KEY))
         if timing is not None and int(timing.numel()) >= 2:
             self._speco_last_oldlogprob_select_elapsed_sec = (
@@ -2629,8 +3258,33 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         response_lens = collect_plan["response_lens"]
         samples: list[dict[str, Any]] = []
         owners: list[int] = []
+        request_mean_accept_len = collect_plan.get("request_mean_accept_len")
+        request_is_hard = collect_plan.get("request_is_hard")
+        request_hard_score = collect_plan.get("request_hard_score")
+        request_completion_indices = collect_plan.get("request_completion_indices")
+        request_elapsed_secs = collect_plan.get("request_elapsed_secs")
+        request_ids = collect_plan.get("request_ids")
+        request_mean_accept_len_tensor = (
+            cast(torch.Tensor, request_mean_accept_len)
+            if torch.is_tensor(request_mean_accept_len)
+            else None
+        )
+        request_is_hard_tensor = (
+            cast(torch.Tensor, request_is_hard)
+            if torch.is_tensor(request_is_hard)
+            else None
+        )
+        request_hard_score_tensor = (
+            cast(torch.Tensor, request_hard_score)
+            if torch.is_tensor(request_hard_score)
+            else None
+        )
         collected_rows = 0
         payload_bytes = 0
+        planned_samples = int(collect_plan["selected_count"])
+        skipped_empty_positions = 0
+        skipped_missing_hidden = 0
+        skipped_empty_hidden = 0
         sample_ref_chunks: dict[int, list[dict[str, Any]]] = {}
         if isinstance(chunk_refs, (list, tuple)) and isinstance(
             chunk_meta, (list, tuple)
@@ -2686,10 +3340,27 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             valid_positions = hidden_positions[batch_idx].reshape(-1)
             valid_rows = int(valid_positions.numel())
             if valid_rows <= 0:
+                skipped_empty_positions += 1
                 continue
             hidden_ref = self._speco_sequence_item(hidden_refs, batch_idx)
             ref_meta = self._speco_sequence_item(hidden_ref_meta, batch_idx)
             ref_chunks = sample_ref_chunks.get(batch_idx)
+            if isinstance(ref_meta, dict):
+                source_index = ref_meta.get("source_batch_index")
+                if source_index is not None and int(source_index) != batch_idx:
+                    raise RuntimeError(
+                        f"SPECO hidden row mismatch: {source_index} != {batch_idx}"
+                    )
+                if ref_meta.get("owner") is not None and int(ref_meta["owner"]) != int(
+                    owner_rank[batch_idx]
+                ):
+                    raise RuntimeError("SPECO hidden owner mismatch")
+                if (
+                    not ref_chunks
+                    and hidden_ref is not None
+                    and "chunk_start" in ref_meta
+                ):
+                    ref_chunks = [{"ref": hidden_ref, **ref_meta}]
             hidden = hidden_rows[batch_idx] if batch_idx < len(hidden_rows) else None
             if ref_chunks:
                 collected_rows += sum(
@@ -2703,9 +3374,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
             elif hidden_ref is None:
                 if hidden is None:
+                    skipped_missing_hidden += 1
                     continue
                 hidden = hidden[:valid_rows].contiguous()
                 if hidden.numel() == 0:
+                    skipped_empty_hidden += 1
                     continue
                 collected_rows += int(hidden.size(0))
                 payload_bytes += int(hidden.numel()) * int(hidden.element_size())
@@ -2736,6 +3409,47 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "global_step": self.global_steps,
                 "replica_rank": owner,
             }
+            if hard_sampling_enabled:
+                if isinstance(request_ids, (list, tuple)) and batch_idx < len(
+                    request_ids
+                ):
+                    sample[_SPECO_VLLM_REQUEST_ID_KEY] = str(request_ids[batch_idx])
+                if request_mean_accept_len_tensor is not None and batch_idx < int(
+                    request_mean_accept_len_tensor.numel()
+                ):
+                    mean_accept_len = float(
+                        request_mean_accept_len_tensor[batch_idx].item()
+                    )
+                    if math.isfinite(mean_accept_len):
+                        sample[_SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY] = (
+                            mean_accept_len
+                        )
+                if request_is_hard_tensor is not None and batch_idx < int(
+                    request_is_hard_tensor.numel()
+                ):
+                    sample[_SPECO_VLLM_REQUEST_IS_HARD_KEY] = bool(
+                        request_is_hard_tensor[batch_idx].item()
+                    )
+                if request_hard_score_tensor is not None and batch_idx < int(
+                    request_hard_score_tensor.numel()
+                ):
+                    sample[_SPECO_VLLM_REQUEST_HARD_SCORE_KEY] = float(
+                        request_hard_score_tensor[batch_idx].item()
+                    )
+                if isinstance(
+                    request_completion_indices, (list, tuple)
+                ) and batch_idx < len(request_completion_indices):
+                    completion_index = request_completion_indices[batch_idx]
+                    if completion_index is not None:
+                        sample[_SPECO_VLLM_REQUEST_COMPLETION_INDEX_KEY] = int(
+                            completion_index
+                        )
+                if isinstance(request_elapsed_secs, (list, tuple)) and batch_idx < len(
+                    request_elapsed_secs
+                ):
+                    elapsed_sec = request_elapsed_secs[batch_idx]
+                    if elapsed_sec is not None:
+                        sample[_SPECO_VLLM_REQUEST_ELAPSED_SEC_KEY] = float(elapsed_sec)
             if ref_chunks:
                 sample["hidden_states_ref_chunks"] = ref_chunks
             elif hidden_ref is None:
@@ -2748,6 +3462,30 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             owners.append(owner)
 
         collected = len(samples)
+        self._speco_last_oldlogprob_skipped_missing_hidden = skipped_missing_hidden
+        missing_hidden_samples = max(planned_samples - collected, 0)
+        logger.info(
+            "[speco oldlogprob payload] step=%s planned=%s payload=%s "
+            "skip_empty_positions=%s skip_missing_hidden=%s skip_empty_hidden=%s",
+            self.global_steps,
+            planned_samples,
+            collected,
+            skipped_empty_positions,
+            skipped_missing_hidden,
+            skipped_empty_hidden,
+        )
+        if not hasattr(self, "_speco_last_hard_selection_metrics"):
+            self._speco_last_hard_selection_metrics = {}
+        self._speco_last_hard_selection_metrics.update(
+            {
+                "drafter/selection/payload_total": collected,
+                "drafter/selection/payload_missing": missing_hidden_samples,
+            }
+        )
+        if missing_hidden_samples:
+            raise RuntimeError(
+                f"SPECO hidden payload incomplete: planned={planned_samples} collected={collected}"
+            )
         if collected <= 0:
             return 0
         dispatch_bucket_count = self._speco_dispatch_bucket_count()
@@ -3153,12 +3891,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 training_plan.source_global_step,
             )
             raise
+        if getattr(self, "_speco_ci_result", None) is not None:
+            self._speco_ci_result.record_workers(outcome.raw_results)
+            self._speco_ci_result.record_metrics(outcome.metrics)
         return outcome.trained, dict(outcome.metrics)
 
     def _speco_activate_drafter_training_model_before_fit(self) -> None:
         if not self.is_drafter_training_enabled(self.config):
             return
-        self._speco_get_drafter_scheduler().activate_training_workers()
+        results = self._speco_get_drafter_scheduler().activate_training_workers()
+        if getattr(self, "_speco_ci_result", None) is not None:
+            self._speco_ci_result.record_workers(results)
 
     def _speco_wait_pending_drafter_publish_rpc(self) -> int:
         if not self._pending_drafter_publish_refs:
@@ -3213,7 +3956,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if after_weight_update
             else scheduler.on_safe_point(context)
         )
-        return dict(event.metrics or {})
+        metrics = dict(event.metrics or {})
+        if getattr(self, "_speco_ci_result", None) is not None:
+            self._speco_ci_result.record_metrics(metrics)
+        return metrics
 
     def _speco_update_output_metrics(self, output: Any, metrics: dict[str, Any]):
         if not metrics:
@@ -3317,6 +4063,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ):
             data = dict(data)
             data.update(latest_rollout_metrics)
+        if (
+            getattr(self, "_speco_ci_result", None) is not None
+            and isinstance(data, dict)
+            and "training/global_step" in data
+        ):
+            self._speco_ci_result.record_metrics(
+                {"training/global_step": data["training/global_step"]}
+            )
         data = _speco_move_drafter_timing_next_to_update_actor(data)
         if isinstance(data, dict):
             data.update(self._speco_freeze_metrics())
@@ -3458,6 +4212,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     serving_version,
                     generation_seconds=generation_elapsed,
                 )
+                try:
+                    self._speco_log_request_accept_len_variance_from_batch(
+                        gen_batch_output, source="rollout"
+                    )
+                except RuntimeError as exc:
+                    logger.warning(
+                        "[speco request accept len] skipped rollout diagnostics: %s",
+                        exc,
+                    )
                 # Active freeze stops hidden-state collection here and in the
                 # scheduler plan; shadow mode keeps collecting. Accept-length
                 # evidence above is ungated and keeps feeding drift detection.
@@ -3481,6 +4244,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 return original_compute_old_log_prob(batch)
 
             oldlogprob_started = time.perf_counter()
+            self._speco_last_hard_selection_metrics = {}
             self._speco_last_oldlogprob_candidate_samples = 0
             self._speco_last_oldlogprob_planned_samples = 0
             self._speco_last_oldlogprob_collected_samples = 0
@@ -3542,6 +4306,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             tu.assign_non_tensor(
                 batch_td, calculate_entropy=calculate_entropy, compute_loss=False
             )
+            batch_td[OLD_LOGPROB_SOURCE_BATCH_INDICES_KEY] = torch.arange(
+                len(batch), dtype=torch.long
+            )
             batch_td[OLD_LOGPROB_COLLECT_MASK_KEY] = collect_plan["collect_mask"]
             batch_td[OLD_LOGPROB_HIDDEN_POSITIONS_KEY] = collect_plan[
                 "hidden_positions"
@@ -3550,6 +4317,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "hidden_position_mask"
             ]
             batch_td[OLD_LOGPROB_OWNER_RANK_KEY] = collect_plan["owner_rank"]
+            if collect_plan.get("hard_enabled"):
+                batch_td[_SPECO_VLLM_REQUEST_IS_HARD_KEY] = collect_plan[
+                    "request_is_hard"
+                ]
+                batch_td[_SPECO_VLLM_REQUEST_HARD_SCORE_KEY] = collect_plan[
+                    "request_hard_score"
+                ]
+                batch_td[_SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY] = collect_plan[
+                    "request_mean_accept_len"
+                ]
             tu.assign_non_tensor_data(
                 batch_td,
                 OLD_LOGPROB_AUX_LAYER_IDS_KEY,
@@ -3640,6 +4417,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     getattr(self, "_speco_last_collect_interval_matched", 0)
                 ),
             }
+            metrics.update(getattr(self, "_speco_last_hard_selection_metrics", {}))
             collection_plan = getattr(self, "_speco_last_collection_plan", None)
             if isinstance(collection_plan, CollectionPlan):
                 metrics.update(collection_plan.metrics())
@@ -3750,6 +4528,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             # this step, next rollout not started). A coinciding periodic save
             # in the base loop coalesces to a no-op via _save_checkpoint.
             self._speco_maybe_save_freeze_branch_checkpoint()
+            self._speco_flush_request_accept_len_payloads()
             return self._speco_update_output_metrics(actor_output, metrics)
 
         def update_weights_with_speco(manager_self, *args, **kwargs):
@@ -3880,6 +4659,25 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return drafter_enabled and training_enabled
 
     def fit(self):
+        result_path = os.getenv("SPECO_CI_RESULT_PATH")
+        if not result_path:
+            return self._speco_fit_impl()
+        from verl_speco.integration.ci_result import CIResult
+
+        self._speco_ci_result = CIResult(self.is_drafter_training_enabled(self.config))
+        try:
+            result = self._speco_fit_impl()
+            self._speco_ci_result.data["completed"] = True
+            return result
+        except BaseException as error:
+            self._speco_ci_result.data["errors"].append(
+                {"type": type(error).__name__, "message": str(error)}
+            )
+            raise
+        finally:
+            self._speco_ci_result.write(result_path)
+
+    def _speco_fit_impl(self):
         try:
             if self.is_drafter_training_enabled(self.config):
                 self._speco_activate_drafter_training_model_before_fit()

@@ -174,6 +174,9 @@ actor_rollout_ref:
         old_logprob_hidden_capture_impl: forward_hook
         use_data_buffer: false
         collect_interval_steps: 5
+        # Print request mean-accept-length variance every N trainer steps.
+        # Set to 0 to disable the periodic variance summary.
+        request_accept_len_variance_interval_steps: 0
         collection_sample_rate: 1.0
         max_collect_samples_per_step_per_replica: 16
         max_collect_tokens_per_step_per_replica: 16384
@@ -288,7 +291,17 @@ actor_rollout_ref:
         dspark_block_size: 7
         dspark_num_anchors: 32
         dspark_loss_decay_gamma: 7.0
+        # Hard pool: lowest request acceptance lengths among eligible scored rows.
+        dspark_hard_candidate_ratio: 0.0
+        # Desired fraction of unique hard requests in the collection set.
+        # Either ratio zero disables hard prioritization; training stays uniform.
         dspark_hard_sample_ratio: 0.0
+        # Shared collection budget for both baseline and hard sampling.
+        dspark_collect_samples_per_step: 80
+        # Never duplicate requests. Fill missing hard slots with unique normals.
+        dspark_hard_shortfall_policy: fill_normal
+        # Retained for config compatibility; request-aware collection does not use it.
+        dspark_hard_collect_window_size: 0
         dspark_hidden_size: null
         dspark_intermediate_size: null
         dspark_sliding_window: null
