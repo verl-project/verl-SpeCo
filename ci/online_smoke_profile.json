@@ -1,0 +1,114 @@
+{
+  "SPECO_TOTAL_TRAINING_STEPS": {
+    "key": "trainer.total_training_steps",
+    "default": "2"
+  },
+  "SPECO_TOTAL_EPOCHS": {
+    "key": "trainer.total_epochs",
+    "default": "1"
+  },
+  "SPECO_MAX_PROMPT_LENGTH": {
+    "key": "data.max_prompt_length",
+    "default": "256"
+  },
+  "SPECO_MAX_RESPONSE_LENGTH": {
+    "key": "data.max_response_length",
+    "default": "512"
+  },
+  "SPECO_TRAIN_BATCH_SIZE": {
+    "key": "data.train_batch_size",
+    "default": "64"
+  },
+  "SPECO_TRAIN_MAX_SAMPLES": {
+    "key": "data.train_max_samples",
+    "default": "128"
+  },
+  "SPECO_VAL_MAX_SAMPLES": {
+    "key": "data.val_max_samples",
+    "default": "32"
+  },
+  "SPECO_PPO_MINI_BATCH_SIZE": {
+    "key": "actor_rollout_ref.actor.ppo_mini_batch_size",
+    "default": "8"
+  },
+  "SPECO_PPO_MICRO_BATCH_SIZE_PER_GPU": {
+    "key": "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu",
+    "default": "1"
+  },
+  "SPECO_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU": {
+    "key": "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu",
+    "default": "1"
+  },
+  "SPECO_REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU": {
+    "key": "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu",
+    "default": "1"
+  },
+  "SPECO_ROLLOUT_N": {
+    "key": "actor_rollout_ref.rollout.n",
+    "default": "1"
+  },
+  "SPECO_DRAFTER_TRAINING_STEPS": {
+    "key": "actor_rollout_ref.rollout.drafter.training.step",
+    "default": "1"
+  },
+  "SPECO_DRAFTER_BATCH_SIZE_PER_GPU": {
+    "key": "actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu",
+    "default": "1"
+  },
+  "SPECO_COLLECT_INTERVAL_STEPS": {
+    "key": "actor_rollout_ref.rollout.drafter.training.collect_interval_steps",
+    "default": "1"
+  },
+  "SPECO_TRAINING_INTERVAL_STEPS": {
+    "key": "actor_rollout_ref.rollout.drafter.training.training_interval_steps",
+    "default": "1"
+  },
+  "SPECO_PUBLISH_INTERVAL_STEPS": {
+    "key": "actor_rollout_ref.rollout.drafter.training.publish_interval_steps",
+    "default": "1"
+  },
+  "SPECO_TRAIN_BATCHES_PER_CYCLE": {
+    "key": "actor_rollout_ref.rollout.drafter.training.train_batches_per_cycle",
+    "default": "1"
+  },
+  "SPECO_PUBLISH_ASYNC": {
+    "key": "actor_rollout_ref.rollout.drafter.training.publish_async",
+    "default": "False"
+  },
+  "SPECO_PUBLISH_DTYPE": {
+    "key": "actor_rollout_ref.rollout.drafter.training.publish_dtype",
+    "default": "bf16"
+  },
+  "SPECO_DRAFT_UPDATE_FLUSH_BEFORE": {
+    "key": "actor_rollout_ref.rollout.drafter.training.draft_update_flush_before",
+    "default": "True"
+  },
+  "SPECO_DRAFT_UPDATE_FLUSH_AFTER": {
+    "key": "actor_rollout_ref.rollout.drafter.training.draft_update_flush_after",
+    "default": "True"
+  },
+  "SPECO_HIDDEN_STATE_WINDOW_MIN_ROWS": {
+    "key": "actor_rollout_ref.rollout.drafter.training.hidden_state_window_min_rows",
+    "default": "32"
+  },
+  "SPECO_HIDDEN_STATE_WINDOW_TOKENS_PER_SAMPLE": {
+    "key": "actor_rollout_ref.rollout.drafter.training.hidden_state_window_tokens_per_sample",
+    "default": "32"
+  },
+  "SPECO_DATALOADER_NUM_WORKERS": {
+    "key": "data.dataloader_num_workers",
+    "default": "0"
+  },
+  "SPECO_VAL_BEFORE_TRAIN": {
+    "key": "trainer.val_before_train",
+    "default": "False"
+  },
+  "SPECO_SAVE_FREQ": {
+    "key": "trainer.save_freq",
+    "default": "-1"
+  },
+  "SPECO_TEST_FREQ": {
+    "key": "trainer.test_freq",
+    "default": "-1"
+  }
+}

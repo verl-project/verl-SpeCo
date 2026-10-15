@@ -17,6 +17,8 @@ from verl_speco.workers.speco_worker import SpecoWorker
 
 def _worker() -> SpecoWorker:
     worker = SpecoWorker.__new__(SpecoWorker)
+    worker.replica_rank = 0
+    worker.worker_incarnation = "worker-0"
     data_buffer = DataBuffer(max_size=8)
     data_buffer.buffer.append({"value": "before"})
     data_buffer._current_step = 4
@@ -96,7 +98,10 @@ def test_collect_only_rollback_discards_unpublished_feature_samples() -> None:
         "feature_store_samples": ["sample-a"],
     }
 
-    worker.rollback_rollout_features([{"collection_id": "collection-4"}])
+    result = worker.rollback_rollout_features([{"collection_id": "collection-4"}])
+
+    assert result["worker_id"] == "0"
+    assert result["worker_incarnation"] == "worker-0"
 
     assert writer.written == []
     assert writer.flushed == []
@@ -110,7 +115,10 @@ def test_collect_only_finalize_publishes_staged_feature_samples() -> None:
         "feature_store_samples": ["sample-a"],
     }
 
-    worker.finalize_rollout_features([{"collection_id": "collection-4"}])
+    result = worker.finalize_rollout_features([{"collection_id": "collection-4"}])
+
+    assert result["worker_id"] == "0"
+    assert result["worker_incarnation"] == "worker-0"
 
     assert writer.written == ["sample-a"]
     assert writer.flushed == [(4, 1)]

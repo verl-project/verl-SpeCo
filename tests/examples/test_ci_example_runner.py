@@ -68,21 +68,21 @@ def _runner_script() -> str:
 
 def test_ci_layers_match_required_shape() -> None:
     rollout_workflows = {
-        "gpu_vllm_unit_tests.yml",
-        "gpu_sglang_unit_tests.yml",
         "npu_vllm_unit_tests.yml",
-        "npu_sglang_unit_tests.yml",
     }
     expected = rollout_workflows | {
         "cpu_unit_tests.yml",
         "gpu_drafter_training_smoke.yml",
+        "examples_e2e_manual.yml",
+        "pr_e2e_comments.yml",
     }
 
     assert expected <= {path.name for path in WORKFLOWS.glob("*.yml")}
     assert "pull_request" in _workflow("cpu_unit_tests.yml")["on"]
 
-    manual_hardware_workflows = (rollout_workflows - {"npu_vllm_unit_tests.yml"}) | {
+    manual_hardware_workflows = {
         "gpu_drafter_training_smoke.yml",
+        "examples_e2e_manual.yml",
     }
     for workflow_name in manual_hardware_workflows:
         triggers = _workflow(workflow_name)["on"]
@@ -110,20 +110,22 @@ def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
     assert "tests/config" in source
     assert "tests/examples" in source
     assert "tests/integration" in source
+    unit_job = _workflow("cpu_unit_tests.yml")["jobs"]["unit-tests"]
+    unit_run = next(step["run"] for step in unit_job["steps"] if "pytest" in step.get("run", ""))
+    assert "tests/unit" in shlex.split(unit_run)
+    assert not any(arg.startswith("tests/unit/") for arg in shlex.split(unit_run))
+    assert "requirements-unit.txt" in source
     assert "tests/ci" not in source
 
 
 def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
     for workflow_name, accelerator, backend, expected_drafters in (
-        ("gpu_vllm_unit_tests.yml", "gpu", "vllm", {"eagle3", "dflash"}),
-        ("gpu_sglang_unit_tests.yml", "gpu", "sglang", {"eagle3", "dflash"}),
         (
             "npu_vllm_unit_tests.yml",
             "npu",
             "vllm",
-            {"eagle3", "megatron-eagle3", "dflash", "dspark"},
+            {"eagle3", "dflash", "dspark"},
         ),
-        ("npu_sglang_unit_tests.yml", "npu", "sglang", {"eagle3", "dflash"}),
     ):
         source = _workflow_source(workflow_name)
         workflow = _workflow(workflow_name)
@@ -158,7 +160,6 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 ]
             } == {
                 ("eagle3", "true"),
-                ("megatron-eagle3", "true"),
                 ("dflash", "true"),
                 ("dspark", "true"),
             }
@@ -169,7 +170,6 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 ]
             } == {
                 ("eagle3", "true"),
-                ("megatron-eagle3", "true"),
                 ("dflash", "false"),
                 ("dspark", "false"),
             }
@@ -200,27 +200,27 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 in source
             )
             assert (
-                "SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS || '2' }}"
+                "SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS }}"
                 in source
             )
             assert (
-                "SPECO_MAX_RESPONSE_LENGTH: ${{ vars.SPECO_MAX_RESPONSE_LENGTH || '512' }}"
+                "SPECO_MAX_RESPONSE_LENGTH: ${{ vars.SPECO_MAX_RESPONSE_LENGTH }}"
                 in source
             )
             assert (
-                "SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE || '64' }}"
+                "SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE }}"
                 in source
             )
             assert (
-                "SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '128' }}"
+                "SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES }}"
                 in source
             )
             assert (
-                "SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES || '32' }}"
+                "SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES }}"
                 in source
             )
             assert (
-                "SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE || '8' }}"
+                "SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE }}"
                 in source
             )
             assert "matrix.enable_training" in source
@@ -382,6 +382,7 @@ def _dry_run(
     backend: str = "vllm",
     accelerator_count: str = "1",
     extra_hydra_args: str | None = None,
+    ci_variables: str | None = None,
 ) -> str:
     """Dump the Hydra overrides the runner would pass, without launching a job."""
     bash = _require_working_bash()
@@ -398,6 +399,8 @@ def _dry_run(
     }
     if extra_hydra_args is not None:
         env["SPECO_EXTRA_HYDRA_ARGS"] = extra_hydra_args
+    if ci_variables is not None:
+        env["SPECO_CI_VARIABLES_JSON"] = ci_variables
     script = "".join(
         f"export {name}={shlex.quote(value)}\n" for name, value in env.items()
     )
@@ -408,7 +411,7 @@ def _dry_run(
     # writer filling the stdin pipe and can deadlock.
     with tempfile.TemporaryDirectory() as tmp:
         entry = Path(tmp) / "dry_run.sh"
-        entry.write_text(script, encoding="utf-8")
+        entry.write_text(script, encoding="utf-8", newline="\n")
         result = subprocess.run(
             [bash, _bash_path(entry, bash), platform, backend, drafter],
             cwd=ROOT,
@@ -513,3 +516,109 @@ def test_separate_training_example_takes_its_device_count_from_the_env() -> None
     ).read_text(encoding="utf-8")
 
     assert "draft_train_gpus_per_node=${DRAFT_TRAIN_GPUS_PER_NODE:-8}" in example
+
+
+def test_megatron_example_uses_shared_manual_workflow() -> None:
+    workflow = _workflow("examples_e2e_manual.yml")
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    options = workflow["on"]["workflow_dispatch"]["inputs"]["example"]["options"]
+    assert "examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh" in options
+
+
+def test_npu_examples_run_without_smoke_dependency() -> None:
+    workflow = _workflow("npu_vllm_unit_tests.yml")
+    assert set(workflow["jobs"]) == {"example"}
+    assert "needs" not in workflow["jobs"]["example"]
+    entries = workflow["jobs"]["example"]["strategy"]["matrix"]["include"]
+    assert {entry["drafter"] for entry in entries} == {"eagle3", "dflash", "dspark"}
+    for event in ("pull_request", "push"):
+        paths = workflow["on"][event]["paths"]
+        assert "ci/**" not in paths
+        assert "ci/run_example_test.sh" in paths
+        assert "ci/check_result.py" in paths
+
+
+
+@pytest.mark.parametrize("platform", ["gpu", "npu"])
+def test_online_log_capture_preserves_failure_and_timing(platform: str) -> None:
+    import json
+
+    bash = _require_working_bash()
+    tail = "  export SPECO_CI_RESULT_PATH" + _runner_script().split("else\n  export SPECO_CI_RESULT_PATH")[-1]
+    tail = tail.rsplit("\nfi", 1)[0]
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        example = root / "failure.sh"
+        example.write_text("echo stdout\necho stderr >&2\nexit 7\n", encoding="utf-8", newline="\n")
+        result = root / "evidence.json"
+        script = root / "run.sh"
+        script.write_text(
+            f"set -euo pipefail\nplatform={platform}\noverrides=()\n"
+            + "example=" + shlex.quote(_bash_path(example, bash)) + "\n"
+            + "SPECO_CI_RESULT_PATH=" + shlex.quote(_bash_path(result, bash)) + "\n"
+            + tail, encoding="utf-8", newline="\n",
+        )
+        process = subprocess.run([bash, _bash_path(script, bash)], capture_output=True)
+        assert process.returncode == 7
+        assert "stdout" in Path(str(result) + ".log").read_text()
+        assert "stderr" in Path(str(result) + ".log").read_text()
+        timing = json.loads(Path(str(result) + ".timing.json").read_text())
+        assert timing["exit_code"] == 7
+        assert timing["elapsed_seconds"] >= 0
+
+
+@pytest.mark.parametrize("initial,overrides,expected", [
+    ("true", ["False"], "false"),
+    ("false", ["True"], "true"),
+    ("true", ["False", "True", "False"], "false"),
+])
+def test_result_check_uses_final_hydra_training_mode(initial, overrides, expected):
+    bash = _require_working_bash()
+    mode_logic = _runner_script().split("# Match the mode actually passed to Hydra")[1]
+    mode_logic = mode_logic[mode_logic.index("for override"):].split('if [[ "${SPECO_DRY_RUN')[0]
+    arguments = ["actor_rollout_ref.rollout.drafter.enable_drafter_training=" + value for value in overrides]
+    script = "enable_training=" + initial + "\noverrides=(" + " ".join(map(shlex.quote, arguments)) + ")\n"
+    script += mode_logic + '\nprintf "%s" "$enable_training"\n'
+    result = subprocess.run([bash, "-s"], input=script.encode("utf-8"), capture_output=True, check=True)
+    assert result.stdout.decode("utf-8") == expected
+
+
+def test_automatic_runner_reads_algorithm_variables_from_github():
+    import json
+
+    stdout = _dry_run("dspark", platform="npu", ci_variables=json.dumps({
+        "SPECO_DSPARK_SPEC_STEPS": "2",
+        "SPECO_DRAFT_TENSOR_PARALLEL_SIZE": "2",
+    }))
+    assert "drafter.rollout.spec_steps=2" in stdout
+    assert "drafter.vllm.draft_tensor_parallel_size=2" in stdout
+
+
+@pytest.mark.parametrize("algorithm", ["domino", "peagle"])
+def test_manual_separate_example_passes_configured_paths_to_both_stages(algorithm, tmp_path):
+    from ci.run_manual_example import prepare
+
+    bash = _require_working_bash()
+    example = "examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh"
+    settings = {
+        "DRAFT_ALGO": algorithm, "RUN_STAGE": "both",
+        "MODEL_PATH": "/models/target", "TRAIN_FILE": "/data/train",
+        "TEST_FILE": "/data/test", "COLLECT_DRAFTER_PATH": "/models/collect",
+        "DRAFT_INIT_PATH": "/models/initial",
+    }
+    env, args, online = prepare(example, settings, "", tmp_path)
+    assert not online and not args
+    script = "python3() { printf '%s\\n' \"$@\"; }; export -f python3\n"
+    script += "".join(
+        f"export {key}={shlex.quote(env[key])}\n"
+        for key in (*settings, "CKPTS_DIR", "FEATURE_STORE_DIR", "DRAFT_CKPTS_DIR")
+    )
+    script += "bash " + shlex.quote(_bash_path(ROOT / example, bash)) + "\n"
+    result = subprocess.run([bash, "-s"], input=script.encode("utf-8"),
+                            capture_output=True, check=True)
+    arguments = result.stdout.decode("utf-8").splitlines()
+    assert "verl_speco.main" in arguments
+    assert "verl_speco.draft_train_launcher" in arguments
+    assert "actor_rollout_ref.rollout.drafter.model_path=/models/collect" in arguments
+    assert "actor_rollout_ref.rollout.drafter.model_path=/models/initial" in arguments
+    assert not any("/path/" in arg for arg in arguments)
