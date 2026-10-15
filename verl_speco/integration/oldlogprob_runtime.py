@@ -1822,9 +1822,10 @@ def _select_and_merge_concatenated_hidden(
 
 
 def _select_oldlogprob_target_logz(
-    context: dict[str, Any], output: Any, micro_batch: Any
+    context: dict[str, Any], output: Any, micro_batch: Any, *, target_logz: Any = None
 ):
-    target_logz = _compute_oldlogprob_target_logz(output, micro_batch)
+    if target_logz is None:
+        target_logz = _compute_oldlogprob_target_logz(output, micro_batch)
     if target_logz is None:
         return None
     selected, _owner_mask = _select_and_merge_concatenated_hidden(
@@ -2029,7 +2030,11 @@ def _install_oldlogprob_hidden_hooks(
 
 
 def _consume_oldlogprob_hidden_capture(
-    engine: Any, model_output: Any = None, micro_batch: Any = None
+    engine: Any,
+    model_output: Any = None,
+    micro_batch: Any = None,
+    *,
+    target_logz: Any = None,
 ):
     import torch
 
@@ -2079,7 +2084,10 @@ def _consume_oldlogprob_hidden_capture(
         )
         target_logz = (
             _select_oldlogprob_target_logz(
-                context, output=model_output, micro_batch=micro_batch
+                context,
+                output=model_output,
+                micro_batch=micro_batch,
+                target_logz=target_logz,
             )
             if micro_batch is not None
             else None
@@ -2118,7 +2126,12 @@ def _consume_oldlogprob_hidden_capture(
 
 
 def _select_oldlogprob_hidden_states(
-    engine: Any, model_output: Any, output_args: dict[str, Any], micro_batch: Any
+    engine: Any,
+    model_output: Any,
+    output_args: dict[str, Any],
+    micro_batch: Any,
+    *,
+    target_logz: Any = None,
 ):
     if not _tensor_key_present(micro_batch, OLD_LOGPROB_COLLECT_MASK_KEY):
         return {}
@@ -2153,7 +2166,10 @@ def _select_oldlogprob_hidden_states(
         context, selected_hidden_list
     )
     target_logz = _select_oldlogprob_target_logz(
-        context, output=model_output, micro_batch=micro_batch
+        context,
+        output=model_output,
+        micro_batch=micro_batch,
+        target_logz=target_logz,
     )
     if _is_sparse_sp_non_source_context(context):
         return {}
@@ -2261,6 +2277,17 @@ def install_oldlogprob_hidden_runtime_patch(
             **kwargs,
         ):
             try:
+                collect_hidden = _tensor_key_present(
+                    micro_batch, OLD_LOGPROB_COLLECT_MASK_KEY
+                )
+                # verl 0.8.0 scales output.logits in place during postprocessing.
+                # Compute the partition from raw logits before that mutation;
+                # retaining one scalar per position avoids cloning full logits.
+                target_logz = (
+                    _compute_oldlogprob_target_logz(output, micro_batch)
+                    if collect_hidden
+                    else None
+                )
                 model_output = prepare_model_outputs(
                     self,
                     output,
@@ -2270,15 +2297,22 @@ def install_oldlogprob_hidden_runtime_patch(
                     *args,
                     **kwargs,
                 )
-                if _tensor_key_present(micro_batch, OLD_LOGPROB_COLLECT_MASK_KEY):
+                if collect_hidden:
                     capture_impl = _oldlogprob_capture_impl(micro_batch)
                     if capture_impl == "forward_hook":
                         hidden_output = _consume_oldlogprob_hidden_capture(
-                            self, model_output=output, micro_batch=micro_batch
+                            self,
+                            model_output=output,
+                            micro_batch=micro_batch,
+                            target_logz=target_logz,
                         )
                     elif capture_impl == "output_hidden_states":
                         hidden_output = _select_oldlogprob_hidden_states(
-                            self, output, output_args, micro_batch
+                            self,
+                            output,
+                            output_args,
+                            micro_batch,
+                            target_logz=target_logz,
                         )
                     else:
                         raise ValueError(

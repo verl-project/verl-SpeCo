@@ -50,7 +50,9 @@ def test_fsdp2_runtime_install_does_not_import_veomni(monkeypatch) -> None:
         raise AssertionError(f"unexpected backend import: {name}")
 
     monkeypatch.setattr(oldlogprob_runtime, "_PATCHED", True)
-    monkeypatch.setattr(oldlogprob_runtime.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(
+        oldlogprob_runtime.importlib, "import_module", fake_import_module
+    )
     monkeypatch.setattr(
         oldlogprob_runtime,
         "_install_oldlogprob_fsdp_batch_postprocess_patch",
@@ -371,9 +373,7 @@ def test_veomni_batch_postprocess_keeps_router_replay_output() -> None:
     )
 
     assert result["model_output"]["routed_experts"] == "routes"
-    assert result["model_output"][OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY] == [
-        "hidden-ref"
-    ]
+    assert result["model_output"][OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY] == ["hidden-ref"]
 
 
 def test_oldlogprob_target_logz_is_temperature_aware() -> None:
@@ -394,6 +394,126 @@ def test_oldlogprob_target_logz_is_disabled_without_temperature() -> None:
     logits = torch.randn(1, 2, 4)
 
     assert _compute_oldlogprob_target_logz({"logits": logits}, {}) is None
+
+
+@pytest.mark.parametrize("capture_impl", ["forward_hook", "output_hidden_states"])
+@pytest.mark.parametrize("inplace_scaling", [True, False])
+@pytest.mark.parametrize("collect_logz", [True, False])
+@pytest.mark.parametrize("lk_temperature", [0.6, 1.0])
+def test_fsdp_logz_capture_precedes_upstream_temperature_scaling(
+    monkeypatch, capture_impl, inplace_scaling, collect_logz, lk_temperature
+) -> None:
+    torch = pytest.importorskip("torch")
+    from verl_speco.backends.lk_loss import (
+        full_vocab_subset_probs,
+        negative_log_acceptance_loss,
+    )
+
+    raw_logits = torch.tensor(
+        [
+            [
+                [30.0, 29.0, 28.0],
+                [31.0, 29.0, 28.0],
+                [28.0, 30.0, 29.0],
+                [32.0, 29.0, 28.0],
+            ]
+        ]
+    )
+    temperature = 0.6
+
+    class FakeEngine:
+        def prepare_model_inputs(self, micro_batch):
+            return {}, {}
+
+        def prepare_model_outputs(
+            self, output, output_args, micro_batch, logits_processor_func
+        ):
+            logits = output.logits.squeeze(0)
+            if inplace_scaling:
+                logits.div_(temperature)
+            else:
+                logits = logits / temperature
+            return {"log_probs": torch.log_softmax(logits, dim=-1)}
+
+    module = SimpleNamespace(FSDPEngineWithLMHead=FakeEngine)
+    monkeypatch.setattr(oldlogprob_runtime, "_PATCHED", False)
+    monkeypatch.setattr(
+        oldlogprob_runtime.importlib, "import_module", lambda name: module
+    )
+    for name in (
+        "_install_oldlogprob_fsdp_batch_postprocess_patch",
+        "_install_oldlogprob_backend_batch_postprocess_patch",
+        "_install_oldlogprob_training_worker_postprocess_patch",
+    ):
+        monkeypatch.setattr(oldlogprob_runtime, name, lambda *args: True)
+    monkeypatch.setattr(
+        oldlogprob_runtime,
+        "_put_oldlogprob_hidden_refs",
+        lambda payload, batch: payload,
+    )
+    monkeypatch.setattr(
+        oldlogprob_runtime, "_build_selection_context", lambda *args: {}
+    )
+    monkeypatch.setattr(
+        oldlogprob_runtime,
+        "_timing_tensor_from_context",
+        lambda context, device: torch.zeros(1, 1, device=device),
+    )
+    monkeypatch.setattr(
+        oldlogprob_runtime, "_oldlogprob_aux_layer_ids_from_batch", lambda batch: [0]
+    )
+    monkeypatch.setattr(
+        oldlogprob_runtime,
+        "_select_and_merge_concatenated_hidden",
+        lambda context, tensors, **kwargs: (
+            torch.cat([t.unsqueeze(0) if t.dim() == 2 else t for t in tensors], dim=-1)[
+                :, 1:3
+            ],
+            torch.tensor([True]),
+        ),
+    )
+    assert oldlogprob_runtime.install_oldlogprob_hidden_runtime_patch(
+        actor_backend="fsdp2"
+    )
+    engine = FakeEngine()
+    hidden = torch.zeros(1, 4, 2)
+    if capture_impl == "forward_hook":
+        engine._speco_oldlogprob_hidden_context = {
+            "aux_keys": ["aux"],
+            "final_key": "final",
+            "captures": {"aux": hidden, "final": hidden},
+            "handles": [],
+        }
+    batch = {
+        oldlogprob_runtime.OLD_LOGPROB_COLLECT_MASK_KEY: torch.tensor([True]),
+        oldlogprob_runtime.OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY: capture_impl,
+    }
+    if collect_logz:
+        batch[OLD_LOGPROB_TARGET_LOGZ_TEMPERATURE_KEY] = lk_temperature
+    output = SimpleNamespace(logits=raw_logits.clone(), hidden_states=(hidden, hidden))
+    result = engine.prepare_model_outputs(output, {}, batch, None)
+    torch.testing.assert_close(
+        result["log_probs"], torch.log_softmax(raw_logits.squeeze(0) / temperature, -1)
+    )
+    if collect_logz:
+        logz = result[oldlogprob_runtime.OLD_LOGPROB_TARGET_LOGZ_KEY]
+        torch.testing.assert_close(
+            logz, torch.logsumexp(raw_logits[:, 1:3] / lk_temperature, -1, keepdim=True)
+        )
+        target = full_vocab_subset_probs(
+            raw_logits[:, 1:3], logz.squeeze(-1), temperature=lk_temperature
+        )
+        torch.testing.assert_close(target.sum(-1), torch.ones(1, 2))
+        draft_logits = torch.zeros_like(target, requires_grad=True)
+        loss = negative_log_acceptance_loss(
+            torch.softmax(draft_logits / lk_temperature, -1), target
+        ).mean()
+        loss.backward()
+        assert loss.item() < 13.0
+        assert draft_logits.grad.abs().max().item() > 0
+    else:
+        assert oldlogprob_runtime.OLD_LOGPROB_TARGET_LOGZ_KEY not in result
+    assert not hasattr(engine, "_speco_oldlogprob_hidden_context")
 
 
 def test_oldlogprob_object_ref_payload_keeps_fp32_target_logz(monkeypatch) -> None:
