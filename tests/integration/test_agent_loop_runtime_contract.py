@@ -16,11 +16,30 @@ from verl_speco.integration import agent_loop_runtime
 
 def test_agent_loop_patch_supports_release_v080_llm_server_client(monkeypatch) -> None:
     class AgentLoopWorker:
+        distillation_enabled = True
+
         async def generate_sequences(self, batch):
             return batch
 
         async def _run_agent_loop(self, sampling_params, trajectory):
-            return sampling_params, trajectory
+            output = SimpleNamespace(extra_fields={})
+            await LLMServerClient().generate(sampling_params=sampling_params)
+            await self._compute_teacher_logprobs(
+                output, [1], [2], False, {"data_source": "math"}
+            )
+            return output
+
+        async def _compute_teacher_logprobs(
+            self,
+            output,
+            prompt_ids,
+            response_ids,
+            validate,
+            sample_kwargs=None,
+        ):
+            return await LLMServerClient().generate(
+                sampling_params={"max_tokens": 1, "prompt_logprobs": 1}
+            )
 
         def _postprocess(self, inputs, input_non_tensor_batch=None, validate=False):
             return inputs, input_non_tensor_batch, validate
@@ -42,7 +61,9 @@ def test_agent_loop_patch_supports_release_v080_llm_server_client(monkeypatch) -
         LLMServerClient=LLMServerClient,
     )
     monkeypatch.setattr(agent_loop_runtime, "_PATCHED", False)
-    monkeypatch.setattr(agent_loop_runtime, "_load_agent_loop_module", lambda: release_v080_module)
+    monkeypatch.setattr(
+        agent_loop_runtime, "_load_agent_loop_module", lambda: release_v080_module
+    )
 
     assert agent_loop_runtime.install_agent_loop_runtime_patch() is True
     assert LLMServerClient._speco_patched_generate is True
@@ -51,7 +72,17 @@ def test_agent_loop_patch_supports_release_v080_llm_server_client(monkeypatch) -
 
     global_steps_token = agent_loop_runtime._CURRENT_GLOBAL_STEPS.set(17)
     try:
-        sampling_params = asyncio.run(LLMServerClient().generate(sampling_params={"temperature": 1.0}))
+        sampling_params = asyncio.run(
+            LLMServerClient().generate(sampling_params={"temperature": 1.0})
+        )
     finally:
         agent_loop_runtime._CURRENT_GLOBAL_STEPS.reset(global_steps_token)
     assert sampling_params["_verl_global_steps"] == 17
+
+    output = asyncio.run(
+        AgentLoopWorker()._run_agent_loop(
+            {"temperature": 1.0}, {"step": 17, "validate": False}
+        )
+    )
+    assert output.extra_fields[agent_loop_runtime.SPECO_STUDENT_DECODE_TIME_KEY] >= 0.0
+    assert output.extra_fields[agent_loop_runtime.SPECO_TEACHER_PREFILL_TIME_KEY] >= 0.0
