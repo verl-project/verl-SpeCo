@@ -869,6 +869,58 @@ def test_dspark_confidence_target_matches_proposal_mode(confidence_target_mode):
     assert confidence_den.detach().item() == pytest.approx(active_weights.sum().item())
 
 
+def test_dspark_fused_greedy_confidence_target_does_not_raise():
+    # Regression: ``target_probs`` is assigned only under the eager branch, so
+    # the fused greedy-confidence path (the default mode with a fused backend)
+    # used to raise UnboundLocalError on the first active chunk.
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError:
+            pytest.skip("CUDA and Ascend NPU are unavailable")
+        if not torch.npu.is_available():
+            pytest.skip("CUDA and Ascend NPU are unavailable")
+        device = torch.device("npu")
+
+    model = _small_dspark_training_model(
+        block_size=2,
+        l1_loss_alpha=0.0,
+        enable_confidence_head=True,
+        confidence_head_alpha=1.0,
+        confidence_target_mode="greedy",
+    ).to(device)
+    with torch.no_grad():
+        model.draft_model.confidence_head.proj.weight.zero_()
+        model.draft_model.confidence_head.proj.bias.fill_(0.4)
+
+    active_hidden = torch.randn(3, 8, device=device)
+    active_prev_tokens = torch.tensor([1, 2, 3], dtype=torch.long, device=device)
+    active_target_hidden = torch.randn(3, 8, device=device)
+    active_weights = torch.tensor([1.0, 0.5, 0.25], device=device)
+    lm_head_weight = torch.randn(32, 8, device=device)
+
+    (
+        _l1_sum,
+        _l1_den,
+        confidence_sum,
+        confidence_den,
+        _accept_sum,
+        _pred_sum,
+    ) = model._compute_distribution_losses_for_active(
+        active_hidden=active_hidden,
+        active_prev_tokens=active_prev_tokens,
+        active_target_hidden=active_target_hidden,
+        active_weights=active_weights,
+        lm_head_weight=lm_head_weight,
+        use_fused=True,
+    )
+
+    assert torch.isfinite(confidence_sum)
+    assert confidence_den.item() > 0
+
+
 def test_dspark_confidence_only_batch_includes_target_last_hidden_states():
     base_trainer = pytest.importorskip("verl_speco.trainer.base_trainer")
 

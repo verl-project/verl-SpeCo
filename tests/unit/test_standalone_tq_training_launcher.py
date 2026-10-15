@@ -131,12 +131,17 @@ def test_ce_only_target_argmax_expected_layout(prefix, source):
     )
 
 
-def test_confidence_only_expected_layout_matches_producer():
+@pytest.mark.parametrize(
+    "l1_prefix,confidence_prefix",
+    [("+", "+"), ("", "++"), ("++", "")],
+)
+def test_confidence_only_expected_layout_matches_producer(l1_prefix, confidence_prefix):
     # A confidence-only configuration (l1=0, confidence>0, ce_target_source=
     # labels) still needs the target's final hidden state. The Consumer must
     # therefore expect dflash_aux_plus_last AND the Producer must be told the
-    # same loss settings; otherwise the two layouts disagree and the feature
-    # contract rejects the samples.
+    # same loss values; otherwise the two layouts disagree and the feature
+    # contract rejects the samples. The loss overrides carry arbitrary Hydra
+    # prefixes (``+``/``++``/none), which must all resolve.
     from verl_speco.integration.oldlogprob_layer_ids import (
         resolve_drafter_hidden_states_layout,
     )
@@ -147,8 +152,8 @@ def test_confidence_only_expected_layout_matches_producer():
     )
     ce_key = "actor_rollout_ref.rollout.drafter.training.ce_target_source"
     args = _training_args() + [
-        f"+{l1_key}=0",
-        f"+{confidence_key}=1.0",
+        f"{l1_prefix}{l1_key}=0",
+        f"{confidence_prefix}{confidence_key}=1.0",
         f"+{ce_key}=labels",
     ]
     commands = build_pipeline_commands(
@@ -158,6 +163,10 @@ def test_confidence_only_expected_layout_matches_producer():
         python_executable="python",
     )
 
+    # The requested loss values must reach the Producer verbatim; the previous
+    # fallback (l1=0.9) would otherwise produce dflash_aux_plus_last by luck.
+    assert f"{l1_key}=0" in commands.producer_overrides
+    assert f"{confidence_key}=1.0" in commands.producer_overrides
     assert any(
         item.endswith("expected_feature.hidden_states_layout=dflash_aux_plus_last")
         for item in commands.consumer_overrides

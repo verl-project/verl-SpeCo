@@ -962,10 +962,14 @@ def build_pipeline_commands(
     # agree, so resolve the loss settings that select it (dflash_aux vs
     # dflash_aux_plus_last) once here and forward the same values to both.
     dspark_l1_loss_alpha = _strip_quotes(
-        _find_override(training_args, _DSPARK_L1_LOSS_ALPHA_KEY) or "0.9"
+        _find_override(training_args, _DSPARK_L1_LOSS_ALPHA_KEY, normalize_key=True)
+        or "0.9"
     )
     dspark_confidence_loss_alpha = _strip_quotes(
-        _find_override(training_args, _DSPARK_CONFIDENCE_LOSS_ALPHA_KEY) or "0.0"
+        _find_override(
+            training_args, _DSPARK_CONFIDENCE_LOSS_ALPHA_KEY, normalize_key=True
+        )
+        or "0.0"
     )
     ce_target_source = _strip_quotes(
         _find_override(training_args, _DSPARK_CE_TARGET_SOURCE_KEY, normalize_key=True)

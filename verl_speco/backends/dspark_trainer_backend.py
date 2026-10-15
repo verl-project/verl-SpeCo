@@ -439,6 +439,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
 
             draft_logits: torch.Tensor | None = None
             draft_probs: torch.Tensor | None
+            target_probs: torch.Tensor | None = None
             if not use_fused and active_draft_log_probs is not None:
                 draft_probs = active_draft_log_probs[start:end].exp()
             elif use_fused and active_draft_logits is not None:
@@ -508,15 +509,18 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 # argmax(p_draft) and the rejection sampler treats the draft as
                 # one-hot, so acceptance collapses to p_target[argmax(p_draft)].
                 if self.confidence_target_mode == "greedy":
-                    if draft_probs is None:
-                        if draft_logits is None:
-                            raise RuntimeError(
-                                "DSpark greedy confidence target requires draft logits"
-                            )
-                        draft_probs = torch.softmax(draft_logits.float(), dim=-1)
+                    # argmax is invariant to the softmax, so reuse draft_probs
+                    # when present (eager) and fall back to the logits (fused).
+                    draft_source = (
+                        draft_probs if draft_probs is not None else draft_logits
+                    )
+                    if draft_source is None:
+                        raise RuntimeError(
+                            "DSpark greedy confidence target requires draft logits"
+                        )
                     if target_probs is None:
                         target_probs = torch.softmax(target_logits.float(), dim=-1)
-                    draft_argmax = draft_probs.argmax(dim=-1, keepdim=True)
+                    draft_argmax = draft_source.argmax(dim=-1, keepdim=True)
                     acceptance_target = (
                         target_probs.gather(-1, draft_argmax).squeeze(-1).detach()
                     )
