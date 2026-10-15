@@ -56,6 +56,7 @@ def test_status_policy_aggregates_distributed_capacity_conservatively() -> None:
     assert result.oldest_sample_step == 2
     assert result.newest_sample_step == 5
     assert not result.data_version_consistent
+    assert result.trainable_valid_tokens == 0
     assert result.worker_snapshots == {
         "0": {
             "buffer_version": 7,
@@ -76,6 +77,21 @@ def test_status_policy_aggregates_distributed_capacity_conservatively() -> None:
     }
 
 
+def test_status_policy_uses_tokens_available_on_every_collective_rank() -> None:
+    result = ConservativeTrainingDataStatusPolicy().aggregate(
+        [
+            _status(trainable_valid_tokens=120),
+            _status(worker_id="1", trainable_valid_tokens=80),
+        ],
+        global_step=5,
+    )
+
+    assert result is not None
+    assert result.trainable_valid_tokens == 80
+    assert result.worker_snapshots["0"]["trainable_valid_tokens"] == 120
+    assert result.worker_snapshots["1"]["trainable_valid_tokens"] == 80
+
+
 def test_status_policy_marks_mismatched_target_versions_unknown() -> None:
     result = ConservativeTrainingDataStatusPolicy().aggregate(
         [_status(target_version=3), _status(target_version=4)], global_step=4
@@ -86,6 +102,4 @@ def test_status_policy_marks_mismatched_target_versions_unknown() -> None:
 
 
 def test_status_policy_returns_none_without_available_workers() -> None:
-    assert (
-        ConservativeTrainingDataStatusPolicy().aggregate([], global_step=4) is None
-    )
+    assert ConservativeTrainingDataStatusPolicy().aggregate([], global_step=4) is None

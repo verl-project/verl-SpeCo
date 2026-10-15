@@ -42,7 +42,9 @@ def test_agent_loop_patch_supports_release_v080_llm_server_client(monkeypatch) -
         LLMServerClient=LLMServerClient,
     )
     monkeypatch.setattr(agent_loop_runtime, "_PATCHED", False)
-    monkeypatch.setattr(agent_loop_runtime, "_load_agent_loop_module", lambda: release_v080_module)
+    monkeypatch.setattr(
+        agent_loop_runtime, "_load_agent_loop_module", lambda: release_v080_module
+    )
 
     assert agent_loop_runtime.install_agent_loop_runtime_patch() is True
     assert LLMServerClient._speco_patched_generate is True
@@ -51,7 +53,24 @@ def test_agent_loop_patch_supports_release_v080_llm_server_client(monkeypatch) -
 
     global_steps_token = agent_loop_runtime._CURRENT_GLOBAL_STEPS.set(17)
     try:
-        sampling_params = asyncio.run(LLMServerClient().generate(sampling_params={"temperature": 1.0}))
+        sampling_params = asyncio.run(
+            LLMServerClient().generate(sampling_params={"temperature": 1.0})
+        )
     finally:
         agent_loop_runtime._CURRENT_GLOBAL_STEPS.reset(global_steps_token)
     assert sampling_params["_verl_global_steps"] == 17
+
+    global_steps_token = agent_loop_runtime._CURRENT_GLOBAL_STEPS.set(18)
+    skip_collection_token = agent_loop_runtime._CURRENT_SKIP_DRAFTER_COLLECTION.set(
+        True
+    )
+    try:
+        sampling_params = asyncio.run(
+            LLMServerClient().generate(sampling_params={"temperature": 1.0})
+        )
+    finally:
+        agent_loop_runtime._CURRENT_SKIP_DRAFTER_COLLECTION.reset(skip_collection_token)
+        agent_loop_runtime._CURRENT_GLOBAL_STEPS.reset(global_steps_token)
+    assert sampling_params["_verl_global_steps"] == 18
+    assert sampling_params["_verl_skip_drafter_collection"] is True
+    assert "_verl_skip_rollout_idle_event" not in sampling_params

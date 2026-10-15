@@ -21,6 +21,19 @@ distribution aligned with verl.
 """
 
 import hydra
+import os
+
+
+def drafter_diagnostic_env() -> dict[str, str]:
+    """Explicitly propagate opt-in diagnostics to the Ray actor tree."""
+    return {
+        name: os.environ[name]
+        for name in (
+            "VERL_DRAFTER_MEMORY_DIAGNOSTICS",
+            "VERL_DRAFTER_KEEP_HOT_TRIM_CACHE",
+        )
+        if name in os.environ
+    }
 
 
 def _config_get(config, *path, default=None):
@@ -119,7 +132,11 @@ def run(config) -> None:
 
     from verl_speco.integration.task_runner import SpecoTaskRunner
 
-    main_ppo.run_ppo(config, task_runner_class=ray.remote(num_cpus=1)(SpecoTaskRunner))
+    runner = ray.remote(num_cpus=1)(SpecoTaskRunner)
+    diagnostic_env = drafter_diagnostic_env()
+    if diagnostic_env:
+        runner = runner.options(runtime_env={"env_vars": diagnostic_env})
+    main_ppo.run_ppo(config, task_runner_class=runner)
 
 
 @hydra.main(config_path="config", config_name="speco_trainer", version_base=None)

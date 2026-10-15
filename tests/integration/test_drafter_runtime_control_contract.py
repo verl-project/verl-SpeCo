@@ -29,7 +29,8 @@ _speco_ray_trainer = pytest.importorskip(
     reason="drafter runtime control contract needs the trainer dependency stack",
 )
 SpecoRayPPOTrainer = _speco_ray_trainer.SpecoRayPPOTrainer
-from verl_speco.trainer.base_trainer import DrafterBaseTrainer
+_base_trainer = pytest.importorskip("verl_speco.trainer.base_trainer")
+DrafterBaseTrainer = _base_trainer.DrafterBaseTrainer
 
 
 class _FakeOldLogProbBatch:
@@ -102,6 +103,9 @@ def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
         )
     )
     trainer._pending_drafter_publish_refs = None
+    trainer._pending_target_lm_head_sync = None
+    trainer._speco_ready_target_lm_head_versions = set()
+    trainer._speco_ready_target_lm_head_workers = {}
     trainer._speco_last_collected_samples = 0
     trainer._speco_pending_request_accept_len_payloads = []
     trainer._ray_get_if_needed = lambda value: value
@@ -173,15 +177,49 @@ def test_drafter_collect_train_and_publish_intervals() -> None:
     ).publish
 
 
+@pytest.mark.parametrize(
+    ("strategy", "expected_collect", "expected_reason"),
+    [
+        ("rollout_idle_worker", True, "collection_enabled"),
+        ("sync", False, "training_interval_not_reached"),
+    ],
+)
+def test_bubble_oldlogprob_collection_uses_only_collection_interval(
+    strategy: str,
+    expected_collect: bool,
+    expected_reason: str,
+) -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_interval_steps": 4,
+            "training_interval_steps": 6,
+            "scheduler": {"execution": {"strategy": strategy}},
+        },
+        step=4,
+    )
+
+    plan = trainer._speco_plan_drafter_collection(
+        _speco_ray_trainer.DrafterCollectionSource.OLD_LOGPROB
+    )
+
+    assert plan.collect is expected_collect
+    assert plan.collect_interval_matched
+    assert not plan.training_interval_matched
+    assert plan.reason == expected_reason
+
+
 def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     trainer = _trainer({"training_interval_steps": 5}, step=4)
     trainer._speco_last_collected_samples = 10
     scheduler = trainer._speco_get_drafter_scheduler()
     config = trainer._speco_drafter_schedule_config()
+
     def plan():
         return scheduler.prepare_training_plan(
             trainer._speco_drafter_schedule_context(), config
         )
+
     assert plan().launch is False
 
     trainer.global_steps = 5
@@ -239,6 +277,59 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
     assert output.meta_info["metrics"]["drafter/scheduler_used"] == 1
     assert output.meta_info["metrics"]["drafter/schedule_strategy"] == 0
     assert output.meta_info["metrics"]["drafter/schedule_reason"] == 3
+
+
+def test_deferred_bubble_publish_drains_before_next_generation() -> None:
+    """Do not require a particular checkpoint-manager update path to publish."""
+
+    trainer = _trainer(
+        {
+            "training_interval_steps": 1,
+            "publish_interval_steps": 0,
+        },
+        step=5,
+    )
+    trainer._speco_last_collected_samples = 1
+    trainer.actor_rollout_wg = _FakeRolloutWorkerGroup()
+    trainer._compute_old_log_prob = lambda batch: batch
+    trainer.checkpoint_manager = SimpleNamespace(update_weights=lambda: None)
+    events = []
+
+    trainer._speco_set_drafter_global_step = lambda **kwargs: None
+    trainer._speco_sync_target_lm_head_weight = lambda plan: {
+        "drafter/target_lm_head_synced": 1
+    }
+    trainer._update_actor = lambda *args, **kwargs: SimpleNamespace(
+        meta_info={"metrics": {}}
+    )
+    trainer._speco_train_drafter = lambda plan: (
+        True,
+        {"drafter/trained": 1},
+    )
+    trainer._speco_publish_drafter_weights = (
+        lambda trained, plan, **kwargs: events.append(
+            ("publish", trained, kwargs.get("after_weight_update"))
+        )
+        or {"drafter/publish_attempted": 1, "drafter/published": 1}
+    )
+    trainer._speco_rollout_idle_worker_enabled = lambda: False
+    trainer._speco_reclaim_rollout_idle_workers_before_generation = lambda: {}
+    trainer._speco_emit_rollout_generation_started = lambda: {}
+    trainer._speco_start_rollout_idle_event_loop = lambda: (None, None)
+    trainer._speco_stop_rollout_idle_event_loop = lambda *args: None
+    trainer._speco_service_rollout_idle_events = lambda **kwargs: {}
+    trainer._speco_emit_rollout_generation_completed = lambda output: {}
+    trainer._speco_store_rollout_metrics = lambda output: None
+    trainer._speco_collect_generation_samples = lambda output: 0
+
+    with trainer._speco_online_fit_hooks():
+        trainer._update_actor("batch")
+        output = trainer.actor_rollout_wg.generate_sequences()
+
+    assert events == [("publish", True, True)]
+    assert output.meta_info["metrics"]["drafter/publish_attempted"] == 1
+    assert output.meta_info["metrics"]["drafter/published"] == 1
+    assert output.meta_info["metrics"]["timing_s/drafter_publish_critical_path"] >= 0.0
 
 
 @pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "veomni"])
@@ -329,7 +420,6 @@ def test_no_drafter_run_refuses_and_leaves_vllm_config_untouched(
     assert "worker_extension_cls" not in vllm_engine
 
 
-
 def test_task_runner_installs_vllm_import_compat_in_its_own_process(
     monkeypatch,
 ) -> None:
@@ -390,7 +480,6 @@ def test_no_drafter_run_does_not_install_vllm_import_compat(monkeypatch) -> None
     # A no-drafter run must never install the SPECO vLLM import-compat mixin;
     # the runner refuses before reaching the import-compat step.
     assert compat_calls == []
-
 
 
 def test_oldlogprob_non_collect_step_uses_original_compute_path() -> None:
@@ -475,9 +564,11 @@ def test_target_head_sync_defers_for_all_lm_head_drafters(
     }
     received = []
     trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
-    trainer._speco_actor_rollout_method = lambda name: lambda rows: [payload]
-    trainer._speco_build_drafter_target_lm_head_sync_args = (
-        lambda value: (value, trainer.global_steps, 1)
+    trainer._speco_actor_rollout_method = lambda name: lambda rows, **kwargs: [payload]
+    trainer._speco_build_drafter_target_lm_head_sync_args = lambda value: (
+        value,
+        trainer.global_steps,
+        1,
     )
     trainer.speco_sync_target_lm_head_weight = (
         lambda value, global_step=None: received.append((value, global_step))
@@ -503,9 +594,11 @@ def test_target_head_transfer_waits_after_actor_update() -> None:
     resolved = []
     trainer._ray_get_if_needed = lambda value: resolved.append(value) or value
     trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
-    trainer._speco_actor_rollout_method = lambda name: lambda rows: [payload]
-    trainer._speco_build_drafter_target_lm_head_sync_args = (
-        lambda value: (value, trainer.global_steps, 1)
+    trainer._speco_actor_rollout_method = lambda name: lambda rows, **kwargs: [payload]
+    trainer._speco_build_drafter_target_lm_head_sync_args = lambda value: (
+        value,
+        trainer.global_steps,
+        1,
     )
     trainer.speco_sync_target_lm_head_weight = (
         lambda value, global_step=None: pending_refs
@@ -521,6 +614,121 @@ def test_target_head_transfer_waits_after_actor_update() -> None:
 
     assert resolved == [[payload], pending_refs]
     assert metrics["drafter/target_lm_head_synced"] == 1
+
+
+def test_bubble_target_head_fetch_completes_before_async_dispatch() -> None:
+    trainer = _trainer(
+        {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}},
+        step=1,
+    )
+    payload = {"weight": "cpu-weight", "export_strategy": "full"}
+    pending_refs = ["pending-target-sync"]
+    resolved = []
+    trainer._ray_get_if_needed = lambda value: resolved.append(value) or value
+    trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
+    trainer._speco_actor_rollout_method = lambda name: lambda rows, **kwargs: [payload]
+    trainer._speco_build_drafter_target_lm_head_sync_args = lambda value: (
+        value,
+        trainer.global_steps,
+        1,
+    )
+    trainer.speco_sync_target_lm_head_weight = (
+        lambda value, global_step=None: pending_refs
+    )
+
+    metrics, pending = trainer._speco_start_target_lm_head_weight_sync()
+
+    assert pending is not None
+    assert "fetch_refs" not in pending
+    assert pending["refs"] == pending_refs
+    assert pending["stage"] == "dispatch"
+    assert pending["target_version"] == trainer.global_steps
+    # The actor payload must be materialized before update_actor can run.  A
+    # Ray ObjectRef alone does not freeze the pre-update model parameters.
+    assert resolved == [[payload]]
+    assert metrics["timing_s/drafter_target_lm_head_fetch_submit"] >= 0.0
+    assert metrics["timing_s/drafter_target_lm_head_fetch_critical_path"] >= 0.0
+    assert (
+        metrics["timing_s/drafter_target_lm_head_prefetch_submit_critical_path"]
+        >= metrics["timing_s/drafter_target_lm_head_fetch_critical_path"]
+    )
+
+    metrics.update(trainer._speco_finish_target_lm_head_weight_sync(pending))
+
+    assert resolved == [[payload], pending_refs]
+    assert metrics["drafter/target_lm_head_synced"] == 1
+
+
+def test_bubble_target_head_prefetch_ignores_transient_fallback_plan() -> None:
+    trainer = _trainer(
+        {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}},
+        step=4,
+    )
+    trainer._speco_last_collected_samples = 31
+    trainer._speco_last_collected_step = trainer.global_steps
+
+    # A scheduler event may temporarily select a synchronous fallback plan
+    # when no version is trainable.  Prefetch eligibility must continue to
+    # follow the configured Bubble mode so that the next window can recover.
+    assert trainer._speco_should_prefetch_target_lm_head()
+
+    trainer._speco_last_collected_samples = 0
+    assert not trainer._speco_should_prefetch_target_lm_head()
+
+    trainer.config.actor_rollout_ref.rollout.drafter.training = {
+        "scheduler": {"execution": {"strategy": "sync"}}
+    }
+    trainer._speco_last_collected_samples = 31
+    assert not trainer._speco_should_prefetch_target_lm_head()
+
+
+def test_bubble_target_head_ready_is_scoped_to_synced_workers() -> None:
+    trainer = _trainer(
+        {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}},
+        step=1,
+    )
+
+    trainer._speco_mark_target_lm_head_version_ready(
+        2,
+        worker_ids=("0", "1"),
+    )
+
+    assert trainer._speco_target_lm_head_ready_for_workers(2, ("0", "1"))
+    assert not trainer._speco_target_lm_head_ready_for_workers(2, ("2", "3"))
+
+    trainer._speco_mark_target_lm_head_version_ready(
+        4,
+        worker_ids=("0", "1", "2", "3"),
+    )
+
+    assert trainer._speco_target_lm_head_ready_for_workers(4, ("2", "3"))
+
+
+def test_sglang_bubble_owner_count_covers_routed_writer_owner() -> None:
+    trainer = _trainer(
+        {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}},
+        step=6,
+    )
+    trainer._speco_owner_bucket_count = lambda: 1
+
+    owner_count = trainer._speco_sglang_collection_owner_count(
+        [{"replica_rank": 0}],
+        [1],
+    )
+
+    assert owner_count == 2
+
+
+def test_sglang_sync_owner_count_keeps_replica_derived_count() -> None:
+    trainer = _trainer({"scheduler": {"execution": {"strategy": "sync"}}}, step=6)
+    trainer._speco_owner_bucket_count = lambda: 4
+
+    owner_count = trainer._speco_sglang_collection_owner_count(
+        [{"replica_rank": 0}],
+        None,
+    )
+
+    assert owner_count == 1
 
 
 def test_target_head_sync_is_skipped_when_training_uses_logits() -> None:
@@ -585,7 +793,10 @@ def test_dspark_oldlogprob_collect_plan_uses_request_hard_quota() -> None:
     assert int((plan["request_is_hard"] & plan["collect_mask"]).sum()) == 20
     assert plan["selection_metrics"]["hard_shortfall"] == 10
     assert plan["selection_metrics"]["selected_normal_total"] == 60
-    assert [int((plan["collect_mask"] & (plan["owner_rank"] == owner)).sum()) for owner in range(5)] == [16] * 5
+    assert [
+        int((plan["collect_mask"] & (plan["owner_rank"] == owner)).sum())
+        for owner in range(5)
+    ] == [16] * 5
     records = trainer._speco_last_request_accept_len_records
     assert records[0]["request_id"] == "req-99"
     assert records[-1]["request_id"] == "req-0"
@@ -633,8 +844,7 @@ def test_oldlogprob_collect_plan_accepts_array_like_request_stats() -> None:
 
     assert plan["selected_count"] == 12
     assert (
-        int(plan["request_is_hard"].logical_and(plan["collect_mask"]).sum().item())
-        == 6
+        int(plan["request_is_hard"].logical_and(plan["collect_mask"]).sum().item()) == 6
     )
     assert plan["request_is_hard"][:6].all()
     assert not plan["request_is_hard"][6:].any()
@@ -667,9 +877,7 @@ def test_dspark_oldlogprob_collect_plan_selects_across_dp_shards() -> None:
     batch_size = 100
     window_size = 50
     accept_lens = [
-        1.0 + ((index * 7) % window_size) / 100.0
-        if index < window_size
-        else 0.1
+        1.0 + ((index * 7) % window_size) / 100.0 if index < window_size else 0.1
         for index in range(batch_size)
     ]
     batch = _oldlogprob_plan_batch(
@@ -687,7 +895,10 @@ def test_dspark_oldlogprob_collect_plan_selects_across_dp_shards() -> None:
     assert plan["selected_count"] == 80
     selected_indices = plan["collect_mask"].nonzero(as_tuple=False).reshape(-1)
     assert int(selected_indices.max()) >= window_size
-    assert [int(((plan["owner_rank"] == owner) & plan["collect_mask"]).sum()) for owner in range(5)] == [16] * 5
+    assert [
+        int(((plan["owner_rank"] == owner) & plan["collect_mask"]).sum())
+        for owner in range(5)
+    ] == [16] * 5
     assert int((plan["request_is_hard"] & plan["collect_mask"]).sum()) == 40
     assert plan["selection_metrics"]["duplicate_hard_count"] == 0
 
@@ -728,7 +939,10 @@ def test_dspark_oldlogprob_collect_plan_fills_normal_without_duplicates() -> Non
     assert plan["selection_metrics"]["hard_shortfall"] == 12
     assert plan["selection_metrics"]["selected_normal_total"] == 28
     assert plan["selection_metrics"]["duplicate_hard_count"] == 0
-    assert [int((plan["collect_mask"] & (plan["owner_rank"] == owner)).sum()) for owner in range(2)] == [16, 16]
+    assert [
+        int((plan["collect_mask"] & (plan["owner_rank"] == owner)).sum())
+        for owner in range(2)
+    ] == [16, 16]
 
 
 def test_oldlogprob_collect_plan_hard_disabled_matches_baseline_order() -> None:
@@ -767,9 +981,7 @@ def test_oldlogprob_collect_plan_hard_disabled_matches_baseline_order() -> None:
     assert plan["hard_enabled"] is False
     assert plan["usable_window_size"] == batch_size
     assert plan["selected_count"] == 6
-    selected_indices = (
-        plan["collect_mask"].nonzero(as_tuple=False).reshape(-1).tolist()
-    )
+    selected_indices = plan["collect_mask"].nonzero(as_tuple=False).reshape(-1).tolist()
     assert [int(index) for index in selected_indices] == [0, 1, 2, 3, 4, 5]
     assert [int(plan["owner_rank"][index].item()) for index in range(6)] == [
         0,
@@ -818,7 +1030,9 @@ def test_oldlogprob_collect_plan_uses_lowest_acceptance_hard_candidates() -> Non
         .tolist()
     )
     assert hard.issubset(set(range(8)))
-    assert plan["request_is_hard"].nonzero(as_tuple=False).flatten().tolist() == list(range(8))
+    assert plan["request_is_hard"].nonzero(as_tuple=False).flatten().tolist() == list(
+        range(8)
+    )
     assert len(hard) == 4
     assert plan["selected_count"] == 8
 
@@ -851,14 +1065,15 @@ def test_oldlogprob_collect_plan_zero_ratio_preserves_baseline_order() -> None:
     plan = trainer._speco_build_oldlogprob_collect_plan(batch)
 
     assert plan["hard_enabled"] is False
-    assert (
-        plan["collect_mask"].nonzero(as_tuple=False).flatten().tolist()
-        == list(range(6))
+    assert plan["collect_mask"].nonzero(as_tuple=False).flatten().tolist() == list(
+        range(6)
     )
 
 
 @pytest.mark.parametrize("window_size", [0, 33, 999])
-def test_oldlogprob_legacy_window_setting_does_not_restrict_collection(window_size) -> None:
+def test_oldlogprob_legacy_window_setting_does_not_restrict_collection(
+    window_size,
+) -> None:
     trainer = _trainer(
         {
             "collect_hidden_states_from_old_logprob": True,
@@ -873,22 +1088,35 @@ def test_oldlogprob_legacy_window_setting_does_not_restrict_collection(window_si
     trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DSPARK"
     trainer._speco_online_enabled = lambda: True
     trainer._speco_owner_bucket_count = lambda: 8
-    batch = _oldlogprob_plan_batch(160, non_tensor_batch={
-        "_verl_request_mean_accept_len": [float(index + 1) for index in range(160)],
-        "_speco_vllm_request_id": [f"req-{index}" for index in range(160)],
-    })
+    batch = _oldlogprob_plan_batch(
+        160,
+        non_tensor_batch={
+            "_verl_request_mean_accept_len": [float(index + 1) for index in range(160)],
+            "_speco_vllm_request_id": [f"req-{index}" for index in range(160)],
+        },
+    )
     expected = trainer._speco_build_oldlogprob_collect_plan(batch)
-    trainer.config.actor_rollout_ref.rollout.drafter.training["dspark_hard_collect_window_size"] = window_size
+    trainer.config.actor_rollout_ref.rollout.drafter.training[
+        "dspark_hard_collect_window_size"
+    ] = window_size
     actual = trainer._speco_build_oldlogprob_collect_plan(batch)
     assert actual["selected_count"] == expected["selected_count"] == 80
-    for key in ("collect_mask", "owner_rank", "hidden_positions", "hidden_position_mask", "request_is_hard"):
+    for key in (
+        "collect_mask",
+        "owner_rank",
+        "hidden_positions",
+        "hidden_position_mask",
+        "request_is_hard",
+    ):
         assert torch.equal(actual[key], expected[key])
     assert actual["selection_metrics"] == expected["selection_metrics"]
 
 
 @pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE3", "DFLASH"])
 @pytest.mark.parametrize("collection_limit", [None, 16, 80, 0])
-def test_oldlogprob_collection_budget_is_scoped_to_dspark(algorithm, collection_limit) -> None:
+def test_oldlogprob_collection_budget_is_scoped_to_dspark(
+    algorithm, collection_limit
+) -> None:
     training_cfg = {
         "collect_hidden_states_from_old_logprob": True,
         "hidden_state_window_tokens_per_sample": 512,
@@ -903,36 +1131,53 @@ def test_oldlogprob_collection_budget_is_scoped_to_dspark(algorithm, collection_
     trainer._speco_owner_bucket_count = lambda: 8
     batch = _oldlogprob_plan_batch(160)
     if algorithm == "DSPARK" and collection_limit == 0:
-        with pytest.raises(ValueError, match="dspark_collect_samples_per_step must be positive"):
+        with pytest.raises(
+            ValueError, match="dspark_collect_samples_per_step must be positive"
+        ):
             trainer._speco_build_oldlogprob_collect_plan(batch)
         return
     plan = trainer._speco_build_oldlogprob_collect_plan(batch)
-    expected = (80 if collection_limit is None else collection_limit) if algorithm == "DSPARK" else 128
+    expected = (
+        (80 if collection_limit is None else collection_limit)
+        if algorithm == "DSPARK"
+        else 128
+    )
     assert plan["selected_count"] == expected
     assert not plan["hard_enabled"]
     assert not plan["request_is_hard"].any()
     for owner in range(8):
-        assert int(((plan["owner_rank"] == owner) & plan["collect_mask"]).sum()) == expected // 8
+        assert (
+            int(((plan["owner_rank"] == owner) & plan["collect_mask"]).sum())
+            == expected // 8
+        )
 
 
 @pytest.mark.parametrize("algorithm", ["EAGLE3", "DFLASH"])
-def test_explicit_hard_sampling_keeps_collection_budget_for_other_algorithms(algorithm) -> None:
-    trainer = _trainer({
-        "collect_hidden_states_from_old_logprob": True,
-        "hidden_state_window_tokens_per_sample": 512,
-        "max_collect_samples_per_step_per_replica": 16,
-        "dspark_collect_samples_per_step": 80,
-        "dspark_hard_candidate_ratio": 0.4,
-        "dspark_hard_sample_ratio": 0.1,
-    }, step=5)
+def test_explicit_hard_sampling_keeps_collection_budget_for_other_algorithms(
+    algorithm,
+) -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "hidden_state_window_tokens_per_sample": 512,
+            "max_collect_samples_per_step_per_replica": 16,
+            "dspark_collect_samples_per_step": 80,
+            "dspark_hard_candidate_ratio": 0.4,
+            "dspark_hard_sample_ratio": 0.1,
+        },
+        step=5,
+    )
     trainer.config.actor_rollout_ref.actor.strategy = "fsdp2"
     trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = algorithm
     trainer._speco_online_enabled = lambda: True
     trainer._speco_owner_bucket_count = lambda: 8
-    batch = _oldlogprob_plan_batch(160, non_tensor_batch={
-        "_verl_request_mean_accept_len": [float(index + 1) for index in range(160)],
-        "_speco_vllm_request_id": [f"req-{index}" for index in range(160)],
-    })
+    batch = _oldlogprob_plan_batch(
+        160,
+        non_tensor_batch={
+            "_verl_request_mean_accept_len": [float(index + 1) for index in range(160)],
+            "_speco_vllm_request_id": [f"req-{index}" for index in range(160)],
+        },
+    )
     plan = trainer._speco_build_oldlogprob_collect_plan(batch)
     assert plan["selected_count"] == 80
     assert int((plan["collect_mask"] & plan["request_is_hard"]).sum()) == 8
@@ -989,7 +1234,6 @@ def test_request_accept_len_variance_respects_log_interval(
         step=4,
     )
 
-    batch_size = 2
     batch = SimpleNamespace(
         batch={},
         non_tensor_batch={
@@ -1009,15 +1253,22 @@ def test_request_accept_len_variance_respects_log_interval(
 
 
 @pytest.mark.parametrize("interval", [0, 3])
-def test_request_accept_len_history_is_independent_of_print_interval(interval, tmp_path, monkeypatch) -> None:
+def test_request_accept_len_history_is_independent_of_print_interval(
+    interval, tmp_path, monkeypatch
+) -> None:
     history_path = tmp_path / "hist.jsonl"
     monkeypatch.setenv("VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH", str(history_path))
     trainer = _trainer({"request_accept_len_variance_interval_steps": interval}, step=4)
-    batch = _oldlogprob_plan_batch(2, non_tensor_batch={
-        "_verl_request_mean_accept_len": [1.0, 3.0],
-        "_speco_vllm_request_id": ["req-0", "req-1"],
-    })
-    assert trainer._speco_log_request_accept_len_variance_from_batch(batch, source="rollout")
+    batch = _oldlogprob_plan_batch(
+        2,
+        non_tensor_batch={
+            "_verl_request_mean_accept_len": [1.0, 3.0],
+            "_speco_vllm_request_id": ["req-0", "req-1"],
+        },
+    )
+    assert trainer._speco_log_request_accept_len_variance_from_batch(
+        batch, source="rollout"
+    )
     trainer._speco_flush_request_accept_len_payloads()
     payloads = [json.loads(line) for line in history_path.read_text().splitlines()]
     assert len(payloads) == 1
@@ -1028,15 +1279,20 @@ def test_request_accept_len_history_is_independent_of_print_interval(interval, t
 
 
 @pytest.mark.parametrize("request_ids", [["req-0", None], ["req-0", "req-0"]])
-def test_rollout_diagnostic_failure_does_not_skip_collection(request_ids, caplog) -> None:
+def test_rollout_diagnostic_failure_does_not_skip_collection(
+    request_ids, caplog
+) -> None:
     trainer = _trainer({"collect_hidden_states_from_old_logprob": True}, step=5)
     trainer.config.actor_rollout_ref.actor.strategy = "fsdp2"
     trainer._speco_online_enabled = lambda: True
     trainer._speco_owner_bucket_count = lambda: 1
-    batch = _oldlogprob_plan_batch(2, non_tensor_batch={
-        "_verl_request_mean_accept_len": [1.0, 3.0],
-        "_speco_vllm_request_id": request_ids,
-    })
+    batch = _oldlogprob_plan_batch(
+        2,
+        non_tensor_batch={
+            "_verl_request_mean_accept_len": [1.0, 3.0],
+            "_speco_vllm_request_id": request_ids,
+        },
+    )
     trainer.actor_rollout_wg = _FakeRolloutWorkerGroup()
     trainer.actor_rollout_wg.generate_sequences = lambda *args, **kwargs: batch
     trainer._compute_old_log_prob = lambda value: value
@@ -1044,7 +1300,9 @@ def test_rollout_diagnostic_failure_does_not_skip_collection(request_ids, caplog
     trainer._speco_wait_pending_drafter_publish = lambda: None
     trainer._speco_store_rollout_metrics = lambda output: None
     collected_outputs = []
-    trainer._speco_collect_generation_samples = lambda output: collected_outputs.append(output) or 0
+    trainer._speco_collect_generation_samples = (
+        lambda output: collected_outputs.append(output) or 0
+    )
     with trainer._speco_online_fit_hooks():
         assert trainer.actor_rollout_wg.generate_sequences() is batch
     assert collected_outputs == [batch]
@@ -1073,12 +1331,15 @@ def test_request_acceptance_diagnostics_skip_unscored_rows(all_unscored) -> None
     if not all_unscored:
         assert trainer._speco_last_request_accept_len_var == 1.0
         assert [
-            record["request_id"] for record in trainer._speco_last_request_accept_len_records
+            record["request_id"]
+            for record in trainer._speco_last_request_accept_len_records
         ] == ["req-0", "req-2"]
 
 
 @pytest.mark.parametrize("request_ids", [["req-0", None], ["req-0", "req-0"]])
-def test_request_acceptance_diagnostics_still_reject_invalid_scored_ids(request_ids) -> None:
+def test_request_acceptance_diagnostics_still_reject_invalid_scored_ids(
+    request_ids,
+) -> None:
     trainer = _trainer({})
     batch = SimpleNamespace(
         batch={},
@@ -1103,28 +1364,34 @@ def test_oldlogprob_collection_materializes_whole_refs_from_all_dp_shards(
         OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY,
     )
 
-    trainer = _trainer({
-        "collect_hidden_states_from_old_logprob": True,
-        "collect_interval_steps": 1,
-        "training_interval_steps": 1,
-        "hidden_state_window_tokens_per_sample": 512,
-        "max_collect_samples_per_step_per_replica": 16,
-        "max_collect_tokens_per_step_per_replica": 16384,
-        "dspark_hard_candidate_ratio": 0.5 if hard_enabled else 0.0,
-        "dspark_hard_sample_ratio": 0.5 if hard_enabled else 0.0,
-    })
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_interval_steps": 1,
+            "training_interval_steps": 1,
+            "hidden_state_window_tokens_per_sample": 512,
+            "max_collect_samples_per_step_per_replica": 16,
+            "max_collect_tokens_per_step_per_replica": 16384,
+            "dspark_hard_candidate_ratio": 0.5 if hard_enabled else 0.0,
+            "dspark_hard_sample_ratio": 0.5 if hard_enabled else 0.0,
+        }
+    )
     trainer.config.actor_rollout_ref.actor.strategy = "fsdp2"
     trainer._speco_online_enabled = lambda: True
     trainer._speco_owner_bucket_count = lambda: 1
-    batch = _oldlogprob_plan_batch(4, non_tensor_batch={
-        "_verl_request_mean_accept_len": [1.0, None, 1.2, 1.3],
-        "_speco_vllm_request_id": ["req-0", None, "req-2", "req-3"],
-    })
+    batch = _oldlogprob_plan_batch(
+        4,
+        non_tensor_batch={
+            "_verl_request_mean_accept_len": [1.0, None, 1.2, 1.3],
+            "_speco_vllm_request_id": ["req-0", None, "req-2", "req-3"],
+        },
+    )
     plan = trainer._speco_build_oldlogprob_collect_plan(batch)
     assert plan["selected_count"] == 4
     stored = {
         "dp-0": torch.arange(2 * 513 * 4, dtype=torch.float32).reshape(2, 513, 4),
-        "dp-1": torch.arange(2 * 513 * 4, dtype=torch.float32).reshape(2, 513, 4) + 10000,
+        "dp-1": torch.arange(2 * 513 * 4, dtype=torch.float32).reshape(2, 513, 4)
+        + 10000,
     }
     outputs = []
     for shard_index in range(2):
@@ -1133,7 +1400,8 @@ def test_oldlogprob_collection_materializes_whole_refs_from_all_dp_shards(
             output, OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY, [f"dp-{shard_index}"] * 2
         )
         tu.assign_non_tensor_stack(
-            output, OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY,
+            output,
+            OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY,
             [{"row_index": row_index} for row_index in range(2)],
         )
         outputs.append(output)
@@ -1185,7 +1453,9 @@ def _dspark_sampler_trainer(hard_sample_ratio: float):
 def test_block_drafter_training_sampler_dspark_enforces_ratio() -> None:
     trainer = _dspark_sampler_trainer(0.375)
     items = [{"_verl_is_hard": True, "id": f"hard-{index}"} for index in range(16)]
-    items.extend({"_verl_is_hard": False, "id": f"normal-{index}"} for index in range(64))
+    items.extend(
+        {"_verl_is_hard": False, "id": f"normal-{index}"} for index in range(64)
+    )
 
     import random as _random
 
@@ -1198,7 +1468,9 @@ def test_block_drafter_training_sampler_dspark_enforces_ratio() -> None:
 def test_block_drafter_training_sampler_dspark_fractional_quota_accumulates() -> None:
     trainer = _dspark_sampler_trainer(0.1)
     items = [{"_verl_is_hard": True, "id": f"hard-{index}"} for index in range(32)]
-    items.extend({"_verl_is_hard": False, "id": f"normal-{index}"} for index in range(48))
+    items.extend(
+        {"_verl_is_hard": False, "id": f"normal-{index}"} for index in range(48)
+    )
 
     import random as _random
 
@@ -1206,7 +1478,9 @@ def test_block_drafter_training_sampler_dspark_fractional_quota_accumulates() ->
     for optimizer_step in range(5):
         trainer.training_steps = optimizer_step
         trainer.optimizer_steps_total = optimizer_step
-        selected = trainer._sample_training_items(items, 4, _random.Random(optimizer_step))
+        selected = trainer._sample_training_items(
+            items, 4, _random.Random(optimizer_step)
+        )
         hard_counts.append(sum(item["_verl_is_hard"] for item in selected))
 
     assert hard_counts == [0, 1, 0, 1, 0]
@@ -1244,7 +1518,9 @@ def test_dspark_fractional_quota_survives_cleanup_and_resume(
 def test_block_drafter_training_sampler_dspark_disabled_is_baseline_random() -> None:
     trainer = _dspark_sampler_trainer(0.0)
     items = [{"_verl_is_hard": True, "id": f"hard-{index}"} for index in range(32)]
-    items.extend({"_verl_is_hard": False, "id": f"normal-{index}"} for index in range(48))
+    items.extend(
+        {"_verl_is_hard": False, "id": f"normal-{index}"} for index in range(48)
+    )
 
     import random as _random
 
@@ -1349,25 +1625,37 @@ def test_actor_checkpoint_failure_preserves_previous_drafter(monkeypatch) -> Non
     ]
 
 
-@pytest.mark.parametrize("candidate,sample,expected_hard", [(0, 0, 0), (.1, .4, 32), (.4, .1, 8), (.2, .3, 24), (.3, .2, 16)])
+@pytest.mark.parametrize(
+    "candidate,sample,expected_hard",
+    [(0, 0, 0), (0.1, 0.4, 32), (0.4, 0.1, 8), (0.2, 0.3, 24), (0.3, 0.2, 16)],
+)
 def test_dspark_hard_sample_ratio_matrix(candidate, sample, expected_hard):
-    trainer = _trainer({
-        "collect_hidden_states_from_old_logprob": True,
-        "collect_interval_steps": 1, "training_interval_steps": 1,
-        "hidden_state_window_tokens_per_sample": 512,
-        "max_collect_samples_per_step_per_replica": 16,
-        "dspark_collect_samples_per_step": 80,
-        "dspark_hard_candidate_ratio": candidate,
-        "dspark_hard_sample_ratio": sample,
-    }, step=5)
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_interval_steps": 1,
+            "training_interval_steps": 1,
+            "hidden_state_window_tokens_per_sample": 512,
+            "max_collect_samples_per_step_per_replica": 16,
+            "dspark_collect_samples_per_step": 80,
+            "dspark_hard_candidate_ratio": candidate,
+            "dspark_hard_sample_ratio": sample,
+        },
+        step=5,
+    )
     trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DSPARK"
     trainer.config.actor_rollout_ref.actor.strategy = "fsdp2"
     trainer._speco_online_enabled = lambda: True
     trainer._speco_owner_bucket_count = lambda: 8
-    batch = _oldlogprob_plan_batch(320, non_tensor_batch={
-        "_verl_request_mean_accept_len": [1 + ((i * 37) % 320) / 320 for i in range(320)],
-        "_speco_vllm_request_id": [f"req-{i}" for i in range(320)],
-    })
+    batch = _oldlogprob_plan_batch(
+        320,
+        non_tensor_batch={
+            "_verl_request_mean_accept_len": [
+                1 + ((i * 37) % 320) / 320 for i in range(320)
+            ],
+            "_speco_vllm_request_id": [f"req-{i}" for i in range(320)],
+        },
+    )
     original = {key: value.clone() for key, value in batch.batch.items()}
     plan = trainer._speco_build_oldlogprob_collect_plan(batch)
     repeat = trainer._speco_build_oldlogprob_collect_plan(batch)

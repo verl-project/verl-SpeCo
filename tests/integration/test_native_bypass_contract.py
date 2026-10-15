@@ -44,6 +44,21 @@ def _config(*, enable=False, training=False) -> object:
     )
 
 
+def test_drafter_diagnostic_env_only_forwards_explicit_switches(monkeypatch) -> None:
+    from verl_speco.main import drafter_diagnostic_env
+
+    monkeypatch.delenv("VERL_DRAFTER_MEMORY_DIAGNOSTICS", raising=False)
+    monkeypatch.delenv("VERL_DRAFTER_KEEP_HOT_TRIM_CACHE", raising=False)
+    assert drafter_diagnostic_env() == {}
+    monkeypatch.setenv("VERL_DRAFTER_MEMORY_DIAGNOSTICS", "true")
+    monkeypatch.setenv("VERL_DRAFTER_KEEP_HOT_TRIM_CACHE", "false")
+    monkeypatch.setenv("UNRELATED_SECRET", "not-forwarded")
+    assert drafter_diagnostic_env() == {
+        "VERL_DRAFTER_MEMORY_DIAGNOSTICS": "true",
+        "VERL_DRAFTER_KEEP_HOT_TRIM_CACHE": "false",
+    }
+
+
 def test_should_bypass_true_when_drafter_disabled() -> None:
     from verl_speco.main import should_bypass_speco
 
@@ -96,9 +111,7 @@ def _patch_verl_entry(monkeypatch) -> list:
     monkeypatch.setattr(main_ppo, "run_ppo", fake_run_ppo)
     monkeypatch.setattr(device, "auto_set_device", lambda config: None)
     monkeypatch.setattr(compat, "check_compatible_verl", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        main_ppo, "migrate_legacy_reward_impl", None, raising=False
-    )
+    monkeypatch.setattr(main_ppo, "migrate_legacy_reward_impl", None, raising=False)
     # Drop any cached SPECO task-runner module so the no-drafter dispatch can
     # prove the bypass never imports it.  monkeypatch restores the originals.
     for mod in list(sys.modules):
@@ -142,9 +155,7 @@ def test_run_uses_speco_task_runner_when_drafter_enabled(monkeypatch) -> None:
     assert task_runner_class is not None
     from verl_speco.integration.task_runner import SpecoTaskRunner
 
-    assert (
-        getattr(task_runner_class, "__ray_actor_class__", None) is SpecoTaskRunner
-    )
+    assert getattr(task_runner_class, "__ray_actor_class__", None) is SpecoTaskRunner
 
 
 def test_run_bypass_propagates_training_without_rollout_error(monkeypatch) -> None:
@@ -178,9 +189,7 @@ def test_run_bypass_strips_speco_overlay_before_native_run(monkeypatch) -> None:
     monkeypatch.setattr(main_ppo, "run_ppo", fake_run_ppo)
     monkeypatch.setattr(device, "auto_set_device", lambda config: None)
     monkeypatch.setattr(compat, "check_compatible_verl", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        main_ppo, "migrate_legacy_reward_impl", None, raising=False
-    )
+    monkeypatch.setattr(main_ppo, "migrate_legacy_reward_impl", None, raising=False)
 
     from verl_speco.main import run
 

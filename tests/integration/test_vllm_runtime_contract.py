@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import sys
 import types
@@ -23,6 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import verl_speco.integration.vllm_runtime as vllm_runtime
 
 from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_REQUEST_STATS_TRACE_HEADER,
@@ -36,6 +38,7 @@ from verl_speco.integration.vllm_runtime import (
     _decode_vllm_request_stats_trace_header,
     _describe_vllm_draft_logits,
     _dspark_confidence_head_enabled,
+    _ensure_vllm_server_drafter_env,
     _invoke_bucket_received_callback,
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
@@ -43,6 +46,8 @@ from verl_speco.integration.vllm_runtime import (
     _pop_vllm_request_stats_for_rollout_output,
     _record_vllm_request_acceptance_stats,
     _record_vllm_spec_decode_scheduler_stats,
+    _rollout_idle_event_bus_name,
+    _rollout_idle_worker_id_for_replica,
     _speco_can_use_npu_target_staging,
     _speco_npu_target_staging,
     _speco_npu_target_staging_decision,
@@ -90,6 +95,155 @@ def test_vllm_speculative_config_maps_eagle3_contract() -> None:
         "model": "/models/drafter",
         "num_speculative_tokens": 3,
     }
+
+
+def test_vllm_rollout_idle_event_config_maps_replica_to_worker() -> None:
+    drafter_cfg = _drafter(
+        training={
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {
+                    "event_bus_name": "bubble-bus",
+                    "training_groups": [["worker-0", "worker-1"]],
+                },
+            }
+        }
+    )
+
+    assert _rollout_idle_event_bus_name(drafter_cfg) == "bubble-bus"
+    assert _rollout_idle_worker_id_for_replica(drafter_cfg, 1) == "worker-1"
+
+
+def test_vllm_server_restores_idle_event_config_from_server_config(monkeypatch) -> None:
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    drafter_cfg = _drafter(
+        training={
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {"event_bus_name": "bubble-bus"},
+            }
+        }
+    )
+
+    resolved, source = _ensure_vllm_server_drafter_env(
+        {"rollout": {"drafter": drafter_cfg}}
+    )
+
+    assert source == "server_config"
+    assert _rollout_idle_event_bus_name(resolved) == "bubble-bus"
+
+
+def test_vllm_server_uses_embedded_runtime_config_when_server_config_is_stale(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    stale_config = _drafter(training={"scheduler": {}})
+    runtime_config = _drafter(
+        training={
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {"event_bus_name": "runtime-bubble-bus"},
+            }
+        }
+    )
+
+    resolved, source = _ensure_vllm_server_drafter_env(
+        {"rollout": {"drafter": stale_config}},
+        json.dumps(runtime_config),
+    )
+
+    assert source == "server_class"
+    assert _rollout_idle_event_bus_name(resolved) == "runtime-bubble-bus"
+
+
+def test_vllm_idle_event_waits_for_all_replica_requests(monkeypatch) -> None:
+    gates = {"a": asyncio.Event(), "b": asyncio.Event()}
+
+    class _BaseServer:
+        async def generate(self, request_id):
+            await gates[request_id].wait()
+            return SimpleNamespace(extra_fields={})
+
+    class _Server(_SpecoVLLMHttpServerMixin, _BaseServer):
+        replica_rank = 0
+
+    events = []
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: _drafter())
+    monkeypatch.setattr(
+        vllm_runtime,
+        "_emit_rollout_idle_worker_event",
+        lambda **kwargs: events.append(kwargs["event_type"]) or True,
+    )
+    server = _Server()
+
+    async def scenario():
+        first = asyncio.create_task(server.generate("a"))
+        second = asyncio.create_task(server.generate("b"))
+        await asyncio.sleep(0)
+        assert events == ["GENERATION_STARTED"]
+        gates["a"].set()
+        await first
+        assert events == ["GENERATION_STARTED"]
+        gates["b"].set()
+        await second
+
+    asyncio.run(scenario())
+    assert events == ["GENERATION_STARTED", "WORKER_IDLE"]
+
+
+def test_vllm_failed_request_does_not_claim_memory_release(monkeypatch) -> None:
+    class _BaseServer:
+        async def generate(self, *args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("generation failed")
+
+    class _Server(_SpecoVLLMHttpServerMixin, _BaseServer):
+        replica_rank = 0
+
+    events = []
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: _drafter())
+    monkeypatch.setattr(
+        vllm_runtime,
+        "_emit_rollout_idle_worker_event",
+        lambda **kwargs: events.append(kwargs) or True,
+    )
+
+    with pytest.raises(RuntimeError, match="generation failed"):
+        asyncio.run(_Server().generate("request-0"))
+
+    assert events[-1]["event_type"] == "WORKER_IDLE"
+    assert events[-1]["memory_released"] is False
+    assert events[-1]["release_source"] == "runtime_request_failed"
+
+
+def test_vllm_runtime_idle_event_does_not_predict_deadline(monkeypatch) -> None:
+    payloads = []
+    monkeypatch.setattr(
+        vllm_runtime,
+        "emit_rollout_idle_event",
+        lambda _bus, payload: payloads.append(payload) or True,
+    )
+
+    emitted = vllm_runtime._emit_rollout_idle_worker_event(
+        drafter_cfg=_drafter(
+            training={
+                "scheduler": {
+                    "execution": {"strategy": "rollout_idle_worker"},
+                    "idle_worker": {
+                        "event_bus_name": "bubble-bus",
+                        "initial_batch_estimate_sec": 9.0,
+                    },
+                }
+            }
+        ),
+        replica_rank=0,
+        event_type="WORKER_IDLE",
+        memory_released=True,
+        release_source="runtime_request_complete",
+    )
+
+    assert emitted is True
+    assert payloads[-1]["must_be_ready_at"] is None
 
 
 def test_vllm_fresh_training_does_not_load_checkpoint_output_root() -> None:
@@ -140,7 +294,9 @@ def test_vllm_initial_drafter_initialization_is_serialized() -> None:
 
 
 @pytest.mark.parametrize("keyword_request_id", [False, True])
-def test_vllm_generate_initializes_once_and_preserves_request_stats(keyword_request_id) -> None:
+def test_vllm_generate_initializes_once_and_preserves_request_stats(
+    keyword_request_id,
+) -> None:
     events = []
 
     class UpstreamServer:
@@ -150,7 +306,13 @@ def test_vllm_generate_initializes_once_and_preserves_request_stats(keyword_requ
             events.append(request_id)
             _stage_vllm_request_stats_for_rollout_output(
                 request_id,
-                {request_id: {"verify_rounds": 4, "draft_tokens": 28, "accepted_tokens": 12}},
+                {
+                    request_id: {
+                        "verify_rounds": 4,
+                        "draft_tokens": 28,
+                        "accepted_tokens": 12,
+                    }
+                },
                 [request_id],
             )
             return SimpleNamespace(extra_fields={})
@@ -175,22 +337,35 @@ def test_vllm_generate_initializes_once_and_preserves_request_stats(keyword_requ
             assert _pop_vllm_request_stats_for_rollout_output(request_id) == ({}, [])
 
     asyncio.run(generate_twice())
-    assert events == ["speco_ensure_draft_initialized", "merge-request-1", "merge-request-2"]
+    assert events == [
+        "speco_ensure_draft_initialized",
+        "merge-request-1",
+        "merge-request-2",
+    ]
 
 
-@pytest.mark.parametrize("failure_mode", ["upstream_error", "metadata_error", "no_extra_fields", "invalid_extra_fields"])
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["upstream_error", "metadata_error", "no_extra_fields", "invalid_extra_fields"],
+)
 def test_vllm_generate_cleans_only_current_request_stats(failure_mode) -> None:
     request_id = f"cleanup-{failure_mode}"
     other_request_id = f"other-{failure_mode}"
-    summaries = {request_id: {"verify_rounds": 4, "draft_tokens": 28, "accepted_tokens": 12}}
+    summaries = {
+        request_id: {"verify_rounds": 4, "draft_tokens": 28, "accepted_tokens": 12}
+    }
     other_summaries = {other_request_id: {"verify_rounds": 2, "accepted_tokens": 6}}
-    output = SimpleNamespace(extra_fields=[] if failure_mode == "invalid_extra_fields" else {})
+    output = SimpleNamespace(
+        extra_fields=[] if failure_mode == "invalid_extra_fields" else {}
+    )
     if failure_mode == "no_extra_fields":
         output = SimpleNamespace()
 
     class UpstreamServer:
         async def generate(self, *args, **kwargs):
-            _stage_vllm_request_stats_for_rollout_output(request_id, summaries, [request_id])
+            _stage_vllm_request_stats_for_rollout_output(
+                request_id, summaries, [request_id]
+            )
             if failure_mode == "upstream_error":
                 raise RuntimeError("upstream generation failed")
             return output
@@ -200,16 +375,25 @@ def test_vllm_generate_cleans_only_current_request_stats(failure_mode) -> None:
             if failure_mode == "metadata_error":
                 raise RuntimeError("metadata conversion failed")
 
-    _stage_vllm_request_stats_for_rollout_output(other_request_id, other_summaries, [other_request_id])
+    _stage_vllm_request_stats_for_rollout_output(
+        other_request_id, other_summaries, [other_request_id]
+    )
     try:
         if failure_mode in ("upstream_error", "metadata_error"):
-            expected_error = "upstream generation failed" if failure_mode == "upstream_error" else "metadata conversion failed"
+            expected_error = (
+                "upstream generation failed"
+                if failure_mode == "upstream_error"
+                else "metadata conversion failed"
+            )
             with pytest.raises(RuntimeError, match=expected_error):
                 asyncio.run(Server().generate(request_id=request_id))
         else:
             assert asyncio.run(Server().generate(request_id=request_id)) is output
         assert _pop_vllm_request_stats_for_rollout_output(request_id) == ({}, [])
-        assert _pop_vllm_request_stats_for_rollout_output(other_request_id) == (other_summaries, [other_request_id])
+        assert _pop_vllm_request_stats_for_rollout_output(other_request_id) == (
+            other_summaries,
+            [other_request_id],
+        )
     finally:
         _pop_vllm_request_stats_for_rollout_output(request_id)
         _pop_vllm_request_stats_for_rollout_output(other_request_id)
@@ -217,7 +401,10 @@ def test_vllm_generate_cleans_only_current_request_stats(failure_mode) -> None:
 
 def test_vllm_generate_cancellation_preserves_concurrent_request_stats() -> None:
     async def run_requests():
-        staged = {request_id: asyncio.Event() for request_id in ("cancelled-request", "active-request")}
+        staged = {
+            request_id: asyncio.Event()
+            for request_id in ("cancelled-request", "active-request")
+        }
         release = asyncio.Event()
 
         class UpstreamServer:
@@ -225,7 +412,13 @@ def test_vllm_generate_cancellation_preserves_concurrent_request_stats() -> None
                 request_id = _vllm_generate_request_id(args, kwargs)
                 _stage_vllm_request_stats_for_rollout_output(
                     request_id,
-                    {request_id: {"verify_rounds": 4, "draft_tokens": 28, "accepted_tokens": 12}},
+                    {
+                        request_id: {
+                            "verify_rounds": 4,
+                            "draft_tokens": 28,
+                            "accepted_tokens": 12,
+                        }
+                    },
                     [request_id],
                 )
                 staged[request_id].set()
@@ -236,19 +429,27 @@ def test_vllm_generate_cancellation_preserves_concurrent_request_stats() -> None
             pass
 
         server = Server()
-        cancelled_task = asyncio.create_task(server.generate(request_id="cancelled-request"))
+        cancelled_task = asyncio.create_task(
+            server.generate(request_id="cancelled-request")
+        )
         active_task = asyncio.create_task(server.generate(request_id="active-request"))
         try:
             await asyncio.gather(*(event.wait() for event in staged.values()))
             cancelled_task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await cancelled_task
-            assert _pop_vllm_request_stats_for_rollout_output("cancelled-request") == ({}, [])
+            assert _pop_vllm_request_stats_for_rollout_output("cancelled-request") == (
+                {},
+                [],
+            )
             release.set()
             output = await active_task
             assert output.extra_fields["_speco_vllm_request_id"] == "active-request"
             assert output.extra_fields["_verl_request_mean_accept_len"] == 4.0
-            assert _pop_vllm_request_stats_for_rollout_output("active-request") == ({}, [])
+            assert _pop_vllm_request_stats_for_rollout_output("active-request") == (
+                {},
+                [],
+            )
         finally:
             release.set()
             cancelled_task.cancel()
@@ -1419,13 +1620,19 @@ def test_vllm_request_acceptance_stats_can_cross_engine_core_trace_headers() -> 
         num_accepted_tokens=6,
         num_invalid_spec_tokens=0,
     )
-    summaries, completion_order = _pop_vllm_request_stats_for_ids(scheduler, ["internal-req-1"])
+    summaries, completion_order = _pop_vllm_request_stats_for_ids(
+        scheduler, ["internal-req-1"]
+    )
 
     assert completion_order == ["internal-req-1"]
     assert scheduler._speco_vllm_request_accept_stats == {}
 
-    engine_core_output = SimpleNamespace(request_id="internal-req-1", trace_headers={"trace": "keep"})
-    _attach_vllm_request_stats_to_trace_headers(engine_core_output, summaries["internal-req-1"])
+    engine_core_output = SimpleNamespace(
+        request_id="internal-req-1", trace_headers={"trace": "keep"}
+    )
+    _attach_vllm_request_stats_to_trace_headers(
+        engine_core_output, summaries["internal-req-1"]
+    )
 
     assert engine_core_output.trace_headers["trace"] == "keep"
     decoded = _decode_vllm_request_stats_trace_header(
@@ -1447,7 +1654,9 @@ def test_vllm_request_acceptance_stats_extra_fields_use_request_output_id() -> N
         "elapsed_sec": 0.5,
     }
 
-    assert _set_vllm_request_stats_on_output(output, {"external-req-1": summary}, ["external-req-1"])
+    assert _set_vllm_request_stats_on_output(
+        output, {"external-req-1": summary}, ["external-req-1"]
+    )
     assert _vllm_request_accept_stats_to_extra_fields(output) == {
         "_speco_vllm_request_id": ["external-req-1"],
         "_speco_vllm_request_verify_rounds": [2],
@@ -1468,7 +1677,9 @@ def test_vllm_request_acceptance_stats_can_stage_for_token_output() -> None:
         "invalid_spec_tokens": 0,
         "completion_index": 5,
     }
-    _stage_vllm_request_stats_for_rollout_output("server-req-1", {"server-req-1": summary}, ["server-req-1"])
+    _stage_vllm_request_stats_for_rollout_output(
+        "server-req-1", {"server-req-1": summary}, ["server-req-1"]
+    )
 
     summaries, completion_order = _pop_vllm_request_stats_for_rollout_output(
         _vllm_generate_request_id(([], {}, "server-req-1"), {})
@@ -1509,9 +1720,9 @@ def test_trainer_drains_async_publish_before_checkpoint_and_validation() -> None
     )[0]
     validate_source = trainer_source.split("    def _validate(", 1)[1]
 
-    assert save_source.index("_speco_wait_pending_drafter_publish()") < save_source.index(
-        "_speco_save_drafter_checkpoint(wait=True)"
-    )
+    assert save_source.index(
+        "_speco_wait_pending_drafter_publish()"
+    ) < save_source.index("_speco_save_drafter_checkpoint(wait=True)")
     assert validate_source.index(
         "_speco_wait_pending_drafter_publish()"
     ) < validate_source.index("super()._validate(")
@@ -1594,7 +1805,9 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(
             self.value = value
 
         def detach(self):
-            raise AssertionError("streamed draft updates must not detach bucket tensors")
+            raise AssertionError(
+                "streamed draft updates must not detach bucket tensors"
+            )
 
         def clone(self):
             raise AssertionError("streamed draft updates must not clone bucket tensors")
@@ -1618,9 +1831,7 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(
             for name, _ in materialized:
                 if name not in self.param_names:
                     raise KeyError(name)
-            self.loaded.append(
-                [(name, tensor.value) for name, tensor in materialized]
-            )
+            self.loaded.append([(name, tensor.value) for name, tensor in materialized])
             return {name for name, _ in materialized}
 
         def _build_fused_kv_buffers(self):
