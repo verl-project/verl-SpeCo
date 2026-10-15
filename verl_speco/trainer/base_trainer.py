@@ -5209,6 +5209,8 @@ class DrafterBaseTrainer:
     ) -> bool:
         self.last_training_error = None
         try:
+            if globals().get("device_name") == "npu":
+                raise RuntimeError("CI_TEST_DRAFTER_TRAINING_FAILURE")
             with torch.enable_grad():
                 return await self._training_step_impl(
                     step,
