@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import inspect
 import logging
@@ -208,8 +209,10 @@ def _speco_worker_init(self, *args, **kwargs):
 
 
 async def _speco_worker_generate_sequences(self, batch):
-    context_tokens = _speco_context_from_batch(batch)
+    _speco_worker_request_started(self)
+    context_tokens = None
     try:
+        context_tokens = _speco_context_from_batch(batch)
         generate_sequences = _speco_parent_method(self, "generate_sequences")
         if not callable(generate_sequences):
             raise AttributeError(
@@ -221,7 +224,9 @@ async def _speco_worker_generate_sequences(self, batch):
         result = _ensure_extra_field_defaults(result)
         return result
     finally:
-        _speco_reset_context(*context_tokens)
+        if context_tokens is not None:
+            _speco_reset_context(*context_tokens)
+        _speco_worker_request_finished(self)
 
 
 async def _speco_worker_run_agent_loop(
@@ -256,6 +261,81 @@ async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs)
     if inspect.isawaitable(result):
         result = await result
     return _speco_default_agent_loop_extra_fields(result)
+
+
+async def _speco_worker_drain(self) -> None:
+    """Wait until all generation calls submitted before this barrier finish.
+
+    Agent-loop workers are async Ray actors: a later RPC can run while an
+    earlier ``generate_sequences`` call is suspended at an ``await``.  A no-op
+    RPC is therefore not a completion barrier.  The wrapper records live
+    generation calls and waits for their shared idle event instead.
+    """
+    event = _speco_worker_idle_event(self)
+    await event.wait()
+    # Native V1 TQ returns after spawning prompt tasks, before they finish.
+    # Draining only generate_sequences RPCs is not a completion barrier there.
+    while True:
+        tasks = list(getattr(self, "background_tasks", ()) or ())
+        if not tasks:
+            return
+        await asyncio.gather(*tasks)
+        await asyncio.sleep(0)  # Allow task-discard callbacks to settle.
+
+
+async def _speco_worker_cancel_pending(self):
+    tasks = list(getattr(self, "background_tasks", ()) or ())
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def install_v1_agent_loop_worker_bridge(manager_cls):
+    """Keep the native TQ manager, installing serializable worker RPCs only."""
+    if manager_cls.__module__ != "verl.trainer.ppo.v1.agent_loop_tq":
+        return False
+    import ray
+    from verl.trainer.ppo.v1 import agent_loop_tq
+
+    if manager_cls is not agent_loop_tq.AgentLoopManagerTQ:
+        return False  # Never replace a caller's custom worker/manager policy.
+    actor_cls = agent_loop_tq.AgentLoopWorkerTQ
+    raw_cls = getattr(actor_cls, "__ray_actor_class__", None)
+    if raw_cls is None:
+        raise RuntimeError("Native V1 TQ worker has no inspectable Ray actor class")
+    if raw_cls.__dict__.get("_speco_explicit_worker_runtime", False):
+        return True
+    agent_loop_tq.AgentLoopWorkerTQ = ray.remote(
+        _build_speco_agent_loop_worker_class(raw_cls)
+    )
+    return True
+
+
+def _speco_worker_idle_event(worker: Any) -> asyncio.Event:
+    event = getattr(worker, "_speco_agent_loop_idle_event", None)
+    if event is None:
+        event = asyncio.Event()
+        event.set()
+        worker._speco_agent_loop_idle_event = event
+        worker._speco_agent_loop_inflight = 0
+    return event
+
+
+def _speco_worker_request_started(worker: Any) -> None:
+    event = _speco_worker_idle_event(worker)
+    worker._speco_agent_loop_inflight = (
+        int(getattr(worker, "_speco_agent_loop_inflight", 0)) + 1
+    )
+    event.clear()
+
+
+def _speco_worker_request_finished(worker: Any) -> None:
+    event = _speco_worker_idle_event(worker)
+    remaining = max(int(getattr(worker, "_speco_agent_loop_inflight", 0)) - 1, 0)
+    worker._speco_agent_loop_inflight = remaining
+    if remaining == 0:
+        event.set()
 
 
 def _speco_worker_postprocess(
@@ -318,7 +398,7 @@ except Exception:  # noqa: BLE001
 
 
 def _build_speco_agent_loop_worker_class(worker_cls):
-    speco_worker_cls = getattr(worker_cls, "_speco_remote_worker_cls", None)
+    speco_worker_cls = worker_cls.__dict__.get("_speco_remote_worker_cls")
     if speco_worker_cls is not None and getattr(
         speco_worker_cls, "_speco_explicit_worker_runtime", False
     ):
@@ -333,6 +413,8 @@ def _build_speco_agent_loop_worker_class(worker_cls):
         "__module__": __name__,
         "__doc__": "Ray-serializable AgentLoopWorker subclass carrying SPECO runtime patches.",
         "__init__": _speco_worker_init,
+        "speco_drain": _speco_worker_drain,
+        "speco_cancel_pending": _speco_worker_cancel_pending,
         "_speco_explicit_worker_runtime": True,
     }
     if callable(generate_sequences):
@@ -464,23 +546,43 @@ def install_agent_loop_runtime_patch() -> bool:
             result = llm_server_generate(self, *args, **kwargs)
             if inspect.isawaitable(result):
                 result = await result
+            from verl_speco.integration.partial_rollout_stats import (
+                record_serving_segment,
+            )
+
+            record_serving_segment(result)
             return result
 
         llm_server_client_cls.generate = speco_llm_server_generate
         llm_server_client_cls._speco_patched_generate = True
 
+    try:
+        from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
+        from verl_speco.integration.partial_rollout_stats import (
+            patch_partial_rollout_client,
+        )
+
+        patch_partial_rollout_client(FullyAsyncLLMServerClient)
+    except ImportError:
+        # Older verl versions have no native partial-rollout client.
+        pass
+
     if not getattr(worker_cls, "_speco_patched_generate_sequences", False):
 
         @wraps(generate_sequences)
         async def speco_generate_sequences(self, batch):
-            context_tokens = _speco_context_from_batch(batch)
+            _speco_worker_request_started(self)
+            context_tokens = None
             try:
+                context_tokens = _speco_context_from_batch(batch)
                 result = generate_sequences(self, batch)
                 if inspect.isawaitable(result):
                     result = await result
                 return _ensure_extra_field_defaults(result)
             finally:
-                _speco_reset_context(*context_tokens)
+                if context_tokens is not None:
+                    _speco_reset_context(*context_tokens)
+                _speco_worker_request_finished(self)
 
         worker_cls.generate_sequences = speco_generate_sequences
         worker_cls._speco_patched_generate_sequences = True
@@ -550,6 +652,10 @@ def install_agent_loop_runtime_patch() -> bool:
 
         worker_cls._postprocess = speco_postprocess
         worker_cls._speco_patched_postprocess = True
+
+    if not getattr(worker_cls, "_speco_patched_drain", False):
+        worker_cls.speco_drain = _speco_worker_drain
+        worker_cls._speco_patched_drain = True
 
     if not getattr(manager_cls, "_speco_patched_init", False):
 

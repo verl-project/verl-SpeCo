@@ -171,7 +171,5 @@ def test_speco_connector_restores_rank0_finished_count() -> None:
         SpecoMooncakeHiddenStatesConnector,
     )
 
-    assert issubclass(
-        SpecoMooncakeHiddenStatesConnector, MooncakeHiddenStatesConnector
-    )
+    assert issubclass(SpecoMooncakeHiddenStatesConnector, MooncakeHiddenStatesConnector)
     assert SpecoMooncakeHiddenStatesConnector.get_finished_count(None) == 1

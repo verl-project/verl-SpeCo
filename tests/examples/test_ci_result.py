@@ -242,7 +242,9 @@ def test_worker_retains_error_when_second_batch_succeeds():
         validate_result(evidence.data, training=True)
 
 
-def test_fit_writes_evidence_after_normal_exit(tmp_path, monkeypatch):
+@pytest.mark.parametrize("v1", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+def test_fit_writes_evidence_after_exit(tmp_path, monkeypatch, v1, failed):
     path = tmp_path / "result.json"
     monkeypatch.setenv("SPECO_CI_RESULT_PATH", str(path))
     trainer = SimpleNamespace(
@@ -260,18 +262,40 @@ def test_fit_writes_evidence_after_normal_exit(tmp_path, monkeypatch):
                 "drafter/published": 1,
             }
         )
+        if failed:
+            raise RuntimeError("fit failed")
         return "finished"
 
-    trainer._speco_fit_impl = run
+    trainer._speco_fit_impl = lambda *args: run()
+    source = "verl_speco/trainer/speco_ray_trainer.py"
+    cls = "SpecoRayPPOTrainer"
+    args = ()
+    if v1:
+        from verl_speco.trainer.v1.speco_mixin import SpecoV1Mixin
+
+        trainer._speco_online_enabled_from_config = lambda config: True
+        trainer._speco_init_ci_result = lambda: SpecoV1Mixin._speco_init_ci_result(
+            trainer
+        )
+        source = "verl_speco/trainer/v1/speco_mixin.py"
+        cls = "SpecoV1Mixin"
+        args = (object(),)
     fit = _method(
-        "verl_speco/trainer/speco_ray_trainer.py",
-        "SpecoRayPPOTrainer",
+        source,
+        cls,
         "fit",
         {"os": os},
     )
-    assert fit(trainer) == "finished"
+    if failed:
+        with pytest.raises(RuntimeError, match="fit failed"):
+            fit(trainer, *args)
+    else:
+        assert fit(trainer, *args) == "finished"
     data = json.loads(path.read_text())
-    assert data["completed"] is True
+    assert data["completed"] is (not failed)
+    assert data["optimizer_steps"] == data["publications"] == 1
+    if failed:
+        assert data["errors"][-1] == {"type": "RuntimeError", "message": "fit failed"}
     with pytest.raises(ValueError, match="suppressed"):
         validate_result(data, training=True)
 

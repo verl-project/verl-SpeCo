@@ -214,7 +214,7 @@ def test_clamped_global_cosine_rejects_invalid_config(kwargs, message) -> None:
     [
         ({"decay_steps": 0}, "lr_decay_steps"),
         ({"decay_steps": 10, "warmup_steps": 10}, "lr_warmup_steps"),
-        ({"min_lr_ratio": -0.1}, "min_lr_ratio"),
+        ({"decay_steps": 10, "min_lr_ratio": -0.1}, "min_lr_ratio"),
     ],
 )
 def test_linear_warmup_decay_rejects_invalid_config(kwargs, message) -> None:
