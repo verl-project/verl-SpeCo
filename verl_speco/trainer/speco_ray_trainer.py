@@ -8933,7 +8933,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     deferred=False,
                 ):
                     metrics.update(
-                        self._speco_publish_drafter_weights(drafter_trained, training_plan)
+                        self._speco_publish_drafter_weights(
+                            drafter_trained, training_plan
+                        )
                     )
             if final_quota_step:
                 metrics.update(

@@ -2508,6 +2508,7 @@ class SpecoWorker(Worker):
             and time.time() + estimate < float(deadline)
         )
         return self._bubble_group_control_value(int(not allowed)) == 0
+
     def _speco_rl_insight_labels(self) -> dict:
         """Stable per-worker label set for RL-Insight metric and trace events.
 
@@ -2890,7 +2891,8 @@ class SpecoWorker(Worker):
                                 prepared_activation_elapsed_sec,
                                 prepared_preflight_elapsed_sec,
                                 float(
-                                    result.get("preflight_to_first_batch_sec", 0.0) or 0.0
+                                    result.get("preflight_to_first_batch_sec", 0.0)
+                                    or 0.0
                                 ),
                             )
                         result["attempted_steps"] += 1
@@ -2931,7 +2933,10 @@ class SpecoWorker(Worker):
                             else None
                         )
                         compile_before = None
-                        if first_step_timings is not None and execution_strategy == "sync":
+                        if (
+                            first_step_timings is not None
+                            and execution_strategy == "sync"
+                        ):
                             from verl_speco.trainer.performance_diagnostics import (
                                 compilation_metadata,
                             )
@@ -2942,8 +2947,12 @@ class SpecoWorker(Worker):
                             if execution_strategy == "sync":
                                 step_ok = await self.trainer.training_step(
                                     self.last_global_step,
-                                    min_sample_step=training_plan.get("min_sample_step"),
-                                    max_sample_step=training_plan.get("max_sample_step"),
+                                    min_sample_step=training_plan.get(
+                                        "min_sample_step"
+                                    ),
+                                    max_sample_step=training_plan.get(
+                                        "max_sample_step"
+                                    ),
                                 )
                             else:
                                 step_ok = await self.trainer.training_accumulation_step(
@@ -2951,7 +2960,9 @@ class SpecoWorker(Worker):
                                     gradient_accumulation_steps,
                                     # Bubble optimizer steps stop as a whole group.
                                     can_start_micro_batch=(
-                                        None if coordinated_idle else can_start_micro_batch
+                                        None
+                                        if coordinated_idle
+                                        else can_start_micro_batch
                                     ),
                                 )
                         except Exception as error:  # noqa: BLE001
@@ -3007,7 +3018,9 @@ class SpecoWorker(Worker):
                                 },
                                 delta,
                             )
-                        training_error = getattr(self.trainer, "last_training_error", None)
+                        training_error = getattr(
+                            self.trainer, "last_training_error", None
+                        )
                         if training_error is not None:
                             result["errors"].append(dict(training_error))
                         elif step_error is not None:
@@ -3034,14 +3047,18 @@ class SpecoWorker(Worker):
                             )
                         else:
                             result["reason"] = (
-                                accumulation_stop_reason or "training_step_returned_false"
+                                accumulation_stop_reason
+                                or "training_step_returned_false"
                             )
                             result["stop_reason"] = result["reason"]
                             if (
                                 execution_strategy == "rollout_idle_worker"
                                 and self._use_replica_local_idle_training()
                                 and (
-                                    (step_error is not None and _is_oom_error(step_error))
+                                    (
+                                        step_error is not None
+                                        and _is_oom_error(step_error)
+                                    )
                                     or (
                                         training_error is not None
                                         and _is_oom_error(training_error)
