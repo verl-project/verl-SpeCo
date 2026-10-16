@@ -9,13 +9,17 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Protocol
 
 from verl_speco.trainer.scheduler.schedule_types import (
     DrafterScheduleConfig,
     DrafterScheduleContext,
     TrainingBudget,
+    _as_int,
 )
+
+from .adaptive_schedule import AdaptiveScheduleController
 
 
 class TrainingBudgetPolicy(Protocol):
@@ -48,4 +52,25 @@ class SyncTrainingBudgetPolicy:
             require_full_batch=config.require_full_batch,
             sample_last_n_steps=config.sample_last_n_steps,
             reason="sync_budget_ready" if max_batches > 0 else "no_training_budget",
+        )
+
+
+class AdaptiveTrainingBudgetPolicy:
+    """A replaceable session cap; never overrides trigger or freeze decisions."""
+
+    def __init__(self, controller: AdaptiveScheduleController) -> None:
+        self.controller = controller
+
+    def make_budget(
+        self, context: DrafterScheduleContext, config: DrafterScheduleConfig
+    ) -> TrainingBudget:
+        budget = SyncTrainingBudgetPolicy().make_budget(context, config)
+        # Preserve the explicit legacy training.step=0 disable switch.
+        if not config.adaptive_schedule.enable or budget.max_batches <= 0:
+            return budget
+        steps = self.controller.training_steps(_as_int(context.global_step))
+        return replace(
+            budget,
+            max_batches=steps,
+            reason="adaptive_budget_ready" if steps > 0 else "no_training_budget",
         )
