@@ -20,6 +20,8 @@ only imported when a drafter is enabled, keeping the no-drafter reward
 distribution aligned with verl.
 """
 
+import os
+
 import hydra
 
 
@@ -91,6 +93,61 @@ def _strip_speco_overlay_for_native_run(config) -> None:
             del config["speco"]
 
 
+def _forward_rl_insight_worker_env(config) -> None:
+    """Forward RL-Insight metadata to Ray workers via the job runtime env.
+
+    Ray worker processes (``SpecoWorker``) never build
+    ``Tracking``/``RLInsightLogger``, and rl-insight keeps its
+    ``project``/``experiment_name`` labels per process, so workers would
+    otherwise emit worker metrics/traces without those labels (and, on
+    multi-node clusters, without ``RL_INSIGHT_SERVER_URL`` at all). The trainer
+    process learns the names from ``trainer.project_name`` /
+    ``trainer.experiment_name`` and the server URL from the environment; this
+    pushes all three into the Ray runtime env that upstream ``run_ppo`` merges
+    before ``ray.init``. Existing environment values are never overridden.
+    """
+
+    trainer_logger = _config_get(config, "trainer", "logger", default=[])
+    loggers = (
+        [trainer_logger] if isinstance(trainer_logger, str) else (trainer_logger or [])
+    )
+    if "rl_insight" not in loggers:
+        return
+
+    env_vars = {}
+    project = _config_get(config, "trainer", "project_name")
+    experiment = _config_get(config, "trainer", "experiment_name")
+    if project:
+        env_vars["VERL_RL_INSIGHT_PROJECT_NAME"] = str(project)
+    if experiment:
+        env_vars["VERL_RL_INSIGHT_EXPERIMENT_NAME"] = str(experiment)
+    server_url = os.environ.get("RL_INSIGHT_SERVER_URL")
+    if server_url:
+        env_vars["RL_INSIGHT_SERVER_URL"] = server_url
+    if not env_vars:
+        return
+
+    for key, value in env_vars.items():
+        os.environ.setdefault(key, value)
+
+    try:
+        from omegaconf import open_dict
+
+        with open_dict(config):
+            node = config
+            for key in ("ray_kwargs", "ray_init", "runtime_env", "env_vars"):
+                if key not in node or node[key] is None:
+                    node[key] = {}
+                node = node[key]
+            for key, value in env_vars.items():
+                if key not in node:
+                    node[key] = value
+    except Exception:
+        # The config may be a read-only/plain namespace; the exported env vars
+        # still cover single-node runs where Ray workers inherit the driver env.
+        pass
+
+
 def run(config) -> None:
     """Resolve SPECO/verl compatibility, device and the task-runner dispatch."""
 
@@ -119,6 +176,7 @@ def run(config) -> None:
 
     from verl_speco.integration.task_runner import SpecoTaskRunner
 
+    _forward_rl_insight_worker_env(config)
     main_ppo.run_ppo(config, task_runner_class=ray.remote(num_cpus=1)(SpecoTaskRunner))
 
 
