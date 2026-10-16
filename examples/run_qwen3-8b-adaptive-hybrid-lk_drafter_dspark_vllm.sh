@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -x
 
-# Run from the repository root; see examples/loss_experiments.md for setup and baseline overrides.
+# Run from the repository root.
 # Set CUDA_VISIBLE_DEVICES externally to select GPUs. Extra arguments override Hydra settings.
 
 # Qwen3-8B DSpark with adaptive hybrid LK (CE=0.5, L1=0.25, LK=0.5, eta=3).

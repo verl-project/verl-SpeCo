@@ -314,10 +314,6 @@ and checkpoint paths:
 bash examples/run_qwen3-8b_drafter_eagle3_vllm.sh
 ```
 
-For the EAGLE3 + LK, DSpark + adaptive hybrid LK, and DFlash + D-PACE
-experiment configurations and their fixed-drafter baselines, see the
-[loss experiment examples](examples/loss_experiments.md).
-
 For NPU with vLLM-Ascend-style graph settings:
 
 ```bash
