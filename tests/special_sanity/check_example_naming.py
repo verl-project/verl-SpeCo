@@ -23,6 +23,12 @@ The standalone/offline draft-training entry point uses:
 
     run_<model>_[actor_<actor-backend>_]drafter_[<drafter-backend>...]_separate_training.sh
 
+The SFT co-train entry point collects hidden states from the SFT forward pass
+(old-logprob) rather than a vllm/sglang rollout, so no rollout backend is
+listed:
+
+    run_<model>_[actor_<actor-backend>_]drafter_<drafter-backend>_sft.sh
+
 Actor and drafter backend identifiers are intentionally not enumerated here.
 This check validates filename structure without duplicating the backend
 registries owned by the implementations.
@@ -37,6 +43,7 @@ from pathlib import Path
 ROLLOUT_BACKENDS = ("vllm", "sglang")
 OPTIONAL_SUFFIXES = ("npu",)
 STANDALONE_SUFFIX = ("separate", "training")
+SFT_SUFFIX = "sft"
 
 DEFAULT_IGNORE_DIRS: tuple[str, ...] = ()
 DEFAULT_IGNORE_FILES: tuple[str, ...] = ()
@@ -70,7 +77,9 @@ def _format_expected() -> str:
         f"rollout-backend in {list(ROLLOUT_BACKENDS)}, or "
         "run_<model>_[actor_<actor-backend>_]drafter_"
         "[<drafter-backend>...]_separate_training.sh with "
-        "zero or more non-empty drafter backend identifiers"
+        "zero or more non-empty drafter backend identifiers, or "
+        "run_<model>_[actor_<actor-backend>_]drafter_"
+        "<drafter-backend>_sft.sh for SFT co-train (no rollout backend)"
     )
 
 
@@ -109,6 +118,17 @@ def check_filename(path: Path, display: str | None = None) -> list[str]:
                 errors.append(
                     f"{shown}: expected non-empty drafter backend identifiers"
                 )
+        return errors
+
+    # SFT co-train mode: hidden states are collected from the SFT forward
+    # pass (old-logprob), so there is no vllm/sglang rollout backend.
+    # Pattern: run_<model>_[actor_<actor-backend>_]drafter_<drafter-backend>_sft.sh
+    if len(spec_tokens) == 2 and spec_tokens[1] == SFT_SUFFIX:
+        drafter_backend = spec_tokens[0]
+        if not drafter_backend:
+            errors.append(
+                f"{shown}: expected a non-empty drafter backend before '_sft'"
+            )
         return errors
 
     if len(spec_tokens) not in (2, 3):

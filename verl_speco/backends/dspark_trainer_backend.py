@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import os
 from copy import deepcopy
-from typing import Any, Optional, cast
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -26,10 +26,10 @@ from verl_speco.backends.dflash_trainer_backend import (
     DFlashTrainingModel,
     _block_acceptance_counts,
     _check_block_drafter_rows,
+    _document_boundary_validity,
     _resolve_sliding_windows,
     _sliding_window_config,
     build_dflash_attention_masks,
-    _document_boundary_validity,
 )
 from verl_speco.models.dflash import resolve_rope_theta
 from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
@@ -39,7 +39,6 @@ from verl_speco.ops.dspark_fused_loss import (
     fused_total_variation,
 )
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
-
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -115,20 +114,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
             raise ValueError(
                 "distribution_loss_impl must be one of: auto, fused, eager"
             )
-        self.ce_target_source = str(
-            ce_target_source or _CE_TARGET_SOURCE_LABELS
-        ).lower()
-        if self.ce_target_source not in _CE_TARGET_SOURCES:
-            raise ValueError(
-                "ce_target_source must be one of: "
-                f"{', '.join(sorted(_CE_TARGET_SOURCES))}"
-            )
-        self.confidence_target_mode = str(confidence_target_mode or "greedy").lower()
-        if self.confidence_target_mode not in {"greedy", "probabilistic"}:
-            raise ValueError(
-                "dspark_confidence_target_mode must be one of: greedy, probabilistic"
-            )
-        self._logged_distribution_loss_backend: Optional[str] = None
+        self._logged_distribution_loss_backend: str | None = None
         self._distribution_loss_by_device: dict[str, bool] = {}
         confidence_head = getattr(self.draft_model, "confidence_head", None)
         self.confidence_loss_enabled = self.confidence_head_alpha > 0
@@ -182,7 +168,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         seq_len: int,
         loss_mask: torch.Tensor,
         device: torch.device,
-        document_ids: Optional[torch.Tensor] = None,
+        document_ids: torch.Tensor | None = None,
     ):
         bsz = loss_mask.shape[0]
         num_candidates = max(seq_len - 1, 0)
@@ -287,8 +273,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
         *,
         active_hidden: torch.Tensor,
         active_prev_tokens: torch.Tensor,
-        restricted_vocab: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
+        restricted_vocab: torch.Tensor | None,
+    ) -> torch.Tensor | None:
         markov_head = getattr(self.draft_model, "markov_head", None)
         if markov_head is None:
             return None
@@ -316,10 +302,10 @@ class DSparkTrainingModel(DFlashTrainingModel):
     def _gather_aligned_target_hidden(
         self,
         *,
-        target_last_hidden_states: Optional[torch.Tensor],
+        target_last_hidden_states: torch.Tensor | None,
         label_indices: torch.Tensor,
         block_keep_mask: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         if target_last_hidden_states is None:
             return None
         if target_last_hidden_states.dim() != 3:
@@ -371,10 +357,10 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_target_hidden: torch.Tensor,
         active_weights: torch.Tensor,
         lm_head_weight: torch.Tensor,
-        use_fused: bool = False,
-        active_draft_logits: Optional[torch.Tensor] = None,
-        active_draft_log_probs: Optional[torch.Tensor] = None,
-        active_target_logits: Optional[torch.Tensor] = None,
+        use_fused: bool,
+        active_draft_logits: torch.Tensor | None = None,
+        active_draft_log_probs: torch.Tensor | None = None,
+        active_target_logits: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -383,23 +369,6 @@ class DSparkTrainingModel(DFlashTrainingModel):
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Compute the DSpark distribution losses for the active (valid) rows.
-
-        Returns ``(l1_sum, l1_den, confidence_sum, confidence_den,
-        acceptance_sum, confidence_pred_sum)``.
-
-        The confidence head learns the analytical rejection-sampling acceptance
-        rate ``alpha = sum_v min(p_v, q_v) = 1 - d_TV`` between the target
-        (verifier) and draft distributions, mirroring ``speculators``. The
-        acceptance target is built from the frozen full-vocab distributions and
-        is detached; the confidence term itself flows into the head and, through
-        the shared draft hidden/Markov features, the draft backbone. Both losses
-        share the same per-chunk draft/target distributions, so the draft
-        full-vocab forward is not repeated when both are enabled.
-
-        ``active_target_logits`` may carry the verifier logits already computed
-        for target-argmax CE, avoiding a second target LM-head projection.
-        """
         if active_hidden.numel() == 0:
             zero = active_weights.new_zeros(())
             return zero, zero, zero, zero, zero, zero
@@ -438,7 +407,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
             weights_chunk = active_weights[start:end].float()
 
             draft_logits: torch.Tensor | None = None
-            draft_probs: torch.Tensor | None
+            draft_probs: torch.Tensor | None = None
             target_probs: torch.Tensor | None = None
             if not use_fused and active_draft_log_probs is not None:
                 draft_probs = active_draft_log_probs[start:end].exp()
@@ -454,9 +423,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 )
                 if markov_bias is not None:
                     draft_logits = draft_logits + markov_bias
-                draft_probs = (
-                    None if use_fused else torch.softmax(draft_logits.float(), dim=-1)
-                )
+                draft_probs = torch.softmax(draft_logits.float(), dim=-1)
 
             with torch.no_grad():
                 target_logits = (
@@ -475,8 +442,6 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 if l1_enabled:
                     tv = fused_total_variation(draft_logits, target_logits)
                 else:
-                    # Confidence-only: the varying part is discarded, so skip
-                    # building an autograd graph for the fused TV.
                     with torch.no_grad():
                         tv = fused_total_variation(draft_logits, target_logits)
                 l1_dist = 2.0 * tv
@@ -492,8 +457,6 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 if l1_enabled:
                     l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
                 else:
-                    # Confidence-only: the varying part is discarded, so skip
-                    # building an autograd graph for the eager L1 distance.
                     with torch.no_grad():
                         l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
                 probabilistic_target = (1.0 - 0.5 * l1_dist).clamp(0.0, 1.0)
@@ -502,15 +465,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 l1_sum = l1_sum + (l1_dist * weights_chunk).sum()
 
             if confidence_enabled:
-                # The head must predict the acceptance the *served* proposal
-                # mode yields. 'probabilistic' drafting samples the draft
-                # softmax, so acceptance = sum_v min(p_draft, p_target) = 1-TV.
-                # 'greedy' drafting (the serving default) proposes
-                # argmax(p_draft) and the rejection sampler treats the draft as
-                # one-hot, so acceptance collapses to p_target[argmax(p_draft)].
                 if self.confidence_target_mode == "greedy":
-                    # argmax is invariant to the softmax, so reuse draft_probs
-                    # when present (eager) and fall back to the logits (fused).
                     draft_source = (
                         draft_probs if draft_probs is not None else draft_logits
                     )
@@ -553,9 +508,6 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     ).sum()
                 )
                 conf_den = conf_den + confidence_weights.sum()
-                # Weight the acceptance and prediction diagnostics by the same
-                # finite-token mask as the loss so ``accept_sum / conf_den`` and
-                # ``pred_sum / conf_den`` stay valid weighted means.
                 accept_sum = accept_sum + (acceptance_target * confidence_weights).sum()
                 pred_sum = (
                     pred_sum
@@ -586,7 +538,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         target_ids: torch.Tensor,
         prev_token_ids: torch.Tensor,
         eval_mask: torch.Tensor,
-        active_logits: Optional[torch.Tensor],
+        active_logits: torch.Tensor | None,
         loss: torch.Tensor,
     ) -> None:
         if not self._should_debug_log():
@@ -631,10 +583,10 @@ class DSparkTrainingModel(DFlashTrainingModel):
         hidden_states_list: list[torch.Tensor],
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
-        document_ids: Optional[torch.Tensor] = None,
-        label_ids: Optional[torch.Tensor] = None,
-        label_mask: Optional[torch.Tensor] = None,
-        target_last_hidden_states: Optional[torch.Tensor] = None,
+        document_ids: torch.Tensor | None = None,
+        label_ids: torch.Tensor | None = None,
+        label_mask: torch.Tensor | None = None,
+        target_last_hidden_states: torch.Tensor | None = None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -1321,12 +1273,12 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_hidden_layers=num_hidden_layers,
-            num_attention_heads=int(getattr(target_text_config, "num_attention_heads")),
+            num_attention_heads=int(target_text_config.num_attention_heads),
             num_key_value_heads=int(
                 getattr(
                     target_text_config,
                     "num_key_value_heads",
-                    getattr(target_text_config, "num_attention_heads"),
+                    target_text_config.num_attention_heads,
                 )
             ),
             head_dim=int(target_head_dim) if target_head_dim is not None else None,
@@ -1530,6 +1482,11 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 item_loss_mask[:] = 1.0
 
+            # Hidden states may be one row shorter than input_ids when a
+            # trailing label token is present (SFT collects hidden states for
+            # positions whose NEXT token is a response token). The hidden_end
+            # logic below truncates only the hidden context, keeping ids/mask
+            # at their full length to preserve the trailing label token.
             _check_block_drafter_rows(
                 int(ids.size(0)),
                 int(full_h.size(0)),
