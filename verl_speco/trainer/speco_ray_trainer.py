@@ -103,6 +103,7 @@ from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
     configure_vllm_runtime_from_config,
 )
+from verl_speco.rl_insight_bridge import trace_state as _rl_insight_trace_state
 from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
 from verl_speco.trainer.hard_sample_selection import partition_hard_candidates
 from verl_speco.trainer.scheduler import (
@@ -177,6 +178,9 @@ _DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
 # tensor cache; it prevents stale readiness markers from authorizing a version
 # that the worker has already evicted.
 _SPECO_TARGET_LM_HEAD_READY_VERSION_LIMIT = 2
+# RL-Insight trace lane for the drafter co-training phases owned by the trainer
+# process. Worker-side phases use per-rank lanes inside SpecoWorker.
+_SPECO_RL_INSIGHT_TRAINER_LANE = "speco_trainer"
 
 _DRAFTER_CHECKPOINT_PATH_PLACEHOLDERS = {
     None,
@@ -8441,7 +8445,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     and not skip_collection_for_quota
                 )
                 if collection_allowed:
-                    collected = self._speco_collect_generation_samples(gen_batch_output)
+                    with _rl_insight_trace_state(
+                        "drafter/collect",
+                        state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                        global_step=self.global_steps,
+                    ):
+                        collected = self._speco_collect_generation_samples(
+                            gen_batch_output
+                        )
                     if collected:
                         meta_info = getattr(gen_batch_output, "meta_info", None)
                         if isinstance(meta_info, dict):
@@ -8740,10 +8751,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 and not self._pending_drafter_publish_refs
                 and self._pending_target_lm_head_sync is None
             )
-            before_actor_event = self._speco_on_before_actor_update(
-                allow_quota_topup=quota_topup_safe,
-                **({"force_quota_completion": True} if final_quota_step else {}),
-            )
+            with _rl_insight_trace_state(
+                "drafter/prepare",
+                state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                global_step=self.global_steps,
+            ):
+                before_actor_event = self._speco_on_before_actor_update(
+                    allow_quota_topup=quota_topup_safe,
+                    **({"force_quota_completion": True} if final_quota_step else {}),
+                )
             training_plan = before_actor_event.training_plan
             if training_plan is None:
                 raise RuntimeError(
@@ -8856,9 +8872,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     training_plan, launch=False, reason="drafter_convergence_frozen"
                 )
             if training_plan.launch:
-                drafter_trained, train_metrics = self._speco_train_drafter(
-                    training_plan
-                )
+                with _rl_insight_trace_state(
+                    "drafter/train",
+                    state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                    global_step=self.global_steps,
+                    strategy=str(
+                        getattr(
+                            training_plan.execution_strategy,
+                            "value",
+                            training_plan.execution_strategy,
+                        )
+                    ),
+                    max_batches=int(training_plan.max_batches),
+                ):
+                    drafter_trained, train_metrics = self._speco_train_drafter(
+                        training_plan
+                    )
             else:
                 drafter_trained, train_metrics = (
                     False,
@@ -8896,9 +8925,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     actor_output=actor_output,
                 )
             else:
-                metrics.update(
-                    self._speco_publish_drafter_weights(drafter_trained, training_plan)
-                )
+                with _rl_insight_trace_state(
+                    "drafter/publish",
+                    state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                    global_step=self.global_steps,
+                    trained=int(bool(drafter_trained)),
+                    deferred=False,
+                ):
+                    metrics.update(
+                        self._speco_publish_drafter_weights(drafter_trained, training_plan)
+                    )
             if final_quota_step:
                 metrics.update(
                     self._speco_finalize_quota_publication(
@@ -9110,11 +9146,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                             "[drafter freeze] probe before-arm failed; "
                             "publishing without paired probe (fail-open)"
                         )
-                publish_metrics = self._speco_publish_drafter_weights(
-                    pending_drafter_publish["drafter_trained"],
-                    pending_drafter_publish["training_plan"],
-                    after_weight_update=True,
-                )
+                with _rl_insight_trace_state(
+                    "drafter/publish",
+                    state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                    global_step=self.global_steps,
+                    trained=int(bool(pending_drafter_publish["drafter_trained"])),
+                    deferred=True,
+                ):
+                    publish_metrics = self._speco_publish_drafter_weights(
+                        pending_drafter_publish["drafter_trained"],
+                        pending_drafter_publish["training_plan"],
+                        after_weight_update=True,
+                    )
                 probe = None
                 if run_probe and before_arm is not None:
                     try:
