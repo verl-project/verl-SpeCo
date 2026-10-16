@@ -216,12 +216,18 @@ def test_worker_retains_error_when_second_batch_succeeds():
         _prepared_training_target_version=1,
         last_global_step=1,
         device_name="cpu",
+        _speco_rl_insight_labels=lambda: {},
+        _speco_emit_rl_insight_worker_metrics=lambda *args, **kwargs: None,
     )
     method = _method(
         "verl_speco/workers/speco_worker.py",
         "SpecoWorker",
         "train_drafter",
-        {"time": time, "_preserve_process_rng_state": lambda device: nullcontext()},
+        {
+            "time": time,
+            "_preserve_process_rng_state": lambda device: nullcontext(),
+            "_rl_insight_trace_state": lambda *args, **kwargs: nullcontext(),
+        },
     )
     plan = {
         "plan_id": "plan",
