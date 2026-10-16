@@ -15,6 +15,7 @@
 
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,13 +23,17 @@ import verl_speco.rl_insight_bridge as bridge
 
 
 class _FakeRLInsight:
-    def __init__(self) -> None:
+    def __init__(self, enabled: bool = True) -> None:
         self.init_calls = 0
+        self.init_kwargs = []
         self.events = []
         self.trace_calls = []
+        self.exits = []
+        self._STATE = SimpleNamespace(enabled=enabled)
 
     def init(self, *args, **kwargs) -> None:
         self.init_calls += 1
+        self.init_kwargs.append(kwargs)
 
     def metric_gauge(self, name, value, **labels) -> None:
         self.events.append(("gauge", name, value, labels))
@@ -41,8 +46,9 @@ class _FakeRLInsight:
                 outer.trace_calls.append(("enter", state_name, state_lane_id, labels))
                 return self_inner
 
-            def __exit__(self_inner, *exc_info):
+            def __exit__(self_inner, exc_type, exc, tb):
                 outer.trace_calls.append(("exit", state_name))
+                outer.exits.append(exc_type)
                 return False
 
         return _Ctx()
@@ -67,6 +73,42 @@ def test_sanitize_metric_name():
         bridge._sanitize_metric_name("drafter/spec_decode/mean-acceptance-length")
         == "drafter_spec_decode_mean_acceptance_length"
     )
+
+
+def test_sanitize_metric_name_folds_other_invalid_chars():
+    assert bridge._sanitize_metric_name("a.b c:d") == "a_b_c_d"
+    assert bridge._sanitize_metric_name("1leading") == "_1leading"
+    assert bridge._sanitize_metric_name("") == "_"
+
+
+def test_init_forwards_project_and_experiment_from_env(monkeypatch):
+    fake = _enable(monkeypatch, _FakeRLInsight())
+    monkeypatch.setenv(bridge.PROJECT_ENV, "my-project")
+    monkeypatch.setenv(bridge.EXPERIMENT_ENV, "my-experiment")
+
+    bridge.log_scalar_metrics("p_", {"a/b": 1.0})
+
+    assert fake.init_kwargs == [
+        {"project": "my-project", "experiment_name": "my-experiment"}
+    ]
+
+
+def test_init_without_server_url_marks_unavailable(monkeypatch):
+    fake = _enable(monkeypatch, _FakeRLInsight(enabled=False))
+
+    bridge.log_scalar_metrics("p_", {"a": 1.0})
+
+    assert fake.init_calls == 1
+    assert fake.events == []
+    assert bridge._init_state == "unavailable"
+
+
+def test_log_scalar_metrics_sanitizes_prefix(monkeypatch):
+    fake = _enable(monkeypatch, _FakeRLInsight())
+
+    bridge.log_scalar_metrics("bad prefix/", {"eagle3/loss": 0.5})
+
+    assert fake.events == [("gauge", "bad_prefix_eagle3_loss", 0.5, {})]
 
 
 def test_disabled_emits_nothing_and_does_not_init(monkeypatch):
@@ -165,6 +207,25 @@ def test_trace_state_propagates_body_exception(monkeypatch):
             raise ValueError("boom")
 
     assert fake.trace_calls[-1] == ("exit", "drafter/train")
+
+
+def test_trace_state_forwards_body_exception_to_monitor(monkeypatch):
+    fake = _enable(monkeypatch, _FakeRLInsight())
+
+    with pytest.raises(ValueError):
+        with bridge.trace_state("drafter/train", state_lane_id="lane"):
+            raise ValueError("boom")
+
+    assert fake.exits == [ValueError]
+
+
+def test_trace_state_exit_uses_none_when_body_succeeds(monkeypatch):
+    fake = _enable(monkeypatch, _FakeRLInsight())
+
+    with bridge.trace_state("drafter/train", state_lane_id="lane"):
+        pass
+
+    assert fake.exits == [None]
 
 
 def test_trace_state_setup_failure_still_runs_body(monkeypatch):

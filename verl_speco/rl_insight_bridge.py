@@ -32,6 +32,8 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
+import sys
 import warnings
 from contextlib import contextmanager
 from typing import Any, Iterator, Mapping
@@ -39,8 +41,17 @@ from typing import Any, Iterator, Mapping
 logger = logging.getLogger(__name__)
 
 ENABLE_ENV = "VERL_RL_INSIGHT_ENABLE"
+PROJECT_ENV = "VERL_RL_INSIGHT_PROJECT_NAME"
+EXPERIMENT_ENV = "VERL_RL_INSIGHT_EXPERIMENT_NAME"
 
-__all__ = ["ENABLE_ENV", "log_scalar_metrics", "trace_state", "reset_for_tests"]
+__all__ = [
+    "ENABLE_ENV",
+    "PROJECT_ENV",
+    "EXPERIMENT_ENV",
+    "log_scalar_metrics",
+    "trace_state",
+    "reset_for_tests",
+]
 
 # Process-local module cache and one-shot init state. Kept as module globals so
 # tests can reset them; values are only ever read/written from the owning
@@ -58,18 +69,37 @@ def _get_module() -> Any:
     return _module
 
 
+def _module_is_enabled() -> bool:
+    """Best-effort probe of rl-insight's process state after ``init()``.
+
+    ``rl_insight.init()`` returns silently without raising when the Ray backend
+    has no server URL, leaving the module disabled. Detecting that lets callers
+    stop paying the emit cost, but the probe falls back to ``True`` when the
+    internal state object is missing so an upstream refactor cannot accidentally
+    disable a working monitor.
+    """
+    state = getattr(_module, "_STATE", None)
+    if state is None:
+        return True
+    return bool(getattr(state, "enabled", True))
+
+
 def _ensure_ready() -> bool:
-    """Lazily initialize rl-insight once; return False when unavailable.
+    """Lazily initialize rl-insight once; return False unless it is truly active.
 
-    Safe to call from every emit helper: disabled runs, import failures, and
-    init failures all collapse to a no-op with at most one warning.
+    Safe to call from every emit helper: disabled runs, import failures, init
+    failures, and the Ray backend's silent "no server URL" bail-out all collapse
+    to a no-op.
 
-    Initialization is intentionally argument-less. In the intended flow the
-    trainer process builds ``Tracking``/``RLInsightLogger`` first, which calls
-    ``rl_insight.init(project=..., experiment_name=..., config=...)`` and creates
-    the job-scoped hub; worker-side calls then attach to that existing hub and
-    inherit its project/experiment labels. Calling ``init`` here is therefore a
-    benign duplicate in the common case.
+    Initialization forwards the resolved project/experiment names from
+    ``VERL_RL_INSIGHT_PROJECT_NAME`` / ``VERL_RL_INSIGHT_EXPERIMENT_NAME``. This
+    is what gives Ray worker processes, which never build
+    ``Tracking``/``RLInsightLogger``, the same ``project``/``experiment_name``
+    labels as the trainer: rl-insight stores labels per process at init time and
+    merges them into every event, and the shared hub does not add them. In the
+    intended flow the trainer process builds ``Tracking``/``RLInsightLogger``
+    first, so the duplicate call here is ignored by rl-insight and the labels
+    already set by that first init win.
     """
     global _init_state
     if os.getenv(ENABLE_ENV) != "1" or _init_state == "unavailable":
@@ -81,13 +111,21 @@ def _ensure_ready() -> bool:
         # process; rl-insight warns and ignores the duplicate, which is benign.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            _get_module().init()
+            _get_module().init(
+                project=os.getenv(PROJECT_ENV) or None,
+                experiment_name=os.getenv(EXPERIMENT_ENV) or None,
+            )
     except Exception:
         _init_state = "unavailable"
         logger.warning(
             "[speco][rl-insight] init failed; monitoring is disabled for this process",
             exc_info=True,
         )
+        return False
+    if not _module_is_enabled():
+        # init() bailed out (e.g. no server URL) without raising; record the
+        # degraded state so later emits short-circuit instead of re-checking.
+        _init_state = "unavailable"
         return False
     _init_state = "ready"
     return True
@@ -114,12 +152,18 @@ def _finite_float(value: Any) -> float | None:
 
 
 def _sanitize_metric_name(name: str) -> str:
-    """Convert an internal metric key into a Prometheus-legal metric name.
+    """Convert an internal metric key or prefix into a Prometheus-legal name.
 
-    Prometheus only accepts ``[a-zA-Z_:][a-zA-Z0-9_:]*``; SPECO metric keys use
-    ``/`` and sometimes ``-`` as separators, so both are folded to ``_``.
+    Prometheus only accepts ``[a-zA-Z_:][a-zA-Z0-9_:]*``. SPECO keys and prefixes
+    use ``/`` and sometimes ``-`` as separators and may carry ``.`` or spaces, so
+    every character outside ``[a-zA-Z0-9_]`` is folded to ``_`` (``:`` is folded
+    too, since recording-rule colons are reserved). A leading digit is prefixed
+    with ``_``. Both the prefix and each key are sanitized before concatenation.
     """
-    return str(name).replace("/", "_").replace("-", "_")
+    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", str(name))
+    if not sanitized or sanitized[0].isdigit():
+        sanitized = f"_{sanitized}"
+    return sanitized
 
 
 def log_scalar_metrics(
@@ -130,18 +174,19 @@ def log_scalar_metrics(
     """Emit every finite scalar in ``metrics`` as a prefixed gauge.
 
     Non-scalar and non-finite values are skipped, matching the defensiveness
-    RL-Insight's own logging path has toward tensor/NaN payloads. ``prefix`` and
-    keys are sanitized once, and rl-insight is initialized at most once per
-    process.
+    RL-Insight's own logging path has toward tensor/NaN payloads. The ``prefix``
+    and every key are sanitized before concatenation, and rl-insight is
+    initialized at most once per process.
     """
     if not isinstance(metrics, Mapping) or not _ensure_ready():
         return
     metric_gauge = _get_module().metric_gauge
+    sanitized_prefix = _sanitize_metric_name(prefix)
     for key, value in metrics.items():
         scalar = _finite_float(value)
         if scalar is None:
             continue
-        name = f"{prefix}{_sanitize_metric_name(str(key))}"
+        name = f"{sanitized_prefix}{_sanitize_metric_name(str(key))}"
         try:
             metric_gauge(name, scalar, **labels)
         except Exception:
@@ -188,8 +233,12 @@ def trace_state(
     try:
         yield
     finally:
+        # Forward the in-flight exception (if any) so monitoring can reflect the
+        # failure; a monitor error is swallowed so it never masks the training
+        # exception or replaces the body result.
+        exc_info = sys.exc_info()
         try:
-            ctx.__exit__(None, None, None)
+            ctx.__exit__(*exc_info)
         except Exception:
             logger.warning(
                 "[speco][rl-insight] trace_state(%s) exit failed",

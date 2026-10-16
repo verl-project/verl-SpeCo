@@ -491,14 +491,13 @@ python3 -m verl_speco.main \
 ```
 
 `verl` sets `VERL_RL_INSIGHT_ENABLE=1` and forwards it to all Ray workers as soon
-as `rl_insight` is in `trainer.logger`. On a multi-node cluster, also add
-`RL_INSIGHT_SERVER_URL` to the runtime-env file passed to `ray job submit` so
-workers on other nodes can reach the server:
-
-```yaml
-env_vars:
-  RL_INSIGHT_SERVER_URL: "http://<server-ip>:18080"
-```
+as `rl_insight` is in `trainer.logger`. SPECO additionally forwards
+`trainer.project_name`, `trainer.experiment_name` and the driver's
+`RL_INSIGHT_SERVER_URL` to every Ray worker through the job runtime env, so
+per-rank worker metrics and traces carry the same `project`/`experiment_name`
+labels as the trainer even on multi-node clusters. Keep `RL_INSIGHT_SERVER_URL`
+exported in the driver environment (or add it to the runtime-env file passed to
+`ray job submit`); the values are only forwarded when present.
 
 The EAGLE3 example scripts enable this automatically when
 `RL_INSIGHT_SERVER_URL` is exported; leaving it unset keeps the default logging.
@@ -535,10 +534,15 @@ Trace timelines (Grafana/Tempo) use a lane per trainer
 
 ### Dashboard
 
-RL-Insight ships a `verl-SpeCo Drafter Co-Training` dashboard under
-`dashboards/speco` in the RL-Insight Grafana folder, covering acceptance
+The metrics and traces above are everything needed to build a Grafana dashboard.
+A companion `verl-SpeCo Drafter Co-Training` dashboard is maintained with the
+RL-Insight project (not bundled in this repository); panels cover acceptance
 length, training activity, the freeze gate, collection/buffer state, the
-per-rank loss/accuracy curves, phase timing, and bubble opportunity.
+per-rank loss/accuracy curves, phase timing, and bubble opportunity. Grafana
+dashboard JSON is schema-versioned, so import the dashboard with the RL-Insight
+revision that provides it (and a Grafana version compatible with that schema).
+If your RL-Insight revision does not bundle it yet, the signals listed above are
+sufficient to assemble the same panels.
 
 ## Testing
 
