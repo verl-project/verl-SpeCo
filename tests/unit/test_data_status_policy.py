@@ -62,12 +62,16 @@ def test_status_policy_aggregates_distributed_capacity_conservatively() -> None:
             "data_version": 4,
             "worker_incarnation": "worker-0",
             "trainable_samples": 8,
+            "min_sample_step": None,
+            "max_sample_step": None,
         },
         "1": {
             "buffer_version": 9,
             "data_version": 5,
             "worker_incarnation": "worker-1",
             "trainable_samples": 8,
+            "min_sample_step": None,
+            "max_sample_step": None,
         },
     }
 

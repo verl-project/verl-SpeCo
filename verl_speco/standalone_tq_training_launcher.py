@@ -50,6 +50,7 @@ from verl_speco.draft_train_launcher import (
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
+from verl_speco.producer.hidden_states_store import _local_ip
 from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.trainer.standalone_resume import load_standalone_resume
 
@@ -70,6 +71,12 @@ _PRODUCER_VLLM_AUX_LAYER_IDS_KEY = (
 _PRODUCER_HIDDEN_DTYPE_KEY = "speco.standalone_tq_producer.hidden_dtype"
 _DSPARK_L1_LOSS_ALPHA_KEY = (
     "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha"
+)
+_DSPARK_CONFIDENCE_LOSS_ALPHA_KEY = (
+    "actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha"
+)
+_DSPARK_CE_TARGET_SOURCE_KEY = (
+    "actor_rollout_ref.rollout.drafter.training.ce_target_source"
 )
 _ALGORITHM_TARGET_LAYER_IDS_KEYS = {
     "EAGLE3": "actor_rollout_ref.rollout.drafter.training.eagle3_target_layer_ids",
@@ -154,6 +161,8 @@ _VLLM_HIDDEN_STATES_DIR = "__SPECO_HIDDEN_STATES_DIR__"
 _TQ_NAMESPACE = "speco-drafter"
 _TQ_PARTITION = "speco_drafter_features"
 _TQ_STORAGE_BACKENDS = ("SimpleStorage", "MooncakeStore")
+_HS_STORES = ("file", "mooncake")
+_HS_STORE_ENV = "SPECO_VLLM_HIDDEN_STATES_STORE"
 _MOONCAKE_MASTER_DEFAULT = "127.0.0.1:50051"
 _MOONCAKE_AUTO_INIT_DEFAULT = False
 
@@ -228,11 +237,15 @@ def _producer_config_keys() -> frozenset[str]:
     return frozenset(keys)
 
 
-def _find_override(overrides: Sequence[str], key: str) -> str | None:
+def _find_override(
+    overrides: Sequence[str], key: str, *, normalize_key: bool = False
+) -> str | None:
     for item in reversed(overrides):
         parsed = _split_override(item)
-        if parsed is not None and parsed[0] == key:
-            return parsed[1]
+        if parsed is not None:
+            candidate = parsed[0].lstrip("+") if normalize_key else parsed[0]
+            if candidate == key:
+                return parsed[1]
     return None
 
 
@@ -541,6 +554,12 @@ def _env_flag(env: Mapping[str, str], name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env(env: Mapping[str, str], name: str, default: str = "") -> str:
+    """Return ``env[name]`` stripped, or ``default`` when it is unset."""
+    value = env.get(name)
+    return default if value is None else str(value).strip()
+
+
 def _resolve_tq_backend(env: Mapping[str, str]) -> str:
     """Return the selected TQ storage backend, rejecting unknown values.
 
@@ -609,9 +628,6 @@ def _tq_backend_overrides(env: Mapping[str, str]) -> list[str]:
     """
     backend = _resolve_tq_backend(env)
 
-    def _env(name: str, default: str) -> str:
-        return str(env.get(name, default)).strip()
-
     if backend == "MooncakeStore":
         auto_init = _env_flag(
             env, "SPECO_TQ_MOONCAKE_AUTO_INIT", _MOONCAKE_AUTO_INIT_DEFAULT
@@ -620,23 +636,170 @@ def _tq_backend_overrides(env: Mapping[str, str]) -> list[str]:
             f"{_TQ_PREFIX}.backend.storage_backend=MooncakeStore",
             f"{_TQ_PREFIX}.backend.MooncakeStore.auto_init={str(auto_init).lower()}",
             f"{_TQ_PREFIX}.backend.MooncakeStore.metadata_server="
-            f"{_env('SPECO_TQ_MOONCAKE_METADATA_SERVER', 'P2PHANDSHAKE')}",
+            f"{_env(env, 'SPECO_TQ_MOONCAKE_METADATA_SERVER', 'P2PHANDSHAKE')}",
             f"{_TQ_PREFIX}.backend.MooncakeStore.master_server_address="
-            f"{_env('SPECO_TQ_MOONCAKE_MASTER', _MOONCAKE_MASTER_DEFAULT)}",
+            f"{_env(env, 'SPECO_TQ_MOONCAKE_MASTER', _MOONCAKE_MASTER_DEFAULT)}",
             f"{_TQ_PREFIX}.backend.MooncakeStore.local_hostname="
-            f"{_env('SPECO_TQ_MOONCAKE_LOCAL_HOSTNAME', '')}",
+            f"{_env(env, 'SPECO_TQ_MOONCAKE_LOCAL_HOSTNAME', '')}",
             f"{_TQ_PREFIX}.backend.MooncakeStore.protocol="
-            f"{_env('SPECO_TQ_MOONCAKE_PROTOCOL', 'tcp')}",
+            f"{_env(env, 'SPECO_TQ_MOONCAKE_PROTOCOL', 'tcp')}",
             f"{_TQ_PREFIX}.backend.MooncakeStore.global_segment_size="
-            f"{_env('SPECO_TQ_MOONCAKE_GLOBAL_SEGMENT_BYTES', str(4 * 1024**3))}",
+            f"{_env(env, 'SPECO_TQ_MOONCAKE_GLOBAL_SEGMENT_BYTES', str(4 * 1024**3))}",
             f"{_TQ_PREFIX}.backend.MooncakeStore.local_buffer_size="
-            f"{_env('SPECO_TQ_MOONCAKE_LOCAL_BUFFER_BYTES', str(2 * 1024**3))}",
+            f"{_env(env, 'SPECO_TQ_MOONCAKE_LOCAL_BUFFER_BYTES', str(2 * 1024**3))}",
         ]
     return [
         f"{_TQ_PREFIX}.backend.storage_backend=SimpleStorage",
         f"{_TQ_PREFIX}.backend.SimpleStorage.total_storage_size=17179869184",
         f"{_TQ_PREFIX}.backend.SimpleStorage.num_data_storage_units=8",
     ]
+
+
+def _resolve_hidden_states_store(env: Mapping[str, str]) -> str:
+    """Return the selected hidden-state transfer backend.
+
+    ``file`` keeps the legacy safetensors connector; ``mooncake`` swaps in the
+    out-of-tree handle-based connector from ``hs_connectors``.
+    """
+    backend = str(env.get(_HS_STORE_ENV, "file")).strip().lower()
+    if backend not in _HS_STORES:
+        raise RuntimeError(
+            f"Unsupported {_HS_STORE_ENV}={backend!r}; expected one of "
+            f"{list(_HS_STORES)}."
+        )
+    return backend
+
+
+def _hidden_states_mooncake_settings(env: Mapping[str, str]) -> dict[str, Any]:
+    """Resolve Mooncake settings, falling back to the TQ Mooncake variables."""
+
+    def pick(name: str, fallback: str, default: str) -> str:
+        return _env(env, name) or _env(env, fallback) or default
+
+    def pick_int(name: str, fallback: str, default: int) -> int:
+        raw = pick(name, fallback, str(default))
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{name} (or {fallback}) must be an integer, got {raw!r}"
+            ) from exc
+
+    local_hostname = (
+        pick(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_LOCAL_HOSTNAME",
+            "SPECO_TQ_MOONCAKE_LOCAL_HOSTNAME",
+            "",
+        )
+        or _local_ip()
+    )
+    return {
+        "local_hostname": local_hostname,
+        "metadata_server": pick(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_METADATA_SERVER",
+            "SPECO_TQ_MOONCAKE_METADATA_SERVER",
+            "P2PHANDSHAKE",
+        ),
+        "master_server_address": pick(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_MASTER",
+            "SPECO_TQ_MOONCAKE_MASTER",
+            _MOONCAKE_MASTER_DEFAULT,
+        ),
+        "global_segment_size": pick_int(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_GLOBAL_SEGMENT_BYTES",
+            "SPECO_TQ_MOONCAKE_GLOBAL_SEGMENT_BYTES",
+            4 * 1024**3,
+        ),
+        "local_buffer_size": pick_int(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_LOCAL_BUFFER_BYTES",
+            "SPECO_TQ_MOONCAKE_LOCAL_BUFFER_BYTES",
+            2 * 1024**3,
+        ),
+        "protocol": pick(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_PROTOCOL",
+            "SPECO_TQ_MOONCAKE_PROTOCOL",
+            "tcp",
+        ),
+        "device_name": pick(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_DEVICE_NAME",
+            "SPECO_TQ_MOONCAKE_DEVICE_NAME",
+            "",
+        ),
+        "num_writer_threads": pick_int(
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_WRITER_THREADS",
+            "SPECO_TQ_MOONCAKE_WRITER_THREADS",
+            8,
+        ),
+    }
+
+
+def _vllm_kv_transfer_config(env: Mapping[str, str]) -> dict[str, Any]:
+    """Build the vLLM ``--kv-transfer-config`` for the selected backend."""
+    if _resolve_hidden_states_store(env) == "mooncake":
+        return {
+            "kv_connector": "SpecoMooncakeHiddenStatesConnector",
+            "kv_connector_module_path": "verl_speco.mooncake_hidden_states_connector",
+            "kv_role": "kv_producer",
+            "kv_connector_extra_config": {
+                "mooncake": _hidden_states_mooncake_settings(env),
+            },
+        }
+    return {
+        "kv_connector": "ExampleHiddenStatesConnector",
+        "kv_role": "kv_producer",
+        "kv_connector_extra_config": {
+            "shared_storage_path": _VLLM_HIDDEN_STATES_DIR,
+            "use_synchronization_lock": True,
+        },
+    }
+
+
+def _hidden_states_store_overrides(env: Mapping[str, str]) -> list[str]:
+    """Producer-side overrides that select the consumer store backend."""
+    if _resolve_hidden_states_store(env) != "mooncake":
+        return []
+    settings = _hidden_states_mooncake_settings(env)
+    prefix = f"{_PRODUCER_PREFIX}.hidden_states_store"
+    return [
+        f"{prefix}.backend=mooncake",
+        f"{prefix}.mooncake.local_hostname={settings['local_hostname']}",
+        f"{prefix}.mooncake.metadata_server={settings['metadata_server']}",
+        f"{prefix}.mooncake.master_server_address={settings['master_server_address']}",
+        f"{prefix}.mooncake.global_segment_size={settings['global_segment_size']}",
+        f"{prefix}.mooncake.local_buffer_size={settings['local_buffer_size']}",
+        f"{prefix}.mooncake.protocol={settings['protocol']}",
+        f"{prefix}.mooncake.device_name={settings['device_name']}",
+        f"{prefix}.mooncake.num_writer_threads={settings['num_writer_threads']}",
+    ]
+
+
+def validate_hidden_states_store(
+    env: Mapping[str, str],
+    *,
+    connect: Callable[..., Any] | None = None,
+    timeout: float = 2.0,
+) -> None:
+    """Fail fast when the handle-based store cannot reach its Mooncake master."""
+    if _resolve_hidden_states_store(env) != "mooncake":
+        return
+    if _env_flag(env, "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_SKIP_PRECHECK", False):
+        return
+    raw = str(_hidden_states_mooncake_settings(env)["master_server_address"])
+    host, _, port = raw.rpartition(":")
+    host = host.strip("[]")
+    if not host or not port.isdigit():
+        raise RuntimeError(
+            f"hidden-states Mooncake master address must be host:port, got {raw!r}"
+        )
+    probe = connect if connect is not None else socket.create_connection
+    try:
+        probe((host, int(port)), timeout=timeout).close()
+    except OSError as exc:
+        raise RuntimeError(
+            "hidden-states Mooncake store selected, but no mooncake_master is "
+            f"reachable at {host}:{port} ({exc}). Start mooncake_master there, or "
+            "set SPECO_VLLM_HIDDEN_STATES_MOONCAKE_SKIP_PRECHECK=true."
+        ) from exc
 
 
 def build_pipeline_commands(
@@ -694,14 +857,7 @@ def build_pipeline_commands(
             "hf_config": {"eagle_aux_hidden_state_layer_ids": capture_layer_ids}
         },
     }
-    kv_transfer_config = {
-        "kv_connector": "ExampleHiddenStatesConnector",
-        "kv_role": "kv_producer",
-        "kv_connector_extra_config": {
-            "shared_storage_path": _VLLM_HIDDEN_STATES_DIR,
-            "use_synchronization_lock": True,
-        },
-    }
+    kv_transfer_config = _vllm_kv_transfer_config(backend_env)
     vllm = None
     if len(config.vllm_endpoints) == 1 and parsed_endpoint.hostname in {
         "127.0.0.1",
@@ -747,6 +903,24 @@ def build_pipeline_commands(
         producer_tuning_overrides.append(item)
     producer_overrides = [
         f"{_ALGORITHM_KEY}={config.algorithm}",
+        "actor_rollout_ref.rollout.drafter.training.dflash_block_size="
+        + (
+            _find_override(
+                training_args,
+                "actor_rollout_ref.rollout.drafter.training.dflash_block_size",
+                normalize_key=True,
+            )
+            or "16"
+        ),
+        "actor_rollout_ref.rollout.drafter.training.preserve_prompt_hidden_states="
+        + (
+            _find_override(
+                training_args,
+                "actor_rollout_ref.rollout.drafter.training.preserve_prompt_hidden_states",
+                normalize_key=True,
+            )
+            or "true"
+        ),
         *tq_overrides,
         *producer_tuning_overrides,
         f"speco.standalone_tq_producer.input_path={config.input_path}",
@@ -772,6 +946,7 @@ def build_pipeline_commands(
                 resumed_optimizer_step=resumed_optimizer_step,
             )
         ),
+        *_hidden_states_store_overrides(backend_env),
     ]
     consumer_internal = [
         f"{_FEATURE_STORE_PREFIX}.type=tq",
@@ -783,12 +958,37 @@ def build_pipeline_commands(
     hidden_dtype = _strip_quotes(
         _find_override(training_args, _PRODUCER_HIDDEN_DTYPE_KEY) or "bfloat16"
     )
-    dspark_l1_loss_alpha = float(
-        _strip_quotes(_find_override(training_args, _DSPARK_L1_LOSS_ALPHA_KEY) or "0.9")
+    # The Producer's collected layout and the Consumer's expected layout must
+    # agree, so resolve the loss settings that select it (dflash_aux vs
+    # dflash_aux_plus_last) once here and forward the same values to both.
+    dspark_l1_loss_alpha = _strip_quotes(
+        _find_override(training_args, _DSPARK_L1_LOSS_ALPHA_KEY, normalize_key=True)
+        or "0.9"
+    )
+    dspark_confidence_loss_alpha = _strip_quotes(
+        _find_override(
+            training_args, _DSPARK_CONFIDENCE_LOSS_ALPHA_KEY, normalize_key=True
+        )
+        or "0.0"
+    )
+    ce_target_source = _strip_quotes(
+        _find_override(training_args, _DSPARK_CE_TARGET_SOURCE_KEY, normalize_key=True)
+        or "labels"
+    )
+    producer_overrides.extend(
+        [
+            f"{_DSPARK_L1_LOSS_ALPHA_KEY}={dspark_l1_loss_alpha}",
+            f"{_DSPARK_CONFIDENCE_LOSS_ALPHA_KEY}={dspark_confidence_loss_alpha}",
+            f"{_DSPARK_CE_TARGET_SOURCE_KEY}={ce_target_source}",
+        ]
     )
     hidden_layout = resolve_drafter_hidden_states_layout(
         config.algorithm,
-        {"dspark_l1_loss_alpha": dspark_l1_loss_alpha},
+        {
+            "dspark_l1_loss_alpha": float(dspark_l1_loss_alpha),
+            "dspark_confidence_loss_alpha": float(dspark_confidence_loss_alpha),
+            "ce_target_source": ce_target_source,
+        },
     )
     consumer_internal.extend(
         [
@@ -922,6 +1122,7 @@ def run_pipeline(
     # created above instead of allowing a stale inherited value to win.
     base_env["RAY_ADDRESS"] = ray_address
     validate_tq_backend(base_env)
+    validate_hidden_states_store(base_env)
     owner: subprocess.Popen[Any] | None = None
     producer: subprocess.Popen[Any] | None = None
     consumer: subprocess.Popen[Any] | None = None

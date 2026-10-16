@@ -40,6 +40,7 @@ from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _raise_standalone_export_error,
     _rewrite_standalone_block_runtime_config,
     _save_standalone_checkpoint,
+    _select_standalone_tracking_metrics,
     _should_log_batch_progress,
     _sync_standalone_export_error,
 )
@@ -109,7 +110,7 @@ def test_tq_clear_retries_transient_failure(monkeypatch) -> None:
     loader = _TransientClearTQLoader(failures=2)
     delays = []
     monkeypatch.setattr(
-        "verl_speco.trainer.draft_training_loop.time.sleep", delays.append
+        "verl_speco.trainer.tq_retry.time.sleep", delays.append
     )
 
     _clear_tq_batch_across_ranks(
@@ -126,7 +127,7 @@ def test_tq_clear_retries_transient_failure(monkeypatch) -> None:
 def test_tq_clear_failure_is_reported_after_three_attempts(monkeypatch) -> None:
     loader = _FakeTQLoader(RuntimeError("clear failed"))
     monkeypatch.setattr(
-        "verl_speco.trainer.draft_training_loop.time.sleep", lambda _: None
+        "verl_speco.trainer.tq_retry.time.sleep", lambda _: None
     )
     with pytest.raises(RuntimeError, match="failed to clear"):
         _clear_tq_batch_across_ranks(
@@ -136,6 +137,25 @@ def test_tq_clear_failure_is_reported_after_three_attempts(monkeypatch) -> None:
             device=torch.device("cpu"),
         )
     assert loader.clear_calls == [["k0", "k1"]] * 3
+
+
+def test_tq_completion_retry_does_not_repeat_successful_clear(monkeypatch) -> None:
+    loader = _FakeTQLoader()
+    events = []
+    monkeypatch.setattr("verl_speco.trainer.tq_retry.time.sleep", lambda _: None)
+
+    def put(event):
+        events.append(event)
+        if len(events) == 1:
+            raise ConnectionError("temporary event failure")
+
+    event = {"kind": "training_completed", "plan_id": 1}
+    _clear_tq_batch_across_ranks(
+        loader, ["k0"], rank=0, device=torch.device("cpu"),
+        training_events=SimpleNamespace(put=put), completion_event=event,
+    )
+    assert loader.clear_calls == [["k0"]]
+    assert events == [event, event]
 
 
 def test_tq_store_connection_failure_is_reported() -> None:
@@ -193,6 +213,16 @@ def test_is_out_of_memory_error_matches_npu_oom_message():
     assert not _is_out_of_memory_error(RuntimeError("bad batch"))
 
 
+def test_prefetch_tracking_subtracts_foreground_wait_not_background_wait():
+    selected = _select_standalone_tracking_metrics({
+        "dspark/loss": 0.5, "perf/step_time": 0.9,
+        "perf/loader_plan_wait_time": 10.0, "perf/batch_ready_wait_time": 0.03,
+        "perf/train_time": 0.65,
+    })
+    assert selected["perf/batch_ready_wait_time"] == 0.03
+    assert selected["perf/other_time"] == pytest.approx(0.22)
+
+
 def test_contains_replay_samples_detects_draft_replay_sample():
     sample = DraftReplaySample(
         input_ids=torch.arange(4),
@@ -207,15 +237,82 @@ def test_contains_replay_samples_detects_draft_replay_sample():
     assert not _contains_replay_samples([{"input_ids": [1, 2]}])
 
 
+def test_standalone_dspark_tracking_keeps_only_core_metrics():
+    metrics = {
+        "dspark/loss": 0.7, "dspark/ce_loss": 2.5, "dspark/l1_loss": 1.0,
+        "dspark/top1_acc": 0.6, "dspark/mean_acceptance_length": 2.0,
+        "train/lr": 1e-6, "perf/step_time": 10.0,
+        "perf/loader_plan_wait_time": 30.0, "perf/batch_ready_wait_time": 3.0,
+        "perf/train_time": 5.0,
+        "train/ploss_0": 2.5, "dspark/valid_token_count": 42.0,
+        "perf/loader_tq_get_time": 1.0,
+    }
+    selected = _select_standalone_tracking_metrics(metrics)
+    assert len(selected) == 12
+    assert selected["dspark/loss"] == 0.7
+    assert selected["perf/other_time"] == 2.0
+    assert "train/ploss_0" not in selected
+    assert selected["perf/loader_tq_get_time"] == 1.0
+    assert "perf/other_time" not in metrics
+
+
+def test_standalone_dspark_tracking_skips_missing_and_nonfinite_metrics():
+    selected = _select_standalone_tracking_metrics({
+        "dspark/ce_loss": float("nan"), "dspark/loss": 1.0,
+        "perf/train_time": float("inf"),
+    })
+    assert selected == {"dspark/loss": 1.0}
+    assert _select_standalone_tracking_metrics({"dflash/accuracy": 0.5}) == {}
+
+
+@pytest.mark.parametrize("prefix", ["eagle3", "dflash", "dspark", "dflash2"])
+def test_standalone_global_loss_and_selector_aggregation(prefix):
+    trainer = SimpleNamespace(
+        _training_metric_sums={
+            f"{prefix}/loss": 6.0,
+            f"{prefix}/selector_loss_sum": 12.0,
+            f"{prefix}/selector_weight_count": 30.0,
+            f"{prefix}/selector_correct_count": 9.0,
+            f"{prefix}/selector_token_count": 15.0,
+        },
+        _training_metric_steps=2, optimizer_steps_total=10, optimizer=None,
+        _block_drafter_metric_prefix=lambda: prefix,
+        _block_drafter_config_value=lambda name, default: 0,
+    )
+    metrics = DrafterBaseTrainer.get_training_metrics(trainer)
+    assert metrics[f"{prefix}/loss"] == 3.0
+    assert metrics[f"{prefix}/selector_loss"] == 0.4
+    assert metrics[f"{prefix}/selector_accuracy"] == 0.6
+
+
+@pytest.mark.parametrize("prefix", ["eagle3", "dflash", "dspark", "dflash2"])
+def test_standalone_core_metrics_for_each_backend(prefix):
+    metrics = {
+        f"{prefix}/loss": 1.0, f"{prefix}/top1_acc": 0.5,
+        f"{prefix}/mean_acceptance_length": 2.0,
+        "train/simulated_acc_len": 1.8, "train/lr": 1e-6,
+        "perf/step_time": 10.0, "perf/batch_ready_wait_time": 3.0,
+        "perf/train_time": 5.0, "train/ploss_0": 1.0,
+        f"{prefix}/count_per_position/0": 100.0,
+        "dflash2/selector_loss": 0.4, "dflash2/selector_accuracy": 0.6,
+    }
+    selected = _select_standalone_tracking_metrics(metrics)
+    assert selected[f"{prefix}/loss"] == 1.0
+    assert selected["perf/other_time"] == 2.0
+    assert "train/ploss_0" not in selected
+    assert ("train/simulated_acc_len" in selected) == (prefix == "eagle3")
+    assert ("dflash2/selector_loss" in selected) == (prefix == "dflash2")
+
+
 def test_standalone_tracking_enables_requested_backends_on_rank_zero(monkeypatch):
     import verl.utils.tracking as tracking_module
 
     created = []
 
     class _FakeTracking:
-        supported_backend = ("wandb", "tensorboard", "console")
+        supported_backend = ("wandb", "tensorboard", "console", "swanlab")
 
-        def __init__(self, project_name, experiment_name, default_backend):
+        def __init__(self, project_name, experiment_name, default_backend, config=None):
             created.append((project_name, experiment_name, list(default_backend)))
 
     monkeypatch.setattr(tracking_module, "Tracking", _FakeTracking)
@@ -235,6 +332,9 @@ def test_standalone_tracking_enables_requested_backends_on_rank_zero(monkeypatch
     # one tracker per supported backend; console/unsupported filtered, duplicates dropped.
     assert created == [("proj", "exp", ["tensorboard"]), ("proj", "exp", ["wandb"])]
     assert _build_standalone_tracking(config, rank=1) == []
+    config.trainer.logger = ["console", "swanlab"]
+    assert len(_build_standalone_tracking(config, rank=0)) == 1
+    assert created[-1] == ("proj", "exp", ["swanlab"])
 
     console_only = OmegaConf.create({"trainer": {"logger": ["console"]}})
     assert _build_standalone_tracking(console_only, rank=0) == []
@@ -248,7 +348,7 @@ def test_standalone_tracking_isolates_a_failing_backend(monkeypatch):
     class _FlakyTracking:
         supported_backend = ("wandb", "tensorboard", "console")
 
-        def __init__(self, project_name, experiment_name, default_backend):
+        def __init__(self, project_name, experiment_name, default_backend, config=None):
             if list(default_backend) == ["wandb"]:
                 raise RuntimeError("wandb unavailable")
 

@@ -28,4 +28,11 @@ def config_int(config: Any, key: str, default: int) -> int:
     return default if value is None else int(value)
 
 
-__all__ = ["config_int"]
+def prefetch_depth(config: Any) -> int:
+    value = config.get("consumer_prefetch_batches", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("consumer_prefetch_batches must be a non-negative integer")
+    return value
+
+
+__all__ = ["config_int", "prefetch_depth"]

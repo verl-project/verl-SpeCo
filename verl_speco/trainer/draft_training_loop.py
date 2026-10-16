@@ -16,22 +16,25 @@
 from __future__ import annotations
 
 import asyncio
-from copy import deepcopy
 import json
 import logging
 import math
 import os
+import sys
 import time
+from copy import deepcopy
+from datetime import timedelta
 from typing import Any, cast
 
 import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import DeviceMesh
 from omegaconf import OmegaConf, open_dict
+from torch.distributed.device_mesh import DeviceMesh
 from verl.utils.device import get_device_name, get_torch_device
 
 from verl_speco.backends.factory import build_trainer_backend
-from verl_speco.config import config_int
+from verl_speco.config import config_int, prefetch_depth
+from verl_speco.standalone_ray_runtime import put_queue
 from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.trainer.base_trainer import (
     DrafterBaseTrainer,
@@ -49,7 +52,18 @@ from verl_speco.trainer.standalone_resume import (
     load_standalone_resume,
     save_standalone_resume,
 )
-from verl_speco.trainer.tq_sample_source import TQFeatureDataLoader, TQLocalBatch
+from verl_speco.trainer.standalone_tracking import (
+    _build_standalone_tracking,
+    _finish_standalone_tracking,
+    _log_standalone_tracking_metrics,
+    _select_standalone_tracking_metrics,
+)
+from verl_speco.trainer.tq_retry import retry_io
+from verl_speco.trainer.tq_sample_source import (
+    TQFeatureDataLoader,
+    TQLocalBatch,
+    TQPrefetchIterator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,109 +85,6 @@ def _is_out_of_memory_error(error: BaseException) -> bool:
 
 def _contains_replay_samples(samples: list[Any]) -> bool:
     return any(isinstance(sample, DraftReplaySample) for sample in samples)
-
-
-_CONSOLE_TRACKING_BACKEND = "console"
-
-
-def _cfg_get(cfg: Any, name: str, default: Any = None) -> Any:
-    """Read ``name`` from a mapping, an object, or a None-shaped config section."""
-    if cfg is None:
-        return default
-    if isinstance(cfg, dict):
-        return cfg.get(name, default)
-    return getattr(cfg, name, default)
-
-
-def _standalone_tracking_backends(config: Any) -> list[str]:
-    """Normalized, de-duplicated, non-console ``trainer.logger`` backends."""
-    backends = _cfg_get(_cfg_get(config, "trainer"), "logger")
-    if backends is None:
-        return []
-    if isinstance(backends, str):
-        backends = [backends]
-    unique = dict.fromkeys(
-        backend
-        for backend in (str(backend).strip().lower() for backend in backends)
-        if backend and backend != _CONSOLE_TRACKING_BACKEND
-    )
-    return list(unique)
-
-
-def _build_standalone_tracking(config: Any, *, rank: int) -> list[Any]:
-    """Build one tracker per requested backend on rank 0 (e.g. TensorBoard, W&B).
-
-    The console logger is handled by the training loop itself; console entries
-    are dropped and unsupported ones are logged and ignored. Each backend is
-    initialized independently, so one failing backend (e.g. W&B without
-    credentials) never disables the others.
-    """
-    if rank != 0:
-        return []
-    requested = _standalone_tracking_backends(config)
-    if not requested:
-        return []
-    try:
-        from verl.utils.tracking import Tracking
-    except Exception:
-        logger.exception("[standalone rank=%s] tracking backend is unavailable", rank)
-        return []
-    supported = [
-        backend for backend in requested if backend in Tracking.supported_backend
-    ]
-    unsupported = [
-        backend for backend in requested if backend not in Tracking.supported_backend
-    ]
-    if unsupported:
-        logger.warning(
-            "[standalone rank=%s] ignoring unsupported tracking backends=%s",
-            rank,
-            unsupported,
-        )
-    trainer_cfg = _cfg_get(config, "trainer")
-    project_name = str(_cfg_get(trainer_cfg, "project_name") or "verl_dspark_drafter")
-    experiment_name = str(
-        _cfg_get(trainer_cfg, "experiment_name") or "standalone_draft"
-    )
-    trackers: list[Any] = []
-    for backend in supported:
-        try:
-            trackers.append(
-                Tracking(
-                    project_name=project_name,
-                    experiment_name=experiment_name,
-                    default_backend=[backend],
-                )
-            )
-        except Exception:
-            logger.exception(
-                "[standalone rank=%s] failed to initialize tracking backend=%s",
-                rank,
-                backend,
-            )
-    return trackers
-
-
-def _log_standalone_tracking_metrics(
-    trackers: list[Any], metrics: dict[str, float], *, step: int
-) -> None:
-    for tracking in trackers:
-        try:
-            tracking.log(data=dict(metrics), step=int(step))
-        except Exception:
-            logger.exception(
-                "[standalone] failed to write tracking metrics at step=%s", step
-            )
-
-
-def _finish_standalone_tracking(trackers: list[Any], *, rank: int) -> None:
-    for tracking in trackers:
-        try:
-            tracking.finish()
-        except Exception:
-            logger.exception(
-                "[standalone rank=%s] failed to finalize a tracking backend", rank
-            )
 
 
 def run_standalone_draft_training(config) -> dict[str, Any]:
@@ -263,9 +174,14 @@ async def _run_standalone_draft_training_async(
     store = None
     feature_replayer = None
     feature_producer = None
+    tq_prefetch = None
+    tq_prefetch_group = None
     current_stage = "activate_training_model"
     try:
-        standalone_trackers = _build_standalone_tracking(config, rank=rank)
+        # Scheduled Ray training delegates tracking to its Driver, which also
+        # receives Producer windows. Subprocess/file training logs locally.
+        if training_events is None:
+            standalone_trackers = _build_standalone_tracking(config, rank=rank)
         stage_started = time.perf_counter()
         logger.info(
             "[standalone rank=%s] activating drafter model algorithm=%s",
@@ -366,6 +282,38 @@ async def _run_standalone_draft_training_async(
         loader: Any
         if feature_store_type == "tq":
             tq_cfg = training_cfg.get("transfer_queue") or {}
+            depth = prefetch_depth(tq_cfg)
+            if depth and scheduled_commands is None:
+                raise ValueError(
+                    "consumer_prefetch_batches requires the scheduled Ray TQ Consumer"
+                )
+            if depth:
+                io_timeout = float(tq_cfg.get("io_timeout_seconds", 30))
+                io_attempts = int(tq_cfg.get("io_retry_max_attempts", 3))
+                collective_timeout = float(
+                    tq_cfg.get("prefetch_collective_timeout_seconds", 180)
+                )
+                retry_deadline = io_attempts * (io_timeout + 5) + sum(
+                    min(0.2 * 2**attempt, 2.0) * 1.1
+                    for attempt in range(max(0, io_attempts - 1))
+                )
+                if (
+                    io_timeout <= 0
+                    or io_attempts < 1
+                    or collective_timeout <= retry_deadline
+                ):
+                    raise ValueError(
+                        "Prefetch collective timeout must exceed the complete TQ get retry deadline"
+                    )
+            if depth and world_size > 1:
+                tq_prefetch_group = dist.new_group(
+                    backend="gloo",
+                    timeout=timedelta(
+                        seconds=float(
+                            tq_cfg.get("prefetch_collective_timeout_seconds", 180)
+                        )
+                    ),
+                )
             loader = TQFeatureDataLoader(
                 store,
                 batch_size=int(training_cfg.get("batch_size_per_gpu", 4)),
@@ -376,7 +324,32 @@ async def _run_standalone_draft_training_async(
                 ),
                 drop_last=bool(tq_cfg.get("drop_last", True)),
                 scheduled_commands=scheduled_commands,
+                process_group=tq_prefetch_group,
+                io_retry_max_attempts=int(tq_cfg.get("io_retry_max_attempts", 3)),
+                io_timeout_seconds=float(tq_cfg.get("io_timeout_seconds", 30)),
             )
+            if training_events is not None and rank == 0:
+                ready_error = None
+                try:
+                    retry_io(
+                        lambda: put_queue(
+                            training_events,
+                            {
+                                "kind": "consumer_ready",
+                                "initial_optimizer_step": initial_optimizer_step,
+                            },
+                        ),
+                        name="Consumer ready event",
+                        attempts=int(tq_cfg.get("io_retry_max_attempts", 3)),
+                    )
+                except Exception as exc:  # noqa: BLE001 - communicate event failure to every rank
+                    ready_error = exc
+            else:
+                ready_error = None
+            if not _all_ranks_true(ready_error is None, trainer.runtime_device):
+                raise RuntimeError(
+                    "Failed to notify Scheduler that Consumer is ready"
+                ) from ready_error
         else:
             loader = DraftFeatureDataLoader(
                 store,
@@ -419,6 +392,16 @@ async def _run_standalone_draft_training_async(
             bool(feature_store_cfg.get("repeat", True)),
         )
         sample_source = loader
+        if feature_store_type == "tq" and depth:
+            tq_prefetch = TQPrefetchIterator(
+                loader,
+                depth,
+                close_timeout=float(
+                    tq_cfg.get("prefetch_collective_timeout_seconds", 180)
+                )
+                + 10,
+            )
+            sample_source = tq_prefetch
         pipeline_cfg = training_cfg.get("target_feature_pipeline", {}) or {}
         pipeline_enabled = bool(pipeline_cfg.get("enabled", False))
         if feature_store_type == "tq" and pipeline_enabled:
@@ -458,11 +441,13 @@ async def _run_standalone_draft_training_async(
         sample_iterator = iter(sample_source)
         while max_steps <= 0 or optimizer_step < max_steps:
             current_stage = "load_next_batch"
+            load_started = time.perf_counter()
             loaded_batch = _next_batch_across_ranks(
                 sample_iterator,
                 rank=rank,
                 device=trainer.runtime_device,
             )
+            batch_ready_wait_seconds = time.perf_counter() - load_started
             if loaded_batch is None:
                 break
             tq_local_batch = (
@@ -604,20 +589,19 @@ async def _run_standalone_draft_training_async(
                     tq_local_batch.global_keys,
                     rank=rank,
                     device=trainer.runtime_device,
+                    training_events=training_events,
+                    completion_event={
+                        "kind": "training_completed",
+                        "plan_id": tq_local_batch.plan_id,
+                        "keys": list(tq_local_batch.global_keys or []),
+                        "successful": True,
+                    },
                 )
                 tq_clear_seconds = time.perf_counter() - tq_clear_started
                 if rank == 0:
                     consumed_sequence_nos.update(
                         tq_local_batch.global_sequence_nos or []
                     )
-                    if training_events is not None:
-                        training_events.put(
-                            {
-                                "kind": "training_completed",
-                                "keys": list(tq_local_batch.global_keys or []),
-                                "successful": True,
-                            }
-                        )
             successful_steps += 1
             optimizer_step = int(trainer.optimizer_steps_total)
             if optimizer_step <= initial_optimizer_step:
@@ -627,27 +611,40 @@ async def _run_standalone_draft_training_async(
                 successful_steps=successful_steps,
                 attempted_batches=attempted_batches,
                 step_elapsed_sec=(
-                    time.perf_counter() - tq_local_batch.cycle_started_at
+                    time.perf_counter() - load_started
                     if tq_local_batch is not None
                     else time.perf_counter() - processing_started
                 ),
             )
             step_metrics["perf/batch_prepare_time"] = batch_prepare_seconds
             step_metrics["perf/train_time"] = train_seconds
-            step_metrics["perf/tq_clear_time"] = tq_clear_seconds
+            step_metrics["perf/batch_finalize_time"] = tq_clear_seconds
             if tq_local_batch is not None:
-                step_metrics["perf/consumer_wait_time"] = float(
+                step_metrics["perf/batch_ready_wait_time"] = batch_ready_wait_seconds
+                step_metrics["perf/loader_plan_wait_time"] = float(
                     tq_local_batch.command_wait_seconds
                 )
-                step_metrics["perf/tq_get_time"] = tq_get_seconds
+                step_metrics["perf/loader_tq_get_time"] = tq_get_seconds
             if feature_replayer is not None:
                 step_metrics.update(feature_replayer.metrics())
             if feature_producer is not None:
                 step_metrics.update(feature_producer.metrics())
             _log_standalone_step_metrics(step_metrics, rank=rank)
-            _log_standalone_tracking_metrics(
-                standalone_trackers, step_metrics, step=optimizer_step
-            )
+            tracking_metrics = _select_standalone_tracking_metrics(step_metrics)
+            if training_events is not None and rank == 0:
+                training_events.put(
+                    {
+                        "kind": "training_metrics",
+                        "step": optimizer_step,
+                        "metrics": tracking_metrics,
+                    }
+                )
+            else:
+                _log_standalone_tracking_metrics(
+                    standalone_trackers,
+                    tracking_metrics,
+                    step=optimizer_step,
+                )
             if save_interval > 0 and optimizer_step % save_interval == 0:
                 _sync_standalone_export_error(trainer, trainer.runtime_device)
                 current_stage = "save_checkpoint"
@@ -719,6 +716,8 @@ async def _run_standalone_draft_training_async(
         )
         raise
     finally:
+        original_error = sys.exc_info()[1]
+        prefetch_cleanup_error = None
         _finish_standalone_tracking(standalone_trackers, rank=rank)
         logger.info(
             "[standalone rank=%s] cleanup starting stage=%s attempted_batches=%s "
@@ -730,6 +729,19 @@ async def _run_standalone_draft_training_async(
         )
         if feature_producer is not None:
             feature_producer.close()
+        if tq_prefetch is not None:
+            try:
+                tq_prefetch.close()
+            except Exception as error:  # noqa: BLE001 - still release the remaining resources
+                prefetch_cleanup_error = error
+                logger.exception("Failed to close TQ prefetch thread")
+        if tq_prefetch_group is not None:
+            try:
+                dist.destroy_process_group(tq_prefetch_group)
+            except Exception as error:  # noqa: BLE001 - still close the client and trainer
+                if prefetch_cleanup_error is None:
+                    prefetch_cleanup_error = error
+                logger.exception("Failed to destroy TQ prefetch process group")
         if feature_replayer is not None:
             feature_replayer.close()
         if store is not None:
@@ -755,6 +767,8 @@ async def _run_standalone_draft_training_async(
         if final_export_failed:
             _raise_standalone_export_error(trainer)
             raise RuntimeError("Standalone checkpoint export failed on another rank")
+        if prefetch_cleanup_error is not None and original_error is None:
+            raise prefetch_cleanup_error
 
     return {
         "rank": rank,
@@ -1441,7 +1455,7 @@ def _build_training_device_mesh(draft_config, world_size: int) -> DeviceMesh | N
 
 def _block_metric_prefix(trainer: DrafterBaseTrainer) -> str | None:
     model_type = str(getattr(getattr(trainer, "backend", None), "model_type", "") or "")
-    if model_type in {"dflash", "dspark", "eagle3"}:
+    if model_type in {"dflash", "dspark", "eagle3", "dflash2"}:
         return model_type
     return None
 
@@ -1502,7 +1516,7 @@ def _standalone_step_metrics(
     }
     prefix = _block_metric_prefix(trainer)
     if prefix is not None:
-        anchor_offset = 1 if prefix == "dflash" else 0
+        anchor_offset = 1 if prefix in {"dflash", "dflash2"} else 0
         losses = _position_metric_series(raw_metrics, prefix, "loss_per_position")
         accuracies = _position_metric_series(
             raw_metrics, prefix, "accuracy_per_position"
@@ -1557,11 +1571,12 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         ("train/simulated_acc_len", "sim_acc_len"),
         ("train/lr", "lr"),
         ("perf/step_time", "step_time"),
-        ("perf/consumer_wait_time", "wait_time"),
-        ("perf/tq_get_time", "tq_get_time"),
+        ("perf/loader_plan_wait_time", "loader_plan_wait_time"),
+        ("perf/loader_tq_get_time", "loader_tq_get_time"),
+        ("perf/batch_ready_wait_time", "batch_ready_wait_time"),
         ("perf/batch_prepare_time", "batch_prepare_time"),
         ("perf/train_time", "train_time"),
-        ("perf/tq_clear_time", "tq_clear_time"),
+        ("perf/batch_finalize_time", "batch_finalize_time"),
         ("replay/cache_hit_ratio", "cache_hit"),
         ("replay/target_forward_time_total", "target_forward_total"),
         ("replay/vllm_request_time_total", "vllm_request_total"),
@@ -1651,37 +1666,36 @@ def _clear_tq_batch_across_ranks(
     *,
     rank: int,
     device: torch.device,
+    training_events: Any | None = None,
+    completion_event: dict[str, Any] | None = None,
 ) -> None:
     """Clear once on rank 0 and report a clear failure to every training rank."""
 
     local_error: BaseException | None = None
     if rank == 0:
-        cleared = False
-        for attempt in range(1, _TQ_CLEAR_MAX_ATTEMPTS + 1):
-            try:
-                loader.clear_completed_batch(global_keys)
-                cleared = True
-                break
-            except BaseException as exc:  # noqa: BLE001
-                local_error = exc
-                if attempt >= _TQ_CLEAR_MAX_ATTEMPTS:
-                    break
-                delay = _TQ_CLEAR_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                logger.warning(
-                    "TQ Consumer clear retry attempt=%s/%s retry_in=%.3fs "
-                    "keys=%s error=%r",
-                    attempt,
-                    _TQ_CLEAR_MAX_ATTEMPTS,
-                    delay,
-                    len(global_keys or []),
-                    exc,
+        try:
+            retry_io(
+                lambda: loader.clear_completed_batch(global_keys),
+                name="TQ Consumer clear",
+                attempts=_TQ_CLEAR_MAX_ATTEMPTS,
+                initial_backoff=_TQ_CLEAR_RETRY_BACKOFF_SECONDS,
+                jitter=False,
+                # Keep the existing clear policy: retry ordinary exceptions,
+                # including TQ's RuntimeError wrappers, not only network errors.
+                retry_if=lambda error: True,
+            )
+            if training_events is not None:
+                retry_io(
+                    lambda: put_queue(
+                        training_events,
+                        completion_event,
+                        timeout=getattr(loader, "io_timeout_seconds", 30),
+                    ),
+                    name="Training completion event",
+                    attempts=getattr(loader, "io_retry_max_attempts", 3),
                 )
-                time.sleep(delay)
-        else:
-            raise AssertionError("unreachable")
-        # A later attempt succeeded, so do not report an earlier transient error.
-        if cleared:
-            local_error = None
+        except BaseException as exc:  # noqa: BLE001 - synchronize failures before the next training collective
+            local_error = exc
     failed = torch.tensor(
         1 if local_error is not None else 0,
         dtype=torch.int32,

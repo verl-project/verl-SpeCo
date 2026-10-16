@@ -140,7 +140,11 @@ DFlash compatibility patches.
 This integration deliberately supports fixed verification length only. Native
 MRV2 does not expose the MRV1 confidence-head/dynamic-length contract, so keep
 `dspark_confidence_loss_alpha=0`, do not publish confidence-head tensors, and
-do not enable dynamic verification length. The Qwen checkpoint must declare
+do not enable dynamic verification length. The MRV1 vLLM path and the standalone
+trainer do support confidence-head training: set `dspark_confidence_loss_alpha>0`
+(optionally `dspark_confidence_head_with_markov`) to train the per-position
+acceptance head against `alpha = sum_v min(p_v, q_v) = 1 - TV`, matching
+`speculators`. The Qwen checkpoint must declare
 `architectures=["Qwen3DSparkModel"]` and use `sample_from_anchor=true` (or omit
 it for the native default); the fixed verification length must not exceed the
 checkpoint's training `block_size`.
@@ -368,6 +372,47 @@ The main mode values are:
 
 Offline training supports every drafter family the online workers support:
 EAGLE-1, EAGLE-2, EAGLE-3, DFlash, DSpark, Domino and P-EAGLE.
+
+DSpark offline training can additionally train the confidence head used for
+dynamic draft-length thresholding. Set `dspark_confidence_loss_alpha>0` (for
+example `0.2`) and the head is created automatically from the target's final
+hidden state; `dspark_confidence_head_with_markov` keeps the Markov previous-token
+embedding in the head input (default `true`). A positive value on either
+`dspark_confidence_head_alpha` or `dspark_confidence_loss_alpha` enables the head,
+while only `dspark_confidence_loss_alpha` weights its BCE term. The BCE target
+tracks the served proposal mode via `dspark_confidence_target_mode`: `greedy`
+(the serving default, one-hot draft) targets `p_target[argmax(p_draft)]`, while
+`probabilistic` targets `1 - TV = sum_v min(p_draft_v, p_target_v)`. Training the
+confidence head requires the target's final hidden state, so the DSpark hidden
+state collection switches to `dflash_aux_plus_last` whenever either it or the L1
+loss is enabled. The standalone scripts expose `DSPARK_CONFIDENCE_HEAD_ALPHA`,
+`DSPARK_CONFIDENCE_HEAD_WITH_MARKOV`, and `DSPARK_CONFIDENCE_LOSS_ALPHA`.
+
+Online co-training (`actor_rollout_ref.rollout.drafter.enable_drafter_training`)
+trains and hot-publishes the same head on the MRV1 path. The checkpoint's
+confidence topology is authoritative: the loader infers whether the head input
+includes the Markov embedding from the checkpoint tensor shape, and a training
+setting that disagrees (or a checkpoint carrying only half of
+`confidence_head.proj.{weight,bias}`) fails closed instead of silently loading
+an incompatible head. The vLLM engine registers the head only when the
+checkpoint declares `enable_confidence_head` and sizes it from
+`confidence_head_with_markov`, so any exported topology loads with the right
+shape. The vLLM-Ascend confidence-thresholded dynamic verify budget
+(`dynamic_spec_config.method=dspark`) assumes a Markov-fused head, so a
+markov-less head (`dspark_confidence_head_with_markov=false` with
+`dspark_markov_rank>0`) is rejected while that dynamic path is configured;
+static serving and offline training (`...training.mode=offline`) may be
+markov-less. The exported `config.json` always records the live topology, so a
+head added while fine-tuning an older checkpoint survives a reload. Enabling
+vLLM-Ascend's confidence-thresholded dynamic verify budget is
+opt-in: on the V1 runner through
+`rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method=dspark`
+(`VLLM_USE_V2_MODEL_RUNNER=0`, requires vllm-ascend#13216, and
+`async_scheduling=False` — the V1 budget consumer is only called when async is
+off), or on the MRV2 runner through
+`rollout.drafter.vllm.speculative_config_overrides.enable_adaptive_verification=true`
+(vllm-ascend#15098, async-compatible); see
+`examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_vllm_npu.sh`.
 
 Domino and P-EAGLE are training-time families with no engine-level speculative
 method of their own (engines serve Domino as a DFlash projector sub-mode, and

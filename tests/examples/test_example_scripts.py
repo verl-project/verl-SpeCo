@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -25,6 +26,7 @@ PPO_EXAMPLES = [
     script
     for script in (ROOT / "examples").glob("*.sh")
     if not script.name.endswith("_separate_training.sh")
+    and "_eval" not in script.name
 ]
 
 
@@ -59,7 +61,13 @@ def _require_working_bash() -> str:
 @pytest.mark.parametrize("script", EXAMPLES, ids=lambda path: path.name)
 def test_example_shell_syntax_is_valid(script: Path) -> None:
     bash = _require_working_bash()
-    subprocess.run([bash, "-n", str(script)], check=True)
+    path = str(script)
+    if os.name == "nt":
+        if "system32" in bash.lower():
+            path = "/mnt/" + script.drive.rstrip(":").lower() + "/" + script.relative_to(script.anchor).as_posix()
+        else:
+            path = script.as_posix()
+    subprocess.run([bash, "-n", path], check=True)
 
 
 @pytest.mark.parametrize("script", PPO_EXAMPLES, ids=lambda path: path.name)
@@ -99,6 +107,14 @@ def test_standalone_tq_training_example_uses_unified_launcher() -> None:
     assert "speco.standalone_tq_producer.per_endpoint_concurrency=" in source
     assert "actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=" in source
     assert "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=" in source
+    assert (
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha="
+        in source
+    )
+    assert (
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha="
+        in source
+    )
     assert "DSPARK_MAX_WINDOW=${DSPARK_MAX_WINDOW:-0}" in source
     assert "DSPARK_MAX_WINDOW=${DSPARK_MAX_WINDOW:-512}" not in source
     assert "training.dspark_max_window=${DSPARK_MAX_WINDOW}" in source
@@ -165,6 +181,20 @@ def test_original_npu_dspark_example_keeps_repository_mrv1_contract() -> None:
     assert "actor_rollout_ref.rollout.max_num_batched_tokens=16384" in source
     assert "actor_rollout_ref.rollout.gpu_memory_utilization=0.7" in source
 
+    assignments = _launch_assignments(source)
+    assert assignments["data.filter_overlong_prompts"] == "False"
+    training_prefix = "actor_rollout_ref.rollout.drafter.training."
+    expected_training = {
+        "dspark_hard_candidate_ratio": "0",
+        "dspark_hard_sample_ratio": "0",
+        "collect_interval_steps": "10",
+        "training_interval_steps": "10",
+        "batch_size_per_gpu": "10",
+        "sample_last_n_steps": "10",
+    }
+    for key, value in expected_training.items():
+        assert assignments[training_prefix + key] == value
+
 
 def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None:
     baseline_source = (
@@ -178,24 +208,36 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     mrv2 = _launch_assignments(mrv2_source)
     added_keys = {
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling",
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.weight_nz_mode",
+        "+actor_rollout_ref.rollout.drafter.vllm.speculative_config_overrides.enable_adaptive_verification",
         "actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha",
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_with_markov",
+    }
+    baseline_only_keys = {
+        "actor_rollout_ref.rollout.drafter.training.dspark_hard_candidate_ratio",
+        "actor_rollout_ref.rollout.drafter.training.dspark_hard_sample_ratio",
+        "actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu",
+        "actor_rollout_ref.rollout.drafter.training.sample_last_n_steps",
     }
     changed_keys = {
         "data.filter_overlong_prompts",
         "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens",
         "actor_rollout_ref.rollout.drafter.training.publish_async",
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha",
+        "actor_rollout_ref.rollout.drafter.training.collect_interval_steps",
+        "actor_rollout_ref.rollout.drafter.training.training_interval_steps",
     }
 
     assert set(mrv2) - set(baseline) == added_keys
-    assert set(baseline) - set(mrv2) == set()
+    assert set(baseline) - set(mrv2) == baseline_only_keys
     assert {
         key: value
         for key, value in mrv2.items()
-        if key not in added_keys | changed_keys
+        if key not in added_keys | baseline_only_keys | changed_keys
     } == {
         key: value
         for key, value in baseline.items()
-        if key not in added_keys | changed_keys
+        if key not in added_keys | baseline_only_keys | changed_keys
     }
     assert (
         baseline["actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens"] == "7"
@@ -208,13 +250,6 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
         mrv2["+actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling"]
         == "False"
     )
-    assert (
-        baseline["actor_rollout_ref.rollout.drafter.training.publish_async"] == "True"
-    )
-    assert (
-        mrv2["actor_rollout_ref.rollout.drafter.training.publish_async"] == "False"
-    )
-
     assert "export VLLM_USE_V1=1" in mrv2_source
     assert "export VLLM_USE_V2_MODEL_RUNNER=1" in mrv2_source
     assert (
@@ -231,12 +266,18 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     assert "data.filter_overlong_prompts=False" in mrv2_source
     assert "data.filter_overlong_prompts=True" not in mrv2_source
     assert "data.filter_overlong_prompts_workers=256" in mrv2_source
-    assert "dspark_confidence_head_alpha=0.0" in mrv2_source
-    assert "dynamic_spec" not in mrv2_source
+    assert "dspark_confidence_head_alpha=1.0" in mrv2_source
+    assert "dspark_confidence_loss_alpha=1.0" in mrv2_source
+    assert "dspark_confidence_head_with_markov=True" in mrv2_source
+    assert "enable_adaptive_verification=True" in mrv2_source
+    assert "additional_config.weight_nz_mode=0" in mrv2_source
+    # The V1 dynamic-verify mechanism must not be *configured* on the MRV2 recipe
+    # (a header comment may still describe it as the V1 alternative).
+    assert not any("dynamic_spec" in key for key in mrv2)
     assert "SPECO MRV2 run directory" not in mrv2_source
     assert "tee -a" not in mrv2_source
-    assert "MODEL_PATH=/path/to/model" in mrv2_source
-    assert "CKPTS_DIR=/path/to/checkpoint" in mrv2_source
-    assert "TRAIN_FILE=/path/to/train_file" in mrv2_source
-    assert "TEST_FILE=/path/to/test_file" in mrv2_source
-    assert "DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter" in mrv2_source
+    assert "MODEL_PATH=${MODEL_PATH:-/path/to/model}" in mrv2_source
+    assert "CKPTS_DIR=${CKPTS_DIR:-/path/to/checkpoint}" in mrv2_source
+    assert "TRAIN_FILE=${TRAIN_FILE:-/path/to/train_file}" in mrv2_source
+    assert "TEST_FILE=${TEST_FILE:-/path/to/test_file}" in mrv2_source
+    assert "DRAFTER_PATH=${DRAFTER_PATH:-/path/to/vllm-compatible-dspark-drafter}" in mrv2_source

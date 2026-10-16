@@ -116,6 +116,36 @@ def test_transfer_queue_training_requires_one_complete_global_batch() -> None:
     assert ready.to_worker_payload()["required_samples"] == 16
 
 
+@pytest.mark.parametrize(
+    "changes, launch, reason",
+    [
+        ({"consumer_ready": False}, False, "consumer_initializing"),
+        ({"outstanding_batches": 2}, False, "outstanding_capacity_reached"),
+        ({"remaining_steps": 1}, False, "training_budget_reserved"),
+        ({"remaining_steps": 0, "outstanding_batches": 0}, False, "training_budget_reserved"),
+        ({}, True, "training_ready"),
+    ],
+)
+def test_scheduler_decides_prefetch_capacity_and_budget(changes, launch, reason):
+    values = {"consumer_training": True, "outstanding_batches": 1,
+              "max_outstanding_batches": 2, **changes}
+    context = QueueScheduleContext(queue_status=QueueStatus(32), config=_config(), **values)
+    plan = DrafterScheduler().plan_queue_training(context)
+    assert plan.launch is launch
+    assert plan.reason == reason
+
+
+def test_scheduler_finishes_budget_only_after_pending_plans_complete():
+    from dataclasses import replace
+
+    context = QueueScheduleContext(queue_status=QueueStatus(32), config=_config(),
+                                   remaining_steps=0, outstanding_batches=1)
+    scheduler = DrafterScheduler()
+    assert not scheduler.queue_budget_exhausted(context)
+    assert scheduler.queue_budget_exhausted(replace(context, outstanding_batches=0))
+    assert not scheduler.queue_budget_exhausted(replace(context, outstanding_batches=0, consumer_ready=False))
+
+
 def test_standalone_executors_apply_plans_and_track_runtime_state() -> None:
     producer_commands = []
     consumer_commands = []

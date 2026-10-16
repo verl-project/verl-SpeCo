@@ -28,6 +28,48 @@ def _metric_float(value: object) -> float | None:
         return None
 
 
+# Per-block drafter training scalars that SpecoWorker.get_training_metrics()
+# reports in each worker result (e.g. dspark/confidence_loss). The summary dict
+# built by TrainingOutcome.from_execution is a fixed whitelist of drafter/*
+# keys, so these "<block_prefix>/<suffix>" scalars are forwarded separately to
+# keep them observable in co-train logs and TensorBoard.
+_BLOCK_METRIC_PASSTHROUGH_SUFFIXES = frozenset(
+    {
+        "confidence_loss",
+        "confidence_accept_rate",
+        "confidence_pred_mean",
+        "confidence_weighted_token_count",
+        "ce_loss",
+        "l1_loss",
+        "accuracy",
+    }
+)
+
+
+def _forward_block_metrics(
+    results: list[dict[str, object]],
+) -> dict[str, float]:
+    """Mean of whitelisted ``<prefix>/<suffix>`` scalars across worker results.
+
+    Keys are kept verbatim (including their block prefix) so DSpark's
+    ``dspark/confidence_*`` and DFlash's ``dflash/...`` metrics retain their
+    namespace. Non-numeric values are skipped.
+    """
+    collected: dict[str, list[float]] = {}
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        for key, raw_value in result.items():
+            if not isinstance(key, str) or "/" not in key:
+                continue
+            if key.rsplit("/", 1)[-1] not in _BLOCK_METRIC_PASSTHROUGH_SUFFIXES:
+                continue
+            value = _metric_float(raw_value)
+            if value is not None:
+                collected.setdefault(key, []).append(value)
+    return {key: sum(values) / len(values) for key, values in collected.items()}
+
+
 @dataclass(frozen=True)
 class TrainingOutcome:
     trained: bool
@@ -45,7 +87,7 @@ class TrainingOutcome:
         *,
         runtime_state: DrafterRuntimeState,
         plan: TrainingPlan,
-    ) -> "TrainingOutcome":
+    ) -> TrainingOutcome:
         normalized_results: list[dict[str, object]] = []
         for result in execution.raw_results:
             if isinstance(result, dict):
@@ -179,6 +221,13 @@ class TrainingOutcome:
                 len(publish_leaders) == 1 and publish_leaders[0].snapshot_ready
             ),
         }
+        # Surface per-block drafter training scalars (e.g. dspark/confidence_*)
+        # computed by SpecoWorker.get_training_metrics() instead of dropping them.
+        for block_key, block_value in _forward_block_metrics(
+            normalized_results
+        ).items():
+            metrics.setdefault(block_key, block_value)
+
         for key in (
             "timing_s/drafter_prepare_batch",
             "timing_s/drafter_forward_loss",

@@ -1,0 +1,23 @@
+{
+  "dspark-mrv2": "examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_vllm_npu.sh",
+  "gpu-megatron-eagle3": "examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm.sh",
+  "megatron-eagle3": "examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh",
+  "gpu-veomni-dspark": "examples/run_qwen3-8b_actor_veomni_drafter_dspark_vllm.sh",
+  "veomni-dspark": "examples/run_qwen3-8b_actor_veomni_drafter_dspark_vllm_npu.sh",
+  "gpu-sglang-dflash2": "examples/run_qwen3-8b_drafter_dflash2_sglang.sh",
+  "gpu-dflash2": "examples/run_qwen3-8b_drafter_dflash2_vllm.sh",
+  "gpu-sglang-dflash": "examples/run_qwen3-8b_drafter_dflash_sglang.sh",
+  "gpu-dflash": "examples/run_qwen3-8b_drafter_dflash_vllm.sh",
+  "dflash": "examples/run_qwen3-8b_drafter_dflash_vllm_npu.sh",
+  "domino-peagle-separate": "examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh",
+  "npu-dspark-separate": "examples/run_qwen3-8b_drafter_dspark_separate_training.sh",
+  "gpu-dspark": "examples/run_qwen3-8b_drafter_dspark_vllm.sh",
+  "dspark": "examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh",
+  "gpu-eagle3-separate": "examples/run_qwen3-8b_drafter_eagle3_separate_training.sh",
+  "gpu-sglang-eagle3": "examples/run_qwen3-8b_drafter_eagle3_sglang.sh",
+  "sglang-eagle3": "examples/run_qwen3-8b_drafter_eagle3_sglang_npu.sh",
+  "gpu-eagle3": "examples/run_qwen3-8b_drafter_eagle3_vllm.sh",
+  "eagle3": "examples/run_qwen3-8b_drafter_eagle3_vllm_npu.sh",
+  "gpu-eagle3-offline": "examples/run_qwen3-8b_drafter_separate_training.sh",
+  "npu-dspark35b-separate": "examples/run_qwen3.6-35b-a3b_drafter_dspark_separate_training.sh"
+}

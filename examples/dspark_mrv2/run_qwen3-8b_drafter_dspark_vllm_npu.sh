@@ -20,9 +20,17 @@ export SPECO_JEMALLOC_RECLAIM_MODE="${SPECO_JEMALLOC_RECLAIM_MODE:-purge}"
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
 
-# Native fixed-K MRV2 does not consume the confidence head. All parameters not
-# listed as MRV2-specific below intentionally match the repository's original
-# run_qwen3-8b_drafter_dspark_vllm_npu.sh example.
+# DSpark confidence-head co-train + confidence-thresholded dynamic verification
+# on the native MRV2 runner (vllm-ascend#15098; the verify budget is consumed in
+# the worker, so async scheduling is fine and left enabled).
+#
+# V1-runner alternative (older vllm-ascend builds with vllm-ascend#13216): set
+# VLLM_USE_V2_MODEL_RUNNER=0, opt in with
+# `rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method=dspark`
+# plus method_params.{initial_verify_budget_per_req,budget_update_interval,
+# budget_threshold}, and disable async scheduling (`async_scheduling=False`) --
+# the V1 budget consumer `take_draft_token_ids()` is only called when async is
+# off. DRAFTER_PATH must already contain confidence_head.proj.{weight,bias}.
 project_name='verl_grpo_example_dspark_drafter'
 exp_name='qwen3_8b_dspark_mrv2_drafter_vllm_npu'
 
@@ -33,11 +41,11 @@ ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-16}
 spec_verify_tokens=${SPECO_DSPARK_VERIFY_TOKENS:-7}
 
-MODEL_PATH=/path/to/model
-CKPTS_DIR=/path/to/checkpoint
-TRAIN_FILE=/path/to/train_file
-TEST_FILE=/path/to/test_file
-DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter
+MODEL_PATH=${MODEL_PATH:-/path/to/model}
+CKPTS_DIR=${CKPTS_DIR:-/path/to/checkpoint}
+TRAIN_FILE=${TRAIN_FILE:-/path/to/train_file}
+TEST_FILE=${TEST_FILE:-/path/to/test_file}
+DRAFTER_PATH=${DRAFTER_PATH:-/path/to/vllm-compatible-dspark-drafter}
 
 
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
@@ -79,6 +87,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_capture_sizes="[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.max_cudagraph_capture_size=512 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode="FULL_DECODE_ONLY" \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.weight_nz_mode=0 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
@@ -93,6 +102,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
     actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH} \
     actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK \
+    +actor_rollout_ref.rollout.drafter.vllm.speculative_config_overrides.enable_adaptive_verification=True \
     actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True \
     actor_rollout_ref.rollout.drafter.training.old_logprob_hidden_capture_impl=forward_hook \
     actor_rollout_ref.rollout.drafter.training.dspark_block_size=7 \
@@ -107,8 +117,9 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.target_lm_head_row_restricted_sync=False \
     actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=0.1 \
     actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=0.9 \
-    actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha=0.0 \
-    actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=0.0 \
+    actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha=1.0 \
+    actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=1.0 \
+    actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_with_markov=True \
     actor_rollout_ref.rollout.drafter.rollout.spec_steps=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=${spec_verify_tokens} \

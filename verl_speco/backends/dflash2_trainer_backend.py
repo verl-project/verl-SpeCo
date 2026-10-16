@@ -137,6 +137,8 @@ class DFlash2TrainingModel(DFlashTrainingModel):
             # the lift is selector_correct_count - selector_base_correct_count.
             metrics = {
                 "selector_loss": selector_loss.detach().float(),
+                "selector_loss_sum": (per_row * row_weights).sum().detach().float(),
+                "selector_weight_count": row_weights.sum().detach().float(),
                 "selector_correct_count": (
                     (torch.argmax(scores, dim=-1) == row_targets) & scored
                 )
