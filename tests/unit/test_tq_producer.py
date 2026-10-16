@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
@@ -735,6 +736,215 @@ def test_run_producer_restarts_input_until_max_samples(tmp_path: Path) -> None:
     assert sorted(tag["sequence_no"] for tag in sample_tags) == [0, 1, 2, 3, 4]
     assert pool.prefill_calls == 5
     assert eos_tags[0]["total_samples"] == 5
+
+
+def test_run_producer_shuffle_permutes_per_epoch_deterministically(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    producer_cfg = config["speco"]["standalone_tq_producer"]
+    producer_cfg["max_samples"] = 4  # two epochs over the two-record file
+    producer_cfg["shuffle"] = True
+    producer_cfg["shuffle_seed"] = 42
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    sample_tags = sorted(
+        (
+            tag
+            for tag in transport.records.values()
+            if tag.get("record_type") == "sample"
+        ),
+        key=lambda tag: int(tag["sequence_no"]),
+    )
+    assert stats.input_count == 4
+    assert [int(tag["sequence_no"]) for tag in sample_tags] == [0, 1, 2, 3]
+    # sequence_no is run-global and follows the permuted queue order, so the
+    # sample_id sequence must equal the per-epoch permutations (speculators
+    # NumPy default_rng(seed + epoch).permutation recipe).
+    records = ["sample-1", "sample-2"]
+    epoch0 = np.random.default_rng(42).permutation(2)
+    epoch1 = np.random.default_rng(43).permutation(2)
+    expected = [records[i] for i in [*epoch0, *epoch1]]
+    assert [tag["sample_id"] for tag in sample_tags] == expected
+
+
+def test_run_producer_shuffle_resume_replays_epoch_order(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    # Epoch 0 already fully consumed: sequence_nos 0 and 1.
+    checkpoint_path = tmp_path / "draft_step_1"
+    save_standalone_resume(
+        checkpoint_path,
+        [0, 1],
+        optimizer_step=1,
+        input_path=input_path,
+    )
+    config = _config(input_path)
+    producer_cfg = config["speco"]["standalone_tq_producer"]
+    producer_cfg["resume_checkpoint_path"] = str(checkpoint_path)
+    producer_cfg["max_samples"] = 2
+    producer_cfg["shuffle"] = True
+    producer_cfg["shuffle_seed"] = 42
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    sample_tags = sorted(
+        (
+            tag
+            for tag in transport.records.values()
+            if tag.get("record_type") == "sample"
+        ),
+        key=lambda tag: int(tag["sequence_no"]),
+    )
+    assert stats.input_count == 2
+    # Only the replayed epoch-1 permutation is queued, with fresh run-global
+    # sequence numbers continuing after the consumed prefix.
+    assert [int(tag["sequence_no"]) for tag in sample_tags] == [2, 3]
+    records = ["sample-1", "sample-2"]
+    epoch1 = np.random.default_rng(43).permutation(2)
+    assert [tag["sample_id"] for tag in sample_tags] == [records[i] for i in epoch1]
+
+
+def test_run_producer_shuffle_resume_with_filtered_rows_stays_aligned(
+    tmp_path: Path,
+) -> None:
+    """Shuffle + prompt-only rows + partial resume stay sequence-aligned.
+
+    Filtered rows consume a sequence_no like any other row (#110 semantics).
+    A resumed run must replay the same permutation, re-filter the same
+    prompt-only row, and republish only the unconsumed samples under their
+    original sequence numbers.
+    """
+    input_path = tmp_path / "input.jsonl"
+    records = [
+        {"sample_id": "sample-1", "prompt": "Q1: ", "response": "A1"},
+        {"sample_id": "sample-2", "prompt": "Q2: ", "response": "A2"},
+        # Prompt-only row: filtered under the default on_missing_response=skip.
+        {"prompt": [{"role": "user", "content": "Q3"}]},
+    ]
+    input_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    base_config = _config(input_path)
+    producer_cfg = base_config["speco"]["standalone_tq_producer"]
+    producer_cfg["shuffle"] = True
+    producer_cfg["shuffle_seed"] = 42
+
+    # First run: one full shuffled pass; the prompt-only row is filtered and
+    # consumes the remaining sequence number of {0, 1, 2}.
+    transport = _Transport()
+    stats_first = asyncio.run(
+        run_producer(
+            base_config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=_Pool(tmp_path),
+        )
+    )
+    assert stats_first.input_count == 2  # yielded requests only
+    assert stats_first.filtered_count == 1
+    assert stats_first.published_count == 2
+    seq_by_sample = {
+        tag["sample_id"]: int(tag["sequence_no"])
+        for tag in transport.records.values()
+        if tag.get("record_type") == "sample"
+    }
+    assert len(seq_by_sample) == 2
+    assert set(seq_by_sample.values()) < {0, 1, 2}
+
+    # Resume having consumed only the lower-numbered sample of epoch 0.
+    consumed = min(seq_by_sample.values())
+    remaining_sample = max(seq_by_sample, key=lambda s: seq_by_sample[s])
+    checkpoint_path = tmp_path / "draft_step_1"
+    save_standalone_resume(
+        checkpoint_path,
+        [consumed],
+        optimizer_step=1,
+        input_path=input_path,
+        producer_shuffle={"shuffle": True, "shuffle_seed": 42},
+    )
+    resume_config = _config(input_path)
+    resume_cfg = resume_config["speco"]["standalone_tq_producer"]
+    resume_cfg["shuffle"] = True
+    resume_cfg["shuffle_seed"] = 42
+    resume_cfg["resume_checkpoint_path"] = str(checkpoint_path)
+    resume_transport = _Transport()
+
+    stats_resumed = asyncio.run(
+        run_producer(
+            resume_config,
+            transport=resume_transport,
+            tokenizer=_Tokenizer(),
+            client_pool=_Pool(tmp_path),
+        )
+    )
+    resumed_tags = [
+        tag
+        for tag in resume_transport.records.values()
+        if tag.get("record_type") == "sample"
+    ]
+    assert stats_resumed.input_count == 1
+    assert stats_resumed.filtered_count == 1  # same row re-filtered
+    assert stats_resumed.published_count == 1  # only the unconsumed sample
+    assert len(resumed_tags) == 1
+    assert resumed_tags[0]["sample_id"] == remaining_sample
+    # The surviving sample keeps its original sequence_no: same permutation,
+    # same assignment, the consumed one skipped in place.
+    assert int(resumed_tags[0]["sequence_no"]) == seq_by_sample[remaining_sample]
+
+
+def test_run_producer_shuffle_resume_rejects_changed_shuffle_config(
+    tmp_path: Path,
+) -> None:
+    """Consumed sequence numbers are permutation positions: refuse a resume
+    whose checkpoint was saved under different shuffle settings."""
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    checkpoint_path = tmp_path / "draft_step_1"
+    save_standalone_resume(
+        checkpoint_path,
+        [0],
+        optimizer_step=1,
+        input_path=input_path,
+        producer_shuffle={"shuffle": True, "shuffle_seed": 42},
+    )
+    config = _config(input_path)
+    producer_cfg = config["speco"]["standalone_tq_producer"]
+    producer_cfg["resume_checkpoint_path"] = str(checkpoint_path)
+    producer_cfg["shuffle"] = True
+    producer_cfg["shuffle_seed"] = 7
+
+    with pytest.raises(ValueError, match="shuffle config changed"):
+        asyncio.run(
+            run_producer(
+                config,
+                transport=_Transport(),
+                tokenizer=_Tokenizer(),
+                client_pool=_Pool(tmp_path),
+            )
+        )
 
 
 def test_run_producer_skips_consumed_sequences_before_vllm(tmp_path: Path) -> None:

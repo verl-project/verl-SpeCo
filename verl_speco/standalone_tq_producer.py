@@ -19,6 +19,7 @@ import asyncio
 import logging
 import math
 import os
+import numpy as np
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -40,6 +41,8 @@ from verl_speco.producer.hidden_states_store import (
 from verl_speco.producer.input_reader import (
     GenerationRequest,
     SampleFilteredError,
+    ShuffledInputUnsupportedError,
+    ShuffledJsonlReader,
     TokenizedRequest,
     build_render_fn,
     iter_input_records,
@@ -241,6 +244,39 @@ async def publish_one(
         published_attempt,
         retry_wait_seconds,
     )
+
+
+def _assert_resume_shuffle_alignment(
+    resume_metadata: dict[str, Any] | None,
+    *,
+    shuffle: bool,
+    shuffle_seed: int,
+) -> None:
+    """Refuse a resume whose checkpoint was written under another shuffle config.
+
+    Consumed sequence numbers are positions in the per-epoch permutations, so
+    changing shuffle settings between runs silently duplicates or skips
+    samples instead of failing loudly.
+    """
+    saved = (resume_metadata or {}).get("producer_shuffle")
+    if saved is None:
+        if shuffle:
+            logger.warning(
+                "Standalone TQ Producer resume checkpoint predates shuffle "
+                "metadata; cannot verify that shuffle_seed matches the run "
+                "that produced the consumed sequence numbers"
+            )
+        return
+    saved_shuffle = bool(saved.get("shuffle", False))
+    saved_seed = int(saved.get("shuffle_seed", 42))
+    if saved_shuffle != shuffle or (shuffle and saved_seed != shuffle_seed):
+        raise ValueError(
+            "Standalone resume shuffle config changed since the checkpoint was "
+            f"saved: saved shuffle={saved_shuffle} shuffle_seed={saved_seed}, "
+            f"current shuffle={shuffle} shuffle_seed={shuffle_seed}; consumed "
+            "sequence numbers are permutation positions and would silently "
+            "misalign"
+        )
 
 
 def _read_on_missing_response(producer_cfg: Any) -> str:
@@ -474,6 +510,11 @@ async def run_producer(
             producer_cfg.get("resume_checkpoint_path"),
             input_path=str(producer_cfg["input_path"]),
         )
+        _assert_resume_shuffle_alignment(
+            resume_metadata,
+            shuffle=bool(producer_cfg.get("shuffle", False)),
+            shuffle_seed=int(producer_cfg.get("shuffle_seed", 42)),
+        )
         logger.info(
             "Standalone TQ Producer resume progress checkpoint=%s consumed=%s step=%s",
             producer_cfg.get("resume_checkpoint_path"),
@@ -655,6 +696,51 @@ async def run_producer(
                 last_heartbeat_at = now
 
         def iter_requests():
+            shuffle = bool(producer_cfg.get("shuffle", False))
+            shuffle_seed = int(producer_cfg.get("shuffle_seed", 42))
+            shuffled_reader: ShuffledJsonlReader | None = None
+            buffered_records: list | None = None
+            if shuffle:
+                try:
+                    shuffled_reader = ShuffledJsonlReader(
+                        str(producer_cfg["input_path"]),
+                        on_error=str(producer_cfg.get("on_error", "skip") or "skip"),
+                        max_consecutive_errors=config_int(
+                            producer_cfg, "max_consecutive_errors", 20
+                        ),
+                        parser_strict_roles=bool(
+                            producer_cfg.get("parser_strict_roles", False)
+                        ),
+                    )
+                    logger.info(
+                        "Standalone TQ Producer indexed %s JSONL lines for "
+                        "shuffle_seed=%s",
+                        shuffled_reader.record_count,
+                        shuffle_seed,
+                    )
+                except ShuffledInputUnsupportedError as exc:
+                    # Parquet rows have no byte offsets to index; fall back to
+                    # buffering the parsed records for this run.
+                    logger.warning(
+                        "Standalone TQ Producer cannot index %s (%s); falling "
+                        "back to buffering parsed records in memory",
+                        producer_cfg["input_path"],
+                        exc,
+                    )
+                    buffered_records = list(
+                        iter_input_records(
+                            str(producer_cfg["input_path"]),
+                            on_error=str(
+                                producer_cfg.get("on_error", "skip") or "skip"
+                            ),
+                            max_consecutive_errors=config_int(
+                                producer_cfg, "max_consecutive_errors", 20
+                            ),
+                            parser_strict_roles=bool(
+                                producer_cfg.get("parser_strict_roles", False)
+                            ),
+                        )
+                    )
             epoch = 0
             source_sequence_no = 0
             render_boundary_cfg = producer_cfg.get("render_boundary", {}) or {}
@@ -678,16 +764,35 @@ async def run_producer(
                 scanned_count = 0
                 considered_count = 0
                 produced_count = 0
-                for source_record in iter_input_records(
-                    str(producer_cfg["input_path"]),
-                    on_error=str(producer_cfg.get("on_error", "skip") or "skip"),
-                    max_consecutive_errors=config_int(
-                        producer_cfg, "max_consecutive_errors", 20
-                    ),
-                    parser_strict_roles=bool(
-                        producer_cfg.get("parser_strict_roles", False)
-                    ),
-                ):
+                if shuffle:
+                    # Deterministic per-epoch permutation (seed + epoch), so a
+                    # resumed run replays the same order and the consumed
+                    # sequence set stays aligned across restarts. Uses the
+                    # speculators RNG recipe (NumPy default_rng(seed + epoch)
+                    # .permutation, cf. distributed_batch_sampler) so the same
+                    # seed produces the same order there and here.
+                    if shuffled_reader is not None:
+                        record_order = np.random.default_rng(
+                            shuffle_seed + epoch
+                        ).permutation(shuffled_reader.record_count)
+                        record_iter = shuffled_reader.iter_records(record_order)
+                    else:
+                        record_order = np.random.default_rng(
+                            shuffle_seed + epoch
+                        ).permutation(len(buffered_records))
+                        record_iter = (buffered_records[i] for i in record_order)
+                else:
+                    record_iter = iter_input_records(
+                        str(producer_cfg["input_path"]),
+                        on_error=str(producer_cfg.get("on_error", "skip") or "skip"),
+                        max_consecutive_errors=config_int(
+                            producer_cfg, "max_consecutive_errors", 20
+                        ),
+                        parser_strict_roles=bool(
+                            producer_cfg.get("parser_strict_roles", False)
+                        ),
+                    )
+                for source_record in record_iter:
                     sequence_no = source_sequence_no
                     source_sequence_no += 1
                     scanned_count += 1

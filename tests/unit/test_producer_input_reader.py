@@ -159,6 +159,53 @@ def test_iter_input_records_reads_jsonl(tmp_path: Path) -> None:
     assert records[0].source_metadata == {"source": "test"}
 
 
+def test_shuffled_jsonl_reader_reads_in_caller_order(tmp_path: Path) -> None:
+    input_path = tmp_path / "train.jsonl"
+    lines = [
+        json.dumps({"sample_id": "a", "prompt": "Q1: ", "response": "A1"}),
+        "",  # blank lines must not shift the byte offsets
+        json.dumps({"sample_id": "b", "prompt": "Q2: ", "response": "A2"}),
+        json.dumps({"sample_id": "c", "prompt": "Q3: ", "response": "A3"}),
+    ]
+    input_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    reader = input_reader.ShuffledJsonlReader(input_path)
+    assert reader.record_count == 3
+
+    order = [2, 0, 1]
+    records = list(reader.iter_records(order))
+
+    sequential = list(input_reader.iter_input_records(input_path))
+    expected = [sequential[i] for i in order]
+    assert [r.sample_id for r in records] == [r.sample_id for r in expected]
+    for shuffled, plain in zip(records, expected):
+        assert (shuffled.prompt, shuffled.response) == (plain.prompt, plain.response)
+
+
+def test_shuffled_jsonl_reader_skips_invalid_lines(tmp_path: Path) -> None:
+    input_path = tmp_path / "train.jsonl"
+    input_path.write_text(
+        json.dumps({"sample_id": "a", "prompt": "Q: ", "response": "A"}) + "\n"
+        + "{not json\n"
+        + json.dumps({"sample_id": "b", "prompt": "Q2: ", "response": "B"}) + "\n",
+        encoding="utf-8",
+    )
+
+    reader = input_reader.ShuffledJsonlReader(input_path, max_consecutive_errors=5)
+    assert reader.record_count == 3  # offsets are collected before parsing
+    records = list(reader.iter_records([0, 1, 2]))
+
+    assert [r.sample_id for r in records] == ["a", "b"]
+
+
+def test_shuffled_jsonl_reader_rejects_parquet(tmp_path: Path) -> None:
+    input_path = tmp_path / "train.parquet"
+    input_path.write_bytes(b"PAR1-fixture")
+
+    with pytest.raises(input_reader.ShuffledInputUnsupportedError):
+        input_reader.ShuffledJsonlReader(input_path)
+
+
 def test_iter_input_records_reads_parquet_rows(monkeypatch, tmp_path: Path) -> None:
     input_path = tmp_path / "train.parquet"
     input_path.write_bytes(b"PAR1-test-fixture")
