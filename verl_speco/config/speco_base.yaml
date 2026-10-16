@@ -162,6 +162,7 @@ actor_rollout_ref:
         allow_lossy_speculative_sampling: false
 
       training:
+        engine: fsdp  # fsdp or veomni; VeOmni requires a full-world FSDP2 mesh.
         mode: online
         # Consumed by the standalone DFlash/DSpark producer only.
         # Cotrain collection keeps its existing behavior.
