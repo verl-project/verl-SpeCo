@@ -48,6 +48,10 @@ from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
 from verl_speco.integration.rollout_publish import release_draft_weights_payload
+from verl_speco.rl_insight_bridge import (
+    log_scalar_metrics as _rl_insight_log_scalar_metrics,
+    trace_state as _rl_insight_trace_state,
+)
 from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
 
 logger = logging.getLogger(__file__)
@@ -1393,6 +1397,45 @@ class SpecoWorker(Worker):
             await self.trainer.cleanup_training(clear_data=False)
         return {"aborted": was_prepared, "rank": self.rank}
 
+    def _speco_rl_insight_labels(self) -> dict:
+        """Stable per-worker label set for RL-Insight metric and trace events.
+
+        ``global_step`` is intentionally excluded so gauges keep one Prometheus
+        series per worker instead of growing a new series every step.
+        """
+        return {
+            "worker_rank": int(self.rank),
+            "replica_rank": int(self.replica_rank),
+            "publish_leader": int(bool(self.is_global_publish_leader)),
+        }
+
+    def _speco_emit_rl_insight_worker_metrics(self, result: dict, labels: dict) -> None:
+        """Export per-rank drafter-worker counters/timings and training metrics.
+
+        These complement the aggregated step metrics the trainer already logs;
+        the labels keep each rollout/drafter rank as its own time series.
+        """
+        prefix = "speco_drafter_worker_"
+        progress = {
+            "successful_steps": result.get("successful_steps"),
+            "attempted_steps": result.get("attempted_steps"),
+            "buffer_size_before": result.get("buffer_size_before"),
+            "buffer_size_after": result.get("buffer_size_after"),
+            "optimizer_step": result.get("optimizer_step"),
+            "publish_snapshot_cached": result.get("publish_snapshot_cached"),
+            "elapsed_sec": result.get("elapsed_sec"),
+            "training_loop_elapsed_sec": result.get("training_loop_elapsed_sec"),
+            "cleanup_elapsed_sec": result.get("cleanup_elapsed_sec"),
+            "publish_snapshot_elapsed_sec": result.get("publish_snapshot_elapsed_sec"),
+        }
+        _rl_insight_log_scalar_metrics(prefix, progress, **labels)
+        train_metrics = {
+            key: value
+            for key, value in result.items()
+            if isinstance(key, str) and "/" in key
+        }
+        _rl_insight_log_scalar_metrics(prefix, train_metrics, **labels)
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def train_drafter(self, training_plan=None):
         result = {
@@ -1447,30 +1490,43 @@ class SpecoWorker(Worker):
         with _preserve_process_rng_state(self.device_name):
             result["triggered"] = True
             start_ts = time.time()
+            rl_insight_labels = self._speco_rl_insight_labels()
+            rl_insight_lane = f"drafter_worker_{int(self.rank)}"
             self.trainer.clear_pending_publish_state_dict()
             try:
                 train_loop_ts = time.time()
                 self.trainer.reset_training_metrics()
-                for _ in range(max_batches):
-                    result["attempted_steps"] += 1
-                    step_ok = await self.trainer.training_step(
-                        self.last_global_step,
-                        min_sample_step=training_plan.get("min_sample_step"),
-                        max_sample_step=training_plan.get("max_sample_step"),
-                    )
-                    error = getattr(self.trainer, "last_training_error", None)
-                    if error is not None:
-                        result["errors"].append(dict(error))
-                    if step_ok:
-                        result["successful_steps"] += 1
+                with _rl_insight_trace_state(
+                    "drafter/worker_train_loop",
+                    state_lane_id=rl_insight_lane,
+                    max_batches=max_batches,
+                    **rl_insight_labels,
+                ):
+                    for _ in range(max_batches):
+                        result["attempted_steps"] += 1
+                        step_ok = await self.trainer.training_step(
+                            self.last_global_step,
+                            min_sample_step=training_plan.get("min_sample_step"),
+                            max_sample_step=training_plan.get("max_sample_step"),
+                        )
+                        error = getattr(self.trainer, "last_training_error", None)
+                        if error is not None:
+                            result["errors"].append(dict(error))
+                        if step_ok:
+                            result["successful_steps"] += 1
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
                 result.update(self.trainer.get_training_metrics())
                 if result["successful_steps"] > 0:
                     if prepare_publish:
                         snapshot_ts = time.time()
-                        cached = self.trainer.prepare_model_state_dict_for_publish(
-                            self.last_global_step
-                        )
+                        with _rl_insight_trace_state(
+                            "drafter/worker_publish_snapshot",
+                            state_lane_id=rl_insight_lane,
+                            **rl_insight_labels,
+                        ):
+                            cached = self.trainer.prepare_model_state_dict_for_publish(
+                                self.last_global_step
+                            )
                         result["publish_snapshot_cached"] = int(cached)
                         result["publish_snapshot_elapsed_sec"] = (
                             time.time() - snapshot_ts
@@ -1487,9 +1543,14 @@ class SpecoWorker(Worker):
                 result.update(self.trainer.get_training_metrics())
             finally:
                 cleanup_ts = time.time()
-                await self.trainer.cleanup_training(
-                    clear_data=result["successful_steps"] > 0
-                )
+                with _rl_insight_trace_state(
+                    "drafter/worker_cleanup",
+                    state_lane_id=rl_insight_lane,
+                    **rl_insight_labels,
+                ):
+                    await self.trainer.cleanup_training(
+                        clear_data=result["successful_steps"] > 0
+                    )
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
 
             result["trained"] = result["successful_steps"] > 0
@@ -1505,6 +1566,7 @@ class SpecoWorker(Worker):
             result["buffer_size_after"] = int(data_status_after["trainable_samples"])
             result["optimizer_step"] = int(self.trainer.optimizer_steps_total)
             result["elapsed_sec"] = time.time() - start_ts
+            self._speco_emit_rl_insight_worker_metrics(result, rl_insight_labels)
             return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

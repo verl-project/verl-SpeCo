@@ -468,6 +468,78 @@ The online PPO entrypoint composes them through
 feature-store training uses
 [`draft_trainer.yaml`](./verl_speco/config/draft_trainer.yaml).
 
+## Online Monitoring with RL-Insight
+
+[RL-Insight](https://github.com/verl-project/rl-insight) can observe the drafter
+co-training loop online. Enabling it is optional and non-invasive: when it is
+off (or unavailable) every SPECO hook degrades to a no-op, so it never changes
+training results or requires `rl_insight` at import time.
+
+### Enable
+
+Start the RL-Insight server (Prometheus + Tempo + Grafana) on a reachable host
+and follow the upstream
+[`verl` integration guide](https://github.com/verl-project/verl/blob/main/docs/advance/rl_insight.md),
+then point the training job at it:
+
+```bash
+export RL_INSIGHT_SERVER_URL="http://<server-ip>:18080"
+python3 -m verl_speco.main \
+    trainer.logger='["console","rl_insight"]' \
+    actor_rollout_ref.rollout.disable_log_stats=False \
+    ...
+```
+
+`verl` sets `VERL_RL_INSIGHT_ENABLE=1` and forwards it to all Ray workers as soon
+as `rl_insight` is in `trainer.logger`. On a multi-node cluster, also add
+`RL_INSIGHT_SERVER_URL` to the runtime-env file passed to `ray job submit` so
+workers on other nodes can reach the server:
+
+```yaml
+env_vars:
+  RL_INSIGHT_SERVER_URL: "http://<server-ip>:18080"
+```
+
+The EAGLE3 example scripts enable this automatically when
+`RL_INSIGHT_SERVER_URL` is exported; leaving it unset keeps the default logging.
+
+### What is monitored
+
+Trainer-side scalars (exported as Prometheus gauges; `/` becomes `_`):
+
+- drafter training: `drafter_trained`, `drafter_train_successful_steps_max`,
+  `drafter_train_buffer_size_*`, `drafter_train_*_consistent`
+- served and predicted acceptance: `drafter_spec_decode_mean_acceptance_length`,
+  and the per-algorithm `*_mean_acceptance_length` / `*_simulated_acc_len`
+- scheduler decisions: `drafter_schedule_launch`,
+  `drafter_schedule_interval_matched`, `drafter_collection_plan_*`,
+  `drafter_data_*`
+- freeze/economics gate: `drafter_freeze_would_freeze`,
+  `drafter_freeze_active_enforced`, `drafter_published`
+- timing: `timing_s_drafter`, `timing_s_drafter_train_rpc`,
+  `timing_s_drafter_publish_*`, `timing_s_drafter_outer_unaccounted`
+
+Per-rank worker signals emitted from `SpecoWorker` (labels
+`worker_rank`/`replica_rank`/`publish_leader`, prefix `speco_drafter_worker_`):
+
+- drafter training metrics such as `speco_drafter_worker_<algo>_loss`,
+  `_top1_acc`, `_mean_acceptance_length`, `_simulated_acc_len`
+- phase wall times `speco_drafter_worker_training_loop_elapsed_sec`,
+  `_publish_snapshot_elapsed_sec`, `_cleanup_elapsed_sec`
+
+Trace timelines (Grafana/Tempo) use a lane per trainer
+(`speco_trainer`) and per worker (`drafter_worker_<rank>`) for the phases
+`drafter/collect`, `drafter/prepare`, `drafter/train`, `drafter/publish`,
+`drafter/worker_train_loop`, `drafter/worker_publish_snapshot`, and
+`drafter/worker_cleanup`.
+
+### Dashboard
+
+RL-Insight ships a `verl-SpeCo Drafter Co-Training` dashboard under
+`dashboards/speco` in the RL-Insight Grafana folder, covering acceptance
+length, training activity, the freeze gate, collection/buffer state, the
+per-rank loss/accuracy curves, phase timing, and bubble opportunity.
+
 ## Testing
 
 CPU-light contract tests can be run with:
