@@ -49,7 +49,10 @@ class DraftFeatureSample:
     last_hidden_states: torch.Tensor | None = None
     target: torch.Tensor | None = None
     target_logprobs: torch.Tensor | None = None
+    target_logz: torch.Tensor | None = None
     position_ids: torch.Tensor | None = None
+    next_token_ids: torch.Tensor | None = None
+    next_token_loss_mask: torch.Tensor | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -69,7 +72,10 @@ class DraftFeatureSample:
             last_hidden_states=payload.get("last_hidden_states", payload.get("target")),
             target=payload.get("target"),
             target_logprobs=payload.get("target_logprobs"),
+            target_logz=payload.get("target_logz"),
             position_ids=payload.get("position_ids"),
+            next_token_ids=payload.get("next_token_ids"),
+            next_token_loss_mask=payload.get("next_token_loss_mask"),
             metadata=dict(payload.get("metadata") or {}),
         )
         sample.validate(strict=strict)
@@ -95,6 +101,10 @@ class DraftFeatureSample:
             self.input_ids = self.input_ids.reshape(-1)
         if self.loss_mask.dim() > 1:
             self.loss_mask = self.loss_mask.reshape(-1)
+        for field_name in ("next_token_ids", "next_token_loss_mask"):
+            value = getattr(self, field_name)
+            if torch.is_tensor(value) and value.dim() > 1:
+                setattr(self, field_name, value.reshape(-1))
         position_ids = self.position_ids
         if torch.is_tensor(position_ids):
             position_ids_tensor = cast(Any, position_ids)
@@ -108,11 +118,29 @@ class DraftFeatureSample:
             ):
                 target_logprobs_tensor = target_logprobs_tensor.squeeze(0)
             self.target_logprobs = target_logprobs_tensor
+        target_logz = self.target_logz
+        if torch.is_tensor(target_logz):
+            target_logz_tensor = cast(Any, target_logz)
+            while target_logz_tensor.dim() > 1 and target_logz_tensor.size(0) == 1:
+                target_logz_tensor = target_logz_tensor.squeeze(0)
+            self.target_logz = target_logz_tensor.float().reshape(-1)
         if self.input_ids.size(0) != self.loss_mask.size(0) and strict:
             raise ValueError(
                 "DraftFeatureSample input_ids/loss_mask length mismatch: "
                 f"{self.input_ids.size(0)} vs {self.loss_mask.size(0)}"
             )
+        if strict:
+            for field_name in ("next_token_ids", "next_token_loss_mask"):
+                value = getattr(self, field_name)
+                if value is not None and not torch.is_tensor(value):
+                    raise TypeError(
+                        f"DraftFeatureSample.{field_name} must be a torch.Tensor when provided"
+                    )
+                if torch.is_tensor(value) and value.size(0) != self.input_ids.size(0):
+                    raise ValueError(
+                        f"DraftFeatureSample input_ids/{field_name} length mismatch: "
+                        f"{self.input_ids.size(0)} vs {value.size(0)}"
+                    )
         if (
             torch.is_tensor(self.position_ids)
             and cast(Any, self.position_ids).size(0) != self.input_ids.size(0)
@@ -168,6 +196,19 @@ class DraftFeatureSample:
                 "DraftFeatureSample.target_logprobs must have shape [rows, topk, 2], "
                 f"got {tuple(cast(Any, self.target_logprobs).shape)}"
             )
+        if self.target_logz is not None and not torch.is_tensor(self.target_logz):
+            raise TypeError(
+                "DraftFeatureSample.target_logz must be a tensor when provided"
+            )
+        if (
+            torch.is_tensor(self.target_logz)
+            and cast(Any, self.target_logz).dim() != 1
+            and strict
+        ):
+            raise ValueError(
+                "DraftFeatureSample.target_logz must have shape [rows], "
+                f"got {tuple(cast(Any, self.target_logz).shape)}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         self.validate(strict=False)
@@ -189,9 +230,21 @@ class DraftFeatureSample:
             payload["target_logprobs"] = (
                 self.target_logprobs.detach().cpu().contiguous()
             )
+        if self.target_logz is not None:
+            payload["target_logz"] = (
+                self.target_logz.detach().cpu().float().contiguous()
+            )
         if self.position_ids is not None:
             payload["position_ids"] = (
                 self.position_ids.detach().cpu().long().contiguous()
+            )
+        if self.next_token_ids is not None:
+            payload["next_token_ids"] = (
+                self.next_token_ids.detach().cpu().long().contiguous()
+            )
+        if self.next_token_loss_mask is not None:
+            payload["next_token_loss_mask"] = (
+                self.next_token_loss_mask.detach().cpu().float().contiguous()
             )
         return payload
 
@@ -212,8 +265,14 @@ class DraftFeatureSample:
             item["last_hidden_states"] = payload["target"]
         if "target_logprobs" in payload:
             item["target_logprobs"] = payload["target_logprobs"]
+        if "target_logz" in payload:
+            item["target_logz"] = payload["target_logz"]
         if "position_ids" in payload:
             item["position_ids"] = payload["position_ids"]
+        if "next_token_ids" in payload:
+            item["next_token_ids"] = payload["next_token_ids"]
+        if "next_token_loss_mask" in payload:
+            item["next_token_loss_mask"] = payload["next_token_loss_mask"]
         for key, value in metadata.items():
             item.setdefault(key, value)
         _populate_verl_alignment_fields(item, metadata)

@@ -32,7 +32,10 @@ _OPTIONAL_TENSOR_FIELDS = (
     "last_hidden_states",
     "target",
     "target_logprobs",
+    "target_logz",
     "position_ids",
+    "next_token_ids",
+    "next_token_loss_mask",
 )
 
 

@@ -201,6 +201,9 @@ def test_worker_retains_error_when_second_batch_succeeds():
         async def cleanup_training(self, **kwargs):
             pass
 
+        def get_training_data_stats(self):
+            return {"buffer_total": 2, "eligible_samples": 2}
+
         def get_training_data_status(self, **kwargs):
             return {"trainable_samples": 0}
 
@@ -208,6 +211,7 @@ def test_worker_retains_error_when_second_batch_succeeds():
         rank=0,
         worker_incarnation="worker-0",
         is_global_publish_leader=True,
+        is_drafter_group_leader=False,
         enable_drafter=True,
         in_drafter_train_group=True,
         trainer=Trainer(),
@@ -233,6 +237,8 @@ def test_worker_retains_error_when_second_batch_succeeds():
     result = asyncio.run(method(worker, plan))
     assert result["trained"] is True
     assert result["successful_steps"] == 1
+    assert result["train_buffer_total"] == 2
+    assert result["train_eligible_samples"] == 2
     assert result["errors"] == [
         {"type": "RuntimeError", "message": "first batch failed"}
     ]

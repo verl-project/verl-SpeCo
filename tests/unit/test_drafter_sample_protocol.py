@@ -126,6 +126,27 @@ def test_hidden_state_tensor_list_round_trip() -> None:
     assert [tuple(value.shape) for value in restored.hidden_states] == [(4, 3), (4, 5)]
 
 
+def test_next_token_labels_round_trip() -> None:
+    sample = replace(
+        _sample(),
+        next_token_ids=torch.tensor([11, 12, 13, 14]),
+        next_token_loss_mask=torch.tensor([1.0, 1.0, 1.0, 1.0]),
+        target_logz=torch.tensor([2.0, 3.0, 4.0, 5.0]),
+    )
+    meta = _metadata()
+
+    restored = decode_sample(
+        make_sample_key(meta),
+        make_ready_tag(meta),
+        encode_sample(sample, meta),
+        ExpectedFeatureConfig(run_id=meta.run_id),
+    )
+
+    assert torch.equal(restored.next_token_ids, sample.next_token_ids)
+    assert torch.equal(restored.next_token_loss_mask, sample.next_token_loss_mask)
+    assert torch.equal(restored.target_logz, sample.target_logz)
+
+
 def test_ready_parser_is_the_shared_discovery_contract() -> None:
     meta = _metadata()
     tag = make_ready_tag(meta)

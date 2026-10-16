@@ -36,12 +36,14 @@ def _sample(index: int = 0):
     loss_mask = torch.tensor([0, 1, 1, 0], dtype=torch.float32)
     hidden_states = torch.randn(4, 8, dtype=torch.float32)
     last_hidden_states = torch.randn(4, 4, dtype=torch.float32)
+    target_logz = torch.arange(4, dtype=torch.float32) + index
     return DraftFeatureSample(
         algorithm="EAGLE3",
         input_ids=input_ids,
         loss_mask=loss_mask,
         hidden_states=hidden_states,
         last_hidden_states=last_hidden_states,
+        target_logz=target_logz,
         metadata={
             "source": "unit",
             "global_step": index,
@@ -70,6 +72,7 @@ def test_torch_shard_feature_store_roundtrip(tmp_path):
     loaded = reader.read(keys[0])
     assert loaded.algorithm == "EAGLE3"
     assert torch.equal(loaded.input_ids, torch.tensor([1, 2, 3, 4]))
+    torch.testing.assert_close(loaded.target_logz, _sample(0).target_logz)
     assert loaded.metadata["hidden_states_layout"] == "eagle3_aux_plus_last"
     assert reader.get_metadata()["num_samples"] == 2
 
