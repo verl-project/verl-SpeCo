@@ -232,6 +232,7 @@ class DominoTrainingModel(DFlashTrainingModel):
         hidden_states_list,
         loss_mask,
         lm_head_weight,
+        target_last_hidden_states=None,
         document_ids=None,
         label_ids=None,
         label_mask=None,

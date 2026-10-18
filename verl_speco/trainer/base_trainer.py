@@ -3081,7 +3081,11 @@ class DrafterBaseTrainer:
         # positions.  Next-token drafters need one additional input row after
         # the hidden-state window.
         model_type = getattr(self.backend, "model_type", None)
-        input_hidden_row_delta = 0 if self._is_block_drafter_backend() else 1
+        # Domino also shifts its labels by one token, so it keeps the trailing
+        # label row in ``input_ids`` (one row longer than the hidden window).
+        input_hidden_row_delta = (
+            0 if self._is_block_drafter_backend() and model_type != "domino" else 1
+        )
         # DSpark keeps context tokens aligned one-to-one with hidden rows, but
         # its labels are shifted by one token. Reserve the trailing token
         # separately instead of exposing it as an extra context row.
