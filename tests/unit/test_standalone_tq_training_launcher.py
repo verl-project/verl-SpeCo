@@ -226,6 +226,24 @@ def test_lk_loss_forwarded_to_producer_and_consumer_layout(
     )
 
 
+@pytest.mark.parametrize("key", ["dflash_lk_loss_alpha", "dspark_lk_loss_alpha"])
+def test_domino_launcher_rejects_lk_loss(key) -> None:
+    args = [item for item in _training_args() if "speculative_algorithm" not in item]
+    args.extend(
+        [
+            "actor_rollout_ref.rollout.drafter.speculative_algorithm=DOMINO",
+            f"actor_rollout_ref.rollout.drafter.training.{key}=0.5",
+        ]
+    )
+    with pytest.raises(ValueError, match=f"Domino does not support LK loss.*{key}"):
+        build_pipeline_commands(
+            resolve_pipeline_config(args, environ={}),
+            args,
+            ray_address="10.0.0.1:6379",
+            python_executable="python",
+        )
+
+
 def test_dflash_without_lk_expects_dflash_aux_layout() -> None:
     args = [
         item

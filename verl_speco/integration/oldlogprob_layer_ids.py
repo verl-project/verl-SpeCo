@@ -82,9 +82,17 @@ def resolve_drafter_hidden_states_layout(algorithm: Any, training_cfg: Any) -> s
     rebuild the target distribution. DSpark additionally needs the final hidden
     for L1/LK losses, confidence acceptance targets, or target-argmax CE.
     DFlash also needs the final hidden state when LK loss is enabled.
+    Domino does not support LK loss and rejects enabled LK settings.
     """
 
     algorithm = str(algorithm or "").strip().upper()
+    if algorithm == "DOMINO":
+        for key in ("dflash_lk_loss_alpha", "dspark_lk_loss_alpha"):
+            if float(_get_nested(training_cfg, (key,), 0.0) or 0.0) > 0:
+                raise ValueError(
+                    f"Domino does not support LK loss; set {key}=0 "
+                    "or select the DFLASH/DSPARK training backend for LK."
+                )
     if algorithm not in DFLASH_FAMILY_ALGORITHMS:
         return "eagle3_aux_plus_last"
     if algorithm == "DSPARK" and (

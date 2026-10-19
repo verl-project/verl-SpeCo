@@ -81,6 +81,11 @@ DFlash projector sub-mode. For rollout, use `speculative_algorithm=DFLASH`
 with a Domino checkpoint on an engine version that supports the Domino
 projector.
 
+Domino training does not support LK loss. Keep `dflash_lk_loss_alpha` and
+`dspark_lk_loss_alpha` at zero when selecting `DOMINO`; positive values are
+rejected during layout resolution and backend initialization. Use the DFlash
+or DSpark training backend for LK loss.
+
 P-EAGLE training is available, but its vLLM parallel-drafting rollout runtime
 is not wired into this overlay yet. Keep rollout drafter serving disabled and
 train or serve the checkpoint separately.

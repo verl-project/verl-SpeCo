@@ -270,6 +270,19 @@ def test_domino_backend_is_block_drafter_metadata() -> None:
     assert backend.model_type == "domino"
 
 
+@pytest.mark.parametrize("key", ["dflash_lk_loss_alpha", "dspark_lk_loss_alpha"])
+def test_domino_backend_rejects_lk_before_building_model(key) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from omegaconf import OmegaConf
+
+    from verl_speco.backends.domino_trainer_backend import DominoTrainerBackend
+
+    config = OmegaConf.create({"rollout": {"drafter": {"training": {key: 0.5}}}})
+    with pytest.raises(ValueError, match=f"Domino does not support LK loss.*{key}"):
+        DominoTrainerBackend(config, OmegaConf.create({}))
+
+
 def test_domino_config_from_file_routes_to_domino(tmp_path) -> None:
     pytest.importorskip("transformers")
     import json
