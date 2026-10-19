@@ -56,7 +56,9 @@ from verl_speco.backends.dflash_trainer_backend import (
     _document_boundary_validity,
 )
 from verl_speco.backends.lr_scheduler import _RESUME_OPTIMIZER_STEPS_KEY
-from verl_speco.integration.oldlogprob_layer_ids import resolve_drafter_hidden_states_layout
+from verl_speco.integration.oldlogprob_layer_ids import (
+    resolve_drafter_hidden_states_layout,
+)
 from verl_speco.models.dflash import resolve_rope_theta
 from verl_speco.models.domino import DominoConfig, DominoDraftModel
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
