@@ -17,7 +17,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.trainer.feature_store import (
     DraftFeatureSample,

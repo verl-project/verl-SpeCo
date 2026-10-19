@@ -105,17 +105,41 @@ def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
     assert "pip install -e ." not in source
     assert "uv pip install --system -e ." not in source
     assert "python -m compileall verl_speco" in source
-    assert "bash -n examples/*.sh" in source
+    assert 'find examples -type f -name "*.sh"' in source
+    assert "xargs -0 -r bash -n" in source
     assert "tests/compat" in source
     assert "tests/config" in source
     assert "tests/examples" in source
     assert "tests/integration" in source
     unit_job = _workflow("cpu_unit_tests.yml")["jobs"]["unit-tests"]
-    unit_run = next(step["run"] for step in unit_job["steps"] if "pytest" in step.get("run", ""))
+    unit_run = next(
+        step["run"] for step in unit_job["steps"] if "pytest" in step.get("run", "")
+    )
     assert "tests/unit" in shlex.split(unit_run)
     assert not any(arg.startswith("tests/unit/") for arg in shlex.split(unit_run))
     assert "requirements-unit.txt" in source
     assert "tests/ci" not in source
+
+
+def test_torch_unit_dependencies_include_v1_stateful_dataloader() -> None:
+    requirements = (ROOT / "ci" / "requirements-unit.txt").read_text()
+    assert {
+        "torchdata",
+        "codetiming",
+        "orjson",
+        "einops",
+        "cachetools",
+        "fastapi",
+        "uvicorn",
+    } <= set(requirements.splitlines())
+
+
+def test_v1_contracts_retain_a_torch_cpu_gate_after_upstream_ci_reorganization() -> (
+    None
+):
+    steps = _workflow("cpu_unit_tests.yml")["jobs"]["unit-tests"]["steps"]
+    assert any("ci/requirements-unit.txt" in step.get("run", "") for step in steps)
+    assert any("tests/v1" in step.get("run", "") for step in steps)
 
 
 def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
@@ -208,17 +232,12 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 in source
             )
             assert (
-                "SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE }}"
-                in source
+                "SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE }}" in source
             )
             assert (
-                "SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES }}"
-                in source
+                "SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES }}" in source
             )
-            assert (
-                "SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES }}"
-                in source
-            )
+            assert "SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES }}" in source
             assert (
                 "SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE }}"
                 in source
@@ -321,9 +340,7 @@ def test_example_runner_covers_gpu_and_npu_backend_matrix() -> None:
     assert "examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh" in source
     assert "gpu/vllm/peagle" in source
     assert "gpu/vllm/domino" in source
-    assert (
-        "examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh" in source
-    )
+    assert "examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh" in source
     # P-EAGLE attends through torch flex_attention, which the NPU runtime does
     # not provide, so the separate-training lane stays GPU-only.
     assert "npu/vllm/peagle" not in source
@@ -370,7 +387,10 @@ def test_example_runner_dry_run_covers_npu_dspark() -> None:
 def test_example_runner_dry_run_omits_ulysses_overrides_for_npu_megatron() -> None:
     stdout = _dry_run("megatron-eagle3", platform="npu", accelerator_count="8")
 
-    assert "example=examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh" in stdout
+    assert (
+        "example=examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh"
+        in stdout
+    )
     assert "draft_algorithm=EAGLE3" in stdout
     assert "ulysses_sequence_parallel_size" not in stdout
 
@@ -510,9 +530,7 @@ def test_example_runner_skips_the_offline_stage_without_training() -> None:
 
 def test_separate_training_example_takes_its_device_count_from_the_env() -> None:
     example = (
-        ROOT
-        / "examples"
-        / "run_qwen3-8b_drafter_domino_peagle_separate_training.sh"
+        ROOT / "examples" / "run_qwen3-8b_drafter_domino_peagle_separate_training.sh"
     ).read_text(encoding="utf-8")
 
     assert "draft_train_gpus_per_node=${DRAFT_TRAIN_GPUS_PER_NODE:-8}" in example
@@ -538,25 +556,35 @@ def test_npu_examples_run_without_smoke_dependency() -> None:
         assert "ci/check_result.py" in paths
 
 
-
 @pytest.mark.parametrize("platform", ["gpu", "npu"])
 def test_online_log_capture_preserves_failure_and_timing(platform: str) -> None:
     import json
 
     bash = _require_working_bash()
-    tail = "  export SPECO_CI_RESULT_PATH" + _runner_script().split("else\n  export SPECO_CI_RESULT_PATH")[-1]
+    tail = (
+        "  export SPECO_CI_RESULT_PATH"
+        + _runner_script().split("else\n  export SPECO_CI_RESULT_PATH")[-1]
+    )
     tail = tail.rsplit("\nfi", 1)[0]
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         example = root / "failure.sh"
-        example.write_text("echo stdout\necho stderr >&2\nexit 7\n", encoding="utf-8", newline="\n")
+        example.write_text(
+            "echo stdout\necho stderr >&2\nexit 7\n", encoding="utf-8", newline="\n"
+        )
         result = root / "evidence.json"
         script = root / "run.sh"
         script.write_text(
             f"set -euo pipefail\nplatform={platform}\noverrides=()\n"
-            + "example=" + shlex.quote(_bash_path(example, bash)) + "\n"
-            + "SPECO_CI_RESULT_PATH=" + shlex.quote(_bash_path(result, bash)) + "\n"
-            + tail, encoding="utf-8", newline="\n",
+            + "example="
+            + shlex.quote(_bash_path(example, bash))
+            + "\n"
+            + "SPECO_CI_RESULT_PATH="
+            + shlex.quote(_bash_path(result, bash))
+            + "\n"
+            + tail,
+            encoding="utf-8",
+            newline="\n",
         )
         process = subprocess.run([bash, _bash_path(script, bash)], capture_output=True)
         assert process.returncode == 7
@@ -567,43 +595,70 @@ def test_online_log_capture_preserves_failure_and_timing(platform: str) -> None:
         assert timing["elapsed_seconds"] >= 0
 
 
-@pytest.mark.parametrize("initial,overrides,expected", [
-    ("true", ["False"], "false"),
-    ("false", ["True"], "true"),
-    ("true", ["False", "True", "False"], "false"),
-])
+@pytest.mark.parametrize(
+    "initial,overrides,expected",
+    [
+        ("true", ["False"], "false"),
+        ("false", ["True"], "true"),
+        ("true", ["False", "True", "False"], "false"),
+    ],
+)
 def test_result_check_uses_final_hydra_training_mode(initial, overrides, expected):
     bash = _require_working_bash()
     mode_logic = _runner_script().split("# Match the mode actually passed to Hydra")[1]
-    mode_logic = mode_logic[mode_logic.index("for override"):].split('if [[ "${SPECO_DRY_RUN')[0]
-    arguments = ["actor_rollout_ref.rollout.drafter.enable_drafter_training=" + value for value in overrides]
-    script = "enable_training=" + initial + "\noverrides=(" + " ".join(map(shlex.quote, arguments)) + ")\n"
+    mode_logic = mode_logic[mode_logic.index("for override") :].split(
+        'if [[ "${SPECO_DRY_RUN'
+    )[0]
+    arguments = [
+        "actor_rollout_ref.rollout.drafter.enable_drafter_training=" + value
+        for value in overrides
+    ]
+    script = (
+        "enable_training="
+        + initial
+        + "\noverrides=("
+        + " ".join(map(shlex.quote, arguments))
+        + ")\n"
+    )
     script += mode_logic + '\nprintf "%s" "$enable_training"\n'
-    result = subprocess.run([bash, "-s"], input=script.encode("utf-8"), capture_output=True, check=True)
+    result = subprocess.run(
+        [bash, "-s"], input=script.encode("utf-8"), capture_output=True, check=True
+    )
     assert result.stdout.decode("utf-8") == expected
 
 
 def test_automatic_runner_reads_algorithm_variables_from_github():
     import json
 
-    stdout = _dry_run("dspark", platform="npu", ci_variables=json.dumps({
-        "SPECO_DSPARK_SPEC_STEPS": "2",
-        "SPECO_DRAFT_TENSOR_PARALLEL_SIZE": "2",
-    }))
+    stdout = _dry_run(
+        "dspark",
+        platform="npu",
+        ci_variables=json.dumps(
+            {
+                "SPECO_DSPARK_SPEC_STEPS": "2",
+                "SPECO_DRAFT_TENSOR_PARALLEL_SIZE": "2",
+            }
+        ),
+    )
     assert "drafter.rollout.spec_steps=2" in stdout
     assert "drafter.vllm.draft_tensor_parallel_size=2" in stdout
 
 
 @pytest.mark.parametrize("algorithm", ["domino", "peagle"])
-def test_manual_separate_example_passes_configured_paths_to_both_stages(algorithm, tmp_path):
+def test_manual_separate_example_passes_configured_paths_to_both_stages(
+    algorithm, tmp_path
+):
     from ci.run_manual_example import prepare
 
     bash = _require_working_bash()
     example = "examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh"
     settings = {
-        "DRAFT_ALGO": algorithm, "RUN_STAGE": "both",
-        "MODEL_PATH": "/models/target", "TRAIN_FILE": "/data/train",
-        "TEST_FILE": "/data/test", "COLLECT_DRAFTER_PATH": "/models/collect",
+        "DRAFT_ALGO": algorithm,
+        "RUN_STAGE": "both",
+        "MODEL_PATH": "/models/target",
+        "TRAIN_FILE": "/data/train",
+        "TEST_FILE": "/data/test",
+        "COLLECT_DRAFTER_PATH": "/models/collect",
         "DRAFT_INIT_PATH": "/models/initial",
     }
     env, args, online = prepare(example, settings, "", tmp_path)
@@ -614,8 +669,9 @@ def test_manual_separate_example_passes_configured_paths_to_both_stages(algorith
         for key in (*settings, "CKPTS_DIR", "FEATURE_STORE_DIR", "DRAFT_CKPTS_DIR")
     )
     script += "bash " + shlex.quote(_bash_path(ROOT / example, bash)) + "\n"
-    result = subprocess.run([bash, "-s"], input=script.encode("utf-8"),
-                            capture_output=True, check=True)
+    result = subprocess.run(
+        [bash, "-s"], input=script.encode("utf-8"), capture_output=True, check=True
+    )
     arguments = result.stdout.decode("utf-8").splitlines()
     assert "verl_speco.main" in arguments
     assert "verl_speco.draft_train_launcher" in arguments

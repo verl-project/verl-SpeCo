@@ -16,7 +16,8 @@ from __future__ import annotations
 import sys
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.integration import transferqueue_bridge as bridge
 

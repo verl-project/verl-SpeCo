@@ -29,8 +29,14 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # Dispatches on ``device.type`` and only names the backends in literals;
     # no device API is called from this module.
     "verl_speco/ops/dspark_fused_loss.py",
+    # FlexAttention kernel dispatch distinguishes CUDA training from inference
+    # and non-CUDA backends; no tensor placement/device allocation occurs here.
+    "verl_speco/models/dflash/flex_attention.py",
     "verl_speco/trainer/base_trainer.py",
     "verl_speco/trainer/draft_training_loop.py",
+    # The V1 adapter passes the configured runtime device through to upstream
+    # V1 Ray workers and is therefore an explicit verl runtime boundary.
+    "verl_speco/trainer/v1/speco_mixin.py",
     "verl_speco/workers/speco_worker.py",
 ]
 

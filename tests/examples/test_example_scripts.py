@@ -75,6 +75,12 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
     script: Path,
 ) -> None:
     source = script.read_text(encoding="utf-8")
+    if script.name == "run_qwen3-8b_v1_hard_freeze_longrun_drafter_dspark_vllm_npu.sh":
+        # This wrapper changes dimensions/policy, then reuses the complete
+        # launch so its entrypoint and drafter switches cannot drift.
+        launch = "run_qwen3-8b_v1_hard_freeze_smoke_drafter_dspark_vllm_npu.sh"
+        assert f'exec bash "${{script_dir}}/{launch}"' in source
+        source = (script.parent / launch).read_text(encoding="utf-8")
 
     assert (
         "python3 -m verl_speco.main" in source or "python -m verl_speco.main" in source
@@ -90,6 +96,33 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
         "actor_rollout_ref.rollout.drafter.training.training_interval_steps=" in source
     )
     assert "actor_rollout_ref.rollout.drafter.training.publish_async=" in source
+
+
+def test_v1_hard_freeze_longrun_uses_full_dimensions_and_normal_policy() -> None:
+    source = (
+        ROOT / "examples" / "run_qwen3-8b_v1_hard_freeze_longrun_drafter_dspark_vllm_npu.sh"
+    ).read_text(encoding="utf-8")
+    for setting in (
+        "export SPECO_TRAIN_BATCH_SIZE=64",
+        "export SPECO_MAX_RESPONSE_LENGTH=8192",
+        "export SPECO_DRAFTER_COLLECT_INTERVAL=5",
+        "export SPECO_DRAFTER_TRAINING_INTERVAL=5",
+        '"${freeze}.gain.practical_gain_all=0.005"',
+        '"${freeze}.gain.practical_gain_hard=0.005"',
+        '"${freeze}.gain.window_updates=3"',
+        '"${freeze}.probe.interval_updates=3"',
+    ):
+        assert setting in source
+    assert '"$@"' in source
+
+
+def test_v1_hard_freeze_runner_selection_is_explicit_in_ray_environment() -> None:
+    source = (
+        ROOT / "examples" / "run_qwen3-8b_v1_hard_freeze_smoke_drafter_dspark_vllm_npu.sh"
+    ).read_text(encoding="utf-8")
+    # An existing Ray head does not inherit the launcher's shell exports.
+    for name in ("VLLM_USE_V1", "VLLM_USE_V2_MODEL_RUNNER"):
+        assert f"++ray_kwargs.ray_init.runtime_env.env_vars.{name}='\"1\"'" in source
 
 
 def test_standalone_tq_training_example_uses_unified_launcher() -> None:
@@ -208,6 +241,8 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     mrv2 = _launch_assignments(mrv2_source)
     added_keys = {
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling",
+        "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes",
+        "data.val_batch_size",
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.weight_nz_mode",
         "+actor_rollout_ref.rollout.drafter.vllm.speculative_config_overrides.enable_adaptive_verification",
         "actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha",

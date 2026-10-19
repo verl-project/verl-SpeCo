@@ -1,4 +1,11 @@
 {
+  "gpu-dspark-mrv2": "examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_vllm.sh",
+  "gpu-dspark-colocate-async": "examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_colocate_async_vllm.sh",
+  "gpu-dspark-separate-async": "examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_separate_async_vllm.sh",
+  "npu-dspark-colocate-async": "examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_colocate_async_vllm_npu.sh",
+  "npu-dspark-separate-async": "examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_separate_async_vllm_npu.sh",
+  "npu-v1-hard-freeze-smoke": "examples/run_qwen3-8b_v1_hard_freeze_smoke_drafter_dspark_vllm_npu.sh",
+  "npu-v1-hard-freeze-longrun": "examples/run_qwen3-8b_v1_hard_freeze_longrun_drafter_dspark_vllm_npu.sh",
   "dspark-mrv2": "examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_vllm_npu.sh",
   "gpu-megatron-eagle3": "examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm.sh",
   "megatron-eagle3": "examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh",

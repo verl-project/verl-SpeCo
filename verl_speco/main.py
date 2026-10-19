@@ -20,6 +20,8 @@ only imported when a drafter is enabled, keeping the no-drafter reward
 distribution aligned with verl.
 """
 
+import inspect
+
 import hydra
 
 
@@ -112,7 +114,24 @@ def run(config) -> None:
         # actor -> rollout weight sync matches verl exactly.  verl selects its
         # own TaskRunner (legacy on 0.8, legacy or V1 on 0.9).
         _strip_speco_overlay_for_native_run(config)
-        main_ppo.run_ppo(config)
+        runner_parameter = inspect.signature(main_ppo.run_ppo).parameters.get(
+            "task_runner_class"
+        )
+        if (
+            runner_parameter is not None
+            and runner_parameter.default is inspect.Parameter.empty
+        ):
+            # Newer verl releases require the native runner explicitly, just
+            # as their own main() entrypoint selects it from trainer.use_v1.
+            if _config_get(config, "trainer", "use_v1", default=False):
+                task_runner_class = main_ppo.TaskRunnerV1
+            else:
+                from verl.trainer.main_ppo_v0 import TaskRunner
+
+                task_runner_class = TaskRunner
+            main_ppo.run_ppo(config, task_runner_class=task_runner_class)
+        else:
+            main_ppo.run_ppo(config)
         return
 
     import ray

@@ -20,6 +20,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("torch")
+
 from verl_speco.producer import input_reader
 
 

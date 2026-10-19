@@ -45,6 +45,19 @@ def compile_friendly_flex_attention(
     value: torch.Tensor,
     **kwargs,
 ) -> torch.Tensor:
+    if (
+        query.device.type == "cuda"
+        and torch.is_grad_enabled()
+        and (query.requires_grad or key.requires_grad or value.requires_grad)
+    ):
+        # Short draft training queries can select flex_decoding. With GQA,
+        # its packed query tile can exceed the mask block size (e.g. 56 * 4
+        # rounds up to 256, while the mask uses 128), leaving no valid kernel.
+        # Use the general training kernel, keeping explicit caller overrides.
+        options = dict(kwargs.get("kernel_options") or {})
+        if "BACKEND" not in options:
+            options.setdefault("FORCE_USE_FLEX_ATTENTION", True)
+        kwargs["kernel_options"] = options
     flex_attention_compiled = (
         WrappedFlexAttention()() if not is_torchdynamo_compiling() else flex_attention
     )

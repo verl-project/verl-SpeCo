@@ -300,7 +300,8 @@ def test_speco_task_runner_selects_release_specific_legacy_extension_points() ->
     assert "copy_to_local(" in source
     assert "model_config.tokenizer" in source
     assert "model_config.processor" in source
-    assert 'config.trainer.get("use_v1", False)' in source
+    assert 'trainer_config = getattr(config, "trainer", None)' in source
+    assert 'trainer_config.get("use_v1", False)' in source
 
     main_source = (
         Path(__file__).resolve().parents[2] / "verl_speco" / "main.py"
