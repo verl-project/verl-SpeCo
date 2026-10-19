@@ -16,6 +16,7 @@ from .drafter_runtime_state import (
     DrafterRuntimeStatus,
     StandaloneQueueState,
 )
+from .adaptive_schedule import AcceptanceFeedback, AdaptiveScheduleConfig
 from .drafter_scheduler import DrafterScheduler, step_matches_interval
 from .schedule_types import (
     CollectionPlan,
@@ -67,6 +68,8 @@ from .standalone_executor import (
 )
 
 __all__ = [
+    "AcceptanceFeedback",
+    "AdaptiveScheduleConfig",
     "AfterActorUpdateContext",
     "AfterWeightUpdateContext",
     "BeforeActorUpdateContext",
