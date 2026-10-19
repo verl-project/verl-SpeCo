@@ -193,6 +193,17 @@ class SpecoV1Mixin:
         self._speco_last_oldlogprob_total_elapsed_sec = 0.0
         self._speco_last_collect_interval_matched = 0
         self._speco_last_collection_outcome = None
+        self._speco_drafter_frozen = False
+        self._speco_freeze_policy = None
+        self._speco_freeze_policy_active = False
+        self._speco_last_freeze_decision = None
+        self._speco_freeze_branch_save_pending = None
+        self._speco_freeze_branch_saved = False
+        self._speco_last_checkpoint_saved_step = None
+        self._speco_last_request_accept_len_records = []
+        self._speco_pending_request_accept_len_payloads = []
+        self._speco_last_request_accept_len_var = 0.0
+        self._speco_v1_evidence_step = None
 
     def __getattr__(self, name):
         """Lazily expose the stable SPECO facade implemented by the legacy adapter.
@@ -256,6 +267,19 @@ class SpecoV1Mixin:
             return {}
         training_plan = getattr(self, "_speco_v1_training_plan", None)
         try:
+            policy = getattr(self, "_speco_freeze_policy", None)
+            run_probe = policy is not None and policy.probe_due(
+                policy.drafter_version + 1
+            )
+            before_arm = None
+            probe = None
+            probe_error = None
+            if run_probe:
+                try:
+                    before_arm = self._speco_run_freeze_probe_arm()
+                except Exception:  # noqa: BLE001 - retain fail-open policy semantics
+                    probe_error = "before_arm_failed"
+                    logger.exception("SPECO V1 paired probe before-arm failed")
             # Keep the established V1 order: the parent completes its actor
             # weight sync before drafter SHM reload starts.  The publish RPC is
             # still awaited here, so the next V1 step cannot consume a partial
@@ -264,14 +288,156 @@ class SpecoV1Mixin:
                 True, training_plan, after_weight_update=True
             )
             waited = self._speco_wait_pending_drafter_publish()
+            if (
+                getattr(self, "_speco_colocate_admission_closed", False)
+                and policy is not None
+                and bool(metrics.get("drafter/published", False))
+            ):
+                # Label requests only after successful atomic commits on every
+                # serving replica. No ordinary request can race this RPC.
+                self._speco_rollout_admission_rpc(
+                    "speco_set_serving_drafter_revision", policy.drafter_version + 1
+                )
             metrics["drafter/publish_waited_after_weight_sync"] = int(waited)
             metrics["drafter/publish_safe_point_after_weight_sync"] = 1
+            if run_probe and before_arm is not None and policy is not None:
+                try:
+                    probe = self._speco_build_freeze_probe_comparison(
+                        before_arm,
+                        self._speco_run_freeze_probe_arm(),
+                        version_before=policy.drafter_version,
+                    )
+                except Exception:  # noqa: BLE001 - missing evidence keeps training
+                    probe_error = "after_arm_failed"
+                    logger.exception("SPECO V1 paired probe after-arm failed")
+            if policy is not None:
+                total_cost = float(getattr(self, "_speco_v1_train_cost_seconds", 0.0))
+                total_cost += self._speco_freeze_publish_cost_seconds(metrics) or 0.0
+                self._speco_freeze_observe_publish(
+                    metrics, update_cost_seconds=total_cost, probe=probe
+                )
+                if run_probe:
+                    self._speco_freeze_log_probe(probe, probe_error)
+                metrics.update(self._speco_freeze_metrics())
             return metrics
         finally:
             # A failed publish raises after the legacy facade has restored the
             # previous payload.  Do not retry it from a later checkpoint hook.
             self._speco_v1_pending_training = False
             self._speco_v1_training_plan = None
+
+    def _speco_freeze_probe_prompt_ids(self, chunk):
+        """Encode the fixed V1 raw prompts with the serving tokenizer path."""
+        cached = chunk.get("_speco_v1_probe_prompt_ids")
+        if cached is not None:
+            return cached
+        if "input_ids" in chunk and "attention_mask" in chunk:
+            prompts = [
+                ids[mask.bool()].tolist()
+                for ids, mask in zip(
+                    chunk["input_ids"], chunk["attention_mask"], strict=True
+                )
+            ]
+        else:
+            # Current native V1 datasets defer tokenization to AgentLoop.
+            # Use exactly its ContinuousToken builder and left-truncation,
+            # rather than guessing a chat template or retokenizing each arm.
+            from transformers import AutoConfig
+            from verl.utils.tokenizer.continuous_token_wiring import (
+                create_continuous_token_builder,
+            )
+
+            model_cfg = self.config.actor_rollout_ref.model
+            hf_config = AutoConfig.from_pretrained(
+                model_cfg.path,
+                trust_remote_code=model_cfg.get("trust_remote_code", False),
+            )
+            builder = create_continuous_token_builder(
+                self.tokenizer,
+                hf_model_type=hf_config.model_type,
+                chat_template_kwargs=dict(
+                    self.config.data.get("apply_chat_template_kwargs", {})
+                ),
+                mm_processor_kwargs=dict(
+                    self.config.data.get("mm_processor_kwargs", {})
+                ),
+                processor=self.processor,
+            )
+            limit = int(self.config.actor_rollout_ref.rollout.prompt_length)
+            prompts = [
+                builder.build_initial_tokens(list(messages))[-limit:]
+                for messages in chunk["raw_prompt"]
+            ]
+        chunk["_speco_v1_probe_prompt_ids"] = prompts
+        return prompts
+
+    def _speco_run_freeze_probe_arm(self):
+        """Probe the serving V1 engines without inserting samples into TQ.
+
+        Both arms run at the post-target-sync boundary in sync mode. Fixed
+        prompt order maps each pair to the same server. V1 collects features
+        only during actor old-logprob inference, which these direct serving
+        calls bypass. Probe tokens never enter PPO/rewards or the TQ buffer.
+        """
+        import ray
+        from uuid import uuid4
+
+        servers = list(self.llm_server_manager.server_handles)
+        if not servers:
+            raise RuntimeError("V1 paired probes require initialized rollout servers")
+        max_tokens = int(self._speco_freeze_probe_config().get("max_new_tokens", 2048))
+        rows, offset, wall_seconds = [], 0, 0.0
+        for chunk in self._speco_freeze_probe_pool_data():
+            prompts = self._speco_freeze_probe_prompt_ids(chunk)
+            refs = []
+            for index, prompt_ids in enumerate(prompts):
+                pair_id = f"speco-freeze-probe-{offset + index:04d}"
+                server = servers[(offset + index) % len(servers)]
+                generate = (
+                    server.speco_generate_probe
+                    if getattr(self, "_speco_colocate_admission_closed", False)
+                    else server.generate
+                )
+                refs.append(
+                    generate.remote(
+                        prompt_ids=prompt_ids,
+                        sampling_params={
+                            "temperature": 0.0,
+                            "top_p": 1.0,
+                            "top_k": -1,
+                            "max_tokens": max_tokens,
+                            "logprobs": False,
+                        },
+                        request_id=f"{pair_id}-{uuid4().hex}",
+                    )
+                )
+            started = time.perf_counter()
+            outputs = ray.get(refs)
+            wall_seconds += time.perf_counter() - started
+            for index, output in enumerate(outputs):
+                fields = getattr(output, "extra_fields", {}) or {}
+                accept = fields.get("_verl_request_mean_accept_len")
+                if accept is None:
+                    rounds = fields.get("spec_num_verify_steps", 0) or 0
+                    accepted = fields.get("spec_num_accepted_tokens", 0) or 0
+                    accept = (
+                        1.0 + float(accepted) / float(rounds) if rounds > 0 else None
+                    )
+                seconds = fields.get("_speco_vllm_request_elapsed_sec")
+                rows.append(
+                    {
+                        "uid": f"speco-freeze-probe-{offset + index:04d}",
+                        "accept": accept,
+                        "tokens": len(getattr(output, "token_ids", [])),
+                        "seconds": float(seconds)
+                        if seconds is not None and float(seconds) > 0
+                        else None,
+                    }
+                )
+            offset += len(outputs)
+        if not rows:
+            raise RuntimeError("V1 paired probe returned no rows")
+        return rows, wall_seconds
 
     def _speco_snapshot_v1_feature_store_checkpoint(self) -> list[dict[str, Any]]:
         if not self._speco_feature_store_checkpoint_configured():
@@ -320,6 +486,9 @@ class SpecoV1Mixin:
             ),
             "feature_store": feature_store,
         }
+        async_evidence = getattr(self, "_speco_v1_async_checkpoint_evidence", None)
+        if async_evidence is not None:
+            manifest["async_rollout_checkpoint"] = async_evidence
         fd, temporary_path = tempfile.mkstemp(
             prefix=".speco_v1_manifest.", suffix=".tmp", dir=checkpoint_dir
         )
@@ -454,6 +623,13 @@ class SpecoV1Mixin:
             raise ValueError(
                 "Phase-1 V1 online SPECO training supports rollout.name=vllm only"
             )
+        freeze = training.get("drafter_convergence_freeze", {}) or {}
+        if freeze.get("enabled", False) and str(
+            config.trainer.v1.get("trainer_mode", "sync")
+        ) not in {"sync", "colocate_async"}:
+            raise ValueError(
+                "V1 marginal-utility freeze requires sync or colocate_async for fixed-target paired probes"
+            )
 
     def _setup(self):
         from verl_speco.integration.vllm_runtime import (
@@ -583,34 +759,92 @@ class SpecoV1Mixin:
         return result
 
     def on_step_end(self):
-        result = super().on_step_end()
-        # The original V1 publish point follows the parent's actor weight sync.
-        # Preserve it for NPU SHM reloads, then synchronously finalize the
-        # drafter publication before returning to the next trainer step.
-        publish_metrics = self._speco_finalize_v1_drafter_publish()
-        if publish_metrics:
-            self._pending_sync_metrics = {
-                **(getattr(self, "_pending_sync_metrics", None) or {}),
-                **publish_metrics,
-            }
-        return result
+        try:
+            result = super().on_step_end()
+            # Native colocate_async resumes the engine during target sync.
+            # Keep ordinary requests behind admission until both probe arms
+            # and the drafter publication have settled at that fixed target.
+            publish_metrics = self._speco_finalize_v1_drafter_publish()
+            if publish_metrics:
+                self._pending_sync_metrics = {
+                    **(getattr(self, "_pending_sync_metrics", None) or {}),
+                    **publish_metrics,
+                }
+            return result
+        finally:
+            if getattr(self, "_speco_colocate_admission_closed", False):
+                self._speco_rollout_admission_rpc("speco_resume_rollout_admission")
+                self._speco_colocate_admission_closed = False
 
     def _save_checkpoint(self):
+        if (
+            getattr(self, "_speco_last_checkpoint_saved_step", None)
+            == self.global_steps
+        ):
+            return None
         drafter_results = None
         if self._speco_online_enabled_from_config(self.config):
             self._speco_wait_pending_drafter_publish()
             drafter_results = self._speco_save_drafter_checkpoint(wait=True)
+            self._speco_freeze_save_state()
         result = super()._save_checkpoint()
+        if getattr(
+            self, "_speco_colocate_admission_closed", False
+        ) and self._speco_freeze_branch_config().get("enabled", False):
+            queue_path = os.path.join(
+                self._speco_v1_checkpoint_directory(), "transfer_queue"
+            )
+            if not os.path.isdir(queue_path) or not os.listdir(queue_path):
+                raise RuntimeError(
+                    "Async freeze branch is incomplete: TransferQueue snapshot is missing"
+                )
+            self._speco_v1_async_checkpoint_evidence = {
+                "transfer_queue": queue_path,
+                "checkpoint_step": int(self.global_steps),
+                "inflight_prompts_reissued_on_resume": True,
+            }
         if self._speco_online_enabled_from_config(self.config):
             feature_store = self._speco_snapshot_v1_feature_store_checkpoint()
             self._speco_write_v1_joint_checkpoint_manifest(
                 drafter_results=drafter_results,
                 feature_store=feature_store,
             )
+        self._speco_last_checkpoint_saved_step = self.global_steps
         return result
 
     def on_sample_end(self):
-        return super().on_sample_end()
+        if not self._speco_colocate_probe_boundary_enabled():
+            return super().on_sample_end()
+        self._speco_rollout_admission_rpc("speco_close_rollout_admission")
+        self._speco_colocate_admission_closed = True
+        try:
+            # Wait only for serving RPCs after abort, not for TQ agent loops:
+            # those loops can be waiting to retry when cards are returned.
+            self.checkpoint_manager.abort_replicas()
+            self._speco_rollout_admission_rpc("speco_wait_rollout_idle")
+            self.checkpoint_manager.sleep_replicas()
+        except BaseException:
+            self._speco_rollout_admission_rpc("speco_resume_rollout_admission")
+            self._speco_colocate_admission_closed = False
+            raise
+
+    def _speco_colocate_probe_boundary_enabled(self):
+        training = self._speco_drafter_training_config() or {}
+        return str(
+            self.config.trainer.v1.get("trainer_mode", "sync")
+        ).lower() == "colocate_async" and bool(
+            training.get("drafter_convergence_freeze", {}).get("enabled", False)
+        )
+
+    def _speco_rollout_admission_rpc(self, method, *args):
+        import ray
+
+        servers = list(self.llm_server_manager.server_handles)
+        if not servers:
+            raise RuntimeError(
+                "V1 async probe boundary requires initialized rollout servers"
+            )
+        return ray.get([getattr(server, method).remote(*args) for server in servers])
 
     def prepare_step(self):
         """Avoid creating an unconsumed rollout at the async loop boundary.
@@ -757,9 +991,114 @@ class SpecoV1Mixin:
             keys=batch.keys, partition_id=batch.partition_id, select_fields=fields
         )
         pad_token_id = getattr(getattr(self, "tokenizer", None), "pad_token_id", 0)
-        return data, DataProto(batch=to_legacy_padded_batch(data, pad_token_id or 0))
+        result = DataProto(batch=to_legacy_padded_batch(data, pad_token_id or 0))
+        # V1 stores request metadata in TQ, not DataProto.non_tensor_batch.
+        # The shared hard-sample and freeze policies require those exact cells.
+        stats = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=["extra_fields"],
+        )
+        cells = stats.get("extra_fields", [])
+        if hasattr(cells, "tolist"):
+            cells = cells.tolist()
+        import numpy as np
+
+        request_fields = [getattr(cell, "data", cell) for cell in cells]
+        # Upstream balances V1 batches with synthetic zero-loss trajectories.
+        # Their extra_fields are copied from a real trajectory, including its
+        # request ID/counters. Keep those actor rows, but never count them as
+        # serving requests or hard-sampling evidence.
+        tags = getattr(batch, "tags", [])
+        padding = [
+            bool(tags[index].get("is_padding", False)) if index < len(tags) else False
+            for index in range(len(request_fields))
+        ]
+        result.meta_info["speco_v1_padding_rows"] = sum(padding)
+        for key in (
+            "_verl_request_mean_accept_len",
+            "_speco_vllm_request_id",
+            "_speco_vllm_request_verify_rounds",
+            "_speco_vllm_request_accepted_tokens",
+            "_speco_vllm_request_completion_index",
+            "_speco_vllm_request_elapsed_sec",
+            "_speco_drafter_revision_min",
+            "_speco_drafter_revision_max",
+            "_speco_drafter_revision_stats",
+        ):
+            values = [
+                cell.get(key) if isinstance(cell, dict) and not padding[index] else None
+                for index, cell in enumerate(request_fields)
+            ]
+            if len(values) == len(result):
+                result.non_tensor_batch[key] = np.asarray(values, dtype=object)
+        return data, result
+
+    def _speco_observe_async_revision_evidence(self, evidence, metrics):
+        import numpy as np
+        from verl.protocol import DataProto
+        from verl_speco.integration.partial_rollout_stats import (
+            group_serving_revision_evidence,
+        )
+
+        current = self._speco_freeze_policy.drafter_version
+        groups, matched = group_serving_revision_evidence(
+            evidence.non_tensor_batch, len(evidence), current
+        )
+        metrics["drafter/freeze_revision_matched_rows"] = matched
+        metrics["drafter/freeze_revision_excluded_rows"] = len(evidence) - matched
+        versions = sorted(groups) or [current]
+        opportunity = bool(self._speco_should_train_drafter_this_step())
+        try:
+            for position, version in enumerate(versions):
+                rows = groups.get(version, [])
+                projection = DataProto(
+                    non_tensor_batch={
+                        "_speco_vllm_request_id": np.array(
+                            [row["id"] for row in rows], dtype=object
+                        ),
+                        "_verl_request_mean_accept_len": np.array(
+                            [row["mean"] for row in rows]
+                        ),
+                    },
+                    meta_info={
+                        "metrics": {
+                            "response_length/mean": sum(row["tokens"] for row in rows)
+                            / len(rows)
+                            if rows
+                            else 0.0
+                        }
+                    },
+                )
+                self._speco_populate_request_accept_len_records(projection)
+                self._speco_observe_rollout_evidence(
+                    projection,
+                    version,
+                    generation_seconds=sum(row["seconds"] for row in rows),
+                    opportunity_this_step=opportunity and position == len(versions) - 1,
+                )
+        finally:
+            # Hard sampling/PPO retain complete original trajectories; only
+            # freeze windows use per-request, per-serving-revision projections.
+            self._speco_populate_request_accept_len_records(evidence)
 
     def _compute_old_log_prob(self, batch, metrics):
+        policy = getattr(self, "_speco_freeze_policy", None)
+        if (
+            policy is not None
+            and getattr(self, "_speco_v1_evidence_step", None) != self.global_steps
+        ):
+            _, evidence = self._speco_v1_batch_data(batch)
+            metrics["drafter/request_padding_rows"] = evidence.meta_info[
+                "speco_v1_padding_rows"
+            ]
+            self._speco_populate_request_accept_len_records(evidence)
+            if self._speco_colocate_probe_boundary_enabled():
+                self._speco_observe_async_revision_evidence(evidence, metrics)
+            else:
+                self._speco_observe_rollout_evidence(evidence, policy.drafter_version)
+            self._speco_v1_evidence_step = self.global_steps
+            metrics.update(self._speco_freeze_metrics())
         if not self._speco_oldlogprob_collection_enabled():
             return super()._compute_old_log_prob(batch, metrics)
 
@@ -780,6 +1119,7 @@ class SpecoV1Mixin:
             OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY,
             OLD_LOGPROB_HIDDEN_POSITIONS_KEY,
             OLD_LOGPROB_OWNER_RANK_KEY,
+            OLD_LOGPROB_SOURCE_BATCH_INDICES_KEY,
         )
 
         nested_data, data_proto = self._speco_v1_batch_data(batch)
@@ -795,6 +1135,9 @@ class SpecoV1Mixin:
             "hidden_position_mask"
         ]
         control[OLD_LOGPROB_OWNER_RANK_KEY] = collect_plan["owner_rank"]
+        control[OLD_LOGPROB_SOURCE_BATCH_INDICES_KEY] = torch.arange(
+            len(data_proto), device=control["input_ids"].device
+        )
         tu.assign_non_tensor_data(
             control,
             OLD_LOGPROB_AUX_LAYER_IDS_KEY,
@@ -825,7 +1168,7 @@ class SpecoV1Mixin:
             compute_loss=False,
             temperature=self.config.actor_rollout_ref.rollout.temperature,
         )
-        output = self.actor_rollout_wg.compute_log_prob(control)
+        output = self._speco_compute_collection_log_prob(control)
         output_data = output
         collected = self._speco_collect_oldlogprob_features(
             data_proto, collect_plan, output_data
@@ -855,6 +1198,7 @@ class SpecoV1Mixin:
             }
         )
         metrics.update(collection_plan_data.metrics())
+        metrics.update(getattr(self, "_speco_last_hard_selection_metrics", {}) or {})
         if collection_outcome is not None:
             metrics.update(collection_outcome.metrics())
             worker_versions = [
@@ -920,6 +1264,33 @@ class SpecoV1Mixin:
         )
         metrics["actor/entropy"] = entropy_agg.detach().item()
         return updated_batch
+
+    def _speco_compute_collection_log_prob(self, control):
+        """Keep separate-async's fixed proximal policy during collection.
+
+        The collection forward bypasses the parent's KVBatchMeta adapter, but
+        must not bypass PPOTrainerSeparateAsync's CPU policy snapshots. Share
+        its snapshot slots so collected and non-collected local steps can be
+        interleaved within the same parameter-sync cycle.
+        """
+        worker = self.actor_rollout_wg
+        if self.config.trainer.v1.get("trainer_mode", "sync") != "separate_async":
+            return worker.compute_log_prob(control)
+
+        local_step = self.local_trigger_step
+        if local_step == 0:
+            worker.save_model_to_cpu(0)
+            return worker.compute_log_prob(control)
+
+        worker.save_model_to_cpu(local_step)
+        try:
+            worker.restore_model_from_cpu(0)
+            return worker.compute_log_prob(control)
+        finally:
+            # Restore before releasing the only copy of the training weights;
+            # if restoration fails, leave that snapshot available for recovery.
+            worker.restore_model_from_cpu(local_step)
+            worker.clear_cpu_model(local_step)
 
     def _speco_v1_spec_decode_sidecar_metrics(self) -> dict[str, float]:
         """Read cumulative EngineCore counters when RequestOutput has no stats."""
@@ -1034,6 +1405,12 @@ class SpecoV1Mixin:
             batch, metrics, timing_raw, global_steps, epoch
         )
         metrics.update(self._speco_v1_spec_decode_metrics(batch))
+        if getattr(self, "_speco_freeze_policy", None) is not None:
+            metrics.update(self._speco_freeze_metrics())
+        if getattr(self, "_speco_ci_result", None) is not None:
+            # Shared training/publication facades already record their own
+            # outcomes; count only generation here to avoid double counting.
+            self._speco_ci_result.record_metrics({"training/global_step": global_steps})
         return result
 
     def _update_actor(self, batch, metrics):
@@ -1064,7 +1441,9 @@ class SpecoV1Mixin:
         if plan is not None:
             if plan.launch:
                 metrics.update(self._speco_park_actor_hccl_for_drafter())
+                started = time.perf_counter()
                 trained, train_metrics = self._speco_train_drafter(plan)
+                self._speco_v1_train_cost_seconds = time.perf_counter() - started
             else:
                 trained = False
                 train_metrics = {
@@ -1078,6 +1457,9 @@ class SpecoV1Mixin:
             metrics.update(train_metrics)
             self._speco_v1_pending_training = bool(trained)
             self._speco_v1_training_plan = plan
+        if getattr(self, "_speco_freeze_policy", None) is not None:
+            self._speco_maybe_save_freeze_branch_checkpoint()
+            self._speco_flush_request_accept_len_payloads()
         return result
 
     def _speco_async_prefit_rollout_warmup_enabled(self) -> bool:
@@ -1152,6 +1534,7 @@ class SpecoV1Mixin:
 
         if bool(getattr(self, "_speco_prepared_for_fit", False)):
             return
+        self._speco_init_ci_result()
         if self._speco_online_enabled_from_config(self.config):
             # The initial online-drafter activation builds the drafter model
             # and its process groups before ``fit`` enters the normal actor
@@ -1167,6 +1550,22 @@ class SpecoV1Mixin:
                         prefit_park,
                     )
             self._speco_activate_drafter_training_model_before_fit()
+            self._speco_freeze_policy = self._speco_init_freeze_policy()
+            self._speco_validate_freeze_branch_config()
+            if self._speco_colocate_probe_boundary_enabled():
+                if self._speco_freeze_policy is None:
+                    raise RuntimeError("V1 async freeze requires an initialized policy")
+                if self._speco_freeze_branch_config().get("enabled", False):
+                    from verl.trainer.ppo.v1.trainer_base import _tq_supports_checkpoint
+
+                    if not _tq_supports_checkpoint():
+                        raise RuntimeError(
+                            "V1 async freeze branch requires TransferQueue checkpoint/reissue support"
+                        )
+                self._speco_rollout_admission_rpc(
+                    "speco_set_serving_drafter_revision",
+                    self._speco_freeze_policy.drafter_version,
+                )
         if self._speco_v1_async_rollout_enabled():
             self._speco_run_async_prefit_rollout_warmup(agent_loop_manager)
             # The async replay-backed loader can report length zero until its
@@ -1208,18 +1607,64 @@ class SpecoV1Mixin:
             return None
         return super().on_train_begin()
 
+    def _speco_init_ci_result(self):
+        if (
+            os.getenv("SPECO_CI_RESULT_PATH")
+            and getattr(self, "_speco_ci_result", None) is None
+        ):
+            from verl_speco.integration.ci_result import CIResult
+
+            self._speco_ci_result = CIResult(
+                self._speco_online_enabled_from_config(self.config)
+            )
+
     def fit(self, agent_loop_manager):
+        result_path = os.getenv("SPECO_CI_RESULT_PATH")
+        if not result_path:
+            return self._speco_fit_impl(agent_loop_manager)
+        self._speco_init_ci_result()
+        try:
+            result = self._speco_fit_impl(agent_loop_manager)
+            self._speco_ci_result.data["completed"] = True
+            return result
+        except BaseException as error:
+            self._speco_ci_result.data["errors"].append(
+                {"type": type(error).__name__, "message": str(error)}
+            )
+            raise
+        finally:
+            self._speco_ci_result.write(result_path)
+
+    def _speco_fit_impl(self, agent_loop_manager):
+        completed = False
         try:
             if not bool(getattr(self, "_speco_prepared_for_fit", False)):
                 # Compatibility fallback for callers other than SpecoTaskRunner.
                 self.prepare_for_fit(agent_loop_manager)
-            return super().fit(agent_loop_manager)
+            result = super().fit(agent_loop_manager)
+            completed = True
+            return result
         finally:
             if self._speco_v1_async_rollout_enabled():
                 # ``fit`` may return or raise while async agent-loop actors
                 # still own vLLM requests or output handlers.  Drain them
                 # before any rollout/DataLoader teardown in either path.
-                self._speco_v1_drain_agent_loop(agent_loop_manager)
+                cancelled = False
+                if not completed:
+                    import ray
+
+                    refs = []
+                    for worker in (
+                        getattr(agent_loop_manager, "agent_loop_workers", ()) or ()
+                    ):
+                        cancel = getattr(worker, "speco_cancel_pending", None)
+                        if cancel is not None:
+                            refs.append(cancel.remote())
+                    if refs:
+                        ray.get(refs)
+                        cancelled = True
+                if not cancelled:
+                    self._speco_v1_drain_agent_loop(agent_loop_manager)
             if self._speco_online_enabled_from_config(self.config):
                 self._speco_wait_pending_drafter_publish()
                 self._speco_wait_pending_drafter_checkpoint()

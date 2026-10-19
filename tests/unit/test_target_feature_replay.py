@@ -487,3 +487,29 @@ def test_vllm_replay_initializes_norm_and_invalidates_old_cache(tmp_path, monkey
     )
     assert calls == []
     assert torch_replayer.vllm_final_norm is None
+
+
+def test_vllm_file_replay_routes_handles_through_the_store() -> None:
+    class _Store:
+        def __init__(self) -> None:
+            self.loaded: list[str] = []
+
+        def load(self, reference: str):
+            self.loaded.append(reference)
+            return {"hidden_states": torch.zeros(2, 4)}, 0
+
+    replayer = TargetFeatureReplayer.__new__(TargetFeatureReplayer)
+    store = _Store()
+    replayer.vllm_hidden_states_store = store
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(prompt_token_ids=[1, 2])],
+        kv_transfer_params={"handle": "hs-key"},
+    )
+
+    path, handle = replayer._extract_transfer_reference(response, [1, 2])
+
+    assert path == ""
+    assert handle == "hs-key"
+    payload = replayer._load_vllm_hidden_states(handle)
+    assert "hidden_states" in payload
+    assert store.loaded == ["hs-key"]

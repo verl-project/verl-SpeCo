@@ -303,6 +303,10 @@ def _native_tq_config(tq_cfg: Mapping[str, Any]) -> dict[str, Any]:
         "connect_timeout_seconds",
         "poll_interval_seconds",
         "drop_last",
+        "consumer_prefetch_batches",
+        "io_retry_max_attempts",
+        "io_timeout_seconds",
+        "prefetch_collective_timeout_seconds",
     }
     return {key: value for key, value in tq_cfg.items() if key not in project_keys}
 
@@ -396,7 +400,7 @@ def list_samples() -> dict[str, dict[str, Any]]:
     if not is_transfer_queue_enabled():
         raise RuntimeError("list_samples called while TransferQueue is not enabled.")
     _ensure_initialized()
-    result = tq.kv_list(partition_id=_partition_id())
+    result = _bounded_kv_call("kv_list", partition_id=_partition_id())
     if result is None:
         return {}
     if not isinstance(result, Mapping):
@@ -432,7 +436,9 @@ def get_samples(keys: Sequence[str]) -> list[tuple[str, dict[str, Any]]]:
     if not is_transfer_queue_enabled():
         raise RuntimeError("get_samples called while TransferQueue is not enabled.")
     _ensure_initialized()
-    result = tq.kv_batch_get(keys=normalized_keys, partition_id=_partition_id())
+    result = _bounded_kv_call(
+        "kv_batch_get", keys=normalized_keys, partition_id=_partition_id()
+    )
     values = _split_batch_result(result, normalized_keys)
     return [
         (key, _tensordict_to_dict(value))
@@ -449,7 +455,45 @@ def clear_samples(keys: Sequence[str]) -> None:
     if not is_transfer_queue_enabled():
         raise RuntimeError("clear_samples called while TransferQueue is not enabled.")
     _ensure_initialized()
-    tq.kv_clear(keys=normalized_keys, partition_id=_partition_id())
+    _bounded_kv_call("kv_clear", keys=normalized_keys, partition_id=_partition_id())
+
+
+def _bounded_kv_call(method: str, **kwargs: Any) -> Any:
+    """Use TQ's own loop so sockets stay on their owner thread, with a deadline.
+
+    TransferQueue 0.1.10 sync methods use run_coroutine_threadsafe but wait
+    indefinitely. Cancel and await cancellation on the same loop before a retry.
+    The outer deadline also detects a storage backend blocking that loop.
+    """
+    config = _state.get("config") or {}
+    timeout = float(config.get("io_timeout_seconds", 0) or 0)
+    if timeout <= 0:
+        return getattr(tq, method)(**kwargs)
+    import asyncio
+    from concurrent.futures import TimeoutError as FutureTimeout
+
+    client = tq.get_client()
+    loop = getattr(client, "_loop", None)
+    if loop is None:
+        raise RuntimeError(
+            "Bounded TQ operations require TransferQueue 0.1.10 sync client"
+        )
+
+    async def invoke():
+        return await asyncio.wait_for(getattr(tq, "async_" + method)(**kwargs), timeout)
+
+    future = asyncio.run_coroutine_threadsafe(invoke(), loop)
+    try:
+        return future.result(timeout=timeout + 5.0)
+    except FutureTimeout:
+        if future.done():
+            # The coroutine's own timeout completed cancellation: safe to retry.
+            raise
+        future.cancel()
+        # A blocking native backend cannot be safely retried on a stuck loop.
+        raise RuntimeError(
+            "TQ client loop did not respond to its I/O deadline"
+        ) from None
 
 
 def close_transfer_queue_client() -> None:

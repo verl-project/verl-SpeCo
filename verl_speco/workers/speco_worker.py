@@ -685,6 +685,12 @@ class SpecoWorker(Worker):
             "hidden_last_hidden_select",
             "target_logprobs_position_start",
             "target_logprobs_position_end",
+            "_verl_request_mean_accept_len",
+            "_speco_vllm_request_id",
+            "_verl_is_hard",
+            "_verl_hard_score",
+            "_speco_vllm_request_completion_index",
+            "_speco_vllm_request_elapsed_sec",
         ):
             if key in batch:
                 metadata[key] = batch[key]
@@ -1073,6 +1079,12 @@ class SpecoWorker(Worker):
                 "hidden_last_hidden_filter",
                 "hidden_last_hidden_select",
                 "hidden_states_layout",
+                "_verl_request_mean_accept_len",
+                "_speco_vllm_request_id",
+                "_verl_is_hard",
+                "_verl_hard_score",
+                "_speco_vllm_request_completion_index",
+                "_speco_vllm_request_elapsed_sec",
                 "target_logprobs_position_start",
                 "target_logprobs_position_end",
                 "global_step",
@@ -1304,6 +1316,15 @@ class SpecoWorker(Worker):
             start_ts = time.time()
             activation_ts = time.time()
             result["activated"] = bool(await self.trainer.activate_training_model())
+            if not result["activated"]:
+                result["errors"] = [
+                    getattr(
+                        self.trainer,
+                        "last_activation_error",
+                        None,
+                    )
+                    or {"type": "ActivationError", "message": "activation_failed"}
+                ]
             result["activation_elapsed_sec"] = time.time() - activation_ts
             release_ts = time.time()
             await self.trainer.release_training_memory_after_activation()
@@ -1424,6 +1445,10 @@ class SpecoWorker(Worker):
         result["activated"] = activated
         if not activated:
             result["reason"] = "activation_failed"
+            result["errors"] = [
+                getattr(self.trainer, "last_activation_error", None)
+                or {"type": "ActivationError", "message": "activation_failed"}
+            ]
             return result
         result.update(
             {
@@ -1453,6 +1478,7 @@ class SpecoWorker(Worker):
             "triggered": False,
             "successful_steps": 0,
             "attempted_steps": 0,
+            "errors": [],
             "elapsed_sec": 0.0,
             "reason": "",
             "worker_id": str(self.rank),
@@ -1517,6 +1543,9 @@ class SpecoWorker(Worker):
                         min_sample_step=training_plan.get("min_sample_step"),
                         max_sample_step=training_plan.get("max_sample_step"),
                     )
+                    error = getattr(self.trainer, "last_training_error", None)
+                    if error is not None:
+                        result["errors"].append(dict(error))
                     if step_ok:
                         result["successful_steps"] += 1
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts

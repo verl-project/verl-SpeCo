@@ -33,7 +33,9 @@ import threading
 import time
 import types
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 from typing import Any, Iterable, cast
 
 from verl_speco.integration.verl_npu_vllm_compat import (
@@ -67,6 +69,11 @@ SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY = "_speco_acceptance_stats_dir"
 SPECO_VLLM_DRAFT_DIAG_ENV = "VERL_SPECO_VLLM_DRAFT_DIAG"
 SPECO_VLLM_NPU_STAGING_ENV = "VERL_SPECO_VLLM_NPU_STAGING"
 SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES = 64 << 20
+SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX = "_speco_vllm_request"
+SPECO_VLLM_REQUEST_STATS_TRACE_HEADER = "x-speco-vllm-request-accept-stats"
+_SPECO_VLLM_REQUEST_OUTPUT_STATS_BY_ID: dict[
+    str, tuple[dict[str, dict[str, Any]], list[str]]
+] = {}
 
 _VLLM_REPLICA_PATCHED = False
 _VLLM_DFLASH_CONFIG_ALIASES_PATCHED = False
@@ -755,6 +762,58 @@ def _speco_npu_target_staging(worker: Any, *, peft_config: dict | None, use_shm:
         yield
     finally:
         _NPU_TARGET_STAGING_STATE.enabled = previous
+
+
+@contextmanager
+def _speco_canonicalize_target_tied_weights(
+    worker: Any, *, peft_config: dict | None = None
+) -> Iterator[None]:
+    """Normalize aliases only while verl reloads the target model.
+
+    New vLLM loaders require a skipped alias's canonical tensor in the same
+    load_weights call. verl supplies one bucket per call, so an alias may arrive
+    separately. Rename it rather than retaining tensors from reused IPC/SHM
+    buffers. Older vLLM/Ascend loaders without alias detection are left alone.
+    """
+    model = getattr(getattr(worker, "model_runner", None), "model", None)
+    if model is None or peft_config is not None:
+        yield
+        return
+    try:
+        from vllm.model_executor.models.utils import _get_tied_embedding_params
+    except ImportError:
+        yield
+        return
+
+    aliases = _get_tied_embedding_params(model)
+    if not aliases:
+        yield
+        return
+
+    original = model.load_weights
+    had_override = "load_weights" in vars(model)
+    previous_override = vars(model).get("load_weights")
+
+    def load_weights(weights, *args, **kwargs):
+        # Materialize names and references only; never clone device tensors.
+        weights = list(weights)
+        names = {name for name, _ in weights}
+        normalized = []
+        for name, tensor in weights:
+            canonical = aliases.get(name, name)
+            if name in aliases and canonical in names:
+                continue
+            normalized.append((canonical, tensor))
+        return original(normalized, *args, **kwargs)
+
+    model.load_weights = load_weights
+    try:
+        yield
+    finally:
+        if had_override:
+            model.load_weights = previous_override
+        else:
+            del model.load_weights
 
 
 def _int_list_or_none(value: Any, field_name: str) -> list[int] | None:
@@ -1533,6 +1592,68 @@ def assert_lossless_vllm_speculative_config(config: Any, *, allow_lossy: bool) -
         )
 
 
+def _dspark_dynamic_spec_config_from_rollout(
+    rollout_cfg: Any,
+) -> dict[str, Any] | None:
+    """Return the validated DSpark dynamic-spec config, or ``None`` if unused.
+
+    The dynamic (confidence-threshold) verify-budget path added by
+    vllm-ascend#13216 is registered under the native ``dspark`` method on the V1
+    model runner, rather than the legacy Ascend ``dflash`` alias used by static
+    DSpark. It is opt-in through
+    ``rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config``.
+    """
+
+    dynamic_config = _get_nested(
+        rollout_cfg,
+        (
+            "engine_kwargs",
+            "vllm",
+            "additional_config",
+            "dynamic_spec_config",
+        ),
+        None,
+    )
+    if dynamic_config is None:
+        return None
+    dynamic_config = _plain_container(dynamic_config)
+    if not isinstance(dynamic_config, dict):
+        raise TypeError(
+            "rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config "
+            "must be a mapping"
+        )
+    method = dynamic_config.get("method")
+    if method is None or str(method).strip() == "":
+        return None
+    if str(method).strip().lower() != "dspark":
+        raise ValueError(
+            "vLLM-Ascend dynamic speculative decoding currently supports only "
+            "dynamic_spec_config.method=dspark"
+        )
+    method_params = dynamic_config.get("method_params") or {}
+    if not isinstance(method_params, dict):
+        raise TypeError("dynamic_spec_config.method_params must be a mapping")
+    for key in ("initial_verify_budget_per_req", "budget_update_interval"):
+        value = method_params.get(key)
+        if value is not None and _positive_int_or_none(value) is None:
+            raise ValueError(
+                f"dynamic_spec_config.method_params.{key} must be positive"
+            )
+    threshold = method_params.get("budget_threshold")
+    if threshold is not None:
+        try:
+            threshold_value = float(threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "dynamic_spec_config.method_params.budget_threshold must be a number"
+            ) from exc
+        if not 0.0 <= threshold_value <= 1.0:
+            raise ValueError(
+                "dynamic_spec_config.method_params.budget_threshold must be in [0, 1]"
+            )
+    return dynamic_config
+
+
 def build_vllm_speculative_config_from_drafter(
     drafter_cfg: dict[str, Any],
     rollout_cfg: Any = None,
@@ -1543,7 +1664,18 @@ def build_vllm_speculative_config_from_drafter(
         return {}
 
     algorithm = _drafter_algorithm(drafter_cfg)
+    dynamic_spec_config = _dspark_dynamic_spec_config_from_rollout(rollout_cfg)
+    if dynamic_spec_config is not None and algorithm != "DSPARK":
+        raise ValueError(
+            "dynamic_spec_config.method=dspark requires "
+            "drafter.speculative_algorithm=DSPARK"
+        )
     method = _speculative_method_from_drafter(drafter_cfg)
+    if dynamic_spec_config is not None:
+        # Static DSpark keeps the legacy Ascend dflash alias for older runtimes.
+        # The dynamic pipeline added by vllm-ascend#13216 is registered under the
+        # native dspark method and consumes confidence-head outputs.
+        method = "dspark"
     spec_model_path = _first_present(
         drafter_cfg.get("model_path"),
         drafter_cfg.get("checkpoint_path"),
@@ -1576,6 +1708,19 @@ def build_vllm_speculative_config_from_drafter(
                 algorithm=algorithm,
                 config=drafter_checkpoint_config,
                 num_speculative_tokens=num_speculative_tokens,
+            )
+        if dynamic_spec_config is not None and not _dspark_confidence_head_enabled(
+            drafter_checkpoint_config
+        ):
+            # The dynamic verify budget is driven by the confidence head; an
+            # engine started from a checkpoint that does not declare one cannot
+            # consume the trained head and would silently ignore the budget.
+            raise ValueError(
+                "dynamic_spec_config.method=dspark requires a drafter checkpoint "
+                "that declares a confidence head (enable_confidence_head=true or "
+                f"confidence_head_alpha>0); got model_path={spec_model_path}. Train "
+                "and export the confidence head first (see "
+                "examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_vllm_npu.sh)."
             )
         if algorithm == "DFLASH2":
             _assert_vllm_supports_dflash2()
@@ -1641,6 +1786,10 @@ def build_vllm_speculative_config_from_drafter(
         )
     canonical_speculative_config = dict(speculative_config)
     speculative_config.update(_plain_container(overrides))
+    if dynamic_spec_config is not None and speculative_config.get("method") != "dspark":
+        raise ValueError(
+            "dynamic_spec_config.method=dspark requires speculative_config.method=dspark"
+        )
     if (
         algorithm == "DSPARK"
         and _is_vllm_ascend_runtime_hint()
@@ -1863,16 +2012,19 @@ patch_transformers_attention_layer_type_constants()
 install_verl_npu_vllm_import_compat()
 
 
-# Drafter params that some DSpark runtimes do not wire into inference.  vLLM's
-# GPU-native Qwen3DSparkForCausalLM.load_weights() carries
-# ``skip_substrs = ["mask_embedding", "confidence_head"]`` and its served
-# Qwen3DSparkModel never registers the confidence head, so publishing a trained
-# drafter's confidence-head weights into it raises on the unknown module.
+# Drafter params that a served DSpark model may not expose.  A served
+# Qwen3DSparkModel registers the confidence head only when the drafter config
+# declares one (``enable_confidence_head=true``) and the checkpoint carries
+# ``confidence_head.proj.{weight,bias}``; vLLM's load_weights() keeps and loads
+# the head when the checkpoint includes it, and drops it otherwise.  Publishing
+# a trained head into a served model that does not register it raises on the
+# unknown module.
 #
-# This is a *candidate* list, not an unconditional skip: other DSpark backends
-# (vllm-ascend is adding confidence-head support) do register these, and dropping
-# a published tensor there would silently stall that head at its initial values.
-# Callers must additionally confirm the resolved model lacks the parameter.
+# This is a *candidate* list, not an unconditional skip: a backend that DOES
+# register the parameter (current vLLM/vllm-ascend do register the confidence
+# head, vllm-ascend#13216/#15098) must keep receiving the published tensors, or
+# the head would silently stall at its initial values.  Callers must
+# additionally confirm the resolved model lacks the parameter before skipping.
 _DSPARK_INFERENCE_ONLY_SKIPPED = ("confidence_head",)
 
 
@@ -1990,6 +2142,27 @@ def _patch_vllm_dspark_parallel_token() -> bool:
     return True
 
 
+def _dspark_confidence_head_enabled(hf_config: Any) -> bool:
+    """Return whether a DSpark checkpoint declares a confidence head.
+
+    The engine must register the head exactly when the checkpoint carries one,
+    so a hot-published head is loaded and a head-less checkpoint does not get a
+    phantom parameter. Older checkpoints may only record ``confidence_head_alpha``.
+    """
+
+    if hf_config is None:
+        return False
+    enabled = _get_nested(hf_config, ("enable_confidence_head",), None)
+    if enabled is not None:
+        resolved = _bool_or_none(enabled)
+        return bool(resolved)
+    alpha = _get_nested(hf_config, ("confidence_head_alpha",), None)
+    try:
+        return alpha is not None and float(alpha) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
 def _patch_vllm_dspark_qwen3_heads() -> bool:
     try:
         import torch
@@ -2014,8 +2187,12 @@ def _patch_vllm_dspark_qwen3_heads() -> bool:
                     config, "markov_rank", getattr(config, "dspark_markov_rank", 256)
                 )
             )
+            self.with_markov = bool(
+                getattr(config, "confidence_head_with_markov", True)
+            )
+            input_dim = int(config.hidden_size) + (rank if self.with_markov else 0)
             self.proj = ReplicatedLinear(
-                config.hidden_size + rank,
+                input_dim,
                 1,
                 bias=True,
                 params_dtype=torch.float32,
@@ -2023,8 +2200,16 @@ def _patch_vllm_dspark_qwen3_heads() -> bool:
                 prefix=f"{prefix}.proj",
             )
 
-        def forward(self, hidden_states: Any, markov_embeds: Any) -> Any:
-            x = torch.cat([hidden_states, markov_embeds], dim=-1)
+        def forward(self, hidden_states: Any, markov_embeds: Any = None) -> Any:
+            if self.with_markov:
+                if markov_embeds is None:
+                    raise ValueError(
+                        "DSpark confidence head expects Markov embeddings when "
+                        "confidence_head_with_markov=True"
+                    )
+                x = torch.cat([hidden_states, markov_embeds], dim=-1)
+            else:
+                x = hidden_states
             confidence, _ = self.proj(x.float())
             return confidence.squeeze(-1)
 
@@ -2082,7 +2267,13 @@ def _patch_vllm_dspark_qwen3_heads() -> bool:
                 self.markov_head = DSparkMarkovHead(
                     vllm_config, prefix=f"{prefix}.markov_head"
                 )
-            if not hasattr(self, "confidence_head"):
+            # Register the confidence head only for checkpoints that declare it,
+            # matching the training-side topology so hot-published weights load
+            # with the right shape. The markov-less topology is offline-only and
+            # is rejected for online training by the trainer backend.
+            if _dspark_confidence_head_enabled(hf_config) and not hasattr(
+                self, "confidence_head"
+            ):
                 self.confidence_head = DSparkConfidenceHead(
                     vllm_config, prefix=f"{prefix}.confidence_head"
                 )
@@ -2391,6 +2582,446 @@ def patch_vllm_spec_decode_acceptance_logging() -> bool:
     return True
 
 
+def _speco_vllm_request_stats_store(scheduler: Any) -> dict[str, dict[str, float]]:
+    stats = getattr(scheduler, "_speco_vllm_request_accept_stats", None)
+    if not isinstance(stats, dict):
+        stats = {}
+        scheduler._speco_vllm_request_accept_stats = stats
+    return stats
+
+
+def _record_vllm_request_acceptance_stats(
+    scheduler: Any,
+    *,
+    request_id: Any,
+    num_draft_tokens: Any,
+    num_accepted_tokens: Any,
+    num_invalid_spec_tokens: Any,
+) -> None:
+    if request_id is None:
+        return
+    draft_tokens = _int_or_zero(num_draft_tokens)
+    accepted_tokens = _int_or_zero(num_accepted_tokens)
+    if isinstance(num_invalid_spec_tokens, dict):
+        num_invalid_spec_tokens = num_invalid_spec_tokens.get(str(request_id), 0)
+    invalid_tokens = _int_or_zero(num_invalid_spec_tokens)
+    if draft_tokens <= 0 and accepted_tokens <= 0 and invalid_tokens <= 0:
+        return
+    stats = _speco_vllm_request_stats_store(scheduler)
+    key = str(request_id)
+    now = time.perf_counter()
+    item = stats.setdefault(
+        key,
+        {
+            "verify_rounds": 0,
+            "draft_tokens": 0,
+            "accepted_tokens": 0,
+            "invalid_spec_tokens": 0,
+            "started_sec": now,
+            "last_update_sec": now,
+        },
+    )
+    item["verify_rounds"] += 1
+    item["draft_tokens"] += max(draft_tokens - invalid_tokens, 0)
+    item["accepted_tokens"] += accepted_tokens
+    item["invalid_spec_tokens"] += invalid_tokens
+    item["last_update_sec"] = now
+    scheduler._speco_vllm_request_accept_record_count = (
+        _int_or_zero(getattr(scheduler, "_speco_vllm_request_accept_record_count", 0))
+        + 1
+    )
+
+
+def _request_ids_from_scheduler_output(output: Any) -> list[str]:
+    candidates = []
+    for name in (
+        "finished_req_ids",
+        "finished_request_ids",
+        "finished_requests",
+        "request_ids",
+    ):
+        value = getattr(output, name, None)
+        if value is not None:
+            candidates.append(value)
+    request_outputs = getattr(output, "request_outputs", None) or getattr(
+        output, "outputs", None
+    )
+    if isinstance(request_outputs, dict):
+        candidates.append(request_outputs.keys())
+    elif isinstance(request_outputs, (list, tuple)):
+        candidates.append(
+            [getattr(item, "request_id", None) for item in request_outputs]
+        )
+
+    request_ids: list[str] = []
+    for candidate in candidates:
+        if isinstance(candidate, (str, bytes)):
+            values = [candidate]
+        else:
+            try:
+                values = list(candidate)
+            except TypeError:
+                values = [candidate]
+        for value in values:
+            if value is not None:
+                request_ids.append(str(value))
+    return list(dict.fromkeys(request_ids))
+
+
+def _pop_vllm_request_stats_for_ids(
+    scheduler: Any,
+    request_ids: Iterable[Any],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    stats = getattr(scheduler, "_speco_vllm_request_accept_stats", None)
+    if not isinstance(stats, dict) or not stats:
+        return {}, []
+    summaries: dict[str, dict[str, Any]] = {}
+    completion_order: list[str] = []
+    completion_counter = _int_or_zero(
+        getattr(scheduler, "_speco_vllm_request_completion_counter", 0)
+    )
+    for request_id in request_ids:
+        request_id = str(request_id)
+        item = stats.pop(request_id, None)
+        if item is None:
+            continue
+        item = dict(item)
+        item["completion_index"] = completion_counter
+        completed_sec = time.perf_counter()
+        item["completed_sec"] = completed_sec
+        item["completed_time"] = time.time()
+        started_sec = item.get("started_sec")
+        if isinstance(started_sec, (int, float)):
+            item["elapsed_sec"] = max(0.0, completed_sec - float(started_sec))
+        completion_counter += 1
+        completion_order.append(request_id)
+        summaries[request_id] = dict(item)
+    if summaries:
+        scheduler._speco_vllm_request_completion_counter = completion_counter
+    return summaries, completion_order
+
+
+def _set_vllm_request_stats_on_output(
+    output: Any,
+    summaries: dict[str, dict[str, Any]],
+    completion_order: list[str],
+) -> bool:
+    if not summaries:
+        return False
+    try:
+        setattr(output, "_speco_vllm_request_accept_stats", summaries)
+        setattr(output, "_speco_vllm_request_completion_order", completion_order)
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def _stage_vllm_request_stats_for_rollout_output(
+    request_id: Any,
+    summaries: dict[str, dict[str, Any]],
+    completion_order: list[str],
+) -> None:
+    if request_id is None or not summaries:
+        return
+    _SPECO_VLLM_REQUEST_OUTPUT_STATS_BY_ID[str(request_id)] = (
+        summaries,
+        completion_order,
+    )
+
+
+def _pop_vllm_request_stats_for_rollout_output(
+    request_id: Any,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    if request_id is None:
+        return {}, []
+    return _SPECO_VLLM_REQUEST_OUTPUT_STATS_BY_ID.pop(str(request_id), ({}, []))
+
+
+def _vllm_generate_request_id(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    if "request_id" in kwargs:
+        return kwargs["request_id"]
+    if len(args) >= 3:
+        return args[2]
+    return None
+
+
+def _encode_vllm_request_stats_trace_header(summary: dict[str, Any]) -> str:
+    return json.dumps(summary, ensure_ascii=True, separators=(",", ":"))
+
+
+def _decode_vllm_request_stats_trace_header(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        decoded = json.loads(value)
+    except Exception:  # noqa: BLE001
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _attach_vllm_request_stats_to_trace_headers(
+    engine_core_output: Any, summary: dict[str, Any]
+) -> None:
+    if not summary:
+        return
+    trace_headers = getattr(engine_core_output, "trace_headers", None)
+    try:
+        headers = dict(trace_headers) if trace_headers is not None else {}
+        headers[SPECO_VLLM_REQUEST_STATS_TRACE_HEADER] = (
+            _encode_vllm_request_stats_trace_header(summary)
+        )
+        setattr(engine_core_output, "trace_headers", headers)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "Failed to attach SPECO request stats to EngineCoreOutput trace headers: %s",
+            exc,
+        )
+
+
+def _attach_vllm_request_stats_to_output(scheduler: Any, output: Any) -> None:
+    stats = getattr(scheduler, "_speco_vllm_request_accept_stats", None)
+    if not isinstance(stats, dict) or not stats:
+        return
+    request_ids = _request_ids_from_scheduler_output(output)
+    if not request_ids:
+        return
+    summaries, completion_order = _pop_vllm_request_stats_for_ids(
+        scheduler, request_ids
+    )
+    if not summaries:
+        return
+    _set_vllm_request_stats_on_output(output, summaries, completion_order)
+
+
+def patch_vllm_request_acceptance_stats() -> bool:
+    """Carry request-level speculative acceptance summaries to rollout outputs.
+
+    vLLM V1 emits final request data through EngineCoreOutput -> RequestOutput,
+    while SchedulerOutput.finished_req_ids is only a cache-release signal in
+    newer commits. Record counters in the scheduler, transport them through an
+    internal trace header on final EngineCoreOutput objects, then restore them
+    on the RequestOutput consumed by verl.
+    """
+
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to install vLLM request acceptance stats patch: %s", exc)
+        return False
+
+    original_make_stats = getattr(Scheduler, "make_spec_decoding_stats", None)
+    if callable(original_make_stats) and not getattr(
+        original_make_stats, "_speco_request_acceptance_stats", False
+    ):
+
+        def patched_make_spec_decoding_stats(
+            self,
+            spec_decoding_stats,
+            num_draft_tokens,
+            num_accepted_tokens,
+            num_invalid_spec_tokens,
+            request_id,
+        ):
+            result = original_make_stats(
+                self,
+                spec_decoding_stats,
+                num_draft_tokens,
+                num_accepted_tokens,
+                num_invalid_spec_tokens,
+                request_id,
+            )
+            try:
+                _record_vllm_request_acceptance_stats(
+                    self,
+                    request_id=request_id,
+                    num_draft_tokens=num_draft_tokens,
+                    num_accepted_tokens=num_accepted_tokens,
+                    num_invalid_spec_tokens=num_invalid_spec_tokens,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to record vLLM request acceptance stats: %s", exc)
+            return result
+
+        setattr(
+            patched_make_spec_decoding_stats, "_speco_request_acceptance_stats", True
+        )
+        setattr(
+            patched_make_spec_decoding_stats,
+            "_speco_original_make_spec_decoding_stats",
+            original_make_stats,
+        )
+        Scheduler.make_spec_decoding_stats = patched_make_spec_decoding_stats
+
+    original_update_from_output = getattr(Scheduler, "update_from_output", None)
+    if callable(original_update_from_output) and not getattr(
+        original_update_from_output,
+        "_speco_request_acceptance_stats",
+        False,
+    ):
+
+        def patched_update_from_output(self, scheduler_output, model_runner_output):
+            engine_core_outputs = original_update_from_output(
+                self, scheduler_output, model_runner_output
+            )
+            try:
+                finished_outputs = []
+                for client_outputs in engine_core_outputs.values():
+                    for engine_core_output in (
+                        getattr(client_outputs, "outputs", None) or ()
+                    ):
+                        is_finished = bool(
+                            getattr(engine_core_output, "finished", False)
+                        )
+                        if (
+                            not is_finished
+                            and getattr(engine_core_output, "finish_reason", None)
+                            is None
+                        ):
+                            continue
+                        request_id = getattr(engine_core_output, "request_id", None)
+                        if request_id is not None:
+                            finished_outputs.append(
+                                (str(request_id), engine_core_output)
+                            )
+                if finished_outputs:
+                    summaries, _ = _pop_vllm_request_stats_for_ids(
+                        self,
+                        [request_id for request_id, _ in finished_outputs],
+                    )
+                    for request_id, engine_core_output in finished_outputs:
+                        summary = summaries.get(request_id)
+                        if summary is not None:
+                            _attach_vllm_request_stats_to_trace_headers(
+                                engine_core_output, summary
+                            )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Failed to attach vLLM request stats to EngineCoreOutputs: %s", exc
+                )
+            return engine_core_outputs
+
+        setattr(patched_update_from_output, "_speco_request_acceptance_stats", True)
+        setattr(
+            patched_update_from_output,
+            "_speco_original_update_from_output",
+            original_update_from_output,
+        )
+        Scheduler.update_from_output = patched_update_from_output
+
+    original_schedule = getattr(Scheduler, "schedule", None)
+    if callable(original_schedule) and not getattr(
+        original_schedule, "_speco_request_acceptance_stats", False
+    ):
+
+        def patched_schedule(self, *args, **kwargs):
+            output = original_schedule(self, *args, **kwargs)
+            try:
+                _attach_vllm_request_stats_to_output(self, output)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to attach vLLM request acceptance stats: %s", exc)
+            return output
+
+        setattr(patched_schedule, "_speco_request_acceptance_stats", True)
+        setattr(patched_schedule, "_speco_original_schedule", original_schedule)
+        Scheduler.schedule = patched_schedule
+
+    try:
+        from vllm.v1.engine.output_processor import OutputProcessor, RequestState
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "Unable to install vLLM output processor request stats patch: %s", exc
+        )
+        return True
+
+    original_process_outputs = getattr(OutputProcessor, "process_outputs", None)
+    if callable(original_process_outputs) and not getattr(
+        original_process_outputs,
+        "_speco_request_acceptance_stats",
+        False,
+    ):
+
+        def patched_process_outputs(self, engine_core_outputs, *args, **kwargs):
+            try:
+                for engine_core_output in engine_core_outputs:
+                    request_id = getattr(engine_core_output, "request_id", None)
+                    req_state = getattr(self, "request_states", {}).get(request_id)
+                    if req_state is None:
+                        continue
+                    trace_headers = getattr(engine_core_output, "trace_headers", None)
+                    if not isinstance(trace_headers, dict):
+                        try:
+                            trace_headers = (
+                                dict(trace_headers) if trace_headers is not None else {}
+                            )
+                        except Exception:  # noqa: BLE001
+                            trace_headers = {}
+                    summary = _decode_vllm_request_stats_trace_header(
+                        trace_headers.get(SPECO_VLLM_REQUEST_STATS_TRACE_HEADER)
+                    )
+                    if summary:
+                        setattr(
+                            req_state, "_speco_vllm_request_accept_summary", summary
+                        )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Failed to stage vLLM request stats on RequestState: %s", exc
+                )
+            return original_process_outputs(self, engine_core_outputs, *args, **kwargs)
+
+        setattr(patched_process_outputs, "_speco_request_acceptance_stats", True)
+        setattr(
+            patched_process_outputs,
+            "_speco_original_process_outputs",
+            original_process_outputs,
+        )
+        OutputProcessor.process_outputs = patched_process_outputs
+
+    original_make_request_output = getattr(RequestState, "make_request_output", None)
+    if callable(original_make_request_output) and not getattr(
+        original_make_request_output,
+        "_speco_request_acceptance_stats",
+        False,
+    ):
+
+        def patched_make_request_output(self, *args, **kwargs):
+            request_output = original_make_request_output(self, *args, **kwargs)
+            if request_output is None:
+                return request_output
+            summary = getattr(self, "_speco_vllm_request_accept_summary", None)
+            if not isinstance(summary, dict) or not summary:
+                return request_output
+            request_id = getattr(request_output, "request_id", None) or getattr(
+                self,
+                "external_req_id",
+                None,
+            )
+            if request_id is not None:
+                request_id = str(request_id)
+                summaries = {request_id: summary}
+                completion_order = [request_id]
+                _set_vllm_request_stats_on_output(
+                    request_output, summaries, completion_order
+                )
+                _stage_vllm_request_stats_for_rollout_output(
+                    request_id, summaries, completion_order
+                )
+                try:
+                    delattr(self, "_speco_vllm_request_accept_summary")
+                except Exception:  # noqa: BLE001
+                    pass
+            return request_output
+
+        setattr(patched_make_request_output, "_speco_request_acceptance_stats", True)
+        setattr(
+            patched_make_request_output,
+            "_speco_original_make_request_output",
+            original_make_request_output,
+        )
+        RequestState.make_request_output = patched_make_request_output
+
+    return True
+
+
 def patch_vllm_dflash_config_aliases() -> bool:
     """Let vLLM consume SPECO DFlash top-level target layer ids."""
 
@@ -2471,7 +3102,10 @@ def _speco_vllm_run_engine_core_with_acceptance_logging(*args, **kwargs):
     patch_vllm_dflash_config_aliases()
     patch_vllm_dspark_registry_aliases()
     patch_vllm_dspark_runtime()
-    patch_vllm_spec_decode_acceptance_logging()
+    # Umbrella installer: also patches per-request acceptance stats
+    # (make_spec_decoding_stats/update_from_output) inside this EngineCore
+    # child process, where the Scheduler instance actually lives.
+    install_vllm_spec_decode_acceptance_logging()
     patch_vllm_worker_proc_entrypoint()
 
     from vllm.v1.engine.core import EngineCoreProc
@@ -2514,7 +3148,9 @@ def _speco_vllm_worker_main_with_runtime_observability(*args, **kwargs):
     patch_vllm_dflash_config_aliases()
     patch_vllm_dspark_registry_aliases()
     patch_vllm_dspark_runtime()
-    patch_vllm_spec_decode_acceptance_logging()
+    # Umbrella installer: per-request stats patches must reach worker
+    # processes too (spawn start method re-imports everything fresh).
+    install_vllm_spec_decode_acceptance_logging()
 
     original = getattr(
         _speco_vllm_worker_main_with_runtime_observability,
@@ -2569,8 +3205,9 @@ def install_vllm_spec_decode_acceptance_logging() -> bool:
     """Install speculative acceptance logs in parent and EngineCore processes."""
 
     scheduler_patched = patch_vllm_spec_decode_acceptance_logging()
+    request_acceptance_patched = patch_vllm_request_acceptance_stats()
     engine_core_patched = patch_vllm_engine_core_entrypoint()
-    return scheduler_patched or engine_core_patched
+    return scheduler_patched or request_acceptance_patched or engine_core_patched
 
 
 def install_vllm_runtime_observability() -> bool:
@@ -2582,6 +3219,7 @@ def install_vllm_runtime_observability() -> bool:
     dspark_draft_load_patched = patch_vllm_dspark_draft_load_config()
     dspark_runtime_patched = patch_vllm_dspark_runtime()
     acceptance_patched = install_vllm_spec_decode_acceptance_logging()
+    request_acceptance_patched = patch_vllm_request_acceptance_stats()
     worker_proc_patched = patch_vllm_worker_proc_entrypoint()
     return (
         dflash_config_patched
@@ -2589,6 +3227,7 @@ def install_vllm_runtime_observability() -> bool:
         or dspark_draft_load_patched
         or dspark_runtime_patched
         or acceptance_patched
+        or request_acceptance_patched
         or worker_proc_patched
     )
 
@@ -2658,6 +3297,124 @@ def _vllm_request_spec_decode_stats_to_metrics(request_stats: Any) -> dict[str, 
             "accepted_tokens": max(0, accepted_tokens),
         }
     )
+
+
+def _vllm_request_accept_fields_from_summaries(
+    summaries: dict[str, dict[str, Any]],
+    ordered_ids: list[str],
+) -> dict[str, Any]:
+    verify_rounds = []
+    draft_tokens = []
+    accepted_tokens = []
+    invalid_tokens = []
+    completion_indices = []
+    mean_accept_len = []
+    elapsed_sec = []
+    for request_id in ordered_ids:
+        item = summaries.get(request_id) or {}
+        rounds = _int_or_zero(item.get("verify_rounds", 0))
+        accepted = _int_or_zero(item.get("accepted_tokens", 0))
+        request_mean_accept_len = 1.0 + accepted / rounds if rounds > 0 else None
+        elapsed_value = item.get("elapsed_sec")
+        request_elapsed_sec = (
+            float(elapsed_value) if isinstance(elapsed_value, (int, float)) else None
+        )
+        verify_rounds.append(rounds)
+        draft_tokens.append(_int_or_zero(item.get("draft_tokens", 0)))
+        accepted_tokens.append(accepted)
+        invalid_tokens.append(_int_or_zero(item.get("invalid_spec_tokens", 0)))
+        completion_indices.append(_int_or_zero(item.get("completion_index", 0)))
+        mean_accept_len.append(request_mean_accept_len)
+        elapsed_sec.append(request_elapsed_sec)
+    return {
+        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_id": ordered_ids,
+        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_verify_rounds": verify_rounds,
+        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_draft_tokens": draft_tokens,
+        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_accepted_tokens": accepted_tokens,
+        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_invalid_spec_tokens": invalid_tokens,
+        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_completion_index": completion_indices,
+        f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_elapsed_sec": elapsed_sec,
+        "_verl_request_mean_accept_len": mean_accept_len,
+    }
+
+
+def _ordered_request_ids_from_summaries(
+    summaries: dict[str, dict[str, Any]],
+    completion_order: Any = None,
+    preferred_request_id: Any = None,
+) -> list[str]:
+    if preferred_request_id is not None and str(preferred_request_id) in summaries:
+        return [str(preferred_request_id)]
+    if isinstance(completion_order, (list, tuple)):
+        ordered_ids = [
+            str(request_id)
+            for request_id in completion_order
+            if str(request_id) in summaries
+        ]
+        ordered_ids.extend(
+            str(request_id)
+            for request_id in summaries
+            if str(request_id) not in set(ordered_ids)
+        )
+        return ordered_ids
+    return list(summaries)
+
+
+def _vllm_request_accept_stats_to_extra_fields(output: Any) -> dict[str, Any]:
+    summaries = getattr(output, "_speco_vllm_request_accept_stats", None)
+    if not isinstance(summaries, dict) or not summaries:
+        return {}
+    ordered_ids = _ordered_request_ids_from_summaries(
+        summaries,
+        completion_order=getattr(output, "_speco_vllm_request_completion_order", None),
+        preferred_request_id=getattr(output, "request_id", None),
+    )
+    return _vllm_request_accept_fields_from_summaries(summaries, ordered_ids)
+
+
+def _vllm_staged_request_accept_stats_to_extra_fields(
+    args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """Per-request stats for servers that rebuild the rollout output object.
+
+    Fully-async verl servers (vllm_async_server.vLLMHttpServer) consume the
+    vLLM ``RequestOutput`` internally and return a fresh ``TokenOutput``, so
+    attribute-based attachment never reaches the returned object. The
+    OutputProcessor patch stages the same summary by request id; pop it here
+    using the request id of this ``generate()`` call.
+    """
+    request_id = _vllm_generate_request_id(args, kwargs)
+    summaries, completion_order = _pop_vllm_request_stats_for_rollout_output(request_id)
+    if not summaries:
+        return {}
+    ordered_ids = _ordered_request_ids_from_summaries(
+        summaries,
+        completion_order=completion_order,
+        preferred_request_id=request_id,
+    )
+    fields = _vllm_request_accept_fields_from_summaries(summaries, ordered_ids)
+    # Agent-loop fans n out into one n=1 generate call per completion, so each
+    # field holds exactly one value; flatten lists to scalars so non_tensor_batch
+    # cells are plain numbers/strings (matches the hard_sample reference
+    # deployment's scalar override in the mixin generate()).
+    scalar_fields = {}
+    for key, value in fields.items():
+        if isinstance(value, (list, tuple)):
+            scalar_fields[key] = value[0] if value else None
+        else:
+            scalar_fields[key] = value
+    return scalar_fields
+
+
+def _vllm_request_accept_stats_to_scalar_extra_fields(output: Any) -> dict[str, Any]:
+    fields = _vllm_request_accept_stats_to_extra_fields(output)
+    scalar_fields = {}
+    for key, value in fields.items():
+        if isinstance(value, (list, tuple)):
+            scalar_fields[key] = value[0] if value else None
+        else:
+            scalar_fields[key] = value
+    return scalar_fields
 
 
 def _build_speco_vllm_stat_logger(server: Any):
@@ -2901,6 +3658,21 @@ class _SpecoVLLMHttpServerMixin:
         )
         if request_metrics:
             extra_fields.update(request_metrics)
+            # MRV2 exposes authoritative final-request counters even when its
+            # scheduler/OutputProcessor metadata path is unavailable. Bridge
+            # those (never the aggregate logger fallback) to hard/freeze cells.
+            rounds = request_metrics["spec_num_verify_steps"]
+            accepted = request_metrics["spec_num_accepted_tokens"]
+            extra_fields.update(
+                {
+                    f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_verify_rounds": rounds,
+                    f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_draft_tokens": request_metrics[
+                        "spec_num_draft_tokens"
+                    ],
+                    f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_accepted_tokens": accepted,
+                    "_verl_request_mean_accept_len": 1.0 + accepted / rounds,
+                }
+            )
         else:
             extra_fields.update(_vllm_spec_decode_stats_to_metrics(fallback_stats))
         if (
@@ -2930,6 +3702,25 @@ class _SpecoVLLMHttpServerMixin:
                 ),
             )
             self._speco_vllm_spec_decode_empty_source_warned = True
+
+    def _speco_add_vllm_request_accept_extra_fields(
+        self, output: Any, extra_fields: dict[str, Any]
+    ) -> None:
+        extra_fields.update(_vllm_request_accept_stats_to_scalar_extra_fields(output))
+
+    def _speco_add_staged_request_accept_extra_fields(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        extra_fields: dict[str, Any],
+    ) -> None:
+        # Fully-async verl servers return a rebuilt TokenOutput; recover the
+        # per-request summary staged by the OutputProcessor patch via request
+        # id. The staged values are scalars and override any list-valued
+        # fields attached from the (possibly n>1) output object.
+        extra_fields.update(
+            _vllm_staged_request_accept_stats_to_extra_fields(args, kwargs)
+        )
 
     async def launch_server(self, *args, **kwargs):
         self._speco_vllm_spec_decode_pending_stats = _new_vllm_spec_decode_stats()
@@ -3012,22 +3803,127 @@ class _SpecoVLLMHttpServerMixin:
             self._speco_initial_draft_weights_ready = True
 
     async def generate(self, *args, **kwargs):
-        if not bool(getattr(self, "_speco_vllm_generate_entered", False)):
-            logger.warning(
-                "[speco acceptance bridge] generate wrapper entered class=%s mro=%s",
-                type(self).__name__,
-                [cls.__name__ for cls in type(self).__mro__[:4]],
-            )
-            self._speco_vllm_generate_entered = True
-        self._speco_install_request_spec_decode_capture()
+        return await _speco_generate_with_request_stats(
+            self, super().generate, args, kwargs
+        )
+
+    def _speco_rollout_admission(self):
+        from verl_speco.integration.rollout_admission import RolloutAdmission
+
+        gate = getattr(self, "_speco_rollout_admission_gate", None)
+        if gate is None:
+            gate = RolloutAdmission()
+            self._speco_rollout_admission_gate = gate
+        return gate
+
+    async def speco_close_rollout_admission(self):
+        self._speco_rollout_admission().close()
+
+    async def speco_wait_rollout_idle(self):
+        await self._speco_rollout_admission().wait_idle()
+
+    async def speco_resume_rollout_admission(self):
+        self._speco_rollout_admission().resume()
+
+    async def speco_set_serving_drafter_revision(self, revision):
+        # The trainer calls this only after all weight commit RPCs have settled,
+        # while ordinary serving is quiescent behind the admission boundary.
+        self._speco_serving_drafter_revision = int(revision)
+
+    async def speco_generate_probe(self, *args, **kwargs):
+        # Dedicated RPC: public generation cannot opt out of admission by
+        # supplying a request ID or a private sampling parameter.
+        return await _speco_generate_with_request_stats_unblocked(
+            self, super().generate, args, kwargs
+        )
+
+
+async def _speco_generate_with_request_stats(self, generate, args, kwargs):
+    async with self._speco_rollout_admission().request():
+        return await _speco_generate_with_request_stats_unblocked(
+            self, generate, args, kwargs
+        )
+
+
+async def _speco_generate_with_request_stats_unblocked(self, generate, args, kwargs):
+    # Agent-loop metadata is not a vLLM SamplingParams field. SGLang consumes
+    # these hints separately; native vLLM returns its actual serving target
+    # revision through output.extra_fields["global_steps"]. Do not replace that
+    # revision with the potentially stale async prompt submission step.
+    sampling_params = kwargs.get("sampling_params")
+    positional_params = "sampling_params" not in kwargs and len(args) >= 2
+    if positional_params:
+        sampling_params = args[1]
+    if isinstance(sampling_params, dict):
+        clean_params = dict(sampling_params)
+        clean_params.pop("_verl_global_steps", None)
+        clean_params.pop("_verl_skip_drafter_collection", None)
+        if positional_params:
+            args = (args[0], clean_params, *args[2:])
+        else:
+            kwargs = {**kwargs, "sampling_params": clean_params}
+    revision_before = int(getattr(self, "_speco_serving_drafter_revision", 0))
+    if not bool(getattr(self, "_speco_vllm_generate_entered", False)):
+        logger.warning(
+            "[speco acceptance bridge] generate wrapper entered class=%s mro=%s",
+            type(self).__name__,
+            [cls.__name__ for cls in type(self).__mro__[:4]],
+        )
+        self._speco_vllm_generate_entered = True
+    self._speco_install_request_spec_decode_capture()
+    request_id = _vllm_generate_request_id(args, kwargs)
+    try:
         await self._speco_ensure_initial_draft_weights()
-        output = await super().generate(*args, **kwargs)
+        request_started = time.perf_counter()
+        output = await generate(*args, **kwargs)
+        request_elapsed = time.perf_counter() - request_started
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
-            self._speco_add_vllm_spec_decode_extra_fields(
-                extra_fields,
-                request_id=self._speco_request_id_from_generate_call(args, kwargs),
+            revision_after = int(getattr(self, "_speco_serving_drafter_revision", 0))
+            extra_fields["_speco_drafter_revision_min"] = min(
+                revision_before, revision_after
             )
+            extra_fields["_speco_drafter_revision_max"] = max(
+                revision_before, revision_after
+            )
+            extra_fields.setdefault(
+                f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_id",
+                str(request_id) if request_id is not None else None,
+            )
+            for suffix in (
+                "verify_rounds",
+                "draft_tokens",
+                "accepted_tokens",
+                "invalid_spec_tokens",
+                "completion_index",
+                "elapsed_sec",
+            ):
+                extra_fields.setdefault(
+                    f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_{suffix}", None
+                )
+            extra_fields.setdefault("_verl_request_mean_accept_len", None)
+            self._speco_add_vllm_spec_decode_extra_fields(
+                extra_fields, request_id=request_id
+            )
+            self._speco_add_vllm_request_accept_extra_fields(output, extra_fields)
+            summaries, completion_order = _pop_vllm_request_stats_for_rollout_output(
+                request_id
+            )
+            if summaries:
+                proxy_output = SimpleNamespace(
+                    request_id=request_id,
+                    _speco_vllm_request_accept_stats=summaries,
+                    _speco_vllm_request_completion_order=completion_order,
+                )
+                extra_fields.update(
+                    _vllm_request_accept_stats_to_scalar_extra_fields(proxy_output)
+                )
+            elapsed_key = f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_elapsed_sec"
+            if (
+                extra_fields.get("_verl_request_mean_accept_len") is not None
+                and extra_fields.get(elapsed_key) is None
+            ):
+                extra_fields[elapsed_key] = request_elapsed
         elif not bool(getattr(self, "_speco_vllm_bad_extra_fields_warned", False)):
             logger.warning(
                 "[speco acceptance bridge] completed output has unsupported "
@@ -3037,6 +3933,11 @@ class _SpecoVLLMHttpServerMixin:
             )
             self._speco_vllm_bad_extra_fields_warned = True
         return output
+    finally:
+        pending = getattr(self, "_speco_vllm_request_spec_decode_stats", None)
+        if isinstance(pending, dict):
+            pending.pop(str(request_id), None)
+        _pop_vllm_request_stats_for_rollout_output(request_id)
 
 
 def _build_speco_vllm_http_server_class(upstream_module: Any):
@@ -3118,11 +4019,18 @@ def _patch_upstream_vllm_http_server_methods(upstream_cls: type[Any]) -> bool:
     import inspect
 
     helper_names = (
+        "_speco_rollout_admission",
+        "speco_close_rollout_admission",
+        "speco_wait_rollout_idle",
+        "speco_resume_rollout_admission",
+        "speco_set_serving_drafter_revision",
         "_speco_request_id_from_generate_call",
         "_speco_pop_vllm_spec_decode_stats",
         "_speco_capture_request_spec_decode_stats",
         "_speco_install_request_spec_decode_capture",
         "_speco_add_vllm_spec_decode_extra_fields",
+        "_speco_ensure_initial_draft_weights",
+        "_speco_add_vllm_request_accept_extra_fields",
     )
     for name in helper_names:
         setattr(
@@ -3181,30 +4089,14 @@ def _patch_upstream_vllm_http_server_methods(upstream_cls: type[Any]) -> bool:
             AsyncLLM.from_vllm_config = original_from_vllm_config_attr
 
     async def generate_with_speco_stats(self, *args, **kwargs):
-        if not bool(getattr(self, "_speco_vllm_generate_entered", False)):
-            logger.warning(
-                "[speco acceptance bridge] generate wrapper entered class=%s mro=%s",
-                type(self).__name__,
-                [cls.__name__ for cls in type(self).__mro__[:4]],
-            )
-            self._speco_vllm_generate_entered = True
-        self._speco_install_request_spec_decode_capture()
-        output = await original_generate(self, *args, **kwargs)
-        extra_fields = getattr(output, "extra_fields", None)
-        if isinstance(extra_fields, dict):
-            self._speco_add_vllm_spec_decode_extra_fields(
-                extra_fields,
-                request_id=self._speco_request_id_from_generate_call(args, kwargs),
-            )
-        elif not bool(getattr(self, "_speco_vllm_bad_extra_fields_warned", False)):
-            logger.warning(
-                "[speco acceptance bridge] completed output has unsupported "
-                "extra_fields type=%s output_type=%s",
-                type(extra_fields).__name__,
-                type(output).__name__,
-            )
-            self._speco_vllm_bad_extra_fields_warned = True
-        return output
+        return await _speco_generate_with_request_stats(
+            self, original_generate.__get__(self, type(self)), args, kwargs
+        )
+
+    async def generate_probe_with_speco_stats(self, *args, **kwargs):
+        return await _speco_generate_with_request_stats_unblocked(
+            self, original_generate.__get__(self, type(self)), args, kwargs
+        )
 
     setattr(launch_server_with_speco_stats, "_speco_vllm_http_method_bridge", True)
     setattr(run_server_with_speco_stats, "_speco_vllm_http_method_bridge", True)
@@ -3212,6 +4104,7 @@ def _patch_upstream_vllm_http_server_methods(upstream_cls: type[Any]) -> bool:
     upstream_cls.launch_server = launch_server_with_speco_stats
     upstream_cls.run_server = run_server_with_speco_stats
     upstream_cls.generate = generate_with_speco_stats
+    upstream_cls.speco_generate_probe = generate_probe_with_speco_stats
     upstream_cls._speco_vllm_http_methods_patched = True
     return True
 
@@ -3324,7 +4217,7 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     # here and keep it out of the config passed to vLLM.
     sidecar_dir = additional_config.pop(
         SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY, None
-    ) or json.loads(serialize_worker_drafter_config(drafter_cfg, run_dir=run_dir)).get(
+    ) or drafter_cfg.get(SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY) or json.loads(serialize_worker_drafter_config(drafter_cfg, run_dir=run_dir)).get(
         SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
     )
     if run_dir and not sidecar_dir:
@@ -3337,6 +4230,11 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
         sidecar_dir = os.path.abspath(sidecar_dir)
 
     drafter_env_payload = _vllm_drafter_env_payload(drafter_cfg)
+    if run_dir:
+        runtime_drafter = _ensure_nested_mapping(
+            config, ("actor_rollout_ref", "rollout", "drafter")
+        )
+        _set_child(runtime_drafter, SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY, sidecar_dir)
     if sidecar_dir:
         drafter_env_payload[SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY] = sidecar_dir
     set_drafter_config_env(json.dumps(drafter_env_payload, sort_keys=True))
@@ -3702,7 +4600,7 @@ except Exception:  # noqa: BLE001
 
 
 class SpecoVLLMWeightSyncCompatExtension(_VLLMWorkerExtensionBase):
-    """Install the serialized NPU IPC-handle compatibility before target weight sync."""
+    """Apply tied-weight and NPU transport compatibility during target sync."""
 
     def update_weights_from_ipc(
         self,
@@ -3718,15 +4616,19 @@ class SpecoVLLMWeightSyncCompatExtension(_VLLMWorkerExtensionBase):
                 "[speco vllm weight sync] installed IPC rebuild compatibility"
             )
         if not _speco_is_npu_vllm_worker(self):
-            return super().update_weights_from_ipc(
-                peft_config=peft_config,
-                base_sync_done=base_sync_done,
-                use_shm=use_shm,
-            )
+            with _speco_canonicalize_target_tied_weights(self, peft_config=peft_config):
+                return super().update_weights_from_ipc(
+                    peft_config=peft_config,
+                    base_sync_done=base_sync_done,
+                    use_shm=use_shm,
+                )
 
         try:
-            with _speco_npu_target_staging(
-                self, peft_config=peft_config, use_shm=use_shm
+            with (
+                _speco_npu_target_staging(
+                    self, peft_config=peft_config, use_shm=use_shm
+                ),
+                _speco_canonicalize_target_tied_weights(self, peft_config=peft_config),
             ):
                 return super().update_weights_from_ipc(
                     peft_config=peft_config,
@@ -4901,8 +5803,11 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         # Diagnostic: check draft state BEFORE target sync
         self._speco_diag_draft_state("before_target_sync")
         try:
-            with _speco_npu_target_staging(
-                self, peft_config=peft_config, use_shm=use_shm
+            with (
+                _speco_npu_target_staging(
+                    self, peft_config=peft_config, use_shm=use_shm
+                ),
+                _speco_canonicalize_target_tied_weights(self, peft_config=peft_config),
             ):
                 result = super().update_weights_from_ipc(
                     peft_config=peft_config,

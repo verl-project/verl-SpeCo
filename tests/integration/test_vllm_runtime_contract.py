@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import os
@@ -22,6 +23,7 @@ import types
 from contextlib import nullcontext
 from inspect import getsource
 from pathlib import Path
+from textwrap import dedent
 from types import SimpleNamespace
 
 import pytest
@@ -29,22 +31,34 @@ import pytest
 import verl_speco.integration.vllm_runtime as vllm_runtime
 
 from verl_speco.integration.vllm_runtime import (
+    SPECO_VLLM_REQUEST_STATS_TRACE_HEADER,
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
     SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS,
     SPECO_VLLM_WORKER_EXTENSION_CLS,
     SpecoVLLMColocateWorkerExtension,
     SpecoVLLMWeightSyncCompatExtension,
     _SpecoVLLMHttpServerMixin,
+    _attach_vllm_request_stats_to_trace_headers,
+    _decode_vllm_request_stats_trace_header,
     _describe_vllm_draft_logits,
+    _dspark_confidence_head_enabled,
     _invoke_bucket_received_callback,
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
+    _pop_vllm_request_stats_for_ids,
+    _pop_vllm_request_stats_for_rollout_output,
+    _record_vllm_request_acceptance_stats,
     _record_vllm_spec_decode_scheduler_stats,
     _record_vllm_worker_spec_decode_output,
     _speco_can_use_npu_target_staging,
     _speco_npu_target_staging,
     _speco_npu_target_staging_decision,
     _speco_persistent_weight_shm_name,
+    _set_vllm_request_stats_on_output,
+    _stage_vllm_request_stats_for_rollout_output,
+    _vllm_generate_request_id,
+    _vllm_request_accept_stats_to_extra_fields,
+    _vllm_request_accept_stats_to_scalar_extra_fields,
     _validate_vllm_dflash_drafter_config,
     _vllm_ascend_has_dspark_pr11153_k_query_runtime,
     _vllm_spec_decode_stats_to_metrics,
@@ -146,6 +160,320 @@ def test_vllm_initial_drafter_initialization_is_serialized() -> None:
 
     assert server.calls == ["speco_ensure_draft_initialized"]
     assert server._speco_initial_draft_weights_ready is True
+
+
+@pytest.mark.parametrize("keyword_request_id", [False, True])
+def test_vllm_generate_initializes_once_and_preserves_request_stats(
+    keyword_request_id,
+) -> None:
+    events = []
+
+    class UpstreamServer:
+        async def generate(self, *args, **kwargs):
+            assert self._speco_initial_draft_weights_ready
+            request_id = _vllm_generate_request_id(args, kwargs)
+            events.append(request_id)
+            _stage_vllm_request_stats_for_rollout_output(
+                request_id,
+                {
+                    request_id: {
+                        "verify_rounds": 4,
+                        "draft_tokens": 28,
+                        "accepted_tokens": 12,
+                    }
+                },
+                [request_id],
+            )
+            return SimpleNamespace(extra_fields={})
+
+    class Server(_SpecoVLLMHttpServerMixin, UpstreamServer):
+        async def collective_rpc(self, method):
+            events.append(method)
+
+    server = Server()
+    server._speco_initial_draft_weights_required = True
+    server._speco_initial_draft_weights_ready = False
+    server._speco_initial_draft_weights_lock = None
+
+    async def generate_twice():
+        for request_id in ("merge-request-1", "merge-request-2"):
+            if keyword_request_id:
+                output = await server.generate(request_id=request_id)
+            else:
+                output = await server.generate([], {}, request_id)
+            assert output.extra_fields["_speco_vllm_request_id"] == request_id
+            assert output.extra_fields["_verl_request_mean_accept_len"] == 4.0
+            assert _pop_vllm_request_stats_for_rollout_output(request_id) == ({}, [])
+
+    asyncio.run(generate_twice())
+    assert events == [
+        "speco_ensure_draft_initialized",
+        "merge-request-1",
+        "merge-request-2",
+    ]
+
+
+@pytest.mark.parametrize("pre_remote_patch", [False, True])
+def test_probe_rpc_bypasses_closed_admission_but_request_id_cannot(pre_remote_patch):
+    events = []
+
+    class UpstreamServer:
+        async def launch_server(self, *args, **kwargs):
+            pass
+
+        async def run_server(self, *args, **kwargs):
+            pass
+
+        async def generate(self, *args, **kwargs):
+            events.append(kwargs["request_id"])
+            return SimpleNamespace(extra_fields={})
+
+    if pre_remote_patch:
+        assert vllm_runtime._patch_upstream_vllm_http_server_methods(UpstreamServer)
+        server = UpstreamServer()
+    else:
+
+        class Server(_SpecoVLLMHttpServerMixin, UpstreamServer):
+            pass
+
+        server = Server()
+
+    async def scenario():
+        await server.speco_close_rollout_admission()
+        production = asyncio.create_task(
+            server.generate(request_id="speco-freeze-probe-spoofed")
+        )
+        await asyncio.sleep(0)
+        assert events == []
+        await asyncio.wait_for(server.speco_wait_rollout_idle(), 1)
+        output = await asyncio.wait_for(
+            server.speco_generate_probe(request_id="paired-arm"), 1
+        )
+        assert output.extra_fields["_speco_vllm_request_id"] == "paired-arm"
+        assert events == ["paired-arm"]
+        assert not production.done()
+        await server.speco_resume_rollout_admission()
+        await asyncio.wait_for(production, 1)
+        assert events == ["paired-arm", "speco-freeze-probe-spoofed"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("pre_remote_patch", [False, True])
+@pytest.mark.parametrize("positional", [False, True])
+@pytest.mark.parametrize("probe", [False, True])
+def test_vllm_sampling_removes_agent_metadata_preserves_serving_step(
+    pre_remote_patch, positional, probe
+):
+    params = {
+        "temperature": 0.7,
+        "max_tokens": 64,
+        "_verl_global_steps": 2,
+        "_verl_skip_drafter_collection": True,
+    }
+
+    class Upstream:
+        async def launch_server(self):
+            pass
+
+        async def run_server(self, args):
+            pass
+
+        async def generate(self, prompt_ids, sampling_params, request_id):
+            assert prompt_ids == [1, 2]
+            assert sampling_params == {"temperature": 0.7, "max_tokens": 64}
+            assert request_id == "metadata-request"
+            # Native async serving revision, not prompt submission version.
+            return SimpleNamespace(extra_fields={"global_steps": 5})
+
+    if pre_remote_patch:
+        assert vllm_runtime._patch_upstream_vllm_http_server_methods(Upstream)
+        server = Upstream()
+    else:
+
+        class Server(_SpecoVLLMHttpServerMixin, Upstream):
+            pass
+
+        server = Server()
+    method = server.speco_generate_probe if probe else server.generate
+    if positional:
+        output = asyncio.run(method([1, 2], params, "metadata-request"))
+    else:
+        output = asyncio.run(
+            method(
+                prompt_ids=[1, 2], sampling_params=params, request_id="metadata-request"
+            )
+        )
+    assert output.extra_fields["global_steps"] == 5
+    assert params["_verl_global_steps"] == 2
+    assert params["_verl_skip_drafter_collection"] is True
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["upstream_error", "metadata_error", "no_extra_fields", "invalid_extra_fields"],
+)
+def test_vllm_generate_cleans_only_current_request_stats(failure_mode) -> None:
+    request_id = f"cleanup-{failure_mode}"
+    other_request_id = f"other-{failure_mode}"
+    summaries = {
+        request_id: {"verify_rounds": 4, "draft_tokens": 28, "accepted_tokens": 12}
+    }
+    other_summaries = {other_request_id: {"verify_rounds": 2, "accepted_tokens": 6}}
+    output = SimpleNamespace(
+        extra_fields=[] if failure_mode == "invalid_extra_fields" else {}
+    )
+    if failure_mode == "no_extra_fields":
+        output = SimpleNamespace()
+
+    class UpstreamServer:
+        async def generate(self, *args, **kwargs):
+            _stage_vllm_request_stats_for_rollout_output(
+                request_id, summaries, [request_id]
+            )
+            if failure_mode == "upstream_error":
+                raise RuntimeError("upstream generation failed")
+            return output
+
+    class Server(_SpecoVLLMHttpServerMixin, UpstreamServer):
+        def _speco_add_vllm_spec_decode_extra_fields(self, extra_fields, *, request_id):
+            if failure_mode == "metadata_error":
+                raise RuntimeError("metadata conversion failed")
+
+    _stage_vllm_request_stats_for_rollout_output(
+        other_request_id, other_summaries, [other_request_id]
+    )
+    try:
+        if failure_mode in ("upstream_error", "metadata_error"):
+            expected_error = (
+                "upstream generation failed"
+                if failure_mode == "upstream_error"
+                else "metadata conversion failed"
+            )
+            with pytest.raises(RuntimeError, match=expected_error):
+                asyncio.run(Server().generate(request_id=request_id))
+        else:
+            assert asyncio.run(Server().generate(request_id=request_id)) is output
+        assert _pop_vllm_request_stats_for_rollout_output(request_id) == ({}, [])
+        assert _pop_vllm_request_stats_for_rollout_output(other_request_id) == (
+            other_summaries,
+            [other_request_id],
+        )
+    finally:
+        _pop_vllm_request_stats_for_rollout_output(request_id)
+        _pop_vllm_request_stats_for_rollout_output(other_request_id)
+
+
+def test_vllm_generate_cancellation_preserves_concurrent_request_stats() -> None:
+    async def run_requests():
+        staged = {
+            request_id: asyncio.Event()
+            for request_id in ("cancelled-request", "active-request")
+        }
+        release = asyncio.Event()
+
+        class UpstreamServer:
+            async def generate(self, *args, **kwargs):
+                request_id = _vllm_generate_request_id(args, kwargs)
+                _stage_vllm_request_stats_for_rollout_output(
+                    request_id,
+                    {
+                        request_id: {
+                            "verify_rounds": 4,
+                            "draft_tokens": 28,
+                            "accepted_tokens": 12,
+                        }
+                    },
+                    [request_id],
+                )
+                staged[request_id].set()
+                await release.wait()
+                return SimpleNamespace(extra_fields={})
+
+        class Server(_SpecoVLLMHttpServerMixin, UpstreamServer):
+            pass
+
+        server = Server()
+        cancelled_task = asyncio.create_task(
+            server.generate(request_id="cancelled-request")
+        )
+        active_task = asyncio.create_task(server.generate(request_id="active-request"))
+        try:
+            await asyncio.gather(*(event.wait() for event in staged.values()))
+            cancelled_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled_task
+            assert _pop_vllm_request_stats_for_rollout_output("cancelled-request") == (
+                {},
+                [],
+            )
+            release.set()
+            output = await active_task
+            assert output.extra_fields["_speco_vllm_request_id"] == "active-request"
+            assert output.extra_fields["_verl_request_mean_accept_len"] == 4.0
+            assert _pop_vllm_request_stats_for_rollout_output("active-request") == (
+                {},
+                [],
+            )
+        finally:
+            release.set()
+            cancelled_task.cancel()
+            active_task.cancel()
+            await asyncio.gather(cancelled_task, active_task, return_exceptions=True)
+            _pop_vllm_request_stats_for_rollout_output("cancelled-request")
+            _pop_vllm_request_stats_for_rollout_output("active-request")
+
+    asyncio.run(run_requests())
+
+
+@pytest.mark.parametrize("stats_transport", ["staged", "output"])
+@pytest.mark.parametrize("unscored_first", [False, True])
+def test_vllm_generate_preserves_unscored_request_ids_and_transport_keys(
+    stats_transport, unscored_first
+) -> None:
+    class UpstreamServer:
+        async def generate(self, *args, **kwargs):
+            request_id = _vllm_generate_request_id(args, kwargs)
+            output = SimpleNamespace(extra_fields={})
+            if request_id == "scored-request":
+                summaries = {
+                    request_id: {
+                        "verify_rounds": 4,
+                        "draft_tokens": 28,
+                        "accepted_tokens": 12,
+                    }
+                }
+                if stats_transport == "staged":
+                    _stage_vllm_request_stats_for_rollout_output(
+                        request_id, summaries, [request_id]
+                    )
+                else:
+                    output.request_id = request_id
+                    _set_vllm_request_stats_on_output(output, summaries, [request_id])
+            return output
+
+    class Server(_SpecoVLLMHttpServerMixin, UpstreamServer):
+        pass
+
+    async def generate_pair():
+        request_ids = ["scored-request", "unscored-request"]
+        if unscored_first:
+            request_ids.reverse()
+        server = Server()
+        return {
+            request_id: await server.generate([], {}, request_id)
+            for request_id in request_ids
+        }
+
+    outputs = asyncio.run(generate_pair())
+    scored = outputs["scored-request"].extra_fields
+    unscored = outputs["unscored-request"].extra_fields
+    assert scored.keys() == unscored.keys()
+    assert scored["_speco_vllm_request_id"] == "scored-request"
+    assert scored["_verl_request_mean_accept_len"] == 4.0
+    assert unscored["_speco_vllm_request_id"] == "unscored-request"
+    assert unscored["_verl_request_mean_accept_len"] is None
+    assert unscored["_speco_vllm_request_verify_rounds"] is None
 
 
 def test_vllm_worker_initializes_dflash_drafter_once(monkeypatch) -> None:
@@ -301,7 +629,15 @@ def test_vllm_weight_sync_extension_has_stable_runtime_path() -> None:
     assert source.index(
         "patch_verl_bucketed_weight_transfer_npu_staging()"
     ) < source.index("super().update_weights_from_ipc(")
-    assert "with _speco_npu_target_staging(" in source
+    tree = ast.parse(dedent(source))
+    assert any(
+        isinstance(item.context_expr, ast.Call)
+        and isinstance(item.context_expr.func, ast.Name)
+        and item.context_expr.func.id == "_speco_npu_target_staging"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.With)
+        for item in node.items
+    )
 
 
 def test_vllm_npu_staging_is_guarded_and_preserves_upstream_fallback() -> None:
@@ -604,6 +940,133 @@ def test_vllm_speculative_config_keeps_native_dspark_on_npu_mrv2(
         "model": str(model_path),
         "num_speculative_tokens": 5,
     }
+
+
+@pytest.mark.parametrize(
+    ("hf_config", "expected"),
+    [
+        ({"enable_confidence_head": True}, True),
+        ({"enable_confidence_head": False}, False),
+        ({"confidence_head_alpha": 1.0}, True),
+        ({"confidence_head_alpha": 0.0}, False),
+        ({}, False),
+        (None, False),
+    ],
+)
+def test_dspark_confidence_head_enabled_from_checkpoint_config(
+    hf_config, expected
+) -> None:
+    assert _dspark_confidence_head_enabled(hf_config) is expected
+
+
+def test_vllm_dynamic_dspark_uses_native_method_on_npu_contract(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        """
+        {
+          "architectures": ["Qwen3DSparkModel"],
+          "markov_head_type": "vanilla",
+          "enable_confidence_head": true,
+          "target_layer_ids": [1, 9, 17, 25, 33]
+        }
+        """,
+        encoding="utf-8",
+    )
+    rollout_cfg = {
+        "engine_kwargs": {
+            "vllm": {
+                "additional_config": {
+                    "dynamic_spec_config": {
+                        "method": "dspark",
+                        "method_params": {
+                            "initial_verify_budget_per_req": 5,
+                            "budget_update_interval": 50,
+                            "budget_threshold": 0.7,
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    config = build_vllm_speculative_config_from_drafter(
+        _drafter(
+            speculative_algorithm="DSPARK",
+            model_path=str(model_path),
+            rollout={"spec_steps": 1, "spec_verify_tokens": 7},
+        ),
+        rollout_cfg=rollout_cfg,
+    )
+
+    assert config["method"] == "dspark"
+    assert config["num_speculative_tokens"] == 7
+
+
+def test_vllm_dynamic_dspark_rejects_checkpoint_without_confidence_head(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla", '
+        '"target_layer_ids": [1, 9, 17, 25, 33]}',
+        encoding="utf-8",
+    )
+    rollout_cfg = {
+        "engine_kwargs": {
+            "vllm": {"additional_config": {"dynamic_spec_config": {"method": "dspark"}}}
+        }
+    }
+
+    with pytest.raises(ValueError, match="confidence head"):
+        build_vllm_speculative_config_from_drafter(
+            _drafter(
+                speculative_algorithm="DSPARK",
+                model_path=str(model_path),
+                rollout={"spec_steps": 1, "spec_verify_tokens": 7},
+            ),
+            rollout_cfg=rollout_cfg,
+        )
+
+
+def test_vllm_dynamic_dspark_rejects_static_dflash_override(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla", '
+        '"enable_confidence_head": true}',
+        encoding="utf-8",
+    )
+    rollout_cfg = {
+        "engine_kwargs": {
+            "vllm": {"additional_config": {"dynamic_spec_config": {"method": "dspark"}}}
+        }
+    }
+
+    with pytest.raises(ValueError, match="requires speculative_config.method=dspark"):
+        build_vllm_speculative_config_from_drafter(
+            _drafter(
+                speculative_algorithm="DSPARK",
+                model_path=str(model_path),
+                rollout={"spec_steps": 1, "spec_verify_tokens": 7},
+                vllm={"speculative_config_overrides": {"method": "dflash"}},
+            ),
+            rollout_cfg=rollout_cfg,
+        )
 
 
 def test_vllm_mrv2_dspark_rejects_legacy_k_plus_one_alignment(
@@ -976,15 +1439,21 @@ def test_vllm_runtime_injects_native_config_and_worker_extension(
         vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
         not in engine_kwargs["additional_config"]
     )
-    sidecar_dir = vllm_runtime._vllm_spec_decode_sidecar_dir()
-    assert sidecar_dir is not None
+    sidecar_dir = config["actor_rollout_ref"]["rollout"]["drafter"][
+        vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
+    ]
     assert sidecar_dir.startswith(str(tmp_path / ".spec_decode_stats"))
     assert "/run-" in sidecar_dir.replace("\\", "/")
 
     # Reconfiguration in the same driver process must reuse its run-scoped
     # directory rather than splitting counters between two locations.
     configure_vllm_runtime_from_config(config)
-    assert vllm_runtime._vllm_spec_decode_sidecar_dir() == sidecar_dir
+    assert (
+        config["actor_rollout_ref"]["rollout"]["drafter"][
+            vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
+        ]
+        == sidecar_dir
+    )
 
 
 def test_vllm_runtime_installs_replica_bridge_without_drafter(monkeypatch) -> None:
@@ -1425,6 +1894,8 @@ def test_vllm_http_server_transports_final_request_acceptance_stats() -> None:
     server.engine = Engine()
     output = asyncio.run(Server.generate(server, request_id="request-1"))
 
+    elapsed = output.extra_fields.pop("_speco_vllm_request_elapsed_sec")
+    assert elapsed >= 0
     assert output.extra_fields == {
         "global_steps": 1,
         "spec_num_draft_tokens": 28.0,
@@ -1432,6 +1903,15 @@ def test_vllm_http_server_transports_final_request_acceptance_stats() -> None:
         "spec_num_verify_steps": 4.0,
         f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_drafts": 4.0,
         f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_accepted_tokens": 9.0,
+        "_speco_vllm_request_id": "request-1",
+        "_speco_vllm_request_verify_rounds": 4.0,
+        "_speco_drafter_revision_min": 0,
+        "_speco_drafter_revision_max": 0,
+        "_speco_vllm_request_draft_tokens": 28.0,
+        "_speco_vllm_request_accepted_tokens": 9.0,
+        "_speco_vllm_request_invalid_spec_tokens": None,
+        "_speco_vllm_request_completion_index": None,
+        "_verl_request_mean_accept_len": 3.25,
     }
     assert server._speco_vllm_request_spec_decode_stats == {}
 
@@ -1627,6 +2107,8 @@ def test_vllm_http_server_transports_stats_with_positional_request_id() -> None:
     server.engine = Engine()
     output = asyncio.run(Server.generate(server, [1], {}, "request-1"))
 
+    elapsed = output.extra_fields.pop("_speco_vllm_request_elapsed_sec")
+    assert elapsed >= 0
     assert output.extra_fields == {
         "global_steps": 1,
         "spec_num_draft_tokens": 21.0,
@@ -1634,8 +2116,200 @@ def test_vllm_http_server_transports_stats_with_positional_request_id() -> None:
         "spec_num_verify_steps": 3.0,
         f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_drafts": 3.0,
         f"{SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX}_accepted_tokens": 5.0,
+        "_speco_vllm_request_id": "request-1",
+        "_speco_vllm_request_verify_rounds": 3.0,
+        "_speco_drafter_revision_min": 0,
+        "_speco_drafter_revision_max": 0,
+        "_speco_vllm_request_draft_tokens": 21.0,
+        "_speco_vllm_request_accepted_tokens": 5.0,
+        "_speco_vllm_request_invalid_spec_tokens": None,
+        "_speco_vllm_request_completion_index": None,
+        "_verl_request_mean_accept_len": 1.0 + 5.0 / 3.0,
     }
     assert server._speco_vllm_request_spec_decode_stats == {}
+
+
+def test_pre_remote_method_patch_preserves_request_metadata_for_hard_sampling():
+    from verl_speco.integration.vllm_runtime import (
+        _patch_upstream_vllm_http_server_methods,
+    )
+
+    class Engine:
+        def generate(self, **kwargs):
+            async def outputs():
+                yield SimpleNamespace(
+                    metrics=SimpleNamespace(
+                        request_spec_decode_stats=SimpleNamespace(
+                            num_verify_steps=2,
+                            num_draft_tokens=14,
+                            num_accepted_tokens=6,
+                        )
+                    )
+                )
+
+            return outputs()
+
+    class Upstream:
+        async def launch_server(self):
+            pass
+
+        async def run_server(self, args):
+            pass
+
+        async def generate(self, prompt_ids, sampling_params, request_id):
+            async for _ in self.engine.generate(request_id=request_id):
+                pass
+            return SimpleNamespace(extra_fields={})
+
+    assert _patch_upstream_vllm_http_server_methods(Upstream)
+    server = Upstream()
+    server.engine = Engine()
+    output = asyncio.run(server.generate([1, 2], {}, "hard-request"))
+    assert output.extra_fields["_speco_vllm_request_id"] == "hard-request"
+    assert output.extra_fields["_verl_request_mean_accept_len"] == 4.0
+    assert output.extra_fields["_speco_vllm_request_elapsed_sec"] >= 0
+    assert server._speco_vllm_request_spec_decode_stats == {}
+
+
+def test_vllm_request_acceptance_stats_keep_stable_transport_keys() -> None:
+    scheduler = SimpleNamespace()
+    _record_vllm_request_acceptance_stats(
+        scheduler,
+        request_id="req-1",
+        num_draft_tokens=7,
+        num_accepted_tokens=3,
+        num_invalid_spec_tokens=1,
+    )
+    _record_vllm_request_acceptance_stats(
+        scheduler,
+        request_id="req-1",
+        num_draft_tokens=7,
+        num_accepted_tokens=4,
+        num_invalid_spec_tokens=0,
+    )
+    output = SimpleNamespace(
+        request_id="req-1",
+        _speco_vllm_request_accept_stats=scheduler._speco_vllm_request_accept_stats,
+    )
+
+    assert _vllm_request_accept_stats_to_extra_fields(output) == {
+        "_speco_vllm_request_id": ["req-1"],
+        "_speco_vllm_request_verify_rounds": [2],
+        "_speco_vllm_request_draft_tokens": [13],
+        "_speco_vllm_request_accepted_tokens": [7],
+        "_speco_vllm_request_invalid_spec_tokens": [1],
+        "_speco_vllm_request_completion_index": [0],
+        "_speco_vllm_request_elapsed_sec": [None],
+        "_verl_request_mean_accept_len": [4.5],
+    }
+
+
+@pytest.mark.parametrize(
+    "invalid_tokens, expected_invalid",
+    [({"req-1": 2, "req-2": 5}, 2), ({"req-2": 5}, 0), (2, 2), (None, 0)],
+)
+def test_vllm_request_acceptance_stats_resolve_invalid_tokens_by_request(
+    invalid_tokens, expected_invalid
+) -> None:
+    scheduler = SimpleNamespace()
+    _record_vllm_request_acceptance_stats(
+        scheduler,
+        request_id="req-1",
+        num_draft_tokens=7,
+        num_accepted_tokens=3,
+        num_invalid_spec_tokens=invalid_tokens,
+    )
+    stats = scheduler._speco_vllm_request_accept_stats["req-1"]
+    assert stats["invalid_spec_tokens"] == expected_invalid
+    assert stats["draft_tokens"] == 7 - expected_invalid
+    assert stats["accepted_tokens"] == 3
+    assert stats["verify_rounds"] == 1
+
+
+def test_vllm_request_acceptance_stats_can_cross_engine_core_trace_headers() -> None:
+    scheduler = SimpleNamespace()
+    _record_vllm_request_acceptance_stats(
+        scheduler,
+        request_id="internal-req-1",
+        num_draft_tokens=7,
+        num_accepted_tokens=6,
+        num_invalid_spec_tokens=0,
+    )
+    summaries, completion_order = _pop_vllm_request_stats_for_ids(
+        scheduler, ["internal-req-1"]
+    )
+
+    assert completion_order == ["internal-req-1"]
+    assert scheduler._speco_vllm_request_accept_stats == {}
+
+    engine_core_output = SimpleNamespace(
+        request_id="internal-req-1", trace_headers={"trace": "keep"}
+    )
+    _attach_vllm_request_stats_to_trace_headers(
+        engine_core_output, summaries["internal-req-1"]
+    )
+
+    assert engine_core_output.trace_headers["trace"] == "keep"
+    decoded = _decode_vllm_request_stats_trace_header(
+        engine_core_output.trace_headers[SPECO_VLLM_REQUEST_STATS_TRACE_HEADER]
+    )
+    assert decoded is not None
+    assert decoded["verify_rounds"] == 1
+    assert decoded["accepted_tokens"] == 6
+
+
+def test_vllm_request_acceptance_stats_extra_fields_use_request_output_id() -> None:
+    output = SimpleNamespace(request_id="external-req-1")
+    summary = {
+        "verify_rounds": 2,
+        "draft_tokens": 14,
+        "accepted_tokens": 8,
+        "invalid_spec_tokens": 1,
+        "completion_index": 3,
+        "elapsed_sec": 0.5,
+    }
+
+    assert _set_vllm_request_stats_on_output(
+        output, {"external-req-1": summary}, ["external-req-1"]
+    )
+    assert _vllm_request_accept_stats_to_extra_fields(output) == {
+        "_speco_vllm_request_id": ["external-req-1"],
+        "_speco_vllm_request_verify_rounds": [2],
+        "_speco_vllm_request_draft_tokens": [14],
+        "_speco_vllm_request_accepted_tokens": [8],
+        "_speco_vllm_request_invalid_spec_tokens": [1],
+        "_speco_vllm_request_completion_index": [3],
+        "_speco_vllm_request_elapsed_sec": [0.5],
+        "_verl_request_mean_accept_len": [5.0],
+    }
+
+
+def test_vllm_request_acceptance_stats_can_stage_for_token_output() -> None:
+    summary = {
+        "verify_rounds": 4,
+        "draft_tokens": 28,
+        "accepted_tokens": 12,
+        "invalid_spec_tokens": 0,
+        "completion_index": 5,
+    }
+    _stage_vllm_request_stats_for_rollout_output(
+        "server-req-1", {"server-req-1": summary}, ["server-req-1"]
+    )
+
+    summaries, completion_order = _pop_vllm_request_stats_for_rollout_output(
+        _vllm_generate_request_id(([], {}, "server-req-1"), {})
+    )
+    output = SimpleNamespace(
+        request_id="server-req-1",
+        _speco_vllm_request_accept_stats=summaries,
+        _speco_vllm_request_completion_order=completion_order,
+    )
+
+    scalar_fields = _vllm_request_accept_stats_to_scalar_extra_fields(output)
+
+    assert scalar_fields["_verl_request_mean_accept_len"] == 4.0
+    assert scalar_fields["_speco_vllm_request_id"] == "server-req-1"
+    assert scalar_fields["_speco_vllm_request_verify_rounds"] == 4
 
 
 def test_trainer_keeps_public_acceptance_metric_name() -> None:

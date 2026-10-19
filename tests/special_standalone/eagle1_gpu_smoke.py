@@ -104,6 +104,8 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     args = parser.parse_args()
+    if args.steps < 1:
+        parser.error("steps must be positive")
 
     device = "cuda"
     torch.manual_seed(0)
@@ -155,6 +157,7 @@ def main() -> None:
         f"trainable_params={sum(p.numel() for p in draft.parameters() if p.requires_grad):,}"
     )
 
+    initial_parameters = [p.detach().clone() for p in draft.parameters() if p.requires_grad]
     first_hidden = first_token = None
     for step in range(args.steps):
         loss_dict = backend.compute_loss(draft, batch, 0)
@@ -162,6 +165,7 @@ def main() -> None:
         vloss = loss_dict["total_local_vloss"] / num_tokens
         ploss = loss_dict["total_local_ploss"] / num_tokens
         loss = loss_dict["v_weight"] * vloss + loss_dict["p_weight"] * ploss
+        assert torch.isfinite(loss).all(), "non-finite drafter loss"
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(draft.parameters(), 1.0)
@@ -189,6 +193,9 @@ def main() -> None:
                 f"loss={float(loss):.4f}  draft_vs_target_top1={av:.4f}"
             )
 
+    assert any(not torch.equal(before, after.detach()) for before, after in zip(
+        initial_parameters, (p for p in draft.parameters() if p.requires_grad)
+    )), "optimizer did not update drafter parameters"
     print(
         f"[smoke] DONE  hidden_loss {first_hidden:.4f}->{hv:.4f}  "
         f"token_loss {first_token:.4f}->{pv:.4f}  top1={av:.4f}"

@@ -33,6 +33,7 @@ def _config(*, mode="sync", bypass=False, rollout_name="vllm"):
             actor=AttrDict(),
             rollout=AttrDict(
                 name=rollout_name,
+                temperature=1.0,
                 drafter=AttrDict(
                     enable=True,
                     enable_drafter_training=True,
@@ -227,13 +228,17 @@ def test_v1_metrics_report_speco_mean_acceptance_length(monkeypatch):
         tags=[{}, {}, {"is_padding": True}],
     )
     metrics = {}
-    Harness()._compute_metrics(batch, metrics, {}, global_steps=1, epoch=0)
+    trainer = Harness()
+    ci_metrics = []
+    trainer._speco_ci_result = types.SimpleNamespace(record_metrics=ci_metrics.append)
+    trainer._compute_metrics(batch, metrics, {}, global_steps=1, epoch=0)
 
     # 1 + (6 + 3) / (4 + 3); the padding record must be ignored.
     assert metrics["drafter/spec_decode/mean_acceptance_length"] == pytest.approx(
         1 + 9 / 7
     )
     assert metrics["upstream/metrics"] == 1
+    assert ci_metrics == [{"training/global_step": 1}]
 
 
 def test_v1_metrics_fall_back_to_engine_core_acceptance_sidecars(monkeypatch, tmp_path):
@@ -271,6 +276,161 @@ def test_online_training_accepts_all_v1_modes(mode):
     SpecoV1Mixin._speco_validate_v1_training_config(_config(mode=mode))
 
 
+@pytest.fixture
+def old_policy_trainer():
+    class Worker:
+        weight = 10
+        failure = None
+
+        def __init__(self):
+            self.snapshots = {}
+            self.observed_weights = []
+            self.restored_slots = []
+
+        def save_model_to_cpu(self, slot):
+            self.snapshots[slot] = self.weight
+
+        def restore_model_from_cpu(self, slot):
+            self.restored_slots.append(slot)
+            if self.failure == ("restore_old" if slot == 0 else "restore_current"):
+                raise RuntimeError(self.failure)
+            self.weight = self.snapshots[slot]
+
+        def clear_cpu_model(self, slot):
+            del self.snapshots[slot]
+
+        def compute_log_prob(self, control):
+            self.observed_weights.append(self.weight)
+            if self.failure == "forward":
+                raise RuntimeError(self.failure)
+            return self.weight
+
+    trainer = SpecoV1Mixin()
+    trainer.config = _config(mode="separate_async")
+    trainer.actor_rollout_wg = Worker()
+    return trainer
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async"])
+def test_collection_forward_does_not_snapshot_other_modes(mode, old_policy_trainer):
+    trainer = old_policy_trainer
+    trainer.config = _config(mode=mode)
+    assert trainer._speco_compute_collection_log_prob(object()) == 10
+    assert trainer.actor_rollout_wg.observed_weights == [10]
+    assert trainer.actor_rollout_wg.snapshots == {}
+    assert trainer.actor_rollout_wg.restored_slots == []
+
+
+@pytest.mark.parametrize(
+    "collect_steps", [(True, True, True), (True, False, True), (False, True, False)]
+)
+def test_separate_async_collection_shares_parent_old_policy_snapshots(
+    collect_steps, old_policy_trainer
+):
+    class Parent:
+        # Same CPU-slot contract as native PPOTrainerSeparateAsync. Its path
+        # must remain compatible when collection is skipped between forwards.
+        def _compute_old_log_prob(self, batch, metrics):
+            worker = self.actor_rollout_wg
+            local_step = self.local_trigger_step
+            if local_step == 0:
+                worker.save_model_to_cpu(0)
+                return worker.compute_log_prob(batch)
+            worker.save_model_to_cpu(local_step)
+            worker.restore_model_from_cpu(0)
+            output = worker.compute_log_prob(batch)
+            worker.restore_model_from_cpu(local_step)
+            worker.clear_cpu_model(local_step)
+            return output
+
+    class Harness(SpecoV1Mixin, Parent):
+        def _speco_oldlogprob_collection_enabled(self):
+            return False
+
+    trainer = Harness()
+    trainer.config = old_policy_trainer.config
+    trainer.actor_rollout_wg = worker = old_policy_trainer.actor_rollout_wg
+    for local_step, collect in enumerate(collect_steps):
+        trainer.local_trigger_step = local_step
+        if collect:
+            assert trainer._speco_compute_collection_log_prob("batch") == 10
+        else:
+            assert trainer._compute_old_log_prob("batch", {}) == 10
+        assert worker.weight == 10 + local_step
+        assert worker.snapshots == {0: 10}
+        worker.weight += 1  # Simulate a main-policy optimizer update.
+    assert worker.observed_weights == [10, 10, 10]
+    # A new sync cycle must replace rather than reuse the previous anchor.
+    trainer.local_trigger_step = 0
+    assert trainer._speco_compute_collection_log_prob("next-cycle") == 13
+    assert worker.snapshots == {0: 13}
+
+
+@pytest.mark.parametrize("failure", ["forward", "restore_old", "restore_current"])
+def test_separate_async_collection_restores_weights_on_failure(
+    failure, old_policy_trainer
+):
+    trainer = old_policy_trainer
+    trainer.local_trigger_step = 1
+    worker = trainer.actor_rollout_wg
+    worker.weight, worker.snapshots, worker.failure = 20, {0: 10}, failure
+    with pytest.raises(RuntimeError, match=failure):
+        trainer._speco_compute_collection_log_prob("batch")
+    assert worker.restored_slots == [0, 1]
+    if failure == "restore_current":
+        assert worker.snapshots[1] == 20
+    else:
+        assert worker.weight == 20
+        assert worker.snapshots == {0: 10}
+
+
+def test_old_logprob_collection_forward_runs_under_old_policy(
+    monkeypatch, old_policy_trainer
+):
+    import torch
+    from verl.utils import tensordict_utils as tu
+    from verl.workers.utils import padding
+
+    # Exercise the actual collection branch, not only its snapshot helper.
+    monkeypatch.setitem(
+        sys.modules, "transfer_queue", types.ModuleType("transfer_queue")
+    )
+    monkeypatch.setattr(padding, "left_right_2_no_padding", lambda control: control)
+    monkeypatch.setattr(tu, "assign_non_tensor_data", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tu, "assign_non_tensor", lambda *args, **kwargs: None)
+
+    class Batch:
+        def __len__(self):
+            return 1
+
+        def to_tensordict(self):
+            return {"input_ids": torch.tensor([[1, 2]])}
+
+    trainer = old_policy_trainer
+    trainer.local_trigger_step = 1
+    trainer._speco_oldlogprob_collection_enabled = lambda: True
+    trainer._speco_v1_batch_data = lambda batch: (None, Batch())
+    trainer._speco_build_oldlogprob_collect_plan = lambda batch: dict.fromkeys(
+        ["collect_mask", "hidden_positions", "hidden_position_mask", "owner_rank"]
+    )
+    trainer._speco_oldlogprob_aux_layer_ids = lambda: []
+    trainer._speco_oldlogprob_hidden_capture_impl = lambda: "forward_hook"
+    trainer._speco_oldlogprob_hidden_layout = lambda: "BSH"
+
+    def fail_collection(batch, plan, output):
+        assert output == 10
+        assert trainer.actor_rollout_wg.weight == 20
+        raise RuntimeError("feature collection failed")
+
+    trainer._speco_collect_oldlogprob_features = fail_collection
+    trainer.actor_rollout_wg.weight = 20
+    trainer.actor_rollout_wg.snapshots = {0: 10}
+    with pytest.raises(RuntimeError, match="feature collection failed"):
+        trainer._compute_old_log_prob(object(), {})
+    assert trainer.actor_rollout_wg.weight == 20
+    assert trainer.actor_rollout_wg.snapshots == {0: 10}
+
+
 def test_async_publish_waits_after_upstream_weight_sync():
     events = []
 
@@ -302,6 +462,103 @@ def test_async_publish_waits_after_upstream_weight_sync():
         trainer._pending_sync_metrics["drafter/publish_waited_after_weight_sync"] == 2
     )
     assert trainer._speco_v1_pending_training is False
+
+
+@pytest.mark.parametrize("failure", [None, "abort", "publish"])
+def test_colocate_probe_boundary_holds_admission_and_releases_on_failure(failure):
+    events = []
+
+    class Upstream:
+        def on_step_end(self):
+            events.append("target_sync_engine_resume")
+
+    class Checkpoints:
+        def abort_replicas(self):
+            events.append("abort")
+            if failure == "abort":
+                raise RuntimeError("abort failed")
+
+        def sleep_replicas(self):
+            events.append("sleep")
+
+    class Harness(SpecoV1Mixin, Upstream):
+        config = _config(mode="colocate_async")
+        checkpoint_manager = Checkpoints()
+
+        def _speco_rollout_admission_rpc(self, method):
+            events.append(method)
+
+        def _speco_finalize_v1_drafter_publish(self):
+            assert self._speco_colocate_admission_closed
+            events.append("paired_probe_publish")
+            if failure == "publish":
+                raise RuntimeError("publish failed")
+            return {}
+
+    trainer = Harness()
+    trainer.config.actor_rollout_ref.rollout.drafter.training[
+        "drafter_convergence_freeze"
+    ] = {"enabled": True}
+    if failure == "abort":
+        with pytest.raises(RuntimeError, match="abort failed"):
+            trainer.on_sample_end()
+        assert events == [
+            "speco_close_rollout_admission",
+            "abort",
+            "speco_resume_rollout_admission",
+        ]
+    else:
+        trainer.on_sample_end()
+        if failure:
+            with pytest.raises(RuntimeError, match="publish failed"):
+                trainer.on_step_end()
+        else:
+            trainer.on_step_end()
+        assert events == [
+            "speco_close_rollout_admission",
+            "abort",
+            "speco_wait_rollout_idle",
+            "sleep",
+            "target_sync_engine_resume",
+            "paired_probe_publish",
+            "speco_resume_rollout_admission",
+        ]
+    assert trainer._speco_colocate_admission_closed is False
+
+
+@pytest.mark.parametrize("saved", [False, True])
+def test_async_branch_checkpoint_requires_real_tq_snapshot(tmp_path, saved):
+    class Parent:
+        def _save_checkpoint(self):
+            if saved:
+                queue = tmp_path / "transfer_queue"
+                queue.mkdir()
+                (queue / "metadata.json").write_text('{"global_steps":3}')
+
+    class Harness(SpecoV1Mixin, Parent):
+        global_steps = 3
+        config = _config(mode="colocate_async")
+        _speco_colocate_admission_closed = True
+
+        def _speco_online_enabled_from_config(self, config):
+            return False
+
+        def _speco_freeze_branch_config(self):
+            return {"enabled": True}
+
+        def _speco_v1_checkpoint_directory(self):
+            return str(tmp_path)
+
+    trainer = Harness()
+    if not saved:
+        with pytest.raises(RuntimeError, match="TransferQueue snapshot"):
+            trainer._save_checkpoint()
+    else:
+        trainer._save_checkpoint()
+        assert trainer._speco_v1_async_checkpoint_evidence["checkpoint_step"] == 3
+        assert trainer._speco_v1_async_checkpoint_evidence[
+            "inflight_prompts_reissued_on_resume"
+        ]
 
 
 def test_final_colocate_async_step_does_not_prefetch_an_unconsumed_rollout():

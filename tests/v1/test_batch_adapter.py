@@ -57,8 +57,20 @@ def test_variable_prompt_boundaries_preserve_all_sequence_fields(multimodal):
     assert data["prompts"][0].tolist() == [11, 12]
 
 
-def test_upstream_unpad_and_oldlogprob_slice_round_trip():
+def test_upstream_unpad_and_oldlogprob_slice_round_trip(monkeypatch):
+    from verl.workers.utils import padding
     from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+    # Exercise upstream layout/slicing on CPU with reference indexing, not a
+    # CUDA-only FlashAttention kernel. Real kernel coverage remains in E2E.
+    def cpu_unpad(hidden_states, mask):
+        lengths = mask.sum(-1, dtype=torch.int32)
+        indices = mask.flatten().nonzero().flatten()
+        offsets = torch.cat([lengths.new_zeros(1), lengths.cumsum(0, dtype=torch.int32)])
+        return hidden_states.flatten(0, 1)[indices], indices, offsets, int(lengths.max())
+
+    monkeypatch.setattr(padding, "unpad_input", cpu_unpad)
+    monkeypatch.setattr(padding, "index_first_axis", lambda values, indices: values[indices])
 
     rows = _batch()
     nested = TensorDict({key: torch.nested.as_nested_tensor(value, layout=torch.jagged)

@@ -247,6 +247,7 @@ class SpecoTaskRunner(_TaskRunnerBase):
         from verl.utils.import_utils import load_class_from_fqn
         from verl_speco.integration.agent_loop_runtime import (
             install_agent_loop_runtime_patch,
+            install_v1_agent_loop_worker_bridge,
         )
         from verl_speco.trainer.v1.factory import get_speco_v1_trainer_cls
 
@@ -277,6 +278,7 @@ class SpecoTaskRunner(_TaskRunnerBase):
             # before Ray snapshots their method table.
             if _drafter_rollout_enabled(config):
                 install_agent_loop_runtime_patch()
+                install_v1_agent_loop_worker_bridge(manager_cls)
             manager = manager_cls.create(
                 config=self._v1_agent_loop_config(config),
                 llm_client=trainer.get_llm_client(),
