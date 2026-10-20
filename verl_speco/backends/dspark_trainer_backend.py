@@ -95,6 +95,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
         debug_log: bool = False,
         debug_log_first_n: int = 2,
         debug_log_interval: int = 100,
+        verifier_norm: Optional[torch.nn.Module] = None,
+        target_hidden_clip_value: Optional[float] = None,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -107,6 +109,12 @@ class DSparkTrainingModel(DFlashTrainingModel):
             sampled_ce_negatives=sampled_ce_negatives,
         )
         self.ce_loss_alpha = float(ce_loss_alpha)
+        self.verifier_norm = (
+            verifier_norm.eval().requires_grad_(False)
+            if verifier_norm is not None
+            else None
+        )
+        self.target_hidden_clip_value = target_hidden_clip_value
         self.l1_loss_alpha = float(l1_loss_alpha)
         self.confidence_head_alpha = float(confidence_head_alpha)
         self.l1_chunk_size = int(l1_chunk_size or 0)
@@ -635,6 +643,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
         label_ids: Optional[torch.Tensor] = None,
         label_mask: Optional[torch.Tensor] = None,
         target_last_hidden_states: Optional[torch.Tensor] = None,
+        target_hidden_is_raw: bool = False,
+        hidden_source: Optional[str] = None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -691,6 +701,36 @@ class DSparkTrainingModel(DFlashTrainingModel):
             label_indices=label_indices,
             block_keep_mask=block_keep_mask,
         )
+        if target_hidden_is_raw:
+            if (
+                hidden_source != "standalone_vllm_reference"
+                or self.verifier_norm is None
+            ):
+                raise ValueError(
+                    "Raw DSpark targets require the standalone vLLM file model path"
+                )
+            if aligned_target_hidden is None:
+                raise ValueError("Target final norm requires target_last_hidden_states")
+            # Like speculators: select supervision positions first, then apply
+            # the frozen verifier norm in forward before projecting targets.
+            with (
+                torch.no_grad(),
+                torch.autocast(device_type=device.type, enabled=False),
+            ):
+                self.verifier_norm.eval()
+                aligned_target_hidden = self.verifier_norm(aligned_target_hidden)
+                bad_target_rows = ~torch.isfinite(aligned_target_hidden).all(dim=-1)
+                clip = self.target_hidden_clip_value
+                if clip is not None:
+                    bad_target_rows |= (
+                        aligned_target_hidden.float().abs().amax(dim=-1) > clip
+                    )
+                aligned_target_hidden = torch.nan_to_num(
+                    aligned_target_hidden, nan=0.0, posinf=0.0, neginf=0.0
+                )
+                if clip is not None:
+                    aligned_target_hidden = aligned_target_hidden.clamp(-clip, clip)
+            eval_mask = eval_mask & ~bad_target_rows
 
         weight_mask = eval_mask.float()
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
@@ -1405,8 +1445,32 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             target_model_path, target_hf_config
         )
         training_cfg = self.config.rollout.drafter.training
+        verifier_norm = None
+        tq_expected = training_cfg.get("transfer_queue", {}).get("expected_feature", {})
+        if (
+            training_cfg.get("mode") == "offline"
+            and training_cfg.get("feature_store", {}).get("type")
+            in {"tq", "ray_reference"}
+            and not training_cfg.get("use_logits", False)
+            and tq_expected.get("payload_kind") == "vllm_reference"
+            and tq_expected.get("hidden_states_layout") == "dflash_aux_plus_last"
+        ):
+            from verl_speco.trainer.target_feature_replay import load_vllm_final_norm
+
+            verifier_norm = load_vllm_final_norm(
+                target_model_path,
+                dtype=torch.bfloat16,
+                trust_remote_code=bool(
+                    self.config.model.get("trust_remote_code", False)
+                ),
+            )
+        clip = training_cfg.get("hidden_state_clip_value", 1.0e4)
         return DSparkTrainingModel(
             draft_model=draft_model,
+            verifier_norm=verifier_norm,
+            target_hidden_clip_value=float(clip)
+            if clip is not None and float(clip) > 0
+            else None,
             block_size=int(
                 training_cfg.get(
                     "dspark_block_size", getattr(drafter_config, "block_size", 7)
@@ -1577,6 +1641,33 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         per_layer_dim = hidden_states.shape[-1] // num_context_layers
         hidden_states_list = list(hidden_states.split(per_layer_dim, dim=-1))
 
+        target_norm_kwargs = {}
+        if batch.get("last_hidden_state_norm") not in {
+            None,
+            "target_final_norm",
+            "raw_target_residual",
+        }:
+            raise ValueError("Unknown DSpark final hidden state")
+        if batch.get("last_hidden_state_norm") == "raw_target_residual":
+            training = self.config.rollout.drafter.training
+            if (
+                batch.get("hidden_source") != "standalone_vllm_reference"
+                or training.get("mode") != "offline"
+                or training.get("feature_store", {}).get("type")
+                not in {"tq", "ray_reference"}
+                or training.get("use_logits", False)
+                or training.get("transfer_queue", {})
+                .get("expected_feature", {})
+                .get("payload_kind")
+                != "vllm_reference"
+            ):
+                raise ValueError(
+                    "Raw DSpark targets are restricted to standalone vLLM file input"
+                )
+            target_norm_kwargs = {
+                "target_hidden_is_raw": True,
+                "hidden_source": batch["hidden_source"],
+            }
         loss, accuracy, loss_pp, acc_pp, count_pp, diagnostics = model(
             input_ids=batch["input_ids"],
             hidden_states_list=hidden_states_list,
@@ -1586,6 +1677,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             document_ids=batch.get("document_ids"),
             label_ids=batch.get("label_ids"),
             label_mask=batch.get("label_mask"),
+            **target_norm_kwargs,
         )
         local_num_tokens = diagnostics.get("ce_weighted_token_count")
         if not torch.is_tensor(local_num_tokens):

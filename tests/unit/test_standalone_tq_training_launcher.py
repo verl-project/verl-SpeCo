@@ -42,6 +42,33 @@ from verl_speco.standalone_tq_training_launcher import (
 import verl_speco.tq_owner as tq_owner
 
 
+@pytest.mark.parametrize("hidden_store,runtime,is_reference", [
+    ("file", "ray", True), ("mooncake", "ray", True), ("file", "subprocess", False),
+])
+def test_reference_mode_uses_existing_ray_prefetch(hidden_store, runtime, is_reference):
+    env = {"SPECO_VLLM_HIDDEN_STATES_STORE": hidden_store}
+    args = [*_training_args(), f"speco.draft_training.runtime_backend={runtime}"]
+    commands = build_pipeline_commands(
+        resolve_pipeline_config(args, environ=env), args, ray_address="10.0.0.1:6379", env=env,
+    )
+    kind = "actor_rollout_ref.rollout.drafter.training.transfer_queue.expected_feature.payload_kind=vllm_reference"
+    assert (kind in commands.producer_overrides) is is_reference
+    assert (kind in commands.consumer_overrides) is is_reference
+    if is_reference:
+        assert "actor_rollout_ref.rollout.drafter.training.transfer_queue.consumer_prefetch_batches=4" in commands.consumer_overrides
+        assert "actor_rollout_ref.rollout.drafter.training.feature_store.type=ray_reference" in commands.consumer_overrides
+        assert "actor_rollout_ref.rollout.drafter.training.feature_store.type=ray_reference" in commands.producer_overrides
+        assert "actor_rollout_ref.rollout.drafter.training.transfer_queue.enable=false" in commands.consumer_overrides
+        assert "actor_rollout_ref.rollout.drafter.training.transfer_queue.enable=false" in commands.producer_overrides
+
+
+def test_reference_mode_rejects_disabled_prefetch():
+    args = [*_training_args(), "actor_rollout_ref.rollout.drafter.training.transfer_queue.consumer_prefetch_batches=0"]
+    with pytest.raises(ValueError, match="prefetch"):
+        build_pipeline_commands(resolve_pipeline_config(args, environ={}), args,
+                                ray_address="10.0.0.1:6379", env={})
+
+
 def _training_args() -> list[str]:
     return [
         "data.train_files=/data/train.jsonl",
@@ -384,7 +411,7 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
         python_executable="python",
     )
 
-    assert commands.owner[:3] == ["python", "-m", "verl_speco.tq_owner"]
+    assert commands.owner == []
     assert commands.vllm is not None
     assert commands.vllm[:3] == ["vllm", "serve", "/models/Qwen3-8B"]
     assert "ExampleHiddenStatesConnector" in " ".join(commands.vllm)
@@ -399,7 +426,7 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
         "-m",
         "verl_speco.draft_train_launcher",
     ]
-    assert any(item.endswith("feature_store.type=tq") for item in commands.consumer)
+    assert any(item.endswith("feature_store.type=ray_reference") for item in commands.consumer)
     assert not any("run_id=user-value" in item for item in commands.consumer)
     assert not any("runtime_backend" in item for item in commands.consumer_overrides)
     assert not any("num_gpus_per_node" in item for item in commands.consumer_overrides)
@@ -608,10 +635,11 @@ def test_pipeline_starts_owner_then_consumer_then_producer() -> None:
             Path(env["SPECO_TQ_OWNER_READY_FILE"]).touch()
         return process
 
-    config = resolve_pipeline_config(_training_args(), environ={})
+    args = [*_training_args(), "speco.draft_training.runtime_backend=subprocess"]
+    config = resolve_pipeline_config(args, environ={})
     commands = build_pipeline_commands(
         config,
-        _training_args(),
+        args,
         ray_address="127.0.0.1:61234",
     )
 
@@ -904,7 +932,7 @@ def test_ray_pipeline_validates_mooncake_master_before_spawning(
         raise OSError("connection refused")
 
     monkeypatch.setattr(launcher.socket, "create_connection", _connect)
-    commands = SimpleNamespace(vllm_endpoints=["http://ready:8000/v1"], vllm=None)
+    commands = SimpleNamespace(vllm_endpoints=["http://ready:8000/v1"], vllm=None, consumer_overrides=())
 
     with pytest.raises(RuntimeError, match="no mooncake_master is reachable"):
         ray_runtime.run_ray_pipeline(
@@ -936,6 +964,12 @@ def test_pipeline_commands_select_mooncake_hidden_states_store() -> None:
 
     assert commands.vllm is not None
     joined_vllm = " ".join(commands.vllm)
+    assert commands.owner == []
+    prefix = "actor_rollout_ref.rollout.drafter.training"
+    assert f"{prefix}.feature_store.type=ray_reference" in commands.consumer_overrides
+    assert f"{prefix}.transfer_queue.enable=false" in commands.consumer_overrides
+    assert f"{prefix}.target_feature_replay.hidden_states_store.backend=mooncake" in commands.consumer_overrides
+    assert f"{prefix}.target_feature_replay.hidden_states_store.mooncake.master_server_address=10.0.0.7:50051" in commands.consumer_overrides
     assert "SpecoMooncakeHiddenStatesConnector" in joined_vllm
     assert "verl_speco.mooncake_hidden_states_connector" in joined_vllm
     assert any(

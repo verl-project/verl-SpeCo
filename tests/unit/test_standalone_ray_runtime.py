@@ -34,6 +34,87 @@ def _commands() -> PipelineCommands:
     )
 
 
+def test_reference_events_retry_same_batch_id_and_use_full_batch():
+    class Queue:
+        def __init__(self):
+            self.items = []
+
+        def put(self, event):
+            self.items.append(event)
+            if len(self.items) == 1:
+                raise ConnectionError("Delivery succeeded but acknowledgement was lost")
+
+    queue = Queue()
+    actor = StandaloneProducerActor({}, queue, reference_batch_size=64)
+    assert actor._notification_batch_size == 64
+
+    async def run():
+        first = await actor._on_references([{"key": "first", "tag": {}}])
+        second = await actor._on_references([{"key": "second", "tag": {}}])
+        assert first["attempts"] == 2 and second["attempts"] == 1
+        assert first["retry_wait_seconds"] > 0 and second["retry_wait_seconds"] == 0
+
+    asyncio.run(run())
+    assert [event["batch_id"] for event in queue.items] == [0, 0, 1]
+    assert queue.items[0] == queue.items[1]
+
+
+def test_file_actor_sends_completion_after_all_metadata_and_metrics(monkeypatch):
+    from queue import Queue
+    import verl_speco.standalone_tq_producer as producer
+
+    config = _runtime_config()
+    training = config.actor_rollout_ref.rollout.drafter.training
+    monkeypatch.setattr(training, "feature_store", SimpleNamespace(type="ray_reference"), raising=False)
+
+    async def run(config, **kwargs):
+        assert kwargs["reference_batch_size"] == 64
+        assert kwargs["on_published"] is None
+        await kwargs["on_references"]([{"key": "first", "tag": {}}])
+        await kwargs["on_references"]([{"key": "tail", "tag": {}}])
+        await kwargs["on_metrics"](2, {"perf/test": 1.0})
+        return producer.ProducerStats(published_count=2)
+
+    monkeypatch.setattr(producer, "run_producer", run)
+    events = Queue()
+    actor = StandaloneProducerActor(config, events, reference_batch_size=64)
+    result = asyncio.run(actor._run_producer())
+    messages = [events.get_nowait() for _ in range(events.qsize())]
+    assert result.published_count == 2
+    assert [event["kind"] for event in messages] == [
+        "samples_ready", "samples_ready", "producer_metrics", "producer_done",
+    ]
+
+
+def test_ray_reference_pipeline_never_starts_tq_and_preserves_untrained_files(tmp_path, monkeypatch):
+    from verl_speco import standalone_ray_runtime as runtime
+
+    hidden_dir = tmp_path / "hidden"
+    hidden_dir.mkdir()
+    untrained = hidden_dir / "untrained.safetensors"
+    untrained.write_bytes(b"untrained")
+    commands = _commands()
+    commands = PipelineCommands(
+        **{**commands.__dict__, "consumer_overrides": ("training.feature_store.type=ray_reference",)}
+    )
+    original_mkdtemp = runtime.tempfile.mkdtemp
+
+    def mkdtemp(*args, **kwargs):
+        if kwargs.get("prefix") == "speco-vllm-hidden-states-":
+            return str(hidden_dir)
+        return original_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(runtime.tempfile, "mkdtemp", mkdtemp)
+    monkeypatch.setattr(runtime, "validate_tq_backend", lambda *args: pytest.fail("TQ validation"))
+    monkeypatch.setattr(runtime, "run_ray_actors", lambda *args, **kwargs: 0)
+    result = runtime.run_ray_pipeline(
+        commands, ray_module=object(), ray_address="unused", environ={},
+        endpoint_ready=lambda _: True,
+        popen=lambda *args, **kwargs: pytest.fail("Started a TQ owner"),
+    )
+    assert result == 0 and untrained.exists()
+
+
 def test_producer_actor_reuses_existing_producer_and_supports_stop(monkeypatch) -> None:
     started = asyncio.Event()
 
@@ -265,6 +346,54 @@ class _FlowRay(_FakeRay):
             return [], list(refs)
         producer = next(ref for ref in refs if ref.name == "producer")
         return [producer], [ref for ref in refs if ref != producer]
+
+
+def test_driver_stops_on_background_finalization_failure(monkeypatch):
+    queues = iter((_RecordingQueue(), _RecordingQueue(events=[
+        {"kind": "finalization_failed", "plan_id": 0},
+    ])))
+    monkeypatch.setattr(
+        "verl_speco.standalone_ray_runtime.compose_runtime_config",
+        lambda overrides: _runtime_config(),
+    )
+    trainer = StandaloneRayTrainer(
+        _commands(), ray_module=_FlowRay(_ProducerHandle()),
+        worker_group_factory=lambda config, **kwargs: _WorkerGroup(),
+        queue_factory=lambda: next(queues), feature_store_factory=lambda config: _ReadyStore(),
+    )
+    with pytest.raises(RuntimeError, match="failed to finalize trained plan=0"):
+        trainer.run()
+
+
+def test_file_driver_kills_group_when_one_rank_reports_training_failure(monkeypatch):
+    from copy import deepcopy
+
+    config = deepcopy(_runtime_config())
+    training = config.actor_rollout_ref.rollout.drafter.training
+    training.feature_store = SimpleNamespace(type="ray_reference")
+    training.get = lambda key, default=None: getattr(training, key, default)
+    training.transfer_queue = {"consumer_prefetch_batches": 2}
+    monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
+    queues = iter((_RecordingQueue(), _RecordingQueue(events=[
+        {"kind": "consumer_failed", "rank": 1, "error": "injected optimizer failure"},
+    ])))
+    ray = _FlowRay(_ProducerHandle())
+    killed = []
+    ray.kill = lambda worker, **kw: killed.append((worker, kw))
+    group = _WorkerGroup()
+    group.workers = ["rank0", "rank1"]
+    trainer = StandaloneRayTrainer(
+        _commands(), ray_module=ray, worker_group_factory=lambda *a, **k: group,
+        queue_factory=lambda **kwargs: next(queues), feature_store_factory=lambda _: _ReadyStore(),
+    )
+    trainer.producer = ray.producer
+    trainer.consumer_wg = group
+    trainer.commands_queue, trainer.events_queue = next(queues), next(queues)
+    original_wait = ray.wait
+    ray.wait = lambda refs, **kw: ((refs, []) if refs[0].name == "stop" else original_wait(refs, **kw))
+    with pytest.raises(RuntimeError, match="rank=1 failed: injected optimizer failure"):
+        trainer.run()
+    assert killed == [("rank0", {"no_restart": True}), ("rank1", {"no_restart": True})]
 
 
 def test_scheduler_executes_one_complete_standalone_batch(monkeypatch) -> None:

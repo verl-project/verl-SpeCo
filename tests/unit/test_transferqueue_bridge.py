@@ -42,7 +42,7 @@ class _FakeTQ:
         self.init_calls.append(config)
 
     def kv_put(self, *, key, partition_id, fields, tag):
-        self.records[key] = (dict(fields), dict(tag))
+        self.records[key] = (None if fields is None else dict(fields), dict(tag))
 
     def kv_list(self, *, partition_id):
         return {key: tag for key, (_, tag) in self.records.items()}
@@ -155,6 +155,18 @@ def _config():
             "SimpleStorage": {"total_storage_size": 16, "num_data_storage_units": 1},
         },
     }
+
+
+def test_metadata_only_publish_list_clear(fake_runtime) -> None:
+    fake_tq, _ = fake_runtime
+    assert bridge.configure_transfer_queue(_config())
+    bridge.connect_transfer_queue_client()
+    tag = {"status": "ready", "hidden_states_path": "/shared/a.safetensors"}
+    bridge.put_metadata("reference-a", tag=tag)
+    assert fake_tq.records["reference-a"] == (None, tag)
+    assert bridge.list_samples()["reference-a"] == tag
+    bridge.clear_samples(["reference-a"])
+    assert "reference-a" not in bridge.list_samples()
 
 
 def test_owner_connects_ray_and_receives_only_native_tq_config(fake_runtime) -> None:

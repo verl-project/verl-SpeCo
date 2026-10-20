@@ -134,6 +134,7 @@ class PendingStandalonePlan:
     plan_id: int
     keys: tuple[str, ...]
     runtime: DrafterRuntimeState
+    entries: tuple[Any, ...] = ()
 
 
 class StandaloneQueueState:
@@ -175,7 +176,9 @@ class StandaloneQueueState:
             )
         entries = [self.ready.popleft() for _ in range(self.batch_size)]
         keys = tuple(entry.key for entry in entries)
-        pending = PendingStandalonePlan(self.next_id, keys, DrafterRuntimeState())
+        pending = PendingStandalonePlan(
+            self.next_id, keys, DrafterRuntimeState(), tuple(entries)
+        )
         self.next_id += 1
         self.pending.append(pending)
         self.reserved.update(keys)

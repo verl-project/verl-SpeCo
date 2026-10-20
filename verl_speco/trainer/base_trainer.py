@@ -486,6 +486,8 @@ def _alignment_window_rows(
 
 
 class DrafterBaseTrainer:
+    combine_standalone_metrics: bool = False
+
     def __init__(
         self,
         config,
@@ -1116,11 +1118,12 @@ class DrafterBaseTrainer:
             dist.all_reduce(reduced, group=self.training_device_mesh.get_group())
         return reduced
 
-    def _record_dflash_training_metrics(self, loss_dict: dict[str, Any]) -> None:
+    def _pack_training_diagnostics(
+        self, loss_dict: dict[str, Any]
+    ) -> tuple[list[str], Optional[torch.Tensor]]:
         diagnostics = loss_dict.get("diagnostics")
         if not isinstance(diagnostics, dict):
-            return
-        self._training_metric_steps += 1
+            return [], None
         prefix = self._block_drafter_metric_prefix()
         scalar_keys = {
             "correct_count": f"{prefix}/correct_count",
@@ -1178,15 +1181,51 @@ class DrafterBaseTrainer:
             metric_keys.extend(f"{metric_prefix}/{idx}" for idx in range(value.numel()))
             values.append(value.detach().float().reshape(-1))
 
-        if not metric_keys:
+        return metric_keys, torch.cat(values) if values else None
+
+    def _accumulate_training_diagnostics(
+        self, keys: list[str], values: list[float]
+    ) -> None:
+        for key, value in zip(keys, values, strict=True):
+            self._training_metric_sums[key] = self._training_metric_sums.get(
+                key, 0.0
+            ) + float(value)
+
+    def _record_dflash_training_metrics(self, loss_dict: dict[str, Any]) -> None:
+        if not isinstance(loss_dict.get("diagnostics"), dict):
             return
-        # Keep the same group/reduction semantics, but batch all diagnostics
-        # into one reduction call and one device-to-host transfer per step.
-        reduced = self._reduce_training_metric(torch.cat(values)).cpu().tolist()
-        for metric_key, item in zip(metric_keys, reduced, strict=True):
-            self._training_metric_sums[metric_key] = self._training_metric_sums.get(
-                metric_key, 0.0
-            ) + float(item)
+        self._training_metric_steps += 1
+        keys, values = self._pack_training_diagnostics(loss_dict)
+        if values is not None:
+            reduced = self._reduce_training_metric(values).cpu().tolist()
+            self._accumulate_training_diagnostics(keys, reduced)
+
+    def _reduce_standalone_step_statistics(self, loss_dict: dict[str, Any]):
+        loss_values = torch.stack(
+            [
+                loss_dict[name].detach()
+                for name in (
+                    "total_local_vloss",
+                    "total_local_ploss",
+                    "local_num_tokens",
+                )
+            ]
+        )
+        keys, diagnostics = self._pack_training_diagnostics(loss_dict)
+        if (
+            diagnostics is None
+            or diagnostics.dtype != loss_values.dtype
+            or diagnostics.device != loss_values.device
+        ):
+            # Preserve the previous precision and behavior for uncommon dtypes.
+            self._record_dflash_training_metrics(loss_dict)
+            return self._reduce_loss_metrics(*loss_values.unbind())
+        reduced, world_size = self._reduce_loss_statistics(
+            torch.cat([loss_values, diagnostics])
+        )
+        self._training_metric_steps += 1
+        self._accumulate_training_diagnostics(keys, reduced[3:].cpu().tolist())
+        return reduced[0], reduced[1], reduced[2], world_size
 
     def _get_sp_group(self):
         if self._has_mesh_dim("sp"):
@@ -3687,11 +3726,12 @@ class DrafterBaseTrainer:
             bad_rows = bad_rows | (row_abs_max > clip_value)
             safe_tensor = safe_tensor.clamp(min=-clip_value, max=clip_value)
 
-        dropped_rows = int(bad_rows.detach().sum().cpu().item())
-        if dropped_rows > 0:
-            logger.debug(
-                f"[Rank {self.rank}] Sanitized {dropped_rows} drafter {name} rows with non-finite or clipped values"
-            )
+        if logger.isEnabledFor(logging.DEBUG):
+            dropped_rows = int(bad_rows.detach().sum().cpu().item())
+            if dropped_rows > 0:
+                logger.debug(
+                    f"[Rank {self.rank}] Sanitized {dropped_rows} drafter {name} rows with non-finite or clipped values"
+                )
 
         return safe_tensor, bad_rows
 
@@ -3701,9 +3741,6 @@ class DrafterBaseTrainer:
         bad_input_rows: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not bad_input_rows.any():
-            return loss_mask, attention_mask
-
         ttt_length = 1
         if getattr(self.backend, "model_type", None) == "eagle3":
             ttt_length = int(self.config.rollout.drafter.training.get("ttt_length", 1))
@@ -3717,13 +3754,14 @@ class DrafterBaseTrainer:
             else:
                 bad_target_rows[:, offset:] |= bad_input_rows[:, : seq_len - offset]
 
-        masked_tokens = int(
-            ((loss_mask > 0) & bad_target_rows).detach().sum().cpu().item()
-        )
-        if masked_tokens > 0:
-            logger.debug(
-                f"[Rank {self.rank}] Masked {masked_tokens} drafter targets due to bad input hidden rows"
+        if logger.isEnabledFor(logging.DEBUG):
+            masked_tokens = int(
+                ((loss_mask > 0) & bad_target_rows).detach().sum().cpu().item()
             )
+            if masked_tokens > 0:
+                logger.debug(
+                    f"[Rank {self.rank}] Masked {masked_tokens} drafter targets due to bad input hidden rows"
+                )
 
         loss_mask = loss_mask.masked_fill(bad_target_rows, 0.0)
         attention_mask = attention_mask.masked_fill(bad_input_rows, 0)
@@ -3764,13 +3802,18 @@ class DrafterBaseTrainer:
                 batch[target_key], target_key, clip_value
             )
             batch[target_key] = target_tensor
-            masked_tokens = int(
-                ((batch["loss_mask"] > 0) & bad_target_rows).detach().sum().cpu().item()
-            )
-            if masked_tokens > 0:
-                logger.debug(
-                    f"[Rank {self.rank}] Masked {masked_tokens} drafter targets due to bad {target_key} rows"
+            if logger.isEnabledFor(logging.DEBUG):
+                masked_tokens = int(
+                    ((batch["loss_mask"] > 0) & bad_target_rows)
+                    .detach()
+                    .sum()
+                    .cpu()
+                    .item()
                 )
+                if masked_tokens > 0:
+                    logger.debug(
+                        f"[Rank {self.rank}] Masked {masked_tokens} drafter targets due to bad {target_key} rows"
+                    )
             batch["loss_mask"] = batch["loss_mask"].masked_fill(bad_target_rows, 0.0)
 
         if "label_mask" in batch:
@@ -5267,17 +5310,47 @@ class DrafterBaseTrainer:
             self.current_rl_step = previous_current_step
 
     async def training_step_from_batch(
-        self, batch: dict[str, torch.Tensor], step: int
+        self, batch: dict[str, torch.Tensor], step: int, *, raise_on_error: bool = False
     ) -> bool:
         """Execute one optimizer step from a pre-built standalone batch."""
         self.last_standalone_training_error = None
         try:
+            if batch.get("hidden_source") == "standalone_vllm_reference":
+                batch = self._stage_standalone_cpu_batch(batch)
             with torch.enable_grad():
                 return await self._training_step_on_batch(batch, step)
         except Exception as e:  # noqa: BLE001
             self.last_standalone_training_error = e
             logger.exception(f"Standalone training step {step} failed with error: {e}")
+            if raise_on_error:
+                raise
             return False
+
+    def _stage_standalone_cpu_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Transfer prepared CPU data only; each algorithm owns its target norm."""
+        training = self.config.rollout.drafter.training
+        if training.get("mode") != "offline" or training.get("feature_store", {}).get(
+            "type"
+        ) not in {"tq", "ray_reference"}:
+            raise ValueError(
+                "File batches require standalone offline file-reference training"
+            )
+        result = {
+            key: value.to(self.runtime_device, non_blocking=True)
+            if torch.is_tensor(value)
+            else value
+            for key, value in batch.items()
+        }
+        # Raw targets must reach the algorithm unchanged. Sanitize them only
+        # after that model applies its own verifier norm.
+        targets = {}
+        if result.get("last_hidden_state_norm") == "raw_target_residual":
+            for key in ("last_hidden_states", "target_last_hidden_states"):
+                if key in result:
+                    targets[key] = result.pop(key)
+        result = self._sanitize_training_batch(result)
+        result.update(targets)
+        return result
 
     async def training_step(
         self,
@@ -5397,6 +5470,13 @@ class DrafterBaseTrainer:
         the same ranks.
         """
         metrics = torch.stack([l_v.detach(), l_p.detach(), l_n.detach()])
+        metrics, world_size = self._reduce_loss_statistics(metrics)
+        return metrics[0], metrics[1], metrics[2], world_size
+
+    def _reduce_loss_statistics(
+        self, metrics: torch.Tensor
+    ) -> tuple[torch.Tensor, int]:
+        """Sum an already-detached statistics vector without changing its dtype."""
         reduce_world_size = 1
         sp_group = self._get_sp_group()
         dp_group = self._get_dp_group()
@@ -5415,7 +5495,7 @@ class DrafterBaseTrainer:
         ):
             dist.all_reduce(metrics, group=self.training_device_mesh.get_group())
             reduce_world_size *= self.training_device_mesh.size()
-        return metrics[0], metrics[1], metrics[2], reduce_world_size
+        return metrics, reduce_world_size
 
     async def _training_step_on_batch(
         self, batch: dict[str, torch.Tensor], step: int
@@ -5428,7 +5508,8 @@ class DrafterBaseTrainer:
         with self._ulysses_group_context():
             with torch.amp.autocast(device_type=device_name, dtype=torch.bfloat16):
                 pad_size = int(
-                    batch.get("_speco_pad_size", self._current_pad_size) or 0
+                    batch.get("_speco_pad_size", getattr(self, "_current_pad_size", 0))
+                    or 0
                 )
                 loss_batch = {
                     key: value
@@ -5440,16 +5521,19 @@ class DrafterBaseTrainer:
                 l_v = loss_dict["total_local_vloss"]
                 l_p = loss_dict["total_local_ploss"]
                 l_n = loss_dict["local_num_tokens"]
-                self._record_dflash_training_metrics(loss_dict)
+                if not getattr(self, "combine_standalone_metrics", False):
+                    self._record_dflash_training_metrics(loss_dict)
         self.record_training_timing(
             "timing_s/drafter_forward_loss", time.time() - forward_ts
         )
 
         # Reduce scalar loss statistics once across SP/DP groups.
         reduce_ts = time.time()
-        global_vloss, global_ploss, global_tokens, reduce_world_size = (
-            self._reduce_loss_metrics(l_v, l_p, l_n)
-        )
+        if getattr(self, "combine_standalone_metrics", False):
+            statistics = self._reduce_standalone_step_statistics(loss_dict)
+        else:
+            statistics = self._reduce_loss_metrics(l_v, l_p, l_n)
+        global_vloss, global_ploss, global_tokens, reduce_world_size = statistics
         self.record_training_timing(
             "timing_s/drafter_reduce_loss", time.time() - reduce_ts
         )

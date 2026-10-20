@@ -23,7 +23,7 @@ def producer_window_metrics(
 ) -> dict[str, float]:
     """Average successful-sample latencies; throughput uses window wall time.
 
-    E2E starts at input preparation and ends after TQ publish/temporary cleanup.
+    E2E starts at input preparation and ends after publication/temporary cleanup.
     Generation is averaged only over samples that actually generated a response.
     Publish queue wait measures enqueue blocking, not residence in that queue.
     """
@@ -55,4 +55,16 @@ def producer_window_metrics(
     generated = [float(t["generate"]) for t in timings if "generate" in t]
     if generated:
         metrics["producer/generation_time"] = sum(generated) / len(generated)
+    for key in (
+        "publish_queue",
+        "publish_encode",
+        "publish_transport",
+        "publish_retry_wait",
+    ):
+        if any(key in t for t in timings):
+            metrics[f"producer/{key}_time"] = average(key)
+    if any("metadata_batch_size" in t for t in timings):
+        # Sample-weighted: each sample experiences the latency of its whole RPC.
+        metrics["producer/metadata_batch_size"] = average("metadata_batch_size")
+        metrics["producer/metadata_submit_time"] = average("metadata_submit")
     return metrics

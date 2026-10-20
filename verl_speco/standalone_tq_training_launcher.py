@@ -142,6 +142,7 @@ _INTERNAL_OVERRIDE_KEYS = frozenset(
         f"{_TQ_PREFIX}.backend.SimpleStorage.total_storage_size",
         f"{_TQ_PREFIX}.backend.SimpleStorage.num_data_storage_units",
         f"{_TQ_PREFIX}.expected_feature.algorithm",
+        f"{_TQ_PREFIX}.expected_feature.payload_kind",
         f"{_TQ_PREFIX}.expected_feature.target_model_path",
         f"{_TQ_PREFIX}.expected_feature.target_revision",
         f"{_TQ_PREFIX}.expected_feature.tokenizer_fingerprint",
@@ -955,6 +956,38 @@ def build_pipeline_commands(
         f"{_FEATURE_STORE_PREFIX}.repeat=false",
         *tq_overrides,
     ]
+    hidden_references = (
+        _strip_quotes(_find_override(training_args, _RUNTIME_BACKEND_KEY) or "ray")
+        == "ray"
+    )
+    if hidden_references:
+        consumer_internal.extend(
+            item.replace(
+                f"{_PRODUCER_PREFIX}.hidden_states_store",
+                "actor_rollout_ref.rollout.drafter.training.target_feature_replay.hidden_states_store",
+            )
+            for item in _hidden_states_store_overrides(backend_env)
+        )
+        owner = []
+        consumer_internal[0] = f"{_FEATURE_STORE_PREFIX}.type=ray_reference"
+        producer_overrides.extend(
+            [
+                f"{_FEATURE_STORE_PREFIX}.type=ray_reference",
+                f"{_TQ_PREFIX}.enable=false",
+            ]
+        )
+        consumer_internal.append(f"{_TQ_PREFIX}.enable=false")
+        kind_override = f"{_TQ_PREFIX}.expected_feature.payload_kind=vllm_reference"
+        producer_overrides.append(kind_override)
+        consumer_internal.append(kind_override)
+        depth_key = f"{_TQ_PREFIX}.consumer_prefetch_batches"
+        requested_depth = _find_override(training_args, depth_key, normalize_key=True)
+        if requested_depth is not None and int(_strip_quotes(requested_depth)) < 1:
+            raise ValueError(
+                "Standalone vLLM file input requires consumer_prefetch_batches >= 1"
+            )
+        if requested_depth is None:
+            consumer_internal.append(f"{depth_key}=4")
     hidden_dtype = _strip_quotes(
         _find_override(training_args, _PRODUCER_HIDDEN_DTYPE_KEY) or "bfloat16"
     )
@@ -1254,6 +1287,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if runtime_backend not in {"subprocess", "ray"}:
         parser.error(f"{_RUNTIME_BACKEND_KEY} must be either subprocess or ray")
+    # Keep command composition consistent with the explicit CLI backend too.
+    training_args = [*training_args, f"{_RUNTIME_BACKEND_KEY}={runtime_backend}"]
 
     try:
         config = resolve_pipeline_config(training_args)
@@ -1272,6 +1307,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ("consumer", commands.consumer),
             ]
             for role, command in printable_commands:
+                if role == "owner" and not command:
+                    continue
                 if command is None:
                     print(
                         f"{role}: external services at "

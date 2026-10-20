@@ -252,12 +252,11 @@ class MooncakeHiddenStatesStore(HiddenStatesStore):
         return payload, byte_size
 
     def release(self, reference: str) -> None:
-        if self._store is None:
-            return
+        store = self._ensure_store()
         # Deletion errors deliberately propagate so callers with a retry policy
         # (the Producer cleanup loop) can retry transient store failures. Callers
         # for which cleanup is strictly best-effort wrap this in their own guard.
-        self._store.delete_sample(reference)
+        store.delete_sample(reference)
 
     def close(self) -> None:
         # hs_connectors exposes no explicit teardown; dropping the reference

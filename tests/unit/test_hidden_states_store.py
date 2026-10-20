@@ -173,3 +173,11 @@ def test_speco_connector_restores_rank0_finished_count() -> None:
 
     assert issubclass(SpecoMooncakeHiddenStatesConnector, MooncakeHiddenStatesConnector)
     assert SpecoMooncakeHiddenStatesConnector.get_finished_count(None) == 1
+
+
+def test_release_initializes_store_for_unread_reference(monkeypatch):
+    store = MooncakeHiddenStatesStore(MooncakeStoreSettings())
+    fake = _FakeMooncake({})
+    monkeypatch.setattr(store, "_ensure_store", lambda: fake)
+    store.release("never-read")
+    assert fake.deleted == ["never-read"]

@@ -1159,26 +1159,38 @@ def build_feature_store_from_config(
     metadata: dict[str, Any] | None = None,
     shard_prefix: str = "shard",
     transfer_queue_cfg: Any | None = None,
+    hidden_states_store_cfg: Any | None = None,
 ) -> Any:
     store_type = (
         str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
         .strip()
         .lower()
     )
-    if store_type == "tq":
+    if store_type in {"tq", "ray_reference"}:
         if not read_only:
             raise ValueError(
-                "feature_store.type=tq is a read-only Consumer data source"
+                f"feature_store.type={store_type} is a read-only Consumer data source"
             )
-        from verl_speco.trainer.tq_feature_store import TQFeatureStore
+        from verl_speco.trainer.tq_feature_store import (
+            ReferenceFeatureStore,
+            TQFeatureStore,
+        )
 
         tq_cfg = transfer_queue_cfg
         if tq_cfg is None:
             tq_cfg = feature_store_cfg.get("tq")
         if tq_cfg is None:
             raise ValueError(
-                "feature_store.type=tq requires the sibling training.transfer_queue configuration"
+                f"feature_store.type={store_type} requires the sibling training.transfer_queue configuration"
             )
+        if store_type == "ray_reference":
+            from verl_speco.trainer.tq_feature_store import _plain_dict
+
+            tq_cfg = {
+                **_plain_dict(tq_cfg),
+                "hidden_states_store": _plain_dict(hidden_states_store_cfg),
+            }
+            return ReferenceFeatureStore.from_config(tq_cfg)
         return TQFeatureStore.from_config(tq_cfg)
     if store_type == "torch_shard":
         store_cls: type[TorchShardFeatureStore] = TorchShardFeatureStore

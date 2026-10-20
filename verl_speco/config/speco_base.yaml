@@ -400,7 +400,7 @@ actor_rollout_ref:
         data_buffer_max_size: 1024
         hidden_state_clip_value: 1.0e4
         feature_store:
-          # `tq` selects the streaming standalone Consumer and does not use path.
+            # Streaming standalone inputs do not use path: tq, or launcher-selected ray_reference.
           type: torch_shard
           path: null
           max_samples_per_shard: 1024
@@ -438,6 +438,8 @@ actor_rollout_ref:
           run_id: null
           schema_version: 2
           expected_feature:
+            # Launcher-owned descriptor, not an independent user switch.
+            payload_kind: null
             algorithm: null
             target_model_path: null
             target_revision: null
@@ -450,6 +452,10 @@ actor_rollout_ref:
           drop_last: true
           # Scheduled Ray Consumer: 0 keeps serial loading, k prefetches k batches.
           consumer_prefetch_batches: 0
+          # ray_reference: whole-batch CPU processes per rank; 0 restores sample threads.
+          consumer_batch_workers: 2
+          # Sample threads used only by the fallback or retained-TQ file path.
+          consumer_prepare_workers: 4
           io_retry_max_attempts: 3
           io_timeout_seconds: 30
           prefetch_collective_timeout_seconds: 180
