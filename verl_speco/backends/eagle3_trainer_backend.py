@@ -1285,8 +1285,8 @@ class Eagle3TrainerBackend:
             )
             or 0
         )
-        adaptive_call = int(getattr(self, "_adaptive_lk_compute_calls", 0)) + 1
-        self._adaptive_lk_compute_calls = adaptive_call
+        adaptive_call = int(getattr(self, "_adaptive_lk_telemetry_calls", 0)) + 1
+        self._adaptive_lk_telemetry_calls = adaptive_call
         log_adaptive_telemetry = adaptive_telemetry_interval > 0 and (
             adaptive_call == 1 or adaptive_call % adaptive_telemetry_interval == 0
         )
@@ -1539,10 +1539,10 @@ class Eagle3TrainerBackend:
                     "tv": round(row[3], 6),
                 }
                 for (idx, _diagnostics), row in zip(
-                    adaptive_lk_step_stats, diagnostic_rows, strict=False
+                    adaptive_lk_step_stats, diagnostic_rows, strict=True
                 )
             ]
-            logger.warning(
+            logger.info(
                 "[drafter adaptive hybrid lk] eta=%.6f per_step=%s",
                 lk_hybrid_eta,
                 formatted_stats,
@@ -1643,6 +1643,11 @@ class Eagle3TrainerBackend:
                 safe_scores,
                 safe_logz,
                 temperature=float(temperature),
+                validation_tolerance=float(
+                    self.config.rollout.drafter.training.get(
+                        "lk_target_logz_tolerance", 5e-2
+                    )
+                ),
             )
             target_probs = torch.where(
                 finite_target_mask.unsqueeze(-1),

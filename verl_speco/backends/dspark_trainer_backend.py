@@ -21,7 +21,6 @@ from typing import Any, Optional, cast
 import torch
 import torch.nn.functional as F
 
-from verl_speco.backends.target_hidden import gather_aligned_target_hidden
 from verl_speco.backends.dflash_trainer_backend import (
     DFlashTrainerBackend,
     DFlashTrainingModel,
@@ -32,11 +31,12 @@ from verl_speco.backends.dflash_trainer_backend import (
     build_dflash_attention_masks,
     _document_boundary_validity,
 )
-from verl_speco.models.dflash import resolve_rope_theta
 from verl_speco.backends.lk_loss import (
     adaptive_hybrid_loss_components,
     negative_log_acceptance_loss,
 )
+from verl_speco.backends.target_hidden import gather_aligned_target_hidden
+from verl_speco.models.dflash import resolve_rope_theta
 from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
 from verl_speco.ops.dspark_fused_loss import (
     fused_label_cross_entropy,
@@ -640,7 +640,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 )
         kl_weight = diagnostic_count.new_zeros(())
         if self.lk_loss_alpha > 0 and self.lk_loss_type == "adaptive_hybrid":
-            mean_acceptance = acceptance_sum / diagnostic_count
+            mean_acceptance = acceptance_sum / diagnostic_count.clamp_min(1.0)
             kl_weight = torch.exp(-self.lk_hybrid_eta * mean_acceptance.detach())
             lk_sum = (
                 kl_weight * weighted_forward_kl_sum

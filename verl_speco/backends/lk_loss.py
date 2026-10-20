@@ -17,28 +17,12 @@ import math
 import torch
 
 
-def _validate_without_device_sync(condition: torch.Tensor, message: str) -> None:
-    """Fail fast on CPU and enqueue an assertion on accelerator devices."""
-
-    if condition.numel() != 1:
-        raise ValueError("LK validation condition must be scalar")
-    if condition.device.type != "cpu":
-        assert_async = getattr(torch, "_assert_async", None)
-        if callable(assert_async):
-            assert_async(condition, message)
-            return
-        # Older torch versions do not expose the asynchronous device assert.
-        # Preserve fail-closed validation there, accepting the legacy sync.
-    if not bool(condition):
-        raise ValueError(message)
-
-
 def full_vocab_subset_probs(
     subset_logits: torch.Tensor,
     target_logz: torch.Tensor,
     *,
     temperature: float = 1.0,
-    validation_tolerance: float = 1e-4,
+    validation_tolerance: float = 5e-2,
 ) -> torch.Tensor:
     """Recover exact full-vocabulary probabilities for selected logits.
 
@@ -46,6 +30,13 @@ def full_vocab_subset_probs(
     as ``subset_logits`` using ``logsumexp(full_logits / temperature)``.  This
     keeps probability mass outside the draft vocabulary in the denominator
     without copying the full target LM head to the drafter.
+
+    The consistency checks are evaluated with a single scalar-tensor transfer
+    and raise a regular ``ValueError`` on every device (a device-side assert
+    would poison the accelerator context). ``validation_tolerance`` must absorb
+    bf16 numerical noise between the actor and drafter-side logits, so it is
+    deliberately loose: it only needs to catch gross snapshot/temperature
+    mismatches, not rounding differences.
     """
 
     if not math.isfinite(float(temperature)) or float(temperature) <= 0:
@@ -57,29 +48,33 @@ def full_vocab_subset_probs(
             "target_logz must match the non-vocabulary dimensions of subset_logits, "
             f"got logz={tuple(target_logz.shape)} logits={tuple(subset_logits.shape)}"
         )
-    _validate_without_device_sync(
-        torch.isfinite(target_logz).all(),
-        "target_logz contains non-finite values",
-    )
 
     scaled_logits = subset_logits.float() / float(temperature)
     log_probs = scaled_logits - target_logz.float().unsqueeze(-1)
     tolerance = max(float(validation_tolerance), 0.0)
-    _validate_without_device_sync(
-        log_probs.detach().amax() <= tolerance,
-        "target_logz is smaller than a selected logit; the actor log partition "
-        "and synchronized LM-head rows are not from the same snapshot",
-    )
-
     probs = torch.exp(log_probs)
-    subset_mass = probs.detach().sum(dim=-1)
-    _validate_without_device_sync(
-        (subset_mass <= 1.0 + tolerance).all(),
-        "selected target probability mass exceeds one; target_logz alignment "
-        "or temperature is inconsistent",
-    )
+    with torch.no_grad():
+        checks = torch.stack(
+            [
+                torch.isfinite(target_logz).all(),
+                log_probs.detach().amax() <= tolerance,
+                (probs.detach().sum(dim=-1) <= 1.0 + tolerance).all(),
+            ]
+        ).cpu()
+    finite_ok, logz_ok, mass_ok = (bool(v) for v in checks)
+    if not finite_ok:
+        raise ValueError("target_logz contains non-finite values")
+    if not logz_ok:
+        raise ValueError(
+            "target_logz is smaller than a selected logit; the actor log partition "
+            "and synchronized LM-head rows are not from the same snapshot"
+        )
+    if not mass_ok:
+        raise ValueError(
+            "selected target probability mass exceeds one; target_logz alignment "
+            "or temperature is inconsistent"
+        )
     return probs
-
 
 def adaptive_diagnostics_to_rows(
     diagnostics: list[dict[str, torch.Tensor]],
@@ -108,7 +103,9 @@ def negative_log_acceptance_loss(
     draft_probs: torch.Tensor, target_probs: torch.Tensor
 ) -> torch.Tensor:
     acceptance = torch.minimum(draft_probs.float(), target_probs.float()).sum(dim=-1)
-    return -torch.log(acceptance.clamp_min(1e-6))
+    # Clamp at float32 tiny (not a coarse epsilon) so gradients survive early
+    # training when the draft/target overlap is still very small.
+    return -torch.log(acceptance.clamp_min(torch.finfo(torch.float32).tiny))
 
 
 def adaptive_hybrid_loss_components(
@@ -140,6 +137,11 @@ def adaptive_hybrid_acceptance_loss(
     eta: float = 3.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Blend forward KL and TV using the current mean acceptance.
+
+    The blend weight ``lambda = exp(-eta * stop_grad(mean_acceptance))`` uses the
+    *unweighted* mean acceptance over the valid positions passed in one call (a
+    TTT step for EAGLE3, all active rows for DFlash/DSpark), independent of any
+    per-position loss weights (fixed decay / D-PACE) applied to the final loss.
 
     ``target_acceptance_probs`` keeps the target's full-vocabulary
     normalization after selecting draft-vocabulary rows, so

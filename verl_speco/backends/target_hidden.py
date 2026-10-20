@@ -26,6 +26,7 @@ def gather_aligned_target_hidden(
             f"{label_indices.size(0)} != {batch_size}"
         )
     indices = (label_indices - 1).clamp(min=0, max=seq_len - 1)
+    # Dropped blocks point at row 0; callers must mask these rows out of the loss.
     indices = torch.where(block_keep_mask.unsqueeze(-1), indices, 0)
     offsets = (
         torch.arange(batch_size, device=indices.device, dtype=indices.dtype).view(

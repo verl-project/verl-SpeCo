@@ -21,13 +21,14 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from safetensors import safe_open
 from transformers import AutoConfig
 
 from verl.utils.device import get_device_id, get_device_name
 from verl_speco.backends.dpace_loss import dpace_position_weights
 from verl_speco.backends.lk_loss import (
-    adaptive_hybrid_acceptance_loss,
+    adaptive_hybrid_loss_components,
     negative_log_acceptance_loss,
 )
 from verl_speco.backends.lr_scheduler import build_drafter_lr_scheduler
@@ -337,6 +338,7 @@ class DFlashTrainingModel(nn.Module):
         lk_temperature: float = 1.0,
         lk_loss_type: str = "alpha",
         lk_hybrid_eta: float = 3.0,
+        lk_chunk_size: int = 1024,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -372,6 +374,7 @@ class DFlashTrainingModel(nn.Module):
                 "lk_loss_type must be 'alpha' or 'adaptive_hybrid', "
                 f"got {lk_loss_type!r}"
             )
+        self.lk_chunk_size = max(int(lk_chunk_size or 0), 0)
         self.lk_hybrid_eta = float(lk_hybrid_eta)
         if not math.isfinite(self.lk_hybrid_eta) or self.lk_hybrid_eta < 0:
             raise ValueError(
@@ -442,6 +445,43 @@ class DFlashTrainingModel(nn.Module):
             cached = torch.exp(-(k - 1).clamp(min=0).float() / gamma)
             self._tensor_template_cache[key] = cached
         return cached
+
+    def _lk_chunk_terms(
+        self,
+        draft_hidden: torch.Tensor,
+        target_hidden: torch.Tensor,
+        weights: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        """Chunked LK terms: (acc_sum, kl_sum, tv_sum, weighted_a, weighted_b).
+
+        For ``alpha`` only ``weighted_a`` (weighted -log acceptance) is set. For
+        ``adaptive_hybrid``, ``weighted_a``/``weighted_b`` are the weighted forward
+        KL / TV sums that the caller blends with the global mean acceptance.
+        """
+        temperature = self.lk_temperature
+        weights = weights.float()
+        zero = weights.new_zeros(())
+        draft_probs = torch.softmax(
+            F.linear(draft_hidden, lm_head_weight).float() / temperature, dim=-1
+        )
+        with torch.no_grad():
+            target_probs = torch.softmax(
+                F.linear(target_hidden, lm_head_weight).float() / temperature, dim=-1
+            )
+        if self.lk_loss_type == "adaptive_hybrid":
+            acceptance, forward_kl, tv = adaptive_hybrid_loss_components(
+                draft_probs, target_probs, target_probs
+            )
+            return (
+                acceptance.sum(),
+                forward_kl.sum(),
+                tv.sum(),
+                (forward_kl * weights).sum(),
+                (tv * weights).sum(),
+            )
+        lk_loss = negative_log_acceptance_loss(draft_probs, target_probs)
+        return zero, zero, zero, (lk_loss * weights).sum(), zero
 
     def _dpace_weight_mask(
         self,
@@ -726,46 +766,23 @@ class DFlashTrainingModel(nn.Module):
         lk_kl_weight_sum = torch.zeros((), dtype=torch.float32, device=device)
         lk_forward_kl_sum = torch.zeros((), dtype=torch.float32, device=device)
         lk_tv_sum = torch.zeros((), dtype=torch.float32, device=device)
+        finite_loss = torch.zeros(0, dtype=torch.bool, device=device)
+        active_loss_weights = active_weights
         if active_targets.numel() == 0:
             loss = flat_weights.sum() * 0.0
-        elif self.loss_mode in {"restricted_ce", "sampled_ce"}:
-            vocab_size = int(lm_head_weight.shape[0])
-            restricted_vocab = self._build_restricted_vocab(
-                input_ids, active_targets, vocab_size
-            )
-            restricted_weight = lm_head_weight.index_select(0, restricted_vocab)
-            active_logits = F.linear(active_hidden, restricted_weight)
-            active_ce_targets = torch.searchsorted(restricted_vocab, active_targets)
-            active_loss = F.cross_entropy(
-                active_logits, active_ce_targets, reduction="none"
-            )
-            finite_loss = torch.isfinite(active_loss)
-            sanitized_rows = (~finite_loss).sum().to(dtype=torch.float32)
-            active_loss = torch.where(
-                finite_loss, active_loss, torch.zeros_like(active_loss)
-            )
-            if self.per_position_loss_weight == "dpace":
-                weight_mask = self._dpace_weight_mask(
-                    per_token_ce=active_loss,
-                    finite_loss=finite_loss,
-                    active_mask=active_mask,
-                    base_loss_mask=base_loss_mask,
-                )
-                flat_weights = weight_mask.view(-1)
-                active_weights = flat_weights[active_mask]
-            active_loss_weights = active_weights * finite_loss.to(
-                dtype=active_weights.dtype
-            )
-            loss_per_token[active_mask] = active_loss
-            local_ce_den = active_loss_weights.sum()
-            valid_token_count = local_ce_den.clamp(min=1e-6)
-            local_ploss_sum = (active_loss * active_loss_weights).sum()
-            loss = local_ploss_sum / valid_token_count
         else:
-            active_logits = F.linear(active_hidden, lm_head_weight)
-            active_loss = F.cross_entropy(
-                active_logits, active_targets, reduction="none"
-            )
+            if self.loss_mode in {"restricted_ce", "sampled_ce"}:
+                vocab_size = int(lm_head_weight.shape[0])
+                restricted_vocab = self._build_restricted_vocab(
+                    input_ids, active_targets, vocab_size
+                )
+                restricted_weight = lm_head_weight.index_select(0, restricted_vocab)
+                active_logits = F.linear(active_hidden, restricted_weight)
+                ce_targets = torch.searchsorted(restricted_vocab, active_targets)
+            else:
+                active_logits = F.linear(active_hidden, lm_head_weight)
+                ce_targets = active_targets
+            active_loss = F.cross_entropy(active_logits, ce_targets, reduction="none")
             finite_loss = torch.isfinite(active_loss)
             sanitized_rows = (~finite_loss).sum().to(dtype=torch.float32)
             active_loss = torch.where(
@@ -797,45 +814,46 @@ class DFlashTrainingModel(nn.Module):
                     "DFlash LK loss requires target_last_hidden_states. "
                     "Enable dflash_aux_plus_last hidden-state collection."
                 )
-            lk_mask = finite_loss & torch.isfinite(active_target_hidden).all(dim=-1)
-            if lk_mask.any():
-                if self.loss_mode in {"restricted_ce", "sampled_ce"}:
-                    draft_logits = F.linear(active_hidden[lk_mask], lm_head_weight)
-                else:
-                    draft_logits = active_logits[lk_mask]
-                target_logits = F.linear(active_target_hidden[lk_mask], lm_head_weight)
-                temperature = self.lk_temperature
-                draft_probs = torch.softmax(draft_logits.float() / temperature, dim=-1)
-                target_probs = torch.softmax(
-                    target_logits.float() / temperature, dim=-1
-                )
-                if self.lk_loss_type == "adaptive_hybrid":
-                    per_token_lk_loss, lk_diagnostics = adaptive_hybrid_acceptance_loss(
-                        draft_probs=draft_probs,
-                        target_acceptance_probs=target_probs,
-                        target_kl_probs=target_probs,
-                        position_mask=torch.ones(
-                            draft_probs.shape[:-1], dtype=torch.bool, device=device
-                        ),
-                        eta=self.lk_hybrid_eta,
+            lk_idx = (
+                (finite_loss & torch.isfinite(active_target_hidden).all(dim=-1))
+                .nonzero(as_tuple=True)[0]
+            )
+            lk_count = int(lk_idx.numel())
+            if lk_count > 0:
+                lk_hidden = active_hidden[lk_idx]
+                lk_target_hidden = active_target_hidden[lk_idx]
+                lk_weights = active_loss_weights[lk_idx]
+                lk_sums = [torch.zeros((), dtype=torch.float32, device=device)] * 5
+                chunk = self.lk_chunk_size if self.lk_chunk_size > 0 else lk_count
+                for start in range(0, lk_count, chunk):
+                    end = min(start + chunk, lk_count)
+                    args = (
+                        lk_hidden[start:end],
+                        lk_target_hidden[start:end],
+                        lk_weights[start:end],
+                        lm_head_weight,
                     )
-                    lk_diagnostic_count = lk_mask.float().sum()
-                    lk_acceptance_sum = (
-                        lk_diagnostics["acceptance"] * lk_diagnostic_count
+                    terms = (
+                        checkpoint(self._lk_chunk_terms, *args, use_reentrant=False)
+                        if torch.is_grad_enabled()
+                        else self._lk_chunk_terms(*args)
                     )
-                    lk_kl_weight_sum = lk_diagnostics["kl_weight"] * lk_diagnostic_count
-                    lk_forward_kl_sum = (
-                        lk_diagnostics["forward_kl"] * lk_diagnostic_count
-                    )
-                    lk_tv_sum = lk_diagnostics["tv"] * lk_diagnostic_count
-                else:
-                    per_token_lk_loss = negative_log_acceptance_loss(
-                        draft_probs,
-                        target_probs,
-                    )
-                lk_weights = active_loss_weights[lk_mask]
-                local_lk_sum = (per_token_lk_loss * lk_weights).sum()
+                    lk_sums = [acc + term for acc, term in zip(lk_sums, terms)]
+                acc_sum, kl_sum, tv_sum, weighted_a, weighted_b = lk_sums
                 local_lk_den = lk_weights.sum()
+                if self.lk_loss_type == "adaptive_hybrid":
+                    count = acc_sum.new_tensor(float(lk_count))
+                    kl_weight = torch.exp(
+                        -self.lk_hybrid_eta * (acc_sum / count).detach()
+                    )
+                    local_lk_sum = kl_weight * weighted_a + (1.0 - kl_weight) * weighted_b
+                    lk_diagnostic_count = count
+                    lk_acceptance_sum = acc_sum.detach()
+                    lk_kl_weight_sum = (kl_weight * count).detach()
+                    lk_forward_kl_sum = kl_sum.detach()
+                    lk_tv_sum = tv_sum.detach()
+                else:
+                    local_lk_sum = weighted_a
                 lk_loss = local_lk_sum / local_lk_den.clamp(min=1e-6)
         loss = (ce_loss * self.ce_loss_alpha) + (lk_loss * self.lk_loss_alpha)
 
@@ -1510,6 +1528,7 @@ class DFlashTrainerBackend:
             lk_temperature=float(training_cfg.get("lk_temperature", 1.0)),
             lk_loss_type=str(training_cfg.get("dflash_lk_loss_type", "alpha")),
             lk_hybrid_eta=float(training_cfg.get("dflash_lk_hybrid_eta", 3.0)),
+            lk_chunk_size=int(training_cfg.get("lk_chunk_size", 1024)),
         ), drafter_config
 
     def _build_target_lm_head(self, target_model_path: str, target_hf_config=None):

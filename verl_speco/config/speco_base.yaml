@@ -279,13 +279,20 @@ actor_rollout_ref:
         # null enables actor-side full-vocabulary logZ capture automatically when
         # EAGLE3 LK is active; set true for collect-only fixed-data ablations.
         capture_target_logz: null
+        # Max tolerated log-prob excess when checking actor logZ against drafter-side
+        # target logits. Loose by default to absorb bf16 noise; raises ValueError.
+        lk_target_logz_tolerance: 0.05
+        # Rows per chunk when computing DFlash/DSpark LK terms (bounds [rows, vocab]
+        # fp32 temporaries; 0 disables chunking). Chunks are recomputed in backward.
+        lk_chunk_size: 1024
         eagle3_ce_loss_alpha: 1.0
         eagle3_lk_loss_alpha: 0.0
         # alpha: -log acceptance; adaptive_hybrid: lambda * KL + (1-lambda) * TV.
         eagle3_lk_loss_type: alpha
         # Paper default for lambda = exp(-eta * stop_gradient(mean_acceptance)).
         eagle3_lk_hybrid_eta: 3.0
-        # Aggregate adaptive diagnostics on GPU and copy them once at this cadence.
+        # Aggregate adaptive diagnostics on GPU and copy them once every N
+        # compute_loss calls (micro-batches, not optimizer steps).
         eagle3_lk_telemetry_interval_steps: 20
         # Hard-label CE target source for backends that support it.
         # labels keeps SpeCo's teacher-forced behavior; target_argmax matches
@@ -307,6 +314,8 @@ actor_rollout_ref:
         dflash_max_window: 512
         dflash_loss_mode: full_vocab
         dflash_sampled_ce_negatives: 0
+        # LK recomputes full-vocab draft logits per chunk, so it also works with
+        # restricted_ce/sampled_ce, but then costs an extra full-vocab projection.
         dflash_ce_loss_alpha: 1.0
         dflash_lk_loss_alpha: 0.0
         # alpha: -log acceptance; adaptive_hybrid: lambda * KL + (1-lambda) * TV.
@@ -340,7 +349,7 @@ actor_rollout_ref:
         dspark_max_window: 0
         dspark_loss_mode: full_vocab
         dspark_sampled_ce_negatives: 0
-        # D-PACE affects DSpark CE only; L1/LK keep dspark_loss_decay_gamma.
+        # D-PACE reweights CE across draft positions; L1/LK keep their loss decay.
         dspark_per_position_loss_weight: fixed_exp_decay
         dspark_dpace_alpha: 0.5
         dspark_markov_rank: 256
