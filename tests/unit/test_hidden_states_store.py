@@ -33,7 +33,7 @@ class _FakeMooncake:
         self.payload = payload
         self.deleted: list[str] = []
 
-    def get_sample(self, key):
+    def get_sample(self, key, *, timeout=120.0):
         return self.payload
 
     def delete_sample(self, key):

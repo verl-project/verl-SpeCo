@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import Executor
 from dataclasses import asdict
 from functools import partial
@@ -35,6 +36,7 @@ def prepare_standalone_cpu_batch(
     pin_memory: bool = True,
     executor: Executor | None = None,
     hidden_states_store: HiddenStatesStore | None = None,
+    read_timeout: float = 30.0,
 ) -> dict[str, Any]:
     """Prepare one assigned batch without trainer state, GPU work or deletion.
 
@@ -48,6 +50,7 @@ def prepare_standalone_cpu_batch(
         if hidden_states_store is not None
         else FileHiddenStatesStore()
     )
+    read_deadline = time.monotonic() + read_timeout
     algorithm = feature_contract.algorithm.upper()
     if algorithm not in {"DSPARK", "DFLASH", "EAGLE3"} or feature_contract.use_logits:
         raise ValueError(
@@ -99,6 +102,7 @@ def prepare_standalone_cpu_batch(
         algorithm=algorithm,
         max_window=max_window,
         store=store,
+        read_deadline=read_deadline,
     )
     chunks = (
         list(executor.map(prepare, tags))
@@ -125,12 +129,20 @@ def prepare_standalone_cpu_batch(
 
 
 @torch.no_grad()
-def _prepare_chunk(tag, *, feature_contract, algorithm, max_window, store):
+def _prepare_chunk(
+    tag, *, feature_contract, algorithm, max_window, store, read_deadline
+):
     """One scheduler-assigned sample; workers perform CPU work only."""
     reference = (
         tag["handle"] if tag["backend"] == "mooncake" else tag["hidden_states_path"]
     )
-    payload, _ = store.load(reference)
+    if store.backend == "mooncake":
+        remaining = read_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Mooncake batch read deadline exceeded")
+        payload, _ = store.load(reference, timeout=remaining)
+    else:
+        payload, _ = store.load(reference)
     if any(
         not isinstance(t, torch.Tensor) or t.device.type != "cpu"
         for t in payload.values()

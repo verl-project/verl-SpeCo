@@ -172,7 +172,9 @@ class HiddenStatesStore:
 
     backend: str = FILE_BACKEND
 
-    def load(self, reference: str) -> tuple[dict[str, torch.Tensor], int]:
+    def load(
+        self, reference: str, *, timeout: float = 120.0
+    ) -> tuple[dict[str, torch.Tensor], int]:
         """Return ``(payload, byte_size)`` for a response reference."""
         raise NotImplementedError
 
@@ -193,13 +195,15 @@ class FileHiddenStatesStore(HiddenStatesStore):
 
     backend = FILE_BACKEND
 
-    def load(self, reference: str) -> tuple[dict[str, torch.Tensor], int]:
+    def load(
+        self, reference: str, *, timeout: float = 30.0
+    ) -> tuple[dict[str, torch.Tensor], int]:
         try:
             from safetensors.torch import load_file
         except ImportError as exc:  # pragma: no cover - dependency issue
             raise RuntimeError("vLLM hidden-state replay requires safetensors") from exc
         path = Path(reference)
-        _wait_for_lock(Path(f"{path}.lock"))
+        _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
         if not path.is_file():
             raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
         payload = dict(load_file(str(path), device="cpu"))
@@ -241,9 +245,11 @@ class MooncakeHiddenStatesStore(HiddenStatesStore):
             self._store = store
             return store
 
-    def load(self, reference: str) -> tuple[dict[str, torch.Tensor], int]:
+    def load(
+        self, reference: str, *, timeout: float = 120.0
+    ) -> tuple[dict[str, torch.Tensor], int]:
         store = self._ensure_store()
-        payload = dict(store.get_sample(reference))
+        payload = dict(store.get_sample(reference, timeout=timeout))
         byte_size = sum(
             int(tensor.numel()) * int(tensor.element_size())
             for tensor in payload.values()

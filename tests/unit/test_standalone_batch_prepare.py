@@ -345,7 +345,7 @@ def test_mooncake_reference_reuses_cpu_prepare_and_cleanup(tmp_path, monkeypatch
             self.loads = 0
             self.deletes = 0
             self.closed = False
-        def load(self, handle):
+        def load(self, handle, *, timeout=120.0):
             assert handle == "hs-1"
             self.loads += 1
             return {"hidden_states": hidden, "token_ids": torch.arange(5)}, 0
@@ -378,3 +378,31 @@ def test_mooncake_reference_reuses_cpu_prepare_and_cleanup(tmp_path, monkeypatch
     assert store.loads == 1 and store.deletes == 2
     adapter.close()
     assert store.closed
+
+
+def test_mooncake_batch_reads_share_one_timeout_budget(tmp_path, monkeypatch):
+    import verl_speco.trainer.standalone_batch_prepare as prepare
+    contract = _contract()
+    tags = [_sample(tmp_path, contract, index=i)[0] for i in range(2)]
+    hidden = torch.zeros(5, 3, 2)
+    for i, tag in enumerate(tags):
+        tag.pop("hidden_states_path")
+        tag.update(backend="mooncake", handle=f"hs-{i}")
+    now = [100.0]
+    timeouts = []
+
+    class Store:
+        backend = "mooncake"
+        def load(self, handle, *, timeout):
+            timeouts.append(timeout)
+            now[0] += 4
+            return {"hidden_states": hidden, "token_ids": torch.arange(5)}, 0
+
+    monkeypatch.setattr(prepare, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    prepare.prepare_standalone_cpu_batch(tags, contract, hidden_states_store=Store(), read_timeout=10, pin_memory=False)
+    assert timeouts == [10, 6]
+    now[0] = 100
+    timeouts.clear()
+    with pytest.raises(TimeoutError, match="batch read deadline"):
+        prepare.prepare_standalone_cpu_batch(tags, contract, hidden_states_store=Store(), read_timeout=3, pin_memory=False)
+    assert timeouts == [3]

@@ -554,12 +554,20 @@ class StandaloneRayTrainer:
         training_cfg = self.consumer_config.actor_rollout_ref.rollout.drafter.training
         tq_cfg = training_cfg.transfer_queue
         hidden_references = _uses_ray_reference(self.consumer_config)
+        source_cfg = tq_cfg
+        if hidden_references:
+            source_cfg = {
+                **tq_cfg,
+                "hidden_states_store": (
+                    training_cfg.get("target_feature_replay") or {}
+                ).get("hidden_states_store"),
+            }
         store = (
-            self.feature_store_factory(tq_cfg)
+            self.feature_store_factory(source_cfg)
             if self.feature_store_factory is not None
             else (
                 ReferenceFeatureStore if hidden_references else TQFeatureStore
-            ).from_config(tq_cfg)
+            ).from_config(source_cfg)
         )
         store.connect()
         scheduler = DrafterScheduler()
@@ -594,6 +602,7 @@ class StandaloneRayTrainer:
         last_published_total = 0
         last_reference_batch_id = -1
         seen_file_keys: set[str] = set()
+        shutdown_entries: dict[str, ReadyEntry] = {}
         trackers: list[Any] = []
 
         def log_tracking_event(event: dict[str, Any]) -> None:
@@ -626,6 +635,15 @@ class StandaloneRayTrainer:
                     metrics,
                     published_total=int(event["published_total"]),
                 )
+
+        def handle_shutdown_event(event):
+            if event.get("kind") == "samples_ready":
+                shutdown_entries.update(
+                    (item["key"], ReadyEntry(item["key"], item["tag"]))
+                    for item in event["entries"]
+                )
+            elif event.get("kind") in {"training_metrics", "producer_metrics"}:
+                log_tracking_event(event)
 
         world_size = int(
             self.consumer_config.speco.draft_training.nproc_per_node
@@ -966,11 +984,7 @@ class StandaloneRayTrainer:
                         except Empty:
                             continue
                         _raise_consumer_failure(event)
-                        if event.get("kind") in {
-                            "training_metrics",
-                            "producer_metrics",
-                        }:
-                            log_tracking_event(event)
+                        handle_shutdown_event(event)
                 else:
                     for ref in consumer_refs:
                         self.ray.get(ref)
@@ -1017,11 +1031,7 @@ class StandaloneRayTrainer:
                                 event = get_queue(self.events_queue, timeout=0.0)
                             except Empty:
                                 continue
-                            if event.get("kind") in {
-                                "training_metrics",
-                                "producer_metrics",
-                            }:
-                                log_tracking_event(event)
+                            handle_shutdown_event(event)
                     self.ray.get(stop_ref)
                 except Exception:  # noqa: BLE001
                     logger.exception("Failed to stop standalone Producer actor")
@@ -1033,8 +1043,19 @@ class StandaloneRayTrainer:
                         event = self.events_queue.get(block=False)
                     except Empty:
                         break
-                    if event.get("kind") in {"training_metrics", "producer_metrics"}:
-                        log_tracking_event(event)
+                    handle_shutdown_event(event)
+                if hidden_references:
+                    shutdown_entries.update((entry.key, entry) for entry in plans.ready)
+                    for pending in plans.pending:
+                        shutdown_entries.update(
+                            (entry.key, entry) for entry in pending.entries
+                        )
+                    cleanup_standalone_samples(
+                        store,
+                        list(shutdown_entries.values()),
+                        reason="shutdown",
+                        attempts=io_attempts,
+                    )
             finally:
                 _finish_standalone_tracking(trackers, rank=0)
                 store.close()

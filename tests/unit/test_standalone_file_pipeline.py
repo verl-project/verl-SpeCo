@@ -111,8 +111,17 @@ def _process_source(tmp_path, monkeypatch, *, missing=False, locked=False):
     commands.put({"kind": "stop"})
     if missing:
         paths[0].unlink()
+    lock_handle = None
     if locked:
-        paths[0].with_suffix(".safetensors.lock").touch()
+        lock_path = paths[0].with_suffix(".safetensors.lock")
+        try:
+            import fcntl
+        except ImportError:
+            lock_path.touch()  # Windows uses the existence-based fallback.
+        else:
+            lock_handle = lock_path.open("wb")
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+
     store = ReferenceFeatureStore({
         "run_id": "run", "ray": {"address": "unused"},
         "expected_feature": {"algorithm": "DFLASH", "target_model_path": "target"},
@@ -124,6 +133,7 @@ def _process_source(tmp_path, monkeypatch, *, missing=False, locked=False):
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
     source = ReferenceBatchPrefetchIterator(loader, 4, workers=2,
                                       prepare_options={"max_window": 4}, close_timeout=30)
+    source._test_lock = lock_handle
     return source, loader, paths
 
 
@@ -145,6 +155,8 @@ def test_process_workers_prepare_different_batches_and_keep_fifo(tmp_path, monke
             time.sleep(0.02)
         assert finished_second, source._error
         assert lock.exists() and paths[0].exists() and not paths[1].exists()
+        if source._test_lock is not None:
+            source._test_lock.close()
         lock.unlink()
         batches = [next(source), next(source)]
         assert [batch.plan_id for batch in batches] == [0, 1]
@@ -160,6 +172,8 @@ def test_process_workers_prepare_different_batches_and_keep_fifo(tmp_path, monke
             loader.clear_completed_batch(batch.global_keys, cleanup_after_load=True)
         assert not any(path.exists() for path in paths)
     finally:
+        if source._test_lock is not None:
+            source._test_lock.close()
         lock.unlink(missing_ok=True)
         source.close()
     assert not source._thread.is_alive() and not source._collector.is_alive()
@@ -178,10 +192,14 @@ def test_process_worker_error_retains_pending_metadata(tmp_path, monkeypatch):
 
 def test_process_prefetch_close_cancels_locked_untrained_batches(tmp_path, monkeypatch):
     source, _, paths = _process_source(tmp_path, monkeypatch, locked=True)
-    source.close()
-    assert paths[0].exists()
-    assert paths[0].with_suffix(".safetensors.lock").exists()
-    assert not source._collector.is_alive() and not source._thread.is_alive()
+    try:
+        source.close()
+        assert paths[0].exists()
+        assert paths[0].with_suffix(".safetensors.lock").exists()
+        assert not source._collector.is_alive() and not source._thread.is_alive()
+    finally:
+        if source._test_lock is not None:
+            source._test_lock.close()
 
 
 @pytest.mark.parametrize("fail_pin", [False, True])
@@ -437,7 +455,7 @@ def test_driver_receives_metadata_once_before_producer_completion(tmp_path, monk
     if training_fails:
         with pytest.raises(RuntimeError, match="injected training failure"):
             trainer.run()
-        assert path.exists()
+        assert not path.exists()
         return
     assert trainer.run() == 0
     submitted = sent_commands

@@ -1919,3 +1919,55 @@ def test_drain_pending_samples_disabled_with_zero_timeout() -> None:
             _UnexpectedTransport(), "run-a", timeout=0.0, poll_interval=0.0
         )
     )
+
+
+@pytest.mark.parametrize("accept_first", [False, True])
+def test_cancel_reference_producer_cleans_only_unsubmitted_results(tmp_path, monkeypatch, accept_first):
+    import verl_speco.standalone_tq_producer as producer
+    from verl_speco.producer.vllm_feature_client import VllmResponse
+    from types import SimpleNamespace
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    input_path.write_text(input_path.read_text(encoding="utf-8") * 10, encoding="utf-8")
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["hidden_states_store"] = {"backend": "mooncake"}
+    config["speco"]["standalone_tq_producer"]["publish_queue_size"] = 1
+    config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["transfer_queue"]["expected_feature"] = {"payload_kind": "vllm_reference"}
+    monkeypatch.setattr(producer, "_load_target_depth", lambda *a: 32)
+    generated, submitted, deleted = set(), set(), []
+    ready = asyncio.Event()
+    store = SimpleNamespace(release=deleted.append)
+
+    class Pool(_Pool):
+        async def prefill_reference(self, request):
+            handle = f"hs-{request.sequence_no}"
+            generated.add(handle)
+            if len(generated) >= 4 + int(accept_first):
+                ready.set()
+            return VllmResponse(None, "http://vllm:8000/v1", handle=handle, store=store)
+
+    async def submit(entries):
+        if accept_first and not submitted:
+            submitted.update(item["tag"]["handle"] for item in entries)
+            return {}
+        await asyncio.Event().wait()
+
+    async def exercise():
+        task = asyncio.create_task(run_producer(
+            config, transport=_Transport(), tokenizer=_Tokenizer(), client_pool=Pool(tmp_path),
+            on_references=submit, reference_batch_size=1,
+        ))
+        # One result is in the publisher, one in the queue, and others can be
+        # blocked in queue.put. All remain producer-owned until RPC success.
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=5)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(exercise())
+    assert set(deleted) == generated - submitted
+    assert len(deleted) == len(set(deleted))
+    assert bool(submitted) == accept_first

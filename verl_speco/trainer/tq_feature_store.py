@@ -213,6 +213,7 @@ class TQFeatureStore:
             [entry.tag for entry in entries],
             FeatureContract(**values),
             hidden_states_store=getattr(self, "hidden_states_store", None),
+            read_timeout=float(self.config.get("io_timeout_seconds", 30)),
             **options,
         )
 

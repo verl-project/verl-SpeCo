@@ -67,6 +67,7 @@ from verl_speco.trainer.target_feature_replay import (
     feature_from_vllm_payload,
     load_vllm_final_norm,
 )
+from verl_speco.trainer.tq_retry import retry_io
 from verl_speco.transport.drafter_sample_protocol import (
     DRAFTER_TQ_PARTITION,
     PROTOCOL_SCHEMA_VERSION,
@@ -144,6 +145,12 @@ def _cleanup_result_sync(result: PreparedFeature) -> float:
     if result.reference_tag is None:
         delete_temporary_result(result.raw)
     return time.monotonic() - cleanup_started
+
+
+def _as_vllm_reference(result: RawVllmFeature | VllmResponse) -> VllmResponse:
+    if not isinstance(result, VllmResponse):
+        raise TypeError("hidden reference publish requires a vLLM reference result")
+    return result
 
 
 async def _delete_result_best_effort(result: RawVllmFeature | VllmResponse) -> None:
@@ -711,6 +718,7 @@ async def run_producer(
         )
         stages: dict[str, tuple[str, float, str]] = {}
         sample_timings: dict[int, dict[str, float]] = {}
+        unsubmitted_references: dict[str, VllmResponse] = {}
         perf_rows: list[dict[str, Any]] = []
         perf_window_started = time.monotonic()
         peak_publish_queue = 0
@@ -1154,6 +1162,9 @@ async def run_producer(
                     replacement_request = await next_replacement(cause=exc)
                     continue
                 timing["prefill"] = time.monotonic() - prefill_started
+                if hidden_references:
+                    reference = _as_vllm_reference(raw)
+                    unsubmitted_references[reference.reference] = reference
                 stats.pending_bytes += int(getattr(raw, "byte_size", 0))
                 peak_pending_bytes = max(peak_pending_bytes, stats.pending_bytes)
                 try:
@@ -1397,6 +1408,10 @@ async def run_producer(
                     peak_publish_inflight = max(peak_publish_inflight, publish_inflight)
                     try:
                         publication = await on_references(entries)
+                        for item in buffered:
+                            unsubmitted_references.pop(
+                                _as_vllm_reference(item.raw).reference, None
+                            )
                     finally:
                         publish_inflight -= 1
                     published_at = time.monotonic()
@@ -1516,6 +1531,10 @@ async def run_producer(
                         result.request.sample_id,
                         put_elapsed,
                     )
+                if hidden_references:
+                    unsubmitted_references.pop(
+                        _as_vllm_reference(result.raw).reference, None
+                    )
                 stats.published_count += 1
                 last_published_at = time.monotonic()
                 if _should_log_sample_progress(stats.published_count):
@@ -1602,6 +1621,20 @@ async def run_producer(
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, *request_tasks, return_exceptions=True)
+            for raw in unsubmitted_references.values():
+                try:
+                    await asyncio.to_thread(
+                        retry_io,
+                        partial(delete_temporary_result, raw),
+                        name="Unsubmitted hidden reference cleanup",
+                        retry_if=lambda exc: True,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to release unsubmitted hidden reference %s",
+                        raw.reference,
+                    )
+            unsubmitted_references.clear()
             window_metrics = log_perf_window(force=True)
             if window_metrics is not None and on_metrics is not None:
                 await on_metrics(stats.published_count, window_metrics)

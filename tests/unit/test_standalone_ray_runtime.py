@@ -851,3 +851,78 @@ def test_trainer_propagates_consumer_error_and_stops_producer(monkeypatch) -> No
 
     with pytest.raises(RuntimeError, match="consumer failed"):
         trainer.run()
+
+
+@pytest.mark.parametrize("end", ["eos", "max_steps"])
+def test_mooncake_driver_cleans_tail_and_late_shutdown_references(monkeypatch, end):
+    from copy import deepcopy
+    from verl_speco.producer import hidden_states_store
+    from verl_speco.trainer.tq_feature_store import ReferenceFeatureStore
+    from verl_speco.transport.drafter_sample_protocol import (
+        PROTOCOL_SCHEMA_VERSION, SampleMetadata, make_reference_tag, make_sample_key,
+    )
+
+    config = deepcopy(_runtime_config())
+    training = config.actor_rollout_ref.rollout.drafter.training
+    training.get = lambda key, default=None: getattr(training, key, default)
+    training.feature_store = SimpleNamespace(type="ray_reference")
+    training.batch_size_per_gpu = 2 if end == "eos" else 1
+    training.max_steps = 0 if end == "eos" else 1
+    training.transfer_queue = {"run_id": "run", "ray": {"address": "unused"}, "consumer_prefetch_batches": 1}
+    training.target_feature_replay = {"hidden_states_store": {"backend": "mooncake", "mooncake": {"master_server_address": "host:50051"}}}
+    deleted = []
+    backend = SimpleNamespace(backend="mooncake", release=deleted.append, close=lambda: None)
+    monkeypatch.setattr(hidden_states_store, "build_hidden_states_store", lambda cfg: backend)
+
+    def entry(index):
+        meta = SampleMetadata(PROTOCOL_SCHEMA_VERSION, "run", str(index), index)
+        tag = make_reference_tag(
+            meta, backend="mooncake", handle=f"hs-{index}",
+            request={"input_ids": [1, 2], "loss_mask": [0, 1], "position_ids": [0, 1],
+                     "feature_positions": [0, 1], "draft_position_ids": [1, 2],
+                     "vllm_prompt_token_ids": [1, 2], "source_metadata": {}},
+            feature_contract={"algorithm": "DSPARK"},
+        )
+        return {"key": make_sample_key(meta), "tag": tag}
+
+    items = [{"kind": "consumer_ready", "initial_optimizer_step": 0},
+             {"kind": "samples_ready", "batch_id": 0, "entries": [entry(0)]}]
+    if end == "eos":
+        items.append({"kind": "producer_done"})
+        expected = ["hs-0"]
+    else:
+        # Budget allows only plan 0; the other references must be discarded.
+        items[1]["entries"].append(entry(1))
+        items.extend([
+            {"kind": "training_completed", "plan_id": 0, "keys": [entry(0)["key"]], "successful": True},
+            {"kind": "samples_ready", "batch_id": 1, "entries": [entry(2)]},
+        ])
+        expected = ["hs-1", "hs-2"]
+    commands, events = _RecordingQueue(), _RecordingQueue(events=items)
+
+    class Ray(_FakeRay):
+        def wait(self, refs, **kwargs):
+            if refs[0].name == "stop":
+                return refs[:1], refs[1:]
+            if events.items:
+                return [], refs
+            consumers = [ref for ref in refs if ref.name.startswith("consumer")]
+            return consumers[:1], [ref for ref in refs if ref not in consumers[:1]]
+
+    configs = []
+    def factory(cfg):
+        configs.append(cfg)
+        return ReferenceFeatureStore.from_config(cfg)
+
+    queues = iter((commands, events))
+    monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
+    trainer = StandaloneRayTrainer(
+        _commands(), ray_module=Ray(_ProducerHandle()), worker_group_factory=lambda *a, **k: _WorkerGroup(),
+        queue_factory=lambda **kw: next(queues), feature_store_factory=factory,
+    )
+    trainer.producer = trainer.ray.producer
+    trainer.consumer_wg = _WorkerGroup()
+    trainer.commands_queue, trainer.events_queue = commands, events
+    assert trainer.run() == 0
+    assert configs[0]["hidden_states_store"]["mooncake"]["master_server_address"] == "host:50051"
+    assert sorted(deleted) == expected
