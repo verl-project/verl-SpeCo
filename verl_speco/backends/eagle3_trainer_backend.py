@@ -1263,6 +1263,22 @@ class Eagle3TrainerBackend:
                 length, device=input_ids.device, dtype=torch.float32
             )
         adaptive_lk_step_stats: list[tuple[int, dict[str, torch.Tensor]]] = []
+        lk_metric_sums = (
+            {
+                key: torch.zeros((), device=input_ids.device, dtype=torch.float32)
+                for key in (
+                    "lk_loss_sum",
+                    "lk_weighted_token_count",
+                    "lk_diagnostic_token_count",
+                    "lk_acceptance_sum",
+                    "lk_kl_weight_sum",
+                    "lk_forward_kl_sum",
+                    "lk_tv_sum",
+                )
+            }
+            if collect_diagnostics and lk_loss_alpha > 0
+            else {}
+        )
         adaptive_telemetry_interval = int(
             self.config.rollout.drafter.training.get(
                 "eagle3_lk_telemetry_interval_steps", 20
@@ -1369,6 +1385,13 @@ class Eagle3TrainerBackend:
                         )
                         if log_adaptive_telemetry:
                             adaptive_lk_step_stats.append((idx, lk_diagnostics))
+                        if lk_metric_sums:
+                            count = valid_position.float().sum().detach()
+                            lk_metric_sums["lk_diagnostic_token_count"] += count
+                            for key in ("acceptance", "kl_weight", "forward_kl", "tv"):
+                                lk_metric_sums[f"lk_{key}_sum"] += (
+                                    lk_diagnostics[key].detach() * count
+                                )
                     else:
                         per_token_lk_loss = negative_log_acceptance_loss(
                             draft_lk_p,
@@ -1378,6 +1401,13 @@ class Eagle3TrainerBackend:
                             valid_position,
                             per_token_lk_loss,
                             torch.zeros_like(per_token_lk_loss),
+                        )
+                    if lk_metric_sums:
+                        lk_metric_sums["lk_loss_sum"] += (
+                            per_token_lk_loss.detach().sum()
+                        )
+                        lk_metric_sums["lk_weighted_token_count"] += (
+                            valid_position.float().sum().detach()
                         )
                     per_token_ploss = per_token_ploss + (
                         per_token_lk_loss * lk_loss_alpha
@@ -1537,6 +1567,7 @@ class Eagle3TrainerBackend:
                 "loss_sum_per_position": loss_sum_per_position.detach(),
                 "correct_per_position": correct_per_position.detach(),
                 "count_per_position": count_per_position.detach(),
+                **lk_metric_sums,
             }
         return result
 

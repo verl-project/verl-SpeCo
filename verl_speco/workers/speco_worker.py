@@ -138,6 +138,15 @@ def _resolve_feature_chunks(chunks, expected_rows: int | None = None):
         return None, None
     output = torch.zeros((full_rows, hidden_size), dtype=dtype)
     has_target_logz = all(target_part is not None for _, _, target_part in pieces)
+    if not has_target_logz and any(part is not None for _, _, part in pieces):
+        missing_chunks = [
+            {"chunk": index, "rows": indices.tolist()}
+            for index, (indices, _, target_part) in enumerate(pieces)
+            if target_part is None
+        ]
+        raise ValueError(
+            f"SPECO target_logz is missing from some feature chunks: {missing_chunks}"
+        )
     target_logz_output = (
         torch.zeros((full_rows,), dtype=torch.float32) if has_target_logz else None
     )

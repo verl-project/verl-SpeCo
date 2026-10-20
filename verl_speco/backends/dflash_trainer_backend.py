@@ -32,6 +32,7 @@ from verl_speco.backends.lk_loss import (
 )
 from verl_speco.backends.lr_scheduler import build_drafter_lr_scheduler
 from verl_speco.backends.optimizers import build_drafter_optimizer
+from verl_speco.backends.target_hidden import gather_aligned_target_hidden
 from verl_speco.models.dflash import (
     DFlashConfig,
     DFlashDraftModel,
@@ -597,23 +598,8 @@ class DFlashTrainingModel(nn.Module):
         label_indices: torch.Tensor,
         block_keep_mask: torch.Tensor,
     ) -> torch.Tensor | None:
-        if target_last_hidden_states is None:
-            return None
-        seq_len = int(target_last_hidden_states.size(1))
-        target_pred_indices = (label_indices - 1).clamp(min=0, max=seq_len - 1)
-        target_pred_indices = torch.where(
-            block_keep_mask.unsqueeze(-1),
-            target_pred_indices,
-            torch.zeros_like(target_pred_indices),
-        )
-        return torch.gather(
-            target_last_hidden_states.unsqueeze(1).expand(
-                -1, target_pred_indices.size(1), -1, -1
-            ),
-            2,
-            target_pred_indices.unsqueeze(-1).expand(
-                -1, -1, -1, target_last_hidden_states.size(-1)
-            ),
+        return gather_aligned_target_hidden(
+            target_last_hidden_states, label_indices, block_keep_mask
         )
 
     def forward(

@@ -260,7 +260,7 @@ class TrainingOutcome:
         # historical synchronous-training reporting contract.
         block_drafter_quality_metric_keys = {
             f"{prefix}/{metric_name}"
-            for prefix in ("dflash", "dspark")
+            for prefix in ("dflash", "dspark", "eagle3")
             for metric_name in (
                 "accuracy",
                 "ce_loss",
@@ -276,7 +276,7 @@ class TrainingOutcome:
         }
         block_drafter_position_metric_prefixes = tuple(
             f"{prefix}/{metric_name}/"
-            for prefix in ("dflash", "dspark")
+            for prefix in ("dflash", "dspark", "eagle3")
             for metric_name in ("accuracy_per_position", "loss_per_position")
         )
         for result in normalized_results:

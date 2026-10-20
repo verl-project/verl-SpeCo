@@ -4823,12 +4823,6 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 "Cannot restore the draft level-2 snapshot: weight source is unknown"
             )
 
-        snapshot_source = getattr(self, "_speco_draft_level2_snapshot_source", None)
-        if snapshot_source not in {"checkpoint", "online"}:
-            raise RuntimeError(
-                "Cannot restore the draft level-2 snapshot: weight source is unknown"
-            )
-
         snapshot_revision = getattr(self, "_speco_draft_level2_snapshot_revision", None)
         runtime_revision = int(getattr(self, "_speco_draft_runtime_revision", 0) or 0)
         if snapshot_revision is None or int(snapshot_revision) != runtime_revision:

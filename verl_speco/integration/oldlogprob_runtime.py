@@ -191,9 +191,31 @@ def _compute_oldlogprob_target_logz(output: Any, micro_batch: Any):
             "SPECO exact EAGLE3 LK requested actor target_logz, but the old-logprob "
             "model output does not expose full-vocabulary logits"
         )
-    return torch.logsumexp(
-        cast(Any, logits).float() / temperature, dim=-1, keepdim=True
-    )
+    logits = cast(Any, logits)
+    vocab_size = logits.shape[-1]
+    rows = logits.reshape(-1, vocab_size)
+    result = torch.empty((rows.size(0), 1), device=logits.device, dtype=torch.float32)
+    # Bound FP32 temporaries to 32 * 16384 elements, including when a single
+    # vocabulary row is large. Never mutate actor logits (also when FP32).
+    with torch.no_grad():
+        for start in range(0, rows.size(0), 32):
+            row_chunk = rows[start : start + 32]
+            logz = torch.full(
+                (row_chunk.size(0), 1),
+                -float("inf"),
+                device=logits.device,
+                dtype=torch.float32,
+            )
+            for vocab_start in range(0, vocab_size, 16384):
+                scaled = row_chunk[:, vocab_start : vocab_start + 16384].to(
+                    dtype=torch.float32, copy=True
+                )
+                scaled.div_(temperature)
+                logz = torch.logaddexp(
+                    logz, torch.logsumexp(scaled, dim=-1, keepdim=True)
+                )
+            result[start : start + row_chunk.size(0)] = logz
+    return result.view(*logits.shape[:-1], 1)
 
 
 def _resolve_hidden_state(
@@ -2334,7 +2356,7 @@ def install_oldlogprob_hidden_runtime_patch(
                 )
                 # verl 0.8.0 scales output.logits in place during postprocessing.
                 # Compute the partition from raw logits before that mutation;
-                # retaining one scalar per position avoids cloning full logits.
+                # FP32 work is chunked; retain only one scalar per position.
                 target_logz = (
                     _compute_oldlogprob_target_logz(output, micro_batch)
                     if collect_hidden

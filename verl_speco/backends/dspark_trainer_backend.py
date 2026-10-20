@@ -21,6 +21,7 @@ from typing import Any, Optional, cast
 import torch
 import torch.nn.functional as F
 
+from verl_speco.backends.target_hidden import gather_aligned_target_hidden
 from verl_speco.backends.dflash_trainer_backend import (
     DFlashTrainerBackend,
     DFlashTrainingModel,
@@ -366,47 +367,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
         label_indices: torch.Tensor,
         block_keep_mask: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        if target_last_hidden_states is None:
-            return None
-        if target_last_hidden_states.dim() != 3:
-            raise ValueError(
-                "DSpark target_last_hidden_states must have shape [batch, seq, hidden], "
-                f"got {tuple(target_last_hidden_states.shape)}"
-            )
-        seq_len = int(target_last_hidden_states.size(1))
-        if seq_len <= 0:
-            return None
-        target_pred_indices = (label_indices - 1).clamp(min=0, max=seq_len - 1)
-        target_pred_indices = torch.where(
-            block_keep_mask.unsqueeze(-1),
-            target_pred_indices,
-            torch.zeros_like(target_pred_indices),
-        )
-        batch_size, _, hidden_size = target_last_hidden_states.shape
-        if target_pred_indices.size(0) != batch_size:
-            raise ValueError(
-                "DSpark label_indices batch size must match target_last_hidden_states: "
-                f"{target_pred_indices.size(0)} != {batch_size}"
-            )
-
-        # Convert each per-batch token index into a row index of a flattened
-        # [batch * seq, hidden] tensor.  The previous gather input was an
-        # expanded [batch, anchors, seq, hidden] view; Ascend may materialize
-        # that view and allocate tens of GiB before gather executes.
-        batch_offsets = (
-            torch.arange(
-                batch_size,
-                device=target_pred_indices.device,
-                dtype=target_pred_indices.dtype,
-            ).view(batch_size, 1, 1)
-            * seq_len
-        )
-        flat_indices = (target_pred_indices + batch_offsets).reshape(-1)
-        flat_target_hidden = target_last_hidden_states.reshape(
-            batch_size * seq_len, hidden_size
-        )
-        return flat_target_hidden.index_select(0, flat_indices).view(
-            *target_pred_indices.shape, hidden_size
+        return gather_aligned_target_hidden(
+            target_last_hidden_states, label_indices, block_keep_mask
         )
 
     def _compute_distribution_losses_for_active(
