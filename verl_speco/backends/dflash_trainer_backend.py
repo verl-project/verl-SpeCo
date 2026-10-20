@@ -815,9 +815,8 @@ class DFlashTrainingModel(nn.Module):
                     "Enable dflash_aux_plus_last hidden-state collection."
                 )
             lk_idx = (
-                (finite_loss & torch.isfinite(active_target_hidden).all(dim=-1))
-                .nonzero(as_tuple=True)[0]
-            )
+                finite_loss & torch.isfinite(active_target_hidden).all(dim=-1)
+            ).nonzero(as_tuple=True)[0]
             lk_count = int(lk_idx.numel())
             if lk_count > 0:
                 lk_hidden = active_hidden[lk_idx]
@@ -846,7 +845,9 @@ class DFlashTrainingModel(nn.Module):
                     kl_weight = torch.exp(
                         -self.lk_hybrid_eta * (acc_sum / count).detach()
                     )
-                    local_lk_sum = kl_weight * weighted_a + (1.0 - kl_weight) * weighted_b
+                    local_lk_sum = (
+                        kl_weight * weighted_a + (1.0 - kl_weight) * weighted_b
+                    )
                     lk_diagnostic_count = count
                     lk_acceptance_sum = acc_sum.detach()
                     lk_kl_weight_sum = (kl_weight * count).detach()

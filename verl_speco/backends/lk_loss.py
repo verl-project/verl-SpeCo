@@ -76,6 +76,7 @@ def full_vocab_subset_probs(
         )
     return probs
 
+
 def adaptive_diagnostics_to_rows(
     diagnostics: list[dict[str, torch.Tensor]],
 ) -> list[list[float]]:
