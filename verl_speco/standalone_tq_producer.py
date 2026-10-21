@@ -627,6 +627,8 @@ async def run_producer(
         # Only standalone DFlash/DSpark use a response-only feature budget.
         producer_cfg = dict(producer_cfg)
         producer_cfg["response_feature_budget"] = algorithm in {"DFLASH", "DSPARK"}
+        # EAGLE3 shifts away two feature rows before computing its loss.
+        producer_cfg["min_feature_rows"] = 3 if algorithm == "EAGLE3" else 1
         producer_cfg["min_response_feature_rows"] = _minimum_response_feature_rows(
             drafter_cfg
         )

@@ -1971,3 +1971,53 @@ def test_cancel_reference_producer_cleans_only_unsubmitted_results(tmp_path, mon
     assert set(deleted) == generated - submitted
     assert len(deleted) == len(set(deleted))
     assert bool(submitted) == accept_first
+
+
+def test_eagle3_filters_short_reference_and_fills_batch_budget(tmp_path, monkeypatch):
+    import verl_speco.standalone_tq_producer as producer
+    from verl_speco.producer.vllm_feature_client import VllmResponse
+    from verl_speco.trainer.tq_feature_store import ReadyEntry, ReferenceFeatureStore
+    from safetensors.torch import save_file
+
+    input_path = tmp_path / "input.jsonl"
+    records = [{"sample_id": name, "prompt": name + ":", "response": "answer"}
+               for name in ("short", "valid-a", "valid-b")]
+    input_path.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+    config["speco"]["standalone_tq_producer"]["vllm_aux_hidden_state_layer_ids"] = [2, 8]
+    drafter = config["actor_rollout_ref"]["rollout"]["drafter"]
+    drafter["speculative_algorithm"] = "EAGLE3"
+    drafter["training"]["transfer_queue"]["expected_feature"] = {"payload_kind": "vllm_reference"}
+    monkeypatch.setattr(producer, "_load_target_depth", lambda *a: 32)
+
+    class Tokenizer:
+        def __call__(self, text, **kwargs):
+            length = 2 if text.endswith(":") else (3 if text.startswith("short:") else 6)
+            return {"input_ids": list(range(length))}
+
+    requested, batches = [], []
+    class Pool(_Pool):
+        async def prefill_reference(self, request):
+            requested.append(request.sample_id)
+            raw = await super().prefill(request)
+            save_file(raw.payload, raw.temporary_path)
+            return VllmResponse(raw.temporary_path, raw.endpoint_url)
+
+    async def submit(entries):
+        batches.append(entries)
+
+    stats = asyncio.run(run_producer(
+        config, tokenizer=Tokenizer(), client_pool=Pool(tmp_path),
+        on_references=submit, reference_batch_size=2,
+    ))
+    assert stats.filtered_count == 1
+    assert stats.published_count == 2
+    assert set(requested) == {"valid-a", "valid-b"}
+    assert [len(batch) for batch in batches] == [2]
+    store = ReferenceFeatureStore({"run_id": "run-a", "ray": {"address": "unused"}})
+    store.connect()
+    entries = [ReadyEntry(item["key"], item["tag"]) for item in batches[0]]
+    assert all(len(entry.tag["request"]["feature_positions"]) == 5 for entry in entries)
+    batch = store.prepare_batch(entries, pin_memory=False)
+    assert batch["input_ids"].shape == (1, 6)

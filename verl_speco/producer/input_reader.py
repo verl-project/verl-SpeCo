@@ -819,6 +819,12 @@ def _build_tokenized_request(
     # A feature window that leaves too little supervision, or that cuts the
     # supervised response, is filtered instead of trained on.
     window_mask = loss_mask[feature_start:feature_end]
+    min_feature_rows = int(_config_value(config, "min_feature_rows", 1))
+    if window_mask.numel() < min_feature_rows:
+        raise SampleFilteredError(
+            f"Producer sample {sample_id!r} has {window_mask.numel()} feature rows, "
+            f"below the algorithm minimum of {min_feature_rows}"
+        )
     response_block_size = int(_config_value(config, "response_block_size", 0) or 0)
     if response_block_size and window_mask.numel() <= response_block_size:
         raise SampleFilteredError(

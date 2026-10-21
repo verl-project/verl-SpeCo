@@ -489,3 +489,19 @@ def test_non_utf8_non_parquet_input_has_actionable_error(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="not UTF-8 JSONL or a Parquet file"):
         list(input_reader.iter_input_records(input_path))
+
+
+@pytest.mark.parametrize("feature_rows", [2, 3, 5])
+def test_minimum_feature_rows_applies_after_window_selection(feature_rows):
+    kwargs = dict(
+        sequence_no=0, sample_id="eagle3", prompt_length=2,
+        full_ids=list(range(6)), source_metadata={},
+        config={"min_feature_rows": 3, "min_supervised_tokens": 1,
+                "max_feature_length": feature_rows},
+    )
+    if feature_rows < 3:
+        with pytest.raises(input_reader.SampleFilteredError, match="2 feature rows"):
+            input_reader._build_tokenized_request(**kwargs)
+    else:
+        request = input_reader._build_tokenized_request(**kwargs)
+        assert request.feature_positions.numel() == feature_rows
