@@ -128,7 +128,9 @@ def test_eagle3_lk_metrics_ignore_log_cadence(standalone_metrics, lk_loss_type):
                               _reduce_training_metric=lambda value: value,
                               _block_drafter_config_value=lambda key, default: default)
     for name in ("reset_training_metrics", "_block_drafter_metric_prefix",
-                 "_record_dflash_training_metrics", "get_training_metrics"):
+                 "_pack_training_diagnostics", "_accumulate_training_diagnostics",
+                 "_summarize_step_metrics", "_record_dflash_training_metrics",
+                 "get_training_metrics"):
         setattr(trainer, name, MethodType(load_function(trainer_path, name), trainer))
     trainer.reset_training_metrics()
     trainer._record_dflash_training_metrics({"diagnostics": diagnostics})

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Standalone vLLM target-feature Producer writing directly to TransferQueue."""
+"""Standalone vLLM Producer with batched Ray hidden references or legacy TQ features."""
 
 from __future__ import annotations
 
@@ -19,10 +19,11 @@ import asyncio
 import logging
 import math
 import os
+import numpy as np
 import time
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from functools import partial
 from typing import Any, Mapping
 
@@ -40,6 +41,7 @@ from verl_speco.producer.hidden_states_store import (
 from verl_speco.producer.input_reader import (
     GenerationRequest,
     SampleFilteredError,
+    ShuffledJsonlReader,
     TokenizedRequest,
     build_render_fn,
     iter_input_records,
@@ -51,6 +53,7 @@ from verl_speco.producer.input_reader import (
 from verl_speco.producer.metrics import producer_window_metrics
 from verl_speco.producer.vllm_feature_client import (
     RawVllmFeature,
+    VllmResponse,
     VllmEndpoint,
     VllmFeatureClientPool,
     delete_temporary_result,
@@ -64,6 +67,7 @@ from verl_speco.trainer.target_feature_replay import (
     feature_from_vllm_payload,
     load_vllm_final_norm,
 )
+from verl_speco.trainer.tq_retry import retry_io
 from verl_speco.transport.drafter_sample_protocol import (
     DRAFTER_TQ_PARTITION,
     PROTOCOL_SCHEMA_VERSION,
@@ -72,6 +76,7 @@ from verl_speco.transport.drafter_sample_protocol import (
     is_ready_sample_tag,
     make_eos_record,
     make_ready_tag,
+    make_reference_tag,
     make_sample_key,
 )
 
@@ -99,17 +104,24 @@ class ProducerStats:
 @dataclass(frozen=True)
 class PreparedFeature:
     request: TokenizedRequest
-    raw: RawVllmFeature
-    sample: DraftFeatureSample
+    raw: RawVllmFeature | VllmResponse
+    sample: DraftFeatureSample | None
     metadata: SampleMetadata
     timing: dict[str, float]
+    reference_tag: dict[str, Any] | None = None
 
 
 def _encode_publish_payload(
     result: PreparedFeature,
-) -> tuple[str, dict[str, torch.Tensor], dict[str, Any], float]:
+) -> tuple[str, dict[str, torch.Tensor] | None, dict[str, Any], float]:
     encode_started = time.monotonic()
     key = make_sample_key(result.metadata)
+    if result.reference_tag is not None:
+        return key, None, result.reference_tag, time.monotonic() - encode_started
+    if result.sample is None:
+        raise ValueError(
+            "Feature publishing requires a sample or a hidden reference tag"
+        )
     fields = encode_sample(result.sample, result.metadata)
     tag = make_ready_tag(result.metadata)
     encode_seconds = time.monotonic() - encode_started
@@ -119,19 +131,29 @@ def _encode_publish_payload(
 def _put_sample_sync(
     transport: Any,
     key: str,
-    fields: dict[str, torch.Tensor],
+    fields: dict[str, torch.Tensor] | None,
     tag: dict[str, Any],
 ) -> None:
-    transport.put_sample(key, fields, tag=tag)
+    if fields is None:
+        transport.put_metadata(key, tag=tag)
+    else:
+        transport.put_sample(key, fields, tag=tag)
 
 
 def _cleanup_result_sync(result: PreparedFeature) -> float:
     cleanup_started = time.monotonic()
-    delete_temporary_result(result.raw)
+    if result.reference_tag is None:
+        delete_temporary_result(result.raw)
     return time.monotonic() - cleanup_started
 
 
-async def _delete_result_best_effort(result: RawVllmFeature) -> None:
+def _as_vllm_reference(result: RawVllmFeature | VllmResponse) -> VllmResponse:
+    if not isinstance(result, VllmResponse):
+        raise TypeError("hidden reference publish requires a vLLM reference result")
+    return result
+
+
+async def _delete_result_best_effort(result: RawVllmFeature | VllmResponse) -> None:
     """Best-effort cleanup for call sites without a retry policy.
 
     ``HiddenStatesStore.release`` propagates deletion failures so the publish
@@ -142,9 +164,9 @@ async def _delete_result_best_effort(result: RawVllmFeature) -> None:
         await asyncio.to_thread(delete_temporary_result, result)
     except Exception as exc:  # noqa: BLE001 - cleanup must not break the producer
         logger.warning(
-            "Standalone TQ Producer best-effort temporary cleanup failed; "
+            "Standalone Producer best-effort temporary cleanup failed; "
             "ignoring path=%s error=%r",
-            result.temporary_path,
+            getattr(result, "temporary_path", getattr(result, "reference", "")),
             exc,
         )
 
@@ -179,7 +201,7 @@ async def publish_one(
                 raise
             delay = retry_backoff_seconds * (2 ** (attempt - 1))
             logger.warning(
-                "Standalone TQ Producer publish retry sample_id=%s sequence_no=%s "
+                "Standalone Producer publish retry sample_id=%s sequence_no=%s "
                 "attempt=%s/%s retry_in=%.3fs error=%r",
                 result.request.sample_id,
                 result.request.sequence_no,
@@ -210,22 +232,28 @@ async def publish_one(
         except Exception as exc:  # noqa: BLE001
             if cleanup_attempt >= _CLEANUP_MAX_ATTEMPTS:
                 logger.warning(
-                    "Standalone TQ Producer temporary cleanup failed; ignoring "
+                    "Standalone Producer temporary cleanup failed; ignoring "
                     "sample_id=%s sequence_no=%s path=%s attempts=%s error=%r",
                     result.request.sample_id,
                     result.request.sequence_no,
-                    result.raw.temporary_path,
+                    getattr(
+                        result.raw,
+                        "temporary_path",
+                        getattr(result.raw, "reference", ""),
+                    ),
                     cleanup_attempt,
                     exc,
                 )
                 break
             delay = retry_backoff_seconds * (2 ** (cleanup_attempt - 1))
             logger.warning(
-                "Standalone TQ Producer temporary cleanup retry sample_id=%s "
+                "Standalone Producer temporary cleanup retry sample_id=%s "
                 "sequence_no=%s path=%s attempt=%s/%s retry_in=%.3fs error=%r",
                 result.request.sample_id,
                 result.request.sequence_no,
-                result.raw.temporary_path,
+                getattr(
+                    result.raw, "temporary_path", getattr(result.raw, "reference", "")
+                ),
                 cleanup_attempt,
                 _CLEANUP_MAX_ATTEMPTS,
                 delay,
@@ -241,6 +269,48 @@ async def publish_one(
         published_attempt,
         retry_wait_seconds,
     )
+
+
+def _assert_resume_shuffle_alignment(
+    resume_metadata: dict[str, Any] | None,
+    *,
+    shuffle: bool,
+    shuffle_seed: int,
+    consumed_sequence_nos: set[int],
+) -> None:
+    """Refuse a resume whose checkpoint was written under another shuffle config.
+
+    Consumed sequence numbers are positions in the per-epoch permutations, so
+    changing shuffle settings between runs silently duplicates or skips
+    samples instead of failing loudly. A legacy checkpoint that predates the
+    saved shuffle metadata cannot be verified either: with existing consumed
+    progress the original (sequential) ordering is the only safe replay, so a
+    shuffled resume is rejected. An empty progress set is a fresh run and may
+    start shuffled freely.
+    """
+    saved = (resume_metadata or {}).get("producer_shuffle")
+    if saved is None:
+        if shuffle and consumed_sequence_nos:
+            raise ValueError(
+                "Standalone resume checkpoint has consumed progress "
+                f"({len(consumed_sequence_nos)} sequence numbers) but predates "
+                "shuffle metadata, so its ordering cannot be verified: with "
+                "shuffle=true the replayed permutation would silently skip "
+                "unconsumed samples and repeat consumed ones. Keep "
+                "shuffle=false to continue this run, or clear the resume "
+                "checkpoint to start a fresh data-progress run."
+            )
+        return
+    saved_shuffle = bool(saved.get("shuffle", False))
+    saved_seed = int(saved.get("shuffle_seed", 42))
+    if saved_shuffle != shuffle or (shuffle and saved_seed != shuffle_seed):
+        raise ValueError(
+            "Standalone resume shuffle config changed since the checkpoint was "
+            f"saved: saved shuffle={saved_shuffle} shuffle_seed={saved_seed}, "
+            f"current shuffle={shuffle} shuffle_seed={shuffle_seed}; consumed "
+            "sequence numbers are permutation positions and would silently "
+            "misalign"
+        )
 
 
 def _read_on_missing_response(producer_cfg: Any) -> str:
@@ -279,6 +349,18 @@ def validate_producer_config(config: Any) -> str:
     missing = [name for name in required if not producer_cfg.get(name)]
     if missing:
         raise ValueError(f"standalone_tq_producer missing required fields: {missing}")
+    if bool(producer_cfg.get("shuffle", False)):
+        input_path = str(producer_cfg.get("input_path") or "")
+        if input_path.lower().endswith((".parquet", ".pq")):
+            # No bounded shuffled Parquet reader exists: rows have no cheap
+            # byte offsets to index, so shuffling would materialize the whole
+            # dataset before the first request. Fail at startup instead of
+            # taking that path silently.
+            raise ValueError(
+                "standalone_tq_producer.shuffle=true requires a line-seekable "
+                f"JSONL input, got Parquet {input_path!r}; convert the input "
+                "to JSONL or set shuffle=false"
+            )
     endpoints = producer_cfg.get("vllm_endpoints")
     if not isinstance(endpoints, list) or not endpoints or not all(endpoints):
         raise ValueError(
@@ -300,7 +382,7 @@ def validate_producer_config(config: Any) -> str:
         producer_cfg.get("vllm_aux_hidden_state_layer_ids"),
     )
     if bool(training_cfg.get("use_logits", False)):
-        raise ValueError("Standalone TQ Producer does not support use_logits=true")
+        raise ValueError("Standalone Producer does not support use_logits=true")
     if int(tq_cfg.get("schema_version", 0)) != PROTOCOL_SCHEMA_VERSION:
         raise ValueError(
             f"transfer_queue.schema_version must be {PROTOCOL_SCHEMA_VERSION}"
@@ -371,7 +453,9 @@ def _tensor_bytes(value: Any) -> int:
     return 0
 
 
-def _sample_bytes(sample: DraftFeatureSample) -> int:
+def _sample_bytes(sample: DraftFeatureSample | None) -> int:
+    if sample is None:
+        return 0
     return sum(
         _tensor_bytes(getattr(sample, name))
         for name in (
@@ -391,25 +475,45 @@ def _format_perf_sample(row: Mapping[str, Any]) -> str:
     return (
         f"sample_id={row['sample_id']} sequence_no={row['sequence_no']} "
         f"endpoint={row['endpoint']} prompt_tokens={row['prompt_tokens']} "
-        f"generated_tokens={row['generated_tokens']} hidden_state_mb={row['mb']:.2f} "
+        f"generated_tokens={row['generated_tokens']} tensor_payload_mb={row['mb']:.2f} "
         f"e2e={_timing_value(timing, 'e2e'):.3f}s "
         f"input_prepare={_timing_value(timing, 'input_prepare'):.3f}s "
         f"input_queue={_timing_value(timing, 'input_queue'):.3f}s "
         f"scheduler_wait={_timing_value(timing, 'scheduler_wait'):.3f}s "
-        f"tq_capacity={_timing_value(timing, 'tq_capacity'):.3f}s "
+        f"publish_capacity={_timing_value(timing, 'publish_capacity'):.3f}s "
         f"generate={_timing_value(timing, 'generate'):.3f}s "
         f"prefill={_timing_value(timing, 'prefill'):.3f}s "
         f"feature_slot={_timing_value(timing, 'feature_slot'):.3f}s "
         f"conversion={_timing_value(timing, 'conversion'):.3f}s "
         f"publish_queue={_timing_value(timing, 'publish_queue'):.3f}s "
-        f"tq_encode={_timing_value(timing, 'tq_encode'):.3f}s "
-        f"tq_transport={_timing_value(timing, 'tq_transport'):.3f}s "
-        f"tq_attempts={int(_timing_value(timing, 'tq_attempts'))} "
-        f"tq_retry_wait={_timing_value(timing, 'tq_retry_wait'):.3f}s "
+        f"publish_encode={_timing_value(timing, 'publish_encode'):.3f}s "
+        f"publish_transport={_timing_value(timing, 'publish_transport'):.3f}s "
+        f"publish_attempts={int(_timing_value(timing, 'publish_attempts'))} "
+        f"publish_retry_wait={_timing_value(timing, 'publish_retry_wait'):.3f}s "
         f"temp_cleanup={_timing_value(timing, 'temp_cleanup'):.3f}s "
         f"active={_timing_value(timing, 'active'):.3f}s "
         f"backpressure={_timing_value(timing, 'backpressure'):.3f}s"
     )
+
+
+async def _collect_reference_batch(
+    queue, first, batch_size: int, *, timeout: float = 0.2
+):
+    """Collect one training batch, flushing partial data on timeout or EOS."""
+    batch = [first]
+    deadline = time.monotonic() + timeout
+    while len(batch) < batch_size:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            item = await asyncio.wait_for(queue.get(), remaining)
+        except TimeoutError:
+            break
+        if item is _PUBLISH_DONE:
+            return batch, True
+        batch.append(item)
+    return batch, False
 
 
 async def run_producer(
@@ -420,15 +524,19 @@ async def run_producer(
     client_pool: Any | None = None,
     before_request: Any | None = None,
     on_published: Any | None = None,
+    on_references: Any | None = None,
+    reference_batch_size: int = 1,
     on_metrics: Any | None = None,
     get_runtime_state: Any | None = None,
 ) -> ProducerStats:
-    """Run the bounded input -> vLLM -> TQ pipeline and publish EOS on success."""
+    """Run the bounded input -> vLLM -> publication pipeline."""
 
     on_missing_response = validate_producer_config(config)
     producer_cfg, drafter_cfg, tq_cfg = _config_sections(config)
     run_id = str(tq_cfg["run_id"])
     stats = ProducerStats()
+    if reference_batch_size < 1:
+        raise ValueError("reference_batch_size must be positive")
     max_consecutive_feature_drops = config_int(
         producer_cfg, "max_consecutive_feature_drops", 20
     )
@@ -441,41 +549,48 @@ async def run_producer(
     publish_executor: ThreadPoolExecutor | None = None
     try:
         logger.info(
-            "Standalone TQ Producer starting run_id=%s input=%s endpoints=%s",
+            "Standalone Producer starting run_id=%s input=%s endpoints=%s",
             run_id,
             producer_cfg["input_path"],
             producer_cfg["vllm_endpoints"],
         )
-        if not transport.configure_transfer_queue(tq_cfg):
-            raise RuntimeError("Standalone TQ Producer requires TransferQueue==0.1.10")
-        ray_cfg = tq_cfg["ray"]
-        logger.info(
-            "Standalone TQ Producer connecting Ray address=%s namespace=%s",
-            ray_cfg["address"],
-            ray_cfg.get("namespace"),
-        )
-        transport.connect_ray_cluster(
-            str(ray_cfg["address"]),
-            str(ray_cfg["namespace"]) if ray_cfg.get("namespace") else None,
-        )
-        logger.info("Standalone TQ Producer connected Ray; initializing TQ client")
-        transport.connect_transfer_queue_client()
-        connected = True
-        logger.info("Standalone TQ Producer connected TQ; waiting for owner_ready")
-        await _wait_for_owner_ready(
-            transport,
-            run_id,
-            timeout=float(producer_cfg["owner_ready_timeout_seconds"]),
-            poll_interval=float(producer_cfg["pending_poll_interval_seconds"]),
-        )
-        logger.info("Standalone TQ Producer observed owner_ready run_id=%s", run_id)
+        if on_references is None:
+            if not transport.configure_transfer_queue(tq_cfg):
+                raise RuntimeError("Standalone Producer requires TransferQueue==0.1.10")
+            ray_cfg = tq_cfg["ray"]
+            logger.info(
+                "Standalone Producer connecting Ray address=%s namespace=%s",
+                ray_cfg["address"],
+                ray_cfg.get("namespace"),
+            )
+            transport.connect_ray_cluster(
+                str(ray_cfg["address"]),
+                str(ray_cfg["namespace"]) if ray_cfg.get("namespace") else None,
+            )
+            logger.info("Standalone Producer connected Ray; initializing TQ client")
+            transport.connect_transfer_queue_client()
+            connected = True
+            logger.info("Standalone Producer connected TQ; waiting for owner_ready")
+            await _wait_for_owner_ready(
+                transport,
+                run_id,
+                timeout=float(producer_cfg["owner_ready_timeout_seconds"]),
+                poll_interval=float(producer_cfg["pending_poll_interval_seconds"]),
+            )
+            logger.info("Standalone Producer observed owner_ready run_id=%s", run_id)
 
         consumed_sequence_nos, resume_metadata = load_standalone_resume(
             producer_cfg.get("resume_checkpoint_path"),
             input_path=str(producer_cfg["input_path"]),
         )
+        _assert_resume_shuffle_alignment(
+            resume_metadata,
+            shuffle=bool(producer_cfg.get("shuffle", False)),
+            shuffle_seed=int(producer_cfg.get("shuffle_seed", 42)),
+            consumed_sequence_nos=consumed_sequence_nos,
+        )
         logger.info(
-            "Standalone TQ Producer resume progress checkpoint=%s consumed=%s step=%s",
+            "Standalone Producer resume progress checkpoint=%s consumed=%s step=%s",
             producer_cfg.get("resume_checkpoint_path"),
             len(consumed_sequence_nos),
             None if resume_metadata is None else resume_metadata.get("optimizer_step"),
@@ -483,11 +598,11 @@ async def run_producer(
 
         if tokenizer is None:
             logger.info(
-                "Standalone TQ Producer loading tokenizer path=%s",
+                "Standalone Producer loading tokenizer path=%s",
                 producer_cfg["tokenizer_path"],
             )
             tokenizer = await asyncio.to_thread(_load_tokenizer, producer_cfg)
-            logger.info("Standalone TQ Producer tokenizer loaded")
+            logger.info("Standalone Producer tokenizer loaded")
         if pool is None:
             endpoint_concurrency = int(producer_cfg["per_endpoint_concurrency"])
             pool = VllmFeatureClientPool(
@@ -506,12 +621,14 @@ async def run_producer(
                 ),
             )
         await pool.start()
-        logger.info("Standalone TQ Producer vLLM client pool started")
+        logger.info("Standalone Producer vLLM client pool started")
 
         algorithm = str(drafter_cfg["speculative_algorithm"]).strip().upper()
         # Only standalone DFlash/DSpark use a response-only feature budget.
         producer_cfg = dict(producer_cfg)
         producer_cfg["response_feature_budget"] = algorithm in {"DFLASH", "DSPARK"}
+        # EAGLE3 shifts away two feature rows before computing its loss.
+        producer_cfg["min_feature_rows"] = 3 if algorithm == "EAGLE3" else 1
         producer_cfg["min_response_feature_rows"] = _minimum_response_feature_rows(
             drafter_cfg
         )
@@ -540,8 +657,24 @@ async def run_producer(
             use_logits=False,
             require_full_alignment=True,
         )
+        hidden_references = (tq_cfg.get("expected_feature") or {}).get(
+            "payload_kind"
+        ) == "vllm_reference"
+        if on_references is not None and not hidden_references:
+            raise ValueError(
+                "Ray metadata publication requires hidden reference payloads"
+            )
         final_norm = None
-        if feature_contract.hidden_states_layout.endswith("_plus_last"):
+        if hidden_references:
+            feature_contract = replace(
+                feature_contract,
+                target_num_hidden_layers=await asyncio.to_thread(
+                    _load_target_depth,
+                    feature_contract.target_model_id,
+                    bool(producer_cfg.get("trust_remote_code", False)),
+                ),
+            )
+        elif feature_contract.hidden_states_layout.endswith("_plus_last"):
             final_norm = await asyncio.to_thread(
                 load_vllm_final_norm,
                 feature_contract.target_model_id,
@@ -560,13 +693,17 @@ async def run_producer(
             max_workers=_FEATURE_CONVERSION_WORKERS,
             thread_name_prefix="speco-feature",
         )
-        publish_workers = int(producer_cfg.get("publish_workers", 4))
+        publish_workers = (
+            1
+            if on_references is not None
+            else int(producer_cfg.get("publish_workers", 4))
+        )
         publish_executor = ThreadPoolExecutor(
             max_workers=publish_workers,
             thread_name_prefix="speco-publish",
         )
         logger.info(
-            "Standalone TQ Producer pipeline workers requests=%s features=%s "
+            "Standalone Producer pipeline workers requests=%s features=%s "
             "publishers=%s",
             int(producer_cfg["max_inflight_requests"]),
             _FEATURE_CONVERSION_WORKERS,
@@ -583,6 +720,7 @@ async def run_producer(
         )
         stages: dict[str, tuple[str, float, str]] = {}
         sample_timings: dict[int, dict[str, float]] = {}
+        unsubmitted_references: dict[str, VllmResponse] = {}
         perf_rows: list[dict[str, Any]] = []
         perf_window_started = time.monotonic()
         peak_publish_queue = 0
@@ -596,13 +734,13 @@ async def run_producer(
         # (default) skip behaviour is not silent.
         if on_missing_response == "skip":
             logger.warning(
-                "Standalone TQ Producer will skip prompt-only rows "
+                "Standalone Producer will skip prompt-only rows "
                 "(on_missing_response=skip); set on_missing_response=generate to "
                 "teacher-target them instead"
             )
         else:
             logger.info(
-                "Standalone TQ Producer will generate responses for prompt-only "
+                "Standalone Producer will generate responses for prompt-only "
                 "rows (on_missing_response=generate)"
             )
 
@@ -625,11 +763,11 @@ async def run_producer(
                     reverse=True,
                 )[:3]
                 logger.info(
-                    "Standalone TQ Producer heartbeat state=%s inputs=%s "
+                    "Standalone Producer heartbeat state=%s inputs=%s "
                     "published=%s filtered=%s dropped=%s request_failed=%s "
                     "input_rate=%.2f/s "
                     "publish_rate=%.2f/s input_queue=%s/%s publish_queue=%s/%s "
-                    "pending_bytes=%s seconds_since_publish=%.0f stages=%s oldest=%s",
+                    "pending_tensor_bytes=%s seconds_since_publish=%.0f stages=%s oldest=%s",
                     get_runtime_state() if get_runtime_state is not None else "running",
                     stats.input_count,
                     stats.published_count,
@@ -655,6 +793,28 @@ async def run_producer(
                 last_heartbeat_at = now
 
         def iter_requests():
+            shuffle = bool(producer_cfg.get("shuffle", False))
+            shuffle_seed = int(producer_cfg.get("shuffle_seed", 42))
+            shuffled_reader: ShuffledJsonlReader | None = None
+            if shuffle:
+                # Parquet+shuffle is rejected up front in
+                # validate_producer_config; ShuffledInputUnsupportedError here
+                # only fires for Parquet content behind a non-Parquet name.
+                shuffled_reader = ShuffledJsonlReader(
+                    str(producer_cfg["input_path"]),
+                    on_error=str(producer_cfg.get("on_error", "skip") or "skip"),
+                    max_consecutive_errors=config_int(
+                        producer_cfg, "max_consecutive_errors", 20
+                    ),
+                    parser_strict_roles=bool(
+                        producer_cfg.get("parser_strict_roles", False)
+                    ),
+                )
+                logger.info(
+                    "Standalone TQ Producer indexed %s JSONL lines for shuffle_seed=%s",
+                    shuffled_reader.record_count,
+                    shuffle_seed,
+                )
             epoch = 0
             source_sequence_no = 0
             render_boundary_cfg = producer_cfg.get("render_boundary", {}) or {}
@@ -670,24 +830,36 @@ async def run_producer(
                     timeout=float(render_boundary_cfg.get("timeout", 10.0) or 10.0),
                 )
                 logger.info(
-                    "Standalone TQ Producer using render-boundary loss masks "
-                    "endpoint=%s",
+                    "Standalone Producer using render-boundary loss masks endpoint=%s",
                     endpoints[0],
                 )
             while True:
                 scanned_count = 0
                 considered_count = 0
                 produced_count = 0
-                for source_record in iter_input_records(
-                    str(producer_cfg["input_path"]),
-                    on_error=str(producer_cfg.get("on_error", "skip") or "skip"),
-                    max_consecutive_errors=config_int(
-                        producer_cfg, "max_consecutive_errors", 20
-                    ),
-                    parser_strict_roles=bool(
-                        producer_cfg.get("parser_strict_roles", False)
-                    ),
-                ):
+                if shuffled_reader is not None:
+                    # Deterministic per-epoch permutation (seed + epoch), so a
+                    # resumed run replays the same order and the consumed
+                    # sequence set stays aligned across restarts. Uses the
+                    # speculators RNG recipe (NumPy default_rng(seed + epoch)
+                    # .permutation, cf. distributed_batch_sampler) so the same
+                    # seed produces the same order there and here.
+                    record_order = np.random.default_rng(
+                        shuffle_seed + epoch
+                    ).permutation(shuffled_reader.record_count)
+                    record_iter = shuffled_reader.iter_records(record_order)
+                else:
+                    record_iter = iter_input_records(
+                        str(producer_cfg["input_path"]),
+                        on_error=str(producer_cfg.get("on_error", "skip") or "skip"),
+                        max_consecutive_errors=config_int(
+                            producer_cfg, "max_consecutive_errors", 20
+                        ),
+                        parser_strict_roles=bool(
+                            producer_cfg.get("parser_strict_roles", False)
+                        ),
+                    )
+                for source_record in record_iter:
                     sequence_no = source_sequence_no
                     source_sequence_no += 1
                     scanned_count += 1
@@ -735,7 +907,7 @@ async def run_producer(
                     except SampleFilteredError as exc:
                         stats.filtered_count += 1
                         logger.warning(
-                            "Standalone TQ Producer filtered sample "
+                            "Standalone Producer filtered sample "
                             "sequence_no=%s sample_id=%s filtered=%s reason=%s",
                             sequence_no,
                             record.sample_id,
@@ -746,13 +918,13 @@ async def run_producer(
                     produced_count += 1
                     yield request
                 if scanned_count == 0:
-                    raise ValueError("Standalone TQ Producer input contains no samples")
+                    raise ValueError("Standalone Producer input contains no samples")
                 if produced_count == 0 and considered_count > 0 and max_samples > 0:
                     # Only rows that were not already consumed count: an epoch
                     # that is entirely resume-skipped must advance to the next
                     # one instead of aborting the run.
                     raise ValueError(
-                        "Standalone TQ Producer filtered every newly considered "
+                        "Standalone Producer filtered every newly considered "
                         f"sample (scanned={scanned_count}, "
                         f"resumed={scanned_count - considered_count}) but still "
                         f"needs max_samples={max_samples}; refusing to rescan "
@@ -762,7 +934,7 @@ async def run_producer(
                     return
                 epoch += 1
                 logger.info(
-                    "Standalone TQ Producer restarting input epoch=%s attempts=%s "
+                    "Standalone Producer restarting input epoch=%s attempts=%s "
                     "target_published=%s",
                     epoch,
                     stats.input_count,
@@ -792,7 +964,7 @@ async def run_producer(
             stats.input_count += 1
             if _should_log_sample_progress(stats.input_count):
                 logger.info(
-                    "Standalone TQ Producer queued input count=%s sample_id=%s",
+                    "Standalone Producer queued input count=%s sample_id=%s",
                     stats.input_count,
                     request.sample_id,
                 )
@@ -817,7 +989,7 @@ async def run_producer(
             for _ in range(worker_count):
                 await input_queue.put(_INPUT_DONE)
             logger.info(
-                "Standalone TQ Producer input exhausted total=%s", stats.input_count
+                "Standalone Producer input exhausted total=%s", stats.input_count
             )
             stages.pop("input", None)
 
@@ -840,7 +1012,7 @@ async def run_producer(
                 and consecutive_replacements > max_consecutive_feature_drops
             ):
                 message = (
-                    "Standalone TQ Producer exceeded "
+                    "Standalone Producer exceeded "
                     f"max_consecutive_feature_drops={max_consecutive_feature_drops} "
                     "consecutive replacements without a successful feature "
                     "conversion; aborting instead of requesting replacement "
@@ -857,7 +1029,7 @@ async def run_producer(
             if replacement is _INPUT_DONE:
                 return None
             logger.info(
-                "Standalone TQ Producer requesting replacement sample "
+                "Standalone Producer requesting replacement sample "
                 "sequence_no=%s sample_id=%s",
                 replacement.sequence_no,
                 replacement.sample_id,
@@ -877,7 +1049,7 @@ async def run_producer(
             stats.request_failed_count += 1
             sample_timings.pop(int(request.sequence_no), None)
             logger.error(
-                "Standalone TQ Producer dropped sample after vLLM %s failure "
+                "Standalone Producer dropped sample after vLLM %s failure "
                 "sequence_no=%s sample_id=%s failed=%s",
                 stage,
                 request.sequence_no,
@@ -914,11 +1086,11 @@ async def run_producer(
                         mark_stage(worker, "scheduler_paused", request.sample_id)
                     await before_request()
                     timing["scheduler_wait"] = time.monotonic() - scheduler_wait_started
-                mark_stage(worker, "tq_capacity", request.sample_id)
+                mark_stage(worker, "publish_capacity", request.sample_id)
                 capacity_started = time.monotonic()
                 # The scheduled Ray path applies high/low-watermark control in
                 # the Driver. Keep legacy polling only for the subprocess path.
-                if before_request is None:
+                if before_request is None and on_references is None:
                     await _wait_for_pending_capacity(
                         transport,
                         run_id,
@@ -927,10 +1099,10 @@ async def run_producer(
                             producer_cfg["pending_poll_interval_seconds"]
                         ),
                     )
-                timing["tq_capacity"] = time.monotonic() - capacity_started
+                timing["publish_capacity"] = time.monotonic() - capacity_started
                 if _should_log_sample_progress(int(request.sequence_no) + 1):
                     logger.info(
-                        "Standalone TQ Producer requesting vLLM sequence_no=%s "
+                        "Standalone Producer requesting vLLM sequence_no=%s "
                         "sample_id=%s mode=%s",
                         request.sequence_no,
                         request.sample_id,
@@ -942,7 +1114,11 @@ async def run_producer(
                     mark_stage(worker, "vllm_generate", request.sample_id)
                     generate_started = time.monotonic()
                     try:
-                        generated = await pool.generate(request)
+                        generated = await (
+                            pool.generate_reference(request)
+                            if hidden_references
+                            else pool.generate(request)
+                        )
                     except Exception as exc:  # noqa: BLE001 - keep the producer alive
                         timing["generate"] = time.monotonic() - generate_started
                         account_request_failure(request, exc, stage="generate")
@@ -960,7 +1136,7 @@ async def run_producer(
                             stats.filtered_count += 1
                             sample_timings.pop(int(request.sequence_no), None)
                             logger.warning(
-                                "Standalone TQ Producer filtered generated sample "
+                                "Standalone Producer filtered generated sample "
                                 "sequence_no=%s sample_id=%s filtered=%s reason=%s",
                                 request.sequence_no,
                                 request.sample_id,
@@ -977,41 +1153,52 @@ async def run_producer(
                 mark_stage(worker, "vllm_prefill", request.sample_id)
                 prefill_started = time.monotonic()
                 try:
-                    raw = await pool.prefill(request)
+                    raw = await (
+                        pool.prefill_reference(request)
+                        if hidden_references
+                        else pool.prefill(request)
+                    )
                 except Exception as exc:  # noqa: BLE001 - keep the producer alive
                     timing["prefill"] = time.monotonic() - prefill_started
                     account_request_failure(request, exc, stage="prefill")
                     replacement_request = await next_replacement(cause=exc)
                     continue
                 timing["prefill"] = time.monotonic() - prefill_started
-                stats.pending_bytes += int(raw.byte_size)
+                if hidden_references:
+                    reference = _as_vllm_reference(raw)
+                    unsubmitted_references[reference.reference] = reference
+                stats.pending_bytes += int(getattr(raw, "byte_size", 0))
                 peak_pending_bytes = max(peak_pending_bytes, stats.pending_bytes)
                 try:
-                    mark_stage(worker, "feature_conversion", request.sample_id)
-                    feature_slot_started = time.monotonic()
-                    async with feature_slots:
-                        timing["feature_slot"] = time.monotonic() - feature_slot_started
-                        conversion_started = time.monotonic()
-                        sample = await event_loop.run_in_executor(
-                            feature_executor,
-                            partial(
-                                feature_from_vllm_payload,
-                                raw,
-                                request,
-                                feature_contract,
-                                final_norm=final_norm,
-                            ),
-                        )
-                        timing["conversion"] = time.monotonic() - conversion_started
+                    sample = None
+                    if not hidden_references:
+                        mark_stage(worker, "feature_conversion", request.sample_id)
+                        feature_slot_started = time.monotonic()
+                        async with feature_slots:
+                            timing["feature_slot"] = (
+                                time.monotonic() - feature_slot_started
+                            )
+                            conversion_started = time.monotonic()
+                            sample = await event_loop.run_in_executor(
+                                feature_executor,
+                                partial(
+                                    feature_from_vllm_payload,
+                                    raw,
+                                    request,
+                                    feature_contract,
+                                    final_norm=final_norm,
+                                ),
+                            )
+                            timing["conversion"] = time.monotonic() - conversion_started
                 except HiddenStateAlignmentError as exc:
                     stats.dropped_count += 1
                     stats.pending_bytes = max(
-                        stats.pending_bytes - int(raw.byte_size), 0
+                        stats.pending_bytes - int(getattr(raw, "byte_size", 0)), 0
                     )
                     await _delete_result_best_effort(raw)
                     sample_timings.pop(int(request.sequence_no), None)
                     logger.warning(
-                        "Standalone TQ Producer dropped misaligned sample "
+                        "Standalone Producer dropped misaligned sample "
                         "sequence_no=%s sample_id=%s dropped=%s reason=%s",
                         request.sequence_no,
                         request.sample_id,
@@ -1034,6 +1221,13 @@ async def run_producer(
                             request, sample, feature_contract, run_id, tq_cfg
                         ),
                         timing=timing,
+                        reference_tag=(
+                            _reference_tag(
+                                request, raw, feature_contract, run_id, tq_cfg
+                            )
+                            if hidden_references
+                            else None
+                        ),
                     )
                 )
                 timing["publish_queue_wait"] = time.monotonic() - enqueue_started
@@ -1047,20 +1241,29 @@ async def run_producer(
             now = time.monotonic()
             window = max(now - perf_window_started, 1e-9)
             tracking_metrics = producer_window_metrics(perf_rows, window)
+            if on_references is not None:
+                logger.info(
+                    "Standalone Producer metadata samples=%s batch_size_avg=%.2f "
+                    "submit_avg=%.3fs enqueue_wait_avg=%.3fs",
+                    len(perf_rows),
+                    tracking_metrics["producer/metadata_batch_size"],
+                    tracking_metrics["producer/metadata_submit_time"],
+                    tracking_metrics["producer/publish_queue_wait_time"],
+                )
             timing_names = (
                 "e2e",
                 "input_prepare",
                 "input_queue",
                 "scheduler_wait",
-                "tq_capacity",
+                "publish_capacity",
                 "generate",
                 "prefill",
                 "feature_slot",
                 "conversion",
                 "publish_queue",
-                "tq_encode",
-                "tq_transport",
-                "tq_retry_wait",
+                "publish_encode",
+                "publish_transport",
+                "publish_retry_wait",
                 "temp_cleanup",
                 "active",
                 "backpressure",
@@ -1072,25 +1275,25 @@ async def run_producer(
             }
             e2e = [_timing_value(row["timing"], "e2e") for row in perf_rows]
             transport_times = [
-                _timing_value(row["timing"], "tq_transport") for row in perf_rows
+                _timing_value(row["timing"], "publish_transport") for row in perf_rows
             ]
             total_mb = sum(float(row["mb"]) for row in perf_rows)
             logger.info(
-                "Standalone TQ Producer perf samples=%s window=%.3fs rate=%.2f/s "
+                "Standalone Producer perf samples=%s window=%.3fs rate=%.2f/s "
                 "e2e_avg=%.3fs e2e_p95=%.3fs e2e_max=%.3fs "
                 "input_prepare_avg=%.3fs input_queue_avg=%.3fs "
-                "scheduler_wait_avg=%.3fs tq_capacity_avg=%.3fs "
+                "scheduler_wait_avg=%.3fs publish_capacity_avg=%.3fs "
                 "generate_avg=%.3fs prefill_avg=%.3fs "
                 "feature_slot_avg=%.3fs conversion_avg=%.3fs "
-                "publish_queue_avg=%.3fs tq_encode_avg=%.3fs "
-                "tq_transport_avg=%.3fs tq_transport_p95=%.3fs "
-                "tq_transport_max=%.3fs temp_cleanup_avg=%.3fs "
-                "tq_retry_wait_avg=%.3fs tq_retried_samples=%s "
-                "active_avg=%.3fs backpressure_avg=%.3fs hidden_state_mb=%.2f "
-                "hidden_state_mb_per_second=%.2f tq_transport_mb_per_second=%.2f "
+                "publish_queue_avg=%.3fs publish_encode_avg=%.3fs "
+                "publish_transport_avg=%.3fs publish_transport_p95=%.3fs "
+                "publish_transport_max=%.3fs temp_cleanup_avg=%.3fs "
+                "publish_retry_wait_avg=%.3fs publish_retried_samples=%s "
+                "active_avg=%.3fs backpressure_avg=%.3fs tensor_payload_mb=%.2f "
+                "tensor_payload_mb_per_second=%.2f tensor_payload_mb_per_transport_second=%.2f "
                 "prefill_tokens=%s prefill_tokens_per_second=%.2f "
                 "publish_queue_peak=%s "
-                "publish_inflight_peak=%s pending_mb_peak=%.2f",
+                "publish_inflight_peak=%s pending_tensor_mb_peak=%.2f",
                 len(perf_rows),
                 window,
                 len(perf_rows) / window,
@@ -1100,22 +1303,22 @@ async def run_producer(
                 averages["input_prepare"],
                 averages["input_queue"],
                 averages["scheduler_wait"],
-                averages["tq_capacity"],
+                averages["publish_capacity"],
                 averages["generate"],
                 averages["prefill"],
                 averages["feature_slot"],
                 averages["conversion"],
                 averages["publish_queue"],
-                averages["tq_encode"],
-                averages["tq_transport"],
+                averages["publish_encode"],
+                averages["publish_transport"],
                 _percentile(transport_times, 0.95),
                 max(transport_times),
                 averages["temp_cleanup"],
-                averages["tq_retry_wait"],
+                averages["publish_retry_wait"],
                 sum(
                     1
                     for row in perf_rows
-                    if _timing_value(row["timing"], "tq_attempts") > 1
+                    if _timing_value(row["timing"], "publish_attempts") > 1
                 ),
                 averages["active"],
                 averages["backpressure"],
@@ -1140,19 +1343,19 @@ async def run_producer(
             )[:2]
             slowest_transport = sorted(
                 perf_rows,
-                key=lambda row: _timing_value(row["timing"], "tq_transport"),
+                key=lambda row: _timing_value(row["timing"], "publish_transport"),
                 reverse=True,
             )[:2]
             logger.info(
-                "Standalone TQ Producer perf middle samples: %s",
+                "Standalone Producer perf middle samples: %s",
                 " | ".join(_format_perf_sample(row) for row in middle),
             )
             logger.info(
-                "Standalone TQ Producer perf slowest e2e samples: %s",
+                "Standalone Producer perf slowest e2e samples: %s",
                 " | ".join(_format_perf_sample(row) for row in slowest_e2e),
             )
             logger.info(
-                "Standalone TQ Producer perf slowest transport samples: %s",
+                "Standalone Producer perf slowest transport samples: %s",
                 " | ".join(_format_perf_sample(row) for row in slowest_transport),
             )
             perf_rows.clear()
@@ -1166,47 +1369,141 @@ async def run_producer(
             nonlocal last_published_at, publish_inflight, peak_publish_inflight
             current = asyncio.current_task()
             worker = current.get_name() if current is not None else "publisher-unknown"
+            buffered: deque[PreparedFeature] = deque()
+            ending = False
             while True:
                 mark_stage(worker, "publish_queue_get")
-                result = await publish_queue.get()
+                if on_references is not None and not buffered:
+                    if ending:
+                        stages.pop(worker, None)
+                        return
+                    first = await publish_queue.get()
+                    if first is _PUBLISH_DONE:
+                        stages.pop(worker, None)
+                        return
+                    batch, ending = await _collect_reference_batch(
+                        publish_queue,
+                        first,
+                        reference_batch_size,
+                    )
+                    buffered.extend(batch)
+                    entries = []
+                    for item in buffered:
+                        if item.reference_tag is None:
+                            raise ValueError(
+                                "Ray reference publication requires hidden reference metadata"
+                            )
+                        entries.append(
+                            {
+                                "key": make_sample_key(item.metadata),
+                                "tag": item.reference_tag,
+                            }
+                        )
+                    submitted_at = time.monotonic()
+                    for item in buffered:
+                        # Queue residence includes batching, but ends before the RPC.
+                        item.timing["publish_queue"] = submitted_at - item.timing.pop(
+                            "publish_queue_started"
+                        )
+                    mark_stage(worker, "metadata_submit", first.request.sample_id)
+                    publish_inflight += 1
+                    peak_publish_inflight = max(peak_publish_inflight, publish_inflight)
+                    try:
+                        publication = await on_references(entries)
+                        for item in buffered:
+                            unsubmitted_references.pop(
+                                _as_vllm_reference(item.raw).reference, None
+                            )
+                    finally:
+                        publish_inflight -= 1
+                    published_at = time.monotonic()
+                    publication = publication or {}
+                    for item in buffered:
+                        item.timing.update(
+                            {
+                                "publish_encode": 0.0,
+                                "publish_transport": float(
+                                    publication.get(
+                                        "transport_seconds", published_at - submitted_at
+                                    )
+                                ),
+                                "publish_retry_wait": float(
+                                    publication.get("retry_wait_seconds", 0.0)
+                                ),
+                                "publish_attempts": float(
+                                    publication.get("attempts", 1)
+                                ),
+                                "metadata_batch_size": float(len(entries)),
+                                "metadata_submit": published_at - submitted_at,
+                                "temp_cleanup": 0.0,
+                                "e2e": published_at - item.timing.pop("e2e_started"),
+                            }
+                        )
+                    if published_at - submitted_at >= 30:
+                        logger.warning(
+                            "Standalone Producer slow metadata submit samples=%s elapsed=%.1fs",
+                            len(entries),
+                            published_at - submitted_at,
+                        )
+                result = (
+                    buffered.popleft()
+                    if on_references is not None
+                    else await publish_queue.get()
+                )
                 if result is _PUBLISH_DONE:
                     stages.pop(worker, None)
                     return
-                result.timing["publish_queue"] = time.monotonic() - result.timing.pop(
-                    "publish_queue_started"
+                if on_references is None:
+                    result.timing["publish_queue"] = (
+                        time.monotonic() - result.timing.pop("publish_queue_started")
+                    )
+                mark_stage(
+                    worker,
+                    "publish_accounting"
+                    if on_references is not None
+                    else "publish_submit",
+                    result.request.sample_id,
                 )
-                mark_stage(worker, "tq_put", result.request.sample_id)
                 put_started = time.monotonic()
                 publish_inflight += 1
                 peak_publish_inflight = max(peak_publish_inflight, publish_inflight)
                 try:
-                    (
-                        _,
-                        encode_seconds,
-                        transport_seconds,
-                        cleanup_seconds,
-                        attempts,
-                        retry_wait_seconds,
-                    ) = await publish_one(
-                        result,
-                        transport,
-                        executor=publish_executor,
-                        max_attempts=int(producer_cfg.get("publish_max_attempts", 3)),
-                        retry_backoff_seconds=float(
-                            producer_cfg.get("publish_retry_backoff_seconds", 0.5)
-                        ),
-                    )
+                    if on_references is not None:
+                        encode_seconds = cleanup_seconds = retry_wait_seconds = 0.0
+                        transport_seconds = result.timing["publish_transport"]
+                        retry_wait_seconds = result.timing["publish_retry_wait"]
+                        attempts = int(result.timing["publish_attempts"])
+                    else:
+                        (
+                            _,
+                            encode_seconds,
+                            transport_seconds,
+                            cleanup_seconds,
+                            attempts,
+                            retry_wait_seconds,
+                        ) = await publish_one(
+                            result,
+                            transport,
+                            executor=publish_executor,
+                            max_attempts=int(
+                                producer_cfg.get("publish_max_attempts", 3)
+                            ),
+                            retry_backoff_seconds=float(
+                                producer_cfg.get("publish_retry_backoff_seconds", 0.5)
+                            ),
+                        )
                 finally:
                     publish_inflight -= 1
                 put_elapsed = time.monotonic() - put_started
-                result.timing["tq_encode"] = encode_seconds
-                result.timing["tq_transport"] = transport_seconds
-                result.timing["tq_attempts"] = float(attempts)
-                result.timing["tq_retry_wait"] = retry_wait_seconds
+                result.timing["publish_encode"] = encode_seconds
+                result.timing["publish_transport"] = transport_seconds
+                result.timing["publish_attempts"] = float(attempts)
+                result.timing["publish_retry_wait"] = retry_wait_seconds
                 result.timing["temp_cleanup"] = cleanup_seconds
-                result.timing["e2e"] = time.monotonic() - result.timing.pop(
-                    "e2e_started"
-                )
+                if on_references is None:
+                    result.timing["e2e"] = time.monotonic() - result.timing.pop(
+                        "e2e_started"
+                    )
                 result.timing["active"] = sum(
                     _timing_value(result.timing, name)
                     for name in (
@@ -1214,8 +1511,8 @@ async def run_producer(
                         "generate",
                         "prefill",
                         "conversion",
-                        "tq_encode",
-                        "tq_transport",
+                        "publish_encode",
+                        "publish_transport",
                         "temp_cleanup",
                     )
                 )
@@ -1224,30 +1521,34 @@ async def run_producer(
                     for name in (
                         "input_queue",
                         "scheduler_wait",
-                        "tq_capacity",
+                        "publish_capacity",
                         "feature_slot",
                         "publish_queue",
-                        "tq_retry_wait",
+                        "publish_retry_wait",
                     )
                 )
                 if put_elapsed >= 30:
                     logger.warning(
-                        "Standalone TQ Producer slow TQ put sample_id=%s elapsed=%.1fs",
+                        "Standalone Producer slow publish sample_id=%s elapsed=%.1fs",
                         result.request.sample_id,
                         put_elapsed,
+                    )
+                if hidden_references:
+                    unsubmitted_references.pop(
+                        _as_vllm_reference(result.raw).reference, None
                     )
                 stats.published_count += 1
                 last_published_at = time.monotonic()
                 if _should_log_sample_progress(stats.published_count):
                     logger.info(
-                        "Standalone TQ Producer published count=%s sequence_no=%s "
+                        "Standalone Producer published count=%s sequence_no=%s "
                         "sample_id=%s",
                         stats.published_count,
                         result.request.sequence_no,
                         result.request.sample_id,
                     )
                 stats.pending_bytes = max(
-                    stats.pending_bytes - int(result.raw.byte_size), 0
+                    stats.pending_bytes - int(getattr(result.raw, "byte_size", 0)), 0
                 )
                 sample_timings.pop(int(result.request.sequence_no), None)
                 perf_rows.append(
@@ -1298,7 +1599,7 @@ async def run_producer(
             if failure_task is not None and failure_error is not None:
                 stats.failed_count += 1
                 logger.error(
-                    "Standalone TQ Producer task failed task=%s stages=%s "
+                    "Standalone Producer task failed task=%s stages=%s "
                     "input_queue=%s publish_queue=%s",
                     failure_task.get_name(),
                     stages,
@@ -1322,6 +1623,20 @@ async def run_producer(
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, *request_tasks, return_exceptions=True)
+            for raw in unsubmitted_references.values():
+                try:
+                    await asyncio.to_thread(
+                        retry_io,
+                        partial(delete_temporary_result, raw),
+                        name="Unsubmitted hidden reference cleanup",
+                        retry_if=lambda exc: True,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to release unsubmitted hidden reference %s",
+                        raw.reference,
+                    )
+            unsubmitted_references.clear()
             window_metrics = log_perf_window(force=True)
             if window_metrics is not None and on_metrics is not None:
                 await on_metrics(stats.published_count, window_metrics)
@@ -1330,17 +1645,22 @@ async def run_producer(
 
         if stats.published_count == 0:
             logger.error(
-                "Standalone TQ Producer published no samples inputs=%s filtered=%s "
+                "Standalone Producer published no samples inputs=%s filtered=%s "
                 "dropped=%s; emitting EOS with total_samples=0",
                 stats.input_count,
                 stats.filtered_count,
                 stats.dropped_count,
             )
-        eos_key, eos_fields, eos_tag = make_eos_record(run_id, stats.published_count)
-        await asyncio.to_thread(transport.put_sample, eos_key, eos_fields, tag=eos_tag)
+        if on_references is None:
+            eos_key, eos_fields, eos_tag = make_eos_record(
+                run_id, stats.published_count
+            )
+            await asyncio.to_thread(
+                transport.put_sample, eos_key, eos_fields, tag=eos_tag
+            )
         completed = True
         logger.info(
-            "Standalone TQ Producer completed inputs=%s published=%s filtered=%s "
+            "Standalone Producer completed inputs=%s published=%s filtered=%s "
             "dropped=%s request_failed=%s failed=%s elapsed=%.3fs average_rate=%.2f/s",
             stats.input_count,
             stats.published_count,
@@ -1464,13 +1784,11 @@ async def _drain_pending_samples(
             )
         )
         if pending == 0:
-            logger.info(
-                "Standalone TQ Producer drained; the consumer cleared all samples"
-            )
+            logger.info("Standalone Producer drained; the consumer cleared all samples")
             return
         if asyncio.get_running_loop().time() >= deadline:
             logger.warning(
-                "Standalone TQ Producer drain timed out with %s unconsumed "
+                "Standalone Producer drain timed out with %s unconsumed "
                 "samples; closing the client may drop them",
                 pending,
             )
@@ -1478,9 +1796,43 @@ async def _drain_pending_samples(
         await asyncio.sleep(poll_interval)
 
 
+def _load_target_depth(model_path: str, trust_remote_code: bool) -> int:
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    return int(getattr(config, "text_config", config).num_hidden_layers)
+
+
+def _reference_tag(request, response, contract, run_id, tq_cfg):
+    values = asdict(contract)
+    values["dtype"] = str(contract.dtype)
+    return make_reference_tag(
+        _sample_metadata(request, None, contract, run_id, tq_cfg),
+        backend="mooncake" if response.is_handle else "file",
+        path=response.hidden_states_path,
+        handle=response.handle,
+        transfer_params=response.transfer_params,
+        request={
+            **{
+                name: getattr(request, name).tolist()
+                for name in (
+                    "input_ids",
+                    "loss_mask",
+                    "position_ids",
+                    "feature_positions",
+                    "draft_position_ids",
+                )
+            },
+            "vllm_prompt_token_ids": list(request.prompt_token_ids),
+            "source_metadata": request.source_metadata,
+        },
+        feature_contract=values,
+    )
+
+
 def _sample_metadata(
     request: TokenizedRequest,
-    sample: DraftFeatureSample,
+    sample: DraftFeatureSample | None,
     contract: FeatureContract,
     run_id: str,
     tq_cfg: Mapping[str, Any],
@@ -1534,7 +1886,7 @@ def _load_tokenizer(config: Mapping[str, Any]) -> Any:
     try:
         from transformers import AutoTokenizer
     except ImportError as exc:
-        raise RuntimeError("Standalone TQ Producer requires transformers") from exc
+        raise RuntimeError("Standalone Producer requires transformers") from exc
     return AutoTokenizer.from_pretrained(
         str(config["tokenizer_path"]),
         trust_remote_code=bool(config.get("trust_remote_code", False)),
@@ -1572,7 +1924,7 @@ def main() -> None:
     try:
         import hydra
     except ImportError as exc:
-        raise RuntimeError("Standalone TQ Producer requires hydra-core") from exc
+        raise RuntimeError("Standalone Producer requires hydra-core") from exc
     hydra.main(config_path="config", config_name="speco_base", version_base=None)(
         _hydra_main
     )()

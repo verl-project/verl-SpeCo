@@ -44,6 +44,7 @@ def save_standalone_resume(
     *,
     optimizer_step: int,
     input_path: str | os.PathLike[str],
+    producer_shuffle: dict[str, Any] | None = None,
 ) -> None:
     checkpoint_dir = Path(checkpoint_path)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -70,6 +71,15 @@ def save_standalone_resume(
         "consumed_sequence_file": CONSUMED_SEQUENCE_NAME,
         "input_fingerprint": build_input_fingerprint(input_path),
     }
+    if producer_shuffle is not None:
+        # Consumed sequence numbers are position-based, so their meaning
+        # depends on the producer shuffle settings that produced them. Saved
+        # here so a resumed Producer can refuse a mismatched configuration
+        # instead of silently reordering the stream.
+        metadata["producer_shuffle"] = {
+            "shuffle": bool(producer_shuffle.get("shuffle", False)),
+            "shuffle_seed": int(producer_shuffle.get("shuffle_seed", 42)),
+        }
     metadata_path = checkpoint_dir / RESUME_METADATA_NAME
     metadata_temporary = metadata_path.with_suffix(metadata_path.suffix + ".incomplete")
     metadata_temporary.write_text(
