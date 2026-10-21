@@ -757,6 +757,12 @@ class DSparkTrainingModel(DFlashTrainingModel):
                         active_target_hidden, lm_head_weight
                     )
                     ce_targets = active_target_logits.argmax(dim=-1)
+                    # Align the accuracy/acceptance diagnostics with the training
+                    # objective: measure draft argmax against the TARGET model's
+                    # argmax (the real speculative acceptance reference) rather
+                    # than the dataset label. This makes `sim_acc_len` the same
+                    # quantity that serving measures.
+                    active_targets = ce_targets
             if self.loss_mode in {"restricted_ce", "sampled_ce"}:
                 restricted_vocab = self._build_restricted_vocab(
                     input_ids, ce_targets, int(lm_head_weight.shape[0])

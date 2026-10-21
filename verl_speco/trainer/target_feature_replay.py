@@ -443,7 +443,7 @@ def feature_from_vllm_payload(
         )
 
     algorithm = str(feature_config.algorithm).strip().upper()
-    if algorithm not in {"EAGLE3", "DFLASH", "DSPARK"}:
+    if algorithm not in {"EAGLE3", "DFLASH", "DSPARK", "DSV4_DSPARK"}:
         raise ValueError(f"Unsupported vLLM feature algorithm {algorithm!r}")
     configured_vllm_ids = (
         feature_config.vllm_aux_hidden_state_layer_ids
@@ -638,7 +638,7 @@ class TargetFeatureReplayer:
             _config_value(self.replay_cfg, "strict_target_model_path", False)
         )
         self.algorithm = str(self.drafter_cfg.speculative_algorithm).upper()
-        if self.algorithm not in {"EAGLE3", "DFLASH", "DSPARK"}:
+        if self.algorithm not in {"EAGLE3", "DFLASH", "DSPARK", "DSV4_DSPARK"}:
             raise ValueError(
                 f"Token replay does not support drafter algorithm {self.algorithm!r}"
             )

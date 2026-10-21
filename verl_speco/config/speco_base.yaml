@@ -189,6 +189,10 @@ actor_rollout_ref:
         max_seq_len: 8192
         step: 10
         batch_size_per_gpu: 4
+        # DSV4 DSpark (also read by other drafters): when true, non-zero ranks
+        # skip loading the released drafter weights so rank 0 loads and
+        # file-shares them. It does NOT build the model on a meta device.
+        init_on_meta: false
         training_interval_steps: 5
         publish_interval_steps: 0
         # Async publish with freeze economics.enabled=true is rejected pending cost accounting.
@@ -338,6 +342,71 @@ actor_rollout_ref:
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
         dspark_debug_log_interval: 100
+        # DSV4-Flash DSpark (DeepSeek-V4-Flash sparse backbone: latent attention +
+        # sink + MoE + mHC). Standalone/offline (independent) training only.
+        # Unset keys fall back to the matching dspark_* value where applicable.
+        dsv4_dspark_block_size: 6
+        # Sampled draft anchors per step. 512 is memory-heavy under EP+DDP (the
+        # reference reports OOM); lower it (e.g. 256 or 4) if you hit OOM.
+        dsv4_dspark_num_anchors: 512
+        dsv4_dspark_loss_decay_gamma: 7.0
+        dsv4_dspark_hidden_size: null
+        dsv4_dspark_weight_dtype: bfloat16  # target dtype for dequantized weights: bfloat16|float16|float32|int8
+        dsv4_dspark_num_target_layers: 3
+        dsv4_dspark_num_hidden_layers: 3
+        dsv4_dspark_mask_token_id: 128799
+        # Decoder-layer indices of the target hidden states the drafter consumes;
+        # defaults to the released DeepSeek-V4-Flash DSpark selection.
+        dsv4_dspark_target_layer_ids: [40, 41, 42]
+        # Optional trainer-side sequence crop. Zero/null keeps every row supplied
+        # by the feature producer; set a positive integer to enable the crop.
+        dsv4_dspark_max_window: 512
+        dsv4_dspark_loss_mode: full_vocab
+        dsv4_dspark_sampled_ce_negatives: 0
+        dsv4_dspark_markov_rank: 256
+        dsv4_dspark_markov_head_type: vanilla
+        dsv4_dspark_confidence_head_alpha: 0.0
+        dsv4_dspark_confidence_loss_alpha: 0.0
+        dsv4_dspark_confidence_head_with_markov: true
+        dsv4_dspark_ce_loss_alpha: 0.1
+        dsv4_dspark_l1_loss_alpha: 0.0
+        # Total-variation-scale distribution coefficient. Folded into the DSpark
+        # L1 distribution term (which is 2 * TV) during backend construction.
+        dsv4_dspark_tv_loss_alpha: 0.0
+        dsv4_dspark_l1_chunk_size: 0
+        # auto | fused | eager. Fused uses the native CUDA/Ascend Triton kernel.
+        dsv4_dspark_distribution_loss_impl: auto
+        dsv4_dspark_debug_log: false
+        dsv4_dspark_debug_log_first_n: 2
+        dsv4_dspark_debug_log_interval: 100
+        # DSV4 backbone hyperparameters (mirror the released config).
+        dsv4_dspark_backbone_num_heads: 64
+        dsv4_dspark_backbone_head_dim: 512
+        dsv4_dspark_backbone_rope_head_dim: 64
+        dsv4_dspark_backbone_q_lora_rank: 1024
+        dsv4_dspark_backbone_o_lora_rank: 1024
+        dsv4_dspark_backbone_o_groups: 8
+        dsv4_dspark_backbone_window_size: 128
+        dsv4_dspark_backbone_rope_theta: 10000.0
+        dsv4_dspark_backbone_rope_factor: 16.0
+        dsv4_dspark_backbone_original_seq_len: 65536
+        dsv4_dspark_backbone_beta_fast: 32.0
+        dsv4_dspark_backbone_beta_slow: 1.0
+        dsv4_dspark_backbone_n_routed_experts: 256
+        dsv4_dspark_backbone_n_shared_experts: 1
+        dsv4_dspark_backbone_n_activated_experts: 6
+        dsv4_dspark_backbone_moe_inter_dim: 2048
+        dsv4_dspark_backbone_score_func: sqrtsoftplus
+        dsv4_dspark_backbone_route_scale: 1.5
+        dsv4_dspark_backbone_swiglu_limit: 10.0
+        dsv4_dspark_backbone_hc_mult: 4
+        dsv4_dspark_backbone_hc_sinkhorn_iters: 20
+        dsv4_dspark_backbone_hc_eps: 1.0e-6
+        # NPU accelerator kernels / expert parallelism (opt-in, require a
+        # distributed run; standalone CPU training keeps both disabled).
+        dsv4_dspark_enable_ep: false
+        dsv4_dspark_ep_no_fsdp: false
+        dsv4_dspark_random_init: false
         # EAGLE3 target layers whose hidden states are concatenated as drafter input.
         eagle3_target_layer_ids: null
         # P-EAGLE (parallel drafting: COD-subsampled multi-depth forward + KL loss).

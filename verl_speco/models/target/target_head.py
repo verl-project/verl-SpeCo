@@ -43,8 +43,14 @@ class TargetHead(nn.Module):
         lm_head_key: str = "lm_head.weight",
         tied_embedding_key: str = "model.embed_tokens.weight",
     ) -> "TargetHead":
-        try:
-            weight = _load_checkpoint_tensor(model_path, lm_head_key)
-        except KeyError:
-            weight = _load_checkpoint_tensor(model_path, tied_embedding_key)
-        return cls(weight)
+        # DeepSeek-V4 packs the target head/embedding as top-level
+        # ``head.weight``/``embed.weight`` rather than the Llama-style keys, so
+        # try those too before failing.
+        last_error: Exception | None = None
+        for key in (lm_head_key, tied_embedding_key, "head.weight", "embed.weight"):
+            try:
+                return cls(_load_checkpoint_tensor(model_path, key))
+            except (KeyError, FileNotFoundError) as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error

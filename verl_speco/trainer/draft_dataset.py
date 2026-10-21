@@ -352,7 +352,16 @@ class DraftFeatureDataLoader:
                 if world_size > 1:
                     rank_samples = rank_samples[: len(samples) // world_size]
             else:
-                rank_keys = keys[rank::world_size]
+                # Shard-level data parallelism: hand each rank a CONTIGUOUS slice
+                # of the shard-major key list so it owns whole shards. Striding
+                # (keys[rank::world_size]) would touch every multi-GB shard while
+                # using only a few samples per shard, causing ~world_size read
+                # amplification under whole-shard reads.
+                if world_size > 1:
+                    per = len(keys) // world_size
+                    rank_keys = keys[rank * per : (rank + 1) * per]
+                else:
+                    rank_keys = keys
                 if world_size > 1:
                     rank_keys = rank_keys[: len(keys) // world_size]
                 rank_samples = self._read_filtered(rank_keys)

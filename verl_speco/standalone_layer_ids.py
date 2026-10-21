@@ -17,7 +17,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-_DECODER_INDEX_ALGORITHMS = frozenset({"DFLASH", "DFLASH2", "DSPARK", "DOMINO"})
+_DECODER_INDEX_ALGORITHMS = frozenset(
+    {"DFLASH", "DFLASH2", "DSPARK", "DSV4_DSPARK", "DOMINO"}
+)
 
 
 def normalize_standalone_layer_ids(

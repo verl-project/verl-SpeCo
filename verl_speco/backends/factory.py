@@ -33,6 +33,7 @@ SUPPORTED_DRAFTER_ALGORITHMS = (
     "DFLASH",
     "DFLASH2",
     "DSPARK",
+    "DSV4_DSPARK",
     "DOMINO",
     "PEAGLE",
 )
@@ -70,6 +71,12 @@ def build_trainer_backend(config, model_config) -> Any:
         from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend
 
         return DSparkTrainerBackend(config, model_config)
+    if algorithm == "DSV4_DSPARK":
+        from verl_speco.backends.dsv4_dspark_trainer_backend import (
+            DSV4DSparkTrainerBackend,
+        )
+
+        return DSV4DSparkTrainerBackend(config, model_config)
     if algorithm == "DOMINO":
         from verl_speco.backends.domino_trainer_backend import DominoTrainerBackend
 

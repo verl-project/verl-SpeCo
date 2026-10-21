@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import tempfile
@@ -25,6 +26,8 @@ from pathlib import Path
 from typing import Any, Iterator, Protocol, cast
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 SCHEMA_VERSION = 1
@@ -425,6 +428,16 @@ class TorchShardFeatureStore:
         self._manifest = self._load_manifest()
         self._pending: list[dict[str, Any]] = []
         self._next_shard_index = self._infer_next_shard_index()
+        # Read-side shard cache: shards are multi-GB and reads arrive in shuffled
+        # key order, so without a cache every sample read would re-load a whole
+        # shard from (possibly remote) storage.
+        self._shard_cache: dict[str, dict[str, Any]] = {}
+        self._shard_cache_max = max(
+            1, int(os.environ.get("FEATURE_STORE_SHARD_CACHE_MAX", "2") or 2)
+        )
+        self._shards_loaded = 0
+        self._shards_total = len(self._manifest)
+        self._shard_load_started = time.time()
         if not self.read_only:
             self._write_metadata()
 
@@ -489,14 +502,22 @@ class TorchShardFeatureStore:
 
     def iter_keys(self, *, shuffle: bool = False, seed: int = 0) -> Iterator[str]:
         self.flush()
-        keys: list[str] = []
-        for entry in self._load_manifest():
-            shard_name = entry["path"]
-            for idx in range(int(entry.get("num_samples", 0))):
-                keys.append(f"{shard_name}:{idx}")
+        entries = self._load_manifest()
+        # Shard-major iteration: emit a whole shard's samples together (shard order
+        # and within-shard order both shuffled) so the read-side shard cache only
+        # ever holds one shard at a time. A globally shuffled key order would touch
+        # every multi-GB shard on almost every read and thrash / OOM.
+        order = list(range(len(entries)))
         if shuffle:
-            random.Random(int(seed)).shuffle(keys)
-        yield from keys
+            random.Random(int(seed)).shuffle(order)
+        for pos, i in enumerate(order):
+            entry = entries[i]
+            shard_name = entry["path"]
+            idxs = list(range(int(entry.get("num_samples", 0))))
+            if shuffle:
+                random.Random(int(seed) * 131 + pos).shuffle(idxs)
+            for idx in idxs:
+                yield f"{shard_name}:{idx}"
 
     def get_metadata(self) -> dict[str, Any]:
         metadata = dict(self.metadata)
@@ -563,11 +584,34 @@ class TorchShardFeatureStore:
         return max_index + 1
 
     def _load_shard(self, shard_name: str) -> dict[str, Any]:
+        cached = self._shard_cache.get(shard_name)
+        if cached is not None:
+            return cached
+        load_started = time.time()
         path = self.path / shard_name
         try:
-            return torch.load(path, map_location="cpu", weights_only=False)
+            shard = torch.load(path, map_location="cpu", weights_only=False)
         except TypeError:
-            return torch.load(path, map_location="cpu")
+            shard = torch.load(path, map_location="cpu")
+        self._shard_cache[shard_name] = shard
+        if len(self._shard_cache) > self._shard_cache_max:
+            for k in list(self._shard_cache.keys()):
+                if k != shard_name:
+                    del self._shard_cache[k]
+                    break
+        self._shards_loaded += 1
+        size_gb = path.stat().st_size / (1024**3)
+        logger.info(
+            "[FeatureStore] loaded shard %s/%s name=%s size=%.2fGB "
+            "elapsed=%.1fs total_elapsed=%.1fs",
+            self._shards_loaded,
+            self._shards_total,
+            shard_name,
+            size_gb,
+            time.time() - load_started,
+            time.time() - self._shard_load_started,
+        )
+        return shard
 
 
 class TokenReplayFeatureStore(TorchShardFeatureStore):

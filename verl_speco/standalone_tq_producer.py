@@ -256,7 +256,7 @@ def _read_on_missing_response(producer_cfg: Any) -> str:
 
 def _minimum_response_feature_rows(training_cfg: Mapping[str, Any]) -> int:
     algorithm = str(training_cfg.get("speculative_algorithm", "")).strip().upper()
-    if algorithm == "DSPARK":
+    if algorithm in ("DSPARK", "DSV4_DSPARK"):
         return 2
     if algorithm == "DFLASH":
         block_size = int(training_cfg.get("dflash_block_size", 16))
@@ -511,7 +511,11 @@ async def run_producer(
         algorithm = str(drafter_cfg["speculative_algorithm"]).strip().upper()
         # Only standalone DFlash/DSpark use a response-only feature budget.
         producer_cfg = dict(producer_cfg)
-        producer_cfg["response_feature_budget"] = algorithm in {"DFLASH", "DSPARK"}
+        producer_cfg["response_feature_budget"] = algorithm in {
+            "DFLASH",
+            "DSPARK",
+            "DSV4_DSPARK",
+        }
         producer_cfg["min_response_feature_rows"] = _minimum_response_feature_rows(
             drafter_cfg
         )
