@@ -515,6 +515,23 @@ def test_dsv4_normalize_applies_training_mask_token_id():
     assert normalized.mask_token_id == 12345
 
 
+def test_dsv4_ep_active_requires_multi_rank_process_group():
+    # A single-rank run cannot slice experts: EP is treated as inactive there
+    # (full expert set, torch reference path) instead of failing at build time.
+    from verl_speco.backends.dsv4_ep_utils import is_ep_active
+
+    config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(
+                speculative_algorithm="DSV4_DSPARK",
+                training=SimpleNamespace(dsv4_dspark_enable_ep=True),
+            )
+        )
+    )
+    # No process group in this test process -> EP inactive despite the config.
+    assert is_ep_active(config) is False
+
+
 def test_dsv4_ep_enabled_supports_namespace_configs():
     from verl_speco.backends.dsv4_ep_utils import is_ep_enabled
 

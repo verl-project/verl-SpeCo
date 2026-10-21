@@ -81,7 +81,7 @@ def test_prepared_batch_runs_actual_optimizer_step_without_old_prepare_state(bat
     trainer.record_training_timing = lambda *args: None
     trainer._reduce_loss_metrics = lambda v, p, n: (v.detach(), p.detach(), n, 1)
     # EP helpers are out of scope for this AST-extracted harness.
-    trainer._is_ep_enabled = lambda: False
+    trainer._is_ep_active = lambda: False
     trainer._sync_non_expert_grads = lambda: None
     trainer._is_checkpoint_leader = lambda: False
     if legacy_pad is not None:

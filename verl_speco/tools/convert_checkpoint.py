@@ -165,11 +165,36 @@ def _merge_ep_expert_slices(state_dict: dict, ep_experts_dir: Path) -> dict:
                     f"rank_{ranks[0]} {tuple(slices[0].shape)} for {key}"
                 )
         merged[key] = torch.cat(slices, dim=0).contiguous()
+
+    # Cross-check the reconstructed expert count against the router weight
+    # (``layers.{i}.ffn.router.weight`` is [n_routed_experts, hidden]), so a
+    # missing or duplicated rank file cannot silently produce the wrong number
+    # of experts.
+    expected_rows = _routed_expert_rows(merged)
+    if expected_rows is not None:
+        bad = {
+            key: tuple(merged[key].shape)
+            for key in sorted(keys)
+            if merged[key].shape[0] != expected_rows
+        }
+        if bad:
+            raise SystemExit(
+                f"Merged expert rows != router n_routed_experts {expected_rows}: "
+                + "; ".join(f"{k} -> {v}" for k, v in sorted(bad.items())[:5])
+            )
     print(
         f"Merged EP expert slices: {len(keys)} tensors x {len(ranks)} ranks "
         f"(rows {local_rows} -> {local_rows * len(ranks)})"
     )
     return merged
+
+
+def _routed_expert_rows(state_dict: dict) -> int | None:
+    """``n_routed_experts`` from a router weight, if the state dict has one."""
+    for key, value in state_dict.items():
+        if re.fullmatch(r"layers\.\d+\.ffn\.router\.weight", key) and value.dim() == 2:
+            return int(value.shape[0])
+    return None
 
 
 def _n_layers(state_dict: dict) -> int:
@@ -206,6 +231,19 @@ def main():
     sd = _load_state_dict(in_dir)
     if args.ep_experts_dir:
         sd = _merge_ep_expert_slices(sd, Path(args.ep_experts_dir))
+        src_cfg = Path(args.config_from) if args.config_from else (in_dir / "config.json")
+        if src_cfg.exists():
+            cfg_n = json.loads(src_cfg.read_text()).get("dsv4_n_routed_experts")
+            merged_rows = _routed_expert_rows(sd)
+            if (
+                cfg_n is not None
+                and merged_rows is not None
+                and int(cfg_n) != merged_rows
+            ):
+                raise SystemExit(
+                    f"Merged expert rows {merged_rows} != config "
+                    f"dsv4_n_routed_experts {int(cfg_n)} ({src_cfg})"
+                )
     n_layers = _n_layers(sd)
     out, skipped, n_unstacked = convert(sd, n_layers)
 

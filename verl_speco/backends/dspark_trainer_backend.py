@@ -1541,10 +1541,19 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         """Whether the configured losses need the final target hidden state.
 
         When True, items carrying the aux-only layout are rejected up front: the
-        l1/tv/confidence/target-argmax losses cannot be computed without
-        ``target_last_hidden_states``.
+        l1/confidence/target-argmax losses cannot be computed without
+        ``target_last_hidden_states``. Mirrors the DSpark build defaults
+        (``dspark_l1_loss_alpha`` defaults to 0.9, matching the hidden-states
+        layout resolver).
         """
-        return False
+        return (
+            float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
+            or float(training_cfg.get("dspark_confidence_loss_alpha", 0.0) or 0.0) > 0
+            or str(
+                training_cfg.get("ce_target_source", "labels") or "labels"
+            ).lower()
+            == "target_argmax"
+        )
 
     def preprocess_individual_items(self, items, device, model_config):
         label = self._preprocess_label()

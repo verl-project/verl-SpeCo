@@ -123,16 +123,12 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
         """
         from verl_speco.backends.dsv4_ep_utils import (
             ensure_ep_divisible,
-            is_ep_enabled,
+            is_ep_active,
             resolve_routed_expert_count,
         )
         from verl_speco.models.dsv4_dspark.backbone import moe_ep
 
-        if not is_ep_enabled(self.config):
-            return None, None
-        if not (
-            torch.distributed.is_available() and torch.distributed.is_initialized()
-        ):
+        if not is_ep_active(self.config):
             return None, None
         n_experts = resolve_routed_expert_count(self.config, drafter_config)
         ambient = moe_ep._EP
@@ -150,12 +146,12 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
 
     def _scan_drafter_index_shards(
         self, model_path: str
-    ) -> tuple[dict[str, str], set[str]] | None:
+    ) -> tuple[dict[str, str], set[str], list[str]] | None:
         """Scan every ``*.index.json`` for drafter (``mtp.*``/embed/head) keys.
 
-        Returns ``(key -> shard file, shards)`` or ``None`` when the directory
-        has no ``*.index.json`` at all (callers fall back to their single-file
-        logic).
+        Returns ``(key -> shard file, shards, index_paths)`` or ``None`` when
+        the directory has no ``*.index.json`` at all (callers fall back to
+        their single-file logic).
         """
         index_paths = sorted(glob.glob(os.path.join(model_path, "*.index.json")))
         if not index_paths:
@@ -173,7 +169,7 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
                     "head.weight",
                 ):
                     key_to_shard[key] = weight_map[key]
-        return key_to_shard, set(key_to_shard.values())
+        return key_to_shard, set(key_to_shard.values()), index_paths
 
     def _load_draft_state_dict(self, model_path: str) -> dict:
         """Load only the drafter (``mtp.*``) tensors, whatever the index layout.
@@ -188,10 +184,10 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
         scanned = self._scan_drafter_index_shards(model_path)
         if scanned is None:
             return super()._load_draft_state_dict(model_path)
-        key_to_shard, drafter_shards = scanned
+        key_to_shard, drafter_shards, index_paths = scanned
 
         if not key_to_shard:
-            if len(glob.glob(os.path.join(model_path, "*.index.json"))) == 1:
+            if len(index_paths) == 1:
                 # Single index without drafter keys: defer to the base loader so
                 # non-mtp checkpoints keep working; build_model then falls back to
                 # the DFlash checkpoint path.
@@ -228,7 +224,7 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
             shards = {os.path.basename(candidate)}
             base_dir = model_path
         else:
-            _, shards = scanned
+            _, shards, _ = scanned
             if not shards:
                 return {}
             base_dir = model_path

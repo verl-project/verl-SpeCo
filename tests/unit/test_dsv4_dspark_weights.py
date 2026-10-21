@@ -723,7 +723,11 @@ def test_convert_checkpoint_merges_ep_expert_slices(tmp_path):
     leader_slice[0] = 0.0
     leader_slice[1] = 1.0
     safetensors_torch.save_file(
-        {"layers.0.ffn.experts.w1": leader_slice},
+        {
+            # The router weight pins n_routed_experts = 4 (2 ranks x 2 local).
+            "layers.0.ffn.router.weight": torch.zeros(4, 2),
+            "layers.0.ffn.experts.w1": leader_slice,
+        },
         str(tmp_path / "model.safetensors"),
     )
     ep_dir = tmp_path / "ep_experts"
@@ -757,3 +761,29 @@ def test_convert_checkpoint_merges_ep_expert_slices(tmp_path):
     assert n_unstacked == 1
     for e in range(4):
         assert f"mtp.0.ffn.experts.{e}.w1.weight" in out
+
+
+def test_convert_checkpoint_merge_rejects_wrong_expert_count(tmp_path):
+    from verl_speco.tools.convert_checkpoint import (
+        _load_state_dict,
+        _merge_ep_expert_slices,
+    )
+
+    safetensors_torch.save_file(
+        {
+            # Router says 4 experts...
+            "layers.0.ffn.router.weight": torch.zeros(4, 2),
+            "layers.0.ffn.experts.w1": torch.zeros(2, 3, 2),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    ep_dir = tmp_path / "ep_experts"
+    ep_dir.mkdir()
+    # ...but only one 2-expert slice is present -> merged rows 2 != 4.
+    torch.save(
+        {"layers.0.ffn.experts.w1": torch.zeros(2, 3, 2)}, ep_dir / "rank_0.pt"
+    )
+    sd = _load_state_dict(tmp_path)
+
+    with pytest.raises(SystemExit, match="n_routed_experts"):
+        _merge_ep_expert_slices(sd, ep_dir)

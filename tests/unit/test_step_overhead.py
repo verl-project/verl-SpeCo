@@ -89,7 +89,7 @@ def test_combined_statistics_preserve_actual_optimizer_update():
         trainer.record_training_timing = lambda *args: None
         trainer._is_checkpoint_leader = lambda: False
         # EP helpers are out of scope for this AST-extracted harness.
-        trainer._is_ep_enabled = lambda: False
+        trainer._is_ep_active = lambda: False
         trainer._sync_non_expert_grads = lambda: None
 
         def compute_loss(model, batch, pad):

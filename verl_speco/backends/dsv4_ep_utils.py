@@ -86,6 +86,24 @@ def is_ep_enabled(config) -> bool:
     return bool(_read_cfg(training, "dsv4_dspark_enable_ep", False))
 
 
+def is_ep_active(config) -> bool:
+    """EP is both requested *and* possible (multi-rank process group).
+
+    ``is_ep_enabled`` only inspects the config; a single-rank run cannot slice
+    experts, so EP is treated as inactive there and training falls back to the
+    full expert set instead of failing at build time.
+    """
+    if not is_ep_enabled(config):
+        return False
+    try:
+        import torch.distributed as dist
+    except ImportError:  # pragma: no cover - torch always ships distributed
+        return False
+    return bool(
+        dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    )
+
+
 def resolve_routed_expert_count(config, drafter_config=None) -> int:
     """Resolve the routed-expert count from the training config and checkpoint.
 
@@ -134,6 +152,52 @@ def _ep_preconfigured() -> bool:
     return moe_ep._EP is not None and moe_ep._EP.size > 1
 
 
+def _resolve_ep_layout(trainer) -> tuple[int, int, int]:
+    """Shared EP preamble: fail closed unless moe_ep was pre-configured.
+
+    Returns ``(world_size, rank, experts_per_rank)``.
+    """
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    experts_per_rank = ensure_ep_divisible(
+        resolve_routed_expert_count(trainer.config), world_size
+    )
+    if not _ep_preconfigured():
+        raise RuntimeError(
+            "DSV4 DSpark EP requires moe_ep.configure() before build_model "
+            "(DrafterBaseTrainer configures it when EP is enabled and "
+            "world_size > 1)"
+        )
+    logger.info(
+        f"[Rank {rank}] EP pre-configured: model already has "
+        f"{experts_per_rank} experts"
+    )
+    return world_size, rank, experts_per_rank
+
+
+def _finish_ep_setup(
+    raw_model: torch.nn.Module,
+    world_size: int,
+    rank: int,
+    experts_per_rank: int,
+    *,
+    log_prefix: str,
+) -> None:
+    """Shared EP tail: rebuild the RoPE table, then break routing symmetry."""
+    draft_model = getattr(raw_model, "draft_model", None) or raw_model
+    if hasattr(draft_model, "_rebuild_freqs"):
+        seq_len = (
+            draft_model.freqs_cis.shape[0] if hasattr(draft_model, "freqs_cis") else 1
+        )
+        draft_model._rebuild_freqs(max(seq_len, 1))
+        if rank == 0:
+            logger.info(
+                f"[{log_prefix}] Rebuilt freqs_cis "
+                f"({draft_model.freqs_cis.device}, {draft_model.freqs_cis.shape})"
+            )
+    _init_router_bias(raw_model, world_size, experts_per_rank, rank)
+
+
 def apply_ep_only(trainer, raw_model: torch.nn.Module):
     """Apply expert parallelism without FSDP2 (EP+DDP).
 
@@ -145,18 +209,10 @@ def apply_ep_only(trainer, raw_model: torch.nn.Module):
     (``DrafterBaseTrainer`` does this whenever EP is enabled and world_size > 1),
     so the model already carries its per-rank expert slice.
     """
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
-    n_experts = resolve_routed_expert_count(trainer.config)
-    experts_per_rank = ensure_ep_divisible(n_experts, world_size)
-    if not _ep_preconfigured():
-        raise RuntimeError(
-            "DSV4 DSpark EP requires moe_ep.configure() before build_model "
-            "(DrafterBaseTrainer configures it when EP is enabled and "
-            "world_size > 1)"
-        )
+    world_size, rank, experts_per_rank = _resolve_ep_layout(trainer)
     logger.info(
-        f"[Rank {rank}] EP pre-configured: model already has {experts_per_rank} experts"
+        f"[Rank {rank}] EP+DDP: {experts_per_rank} experts/rank, "
+        f"non-expert grads synced via all-reduce"
     )
 
     # Move to device and set requires_grad
@@ -186,29 +242,8 @@ def apply_ep_only(trainer, raw_model: torch.nn.Module):
             f"{n_trainable - len(expert_param_ids)} non-expert params (DDP sync)"
         )
 
-    # Step 7: Rebuild freqs_cis on CPU
-    draft_model = getattr(raw_model, "draft_model", None) or raw_model
-    if hasattr(draft_model, "_rebuild_freqs"):
-        seq_len = (
-            draft_model.freqs_cis.shape[0] if hasattr(draft_model, "freqs_cis") else 1
-        )
-        draft_model._rebuild_freqs(max(seq_len, 1))
-        if rank == 0:
-            logger.info(
-                f"[EP-only] Rebuilt freqs_cis "
-                f"({draft_model.freqs_cis.device}, {draft_model.freqs_cis.shape})"
-            )
-
-    # Step 8: Initialize router bias to break routing symmetry before first forward.
-    # With random init or fresh checkpoint, bias=0 causes all tokens to route to
-    # the same expert, producing 0-token ranks → all_to_all deadlock in moe_ep.
-    # Inject rank-aware bias so each rank's experts get roughly equal load.
-    _init_router_bias(raw_model, world_size, experts_per_rank, rank)
-
-    logger.info(
-        f"[Rank {rank}] EP+DDP applied: EP={world_size}, "
-        f"{experts_per_rank} experts/rank, "
-        f"non-expert grads synced via all-reduce"
+    _finish_ep_setup(
+        raw_model, world_size, rank, experts_per_rank, log_prefix="EP-only"
     )
 
 
@@ -235,10 +270,7 @@ def apply_ep_fsdp2(
     (``DrafterBaseTrainer`` does this whenever EP is enabled and world_size > 1),
     so the model already carries its per-rank expert slice.
     """
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
-    n_experts = resolve_routed_expert_count(trainer.config)
-    experts_per_rank = ensure_ep_divisible(n_experts, world_size)
+    world_size, rank, experts_per_rank = _resolve_ep_layout(trainer)
     # Expert DTensors are built on the raw (dp, sp) training mesh. The experts
     # are in ``ignored_params`` (never sharded/reduced), so the placements only
     # need to keep the optimizer/grad-norm from mixing plain tensors with
@@ -248,23 +280,13 @@ def apply_ep_fsdp2(
         trainer.config.rollout.drafter.training.get("dsv4_dspark_random_init", False)
     )
 
-    if not _ep_preconfigured():
-        raise RuntimeError(
-            "DSV4 DSpark EP requires moe_ep.configure() before build_model "
-            "(DrafterBaseTrainer configures it when EP is enabled and "
-            "world_size > 1)"
-        )
-    logger.info(
-        f"[Rank {rank}] EP pre-configured: model already has {experts_per_rank} experts"
-    )
-
     # Move to device (cast to bf16 first to halve memory, matching speculators)
     raw_model.to(torch.bfloat16)
     raw_model.to(trainer.runtime_device)
 
-    # Step 5: shard_experts_as_dtensor — wrap the routed experts (one local EP
-    # slice per rank) as Shard(0) DTensors. This keeps every parameter a DTensor
-    # so FSDP2's gradient-norm reduction and the optimizer do not mix plain
+    # shard_experts_as_dtensor — wrap the routed experts (one local EP slice
+    # per rank) as Shard(0) DTensors. This keeps every parameter a DTensor so
+    # FSDP2's gradient-norm reduction and the optimizer do not mix plain
     # tensors with DTensors (uniform with the released reference flow).
     draft_model = getattr(raw_model, "draft_model", None) or raw_model
     if hasattr(draft_model, "shard_experts_as_dtensor"):
@@ -272,7 +294,7 @@ def apply_ep_fsdp2(
         if rank == 0:
             logger.info("[EP] Experts wrapped as Shard(0) DTensors")
 
-    # Step 6: FSDP2 wrap draft_model per-layer + root
+    # FSDP2 wrap draft_model per-layer + root
     mp_policy = fsdp_kwargs["mp_policy"]
     reshard = True
 
@@ -310,25 +332,10 @@ def apply_ep_fsdp2(
         ignored_params=ignored_params if ignored_params else None,
     )
 
-    # Step 7: Rebuild freqs_cis
-    if hasattr(draft_model, "_rebuild_freqs"):
-        seq_len = (
-            draft_model.freqs_cis.shape[0] if hasattr(draft_model, "freqs_cis") else 1
-        )
-        draft_model._rebuild_freqs(max(seq_len, 1))
-        if rank == 0:
-            logger.info(
-                f"[EP] Rebuilt freqs_cis "
-                f"({draft_model.freqs_cis.device}, {draft_model.freqs_cis.shape})"
-            )
-
     # Mark FSDP2 mode (skip _sync_non_expert_grads)
     trainer._ep_ddp_world_size = 0  # 0 = FSDP2 mode (no manual gradient sync)
 
-    # Initialize router bias to break routing symmetry before first forward.
-    # Random init and continued training share the EP layout: each rank owns its
-    # local expert slice, so initialize the per-rank bias the same way.
-    _init_router_bias(raw_model, world_size, experts_per_rank, rank)
+    _finish_ep_setup(raw_model, world_size, rank, experts_per_rank, log_prefix="EP")
     logger.info(
         f"[Rank {rank}] EP+FSDP2 applied: EP={world_size}, "
         f"{experts_per_rank} experts/rank, "
@@ -414,7 +421,7 @@ def dump_local_expert_slices(trainer, checkpoint_path: str) -> str | None:
 
     (rank-ordered concat; rank r owns experts ``[r * local, (r + 1) * local)``).
     """
-    if not is_ep_enabled(trainer.config):
+    if not is_ep_active(trainer.config):
         return None
 
     model = getattr(trainer, "model", None)

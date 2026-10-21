@@ -1043,15 +1043,18 @@ class DrafterBaseTrainer:
     # shared trainer file small and avoid importing the DSV4 module tree unless
     # the algorithm is actually selected.
 
-    def _is_ep_enabled(self) -> bool:
-        # Cached: the training config is static after construction and this is
-        # queried on the per-step hot path.
-        cached = getattr(self, "_is_ep_enabled_cache", None)
-        if cached is None:
-            from verl_speco.backends.dsv4_ep_utils import is_ep_enabled
+    def _is_ep_active(self) -> bool:
+        """EP is requested *and* possible (multi-rank process group).
 
-            cached = bool(is_ep_enabled(self.config))
-            self._is_ep_enabled_cache = cached
+        Cached: both the config and the process group are static after
+        construction and this is queried on the per-step hot path.
+        """
+        cached = getattr(self, "_is_ep_active_cache", None)
+        if cached is None:
+            from verl_speco.backends.dsv4_ep_utils import is_ep_active
+
+            cached = bool(is_ep_active(self.config))
+            self._is_ep_active_cache = cached
         return cached
 
     def _apply_ep_only(self, raw_model) -> None:
@@ -1430,7 +1433,7 @@ class DrafterBaseTrainer:
         random_init = bool(
             self.config.rollout.drafter.training.get("dsv4_dspark_random_init", False)
         )
-        ep_enabled = self._is_ep_enabled()
+        ep_enabled = self._is_ep_active()
         # Under EP every rank must load its OWN released expert slice (the
         # pre-configured model is already sliced), so init_on_meta must not make
         # non-zero ranks skip loading. Short-circuit on the config flags first so
@@ -1451,7 +1454,7 @@ class DrafterBaseTrainer:
                 f"{self._drafter_strategy()!r}); DDP/FSDP1/VeOmni would "
                 "all-reduce or mismatch rank-local expert parameters."
             )
-        if ep_enabled and dist.is_initialized() and dist.get_world_size() > 1:
+        if ep_enabled:
             world_size = dist.get_world_size()
             from verl_speco.backends.dsv4_ep_utils import (
                 ensure_ep_divisible,
@@ -5801,7 +5804,7 @@ class DrafterBaseTrainer:
         )
         backward_ts = time.time()
         local_loss.backward()
-        if self._is_ep_enabled():
+        if self._is_ep_active():
             # EP keeps each rank's experts local; non-expert params are
             # replicated and need a manual gradient all-reduce.
             self._sync_non_expert_grads()
@@ -5811,7 +5814,7 @@ class DrafterBaseTrainer:
 
         # 更新权重
         optimizer_ts = time.time()
-        if self._is_ep_enabled():
+        if self._is_ep_active():
             # Mixed DTensor placements / rank-local expert grads: use the
             # replication-corrected global norm so every rank clips identically.
             # In the EP+DDP mode the non-expert grads are plain tensors that
