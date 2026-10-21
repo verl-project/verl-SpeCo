@@ -630,8 +630,7 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
             # the loss reads target logits (target-argmax CE / distribution TV).
             # An empty placeholder would make those losses produce zero tokens.
             needs_real_head = (
-                str(training_cfg.get("ce_target_source", "labels"))
-                == "target_argmax"
+                str(training_cfg.get("ce_target_source", "labels")) == "target_argmax"
                 or float(training_cfg.get("dsv4_dspark_tv_loss_alpha", 0) or 0) > 0
                 or float(training_cfg.get("dsv4_dspark_l1_loss_alpha", 0) or 0) > 0
             )
@@ -651,9 +650,7 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
                     )
                 )
                 vocab_size = int(
-                    getattr(
-                        target_text_config, "vocab_size", drafter_config.vocab_size
-                    )
+                    getattr(target_text_config, "vocab_size", drafter_config.vocab_size)
                 )
                 lm_head_weight = torch.empty(
                     vocab_size, hidden_size, dtype=torch.bfloat16

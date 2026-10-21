@@ -30,6 +30,9 @@ from .configuration_dsv4_dspark import DSV4DSparkConfig
 class DSV4DSparkDraftModel(DSparkDraftModel):
     config_class = DSV4DSparkConfig
     _no_split_modules = ["MhcDecoderBlock"]
+    # Registered in __init__ as a non-persistent buffer; annotated so mypy can
+    # type _rebuild_freqs' device read.
+    freqs_cis: torch.Tensor
 
     def __init__(self, config: DSV4DSparkConfig) -> None:
         bb = _BackboneConfig(config)
@@ -281,9 +284,9 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         block_freqs = self._rope_at(draft_position_ids.reshape(-1).long()).reshape(
             *draft_position_ids.shape, rope_dim_half, 2
         )
-        context_freqs = self._rope_at(
-            context_position_ids.reshape(-1).long()
-        ).reshape(*context_position_ids.shape, rope_dim_half, 2)
+        context_freqs = self._rope_at(context_position_ids.reshape(-1).long()).reshape(
+            *context_position_ids.shape, rope_dim_half, 2
+        )
         if dense_attention_mask is None and block_mask is not None:
             # The DSV4 sink attention consumes a dense bias only. The DFlash mask
             # builder returns a flex ``BlockMask`` on CUDA, which this model does

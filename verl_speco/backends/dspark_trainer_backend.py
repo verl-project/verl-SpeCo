@@ -1549,9 +1549,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         return (
             float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
             or float(training_cfg.get("dspark_confidence_loss_alpha", 0.0) or 0.0) > 0
-            or str(
-                training_cfg.get("ce_target_source", "labels") or "labels"
-            ).lower()
+            or str(training_cfg.get("ce_target_source", "labels") or "labels").lower()
             == "target_argmax"
         )
 

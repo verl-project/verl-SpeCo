@@ -166,8 +166,7 @@ def _resolve_ep_layout(trainer) -> tuple[int, int, int]:
             "world_size > 1)"
         )
     logger.info(
-        f"[Rank {rank}] EP pre-configured: model already has "
-        f"{experts_per_rank} experts"
+        f"[Rank {rank}] EP pre-configured: model already has {experts_per_rank} experts"
     )
     return world_size, rank, experts_per_rank
 

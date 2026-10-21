@@ -148,11 +148,11 @@ def _merge_ep_expert_slices(
         raise SystemExit(f"No rank_*.pt expert slices in {ep_experts_dir}")
     ranks = [int(p.stem.split("_")[-1]) for p in rank_files]
     if ranks != list(range(len(ranks))):
-        raise SystemExit(
-            f"Non-contiguous EP expert ranks {ranks} in {ep_experts_dir}"
-        )
+        raise SystemExit(f"Non-contiguous EP expert ranks {ranks} in {ep_experts_dir}")
 
-    payloads = [torch.load(p, map_location="cpu", weights_only=True) for p in rank_files]
+    payloads = [
+        torch.load(p, map_location="cpu", weights_only=True) for p in rank_files
+    ]
     keys = set(payloads[0])
     for rank, payload in zip(ranks, payloads):
         if set(payload) != keys:
