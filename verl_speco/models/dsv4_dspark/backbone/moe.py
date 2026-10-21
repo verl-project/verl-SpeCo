@@ -36,6 +36,10 @@ class Router(nn.Module):
         self.route_scale = cfg.route_scale
         self.score_func = cfg.score_func
         self.weight = nn.Parameter(torch.empty(cfg.n_routed_experts, cfg.hidden_size))
+        # Explicit init: an uninitialized ``torch.empty`` router gives degenerate
+        # (constant or garbage) logits, collapsing every token onto the same few
+        # experts. ``normal_`` breaks that symmetry deterministically.
+        nn.init.normal_(self.weight, std=float(cfg.hidden_size) ** -0.5)
         self.register_buffer("bias", torch.zeros(cfg.n_routed_experts), persistent=True)
         self.n_routed_experts = cfg.n_routed_experts
         self._log_load = os.environ.get("DSPARK_LOG_EXPERT_LOAD") == "1"
@@ -44,6 +48,10 @@ class Router(nn.Module):
         self._sel_counts: torch.Tensor | None = None
         self._step_load: torch.Tensor | None = None
         self._bias_initialized = False
+        # Per-rank EP routing preference. Kept OUT of the parameter/buffer state
+        # so the exported ``bias`` stays the real (rank-independent) load-balance
+        # bias; used only to break routing symmetry during EP training.
+        self._ep_rank_bias: torch.Tensor | None = None
 
     def _score(self, scores: torch.Tensor) -> torch.Tensor:
         if self.score_func == "softmax":
@@ -55,6 +63,8 @@ class Router(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         scores = self._score(F.linear(x.float(), self.weight.float()))
         selection = scores + self.bias.float()
+        if self._ep_rank_bias is not None:
+            selection = selection + self._ep_rank_bias
         indices = selection.topk(self.topk, dim=-1)[1]
         weights = scores.gather(1, indices)
         if self.score_func != "softmax":

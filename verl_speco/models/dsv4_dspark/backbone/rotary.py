@@ -65,24 +65,38 @@ def precompute_freqs_cis(
 def apply_rotary_emb(
     x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
 ) -> torch.Tensor:
+    """Apply interleaved RoPE to ``x`` using per-position frequencies.
+
+    ``freqs_cis`` must carry the sequence axis per batch row, i.e. shape
+    ``[..., S, rope_dim // 2, 2]`` with leading dims that broadcast against
+    ``x``'s leading dims (``x`` is ``[..., S, H, rope_dim]``). The sequence axis
+    is kept explicit: gathering the flattened ``[batch * S]`` positions and
+    taking ``cos[:seq_len]`` would otherwise apply row 0's rotation to every row.
+    """
     if freqs_cis.is_complex():
         freqs_cis = torch.view_as_real(freqs_cis)
     rope_dim = x.shape[-1]
     if freqs_cis.shape[-2] != rope_dim // 2:
         freqs_cis = freqs_cis[..., : rope_dim // 2, :]
+    # ``freqs_cis`` is ``[..., S, rope_dim // 2, 2]``; ``x`` is either
+    # ``[..., S, H, rope_dim]`` (head axis present, e.g. q/o) or
+    # ``[..., S, rope_dim]`` (head-less shared KV).
+    head_axis = x.dim() == freqs_cis.dim()
+    seq_axis = -3 if head_axis else -2
+    seq_len = x.shape[seq_axis]
+    if freqs_cis.shape[-3] != seq_len:
+        # Tolerate a longer precomputed table by slicing to the sequence length.
+        freqs_cis = freqs_cis[..., :seq_len, :, :]
     cos = freqs_cis[..., 0].repeat_interleave(2, dim=-1)
     sin = freqs_cis[..., 1].repeat_interleave(2, dim=-1)
     if inverse:
         sin = -sin
-    seq_len = x.shape[1] if x.dim() >= 2 else x.shape[0]
-    cos = cos[:seq_len, :rope_dim] if cos.dim() == 2 else cos[..., :seq_len, :rope_dim]
-    sin = sin[:seq_len, :rope_dim] if sin.dim() == 2 else sin[..., :seq_len, :rope_dim]
-    cos_shape = [1] * x.ndim
-    seq_axis = 1 if x.dim() >= 2 else 0
-    cos_shape[seq_axis] = seq_len
-    cos_shape[-1] = rope_dim
-    cos = cos.reshape(*cos_shape).float()
-    sin = sin.reshape(*cos_shape).float()
+    # Insert the broadcast axis for the head/stream dim only when it exists.
+    if head_axis:
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+    cos = cos.float()
+    sin = sin.float()
     xf = x.float()
     pair = xf.unflatten(-1, (-1, 2))
     rotate_half = torch.stack((-pair[..., 1], pair[..., 0]), dim=-1).flatten(-2)

@@ -1405,11 +1405,9 @@ class DrafterBaseTrainer:
                 )
                 self._apply_ep_fsdp2(
                     raw_model,
-                    {
-                        "mesh": self.fsdp_device_mesh,
-                        "mp_policy": ep_mp_policy,
-                        "offload_policy": None,
-                    },
+                    # ``apply_ep_fsdp2`` derives the FSDP2 mesh from the trainer's
+                    # raw (dp, sp) training mesh itself; only the mp policy is read.
+                    {"mp_policy": ep_mp_policy},
                     fsdp_config,
                     use_skip_loading,
                 )

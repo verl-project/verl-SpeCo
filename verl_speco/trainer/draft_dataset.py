@@ -356,14 +356,12 @@ class DraftFeatureDataLoader:
                 # of the shard-major key list so it owns whole shards. Striding
                 # (keys[rank::world_size]) would touch every multi-GB shard while
                 # using only a few samples per shard, causing ~world_size read
-                # amplification under whole-shard reads.
-                if world_size > 1:
-                    per = len(keys) // world_size
-                    rank_keys = keys[rank * per : (rank + 1) * per]
-                else:
-                    rank_keys = keys
-                if world_size > 1:
-                    rank_keys = rank_keys[: len(keys) // world_size]
+                # amplification under whole-shard reads. Each rank takes exactly
+                # ``len(keys) // world_size`` keys; the remainder is not read here
+                # (distributed runs truncate to the global minimum in
+                # ``_synchronize_length`` anyway, so it would be dropped regardless).
+                per = len(keys) // world_size if world_size > 1 else len(keys)
+                rank_keys = keys[rank * per : (rank + 1) * per]
                 rank_samples = self._read_filtered(rank_keys)
             rank_samples = self._synchronize_length(rank_samples)
             rank_samples = self._maybe_group_by_length(rank_samples)

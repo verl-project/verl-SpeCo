@@ -144,6 +144,12 @@ class DSV4DSparkConfig(DSparkConfig):
             internal_config["enable_confidence_head"] = (
                 float(internal_config.get("confidence_head_alpha", 0.0)) > 0.0
             )
+        # The released config is the *target* config, which may declare sliding
+        # window attention (``sliding_window``/``layer_types``). The DSV4 draft
+        # backbone is dense sink attention and only supports a single dense mask,
+        # so force sliding-window off instead of inheriting a mask-list layout
+        # that ``_mask_to_bias`` would reject at forward time.
+        internal_config["use_sliding_window"] = False
         loaded = cls.from_dict(internal_config)
         loaded._source_checkpoint_config = source_config
         return loaded

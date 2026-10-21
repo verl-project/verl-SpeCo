@@ -32,8 +32,18 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
     _no_split_modules = ["MhcDecoderBlock"]
 
     def __init__(self, config: DSV4DSparkConfig) -> None:
-        super().__init__(config)
         bb = _BackboneConfig(config)
+        # The parent builds a DFlash decoder stack sized by ``num_hidden_layers``;
+        # the DSV4 backbone replaces it entirely. Zero the depth only for the
+        # parent call so we never materialize the unused DFlash layers, then
+        # restore it (the backbone modules read ``num_hidden_layers`` too).
+        draft_depth = int(config.num_hidden_layers)
+        try:
+            config.num_hidden_layers = 0
+            super().__init__(config)
+        finally:
+            config.num_hidden_layers = draft_depth
+        self.num_layers = draft_depth
         self.backbone_cfg = bb
         self.grad_checkpoint = bool(int(os.environ.get("DSPARK_RECOMPUTE", "0")))
 
@@ -58,24 +68,6 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             ).contiguous(),
             persistent=False,
         )
-        self._init_backbone_params()
-
-    def _init_backbone_params(self) -> None:
-        if any(p.is_meta for p in self.parameters()):
-            return
-        std = 0.02
-        for m in [*self.layers, self.hc_head]:
-            for name, p in m.named_parameters():
-                if (
-                    p.dim() >= 2
-                    and (".fn" in name or "weight" in name or "hc_fn" in name)
-                    and (
-                        torch.isnan(p).any()
-                        or not p.abs().sum().isfinite()
-                        or p.abs().sum() == 0
-                    )
-                ):
-                    nn.init.normal_(p, std=std)
 
     def _rebuild_freqs(self, seqlen: int) -> None:
         bb = self.backbone_cfg
@@ -190,10 +182,12 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
     def shard_experts_as_dtensor(self, mesh) -> None:
         from torch.distributed.tensor import DTensor, Replicate, Shard
 
-        # Experts are sharded over the (expert-parallel) leading mesh dim and
-        # replicated over the remaining dims. FSDP2's standard flow needs every
-        # parameter to be a DTensor, otherwise the gradient-norm reduction mixes
-        # plain tensors with DTensors and fails.
+        # Wrap each rank's *already EP-sliced* routed experts as a DTensor purely
+        # so no plain tensor is mixed with DTensors in FSDP2's gradient-norm
+        # reduction / optimizer. The experts are listed in ``fsdp_ignored_params``
+        # and are therefore never sharded or reduced by FSDP2; the placements only
+        # need to match the mesh arity (Shard on the leading dim, Replicate on the
+        # rest), not to describe the true EP distribution.
         placements = [Shard(0)] + [Replicate() for _ in range(int(mesh.ndim) - 1)]
 
         for module in self.modules():
@@ -260,8 +254,15 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         else:
             draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)
 
-        block_freqs = self._rope_at(draft_position_ids.reshape(-1).long())
-        context_freqs = self._rope_at(context_position_ids.reshape(-1).long())
+        # Keep the sequence axis per batch row: flattening the positions would
+        # lose the batch dimension and apply batch row 0's rotation to every row.
+        rope_dim_half = self._rope_dim // 2
+        block_freqs = self._rope_at(draft_position_ids.reshape(-1).long()).reshape(
+            *draft_position_ids.shape, rope_dim_half, 2
+        )
+        context_freqs = self._rope_at(
+            context_position_ids.reshape(-1).long()
+        ).reshape(*context_position_ids.shape, rope_dim_half, 2)
         if dense_attention_mask is None and block_mask is not None:
             # The DSV4 sink attention consumes a dense bias only. The DFlash mask
             # builder returns a flex ``BlockMask`` on CUDA, which this model does

@@ -336,6 +336,13 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
                         )
                     )
                     inferred = fc_w.size(1) // target_hs
+                    if fc_w.size(1) % target_hs != 0:
+                        raise ValueError(
+                            f"DSV4 DSpark {fc_key} input dim "
+                            f"{int(fc_w.size(1))} is not divisible by "
+                            f"target_hidden_size={target_hs}; cannot infer "
+                            "num_context_layers."
+                        )
                     if inferred > 0 and inferred != getattr(
                         drafter_config, "num_context_layers", 0
                     ):
@@ -698,6 +705,16 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
             l1_chunk_size=int(training_cfg.get("dsv4_dspark_l1_chunk_size", 0)),
             distribution_loss_impl=str(
                 training_cfg.get("dsv4_dspark_distribution_loss_impl", "auto")
+            ),
+            # Without an explicit ``ce_target_source`` the training model defaults
+            # to dataset labels, silently ignoring a configured target_argmax CE
+            # even though the target head and aux-plus-last layout are set up.
+            ce_target_source=str(training_cfg.get("ce_target_source", "labels")),
+            confidence_target_mode=str(
+                training_cfg.get(
+                    "dsv4_dspark_confidence_target_mode",
+                    training_cfg.get("dspark_confidence_target_mode", "greedy"),
+                )
             ),
             debug_log=bool(training_cfg.get("dsv4_dspark_debug_log", False)),
             debug_log_first_n=int(training_cfg.get("dsv4_dspark_debug_log_first_n", 2)),

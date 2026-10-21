@@ -72,7 +72,7 @@ python -m verl_speco.draft_train_launcher \
     actor_rollout_ref.rollout.drafter.training.save_final_checkpoint=False \
     actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu=${BATCH_SIZE} \
     actor_rollout_ref.rollout.drafter.training.init_on_meta=${INIT_ON_META} \
-    +actor_rollout_ref.rollout.drafter.training.dsv4_dspark_random_init=${RANDOM_INIT} \
+    actor_rollout_ref.rollout.drafter.training.dsv4_dspark_random_init=${RANDOM_INIT} \
     actor_rollout_ref.rollout.drafter.training.dsv4_dspark_hidden_size=4096 \
     actor_rollout_ref.rollout.drafter.training.dsv4_dspark_num_target_layers=3 \
     actor_rollout_ref.rollout.drafter.training.dsv4_dspark_num_hidden_layers=3 \
@@ -101,7 +101,7 @@ python -m verl_speco.draft_train_launcher \
     actor_rollout_ref.rollout.drafter.training.dsv4_dspark_backbone_window_size=128 \
     actor_rollout_ref.rollout.drafter.training.dsv4_dspark_backbone_n_shared_experts=1 \
     actor_rollout_ref.rollout.drafter.training.dsv4_dspark_enable_ep=${ENABLE_EP} \
-    +actor_rollout_ref.rollout.drafter.training.dsv4_dspark_ep_no_fsdp=${EP_NO_FSDP} \
+    actor_rollout_ref.rollout.drafter.training.dsv4_dspark_ep_no_fsdp=${EP_NO_FSDP} \
     actor_rollout_ref.rollout.drafter.training.dsv4_dspark_debug_log=False \
     actor_rollout_ref.rollout.drafter.training.lr=2e-4 \
     actor_rollout_ref.rollout.drafter.training.lr_scheduler_type=cosine \

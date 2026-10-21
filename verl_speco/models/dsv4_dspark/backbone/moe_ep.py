@@ -35,6 +35,9 @@ class _EPCtx:
 
 _EP: _EPCtx | None = None
 
+# Debug-only forward counter for DSPARK_DEBUG_EP (see ``moe_dispatch_ep``).
+_EP_DBG = 0
+
 
 def configure(group, rank: int, size: int, experts_per_rank: int) -> None:
     global _EP
@@ -166,10 +169,7 @@ def moe_dispatch_ep(
 
     if os.environ.get("DSPARK_DEBUG_EP") == "1":
         global _EP_DBG
-        try:
-            _EP_DBG += 1
-        except NameError:
-            _EP_DBG = 1
+        _EP_DBG += 1
         if _EP_DBG <= 4:
             print(
                 f"[EPDEBUG rank={ep.rank}/{ep.size}] T={T} n_routed={input_splits.sum().item()} "

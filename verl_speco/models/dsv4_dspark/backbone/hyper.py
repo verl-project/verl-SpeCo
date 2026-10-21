@@ -76,6 +76,10 @@ class HyperConnection(nn.Module):
         self.input_norm = UnweightedRMSNorm(cfg.rms_norm_eps)
         mix = (2 + self.hc_mult) * self.hc_mult
         self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * cfg.hidden_size))
+        # Explicit init (small): otherwise ``torch.empty`` leaves the mixing matrix
+        # as garbage/near-zero. Near-zero yields sigmoid(0)/uniform-softmax, a stable
+        # starting point for the hyper-connection.
+        nn.init.normal_(self.fn, std=0.02)
         self.base = nn.Parameter(torch.zeros(mix))
         self.scale = nn.Parameter(torch.ones(3))
 
@@ -96,6 +100,7 @@ class HyperHead(nn.Module):
         self.hc_fn = nn.Parameter(
             torch.empty(self.hc_mult, self.hc_mult * cfg.hidden_size)
         )
+        nn.init.normal_(self.hc_fn, std=0.02)
         self.hc_base = nn.Parameter(torch.zeros(self.hc_mult))
         self.hc_scale = nn.Parameter(torch.ones(1))
 

@@ -540,12 +540,15 @@ def test_dsv4_init_router_bias_breaks_symmetry():
 
     _init_router_bias(model, world_size=2, experts_per_rank=2, rank=1)
 
-    # The bias is a small random perturbation whose purpose is to break routing
-    # symmetry (the per-expert noise dominates the +/- boost), so assert that it
-    # is initialized and non-uniform rather than that local experts win.
+    # The shared (exported) bias must stay untouched; the per-rank preference is
+    # a transient attribute applied at routing time only.
+    assert torch.count_nonzero(router.bias).item() == 0
     assert router._bias_initialized is True
-    assert torch.count_nonzero(router.bias).item() == router.bias.numel()
-    assert router.bias.std().item() > 0
+    assert router._ep_rank_bias is not None
+    assert router._ep_rank_bias.shape == (router.bias.numel(),)
+    # Rank 1 owns global experts [2, 3] and prefers them (+boost), the rest -boost.
+    assert router._ep_rank_bias[2] > 0 and router._ep_rank_bias[3] > 0
+    assert router._ep_rank_bias[0] < 0 and router._ep_rank_bias[1] < 0
 
 
 def test_dsv4_load_embedding_handles_multiple_index_and_nested_key(tmp_path):
@@ -783,3 +786,68 @@ def test_dsv4_model_freqs_use_yarn_scaling():
 
     assert torch.allclose(model.freqs_cis, yarn)
     assert not torch.allclose(model.freqs_cis, plain)
+
+
+def test_dsv4_rope_is_batch_invariant():
+    # Regression: gathering the flattened positions and truncating to the first
+    # ``seq_len`` rows applied batch row 0's rotation to every row.
+    model = DSV4DSparkDraftModel(_tiny_dsv4_config())
+    model.eval()
+    bsz, ctx, n = 2, 10, 8
+    torch.manual_seed(0)
+    ctx_feat = torch.randn(bsz, ctx, 64)
+    draft_ids = torch.randint(0, 100, (bsz, n))
+    # Distinct per-row draft positions (mirrors per-sample anchor sampling).
+    draft_pos = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7], [20, 21, 22, 23, 24, 25, 26, 27]])
+    ctx_pos = torch.arange(ctx).unsqueeze(0).expand(bsz, -1).contiguous()
+    mask = torch.ones(bsz, 1, n, ctx + n, dtype=torch.bool)
+
+    with torch.no_grad():
+        batched = model(
+            draft_ids, ctx_feat, draft_pos, ctx_pos, dense_attention_mask=mask
+        )
+        solo = torch.cat(
+            [
+                model(
+                    draft_ids[i : i + 1],
+                    ctx_feat[i : i + 1],
+                    draft_pos[i : i + 1],
+                    ctx_pos[i : i + 1],
+                    dense_attention_mask=mask[i : i + 1],
+                )
+                for i in range(bsz)
+            ],
+            dim=0,
+        )
+    torch.testing.assert_close(batched, solo, atol=1e-5, rtol=1e-4)
+
+
+def test_dsv4_router_init_is_non_degenerate():
+    # Regression: ``torch.empty`` router weights could be all-zero/garbage, making
+    # every token collapse onto the first ``topk`` experts.
+    torch.manual_seed(0)
+    model = DSV4DSparkDraftModel(_tiny_dsv4_config())
+    router = model.layers[0].ffn.router
+    assert router.weight.std().item() > 0
+    _, indices = router(torch.randn(256, 64))
+    assert set(indices.flatten().tolist()) == set(
+        range(router.n_routed_experts)
+    )
+
+
+def test_dsv4_build_model_wires_ce_target_source():
+    # Regression: the DSV4 build_model dropped ``ce_target_source`` so a
+    # configured target_argmax CE was silently ignored (defaulted to labels).
+    training = dict(_fallback_training_cfg())
+    training["ce_target_source"] = "target_argmax"
+    training["dsv4_dspark_confidence_target_mode"] = "probabilistic"
+    backend = _backend(training)
+    backend.config.rollout.drafter.model_path = ""
+    backend._get_target_hf_config = _target_hf_config
+    backend._build_target_lm_head = lambda *args, **kwargs: None
+    backend._skip_weight_loading = True
+
+    model, _ = backend.build_model()
+
+    assert model.ce_target_source == "target_argmax"
+    assert model.confidence_target_mode == "probabilistic"

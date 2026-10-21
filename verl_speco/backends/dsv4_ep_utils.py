@@ -23,16 +23,19 @@ logger = logging.getLogger(__name__)
 
 
 def _init_router_bias(model, world_size, experts_per_rank, rank):
-    """Initialize the MoE router bias so each rank's experts get load.
+    """Install a per-rank EP routing preference to break routing symmetry.
 
-    With random init the router logits are arbitrary and can concentrate all
-    tokens on a handful of experts, which makes the EP all-to-all splits wildly
-    uneven and hangs the first collective. We therefore bias every rank towards
-    its *own* experts and run a short probe-based calibration that raises the
-    boost until the local experts win the top-k on a random probe (i.e. until the
-    rank keeps routing to itself), which keeps the per-rank all-to-all traffic
-    balanced.
+    A (near-)zero router makes the selection logits constant, so every token
+    collapses onto the first ``topk`` experts and the other ranks receive no
+    real rows in the all-to-all. We therefore give each rank a small transient
+    preference (+boost for its own experts, -boost for the rest).
+
+    The preference is stored on the module as ``_ep_rank_bias`` (a plain
+    attribute, not a parameter/buffer) and applied at routing time only, so the
+    shared ``router.bias`` buffer keeps its real, rank-independent value and the
+    exported checkpoint is not polluted with rank-local routing state.
     """
+    boost = 0.5
     n_experts = world_size * experts_per_rank
     for module in model.modules():
         router = getattr(module, "router", None)
@@ -40,7 +43,6 @@ def _init_router_bias(model, world_size, experts_per_rank, rank):
             continue
         if not hasattr(router, "bias") or router.bias.shape[0] != n_experts:
             continue
-        topk = int(getattr(router, "topk", 1))
         with torch.no_grad():
             n_bias = router.bias.numel()
             # Bias is the global expert vector; guard against partially-sharded
@@ -49,19 +51,21 @@ def _init_router_bias(model, world_size, experts_per_rank, rank):
                 continue
             local_start = rank * experts_per_rank
             local_end = min(local_start + experts_per_rank, n_bias)
-            # Moderate local preference: enough to break random-init symmetry
-            # without driving all traffic to the rank's own experts.
-            bias = torch.full_like(router.bias.float(), -0.5)
-            bias[local_start:local_end] = 0.5
-            bias[local_start:local_end] += (
-                torch.randn(local_end - local_start, device=bias.device) * 0.01
+            preference = torch.full(
+                (n_bias,), -boost, dtype=torch.float32, device=router.bias.device
             )
-            router.bias.copy_(bias.to(router.bias.dtype))
+            preference[local_start:local_end] = boost
+            # Break the within-rank symmetry so ties do not all go to one expert.
+            preference[local_start:local_end] += (
+                torch.randn(local_end - local_start, device=router.bias.device) * 0.01
+            )
+            router._ep_rank_bias = preference
             if hasattr(router, "_bias_initialized"):
                 router._bias_initialized = True
     if rank == 0:
         logger.info(
-            f"[EP] Router bias initialized: boost=±5.0 for {experts_per_rank} local experts/rank"
+            f"[EP] Router EP preference set: boost=±{boost} for "
+            f"{experts_per_rank} local experts/rank (shared bias preserved for export)"
         )
 
 
@@ -331,10 +335,10 @@ def apply_ep_fsdp2(
     rank = dist.get_rank()
     n_experts = resolve_routed_expert_count(trainer.config)
     experts_per_rank = ensure_ep_divisible(n_experts, world_size)
-    # Keep the raw drafter mesh for the expert DTensors: FSDP2 uses a reshaped
-    # (dp, sp) mesh, and having the expert DTensors on the *unreshaped* mesh
-    # keeps them non-overlapping so FSDP2 can concatenate meshes (they are also
-    # in ``ignored_params`` so FSDP2 never shards them).
+    # Expert DTensors are built on the raw (dp, sp) training mesh so their
+    # placement arity matches FSDP2's mesh. The experts are in ``ignored_params``
+    # (never sharded/reduced), so the placements are only there to keep the
+    # optimizer/grad-norm from mixing plain tensors with DTensors.
     mesh = trainer.training_device_mesh
     random_init = bool(
         trainer.config.rollout.drafter.training.get("dsv4_dspark_random_init", False)
@@ -522,39 +526,50 @@ def sync_non_expert_grads(trainer) -> None:
     # not "nothing to do".
     expert_ids = getattr(trainer, "_ep_expert_param_ids", None) or set()
 
-    grads_to_reduce = []
+    # Build a canonical, rank-invariant list: parameters that happen to miss a
+    # gradient on one rank are still reduced (as zeros) so every rank issues the
+    # same collective shapes/dtypes. A rank-dependent grad-presence skew would
+    # otherwise desync the all-reduce and hang.
+    entries: list[tuple[torch.nn.Parameter, torch.Tensor, bool]] = []
     for p in trainer.model.parameters():
-        if id(p) in expert_ids:
+        if id(p) in expert_ids or not p.requires_grad:
             continue
         if p.grad is not None:
-            grads_to_reduce.append(p.grad)
+            entries.append((p, p.grad, True))
+        else:
+            entries.append((p, torch.zeros_like(p), False))
 
-    if not grads_to_reduce:
+    if not entries:
         return
 
     if os.environ.get("DSPARK_DEBUG_EP") == "1":
-        shapes = sorted(g.numel() for g in grads_to_reduce)
+        total_numel = sum(g.numel() for _, g, _ in entries)
         print(
             f"[EPDEBUG gradsync rank={dist.get_rank()}] "
-            f"n_grads={len(grads_to_reduce)} total_numel={sum(shapes)} "
-            f"dtypes={sorted({str(g.dtype) for g in grads_to_reduce})}",
+            f"n_grads={len(entries)} total_numel={total_numel} "
+            f"dtypes={sorted({str(g.dtype) for _, g, _ in entries})}",
             flush=True,
         )
 
     # Group by dtype so mixed-precision non-expert params can be reduced
     # together; avoid torch private ``_flatten_dense_tensors`` helpers.
-    grads_by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
-    for grad in grads_to_reduce:
-        grads_by_dtype.setdefault(grad.dtype, []).append(grad)
+    grads_by_dtype: dict[
+        torch.dtype, list[tuple[torch.nn.Parameter, torch.Tensor, bool]]
+    ] = {}
+    for entry in entries:
+        grads_by_dtype.setdefault(entry[1].dtype, []).append(entry)
 
-    for grads in grads_by_dtype.values():
-        flat_grad = torch.cat([grad.reshape(-1) for grad in grads])
+    for group in grads_by_dtype.values():
+        flat_grad = torch.cat([grad.reshape(-1) for _, grad, _ in group])
         dist.all_reduce(flat_grad, op=dist.ReduceOp.SUM)
         flat_grad.div_(float(world_size))
         offset = 0
-        for grad in grads:
+        for _, grad, had_grad in group:
             numel = grad.numel()
-            grad.copy_(flat_grad[offset : offset + numel].view_as(grad))
+            # Only write back params that owned a gradient; a synthesized zero
+            # must not create a spurious optimizer update.
+            if had_grad:
+                grad.copy_(flat_grad[offset : offset + numel].view_as(grad))
             offset += numel
 
 

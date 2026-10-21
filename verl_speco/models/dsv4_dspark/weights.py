@@ -437,7 +437,7 @@ def load_released_draft(
     # slice, so released experts are routed to their owner rank instead of being
     # written positionally (see the context resolution above).
     for key, (mapped, tensor) in all_results.items():
-        if mapped.endswith("_idx_") or ("_idx_" in mapped and ".experts." in mapped):
+        if "_idx_" in mapped and ".experts." in mapped:
             base, _, expert_str = mapped.rpartition("_idx_")
             expert_idx = int(expert_str)
             if base not in model_state:
