@@ -1058,6 +1058,12 @@ class DrafterBaseTrainer:
             self._is_ep_active_cache = cached
         return cached
 
+    def _is_ep_enabled(self) -> bool:
+        """Config-only EP request (no process-group check); see _is_ep_active."""
+        from verl_speco.backends.dsv4_ep_utils import is_ep_enabled
+
+        return is_ep_enabled(self.config)
+
     def _apply_ep_only(self, raw_model) -> None:
         from verl_speco.backends.dsv4_ep_utils import apply_ep_only
 
@@ -1435,6 +1441,14 @@ class DrafterBaseTrainer:
             self.config.rollout.drafter.training.get("dsv4_dspark_random_init", False)
         )
         ep_enabled = self._is_ep_active()
+        if self._is_ep_enabled() and not ep_enabled:
+            # EP was requested but degraded (single-rank / no process group):
+            # make the fallback to the full expert set visible at the boundary.
+            logger.warning(
+                "DSV4 DSpark EP requested (dsv4_dspark_enable_ep=true) but the "
+                "process group is uninitialized or has a single rank; training "
+                "on the full expert set without expert parallelism."
+            )
         # Under EP every rank must load its OWN released expert slice (the
         # pre-configured model is already sliced), so init_on_meta must not make
         # non-zero ranks skip loading. Short-circuit on the config flags first so

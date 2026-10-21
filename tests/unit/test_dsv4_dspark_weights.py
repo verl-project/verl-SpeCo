@@ -819,3 +819,30 @@ def test_convert_checkpoint_merge_validates_against_config_rows(
     # Neither source available -> loud warning instead of a silent pass.
     _merge_ep_expert_slices(sd, ep_dir)
     assert "could not validate the merged EP expert count" in capsys.readouterr().out
+
+
+def test_convert_checkpoint_inspect_ignores_malformed_config(
+    tmp_path, capsys, monkeypatch
+):
+    # --inspect is a dry run and must not parse config.json.
+    import sys
+
+    from verl_speco.tools import convert_checkpoint
+
+    safetensors_torch.save_file(
+        {
+            "layers.0.ffn.router.weight": torch.zeros(4, 2),
+            "layers.0.ffn.experts.w1": torch.zeros(2, 3, 2),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    (tmp_path / "config.json").write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["convert_checkpoint", "--in", str(tmp_path), "--inspect"],
+    )
+
+    convert_checkpoint.main()
+
+    assert "Sample mtp.* keys" in capsys.readouterr().out

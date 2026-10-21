@@ -87,35 +87,18 @@ def is_ep_enabled(config) -> bool:
     return bool(_read_cfg(training, "dsv4_dspark_enable_ep", False))
 
 
-_SINGLE_RANK_EP_WARNED = False
-
-
 def is_ep_active(config) -> bool:
     """EP is both requested *and* possible (multi-rank process group).
 
     ``is_ep_enabled`` only inspects the config; a single-rank run cannot slice
     experts, so EP is treated as inactive there and training falls back to the
-    full expert set instead of failing at build time. The fallback is logged
-    once.
+    full expert set (the build boundary logs that degradation).
     """
-    global _SINGLE_RANK_EP_WARNED
     if not is_ep_enabled(config):
         return False
-    try:
-        import torch.distributed as dist
-    except ImportError:  # pragma: no cover - torch always ships distributed
-        return False
-    active = bool(
+    return bool(
         dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
     )
-    if not active and not _SINGLE_RANK_EP_WARNED:
-        _SINGLE_RANK_EP_WARNED = True
-        logger.warning(
-            "DSV4 DSpark EP requested (dsv4_dspark_enable_ep=true) but the process "
-            "group is uninitialized or has a single rank; training on the full "
-            "expert set without expert parallelism."
-        )
-    return active
 
 
 def resolve_routed_expert_count(config, drafter_config=None) -> int:

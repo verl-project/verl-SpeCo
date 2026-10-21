@@ -241,9 +241,12 @@ def main():
     args = ap.parse_args()
 
     in_dir = Path(args.inp)
+    # --inspect is a dry run: do not touch config.json (pre-existing behavior).
     src_cfg = Path(args.config_from) if args.config_from else (in_dir / "config.json")
     cfg = (
-        json.loads(src_cfg.read_text()) if src_cfg.exists() else None
+        json.loads(src_cfg.read_text())
+        if src_cfg.exists() and not args.inspect
+        else None
     )
 
     sd = _load_state_dict(in_dir)
