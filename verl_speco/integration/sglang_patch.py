@@ -28,6 +28,8 @@ import torch
 import sglang.srt.entrypoints.engine
 from sglang.srt.utils import MultiprocessingSerializer
 
+from verl_speco.integration.drafter_config_env import get_drafter_config_env
+
 try:
     import triton
     import triton.language as tl
@@ -316,7 +318,7 @@ def _get_route_markers() -> tuple[str | None, str | None]:
 
 
 def _speco_drafter_runtime_enabled() -> bool:
-    raw = os.environ.get("VERL_SPECO_SGLANG_DRAFTER_CONFIG")
+    raw = get_drafter_config_env()
     if not raw:
         return False
     try:

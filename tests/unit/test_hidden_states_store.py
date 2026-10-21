@@ -33,7 +33,7 @@ class _FakeMooncake:
         self.payload = payload
         self.deleted: list[str] = []
 
-    def get_sample(self, key):
+    def get_sample(self, key, *, timeout=120.0):
         return self.payload
 
     def delete_sample(self, key):
@@ -171,7 +171,13 @@ def test_speco_connector_restores_rank0_finished_count() -> None:
         SpecoMooncakeHiddenStatesConnector,
     )
 
-    assert issubclass(
-        SpecoMooncakeHiddenStatesConnector, MooncakeHiddenStatesConnector
-    )
+    assert issubclass(SpecoMooncakeHiddenStatesConnector, MooncakeHiddenStatesConnector)
     assert SpecoMooncakeHiddenStatesConnector.get_finished_count(None) == 1
+
+
+def test_release_initializes_store_for_unread_reference(monkeypatch):
+    store = MooncakeHiddenStatesStore(MooncakeStoreSettings())
+    fake = _FakeMooncake({})
+    monkeypatch.setattr(store, "_ensure_store", lambda: fake)
+    store.release("never-read")
+    assert fake.deleted == ["never-read"]

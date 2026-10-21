@@ -18,6 +18,7 @@ import asyncio
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 import verl_speco.producer.vllm_feature_client as client_module
 from verl_speco.producer.hidden_states_store import HiddenStatesStore
@@ -45,6 +46,48 @@ class _RecordingStore(HiddenStatesStore):
 
     def release(self, reference: str) -> None:
         self.released.append(reference)
+
+
+def test_prefill_reference_does_not_load_or_release_file(monkeypatch):
+    endpoint = VllmEndpoint("http://vllm:8000/v1", 1)
+    store = _RecordingStore()
+    store.backend = "file"
+
+    async def fake_prefill(*args, **kwargs):
+        return VllmResponse("/shared/a.safetensors", endpoint.base_url)
+
+    monkeypatch.setattr(client_module, "request_prefill", fake_prefill)
+    pool = VllmFeatureClientPool(
+        [endpoint], model="target", max_inflight_requests=1,
+        request_timeout=10, hidden_states_store=store,
+    )
+    pool._states = [client_module._EndpointState(endpoint, object(), asyncio.Semaphore(1))]
+    response = asyncio.run(pool.prefill_reference(SimpleNamespace(prompt_token_ids=[1, 2])))
+    assert isinstance(response, VllmResponse)
+    assert response.hidden_states_path == "/shared/a.safetensors"
+    assert store.loaded == store.released == []
+    assert pool._states[0].inflight == 0
+
+
+def test_prefill_reference_transfers_handle_without_reading(monkeypatch):
+    endpoint = VllmEndpoint("http://vllm:8000/v1", 1)
+    store = _RecordingStore()
+    params = {"handle": "hs-123", "version": 1, "metadata": {"rows": 2}}
+
+    async def prefill(*args, **kwargs):
+        return VllmResponse(None, endpoint.base_url, handle="hs-123", transfer_params=params)
+
+    monkeypatch.setattr(client_module, "request_prefill", prefill)
+    pool = VllmFeatureClientPool(
+        [endpoint], model="target", max_inflight_requests=1,
+        request_timeout=10, hidden_states_store=store,
+    )
+    pool._states = [client_module._EndpointState(endpoint, object(), asyncio.Semaphore(1))]
+    response = asyncio.run(pool.prefill_reference(SimpleNamespace(prompt_token_ids=[1, 2])))
+    assert response.transfer_params == params
+    assert store.loaded == store.released == []
+    delete_temporary_result(response)
+    assert store.released == ["hs-123"]
 
 
 def test_request_generate_returns_store_handle() -> None:

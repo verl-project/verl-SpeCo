@@ -343,6 +343,16 @@ def make_sample_key(global_step: Any, replica_rank: Any, request_id: Any) -> str
     return f"speco:{global_step}:{replica_rank}:{request_id}"
 
 
+def put_metadata(key: str, *, tag: dict) -> None:
+    """Publish a tag-only record without encoding or storing tensor fields."""
+    if not is_transfer_queue_enabled():
+        raise RuntimeError("put_metadata called while TransferQueue is not enabled.")
+    if not tag:
+        raise ValueError("Metadata records require a non-empty tag")
+    _ensure_initialized()
+    tq.kv_put(key=key, partition_id=_partition_id(), fields=None, tag=tag)
+
+
 def put_sample(
     key: str,
     tensor_dict: dict,
@@ -626,6 +636,7 @@ __all__ = [
     "list_samples",
     "make_sample_key",
     "put_sample",
+    "put_metadata",
     "get_sample",
     "get_samples",
 ]

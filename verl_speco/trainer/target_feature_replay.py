@@ -401,8 +401,21 @@ def feature_from_vllm_payload(
     feature_config: FeatureContract,
     *,
     final_norm: nn.Module | None = None,
+    normalize_final_hidden: bool = True,
+    split_hidden_states: bool = False,
+    validate_finite: bool = True,
 ) -> DraftFeatureSample:
-    """Pure vLLM payload conversion shared by replay and standalone Producer."""
+    """Convert vLLM output; standalone CPU prefetch can retain raw final residuals.
+
+    Existing callers normalize as before. Raw output is explicitly marked and
+    must only enter a training path that applies the frozen target norm.
+    File batch assembly can request separate aux/final views, leaving flattening
+    and BF16 conversion to the write into its final batch buffer.
+    Its caller may skip the CPU finite scan when training-side sanitation owns
+    invalid rows; other paths retain the default full validation.
+    """
+    if split_hidden_states and normalize_final_hidden:
+        raise ValueError("Split file features require raw final hidden states")
 
     values = getattr(payload, "payload", payload)
     if not isinstance(values, Mapping):
@@ -435,8 +448,10 @@ def feature_from_vllm_payload(
             "vLLM hidden_states must have shape [seq, layers, hidden], "
             f"got {tuple(hidden.shape)}"
         )
-    if torch.is_floating_point(hidden) and not bool(
-        torch.isfinite(hidden).all().item()
+    if (
+        validate_finite
+        and torch.is_floating_point(hidden)
+        and not bool(torch.isfinite(hidden).all().item())
     ):
         raise HiddenStateAlignmentError(
             "vLLM hidden_states contain NaN/Inf; refusing to train on them"
@@ -522,19 +537,50 @@ def feature_from_vllm_payload(
                 f"hidden_position_offset={hidden_position_offset}"
             )
 
-    selected = hidden.index_select(0, relative_positions).to(dtype=feature_config.dtype)
+    if split_hidden_states:
+        start = int(relative_positions[0].item())
+        contiguous = torch.equal(
+            relative_positions,
+            torch.arange(
+                start,
+                start + relative_positions.numel(),
+                dtype=torch.long,
+                device=relative_positions.device,
+            ),
+        )
+        selected = (
+            hidden[start : start + relative_positions.numel()]
+            if contiguous
+            else hidden.index_select(0, relative_positions)
+        )
+        # Preserve non-BF16 intermediate rounding used by existing configurations.
+        # BF16 is the final training-buffer dtype, so that conversion can wait.
+        if feature_config.dtype != torch.bfloat16:
+            selected = selected.to(dtype=feature_config.dtype)
+    else:
+        selected = hidden.index_select(0, relative_positions).to(
+            dtype=feature_config.dtype
+        )
     # Layer-ID normalization changes which vLLM outputs are requested, not the
     # number or order of returned auxiliary tensors, so the target-side count
     # remains the correct split point here.
-    aux_hidden = selected[:, : len(vllm_aux_layer_ids), :].flatten(1)
+    aux_layers = selected[:, : len(vllm_aux_layer_ids), :]
+    aux_hidden = aux_layers if split_hidden_states else aux_layers.flatten(1)
+    final_hidden = None
     if include_final:
-        if final_norm is None:
-            raise ValueError("vLLM plus_last features require the target final norm")
-        # Auxiliary layers stay raw. Only the final supervision block goes
-        # through the frozen target norm, exactly once, before storage/transport.
-        with torch.no_grad():
-            final_hidden = final_norm(selected[:, final_source_index, :])
-        output_hidden = torch.cat([aux_hidden, final_hidden], dim=-1)
+        final_hidden = selected[:, final_source_index, :]
+        if normalize_final_hidden:
+            if final_norm is None:
+                raise ValueError(
+                    "vLLM plus_last features require the target final norm"
+                )
+            with torch.no_grad():
+                final_hidden = final_norm(final_hidden)
+        output_hidden = (
+            aux_hidden
+            if split_hidden_states
+            else torch.cat([aux_hidden, final_hidden], dim=-1)
+        )
     else:
         output_hidden = aux_hidden
     selected_input_ids = request.input_ids.index_select(0, feature_positions).long()
@@ -579,12 +625,19 @@ def feature_from_vllm_payload(
     if feature_config.vllm_aux_hidden_state_layer_ids is not None:
         metadata["vllm_aux_hidden_state_layer_ids"] = vllm_aux_layer_ids
     if include_final:
-        metadata["last_hidden_state_norm"] = "target_final_norm"
+        metadata["last_hidden_state_norm"] = (
+            "target_final_norm" if normalize_final_hidden else "raw_target_residual"
+        )
     return DraftFeatureSample(
         algorithm=algorithm,
         input_ids=selected_input_ids,
         loss_mask=selected_loss_mask,
-        hidden_states=output_hidden.cpu().contiguous(),
+        hidden_states=output_hidden.cpu()
+        if split_hidden_states
+        else output_hidden.cpu().contiguous(),
+        last_hidden_states=final_hidden.cpu()
+        if split_hidden_states and final_hidden is not None
+        else None,
         position_ids=draft_position_ids,
         metadata=metadata,
     )

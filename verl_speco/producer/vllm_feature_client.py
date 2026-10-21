@@ -20,9 +20,9 @@ import inspect
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, cast
 
 from verl_speco.producer.hidden_states_store import (
     FILE_BACKEND,
@@ -57,6 +57,8 @@ class VllmResponse:
     endpoint_url: str
     generated_token_ids: tuple[int, ...] = ()
     handle: str | None = None
+    transfer_params: dict[str, Any] = field(default_factory=dict)
+    store: HiddenStatesStore | None = field(default=None, compare=False, repr=False)
 
     @property
     def reference(self) -> str:
@@ -130,6 +132,7 @@ async def request_prefill(
         hidden_states_path=path,
         endpoint_url=endpoint.base_url,
         handle=handle,
+        transfer_params=dict(params),
     )
 
 
@@ -171,6 +174,7 @@ async def request_generate(
         endpoint_url=endpoint.base_url,
         generated_token_ids=tuple(int(token_id) for token_id in generated),
         handle=handle,
+        transfer_params=dict(params),
     )
 
 
@@ -203,7 +207,15 @@ def load_hidden_state_result(
     )
 
 
-def delete_temporary_result(raw: RawVllmFeature) -> None:
+def delete_temporary_result(raw: RawVllmFeature | VllmResponse) -> None:
+    if isinstance(raw, VllmResponse):
+        if raw.store is not None:
+            raw.store.release(raw.reference)
+        elif raw.is_handle:
+            raise ValueError("Handle cleanup requires its owning hidden-state store")
+        else:
+            FileHiddenStatesStore().release(raw.reference)
+        return
     if raw.store is not None:
         raw.store.release(raw.temporary_path)
         return
@@ -274,23 +286,46 @@ class VllmFeatureClientPool:
         ]
 
     async def prefill(self, request: Any) -> RawVllmFeature:
-        return await self._request(request, generate=False)
+        return cast(RawVllmFeature, await self._request(request, generate=False))
 
     async def generate(self, request: Any) -> RawVllmFeature:
-        return await self._request(request, generate=True)
+        return cast(RawVllmFeature, await self._request(request, generate=True))
 
-    async def _request(self, request: Any, *, generate: bool) -> RawVllmFeature:
+    async def prefill_reference(self, request: Any) -> VllmResponse:
+        """Transfer ownership of a hidden reference without loading its tensors.
+
+        The caller must retain the payload until consumption or explicitly release
+        it if it cannot publish the reference. Existing eager APIs are unchanged.
+        """
+        return cast(
+            VllmResponse,
+            await self._request(request, generate=False, reference_only=True),
+        )
+
+    async def generate_reference(self, request: Any) -> VllmResponse:
+        """Generate tokens without loading the unused connector output."""
+        return cast(
+            VllmResponse,
+            await self._request(request, generate=True, reference_only=True),
+        )
+
+    async def _request(
+        self, request: Any, *, generate: bool, reference_only: bool = False
+    ) -> RawVllmFeature | VllmResponse:
         if not self._states:
             raise RuntimeError("VllmFeatureClientPool.start() must be called first")
         async with self._global_semaphore:
-            return await self._request_with_retries(request, generate=generate)
+            return await self._request_with_retries(
+                request, generate=generate, reference_only=reference_only
+            )
 
     async def _request_with_retries(
         self,
         request: Any,
         *,
         generate: bool,
-    ) -> RawVllmFeature:
+        reference_only: bool = False,
+    ) -> RawVllmFeature | VllmResponse:
         total_attempts = _DEFAULT_MAX_RETRIES + 1
         failed_in_round: set[str] = set()
         for attempt in range(1, total_attempts + 1):
@@ -306,7 +341,7 @@ class VllmFeatureClientPool:
             state.inflight += 1
             request_started = time.monotonic()
             response: VllmResponse | None = None
-            loaded = False
+            accepted = False
             try:
                 async with state.semaphore:
                     if generate:
@@ -326,12 +361,23 @@ class VllmFeatureClientPool:
                             model=self.model,
                             timeout=self.request_timeout,
                         )
-                    raw = await asyncio.to_thread(
-                        load_hidden_state_result,
-                        response,
-                        self.hidden_states_store,
-                    )
-                    loaded = True
+                    if reference_only:
+                        expected = (
+                            MOONCAKE_BACKEND if response.is_handle else FILE_BACKEND
+                        )
+                        if self.hidden_states_store.backend != expected:
+                            raise ValueError(
+                                "vLLM reference backend does not match configured store"
+                            )
+                        raw: RawVllmFeature | VllmResponse = replace(
+                            response, store=self.hidden_states_store
+                        )
+                    else:
+                        raw = await asyncio.to_thread(
+                            load_hidden_state_result,
+                            response,
+                            self.hidden_states_store,
+                        )
                 state.requests += 1
                 if self._should_log_success(state.requests):
                     logger.info(
@@ -344,6 +390,7 @@ class VllmFeatureClientPool:
                         state.inflight,
                         time.monotonic() - request_started,
                     )
+                accepted = True
                 return raw
             except ValueError:
                 # Response validation failures are deterministic protocol/data
@@ -386,10 +433,10 @@ class VllmFeatureClientPool:
                 await asyncio.sleep(backoff)
             finally:
                 # The server has already published the hidden states, so a
-                # reference fetched but not loaded must be released; otherwise
+                # reference not handed to the caller must be released; otherwise
                 # retries (and cancellation) leak a file or leave an object in
                 # the bounded Mooncake store.
-                if response is not None and not loaded:
+                if response is not None and not accepted:
                     await self._release_unconsumed(response)
                 state.inflight = max(state.inflight - 1, 0)
         raise RuntimeError(
@@ -397,7 +444,7 @@ class VllmFeatureClientPool:
         )
 
     async def _release_unconsumed(self, response: VllmResponse) -> None:
-        """Best-effort release of a fetched reference whose load failed.
+        """Best-effort release of a response not handed to the caller.
 
         Only release when the response matches the configured store; a backend
         mismatch is a deterministic protocol error that must not trigger a

@@ -74,6 +74,35 @@ def test_torch_shard_feature_store_roundtrip(tmp_path):
     assert reader.get_metadata()["num_samples"] == 2
 
 
+def test_feature_store_checkpoint_cursor_accepts_appended_shards(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=2)
+    store.write_many([_sample(0), _sample(1)])
+    cursor = store.checkpoint_state()
+    store.write_many([_sample(2), _sample(3)])
+    store.close()
+
+    resumed = TorchShardFeatureStore(tmp_path)
+    restored = resumed.restore_checkpoint_state(cursor)
+
+    assert restored["num_shards"] == 1
+    assert restored["num_samples"] == 2
+    assert resumed.get_metadata()["num_samples"] == 4
+
+
+def test_feature_store_checkpoint_cursor_rejects_rewritten_manifest_prefix(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=2)
+    store.write_many([_sample(0), _sample(1)])
+    cursor = store.checkpoint_state()
+    store.close()
+
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        '{"num_samples": 2, "path": "rewritten.pt"}\n', encoding="utf-8"
+    )
+    resumed = TorchShardFeatureStore(tmp_path)
+
+    with pytest.raises(RuntimeError, match="does not match manifest prefix"):
+        resumed.restore_checkpoint_state(cursor)
 def test_token_replay_feature_store_roundtrip(tmp_path):
     sample = DraftReplaySample(
         algorithm="DSPARK",

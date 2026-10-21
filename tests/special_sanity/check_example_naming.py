@@ -17,7 +17,8 @@
 SpeCo examples intentionally expose both the drafter backend and rollout
 backend in the filename because those combinations are the product surface:
 
-    run_<model>_[actor_<actor-backend>_]drafter_<drafter-backend>_<rollout-backend>[_npu].sh
+    run_<model>_[actor_<actor-backend>_]drafter_<drafter-backend>_\
+      [colocate_async|separate_async_]<rollout-backend>[_npu].sh
 
 The standalone/offline draft-training entry point uses:
 
@@ -37,6 +38,7 @@ from pathlib import Path
 ROLLOUT_BACKENDS = ("vllm", "sglang")
 OPTIONAL_SUFFIXES = ("npu",)
 STANDALONE_SUFFIX = ("separate", "training")
+ASYNC_TRAINER_MODES = (("colocate", "async"), ("separate", "async"))
 
 DEFAULT_IGNORE_DIRS: tuple[str, ...] = ()
 DEFAULT_IGNORE_FILES: tuple[str, ...] = ()
@@ -64,7 +66,8 @@ def _is_ignored(
 def _format_expected() -> str:
     return (
         "expected run_<model>_[actor_<actor-backend>_]drafter_"
-        "<drafter-backend>_<rollout-backend>[_npu].sh "
+        "<drafter-backend>_[colocate_async|separate_async_]"
+        "<rollout-backend>[_npu].sh "
         "with actor-backend set to any non-empty backend identifier, "
         "with drafter-backend set to any non-empty backend identifier and "
         f"rollout-backend in {list(ROLLOUT_BACKENDS)}, or "
@@ -111,12 +114,29 @@ def check_filename(path: Path, display: str | None = None) -> list[str]:
                 )
         return errors
 
-    if len(spec_tokens) not in (2, 3):
+    suffix = spec_tokens[-1] if spec_tokens and spec_tokens[-1] in OPTIONAL_SUFFIXES else None
+    core_tokens = spec_tokens[:-1] if suffix is not None else spec_tokens
+    if (
+        len(core_tokens) == 3
+        and core_tokens[-2] in ROLLOUT_BACKENDS
+        and core_tokens[-1] not in OPTIONAL_SUFFIXES
+    ):
+        errors.append(
+            f"{shown}: unknown optional suffix '{core_tokens[-1]}', "
+            f"expected one of {list(OPTIONAL_SUFFIXES)}"
+        )
+        return errors
+    if len(core_tokens) not in (2, 4):
         errors.append(f"{shown}: invalid backend suffix; {_format_expected()}")
         return errors
 
-    drafter_backend, rollout_backend = spec_tokens[0], spec_tokens[1]
-    suffix = spec_tokens[2] if len(spec_tokens) == 3 else None
+    drafter_backend, rollout_backend = core_tokens[0], core_tokens[-1]
+    trainer_mode = tuple(core_tokens[1:-1])
+    if trainer_mode and trainer_mode not in ASYNC_TRAINER_MODES:
+        errors.append(
+            f"{shown}: unknown async trainer mode {'_'.join(trainer_mode)!r}; "
+            "expected colocate_async or separate_async"
+        )
     if not drafter_backend:
         errors.append(
             f"{shown}: expected a non-empty drafter backend before the rollout backend"
@@ -124,10 +144,6 @@ def check_filename(path: Path, display: str | None = None) -> list[str]:
     if rollout_backend not in ROLLOUT_BACKENDS:
         errors.append(
             f"{shown}: unknown rollout backend '{rollout_backend}', expected one of {list(ROLLOUT_BACKENDS)}"
-        )
-    if suffix is not None and suffix not in OPTIONAL_SUFFIXES:
-        errors.append(
-            f"{shown}: unknown optional suffix '{suffix}', expected one of {list(OPTIONAL_SUFFIXES)}"
         )
     return errors
 

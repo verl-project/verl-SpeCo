@@ -20,6 +20,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("torch")
+
 from verl_speco.producer import input_reader
 
 
@@ -157,6 +159,55 @@ def test_iter_input_records_reads_jsonl(tmp_path: Path) -> None:
     assert records[0].prompt == "Q: "
     assert records[0].response == "A"
     assert records[0].source_metadata == {"source": "test"}
+
+
+def test_shuffled_jsonl_reader_reads_in_caller_order(tmp_path: Path) -> None:
+    input_path = tmp_path / "train.jsonl"
+    lines = [
+        json.dumps({"sample_id": "a", "prompt": "Q1: ", "response": "A1"}),
+        "",  # blank lines must not shift the byte offsets
+        json.dumps({"sample_id": "b", "prompt": "Q2: ", "response": "A2"}),
+        json.dumps({"sample_id": "c", "prompt": "Q3: ", "response": "A3"}),
+    ]
+    input_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    reader = input_reader.ShuffledJsonlReader(input_path)
+    assert reader.record_count == 3
+
+    order = [2, 0, 1]
+    records = list(reader.iter_records(order))
+
+    sequential = list(input_reader.iter_input_records(input_path))
+    expected = [sequential[i] for i in order]
+    assert [r.sample_id for r in records] == [r.sample_id for r in expected]
+    for shuffled, plain in zip(records, expected):
+        assert (shuffled.prompt, shuffled.response) == (plain.prompt, plain.response)
+
+
+def test_shuffled_jsonl_reader_skips_invalid_lines(tmp_path: Path) -> None:
+    input_path = tmp_path / "train.jsonl"
+    input_path.write_text(
+        json.dumps({"sample_id": "a", "prompt": "Q: ", "response": "A"})
+        + "\n"
+        + "{not json\n"
+        + json.dumps({"sample_id": "b", "prompt": "Q2: ", "response": "B"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    reader = input_reader.ShuffledJsonlReader(input_path, max_consecutive_errors=5)
+    assert reader.record_count == 3  # offsets are collected before parsing
+    records = list(reader.iter_records([0, 1, 2]))
+
+    assert [r.sample_id for r in records] == ["a", "b"]
+
+
+def test_shuffled_jsonl_reader_rejects_parquet(tmp_path: Path) -> None:
+    input_path = tmp_path / "train.parquet"
+    input_path.write_bytes(b"PAR1-fixture")
+
+    with pytest.raises(input_reader.ShuffledInputUnsupportedError):
+        input_reader.ShuffledJsonlReader(input_path)
 
 
 def test_iter_input_records_reads_parquet_rows(monkeypatch, tmp_path: Path) -> None:
@@ -314,7 +365,9 @@ def test_finalize_generated_request_aligns_connector_excluding_final_token() -> 
     assert finalized.draft_position_ids.tolist() == [3, 4]
 
 
-def test_prefilled_response_limits_vllm_prefix_after_selecting_training_window() -> None:
+def test_prefilled_response_limits_vllm_prefix_after_selecting_training_window() -> (
+    None
+):
     prepared = input_reader._build_tokenized_request(
         sequence_no=0,
         sample_id="long-response",
@@ -345,7 +398,9 @@ def test_prefilled_response_filters_prompt_prefix_beyond_vllm_limit() -> None:
         )
 
 
-def test_iter_jsonl_conversation_splits_final_assistant_response(tmp_path: Path) -> None:
+def test_iter_jsonl_conversation_splits_final_assistant_response(
+    tmp_path: Path,
+) -> None:
     input_path = tmp_path / "conversation.jsonl"
     input_path.write_text(
         json.dumps(
@@ -387,7 +442,9 @@ def test_iter_jsonl_legacy_conversations_normalizes_from_value(tmp_path: Path) -
     assert record.response == "Answer"
 
 
-def test_prepare_generated_prefill_request_uses_full_sequence_without_final_token() -> None:
+def test_prepare_generated_prefill_request_uses_full_sequence_without_final_token() -> (
+    None
+):
     request = input_reader.GenerationRequest(
         sequence_no=0,
         sample_id="generated-row",
@@ -432,3 +489,19 @@ def test_non_utf8_non_parquet_input_has_actionable_error(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="not UTF-8 JSONL or a Parquet file"):
         list(input_reader.iter_input_records(input_path))
+
+
+@pytest.mark.parametrize("feature_rows", [2, 3, 5])
+def test_minimum_feature_rows_applies_after_window_selection(feature_rows):
+    kwargs = dict(
+        sequence_no=0, sample_id="eagle3", prompt_length=2,
+        full_ids=list(range(6)), source_metadata={},
+        config={"min_feature_rows": 3, "min_supervised_tokens": 1,
+                "max_feature_length": feature_rows},
+    )
+    if feature_rows < 3:
+        with pytest.raises(input_reader.SampleFilteredError, match="2 feature rows"):
+            input_reader._build_tokenized_request(**kwargs)
+    else:
+        request = input_reader._build_tokenized_request(**kwargs)
+        assert request.feature_positions.numel() == feature_rows

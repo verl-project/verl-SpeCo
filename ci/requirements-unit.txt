@@ -11,3 +11,11 @@ safetensors
 pillow
 scipy
 psutil
+torchdata
+# Native V1 trainer import chain: profiler, tracking, and tensor reshaping.
+codetiming
+orjson
+einops
+cachetools
+fastapi
+uvicorn

@@ -49,6 +49,7 @@ def _worker(*, data_version: int) -> SpecoWorker:
     worker.enable_drafter = True
     worker.in_drafter_train_group = True
     worker._rank = 0
+    worker.replica_rank = 0
     worker.worker_incarnation = "worker-0"
     worker.last_global_step = 4
     worker.device_name = "cpu"

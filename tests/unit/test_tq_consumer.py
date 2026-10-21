@@ -17,7 +17,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.trainer.feature_store import (
     DraftFeatureSample,
@@ -87,14 +88,18 @@ def _entry(sequence_no: int) -> ReadyEntry:
     return ReadyEntry(key=make_sample_key(meta), tag=make_ready_tag(meta))
 
 
-def test_feature_store_factory_builds_tq_without_path() -> None:
+@pytest.mark.parametrize("store_type", ["tq", "ray_reference"])
+def test_feature_store_factory_builds_tq_without_path(store_type) -> None:
     store = build_feature_store_from_config(
-        {"type": "tq", "path": None},
+        {"type": store_type, "path": None},
         read_only=True,
         transfer_queue_cfg=_config(),
     )
     assert isinstance(store, TQFeatureStore)
     assert store.run_id == "run-a"
+    if store_type == "ray_reference":
+        from verl_speco.trainer.tq_feature_store import ReferenceFeatureStore
+        assert isinstance(store, ReferenceFeatureStore)
 
 
 def test_tq_store_defaults_to_current_protocol_version() -> None:

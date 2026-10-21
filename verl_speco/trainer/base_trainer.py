@@ -486,6 +486,8 @@ def _alignment_window_rows(
 
 
 class DrafterBaseTrainer:
+    combine_standalone_metrics: bool = False
+
     def __init__(
         self,
         config,
@@ -937,7 +939,7 @@ class DrafterBaseTrainer:
         )
 
     def _is_block_drafter_backend(self) -> bool:
-        return getattr(self.backend, "model_type", None) in {
+        return getattr(getattr(self, "backend", None), "model_type", None) in {
             "dflash",
             "dflash2",
             "dspark",
@@ -1151,11 +1153,12 @@ class DrafterBaseTrainer:
             dist.all_reduce(reduced, group=self.training_device_mesh.get_group())
         return reduced
 
-    def _record_dflash_training_metrics(self, loss_dict: dict[str, Any]) -> None:
+    def _pack_training_diagnostics(
+        self, loss_dict: dict[str, Any]
+    ) -> tuple[list[str], Optional[torch.Tensor]]:
         diagnostics = loss_dict.get("diagnostics")
         if not isinstance(diagnostics, dict):
-            return
-        self._training_metric_steps += 1
+            return [], None
         prefix = self._block_drafter_metric_prefix()
         scalar_keys = {
             "correct_count": f"{prefix}/correct_count",
@@ -1213,15 +1216,51 @@ class DrafterBaseTrainer:
             metric_keys.extend(f"{metric_prefix}/{idx}" for idx in range(value.numel()))
             values.append(value.detach().float().reshape(-1))
 
-        if not metric_keys:
+        return metric_keys, torch.cat(values) if values else None
+
+    def _accumulate_training_diagnostics(
+        self, keys: list[str], values: list[float]
+    ) -> None:
+        for key, value in zip(keys, values, strict=True):
+            self._training_metric_sums[key] = self._training_metric_sums.get(
+                key, 0.0
+            ) + float(value)
+
+    def _record_dflash_training_metrics(self, loss_dict: dict[str, Any]) -> None:
+        if not isinstance(loss_dict.get("diagnostics"), dict):
             return
-        # Keep the same group/reduction semantics, but batch all diagnostics
-        # into one reduction call and one device-to-host transfer per step.
-        reduced = self._reduce_training_metric(torch.cat(values)).cpu().tolist()
-        for metric_key, item in zip(metric_keys, reduced, strict=True):
-            self._training_metric_sums[metric_key] = self._training_metric_sums.get(
-                metric_key, 0.0
-            ) + float(item)
+        self._training_metric_steps += 1
+        keys, values = self._pack_training_diagnostics(loss_dict)
+        if values is not None:
+            reduced = self._reduce_training_metric(values).cpu().tolist()
+            self._accumulate_training_diagnostics(keys, reduced)
+
+    def _reduce_standalone_step_statistics(self, loss_dict: dict[str, Any]):
+        loss_values = torch.stack(
+            [
+                loss_dict[name].detach()
+                for name in (
+                    "total_local_vloss",
+                    "total_local_ploss",
+                    "local_num_tokens",
+                )
+            ]
+        )
+        keys, diagnostics = self._pack_training_diagnostics(loss_dict)
+        if (
+            diagnostics is None
+            or diagnostics.dtype != loss_values.dtype
+            or diagnostics.device != loss_values.device
+        ):
+            # Preserve the previous precision and behavior for uncommon dtypes.
+            self._record_dflash_training_metrics(loss_dict)
+            return self._reduce_loss_metrics(*loss_values.unbind())
+        reduced, world_size = self._reduce_loss_statistics(
+            torch.cat([loss_values, diagnostics])
+        )
+        self._training_metric_steps += 1
+        self._accumulate_training_diagnostics(keys, reduced[3:].cpu().tolist())
+        return reduced[0], reduced[1], reduced[2], world_size
 
     def _get_sp_group(self):
         if self._has_mesh_dim("sp"):
@@ -1315,9 +1354,11 @@ class DrafterBaseTrainer:
         ep_enabled = self._is_ep_enabled()
         # Under EP every rank must load its OWN released expert slice (the
         # pre-configured model is already sliced), so init_on_meta must not make
-        # non-zero ranks skip loading.
+        # non-zero ranks skip loading. Short-circuit on the config flags first so
+        # runs that opt out never touch process-group queries.
         use_skip_loading = (
-            dist.is_initialized()
+            (random_init or init_on_meta)
+            and dist.is_initialized()
             and dist.get_world_size() > 1
             and (
                 random_init
@@ -1353,7 +1394,18 @@ class DrafterBaseTrainer:
         raw_model, drafter_model_config = self.backend.build_model()
         if use_skip_loading:
             delattr(self.backend, "_skip_weight_loading")
-        if not ep_enabled:
+
+        # FSDP2 loads the full state through fsdp2_load_full_state_dict(), which
+        # places only rank 0 on the accelerator during the broadcast. Moving the
+        # raw model first would materialize a full drafter replica on every rank
+        # and can exhaust NPU memory during checkpoint resume. The EP paths move
+        # the model to the device inside apply_ep_only/apply_ep_fsdp2 instead.
+        use_fsdp2 = (
+            self._drafter_strategy() != "ddp"
+            and self.fsdp_device_mesh is not None
+            and dist.is_initialized()
+        )
+        if not use_fsdp2:
             raw_model.to(self.runtime_device)
 
         # B. 获取全量状态用于 FSDP 初始化
@@ -1375,7 +1427,7 @@ class DrafterBaseTrainer:
                 find_unused_parameters=self._drafter_ddp_find_unused_parameters(),
                 broadcast_buffers=False,
             )
-        elif self.fsdp_device_mesh is not None and dist.is_initialized():
+        elif use_fsdp2:
             fsdp_config = self._resolve_fsdp_config()
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=torch.bfloat16,
@@ -1552,6 +1604,33 @@ class DrafterBaseTrainer:
                     )
         self.optimizer_steps_total = resume_optimizer_steps
         self.training_steps = resume_training_steps
+        buffer_state_file = (
+            resume_metadata.get("buffer_state_file") if resume_enabled else None
+        )
+        if buffer_state_file:
+            buffer_state_path = os.path.join(
+                str(spec_model_path), str(buffer_state_file)
+            )
+            try:
+                buffer_state = torch.load(
+                    buffer_state_path, map_location="cpu", weights_only=False
+                )
+                if (
+                    not isinstance(buffer_state, dict)
+                    or int(buffer_state.get("version", 0)) != 1
+                ):
+                    raise RuntimeError("invalid buffer state")
+                self.data_buffer.buffer.clear()
+                self.data_buffer.buffer.extend(buffer_state.get("data_buffer", []))
+                self.data_buffer._current_step = buffer_state.get("data_buffer_step")
+                self.collected_data.clear()
+                self.collected_data.extend(buffer_state.get("collected_data", []))
+                self.buffer_version = int(buffer_state.get("buffer_version", 0))
+                self.current_rl_step = int(buffer_state.get("current_rl_step", 0))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to restore drafter buffer checkpoint from {buffer_state_path}: {exc}"
+                ) from exc
         self.drafter_train_config = drafter_train_config
         self.model_config = drafter_model_config
         self.pad_token_id = int(
@@ -1593,8 +1672,15 @@ class DrafterBaseTrainer:
                         "speculative_algorithm"
                     ],
                     "model_path": rollout_config["drafter"]["model_path"],
-                    "is_offload_optimizer": False,
-                    "is_offload_param": False,
+                    # Preserve explicit drafter offload settings.  In particular,
+                    # checkpoint resume may need CPU-resident state until the
+                    # training window is activated.
+                    "is_offload_optimizer": bool(
+                        drafter_train_config.get("is_offload_optimizer", False)
+                    ),
+                    "is_offload_param": bool(
+                        drafter_train_config.get("is_offload_param", False)
+                    ),
                     "vloss_weight": 1.0,
                     "ploss_weight": 0.1,
                     "data_augment_std": 0.2,
@@ -1680,7 +1766,11 @@ class DrafterBaseTrainer:
 
     def _get_pretrained_export_model(self):
         model = self.model.module if hasattr(self.model, "module") else self.model
-        if self._is_block_drafter_backend() and hasattr(model, "draft_model"):
+        # A standalone export helper may be exercised before backend attachment;
+        # a training wrapper with draft_model is still safe to unwrap.
+        if hasattr(model, "draft_model") and (
+            self._is_block_drafter_backend() or not hasattr(self, "backend")
+        ):
             return model.draft_model, (
                 "draft_model.",
                 "module.draft_model.",
@@ -2016,6 +2106,8 @@ class DrafterBaseTrainer:
 
         save_kwargs = self._infer_pretrained_save_kwargs()
         metadata_path = os.path.join(checkpoint_path, "metadata.json")
+        buffer_state = self._speco_checkpoint_buffer_state()
+        buffer_state_file = "buffer_state.pt" if buffer_state is not None else None
         trainer_state = {
             "version": 2,
             "optimizer_steps_total": int(self.optimizer_steps_total),
@@ -2043,6 +2135,10 @@ class DrafterBaseTrainer:
                     checkpoint_path, state_dict=model_state_dict, **save_kwargs
                 )
                 self._copy_drafter_auxiliary_files(checkpoint_path)
+                if buffer_state_file is not None:
+                    self._atomic_torch_save(
+                        buffer_state, os.path.join(checkpoint_path, buffer_state_file)
+                    )
                 self._atomic_json_dump(
                     {
                         "step": step,
@@ -2051,6 +2147,7 @@ class DrafterBaseTrainer:
                         "complete": not defer_completion,
                         "trainer_state": trainer_state,
                         "optimizer": optimizer_manifest,
+                        "buffer_state_file": buffer_state_file,
                     },
                     metadata_path,
                 )
@@ -2126,6 +2223,18 @@ class DrafterBaseTrainer:
             optimizer_manifest,
             defer_completion=defer_completion,
         )
+
+    def _speco_checkpoint_buffer_state(self) -> dict[str, Any] | None:
+        if not self.use_data_buffer:
+            return None
+        return {
+            "version": 1,
+            "buffer_version": int(self.buffer_version),
+            "current_rl_step": int(self.current_rl_step),
+            "data_buffer_step": self.data_buffer._current_step,
+            "data_buffer": list(self.data_buffer.buffer),
+            "collected_data": list(self.collected_data),
+        }
 
     def save_checkpoint(
         self,
@@ -3734,11 +3843,12 @@ class DrafterBaseTrainer:
             bad_rows = bad_rows | (row_abs_max > clip_value)
             safe_tensor = safe_tensor.clamp(min=-clip_value, max=clip_value)
 
-        dropped_rows = int(bad_rows.detach().sum().cpu().item())
-        if dropped_rows > 0:
-            logger.debug(
-                f"[Rank {self.rank}] Sanitized {dropped_rows} drafter {name} rows with non-finite or clipped values"
-            )
+        if logger.isEnabledFor(logging.DEBUG):
+            dropped_rows = int(bad_rows.detach().sum().cpu().item())
+            if dropped_rows > 0:
+                logger.debug(
+                    f"[Rank {self.rank}] Sanitized {dropped_rows} drafter {name} rows with non-finite or clipped values"
+                )
 
         return safe_tensor, bad_rows
 
@@ -3748,9 +3858,6 @@ class DrafterBaseTrainer:
         bad_input_rows: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not bad_input_rows.any():
-            return loss_mask, attention_mask
-
         ttt_length = 1
         if getattr(self.backend, "model_type", None) == "eagle3":
             ttt_length = int(self.config.rollout.drafter.training.get("ttt_length", 1))
@@ -3764,13 +3871,14 @@ class DrafterBaseTrainer:
             else:
                 bad_target_rows[:, offset:] |= bad_input_rows[:, : seq_len - offset]
 
-        masked_tokens = int(
-            ((loss_mask > 0) & bad_target_rows).detach().sum().cpu().item()
-        )
-        if masked_tokens > 0:
-            logger.debug(
-                f"[Rank {self.rank}] Masked {masked_tokens} drafter targets due to bad input hidden rows"
+        if logger.isEnabledFor(logging.DEBUG):
+            masked_tokens = int(
+                ((loss_mask > 0) & bad_target_rows).detach().sum().cpu().item()
             )
+            if masked_tokens > 0:
+                logger.debug(
+                    f"[Rank {self.rank}] Masked {masked_tokens} drafter targets due to bad input hidden rows"
+                )
 
         loss_mask = loss_mask.masked_fill(bad_target_rows, 0.0)
         attention_mask = attention_mask.masked_fill(bad_input_rows, 0)
@@ -3811,13 +3919,18 @@ class DrafterBaseTrainer:
                 batch[target_key], target_key, clip_value
             )
             batch[target_key] = target_tensor
-            masked_tokens = int(
-                ((batch["loss_mask"] > 0) & bad_target_rows).detach().sum().cpu().item()
-            )
-            if masked_tokens > 0:
-                logger.debug(
-                    f"[Rank {self.rank}] Masked {masked_tokens} drafter targets due to bad {target_key} rows"
+            if logger.isEnabledFor(logging.DEBUG):
+                masked_tokens = int(
+                    ((batch["loss_mask"] > 0) & bad_target_rows)
+                    .detach()
+                    .sum()
+                    .cpu()
+                    .item()
                 )
+                if masked_tokens > 0:
+                    logger.debug(
+                        f"[Rank {self.rank}] Masked {masked_tokens} drafter targets due to bad {target_key} rows"
+                    )
             batch["loss_mask"] = batch["loss_mask"].masked_fill(bad_target_rows, 0.0)
 
         if "label_mask" in batch:
@@ -4394,7 +4507,16 @@ class DrafterBaseTrainer:
 
             items_used += 1
             packed_tokens_before_shift += train_seq_len
-            if self._is_block_drafter_backend():
+            if self.backend.model_type == "peagle":
+                packed_loss_tokens += int(
+                    item_loss_mask[1 : 1 + train_seq_len]
+                    .detach()
+                    .float()
+                    .sum()
+                    .cpu()
+                    .item()
+                )
+            elif self._is_block_drafter_backend():
                 packed_loss_tokens += int(
                     item_loss_mask[:train_seq_len].detach().float().sum().cpu().item()
                 )
@@ -4670,7 +4792,9 @@ class DrafterBaseTrainer:
                 input_id_chunks.append(ids[:train_seq_len])
                 hidden_state_chunks.append(h_states[:train_seq_len])
                 position_id_chunks.append(item_position_ids[:train_seq_len])
-            if self._is_block_drafter_backend():
+            if self.backend.model_type == "peagle":
+                loss_mask_chunks.append(item_loss_mask[1 : 1 + train_seq_len])
+            elif self._is_block_drafter_backend():
                 loss_mask_chunks.append(item_loss_mask[:train_seq_len])
                 # Keep the trailing label token(s) that the context window
                 # cannot represent, so the drafter can still supervise them.
@@ -5311,11 +5435,13 @@ class DrafterBaseTrainer:
             self.current_rl_step = previous_current_step
 
     async def training_step_from_batch(
-        self, batch: dict[str, torch.Tensor], step: int
+        self, batch: dict[str, torch.Tensor], step: int, *, raise_on_error: bool = False
     ) -> bool:
         """Execute one optimizer step from a pre-built standalone batch."""
         self.last_standalone_training_error = None
         try:
+            if batch.get("hidden_source") == "standalone_vllm_reference":
+                batch = self._stage_standalone_cpu_batch(batch)
             with torch.enable_grad():
                 result = await self._training_step_on_batch(batch, step)
                 if not result:
@@ -5328,7 +5454,35 @@ class DrafterBaseTrainer:
         except Exception as e:  # noqa: BLE001
             self.last_standalone_training_error = e
             logger.exception(f"Standalone training step {step} failed with error: {e}")
+            if raise_on_error:
+                raise
             return False
+
+    def _stage_standalone_cpu_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Transfer prepared CPU data only; each algorithm owns its target norm."""
+        training = self.config.rollout.drafter.training
+        if training.get("mode") != "offline" or training.get("feature_store", {}).get(
+            "type"
+        ) not in {"tq", "ray_reference"}:
+            raise ValueError(
+                "File batches require standalone offline file-reference training"
+            )
+        result = {
+            key: value.to(self.runtime_device, non_blocking=True)
+            if torch.is_tensor(value)
+            else value
+            for key, value in batch.items()
+        }
+        # Raw targets must reach the algorithm unchanged. Sanitize them only
+        # after that model applies its own verifier norm.
+        targets = {}
+        if result.get("last_hidden_state_norm") == "raw_target_residual":
+            for key in ("last_hidden_states", "target_last_hidden_states"):
+                if key in result:
+                    targets[key] = result.pop(key)
+        result = self._sanitize_training_batch(result)
+        result.update(targets)
+        return result
 
     async def training_step(
         self,
@@ -5448,6 +5602,13 @@ class DrafterBaseTrainer:
         the same ranks.
         """
         metrics = torch.stack([l_v.detach(), l_p.detach(), l_n.detach()])
+        metrics, world_size = self._reduce_loss_statistics(metrics)
+        return metrics[0], metrics[1], metrics[2], world_size
+
+    def _reduce_loss_statistics(
+        self, metrics: torch.Tensor
+    ) -> tuple[torch.Tensor, int]:
+        """Sum an already-detached statistics vector without changing its dtype."""
         reduce_world_size = 1
         sp_group = self._get_sp_group()
         dp_group = self._get_dp_group()
@@ -5466,7 +5627,7 @@ class DrafterBaseTrainer:
         ):
             dist.all_reduce(metrics, group=self.training_device_mesh.get_group())
             reduce_world_size *= self.training_device_mesh.size()
-        return metrics[0], metrics[1], metrics[2], reduce_world_size
+        return metrics, reduce_world_size
 
     async def _training_step_on_batch(
         self, batch: dict[str, torch.Tensor], step: int
@@ -5479,7 +5640,8 @@ class DrafterBaseTrainer:
         with self._ulysses_group_context():
             with torch.amp.autocast(device_type=device_name, dtype=torch.bfloat16):
                 pad_size = int(
-                    batch.get("_speco_pad_size", self._current_pad_size) or 0
+                    batch.get("_speco_pad_size", getattr(self, "_current_pad_size", 0))
+                    or 0
                 )
                 loss_batch = {
                     key: value
@@ -5491,16 +5653,19 @@ class DrafterBaseTrainer:
                 l_v = loss_dict["total_local_vloss"]
                 l_p = loss_dict["total_local_ploss"]
                 l_n = loss_dict["local_num_tokens"]
-                self._record_dflash_training_metrics(loss_dict)
+                if not getattr(self, "combine_standalone_metrics", False):
+                    self._record_dflash_training_metrics(loss_dict)
         self.record_training_timing(
             "timing_s/drafter_forward_loss", time.time() - forward_ts
         )
 
         # Reduce scalar loss statistics once across SP/DP groups.
         reduce_ts = time.time()
-        global_vloss, global_ploss, global_tokens, reduce_world_size = (
-            self._reduce_loss_metrics(l_v, l_p, l_n)
-        )
+        if getattr(self, "combine_standalone_metrics", False):
+            statistics = self._reduce_standalone_step_statistics(loss_dict)
+        else:
+            statistics = self._reduce_loss_metrics(l_v, l_p, l_n)
+        global_vloss, global_ploss, global_tokens, reduce_world_size = statistics
         self.record_training_timing(
             "timing_s/drafter_reduce_loss", time.time() - reduce_ts
         )
