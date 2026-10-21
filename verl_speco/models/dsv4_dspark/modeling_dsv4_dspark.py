@@ -236,8 +236,21 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 "(mixed sliding-window layouts)"
             )
         mask = dense_attention_mask
-        while mask.dim() > 3:
+        if mask.dim() == 4:
+            # The shared DFlash mask builder emits [bsz, 1, draft, ctx+draft].
+            # A multi-head mask would need per-head sink attention; fail closed
+            # instead of silently squeezing the wrong dim.
+            if mask.size(1) != 1:
+                raise NotImplementedError(
+                    "DSV4 sink attention does not support multi-head dense "
+                    f"masks (got shape {tuple(mask.shape)})"
+                )
             mask = mask.squeeze(1)
+        if mask.dim() != 3:
+            raise ValueError(
+                "DSV4 sink attention expects a [bsz, 1, draft, ctx+draft] "
+                f"dense mask, got {mask.dim()} dims"
+            )
         neg_inf = torch.finfo(mask.float().dtype).min
         return torch.where(mask.bool(), 0.0, neg_inf).to(torch.float32)
 

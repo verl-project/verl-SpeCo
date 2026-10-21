@@ -341,6 +341,14 @@ class DraftFeatureDataLoader:
             rank = int(self.config.rank)
             world_size = int(self.config.world_size)
             if self._uses_step_window:
+                # NOTE: this path intentionally filters BEFORE distributed
+                # slicing (see test_draft_feature_dataloader_filters_before_
+                # distributed_slicing): every rank must see every matching
+                # sample so the stride yields a balanced, interleaved split.
+                # A restrictive window can match only a contiguous shard range,
+                # so per-rank contiguous slices (the main path's shard-level DP)
+                # would empty some ranks. The cost is full read amplification;
+                # removing it needs shard-level step metadata from the producer.
                 samples = [
                     sample
                     for sample in self._read_filtered(keys)

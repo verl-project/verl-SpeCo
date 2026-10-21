@@ -148,29 +148,16 @@ def _fused_permute_dispatch_npu(
     if _MOE_PROF:
         torch.npu.synchronize()
         _t1 = _time.perf_counter()
-    from . import moe_compile
-
-    if moe_compile._ENABLED:
-        out = moe_compile.run(
-            w1,
-            w3,
-            w2,
-            routed_input,
-            counts,
-            experts.swiglu_limit,
-            routed_scores.reshape(-1),
-        )
-    else:
-        out = swiglu_grouped(
-            routed_input.bfloat16(),
-            w1.bfloat16(),
-            w3.bfloat16(),
-            w2.bfloat16(),
-            counts,
-            routed_scores.reshape(-1).bfloat16(),
-            experts.swiglu_limit,
-            _grouped_matmul,
-        )
+    out = swiglu_grouped(
+        routed_input.bfloat16(),
+        w1.bfloat16(),
+        w3.bfloat16(),
+        w2.bfloat16(),
+        counts,
+        routed_scores.reshape(-1).bfloat16(),
+        experts.swiglu_limit,
+        _grouped_matmul,
+    )
     if _MOE_PROF:
         torch.npu.synchronize()
         _t2 = _time.perf_counter()

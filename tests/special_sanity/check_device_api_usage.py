@@ -29,10 +29,6 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # Dispatches on ``device.type`` and only names the backends in literals;
     # no device API is called from this module.
     "verl_speco/ops/dspark_fused_loss.py",
-    # Installs torch.compile/inductor shims for both the CUDA and Ascend NPU
-    # dispatch paths; it only names the backends to patch their capability
-    # probes and never calls a device API directly.
-    "verl_speco/models/dsv4_dspark/backbone/moe_compile.py",
     # Synchronizes the active accelerator behind a device-name guard for the
     # optional forward profiler; it selects CUDA vs NPU by device name only.
     "verl_speco/models/dsv4_dspark/backbone/block.py",
