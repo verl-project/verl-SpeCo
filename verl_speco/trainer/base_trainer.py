@@ -21,6 +21,7 @@ import asyncio
 import random
 import fnmatch
 import shutil
+from uuid import uuid4
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Any, cast
@@ -69,6 +70,15 @@ _ALIGNMENT_DEBUG_MAX_SAMPLES_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_MAX_SAMPLES_PER
 _ALIGNMENT_DEBUG_TOKEN_WINDOW_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_TOKEN_WINDOW"
 _ALIGNMENT_DEBUG_RANKS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_RANKS"
 _LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
+
+
+def _training_sample_uid(source_item: dict[str, Any]) -> str:
+    """Keep sample identity stable across draws and independent of object lifetime."""
+    sample_uid = source_item.get("_speco_sample_uid")
+    if sample_uid is None:
+        sample_uid = uuid4().hex
+        source_item["_speco_sample_uid"] = sample_uid
+    return str(sample_uid)
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -973,7 +983,7 @@ class DrafterBaseTrainer:
         self._training_metric_sums = {}
         self._training_metric_steps = 0
         self._training_sample_draws = 0
-        self._training_unique_sample_ids: set[int] = set()
+        self._training_unique_sample_ids: set[str] = set()
 
     def get_training_metrics(self) -> dict[str, float]:
         sums = dict(self._training_metric_sums)
@@ -3637,6 +3647,12 @@ class DrafterBaseTrainer:
                 ),
             }
             if shifted_block_labels:
+                if not 0 <= feature_start < feature_end < input_seq_length:
+                    raise ValueError(
+                        "DSpark next-token labels require a trailing input row: "
+                        f"feature_start={feature_start}, feature_end={feature_end}, "
+                        f"input_seq_length={input_seq_length}"
+                    )
                 data_item["next_token_ids"] = cpu_input_ids[
                     i, feature_start + 1 : feature_end + 1
                 ]
@@ -4432,7 +4448,7 @@ class DrafterBaseTrainer:
         )
         items_seen = len(items)
         items_used = 0
-        used_sample_ids: list[int] = []
+        used_sample_ids: list[str] = []
         items_dropped_short = 0
         items_dropped_missing_target = 0
         packed_tokens_before_shift = 0
@@ -4630,7 +4646,7 @@ class DrafterBaseTrainer:
                 continue
 
             items_used += 1
-            used_sample_ids.append(id(source_item))
+            used_sample_ids.append(_training_sample_uid(source_item))
             packed_tokens_before_shift += train_seq_len
             if self.backend.model_type == "peagle":
                 packed_loss_tokens += int(

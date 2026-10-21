@@ -82,35 +82,45 @@ def test_dflash_empty_target_and_flat_gather(monkeypatch):
     assert gather(None, labels, keep) is None
 
 
-def test_eagle3_lk_metrics_ignore_log_cadence():
-    from verl_speco.backends.lk_loss import adaptive_hybrid_acceptance_loss
+@pytest.mark.parametrize("standalone_metrics", [None, False, True])
+@pytest.mark.parametrize("lk_loss_type", ["alpha", "adaptive_hybrid"])
+def test_eagle3_lk_metrics_ignore_log_cadence(standalone_metrics, lk_loss_type):
+    from verl_speco.backends.lk_loss import adaptive_hybrid_acceptance_loss, negative_log_acceptance_loss
 
     path = "verl_speco/backends/eagle3_trainer_backend.py"
     compute = load_function(path, "compute_loss", math=math,
                             adaptive_hybrid_acceptance_loss=adaptive_hybrid_acceptance_loss,
+                            negative_log_acceptance_loss=negative_log_acceptance_loss,
                             _masked_soft_cross_entropy=load_function(path, "_masked_soft_cross_entropy"))
     class Config(dict):
         __getattr__ = dict.__getitem__
     backend = SimpleNamespace(
         config=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(training=Config(
-            use_logits=False, eagle3_lk_loss_alpha=1.0, eagle3_lk_loss_type="adaptive_hybrid",
+            use_logits=False, eagle3_ce_loss_alpha=0.0,
+            eagle3_lk_loss_alpha=1.0, eagle3_lk_loss_type=lk_loss_type,
             eagle3_lk_telemetry_interval_steps=0)))),
-        enable_standalone_training_metrics=True,
         target_model=lambda x: torch.zeros(1, 2, 3),
         _compute_target_p_padded=lambda **kw: (torch.full((1, 3, 3), 1/3), torch.ones(1, 3)),
         _compute_target_acceptance_p_padded=lambda **kw: torch.full((1, 3, 3), 1/3),
     )
+    if standalone_metrics is not None:
+        backend.enable_standalone_training_metrics = standalone_metrics
+    logits = torch.nn.Parameter(torch.zeros(1, 2, 3))
     class Model:
         t2d = torch.ones(3, dtype=torch.bool)
         def __call__(self, **kw):
-            return dict(logits=[torch.zeros(1, 2, 3)], position_masks=[torch.ones(1, 2)])
+            return dict(logits=[logits], position_masks=[torch.ones(1, 2)])
     batch = dict(input_ids=torch.zeros(1, 2, dtype=torch.long), hidden_states=torch.zeros(1, 2, 3),
                  last_hidden_states=torch.zeros(1, 2, 3), target_logz=torch.zeros(1, 2),
                  attention_mask=torch.ones(1, 2), loss_mask=torch.ones(1, 2),
                  position_ids=torch.arange(2).unsqueeze(0))
-    diagnostics = compute(backend, Model(), batch, 0)["diagnostics"]
-    assert diagnostics["lk_diagnostic_token_count"].item() == 2
-    assert diagnostics["lk_acceptance_sum"].item() == pytest.approx(2)
+    result = compute(backend, Model(), batch, 0)
+    result["total_local_ploss"].backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+    diagnostics = result["diagnostics"]
+    if lk_loss_type == "adaptive_hybrid":
+        assert diagnostics["lk_diagnostic_token_count"].item() == 2
+        assert diagnostics["lk_acceptance_sum"].item() == pytest.approx(2)
     assert diagnostics["lk_weighted_token_count"].item() == 2
     trainer_path = "verl_speco/trainer/base_trainer.py"
     trainer = SimpleNamespace(backend=SimpleNamespace(model_type="eagle3"),
@@ -123,8 +133,23 @@ def test_eagle3_lk_metrics_ignore_log_cadence():
     trainer.reset_training_metrics()
     trainer._record_dflash_training_metrics({"diagnostics": diagnostics})
     metrics = trainer.get_training_metrics()
-    assert metrics["eagle3/lk/acceptance"] == pytest.approx(1)
+    if lk_loss_type == "adaptive_hybrid":
+        assert metrics["eagle3/lk/acceptance"] == pytest.approx(1)
     assert metrics["eagle3/lk_loss"] == pytest.approx(0, abs=1e-6)
+
+
+def test_training_sample_uid_survives_copies_and_object_replacement():
+    from uuid import uuid4
+
+    uid = load_function("verl_speco/trainer/base_trainer.py", "_training_sample_uid", uuid4=uuid4)
+    item = {}
+    first = uid(item)
+    assert uid(item) == first
+    copied_item = dict(item)
+    del item
+    assert uid(copied_item) == first
+    # Different samples with identical contents must still count separately.
+    assert uid({}) != first
 
 
 def test_shared_target_alignment_handles_noncontiguous_features_and_gradients():

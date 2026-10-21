@@ -1246,8 +1246,9 @@ class Eagle3TrainerBackend:
         quality_tokens = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
         quality_topk = min(5, int(all_step_logits[0].size(-1)))
         quality_step_stats = []
-        collect_diagnostics = bool(
-            getattr(self, "enable_standalone_training_metrics", False)
+        collect_diagnostics = (
+            bool(getattr(self, "enable_standalone_training_metrics", False))
+            or lk_loss_alpha > 0
         )
         loss_sum_per_position = None
         correct_per_position = None

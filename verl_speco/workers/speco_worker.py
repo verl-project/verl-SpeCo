@@ -162,11 +162,6 @@ def _resolve_feature_chunks(chunks, expected_rows: int | None = None):
     )
 
 
-def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
-    hidden, _target_logz = _resolve_feature_chunks(chunks, expected_rows=expected_rows)
-    return hidden
-
-
 @dataclass(frozen=True)
 class RolloutParallelLayout:
     infer_tp: int
