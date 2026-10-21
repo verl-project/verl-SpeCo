@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import random
 import tempfile
@@ -351,6 +352,10 @@ class DraftFeatureStore(Protocol):
 
     def get_metadata(self) -> dict[str, Any]: ...
 
+    def checkpoint_state(self) -> dict[str, Any]: ...
+
+    def restore_checkpoint_state(self, state: dict[str, Any]) -> dict[str, Any]: ...
+
     def close(self) -> None: ...
 
 
@@ -427,6 +432,11 @@ class TorchShardFeatureStore:
         self._next_shard_index = self._infer_next_shard_index()
         if not self.read_only:
             self._write_metadata()
+
+        # A checkpoint cursor is a durable manifest prefix, rather than a
+        # mutable in-memory iterator position.  Writers can append after a
+        # checkpoint without invalidating the resumed prefix.
+        self._checkpoint_cursor: dict[str, Any] | None = None
 
     def write_many(
         self, samples: list[DraftStoredSample | dict[str, Any]]
@@ -511,6 +521,87 @@ class TorchShardFeatureStore:
             int(entry.get("num_samples", 0)) for entry in self._load_manifest()
         )
         return metadata
+
+    @staticmethod
+    def _manifest_prefix_sha256(entries: list[dict[str, Any]]) -> str:
+        digest = hashlib.sha256()
+        for entry in entries:
+            digest.update(
+                json.dumps(
+                    entry, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            )
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def checkpoint_state(self) -> dict[str, Any]:
+        """Flush and return a resumable, append-safe manifest cursor.
+
+        The state deliberately describes the checkpoint's manifest *prefix*.
+        A later collection may append shards before restart; restoring accepts
+        that suffix but rejects a rewritten or truncated prefix, preventing a
+        silent replay against a different feature set.
+        """
+
+        if not self.read_only:
+            self.flush()
+        entries = self._load_manifest()
+        state = {
+            "format": "torch_shard_feature_store_cursor",
+            "version": 1,
+            "path": str(self.path.resolve()),
+            "manifest": self.manifest_path.name,
+            "num_shards": len(entries),
+            "num_samples": sum(int(entry.get("num_samples", 0)) for entry in entries),
+            "manifest_prefix_sha256": self._manifest_prefix_sha256(entries),
+            "next_shard_index": int(self._next_shard_index),
+        }
+        self._checkpoint_cursor = dict(state)
+        return state
+
+    def restore_checkpoint_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Validate and restore a previously checkpointed manifest cursor."""
+
+        if not isinstance(state, dict):
+            raise TypeError("Feature-store checkpoint state must be a mapping")
+        if (
+            state.get("format") != "torch_shard_feature_store_cursor"
+            or int(state.get("version", 0)) != 1
+        ):
+            raise ValueError("Unsupported feature-store checkpoint cursor format")
+        expected_path = str(Path(str(state.get("path", ""))).resolve())
+        if expected_path != str(self.path.resolve()):
+            raise ValueError(
+                "Feature-store checkpoint path does not match configured path: "
+                f"checkpoint={expected_path!r} configured={str(self.path.resolve())!r}"
+            )
+        try:
+            expected_shards = int(state["num_shards"])
+            expected_samples = int(state["num_samples"])
+            expected_digest = str(state["manifest_prefix_sha256"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Invalid feature-store checkpoint cursor") from exc
+        if expected_shards < 0 or expected_samples < 0:
+            raise ValueError("Feature-store checkpoint cursor has negative counts")
+
+        entries = self._load_manifest()
+        if len(entries) < expected_shards:
+            raise RuntimeError(
+                "Feature-store manifest was truncated after checkpoint: "
+                f"expected at least {expected_shards} shards, found {len(entries)}"
+            )
+        prefix = entries[:expected_shards]
+        prefix_samples = sum(int(entry.get("num_samples", 0)) for entry in prefix)
+        if (
+            prefix_samples != expected_samples
+            or self._manifest_prefix_sha256(prefix) != expected_digest
+        ):
+            raise RuntimeError(
+                "Feature-store checkpoint cursor does not match manifest prefix; "
+                "refusing to resume with rewritten samples"
+            )
+        self._checkpoint_cursor = dict(state)
+        return dict(state)
 
     def close(self) -> None:
         if not self.read_only:
@@ -1068,26 +1159,38 @@ def build_feature_store_from_config(
     metadata: dict[str, Any] | None = None,
     shard_prefix: str = "shard",
     transfer_queue_cfg: Any | None = None,
+    hidden_states_store_cfg: Any | None = None,
 ) -> Any:
     store_type = (
         str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
         .strip()
         .lower()
     )
-    if store_type == "tq":
+    if store_type in {"tq", "ray_reference"}:
         if not read_only:
             raise ValueError(
-                "feature_store.type=tq is a read-only Consumer data source"
+                f"feature_store.type={store_type} is a read-only Consumer data source"
             )
-        from verl_speco.trainer.tq_feature_store import TQFeatureStore
+        from verl_speco.trainer.tq_feature_store import (
+            ReferenceFeatureStore,
+            TQFeatureStore,
+        )
 
         tq_cfg = transfer_queue_cfg
         if tq_cfg is None:
             tq_cfg = feature_store_cfg.get("tq")
         if tq_cfg is None:
             raise ValueError(
-                "feature_store.type=tq requires the sibling training.transfer_queue configuration"
+                f"feature_store.type={store_type} requires the sibling training.transfer_queue configuration"
             )
+        if store_type == "ray_reference":
+            from verl_speco.trainer.tq_feature_store import _plain_dict
+
+            tq_cfg = {
+                **_plain_dict(tq_cfg),
+                "hidden_states_store": _plain_dict(hidden_states_store_cfg),
+            }
+            return ReferenceFeatureStore.from_config(tq_cfg)
         return TQFeatureStore.from_config(tq_cfg)
     if store_type == "torch_shard":
         store_cls: type[TorchShardFeatureStore] = TorchShardFeatureStore

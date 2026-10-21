@@ -12,3 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Hydra config package for SPECO."""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+def config_int(config: Any, key: str, default: int) -> int:
+    """Resolve an integer config value, defaulting only when absent or ``None``.
+
+    Unlike ``config.get(key, default) or default`` this keeps an explicit ``0``,
+    which several knobs use to mean "fail on the first bad row".
+    """
+    value = config.get(key)
+    return default if value is None else int(value)
+
+
+def prefetch_depth(config: Any) -> int:
+    value = config.get("consumer_prefetch_batches", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("consumer_prefetch_batches must be a non-negative integer")
+    return value
+
+
+__all__ = ["config_int", "prefetch_depth"]

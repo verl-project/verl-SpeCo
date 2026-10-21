@@ -17,6 +17,7 @@ import asyncio
 from inspect import getsource
 from types import SimpleNamespace
 
+from omegaconf import OmegaConf
 import pytest
 
 from verl_speco.integration import rollout_publish
@@ -26,12 +27,53 @@ class _FakeObjectRef:
     pass
 
 
+@pytest.mark.parametrize("use_omegaconf", [False, True])
+def test_upstream_rollout_init_temporarily_hides_speco_drafter_config(
+    use_omegaconf: bool,
+) -> None:
+    config = {"rollout": {"name": "vllm", "drafter": {"enable": True}}}
+    worker = SimpleNamespace(config=OmegaConf.create(config) if use_omegaconf else config)
+
+    with rollout_publish._without_speco_drafter_rollout_config(worker):
+        rollout = worker.config.rollout if use_omegaconf else worker.config["rollout"]
+        assert "drafter" not in rollout
+        assert rollout["name"] == "vllm"
+
+    rollout = worker.config.rollout if use_omegaconf else worker.config["rollout"]
+    assert rollout["drafter"]["enable"] is True
+
+
 class _FakeRay:
     ObjectRef = _FakeObjectRef
 
     @staticmethod
     def get(value):
         return {"resolved": value}
+
+
+@pytest.mark.parametrize("use_omegaconf", [False, True])
+def test_vllm_replica_config_excludes_speco_drafter(use_omegaconf: bool) -> None:
+    config = {"name": "vllm", "drafter": {"enable": True}}
+    value = OmegaConf.create(config) if use_omegaconf else config
+    from verl_speco.integration.vllm_runtime import _rollout_config_without_drafter
+
+    result = _rollout_config_without_drafter(value)
+    assert "drafter" not in result
+    assert result["name"] == "vllm"
+    assert "drafter" in value
+
+
+def test_v1_agent_loop_config_excludes_speco_drafter() -> None:
+    pytest.importorskip("ray")
+    from verl_speco.integration.task_runner import SpecoTaskRunner
+
+    config = OmegaConf.create(
+        {"actor_rollout_ref": {"rollout": {"name": "vllm", "drafter": {"enable": True}}}}
+    )
+    agent_config = SpecoTaskRunner._v1_agent_loop_config(config)
+
+    assert "drafter" not in agent_config.actor_rollout_ref.rollout
+    assert config.actor_rollout_ref.rollout.drafter.enable is True
 
 
 def test_materialize_direct_and_object_ref_payloads(monkeypatch) -> None:
@@ -422,7 +464,7 @@ def test_publish_state_filter_excludes_block_drafter_embedding() -> None:
     assert set(trainer._get_trainable_state_dict()) == {"draft_model.fc.weight"}
 
 
-def test_mrv2_dspark_publish_excludes_frozen_confidence_head(monkeypatch) -> None:
+def test_mrv2_dspark_publish_includes_confidence_head(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     torch = pytest.importorskip("torch")
     base_trainer = pytest.importorskip(
@@ -447,8 +489,12 @@ def test_mrv2_dspark_publish_excludes_frozen_confidence_head(monkeypatch) -> Non
         }
     )
 
+    # MRV2 (vllm-ascend#15098) now registers and consumes the confidence head,
+    # so it must enter the online update payload instead of being frozen.
     assert set(trainer._get_trainable_state_dict()) == {
-        "draft_model.markov_head.markov_w1.weight"
+        "draft_model.markov_head.markov_w1.weight",
+        "draft_model.confidence_head.proj.weight",
+        "draft_model.confidence_head.proj.bias",
     }
 
 
@@ -527,8 +573,13 @@ def test_idle_drafter_lifecycle_offloads_dspark_target_lm_head(
     )
     trainer.model = None
     trainer.optimizer = None
+    trainer.config = SimpleNamespace(actor=SimpleNamespace(strategy="fsdp"))
+    trainer.park_hccl_after_drafter_training = False
+    trainer.buffer_version = 0
     trainer._training_active = True
     trainer._training_initialized = True
+    trainer.buffer_version = 0
+    trainer.park_hccl_after_drafter_training = False
     monkeypatch.setattr(base_trainer, "device_name", "cpu")
 
     if release_method == "cleanup_training":
@@ -643,6 +694,8 @@ def test_dspark_pretrained_export_strips_only_training_wrapper_prefix() -> None:
             "draft_model.hidden_norm.weight": torch.ones(2),
             "draft_model.norm.weight": torch.ones(2),
             "draft_model.markov_head.markov_w1.weight": torch.ones(2, 2),
+            "draft_model.confidence_head.proj.weight": torch.ones(1, 4),
+            "draft_model.confidence_head.proj.bias": torch.ones(1),
         },
     )
 
@@ -653,7 +706,72 @@ def test_dspark_pretrained_export_strips_only_training_wrapper_prefix() -> None:
         "hidden_norm.weight",
         "norm.weight",
         "markov_head.markov_w1.weight",
+        "confidence_head.proj.weight",
+        "confidence_head.proj.bias",
     }
+
+
+def test_mrv1_dspark_publish_keeps_trainable_confidence_head(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    torch = pytest.importorskip("torch")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="publish state filtering needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(
+        model_type="dspark", trains_draft_lm_head=False, trains_draft_embeddings=False
+    )
+    trainer.training_device_mesh = None
+    trainer._frozen_param_names = []
+    trainer.model = SimpleNamespace(
+        state_dict=lambda: {
+            "draft_model.confidence_head.proj.weight": torch.ones(1, 2),
+            "draft_model.confidence_head.proj.bias": torch.ones(1),
+            "draft_model.embed_tokens.weight": torch.ones(2, 2),
+            "draft_model.fc.weight": torch.ones(2, 2),
+        }
+    )
+
+    assert set(trainer._get_trainable_state_dict()) == {
+        "draft_model.confidence_head.proj.weight",
+        "draft_model.confidence_head.proj.bias",
+        "draft_model.fc.weight",
+    }
+
+
+def test_dspark_training_metrics_report_confidence_loss() -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="confidence metrics need the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(model_type="dspark")
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(training={"dspark_block_size": 2})
+        )
+    )
+    trainer._training_metric_sums = {
+        "dspark/confidence_loss_sum": 3.0,
+        "dspark/confidence_weighted_token_count": 2.0,
+        "dspark/confidence_accept_rate_sum": 1.0,
+        "dspark/confidence_pred_mean_sum": 0.5,
+    }
+    trainer._training_metric_steps = 1
+    trainer.optimizer_steps_total = 0
+    trainer.optimizer = None
+
+    metrics = trainer.get_training_metrics()
+
+    assert metrics["dspark/confidence_loss"] == pytest.approx(1.5)
+    assert metrics["dspark/confidence_accept_rate"] == pytest.approx(0.5)
+    assert metrics["dspark/confidence_pred_mean"] == pytest.approx(0.25)
+    assert metrics["dspark/confidence_weighted_token_count"] == pytest.approx(2.0)
 
 
 @pytest.mark.parametrize("runner", ["0", "1"])

@@ -147,7 +147,9 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_veomni_trainer
     actor_rollout_ref.rollout.drafter.training.target_lm_head_row_restricted_sync=False \
     actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=0.1 \
     actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=0.45 \
-    actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=0.0 \
+    actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha=1.0 \
+    actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_with_markov=True \
+    actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=1.0 \
     actor_rollout_ref.rollout.drafter.rollout.spec_steps=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=7 \

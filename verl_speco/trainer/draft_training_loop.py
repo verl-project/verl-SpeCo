@@ -16,21 +16,27 @@
 from __future__ import annotations
 
 import asyncio
-from copy import deepcopy
 import json
 import logging
 import math
 import os
+import sys
 import time
+from copy import deepcopy
+from datetime import timedelta
+from functools import partial
 from typing import Any, cast
 
 import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import DeviceMesh
 from omegaconf import OmegaConf, open_dict
+from torch.distributed.device_mesh import DeviceMesh
 from verl.utils.device import get_device_name, get_torch_device
 
 from verl_speco.backends.factory import build_trainer_backend
+from verl_speco.config import config_int, prefetch_depth
+from verl_speco.standalone_ray_runtime import put_queue
+from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.trainer.base_trainer import (
     DrafterBaseTrainer,
     resolve_drafter_strategy,
@@ -47,9 +53,26 @@ from verl_speco.trainer.standalone_resume import (
     load_standalone_resume,
     save_standalone_resume,
 )
-from verl_speco.trainer.tq_sample_source import TQFeatureDataLoader, TQLocalBatch
+from verl_speco.trainer.standalone_tracking import (
+    _build_standalone_tracking,
+    _finish_standalone_tracking,
+    _log_standalone_tracking_metrics,
+    _select_standalone_tracking_metrics,
+)
+from verl_speco.trainer.tq_retry import retry_io
+from verl_speco.trainer.standalone_batch_finalize import AsyncBatchFinalizer
+from verl_speco.trainer.reference_batch_prefetch import ReferenceBatchPrefetchIterator
+from verl_speco.trainer.tq_sample_source import (
+    TQFeatureDataLoader,
+    TQLocalBatch,
+    TQPrefetchIterator,
+)
 
 logger = logging.getLogger(__name__)
+
+_TQ_GET_MAX_SYNC_INTERVAL_STEPS = 50
+_TQ_CLEAR_MAX_ATTEMPTS = 3
+_TQ_CLEAR_RETRY_BACKOFF_SECONDS = 0.5
 
 
 def _should_log_batch_progress(attempted_batches: int) -> bool:
@@ -72,8 +95,14 @@ def run_standalone_draft_training(config) -> dict[str, Any]:
     return asyncio.run(_run_standalone_draft_training_async(config))
 
 
-async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
+async def _run_standalone_draft_training_async(
+    config,
+    *,
+    scheduled_commands: Any | None = None,
+    training_events: Any | None = None,
+) -> dict[str, Any]:
     rank, local_rank, world_size = _init_distributed()
+    standalone_trackers: list[Any] = []
     logger.info(
         "[standalone rank=%s] distributed runtime initialized local_rank=%s world_size=%s",
         rank,
@@ -93,13 +122,15 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         str(training_cfg.get("mode", "offline") or "offline").strip().lower()
     )
     replay_feature_store_types = {"token_replay", "jsonl_token_replay", "jsonl"}
-    if feature_store_type != "tq" and not feature_store_cfg.get("path"):
+    if feature_store_type not in {"tq", "ray_reference"} and not feature_store_cfg.get(
+        "path"
+    ):
         raise ValueError(
             "actor_rollout_ref.rollout.drafter.training.feature_store.path is required"
         )
-    if feature_store_type == "tq" and training_mode != "offline":
+    if feature_store_type in {"tq", "ray_reference"} and training_mode != "offline":
         raise ValueError(
-            "feature_store.type=tq requires standalone training.mode=offline"
+            f"feature_store.type={feature_store_type} requires standalone training.mode=offline"
         )
     if feature_store_type in replay_feature_store_types and training_mode != "offline":
         raise ValueError(
@@ -131,6 +162,10 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         data_parallel_process_group=None,
         backend=backend,
     )
+    # Fail in the main thread before the first batch when a resumed checkpoint
+    # declares another layer-ID convention. The export path repeats this check
+    # while rewriting the runtime config, but only on the writer thread.
+    _assert_standalone_layer_migration(trainer, getattr(backend, "model_type", None))
     max_steps = int(training_cfg.get("max_steps", training_cfg.get("step", 1000)) or 0)
     save_interval = int(training_cfg.get("save_interval_steps", 0) or 0)
     successful_steps = 0
@@ -141,11 +176,20 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     last_saved_step = 0
     consumed_sequence_nos: set[int] = set()
     standalone_input_path = _standalone_input_path(config)
+    standalone_producer_shuffle = _standalone_producer_shuffle(config)
+    trainer.combine_standalone_metrics = feature_store_type == "ray_reference"
     store = None
     feature_replayer = None
     feature_producer = None
+    tq_prefetch: TQPrefetchIterator | ReferenceBatchPrefetchIterator | None = None
+    tq_prefetch_group = None
+    batch_finalizer = None
     current_stage = "activate_training_model"
     try:
+        # Scheduled Ray training delegates tracking to its Driver, which also
+        # receives Producer windows. Subprocess/file training logs locally.
+        if training_events is None:
+            standalone_trackers = _build_standalone_tracking(config, rank=rank)
         stage_started = time.perf_counter()
         logger.info(
             "[standalone rank=%s] activating drafter model algorithm=%s",
@@ -165,7 +209,7 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         initial_optimizer_step = int(trainer.optimizer_steps_total)
         optimizer_step = initial_optimizer_step
         last_saved_step = optimizer_step
-        if feature_store_type == "tq":
+        if feature_store_type in {"tq", "ray_reference"}:
             consumed_sequence_nos, resume_metadata = load_standalone_resume(
                 drafter_cfg.get("model_path"),
                 input_path=standalone_input_path,
@@ -202,9 +246,12 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             feature_store_cfg,
             read_only=True,
             transfer_queue_cfg=training_cfg.get("transfer_queue"),
+            hidden_states_store_cfg=(
+                training_cfg.get("target_feature_replay") or {}
+            ).get("hidden_states_store"),
         )
-        if feature_store_type == "tq":
-            current_stage = "connect_tq_feature_store"
+        if feature_store_type in {"tq", "ray_reference"}:
+            current_stage = "connect_feature_store"
             _connect_tq_store_across_ranks(
                 store,
                 rank=rank,
@@ -244,8 +291,77 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             )
         current_stage = "create_dataloader"
         loader: Any
-        if feature_store_type == "tq":
+        if feature_store_type in {"tq", "ray_reference"}:
             tq_cfg = training_cfg.get("transfer_queue") or {}
+            depth = prefetch_depth(tq_cfg)
+            if feature_store_type == "ray_reference" and rank == 0:
+                batch_finalizer = AsyncBatchFinalizer(capacity=depth + 1)
+            hidden_references = (tq_cfg.get("expected_feature") or {}).get(
+                "payload_kind"
+            ) == "vllm_reference"
+            if feature_store_type == "ray_reference" and not hidden_references:
+                raise ValueError(
+                    "ray_reference requires launcher-provided hidden reference metadata"
+                )
+            prepare_batch = None
+            if hidden_references:
+                if not depth or scheduled_commands is None:
+                    raise ValueError(
+                        "Reference input requires scheduler-controlled Consumer prefetch"
+                    )
+                if int(training_cfg.get("gradient_accumulation_steps", 1)) != 1:
+                    raise ValueError(
+                        "Reference input currently requires one optimizer step per scheduled batch"
+                    )
+                algorithm = str(drafter_cfg.speculative_algorithm).lower()
+                packing_cfg = training_cfg.get("packing") or {}
+                prepare_batch = partial(
+                    store.prepare_batch,
+                    max_window=training_cfg.get(
+                        f"{algorithm}_max_window",
+                        512 if algorithm == "dflash" else None,
+                    ),
+                    packing=bool(packing_cfg.get("enable", False)),
+                    block_size=int(
+                        getattr(
+                            trainer.model_config,
+                            "block_size",
+                            training_cfg.get(f"{algorithm}_block_size", 16),
+                        )
+                    ),
+                    max_packed_len=int(packing_cfg.get("max_packed_len", 0) or 0),
+                )
+            if depth and scheduled_commands is None:
+                raise ValueError(
+                    "consumer_prefetch_batches requires the scheduled Ray Consumer"
+                )
+            if depth:
+                io_timeout = float(tq_cfg.get("io_timeout_seconds", 30))
+                io_attempts = int(tq_cfg.get("io_retry_max_attempts", 3))
+                collective_timeout = float(
+                    tq_cfg.get("prefetch_collective_timeout_seconds", 180)
+                )
+                retry_deadline = io_attempts * (io_timeout + 5) + sum(
+                    min(0.2 * 2**attempt, 2.0) * 1.1
+                    for attempt in range(max(0, io_attempts - 1))
+                )
+                if (
+                    io_timeout <= 0
+                    or io_attempts < 1
+                    or collective_timeout <= retry_deadline
+                ):
+                    raise ValueError(
+                        "Prefetch collective timeout must exceed the complete data preparation retry deadline"
+                    )
+            if depth and world_size > 1:
+                tq_prefetch_group = dist.new_group(
+                    backend="gloo",
+                    timeout=timedelta(
+                        seconds=float(
+                            tq_cfg.get("prefetch_collective_timeout_seconds", 180)
+                        )
+                    ),
+                )
             loader = TQFeatureDataLoader(
                 store,
                 batch_size=int(training_cfg.get("batch_size_per_gpu", 4)),
@@ -255,7 +371,35 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                     tq_cfg.get("poll_interval_seconds", 0.5) or 0.5
                 ),
                 drop_last=bool(tq_cfg.get("drop_last", True)),
+                scheduled_commands=scheduled_commands,
+                process_group=tq_prefetch_group,
+                io_retry_max_attempts=int(tq_cfg.get("io_retry_max_attempts", 3)),
+                io_timeout_seconds=float(tq_cfg.get("io_timeout_seconds", 30)),
+                prepare_batch=prepare_batch,
+                cleanup_after_load=feature_store_type == "ray_reference",
             )
+            if training_events is not None and rank == 0:
+                ready_error = None
+                try:
+                    retry_io(
+                        lambda: put_queue(
+                            training_events,
+                            {
+                                "kind": "consumer_ready",
+                                "initial_optimizer_step": initial_optimizer_step,
+                            },
+                        ),
+                        name="Consumer ready event",
+                        attempts=int(tq_cfg.get("io_retry_max_attempts", 3)),
+                    )
+                except Exception as exc:  # noqa: BLE001 - communicate event failure to every rank
+                    ready_error = exc
+            else:
+                ready_error = None
+            if not _all_ranks_true(ready_error is None, trainer.runtime_device):
+                raise RuntimeError(
+                    "Failed to notify Scheduler that Consumer is ready"
+                ) from ready_error
         else:
             loader = DraftFeatureDataLoader(
                 store,
@@ -272,6 +416,21 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                     max_sample_step=_optional_int(
                         feature_store_cfg.get("max_sample_step")
                     ),
+                    group_by_length=bool(training_cfg.get("group_by_length", False)),
+                    group_by_length_megabatch=int(
+                        training_cfg.get("group_by_length_megabatch", 8) or 8
+                    ),
+                    on_error=str(feature_store_cfg.get("on_error", "skip") or "skip"),
+                    max_consecutive_errors=config_int(
+                        feature_store_cfg, "max_consecutive_errors", 20
+                    ),
+                    min_supervised_tokens=int(
+                        feature_store_cfg.get("min_supervised_tokens", 1) or 0
+                    ),
+                    strict_token_alignment=str(
+                        feature_store_cfg.get("strict_token_alignment", "warn")
+                        or "warn"
+                    ),
                 ),
             )
         logger.info(
@@ -283,9 +442,38 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             bool(feature_store_cfg.get("repeat", True)),
         )
         sample_source = loader
+        if feature_store_type in {"tq", "ray_reference"} and depth:
+            batch_workers = int(tq_cfg.get("consumer_batch_workers", 2))
+            if batch_workers < 0:
+                raise ValueError("consumer_batch_workers must be non-negative")
+            prefetch_options = {
+                "close_timeout": float(
+                    tq_cfg.get("prefetch_collective_timeout_seconds", 180)
+                )
+                + 10,
+                "pin_device": trainer.runtime_device,
+            }
+            if feature_store_type == "ray_reference" and batch_workers:
+                assert prepare_batch is not None
+                tq_prefetch = ReferenceBatchPrefetchIterator(
+                    loader,
+                    depth,
+                    workers=batch_workers,
+                    prepare_options=prepare_batch.keywords,
+                    **prefetch_options,
+                )
+            else:
+                tq_prefetch = TQPrefetchIterator(
+                    loader,
+                    depth,
+                    pin_memory=hidden_references,
+                    prepare_workers=int(tq_cfg.get("consumer_prepare_workers", 4)),
+                    **prefetch_options,
+                )
+            sample_source = tq_prefetch
         pipeline_cfg = training_cfg.get("target_feature_pipeline", {}) or {}
         pipeline_enabled = bool(pipeline_cfg.get("enabled", False))
-        if feature_store_type == "tq" and pipeline_enabled:
+        if feature_store_type in {"tq", "ray_reference"} and pipeline_enabled:
             raise ValueError(
                 "feature_store.type=tq already contains target hidden states and cannot be "
                 "combined with target_feature_pipeline.enabled=true"
@@ -322,11 +510,14 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         sample_iterator = iter(sample_source)
         while max_steps <= 0 or optimizer_step < max_steps:
             current_stage = "load_next_batch"
+            load_started = time.perf_counter()
             loaded_batch = _next_batch_across_ranks(
                 sample_iterator,
                 rank=rank,
                 device=trainer.runtime_device,
+                require_prepared=feature_store_type == "ray_reference",
             )
+            batch_ready_wait_seconds = time.perf_counter() - load_started
             if loaded_batch is None:
                 break
             tq_local_batch = (
@@ -337,8 +528,31 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 if tq_local_batch is not None
                 else loaded_batch
             )
-            step_started = time.perf_counter()
+            processing_started = time.perf_counter()
+            batch_prepare_seconds = 0.0
+            train_seconds = 0.0
+            tq_clear_seconds = 0.0
+            tq_get_seconds = (
+                float(tq_local_batch.tq_get_seconds)
+                if tq_local_batch is not None
+                else 0.0
+            )
             attempted_batches += 1
+            # Computing the slowest-rank TQ fetch time requires a collective.
+            # Keep per-step precision while debugging, but avoid paying for a
+            # logging-only all-reduce on every normal training step.
+            if (
+                tq_local_batch is not None
+                and tq_local_batch.prepared_batch is None
+                and (
+                    logger.isEnabledFor(logging.DEBUG)
+                    or attempted_batches % _TQ_GET_MAX_SYNC_INTERVAL_STEPS == 0
+                )
+            ):
+                tq_get_seconds = _max_across_ranks_float(
+                    tq_get_seconds,
+                    trainer.runtime_device,
+                )
             log_batch_progress = _should_log_batch_progress(attempted_batches)
             if log_batch_progress:
                 logger.info(
@@ -346,7 +560,9 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                     "successful_steps=%s",
                     rank,
                     attempted_batches,
-                    len(samples),
+                    len(tq_local_batch.local_keys)
+                    if tq_local_batch is not None
+                    else len(samples),
                     successful_steps,
                 )
             current_stage = "materialize_target_features"
@@ -391,17 +607,27 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             else:
                 materialized_samples = samples
             current_stage = "prepare_training_batch"
-            batch = trainer.prepare_training_batch_from_samples(
-                cast(list[Any], materialized_samples),
-                step=optimizer_step,
-            )
+            batch: dict[str, Any] | None
+            batch_prepare_started = time.perf_counter()
+            if tq_local_batch is not None and tq_local_batch.prepared_batch is not None:
+                batch = tq_local_batch.prepared_batch
+                # Background work is not part of this main-thread wall time.
+                batch_prepare_seconds = 0.0
+            else:
+                batch = trainer.prepare_training_batch_from_samples(
+                    cast(list[Any], materialized_samples),
+                    step=optimizer_step,
+                )
+                batch_prepare_seconds = time.perf_counter() - batch_prepare_started
             has_batch = batch is not None
             current_stage = "synchronize_batch_readiness"
-            if not _all_ranks_true(has_batch, trainer.runtime_device):
+            if feature_store_type != "ray_reference" and not _all_ranks_true(
+                has_batch, trainer.runtime_device
+            ):
                 if tq_local_batch is not None:
                     raise RuntimeError(
-                        "TQ Consumer could not prepare a valid batch on every rank; "
-                        "the TQ keys were intentionally not cleared"
+                        "Standalone Consumer could not prepare a valid batch on every rank; "
+                        "the source samples were intentionally retained"
                     )
                 if rank == 0:
                     logger.warning(
@@ -420,7 +646,14 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                     attempted_batches,
                     optimizer_step,
                 )
-            ok = await trainer.training_step_from_batch(batch, optimizer_step)
+            train_started = time.perf_counter()
+            if feature_store_type == "ray_reference":
+                ok = await trainer.training_step_from_batch(
+                    batch, optimizer_step, raise_on_error=True
+                )
+            else:
+                ok = await trainer.training_step_from_batch(batch, optimizer_step)
+            train_seconds = time.perf_counter() - train_started
             step_error = getattr(trainer, "last_standalone_training_error", None)
             if step_error is not None and _is_out_of_memory_error(step_error):
                 raise RuntimeError(
@@ -430,21 +663,39 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                     "dspark_num_anchors/block_size or disable DSpark L1 loss."
                 ) from step_error
             current_stage = "synchronize_training_step"
-            if not _all_ranks_true(ok, trainer.runtime_device):
+            if feature_store_type == "ray_reference" and not ok:
+                raise RuntimeError(
+                    "Standalone file training did not complete an optimizer step"
+                )
+            if feature_store_type != "ray_reference" and not _all_ranks_true(
+                ok, trainer.runtime_device
+            ):
                 if tq_local_batch is not None:
                     raise RuntimeError(
-                        "TQ Consumer training_step_from_batch failed on at least one rank; "
-                        "the TQ keys were intentionally not cleared"
+                        "Standalone Consumer training_step_from_batch failed on at least one rank; "
+                        "the source samples were intentionally retained"
                     )
                 continue
             if tq_local_batch is not None:
-                current_stage = "clear_tq_batch"
+                current_stage = "finalize_completed_batch"
+                tq_clear_started = time.perf_counter()
                 _clear_tq_batch_across_ranks(
                     cast(TQFeatureDataLoader, loader),
                     tq_local_batch.global_keys,
                     rank=rank,
                     device=trainer.runtime_device,
+                    training_events=training_events,
+                    completion_event={
+                        "kind": "training_completed",
+                        "plan_id": tq_local_batch.plan_id,
+                        "keys": list(tq_local_batch.global_keys or []),
+                        "successful": True,
+                    },
+                    finalizer=batch_finalizer,
+                    synchronize=feature_store_type != "ray_reference",
+                    cleanup_after_load=tq_local_batch.cleanup_after_load,
                 )
+                tq_clear_seconds = time.perf_counter() - tq_clear_started
                 if rank == 0:
                     consumed_sequence_nos.update(
                         tq_local_batch.global_sequence_nos or []
@@ -457,41 +708,130 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 trainer,
                 successful_steps=successful_steps,
                 attempted_batches=attempted_batches,
-                step_elapsed_sec=time.perf_counter() - step_started,
+                step_elapsed_sec=(
+                    time.perf_counter() - load_started
+                    if tq_local_batch is not None
+                    else time.perf_counter() - processing_started
+                ),
             )
+            step_metrics["perf/batch_prepare_time"] = batch_prepare_seconds
+            step_metrics["perf/train_time"] = train_seconds
+            step_metrics["perf/batch_finalize_time"] = tq_clear_seconds
+            if tq_local_batch is not None:
+                step_metrics["perf/batch_ready_wait_time"] = batch_ready_wait_seconds
+                step_metrics["perf/loader_plan_wait_time"] = float(
+                    tq_local_batch.command_wait_seconds
+                )
+                if getattr(tq_local_batch, "prepared_batch", None) is None:
+                    step_metrics["perf/loader_tq_get_time"] = tq_get_seconds
+                else:
+                    step_metrics["perf/loader_batch_prepare_time"] = float(
+                        tq_local_batch.batch_prepare_seconds
+                    )
             if feature_replayer is not None:
                 step_metrics.update(feature_replayer.metrics())
             if feature_producer is not None:
                 step_metrics.update(feature_producer.metrics())
             _log_standalone_step_metrics(step_metrics, rank=rank)
+            tracking_metrics = _select_standalone_tracking_metrics(step_metrics)
+            if training_events is not None and rank == 0:
+                event = {
+                    "kind": "training_metrics",
+                    "step": optimizer_step,
+                    "metrics": tracking_metrics,
+                }
+                if batch_finalizer is not None:
+                    _submit_standalone_metrics(
+                        batch_finalizer, training_events, event, tq_cfg
+                    )
+                else:
+                    training_events.put(event)
+            else:
+                _log_standalone_tracking_metrics(
+                    standalone_trackers,
+                    tracking_metrics,
+                    step=optimizer_step,
+                )
             if save_interval > 0 and optimizer_step % save_interval == 0:
+                if feature_store_type == "ray_reference":
+                    _drain_batch_finalizer_across_ranks(
+                        batch_finalizer, trainer.runtime_device
+                    )
+                _sync_standalone_export_error(trainer, trainer.runtime_device)
                 current_stage = "save_checkpoint"
+                checkpoint_started = time.perf_counter()
+                if rank == 0:
+                    logger.info(
+                        "[standalone rank=%s] checkpoint saving step=%s",
+                        rank,
+                        optimizer_step,
+                    )
                 last_save_result = _save_standalone_checkpoint(
                     trainer,
                     optimizer_step,
                     consumed_sequence_nos=consumed_sequence_nos,
                     input_path=(
-                        standalone_input_path if feature_store_type == "tq" else None
+                        standalone_input_path
+                        if feature_store_type in {"tq", "ray_reference"}
+                        else None
+                    ),
+                    producer_shuffle=(
+                        standalone_producer_shuffle
+                        if feature_store_type in {"tq", "ray_reference"}
+                        else None
                     ),
                 )
+                if rank == 0:
+                    logger.info(
+                        "[standalone rank=%s] checkpoint saved step=%s elapsed=%.3fs",
+                        rank,
+                        optimizer_step,
+                        time.perf_counter() - checkpoint_started,
+                    )
                 if _sync_any_rank_saved_checkpoint(last_save_result.get("saved")):
                     last_saved_step = optimizer_step
                 _barrier()
             current_stage = "load_next_batch"
+        if feature_store_type == "ray_reference":
+            _drain_batch_finalizer_across_ranks(batch_finalizer, trainer.runtime_device)
+        # Catch an export failure reported after the last in-loop check, before
+        # the final save can succeed and end the run as a silent partial export.
+        _sync_standalone_export_error(trainer, trainer.runtime_device)
         final_save = bool(training_cfg.get("save_final_checkpoint", True))
         if final_save and successful_steps > 0 and optimizer_step != last_saved_step:
             current_stage = "save_final_checkpoint"
+            checkpoint_started = time.perf_counter()
+            if rank == 0:
+                logger.info(
+                    "[standalone rank=%s] final checkpoint saving step=%s",
+                    rank,
+                    optimizer_step,
+                )
             last_save_result = _save_standalone_checkpoint(
                 trainer,
                 optimizer_step,
                 wait=True,
                 consumed_sequence_nos=consumed_sequence_nos,
                 input_path=(
-                    standalone_input_path if feature_store_type == "tq" else None
+                    standalone_input_path
+                    if feature_store_type in {"tq", "ray_reference"}
+                    else None
+                ),
+                producer_shuffle=(
+                    standalone_producer_shuffle
+                    if feature_store_type in {"tq", "ray_reference"}
+                    else None
                 ),
             )
+            if rank == 0:
+                logger.info(
+                    "[standalone rank=%s] final checkpoint saved step=%s elapsed=%.3fs",
+                    rank,
+                    optimizer_step,
+                    time.perf_counter() - checkpoint_started,
+                )
             _barrier()
-    except Exception:
+    except Exception as training_error:
         logger.exception(
             "[standalone rank=%s] training failed stage=%s attempted_batches=%s "
             "successful_steps=%s optimizer_step=%s",
@@ -501,8 +841,30 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             successful_steps,
             optimizer_step,
         )
+        if feature_store_type == "ray_reference" and training_events is not None:
+            try:
+                put_queue(
+                    training_events,
+                    {
+                        "kind": "consumer_failed",
+                        "rank": rank,
+                        "error": str(training_error),
+                    },
+                    timeout=30,
+                )
+            except Exception:
+                logger.exception("Failed to notify Driver of Consumer failure")
         raise
     finally:
+        original_error = sys.exc_info()[1]
+        prefetch_cleanup_error = None
+        if batch_finalizer is not None:
+            try:
+                batch_finalizer.close()
+            except Exception as error:  # noqa: BLE001 - still close the remaining resources
+                prefetch_cleanup_error = error
+                logger.exception("Failed to drain completed file batches")
+        _finish_standalone_tracking(standalone_trackers, rank=rank)
         logger.info(
             "[standalone rank=%s] cleanup starting stage=%s attempted_batches=%s "
             "successful_steps=%s",
@@ -513,22 +875,54 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         )
         if feature_producer is not None:
             feature_producer.close()
+        if tq_prefetch is not None:
+            try:
+                tq_prefetch.close()
+            except Exception as error:  # noqa: BLE001 - still release the remaining resources
+                prefetch_cleanup_error = error
+                logger.exception("Failed to close TQ prefetch thread")
+        if tq_prefetch_group is not None:
+            try:
+                dist.destroy_process_group(tq_prefetch_group)
+            except Exception as error:  # noqa: BLE001 - still close the client and trainer
+                if prefetch_cleanup_error is None:
+                    prefetch_cleanup_error = error
+                logger.exception("Failed to destroy TQ prefetch process group")
         if feature_replayer is not None:
             feature_replayer.close()
         if store is not None:
             store.close()
         logger.info("[standalone rank=%s] cleaning trainer resources", rank)
         await trainer.cleanup_training(clear_data=True)
+        failed_file_run = (
+            feature_store_type == "ray_reference" and original_error is not None
+        )
+        final_export_failed = (
+            False
+            if failed_file_run
+            else _sync_standalone_export_error(
+                trainer, trainer.runtime_device, raise_on_error=False
+            )
+        )
         if dist.is_initialized():
-            logger.info(
-                "[standalone rank=%s] entering final process-group barrier", rank
-            )
-            dist.barrier()
-            logger.info(
-                "[standalone rank=%s] final process-group barrier complete", rank
-            )
+            if not failed_file_run:
+                logger.info(
+                    "[standalone rank=%s] entering final process-group barrier", rank
+                )
+                dist.barrier()
+                logger.info(
+                    "[standalone rank=%s] final process-group barrier complete", rank
+                )
             dist.destroy_process_group()
         logger.info("[standalone rank=%s] cleanup complete", rank)
+        # cleanup_training waits for the pending full-checkpoint writer. Its
+        # standalone finalize callback may only report an export failure while
+        # that wait is completing, after the last check in the training loop.
+        if final_export_failed:
+            _raise_standalone_export_error(trainer)
+            raise RuntimeError("Standalone checkpoint export failed on another rank")
+        if prefetch_cleanup_error is not None and original_error is None:
+            raise prefetch_cleanup_error
 
     return {
         "rank": rank,
@@ -552,23 +946,25 @@ def _save_standalone_checkpoint(
     wait: bool = False,
     consumed_sequence_nos: set[int] | None = None,
     input_path: str | None = None,
+    producer_shuffle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     consumed_snapshot = torch.tensor(
         sorted(consumed_sequence_nos or ()), dtype=torch.int64
     )
     save_checkpoint = getattr(trainer, "save_checkpoint", None)
     if callable(save_checkpoint):
-        result = save_checkpoint(int(step), wait=wait)
+        result = save_checkpoint(int(step), wait=wait, defer_completion=True)
         checkpoint_path = result.get("path")
         is_export_leader = result.get("reason") in {"saved", "scheduled"}
         if result.get("saved") and checkpoint_path and is_export_leader:
             if wait:
-                _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
-                _save_resume_sidecar(
+                _finalize_standalone_checkpoint_files(
+                    trainer,
                     checkpoint_path,
-                    consumed_snapshot,
+                    consumed_snapshot=consumed_snapshot,
                     step=step,
                     input_path=input_path,
+                    producer_shuffle=producer_shuffle,
                 )
             else:
                 future = getattr(trainer, "_pending_full_checkpoint_future", None)
@@ -581,6 +977,7 @@ def _save_standalone_checkpoint(
                             consumed_snapshot=consumed_snapshot,
                             step=step,
                             input_path=input_path,
+                            producer_shuffle=producer_shuffle,
                         )
                     )
         return result
@@ -610,12 +1007,13 @@ def _save_standalone_checkpoint(
     if future is not None and wait:
         future.result()
         trainer._pending_full_checkpoint_future = None
-        _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
-        _save_resume_sidecar(
+        _finalize_standalone_checkpoint_files(
+            trainer,
             checkpoint_path,
-            consumed_snapshot,
+            consumed_snapshot=consumed_snapshot,
             step=step,
             input_path=input_path,
+            producer_shuffle=producer_shuffle,
         )
     elif future is not None:
         future.add_done_callback(
@@ -626,6 +1024,7 @@ def _save_standalone_checkpoint(
                 consumed_snapshot=consumed_snapshot,
                 step=step,
                 input_path=input_path,
+                producer_shuffle=producer_shuffle,
             )
         )
     return {
@@ -665,22 +1064,95 @@ def _finalize_standalone_checkpoint(
     consumed_snapshot: torch.Tensor | None = None,
     step: int | None = None,
     input_path: str | None = None,
+    producer_shuffle: dict[str, Any] | None = None,
 ) -> None:
     try:
         completed_future.result()
-    except Exception:
-        _rewrite_standalone_block_runtime_config(
-            trainer, checkpoint_path, completed_future
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "[standalone] checkpoint writer failed step=%s path=%s",
+            step,
+            checkpoint_path,
         )
+        try:
+            _set_standalone_checkpoint_complete(checkpoint_path, complete=False)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[standalone] failed to invalidate checkpoint step=%s path=%s",
+                step,
+                checkpoint_path,
+            )
+        if getattr(trainer, "_standalone_export_error", None) is None:
+            setattr(trainer, "_standalone_export_error", exc)
         return
 
+    # This callback runs on the checkpoint writer thread, where concurrent.futures
+    # only logs a raise. Record it so the training loop can fail from the main
+    # thread instead of finishing with an unmigrated runtime config.
+    try:
+        _finalize_standalone_checkpoint_files(
+            trainer,
+            checkpoint_path,
+            consumed_snapshot=consumed_snapshot,
+            step=step,
+            input_path=input_path,
+            producer_shuffle=producer_shuffle,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "[standalone] checkpoint export failed step=%s path=%s",
+            step,
+            checkpoint_path,
+        )
+        if getattr(trainer, "_standalone_export_error", None) is None:
+            setattr(trainer, "_standalone_export_error", exc)
+
+
+def _finalize_standalone_checkpoint_files(
+    trainer: DrafterBaseTrainer,
+    checkpoint_path: str,
+    *,
+    consumed_snapshot: torch.Tensor | None,
+    step: int | None,
+    input_path: str | None,
+    producer_shuffle: dict[str, Any] | None = None,
+) -> None:
+    """Commit standalone-only files before publishing a managed checkpoint."""
+
+    _set_standalone_checkpoint_complete(checkpoint_path, complete=False)
     _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
     _save_resume_sidecar(
         checkpoint_path,
         consumed_snapshot,
         step=step,
         input_path=input_path,
+        producer_shuffle=producer_shuffle,
     )
+    _set_standalone_checkpoint_complete(checkpoint_path, complete=True)
+
+
+def _set_standalone_checkpoint_complete(
+    checkpoint_path: str, *, complete: bool
+) -> None:
+    """Atomically publish or invalidate an existing managed checkpoint."""
+
+    metadata_path = os.path.join(checkpoint_path, "metadata.json")
+    if not os.path.exists(metadata_path):
+        return
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Cannot update standalone checkpoint metadata {metadata_path}: {exc}"
+        ) from exc
+    if not isinstance(metadata, dict):
+        raise TypeError(
+            f"Cannot update standalone checkpoint metadata {metadata_path}: "
+            "expected object"
+        )
+    metadata["complete"] = bool(complete)
+    DrafterBaseTrainer._atomic_json_dump(metadata, metadata_path)
 
 
 def _save_resume_sidecar(
@@ -689,6 +1161,7 @@ def _save_resume_sidecar(
     *,
     step: int | None,
     input_path: str | None,
+    producer_shuffle: dict[str, Any] | None = None,
 ) -> None:
     if consumed_snapshot is None or step is None or input_path is None:
         return
@@ -697,6 +1170,7 @@ def _save_resume_sidecar(
         consumed_snapshot,
         optimizer_step=step,
         input_path=input_path,
+        producer_shuffle=producer_shuffle,
     )
 
 
@@ -710,6 +1184,30 @@ def _standalone_input_path(config: Any) -> str | None:
     if train_files is not None and len(train_files) == 1:
         return str(train_files[0])
     return None
+
+
+def _standalone_producer_shuffle(config: Any) -> dict[str, Any] | None:
+    """Producer shuffle settings to persist beside standalone checkpoints.
+
+    Consumed sequence numbers are permutation positions, so a resumed Producer
+    must see the settings that produced them (see ``_assert_resume_shuffle_
+    alignment`` in the producer).
+    """
+    speco_cfg = getattr(config, "speco", None)
+    if speco_cfg is None and isinstance(config, dict):
+        speco_cfg = config.get("speco")
+    producer_cfg = getattr(speco_cfg, "standalone_tq_producer", None)
+    if producer_cfg is None and isinstance(speco_cfg, dict):
+        producer_cfg = speco_cfg.get("standalone_tq_producer")
+    if producer_cfg is None:
+        return None
+    try:
+        return {
+            "shuffle": bool(producer_cfg.get("shuffle", False)),
+            "shuffle_seed": int(producer_cfg.get("shuffle_seed", 42)),
+        }
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def _ensure_dict_child(config: dict[str, Any], key: str) -> dict[str, Any]:
@@ -806,6 +1304,147 @@ _VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
     ),
 }
 
+_STANDALONE_TRAINING_LAYER_KEYS = {
+    "dflash": "dflash_target_layer_ids",
+    "dflash2": "dflash2_target_layer_ids",
+    "dspark": "dspark_target_layer_ids",
+    "domino": "domino_target_layer_ids",
+}
+
+
+def _standalone_training_layer_ids(
+    trainer: DrafterBaseTrainer, backend_type: str
+) -> list[int] | None:
+    drafter_cfg = getattr(
+        getattr(getattr(trainer, "config", None), "rollout", None), "drafter", None
+    )
+    training_cfg = getattr(drafter_cfg, "training", None)
+    key = _STANDALONE_TRAINING_LAYER_KEYS.get(backend_type)
+    if training_cfg is None or key is None:
+        return None
+    value = (
+        training_cfg.get(key, None)
+        if hasattr(training_cfg, "get")
+        else getattr(training_cfg, key, None)
+    )
+    if value is None:
+        return None
+    layer_ids = [int(layer_id) for layer_id in value]
+    if not layer_ids or any(layer_id < 0 for layer_id in layer_ids):
+        raise ValueError(
+            f"Invalid standalone {key}={layer_ids}: expected non-negative "
+            "decoder-layer IDs"
+        )
+    return layer_ids
+
+
+def _source_vllm_aux_layer_ids(
+    source_config: dict[str, Any] | None,
+) -> list[int] | None:
+    if source_config is None:
+        return None
+    for key in (
+        "aux_hidden_state_layer_ids",
+        "eagle_aux_hidden_state_layer_ids",
+    ):
+        value = source_config.get(key)
+        if value is not None:
+            return [int(layer_id) for layer_id in value]
+    return None
+
+
+def _source_target_layer_ids(
+    source_config: dict[str, Any], backend_type: str
+) -> list[int] | None:
+    """Read the layer IDs a source drafter config declares as decoder indices."""
+
+    candidates = [source_config]
+    for child_key in ("dflash_config", f"{backend_type}_config"):
+        child = source_config.get(child_key)
+        if isinstance(child, dict):
+            candidates.append(child)
+    for candidate in candidates:
+        value = candidate.get("target_layer_ids")
+        if value is not None:
+            return [int(layer_id) for layer_id in value]
+    return None
+
+
+def _assert_standalone_layer_migration(
+    trainer: DrafterBaseTrainer, backend_type: str | None
+) -> None:
+    """Reject a resumed checkpoint whose layer IDs use another convention.
+
+    The checkpoint export path performs the same comparison while rewriting the
+    runtime config, but that runs on the async checkpoint writer thread where a
+    raise cannot reach the training loop.  Running the check up front keeps the
+    failure in the main thread, before the run spends any GPU time.
+    """
+
+    if backend_type is None:
+        return
+    launcher_layer_ids = _standalone_training_layer_ids(trainer, backend_type)
+    if launcher_layer_ids is None:
+        return
+    source_config = _load_source_drafter_config(trainer)
+    if source_config is None:
+        return
+    _, expected_vllm_ids = normalize_standalone_layer_ids(
+        backend_type, launcher_layer_ids, None
+    )
+    source_vllm_ids = _source_vllm_aux_layer_ids(source_config)
+    if source_vllm_ids is not None:
+        if source_vllm_ids != list(expected_vllm_ids):
+            raise ValueError(
+                "Standalone layer-ID migration mismatch: source checkpoint "
+                f"vLLM IDs are {source_vllm_ids}, but launcher decoder IDs "
+                f"{launcher_layer_ids} imply {list(expected_vllm_ids)}"
+            )
+        return
+    source_target_ids = _source_target_layer_ids(source_config, backend_type)
+    if source_target_ids is not None and source_target_ids != launcher_layer_ids:
+        raise ValueError(
+            "Cannot safely migrate standalone checkpoint target_layer_ids "
+            f"{source_target_ids}: source config has no explicit vLLM auxiliary "
+            f"IDs and launcher expects {launcher_layer_ids}"
+        )
+
+
+def _raise_standalone_export_error(trainer: DrafterBaseTrainer) -> None:
+    """Re-raise a checkpoint export failure captured on the writer thread."""
+
+    error = getattr(trainer, "_standalone_export_error", None)
+    if error is not None:
+        raise RuntimeError(
+            "Standalone checkpoint export failed; the writer thread logged the "
+            "underlying traceback"
+        ) from error
+
+
+def _sync_standalone_export_error(
+    trainer: DrafterBaseTrainer,
+    device: torch.device,
+    *,
+    raise_on_error: bool = True,
+) -> bool:
+    """Make a checkpoint export failure visible to every distributed rank."""
+
+    error = getattr(trainer, "_standalone_export_error", None)
+    if not dist.is_initialized() or dist.get_world_size() <= 1:
+        failed = error is not None
+    else:
+        failed_tensor = torch.tensor(
+            [1 if error is not None else 0], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(failed_tensor, op=dist.ReduceOp.MAX)
+        failed = bool(failed_tensor.item())
+
+    if failed and raise_on_error:
+        if error is not None:
+            _raise_standalone_export_error(trainer)
+        raise RuntimeError("Standalone checkpoint export failed on another rank")
+    return failed
+
 
 def _rewrite_standalone_block_runtime_config(
     trainer: DrafterBaseTrainer,
@@ -834,28 +1473,26 @@ def _rewrite_standalone_block_runtime_config(
 
     config_path = os.path.join(checkpoint_path, "config.json")
     if not os.path.exists(config_path):
-        logger.warning(
-            "Cannot rewrite standalone runtime config: missing %s", config_path
+        raise FileNotFoundError(
+            f"Cannot rewrite standalone runtime config: missing {config_path}"
         )
-        return
 
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             training_config = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning(
-            "Cannot rewrite standalone runtime config %s: %s", config_path, exc
-        )
-        return
+        raise RuntimeError(
+            f"Cannot rewrite standalone runtime config {config_path}: {exc}"
+        ) from exc
     if not isinstance(training_config, dict):
-        logger.warning(
-            "Cannot rewrite standalone runtime config %s: expected object", config_path
+        raise TypeError(
+            f"Cannot rewrite standalone runtime config {config_path}: expected object"
         )
-        return
 
     variant_child_key, variant_alias_keys = _VARIANT_RUNTIME_ALIASES.get(
         backend_type, (None, ())
     )
+    source_runtime_config = _load_source_drafter_config(trainer)
     training_dflash_config = training_config.get("dflash_config")
     training_variant_config = (
         training_config.get(variant_child_key) if variant_child_key else None
@@ -873,10 +1510,43 @@ def _rewrite_standalone_block_runtime_config(
             else None
         )
     )
-    training_aux_layer_ids: list[int] | None = None
+    launcher_target_layer_ids = _standalone_training_layer_ids(trainer, backend_type)
+    if launcher_target_layer_ids is not None:
+        expected_vllm_ids = [layer_id + 1 for layer_id in launcher_target_layer_ids]
+        source_vllm_ids = _source_vllm_aux_layer_ids(source_runtime_config)
+        saved_layer_ids = (
+            [int(layer_id) for layer_id in training_target_layer_ids]
+            if training_target_layer_ids is not None
+            else None
+        )
+        if source_vllm_ids is not None:
+            if source_vllm_ids != expected_vllm_ids:
+                raise ValueError(
+                    "Standalone layer-ID migration mismatch: source checkpoint "
+                    f"vLLM IDs are {source_vllm_ids}, but launcher decoder IDs "
+                    f"{launcher_target_layer_ids} imply {expected_vllm_ids}"
+                )
+        elif saved_layer_ids not in (None, launcher_target_layer_ids):
+            raise ValueError(
+                "Cannot safely migrate standalone checkpoint target_layer_ids "
+                f"{saved_layer_ids}: source config has no explicit vLLM auxiliary "
+                f"IDs and launcher expects {launcher_target_layer_ids}"
+            )
+        # save_pretrained may have serialized a released speculators config whose
+        # target_layer_ids were copied verbatim from output-index aux IDs. The
+        # standalone launcher's decoder IDs are authoritative for this run.
+        training_target_layer_ids = launcher_target_layer_ids
+        training_config["target_layer_ids"] = list(launcher_target_layer_ids)
+        if isinstance(training_dflash_config, dict):
+            training_dflash_config["target_layer_ids"] = list(launcher_target_layer_ids)
+        if isinstance(training_variant_config, dict):
+            training_variant_config["target_layer_ids"] = list(
+                launcher_target_layer_ids
+            )
+    training_decoder_layer_ids: list[int] | None = None
     if training_target_layer_ids is not None:
         try:
-            training_aux_layer_ids = [
+            training_decoder_layer_ids = [
                 int(layer_id) for layer_id in training_target_layer_ids
             ]
         except (TypeError, ValueError):
@@ -885,25 +1555,17 @@ def _rewrite_standalone_block_runtime_config(
                 training_target_layer_ids,
             )
         else:
-            if any(layer_id < 1 for layer_id in training_aux_layer_ids):
+            if any(layer_id < 0 for layer_id in training_decoder_layer_ids):
                 raise ValueError(
                     "Cannot export standalone DFlash runtime config with "
-                    f"target_layer_ids={training_aux_layer_ids}: each training layer id "
-                    "must be at least 1."
+                    f"target_layer_ids={training_decoder_layer_ids}: each decoder "
+                    "layer id must be non-negative."
                 )
 
     training_config_path = os.path.join(checkpoint_path, "speco_training_config.json")
-    try:
-        with open(training_config_path, "w", encoding="utf-8") as f:
-            json.dump(training_config, f, indent=2, sort_keys=True)
-    except OSError as exc:
-        logger.warning(
-            "Failed to write standalone training config copy %s: %s",
-            training_config_path,
-            exc,
-        )
+    DrafterBaseTrainer._atomic_json_dump(training_config, training_config_path)
 
-    runtime_config = _load_source_drafter_config(trainer)
+    runtime_config = source_runtime_config
     if runtime_config is None:
         runtime_config = deepcopy(training_config)
         logger.warning(
@@ -928,26 +1590,20 @@ def _rewrite_standalone_block_runtime_config(
             training_config.get("projector_type", "domino") or "domino"
         )
 
-    if training_aux_layer_ids is not None:
-        # Training captures these transformer layer outputs verbatim.  vLLM
-        # requires its DFlash target aliases to be one less than the EAGLE aux
-        # ids, so preserve the training ids as aux ids and shift only the
-        # runtime-facing aliases.
-        runtime_target_layer_ids = [layer_id - 1 for layer_id in training_aux_layer_ids]
-        runtime_config["eagle_aux_hidden_state_layer_ids"] = training_aux_layer_ids
+    if training_decoder_layer_ids is not None:
+        # Training and runtime configs use zero-based decoder-layer indices.
+        # vLLM's EAGLE auxiliary alias addresses layer outputs, so it is the
+        # same capture plan shifted by one.
+        runtime_target_layer_ids = list(training_decoder_layer_ids)
+        runtime_config["eagle_aux_hidden_state_layer_ids"] = [
+            layer_id + 1 for layer_id in training_decoder_layer_ids
+        ]
         runtime_config["target_layer_ids"] = runtime_target_layer_ids
         dflash_config["target_layer_ids"] = runtime_target_layer_ids
         if variant_child_key:
             variant_config["target_layer_ids"] = runtime_target_layer_ids
 
-    try:
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(runtime_config, f, indent=2, sort_keys=True)
-            f.write("\n")
-    except OSError as exc:
-        logger.warning(
-            "Failed to write standalone runtime config %s: %s", config_path, exc
-        )
+    DrafterBaseTrainer._atomic_json_dump(runtime_config, config_path)
 
 
 def _disable_standalone_sequence_parallel(draft_config) -> None:
@@ -988,7 +1644,7 @@ def _build_training_device_mesh(draft_config, world_size: int) -> DeviceMesh | N
 
 def _block_metric_prefix(trainer: DrafterBaseTrainer) -> str | None:
     model_type = str(getattr(getattr(trainer, "backend", None), "model_type", "") or "")
-    if model_type in {"dflash", "dspark", "eagle3"}:
+    if model_type in {"dflash", "dspark", "eagle3", "dflash2"}:
         return model_type
     return None
 
@@ -1049,7 +1705,7 @@ def _standalone_step_metrics(
     }
     prefix = _block_metric_prefix(trainer)
     if prefix is not None:
-        anchor_offset = 1 if prefix == "dflash" else 0
+        anchor_offset = 1 if prefix in {"dflash", "dflash2"} else 0
         losses = _position_metric_series(raw_metrics, prefix, "loss_per_position")
         accuracies = _position_metric_series(
             raw_metrics, prefix, "accuracy_per_position"
@@ -1104,6 +1760,13 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         ("train/simulated_acc_len", "sim_acc_len"),
         ("train/lr", "lr"),
         ("perf/step_time", "step_time"),
+        ("perf/loader_plan_wait_time", "loader_plan_wait_time"),
+        ("perf/loader_tq_get_time", "loader_tq_get_time"),
+        ("perf/loader_batch_prepare_time", "loader_batch_prepare_time"),
+        ("perf/batch_ready_wait_time", "batch_ready_wait_time"),
+        ("perf/batch_prepare_time", "batch_prepare_time"),
+        ("perf/train_time", "train_time"),
+        ("perf/batch_finalize_time", "batch_finalize_time"),
         ("replay/cache_hit_ratio", "cache_hit"),
         ("replay/target_forward_time_total", "target_forward_total"),
         ("replay/vllm_request_time_total", "vllm_request_total"),
@@ -1115,10 +1778,15 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         value = float(metrics[key])
         if key == "train/lr":
             fields.append(f"{label}={value:.3e}")
-        elif key.endswith("_time_total") or key in {
-            "perf/step_time",
-            "replay/target_forward_time_total",
-        }:
+        elif (
+            key.endswith("_time_total")
+            or key.startswith("perf/")
+            or key
+            in {
+                "perf/step_time",
+                "replay/target_forward_time_total",
+            }
+        ):
             fields.append(f"{label}={value:.3f}s")
         else:
             fields.append(f"{label}={value:.4f}")
@@ -1173,21 +1841,125 @@ def _all_ranks_true(value: bool, device: torch.device) -> bool:
     return bool(ready.item())
 
 
+def _max_across_ranks_float(value: float, device: torch.device) -> float:
+    """Return the slowest-rank duration for a distributed standalone stage."""
+
+    maximum = torch.tensor(float(value), dtype=torch.float32, device=device)
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+    return float(maximum.item())
+
+
+def _submit_standalone_metrics(finalizer, events, event, config) -> None:
+    """Keep every metrics snapshot on the bounded ACK executor, never on GPU."""
+
+    def send() -> None:
+        try:
+            retry_io(
+                lambda: put_queue(
+                    events, event, timeout=config.get("io_timeout_seconds", 30)
+                ),
+                name="Standalone metrics event",
+                attempts=int(config.get("io_retry_max_attempts", 3)),
+            )
+        except Exception:
+            try:
+                put_queue(
+                    events,
+                    {
+                        "kind": "finalization_failed",
+                        "step": event["step"],
+                        "phase": "metrics",
+                    },
+                    timeout=config.get("io_timeout_seconds", 30),
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to notify Driver of metrics publication failure"
+                )
+            raise
+
+    finalizer.submit(send)
+
+
 def _clear_tq_batch_across_ranks(
     loader: TQFeatureDataLoader,
     global_keys: list[str] | None,
     *,
     rank: int,
     device: torch.device,
+    training_events: Any | None = None,
+    completion_event: dict[str, Any] | None = None,
+    finalizer: AsyncBatchFinalizer | None = None,
+    synchronize: bool = True,
+    cleanup_after_load: bool = False,
 ) -> None:
-    """Clear once on rank 0 and report a clear failure to every training rank."""
+    """Finalize on rank 0; ray_reference uses async ACK without a per-step collective."""
+
+    def complete() -> None:
+        retry_io(
+            lambda: (
+                loader.clear_completed_batch(global_keys, cleanup_after_load=True)
+                if cleanup_after_load
+                else loader.clear_completed_batch(global_keys)
+            ),
+            name="Consumer batch cleanup",
+            attempts=_TQ_CLEAR_MAX_ATTEMPTS,
+            initial_backoff=_TQ_CLEAR_RETRY_BACKOFF_SECONDS,
+            jitter=False,
+            # Keep the existing clear policy: retry ordinary exceptions,
+            # including TQ's RuntimeError wrappers, not only network errors.
+            retry_if=lambda error: True,
+        )
+        if training_events is not None:
+            retry_io(
+                lambda: put_queue(
+                    training_events,
+                    completion_event,
+                    timeout=getattr(loader, "io_timeout_seconds", 30),
+                ),
+                name="Training completion event",
+                attempts=getattr(loader, "io_retry_max_attempts", 3),
+            )
 
     local_error: BaseException | None = None
     if rank == 0:
         try:
-            loader.clear_completed_batch(global_keys)
-        except BaseException as exc:  # noqa: BLE001
+            if finalizer is None:
+                complete()
+            else:
+
+                def complete_async() -> None:
+                    try:
+                        complete()
+                    except Exception:
+                        # Wake the Driver even if training is waiting for a new plan.
+                        # The Future retains the original failure for the main thread.
+                        if training_events is not None:
+                            try:
+                                put_queue(
+                                    training_events,
+                                    {
+                                        "kind": "finalization_failed",
+                                        "plan_id": (completion_event or {}).get(
+                                            "plan_id"
+                                        ),
+                                    },
+                                    timeout=getattr(loader, "io_timeout_seconds", 30),
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to notify Driver of file finalization failure"
+                                )
+                        raise
+
+                finalizer.submit(complete_async)
+        except BaseException as exc:  # noqa: BLE001 - synchronize failures before the next training collective
             local_error = exc
+    if not synchronize:
+        if local_error is not None:
+            raise local_error
+        return
     failed = torch.tensor(
         1 if local_error is not None else 0,
         dtype=torch.int32,
@@ -1198,9 +1970,20 @@ def _clear_tq_batch_across_ranks(
     if bool(failed.item()):
         if local_error is not None:
             raise RuntimeError(
-                "rank 0 failed to clear a completed TQ batch"
+                "rank 0 failed to clear a completed batch"
             ) from local_error
-        raise RuntimeError("rank 0 failed to clear a completed TQ batch")
+        raise RuntimeError("rank 0 failed to clear a completed batch")
+
+
+def _drain_batch_finalizer_across_ranks(finalizer, device) -> None:
+    error = None
+    if finalizer is not None:
+        try:
+            finalizer.drain()
+        except Exception as exc:  # noqa: BLE001 - every rank must stop before saving
+            error = exc
+    if not _all_ranks_true(error is None, device):
+        raise RuntimeError("Failed to finalize completed file batches") from error
 
 
 def _connect_tq_store_across_ranks(store, *, rank: int, device: torch.device) -> None:
@@ -1228,6 +2011,7 @@ def _next_batch_across_ranks(
     *,
     rank: int,
     device: torch.device,
+    require_prepared: bool = False,
 ) -> Any | None:
     """Fetch one batch and make producer failures visible to every rank.
 
@@ -1241,6 +2025,12 @@ def _next_batch_across_ranks(
     exhausted = False
     try:
         samples = next(source)
+        if samples is None:
+            raise RuntimeError("Successful batch fetch returned no samples")
+        if require_prepared and (
+            not isinstance(samples, TQLocalBatch) or not samples.prepared_batch
+        ):
+            raise RuntimeError("Reference input returned no prepared training batch")
     except StopIteration:
         exhausted = True
     except BaseException as exc:  # noqa: BLE001

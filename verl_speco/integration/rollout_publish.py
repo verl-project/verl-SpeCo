@@ -18,7 +18,10 @@ from __future__ import annotations
 import logging
 import os
 import time
+from contextlib import contextmanager
 from typing import Any, Optional, cast
+
+from omegaconf import OmegaConf, open_dict
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -57,6 +60,43 @@ def _get_nested(config: Any, path: tuple[str, ...], default=None):
         else:
             current = getattr(current, key, default)
     return current
+
+
+@contextmanager
+def _without_speco_drafter_rollout_config(worker: Any):
+    """Hide SPECO-only rollout config while VERL builds its upstream dataclass."""
+    worker_config = getattr(worker, "config", None)
+    if worker_config is None:
+        yield
+        return
+    rollout_config = (
+        cast(Any, worker_config).get("rollout")
+        if hasattr(worker_config, "get")
+        else getattr(worker_config, "rollout", None)
+    )
+    if rollout_config is None or not hasattr(rollout_config, "get"):
+        yield
+        return
+
+    missing = object()
+    drafter_config = rollout_config.get("drafter", missing)
+    if drafter_config is missing:
+        yield
+        return
+
+    if OmegaConf.is_config(rollout_config):
+        with open_dict(rollout_config):
+            del rollout_config["drafter"]
+    else:
+        del rollout_config["drafter"]
+    try:
+        yield
+    finally:
+        if OmegaConf.is_config(rollout_config):
+            with open_dict(rollout_config):
+                rollout_config["drafter"] = drafter_config
+        else:
+            rollout_config["drafter"] = drafter_config
 
 
 def rollout_backend_name(config: Any) -> Optional[str]:
@@ -227,17 +267,20 @@ def install_sglang_runtime_for_worker(worker: Any) -> None:
     """Install SPECO SGLang runtime hooks inside an actor-rollout worker process."""
 
     try:
+        from verl_speco.integration.drafter_config_env import (
+            get_drafter_config_env,
+            set_drafter_config_env,
+        )
         from verl_speco.integration.sglang_runtime import (
-            SPECO_SGLANG_DRAFTER_CONFIG_ENV,
             patch_sglang_server_adapter_update,
         )
     except Exception:  # noqa: BLE001
         return
 
-    drafter_env = getattr(type(worker), "_speco_sglang_drafter_config_env", None)
+    drafter_env = getattr(type(worker), "_speco_drafter_config_env", None)
     if drafter_env:
-        os.environ[SPECO_SGLANG_DRAFTER_CONFIG_ENV] = drafter_env
-    if os.getenv(SPECO_SGLANG_DRAFTER_CONFIG_ENV):
+        set_drafter_config_env(drafter_env)
+    if get_drafter_config_env():
         patch_sglang_server_adapter_update()
 
 
@@ -277,9 +320,7 @@ def install_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
     except Exception:  # noqa: BLE001
         return
 
-    drafter_env = (
-        getattr(type(worker), "_speco_sglang_drafter_config_env", None) or None
-    )
+    drafter_env = getattr(type(worker), "_speco_drafter_config_env", None) or None
     if not oldlogprob_hidden_runtime_enabled(
         getattr(worker, "config", None), drafter_env=drafter_env
     ):
@@ -319,9 +360,7 @@ def validate_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
             "SPECO could not import the VeOmni hidden-state validator"
         ) from exc
 
-    drafter_env = (
-        getattr(type(worker), "_speco_sglang_drafter_config_env", None) or None
-    )
+    drafter_env = getattr(type(worker), "_speco_drafter_config_env", None) or None
     if not oldlogprob_hidden_runtime_enabled(config, drafter_env=drafter_env):
         return
 
@@ -893,7 +932,11 @@ class DraftWeightPublishMixin:
     def init_model(self, *args, **kwargs):
         install_rollout_runtime_for_worker(self)
         install_oldlogprob_hidden_runtime_for_worker(self)
-        result = super().init_model(*args, **kwargs)
+        # VERL 0.10 materializes ``RolloutConfig`` here. Its dataclass does not
+        # accept SPECO's nested ``drafter`` extension, which is restored as soon
+        # as the upstream initialization finishes.
+        with _without_speco_drafter_rollout_config(self):
+            result = super().init_model(*args, **kwargs)
         validate_oldlogprob_hidden_runtime_for_worker(self)
         return result
 

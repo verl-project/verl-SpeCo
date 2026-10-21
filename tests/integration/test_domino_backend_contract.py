@@ -382,3 +382,58 @@ def test_domino_setup_optimizer_without_resume_starts_curriculum_at_zero() -> No
 
     assert model._curriculum_step == 0
     assert model._current_lambda_base() == pytest.approx(1.0)
+
+
+def test_domino_forward_accepts_trailing_label_sequence() -> None:
+    """Domino overrides ``DFlashTrainingModel.forward``; it must accept the
+    trailing label sequence (``label_ids``/``label_mask``) and keep the final
+    label token reachable."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    import torch
+
+    from verl_speco.backends.domino_trainer_backend import DominoTrainingModel
+    from verl_speco.models.domino import DominoDraftModel
+
+    torch.manual_seed(0)
+    config = _tiny_domino_config()
+    model = DominoTrainingModel(
+        draft_model=DominoDraftModel(config),
+        block_size=config.block_size,
+        num_anchors=config.num_anchors,
+        pure_draft_prefix_len=config.pure_draft_prefix_len,
+    )
+
+    context_rows = 16
+    bsz = 2
+    input_ids = torch.randint(0, config.vocab_size, (bsz, context_rows))
+    hidden_states_list = [
+        torch.randn(bsz, context_rows, config.target_hidden_size)
+        for _ in config.target_layer_ids
+    ]
+    loss_mask = torch.ones(bsz, context_rows, dtype=torch.long)
+    label_ids = torch.cat(
+        [input_ids, torch.randint(0, config.vocab_size, (bsz, 1))], dim=1
+    )
+    label_mask = torch.ones(bsz, context_rows + 1, dtype=torch.long)
+    lm_head_weight = torch.randn(config.vocab_size, config.hidden_size)
+
+    _, _, _, _, _, diagnostics = model(
+        input_ids,
+        hidden_states_list,
+        loss_mask,
+        lm_head_weight,
+        label_ids=label_ids,
+        label_mask=label_mask,
+    )
+    assert float(diagnostics["quality_token_count"]) > 0
+
+    targets, _, eval_mask, label_indices = model._build_label_tensors(
+        input_ids=label_ids,
+        loss_mask=label_mask,
+        anchor_positions=torch.tensor([[context_rows - 1]]),
+        block_keep_mask=torch.ones(1, 1, dtype=torch.bool),
+    )
+    assert label_indices[0, 0, 0].item() == context_rows
+    assert targets[0, 0, 0].item() == label_ids[0, context_rows].item()
+    assert bool(eval_mask[0, 0, 0])

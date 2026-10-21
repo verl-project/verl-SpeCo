@@ -17,7 +17,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.trainer.feature_store import (
     DraftFeatureSample,
@@ -87,14 +88,18 @@ def _entry(sequence_no: int) -> ReadyEntry:
     return ReadyEntry(key=make_sample_key(meta), tag=make_ready_tag(meta))
 
 
-def test_feature_store_factory_builds_tq_without_path() -> None:
+@pytest.mark.parametrize("store_type", ["tq", "ray_reference"])
+def test_feature_store_factory_builds_tq_without_path(store_type) -> None:
     store = build_feature_store_from_config(
-        {"type": "tq", "path": None},
+        {"type": store_type, "path": None},
         read_only=True,
         transfer_queue_cfg=_config(),
     )
     assert isinstance(store, TQFeatureStore)
     assert store.run_id == "run-a"
+    if store_type == "ray_reference":
+        from verl_speco.trainer.tq_feature_store import ReferenceFeatureStore
+        assert isinstance(store, ReferenceFeatureStore)
 
 
 def test_tq_store_defaults_to_current_protocol_version() -> None:
@@ -234,6 +239,44 @@ def test_eos_drops_incomplete_global_tail() -> None:
     loader = TQFeatureDataLoader(store, batch_size=2, rank=0, world_size=1)
     assert list(loader) == []
     assert store.clear_calls == [[entry.key]]
+
+
+def test_scheduled_loader_uses_driver_selected_keys_without_listing() -> None:
+    entries = [_entry(0), _entry(1)]
+    store = _FakeStore(entries, eos=False)
+
+    class Commands:
+        def __init__(self):
+            self.values = [
+                {
+                    "kind": "batch",
+                    "global_keys": [entry.key for entry in entries],
+                    "global_sequence_nos": [0, 1],
+                    "assignments": [
+                        [{"key": entry.key, "tag": entry.tag} for entry in entries]
+                    ],
+                },
+                {"kind": "stop"},
+            ]
+
+        def get(self, *, block):
+            assert block is True
+            return self.values.pop(0)
+
+    store.list_ready = lambda: pytest.fail("scheduled Consumer must not list TQ")
+    loader = TQFeatureDataLoader(
+        store,
+        batch_size=2,
+        rank=0,
+        world_size=1,
+        scheduled_commands=Commands(),
+    )
+
+    batches = list(loader)
+
+    assert len(batches) == 1
+    assert batches[0].global_keys == [entry.key for entry in entries]
+    assert store.get_calls == [[entry.key for entry in entries]]
 
 
 def test_rank0_discovery_failure_is_raised_without_clearing() -> None:

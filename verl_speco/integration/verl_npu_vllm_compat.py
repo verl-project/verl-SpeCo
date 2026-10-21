@@ -122,35 +122,44 @@ def _install_verl_v080_npu_vllm_import_compat(
 def _temporary_verl_v090_fused_moe_import(
     module_importer: Callable[[str], Any],
 ) -> Iterator[None]:
-    """Provide only the temporary package export expected by verl's NPU patch.
+    """Provide temporary symbols expected by verl's legacy NPU patch.
 
     Some modular vLLM revisions keep ``FusedMoE`` in ``fused_moe.layer``
-    without re-exporting it; newer revisions remove that factory entirely.
-    verl v0.9 imports the package-level symbol before it can skip the obsolete
-    class-level hook. Export the exact factory or a non-class sentinel only for
-    that import, then restore the package namespace even when import fails.
+    without re-exporting it; newer revisions remove that factory entirely or
+    export it as a factory function.  verl v0.9's NPU patch unconditionally
+    accesses ``FusedMoE.weight_loader`` at import time.  Supply the missing
+    export and/or a temporary loader attribute only for that import, then
+    restore the vLLM namespace even when import fails.
     """
 
     fused_moe_package = module_importer(_VLLM_FUSED_MOE_PACKAGE)
-    if hasattr(fused_moe_package, "FusedMoE"):
-        yield
-        return
+    added_package_export = not hasattr(fused_moe_package, "FusedMoE")
+    if added_package_export:
+        try:
+            fused_moe_layer = module_importer(_VLLM_FUSED_MOE_LAYER_MODULE)
+        except ModuleNotFoundError as exc:
+            if exc.name != _VLLM_FUSED_MOE_LAYER_MODULE:
+                raise
+            fused_moe_layer = None
+        fused_moe = getattr(fused_moe_layer, "FusedMoE", None)
+        if fused_moe is None:
+            fused_moe = _unavailable_fused_moe
+        fused_moe_package.FusedMoE = fused_moe
+    else:
+        fused_moe = fused_moe_package.FusedMoE
 
-    try:
-        fused_moe_layer = module_importer(_VLLM_FUSED_MOE_LAYER_MODULE)
-    except ModuleNotFoundError as exc:
-        if exc.name != _VLLM_FUSED_MOE_LAYER_MODULE:
-            raise
-        fused_moe_layer = None
-    fused_moe = getattr(fused_moe_layer, "FusedMoE", None)
-    if fused_moe is None:
-        fused_moe = _unavailable_fused_moe
-
-    fused_moe_package.FusedMoE = fused_moe
+    added_weight_loader = not hasattr(fused_moe, "weight_loader")
+    if added_weight_loader:
+        setattr(fused_moe, "weight_loader", _unused_factory_weight_loader)
     try:
         yield
     finally:
-        if getattr(fused_moe_package, "FusedMoE", None) is fused_moe:
+        if added_weight_loader and hasattr(fused_moe, "weight_loader"):
+            delattr(fused_moe, "weight_loader")
+        if (
+            added_package_export
+            and getattr(fused_moe_package, "FusedMoE", None) is fused_moe
+        ):
             del fused_moe_package.FusedMoE
 
 
@@ -160,22 +169,49 @@ def install_verl_npu_vllm_import_compat(
     """Eagerly import the installed release's NPU vLLM initialization safely."""
 
     global _IMPORT_COMPAT_APPLIED
-    if _IMPORT_COMPAT_APPLIED or _VERL_NPU_VLLM_PATCH_MODULE in sys.modules:
+    # A custom importer is used by the compatibility contract tests and must be
+    # able to exercise the patch even if a prior test imported the real module.
+    # The production importer remains idempotent once the module is present.
+    if _IMPORT_COMPAT_APPLIED or (
+        module_importer is importlib.import_module
+        and _VERL_NPU_VLLM_PATCH_MODULE in sys.modules
+    ):
         return False
     if not _module_available("torch_npu"):
         return False
 
-    if _uses_verl_v090_runner():
+    runner_api = "0.9" if _uses_verl_v090_runner() else "0.8"
+    if runner_api == "0.9":
         with _temporary_verl_v090_fused_moe_import(module_importer):
             module_importer(_VERL_NPU_VLLM_PATCH_MODULE)
     elif not _install_verl_v080_npu_vllm_import_compat(module_importer):
-        return False
+        # Some downstream 0.9 builds retain ``verl.trainer.main_ppo`` rather
+        # than ``main_ppo_v0``.  The layout check above consequently identifies
+        # them as 0.8, while their NPU patch still unconditionally accesses
+        # ``FusedMoE.weight_loader``.  Do not leave that import to the Ray HTTP
+        # actor: retry it with the version-independent temporary namespace
+        # compatibility used for 0.9.
+        runner_api = "fallback"
+        with _temporary_verl_v090_fused_moe_import(module_importer):
+            module_importer(_VERL_NPU_VLLM_PATCH_MODULE)
     _IMPORT_COMPAT_APPLIED = True
     logger.warning(
         "Applied verl NPU vLLM import compatibility for legacy runner API %s",
-        "0.9" if _uses_verl_v090_runner() else "0.8",
+        runner_api,
     )
     return True
+
+
+def install_verl_npu_vllm_worker_process_compat() -> None:
+    """Install the import guard before a Ray worker deserializes its actor.
+
+    Ray runs ``worker_process_setup_hook`` before it imports the actor class.
+    That ordering matters for the vLLM HTTP actor: deserializing its upstream
+    base class imports verl's NPU patch, so an ``__init__`` or module-level
+    hook on the derived SPECO class runs too late.
+    """
+
+    install_verl_npu_vllm_import_compat()
 
 
 def install_verl_npu_checkpoint_reclaim(
@@ -465,13 +501,32 @@ class VerlNPUVLLMImportCompatMixin:
 
     def __init__(self, *args, **kwargs):
         from verl_speco.integration.compat import check_compatible_verl
+        from verl_speco.integration.vllm_runtime import install_vllm_runtime_for_worker
 
         check_compatible_verl()
         install_verl_npu_vllm_import_compat()
         install_verl_fsdp_training_output_release_compat()
         install_verl_npu_checkpoint_reclaim()
         install_verl_npu_fsdp2_weight_export_compat()
+        # V1 constructs rollout replicas from inside this WorkerDict process.
+        # Install SPECO's server/EngineCore runtime hooks before upstream
+        # worker initialization resolves the rollout registry.
+        install_vllm_runtime_for_worker(self)
         super().__init__(*args, **kwargs)
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
+    def init_model(self, *args, **kwargs):
+        # ``rollout.drafter`` is a SPECO extension and is not accepted by
+        # upstream verl's RolloutConfig dataclass. Online-drafter workers also
+        # receive DraftWeightPublishMixin, which already hides it at this
+        # boundary; no-drafter workers do not, so the compatibility mixin must
+        # enforce the same boundary for every V1 vLLM worker.
+        from verl_speco.integration.rollout_publish import (
+            _without_speco_drafter_rollout_config,
+        )
+
+        with _without_speco_drafter_rollout_config(self):
+            return super().init_model(*args, **kwargs)
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
     async def update_weights(self, global_steps: int | None = None, mode: str = "auto"):

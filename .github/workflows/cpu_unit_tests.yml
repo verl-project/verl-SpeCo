@@ -49,7 +49,10 @@ jobs:
         run: python -m compileall verl_speco
 
       - name: Validate example shell syntax
-        run: bash -n examples/*.sh
+        run: find examples -type f -name "*.sh" -print0 | xargs -0 -r bash -n
+
+      - name: Verify manual PR target resolution
+        run: node --test tests/examples/test_pr_target.cjs tests/examples/test_pr_comments.cjs
 
       - name: Run CPU unit contract tests
         env:
@@ -63,8 +66,48 @@ jobs:
           tests/integration
           -q
 
-  drafter-parallelism:
-    name: Drafter parallelism tests (torch CPU)
+  unit-tests:
+    name: All unit tests (torch CPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out verl-SpeCo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check out supported upstream verl
+        run: |
+          set -euo pipefail
+          verl_ref="$(awk -F= '/^VERL_BASE_BRANCH=/{print $2}' REQUIRED_VERL.txt)"
+          mkdir -p .ci
+          git clone --filter=blob:none https://github.com/verl-project/verl .ci/upstream-verl
+          git -C .ci/upstream-verl checkout "${verl_ref}"
+
+      - name: Install CPU torch, upstream runtime deps and test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install uv
+          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system -r ci/requirements-ci.txt -r ci/requirements-unit.txt
+
+      - name: Run all unit tests and CPU distributed regression
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/.ci/upstream-verl
+          VERL_SPECO_UPSTREAM_ROOT: ${{ github.workspace }}/.ci/upstream-verl
+        run: >-
+          python -m pytest
+          tests/unit
+          tests/v1
+          tests/integration/test_drafter_ddp_distributed.py
+          -q -ra
+
+  drafter-models:
+    name: Drafter model/checkpoint tests (torch CPU)
     runs-on: ubuntu-24.04
     timeout-minutes: 25
 
@@ -92,14 +135,15 @@ jobs:
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -r ci/requirements-ci.txt
           python -m pip install ray peft tensordict transformers numpy pydantic
+          python -m pip install -r ci/requirements-unit.txt
 
-      - name: Run drafter parallelism tests
+      - name: Run drafter model/checkpoint tests
         env:
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/.ci/upstream-verl
           VERL_SPECO_UPSTREAM_ROOT: ${{ github.workspace }}/.ci/upstream-verl
         run: >-
           python -m pytest
-          tests/unit/test_fsdp_shard_size.py
-          tests/integration/test_drafter_ddp_distributed.py
+          tests/integration/test_drafter_checkpoint.py
+          tests/integration/test_dspark_trainer_backend.py
+          --deselect "tests/integration/test_dspark_trainer_backend.py::test_dspark_checkpoint_preserves_source_config_and_vllm_weight_names"
           -q
-

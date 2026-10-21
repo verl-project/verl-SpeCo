@@ -22,6 +22,8 @@ from verl_speco.trainer.scheduler import (
     DrafterScheduleConfig,
     DrafterScheduleContext,
     DrafterScheduler,
+    DrafterTrainingDataSource,
+    ProducerAction,
     TrainingDataStatus,
     TrainingPlan,
     step_matches_interval,
@@ -115,6 +117,29 @@ def test_sglang_collection_plan_contains_static_budget_and_metrics() -> None:
     assert plan.max_tokens_per_replica == 2048
     assert plan.metrics()["drafter/collection_plan_source"] == 1
     assert plan.metrics()["drafter/collection_plan_reason"] == 7
+    assert plan.producer_action is ProducerAction.RUN
+    assert plan.max_new_samples is None
+
+
+def test_collection_ids_are_unique_and_ordered_by_source_step() -> None:
+    scheduler = DrafterScheduler()
+    config = DrafterScheduleConfig(collect_interval_steps=1)
+    first = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=1, source=DrafterCollectionSource.OLD_LOGPROB
+        ),
+        config,
+    )
+    second = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=2, source=DrafterCollectionSource.OLD_LOGPROB
+        ),
+        config,
+    )
+
+    assert first.collection_id < second.collection_id
+    assert first.collection_id == "collection-00000000000000000001-00000000000000000001-oldlogprob"
+    assert second.collection_id == "collection-00000000000000000002-00000000000000000002-oldlogprob"
 
 
 def test_oldlogprob_collection_plan_preserves_training_interval_requirement() -> None:
@@ -157,6 +182,15 @@ def test_oldlogprob_collection_plan_preserves_training_interval_requirement() ->
             ),
             DrafterScheduleConfig(collect_interval_steps=2),
             "source_disabled",
+        ),
+        (
+            DrafterCollectionContext(
+                global_step=2,
+                source=DrafterCollectionSource.SGLANG,
+                drafter_frozen=True,
+            ),
+            DrafterScheduleConfig(collect_interval_steps=2),
+            "drafter_frozen",
         ),
         (
             DrafterCollectionContext(
@@ -209,6 +243,8 @@ def test_sync_plan_launches_for_current_step_samples() -> None:
     assert plan.max_sample_step == 5
     assert plan.data_filter_reason == "current_step_only"
     assert plan.publish_after_success
+    assert plan.data_source is DrafterTrainingDataSource.LOCAL_BUFFER
+    assert plan.required_samples is None
     assert plan.to_worker_payload()["execution_strategy"] == "sync"
     assert plan.to_worker_payload()["min_sample_step"] == 5
     assert plan.to_worker_payload()["max_sample_step"] == 5

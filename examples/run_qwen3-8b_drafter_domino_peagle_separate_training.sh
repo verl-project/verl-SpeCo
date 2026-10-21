@@ -32,20 +32,20 @@ ppo_gpus_per_node=8
 # environment instead, which is what a smaller box (or CI) needs.
 draft_train_gpus_per_node=${DRAFT_TRAIN_GPUS_PER_NODE:-8}
 
-MODEL_PATH=/path/to/model
-CKPTS_DIR=/path/to/checkpoint
-TRAIN_FILE=/path/to/train_file
-TEST_FILE=/path/to/test_file
+MODEL_PATH=${MODEL_PATH:-/path/to/model}
+CKPTS_DIR=${CKPTS_DIR:-/path/to/checkpoint}
+TRAIN_FILE=${TRAIN_FILE:-/path/to/train_file}
+TEST_FILE=${TEST_FILE:-/path/to/test_file}
 
 case "${DRAFT_ALGO}" in
   domino)
     COLLECT_ALGO="DFLASH"
     TRAIN_ALGO="DOMINO"
     # Stage-1 drafter: any engine-servable DFlash drafter for the rollout.
-    COLLECT_DRAFTER_PATH=/path/to/vllm-compatible-dflash-drafter
+    COLLECT_DRAFTER_PATH=${COLLECT_DRAFTER_PATH:-/path/to/vllm-compatible-dflash-drafter}
     # Stage-2 drafter: an existing Domino checkpoint, or a path that does not
     # exist yet to cold-start the draft from the target config.
-    DRAFT_INIT_PATH=/path/to/domino-drafter-or-new-dir
+    DRAFT_INIT_PATH=${DRAFT_INIT_PATH:-/path/to/domino-drafter-or-new-dir}
     ALGO_TRAIN_ARGS=(
       actor_rollout_ref.rollout.drafter.training.domino_block_size=16
       actor_rollout_ref.rollout.drafter.training.domino_num_anchors=512
@@ -59,8 +59,8 @@ case "${DRAFT_ALGO}" in
   peagle)
     COLLECT_ALGO="EAGLE3"
     TRAIN_ALGO="PEAGLE"
-    COLLECT_DRAFTER_PATH=/path/to/vllm-compatible-eagle3-drafter
-    DRAFT_INIT_PATH=/path/to/peagle-drafter-or-new-dir
+    COLLECT_DRAFTER_PATH=${COLLECT_DRAFTER_PATH:-/path/to/vllm-compatible-eagle3-drafter}
+    DRAFT_INIT_PATH=${DRAFT_INIT_PATH:-/path/to/peagle-drafter-or-new-dir}
     ALGO_TRAIN_ARGS=(
       actor_rollout_ref.rollout.drafter.training.peagle_num_draft_layers=4
       actor_rollout_ref.rollout.drafter.training.peagle_num_aux_hidden_states=3
@@ -77,8 +77,8 @@ esac
 
 project_name="verl_grpo_example_${DRAFT_ALGO}_drafter"
 exp_name="qwen3_8b_${DRAFT_ALGO}_separate_drafter_vllm_gpu"
-FEATURE_STORE_DIR=/path/to/speco/${DRAFT_ALGO}_features
-DRAFT_CKPTS_DIR=/path/to/speco/${DRAFT_ALGO}_draft_ckpts
+FEATURE_STORE_DIR=${FEATURE_STORE_DIR:-/path/to/speco/${DRAFT_ALGO}_features}
+DRAFT_CKPTS_DIR=${DRAFT_CKPTS_DIR:-/path/to/speco/${DRAFT_ALGO}_draft_ckpts}
 
 if [ "${RUN_STAGE}" = "both" ] || [ "${RUN_STAGE}" = "collect" ]; then
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \

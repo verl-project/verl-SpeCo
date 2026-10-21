@@ -64,6 +64,9 @@ coverage.xml
 pytest.ini
 output.txt
 
+# Local code-review checkouts
+.review-*/
+
 # Translations
 *.mo
 *.pot
@@ -132,6 +135,7 @@ ENV/
 
 # local logs
 logs
+.logs
 log
 outputs
 .history

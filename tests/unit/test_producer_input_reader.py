@@ -20,7 +20,129 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("torch")
+
 from verl_speco.producer import input_reader
+
+
+@pytest.mark.parametrize("response_budget", [0, 2, 3])
+def test_prompt_context_does_not_consume_response_feature_budget(response_budget):
+    request = input_reader._build_tokenized_request(
+        sequence_no=0,
+        sample_id="long-prompt",
+        prompt_length=10,
+        full_ids=list(range(15)),
+        source_metadata={},
+        config={
+            "preserve_prompt_context": True,
+            "max_feature_length": response_budget,
+            "min_response_feature_rows": 2,
+        },
+    )
+    end = 15 if response_budget == 0 else 10 + response_budget
+    assert request.feature_positions.tolist() == list(range(end))
+    assert request.loss_mask[:10].sum().item() == 0
+    assert request.loss_mask[10:end].sum().item() == end - 10
+
+
+def test_prompt_context_still_obeys_sequence_limit():
+    with pytest.raises(input_reader.SampleFilteredError, match="max_sequence_length"):
+        input_reader._build_tokenized_request(
+            sequence_no=0,
+            sample_id="too-long",
+            prompt_length=10,
+            full_ids=list(range(15)),
+            source_metadata={},
+            config={
+                "preserve_prompt_context": True,
+                "max_feature_length": 3,
+                "max_sequence_length": 12,
+            },
+        )
+
+
+@pytest.mark.parametrize("preserve", [False, True])
+def test_prompt_context_option_keeps_same_response_budget(preserve):
+    request = input_reader._build_tokenized_request(
+        sequence_no=0,
+        sample_id="optional-context",
+        prompt_length=10,
+        full_ids=list(range(15)),
+        source_metadata={},
+        config={
+            "preserve_prompt_context": preserve,
+            "response_feature_budget": True,
+            "max_feature_length": 3,
+        },
+    )
+    start = 0 if preserve else 9
+    assert request.feature_positions.tolist() == list(range(start, 13))
+    assert request.loss_mask[10:13].sum().item() == 3
+
+
+def test_legacy_feature_window_keeps_prompt_anchor_budget():
+    request = input_reader._build_tokenized_request(
+        sequence_no=0,
+        sample_id="legacy",
+        prompt_length=10,
+        full_ids=list(range(15)),
+        source_metadata={},
+        config={"max_feature_length": 3},
+    )
+    assert request.feature_positions.tolist() == [9, 10, 11]
+
+
+@pytest.mark.parametrize("minimum", [2, 4, 16])
+@pytest.mark.parametrize("preserve", [False, True])
+def test_short_response_filtered_even_with_unlimited_feature_budget(minimum, preserve):
+    with pytest.raises(input_reader.SampleFilteredError):
+        input_reader._build_tokenized_request(
+            sequence_no=0,
+            sample_id="short-response",
+            prompt_length=10,
+            full_ids=list(range(10 + minimum - 1)),
+            source_metadata={},
+            config={
+                "preserve_prompt_context": preserve,
+                "response_feature_budget": True,
+                "min_response_feature_rows": minimum,
+                "max_feature_length": 0,
+            },
+        )
+
+
+@pytest.mark.parametrize("minimum", [2, 4, 16])
+def test_minimum_response_length_is_retained(minimum):
+    request = input_reader._build_tokenized_request(
+        sequence_no=0,
+        sample_id="minimum-response",
+        prompt_length=10,
+        full_ids=list(range(10 + minimum)),
+        source_metadata={},
+        config={
+            "preserve_prompt_context": True,
+            "response_feature_budget": True,
+            "min_response_feature_rows": minimum,
+            "max_feature_length": minimum,
+        },
+    )
+    assert request.feature_positions.numel() == 10 + minimum
+
+
+def test_prompt_context_preserves_generated_hidden_row_limit():
+    request = input_reader._build_tokenized_request(
+        sequence_no=0,
+        sample_id="generated",
+        prompt_length=10,
+        full_ids=list(range(15)),
+        source_metadata={},
+        config={"preserve_prompt_context": True, "max_feature_length": 10},
+        vllm_prompt_token_ids=list(range(14)),
+        feature_end_limit=14,
+    )
+    assert request.feature_positions.tolist() == list(range(14))
+    assert request.input_ids.tolist() == list(range(15))
+    assert request.prompt_token_ids == list(range(14))
 
 
 def test_iter_input_records_reads_jsonl(tmp_path: Path) -> None:
@@ -37,6 +159,55 @@ def test_iter_input_records_reads_jsonl(tmp_path: Path) -> None:
     assert records[0].prompt == "Q: "
     assert records[0].response == "A"
     assert records[0].source_metadata == {"source": "test"}
+
+
+def test_shuffled_jsonl_reader_reads_in_caller_order(tmp_path: Path) -> None:
+    input_path = tmp_path / "train.jsonl"
+    lines = [
+        json.dumps({"sample_id": "a", "prompt": "Q1: ", "response": "A1"}),
+        "",  # blank lines must not shift the byte offsets
+        json.dumps({"sample_id": "b", "prompt": "Q2: ", "response": "A2"}),
+        json.dumps({"sample_id": "c", "prompt": "Q3: ", "response": "A3"}),
+    ]
+    input_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    reader = input_reader.ShuffledJsonlReader(input_path)
+    assert reader.record_count == 3
+
+    order = [2, 0, 1]
+    records = list(reader.iter_records(order))
+
+    sequential = list(input_reader.iter_input_records(input_path))
+    expected = [sequential[i] for i in order]
+    assert [r.sample_id for r in records] == [r.sample_id for r in expected]
+    for shuffled, plain in zip(records, expected):
+        assert (shuffled.prompt, shuffled.response) == (plain.prompt, plain.response)
+
+
+def test_shuffled_jsonl_reader_skips_invalid_lines(tmp_path: Path) -> None:
+    input_path = tmp_path / "train.jsonl"
+    input_path.write_text(
+        json.dumps({"sample_id": "a", "prompt": "Q: ", "response": "A"})
+        + "\n"
+        + "{not json\n"
+        + json.dumps({"sample_id": "b", "prompt": "Q2: ", "response": "B"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    reader = input_reader.ShuffledJsonlReader(input_path, max_consecutive_errors=5)
+    assert reader.record_count == 3  # offsets are collected before parsing
+    records = list(reader.iter_records([0, 1, 2]))
+
+    assert [r.sample_id for r in records] == ["a", "b"]
+
+
+def test_shuffled_jsonl_reader_rejects_parquet(tmp_path: Path) -> None:
+    input_path = tmp_path / "train.parquet"
+    input_path.write_bytes(b"PAR1-fixture")
+
+    with pytest.raises(input_reader.ShuffledInputUnsupportedError):
+        input_reader.ShuffledJsonlReader(input_path)
 
 
 def test_iter_input_records_reads_parquet_rows(monkeypatch, tmp_path: Path) -> None:
@@ -194,7 +365,9 @@ def test_finalize_generated_request_aligns_connector_excluding_final_token() -> 
     assert finalized.draft_position_ids.tolist() == [3, 4]
 
 
-def test_prefilled_response_limits_vllm_prefix_after_selecting_training_window() -> None:
+def test_prefilled_response_limits_vllm_prefix_after_selecting_training_window() -> (
+    None
+):
     prepared = input_reader._build_tokenized_request(
         sequence_no=0,
         sample_id="long-response",
@@ -209,9 +382,10 @@ def test_prefilled_response_limits_vllm_prefix_after_selecting_training_window()
     assert prepared.prompt_token_ids == [0, 1, 2, 3, 4, 5]
 
 
-def test_prefilled_response_rejects_prompt_prefix_beyond_vllm_limit() -> None:
+def test_prefilled_response_filters_prompt_prefix_beyond_vllm_limit() -> None:
+    # Over-length samples are data-filtered (skipped upstream), not fatal.
     with pytest.raises(
-        ValueError,
+        input_reader.SampleFilteredError,
         match=r"vLLM prefill of 13 tokens.*max_sequence_length=8",
     ):
         input_reader._build_tokenized_request(
@@ -224,7 +398,9 @@ def test_prefilled_response_rejects_prompt_prefix_beyond_vllm_limit() -> None:
         )
 
 
-def test_iter_jsonl_conversation_splits_final_assistant_response(tmp_path: Path) -> None:
+def test_iter_jsonl_conversation_splits_final_assistant_response(
+    tmp_path: Path,
+) -> None:
     input_path = tmp_path / "conversation.jsonl"
     input_path.write_text(
         json.dumps(
@@ -266,7 +442,9 @@ def test_iter_jsonl_legacy_conversations_normalizes_from_value(tmp_path: Path) -
     assert record.response == "Answer"
 
 
-def test_prepare_generated_prefill_request_uses_full_sequence_without_final_token() -> None:
+def test_prepare_generated_prefill_request_uses_full_sequence_without_final_token() -> (
+    None
+):
     request = input_reader.GenerationRequest(
         sequence_no=0,
         sample_id="generated-row",
@@ -311,3 +489,19 @@ def test_non_utf8_non_parquet_input_has_actionable_error(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="not UTF-8 JSONL or a Parquet file"):
         list(input_reader.iter_input_records(input_path))
+
+
+@pytest.mark.parametrize("feature_rows", [2, 3, 5])
+def test_minimum_feature_rows_applies_after_window_selection(feature_rows):
+    kwargs = dict(
+        sequence_no=0, sample_id="eagle3", prompt_length=2,
+        full_ids=list(range(6)), source_metadata={},
+        config={"min_feature_rows": 3, "min_supervised_tokens": 1,
+                "max_feature_length": feature_rows},
+    )
+    if feature_rows < 3:
+        with pytest.raises(input_reader.SampleFilteredError, match="2 feature rows"):
+            input_reader._build_tokenized_request(**kwargs)
+    else:
+        request = input_reader._build_tokenized_request(**kwargs)
+        assert request.feature_positions.numel() == feature_rows

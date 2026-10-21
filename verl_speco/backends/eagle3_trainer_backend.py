@@ -22,6 +22,7 @@ from transformers import AutoConfig
 
 from verl.utils.device import get_device_id, get_device_name
 from verl_speco.backends.lr_scheduler import build_drafter_lr_scheduler
+from verl_speco.backends.optimizers import build_drafter_optimizer
 from verl_speco.models.auto import (
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
@@ -43,6 +44,38 @@ _LAST_HIDDEN_LOGPROB_CHECK_MAX_LOGS_ENV = (
 _HIDDEN_BLOCK_DEBUG_LOG_COUNT = 0
 _RAW_TOPK_DEBUG_LOG_COUNT = 0
 _RAW_HIDDEN_METADATA_SOURCE = "raw_hidden_metadata"
+
+
+class _Eagle3VllmTargetHead(torch.nn.Module):
+    """EAGLE3-owned verifier norm and head for raw standalone vLLM residuals."""
+
+    def __init__(self, head, verifier_norm, clip_value=None):
+        super().__init__()
+        self.fc = head.fc.requires_grad_(False)
+        self.verifier_norm = verifier_norm.eval().requires_grad_(False)
+        self.clip_value = clip_value
+
+    def forward(self, hidden_states, *, hidden_is_raw=False, hidden_source=None):
+        if not hidden_is_raw:
+            return self.fc(hidden_states)
+        if hidden_source != "standalone_vllm_reference":
+            raise ValueError(
+                "EAGLE3 verifier norm accepts standalone vLLM file residuals only"
+            )
+        with (
+            torch.no_grad(),
+            torch.autocast(device_type=hidden_states.device.type, enabled=False),
+        ):
+            hidden_states = self.verifier_norm(hidden_states)
+            bad_rows = ~torch.isfinite(hidden_states).all(dim=-1)
+            if self.clip_value is not None:
+                bad_rows |= hidden_states.float().abs().amax(dim=-1) > self.clip_value
+            hidden_states = torch.nan_to_num(
+                hidden_states, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            if self.clip_value is not None:
+                hidden_states = hidden_states.clamp(-self.clip_value, self.clip_value)
+        return self.fc(hidden_states), bad_rows
 
 
 class _SyncedTargetHead(torch.nn.Module):
@@ -645,14 +678,7 @@ class Eagle3TrainerBackend:
         return "eagle3"
 
     def setup_optimizer(self, drafter_model, drafter_train_config):
-        trainable_params = [p for p in drafter_model.parameters() if p.requires_grad]
-
-        return torch.optim.AdamW(
-            trainable_params,
-            lr=drafter_train_config.lr,
-            betas=(0.9, 0.95),
-            weight_decay=drafter_train_config.get("weight_decay", 1e-2),
-        )
+        return build_drafter_optimizer(drafter_model, drafter_train_config)
 
     def setup_scheduler(self, optimizer, train_cfg):
         return build_drafter_lr_scheduler(optimizer, train_cfg)
@@ -843,13 +869,42 @@ class Eagle3TrainerBackend:
                 vocab_size,
                 hidden_size,
             )
-            return _SyncedTargetHead(hidden_size=hidden_size, vocab_size=vocab_size)
+            return self._maybe_build_vllm_target_head(
+                _SyncedTargetHead(hidden_size=hidden_size, vocab_size=vocab_size),
+                target_model_path,
+            )
 
         target_head = TargetHead.from_pretrained(
             model_path=target_model_path,
         )
 
-        return target_head
+        return self._maybe_build_vllm_target_head(target_head, target_model_path)
+
+    def _maybe_build_vllm_target_head(self, head, target_model_path):
+        training = self.config.rollout.drafter.training
+        if (
+            self.model_type != "eagle3"
+            or training.get("mode") != "offline"
+            or training.get("feature_store", {}).get("type")
+            not in {"tq", "ray_reference"}
+            or training.get("use_logits", False)
+            or training.get("transfer_queue", {})
+            .get("expected_feature", {})
+            .get("payload_kind")
+            != "vllm_reference"
+        ):
+            return head
+        from verl_speco.trainer.target_feature_replay import load_vllm_final_norm
+
+        norm = load_vllm_final_norm(
+            target_model_path,
+            dtype=torch.bfloat16,
+            trust_remote_code=bool(self.config.model.get("trust_remote_code", False)),
+        )
+        clip = training.get("hidden_state_clip_value", 1.0e4)
+        return _Eagle3VllmTargetHead(
+            head, norm, float(clip) if clip is not None and float(clip) > 0 else None
+        )
 
     def preprocess_individual_items(self, items, device, model_config):
         """
@@ -982,6 +1037,30 @@ class Eagle3TrainerBackend:
         input_ids = batch["input_ids"]
         hidden_states = batch["hidden_states"]
         last_hidden_states = batch.get("last_hidden_states", None)
+        if batch.get("last_hidden_state_norm") not in {
+            None,
+            "target_final_norm",
+            "raw_target_residual",
+        }:
+            raise ValueError("Unknown EAGLE3 final hidden state")
+        raw_target_hidden = batch.get("last_hidden_state_norm") == "raw_target_residual"
+        if raw_target_hidden:
+            training = self.config.rollout.drafter.training
+            if (
+                batch.get("hidden_source") != "standalone_vllm_reference"
+                or training.get("mode") != "offline"
+                or training.get("feature_store", {}).get("type")
+                not in {"tq", "ray_reference"}
+                or training.get("use_logits", False)
+                or training.get("transfer_queue", {})
+                .get("expected_feature", {})
+                .get("payload_kind")
+                != "vllm_reference"
+                or not isinstance(self.target_model, _Eagle3VllmTargetHead)
+            ):
+                raise ValueError(
+                    "Raw EAGLE3 targets are restricted to standalone vLLM file input"
+                )
         attention_mask = batch["attention_mask"]
         loss_mask = batch["loss_mask"]
         position_ids = batch["position_ids"]
@@ -1086,7 +1165,15 @@ class Eagle3TrainerBackend:
                     padding_size=_current_pad_size,
                 ).unsqueeze(0)
                 with torch.no_grad():
-                    target_scores = self.target_model(last_hidden_states)
+                    if raw_target_hidden:
+                        target_scores, bad_target_rows = self.target_model(
+                            last_hidden_states,
+                            hidden_is_raw=True,
+                            hidden_source=batch["hidden_source"],
+                        )
+                        loss_mask = loss_mask.masked_fill(bad_target_rows, 0.0)
+                    else:
+                        target_scores = self.target_model(last_hidden_states)
         else:
             all_step_logits = all_step_logits
             all_step_position_mask = all_step_position_mask
@@ -1112,7 +1199,15 @@ class Eagle3TrainerBackend:
                         "last_hidden_states is required when use_logits=False"
                     )
                 with torch.no_grad():
-                    target_scores = self.target_model(last_hidden_states)
+                    if raw_target_hidden:
+                        target_scores, bad_target_rows = self.target_model(
+                            last_hidden_states,
+                            hidden_is_raw=True,
+                            hidden_source=batch["hidden_source"],
+                        )
+                        loss_mask = loss_mask.masked_fill(bad_target_rows, 0.0)
+                    else:
+                        target_scores = self.target_model(last_hidden_states)
 
         length = len(all_step_logits)
         if length == 0:

@@ -41,7 +41,13 @@ speco:
     tokenizer_fingerprint: null
     target_model_id: null
     target_model_revision: null
+    # Canonical decoder-layer indices consumed by the drafter. The unified
+    # launcher derives this from vllm_aux_hidden_state_layer_ids.
     target_layer_ids: null
+    # IDs passed to vLLM output_hidden_states. For DSpark/DFlash/Domino the
+    # launcher subtracts one to produce target_layer_ids; EAGLE3 keeps these
+    # IDs unchanged because its config already uses vLLM output IDs.
+    vllm_aux_hidden_state_layer_ids: null
     hidden_dtype: bfloat16
     trust_remote_code: false
     vllm_endpoints:
@@ -52,15 +58,86 @@ speco:
     per_endpoint_concurrency: 4
     input_queue_size: 32
     publish_queue_size: 16
+    # Dedicated blocking TransferQueue writers. Feature conversion keeps its
+    # own executor so network stalls cannot starve hidden-state conversion.
+    publish_workers: 4
+    # Total TransferQueue put attempts per sample. Retries use exponential
+    # backoff and keep the temporary hidden-state result until one succeeds.
+    publish_max_attempts: 3
+    publish_retry_backoff_seconds: 0.5
     max_pending_samples: 1024
     # Zero means one input-file pass. The unified launcher sets this to the
     # exact number of samples required by max_steps and the global batch size.
     max_samples: 0
+    # When true the Producer indexes the JSONL input once (one byte offset per
+    # line) and queues records in a per-epoch permutation seeded with
+    # shuffle_seed + epoch (speculators NumPy default_rng recipe).
+    # Deterministic across restarts so resumed runs replay the same per-epoch
+    # order. Parquet inputs are rejected with shuffle=true: rows have no
+    # cheap offsets to index and a bounded shuffled Parquet reader is not
+    # available yet.
+    shuffle: false
+    shuffle_seed: 42
     pending_poll_interval_seconds: 0.5
+    # After publishing EOS the producer waits until the consumer clears every
+    # published sample before closing the remote client. Bound that wait with
+    # SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS (default 1800; 0 disables).
     owner_ready_timeout_seconds: 120
     max_sequence_length: 8192
+    # Standalone DFlash/DSpark: response feature rows, excluding prompt context.
+    # Finite budgets must allow at least 2 rows for DSpark, or dflash_block_size
+    # rows for DFlash. Actual samples below these minima are filtered.
+    # Other algorithms: total feature-window rows, including the prompt anchor.
+    # Zero disables this limit.
     max_feature_length: 512
     generation_max_tokens: 511
+    # Per endpoint: log the first three successful HTTP requests, then every N.
+    # Zero disables successful-request logs; failures are always logged.
+    vllm_success_log_interval: 100
+    # Server-side differential rendering for the assistant loss boundary.
+    # Requires a vLLM /render endpoint at the first vllm_endpoints entry.
+    render_boundary:
+      enabled: false
+      # Per-request timeout for the tokenizer-only /render call.
+      timeout: 10
+    # Consumer side of the vLLM hidden-state transfer. ``file`` reads the legacy
+    # safetensors path; ``mooncake`` reads the handle-based store written by the
+    # out-of-tree hs_connectors connector. The standalone launcher injects the
+    # mooncake settings from SPECO_VLLM_HIDDEN_STATES_* when selected.
+    # Keep in sync with the target-replay copy in draft_trainer.yaml.
+    hidden_states_store:
+      backend: file
+      mooncake:
+        local_hostname: ""
+        metadata_server: P2PHANDSHAKE
+        master_server_address: 127.0.0.1:50051
+        global_segment_size: 4294967296
+        local_buffer_size: 2147483648
+        protocol: tcp
+        device_name: ""
+        num_writer_threads: 8
+    # Bad-row policy while scanning the input file: skip drops and counts an
+    # unparseable row, raise aborts; max_consecutive_errors is the breaker.
+    on_error: skip
+    max_consecutive_errors: 20
+    # Samples that fail to produce a training payload (misaligned or NaN/Inf
+    # hidden states, filtered after target generation, or a terminal vLLM
+    # request failure) are replaced while max_samples > 0; abort after this many
+    # consecutive replacements without a successful feature conversion instead
+    # of requesting replacements forever.
+    max_consecutive_feature_drops: 20
+    # Tolerant role cleaning for ShareGPT rows (unknown roles map to assistant,
+    # order-violating turns are dropped instead of aborting the run).
+    parser_strict_roles: false
+    # skip|generate for rows without an assistant response. Offline training
+    # cannot teacher-force them, so skip drops them (counts as filtered data)
+    # instead of asking the 35B target to generate (very slow). Use generate to
+    # restore the old fallback behaviour.
+    on_missing_response: skip
+    # Filter rows whose feature window leaves too few supervised tokens.
+    min_supervised_tokens: 1
+    # drop|keep when the feature window cuts the supervised response.
+    on_truncated_supervision: keep
 
 actor_rollout_ref:
   rollout:
@@ -90,6 +167,9 @@ actor_rollout_ref:
       training:
         engine: fsdp  # fsdp or veomni; VeOmni requires a full-world FSDP2 mesh.
         mode: online
+        # Consumed by the standalone DFlash/DSpark producer only.
+        # Cotrain collection keeps its existing behavior.
+        preserve_prompt_hidden_states: false
         collect_hidden_states_from_sgl: false
         collect_hidden_states_from_old_logprob: false
         # SGLang does not apply the target final norm to captured aux states.
@@ -98,6 +178,9 @@ actor_rollout_ref:
         old_logprob_hidden_capture_impl: forward_hook
         use_data_buffer: false
         collect_interval_steps: 5
+        # Print request mean-accept-length variance every N trainer steps.
+        # Set to 0 to disable the periodic variance summary.
+        request_accept_len_variance_interval_steps: 0
         collection_sample_rate: 1.0
         max_collect_samples_per_step_per_replica: 16
         max_collect_tokens_per_step_per_replica: 16384
@@ -112,6 +195,7 @@ actor_rollout_ref:
         batch_size_per_gpu: 4
         training_interval_steps: 5
         publish_interval_steps: 0
+        # Async publish with freeze economics.enabled=true is rejected pending cost accounting.
         publish_async: false
         publish_dtype: null
         publish_param_name_patterns: null
@@ -123,6 +207,10 @@ actor_rollout_ref:
         skip_heavy_cleanup_after_drafter_training: false
         # Keep trainer objects resident while releasing idle NPU HCCL memory.
         park_hccl_after_drafter_training: false
+        # Keep drafter state on CPU outside its short training window when NPU
+        # capacity is shared with actor and rollout workers.
+        is_offload_param: false
+        is_offload_optimizer: false
         save_full_drafter_checkpoint: true
         sample_last_n_steps: 20
         train_batches_per_cycle: 4
@@ -140,6 +228,27 @@ actor_rollout_ref:
         # default: it is only needed when a trainable param can miss a gradient.
         ddp_find_unused_parameters: false
         lr: 1e-5
+        # Optimizer for drafter training. "adamw" keeps the historical single
+        # AdamW over all trainable params. "muon" applies Muon to 2D hidden
+        # weight matrices and AdamW to the rest (norms, biases, embeddings,
+        # and output heads), mirroring speculators.train.optimizers. Muon needs
+        # fsdp2 or ddp: FSDP1 shards parameters to 1D and is rejected.
+        optimizer: adamw
+        weight_decay: 1e-2
+        # AdamW (running-momentum) betas for the non-Muon parameter group.
+        adamw_betas: [0.9, 0.95]
+        # Muon-only options (ignored when optimizer=adamw).
+        # null uses the same lr as AdamW, matching speculators; set an explicit
+        # value to override (muon_adjust_lr_fn rescales the update to AdamW RMS).
+        muon_lr: null
+        muon_momentum: 0.95
+        muon_nesterov: true
+        muon_weight_decay: 0.1
+        muon_ns_steps: 5
+        muon_adjust_lr_fn: match_rms_adamw
+        # Extra parameter-name substrings kept on AdamW even when 2D, on top of
+        # the built-in defaults (embeddings, lm_head, codebook, markov_w1/w2).
+        muon_adamw_name_hints: null
         lr_warmup_steps: 0
         # Supported standalone drafter scheduler types:
         # constant, cosine, linear, global_cosine.
@@ -156,6 +265,21 @@ actor_rollout_ref:
         logits_coverage_mask_min_ratio: 0.1
         logits_coverage_mask_require_top1: false
         ttt_length: 1
+        # DFlash-family document-aware packing: concatenate the batch's samples
+        # into one row (each padded to a block_size multiple) and isolate them via
+        # document_ids. Disabled by default because it changes the batch.
+        packing:
+          enable: false
+          max_packed_len: 0
+        # Group similar-length samples into a batch to cut padding. Off by
+        # default because batch composition changes the loss trajectory.
+        group_by_length: false
+        # Samples per grouping megabatch, as a multiple of batch_size_per_gpu.
+        group_by_length_megabatch: 8
+        # Hard-label CE target source for backends that support it.
+        # labels keeps SpeCo's teacher-forced behavior; target_argmax matches
+        # speculators-style CE against the target model top-1 token.
+        ce_target_source: labels
         vocab_mapping_path: null
         dflash_block_size: 16
         dflash_num_anchors: 512
@@ -164,6 +288,7 @@ actor_rollout_ref:
         dflash_front_position_count: 0
         dflash_hard_sample_ratio: 0.0
         dflash_hidden_size: null
+        dflash_sliding_window: null
         dflash_num_target_layers: 5
         dflash_num_hidden_layers: 1
         dflash_mask_token_id: null
@@ -174,13 +299,27 @@ actor_rollout_ref:
         dspark_block_size: 7
         dspark_num_anchors: 32
         dspark_loss_decay_gamma: 7.0
+        # Hard pool: lowest request acceptance lengths among eligible scored rows.
+        dspark_hard_candidate_ratio: 0.0
+        # Desired fraction of unique hard requests in the collection set.
+        # Either ratio zero disables hard prioritization; training stays uniform.
         dspark_hard_sample_ratio: 0.0
+        # Shared collection budget for both baseline and hard sampling.
+        dspark_collect_samples_per_step: 80
+        # Never duplicate requests. Fill missing hard slots with unique normals.
+        dspark_hard_shortfall_policy: fill_normal
+        # Retained for config compatibility; request-aware collection does not use it.
+        dspark_hard_collect_window_size: 0
         dspark_hidden_size: null
+        dspark_intermediate_size: null
+        dspark_sliding_window: null
         dspark_num_target_layers: 5
         dspark_num_hidden_layers: 5
         dspark_mask_token_id: null
         dspark_target_layer_ids: null
-        dspark_max_window: 512
+        # Optional trainer-side sequence crop. Zero/null keeps every row supplied
+        # by the feature producer; set a positive integer to enable the crop.
+        dspark_max_window: 0
         dspark_loss_mode: full_vocab
         dspark_sampled_ce_negatives: 0
         dspark_markov_rank: 256
@@ -188,6 +327,14 @@ actor_rollout_ref:
         dspark_confidence_head_alpha: 0.0
         dspark_confidence_loss_alpha: 0.0
         dspark_confidence_head_with_markov: true
+        # When true the confidence loss does not backpropagate into the shared
+        # draft backbone/Markov features: only the confidence head is trained.
+        dspark_confidence_detach_backbone: false
+        # Acceptance target the confidence head regresses to. "greedy" (the
+        # serving default) proposes argmax(p_draft) with a one-hot draft, so the
+        # target is p_target[argmax(p_draft)]; "probabilistic" samples the draft
+        # softmax, so the target is sum_v min(p_draft_v, p_target_v) = 1 - TV.
+        dspark_confidence_target_mode: greedy
         dspark_ce_loss_alpha: 0.1
         # DeepSpec Qwen3 fixed-K default. Confidence BCE is unsupported on MRV2
         # and must not implicitly reduce the distribution-matching objective.
@@ -254,7 +401,7 @@ actor_rollout_ref:
         data_buffer_max_size: 1024
         hidden_state_clip_value: 1.0e4
         feature_store:
-          # `tq` selects the streaming standalone Consumer and does not use path.
+            # Streaming standalone inputs do not use path: tq, or launcher-selected ray_reference.
           type: torch_shard
           path: null
           max_samples_per_shard: 1024
@@ -270,6 +417,12 @@ actor_rollout_ref:
           train_on: last_assistant
           min_sample_step: null
           max_sample_step: null
+          # Read-side filtering for stored feature samples: skip/raise on a
+          # corrupt sample, minimum supervised tokens, and alignment validation.
+          on_error: skip
+          max_consecutive_errors: 20
+          min_supervised_tokens: 1
+          strict_token_alignment: warn
         # TransferQueue transport for standalone drafter training. The owner,
         # vLLM Producer, and every torchrun Consumer rank share this connection
         # configuration. Default off; requires TransferQueue==0.1.10.
@@ -286,6 +439,8 @@ actor_rollout_ref:
           run_id: null
           schema_version: 2
           expected_feature:
+            # Launcher-owned descriptor, not an independent user switch.
+            payload_kind: null
             algorithm: null
             target_model_path: null
             target_revision: null
@@ -296,6 +451,15 @@ actor_rollout_ref:
           connect_timeout_seconds: 120
           poll_interval_seconds: 0.5
           drop_last: true
+          # Scheduled Ray Consumer: 0 keeps serial loading, k prefetches k batches.
+          consumer_prefetch_batches: 0
+          # ray_reference: whole-batch CPU processes per rank; 0 restores sample threads.
+          consumer_batch_workers: 2
+          # Sample threads used only by the fallback or retained-TQ file path.
+          consumer_prepare_workers: 4
+          io_retry_max_attempts: 3
+          io_timeout_seconds: 30
+          prefetch_collective_timeout_seconds: 180
           controller:
             polling_mode: true
           backend:
@@ -303,3 +467,86 @@ actor_rollout_ref:
             SimpleStorage:
               total_storage_size: 100000
               num_data_storage_units: 8
+            MooncakeStore:
+              # auto_init=false requires an external mooncake_master reachable
+              # at master_server_address; the standalone launcher probes it and
+              # fails fast otherwise. Set SPECO_TQ_MOONCAKE_AUTO_INIT=true to let
+              # TransferQueue start (and own) the master instead.
+              auto_init: false
+              metadata_server: P2PHANDSHAKE
+              master_server_address: 127.0.0.1:50051
+              local_hostname: ""
+              protocol: tcp
+              global_segment_size: 4294967296
+              local_buffer_size: 2147483648
+
+        # Drafter convergence freeze: stop drafter training once a new drafter
+        # version no longer pays for its train+publish cost. Policy training
+        # continues; the frozen drafter keeps serving speculative decoding in
+        # rollout. See drafter_marginal_utility_freeze_rfc.md.
+        drafter_convergence_freeze:
+          enabled: false
+          # 冻结方法: marginal_utility_v1 — 按"成功发布的 drafter 版本"聚合的
+          # 边际效用策略 (见 drafter_marginal_utility_freeze_rfc.md)。
+          # 旧单指标 legacy tracker 已移除, 配置 legacy 会在启动时报错。
+          method: marginal_utility_v1
+          # ---------------------------------------------------------------- #
+          # 默认 enabled=false, 且先 shadow; active 前完成标定。
+          # ---------------------------------------------------------------- #
+          # active 冻结: 停 drafter 训练 + 停 hidden states 采集; per-step
+          # accept-length 与 PPO old_log_prob 照常(漂移检测/主训练需要)。
+          mode: shadow                      # shadow(只报 would_freeze, 不改变训练/采集) | active(执行冻结)
+          # 冻结生效点分叉 checkpoint (freeze_transition_branch_checkpoint_design.md):
+          # active 模式首次 LEARNING -> FROZEN 时, 在 actor 更新完成后的既有
+          # checkpoint 安全点自动保存一次完整 global_step_S (含 drafter draft_step_S
+          # 与 freeze sidecar) 并原子提交 freeze_branch_manifest.json, 作为
+          # active/shadow 两个分支共同父节点。仅支持 marginal_utility_v1 +
+          # mode=active; 第一版只允许 once=true / fail_on_error=true (失败即停)。
+          # 恢复分叉时两个分支都必须保持 enabled=false。
+          branch_checkpoint:
+            enabled: false
+            once: true
+            fail_on_error: true
+          spec_verify_tokens: null         # 非空时额外上报 q_*_normalized; 在线判据不依赖它
+          observation:
+            min_requests_per_version: 256  # 单版本窗有效所需最小请求数, 不足则 fail-open
+            min_rollout_steps_per_version: 2
+            trim_fraction: 0.05            # Q_all 两端各裁 5%
+            hard_quantile: 0.10            # Q_hard = 最差 10% 请求的条件均值
+          gain:
+            window_updates: 3              # 最近 W 次"真实有效更新"
+            patience_updates: 3            # 连续 M 次候选才冻结
+            confidence_level: 0.95
+            bootstrap_samples: 300         # 在线 block-bootstrap 次数(按 rollout-step)
+            practical_gain_all: 0.005      # shadow 初值, active 前需按噪声/系统收益标定
+            practical_gain_hard: 0.005
+            growth_epsilon: 0.005          # LCB(gain) 超过它才算"曾显著增长"
+            freeze_guard_drop_all: 0.02    # 当前相对近期最好 Q_all 回撤 UCB 上限
+            freeze_guard_drop_hard: 0.03
+          noise:
+            quantile: 0.95
+            min_pseudo_samples: 20         # 不足时只用 practical ε, 不臆造噪声
+          economics:
+            enabled: false                 # Phase 1 只上报 ROI, 不参与冻结
+            cost_margin: 1.0
+            cost_window_updates: 3
+          probe:
+            # 固定 paired probe (RFC sec. 6): 同一 target checkpoint / 同一固定
+            # prompt 集 / greedy, 在第 N 次成功发布前后各生成一轮, 按请求配对做
+            # paired bootstrap。probe 只在冻结策略存在时由 trainer 执行。
+            enabled: false
+            interval_updates: 3            # 每 N 次成功发布做一次 paired probe
+            prompts_file: null             # null=取 train_files 的前 prompt_count 条
+            prompt_count: 256              # 固定 prompt 池大小(强制取文件前 N 行, 不 shuffle)
+            batch_size: 64                 # 每臂逐批生成 chunk 大小; 全池 prompt_count 行按序分批跑完
+            max_new_tokens: 2048           # 两臂 greedy 生成长度上限(省成本)
+            min_coverage: 0.8              # timing 对覆盖率低于此值=证据不完整
+            min_timing_pairs: 16           # timing 对数低于此值=证据不完整
+            seed: 20260915                 # 同时作为 bootstrap 可复现种子
+          resume:
+            drop_all: 0.05                 # 相对冻结锚点退化 LCB 超此 -> 恢复
+            drop_hard: 0.05
+            patience_opportunities: 3
+            low_fraction_accelerator: 0.10 # low_fraction 回升 + hard 超噪 -> 恢复耐心降一档
+            missing_evidence_opportunities: 3  # 连续缺证据 fail-open 恢复
+            max_frozen_opportunities: 12   # 预留字段, 当前未生效(周期强制 probe 未实现, 勿依赖其触发任何行为)
