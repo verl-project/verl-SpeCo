@@ -440,7 +440,9 @@ def test_peagle_rejects_packed_lengths_that_do_not_cover_the_sequence() -> None:
         model(**kwargs)
 
 
-def test_peagle_checkpoint_export_unwraps_the_training_model() -> None:
+@pytest.mark.parametrize("model_type", [None, "peagle", "dflash", "dflash2", "dspark", "domino", "eagle3"])
+@pytest.mark.parametrize("module_wrapped", [False, True])
+def test_peagle_checkpoint_export_unwraps_the_training_model(model_type, module_wrapped) -> None:
     pytest.importorskip("torch")
     from types import SimpleNamespace
 
@@ -448,9 +450,16 @@ def test_peagle_checkpoint_export_unwraps_the_training_model() -> None:
 
     draft = SimpleNamespace(name="draft")
     trainer = object.__new__(base_trainer_mod.DrafterBaseTrainer)
-    trainer.model = SimpleNamespace(draft_model=draft)
+    training_model = SimpleNamespace(draft_model=draft)
+    trainer.model = SimpleNamespace(module=training_model) if module_wrapped else training_model
+    if model_type is not None:
+        trainer.backend = SimpleNamespace(model_type=model_type)
 
     export_model, strip_prefixes = trainer._get_pretrained_export_model()
 
-    assert export_model is draft
-    assert "draft_model." in strip_prefixes
+    if model_type == "eagle3":
+        assert export_model is training_model
+        assert strip_prefixes == ()
+    else:
+        assert export_model is draft
+        assert strip_prefixes == ("draft_model.", "module.draft_model.", "_orig_mod.draft_model.")
