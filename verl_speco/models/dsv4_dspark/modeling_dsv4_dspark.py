@@ -74,6 +74,10 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
 
     def _rebuild_freqs(self, seqlen: int) -> None:
         bb = self.backbone_cfg
+        # Rebuild on the current buffer's device: the EP setup rebuilds after the
+        # bf16 buffer cast to restore fp32 precision, and a CPU rebuild there
+        # would leave the table host-resident and force a full-table H2D copy on
+        # every forward (see _rope_at).
         self.freqs_cis = torch.view_as_real(
             precompute_freqs_cis(
                 self._rope_dim,
@@ -83,6 +87,7 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 bb.rope_factor,
                 bb.beta_fast,
                 bb.beta_slow,
+                device=self.freqs_cis.device.type,
             )
         ).contiguous()
 
@@ -183,16 +188,16 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
         return params
 
     def shard_experts_as_dtensor(self, mesh) -> None:
-        from torch.distributed.tensor import DTensor, Replicate, Shard
+        from torch.distributed.tensor import DTensor, Shard
 
         # Wrap each rank's *already EP-sliced* routed experts as a DTensor purely
         # so no plain tensor is mixed with DTensors in FSDP2's gradient-norm
-        # reduction / optimizer. The experts are listed in ``fsdp_ignored_params``
-        # and are therefore never sharded or reduced by FSDP2; the placements only
-        # need to match the mesh arity (Shard on the leading dim, Replicate on the
-        # rest), not to describe the true EP distribution.
-        placements = [Shard(0)] + [Replicate() for _ in range(int(mesh.ndim) - 1)]
-
+        # reduction / optimizer. A single Shard(0) placement keeps the DTensor's
+        # global shape equal to the local EP slice: the experts are rank-disjoint
+        # EP shards, NOT replicas, so grad-norm consumers must treat the local
+        # values as disjoint contributions (see DrafterBaseTrainer's
+        # _clip_dtensor_grad_norm_; a Replicate placement here would make it
+        # divide the expert norm by the EP world size).
         for module in self.modules():
             if type(module).__name__ != "GroupedExperts":
                 continue
@@ -200,7 +205,7 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 p = getattr(module, name, None)
                 if p is None or isinstance(p.data, DTensor):
                     continue
-                dt = DTensor.from_local(p.data, mesh, placements, run_check=False)
+                dt = DTensor.from_local(p.data, mesh, [Shard(0)], run_check=False)
                 setattr(
                     module, name, torch.nn.Parameter(dt, requires_grad=p.requires_grad)
                 )

@@ -288,7 +288,8 @@ def apply_ep_only(trainer, raw_model: torch.nn.Module, use_skip_loading: bool):
         draft_model._rebuild_freqs(max(seq_len, 1))
         if rank == 0:
             logger.info(
-                f"[EP-only] Rebuilt freqs_cis (CPU, {draft_model.freqs_cis.shape})"
+                f"[EP-only] Rebuilt freqs_cis "
+                f"({draft_model.freqs_cis.device}, {draft_model.freqs_cis.shape})"
             )
 
     # Step 8: Initialize router bias to break routing symmetry before first forward.
@@ -488,7 +489,10 @@ def apply_ep_fsdp2(
         )
         draft_model._rebuild_freqs(max(seq_len, 1))
         if rank == 0:
-            logger.info(f"[EP] Rebuilt freqs_cis (CPU, {draft_model.freqs_cis.shape})")
+            logger.info(
+                f"[EP] Rebuilt freqs_cis "
+                f"({draft_model.freqs_cis.device}, {draft_model.freqs_cis.shape})"
+            )
 
     # Mark FSDP2 mode (skip _sync_non_expert_grads)
     trainer._ep_ddp_world_size = 0  # 0 = FSDP2 mode (no manual gradient sync)
