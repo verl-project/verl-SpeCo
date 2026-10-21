@@ -358,7 +358,7 @@ actor_rollout_ref:
         dsv4_dspark_num_anchors: 512
         dsv4_dspark_loss_decay_gamma: 7.0
         dsv4_dspark_hidden_size: null
-        dsv4_dspark_weight_dtype: bfloat16  # target dtype for dequantized weights: bfloat16|float16|float32|int8
+        dsv4_dspark_weight_dtype: bfloat16  # target dtype for dequantized weights: bfloat16|float16|float32 (int8 is rejected: post-dequant int8 cannot train)
         dsv4_dspark_num_target_layers: 3
         dsv4_dspark_num_hidden_layers: 3
         dsv4_dspark_mask_token_id: 128799

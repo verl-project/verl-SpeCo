@@ -577,7 +577,9 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
                     "fp16": torch.float16,
                     "float32": torch.float32,
                     "fp32": torch.float32,
-                    "int8": torch.int8,
+                    # No int8: target_dtype is the POST-dequantization dtype, so
+                    # int8 would re-quantize the dequantized values (and int8
+                    # params cannot train).
                 }
                 target_dtype = dtype_map.get(target_dtype_str, torch.bfloat16)
                 ep_rank, experts_per_rank = self._released_load_ep_context(
