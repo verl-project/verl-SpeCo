@@ -119,6 +119,59 @@ def _load_state_dict(in_dir: Path):
     raise SystemExit(f"No model.safetensors[.index.json] in {in_dir}")
 
 
+def _merge_ep_expert_slices(state_dict: dict, ep_experts_dir: Path) -> dict:
+    """Merge the per-rank EP expert dumps back into full stacked weights.
+
+    ``dump_local_expert_slices`` writes ``ep_experts/rank_<r>.pt`` with
+    identical keys (``layers.{i}.ffn.experts.{w1,w2,w3}``) holding each rank's
+    disjoint expert slice; the leader-only ``model.safetensors`` carries just
+    the leader's slice under the same keys. Rank r owns experts
+    ``[r * local, (r + 1) * local)``, so rank-ordered concat reconstructs the
+    full stacked weight.
+    """
+    import torch
+
+    rank_files = sorted(
+        ep_experts_dir.glob("rank_*.pt"),
+        key=lambda p: int(p.stem.split("_")[-1]),
+    )
+    if not rank_files:
+        raise SystemExit(f"No rank_*.pt expert slices in {ep_experts_dir}")
+    ranks = [int(p.stem.split("_")[-1]) for p in rank_files]
+    if ranks != list(range(len(ranks))):
+        raise SystemExit(
+            f"Non-contiguous EP expert ranks {ranks} in {ep_experts_dir}"
+        )
+
+    payloads = [torch.load(p, map_location="cpu", weights_only=True) for p in rank_files]
+    keys = set(payloads[0])
+    for rank, payload in zip(ranks, payloads):
+        if set(payload) != keys:
+            raise SystemExit(
+                f"rank_{rank} expert keys differ from rank_{ranks[0]}: "
+                f"{sorted(set(payload) ^ keys)[:5]}"
+            )
+
+    merged = dict(state_dict)
+    sample_key = sorted(keys)[0]
+    local_rows = int(payloads[0][sample_key].shape[0])
+    for key in sorted(keys):
+        slices = [payload[key] for payload in payloads]
+        shape_rest = tuple(slices[0].shape[1:])
+        for rank, s in zip(ranks, slices):
+            if tuple(s.shape[1:]) != shape_rest:
+                raise SystemExit(
+                    f"rank_{rank} slice shape {tuple(s.shape)} incompatible with "
+                    f"rank_{ranks[0]} {tuple(slices[0].shape)} for {key}"
+                )
+        merged[key] = torch.cat(slices, dim=0).contiguous()
+    print(
+        f"Merged EP expert slices: {len(keys)} tensors x {len(ranks)} ranks "
+        f"(rows {local_rows} -> {local_rows * len(ranks)})"
+    )
+    return merged
+
+
 def _n_layers(state_dict: dict) -> int:
     ns = {
         int(m.group(1))
@@ -138,11 +191,21 @@ def main():
     ap.add_argument("--in", dest="inp", required=True, help="trainer checkpoint dir")
     ap.add_argument("--out", help="output dir for mtp.* checkpoint")
     ap.add_argument("--config-from", help="config.json to copy into output")
+    ap.add_argument(
+        "--ep-experts-dir",
+        help=(
+            "ep_experts/ dir holding rank_<r>.pt slices written by "
+            "dump_local_expert_slices; rank-ordered concat restores the full "
+            "stacked expert weights before conversion"
+        ),
+    )
     ap.add_argument("--inspect", action="store_true", help="dry run: show key mapping")
     args = ap.parse_args()
 
     in_dir = Path(args.inp)
     sd = _load_state_dict(in_dir)
+    if args.ep_experts_dir:
+        sd = _merge_ep_expert_slices(sd, Path(args.ep_experts_dir))
     n_layers = _n_layers(sd)
     out, skipped, n_unstacked = convert(sd, n_layers)
 

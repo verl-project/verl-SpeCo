@@ -1525,16 +1525,39 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             debug_log_interval=int(training_cfg.get("dspark_debug_log_interval", 100)),
         ), drafter_config
 
+    def _preprocess_label(self) -> str:
+        """Backend name used in preprocessing error messages."""
+        return "DSpark"
+
+    def _preprocess_window_key(self) -> str:
+        """Training-config key holding the optional preprocessing crop."""
+        return "dspark_max_window"
+
+    def _preprocess_default_num_target_layers(self) -> int:
+        """Fallback context-layer count when the model config does not set one."""
+        return 5
+
+    def _preprocess_requires_target_hidden(self, training_cfg) -> bool:
+        """Whether the configured losses need the final target hidden state.
+
+        When True, items carrying the aux-only layout are rejected up front: the
+        l1/tv/confidence/target-argmax losses cannot be computed without
+        ``target_last_hidden_states``.
+        """
+        return False
+
     def preprocess_individual_items(self, items, device, model_config):
+        label = self._preprocess_label()
+        window_key = self._preprocess_window_key()
         res = {"ids": [], "h_states": [], "masks": [], "target_last_h_states": []}
-        raw_max_window = self.config.rollout.drafter.training.get("dspark_max_window")
+        raw_max_window = self.config.rollout.drafter.training.get(window_key)
         max_window = (
             None
             if raw_max_window is None or str(raw_max_window).strip() == ""
             else int(raw_max_window)
         )
         if max_window is not None and max_window < 0:
-            raise ValueError("dspark_max_window must be non-negative")
+            raise ValueError(f"{window_key} must be non-negative")
         if max_window == 0:
             max_window = None
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
@@ -1545,17 +1568,31 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             getattr(
                 model_config,
                 "num_context_layers",
-                getattr(model_config, "num_target_layers", 5),
+                getattr(
+                    model_config,
+                    "num_target_layers",
+                    self._preprocess_default_num_target_layers(),
+                ),
             )
         )
         expected_hidden_dim = h_dim * num_context_layers
+        requires_target_hidden = self._preprocess_requires_target_hidden(
+            self.config.rollout.drafter.training
+        )
 
         for item in items:
             layout = item.get("hidden_states_layout")
             if layout not in (None, "dflash_aux", "dflash_aux_plus_last"):
                 raise ValueError(
-                    f"DSpark expected hidden_states_layout='dflash_aux' or 'dflash_aux_plus_last', got {layout!r}. "
-                    "This usually means EAGLE3 aux+last hidden states were routed into DSpark training."
+                    f"{label} expected hidden_states_layout='dflash_aux' or 'dflash_aux_plus_last', got {layout!r}. "
+                    f"This usually means EAGLE3 aux+last hidden states were routed into {label} training."
+                )
+            if requires_target_hidden and layout == "dflash_aux":
+                raise ValueError(
+                    f"{label} target-hidden losses are enabled (l1/tv/"
+                    "confidence/target-argmax) but the feature item layout is "
+                    "'dflash_aux'; expected 'dflash_aux_plus_last' with the final "
+                    "target hidden states."
                 )
             ids = item["input_ids"].to(device, non_blocking=True)
             raw_h = item["hidden_states"]
@@ -1565,7 +1602,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             full_h = full_h.to(device, dtype=torch.bfloat16)
             if full_h.size(-1) < expected_hidden_dim:
                 raise ValueError(
-                    f"DSpark expected at least {expected_hidden_dim} hidden dims "
+                    f"{label} expected at least {expected_hidden_dim} hidden dims "
                     f"({num_context_layers} context layers of size {h_dim}), got {full_h.size(-1)}"
                 )
             target_last_h = None
@@ -1573,7 +1610,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 expected_with_last = expected_hidden_dim + h_dim
                 if full_h.size(-1) != expected_with_last:
                     raise ValueError(
-                        "DSpark hidden_states_layout='dflash_aux_plus_last' expected exactly "
+                        f"{label} hidden_states_layout='dflash_aux_plus_last' expected exactly "
                         f"{expected_with_last} hidden dims ({num_context_layers} context layers plus final hidden), "
                         f"got {full_h.size(-1)}"
                     )
@@ -1581,7 +1618,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 full_h = full_h[..., :expected_hidden_dim]
             elif layout == "dflash_aux" and full_h.size(-1) != expected_hidden_dim:
                 raise ValueError(
-                    f"DSpark hidden_states_layout='dflash_aux' expected exactly {expected_hidden_dim} hidden dims "
+                    f"{label} hidden_states_layout='dflash_aux' expected exactly {expected_hidden_dim} hidden dims "
                     f"({num_context_layers} context layers of size {h_dim}), got {full_h.size(-1)}"
                 )
 
@@ -1604,7 +1641,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 int(ids.size(0)),
                 int(full_h.size(0)),
                 int(item_loss_mask.size(0)),
-                "DSpark",
+                label,
             )
             if max_window is None:
                 start, end = 0, ids.size(0)

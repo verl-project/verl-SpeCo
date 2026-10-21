@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import logging
 import os
-import tempfile
-import time
 
 import torch
 import torch.distributed as dist
@@ -57,6 +55,9 @@ def _init_router_bias(model, world_size, experts_per_rank, rank):
                 torch.randn(local_end - local_start, device=router.bias.device) * 0.01
             )
             router._ep_rank_bias = preference
+            # Mark the router's own symmetry-breaking as done: the per-rank
+            # preference below supersedes update_load_balance_bias's first-step
+            # random init, so the two mechanisms do not stack.
             if hasattr(router, "_bias_initialized"):
                 router._bias_initialized = True
     if rank == 0:
@@ -133,124 +134,32 @@ def _ep_preconfigured() -> bool:
     return moe_ep._EP is not None and moe_ep._EP.size > 1
 
 
-def apply_ep_only(trainer, raw_model: torch.nn.Module, use_skip_loading: bool):
+def apply_ep_only(trainer, raw_model: torch.nn.Module):
     """Apply expert parallelism without FSDP2 (EP+DDP).
 
     Each rank keeps a disjoint ``n_routed_experts / world_size`` slice of the
     experts and non-expert parameters stay replicated (gradients are synced
     manually by :func:`sync_non_expert_grads`).
 
-    If ``moe_ep`` is already configured (pre-build), the model already carries
-    the per-rank expert slice, so the file-share and EP-slice steps are skipped.
+    Requires ``moe_ep.configure()`` to have run before ``build_model``
+    (``DrafterBaseTrainer`` does this whenever EP is enabled and world_size > 1),
+    so the model already carries its per-rank expert slice.
     """
-    from verl_speco.models.dsv4_dspark.backbone import moe_ep
-
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     n_experts = resolve_routed_expert_count(trainer.config)
     experts_per_rank = ensure_ep_divisible(n_experts, world_size)
-    pre_configured = _ep_preconfigured()
-    if pre_configured:
-        # EP was configured before build_model — the model already carries the
-        # per-rank expert slice. Skip file-share and EP slice; just record the
-        # EP metadata and set up grads.
-        logger.info(
-            f"[Rank {rank}] EP pre-configured: model already has {experts_per_rank} experts, skipping file-share + slice"
+    if not _ep_preconfigured():
+        raise RuntimeError(
+            "DSV4 DSpark EP requires moe_ep.configure() before build_model "
+            "(DrafterBaseTrainer configures it when EP is enabled and "
+            "world_size > 1)"
         )
-        for module in raw_model.modules():
-            experts = getattr(module, "experts", None)
-            if experts is None or not hasattr(experts, "w1") or experts.w1.dim() < 3:
-                continue
-            module._ep_patched = True
-            module._ep_num_experts = n_experts
-            module._ep_experts_per_rank = experts_per_rank
-    else:
-        # Step 1: File-share weights from rank0
-        shard_dir = tempfile.gettempdir()
-        state_file = os.path.join(shard_dir, "dsv4_dspark_rank0_state.pt")
-        ready_file = os.path.join(shard_dir, "dsv4_dspark_rank0_ready.flag")
+    logger.info(
+        f"[Rank {rank}] EP pre-configured: model already has {experts_per_rank} experts"
+    )
 
-        for f in (state_file, ready_file):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
-        dist.barrier()
-
-        if rank == 0:
-            state_dict = raw_model.state_dict()
-            torch.save(state_dict, state_file)
-            del state_dict
-            with open(ready_file, "w") as ready_handle:
-                ready_handle.write(str(os.path.getsize(state_file)))
-            logger.info(f"[Rank 0] Saved full state dict to {state_file}")
-        elif use_skip_loading:
-            wait_start = time.time()
-            expected_size = None
-            while True:
-                if os.path.exists(ready_file):
-                    try:
-                        with open(ready_file) as ready_handle:
-                            expected_size = int(ready_handle.read().strip())
-                    except (OSError, ValueError):
-                        expected_size = None
-                if (
-                    expected_size is not None
-                    and os.path.exists(state_file)
-                    and os.path.getsize(state_file) == expected_size
-                ):
-                    break
-                if time.time() - wait_start > 600:
-                    raise TimeoutError(
-                        f"Rank {rank} timed out waiting for {ready_file}"
-                    )
-                time.sleep(2)
-            loaded_state = torch.load(state_file, map_location="cpu", weights_only=True)
-            raw_model.load_state_dict(loaded_state, strict=False)
-            del loaded_state
-            logger.info(
-                f"[Rank {rank}] Loaded state dict (waited {time.time() - wait_start:.0f}s)"
-            )
-
-        dist.barrier()
-        if rank == 0:
-            for f in (state_file, ready_file):
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
-
-        # Step 2: EP slice — split the routed experts evenly across ranks
-        for module in raw_model.modules():
-            experts = getattr(module, "experts", None)
-            if experts is None or not hasattr(experts, "w1") or experts.w1.dim() < 3:
-                continue
-            if experts.w1.shape[0] == n_experts:
-                start = rank * experts_per_rank
-                end = start + experts_per_rank
-                for w_name in ("w1", "w3", "w2"):
-                    param = getattr(experts, w_name)
-                    setattr(
-                        experts,
-                        w_name,
-                        torch.nn.Parameter(param.data[start:end].clone()),
-                    )
-                if hasattr(experts, "num_local_experts"):
-                    experts.num_local_experts = experts_per_rank
-            module._ep_patched = True
-            module._ep_num_experts = n_experts
-            module._ep_experts_per_rank = experts_per_rank
-
-        # Step 3: Configure moe_ep
-        moe_ep.configure(
-            group=dist.group.WORLD,
-            rank=rank,
-            size=world_size,
-            experts_per_rank=experts_per_rank,
-        )
-        moe_ep.enable()
-
-    # Step 6: Move to device and set requires_grad
+    # Move to device and set requires_grad
     raw_model.to(trainer.runtime_device)
     n_trainable = 0
     expert_param_ids: set[int] = set()
@@ -261,9 +170,7 @@ def apply_ep_only(trainer, raw_model: torch.nn.Module, use_skip_loading: bool):
             p.requires_grad = True
             n_trainable += 1
 
-    # Collect expert param ids (local, no gradient sync needed). Scan the expert
-    # modules directly rather than relying on the ``_ep_patched`` marker so the
-    # pre-configured path (no slice loop) is covered too.
+    # Collect expert param ids (local, no gradient sync needed).
     for module in raw_model.modules():
         experts = getattr(module, "experts", None)
         if experts is None or not hasattr(experts, "w1") or experts.w1.dim() < 3:
@@ -310,7 +217,6 @@ def apply_ep_fsdp2(
     raw_model: torch.nn.Module,
     fsdp_kwargs: dict,
     fsdp_config,
-    use_skip_loading: bool,
 ):
     """Apply expert parallelism together with FSDP2.
 
@@ -319,118 +225,40 @@ def apply_ep_fsdp2(
     the FSDP2 hooks; the wrapper's own parameters are not FSDP2-managed.
 
     Flow:
-    1. File-share weights from rank0 (unless pre-configured / random init)
-    2. EP slice: split the routed experts evenly across ranks
-    3. Configure moe_ep + optional grouped-GEMM
-    4. Move to device
-    5. shard_experts_as_dtensor: wrap expert params as Shard(0) DTensors
-    6. FSDP2 wrap draft_model: per-layer (shared_experts, attn, block) + root
+    1. Move to device (bf16 cast first to halve memory)
+    2. shard_experts_as_dtensor: wrap expert params as Shard(0) DTensors
+    3. FSDP2 wrap draft_model: per-layer (shared_experts, attn, block) + root
        with ignored_params=expert DTensors
-    7. Set self.model = raw_model (training wrapper still calls draft_model)
+    4. Set self.model = raw_model (training wrapper still calls draft_model)
+
+    Requires ``moe_ep.configure()`` to have run before ``build_model``
+    (``DrafterBaseTrainer`` does this whenever EP is enabled and world_size > 1),
+    so the model already carries its per-rank expert slice.
     """
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     n_experts = resolve_routed_expert_count(trainer.config)
     experts_per_rank = ensure_ep_divisible(n_experts, world_size)
-    # Expert DTensors are built on the raw (dp, sp) training mesh so their
-    # placement arity matches FSDP2's mesh. The experts are in ``ignored_params``
-    # (never sharded/reduced), so the placements are only there to keep the
-    # optimizer/grad-norm from mixing plain tensors with DTensors.
+    # Expert DTensors are built on the raw (dp, sp) training mesh. The experts
+    # are in ``ignored_params`` (never sharded/reduced), so the placements only
+    # need to keep the optimizer/grad-norm from mixing plain tensors with
+    # DTensors.
     mesh = trainer.training_device_mesh
     random_init = bool(
         trainer.config.rollout.drafter.training.get("dsv4_dspark_random_init", False)
     )
 
-    from verl_speco.models.dsv4_dspark.backbone import moe_ep
-
-    pre_configured = _ep_preconfigured()
-
-    if pre_configured:
-        # EP was configured before build_model: the model already carries its
-        # per-rank expert slice (and each rank loaded its own released weights),
-        # so file-share / slice / moe_ep config must be skipped. File-sharing
-        # rank0's state here would broadcast rank0's slice to every rank and
-        # silently misalign the experts.
-        logger.info(
-            f"[Rank {rank}] EP pre-configured: skipping file-share + EP slice + moe_ep config"
+    if not _ep_preconfigured():
+        raise RuntimeError(
+            "DSV4 DSpark EP requires moe_ep.configure() before build_model "
+            "(DrafterBaseTrainer configures it when EP is enabled and "
+            "world_size > 1)"
         )
-    else:
-        # Legacy path: EP was not pre-configured, so the model still holds the
-        # full expert set. File-share from rank0 (when ranks skipped loading),
-        # slice the routed experts per rank, then configure moe_ep.
-        from verl_speco.models.dsv4_dspark.backbone import moe_ep
+    logger.info(
+        f"[Rank {rank}] EP pre-configured: model already has {experts_per_rank} experts"
+    )
 
-        shard_dir = tempfile.gettempdir()
-        state_file = os.path.join(shard_dir, "dsv4_dspark_rank0_state.pt")
-        ready_file = os.path.join(shard_dir, "dsv4_dspark_rank0_ready.flag")
-        for f in (state_file, ready_file):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
-        dist.barrier()
-
-        if rank == 0:
-            state_dict = raw_model.state_dict()
-            torch.save(state_dict, state_file)
-            del state_dict
-            with open(ready_file, "w") as ready_handle:
-                ready_handle.write("ready")
-            logger.info(f"[Rank 0] Saved full state dict to {state_file}")
-        elif use_skip_loading:
-            wait_start = time.time()
-            while not os.path.exists(ready_file):
-                if time.time() - wait_start > 600:
-                    raise TimeoutError(
-                        f"Rank {rank} timed out waiting for {ready_file}"
-                    )
-                time.sleep(2)
-            loaded_state = torch.load(state_file, map_location="cpu", weights_only=True)
-            raw_model.load_state_dict(loaded_state, strict=False)
-            del loaded_state
-            logger.info(
-                f"[Rank {rank}] Loaded state dict (waited {time.time() - wait_start:.0f}s)"
-            )
-
-        dist.barrier()
-        if rank == 0:
-            for f in (state_file, ready_file):
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
-
-        # EP slice -- split the routed experts evenly across ranks
-        draft_model_inner = getattr(raw_model, "draft_model", None) or raw_model
-        for module in draft_model_inner.modules():
-            experts = getattr(module, "experts", None)
-            if experts is None or not hasattr(experts, "w1") or experts.w1.dim() < 3:
-                continue
-            if experts.w1.shape[0] == n_experts:
-                start = rank * experts_per_rank
-                end = start + experts_per_rank
-                for w_name in ("w1", "w3", "w2"):
-                    param = getattr(experts, w_name)
-                    setattr(
-                        experts,
-                        w_name,
-                        torch.nn.Parameter(param.data[start:end].clone()),
-                    )
-                if hasattr(experts, "num_local_experts"):
-                    experts.num_local_experts = experts_per_rank
-            module._ep_patched = True
-            module._ep_num_experts = n_experts
-            module._ep_experts_per_rank = experts_per_rank
-
-        moe_ep.configure(
-            group=dist.group.WORLD,
-            rank=rank,
-            size=world_size,
-            experts_per_rank=experts_per_rank,
-        )
-        moe_ep.enable()
-
-    # Step 4: Move to device (cast to bf16 first to halve memory, matching speculators)
+    # Move to device (cast to bf16 first to halve memory, matching speculators)
     raw_model.to(torch.bfloat16)
     raw_model.to(trainer.runtime_device)
 
@@ -579,7 +407,12 @@ def dump_local_expert_slices(trainer, checkpoint_path: str) -> str | None:
     only; under expert parallelism that file contains just the leader's expert
     slice (``n_routed_experts / world_size`` rows). Every rank dumps its own
     slice under ``<checkpoint_path>/ep_experts/rank_<r>.pt`` so a complete
-    drafter can be reconstructed afterwards.
+    drafter can be reconstructed with
+
+        python -m verl_speco.tools.convert_checkpoint --in <ckpt_dir> \
+            --ep-experts-dir <ckpt_dir>/ep_experts --out <out_dir>
+
+    (rank-ordered concat; rank r owns experts ``[r * local, (r + 1) * local)``).
     """
     if not is_ep_enabled(trainer.config):
         return None

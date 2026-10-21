@@ -23,7 +23,6 @@ from copy import deepcopy
 
 import torch
 
-from verl_speco.backends.dflash_trainer_backend import _check_block_drafter_rows
 from verl_speco.backends.dspark_trainer_backend import (
     DSparkTrainerBackend,
     DSparkTrainingModel,
@@ -114,18 +113,20 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
         return "dsv4_dspark"
 
     def _released_load_ep_context(self, drafter_config):
-        """Explicit expert-parallel context for :func:`load_released_draft`.
+        """Expert-parallel context for :func:`load_released_draft`.
 
-        Derived from the training config (validated against the checkpoint's
-        ``dsv4_n_routed_experts``) and the process group rather than the ambient
-        ``moe_ep._EP`` global, so a stale context cannot silently mis-route the
-        released expert weights.
+        ``DrafterBaseTrainer`` configures ``moe_ep`` immediately before
+        ``build_model``, so the ambient ``moe_ep._EP`` context is authoritative
+        and fresh; this only validates the training config against the
+        checkpoint's ``dsv4_n_routed_experts`` and cross-checks the ambient
+        slice size before handing out the rank/slice pair.
         """
         from verl_speco.backends.dsv4_ep_utils import (
             ensure_ep_divisible,
             is_ep_enabled,
             resolve_routed_expert_count,
         )
+        from verl_speco.models.dsv4_dspark.backbone import moe_ep
 
         if not is_ep_enabled(self.config):
             return None, None
@@ -133,12 +134,46 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
             torch.distributed.is_available() and torch.distributed.is_initialized()
         ):
             return None, None
-        world = torch.distributed.get_world_size()
-        if world <= 1:
-            return None, None
         n_experts = resolve_routed_expert_count(self.config, drafter_config)
-        experts_per_rank = ensure_ep_divisible(n_experts, world)
-        return torch.distributed.get_rank(), experts_per_rank
+        ambient = moe_ep._EP
+        if ambient is None or ambient.size <= 1:
+            return None, None
+        experts_per_rank = ensure_ep_divisible(n_experts, ambient.size)
+        if ambient.experts_per_rank != experts_per_rank:
+            raise ValueError(
+                f"DSV4 DSpark ambient EP context (experts_per_rank="
+                f"{ambient.experts_per_rank}) disagrees with the training config "
+                f"(n_routed_experts={n_experts} over {ambient.size} ranks -> "
+                f"{experts_per_rank})"
+            )
+        return ambient.rank, ambient.experts_per_rank
+
+    def _scan_drafter_index_shards(
+        self, model_path: str
+    ) -> tuple[dict[str, str], set[str]] | None:
+        """Scan every ``*.index.json`` for drafter (``mtp.*``/embed/head) keys.
+
+        Returns ``(key -> shard file, shards)`` or ``None`` when the directory
+        has no ``*.index.json`` at all (callers fall back to their single-file
+        logic).
+        """
+        index_paths = sorted(glob.glob(os.path.join(model_path, "*.index.json")))
+        if not index_paths:
+            return None
+        key_to_shard: dict[str, str] = {}
+        for path in index_paths:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    weight_map = json.load(f).get("weight_map", {})
+            except (OSError, json.JSONDecodeError):
+                continue
+            for key in weight_map:
+                if str(key).startswith("mtp.") or key in (
+                    "embed.weight",
+                    "head.weight",
+                ):
+                    key_to_shard[key] = weight_map[key]
+        return key_to_shard, set(key_to_shard.values())
 
     def _load_draft_state_dict(self, model_path: str) -> dict:
         """Load only the drafter (``mtp.*``) tensors, whatever the index layout.
@@ -150,30 +185,13 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
         select only the shards that contain drafter keys and merge across every
         index that carries them.
         """
-        index_paths = sorted(glob.glob(os.path.join(model_path, "*.index.json")))
-        if not index_paths:
+        scanned = self._scan_drafter_index_shards(model_path)
+        if scanned is None:
             return super()._load_draft_state_dict(model_path)
+        key_to_shard, drafter_shards = scanned
 
-        drafter_shards: set[str] = set()
-        matched = False
-        for path in index_paths:
-            try:
-                with open(path, encoding="utf-8") as f:
-                    weight_map = json.load(f).get("weight_map", {})
-            except (OSError, json.JSONDecodeError):
-                continue
-            drafter_keys = [
-                key
-                for key in weight_map
-                if str(key).startswith("mtp.") or key in ("embed.weight", "head.weight")
-            ]
-            if not drafter_keys:
-                continue
-            matched = True
-            drafter_shards.update(weight_map[key] for key in drafter_keys)
-
-        if not matched:
-            if len(index_paths) == 1:
+        if not key_to_shard:
+            if len(glob.glob(os.path.join(model_path, "*.index.json"))) == 1:
                 # Single index without drafter keys: defer to the base loader so
                 # non-mtp checkpoints keep working; build_model then falls back to
                 # the DFlash checkpoint path.
@@ -200,35 +218,23 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
         """
         from safetensors import safe_open
 
-        index_paths = sorted(glob.glob(os.path.join(model_path, "*.index.json")))
-        shards: list[str] = []
-        if index_paths:
-            for path in index_paths:
-                try:
-                    with open(path, encoding="utf-8") as f:
-                        weight_map = json.load(f).get("weight_map", {})
-                except (OSError, json.JSONDecodeError):
-                    continue
-                shards.extend(
-                    weight_map[key]
-                    for key in weight_map
-                    if str(key).startswith("mtp.")
-                    or key in ("embed.weight", "head.weight")
-                )
-            if not shards:
-                return {}
-            base_dir = model_path
-        else:
+        scanned = self._scan_drafter_index_shards(model_path)
+        if scanned is None:
             candidate = os.path.join(model_path, "model.safetensors")
             if not os.path.exists(candidate):
                 candidate = os.path.join(model_path, "quant_model_weights.safetensors")
             if not os.path.exists(candidate):
                 return {}
-            shards = [os.path.basename(candidate)]
-            base_dir = os.path.dirname(candidate)
+            shards = {os.path.basename(candidate)}
+            base_dir = model_path
+        else:
+            _, shards = scanned
+            if not shards:
+                return {}
+            base_dir = model_path
 
         metadata: dict = {}
-        for shard in sorted(set(shards)):
+        for shard in sorted(shards):
             shard_path = os.path.join(base_dir, shard)
             if not os.path.exists(shard_path):
                 # Match load_released_draft: tolerate a listed-but-missing shard.
@@ -725,34 +731,19 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
             ),
         ), drafter_config
 
-    def preprocess_individual_items(self, items, device, model_config):
-        res = {"ids": [], "h_states": [], "masks": [], "target_last_h_states": []}
-        raw_max_window = self.config.rollout.drafter.training.get(
-            "dsv4_dspark_max_window"
-        )
-        max_window = (
-            None
-            if raw_max_window is None or str(raw_max_window).strip() == ""
-            else int(raw_max_window)
-        )
-        if max_window is not None and max_window < 0:
-            raise ValueError("dsv4_dspark_max_window must be non-negative")
-        if max_window == 0:
-            max_window = None
-        pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
-        h_dim = int(
-            getattr(model_config, "target_hidden_size", model_config.hidden_size)
-        )
-        num_context_layers = int(
-            getattr(
-                model_config,
-                "num_context_layers",
-                getattr(model_config, "num_target_layers", 3),
-            )
-        )
-        expected_hidden_dim = h_dim * num_context_layers
-        training_cfg = self.config.rollout.drafter.training
-        requires_target_hidden = (
+    def _preprocess_label(self) -> str:
+        return "DSV4 DSpark"
+
+    def _preprocess_window_key(self) -> str:
+        return "dsv4_dspark_max_window"
+
+    def _preprocess_default_num_target_layers(self) -> int:
+        return 3
+
+    def _preprocess_requires_target_hidden(self, training_cfg) -> bool:
+        # The l1/tv/confidence losses and target-argmax CE read the final target
+        # hidden state, so aux-only feature items cannot serve them.
+        return (
             float(training_cfg.get("dsv4_dspark_l1_loss_alpha", 0.0) or 0.0) > 0
             or float(training_cfg.get("dsv4_dspark_tv_loss_alpha", 0.0) or 0.0) > 0
             or float(training_cfg.get("dsv4_dspark_confidence_loss_alpha", 0.0) or 0.0)
@@ -760,93 +751,3 @@ class DSV4DSparkTrainerBackend(DSparkTrainerBackend):
             or str(training_cfg.get("ce_target_source", "labels") or "labels").lower()
             == "target_argmax"
         )
-
-        for item in items:
-            layout = item.get("hidden_states_layout")
-            if layout not in (None, "dflash_aux", "dflash_aux_plus_last"):
-                raise ValueError(
-                    f"DSV4 DSpark expected hidden_states_layout='dflash_aux' or "
-                    f"'dflash_aux_plus_last', got {layout!r}."
-                )
-            if requires_target_hidden and layout == "dflash_aux":
-                raise ValueError(
-                    "DSV4 DSpark target-hidden losses are enabled (l1/tv/"
-                    "confidence/target-argmax) but the feature item layout is "
-                    "'dflash_aux'; expected 'dflash_aux_plus_last' with the final "
-                    "target hidden states."
-                )
-            ids = item["input_ids"].to(device, non_blocking=True)
-            raw_h = item["hidden_states"]
-            full_h = (
-                torch.cat(raw_h, dim=-1) if isinstance(raw_h, (list, tuple)) else raw_h
-            )
-            full_h = full_h.to(device, dtype=torch.bfloat16)
-            if full_h.size(-1) < expected_hidden_dim:
-                raise ValueError(
-                    f"DSV4 DSpark expected at least {expected_hidden_dim} hidden dims "
-                    f"({num_context_layers} context layers of size {h_dim}), "
-                    f"got {full_h.size(-1)}"
-                )
-            target_last_h = None
-            if layout == "dflash_aux_plus_last":
-                expected_with_last = expected_hidden_dim + h_dim
-                if full_h.size(-1) != expected_with_last:
-                    raise ValueError(
-                        "DSV4 DSpark hidden_states_layout='dflash_aux_plus_last' expected "
-                        f"exactly {expected_with_last} hidden dims, got {full_h.size(-1)}"
-                    )
-                target_last_h = full_h[..., expected_hidden_dim:expected_with_last]
-                full_h = full_h[..., :expected_hidden_dim]
-            elif layout == "dflash_aux" and full_h.size(-1) != expected_hidden_dim:
-                raise ValueError(
-                    "DSV4 DSpark hidden_states_layout='dflash_aux' expected exactly "
-                    f"{expected_hidden_dim} hidden dims, got {full_h.size(-1)}"
-                )
-
-            if item.get("loss_mask") is not None:
-                item_loss_mask = item["loss_mask"].to(
-                    device, dtype=torch.float32, non_blocking=True
-                )
-            elif "prompts" in item and "responses" in item:
-                item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
-                prompt_len = item["prompts"].size(0)
-                responses = item["responses"]
-                item_loss_mask[prompt_len : prompt_len + responses.size(0)] = (
-                    responses != pad_id
-                ).float()[: max(0, ids.size(0) - prompt_len)]
-            else:
-                item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
-                item_loss_mask[:] = 1.0
-
-            _check_block_drafter_rows(
-                int(ids.size(0)),
-                int(full_h.size(0)),
-                int(item_loss_mask.size(0)),
-                "DSV4 DSpark",
-            )
-            if max_window is None:
-                start, end = 0, ids.size(0)
-            else:
-                nonzero = torch.nonzero(item_loss_mask)
-                if nonzero.numel() > 0:
-                    r_start = nonzero[0, 0]
-                    start = torch.clamp(
-                        r_start - (max_window // 2),
-                        min=0,
-                        max=max(0, ids.size(0) - max_window),
-                    ).item()
-                    end = min(start + max_window, ids.size(0))
-                else:
-                    start, end = max(0, ids.size(0) - max_window), ids.size(0)
-
-            # ``ids`` / ``item_loss_mask`` carry the (optional) trailing label
-            # token; the hidden context is one row shorter when it is present.
-            hidden_end = max(start, min(end, int(full_h.size(0))))
-            res["ids"].append(ids[start:end])
-            res["h_states"].append(full_h[start:hidden_end, :expected_hidden_dim])
-            res["masks"].append(item_loss_mask[start:end])
-            if target_last_h is not None:
-                res["target_last_h_states"].append(target_last_h[start:hidden_end])
-            else:
-                res["target_last_h_states"].append(None)
-        return res

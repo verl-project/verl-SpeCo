@@ -710,3 +710,50 @@ def test_target_head_falls_back_to_embed_weight(tmp_path):
     head = TargetHead.from_pretrained(str(tmp_path))
 
     torch.testing.assert_close(head.fc.weight, torch.ones(8, 4))
+
+
+def test_convert_checkpoint_merges_ep_expert_slices(tmp_path):
+    from verl_speco.tools.convert_checkpoint import (
+        _load_state_dict,
+        _merge_ep_expert_slices,
+    )
+
+    # Leader-only export: the stacked expert weight holds just the leader slice.
+    leader_slice = torch.zeros(2, 3, 2)
+    leader_slice[0] = 0.0
+    leader_slice[1] = 1.0
+    safetensors_torch.save_file(
+        {"layers.0.ffn.experts.w1": leader_slice},
+        str(tmp_path / "model.safetensors"),
+    )
+    ep_dir = tmp_path / "ep_experts"
+    ep_dir.mkdir()
+    for rank in range(2):
+        sl = torch.zeros(2, 3, 2)
+        sl[0] = 10.0 * rank
+        sl[1] = 10.0 * rank + 1.0
+        torch.save({"layers.0.ffn.experts.w1": sl}, ep_dir / f"rank_{rank}.pt")
+
+    sd = _load_state_dict(tmp_path)
+    assert sd["layers.0.ffn.experts.w1"].shape == (2, 3, 2)  # leader slice only
+
+    merged = _merge_ep_expert_slices(sd, ep_dir)
+    assert merged["layers.0.ffn.experts.w1"].shape == (4, 3, 2)
+    # Rank r owns experts [r*local, (r+1)*local): rank0 rows 0-1, rank1 rows 2-3.
+    torch.testing.assert_close(merged["layers.0.ffn.experts.w1"][0], torch.zeros(3, 2))
+    torch.testing.assert_close(
+        merged["layers.0.ffn.experts.w1"][1], torch.ones(3, 2)
+    )
+    torch.testing.assert_close(
+        merged["layers.0.ffn.experts.w1"][2], torch.full((3, 2), 10.0)
+    )
+    torch.testing.assert_close(
+        merged["layers.0.ffn.experts.w1"][3], torch.full((3, 2), 11.0)
+    )
+
+    from verl_speco.tools.convert_checkpoint import convert
+
+    out, _skipped, n_unstacked = convert(merged, 1)
+    assert n_unstacked == 1
+    for e in range(4):
+        assert f"mtp.0.ffn.experts.{e}.w1.weight" in out

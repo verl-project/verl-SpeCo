@@ -178,34 +178,61 @@ def resolve_drafter_strategy(config) -> str:
 
 
 @torch.no_grad()
-def _clip_dtensor_grad_norm_(parameters, max_norm: float) -> torch.Tensor:
-    """Clip FSDP2/EP gradients without stacking incompatible DTensor meshes.
+def _clip_dtensor_grad_norm_(
+    parameters,
+    max_norm: float,
+    *,
+    disjoint_plain_param_ids: set[int] | None = None,
+    replicated_world_size: int = 1,
+) -> torch.Tensor:
+    """Clip EP/FSDP2 gradients with the true global norm, one coefficient.
 
     ``torch.nn.utils.clip_grad_norm_`` cannot handle the mixed DTensor
-    placements an EP run produces (FSDP2-sharded non-experts + Replicate-placement
-    expert slices), and a per-rank coefficient would scale the replicated/shared
+    placements an EP run produces (FSDP2-sharded non-experts + rank-disjoint
+    expert slices), and a per-rank coefficient would scale the shared
     parameters inconsistently across ranks. This computes the true global norm
-    (replication-corrected local sums, then one all-reduce) and applies a single
-    coefficient on every rank.
+    and applies a single coefficient on every rank.
+
+    Per-parameter contribution semantics:
+    - DTensor grads: ``Replicate`` mesh dims are replicas (divide by their size
+      before the all-reduce); sharded/other dims are disjoint contributions.
+    - Plain-tensor grads (the EP+DDP path): params listed in
+      ``disjoint_plain_param_ids`` are rank-disjoint (EP expert slices, summed
+      as-is); every other plain param is a replica whose gradient
+      ``sync_non_expert_grads`` has already world-averaged, so its squared sum
+      is divided by ``replicated_world_size`` instead of being counted once per
+      rank.
     """
     params = [p for p in parameters if p.grad is not None]
     local_total = None
     for param in params:
         grad = param.grad
-        local_grad = grad.to_local() if hasattr(grad, "to_local") else grad
+        is_dtensor = hasattr(grad, "to_local")
+        local_grad = grad.to_local() if is_dtensor else grad
         squared = local_grad.detach().float().pow(2).sum()
 
-        # Replicated DTensor dimensions would otherwise be counted once per rank
-        # by the all-reduce below. Sharded dimensions contain disjoint elements.
-        replication = 1
-        placements = getattr(grad, "placements", ())
-        mesh = getattr(grad, "device_mesh", None)
-        if mesh is not None:
-            from torch.distributed.tensor.placement_types import Replicate
+        if is_dtensor:
+            # Replicated DTensor dimensions would otherwise be counted once per
+            # rank by the all-reduce below. Sharded dims contain disjoint
+            # elements.
+            replication = 1
+            placements = getattr(grad, "placements", ())
+            mesh = getattr(grad, "device_mesh", None)
+            if mesh is not None:
+                from torch.distributed.tensor.placement_types import Replicate
 
-            for dim, placement in enumerate(placements):
-                if isinstance(placement, Replicate):
-                    replication *= int(mesh.size(dim))
+                for dim, placement in enumerate(placements):
+                    if isinstance(placement, Replicate):
+                        replication *= int(mesh.size(dim))
+        elif (
+            disjoint_plain_param_ids is not None
+            and id(param) not in disjoint_plain_param_ids
+        ):
+            # EP+DDP: already world-averaged replicated grad -- count it once.
+            replication = max(1, int(replicated_world_size))
+        else:
+            # Plain rank-disjoint contribution (EP expert slice).
+            replication = 1
         if replication > 1:
             squared = squared / replication
         local_total = squared if local_total is None else local_total + squared
@@ -1027,17 +1054,15 @@ class DrafterBaseTrainer:
             self._is_ep_enabled_cache = cached
         return cached
 
-    def _apply_ep_only(self, raw_model, use_skip_loading: bool) -> None:
+    def _apply_ep_only(self, raw_model) -> None:
         from verl_speco.backends.dsv4_ep_utils import apply_ep_only
 
-        apply_ep_only(self, raw_model, use_skip_loading)
+        apply_ep_only(self, raw_model)
 
-    def _apply_ep_fsdp2(
-        self, raw_model, fsdp_kwargs, fsdp_config, use_skip_loading: bool
-    ) -> None:
+    def _apply_ep_fsdp2(self, raw_model, fsdp_kwargs, fsdp_config) -> None:
         from verl_speco.backends.dsv4_ep_utils import apply_ep_fsdp2
 
-        apply_ep_fsdp2(self, raw_model, fsdp_kwargs, fsdp_config, use_skip_loading)
+        apply_ep_fsdp2(self, raw_model, fsdp_kwargs, fsdp_config)
 
     def _sync_non_expert_grads(self) -> None:
         from verl_speco.backends.dsv4_ep_utils import sync_non_expert_grads
@@ -1505,7 +1530,7 @@ class DrafterBaseTrainer:
                 logger.debug(
                     "Building DSV4 DSpark drafter with expert parallelism (no FSDP2)"
                 )
-                self._apply_ep_only(raw_model, use_skip_loading)
+                self._apply_ep_only(raw_model)
             elif ep_enabled:
                 logger.debug("Building DSV4 DSpark drafter with EP + FSDP2")
                 ep_mp_policy = MixedPrecisionPolicy(
@@ -1517,7 +1542,6 @@ class DrafterBaseTrainer:
                     # raw (dp, sp) training mesh itself; only the mp policy is read.
                     {"mp_policy": ep_mp_policy},
                     fsdp_config,
-                    use_skip_loading,
                 )
             else:
                 logger.debug("Building drafter model with its configured FSDP2 mesh")
@@ -5788,10 +5812,19 @@ class DrafterBaseTrainer:
         # 更新权重
         optimizer_ts = time.time()
         if self._is_ep_enabled():
-            # Mixed DTensor placements + rank-local expert grads: use the
+            # Mixed DTensor placements / rank-local expert grads: use the
             # replication-corrected global norm so every rank clips identically.
+            # In the EP+DDP mode the non-expert grads are plain tensors that
+            # sync_non_expert_grads has already world-averaged -- count each
+            # replicated contribution once instead of once per rank.
+            ep_ddp_world_size = int(getattr(self, "_ep_ddp_world_size", 0) or 0)
             grad_norm = _clip_dtensor_grad_norm_(
-                self.model.parameters(), max_norm=1.0
+                self.model.parameters(),
+                max_norm=1.0,
+                disjoint_plain_param_ids=getattr(self, "_ep_expert_param_ids", None),
+                replicated_world_size=(
+                    ep_ddp_world_size if ep_ddp_world_size > 1 else 1
+                ),
             )
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(
