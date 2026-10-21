@@ -177,6 +177,51 @@ def resolve_drafter_strategy(config) -> str:
     return str(strategy or "").lower()
 
 
+@torch.no_grad()
+def _clip_dtensor_grad_norm_(parameters, max_norm: float) -> torch.Tensor:
+    """Clip FSDP2/EP gradients without stacking incompatible DTensor meshes.
+
+    ``torch.nn.utils.clip_grad_norm_`` cannot handle the mixed DTensor
+    placements an EP run produces (FSDP2-sharded non-experts + Replicate-placement
+    expert slices), and a per-rank coefficient would scale the replicated/shared
+    parameters inconsistently across ranks. This computes the true global norm
+    (replication-corrected local sums, then one all-reduce) and applies a single
+    coefficient on every rank.
+    """
+    params = [p for p in parameters if p.grad is not None]
+    local_total = None
+    for param in params:
+        grad = param.grad
+        local_grad = grad.to_local() if hasattr(grad, "to_local") else grad
+        squared = local_grad.detach().float().pow(2).sum()
+
+        # Replicated DTensor dimensions would otherwise be counted once per rank
+        # by the all-reduce below. Sharded dimensions contain disjoint elements.
+        replication = 1
+        placements = getattr(grad, "placements", ())
+        mesh = getattr(grad, "device_mesh", None)
+        if mesh is not None:
+            from torch.distributed.tensor.placement_types import Replicate
+
+            for dim, placement in enumerate(placements):
+                if isinstance(placement, Replicate):
+                    replication *= int(mesh.size(dim))
+        if replication > 1:
+            squared = squared / replication
+        local_total = squared if local_total is None else local_total + squared
+
+    if local_total is None:
+        return torch.zeros((), device=get_torch_device().current_device())
+    if dist.is_initialized():
+        dist.all_reduce(local_total, op=dist.ReduceOp.SUM)
+    total_norm = local_total.sqrt()
+    clip_coef = min(1.0, float(max_norm) / (float(total_norm.item()) + 1e-6))
+    if clip_coef < 1.0:
+        for param in params:
+            param.grad.mul_(clip_coef)
+    return total_norm
+
+
 class _DrafterOptimizerState:
     """DCP Stateful adapter for FSDP1/FSDP2 optimizer state dicts."""
 
@@ -969,9 +1014,15 @@ class DrafterBaseTrainer:
     # the algorithm is actually selected.
 
     def _is_ep_enabled(self) -> bool:
-        from verl_speco.backends.dsv4_ep_utils import is_ep_enabled
+        # Cached: the training config is static after construction and this is
+        # queried on the per-step hot path.
+        cached = getattr(self, "_is_ep_enabled_cache", None)
+        if cached is None:
+            from verl_speco.backends.dsv4_ep_utils import is_ep_enabled
 
-        return is_ep_enabled(self.config)
+            cached = bool(is_ep_enabled(self.config))
+            self._is_ep_enabled_cache = cached
+        return cached
 
     def _apply_ep_only(self, raw_model, use_skip_loading: bool) -> None:
         from verl_speco.backends.dsv4_ep_utils import apply_ep_only
@@ -1391,9 +1442,11 @@ class DrafterBaseTrainer:
             moe_ep.enable()
         if use_skip_loading:
             self.backend._skip_weight_loading = True
-        raw_model, drafter_model_config = self.backend.build_model()
-        if use_skip_loading:
-            delattr(self.backend, "_skip_weight_loading")
+        try:
+            raw_model, drafter_model_config = self.backend.build_model()
+        finally:
+            if use_skip_loading:
+                delattr(self.backend, "_skip_weight_loading")
 
         # FSDP2 loads the full state through fsdp2_load_full_state_dict(), which
         # places only rank 0 on the accelerator during the broadcast. Moving the
@@ -5731,9 +5784,16 @@ class DrafterBaseTrainer:
 
         # 更新权重
         optimizer_ts = time.time()
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), max_norm=1.0
-        )
+        if self._is_ep_enabled():
+            # Mixed DTensor placements + rank-local expert grads: use the
+            # replication-corrected global norm so every rank clips identically.
+            grad_norm = _clip_dtensor_grad_norm_(
+                self.model.parameters(), max_norm=1.0
+            )
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm=1.0
+            )
         if not torch.isfinite(grad_norm):
             logger.error(
                 f"Step {self.training_steps + 1}: non-finite drafter grad norm, "

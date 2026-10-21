@@ -41,18 +41,15 @@ def _init_router_bias(model, world_size, experts_per_rank, rank):
         router = getattr(module, "router", None)
         if router is None:
             continue
+        # Bias is the global expert vector; shape[0] != n_experts rejects a
+        # partially-sharded buffer we must not write a mismatched slice into.
         if not hasattr(router, "bias") or router.bias.shape[0] != n_experts:
             continue
         with torch.no_grad():
-            n_bias = router.bias.numel()
-            # Bias is the global expert vector; guard against partially-sharded
-            # buffers so we never write a mismatched slice.
-            if n_bias < n_experts:
-                continue
             local_start = rank * experts_per_rank
-            local_end = min(local_start + experts_per_rank, n_bias)
+            local_end = min(local_start + experts_per_rank, n_experts)
             preference = torch.full(
-                (n_bias,), -boost, dtype=torch.float32, device=router.bias.device
+                (n_experts,), -boost, dtype=torch.float32, device=router.bias.device
             )
             preference[local_start:local_end] = boost
             # Break the within-rank symmetry so ties do not all go to one expert.

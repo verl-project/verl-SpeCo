@@ -78,15 +78,10 @@ def apply_rotary_emb(
     rope_dim = x.shape[-1]
     if freqs_cis.shape[-2] != rope_dim // 2:
         freqs_cis = freqs_cis[..., : rope_dim // 2, :]
-    # ``freqs_cis`` is ``[..., S, rope_dim // 2, 2]``; ``x`` is either
-    # ``[..., S, H, rope_dim]`` (head axis present, e.g. q/o) or
-    # ``[..., S, rope_dim]`` (head-less shared KV).
+    # ``freqs_cis`` is ``[..., S, rope_dim // 2, 2]`` (per-position, S matching
+    # ``x``); ``x`` is either ``[..., S, H, rope_dim]`` (head axis present, e.g.
+    # q/o) or ``[..., S, rope_dim]`` (head-less shared KV).
     head_axis = x.dim() == freqs_cis.dim()
-    seq_axis = -3 if head_axis else -2
-    seq_len = x.shape[seq_axis]
-    if freqs_cis.shape[-3] != seq_len:
-        # Tolerate a longer precomputed table by slicing to the sequence length.
-        freqs_cis = freqs_cis[..., :seq_len, :, :]
     cos = freqs_cis[..., 0].repeat_interleave(2, dim=-1)
     sin = freqs_cis[..., 1].repeat_interleave(2, dim=-1)
     if inverse:

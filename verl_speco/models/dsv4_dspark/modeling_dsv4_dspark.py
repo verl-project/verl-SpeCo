@@ -203,9 +203,10 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 )
 
     def _rope_at(self, positions: torch.Tensor) -> torch.Tensor:
-        if not getattr(self, "_freqs_ok", False):
-            self._freqs_ok = True
-            self._rebuild_freqs(max(self.freqs_cis.shape[0], 1))
+        # ``_freqs_ok`` only marks that the precomputed table is valid on the
+        # current device (EP paths rebuild it after the device move); the table
+        # itself is already sized in ``__init__``, so no rebuild is needed here.
+        self._freqs_ok = True
         if positions.numel() and int(positions.max()) >= self.freqs_cis.shape[0]:
             self._rebuild_freqs(int(positions.max()) + 1)
         return self.freqs_cis.to(positions.device)[positions]
