@@ -62,6 +62,8 @@ class TQFeatureStore:
     successful optimizer step, so discovery must happen for every global batch.
     """
 
+    uses_transfer_queue = True
+
     def __init__(self, config: Mapping[str, Any]):
         self.config = _plain_dict(config)
         self.run_id = str(self.config.get("run_id") or "").strip()
@@ -168,6 +170,53 @@ class TQFeatureStore:
             )
         return samples
 
+    def prepare_batch(self, entries: Sequence[ReadyEntry], **options) -> dict[str, Any]:
+        """Materialize only scheduler-assigned file tags; never fetch TQ fields."""
+        from verl_speco.trainer.standalone_batch_prepare import (
+            prepare_standalone_cpu_batch,
+        )
+        from verl_speco.trainer.target_feature_replay import FeatureContract
+        from verl_speco.transport.drafter_sample_protocol import (
+            SampleMetadata,
+            make_sample_key,
+            validate_reference_tag,
+        )
+        import torch
+
+        self._require_connected()
+        if not entries:
+            raise ValueError("Cannot prepare an empty file batch")
+        expected = self.expected_config
+        for entry in entries:
+            validate_reference_tag(entry.tag)
+            meta = SampleMetadata.from_dict(entry.tag)
+            if meta.run_id != self.run_id or entry.key != make_sample_key(meta):
+                raise ValueError("Hidden reference identity mismatch")
+            contract = entry.tag["feature_contract"]
+            for name, actual in (
+                ("algorithm", contract.get("algorithm")),
+                ("target_model_path", contract.get("target_model_id")),
+                ("target_revision", contract.get("target_model_revision")),
+                ("tokenizer_fingerprint", contract.get("tokenizer_fingerprint")),
+                ("hidden_states_layout", contract.get("hidden_states_layout")),
+                ("hidden_dtype", str(contract.get("dtype", "")).removeprefix("torch.")),
+                ("target_layer_ids", tuple(contract.get("target_layer_ids", []))),
+            ):
+                wanted = getattr(expected, name)
+                if wanted is not None and actual != wanted:
+                    raise ValueError(
+                        f"Unexpected file feature {name}: {actual!r} != {wanted!r}"
+                    )
+        values = dict(entries[0].tag["feature_contract"])
+        values["dtype"] = getattr(torch, values["dtype"].removeprefix("torch."))
+        return prepare_standalone_cpu_batch(
+            [entry.tag for entry in entries],
+            FeatureContract(**values),
+            hidden_states_store=getattr(self, "hidden_states_store", None),
+            read_timeout=float(self.config.get("io_timeout_seconds", 30)),
+            **options,
+        )
+
     def clear_many(self, keys: Sequence[str]) -> None:
         self._require_connected()
         clear_samples([str(key) for key in keys])
@@ -207,6 +256,47 @@ class TQFeatureStore:
             raise RuntimeError(
                 "TQFeatureStore.connect() must be called before data access"
             )
+
+
+class ReferenceFeatureStore(TQFeatureStore):
+    """Prepare hidden references without connecting to TransferQueue.
+
+    Ready metadata is owned by the Driver's scheduler, not this rank-local adapter.
+    """
+
+    uses_transfer_queue = False
+
+    def __init__(self, config: Mapping[str, Any]):
+        super().__init__(config)
+        from verl_speco.producer.hidden_states_store import build_hidden_states_store
+
+        # Client setup is lazy; spawned workers construct their own store.
+        self.hidden_states_store = build_hidden_states_store(
+            self.config.get("hidden_states_store")
+        )
+
+    def connect(self) -> None:
+        self._connected = True
+
+    def owner_ready(self) -> bool:
+        self._require_connected()
+        return True
+
+    def clear_many(self, keys: Sequence[str]) -> None:
+        self._require_connected()
+        # Only scheduler completion releases metadata; cleanup releases hidden references.
+
+    def list_ready(self, run_id: str | None = None) -> list[ReadyEntry]:
+        raise RuntimeError(
+            "Hidden references must arrive through scheduler assignments"
+        )
+
+    def get_many(self, entries: Sequence[ReadyEntry]) -> list[DraftFeatureSample]:
+        raise RuntimeError("Hidden references require CPU batch preparation")
+
+    def close_local(self) -> None:
+        self.hidden_states_store.close()
+        self._connected = False
 
 
 def _plain_dict(value: Any) -> dict[str, Any]:

@@ -71,6 +71,7 @@ class DSparkConfig(DFlashConfig):
         enable_confidence_head: Optional[bool] = None,
         confidence_head_alpha: float = 0.0,
         confidence_head_with_markov: bool = True,
+        confidence_detach_backbone: bool = False,
         ce_loss_alpha: float = 0.1,
         l1_loss_alpha: float = 0.9,
         loss_decay_gamma: float = 7.0,
@@ -94,16 +95,25 @@ class DSparkConfig(DFlashConfig):
             else self.confidence_head_alpha > 0.0
         )
         self.confidence_head_with_markov = bool(confidence_head_with_markov)
+        self.confidence_detach_backbone = bool(confidence_detach_backbone)
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
         self.loss_decay_gamma = float(loss_decay_gamma)
 
     def to_dict(self) -> dict:
-        """Preserve source checkpoint fields and append newly introduced fields."""
+        """Preserve source fields while exporting the active confidence topology."""
         config = super().to_dict()
+        confidence_config = {
+            "enable_confidence_head": self.enable_confidence_head,
+            "confidence_head_alpha": self.confidence_head_alpha,
+            "confidence_head_with_markov": self.confidence_head_with_markov,
+        }
         source_config = config.pop("_source_checkpoint_config", None)
         if source_config is not None:
             config.update(deepcopy(source_config))
+        # A source checkpoint may predate the confidence head. Training can add the
+        # head later, so these live values must win over the preserved source JSON.
+        config.update(confidence_config)
         return config
 
     def to_diff_dict(self) -> dict:

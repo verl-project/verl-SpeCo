@@ -186,6 +186,12 @@ class DSparkDraftModel(DFlashDraftModel):
         self.confidence_head_with_markov = bool(
             getattr(config, "confidence_head_with_markov", True)
         )
+        # When set, the confidence loss does not backpropagate into the shared
+        # draft backbone/Markov features, so co-training only updates the
+        # confidence head and cannot degrade the draft acceptance.
+        self.confidence_detach_backbone = bool(
+            getattr(config, "confidence_detach_backbone", False)
+        )
         if (
             self.enable_confidence_head
             and self.confidence_head_with_markov
@@ -222,12 +228,16 @@ class DSparkDraftModel(DFlashDraftModel):
     ) -> Optional[torch.Tensor]:
         if self.confidence_head is None:
             return None
+        if self.confidence_detach_backbone:
+            draft_hidden = draft_hidden.detach()
         if self.confidence_head_with_markov:
             if self.markov_head is None:
                 return None
             prev_embeddings = self.markov_head.get_prev_embeddings(prev_token_ids).to(
                 dtype=draft_hidden.dtype
             )
+            if self.confidence_detach_backbone:
+                prev_embeddings = prev_embeddings.detach()
             return self.confidence_head(
                 torch.cat([draft_hidden, prev_embeddings], dim=-1)
             ).float()

@@ -54,6 +54,18 @@ case "${platform}/${backend}/${drafter}" in
     ;;
 esac
 
+# Share variable resolution with manual/comment runs before resolving paths or topology.
+ci_python="$(command -v python || command -v python3)"
+ci_variables="$("${ci_python}" - <<'PYVARS'
+import os, shlex
+from ci.run_manual_example import configured_environment
+for key, value in configured_environment(os.environ).items():
+    if key.startswith("SPECO_") and os.environ.get(key) != value:
+        print("export " + shlex.quote(key + "=" + value))
+PYVARS
+)"
+eval "${ci_variables}"
+
 required_vars=(
   SPECO_TARGET_MODEL
   SPECO_TRAIN_FILE
@@ -159,6 +171,22 @@ PY
     export SGLANG_DEEPEP_BF16_DISPATCH="${SGLANG_DEEPEP_BF16_DISPATCH:-1}"
     export SGLANG_SET_CPU_AFFINITY="${SGLANG_SET_CPU_AFFINITY:-1}"
   fi
+fi
+
+# Use the same small online profile as manual/comment-triggered examples.
+if [[ "${platform}" == "npu" && "${separate_training}" != "true" ]]; then
+  profile_python="$(command -v python || command -v python3)"
+  profile_values="$("${profile_python}" - <<'PYPROFILE'
+import json, os
+from pathlib import Path
+variables = json.loads(os.environ.get("SPECO_CI_VARIABLES_JSON", "{}"))
+for key, spec in json.loads(Path("ci/online_smoke_profile.json").read_text()).items():
+    print(key + "\t" + (os.environ.get(key) or variables.get(key) or spec["default"]))
+PYPROFILE
+)"
+  while IFS=$'\t' read -r profile_key profile_value; do
+    export "${profile_key}=${profile_value}"
+  done <<< "${profile_values}"
 fi
 
 enable_training="${SPECO_ENABLE_TRAINING:-true}"
@@ -326,6 +354,16 @@ if [[ -n "${SPECO_EXTRA_HYDRA_ARGS:-}" ]]; then
   done <<< "${SPECO_EXTRA_HYDRA_ARGS}"
 fi
 
+# Match the mode actually passed to Hydra (the last override wins).
+for override in "${overrides[@]}"; do
+  case "${override}" in
+    actor_rollout_ref.rollout.drafter.enable_drafter_training=*)
+      enable_training="${override#*=}"
+      enable_training="${enable_training,,}"
+      ;;
+  esac
+done
+
 if [[ "${SPECO_DRY_RUN:-false}" == "true" ]]; then
   echo "platform=${platform}"
   echo "backend=${backend}"
@@ -353,5 +391,11 @@ if [[ "${separate_training}" == "true" ]]; then
     echo "SPECO_ENABLE_TRAINING is not true; skipping the offline train stage"
   fi
 else
-  bash "${example}" "${overrides[@]}"
+  export SPECO_CI_RESULT_PATH="${SPECO_CI_RESULT_PATH:-${SPECO_CKPT_DIR}/speco-ci-${backend}-${drafter}.json}"
+  rm -f -- "${SPECO_CI_RESULT_PATH}"
+  mkdir -p -- "$(dirname "${SPECO_CI_RESULT_PATH}")"
+  run_started=${SECONDS}
+  trap 'run_status=$?; printf "{\"elapsed_seconds\":%d,\"exit_code\":%d}\n" "$((SECONDS - run_started))" "${run_status}" > "${SPECO_CI_RESULT_PATH}.timing.json"' EXIT
+  bash "${example}" "${overrides[@]}" 2>&1 | tee "${SPECO_CI_RESULT_PATH}.log"
+  python ci/check_result.py "${SPECO_CI_RESULT_PATH}" --training "${enable_training}"
 fi

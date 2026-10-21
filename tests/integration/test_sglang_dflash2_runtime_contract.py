@@ -737,6 +737,8 @@ def test_http_server_installs_fields_compat_inside_actor(monkeypatch) -> None:
 
 
 def test_verl_legacy_launcher_uses_current_sglang_engine_shape(monkeypatch) -> None:
+    monkeypatch.delenv(sglang_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    monkeypatch.delenv("VERL_SPECO_SGLANG_DRAFTER_CONFIG", raising=False)
     entrypoints = types.ModuleType("sglang.srt.entrypoints")
     http_server = types.ModuleType("sglang.srt.entrypoints.http_server")
     callback_attrs = {
@@ -830,7 +832,7 @@ def test_verl_legacy_launcher_applies_drafter_config_at_scheduler_boundary(
     monkeypatch.setitem(sys.modules, "sglang.srt.entrypoints", entrypoints)
     monkeypatch.setitem(sys.modules, "sglang.srt.entrypoints.http_server", http_server)
     monkeypatch.setenv(
-        sglang_runtime.SPECO_SGLANG_DRAFTER_CONFIG_ENV,
+        sglang_runtime.SPECO_DRAFTER_CONFIG_ENV,
         json.dumps(
             {
                 "enable": True,
@@ -890,7 +892,7 @@ def test_engine_launcher_applies_drafter_config_when_constructor_bypasses_init(
     monkeypatch.setitem(sys.modules, "sglang.srt.entrypoints", entrypoints)
     monkeypatch.setitem(sys.modules, "sglang.srt.entrypoints.http_server", http_server)
     monkeypatch.setenv(
-        sglang_runtime.SPECO_SGLANG_DRAFTER_CONFIG_ENV,
+        sglang_runtime.SPECO_DRAFTER_CONFIG_ENV,
         json.dumps(
             {
                 "enable": True,

@@ -31,6 +31,8 @@ from verl_speco.integration.sglang_adapter import (
     _call_flashinfer_plan_with_abi_compat,
 )
 
+from verl_speco.integration.drafter_config_env import get_drafter_config_env
+
 try:
     import triton
     import triton.language as tl
@@ -372,7 +374,7 @@ def _get_route_markers() -> tuple[str | None, str | None]:
 
 
 def _speco_drafter_runtime_enabled() -> bool:
-    raw = os.environ.get("VERL_SPECO_SGLANG_DRAFTER_CONFIG")
+    raw = get_drafter_config_env()
     if not raw:
         return False
     try:
@@ -521,6 +523,48 @@ def patch_sglang_qwen3_rope_compat() -> None:
     logger.warning("SGLang Qwen3 rope-parameters compatibility patch active.")
 
 
+@torch.inference_mode()
+def _refresh_dspark_ctx_kv_caches(model) -> None:
+    """Re-sync DSpark's cached K/V projection and k_norm copies after a reload.
+
+    ``DSparkDraftMixin`` caches ``torch.cat``/``torch.stack`` copies of every
+    layer's KV projection and ``k_norm`` weights for the context-KV writer, and
+    never invalidates them. A tensor weight update copies into the parameters in
+    place, so without this the served draft keeps injecting target hidden states
+    with the initial checkpoint's K/V projection while its Q/MLP/Markov weights
+    move on. The buffers are refreshed in place because a CUDA graph may have
+    captured their addresses. They were built under ``torch.inference_mode`` by
+    the writer, so they are inference tensors and only accept in-place updates
+    from inside inference mode.
+    """
+    layers = getattr(model, "layers", None)
+    fused = getattr(model, "_fused_kv_write_cache", None)
+    bundle = None if fused is None else fused[1]
+    stacked = getattr(model, "_stacked_ctx_kv_cache", None)
+    if layers is None or (bundle is None and not stacked):
+        return
+
+    attns = [layer.self_attn for layer in layers]
+    kv_slices = [slice(a.q_size, a.q_size + 2 * a.kv_size) for a in attns]
+    kv_weight = torch.cat(
+        [a.qkv_proj.weight[s] for a, s in zip(attns, kv_slices)], dim=0
+    )
+    k_norm_weight = torch.stack([a.k_norm.weight for a in attns])
+    if bundle is not None:
+        w_all, _, knw, *_ = bundle
+        w_all.copy_(kv_weight)
+        knw.copy_(k_norm_weight)
+    if stacked:
+        stacked["weight"].copy_(kv_weight)
+        if stacked["bias"] is not None:
+            stacked["bias"].copy_(
+                torch.cat(
+                    [a.qkv_proj.bias[s] for a, s in zip(attns, kv_slices)], dim=0
+                )
+            )
+        stacked["k_norm_weight"].copy_(k_norm_weight)
+
+
 def _runner_update_weights_from_tensor(runner, named_tensors, load_format):
     """Load tensors through a model runner on either sglang generation.
 
@@ -530,7 +574,10 @@ def _runner_update_weights_from_tensor(runner, named_tensors, load_format):
     update = getattr(runner, "update_weights_from_tensor", None)
     if update is None:
         update = runner.weight_updater.update_weights_from_tensor
-    return update(named_tensors=named_tensors, load_format=load_format)
+    result = update(named_tensors=named_tensors, load_format=load_format)
+    if result and result[0]:
+        _refresh_dspark_ctx_kv_caches(getattr(runner, "model", None))
+    return result
 
 
 # Speculative workers that drive the draft through a plain TpModelWorker and

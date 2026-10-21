@@ -16,15 +16,21 @@
 from __future__ import annotations
 
 import asyncio
-import errno
-import importlib
 import inspect
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, cast
+
+from verl_speco.producer.hidden_states_store import (
+    FILE_BACKEND,
+    MOONCAKE_BACKEND,
+    FileHiddenStatesStore,
+    HiddenStatesStore,
+    build_hidden_states_store,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -47,9 +53,20 @@ class VllmEndpoint:
 
 @dataclass(frozen=True)
 class VllmResponse:
-    hidden_states_path: str
+    hidden_states_path: str | None
     endpoint_url: str
     generated_token_ids: tuple[int, ...] = ()
+    handle: str | None = None
+    transfer_params: dict[str, Any] = field(default_factory=dict)
+    store: HiddenStatesStore | None = field(default=None, compare=False, repr=False)
+
+    @property
+    def reference(self) -> str:
+        return self.handle or os.fspath(self.hidden_states_path or "")
+
+    @property
+    def is_handle(self) -> bool:
+        return self.handle is not None
 
 
 @dataclass(frozen=True)
@@ -59,6 +76,8 @@ class RawVllmFeature:
     endpoint_url: str
     byte_size: int
     generated_token_ids: tuple[int, ...] = ()
+    store: HiddenStatesStore | None = field(default=None, compare=False, repr=False)
+    is_handle: bool = False
 
 
 @dataclass
@@ -68,6 +87,21 @@ class _EndpointState:
     semaphore: asyncio.Semaphore
     inflight: int = 0
     requests: int = 0
+
+
+def _parse_transfer_reference(
+    params: Mapping[str, Any], *, operation: str
+) -> tuple[str | None, str | None]:
+    """Return ``(hidden_states_path, handle)`` from kv_transfer_params."""
+    path = params.get("hidden_states_path")
+    handle = params.get("handle")
+    if not path and not handle:
+        raise ValueError(f"vLLM {operation} response missing hidden_states_path/handle")
+    if path and handle:
+        raise ValueError(
+            f"vLLM {operation} response has both hidden_states_path and handle"
+        )
+    return (os.fspath(path) if path else None, str(handle) if handle else None)
 
 
 async def request_prefill(
@@ -93,10 +127,13 @@ async def request_prefill(
     params = getattr(response, "kv_transfer_params", None)
     if not isinstance(params, Mapping):
         raise ValueError("vLLM response missing kv_transfer_params")
-    path = params.get("hidden_states_path")
-    if not path:
-        raise ValueError("vLLM response missing hidden_states_path")
-    return VllmResponse(os.fspath(path), endpoint.base_url)
+    path, handle = _parse_transfer_reference(params, operation="prefill")
+    return VllmResponse(
+        hidden_states_path=path,
+        endpoint_url=endpoint.base_url,
+        handle=handle,
+        transfer_params=dict(params),
+    )
 
 
 async def request_generate(
@@ -131,35 +168,59 @@ async def request_generate(
     params = getattr(response, "kv_transfer_params", None)
     if not isinstance(params, Mapping):
         raise ValueError("vLLM generation response missing kv_transfer_params")
-    path = params.get("hidden_states_path")
-    if not path:
-        raise ValueError("vLLM generation response missing hidden_states_path")
+    path, handle = _parse_transfer_reference(params, operation="generation")
     return VllmResponse(
-        os.fspath(path),
-        endpoint.base_url,
-        tuple(int(token_id) for token_id in generated),
+        hidden_states_path=path,
+        endpoint_url=endpoint.base_url,
+        generated_token_ids=tuple(int(token_id) for token_id in generated),
+        handle=handle,
+        transfer_params=dict(params),
     )
 
 
-def load_hidden_state_result(response: VllmResponse) -> RawVllmFeature:
-    try:
-        from safetensors.torch import load_file
-    except ImportError as exc:
-        raise RuntimeError("vLLM Producer requires safetensors") from exc
-    path = Path(response.hidden_states_path)
-    _wait_for_lock(Path(f"{path}.lock"))
-    if not path.is_file():
-        raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
+def load_hidden_state_result(
+    response: VllmResponse,
+    store: HiddenStatesStore | None = None,
+) -> RawVllmFeature:
+    if response.is_handle:
+        resolved = store or build_hidden_states_store({"backend": MOONCAKE_BACKEND})
+    else:
+        if response.hidden_states_path is None:
+            raise ValueError("vLLM response missing hidden_states_path/handle")
+        resolved = store or FileHiddenStatesStore()
+    expected_backend = MOONCAKE_BACKEND if response.is_handle else FILE_BACKEND
+    if resolved.backend != expected_backend:
+        raise ValueError(
+            f"vLLM returned a {expected_backend} reference but the consumer is "
+            f"configured for the {resolved.backend} hidden-state store"
+        )
+    reference = response.reference
+    payload, byte_size = resolved.load(reference)
     return RawVllmFeature(
-        payload=dict(load_file(str(path), device="cpu")),
-        temporary_path=str(path),
+        payload=payload,
+        temporary_path=reference,
         endpoint_url=response.endpoint_url,
-        byte_size=int(path.stat().st_size),
+        byte_size=byte_size,
         generated_token_ids=response.generated_token_ids,
+        store=resolved,
+        is_handle=response.is_handle,
     )
 
 
-def delete_temporary_result(raw: RawVllmFeature) -> None:
+def delete_temporary_result(raw: RawVllmFeature | VllmResponse) -> None:
+    if isinstance(raw, VllmResponse):
+        if raw.store is not None:
+            raw.store.release(raw.reference)
+        elif raw.is_handle:
+            raise ValueError("Handle cleanup requires its owning hidden-state store")
+        else:
+            FileHiddenStatesStore().release(raw.reference)
+        return
+    if raw.store is not None:
+        raw.store.release(raw.temporary_path)
+        return
+    # Fallback for callers that construct RawVllmFeature without a store (e.g.
+    # the test client pools); the client pool always sets one.
     path = Path(raw.temporary_path)
     path.unlink(missing_ok=True)
     Path(f"{path}.lock").unlink(missing_ok=True)
@@ -180,6 +241,7 @@ class VllmFeatureClientPool:
         max_inflight_requests: int,
         request_timeout: float,
         success_log_interval: int = 100,
+        hidden_states_store: HiddenStatesStore | None = None,
     ) -> None:
         if not endpoints:
             raise ValueError("At least one vLLM endpoint is required")
@@ -193,6 +255,9 @@ class VllmFeatureClientPool:
         self.success_log_interval = int(success_log_interval)
         if self.success_log_interval < 0:
             raise ValueError("success_log_interval must be non-negative")
+        self.hidden_states_store = hidden_states_store or build_hidden_states_store(
+            {"backend": FILE_BACKEND}
+        )
         self._global_semaphore = asyncio.Semaphore(max_inflight_requests)
         self._states: list[_EndpointState] = []
 
@@ -221,23 +286,46 @@ class VllmFeatureClientPool:
         ]
 
     async def prefill(self, request: Any) -> RawVllmFeature:
-        return await self._request(request, generate=False)
+        return cast(RawVllmFeature, await self._request(request, generate=False))
 
     async def generate(self, request: Any) -> RawVllmFeature:
-        return await self._request(request, generate=True)
+        return cast(RawVllmFeature, await self._request(request, generate=True))
 
-    async def _request(self, request: Any, *, generate: bool) -> RawVllmFeature:
+    async def prefill_reference(self, request: Any) -> VllmResponse:
+        """Transfer ownership of a hidden reference without loading its tensors.
+
+        The caller must retain the payload until consumption or explicitly release
+        it if it cannot publish the reference. Existing eager APIs are unchanged.
+        """
+        return cast(
+            VllmResponse,
+            await self._request(request, generate=False, reference_only=True),
+        )
+
+    async def generate_reference(self, request: Any) -> VllmResponse:
+        """Generate tokens without loading the unused connector output."""
+        return cast(
+            VllmResponse,
+            await self._request(request, generate=True, reference_only=True),
+        )
+
+    async def _request(
+        self, request: Any, *, generate: bool, reference_only: bool = False
+    ) -> RawVllmFeature | VllmResponse:
         if not self._states:
             raise RuntimeError("VllmFeatureClientPool.start() must be called first")
         async with self._global_semaphore:
-            return await self._request_with_retries(request, generate=generate)
+            return await self._request_with_retries(
+                request, generate=generate, reference_only=reference_only
+            )
 
     async def _request_with_retries(
         self,
         request: Any,
         *,
         generate: bool,
-    ) -> RawVllmFeature:
+        reference_only: bool = False,
+    ) -> RawVllmFeature | VllmResponse:
         total_attempts = _DEFAULT_MAX_RETRIES + 1
         failed_in_round: set[str] = set()
         for attempt in range(1, total_attempts + 1):
@@ -252,6 +340,8 @@ class VllmFeatureClientPool:
             state = choose_endpoint(candidates)
             state.inflight += 1
             request_started = time.monotonic()
+            response: VllmResponse | None = None
+            accepted = False
             try:
                 async with state.semaphore:
                     if generate:
@@ -271,7 +361,23 @@ class VllmFeatureClientPool:
                             model=self.model,
                             timeout=self.request_timeout,
                         )
-                    raw = await asyncio.to_thread(load_hidden_state_result, response)
+                    if reference_only:
+                        expected = (
+                            MOONCAKE_BACKEND if response.is_handle else FILE_BACKEND
+                        )
+                        if self.hidden_states_store.backend != expected:
+                            raise ValueError(
+                                "vLLM reference backend does not match configured store"
+                            )
+                        raw: RawVllmFeature | VllmResponse = replace(
+                            response, store=self.hidden_states_store
+                        )
+                    else:
+                        raw = await asyncio.to_thread(
+                            load_hidden_state_result,
+                            response,
+                            self.hidden_states_store,
+                        )
                 state.requests += 1
                 if self._should_log_success(state.requests):
                     logger.info(
@@ -284,6 +390,7 @@ class VllmFeatureClientPool:
                         state.inflight,
                         time.monotonic() - request_started,
                     )
+                accepted = True
                 return raw
             except ValueError:
                 # Response validation failures are deterministic protocol/data
@@ -325,10 +432,36 @@ class VllmFeatureClientPool:
                 )
                 await asyncio.sleep(backoff)
             finally:
+                # The server has already published the hidden states, so a
+                # reference not handed to the caller must be released; otherwise
+                # retries (and cancellation) leak a file or leave an object in
+                # the bounded Mooncake store.
+                if response is not None and not accepted:
+                    await self._release_unconsumed(response)
                 state.inflight = max(state.inflight - 1, 0)
         raise RuntimeError(
             "unreachable: vLLM request retry loop exhausted without returning"
         )
+
+    async def _release_unconsumed(self, response: VllmResponse) -> None:
+        """Best-effort release of a response not handed to the caller.
+
+        Only release when the response matches the configured store; a backend
+        mismatch is a deterministic protocol error that must not trigger a
+        delete against the wrong store.
+        """
+        expected = MOONCAKE_BACKEND if response.is_handle else FILE_BACKEND
+        reference = response.reference
+        if self.hidden_states_store.backend != expected or not reference:
+            return
+        try:
+            await asyncio.to_thread(self.hidden_states_store.release, reference)
+        except Exception as exc:  # noqa: BLE001 - retry cleanup is best effort
+            logger.warning(
+                "Failed to release unconsumed vLLM hidden-state reference %s: %r",
+                reference,
+                exc,
+            )
 
     def _should_log_success(self, count: int) -> bool:
         interval = self.success_log_interval
@@ -343,6 +476,7 @@ class VllmFeatureClientPool:
             result = close()
             if inspect.isawaitable(result):
                 await result
+        self.hidden_states_store.close()
 
 
 def _http_error_detail(exc: Exception) -> tuple[Any, Any, str]:
@@ -356,40 +490,6 @@ def _http_error_detail(exc: Exception) -> tuple[Any, Any, str]:
     if not isinstance(body, str):
         body = repr(body)
     return status_code, request_id, body[:2048]
-
-
-def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
-    if not lock_path.exists():
-        return
-    try:
-        fcntl: Any = importlib.import_module("fcntl")
-    except ImportError:
-        # vLLM's file connector is Linux-only. Keep the old existence-based
-        # fallback for dependency-light tests on other platforms.
-        deadline = time.monotonic() + timeout
-        while lock_path.exists():
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for vLLM hidden-state lock: {lock_path}"
-                )
-            time.sleep(0.01)
-        return
-
-    deadline = time.monotonic() + timeout
-    with lock_path.open("rb") as lock_file:
-        while True:
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-                return
-            except OSError as exc:
-                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
-                    raise
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"Timed out waiting for vLLM hidden-state lock: {lock_path}"
-                    ) from exc
-                time.sleep(0.01)
 
 
 __all__ = [

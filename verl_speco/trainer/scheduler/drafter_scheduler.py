@@ -21,6 +21,7 @@ remain unchanged.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Sequence
 from uuid import uuid4
 
@@ -121,6 +122,7 @@ class DrafterScheduler:
         self._publish_executor = publish_executor
         self.collection_strategy = SyncCollectionStrategy()
         self._collection_executor = collection_executor
+        self._collection_sequence = 0
         self.standalone_collection_strategy = StandaloneCollectionExecutionStrategy()
         self.standalone_training_strategy = StandaloneTrainingExecutionStrategy()
         self._standalone_collection_executor = standalone_collection_executor
@@ -209,11 +211,24 @@ class DrafterScheduler:
             "data_source": DrafterTrainingDataSource.TRANSFER_QUEUE,
             "required_samples": config.global_batch_size,
         }
-        if context.consumer_training:
+        if not context.consumer_ready:
+            return TrainingPlan(launch=False, reason="consumer_initializing", **common)
+        if (
+            context.remaining_steps is not None
+            and context.outstanding_batches >= context.remaining_steps
+        ):
+            return TrainingPlan(
+                launch=False, reason="training_budget_reserved", **common
+            )
+        if context.consumer_training and context.max_outstanding_batches == 1:
             return TrainingPlan(
                 launch=False,
                 reason="consumer_training",
                 **common,
+            )
+        if context.outstanding_batches >= context.max_outstanding_batches:
+            return TrainingPlan(
+                launch=False, reason="outstanding_capacity_reached", **common
             )
         if status.ready_samples < config.global_batch_size:
             return TrainingPlan(
@@ -226,6 +241,16 @@ class DrafterScheduler:
             reason="training_ready",
             selected_keys=selected_keys,
             **common,
+        )
+
+    @staticmethod
+    def queue_budget_exhausted(context: QueueScheduleContext) -> bool:
+        """Stop only after the restored training budget and all plans finish."""
+        return (
+            context.consumer_ready
+            and context.remaining_steps is not None
+            and context.remaining_steps <= 0
+            and context.outstanding_batches == 0
         )
 
     def execute_standalone_collection_plan(
@@ -395,6 +420,19 @@ class DrafterScheduler:
     ) -> bool:
         return step_matches_interval(global_step, config.collect_interval_steps)
 
+    def _next_collection_id(
+        self, source: DrafterCollectionSource, global_step: object
+    ) -> str:
+        try:
+            source_global_step = int(str(global_step))
+        except (TypeError, ValueError):
+            source_global_step = -1
+        self._collection_sequence += 1
+        return (
+            f"collection-{source_global_step:020d}-"
+            f"{self._collection_sequence:020d}-{source.value}"
+        )
+
     def plan_collection(
         self,
         context: DrafterCollectionContext,
@@ -405,7 +443,9 @@ class DrafterScheduler:
             context.global_step, config
         )
         common: Any = {
-            "collection_id": uuid4().hex,
+            "collection_id": self._next_collection_id(
+                context.source, context.global_step
+            ),
             "source": context.source,
             "source_global_step": context.global_step,
             "collect_interval_matched": collect_interval_matched,
@@ -421,6 +461,8 @@ class DrafterScheduler:
             return CollectionPlan(collect=False, reason="drafter_disabled", **common)
         if not context.source_enabled:
             return CollectionPlan(collect=False, reason="source_disabled", **common)
+        if context.drafter_frozen:
+            return CollectionPlan(collect=False, reason="drafter_frozen", **common)
         if context.validation:
             return CollectionPlan(collect=False, reason="validation", **common)
         if not collect_interval_matched:
@@ -458,6 +500,12 @@ class DrafterScheduler:
             context.schedule_context,
             context.config,
         )
+        # Freeze gate: force launch=False BEFORE prepare_training_execution so
+        # a frozen step never runs the target lm-head sync / set-global-step
+        # prepare RPCs that exist only to feed drafter training. The post-actor
+        # frozen replacement in the trainer remains as defense in depth.
+        if getattr(context, "drafter_frozen", False) and plan.launch:
+            plan = replace(plan, launch=False, reason="drafter_convergence_frozen")
         metrics: dict[str, Any] = dict(plan.metrics())
         metrics.update(self.prepare_training_execution(plan))
         return SchedulerEventOutcome(
