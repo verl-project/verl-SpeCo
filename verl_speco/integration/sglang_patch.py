@@ -558,9 +558,7 @@ def _refresh_dspark_ctx_kv_caches(model) -> None:
         stacked["weight"].copy_(kv_weight)
         if stacked["bias"] is not None:
             stacked["bias"].copy_(
-                torch.cat(
-                    [a.qkv_proj.bias[s] for a, s in zip(attns, kv_slices)], dim=0
-                )
+                torch.cat([a.qkv_proj.bias[s] for a, s in zip(attns, kv_slices)], dim=0)
             )
         stacked["k_norm_weight"].copy_(k_norm_weight)
 

@@ -118,9 +118,11 @@ def _configure_sglang_drafter_logging(config) -> None:
     # cache compiled expressions, so changing the environment alone is too late.
     ray_constants = sys.modules.get("ray._private.ray_constants")
     if ray_constants is not None:
-        ray_constants.RAY_DEDUP_LOGS_ALLOW_REGEX = os.environ[
-            "RAY_DEDUP_LOGS_ALLOW_REGEX"
-        ]
+        setattr(
+            ray_constants,
+            "RAY_DEDUP_LOGS_ALLOW_REGEX",
+            os.environ["RAY_DEDUP_LOGS_ALLOW_REGEX"],
+        )
     ray_logging = sys.modules.get("ray._private.ray_logging")
     if ray_logging is not None:
         for name in ("stdout_deduplicator", "stderr_deduplicator"):
