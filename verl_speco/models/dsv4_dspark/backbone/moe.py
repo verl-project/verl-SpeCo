@@ -42,10 +42,8 @@ class Router(nn.Module):
         nn.init.normal_(self.weight, std=float(cfg.hidden_size) ** -0.5)
         self.register_buffer("bias", torch.zeros(cfg.n_routed_experts), persistent=True)
         self.n_routed_experts = cfg.n_routed_experts
-        self._log_load = os.environ.get("DSPARK_LOG_EXPERT_LOAD") == "1"
         self._balance = os.environ.get("DSPARK_MOE_BALANCE") == "1"
         self._balance_rate = float(os.environ.get("DSPARK_MOE_BALANCE_RATE", "1e-3"))
-        self._sel_counts: torch.Tensor | None = None
         self._step_load: torch.Tensor | None = None
         self._bias_initialized = False
         # Per-rank EP routing preference. Kept OUT of the parameter/buffer state
@@ -70,16 +68,12 @@ class Router(nn.Module):
         if self.score_func != "softmax":
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
         weights = weights * self.route_scale
-        if self._log_load or (self._balance and self.training):
-            _cnt = (
+        if self._balance and self.training:
+            self._step_load = (
                 torch.bincount(indices.reshape(-1), minlength=self.n_routed_experts)
                 .detach()
                 .float()
             )
-            if self._log_load:
-                self._sel_counts = _cnt
-            if self._balance and self.training:
-                self._step_load = _cnt
         return weights, indices
 
     @torch.no_grad()

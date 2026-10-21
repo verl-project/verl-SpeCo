@@ -211,7 +211,10 @@ def _clip_dtensor_grad_norm_(parameters, max_norm: float) -> torch.Tensor:
         local_total = squared if local_total is None else local_total + squared
 
     if local_total is None:
-        return torch.zeros((), device=get_torch_device().current_device())
+        # Nothing to clip: return a plain CPU scalar (no accelerator device is
+        # required, unlike ``device=<current_device_idx>`` which fails on
+        # CPU-only torch builds). The caller only inspects ``isfinite``.
+        return torch.zeros(())
     if dist.is_initialized():
         dist.all_reduce(local_total, op=dist.ReduceOp.SUM)
     total_norm = local_total.sqrt()

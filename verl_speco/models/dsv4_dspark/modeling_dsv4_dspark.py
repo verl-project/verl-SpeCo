@@ -43,6 +43,9 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
             super().__init__(config)
         finally:
             config.num_hidden_layers = draft_depth
+        # Restore the parent's depth attribute: the zero-depth ``super().__init__``
+        # above left ``self.num_layers`` at 0, but the model depth is ``draft_depth``
+        # (self-describing attribute, not to be confused with ``config``).
         self.num_layers = draft_depth
         self.backbone_cfg = bb
         self.grad_checkpoint = bool(int(os.environ.get("DSPARK_RECOMPUTE", "0")))
@@ -203,10 +206,9 @@ class DSV4DSparkDraftModel(DSparkDraftModel):
                 )
 
     def _rope_at(self, positions: torch.Tensor) -> torch.Tensor:
-        # ``_freqs_ok`` only marks that the precomputed table is valid on the
-        # current device (EP paths rebuild it after the device move); the table
-        # itself is already sized in ``__init__``, so no rebuild is needed here.
-        self._freqs_ok = True
+        # The precomputed table is already sized in ``__init__`` (and rebuilt by
+        # the EP setup after the device move); grow it only when a position
+        # exceeds the current length.
         if positions.numel() and int(positions.max()) >= self.freqs_cis.shape[0]:
             self._rebuild_freqs(int(positions.max()) + 1)
         return self.freqs_cis.to(positions.device)[positions]

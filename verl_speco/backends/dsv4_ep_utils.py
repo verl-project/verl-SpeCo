@@ -286,7 +286,6 @@ def apply_ep_only(trainer, raw_model: torch.nn.Module, use_skip_loading: bool):
             draft_model.freqs_cis.shape[0] if hasattr(draft_model, "freqs_cis") else 1
         )
         draft_model._rebuild_freqs(max(seq_len, 1))
-        draft_model._freqs_ok = True
         if rank == 0:
             logger.info(
                 f"[EP-only] Rebuilt freqs_cis (CPU, {draft_model.freqs_cis.shape})"
@@ -488,7 +487,6 @@ def apply_ep_fsdp2(
             draft_model.freqs_cis.shape[0] if hasattr(draft_model, "freqs_cis") else 1
         )
         draft_model._rebuild_freqs(max(seq_len, 1))
-        draft_model._freqs_ok = True
         if rank == 0:
             logger.info(f"[EP] Rebuilt freqs_cis (CPU, {draft_model.freqs_cis.shape})")
 

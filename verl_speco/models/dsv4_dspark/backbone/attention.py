@@ -80,7 +80,6 @@ class LatentAttention(nn.Module):
         self.head_dim = cfg.head_dim
         self.rope_head_dim = cfg.rope_head_dim
         self.n_groups = cfg.o_groups
-        self.eps = cfg.rms_norm_eps
         self.scale = cfg.head_dim**-0.5
 
         self.wq_a = nn.Linear(cfg.hidden_size, cfg.q_lora_rank, bias=False)
