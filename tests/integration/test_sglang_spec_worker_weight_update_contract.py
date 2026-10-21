@@ -340,3 +340,97 @@ def test_runner_update_prefers_the_runner_level_method(sglang_patch) -> None:
         "ok",
     )
     assert calls == [("runner", "x")]
+
+
+def _fake_dspark_model(torch, *, with_stacked, with_bias=False):
+    """Minimal DSparkDraftMixin stand-in holding the cached KV-write copies."""
+    q_size, kv_size, hidden, n_layers = 4, 2, 3, 2
+
+    def layer():
+        attn = types.SimpleNamespace(
+            q_size=q_size,
+            kv_size=kv_size,
+            qkv_proj=types.SimpleNamespace(
+                weight=torch.zeros(q_size + 2 * kv_size, hidden),
+                bias=torch.zeros(q_size + 2 * kv_size) if with_bias else None,
+            ),
+            k_norm=types.SimpleNamespace(weight=torch.ones(kv_size)),
+        )
+        return types.SimpleNamespace(self_attn=attn)
+
+    model = types.SimpleNamespace(
+        layers=[layer() for _ in range(n_layers)],
+        _fused_kv_write_cache=None,
+        _stacked_ctx_kv_cache=None,
+    )
+    kv_rows = n_layers * 2 * kv_size
+    # The real writer builds these caches under torch.inference_mode(), which
+    # makes them inference tensors that reject in-place updates elsewhere.
+    with torch.inference_mode():
+        model._fused_kv_write_cache = (
+            1,
+            (torch.zeros(kv_rows, hidden), None, torch.ones(n_layers, kv_size)),
+        )
+        if with_stacked:
+            model._stacked_ctx_kv_cache = {
+                "weight": torch.zeros(kv_rows, hidden),
+                "bias": torch.zeros(kv_rows) if with_bias else None,
+                "k_norm_weight": torch.ones(n_layers, kv_size),
+            }
+    return model
+
+
+@pytest.mark.parametrize("with_stacked", [False, True], ids=["fused", "fused+stacked"])
+def test_draft_publish_refreshes_dspark_ctx_kv_caches(
+    sglang_patch, with_stacked
+) -> None:
+    """The cached cat/stack copies must follow an in-place weight update."""
+    import torch
+
+    model = _fake_dspark_model(torch, with_stacked=with_stacked, with_bias=with_stacked)
+    w_all, _, knw = model._fused_kv_write_cache[1]
+    w_all_ptr, knw_ptr = w_all.data_ptr(), knw.data_ptr()
+
+    def update(named_tensors, load_format):
+        for layer in model.layers:
+            attn = layer.self_attn
+            attn.qkv_proj.weight.fill_(5.0)
+            if attn.qkv_proj.bias is not None:
+                attn.qkv_proj.bias.fill_(6.0)
+            attn.k_norm.weight.fill_(7.0)
+        return True, "ok"
+
+    runner = types.SimpleNamespace(update_weights_from_tensor=update, model=model)
+    assert sglang_patch._runner_update_weights_from_tensor(runner, [], None) == (
+        True,
+        "ok",
+    )
+
+    # K/V rows only (Q rows are not cached), refreshed without moving the buffers.
+    assert torch.all(w_all == 5.0) and torch.all(knw == 7.0)
+    assert w_all.data_ptr() == w_all_ptr and knw.data_ptr() == knw_ptr
+    if with_stacked:
+        stacked = model._stacked_ctx_kv_cache
+        assert torch.all(stacked["weight"] == 5.0)
+        assert torch.all(stacked["bias"] == 6.0)
+        assert torch.all(stacked["k_norm_weight"] == 7.0)
+
+
+def test_failed_update_and_cacheless_models_skip_the_refresh(sglang_patch) -> None:
+    import torch
+
+    model = _fake_dspark_model(torch, with_stacked=False)
+    w_all = model._fused_kv_write_cache[1][0]
+    failing = types.SimpleNamespace(
+        update_weights_from_tensor=lambda named_tensors, load_format: (False, "no"),
+        model=model,
+    )
+    assert sglang_patch._runner_update_weights_from_tensor(failing, [], None) == (
+        False,
+        "no",
+    )
+    assert torch.all(w_all == 0.0)
+
+    # Target models and runners without a model carry no such cache.
+    sglang_patch._refresh_dspark_ctx_kv_caches(_FakeModel())
+    sglang_patch._refresh_dspark_ctx_kv_caches(None)

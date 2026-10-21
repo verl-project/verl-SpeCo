@@ -97,7 +97,7 @@ drafter backend you use.
 | EAGLE3 | &gt;= 0.18.0 | &gt;= 0.18.0 | &gt;= 0.5.10 |
 | DFlash | &gt;= 0.20.2 | &gt;= 0.20.2 | &gt;= 0.5.12 |
 | DFlash2 | &gt;= 0.28.0 (served as DFlash) | - | [main](https://github.com/sgl-project/sglang) (served as DFLASH; no tagged release up to 0.5.18) |
-| DSpark | GPU: [main](https://github.com/vllm-project/vllm/tree/main)<br>NPU: [`58d3918`](https://github.com/vllm-project/vllm/tree/58d3918e3ea0a544ffedadad2ba84559e9c51d8f) | NPU: [`6af9257`](https://github.com/vllm-project/vllm-ascend/tree/6af9257e449ca139ccd228f0d71ca7d2c09909c9)<br>NPU (MRV2): [`27a9476`](https://github.com/vllm-project/vllm-ascend/tree/27a94764b5ead50ed3e42ab52a257c2173032750) | - |
+| DSpark | GPU: [main](https://github.com/vllm-project/vllm/tree/main)<br>NPU: [`58d3918`](https://github.com/vllm-project/vllm/tree/58d3918e3ea0a544ffedadad2ba84559e9c51d8f) | NPU: [`6af9257`](https://github.com/vllm-project/vllm-ascend/tree/6af9257e449ca139ccd228f0d71ca7d2c09909c9)<br>NPU (MRV2): [`27a9476`](https://github.com/vllm-project/vllm-ascend/tree/27a94764b5ead50ed3e42ab52a257c2173032750) | [`76e06fe`](https://github.com/sgl-project/sglang/tree/76e06febab732d28a61b75a61b7835284568cdfb) (adapter-tested; GPU rollout unverified) |
 | Domino | DFlash-compatible runtime with Domino projector support | Runtime-specific | Runtime-specific |
 | P-EAGLE | Not wired | Not wired | Not wired |
 
