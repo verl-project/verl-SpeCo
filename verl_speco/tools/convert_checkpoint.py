@@ -119,7 +119,11 @@ def _load_state_dict(in_dir: Path):
     raise SystemExit(f"No model.safetensors[.index.json] in {in_dir}")
 
 
-def _merge_ep_expert_slices(state_dict: dict, ep_experts_dir: Path) -> dict:
+def _merge_ep_expert_slices(
+    state_dict: dict,
+    ep_experts_dir: Path,
+    expected_expert_rows: int | None = None,
+) -> dict:
     """Merge the per-rank EP expert dumps back into full stacked weights.
 
     ``dump_local_expert_slices`` writes ``ep_experts/rank_<r>.pt`` with
@@ -128,6 +132,11 @@ def _merge_ep_expert_slices(state_dict: dict, ep_experts_dir: Path) -> dict:
     the leader's slice under the same keys. Rank r owns experts
     ``[r * local, (r + 1) * local)``, so rank-ordered concat reconstructs the
     full stacked weight.
+
+    ``expected_expert_rows`` (``dsv4_n_routed_experts`` from the checkpoint
+    config, when available) is cross-checked against the reconstructed row
+    count so a missing or duplicated rank file fails loudly; the router weight
+    in the export provides the same check independently.
     """
     import torch
 
@@ -165,26 +174,30 @@ def _merge_ep_expert_slices(state_dict: dict, ep_experts_dir: Path) -> dict:
                     f"rank_{ranks[0]} {tuple(slices[0].shape)} for {key}"
                 )
         merged[key] = torch.cat(slices, dim=0).contiguous()
+    merged_rows = local_rows * len(ranks)
 
-    # Cross-check the reconstructed expert count against the router weight
-    # (``layers.{i}.ffn.router.weight`` is [n_routed_experts, hidden]), so a
+    # The router weight (``layers.{i}.ffn.router.weight`` is
+    # [n_routed_experts, hidden]) independently pins the expert count; a
     # missing or duplicated rank file cannot silently produce the wrong number
-    # of experts.
-    expected_rows = _routed_expert_rows(merged)
-    if expected_rows is not None:
-        bad = {
-            key: tuple(merged[key].shape)
-            for key in sorted(keys)
-            if merged[key].shape[0] != expected_rows
-        }
-        if bad:
+    # of experts when either this or ``expected_expert_rows`` is available.
+    router_rows = _routed_expert_rows(merged)
+    for label, expected in (
+        ("config dsv4_n_routed_experts", expected_expert_rows),
+        ("router n_routed_experts", router_rows),
+    ):
+        if expected is not None and merged_rows != int(expected):
             raise SystemExit(
-                f"Merged expert rows != router n_routed_experts {expected_rows}: "
-                + "; ".join(f"{k} -> {v}" for k, v in sorted(bad.items())[:5])
+                f"Merged expert rows {merged_rows} != {label} {int(expected)}"
             )
+    if expected_expert_rows is None and router_rows is None:
+        print(
+            "WARNING: could not validate the merged EP expert count (no router "
+            "weight in the export and no dsv4_n_routed_experts in the config); "
+            "verify the rank_*.pt set covers every expert."
+        )
     print(
         f"Merged EP expert slices: {len(keys)} tensors x {len(ranks)} ranks "
-        f"(rows {local_rows} -> {local_rows * len(ranks)})"
+        f"(rows {local_rows} -> {merged_rows})"
     )
     return merged
 
@@ -228,22 +241,22 @@ def main():
     args = ap.parse_args()
 
     in_dir = Path(args.inp)
+    src_cfg = Path(args.config_from) if args.config_from else (in_dir / "config.json")
+    cfg = (
+        json.loads(src_cfg.read_text()) if src_cfg.exists() else None
+    )
+
     sd = _load_state_dict(in_dir)
     if args.ep_experts_dir:
-        sd = _merge_ep_expert_slices(sd, Path(args.ep_experts_dir))
-        src_cfg = Path(args.config_from) if args.config_from else (in_dir / "config.json")
-        if src_cfg.exists():
-            cfg_n = json.loads(src_cfg.read_text()).get("dsv4_n_routed_experts")
-            merged_rows = _routed_expert_rows(sd)
-            if (
-                cfg_n is not None
-                and merged_rows is not None
-                and int(cfg_n) != merged_rows
-            ):
-                raise SystemExit(
-                    f"Merged expert rows {merged_rows} != config "
-                    f"dsv4_n_routed_experts {int(cfg_n)} ({src_cfg})"
-                )
+        sd = _merge_ep_expert_slices(
+            sd,
+            Path(args.ep_experts_dir),
+            expected_expert_rows=(
+                int(cfg["dsv4_n_routed_experts"])
+                if cfg and cfg.get("dsv4_n_routed_experts") is not None
+                else None
+            ),
+        )
     n_layers = _n_layers(sd)
     out, skipped, n_unstacked = convert(sd, n_layers)
 
@@ -269,9 +282,8 @@ def main():
     save_file(out, str(out_dir / "model.safetensors"), metadata={"format": "pt"})
     print(f"\nWrote {out_dir / 'model.safetensors'}")
 
-    src_cfg = Path(args.config_from) if args.config_from else (in_dir / "config.json")
-    if src_cfg.exists():
-        cfg = json.loads(src_cfg.read_text())
+    if cfg is not None:
+        cfg = dict(cfg)
         tids = cfg.get("dspark_target_layer_ids")
         if tids and not cfg.get("eagle_aux_hidden_state_layer_ids"):
             cfg["eagle_aux_hidden_state_layer_ids"] = tids

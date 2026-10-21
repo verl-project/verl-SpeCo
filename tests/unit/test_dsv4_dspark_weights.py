@@ -787,3 +787,35 @@ def test_convert_checkpoint_merge_rejects_wrong_expert_count(tmp_path):
 
     with pytest.raises(SystemExit, match="n_routed_experts"):
         _merge_ep_expert_slices(sd, ep_dir)
+
+
+def test_convert_checkpoint_merge_validates_against_config_rows(
+    tmp_path, capsys
+):
+    from verl_speco.tools.convert_checkpoint import (
+        _load_state_dict,
+        _merge_ep_expert_slices,
+    )
+
+    # No router weight in the export (e.g. a prefixed export): the config's
+    # dsv4_n_routed_experts is the fallback validation source.
+    safetensors_torch.save_file(
+        {"layers.0.ffn.experts.w1": torch.zeros(2, 3, 2)},
+        str(tmp_path / "model.safetensors"),
+    )
+    ep_dir = tmp_path / "ep_experts"
+    ep_dir.mkdir()
+    torch.save(
+        {"layers.0.ffn.experts.w1": torch.zeros(2, 3, 2)}, ep_dir / "rank_0.pt"
+    )
+    sd = _load_state_dict(tmp_path)
+
+    merged = _merge_ep_expert_slices(sd, ep_dir, expected_expert_rows=2)
+    assert merged["layers.0.ffn.experts.w1"].shape == (2, 3, 2)
+
+    with pytest.raises(SystemExit, match="dsv4_n_routed_experts 4"):
+        _merge_ep_expert_slices(sd, ep_dir, expected_expert_rows=4)
+
+    # Neither source available -> loud warning instead of a silent pass.
+    _merge_ep_expert_slices(sd, ep_dir)
+    assert "could not validate the merged EP expert count" in capsys.readouterr().out

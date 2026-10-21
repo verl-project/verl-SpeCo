@@ -1046,8 +1046,9 @@ class DrafterBaseTrainer:
     def _is_ep_active(self) -> bool:
         """EP is requested *and* possible (multi-rank process group).
 
-        Cached: both the config and the process group are static after
-        construction and this is queried on the per-step hot path.
+        Cached on first query, so it must not be called before
+        ``init_process_group`` (that would pin the result at False); every
+        current call site runs after initialization.
         """
         cached = getattr(self, "_is_ep_active_cache", None)
         if cached is None:
