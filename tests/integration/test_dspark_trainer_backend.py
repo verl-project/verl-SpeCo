@@ -2221,16 +2221,19 @@ def test_block_drafter_label_mask_keeps_shorter_sample_tail():
     assert float(batch["label_mask"][1, 5]) == 1.0
 
 
-def test_block_drafter_packing_rejects_trailing_label():
-    """Document-aware packing does not carry the trailing label token yet, so
-    the combination must fail closed instead of silently dropping it."""
+def test_block_drafter_packing_keeps_trailing_label():
+    """Document-aware packing keeps the trailing label row inside its document."""
     trainer = _label_packing_trainer()
     trainer.config.rollout.drafter.training["packing"] = {
         "enable": True,
         "max_packed_len": 0,
     }
-    with pytest.raises(NotImplementedError, match="trailing drafter label token"):
-        trainer.prepare_training_batch_from_samples([_feature_sample(5, 4)], step=0)
+    batch = trainer.prepare_training_batch_from_samples([_feature_sample(5, 4)], step=0)
+    assert batch is not None
+    doc = batch["document_ids"][0].tolist()
+    assert doc[:5] == [0] * 5
+    assert all(d == -1 for d in doc[5:])
+    assert float(batch["hidden_states"][0, 4].abs().sum()) == 0.0
 
 
 def test_block_drafter_packing_allows_equal_length_context():
