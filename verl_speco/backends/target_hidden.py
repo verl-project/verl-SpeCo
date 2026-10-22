@@ -41,3 +41,29 @@ def gather_aligned_target_hidden(
         .index_select(0, (indices + offsets).reshape(-1))
         .view(*indices.shape, hidden_size)
     )
+
+
+def normalize_raw_target_hidden(
+    verifier_norm: torch.nn.Module,
+    hidden: torch.Tensor,
+    *,
+    clip: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the frozen verifier final norm to raw vLLM final hidden rows.
+
+    Returns the sanitized hidden states and a boolean mask of rows that were
+    non-finite or exceeded ``clip`` so callers can drop them from the loss.
+    """
+    with (
+        torch.no_grad(),
+        torch.autocast(device_type=hidden.device.type, enabled=False),
+    ):
+        verifier_norm.eval()
+        hidden = verifier_norm(hidden)
+        bad_rows = ~torch.isfinite(hidden).all(dim=-1)
+        if clip is not None:
+            bad_rows |= hidden.float().abs().amax(dim=-1) > clip
+        hidden = torch.nan_to_num(hidden, nan=0.0, posinf=0.0, neginf=0.0)
+        if clip is not None:
+            hidden = hidden.clamp(-clip, clip)
+    return hidden, bad_rows

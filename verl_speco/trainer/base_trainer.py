@@ -3199,15 +3199,13 @@ class DrafterBaseTrainer:
             getattr(model_config, "pad_token_id", self.pad_token_id)
             or self.pad_token_id
         )
-        # Block drafters consume token ids and target hidden states at the same
-        # positions.  Next-token drafters need one additional input row after
-        # the hidden-state window.
+        # Only DSpark carries its trailing label separately (``next_token_ids``),
+        # so it alone keeps context tokens aligned one-to-one with hidden rows.
+        # Every other drafter (including DFlash, DFlash2 and Domino) keeps the
+        # trailing label row in ``input_ids`` (one row longer than the hidden
+        # window), which the block-drafter batch builder exposes as label_ids.
         model_type = getattr(self.backend, "model_type", None)
-        # Domino also shifts its labels by one token, so it keeps the trailing
-        # label row in ``input_ids`` (one row longer than the hidden window).
-        input_hidden_row_delta = (
-            0 if self._is_block_drafter_backend() and model_type != "domino" else 1
-        )
+        input_hidden_row_delta = 0 if model_type == "dspark" else 1
         # DSpark keeps context tokens aligned one-to-one with hidden rows, but
         # its labels are shifted by one token. Reserve the trailing token
         # separately instead of exposing it as an extra context row.

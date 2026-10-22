@@ -33,7 +33,10 @@ from verl_speco.backends.lk_loss import (
 )
 from verl_speco.backends.lr_scheduler import build_drafter_lr_scheduler
 from verl_speco.backends.optimizers import build_drafter_optimizer
-from verl_speco.backends.target_hidden import gather_aligned_target_hidden
+from verl_speco.backends.target_hidden import (
+    gather_aligned_target_hidden,
+    normalize_raw_target_hidden,
+)
 from verl_speco.models.dflash import (
     DFlashConfig,
     DFlashDraftModel,
@@ -339,8 +342,16 @@ class DFlashTrainingModel(nn.Module):
         lk_loss_type: str = "alpha",
         lk_hybrid_eta: float = 3.0,
         lk_chunk_size: int = 1024,
+        verifier_norm: torch.nn.Module | None = None,
+        target_hidden_clip_value: float | None = None,
     ):
         super().__init__()
+        self.verifier_norm = (
+            verifier_norm.eval().requires_grad_(False)
+            if verifier_norm is not None
+            else None
+        )
+        self.target_hidden_clip_value = target_hidden_clip_value
         self.draft_model = draft_model
         self.config = draft_model.config
         self.block_size = block_size
@@ -652,6 +663,8 @@ class DFlashTrainingModel(nn.Module):
         document_ids: torch.Tensor | None = None,
         label_ids: torch.Tensor | None = None,
         label_mask: torch.Tensor | None = None,
+        target_hidden_is_raw: bool = False,
+        hidden_source: str | None = None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -719,6 +732,22 @@ class DFlashTrainingModel(nn.Module):
             label_mask.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
         )
         weight_mask = weight_mask * original_loss_mask
+        if target_hidden_is_raw:
+            if (
+                hidden_source != "standalone_vllm_reference"
+                or self.verifier_norm is None
+            ):
+                raise ValueError(
+                    "Raw DFlash targets require the standalone vLLM file model path"
+                )
+            if aligned_target_hidden is None:
+                raise ValueError("Target final norm requires target_last_hidden_states")
+            aligned_target_hidden, bad_target_rows = normalize_raw_target_hidden(
+                self.verifier_norm,
+                aligned_target_hidden,
+                clip=self.target_hidden_clip_value,
+            )
+            weight_mask = weight_mask * (~bad_target_rows).float()
         binary_eval_mask = weight_mask.view(-1)
         base_loss_mask = weight_mask.clone()
 
@@ -1505,8 +1534,32 @@ class DFlashTrainerBackend:
             target_model_path, target_hf_config
         )
         training_cfg = self.config.rollout.drafter.training
+        verifier_norm = None
+        tq_expected = training_cfg.get("transfer_queue", {}).get("expected_feature", {})
+        if (
+            training_cfg.get("mode") == "offline"
+            and training_cfg.get("feature_store", {}).get("type")
+            in {"tq", "ray_reference"}
+            and not training_cfg.get("use_logits", False)
+            and tq_expected.get("payload_kind") == "vllm_reference"
+            and tq_expected.get("hidden_states_layout") == "dflash_aux_plus_last"
+        ):
+            from verl_speco.trainer.target_feature_replay import load_vllm_final_norm
+
+            verifier_norm = load_vllm_final_norm(
+                target_model_path,
+                dtype=torch.bfloat16,
+                trust_remote_code=bool(
+                    self.config.model.get("trust_remote_code", False)
+                ),
+            )
+        clip = training_cfg.get("hidden_state_clip_value", 1.0e4)
         return DFlashTrainingModel(
             draft_model=draft_model,
+            verifier_norm=verifier_norm,
+            target_hidden_clip_value=float(clip)
+            if clip is not None and float(clip) > 0
+            else None,
             block_size=int(training_cfg.get("dflash_block_size", 16)),
             num_anchors=int(training_cfg.get("dflash_num_anchors", 512)),
             loss_decay_gamma=float(training_cfg.get("dflash_loss_decay_gamma", 7.0)),
@@ -1686,6 +1739,34 @@ class DFlashTrainerBackend:
 
         hidden_states_list = list(hidden_states.split(per_layer_dim, dim=-1))
 
+        target_norm_kwargs = {}
+        if batch.get("last_hidden_state_norm") not in {
+            None,
+            "target_final_norm",
+            "raw_target_residual",
+        }:
+            raise ValueError("Unknown DFlash final hidden state")
+        if batch.get("last_hidden_state_norm") == "raw_target_residual":
+            training = self.config.rollout.drafter.training
+            if (
+                batch.get("hidden_source") != "standalone_vllm_reference"
+                or training.get("mode") != "offline"
+                or training.get("feature_store", {}).get("type")
+                not in {"tq", "ray_reference"}
+                or training.get("use_logits", False)
+                or training.get("transfer_queue", {})
+                .get("expected_feature", {})
+                .get("payload_kind")
+                != "vllm_reference"
+            ):
+                raise ValueError(
+                    "Raw DFlash targets are restricted to standalone vLLM file input"
+                )
+            target_norm_kwargs = {
+                "target_hidden_is_raw": True,
+                "hidden_source": batch["hidden_source"],
+            }
+
         loss, accuracy, loss_pp, acc_pp, count_pp, diagnostics = model(
             input_ids=batch["input_ids"],
             hidden_states_list=hidden_states_list,
@@ -1695,6 +1776,7 @@ class DFlashTrainerBackend:
             document_ids=batch.get("document_ids"),
             label_ids=batch.get("label_ids"),
             label_mask=batch.get("label_mask"),
+            **target_norm_kwargs,
         )
         local_num_tokens = count_pp.sum().to(loss.device, dtype=loss.dtype)
         return {

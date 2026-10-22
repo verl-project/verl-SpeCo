@@ -369,6 +369,114 @@ def test_dflash_trailing_label_token_is_supervised() -> None:
     assert 12 in captured["targets"].tolist()
 
 
+def _collection_trainer(model_type: str) -> DrafterBaseTrainer:
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(model_type=model_type)
+    trainer.config = OmegaConf.create(
+        {"rollout": {"drafter": {"training": {"use_logits": False}}}}
+    )
+    trainer.copy_stream = None
+    trainer.rank = 0
+    trainer.pad_token_id = 0
+    trainer.model_config = None
+    trainer.current_rl_step = 0
+    trainer.use_data_buffer = False
+    trainer.collected_data = []
+    trainer.buffer_version = 0
+    return trainer
+
+
+def _collect_two_response_tokens(model_type: str) -> dict:
+    trainer = _collection_trainer(model_type)
+    trainer.collect_online_data(
+        {
+            "input_ids": torch.tensor([[10, 11, 12]]),
+            "prompts": torch.tensor([[10]]),
+            "responses": torch.tensor([[11, 12]]),
+        },
+        torch.randn(1, 2, 4),
+    )
+    assert len(trainer.collected_data) == 1
+    return trainer.collected_data[0]
+
+
+def test_dflash_collection_keeps_trailing_label_for_sampler() -> None:
+    """One prompt token + two response tokens + two hidden rows must keep the
+    trailing label so the DFlash anchor sampler still finds a valid anchor."""
+    item = _collect_two_response_tokens("dflash")
+    assert item["input_ids"].tolist() == [10, 11, 12]
+    assert item["hidden_states"].size(0) == 2
+
+    config = DFlashConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=16,
+        num_target_layers=4,
+        num_context_layers=1,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1],
+        mask_token_id=15,
+    )
+    model = DFlashTrainingModel(
+        draft_model=DFlashDraftModel(config), block_size=2, num_anchors=2
+    )
+    label_mask = (item["loss_mask"] > 0).float().unsqueeze(0)
+    _, keep = model._sample_anchor_positions(
+        item["input_ids"].numel(), label_mask, torch.device("cpu")
+    )
+    assert int(keep.sum()) >= 1
+
+
+def test_dspark_collection_keeps_context_aligned_with_hidden_rows() -> None:
+    item = _collect_two_response_tokens("dspark")
+    assert item["input_ids"].tolist() == [10, 11]
+    assert item["next_token_ids"].tolist() == [11, 12]
+
+
+def test_dflash_raw_target_hidden_requires_standalone_reference_source() -> None:
+    config = DFlashConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=16,
+        num_target_layers=4,
+        num_context_layers=1,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1],
+        mask_token_id=15,
+    )
+    norm = nn.LayerNorm(8)
+    model = DFlashTrainingModel(
+        draft_model=DFlashDraftModel(config),
+        block_size=2,
+        num_anchors=2,
+        lk_loss_alpha=1.0,
+        verifier_norm=norm,
+        target_hidden_clip_value=1.0e4,
+    )
+    model.eval()
+    kwargs = dict(
+        input_ids=torch.tensor([[10, 11, 12]]),
+        hidden_states_list=[torch.randn(1, 3, 8)],
+        loss_mask=torch.ones(1, 3),
+        lm_head_weight=torch.randn(config.vocab_size, 8),
+        target_last_hidden_states=torch.randn(1, 3, 8),
+        target_hidden_is_raw=True,
+    )
+    with pytest.raises(ValueError, match="standalone vLLM"):
+        model(**kwargs, hidden_source="co_train")
+    outputs = model(**kwargs, hidden_source="standalone_vllm_reference")
+    assert torch.isfinite(outputs[0])
+
 class _RecordingLayer(nn.Module):
     def __init__(self):
         super().__init__()

@@ -60,7 +60,7 @@ def prepare_standalone_cpu_batch(
         raise ValueError("Reference prefetch requires full feature alignment")
     valid_layouts = {
         "DSPARK": {"dflash_aux", "dflash_aux_plus_last"},
-        "DFLASH": {"dflash_aux"},
+        "DFLASH": {"dflash_aux", "dflash_aux_plus_last"},
         "EAGLE3": {"eagle3_aux_plus_last"},
     }
     if feature_contract.hidden_states_layout not in valid_layouts[algorithm]:
