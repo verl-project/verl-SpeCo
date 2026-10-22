@@ -944,6 +944,9 @@ def test_dspark_confidence_only_batch_includes_target_last_hidden_states():
 
     trainer = object.__new__(base_trainer.DrafterBaseTrainer)
     trainer.backend = _FakeBackend()
+    trainer._bubble_time_enabled = False
+    trainer._active_training_reservation_id = None
+    trainer._active_training_target_version = None
     trainer.batch_size = 1
     trainer.current_rl_step = 0
     trainer.training_steps = 0

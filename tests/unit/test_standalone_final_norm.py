@@ -68,7 +68,8 @@ def test_prepared_batch_runs_actual_optimizer_step_without_old_prepare_state(bat
     from contextlib import nullcontext
 
     cls = _load_class("verl_speco/trainer/base_trainer.py", "DrafterBaseTrainer",
-                      {"_training_step_on_batch"}, {"time": time, "device_name": "cpu"})
+                      {"_training_step_on_batch", "_clip_training_grad_norm"},
+                      {"time": time, "device_name": "cpu"})
     trainer = cls()
     trainer.model = torch.nn.Linear(2, 1, bias=False)
     with torch.no_grad():

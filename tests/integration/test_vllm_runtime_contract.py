@@ -26,8 +26,8 @@ from textwrap import dedent
 from types import SimpleNamespace
 
 import pytest
-
 import verl_speco.integration.vllm_runtime as vllm_runtime
+
 
 from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_REQUEST_STATS_TRACE_HEADER,
@@ -41,6 +41,7 @@ from verl_speco.integration.vllm_runtime import (
     _decode_vllm_request_stats_trace_header,
     _describe_vllm_draft_logits,
     _dspark_confidence_head_enabled,
+    _ensure_vllm_server_drafter_env,
     _invoke_bucket_received_callback,
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
@@ -48,6 +49,8 @@ from verl_speco.integration.vllm_runtime import (
     _pop_vllm_request_stats_for_rollout_output,
     _record_vllm_request_acceptance_stats,
     _record_vllm_spec_decode_scheduler_stats,
+    _rollout_idle_event_bus_name,
+    _rollout_idle_worker_id_for_replica,
     _record_vllm_worker_spec_decode_output,
     _speco_can_use_npu_target_staging,
     _speco_npu_target_staging,
@@ -74,6 +77,25 @@ from verl_speco.integration.vllm_runtime import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_drafter_config_environment(monkeypatch):
+    # Bubble's generate wrapper now reads this config before upstream generate.
+    # Track both names even when initially absent: legacy tests can write them
+    # through os.environ rather than monkeypatch and leave non-JSON sentinels.
+    monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, "")
+    monkeypatch.setenv("VERL_SPECO_SGLANG_DRAFTER_CONFIG", "")
+    from verl_speco.integration.phase_timing import logger
+
+    saved = list(logger.handlers), logger.level, logger.disabled, logger.propagate
+    yield
+    for handler in list(logger.handlers):
+        if handler not in saved[0]:
+            logger.removeHandler(handler)
+            handler.close()
+    logger.setLevel(saved[1])
+    logger.disabled, logger.propagate = saved[2:]
+
+
 def _drafter(**overrides):
     config = {
         "enable": True,
@@ -97,6 +119,254 @@ def test_vllm_speculative_config_maps_eagle3_contract() -> None:
         "model": "/models/drafter",
         "num_speculative_tokens": 3,
     }
+
+
+def test_vllm_rollout_idle_event_config_maps_replica_to_worker() -> None:
+    drafter_cfg = _drafter(
+        training={
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {
+                    "event_bus_name": "bubble-bus",
+                    "training_groups": [["worker-0", "worker-1"]],
+                },
+            }
+        }
+    )
+
+    assert _rollout_idle_event_bus_name(drafter_cfg) == "bubble-bus"
+    assert _rollout_idle_worker_id_for_replica(drafter_cfg, 1) == "worker-1"
+
+
+def test_vllm_server_restores_idle_event_config_from_server_config(monkeypatch) -> None:
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    drafter_cfg = _drafter(
+        training={
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {"event_bus_name": "bubble-bus"},
+            }
+        }
+    )
+
+    resolved, source = _ensure_vllm_server_drafter_env(
+        {"rollout": {"drafter": drafter_cfg}}
+    )
+
+    assert source == "server_config"
+    assert _rollout_idle_event_bus_name(resolved) == "bubble-bus"
+
+
+def test_vllm_server_uses_embedded_runtime_config_when_server_config_is_stale(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    stale_config = _drafter(training={"scheduler": {}})
+    runtime_config = _drafter(
+        training={
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {"event_bus_name": "runtime-bubble-bus"},
+            }
+        }
+    )
+
+    resolved, source = _ensure_vllm_server_drafter_env(
+        {"rollout": {"drafter": stale_config}},
+        json.dumps(runtime_config),
+    )
+
+    assert source == "server_class"
+    assert _rollout_idle_event_bus_name(resolved) == "runtime-bubble-bus"
+
+
+@pytest.mark.parametrize("pre_remote_patch", [False, True])
+def test_merged_server_launch_restores_bubble_config_before_initial_draft(
+    monkeypatch, pre_remote_patch
+):
+    drafter = _drafter(
+        speculative_algorithm="DSPARK",
+        training={
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {"event_bus_name": "merge-bubble-bus"},
+            }
+        },
+    )
+    monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, json.dumps(drafter))
+    monkeypatch.setattr(
+        vllm_runtime, "install_vllm_runtime_observability", lambda: None
+    )
+    monkeypatch.setattr(
+        vllm_runtime,
+        "_ensure_vllm_drafter_speculative_config_from_env",
+        lambda cfg: None,
+    )
+
+    class Upstream:
+        async def launch_server(self):
+            return "launched"
+
+        async def run_server(self, args):
+            pass
+
+        async def generate(self, request_id):
+            return SimpleNamespace(extra_fields={})
+
+    if pre_remote_patch:
+        assert vllm_runtime._patch_upstream_vllm_http_server_methods(Upstream)
+    cls = vllm_runtime._build_speco_vllm_http_server_class(
+        SimpleNamespace(vLLMHttpServer=Upstream)
+    )
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV)
+    server = cls()
+    server.config = {"name": "vllm"}
+    assert asyncio.run(server.launch_server()) == "launched"
+    assert (
+        _rollout_idle_event_bus_name(vllm_runtime._load_env_drafter_config())
+        == "merge-bubble-bus"
+    )
+    assert server._speco_initial_draft_weights_required
+    assert not server._speco_initial_draft_weights_ready
+
+
+def test_sync_generation_does_not_enter_bubble_lease(monkeypatch):
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: _drafter())
+    monkeypatch.setattr(
+        vllm_runtime,
+        "_speco_generate_with_idle_lease",
+        lambda *args: pytest.fail("Sync must not acquire a Bubble lease"),
+    )
+
+    class Upstream:
+        async def generate(self, request_id):
+            return SimpleNamespace(extra_fields={})
+
+    class Server(_SpecoVLLMHttpServerMixin, Upstream):
+        pass
+
+    assert asyncio.run(Server().generate("sync-request")).extra_fields is not None
+
+
+@pytest.mark.parametrize("pre_remote_patch", [False, True])
+def test_vllm_idle_event_waits_for_all_replica_requests(
+    monkeypatch, pre_remote_patch
+) -> None:
+    gates = {"a": asyncio.Event(), "b": asyncio.Event()}
+
+    class _BaseServer:
+        async def generate(self, request_id):
+            await gates[request_id].wait()
+            return SimpleNamespace(extra_fields={})
+
+    class _Server(_SpecoVLLMHttpServerMixin, _BaseServer):
+        replica_rank = 0
+
+    events = []
+    monkeypatch.setattr(
+        vllm_runtime,
+        "_load_env_drafter_config",
+        lambda: _drafter(
+            training={
+                "scheduler": {
+                    "execution": {"strategy": "rollout_idle_worker"},
+                    "idle_worker": {"enabled": True},
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_runtime,
+        "_emit_rollout_idle_worker_event",
+        lambda **kwargs: events.append(kwargs["event_type"]) or True,
+    )
+    if pre_remote_patch:
+        _BaseServer.launch_server = _SpecoVLLMHttpServerMixin.launch_server
+        _BaseServer.run_server = _SpecoVLLMHttpServerMixin.run_server
+        assert vllm_runtime._patch_upstream_vllm_http_server_methods(_BaseServer)
+        server = _BaseServer()
+    else:
+        server = _Server()
+
+    async def scenario():
+        first = asyncio.create_task(server.generate("a"))
+        second = asyncio.create_task(server.generate("b"))
+        await asyncio.sleep(0)
+        assert events == ["GENERATION_STARTED"]
+        gates["a"].set()
+        await first
+        assert events == ["GENERATION_STARTED"]
+        gates["b"].set()
+        await second
+
+    asyncio.run(scenario())
+    assert events == ["GENERATION_STARTED", "WORKER_IDLE"]
+
+
+def test_vllm_failed_request_does_not_claim_memory_release(monkeypatch) -> None:
+    class _BaseServer:
+        async def generate(self, *args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("generation failed")
+
+    class _Server(_SpecoVLLMHttpServerMixin, _BaseServer):
+        replica_rank = 0
+
+    events = []
+    monkeypatch.setattr(
+        vllm_runtime,
+        "_load_env_drafter_config",
+        lambda: _drafter(
+            training={
+                "scheduler": {
+                    "execution": {"strategy": "rollout_idle_worker"},
+                    "idle_worker": {"enabled": True},
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_runtime,
+        "_emit_rollout_idle_worker_event",
+        lambda **kwargs: events.append(kwargs) or True,
+    )
+
+    with pytest.raises(RuntimeError, match="generation failed"):
+        asyncio.run(_Server().generate("request-0"))
+
+    assert events[-1]["event_type"] == "WORKER_IDLE"
+    assert events[-1]["memory_released"] is False
+    assert events[-1]["release_source"] == "runtime_request_failed"
+
+
+def test_vllm_runtime_idle_event_does_not_predict_deadline(monkeypatch) -> None:
+    payloads = []
+    monkeypatch.setattr(
+        vllm_runtime,
+        "emit_rollout_idle_event",
+        lambda _bus, payload: payloads.append(payload) or True,
+    )
+
+    emitted = vllm_runtime._emit_rollout_idle_worker_event(
+        drafter_cfg=_drafter(
+            training={
+                "scheduler": {
+                    "execution": {"strategy": "rollout_idle_worker"},
+                    "idle_worker": {
+                        "event_bus_name": "bubble-bus",
+                        "initial_batch_estimate_sec": 9.0,
+                    },
+                }
+            }
+        ),
+        replica_rank=0,
+        event_type="WORKER_IDLE",
+        memory_released=True,
+        release_source="runtime_request_complete",
+    )
+
+    assert emitted is True
+    assert payloads[-1]["must_be_ready_at"] is None
 
 
 def test_vllm_fresh_training_does_not_load_checkpoint_output_root() -> None:
@@ -363,7 +633,153 @@ def test_vllm_generate_cleans_only_current_request_stats(failure_mode) -> None:
         _pop_vllm_request_stats_for_rollout_output(other_request_id)
 
 
-def test_vllm_generate_cancellation_preserves_concurrent_request_stats() -> None:
+async def _wait_for_generate_staging(staged, tasks):
+    ready = asyncio.gather(*(event.wait() for event in staged.values()))
+    try:
+        done, _ = await asyncio.wait(
+            [ready, *tasks], timeout=5, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in tasks:
+            if task in done:
+                task.result()  # Surface generation errors before waiting forever.
+        assert ready in done, "Generation did not stage request statistics in time"
+        await ready
+    finally:
+        ready.cancel()
+        await asyncio.gather(ready, return_exceptions=True)
+
+
+def test_generate_staging_wait_surfaces_failure_before_event():
+    async def run():
+        async def fail():
+            raise RuntimeError("generation failed before staging")
+
+        task = asyncio.create_task(fail())
+        with pytest.raises(RuntimeError, match="before staging"):
+            await asyncio.wait_for(
+                _wait_for_generate_staging({"request": asyncio.Event()}, [task]),
+                timeout=1,
+            )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_generation_diagnostics_preserve_sync_calls_and_output(monkeypatch, enabled):
+    from verl_speco.integration import generation_diagnostics as diagnostics
+
+    monkeypatch.setenv("VERL_SPECO_PHASE_TIMING", str(enabled).lower())
+    records = []
+    monkeypatch.setattr(
+        diagnostics,
+        "emit_summary",
+        lambda kind, **fields: records.append((kind, fields)),
+    )
+    output = SimpleNamespace(extra_fields={}, token_ids=[1, 2, 3])
+    calls = []
+
+    class UpstreamServer:
+        async def generate(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return output
+
+    class Server(_SpecoVLLMHttpServerMixin, UpstreamServer):
+        pass
+
+    server = Server()
+    result = asyncio.run(server.generate([1], {"_verl_global_steps": 2}, "request"))
+    assert result is output and len(calls) == 1
+    assert calls[0] == (([1], {}, "request"), {})
+    if enabled:
+        assert [kind for kind, _ in records] == ["runtime_identity", "replica_episode"]
+        summary = records[1][1]
+        assert summary["requests"] == 1 and summary["failed"] == 0
+        assert summary["source_step_min"] == 2
+        assert summary["slowest"]["response_tokens"] == 3
+        assert summary["lease_acquire_sum_s"] == 0
+        assert "generate_s" in summary["slowest"]
+    else:
+        assert not records and not hasattr(server, "_speco_generation_request_summary")
+
+
+def test_generation_diagnostics_separate_lease_from_raw_generate(monkeypatch):
+    from verl_speco.integration import generation_diagnostics as diagnostics
+
+    monkeypatch.setenv("VERL_SPECO_PHASE_TIMING", "true")
+    clock = [0.0]
+    monkeypatch.setattr(vllm_runtime.time, "perf_counter", lambda: clock[0])
+    records, calls = [], []
+    monkeypatch.setattr(
+        diagnostics,
+        "emit_summary",
+        lambda kind, **fields: records.append(fields)
+        if kind == "replica_episode"
+        else None,
+    )
+    config = _drafter(
+        training={
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {"event_bus_name": "test-bus"},
+            }
+        }
+    )
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: config)
+
+    async def acquire(*args, **kwargs):
+        calls.append("acquire")
+        clock[0] += 3.0
+        return True, 3.0
+
+    async def release(*args, **kwargs):
+        calls.append("release")
+        clock[0] += 2.0
+        return True
+
+    monkeypatch.setattr(vllm_runtime, "acquire_rollout_resource_lease", acquire)
+    monkeypatch.setattr(vllm_runtime, "release_rollout_resource_lease", release)
+
+    class UpstreamServer:
+        async def generate(self, *args, **kwargs):
+            calls.append("generate")
+            clock[0] += 7.0
+            return SimpleNamespace(extra_fields={}, token_ids=[1, 2])
+
+    class Server(_SpecoVLLMHttpServerMixin, UpstreamServer):
+        replica_rank = 1
+
+        async def _speco_ensure_initial_draft_weights(self):
+            clock[0] += 1.0
+
+    asyncio.run(Server().generate([1], {"_verl_global_steps": 3}, "id"))
+    assert calls == ["acquire", "generate", "release"]
+    assert len(records) == 1
+    trace = records[0]["slowest"]
+    assert trace["initialize_s"] == 2.0
+    assert trace["lease_acquire_s"] == 3.0
+    assert trace["lease_acquire_called"] and trace["lease_acquired"]
+    assert records[0]["lease_acquire_calls"] == 1
+    assert trace["generate_s"] == 7.0
+    assert trace["release_s"] == 2.0
+    assert trace["total_s"] == 14.0 and trace["wrapper_s"] == 0.0
+
+
+@pytest.mark.parametrize("diagnostic_enabled", [False, True])
+def test_vllm_generate_cancellation_preserves_concurrent_request_stats(
+    monkeypatch, diagnostic_enabled
+) -> None:
+    from verl_speco.integration import generation_diagnostics as diagnostics
+
+    monkeypatch.setenv("VERL_SPECO_PHASE_TIMING", str(diagnostic_enabled).lower())
+    records = []
+    monkeypatch.setattr(
+        diagnostics,
+        "emit_summary",
+        lambda kind, **fields: records.append(fields)
+        if kind == "replica_episode"
+        else None,
+    )
+
     async def run_requests():
         staged = {
             request_id: asyncio.Event()
@@ -398,7 +814,7 @@ def test_vllm_generate_cancellation_preserves_concurrent_request_stats() -> None
         )
         active_task = asyncio.create_task(server.generate(request_id="active-request"))
         try:
-            await asyncio.gather(*(event.wait() for event in staged.values()))
+            await _wait_for_generate_staging(staged, [cancelled_task, active_task])
             cancelled_task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await cancelled_task
@@ -423,6 +839,11 @@ def test_vllm_generate_cancellation_preserves_concurrent_request_stats() -> None
             _pop_vllm_request_stats_for_rollout_output("active-request")
 
     asyncio.run(run_requests())
+    if diagnostic_enabled:
+        assert len(records) == 1
+        assert records[0]["requests"] == 2 and records[0]["failed"] == 1
+    else:
+        assert not records
 
 
 @pytest.mark.parametrize("stats_transport", ["staged", "output"])
@@ -1493,6 +1914,28 @@ def test_vllm_http_actor_installs_import_guard_before_deserialization() -> None:
     assert json.loads(json.dumps(runtime_env)) == runtime_env
 
 
+@pytest.mark.parametrize("actor_override", [None, "false"])
+def test_vllm_server_forwards_generation_diagnostics_without_overriding_actor_env(
+    monkeypatch, actor_override
+):
+    monkeypatch.setenv("VERL_SPECO_PHASE_TIMING", "true")
+
+    class Actor:
+        def options(self, **options):
+            return options
+
+    env = {} if actor_override is None else {"VERL_SPECO_PHASE_TIMING": actor_override}
+    options = vllm_runtime._SpecoVLLMHttpServerActorClass(Actor()).options(
+        runtime_env={"env_vars": env}
+    )
+    assert options["runtime_env"]["env_vars"]["VERL_SPECO_PHASE_TIMING"] == (
+        actor_override or "true"
+    )
+    assert env == (
+        {} if actor_override is None else {"VERL_SPECO_PHASE_TIMING": actor_override}
+    )
+
+
 def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(
     monkeypatch, tmp_path
 ) -> None:
@@ -1667,6 +2110,130 @@ def test_vllm_acceptance_stats_keep_stable_transport_keys() -> None:
     }
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_request_engine_timing_is_opt_in_and_drained(monkeypatch, enabled):
+    from verl_speco.integration import generation_diagnostics
+
+    monkeypatch.setenv("VERL_SPECO_PHASE_TIMING", str(enabled).lower())
+    traces = []
+    monkeypatch.setattr(
+        generation_diagnostics,
+        "record_request",
+        lambda owner, trace, **kwargs: traces.append(dict(trace)),
+    )
+    monkeypatch.setattr(generation_diagnostics, "flush_requests", lambda owner: None)
+
+    class Engine:
+        def generate(self, *args, **kwargs):
+            async def outputs():
+                yield SimpleNamespace(
+                    finished=True,
+                    metrics=SimpleNamespace(
+                        arrival_time=1.0,
+                        first_scheduled_time=2.0,
+                        first_token_time=3.0,
+                        last_token_time=4.0,
+                        finished_time=5.0,
+                    ),
+                )
+
+            return outputs()
+
+    class Upstream:
+        async def generate(self, *args, **kwargs):
+            async for _ in self.engine.generate(request_id=kwargs["request_id"]):
+                pass
+            return SimpleNamespace(extra_fields={"global_steps": 1})
+
+    class Server(_SpecoVLLMHttpServerMixin, Upstream):
+        pass
+
+    server = Server()
+    server.engine = Engine()
+    output = asyncio.run(server.generate(request_id="timing-request"))
+    assert output.extra_fields["global_steps"] == 1
+    assert not getattr(server, "_speco_vllm_request_engine_timings", {})
+    if enabled:
+        assert traces[0]["engine_timing"] == {
+            "queue_s": 1.0,
+            "time_to_first_token_s": 2.0,
+            "decode_span_s": 1.0,
+            "request_span_s": 4.0,
+        }
+    else:
+        assert not traces
+
+
+@pytest.mark.parametrize("mode", ["recent", "metrics_missing", "no_final", "failure"])
+def test_engine_diagnostic_status_and_cleanup_preserve_serving(monkeypatch, mode):
+    from verl_speco.integration import generation_diagnostics
+
+    monkeypatch.setenv("VERL_SPECO_PHASE_TIMING", "true")
+    traces = []
+    monkeypatch.setattr(
+        generation_diagnostics,
+        "record_request",
+        lambda owner, trace, **kwargs: traces.append((dict(trace), kwargs["failed"])),
+    )
+    monkeypatch.setattr(generation_diagnostics, "flush_requests", lambda owner: None)
+    monkeypatch.setattr(
+        generation_diagnostics, "emit_runtime_identity", lambda *args: None
+    )
+
+    class Engine:
+        def generate(self, *args, **kwargs):
+            async def outputs():
+                yield SimpleNamespace(
+                    finished=mode != "no_final",
+                    metrics=None
+                    if mode == "metrics_missing"
+                    else SimpleNamespace(
+                        arrival_time=1792495000.0,
+                        queued_ts=100.0,
+                        scheduled_ts=102.0,
+                        first_token_ts=103.0,
+                        last_token_ts=110.0,
+                        first_token_latency=3.5,
+                    ),
+                )
+
+            return outputs()
+
+    class Upstream:
+        async def generate(self, *args, **kwargs):
+            async for _ in self.engine.generate(request_id=kwargs["request_id"]):
+                pass
+            if mode == "failure":
+                raise RuntimeError("original serving failure")
+            return SimpleNamespace(extra_fields={"global_steps": 1})
+
+    class Server(_SpecoVLLMHttpServerMixin, Upstream):
+        pass
+
+    server = Server()
+    server.engine = Engine()
+    if mode == "failure":
+        with pytest.raises(RuntimeError, match="original serving failure"):
+            asyncio.run(server.generate(request_id="diagnostic"))
+    else:
+        asyncio.run(server.generate(request_id="diagnostic"))
+    trace, failed = traces[0]
+    assert failed == (mode == "failure")
+    expected = {
+        "recent": "available",
+        "failure": "available",
+        "metrics_missing": "metrics_missing",
+        "no_final": "final_output_not_seen",
+    }
+    assert trace["engine_timing_status"]["state"] == expected[mode]
+    if mode in {"recent", "failure"}:
+        assert trace["engine_timing"]["queue_s"] == 2.0
+        assert trace["engine_timing"]["decode_span_s"] == 7.0
+    else:
+        assert "engine_timing" not in trace
+    assert not server._speco_vllm_request_engine_timings
+
+
 def test_vllm_http_server_transports_final_request_acceptance_stats() -> None:
     class Engine:
         def generate(self, *args, **kwargs):
@@ -1746,6 +2313,41 @@ def test_vllm_worker_output_records_acceptance_once_per_tp_group(monkeypatch) ->
     )
     assert [item[1]["num_accepted_tokens"] for item in recorded] == [2, 0]
     assert [item[1]["num_draft_tokens"] for item in recorded] == [3, 2]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_sidecar_io_diagnostics_do_not_change_counter_payload(
+    monkeypatch, tmp_path, enabled
+):
+    from verl_speco.integration import generation_diagnostics
+
+    monkeypatch.setenv("VERL_SPECO_PHASE_TIMING", str(enabled).lower())
+    calls = []
+    monkeypatch.setattr(
+        generation_diagnostics,
+        "record_sidecar_io",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    runtime = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            additional_config={
+                vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY: str(tmp_path)
+            }
+        ),
+        _speco_spec_decode_total_drafts=4,
+        _speco_spec_decode_total_accepted=8,
+        _speco_spec_decode_total_draft_tokens=28,
+    )
+    assert vllm_runtime._write_vllm_spec_decode_sidecar(runtime)
+    assert vllm_runtime.read_vllm_spec_decode_sidecar_totals(str(tmp_path)) == {
+        "drafts": 4.0,
+        "accepted_tokens": 8.0,
+        "draft_tokens": 28.0,
+    }
+    assert bool(calls) == enabled
+    if enabled:
+        assert calls[0][1]["succeeded"]
+        assert calls[0][0][2] >= 0
 
 
 def test_vllm_acceptance_sidecar_is_independent_of_log_stats(

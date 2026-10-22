@@ -248,6 +248,26 @@ def test_online_training_accepts_all_v1_modes(mode):
     SpecoV1Mixin._speco_validate_v1_training_config(_config(mode=mode))
 
 
+@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+@pytest.mark.parametrize("nested", [True, False])
+def test_online_training_rejects_bubble_before_worker_setup(mode, nested):
+    config = _config(mode=mode)
+    training = config.actor_rollout_ref.rollout.drafter.training
+    if nested:
+        training["scheduler"] = {"execution": {"strategy": "rollout_idle_worker"}}
+    else:
+        training["execution_strategy"] = "rollout_idle_worker"
+
+    class Harness(SpecoV1Mixin):
+        def _speco_install_v1_standalone_publish_worker(self):
+            pytest.fail("unsupported configuration must fail before worker setup")
+
+    trainer = Harness()
+    trainer.config = config
+    with pytest.raises(ValueError, match="V1 does not support Bubble Time"):
+        trainer._setup()
+
+
 @pytest.fixture
 def old_policy_trainer():
     class Worker:
@@ -1008,8 +1028,8 @@ def test_setup_resolves_drafter_before_upstream_and_creates_worker_after(monkeyp
 
     assert Harness()._setup() == "ready"
     assert events == [
-        "install_standalone_publish_worker",
         "validate",
+        "install_standalone_publish_worker",
         "state",
         "resume",
         "configure",
