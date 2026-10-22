@@ -21,6 +21,8 @@ from .schedule_types import (
     CollectionPlan,
     CollectionPayload,
     CollectionWorkerResult,
+    AvailableTrainingResources,
+    IdleWindowConfidence,
     DrafterCollectionContext,
     DrafterCollectionSource,
     DrafterExecutionStrategy,
@@ -29,6 +31,8 @@ from .schedule_types import (
     DrafterTrainingDataSource,
     ProducerAction,
     PublishPlan,
+    RolloutWorkerEvent,
+    RolloutWorkerEventType,
     QueueScheduleContext,
     QueueScheduleConfig,
     QueueStatus,
@@ -52,7 +56,11 @@ from .lifecycle import (
     BeforeActorUpdateContext,
     SchedulerEventOutcome,
 )
-from .collection_strategy import CollectionOutcome, DrafterCollectionStrategy
+from .collection_strategy import (
+    CollectionFinalizeError,
+    CollectionOutcome,
+    DrafterCollectionStrategy,
+)
 from .collection_adapter import DrafterCollectionAdapter
 from .training_outcome import TrainingOutcome
 from .standalone_executor import (
@@ -69,11 +77,14 @@ from .standalone_executor import (
 __all__ = [
     "AfterActorUpdateContext",
     "AfterWeightUpdateContext",
+    "AvailableTrainingResources",
+    "IdleWindowConfidence",
     "BeforeActorUpdateContext",
     "CollectionPlan",
     "CollectionPayload",
     "CollectionWorkerResult",
     "CollectionOutcome",
+    "CollectionFinalizeError",
     "ConservativeTrainingDataStatusPolicy",
     "CallbackDrafterWorkerExecutor",
     "CallbackDrafterCollectionExecutor",
@@ -96,6 +107,8 @@ __all__ = [
     "DrafterCollectionStrategy",
     "DrafterPublishExecutor",
     "PublishPlan",
+    "RolloutWorkerEvent",
+    "RolloutWorkerEventType",
     "ProducerAction",
     "QueueScheduleContext",
     "QueueScheduleConfig",

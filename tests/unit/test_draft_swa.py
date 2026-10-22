@@ -745,6 +745,8 @@ def test_prepare_training_batch_carries_document_ids_to_final_batch() -> None:
 
     trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
     trainer.backend = _FakeBackend()
+    trainer._active_training_reservation_id = None
+    trainer._bubble_time_enabled = False
     trainer.batch_size = 1
     trainer.current_rl_step = 0
     trainer.training_steps = 0

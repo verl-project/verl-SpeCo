@@ -38,6 +38,9 @@ _CURRENT_GLOBAL_STEPS = contextvars.ContextVar(
     "speco_current_global_steps", default=None
 )
 _CURRENT_VALIDATE = contextvars.ContextVar("speco_current_validate", default=False)
+_CURRENT_SKIP_DRAFTER_COLLECTION = contextvars.ContextVar(
+    "speco_current_skip_drafter_collection", default=False
+)
 # Fixed paired-probe batches (RFC sec. 6) force greedy sampling and a length
 # cap so the two arms are comparable and cheap regardless of val_kwargs.
 _CURRENT_PROBE_MAX_TOKENS = contextvars.ContextVar(
@@ -114,7 +117,9 @@ def _ensure_extra_field_defaults(result: Any) -> Any:
 
     for key in _DEFAULT_EXTRA_KEYS:
         if key not in non_tensor_batch:
-            values = np.empty(batch_len, dtype=object)
+            values: np.ndarray[Any, np.dtype[np.object_]] = np.empty(
+                batch_len, dtype=object
+            )
             values[:] = [None for _ in range(batch_len)]
             non_tensor_batch[key] = values
     return result
@@ -127,20 +132,26 @@ def _sampling_params_with_speco_context(sampling_params: Any) -> Any:
     global_steps = _CURRENT_GLOBAL_STEPS.get()
     if global_steps is not None:
         patched.setdefault("_verl_global_steps", global_steps)
-    if bool(_CURRENT_VALIDATE.get()):
+    validate = bool(_CURRENT_VALIDATE.get())
+    skip_collection = bool(_CURRENT_SKIP_DRAFTER_COLLECTION.get())
+    if validate or skip_collection:
         patched["_verl_skip_drafter_collection"] = True
     return patched
 
 
 def _sampling_params_with_speco_step(
-    sampling_params: Any, *, global_steps: Any, validate: bool
+    sampling_params: Any,
+    *,
+    global_steps: Any,
+    validate: bool,
+    skip_drafter_collection: bool = False,
 ) -> Any:
     if not isinstance(sampling_params, dict):
         return sampling_params
     patched = dict(sampling_params)
     if global_steps is not None and global_steps != -1:
         patched["_verl_global_steps"] = global_steps
-    if validate:
+    if validate or skip_drafter_collection:
         patched["_verl_skip_drafter_collection"] = True
     return patched
 
@@ -178,6 +189,9 @@ def _speco_context_from_batch(batch: Any) -> tuple[Any, ...]:
     meta_info = meta_info if isinstance(meta_info, dict) else {}
     global_steps_token = _CURRENT_GLOBAL_STEPS.set(meta_info.get("global_steps"))
     validate_token = _CURRENT_VALIDATE.set(bool(meta_info.get("validate", False)))
+    skip_collection_token = _CURRENT_SKIP_DRAFTER_COLLECTION.set(
+        bool(meta_info.get("skip_drafter_collection", False))
+    )
     probe_greedy_token = _CURRENT_PROBE_GREEDY.set(
         bool(meta_info.get("_speco_freeze_probe", False))
     )
@@ -189,10 +203,13 @@ def _speco_context_from_batch(batch: Any) -> tuple[Any, ...]:
         validate_token,
         probe_greedy_token,
         probe_max_tokens_token,
+        skip_collection_token,
     )
 
 
 def _speco_reset_context(*tokens: Any) -> None:
+    if len(tokens) >= 5:
+        _CURRENT_SKIP_DRAFTER_COLLECTION.reset(tokens[4])
     if len(tokens) >= 4:
         _CURRENT_PROBE_MAX_TOKENS.reset(tokens[3])
         _CURRENT_PROBE_GREEDY.reset(tokens[2])
@@ -237,6 +254,7 @@ async def _speco_worker_run_agent_loop(
         sampling_params,
         global_steps=trajectory.get("step"),
         validate=bool(trajectory.get("validate", False)),
+        skip_drafter_collection=bool(trajectory.get("skip_drafter_collection", False)),
     )
     sampling_params = _apply_probe_sampling_overrides(sampling_params)
     run_agent_loop = _speco_parent_method(self, "_run_agent_loop")
@@ -598,6 +616,9 @@ def install_agent_loop_runtime_patch() -> bool:
                 sampling_params,
                 global_steps=trajectory.get("step"),
                 validate=bool(trajectory.get("validate", False)),
+                skip_drafter_collection=bool(
+                    trajectory.get("skip_drafter_collection", False)
+                ),
             )
             sampling_params = _apply_probe_sampling_overrides(sampling_params)
             result = run_agent_loop(self, sampling_params, trajectory, *args, **kwargs)

@@ -18,20 +18,20 @@ from types import SimpleNamespace
 
 import pytest
 
+from verl_speco.trainer.scheduler import CallbackDrafterWorkerExecutor
+
 torch = pytest.importorskip(
     "torch",
     reason="drafter runtime control contract needs PyTorch",
 )
-
-from verl_speco.trainer.scheduler import CallbackDrafterWorkerExecutor
-
 
 _speco_ray_trainer = pytest.importorskip(
     "verl_speco.trainer.speco_ray_trainer",
     reason="drafter runtime control contract needs the trainer dependency stack",
 )
 SpecoRayPPOTrainer = _speco_ray_trainer.SpecoRayPPOTrainer
-from verl_speco.trainer.base_trainer import DrafterBaseTrainer
+_base_trainer = pytest.importorskip("verl_speco.trainer.base_trainer")
+DrafterBaseTrainer = _base_trainer.DrafterBaseTrainer
 
 
 class _FakeOldLogProbBatch:
@@ -105,6 +105,8 @@ def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
     )
     trainer._pending_drafter_publish_refs = None
     trainer._pending_target_lm_head_sync = None
+    trainer._speco_ready_target_lm_head_versions = set()
+    trainer._speco_ready_target_lm_head_workers = {}
     trainer._speco_last_collected_samples = 0
     trainer._speco_get_drafter_scheduler().bind_worker_executor(
         CallbackDrafterWorkerExecutor(
@@ -228,6 +230,38 @@ def test_drafter_collect_train_and_publish_intervals() -> None:
     ).publish
 
 
+@pytest.mark.parametrize(
+    ("strategy", "expected_collect", "expected_reason"),
+    [
+        ("rollout_idle_worker", True, "collection_enabled"),
+        ("sync", False, "training_interval_not_reached"),
+    ],
+)
+def test_bubble_oldlogprob_collection_uses_only_collection_interval(
+    strategy: str,
+    expected_collect: bool,
+    expected_reason: str,
+) -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_interval_steps": 4,
+            "training_interval_steps": 6,
+            "scheduler": {"execution": {"strategy": strategy}},
+        },
+        step=4,
+    )
+
+    plan = trainer._speco_plan_drafter_collection(
+        _speco_ray_trainer.DrafterCollectionSource.OLD_LOGPROB
+    )
+
+    assert plan.collect is expected_collect
+    assert plan.collect_interval_matched
+    assert not plan.training_interval_matched
+    assert plan.reason == expected_reason
+
+
 def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     trainer = _trainer({"training_interval_steps": 5}, step=4)
     trainer._speco_last_collected_samples = 10
@@ -297,6 +331,55 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
     assert output.meta_info["metrics"]["drafter/scheduler_used"] == 1
     assert output.meta_info["metrics"]["drafter/schedule_strategy"] == 0
     assert output.meta_info["metrics"]["drafter/schedule_launch"] == 1
+
+
+def test_deferred_bubble_publish_drains_before_next_generation() -> None:
+    """A completed Bubble plan publishes before serving the next rollout."""
+    trainer = _trainer(
+        {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}},
+        step=5,
+    )
+    trainer.actor_rollout_wg = _FakeRolloutWorkerGroup()
+    trainer._compute_old_log_prob = lambda batch: batch
+    trainer._update_actor = lambda batch: batch
+    trainer.checkpoint_manager = SimpleNamespace(update_weights=lambda: None)
+    events = []
+    trainer.actor_rollout_wg.generate_sequences = lambda: (
+        events.append("generate") or SimpleNamespace(meta_info={"metrics": {}})
+    )
+    trainer._speco_get_drafter_scheduler().plan_publish = lambda **kwargs: (
+        SimpleNamespace(publish=True)
+    )
+    completed = [SimpleNamespace(plan_id="completed-quota", publish_after_success=True)]
+
+    def reclaim(*, on_completed):
+        if completed:
+            return on_completed(completed.pop(), SimpleNamespace(trained=True))
+        return {}
+
+    trainer._speco_reclaim_rollout_idle_workers_before_post_rollout = reclaim
+    trainer._speco_set_drafter_global_step = lambda **kwargs: None
+    trainer._speco_publish_drafter_weights = lambda trained, plan, **kwargs: (
+        events.append(("publish", trained, kwargs.get("after_weight_update")))
+        or {"drafter/publish_attempted": 1, "drafter/published": 1}
+    )
+    trainer._speco_reclaim_rollout_idle_workers_before_generation = lambda: {}
+    trainer._speco_emit_rollout_generation_started = lambda: {}
+    trainer._speco_start_rollout_idle_event_loop = lambda: (None, None)
+    trainer._speco_stop_rollout_idle_event_loop = lambda *args: None
+    trainer._speco_service_rollout_idle_events = lambda **kwargs: {}
+    trainer._speco_emit_rollout_generation_completed = lambda output, **kwargs: {}
+    trainer._speco_store_rollout_metrics = lambda output: None
+    trainer._speco_collect_generation_samples = lambda output: 0
+
+    with trainer._speco_online_fit_hooks():
+        trainer.actor_rollout_wg.generate_sequences()
+        assert events == ["generate"]
+        output = trainer.actor_rollout_wg.generate_sequences()
+
+    assert events == ["generate", ("publish", True, True), "generate"]
+    assert output.meta_info["metrics"]["drafter/published"] == 1
+    assert output.meta_info["metrics"]["timing_s/drafter_publish_critical_path"] >= 0.0
 
 
 @pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "veomni"])
@@ -581,6 +664,117 @@ def test_target_head_transfer_waits_after_actor_update() -> None:
 
     assert resolved == [[payload], pending_refs]
     assert metrics["drafter/target_lm_head_synced"] == 1
+
+
+def test_bubble_target_head_prefetch_resolves_fetch_before_dispatch() -> None:
+    trainer = _trainer(
+        {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}},
+        step=1,
+    )
+    payload = {"weight": "cpu-weight", "export_strategy": "full"}
+    pending_refs = [{"worker_id": "0", "accepted": True, "global_step": 1}]
+    resolved = []
+    trainer._ray_get_if_needed = lambda value: resolved.append(value) or value
+    trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
+    trainer._speco_actor_rollout_method = lambda name: lambda rows, **kwargs: [payload]
+    trainer._speco_build_drafter_target_lm_head_sync_args = lambda value, global_step=None: (
+        value,
+        trainer.global_steps,
+        1,
+    )
+    trainer.speco_sync_target_lm_head_weight = (
+        lambda value, global_step=None: pending_refs
+    )
+
+    metrics, pending = trainer._speco_start_target_lm_head_weight_sync()
+
+    assert pending is not None
+    assert pending["fetch_refs"] == [payload]
+    assert "refs" not in pending
+    assert pending["stage"] == "fetch"
+    assert pending["target_version"] == trainer.global_steps
+    # Bubble prefetch submits the actor export without blocking. The finish
+    # boundary resolves it before dispatching the snapshot to the drafter.
+    assert resolved == []
+    assert metrics["timing_s/drafter_target_lm_head_fetch_submit"] >= 0.0
+    assert metrics["timing_s/drafter_target_lm_head_prefetch_submit_critical_path"] >= 0.0
+
+    metrics.update(trainer._speco_finish_target_lm_head_weight_sync(pending))
+
+    assert resolved == [[payload], pending_refs]
+    assert metrics["drafter/target_lm_head_synced"] == 1
+
+
+def test_bubble_target_head_prefetch_ignores_transient_fallback_plan() -> None:
+    trainer = _trainer(
+        {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}},
+        step=4,
+    )
+    trainer._speco_last_collected_samples = 31
+    trainer._speco_last_collected_step = trainer.global_steps
+
+    # A scheduler event may temporarily select a synchronous fallback plan
+    # when no version is trainable.  Prefetch eligibility must continue to
+    # follow the configured Bubble mode so that the next window can recover.
+    assert trainer._speco_should_prefetch_target_lm_head()
+
+    trainer._speco_last_collected_samples = 0
+    assert not trainer._speco_should_prefetch_target_lm_head()
+
+    trainer.config.actor_rollout_ref.rollout.drafter.training = {
+        "scheduler": {"execution": {"strategy": "sync"}}
+    }
+    trainer._speco_last_collected_samples = 31
+    assert not trainer._speco_should_prefetch_target_lm_head()
+
+
+def test_bubble_target_head_ready_is_scoped_to_synced_workers() -> None:
+    trainer = _trainer(
+        {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}},
+        step=1,
+    )
+
+    trainer._speco_mark_target_lm_head_version_ready(
+        2,
+        worker_ids=("0", "1"),
+    )
+
+    assert trainer._speco_target_lm_head_ready_for_workers(2, ("0", "1"))
+    assert not trainer._speco_target_lm_head_ready_for_workers(2, ("2", "3"))
+
+    trainer._speco_mark_target_lm_head_version_ready(
+        4,
+        worker_ids=("0", "1", "2", "3"),
+    )
+
+    assert trainer._speco_target_lm_head_ready_for_workers(4, ("2", "3"))
+
+
+def test_sglang_bubble_owner_count_covers_routed_writer_owner() -> None:
+    trainer = _trainer(
+        {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}},
+        step=6,
+    )
+    trainer._speco_owner_bucket_count = lambda: 1
+
+    owner_count = trainer._speco_sglang_collection_owner_count(
+        [{"replica_rank": 0}],
+        [1],
+    )
+
+    assert owner_count == 2
+
+
+def test_sglang_sync_owner_count_keeps_replica_derived_count() -> None:
+    trainer = _trainer({"scheduler": {"execution": {"strategy": "sync"}}}, step=6)
+    trainer._speco_owner_bucket_count = lambda: 4
+
+    owner_count = trainer._speco_sglang_collection_owner_count(
+        [{"replica_rank": 0}],
+        None,
+    )
+
+    assert owner_count == 1
 
 
 def test_target_head_sync_is_skipped_when_training_uses_logits() -> None:
@@ -1165,7 +1359,6 @@ def test_request_accept_len_variance_respects_log_interval(
         step=4,
     )
 
-    batch_size = 2
     batch = SimpleNamespace(
         batch={},
         non_tensor_batch={
@@ -1230,6 +1423,7 @@ def test_rollout_diagnostic_failure_does_not_skip_collection(
     trainer._compute_old_log_prob = lambda value: value
     trainer._update_actor = lambda value: value
     trainer._speco_wait_pending_drafter_publish = lambda: None
+    trainer._speco_set_drafter_global_step = lambda **kwargs: None
     trainer._speco_store_rollout_metrics = lambda output: None
     collected_outputs = []
     trainer._speco_collect_generation_samples = (
@@ -1611,6 +1805,46 @@ def test_oldlogprob_collect_plan_tracks_short_response_skip_metric_state() -> No
     assert plan["response_lens"] == [3]
     assert plan["selected_count"] == 1
     assert trainer._speco_last_oldlogprob_short_response_skipped == 0
+
+
+def test_oldlogprob_local_batches_have_distinct_retry_stable_sample_ids() -> None:
+    from verl_speco.trainer.data_buffer import DataBuffer
+
+    trainer = _oldlogprob_collect_plan_trainer()
+    buffer = DataBuffer(max_size=10)
+    captured = []
+
+    def execute(plan, payload):
+        for bucket in payload.buckets:
+            for sample in bucket:
+                captured.append(sample["_speco_global_sample_id"])
+                buffer.add_batch(sample)
+        return SimpleNamespace(collected_samples=1)
+
+    trainer._speco_execute_collection = execute
+    output = {_speco_ray_trainer.OLD_LOGPROB_HIDDEN_STATES_KEY: torch.ones(1, 3, 2)}
+    plans = []
+    batches = []
+    # V1 parameter_sync_step > 1 keeps global_steps fixed across local batches.
+    for token in (21, 31, 41):
+        batch = SimpleNamespace(
+            batch={
+                "prompts": torch.tensor([[11, 12]]),
+                "responses": torch.tensor([[token, token + 1, token + 2]]),
+                "attention_mask": torch.ones(1, 5, dtype=torch.long),
+            }
+        )
+        plan = trainer._speco_build_oldlogprob_collect_plan(batch)
+        assert plan is not None
+        trainer._speco_collect_oldlogprob_features(batch, plan, output)
+        plans.append(plan)
+        batches.append(batch)
+
+    assert len(buffer.get_all_data()) == 3
+    assert len(set(captured)) == 3
+    trainer._speco_collect_oldlogprob_features(batches[0], plans[0], output)
+    assert captured[-1] == captured[0]
+    assert len(buffer.get_all_data()) == 3
 
 
 def test_oldlogprob_collection_omits_masked_response_token_from_payload() -> None:

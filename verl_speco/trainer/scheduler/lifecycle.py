@@ -22,10 +22,14 @@ from verl_speco.trainer.scheduler.training_outcome import TrainingOutcome
 class BeforeActorUpdateContext:
     schedule_context: DrafterScheduleContext
     config: DrafterScheduleConfig
+    allow_quota_topup: bool = True
     # Marginal-utility/legacy freeze gate, evaluated in the trainer immediately
     # before this context is built. True -> plan is forced to launch=False
     # before any worker prepare RPC (notably the target lm-head sync).
     drafter_frozen: bool = False
+    idle_continuation_plan: TrainingPlan | None = None
+    # Only the normal final PPO step may request early debt completion.
+    force_quota_completion: bool = False
 
 
 @dataclass(frozen=True)

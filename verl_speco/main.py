@@ -23,6 +23,21 @@ distribution aligned with verl.
 import inspect
 
 import hydra
+import os
+
+
+def drafter_diagnostic_env() -> dict[str, str]:
+    """Explicitly propagate opt-in diagnostics to the Ray actor tree."""
+    return {
+        name: os.environ[name]
+        for name in (
+            "VERL_DRAFTER_MEMORY_DIAGNOSTICS",
+            "VERL_DRAFTER_KEEP_HOT_TRIM_CACHE",
+            "VERL_SPECO_PHASE_TIMING",
+            "VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL",
+        )
+        if name in os.environ
+    }
 
 
 def _config_get(config, *path, default=None):
@@ -93,6 +108,48 @@ def _strip_speco_overlay_for_native_run(config) -> None:
             del config["speco"]
 
 
+def configure_phase_diagnostic_runtime_env(config) -> None:
+    """Keep opt-in Bubble driver diagnostics visible in Ray's root env too.
+
+    The actor-class override below is still needed for already running Ray
+    clusters. Configuring both also survives upstream wrappers that replace
+    class runtime options (for example a profiler runtime environment).
+    """
+    value = os.environ.get("VERL_SPECO_PHASE_TIMING", "")
+    if (
+        value.lower() not in {"1", "true", "yes"}
+        or _config_get(
+            config,
+            "actor_rollout_ref",
+            "rollout",
+            "drafter",
+            "training",
+            "scheduler",
+            "execution",
+            "strategy",
+            default="sync",
+        )
+        != "rollout_idle_worker"
+    ):
+        return
+    from omegaconf import OmegaConf
+
+    OmegaConf.update(
+        config,
+        "ray_kwargs.ray_init.runtime_env.env_vars.VERL_SPECO_PHASE_TIMING",
+        value,
+        force_add=True,
+    )
+    ablation = os.environ.get("VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL")
+    if ablation is not None:
+        OmegaConf.update(
+            config,
+            "ray_kwargs.ray_init.runtime_env.env_vars.VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL",
+            ablation,
+            force_add=True,
+        )
+
+
 def run(config) -> None:
     """Resolve SPECO/verl compatibility, device and the task-runner dispatch."""
 
@@ -138,7 +195,12 @@ def run(config) -> None:
 
     from verl_speco.integration.task_runner import SpecoTaskRunner
 
-    main_ppo.run_ppo(config, task_runner_class=ray.remote(num_cpus=1)(SpecoTaskRunner))
+    configure_phase_diagnostic_runtime_env(config)
+    runner = ray.remote(num_cpus=1)(SpecoTaskRunner)
+    diagnostic_env = drafter_diagnostic_env()
+    if diagnostic_env:
+        runner = runner.options(runtime_env={"env_vars": diagnostic_env})
+    main_ppo.run_ppo(config, task_runner_class=runner)
 
 
 @hydra.main(config_path="config", config_name="speco_trainer", version_base=None)
