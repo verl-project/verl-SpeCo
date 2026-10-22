@@ -4763,6 +4763,56 @@ class DrafterBaseTrainer:
             len(ids_out),
         )
 
+    @staticmethod
+    def _extend_chunks_with_trailing_labels(
+        input_id_chunks: list[torch.Tensor],
+        loss_mask_chunks: list[torch.Tensor],
+        hidden_state_chunks: list[torch.Tensor],
+        position_id_chunks: list[torch.Tensor],
+        target_last_hidden_state_chunks: list[torch.Tensor],
+        label_id_chunks: list[torch.Tensor],
+        label_mask_chunks: list[torch.Tensor],
+    ) -> tuple[
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[torch.Tensor],
+    ]:
+        """Append each sample's trailing label rows to its context chunks."""
+
+        def zeros_like_rows(chunk: torch.Tensor, n: int) -> torch.Tensor:
+            return torch.zeros(
+                (n, *chunk.shape[1:]), dtype=chunk.dtype, device=chunk.device
+            )
+
+        ids_out, mask_out, hidden_out, pos_out, target_out = [], [], [], [], []
+        for idx, ids in enumerate(input_id_chunks):
+            ext = max(int(label_id_chunks[idx].size(0)) - int(ids.size(0)), 0)
+            if ext == 0:
+                ids_out.append(ids)
+                mask_out.append(loss_mask_chunks[idx])
+                hidden_out.append(hidden_state_chunks[idx])
+                pos_out.append(position_id_chunks[idx])
+                if target_last_hidden_state_chunks:
+                    target_out.append(target_last_hidden_state_chunks[idx])
+                continue
+            real = int(ids.size(0))
+            ids_out.append(torch.cat([ids, label_id_chunks[idx][real : real + ext]]))
+            mask_out.append(
+                torch.cat(
+                    [loss_mask_chunks[idx], label_mask_chunks[idx][real : real + ext]]
+                )
+            )
+            hidden = hidden_state_chunks[idx]
+            hidden_out.append(torch.cat([hidden, zeros_like_rows(hidden, ext)]))
+            pos = position_id_chunks[idx]
+            pos_out.append(torch.cat([pos, zeros_like_rows(pos, ext)]))
+            if target_last_hidden_state_chunks:
+                target = target_last_hidden_state_chunks[idx]
+                target_out.append(torch.cat([target, zeros_like_rows(target, ext)]))
+        return ids_out, mask_out, hidden_out, pos_out, target_out
+
     def _pack_block_drafter_batch(
         self,
         input_id_chunks: list[torch.Tensor],
@@ -5456,9 +5506,8 @@ class DrafterBaseTrainer:
                 block_label_len = min(ids.size(0), item_loss_mask.size(0))
                 if block_label_len > train_seq_len:
                     trailing_label_rows += 1
-                if not packing_enabled:
-                    label_id_chunks.append(ids[:block_label_len])
-                    label_mask_chunks.append(item_loss_mask[:block_label_len])
+                label_id_chunks.append(ids[:block_label_len])
+                label_mask_chunks.append(item_loss_mask[:block_label_len])
             elif uses_shifted_eagle_inputs:
                 loss_mask_chunks.append(item_loss_mask[2 : 2 + train_seq_len])
             else:
@@ -5508,13 +5557,26 @@ class DrafterBaseTrainer:
         label_mask = None
         document_ids = None
         if packing_enabled:
-            # Packing carries context chunks only, so it cannot represent the
-            # trailing label token; refuse instead of dropping supervision.
             if trailing_label_rows:
-                raise NotImplementedError(
-                    "Document-aware packing does not support the trailing drafter "
-                    f"label token ({trailing_label_rows} sample(s) carry one); disable "
-                    "rollout.drafter.training.packing.enable for block drafters."
+                # Extend each document by its trailing label rows so they stay
+                # inside the document (same document id). The packed input ids
+                # and loss mask then double as label ids/mask; the extra rows
+                # have zero hidden states and are never attended as context
+                # (context keys precede the anchor).
+                (
+                    input_id_chunks,
+                    loss_mask_chunks,
+                    hidden_state_chunks,
+                    position_id_chunks,
+                    target_last_hidden_state_chunks,
+                ) = self._extend_chunks_with_trailing_labels(
+                    input_id_chunks,
+                    loss_mask_chunks,
+                    hidden_state_chunks,
+                    position_id_chunks,
+                    target_last_hidden_state_chunks,
+                    label_id_chunks,
+                    label_mask_chunks,
                 )
             packed = self._pack_block_drafter_batch(
                 input_id_chunks,

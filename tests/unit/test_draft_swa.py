@@ -477,6 +477,7 @@ def test_dflash_raw_target_hidden_requires_standalone_reference_source() -> None
     outputs = model(**kwargs, hidden_source="standalone_vllm_reference")
     assert torch.isfinite(outputs[0])
 
+
 class _RecordingLayer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1045,3 +1046,54 @@ def test_eagle3_lk_replay_rejects_missing_target_logz() -> None:
 
     with pytest.raises(ValueError, match="missing target_logz"):
         trainer._prepare_training_batch()
+
+
+def test_prepare_training_batch_packing_keeps_trailing_label_row() -> None:
+    seq_len, hidden = 8, 4
+    ids = torch.arange(seq_len + 1, dtype=torch.long)
+    hidden_states = torch.randn(seq_len, hidden)
+    loss_mask = torch.ones(seq_len + 1)
+
+    class _FakeBackend:
+        model_type = "dflash"
+
+        def preprocess_individual_items(self, items, dev, model_config):
+            return {
+                "ids": [ids],
+                "h_states": [hidden_states],
+                "masks": [loss_mask],
+                "position_ids": [torch.arange(seq_len, dtype=torch.long)],
+            }
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = _FakeBackend()
+    trainer._active_training_reservation_id = None
+    trainer._bubble_time_enabled = False
+    trainer.batch_size = 1
+    trainer.current_rl_step = 0
+    trainer.training_steps = 0
+    trainer.use_data_buffer = False
+    trainer.collected_data = [{"step": 0, "hidden_states": hidden_states}]
+    trainer.config = OmegaConf.create(
+        {
+            "rollout": {
+                "drafter": {
+                    "training": {
+                        "dflash_block_size": 4,
+                        "packing": {"enable": True, "max_packed_len": 0},
+                    }
+                }
+            }
+        }
+    )
+    trainer.use_ulysses_sp = False
+    trainer.rank = 0
+    trainer.model_config = None
+    trainer.model = nn.Linear(2, 2)
+
+    batch = trainer._prepare_training_batch()
+
+    assert batch is not None
+    assert batch["input_ids"][0].tolist() == list(range(seq_len + 1)) + [0, 0, 0]
+    assert batch["document_ids"][0].tolist() == [0] * (seq_len + 1) + [-1] * 3
+    assert batch["hidden_states"][0, seq_len:].abs().sum().item() == 0
