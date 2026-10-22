@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import logging
 import math
 from types import MethodType, SimpleNamespace
@@ -18,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def load_function(path, name, **bindings):
     tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
-    node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+    node = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
     node.decorator_list = []
     namespace = dict(torch=torch, F=torch.nn.functional, logging=logging, Any=Any, Optional=Optional, cast=cast,
                      logger=logging.getLogger(__name__), **bindings)
@@ -26,16 +27,20 @@ def load_function(path, name, **bindings):
     return namespace[name]
 
 
+async def _identity_async(value):
+    return value
+
+
 def test_feature_chunks_reject_partial_logz_but_allow_legacy():
     resolve = load_function("verl_speco/workers/speco_worker.py", "_resolve_feature_chunks",
-                            _resolve_ray_object_ref=lambda x: x)
+                            asyncio=asyncio, _resolve_ray_object_ref=_identity_async)
     chunks = [dict(ref=dict(hidden_states=torch.ones(2, 3), target_logz=torch.ones(2)),
                    chunk_length=2, chunk_row_indices=[0, 1]),
               dict(ref=torch.ones(2, 3), chunk_length=2, chunk_row_indices=[2, 3])]
     with pytest.raises(ValueError, match="target_logz.*chunk"):
-        resolve(chunks)
+        asyncio.run(resolve(chunks))
     chunks[0]["ref"] = torch.ones(2, 3)
-    hidden, logz = resolve(chunks)
+    hidden, logz = asyncio.run(resolve(chunks))
     assert hidden.shape == (1, 4, 3)
     assert logz is None
 
@@ -171,10 +176,10 @@ def test_shared_target_alignment_handles_noncontiguous_features_and_gradients():
 
 def test_feature_chunks_preserve_target_logz_row_order():
     resolve = load_function("verl_speco/workers/speco_worker.py", "_resolve_feature_chunks",
-                            _resolve_ray_object_ref=lambda x: x)
-    hidden, logz = resolve([
+                            asyncio=asyncio, _resolve_ray_object_ref=_identity_async)
+    hidden, logz = asyncio.run(resolve([
         dict(ref=dict(hidden_states=torch.tensor([[2., 3.], [4., 5.]]),
                       target_logz=torch.tensor([6., 7.])),
-             chunk_length=2, chunk_row_indices=[1, 0])])
+             chunk_length=2, chunk_row_indices=[1, 0])]))
     torch.testing.assert_close(hidden, torch.tensor([[[4., 5.], [2., 3.]]]))
     torch.testing.assert_close(logz, torch.tensor([[7., 6.]]))

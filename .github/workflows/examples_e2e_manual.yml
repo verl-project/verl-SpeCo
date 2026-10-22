@@ -16,6 +16,7 @@ on:
         required: true
         type: choice
         options:
+          - examples/bubble_time/run_qwen3-8b_drafter_dspark_vllm.sh
           - examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_colocate_async_vllm.sh
           - examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_separate_async_vllm.sh
           - examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_vllm.sh

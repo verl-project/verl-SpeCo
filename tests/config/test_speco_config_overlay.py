@@ -57,6 +57,22 @@ def _copy_overlay_configs(
         (composed_config_dir / config_name).write_text(config_source, encoding="utf-8")
 
 
+@pytest.mark.parametrize("value", ["true", "false"])
+def test_legacy_sync_cleanup_override_remains_composable(value: str) -> None:
+    with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
+        config = compose(
+            config_name="speco_base",
+            overrides=[
+                "actor_rollout_ref.rollout.drafter.training."
+                f"skip_heavy_cleanup_after_drafter_training={value}"
+            ],
+        )
+    assert (
+        config.actor_rollout_ref.rollout.drafter.training.skip_heavy_cleanup_after_drafter_training
+        is (value == "true")
+    )
+
+
 def test_overlay_has_expected_default_drafter_shape() -> None:
     raw = OmegaConf.load(CONFIG_DIR / "speco_base.yaml")
     drafter = raw.actor_rollout_ref.rollout.drafter

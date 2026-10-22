@@ -203,6 +203,8 @@ def test_worker_retains_error_when_second_batch_succeeds():
 
         def get_training_data_stats(self):
             return {"buffer_total": 2, "eligible_samples": 2}
+        def release_training_data_reservation(self, plan_id):
+            return 0
 
         def get_training_data_status(self, **kwargs):
             return {"trainable_samples": 0}
@@ -218,6 +220,12 @@ def test_worker_retains_error_when_second_batch_succeeds():
         _prepared_training_plan_id="plan",
         _prepared_training_data_version=1,
         _prepared_training_target_version=1,
+        _prepared_training_activation_elapsed_sec=0.0,
+        _prepared_training_preflight_elapsed_sec=0.0,
+        _prepared_training_ready_ts=None,
+        _drafter_reclaim_requested=False,
+        _reclaim_control_lock=nullcontext,
+        _should_keep_drafter_training_hot=lambda *args, **kwargs: False,
         last_global_step=1,
         device_name="cpu",
     )
@@ -225,7 +233,11 @@ def test_worker_retains_error_when_second_batch_succeeds():
         "verl_speco/workers/speco_worker.py",
         "SpecoWorker",
         "train_drafter",
-        {"time": time, "_preserve_process_rng_state": lambda device: nullcontext()},
+        {
+            "time": time,
+            "logger": logging.getLogger(__name__),
+            "_preserve_process_rng_state": lambda device: nullcontext(),
+        },
     )
     plan = {
         "plan_id": "plan",

@@ -116,6 +116,7 @@ def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
         step["run"] for step in unit_job["steps"] if "pytest" in step.get("run", "")
     )
     assert "tests/unit" in shlex.split(unit_run)
+    assert "tests/integration" in shlex.split(unit_run)
     assert not any(arg.startswith("tests/unit/") for arg in shlex.split(unit_run))
     assert "requirements-unit.txt" in source
     assert "tests/ci" not in source

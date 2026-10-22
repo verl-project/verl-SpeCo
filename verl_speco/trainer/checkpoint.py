@@ -42,6 +42,21 @@ class DrafterCheckpointMetadataError(ValueError):
     """Raised when a managed drafter checkpoint has invalid metadata."""
 
 
+def validate_checkpoint_buffer_ownership(state: dict[str, Any]) -> None:
+    """Legacy partial Bubble checkpoints cannot restore their replay owners."""
+    for sample in state.get("data_buffer", []):
+        if not isinstance(sample, dict):
+            continue
+        if sample.get("_drafter_reserved_by") is not None or sample.get(
+            "_drafter_replay_pinned", False
+        ):
+            raise DrafterCheckpointMetadataError(
+                "Checkpoint contains unfinished Bubble replay ownership. "
+                "Resume from a checkpoint saved after quota publication; "
+                "clearing replay pins would silently discard unfinished training."
+            )
+
+
 def _managed_checkpoint_step(path: str) -> Optional[int]:
     match = _DRAFT_STEP_PATTERN.match(os.path.basename(os.path.normpath(path)))
     return int(match.group(1)) if match is not None else None

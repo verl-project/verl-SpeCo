@@ -587,6 +587,17 @@ class SpecoV1Mixin:
             drafter.get("enable_drafter_training", False)
         ):
             return
+        from verl_speco.trainer.scheduler import DrafterScheduleConfig
+
+        if (
+            DrafterScheduleConfig.from_mapping(training).execution_strategy.value
+            == "rollout_idle_worker"
+        ):
+            raise ValueError(
+                "verl V1 does not support Bubble Time (rollout_idle_worker): "
+                "the rollout idle event bus lifecycle is not integrated; "
+                "use scheduler.execution.strategy=sync or the legacy trainer"
+            )
         if bool(training.get("collect_hidden_states_from_sgl", False)):
             raise ValueError(
                 "verl V1 online SPECO training currently requires "
@@ -617,6 +628,7 @@ class SpecoV1Mixin:
             )
 
     def _setup(self):
+        self._speco_validate_v1_training_config(self.config)
         from verl_speco.integration.vllm_runtime import (
             configure_vllm_runtime_from_config,
         )
@@ -625,7 +637,6 @@ class SpecoV1Mixin:
         # construction, otherwise its CheckpointEngineWorker actors are already
         # fixed without the draft-publication facade.
         self._speco_install_v1_standalone_publish_worker()
-        self._speco_validate_v1_training_config(self.config)
         self._speco_init_state()
         if self._speco_online_enabled_from_config(self.config):
             # Resolve a resumed draft checkpoint before V1 creates the rollout
@@ -1282,9 +1293,16 @@ class SpecoV1Mixin:
         """Read cumulative EngineCore counters when RequestOutput has no stats."""
 
         from verl_speco.integration.vllm_runtime import (
+            _drafter_config_from_config,
+            _vllm_acceptance_sidecar_enabled,
             SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY,
             read_vllm_spec_decode_sidecar_totals,
         )
+
+        if not _vllm_acceptance_sidecar_enabled(
+            _drafter_config_from_config(self.config)
+        ):
+            return {}
 
         run_dir = getattr(
             getattr(getattr(self, "config", None), "trainer", None),
