@@ -93,9 +93,19 @@ def test_sglang_acceptance_stats_use_vllm_compatible_transport_keys() -> None:
             "layers.0.self_attn.q_proj.weight",
         ),
         (
-            "_orig_mod.draft_model.candidate_selector.predecessor_codebook.weight",
+            "candidate_selector.predecessor_codebook.weight",
             "DFLASH2",
             "candidate_selector.predecessor_codebook",
+        ),
+        (
+            "midlayer.self_attn.q_proj.weight",
+            "EAGLE3",
+            "midlayer.self_attn.q_proj.weight",
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.weight",
+            "DFLASH",
+            "model.layers.0.self_attn.q_proj.weight",
         ),
     ],
 )

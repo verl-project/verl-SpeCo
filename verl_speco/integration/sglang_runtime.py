@@ -922,6 +922,11 @@ def _validate_sglang_dspark_config(drafter_cfg: dict[str, Any]) -> int:
     )
     if gamma is None:
         raise ValueError("SGLang DSpark requires positive rollout.spec_verify_tokens")
+    rollout_cfg = drafter_cfg.get("rollout") or {}
+    for key in ("spec_steps", "spec_topk"):
+        value = rollout_cfg.get(key)
+        if value is not None and int(value) != 1:
+            raise ValueError(f"SGLang DSpark requires rollout.{key}=1, got {value}")
 
     config_path = os.path.join(os.fspath(model_path), "config.json")
     if os.path.isfile(config_path):
@@ -1220,29 +1225,27 @@ def speco_sglang_draft_weight_loader(model, named_tensors):
 def _sglang_draft_param_name(name: str, algorithm: str) -> str:
     """Translate trainer parameter names to the SGLang draft namespace."""
 
-    translated = name
-    strip_prefixes: tuple[str, ...] = (
-        "module.",
-        "_orig_mod.",
-        "draft_model.",
-        "model.draft_model.",
-    )
-    if algorithm in {"DFLASH", "DFLASH2", "DSPARK"}:
-        strip_prefixes = (*strip_prefixes, "model.")
-    changed = True
-    while changed:
-        changed = False
-        for prefix in strip_prefixes:
-            if translated.startswith(prefix):
-                translated = translated[len(prefix) :]
-                changed = True
-    if "midlayer." in translated:
-        translated = translated.replace("midlayer.", "layers.0.")
-    if algorithm in {"DFLASH", "DFLASH2"}:
-        from verl_speco.integration.vllm_runtime import _dflash2_engine_param_name
+    if algorithm == "DSPARK":
+        translated = name
+        strip_prefixes = (
+            "module.",
+            "_orig_mod.",
+            "draft_model.",
+            "model.draft_model.",
+            "model.",
+        )
+        changed = True
+        while changed:
+            changed = False
+            for prefix in strip_prefixes:
+                if translated.startswith(prefix):
+                    translated = translated[len(prefix) :]
+                    changed = True
+        return translated.replace("midlayer.", "layers.0.")
 
-        translated = _dflash2_engine_param_name(translated)
-    return translated
+    from verl_speco.integration.vllm_runtime import _dflash2_engine_param_name
+
+    return _dflash2_engine_param_name(name)
 
 
 @functools.lru_cache(maxsize=1)
@@ -1985,7 +1988,16 @@ class _SpecoSGLangHttpServerMixin:
         drafter_cfg = self._speco_drafter_cfg()
         training_cfg = drafter_cfg.get("training") or {}
         uses_dflash_aux_hidden = _drafter_uses_dflash_aux_hidden(drafter_cfg)
-        if not bool(drafter_cfg.get("enable")):
+        collect_hidden_states = bool(
+            drafter_cfg.get("enable")
+            and drafter_cfg.get("enable_drafter_training")
+            and training_cfg.get("collect_hidden_states_from_sgl")
+        )
+        is_dspark = bool(drafter_cfg.get("enable")) and (
+            str(drafter_cfg.get("speculative_algorithm", "") or "").upper()
+            == "DSPARK"
+        )
+        if not (collect_hidden_states or is_dspark):
             return await cast(Any, super()).generate(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(sampling_params),
@@ -1993,10 +2005,6 @@ class _SpecoSGLangHttpServerMixin:
                 image_data=image_data,
                 video_data=video_data,
             )
-        collect_hidden_states = bool(
-            drafter_cfg.get("enable_drafter_training")
-            and training_cfg.get("collect_hidden_states_from_sgl")
-        )
 
         original_sampling_params = sampling_params
         request_global_steps = original_sampling_params.get("_verl_global_steps")
