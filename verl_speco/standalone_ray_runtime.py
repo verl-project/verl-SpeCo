@@ -207,6 +207,7 @@ class StandaloneProducerActor:
             "kind": "samples_ready",
             "batch_id": self._reference_batch_id,
             "entries": entries,
+            "sent_at": time.monotonic(),
         }
         metrics = {"attempts": 0.0, "transport_seconds": 0.0, "retry_wait_seconds": 0.0}
         last_finished: float | None = None
@@ -602,6 +603,7 @@ class StandaloneRayTrainer:
         last_published_total = 0
         last_reference_batch_id = -1
         seen_file_keys: set[str] = set()
+        reference_received_times: dict[str, tuple[float, float]] = {}
         shutdown_entries: dict[str, ReadyEntry] = {}
         trackers: list[Any] = []
 
@@ -670,6 +672,17 @@ class StandaloneRayTrainer:
                     for rank_entries in assignments
                 ],
             }
+            if hidden_references:
+                now = time.monotonic()
+                received = [
+                    reference_received_times.pop(entry.key)
+                    for entry in selected_entries
+                ]
+                command["delivery_times"] = {
+                    "metadata_event_age_time": max(age for _, age in received),
+                    "scheduler_ready_wait_time": now - max(at for at, _ in received),
+                }
+                command["dispatched_at"] = now
             retry_io(
                 lambda: put_queue(
                     self.commands_queue,
@@ -906,13 +919,15 @@ class StandaloneRayTrainer:
                     from verl_speco.transport.drafter_sample_protocol import (
                         SampleMetadata,
                         make_sample_key,
-                        validate_reference_tag,
+                        validate_reference_envelope,
                     )
 
                     incoming = []
+                    received_at = time.monotonic()
+                    event_age = received_at - float(event.get("sent_at", received_at))
                     for item in event["entries"]:
                         tag = item["tag"]
-                        validate_reference_tag(tag)
+                        validate_reference_envelope(tag)
                         meta = SampleMetadata.from_dict(tag)
                         key = str(item["key"])
                         if meta.run_id != store.run_id or key != make_sample_key(meta):
@@ -921,6 +936,7 @@ class StandaloneRayTrainer:
                             )
                         if key not in seen_file_keys:
                             incoming.append(ReadyEntry(key, tag))
+                            reference_received_times[key] = (received_at, event_age)
                             seen_file_keys.add(key)
                     plans.refresh([*plans.ready, *incoming])
                     ready_hint += len(incoming)

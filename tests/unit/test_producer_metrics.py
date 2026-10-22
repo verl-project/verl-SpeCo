@@ -114,3 +114,34 @@ def test_single_tracker_accepts_both_streams_and_records_safe_config(monkeypatch
     assert tracker.config["standalone_training"] == {"lr": 1e-6, "algorithm": "DSPARK"}
     assert tracker.config["trainer"]["project_name"] == "test"
     assert [call["step"] for call in tracker.calls] == [100, 3]
+
+
+def test_http_occupancy_is_time_weighted_and_survives_window_reset(monkeypatch):
+    import verl_speco.producer.metrics as module
+    clock = [0.0]
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    stats = module.ProducerDiagnostics()
+    clock[0] = 1
+    stats.http_start()
+    clock[0] = 3
+    stats.http_start()
+    clock[0] = 4
+    stats.http_finish()
+    stats.loop_lag(0.2)
+    stats.loop_lag(0.4)
+    clock[0] = 5
+    first = stats.snapshot()
+    assert first["http_inflight_avg"] == 1.0
+    assert first["http_inflight_peak"] == 2
+    assert first["http_inflight_now"] == 1
+    assert first["http_calls"] == 2
+    assert first["loop_lag_avg"] == pytest.approx(0.3)
+    assert first["loop_lag_max"] == 0.4
+    clock[0] = 7
+    stats.http_finish()
+    clock[0] = 8
+    second = stats.snapshot()
+    assert second["http_inflight_avg"] == pytest.approx(2 / 3)
+    assert second["http_inflight_peak"] == 1
+    assert second["http_inflight_now"] == second["http_calls"] == 0
+    assert second["loop_lag_max"] == 0

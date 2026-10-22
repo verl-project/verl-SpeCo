@@ -21,7 +21,7 @@ import time
 from collections import deque
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from queue import Empty
 from typing import Any
@@ -54,6 +54,7 @@ class TQLocalBatch:
     batch_prepare_seconds: float = 0.0
     file_entries: list[ReadyEntry] | None = None
     cleanup_after_load: bool = False
+    delivery_times: dict[str, float] = field(default_factory=dict)
 
 
 def build_assignments(
@@ -258,6 +259,11 @@ class TQFeatureDataLoader:
                 or len(wire_assignments) != self.world_size
             ):
                 raise RuntimeError("TQ loader received malformed rank assignments")
+            delivery_times = dict(command.get("delivery_times", {}))
+            if "dispatched_at" in command:
+                delivery_times["command_delivery_time"] = (
+                    time.monotonic() - command["dispatched_at"]
+                )
             local_entries = [
                 _entry_from_wire(item) for item in wire_assignments[self.rank]
             ]
@@ -321,6 +327,7 @@ class TQFeatureDataLoader:
                 batch_prepare_seconds=batch_prepare_seconds,
                 file_entries=local_entries if not materialize else None,
                 cleanup_after_load=cleanup_after_load,
+                delivery_times=delivery_times,
             )
             cycle_started_at = time.perf_counter()
             command_wait_seconds = 0.0
@@ -505,6 +512,7 @@ class TQPrefetchIterator:
                     if self._pin_thread is None:
                         self._batches.append(batch)
                     else:
+                        batch.delivery_times["_pin_queued_at"] = time.monotonic()
                         self._pin_batches.append(batch)
                     self._condition.notify_all()
         except BaseException as exc:  # noqa: BLE001 - surface worker failures in the main thread
@@ -545,14 +553,23 @@ class TQPrefetchIterator:
                         return
                     batch = self._pin_batches.popleft()
                 started = time.perf_counter()
+                delivery_times = dict(batch.delivery_times)
+                queued_at = delivery_times.pop("_pin_queued_at", None)
+                if queued_at is not None:
+                    delivery_times["loader_pin_queue_time"] = (
+                        time.monotonic() - queued_at
+                    )
                 if batch.prepared_batch is None:
                     raise RuntimeError("File pinning received no prepared batch")
                 pinned = {
                     key: value.pin_memory() if torch.is_tensor(value) else value
                     for key, value in batch.prepared_batch.items()
                 }
+                delivery_times["loader_pin_time"] = time.perf_counter() - started
+                delivery_times["_ready_at"] = time.monotonic()
                 batch = replace(
                     batch,
+                    delivery_times=delivery_times,
                     prepared_batch=pinned,
                     batch_prepare_seconds=batch.batch_prepare_seconds
                     + time.perf_counter()
@@ -579,6 +596,12 @@ class TQPrefetchIterator:
             self._condition.wait_for(lambda: bool(self._batches) or self._done)
             if self._batches:
                 batch = self._batches.popleft()
+                if self._pin_thread is not None:
+                    ready_at = batch.delivery_times.pop("_ready_at", None)
+                    if ready_at is not None:
+                        batch.delivery_times["loader_ready_queue_time"] = (
+                            time.monotonic() - ready_at
+                        )
                 self._reserved -= 1
                 self._condition.notify_all()
                 return batch

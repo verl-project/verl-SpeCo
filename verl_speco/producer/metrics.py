@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 
@@ -60,6 +61,17 @@ def producer_window_metrics(
         "publish_encode",
         "publish_transport",
         "publish_retry_wait",
+        "input_dispatch",
+        "input_get_wait",
+        "prefill_global_wait",
+        "prefill_endpoint_wait",
+        "prefill_http",
+        "prefill_retry_backoff",
+        "metadata_build",
+        "publish_enqueue",
+        "publish_residence",
+        "publish_batch_wait",
+        "metadata_ready_delay",
     ):
         if any(key in t for t in timings):
             metrics[f"producer/{key}_time"] = average(key)
@@ -68,3 +80,55 @@ def producer_window_metrics(
         metrics["producer/metadata_batch_size"] = average("metadata_batch_size")
         metrics["producer/metadata_submit_time"] = average("metadata_submit")
     return metrics
+
+
+class ProducerDiagnostics:
+    """Event-loop-local counters; HTTP occupancy is weighted by wall time."""
+
+    def __init__(self):
+        self._started = self._changed = time.monotonic()
+        self.http_inflight = 0
+        self._area = 0.0
+        self._peak = 0
+        self._calls = 0
+        self._lag_sum = self._lag_max = 0.0
+        self._lag_count = 0
+
+    def http_start(self):
+        self._update_area()
+        self.http_inflight += 1
+        self._peak = max(self._peak, self.http_inflight)
+        self._calls += 1
+
+    def http_finish(self):
+        self._update_area()
+        self.http_inflight -= 1
+
+    def _update_area(self):
+        now = time.monotonic()
+        self._area += (now - self._changed) * self.http_inflight
+        self._changed = now
+
+    def loop_lag(self, seconds):
+        self._lag_sum += seconds
+        self._lag_max = max(self._lag_max, seconds)
+        self._lag_count += 1
+
+    def snapshot(self, *, reset=True):
+        now = time.monotonic()
+        area = self._area + (now - self._changed) * self.http_inflight
+        result = {
+            "http_inflight_avg": area / max(now - self._started, 1e-9),
+            "http_inflight_peak": self._peak,
+            "http_inflight_now": self.http_inflight,
+            "http_calls": self._calls,
+            "loop_lag_avg": self._lag_sum / max(self._lag_count, 1),
+            "loop_lag_max": self._lag_max,
+        }
+        if reset:
+            self._started = self._changed = now
+            self._area = 0.0
+            self._peak = self.http_inflight
+            self._calls = self._lag_count = 0
+            self._lag_sum = self._lag_max = 0.0
+        return result
