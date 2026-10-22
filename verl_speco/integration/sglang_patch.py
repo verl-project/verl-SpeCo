@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import textwrap
+from contextlib import contextmanager
 from functools import wraps
 from typing import Any, Callable, Iterable, TypeGuard, cast
 
@@ -563,6 +564,42 @@ def _refresh_dspark_ctx_kv_caches(model) -> None:
         stacked["k_norm_weight"].copy_(k_norm_weight)
 
 
+@contextmanager
+def _dspark_partial_confidence_load(model):
+    """Keep checkpoint validation strict, but permit incremental tensor buckets."""
+    original_load = getattr(model, "_load_confidence_weights", None)
+    if not callable(original_load):
+        yield
+        return
+
+    # DSpark's checkpoint loader requires all confidence parameters on every
+    # call. A weight-sync bucket contains only a subset; validate/load that
+    # subset while retaining unknown-name and tensor-shape checks upstream.
+    had_instance_override = "_load_confidence_weights" in vars(model)
+    instance_override = vars(model).get("_load_confidence_weights")
+
+    def load_partial_confidence_weights(*, confidence_weights, params_dict):
+        confidence_weights = list(confidence_weights)
+        supplied_names = {name for name, _ in confidence_weights}
+        partial_params = {
+            name: param
+            for name, param in params_dict.items()
+            if not name.startswith("confidence_head.") or name in supplied_names
+        }
+        return original_load(
+            confidence_weights=confidence_weights, params_dict=partial_params
+        )
+
+    model._load_confidence_weights = load_partial_confidence_weights
+    try:
+        yield
+    finally:
+        if had_instance_override:
+            model._load_confidence_weights = instance_override
+        else:
+            del model._load_confidence_weights
+
+
 def _runner_update_weights_from_tensor(runner, named_tensors, load_format):
     """Load tensors through a model runner on either sglang generation.
 
@@ -572,7 +609,9 @@ def _runner_update_weights_from_tensor(runner, named_tensors, load_format):
     update = getattr(runner, "update_weights_from_tensor", None)
     if update is None:
         update = runner.weight_updater.update_weights_from_tensor
-    result = update(named_tensors=named_tensors, load_format=load_format)
+    model = getattr(runner, "model", None)
+    with _dspark_partial_confidence_load(model):
+        result = update(named_tensors=named_tensors, load_format=load_format)
     if result and result[0]:
         _refresh_dspark_ctx_kv_caches(getattr(runner, "model", None))
     return result

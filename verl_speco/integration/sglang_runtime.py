@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import dataclasses
 import functools
 import hashlib
@@ -128,6 +129,7 @@ _SPECO_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
 
 _SERVER_ARGS_PATCHED = False
 _SGLANG_REPLICA_PATCHED = False
+_VERL_SGLANG_LAUNCH = contextvars.ContextVar("speco_verl_sglang_launch", default=False)
 
 
 def _sglang_spec_decode_extra_fields(meta_info: Any) -> dict[str, float]:
@@ -240,7 +242,12 @@ def _install_verl_launch_subprocesses_compat() -> None:
             except (TypeError, ValueError):
                 server_args = kwargs.get("server_args")
             _apply_drafter_config_at_scheduler_boundary(server_args)
-            return original_launcher(*args, **kwargs)
+            result = original_launcher(*args, **kwargs)
+            # verl unpacks the third item as scheduler_info, while native
+            # Engine callers still need SGLang's original tuple unchanged.
+            if _VERL_SGLANG_LAUNCH.get():
+                return _verl_sglang_launch_result(result)
+            return result
 
         setattr(engine_cls, "_speco_original_launch_subprocesses", original_launcher)
         setattr(
@@ -270,14 +277,17 @@ def _install_verl_launch_subprocesses_compat() -> None:
             getattr(engine_cls, "run_detokenizer_process_func", None)
             or http_server.run_detokenizer_process,
         )
-        result = launcher(*args, **kwargs)
-        if len(result) >= 4 and hasattr(result[3], "scheduler_infos"):
-            scheduler_infos = result[3].scheduler_infos
-            scheduler_info = scheduler_infos[0] if scheduler_infos else {}
-            return result[:2] + (scheduler_info,) + result[2:]
-        return result
+        return _verl_sglang_launch_result(launcher(*args, **kwargs))
 
     setattr(http_server, "_launch_subprocesses", _launch_subprocesses)
+
+
+def _verl_sglang_launch_result(result):
+    if len(result) >= 4 and hasattr(result[3], "scheduler_infos"):
+        scheduler_infos = result[3].scheduler_infos
+        scheduler_info = scheduler_infos[0] if scheduler_infos else {}
+        return result[:2] + (scheduler_info,) + result[2:]
+    return result
 
 
 def _apply_drafter_config_at_scheduler_boundary(server_args: Any) -> None:
@@ -1844,7 +1854,11 @@ class _SpecoSGLangHttpServerMixin:
         if upstream_module is not None:
             _install_verl_server_args_fields_compat(upstream_module)
         _install_verl_launch_subprocesses_compat()
-        return await upstream_launch_server(*args, **kwargs)
+        launch_token = _VERL_SGLANG_LAUNCH.set(True)
+        try:
+            return await upstream_launch_server(*args, **kwargs)
+        finally:
+            _VERL_SGLANG_LAUNCH.reset(launch_token)
 
     def _speco_drafter_cfg(self) -> dict[str, Any]:
         cached_cfg = getattr(self, "_speco_drafter_config", None)

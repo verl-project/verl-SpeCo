@@ -870,6 +870,76 @@ def test_verl_legacy_launcher_applies_drafter_config_at_scheduler_boundary(
     assert server_args.enable_draft_weights_cpu_backup is True
 
 
+@pytest.mark.parametrize("modern_result", [False, True])
+@pytest.mark.parametrize("module_entry", [False, True])
+@pytest.mark.parametrize("fail_launch", [False, True])
+def test_verl_launch_adapts_engine_result_only_in_actor_context(
+    monkeypatch, modern_result, module_entry, fail_launch
+) -> None:
+    http_server = types.ModuleType("sglang.srt.entrypoints.http_server")
+    scheduler_info = {"max_total_num_tokens": 1024}
+    original_result = ("tokenizer", "template", scheduler_info, "port", "watchdog")
+    if modern_result:
+        original_result = (
+            "tokenizer",
+            "template",
+            "port",
+            types.SimpleNamespace(scheduler_infos=[scheduler_info]),
+            "watchdog",
+            [],
+        )
+
+    class Engine:
+        @classmethod
+        def _launch_subprocesses(cls, *, server_args, **kwargs):
+            return original_result
+
+    http_server.Engine = Engine
+    for name in (
+        "init_tokenizer_manager",
+        "run_scheduler_process",
+        "run_detokenizer_process",
+    ):
+        setattr(http_server, name, object())
+    monkeypatch.setitem(sys.modules, http_server.__name__, http_server)
+    monkeypatch.setattr(
+        sglang_runtime, "install_sglang_server_actor_runtime", lambda: {}
+    )
+    monkeypatch.setattr(
+        sglang_runtime, "_apply_drafter_config_at_scheduler_boundary", lambda _: None
+    )
+
+    class UpstreamServer:
+        async def launch_server(self):
+            launcher = (
+                http_server._launch_subprocesses
+                if module_entry
+                else Engine._launch_subprocesses
+            )
+            # Same unpacking as verl release/v0.8.0 and release/v0.9.0.
+            _, _, self.scheduler_info, *_ = launcher(server_args=object())
+            # /get_server_info requires a mapping, not PortArgs.
+            assert {**self.scheduler_info} == scheduler_info
+            if fail_launch:
+                raise RuntimeError("launch failed")
+            return self.scheduler_info
+
+    class Server(sglang_runtime._SpecoSGLangHttpServerMixin, UpstreamServer):
+        pass
+
+    if fail_launch:
+        with pytest.raises(RuntimeError, match="launch failed"):
+            asyncio.run(Server().launch_server())
+    else:
+        assert asyncio.run(Server().launch_server()) == scheduler_info
+
+    # Native Engine.__init__ relies on its original tuple even after a failed
+    # verl launch, and repeated installation must not double-insert metadata.
+    sglang_runtime._install_verl_launch_subprocesses_compat()
+    assert Engine._launch_subprocesses(server_args=object()) is original_result
+    assert not sglang_runtime._VERL_SGLANG_LAUNCH.get()
+
+
 def test_engine_launcher_applies_drafter_config_when_constructor_bypasses_init(
     monkeypatch,
 ) -> None:
