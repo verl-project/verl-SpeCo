@@ -741,10 +741,10 @@ class DSparkTrainingModel(DFlashTrainingModel):
         document_ids: Optional[torch.Tensor] = None,
         label_ids: Optional[torch.Tensor] = None,
         label_mask: Optional[torch.Tensor] = None,
-        next_token_ids: Optional[torch.Tensor] = None,
-        next_token_loss_mask: Optional[torch.Tensor] = None,
         target_hidden_is_raw: bool = False,
         hidden_source: Optional[str] = None,
+        next_token_ids: Optional[torch.Tensor] = None,
+        next_token_loss_mask: Optional[torch.Tensor] = None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
