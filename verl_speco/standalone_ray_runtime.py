@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from verl_speco.config import prefetch_depth
+from verl_speco.producer.metrics import current_ray_node_id
 from verl_speco.standalone_tq_training_launcher import (
     _VLLM_HIDDEN_STATES_DIR,
     PipelineCommands,
@@ -171,6 +172,7 @@ class StandaloneProducerActor:
         self._run_gate = asyncio.Event()
         self._run_gate.set()
         self._events = events
+        self._clock_node_id = current_ray_node_id()
         self._paused_at: float | None = None
         self._published_total = 0
         self._notified_published_total = 0
@@ -208,6 +210,7 @@ class StandaloneProducerActor:
             "batch_id": self._reference_batch_id,
             "entries": entries,
             "sent_at": time.monotonic(),
+            "clock_node_id": self._clock_node_id,
         }
         metrics = {"attempts": 0.0, "transport_seconds": 0.0, "retry_wait_seconds": 0.0}
         last_finished: float | None = None
@@ -555,6 +558,7 @@ class StandaloneRayTrainer:
         training_cfg = self.consumer_config.actor_rollout_ref.rollout.drafter.training
         tq_cfg = training_cfg.transfer_queue
         hidden_references = _uses_ray_reference(self.consumer_config)
+        clock_node_id = current_ray_node_id()
         source_cfg = tq_cfg
         if hidden_references:
             source_cfg = {
@@ -603,7 +607,7 @@ class StandaloneRayTrainer:
         last_published_total = 0
         last_reference_batch_id = -1
         seen_file_keys: set[str] = set()
-        reference_received_times: dict[str, tuple[float, float]] = {}
+        reference_received_times: dict[str, tuple[float, float | None]] = {}
         shutdown_entries: dict[str, ReadyEntry] = {}
         trackers: list[Any] = []
 
@@ -679,10 +683,14 @@ class StandaloneRayTrainer:
                     for entry in selected_entries
                 ]
                 command["delivery_times"] = {
-                    "metadata_event_age_time": max(age for _, age in received),
                     "scheduler_ready_wait_time": now - max(at for at, _ in received),
                 }
+                if all(age is not None for _, age in received):
+                    command["delivery_times"]["metadata_event_age_time"] = max(
+                        age for _, age in received
+                    )
                 command["dispatched_at"] = now
+                command["clock_node_id"] = clock_node_id
             retry_io(
                 lambda: put_queue(
                     self.commands_queue,
@@ -924,7 +932,14 @@ class StandaloneRayTrainer:
 
                     incoming = []
                     received_at = time.monotonic()
-                    event_age = received_at - float(event.get("sent_at", received_at))
+                    # Different Ray nodes need not share a monotonic clock origin.
+                    event_age = (
+                        received_at - float(event["sent_at"])
+                        if clock_node_id is not None
+                        and event.get("clock_node_id") == clock_node_id
+                        and "sent_at" in event
+                        else None
+                    )
                     for item in event["entries"]:
                         tag = item["tag"]
                         validate_reference_envelope(tag)

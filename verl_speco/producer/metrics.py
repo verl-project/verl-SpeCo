@@ -19,6 +19,19 @@ import time
 from typing import Any
 
 
+def current_ray_node_id() -> str | None:
+    """Identify a shared monotonic clock; unknown/non-Ray callers omit remote timings."""
+    try:
+        import ray
+
+        if ray.is_initialized():
+            node_id = ray.get_runtime_context().get_node_id()
+            return str(node_id) if node_id else None
+    except (ImportError, AttributeError, RuntimeError):
+        pass
+    return None
+
+
 def producer_window_metrics(
     rows: list[dict[str, Any]], elapsed: float
 ) -> dict[str, float]:

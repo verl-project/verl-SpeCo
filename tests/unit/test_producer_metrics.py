@@ -145,3 +145,16 @@ def test_http_occupancy_is_time_weighted_and_survives_window_reset(monkeypatch):
     assert second["http_inflight_peak"] == 1
     assert second["http_inflight_now"] == second["http_calls"] == 0
     assert second["loop_lag_max"] == 0
+
+
+@pytest.mark.parametrize("initialized,node_id,expected", [
+    (True, "node-a", "node-a"), (False, "node-a", None), (True, "", None),
+])
+def test_clock_identity_requires_initialized_ray(monkeypatch, initialized, node_id, expected):
+    from verl_speco.producer.metrics import current_ray_node_id
+
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(
+        is_initialized=lambda: initialized,
+        get_runtime_context=lambda: SimpleNamespace(get_node_id=lambda: node_id),
+    ))
+    assert current_ray_node_id() == expected

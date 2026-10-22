@@ -30,6 +30,7 @@ import torch
 import torch.distributed as dist
 
 from verl_speco.standalone_ray_runtime import get_queue
+from verl_speco.producer.metrics import current_ray_node_id
 from verl_speco.trainer.feature_store import DraftFeatureSample
 from verl_speco.trainer.tq_feature_store import ReadyEntry, TQFeatureStore
 from verl_speco.trainer.tq_retry import retry_io
@@ -104,6 +105,7 @@ class TQFeatureDataLoader:
         self.poll_interval_seconds = max(float(poll_interval_seconds), 0.01)
         self.drop_last = bool(drop_last)
         self.scheduled_commands = scheduled_commands
+        self._clock_node_id = current_ray_node_id()
         self.process_group = process_group
         self.stop_event = stop_event
         self.io_retry_max_attempts = io_retry_max_attempts
@@ -260,7 +262,11 @@ class TQFeatureDataLoader:
             ):
                 raise RuntimeError("TQ loader received malformed rank assignments")
             delivery_times = dict(command.get("delivery_times", {}))
-            if "dispatched_at" in command:
+            if (
+                self._clock_node_id is not None
+                and command.get("clock_node_id") == self._clock_node_id
+                and "dispatched_at" in command
+            ):
                 delivery_times["command_delivery_time"] = (
                     time.monotonic() - command["dispatched_at"]
                 )
