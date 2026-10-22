@@ -2273,8 +2273,7 @@ class _SpecoSGLangHttpServerMixin:
             and training_cfg.get("collect_hidden_states_from_sgl")
         )
         is_dspark = bool(drafter_cfg.get("enable")) and (
-            str(drafter_cfg.get("speculative_algorithm", "") or "").upper()
-            == "DSPARK"
+            str(drafter_cfg.get("speculative_algorithm", "") or "").upper() == "DSPARK"
         )
         if not (collect_hidden_states or is_dspark):
             output = await cast(Any, super()).generate(
