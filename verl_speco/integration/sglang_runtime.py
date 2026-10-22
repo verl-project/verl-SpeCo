@@ -1707,9 +1707,10 @@ class _SpecoSGLangHttpServerMixin:
             algorithm = (
                 str(drafter_cfg.get("speculative_algorithm", "") or "").strip().upper()
             )
-            max_window_key = (
-                "dspark_max_window" if algorithm == "DSPARK" else "dflash_max_window"
-            )
+            max_window_key = {
+                "DSPARK": "dspark_max_window",
+                "DSV4_DSPARK": "dsv4_dspark_max_window",
+            }.get(algorithm, "dflash_max_window")
             dflash_max_window = _positive_int_or_none(
                 training_cfg.get(max_window_key, training_cfg.get("dflash_max_window"))
             )

@@ -341,6 +341,14 @@ class DraftFeatureDataLoader:
             rank = int(self.config.rank)
             world_size = int(self.config.world_size)
             if self._uses_step_window:
+                # NOTE: this path intentionally filters BEFORE distributed
+                # slicing (see test_draft_feature_dataloader_filters_before_
+                # distributed_slicing): every rank must see every matching
+                # sample so the stride yields a balanced, interleaved split.
+                # A restrictive window can match only a contiguous shard range,
+                # so per-rank contiguous slices (the main path's shard-level DP)
+                # would empty some ranks. The cost is full read amplification;
+                # removing it needs shard-level step metadata from the producer.
                 samples = [
                     sample
                     for sample in self._read_filtered(keys)
@@ -352,9 +360,16 @@ class DraftFeatureDataLoader:
                 if world_size > 1:
                     rank_samples = rank_samples[: len(samples) // world_size]
             else:
-                rank_keys = keys[rank::world_size]
-                if world_size > 1:
-                    rank_keys = rank_keys[: len(keys) // world_size]
+                # Shard-level data parallelism: hand each rank a CONTIGUOUS slice
+                # of the shard-major key list so it owns whole shards. Striding
+                # (keys[rank::world_size]) would touch every multi-GB shard while
+                # using only a few samples per shard, causing ~world_size read
+                # amplification under whole-shard reads. Each rank takes exactly
+                # ``len(keys) // world_size`` keys; the remainder is not read here
+                # (distributed runs truncate to the global minimum in
+                # ``_synchronize_length`` anyway, so it would be dropped regardless).
+                per = len(keys) // world_size if world_size > 1 else len(keys)
+                rank_keys = keys[rank * per : (rank + 1) * per]
                 rank_samples = self._read_filtered(rank_keys)
             rank_samples = self._synchronize_length(rank_samples)
             rank_samples = self._maybe_group_by_length(rank_samples)

@@ -1302,12 +1302,54 @@ _VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
             "mask_token_id",
         ),
     ),
+    "dsv4_dspark": (
+        "dsv4_dspark_config",
+        (
+            "block_size",
+            "num_anchors",
+            "markov_rank",
+            "markov_head_type",
+            "confidence_head_alpha",
+            "confidence_head_with_markov",
+            "ce_loss_alpha",
+            "l1_loss_alpha",
+            "loss_decay_gamma",
+            "target_layer_ids",
+            "num_context_layers",
+            "num_target_layers",
+            "target_num_hidden_layers",
+            "mask_token_id",
+            "dsv4_num_heads",
+            "dsv4_head_dim",
+            "dsv4_rope_head_dim",
+            "dsv4_q_lora_rank",
+            "dsv4_o_lora_rank",
+            "dsv4_o_groups",
+            "dsv4_window_size",
+            "dsv4_rope_theta",
+            "dsv4_rope_factor",
+            "dsv4_original_seq_len",
+            "dsv4_beta_fast",
+            "dsv4_beta_slow",
+            "dsv4_n_routed_experts",
+            "dsv4_n_shared_experts",
+            "dsv4_n_activated_experts",
+            "dsv4_moe_inter_dim",
+            "dsv4_score_func",
+            "dsv4_route_scale",
+            "dsv4_swiglu_limit",
+            "dsv4_hc_mult",
+            "dsv4_hc_sinkhorn_iters",
+            "dsv4_hc_eps",
+        ),
+    ),
 }
 
 _STANDALONE_TRAINING_LAYER_KEYS = {
     "dflash": "dflash_target_layer_ids",
     "dflash2": "dflash2_target_layer_ids",
     "dspark": "dspark_target_layer_ids",
+    "dsv4_dspark": "dsv4_dspark_target_layer_ids",
     "domino": "domino_target_layer_ids",
 }
 
@@ -1458,7 +1500,7 @@ def _rewrite_standalone_block_runtime_config(
     contract and only merge the alias fields needed by vLLM/SGLang.
     """
     backend_type = getattr(getattr(trainer, "backend", None), "model_type", None)
-    if backend_type not in {"dflash", "dflash2", "dspark", "domino"}:
+    if backend_type not in {"dflash", "dflash2", "dspark", "dsv4_dspark", "domino"}:
         return
 
     if completed_future is not None:
@@ -1644,7 +1686,7 @@ def _build_training_device_mesh(draft_config, world_size: int) -> DeviceMesh | N
 
 def _block_metric_prefix(trainer: DrafterBaseTrainer) -> str | None:
     model_type = str(getattr(getattr(trainer, "backend", None), "model_type", "") or "")
-    if model_type in {"dflash", "dspark", "eagle3", "dflash2"}:
+    if model_type in {"dflash", "dspark", "eagle3", "dflash2", "dsv4_dspark"}:
         return model_type
     return None
 
@@ -1818,6 +1860,13 @@ def _configure_device(local_rank: int) -> None:
     device_name = get_device_name()
     device_module = get_torch_device()
     if device_name == "cpu":
+        return
+    if device_name == "npu":
+        # torch_npu exposes set_device on the ``torch_npu.npu`` submodule, not on
+        # the top-level module get_torch_device() returns, so bind explicitly.
+        import torch_npu
+
+        torch_npu.npu.set_device(int(local_rank))
         return
     set_device = getattr(device_module, "set_device", None)
     if callable(set_device):

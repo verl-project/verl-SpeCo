@@ -177,6 +177,81 @@ def resolve_drafter_strategy(config) -> str:
     return str(strategy or "").lower()
 
 
+@torch.no_grad()
+def _clip_dtensor_grad_norm_(
+    parameters,
+    max_norm: float,
+    *,
+    disjoint_plain_param_ids: set[int] | None = None,
+    replicated_world_size: int = 1,
+) -> torch.Tensor:
+    """Clip EP/FSDP2 gradients with the true global norm, one coefficient.
+
+    ``torch.nn.utils.clip_grad_norm_`` cannot handle the mixed DTensor
+    placements an EP run produces (FSDP2-sharded non-experts + rank-disjoint
+    expert slices), and a per-rank coefficient would scale the shared
+    parameters inconsistently across ranks. This computes the true global norm
+    and applies a single coefficient on every rank.
+
+    Per-parameter contribution semantics:
+    - DTensor grads: ``Replicate`` mesh dims are replicas (divide by their size
+      before the all-reduce); sharded/other dims are disjoint contributions.
+    - Plain-tensor grads (the EP+DDP path): params listed in
+      ``disjoint_plain_param_ids`` are rank-disjoint (EP expert slices, summed
+      as-is); every other plain param is a replica whose gradient
+      ``sync_non_expert_grads`` has already world-averaged, so its squared sum
+      is divided by ``replicated_world_size`` instead of being counted once per
+      rank.
+    """
+    params = [p for p in parameters if p.grad is not None]
+    local_total = None
+    for param in params:
+        grad = param.grad
+        is_dtensor = hasattr(grad, "to_local")
+        local_grad = grad.to_local() if is_dtensor else grad
+        squared = local_grad.detach().float().pow(2).sum()
+
+        if is_dtensor:
+            # Replicated DTensor dimensions would otherwise be counted once per
+            # rank by the all-reduce below. Sharded dims contain disjoint
+            # elements.
+            replication = 1
+            placements = getattr(grad, "placements", ())
+            mesh = getattr(grad, "device_mesh", None)
+            if mesh is not None:
+                from torch.distributed.tensor.placement_types import Replicate
+
+                for dim, placement in enumerate(placements):
+                    if isinstance(placement, Replicate):
+                        replication *= int(mesh.size(dim))
+        elif (
+            disjoint_plain_param_ids is not None
+            and id(param) not in disjoint_plain_param_ids
+        ):
+            # EP+DDP: already world-averaged replicated grad -- count it once.
+            replication = max(1, int(replicated_world_size))
+        else:
+            # Plain rank-disjoint contribution (EP expert slice).
+            replication = 1
+        if replication > 1:
+            squared = squared / replication
+        local_total = squared if local_total is None else local_total + squared
+
+    if local_total is None:
+        # Nothing to clip: return a plain CPU scalar (no accelerator device is
+        # required, unlike ``device=<current_device_idx>`` which fails on
+        # CPU-only torch builds). The caller only inspects ``isfinite``.
+        return torch.zeros(())
+    if dist.is_initialized():
+        dist.all_reduce(local_total, op=dist.ReduceOp.SUM)
+    total_norm = local_total.sqrt()
+    clip_coef = min(1.0, float(max_norm) / (float(total_norm.item()) + 1e-6))
+    if clip_coef < 1.0:
+        for param in params:
+            param.grad.mul_(clip_coef)
+    return total_norm
+
+
 class _DrafterOptimizerState:
     """DCP Stateful adapter for FSDP1/FSDP2 optimizer state dicts."""
 
@@ -1021,6 +1096,7 @@ class DrafterBaseTrainer:
             "dflash",
             "dflash2",
             "dspark",
+            "dsv4_dspark",
             "domino",
         }
 
@@ -1044,9 +1120,57 @@ class DrafterBaseTrainer:
 
     def _block_drafter_metric_prefix(self) -> str:
         model_type = str(getattr(self.backend, "model_type", "dflash") or "dflash")
-        if model_type in {"dspark", "domino", "eagle3", "dflash2"}:
+        if model_type in {"dspark", "dsv4_dspark", "domino", "eagle3", "dflash2"}:
             return model_type
         return "dflash"
+
+    # --- DSV4 DSpark Expert Parallelism (thin delegates) -------------------
+    # All logic lives in ``backends.dsv4_ep_utils``; these wrappers keep the
+    # shared trainer file small and avoid importing the DSV4 module tree unless
+    # the algorithm is actually selected.
+
+    def _is_ep_active(self) -> bool:
+        """EP is requested *and* possible (multi-rank process group).
+
+        Cached on first query, so it must not be called before
+        ``init_process_group`` (that would pin the result at False); every
+        current call site runs after initialization.
+        """
+        cached = getattr(self, "_is_ep_active_cache", None)
+        if cached is None:
+            from verl_speco.backends.dsv4_ep_utils import is_ep_active
+
+            cached = bool(is_ep_active(getattr(self, "config", None)))
+            self._is_ep_active_cache = cached
+        return cached
+
+    def _is_ep_enabled(self) -> bool:
+        """Config-only EP request (no process-group check); see _is_ep_active."""
+        from verl_speco.backends.dsv4_ep_utils import is_ep_enabled
+
+        return is_ep_enabled(self.config)
+
+    def _apply_ep_only(self, raw_model) -> None:
+        from verl_speco.backends.dsv4_ep_utils import apply_ep_only
+
+        apply_ep_only(self, raw_model)
+
+    def _apply_ep_fsdp2(self, raw_model, fsdp_kwargs, fsdp_config) -> None:
+        from verl_speco.backends.dsv4_ep_utils import apply_ep_fsdp2
+
+        apply_ep_fsdp2(self, raw_model, fsdp_kwargs, fsdp_config)
+
+    def _sync_non_expert_grads(self) -> None:
+        from verl_speco.backends.dsv4_ep_utils import sync_non_expert_grads
+
+        sync_non_expert_grads(self)
+
+    def _dump_local_expert_slices(self, checkpoint_path: str) -> str | None:
+        if self.backend.model_type != "dsv4_dspark":
+            return None
+        from verl_speco.backends.dsv4_ep_utils import dump_local_expert_slices
+
+        return dump_local_expert_slices(self, checkpoint_path)
 
     def _block_drafter_config_value(self, suffix: str, default: Any) -> Any:
         training_cfg = self.config.rollout.drafter.training
@@ -1404,7 +1528,7 @@ class DrafterBaseTrainer:
         pending_target_weight = self._pending_target_lm_head_weight
         if (
             getattr(self.backend, "model_type", None)
-            in {"eagle3", "dflash", "dflash2", "dspark", "domino"}
+            in {"eagle3", "dflash", "dflash2", "dspark", "dsv4_dspark", "domino"}
             and torch.is_tensor(pending_target_weight)
             and pending_target_weight.dim() == 2
         ):
@@ -1415,12 +1539,74 @@ class DrafterBaseTrainer:
             )
         else:
             setattr(self.backend, "_initial_target_lm_head_shape", None)
-        raw_model, drafter_model_config = self.backend.build_model()
+
+        # DSV4 DSpark supports meta/skip loading and expert parallelism. Both
+        # are no-ops for every other drafter backend.
+        init_on_meta = bool(
+            self.config.rollout.drafter.training.get("init_on_meta", False)
+        )
+        random_init = bool(
+            self.config.rollout.drafter.training.get("dsv4_dspark_random_init", False)
+        )
+        ep_enabled = self._is_ep_active()
+        if self._is_ep_enabled() and not ep_enabled:
+            # EP was requested but degraded (single-rank / no process group):
+            # make the fallback to the full expert set visible at the boundary.
+            logger.warning(
+                "DSV4 DSpark EP requested (dsv4_dspark_enable_ep=true) but the "
+                "process group is uninitialized or has a single rank; training "
+                "on the full expert set without expert parallelism."
+            )
+        # Under EP every rank must load its OWN released expert slice (the
+        # pre-configured model is already sliced), so init_on_meta must not make
+        # non-zero ranks skip loading. Short-circuit on the config flags first so
+        # runs that opt out never touch process-group queries.
+        use_skip_loading = (
+            (random_init or init_on_meta)
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and (
+                random_init
+                or (init_on_meta and dist.get_rank() != 0 and not ep_enabled)
+            )
+        )
+        if ep_enabled and self._drafter_strategy() != "fsdp2":
+            raise ValueError(
+                "DSV4 DSpark expert parallelism requires "
+                "actor_rollout_ref.actor.strategy=fsdp2 (got "
+                f"{self._drafter_strategy()!r}); DDP/FSDP1/VeOmni would "
+                "all-reduce or mismatch rank-local expert parameters."
+            )
+        if ep_enabled:
+            world_size = dist.get_world_size()
+            from verl_speco.backends.dsv4_ep_utils import (
+                ensure_ep_divisible,
+                resolve_routed_expert_count,
+            )
+            from verl_speco.models.dsv4_dspark.backbone import moe_ep
+
+            n_experts = resolve_routed_expert_count(self.config)
+            experts_per_rank = ensure_ep_divisible(n_experts, world_size)
+            moe_ep.configure(
+                group=dist.group.WORLD,
+                rank=dist.get_rank(),
+                size=world_size,
+                experts_per_rank=experts_per_rank,
+            )
+            moe_ep.enable()
+        if use_skip_loading:
+            self.backend._skip_weight_loading = True
+        try:
+            raw_model, drafter_model_config = self.backend.build_model()
+        finally:
+            if use_skip_loading:
+                delattr(self.backend, "_skip_weight_loading")
 
         # FSDP2 loads the full state through fsdp2_load_full_state_dict(), which
         # places only rank 0 on the accelerator during the broadcast. Moving the
         # raw model first would materialize a full drafter replica on every rank
-        # and can exhaust NPU memory during checkpoint resume.
+        # and can exhaust NPU memory during checkpoint resume. The EP paths move
+        # the model to the device inside apply_ep_only/apply_ep_fsdp2 instead.
         use_fsdp2 = (
             self._drafter_strategy() != "ddp"
             and self.fsdp_device_mesh is not None
@@ -1461,17 +1647,39 @@ class DrafterBaseTrainer:
                 "mp_policy": mp_policy,
                 "offload_policy": None,
             }
-            logger.debug("Building drafter model with its configured FSDP2 mesh")
-
-            full_state = raw_model.state_dict()
-            apply_fsdp2(raw_model, fsdp_kwargs, fsdp_config)
-
-            # Load full state dict using the same mesh as used by drafter FSDP wrapping
-            fsdp2_load_full_state_dict(
-                raw_model, full_state, self.fsdp_device_mesh, None
+            ep_no_fsdp = bool(
+                self.config.rollout.drafter.training.get(
+                    "dsv4_dspark_ep_no_fsdp", False
+                )
             )
+            if ep_enabled and ep_no_fsdp:
+                logger.debug(
+                    "Building DSV4 DSpark drafter with expert parallelism (no FSDP2)"
+                )
+                self._apply_ep_only(raw_model)
+            elif ep_enabled:
+                logger.debug("Building DSV4 DSpark drafter with EP + FSDP2")
+                ep_mp_policy = MixedPrecisionPolicy(
+                    param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+                )
+                self._apply_ep_fsdp2(
+                    raw_model,
+                    # ``apply_ep_fsdp2`` derives the FSDP2 mesh from the trainer's
+                    # raw (dp, sp) training mesh itself; only the mp policy is read.
+                    {"mp_policy": ep_mp_policy},
+                    fsdp_config,
+                )
+            else:
+                logger.debug("Building drafter model with its configured FSDP2 mesh")
+                full_state = raw_model.state_dict()
+                apply_fsdp2(raw_model, fsdp_kwargs, fsdp_config)
+
+                # Load full state dict using the same mesh as used by drafter FSDP wrapping
+                fsdp2_load_full_state_dict(
+                    raw_model, full_state, self.fsdp_device_mesh, None
+                )
+                del full_state
             self.model = raw_model
-            del full_state
         elif (
             self.training_process_group is not None
             and self.training_group_world_size > 1
@@ -2414,6 +2622,13 @@ class DrafterBaseTrainer:
 
         checkpoint_started = time.perf_counter()
         checkpoint_path = os.path.join(self.checkpoint_dir, f"draft_step_{int(step)}")
+        # Expert-parallel ranks each hold a disjoint expert slice; dump every
+        # rank's slice before the leader-only export so the drafter can be
+        # reconstructed completely offline.
+        try:
+            self._dump_local_expert_slices(checkpoint_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to dump local EP expert slices: %s", exc)
         if (
             self.rollout_dp_rank != 0
             and not self._use_flattened_drafter_fsdp_mesh()
@@ -4788,9 +5003,10 @@ class DrafterBaseTrainer:
         position_list = preprocessed_lists.get("position_ids")
         target_last_h_list = preprocessed_lists.get("target_last_h_states")
         dspark_target_hidden_required = (
-            self.backend.model_type == "dspark"
+            self.backend.model_type in ("dspark", "dsv4_dspark")
             and resolve_drafter_hidden_states_layout(
-                "DSPARK", self.config.rollout.drafter.training
+                "DSV4_DSPARK" if self.backend.model_type == "dsv4_dspark" else "DSPARK",
+                self.config.rollout.drafter.training,
             )
             == "dflash_aux_plus_last"
         )
@@ -5378,7 +5594,10 @@ class DrafterBaseTrainer:
                 dtype=torch.long,
                 device=dev,
             )
-        elif self.backend.model_type == "dspark" and target_last_hidden_state_chunks:
+        elif (
+            self.backend.model_type in ("dspark", "dsv4_dspark")
+            and target_last_hidden_state_chunks
+        ):
             batch["target_last_hidden_states"] = target_last_hidden_states
 
         batch = self._sanitize_training_batch(batch)
@@ -5403,7 +5622,8 @@ class DrafterBaseTrainer:
             peagle_last_hidden_states = batch["last_hidden_states"]
             peagle_seq_lengths = batch["seq_lengths"]
         elif (
-            self.backend.model_type == "dspark" and "target_last_hidden_states" in batch
+            self.backend.model_type in ("dspark", "dsv4_dspark")
+            and "target_last_hidden_states" in batch
         ):
             target_last_hidden_states = batch["target_last_hidden_states"]
 
@@ -5445,7 +5665,7 @@ class DrafterBaseTrainer:
                             last_hidden_states, (0, 0, 0, pad_size), value=0.0
                         )
                 elif (
-                    self.backend.model_type == "dspark"
+                    self.backend.model_type in ("dspark", "dsv4_dspark")
                     and "target_last_hidden_states" in batch
                 ):
                     target_last_hidden_states = torch.nn.functional.pad(
@@ -5466,7 +5686,7 @@ class DrafterBaseTrainer:
                         last_hidden_states, dim=1, padding=False
                     )
             elif (
-                self.backend.model_type == "dspark"
+                self.backend.model_type in ("dspark", "dsv4_dspark")
                 and "target_last_hidden_states" in batch
             ):
                 target_last_hidden_states = slice_input_tensor(
@@ -5497,7 +5717,10 @@ class DrafterBaseTrainer:
         elif self.backend.model_type == "peagle":
             batch["last_hidden_states"] = peagle_last_hidden_states
             batch["seq_lengths"] = peagle_seq_lengths
-        elif self.backend.model_type == "dspark" and target_last_hidden_state_chunks:
+        elif (
+            self.backend.model_type in ("dspark", "dsv4_dspark")
+            and target_last_hidden_state_chunks
+        ):
             batch["target_last_hidden_states"] = target_last_hidden_states
         if document_ids is not None:
             batch["document_ids"] = document_ids
@@ -6158,7 +6381,14 @@ class DrafterBaseTrainer:
             if batch.get("hidden_source") == "standalone_vllm_reference":
                 batch = self._stage_standalone_cpu_batch(batch)
             with torch.enable_grad():
-                return await self._training_step_on_batch(batch, step)
+                result = await self._training_step_on_batch(batch, step)
+                if not result:
+                    logger.warning(
+                        f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] "
+                        f"training_step_from_batch returned False at step {step} "
+                        f"(keys={sorted(batch.keys())[:8]})"
+                    )
+                return result
         except Exception as e:  # noqa: BLE001
             self.last_standalone_training_error = e
             logger.exception(f"Standalone training step {step} failed with error: {e}")
@@ -6471,8 +6701,12 @@ class DrafterBaseTrainer:
         )
 
         if float(global_tokens.detach().float().item()) <= 0:
-            logger.debug(
-                f"Step {self.training_steps + 1}: no finite drafter target tokens, skipping optimizer step"
+            logger.warning(
+                f"[DrafterTrainer rank {self.rank}] Step {self.training_steps + 1}: "
+                "no finite drafter target tokens, skipping optimizer step "
+                f"(local_num_tokens={float(l_n.detach().float().item()) if torch.is_tensor(l_n) else l_n}, "
+                f"local_vloss={float(l_v.detach().float().item()) if torch.is_tensor(l_v) else l_v}, "
+                f"local_ploss={float(l_p.detach().float().item()) if torch.is_tensor(l_p) else l_p})"
             )
             return False
         self._current_accumulation_valid_tokens += int(
@@ -6505,6 +6739,7 @@ class DrafterBaseTrainer:
             "eagle3",
             "dflash",
             "dspark",
+            "dsv4_dspark",
             "dflash2",
         } and getattr(self.backend, "enable_standalone_training_metrics", False):
             # Log the actual globally reduced optimization objective, including
@@ -6527,6 +6762,10 @@ class DrafterBaseTrainer:
             local_loss = local_loss / denom
         backward_ts = time.time()
         local_loss.backward()
+        if self._is_ep_active():
+            # EP keeps each rank's experts local; non-expert params are
+            # replicated and need a manual gradient all-reduce.
+            self._sync_non_expert_grads()
         self.record_training_timing(
             "timing_s/drafter_backward", time.time() - backward_ts
         )
@@ -6541,7 +6780,23 @@ class DrafterBaseTrainer:
             for parameter in self.model.parameters():
                 if parameter.grad is not None:
                     parameter.grad.div_(accumulation_denom)
-        grad_norm = self._clip_training_grad_norm()
+        if self._is_ep_active():
+            # Mixed DTensor placements / rank-local expert grads: use the
+            # replication-corrected global norm so every rank clips identically.
+            # In the EP+DDP mode the non-expert grads are plain tensors that
+            # sync_non_expert_grads has already world-averaged -- count each
+            # replicated contribution once instead of once per rank.
+            ep_ddp_world_size = int(getattr(self, "_ep_ddp_world_size", 0) or 0)
+            grad_norm = _clip_dtensor_grad_norm_(
+                self.model.parameters(),
+                max_norm=1.0,
+                disjoint_plain_param_ids=getattr(self, "_ep_expert_param_ids", None),
+                replicated_world_size=(
+                    ep_ddp_world_size if ep_ddp_world_size > 1 else 1
+                ),
+            )
+        else:
+            grad_norm = self._clip_training_grad_norm()
         if not torch.isfinite(grad_norm):
             logger.error(
                 f"Step {self.training_steps + 1}: non-finite drafter grad norm, "

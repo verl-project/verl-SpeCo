@@ -82,6 +82,7 @@ _ALGORITHM_TARGET_LAYER_IDS_KEYS = {
     "EAGLE3": "actor_rollout_ref.rollout.drafter.training.eagle3_target_layer_ids",
     "DFLASH": "actor_rollout_ref.rollout.drafter.training.dflash_target_layer_ids",
     "DSPARK": "actor_rollout_ref.rollout.drafter.training.dspark_target_layer_ids",
+    "DSV4_DSPARK": "actor_rollout_ref.rollout.drafter.training.dsv4_dspark_target_layer_ids",
     "DOMINO": "actor_rollout_ref.rollout.drafter.training.domino_target_layer_ids",
 }
 _MAX_STEPS_KEY = "actor_rollout_ref.rollout.drafter.training.max_steps"

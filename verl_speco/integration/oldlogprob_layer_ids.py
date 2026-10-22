@@ -20,7 +20,9 @@ from typing import Any
 # Drafters that consume the DFlash aux context layers instead of the EAGLE
 # aux-plus-final layout. Domino and DFlash2 are DFlash variants, so they share
 # the layout.
-DFLASH_FAMILY_ALGORITHMS = frozenset({"DFLASH", "DFLASH2", "DSPARK", "DOMINO"})
+DFLASH_FAMILY_ALGORITHMS = frozenset(
+    {"DFLASH", "DFLASH2", "DSPARK", "DSV4_DSPARK", "DOMINO"}
+)
 
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
@@ -66,10 +68,10 @@ def _drafter_algorithm(drafter_cfg: Any) -> str:
 
 def _is_dspark_config(config: Any) -> bool:
     algorithm = _drafter_algorithm(config)
-    if algorithm == "DSPARK":
+    if algorithm in ("DSPARK", "DSV4_DSPARK"):
         return True
     return any(
-        architecture in {"DSparkDraftModel", "Qwen3DSparkModel"}
+        architecture in {"DSparkDraftModel", "Qwen3DSparkModel", "DSV4DSparkDraftModel"}
         for architecture in _config_architectures(config)
     )
 
@@ -86,18 +88,32 @@ def resolve_drafter_hidden_states_layout(algorithm: Any, training_cfg: Any) -> s
     algorithm = str(algorithm or "").strip().upper()
     if algorithm not in DFLASH_FAMILY_ALGORITHMS:
         return "eagle3_aux_plus_last"
-    if algorithm == "DSPARK" and (
-        float(_get_nested(training_cfg, ("dspark_l1_loss_alpha",), 0.9) or 0.0) > 0
-        or float(
-            _get_nested(training_cfg, ("dspark_confidence_loss_alpha",), 0.0) or 0.0
-        )
-        > 0
-        or str(
-            _get_nested(training_cfg, ("ce_target_source",), "labels") or "labels"
-        ).lower()
-        == "target_argmax"
-    ):
-        return "dflash_aux_plus_last"
+    if algorithm in ("DSPARK", "DSV4_DSPARK"):
+        loss_prefix = "dsv4_dspark" if algorithm == "DSV4_DSPARK" else "dspark"
+        default_l1 = 0.0 if algorithm == "DSV4_DSPARK" else 0.9
+        if (
+            float(
+                _get_nested(training_cfg, (f"{loss_prefix}_l1_loss_alpha",), default_l1)
+                or 0.0
+            )
+            > 0
+            or float(
+                _get_nested(training_cfg, (f"{loss_prefix}_tv_loss_alpha",), 0.0) or 0.0
+            )
+            > 0
+            or float(
+                _get_nested(
+                    training_cfg, (f"{loss_prefix}_confidence_loss_alpha",), 0.0
+                )
+                or 0.0
+            )
+            > 0
+            or str(
+                _get_nested(training_cfg, ("ce_target_source",), "labels") or "labels"
+            ).lower()
+            == "target_argmax"
+        ):
+            return "dflash_aux_plus_last"
     return "dflash_aux"
 
 
@@ -113,6 +129,7 @@ def _is_dflash_config(drafter_cfg: Any, model_configs: tuple[Any, ...]) -> bool:
             "Qwen3DFlash2Model",
             "DSparkDraftModel",
             "Qwen3DSparkModel",
+            "DSV4DSparkDraftModel",
             "DominoDraftModel",
             "Qwen3DominoModel",
         }
@@ -298,8 +315,8 @@ def resolve_oldlogprob_aux_layer_ids(
     model_configs = tuple(config for config in model_configs if config is not None)
     if _is_dflash_config(drafter_cfg, model_configs):
         algorithm = _drafter_algorithm(drafter_cfg)
-        is_dspark = algorithm == "DSPARK" or (
-            algorithm != "DFLASH"
+        is_dspark = algorithm in ("DSPARK", "DSV4_DSPARK") or (
+            algorithm not in ("DFLASH", "DSPARK", "DSV4_DSPARK")
             and any(_is_dspark_config(config) for config in model_configs)
         )
         for config in (drafter_cfg, *model_configs):

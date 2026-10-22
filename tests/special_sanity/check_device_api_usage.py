@@ -29,6 +29,9 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # Dispatches on ``device.type`` and only names the backends in literals;
     # no device API is called from this module.
     "verl_speco/ops/dspark_fused_loss.py",
+    # Synchronizes the active accelerator behind a device-name guard for the
+    # optional forward profiler; it selects CUDA vs NPU by device name only.
+    "verl_speco/models/dsv4_dspark/backbone/block.py",
     # FlexAttention kernel dispatch distinguishes CUDA training from inference
     # and non-CUDA backends; no tensor placement/device allocation occurs here.
     "verl_speco/models/dflash/flex_attention.py",

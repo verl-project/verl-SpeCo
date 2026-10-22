@@ -431,6 +431,9 @@ def test_feature_sample_restores_online_alignment_metadata():
 
 
 def test_draft_feature_dataloader_slices_keys_by_rank(tmp_path):
+    # Shard-level data parallelism: ranks split the shard-major key list into
+    # CONTIGUOUS slices (each rank owns whole shards) instead of striding, to
+    # avoid ~world_size read amplification when a sample read loads a whole shard.
     store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=4)
     store.write_many([_sample(i) for i in range(4)])
     store.close()
@@ -450,8 +453,8 @@ def test_draft_feature_dataloader_slices_keys_by_rank(tmp_path):
 
     rank0_ids = [int(sample.input_ids[0].item()) for batch in rank0 for sample in batch]
     rank1_ids = [int(sample.input_ids[0].item()) for batch in rank1 for sample in batch]
-    assert rank0_ids == [1, 3]
-    assert rank1_ids == [2, 4]
+    assert rank0_ids == [1, 2]
+    assert rank1_ids == [3, 4]
 
 
 def test_draft_feature_dataloader_balances_uneven_distributed_shards(tmp_path):
