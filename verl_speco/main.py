@@ -21,9 +21,6 @@ distribution aligned with verl.
 """
 
 import inspect
-import os
-import re
-import sys
 
 import hydra
 
@@ -96,53 +93,8 @@ def _strip_speco_overlay_for_native_run(config) -> None:
             del config["speco"]
 
 
-def _configure_sglang_drafter_logging(config) -> None:
-    """Keep every drafter loss line when Ray forwards SGLang training logs."""
-
-    rollout = _config_get(config, "actor_rollout_ref", "rollout")
-    if _config_get(rollout, "name") != "sglang" or not _config_get(
-        rollout, "drafter", "enable_drafter_training", default=False
-    ):
-        return
-
-    # Ray reads this on import in the driver, before worker runtime_env applies.
-    # Exempt only loss records and retain any user-provided allow expression.
-    pattern = r"\[drafter loss\]"
-    existing = os.environ.get("RAY_DEDUP_LOGS_ALLOW_REGEX", "")
-    if pattern not in existing:
-        os.environ["RAY_DEDUP_LOGS_ALLOW_REGEX"] = (
-            f"{existing}|{pattern}" if existing else pattern
-        )
-
-    # A launcher may have imported Ray already. Its driver-side deduplicators
-    # cache compiled expressions, so changing the environment alone is too late.
-    ray_constants = sys.modules.get("ray._private.ray_constants")
-    if ray_constants is not None:
-        setattr(
-            ray_constants,
-            "RAY_DEDUP_LOGS_ALLOW_REGEX",
-            os.environ["RAY_DEDUP_LOGS_ALLOW_REGEX"],
-        )
-    ray_logging = sys.modules.get("ray._private.ray_logging")
-    if ray_logging is not None:
-        for name in ("stdout_deduplicator", "stderr_deduplicator"):
-            deduplicator = getattr(ray_logging, name, None)
-            if deduplicator is None:
-                continue
-            allow_re = deduplicator.allow_re
-            if allow_re is None:
-                deduplicator.allow_re = re.compile(pattern)
-            elif not allow_re.search("[drafter loss]"):
-                deduplicator.allow_re = re.compile(
-                    f"{allow_re.pattern}|{pattern}", allow_re.flags
-                )
-
-
 def run(config) -> None:
     """Resolve SPECO/verl compatibility, device and the task-runner dispatch."""
-
-    # main_ppo imports Ray, so configure deduplication before importing verl.
-    _configure_sglang_drafter_logging(config)
 
     from verl.trainer import main_ppo
     from verl.utils.device import auto_set_device
