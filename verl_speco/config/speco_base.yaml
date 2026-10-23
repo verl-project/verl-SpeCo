@@ -215,8 +215,8 @@ actor_rollout_ref:
         park_hccl_after_drafter_training: false
         # Keep drafter state on CPU outside its short training window when NPU
         # capacity is shared with actor and rollout workers.
-        is_offload_param: false
-        is_offload_optimizer: false
+        is_offload_param: true
+        is_offload_optimizer: true
         save_full_drafter_checkpoint: true
         sample_last_n_steps: 20
         train_batches_per_cycle: 4

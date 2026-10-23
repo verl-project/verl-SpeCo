@@ -73,6 +73,21 @@ def test_legacy_sync_cleanup_override_remains_composable(value: str) -> None:
     )
 
 
+@pytest.mark.parametrize("value", ["true", "false"])
+def test_drafter_offload_flags_remain_overridable(value: str) -> None:
+    with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
+        config = compose(
+            config_name="speco_base",
+            overrides=[
+                f"actor_rollout_ref.rollout.drafter.training.{key}={value}"
+                for key in ("is_offload_param", "is_offload_optimizer")
+            ],
+        )
+    training = config.actor_rollout_ref.rollout.drafter.training
+    assert training.is_offload_param is (value == "true")
+    assert training.is_offload_optimizer is (value == "true")
+
+
 def test_overlay_has_expected_default_drafter_shape() -> None:
     raw = OmegaConf.load(CONFIG_DIR / "speco_base.yaml")
     drafter = raw.actor_rollout_ref.rollout.drafter
@@ -102,6 +117,8 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.training.resume_trainer_state_from_checkpoint is True
     assert drafter.training.eagle1_num_hidden_layers == 1
     assert drafter.training.mode == "online"
+    assert drafter.training.is_offload_param is True
+    assert drafter.training.is_offload_optimizer is True
     assert drafter.training.preserve_prompt_hidden_states is False
     assert standalone_training.preserve_prompt_hidden_states is True
     assert drafter.training.feature_store.type == "torch_shard"
