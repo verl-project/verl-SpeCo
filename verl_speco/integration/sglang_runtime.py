@@ -1558,7 +1558,9 @@ async def _sgl_http_update_weights_from_tensor(
         host = f"[{host}]"
     url = f"http://{host}:{server_args.port}/update_weights_from_tensor"
     post_kwargs: dict[str, Any] = {"json": payload}
-    api_key = getattr(server_args, "api_key", None)
+    api_key = getattr(server_args, "admin_api_key", None) or getattr(
+        server_args, "api_key", None
+    )
     if api_key:
         post_kwargs["headers"] = {"Authorization": f"Bearer {api_key}"}
     async with get_session() as session:
