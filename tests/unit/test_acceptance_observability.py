@@ -14,6 +14,10 @@ from typing import Any
 import pytest
 
 from verl_speco.integration import vllm_runtime as runtime
+from verl_speco.integration.agent_loop_runtime import (
+    SPECO_STUDENT_DECODE_TIME_KEY,
+    SPECO_TEACHER_PREFILL_TIME_KEY,
+)
 
 
 def _trainer_helpers():
@@ -26,8 +30,9 @@ def _trainer_helpers():
         "_speco_float_values",
         "_speco_optional_float",
         "_speco_vllm_spec_decode_stats_from_batch",
-        "_speco_vllm_spec_decode_metrics_from_stats",
-        "_speco_merge_vllm_spec_decode_stats",
+        "_speco_phase_timing_stats_from_batch",
+        "_speco_rollout_metrics_from_stats",
+        "_speco_merge_rollout_stats",
     }
     constants = {
         "_SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY",
@@ -36,6 +41,12 @@ def _trainer_helpers():
         "_SPECO_VLLM_REQUEST_ACCEPTED_TOKENS_KEY",
         "_SPECO_VLLM_REQUEST_ID_KEY",
         "SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC",
+        "_SPECO_STUDENT_DECODE_TOTAL_KEY",
+        "_SPECO_STUDENT_DECODE_COUNT_KEY",
+        "_SPECO_STUDENT_DECODE_MAX_KEY",
+        "_SPECO_TEACHER_PREFILL_TOTAL_KEY",
+        "_SPECO_TEACHER_PREFILL_COUNT_KEY",
+        "_SPECO_TEACHER_PREFILL_MAX_KEY",
     }
     nodes = [
         node
@@ -79,6 +90,8 @@ def _trainer_helpers():
         "logger": logging.getLogger(__name__),
         "SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX": runtime.SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
         "_get_nested": runtime._get_nested,
+        "SPECO_STUDENT_DECODE_TIME_KEY": SPECO_STUDENT_DECODE_TIME_KEY,
+        "SPECO_TEACHER_PREFILL_TIME_KEY": SPECO_TEACHER_PREFILL_TIME_KEY,
     }
     module = ast.Module(
         body=[
@@ -157,6 +170,32 @@ def test_generate_drains_acceptance_once_and_restores_trainer_metric(
     assert "available=False source=missing" in caplog.text
 
 
+def test_acceptance_and_opd_timing_accumulate_together():
+    helpers = _trainer_helpers()
+    driver = helpers["Subject"]()
+    driver.global_steps = 1
+    driver._speco_store_rollout_metrics(
+        _request_batch(
+            **{
+                SPECO_STUDENT_DECODE_TIME_KEY: [0.2, 0.4],
+                SPECO_TEACHER_PREFILL_TIME_KEY: [0.3, 0.5],
+            }
+        )
+    )
+    # A later batch can carry phase timings without acceptance counters.
+    driver._speco_store_rollout_metrics(
+        SimpleNamespace(non_tensor_batch={SPECO_STUDENT_DECODE_TIME_KEY: [0.9]})
+    )
+    metrics = driver._speco_current_step_rollout_metrics()
+    assert metrics["drafter/spec_decode/mean_acceptance_length"] == pytest.approx(3.4)
+    assert metrics["timing_s/student_decode"] == pytest.approx(0.9)
+    assert metrics["timing_s/student_decode_mean"] == pytest.approx(0.5)
+    assert metrics["timing_s/teacher_prefill"] == pytest.approx(0.5)
+    assert metrics["timing_s/teacher_prefill_mean"] == pytest.approx(0.4)
+    driver.global_steps = 2
+    assert driver._speco_current_step_rollout_metrics() == {}
+
+
 @pytest.mark.parametrize("kind", ["scheduler", "iteration", "both", "dict"])
 def test_acceptance_callback_compatibility_does_not_double_count(kind):
     spec = SimpleNamespace(num_drafts=4, num_draft_tokens=20, num_accepted_tokens=12)
@@ -220,7 +259,7 @@ def _request_batch(**overrides):
 def test_complete_request_fallback_is_weighted_and_never_mixed_with_aggregate():
     helpers = _trainer_helpers()
     stats_from_batch = helpers["_speco_vllm_spec_decode_stats_from_batch"]
-    metrics = helpers["_speco_vllm_spec_decode_metrics_from_stats"]
+    metrics = helpers["_speco_rollout_metrics_from_stats"]
     diagnostics = {}
     stats = stats_from_batch(_request_batch(), diagnostics=diagnostics)
     assert diagnostics["source"] == "request"
@@ -257,7 +296,7 @@ def test_incomplete_request_fallback_omits_metric(field, values):
         _request_batch(**{field: values})
     )
     assert stats == {}
-    assert helpers["_speco_vllm_spec_decode_metrics_from_stats"](stats) == {}
+    assert helpers["_speco_rollout_metrics_from_stats"](stats) == {}
 
 
 def test_nested_counts_and_all_rejected_tokens_remain_valid():
@@ -270,7 +309,7 @@ def test_nested_counts_and_all_rejected_tokens_remain_valid():
         )
     )
     assert (
-        helpers["_speco_vllm_spec_decode_metrics_from_stats"](stats)[
+        helpers["_speco_rollout_metrics_from_stats"](stats)[
             "drafter/spec_decode/mean_acceptance_length"
         ]
         == 1.0

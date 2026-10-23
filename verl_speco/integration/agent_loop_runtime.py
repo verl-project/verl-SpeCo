@@ -19,6 +19,7 @@ import asyncio
 import contextvars
 import inspect
 import logging
+import time
 import types
 from functools import wraps
 from typing import Any, cast
@@ -26,6 +27,8 @@ from typing import Any, cast
 logger = logging.getLogger(__file__)
 
 _PATCHED = False
+SPECO_STUDENT_DECODE_TIME_KEY = "speco_student_decode_time_s"
+SPECO_TEACHER_PREFILL_TIME_KEY = "speco_teacher_prefill_time_s"
 _DEFAULT_EXTRA_KEYS = {
     "_speco_vllm_spec_decode_accepted_tokens",
     "_speco_vllm_spec_decode_drafts",
@@ -35,6 +38,8 @@ _DEFAULT_EXTRA_KEYS = {
     "max_global_steps",
     "extras",
     "drafter_sample",
+    SPECO_STUDENT_DECODE_TIME_KEY,
+    SPECO_TEACHER_PREFILL_TIME_KEY,
 }
 _CURRENT_GLOBAL_STEPS = contextvars.ContextVar(
     "speco_current_global_steps", default=None
@@ -67,6 +72,9 @@ def _apply_probe_sampling_overrides(sampling_params: Any) -> Any:
     return sampling_params
 
 
+_CURRENT_STUDENT_DECODE_TIMES: contextvars.ContextVar[list[float] | None] = (
+    contextvars.ContextVar("speco_current_student_decode_times", default=None)
+)
 SPECO_AGENT_LOOP_MANAGER_CLASS = (
     "verl_speco.integration.agent_loop_runtime.SpecoAgentLoopManager"
 )
@@ -220,6 +228,80 @@ def _speco_reset_context(*tokens: Any) -> None:
         _CURRENT_GLOBAL_STEPS.reset(tokens[0])
 
 
+def _record_phase_time(output: Any, key: str, elapsed: float) -> None:
+    extra_fields = getattr(output, "extra_fields", None)
+    if isinstance(extra_fields, dict):
+        previous = extra_fields.get(key)
+        extra_fields[key] = (0.0 if previous is None else previous) + elapsed
+
+
+async def _compute_teacher_logprobs_with_timing(
+    worker: Any,
+    compute_teacher_logprobs: Any,
+    output: Any,
+    prompt_ids: Any,
+    response_ids: Any,
+    validate: bool,
+    sample_kwargs: Any = None,
+) -> Any:
+    """Run upstream teacher scoring and record its end-to-end prefill latency.
+
+    Latency is accumulated per output. Only installed on the vLLM agent-loop
+    worker path; the SGLang worker path does not record teacher prefill time.
+    """
+
+    measure = bool(getattr(worker, "distillation_enabled", False)) and not validate
+    started = time.perf_counter() if measure else None
+    # Teacher traffic can use the same LLMServerClient class as student rollout.
+    # Temporarily disable the student accumulator so it stays student-only.
+    student_times_token = _CURRENT_STUDENT_DECODE_TIMES.set(None)
+    try:
+        result = compute_teacher_logprobs(
+            worker,
+            output,
+            prompt_ids,
+            response_ids,
+            validate,
+            sample_kwargs,
+        )
+        if inspect.isawaitable(result):
+            result = await result
+    finally:
+        _CURRENT_STUDENT_DECODE_TIMES.reset(student_times_token)
+    if started is not None:
+        _record_phase_time(
+            output,
+            SPECO_TEACHER_PREFILL_TIME_KEY,
+            time.perf_counter() - started,
+        )
+    return result
+
+
+async def _run_agent_loop_with_student_timing(call: Any, *args, **kwargs) -> Any:
+    """Measure student LLM request wall time across all turns of one trajectory."""
+
+    if _CURRENT_STUDENT_DECODE_TIMES.get() is not None:
+        result = call(*args, **kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    student_decode_times: list[float] = []
+    token = _CURRENT_STUDENT_DECODE_TIMES.set(student_decode_times)
+    try:
+        result = call(*args, **kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+    finally:
+        _CURRENT_STUDENT_DECODE_TIMES.reset(token)
+    _record_phase_time(
+        result,
+        SPECO_STUDENT_DECODE_TIME_KEY,
+        sum(student_decode_times),
+    )
+    return result
+
+
 def _speco_worker_init(self, *args, **kwargs):
     install_agent_loop_runtime_patch()
     init = _speco_parent_method(self, "__init__")
@@ -264,10 +346,14 @@ async def _speco_worker_run_agent_loop(
         raise AttributeError(
             "SPECO AgentLoop worker parent has no _run_agent_loop method"
         )
-    result = run_agent_loop(self, sampling_params, trajectory, *args, **kwargs)
-    if inspect.isawaitable(result):
-        result = await result
-    return result
+    return await _run_agent_loop_with_student_timing(
+        run_agent_loop,
+        self,
+        sampling_params,
+        trajectory,
+        *args,
+        **kwargs,
+    )
 
 
 async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs):
@@ -538,6 +624,7 @@ def install_agent_loop_runtime_patch() -> bool:
     generate_sequences = getattr(worker_cls, "generate_sequences", None)
     run_agent_loop = getattr(worker_cls, "_run_agent_loop", None)
     agent_loop_postprocess = getattr(worker_cls, "_agent_loop_postprocess", None)
+    compute_teacher_logprobs = getattr(worker_cls, "_compute_teacher_logprobs", None)
     postprocess = getattr(worker_cls, "_postprocess", None)
     manager_init = getattr(manager_cls, "__init__", None)
     manager_generate_sequences = getattr(manager_cls, "generate_sequences", None)
@@ -563,9 +650,13 @@ def install_agent_loop_runtime_patch() -> bool:
                 kwargs["sampling_params"] = _sampling_params_with_speco_context(
                     kwargs["sampling_params"]
                 )
+            student_decode_times = _CURRENT_STUDENT_DECODE_TIMES.get()
+            started = time.perf_counter() if student_decode_times is not None else None
             result = llm_server_generate(self, *args, **kwargs)
             if inspect.isawaitable(result):
                 result = await result
+            if started is not None:
+                student_decode_times.append(time.perf_counter() - started)
             from verl_speco.integration.partial_rollout_stats import (
                 record_serving_segment,
             )
@@ -623,10 +714,14 @@ def install_agent_loop_runtime_patch() -> bool:
                 ),
             )
             sampling_params = _apply_probe_sampling_overrides(sampling_params)
-            result = run_agent_loop(self, sampling_params, trajectory, *args, **kwargs)
-            if inspect.isawaitable(result):
-                result = await result
-            return result
+            return await _run_agent_loop_with_student_timing(
+                run_agent_loop,
+                self,
+                sampling_params,
+                trajectory,
+                *args,
+                **kwargs,
+            )
 
         worker_cls._run_agent_loop = speco_run_agent_loop
         worker_cls._speco_patched_run_agent_loop = True
@@ -652,6 +747,32 @@ def install_agent_loop_runtime_patch() -> bool:
 
         worker_cls._agent_loop_postprocess = speco_agent_loop_postprocess
         worker_cls._speco_patched_agent_loop_postprocess = True
+
+    if callable(compute_teacher_logprobs) and not getattr(
+        worker_cls, "_speco_patched_compute_teacher_logprobs", False
+    ):
+
+        @wraps(compute_teacher_logprobs)
+        async def speco_compute_teacher_logprobs(
+            self,
+            output,
+            prompt_ids,
+            response_ids,
+            validate,
+            sample_kwargs=None,
+        ):
+            return await _compute_teacher_logprobs_with_timing(
+                self,
+                compute_teacher_logprobs,
+                output,
+                prompt_ids,
+                response_ids,
+                validate,
+                sample_kwargs,
+            )
+
+        worker_cls._compute_teacher_logprobs = speco_compute_teacher_logprobs
+        worker_cls._speco_patched_compute_teacher_logprobs = True
 
     if not getattr(worker_cls, "_speco_patched_postprocess", False):
 

@@ -51,6 +51,7 @@ from verl.utils.distributed import (
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
+from verl_speco.integration.opd_cotrain import ensure_student_only_feature_payload
 from verl_speco.integration.rollout_publish import release_draft_weights_payload
 from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
 
@@ -1315,6 +1316,7 @@ class SpecoWorker(Worker):
             if not sample:
                 result["rejected_samples"] += 1
                 continue
+            ensure_student_only_feature_payload(sample)
             batch = {
                 "input_ids": sample["input_ids"],
                 "prompts": sample["prompts"],

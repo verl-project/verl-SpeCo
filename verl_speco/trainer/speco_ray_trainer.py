@@ -38,7 +38,13 @@ from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 from verl_speco.integration.agent_loop_runtime import (
     SPECO_AGENT_LOOP_MANAGER_CLASS,
+    SPECO_STUDENT_DECODE_TIME_KEY,
+    SPECO_TEACHER_PREFILL_TIME_KEY,
     install_agent_loop_runtime_patch,
+)
+from verl_speco.integration.opd_cotrain import (
+    detach_student_feature,
+    student_policy_batch_keys,
 )
 from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
 from verl_speco.integration.rollout_idle_events import (
@@ -141,6 +147,12 @@ _SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY = "_verl_request_mean_accept_len"
 _SPECO_VLLM_REQUEST_IS_HARD_KEY = "_verl_is_hard"
 _SPECO_VLLM_REQUEST_HARD_SCORE_KEY = "_verl_hard_score"
 _SPECO_VLLM_REQUEST_ID_KEY = "_speco_vllm_request_id"
+_SPECO_STUDENT_DECODE_TOTAL_KEY = "_speco_student_decode_total"
+_SPECO_STUDENT_DECODE_COUNT_KEY = "_speco_student_decode_count"
+_SPECO_STUDENT_DECODE_MAX_KEY = "_speco_student_decode_max"
+_SPECO_TEACHER_PREFILL_TOTAL_KEY = "_speco_teacher_prefill_total"
+_SPECO_TEACHER_PREFILL_COUNT_KEY = "_speco_teacher_prefill_count"
+_SPECO_TEACHER_PREFILL_MAX_KEY = "_speco_teacher_prefill_max"
 _SPECO_DRAFTER_TIMING_DEDUCTED_KEY = "_speco_drafter_timing_deducted_from_update_actor"
 _SPECO_BOOTSTRAP_FALLBACK_IDLE_WINDOW_SEC = 10.0
 # Meta-info markers carried by fixed paired-probe batches (RFC sec. 6).
@@ -183,10 +195,14 @@ _POLICY_MODEL_NON_TENSOR_KEYS = {
 
 def _select_policy_model_batch(batch: DataProto) -> DataProto:
     """Keep rollout/drafter side-channel data out of policy-model forward paths."""
+    batch_keys = student_policy_batch_keys(batch.batch.keys())
     non_tensor_batch_keys = [
         key for key in _POLICY_MODEL_NON_TENSOR_KEYS if key in batch.non_tensor_batch
     ]
-    return batch.select(non_tensor_batch_keys=non_tensor_batch_keys)
+    return batch.select(
+        batch_keys=batch_keys,
+        non_tensor_batch_keys=non_tensor_batch_keys,
+    )
 
 
 def _get_nested(config, path, default=None):
@@ -593,18 +609,39 @@ def _speco_vllm_spec_decode_stats_from_batch(
     }
 
 
-def _speco_vllm_spec_decode_metrics_from_stats(
+def _speco_rollout_metrics_from_stats(
     stats: dict[str, float],
 ) -> dict[str, float]:
+    metrics: dict[str, float] = {}
     drafts = float(stats.get(_SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY, 0.0) or 0.0)
-    if drafts <= 0.0:
-        return {}
-    accepted_tokens = float(
-        stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY, 0.0) or 0.0
-    )
-    return {
-        SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC: 1.0 + accepted_tokens / drafts
-    }
+    if drafts > 0.0:
+        accepted_tokens = float(
+            stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY, 0.0) or 0.0
+        )
+        metrics[SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC] = (
+            1.0 + accepted_tokens / drafts
+        )
+    for phase, total_key, count_key, max_key in (
+        (
+            "student_decode",
+            _SPECO_STUDENT_DECODE_TOTAL_KEY,
+            _SPECO_STUDENT_DECODE_COUNT_KEY,
+            _SPECO_STUDENT_DECODE_MAX_KEY,
+        ),
+        (
+            "teacher_prefill",
+            _SPECO_TEACHER_PREFILL_TOTAL_KEY,
+            _SPECO_TEACHER_PREFILL_COUNT_KEY,
+            _SPECO_TEACHER_PREFILL_MAX_KEY,
+        ),
+    ):
+        count = float(stats.get(count_key, 0.0) or 0.0)
+        if count > 0.0:
+            metrics[f"timing_s/{phase}"] = float(stats.get(max_key, 0.0) or 0.0)
+            metrics[f"timing_s/{phase}_mean"] = (
+                float(stats.get(total_key, 0.0) or 0.0) / count
+            )
+    return metrics
 
 
 def _speco_truthy_meta_value(value: Any) -> bool:
@@ -657,6 +694,33 @@ def _speco_is_validation_generation(
     )
 
 
+def _speco_phase_timing_stats_from_batch(batch: Any) -> dict[str, float]:
+    non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+    if not isinstance(non_tensor_batch, dict):
+        return {}
+    stats: dict[str, float] = {}
+    for source_key, total_key, count_key, max_key in (
+        (
+            SPECO_STUDENT_DECODE_TIME_KEY,
+            _SPECO_STUDENT_DECODE_TOTAL_KEY,
+            _SPECO_STUDENT_DECODE_COUNT_KEY,
+            _SPECO_STUDENT_DECODE_MAX_KEY,
+        ),
+        (
+            SPECO_TEACHER_PREFILL_TIME_KEY,
+            _SPECO_TEACHER_PREFILL_TOTAL_KEY,
+            _SPECO_TEACHER_PREFILL_COUNT_KEY,
+            _SPECO_TEACHER_PREFILL_MAX_KEY,
+        ),
+    ):
+        values = _speco_float_values(non_tensor_batch.get(source_key))
+        if values:
+            stats[total_key] = float(sum(values))
+            stats[count_key] = float(len(values))
+            stats[max_key] = float(max(values))
+    return stats
+
+
 def _speco_set_generation_meta_flag(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
@@ -687,7 +751,7 @@ def _speco_set_generation_meta_flag(
     return lambda: None
 
 
-def _speco_merge_vllm_spec_decode_stats(
+def _speco_merge_rollout_stats(
     existing: dict[str, float] | None,
     current: dict[str, float],
 ) -> dict[str, float]:
@@ -696,10 +760,19 @@ def _speco_merge_vllm_spec_decode_stats(
     totals = {
         _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY: 0.0,
         _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY: 0.0,
+        _SPECO_STUDENT_DECODE_TOTAL_KEY: 0.0,
+        _SPECO_STUDENT_DECODE_COUNT_KEY: 0.0,
+        _SPECO_TEACHER_PREFILL_TOTAL_KEY: 0.0,
+        _SPECO_TEACHER_PREFILL_COUNT_KEY: 0.0,
     }
     for key in totals:
         totals[key] = float((existing or {}).get(key, 0.0) or 0.0) + float(
             current.get(key, 0.0) or 0.0
+        )
+    for key in (_SPECO_STUDENT_DECODE_MAX_KEY, _SPECO_TEACHER_PREFILL_MAX_KEY):
+        totals[key] = max(
+            float((existing or {}).get(key, 0.0) or 0.0),
+            float(current.get(key, 0.0) or 0.0),
         )
     return totals
 
@@ -5582,7 +5655,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 if hidden is None:
                     skipped_missing_hidden += 1
                     continue
-                hidden = hidden[:valid_rows].contiguous()
+                hidden = detach_student_feature(hidden)[:valid_rows].contiguous()
                 if hidden.numel() == 0:
                     skipped_empty_hidden += 1
                     continue
@@ -5665,7 +5738,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 sample["hidden_states_ref_chunks"] = ref_chunks
             elif hidden_ref is None:
                 hidden = cast(torch.Tensor, hidden)
-                sample["hidden_states"] = hidden.detach().cpu().unsqueeze(0)
+                sample["hidden_states"] = hidden.cpu().unsqueeze(0)
             else:
                 sample["hidden_states_ref"] = hidden_ref
                 sample["hidden_states_ref_meta"] = ref_meta
@@ -7660,7 +7733,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY, 0),
                 diagnostics.get("reason"),
             )
-        self._speco_last_rollout_metrics = _speco_merge_vllm_spec_decode_stats(
+        stats.update(_speco_phase_timing_stats_from_batch(output))
+        self._speco_last_rollout_metrics = _speco_merge_rollout_stats(
             getattr(self, "_speco_last_rollout_metrics", None),
             stats,
         )
@@ -7670,7 +7744,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self, "global_steps", None
         ):
             return {}
-        return _speco_vllm_spec_decode_metrics_from_stats(
+        return _speco_rollout_metrics_from_stats(
             getattr(self, "_speco_last_rollout_metrics", None) or {}
         )
 
