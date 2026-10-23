@@ -69,10 +69,13 @@ speco:
     # Zero means one input-file pass. The unified launcher sets this to the
     # exact number of samples required by max_steps and the global batch size.
     max_samples: 0
-    # When true the Producer buffers the input file once and queues records in
-    # a per-epoch permutation seeded with shuffle_seed + epoch, matching the
-    # speculators rng.permutation(seed, epoch) recipe. Deterministic across
-    # restarts so resumed runs replay the same per-epoch order.
+    # When true the Producer indexes the JSONL input once (one byte offset per
+    # line) and queues records in a per-epoch permutation seeded with
+    # shuffle_seed + epoch (speculators NumPy default_rng recipe).
+    # Deterministic across restarts so resumed runs replay the same per-epoch
+    # order. Parquet inputs are rejected with shuffle=true: rows have no
+    # cheap offsets to index and a bounded shuffled Parquet reader is not
+    # available yet.
     shuffle: false
     shuffle_seed: 42
     pending_poll_interval_seconds: 0.5
@@ -153,9 +156,13 @@ actor_rollout_ref:
         cuda_graph_max_bs: null
 
       vllm:
+        # File-based fallback for acceptance metrics. False disables sidecar
+        # directory creation/read/write; request and engine stats stay enabled.
+        acceptance_sidecar_enabled: true
         draft_tensor_parallel_size: null
         max_model_len: null
         enforce_eager: null
+        draft_sample_method: greedy
         speculative_config_overrides: {}
         # RL rollout assumes exact target-distribution verification. Set this
         # only when intentionally opting into a lossy acceptance method.
@@ -190,6 +197,8 @@ actor_rollout_ref:
         step: 10
         batch_size_per_gpu: 4
         training_interval_steps: 5
+        min_trainable_batches: 1
+        require_full_batch: false
         publish_interval_steps: 0
         # Async publish with freeze economics.enabled=true is rejected pending cost accounting.
         publish_async: false
@@ -200,6 +209,7 @@ actor_rollout_ref:
         draft_update_pause_generation: true
         draft_update_flush_before: true
         draft_update_flush_after: true
+        # Legacy Sync option; Bubble uses its own lifecycle/keep-hot policy.
         skip_heavy_cleanup_after_drafter_training: false
         # Keep trainer objects resident while releasing idle NPU HCCL memory.
         park_hccl_after_drafter_training: false
@@ -272,6 +282,27 @@ actor_rollout_ref:
         group_by_length: false
         # Samples per grouping megabatch, as a multiple of batch_size_per_gpu.
         group_by_length_megabatch: 8
+        # Temperature used for both target and draft distributions in LK losses.
+        # Set this to actor_rollout_ref.rollout.temperature for probabilistic drafts.
+        lk_temperature: 1.0
+        # null enables actor-side full-vocabulary logZ capture automatically when
+        # EAGLE3 LK is active; set true for collect-only fixed-data ablations.
+        capture_target_logz: null
+        # Max tolerated log-prob excess when checking actor logZ against drafter-side
+        # target logits. Loose by default to absorb bf16 noise; raises ValueError.
+        lk_target_logz_tolerance: 0.05
+        # Rows per chunk when computing DFlash/DSpark LK terms (bounds [rows, vocab]
+        # fp32 temporaries; 0 disables chunking). Chunks are recomputed in backward.
+        lk_chunk_size: 1024
+        eagle3_ce_loss_alpha: 1.0
+        eagle3_lk_loss_alpha: 0.0
+        # alpha: -log acceptance; adaptive_hybrid: lambda * KL + (1-lambda) * TV.
+        eagle3_lk_loss_type: alpha
+        # Paper default for lambda = exp(-eta * stop_gradient(mean_acceptance)).
+        eagle3_lk_hybrid_eta: 3.0
+        # Aggregate adaptive diagnostics on GPU and copy them once every N
+        # compute_loss calls (micro-batches, not optimizer steps).
+        eagle3_lk_telemetry_interval_steps: 20
         # Hard-label CE target source for backends that support it.
         # labels keeps SpeCo's teacher-forced behavior; target_argmax matches
         # speculators-style CE against the target model top-1 token.
@@ -292,6 +323,15 @@ actor_rollout_ref:
         dflash_max_window: 512
         dflash_loss_mode: full_vocab
         dflash_sampled_ce_negatives: 0
+        # LK recomputes full-vocab draft logits per chunk, so it also works with
+        # restricted_ce/sampled_ce, but then costs an extra full-vocab projection.
+        dflash_ce_loss_alpha: 1.0
+        dflash_lk_loss_alpha: 0.0
+        # alpha: -log acceptance; adaptive_hybrid: lambda * KL + (1-lambda) * TV.
+        dflash_lk_loss_type: alpha
+        dflash_lk_hybrid_eta: 3.0
+        dflash_per_position_loss_weight: fixed_exp_decay
+        dflash_dpace_alpha: 0.5
         dspark_block_size: 7
         dspark_num_anchors: 32
         dspark_loss_decay_gamma: 7.0
@@ -318,6 +358,9 @@ actor_rollout_ref:
         dspark_max_window: 0
         dspark_loss_mode: full_vocab
         dspark_sampled_ce_negatives: 0
+        # D-PACE reweights CE across draft positions; L1/LK keep their loss decay.
+        dspark_per_position_loss_weight: fixed_exp_decay
+        dspark_dpace_alpha: 0.5
         dspark_markov_rank: 256
         dspark_markov_head_type: vanilla
         dspark_confidence_head_alpha: 0.0
@@ -338,6 +381,10 @@ actor_rollout_ref:
         # auto | fused | eager. Fused uses the native CUDA/Ascend Triton kernel.
         dspark_distribution_loss_impl: auto
         # Only used by the eager fallback/reference implementation.
+        dspark_lk_loss_alpha: 0.0
+        # alpha: -log acceptance; adaptive_hybrid: lambda * KL + (1-lambda) * TV.
+        dspark_lk_loss_type: alpha
+        dspark_lk_hybrid_eta: 3.0
         dspark_l1_chunk_size: 0
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
@@ -397,7 +444,7 @@ actor_rollout_ref:
         data_buffer_max_size: 1024
         hidden_state_clip_value: 1.0e4
         feature_store:
-          # `tq` selects the streaming standalone Consumer and does not use path.
+            # Streaming standalone inputs do not use path: tq, or launcher-selected ray_reference.
           type: torch_shard
           path: null
           max_samples_per_shard: 1024
@@ -435,6 +482,8 @@ actor_rollout_ref:
           run_id: null
           schema_version: 2
           expected_feature:
+            # Launcher-owned descriptor, not an independent user switch.
+            payload_kind: null
             algorithm: null
             target_model_path: null
             target_revision: null
@@ -447,6 +496,10 @@ actor_rollout_ref:
           drop_last: true
           # Scheduled Ray Consumer: 0 keeps serial loading, k prefetches k batches.
           consumer_prefetch_batches: 0
+          # ray_reference: whole-batch CPU processes per rank; 0 restores sample threads.
+          consumer_batch_workers: 2
+          # Sample threads used only by the fallback or retained-TQ file path.
+          consumer_prepare_workers: 4
           io_retry_max_attempts: 3
           io_timeout_seconds: 30
           prefetch_collective_timeout_seconds: 180
@@ -469,6 +522,90 @@ actor_rollout_ref:
               protocol: tcp
               global_segment_size: 4294967296
               local_buffer_size: 2147483648
+        scheduler:
+          execution:
+            # sync | rollout_idle_worker
+            strategy: sync
+          # Optional hybrid Bubble quota. Each training interval creates one
+          # quality target after data becomes trainable. Bubble work repays it
+          # across real rollout-idle windows. ``training.step`` remains the
+          # per-idle-window cap; target_steps is the per-cycle optimizer target.
+          # Set target_steps=null only when intentionally reusing training.step.
+          training_quota:
+            enable: false
+            target_steps: 20
+            # interval: strict Bubble-vs-Sync equivalence experiment.
+            # adaptive: production mode; each selected refresh still executes
+            # all 20 optimizer steps on one immutable data version.
+            trigger_mode: adaptive
+            acceptance_drop_ratio: 0.03
+            loss_increase_ratio: 0.10
+            min_refresh_interval_steps: 2
+            # A forced refresh prevents a healthy accept-length signal from
+            # leaving the drafter permanently stale.
+            max_refresh_interval_steps: 10
+            # Age thresholds are also exported as observability metrics. They
+            # only permit serial assistance when the fallback below is enabled.
+            max_debt_age_steps: 1
+            # With critical-path fallback enabled, this is the hard completion
+            # deadline. Production mode leaves debt pending for later bubbles.
+            max_completion_lag_steps: 3
+            max_accumulated_debt: 20
+            # Used only when critical-path fallback is explicitly enabled.
+            max_sync_topup_steps: 2
+            # Production Bubble must not borrow PPO/rollout critical-path
+            # resources. Set true only for strict freshness experiments that
+            # explicitly accept Sync-like blocking completion.
+            allow_critical_path_fallback: false
+          idle_worker:
+            require_memory_released: true
+            drain_before_next_rollout: true
+            # Reuse device tensors within a rollout. By default park them on
+            # CPU before PPO and rollout wake-up; enable only with enough memory
+            # for both the main workload and the resident drafter trainer.
+            keep_hot_between_plans: false
+            # Experimental: enable only after validating an equal-topology
+            # subgroup state handoff and its end-to-end cost on the target host.
+            writer_migration_enable: false
+            writer_migration_history_steps: 4
+            writer_migration_min_idle_gain_sec: 1.0
+            writer_migration_cost_margin: 2.0
+            # Last-resort Bubble fallback. If every replica-local group is
+            # disabled (for example OOM during activation), allow the scheduler
+            # to require the full drafter collective to be idle. Disabled by
+            # default because it reduces Bubble granularity and can reintroduce
+            # rollout wake-up memory pressure.
+            full_collective_fallback: false
+            event_bus_name: null
+            event_poll_interval_sec: 0.05
+            # Let asynchronous staging overlap later work, but bound how long
+            # rollout may keep serving an older drafter version.
+            max_publish_lag_steps: 2
+            max_pending_publish: 1
+            # Bubble-only, opt-in: stage an already cached CPU snapshot before
+            # upstream weight sync. Never exports GPU weights on this path;
+            # commit and publication ACK remain at their existing boundaries.
+            early_publish_staging: false
+            # Bubble-only, capability checked. Driver forwards an immutable
+            # CPU head reference rather than materializing a full torch tensor.
+            head_reference_transport: true
+            # Use recent per-writer steady steps and matching cleanup mode.
+            # Keeps first-step overhead, deadline and reclaim guards separate.
+            calibrated_budgets: true
+            # Experimental bounded retry: same hot writer, budgeted optimizer
+            # steps per idle episode, backed by same-replica completed history.
+            historical_window_readmission: false
+            # Repeated per-token generation slowdown means the predicted idle
+            # window was unsafe. Pause new Bubble launches briefly instead of
+            # continuing to interfere at a one-batch cap.
+            gen_slowdown_patience: 2
+            gen_slowdown_cooldown_steps: 2
+            # Explicit training_groups wins.  With group_mode=auto, the
+            # scheduler forms stable collective groups from known rollout
+            # workers and only trains when a full group is idle.
+            group_mode: auto
+            group_size: null
+            training_groups: []
 
         # Drafter convergence freeze: stop drafter training once a new drafter
         # version no longer pays for its train+publish cost. Policy training

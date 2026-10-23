@@ -54,8 +54,9 @@ class ConservativeTrainingDataStatusPolicy:
         common_data_version = (
             data_versions[0] if data_version_consistent and data_versions else None
         )
-        worker_snapshots: dict[str, dict[str, object]] = {
-            s.worker_id: {
+        worker_snapshots: dict[str, dict[str, object]] = {}
+        for s in statuses:
+            snapshot: dict[str, object] = {
                 "buffer_version": s.buffer_version,
                 "data_version": (
                     s.data_version
@@ -68,8 +69,9 @@ class ConservativeTrainingDataStatusPolicy:
                 "min_sample_step": s.min_sample_step,
                 "max_sample_step": s.max_sample_step,
             }
-            for s in statuses
-        }
+            if s.trainable_valid_tokens:
+                snapshot["trainable_valid_tokens"] = s.trainable_valid_tokens
+            worker_snapshots[s.worker_id] = snapshot
         return TrainingDataStatus(
             current_step=_as_int(global_step),
             current_step_samples=min(s.current_step_samples for s in statuses),
@@ -105,6 +107,7 @@ class ConservativeTrainingDataStatusPolicy:
             ),
             buffer_version=min(s.buffer_version for s in statuses),
             worker_snapshots=worker_snapshots,
+            trainable_valid_tokens=min(s.trainable_valid_tokens for s in statuses),
             min_sample_step=min(
                 (s.min_sample_step for s in statuses if s.min_sample_step is not None),
                 default=None,

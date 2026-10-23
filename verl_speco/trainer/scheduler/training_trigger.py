@@ -44,7 +44,10 @@ class IntervalAndBufferTrigger:
             return TriggerDecision(False, "pending_training")
         if not interval_matched:
             return TriggerDecision(False, "interval_not_reached")
-        if context.collected_samples_this_step <= 0:
+        if (
+            context.collected_samples_this_step <= 0
+            and not context.allow_cached_training
+        ):
             if context.oldlogprob_collection_requested:
                 return TriggerDecision(False, "no_current_step_oldlogprob_samples")
             if not config.use_data_buffer:

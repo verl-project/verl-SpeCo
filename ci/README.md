@@ -311,7 +311,7 @@ comments alone never start hardware tests. Fork authors do not need Actions
 write permission. The controller runs only on GitHub-hosted runners and never
 checks out PR code or executes comment text as shell commands.
 
-`ci/comment_cases.json` lists aliases for all 21 scripts. An unknown alias
+`ci/comment_cases.json` lists aliases for all example scripts. An unknown alias
 returns the available names. Other scripts use descriptive GPU/NPU aliases.
 The approved SHA is checked again by the dispatched workflow: new commits,
 edited requests, closed PRs, and duplicate approvals cannot silently start a

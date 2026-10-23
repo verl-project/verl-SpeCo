@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Algorithm-neutral TransferQueue codec for ``DraftFeatureSample``."""
+"""Shared TQ sample envelope, hidden reference tags, and feature tensor codec."""
 
 from __future__ import annotations
 
 import json
+import math
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
@@ -26,13 +28,27 @@ from verl_speco.trainer.feature_store import DraftFeatureSample
 
 PROTOCOL_SCHEMA_VERSION = 2
 DRAFTER_TQ_PARTITION = "speco_drafter_features"
+REFERENCE_KIND = "vllm_reference"
+REFERENCE_VERSION = 1
+_REQUEST_ARRAYS = (
+    "input_ids",
+    "loss_mask",
+    "position_ids",
+    "feature_positions",
+    "draft_position_ids",
+    "vllm_prompt_token_ids",
+)
+
 _MANIFEST_FIELD = "sample__manifest_json"
 _REQUIRED_SAMPLE_FIELDS = ("input_ids", "loss_mask", "hidden_states")
 _OPTIONAL_TENSOR_FIELDS = (
     "last_hidden_states",
     "target",
     "target_logprobs",
+    "target_logz",
     "position_ids",
+    "next_token_ids",
+    "next_token_loss_mask",
 )
 
 
@@ -105,6 +121,105 @@ def make_sample_key(meta: SampleMetadata) -> str:
 def make_ready_tag(meta: SampleMetadata) -> dict[str, Any]:
     meta.validate()
     return {"record_type": "sample", "status": "ready", **meta.to_dict()}
+
+
+def make_reference_tag(
+    meta: SampleMetadata,
+    *,
+    path: str | None = None,
+    backend: str = "file",
+    handle: str | None = None,
+    transfer_params: Mapping[str, Any] | None = None,
+    request: Mapping[str, Any],
+    feature_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build a ready tag from ordinary lists/dicts supplied by the producer."""
+    tag = {
+        **make_ready_tag(meta),
+        "payload_kind": REFERENCE_KIND,
+        "reference_version": REFERENCE_VERSION,
+        "backend": backend,
+        **({"hidden_states_path": path} if backend == "file" else {"handle": handle}),
+        "transfer_params": dict(transfer_params or {}),
+        "request": dict(request),
+        "feature_contract": dict(feature_contract),
+    }
+    validate_reference_tag(tag)
+    # Return an owned metadata tree, with no tensors or mutable caller aliases.
+    return deepcopy(tag)
+
+
+def validate_reference_tag(tag: Mapping[str, Any]) -> None:
+    """Reject incomplete or incompatible metadata before opening any file."""
+    SampleMetadata.from_dict(tag).validate()
+    if tag.get("record_type") != "sample" or tag.get("status") != "ready":
+        raise ValueError("Hidden reference must be a ready sample")
+    if tag.get("payload_kind") != REFERENCE_KIND:
+        raise ValueError("Unsupported hidden reference payload_kind")
+    if tag.get("reference_version") != REFERENCE_VERSION:
+        raise ValueError("Unsupported hidden reference version")
+    backend = tag.get("backend")
+    if backend not in {"file", "mooncake"}:
+        raise ValueError("Hidden references require backend=file or mooncake")
+    field = "hidden_states_path" if backend == "file" else "handle"
+    reference = tag.get(field)
+    if not isinstance(reference, str) or not reference.strip():
+        raise ValueError(f"Hidden reference requires {field}")
+    other = "handle" if backend == "file" else "hidden_states_path"
+    if tag.get(other) is not None:
+        raise ValueError("Hidden reference must select exactly one backend")
+    params = tag.get("transfer_params", {})
+    if not isinstance(params, Mapping):
+        raise ValueError("Hidden reference transfer_params must be a mapping")
+    if field in params and params[field] != reference:
+        raise ValueError("Hidden reference and transfer_params disagree")
+    request = tag.get("request")
+    if not isinstance(request, dict):
+        raise ValueError("Hidden references require request metadata")
+    for name in _REQUEST_ARRAYS:
+        value = request.get(name)
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"Hidden reference request requires non-empty {name} list")
+        if any(
+            isinstance(item, bool) or not isinstance(item, (int, float))
+            for item in value
+        ):
+            raise ValueError(f"Hidden reference {name} must contain numbers")
+        if name != "loss_mask" and any(not isinstance(item, int) for item in value):
+            raise ValueError(f"Hidden reference {name} must contain integers")
+    if not (
+        len(request["input_ids"])
+        == len(request["loss_mask"])
+        == len(request["position_ids"])
+    ):
+        raise ValueError("Hidden reference token/mask/position lengths differ")
+    if len(request["feature_positions"]) != len(request["draft_position_ids"]):
+        raise ValueError("Hidden reference feature/draft position lengths differ")
+    if any(
+        p < 0 or p >= len(request["input_ids"]) for p in request["feature_positions"]
+    ):
+        raise ValueError("Hidden reference feature positions are out of range")
+    if not isinstance(request.get("source_metadata"), dict):
+        raise ValueError("Hidden reference requires source_metadata mapping")
+    if not isinstance(tag.get("feature_contract"), dict) or not tag["feature_contract"]:
+        raise ValueError("Hidden reference requires feature_contract mapping")
+    _validate_plain_metadata(dict(tag))
+
+
+def _validate_plain_metadata(value: Any) -> None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float) and math.isfinite(value):
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_plain_metadata(item)
+        return
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        for item in value.values():
+            _validate_plain_metadata(item)
+        return
+    raise ValueError("Hidden reference must contain finite plain metadata only")
 
 
 def parse_ready_tag(
@@ -462,6 +577,8 @@ __all__ = [
     "is_ready_sample_tag",
     "make_eos_record",
     "make_ready_tag",
+    "make_reference_tag",
+    "validate_reference_tag",
     "make_sample_key",
     "parse_ready_tag",
 ]

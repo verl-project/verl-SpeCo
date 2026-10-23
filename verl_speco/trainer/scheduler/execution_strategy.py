@@ -106,3 +106,122 @@ class SyncExecutionStrategy:
             raise
         elapsed_sec = time.perf_counter() - started_at
         return ExecutionOutcome(raw_results=results, elapsed_sec=elapsed_sec)
+
+
+def _preflight_ready(plan: TrainingPlan, readiness: list[Any]) -> bool:
+    participants = [
+        result
+        for result in readiness
+        if isinstance(result, dict) and result.get("participating", False)
+    ]
+    expected_worker_ids = set((plan.worker_snapshots or {}).keys())
+    ready_worker_ids = {
+        str(result.get("worker_id", result.get("rank", "")))
+        for result in participants
+        if bool(result.get("ready", False))
+    }
+    return bool(expected_worker_ids) and (
+        ready_worker_ids == expected_worker_ids
+        and len(participants) == len(expected_worker_ids)
+        and all(bool(result.get("ready", False)) for result in participants)
+        and all(
+            result.get("data_version") == plan.data_version for result in participants
+        )
+        and all(
+            plan.required_target_version is None
+            or result.get("target_version") == plan.required_target_version
+            for result in participants
+        )
+    )
+
+
+class RolloutIdleWorkerExecutionStrategy:
+    """Submit a ready idle-worker plan and return without blocking."""
+
+    def execute(
+        self,
+        plan: TrainingPlan,
+        *,
+        executor: DrafterWorkerExecutor,
+        runtime_state: DrafterRuntimeState,
+    ) -> ExecutionOutcome:
+        if not plan.launch:
+            raise ValueError("Cannot execute an inactive drafter training plan")
+        if runtime_state.status in {
+            DrafterRuntimeStatus.COMPLETED,
+            DrafterRuntimeStatus.FAILED,
+        }:
+            runtime_state.reset()
+
+        started_at = time.perf_counter()
+        runtime_state.submit(plan, started_at=started_at)
+        try:
+            try:
+                readiness = executor.preflight_training(plan)
+            except Exception:
+                executor.abort_training_preflight(plan)
+                raise
+            if not _preflight_ready(plan, readiness):
+                executor.abort_training_preflight(plan)
+                return ExecutionOutcome(
+                    raw_results=readiness,
+                    elapsed_sec=time.perf_counter() - started_at,
+                    launched=False,
+                    reason="worker_preflight_failed",
+                )
+            submission = executor.submit_training(plan)
+            runtime_state.training_ref = submission
+            runtime_state.mark_running()
+        except Exception as error:
+            runtime_state.mark_failed(error)
+            raise
+        return ExecutionOutcome(
+            raw_results=[],
+            elapsed_sec=time.perf_counter() - started_at,
+            reason="submitted_async",
+        )
+
+    def poll(
+        self,
+        *,
+        executor: DrafterWorkerExecutor,
+        runtime_state: DrafterRuntimeState,
+    ) -> ExecutionOutcome | None:
+        if runtime_state.status is not DrafterRuntimeStatus.RUNNING:
+            return None
+        ready, submission = executor.poll_training(runtime_state.training_ref)
+        if not ready:
+            return None
+        try:
+            results = executor.resolve_training(submission)
+        except Exception as error:
+            runtime_state.mark_failed(error)
+            raise
+        elapsed_sec = (
+            time.perf_counter() - runtime_state.started_at
+            if runtime_state.started_at is not None
+            else 0.0
+        )
+        return ExecutionOutcome(raw_results=results, elapsed_sec=elapsed_sec)
+
+    def wait(
+        self,
+        *,
+        executor: DrafterWorkerExecutor,
+        runtime_state: DrafterRuntimeState,
+    ) -> ExecutionOutcome | None:
+        """Drain an in-flight batch after reclaim before PPO reuses resources."""
+
+        if runtime_state.status is not DrafterRuntimeStatus.RUNNING:
+            return None
+        try:
+            results = executor.resolve_training(runtime_state.training_ref)
+        except Exception as error:
+            runtime_state.mark_failed(error)
+            raise
+        elapsed_sec = (
+            time.perf_counter() - runtime_state.started_at
+            if runtime_state.started_at is not None
+            else 0.0
+        )
+        return ExecutionOutcome(raw_results=results, elapsed_sec=elapsed_sec)

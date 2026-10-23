@@ -52,6 +52,23 @@ def test_partial_window_uses_actual_sample_count():
     assert metrics["producer/samples_per_second"] == pytest.approx(3.7)
 
 
+def test_metadata_metrics_report_per_sample_latency_and_real_batch_size():
+    rows = [{"timing": {
+        "e2e": 6.0, "publish_queue": 2.0, "publish_queue_wait": 0.5,
+        "publish_transport": 1.0, "publish_retry_wait": 0.2,
+        "metadata_batch_size": 4, "metadata_submit": 1.2,
+    }}] * 4
+    metrics = producer_window_metrics(rows, elapsed=3)
+    assert metrics["producer/samples_per_second"] == pytest.approx(4 / 3)
+    assert metrics["producer/publish_queue_time"] == 2.0
+    assert metrics["producer/publish_queue_wait_time"] == 0.5
+    assert metrics["producer/publish_transport_time"] == 1.0
+    assert metrics["producer/publish_retry_wait_time"] == 0.2
+    assert metrics["producer/metadata_batch_size"] == 4
+    assert metrics["producer/metadata_submit_time"] == 1.2
+    assert not any("tq" in key for key in metrics)
+
+
 def test_producer_logging_uses_published_count_and_independent_step_backends():
     calls = []
     class Tracker:

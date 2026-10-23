@@ -74,6 +74,7 @@ def test_stock_verl_rollout_adapter_lacks_native_draft_update_api() -> None:
     fails fast.  The native path is provisioned for future vLLM V1 backends
     or runtime injection that expose these APIs.
     """
+    pytest.importorskip("vllm", reason="stock adapter contract needs vLLM")
     pytest.importorskip("verl", reason="stock adapter contract needs verl")
     from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter
 
@@ -92,6 +93,7 @@ def test_patch_vllm_server_adapter_update_does_not_inject_update_draft_weights(
     early-return guard would short-circuit ``select_draft_update_strategy``,
     making the native/compat selector and its startup log dead code.
     """
+    pytest.importorskip("vllm", reason="ServerAdapter contract needs vLLM")
     pytest.importorskip("verl", reason="needs verl ServerAdapter")
     from verl.workers.rollout.vllm_rollout import vllm_rollout as vllm_rollout_mod
 
@@ -117,6 +119,7 @@ def test_production_attach_after_init_selects_compat_on_stock_adapter(
     """After production init (IPC patches only, no compat pre-injection),
     ``attach_draft_weight_updater`` on a stock adapter must run the strategy
     selector, log the decision, and bind the compat method."""
+    pytest.importorskip("vllm", reason="ServerAdapter contract needs vLLM")
     pytest.importorskip("verl", reason="needs verl ServerAdapter")
     from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter
 

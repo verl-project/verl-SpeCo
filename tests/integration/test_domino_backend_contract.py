@@ -164,6 +164,81 @@ def test_domino_forward_passes_dense_mask_off_cuda(monkeypatch) -> None:
     assert dense_mask.dtype == torch.bool
 
 
+def test_domino_forward_accepts_target_last_hidden_states() -> None:
+    """DFlashTrainerBackend.compute_loss passes ``target_last_hidden_states``
+    to every inheriting model; Domino must accept (and ignore) it."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    import torch
+
+    from verl_speco.backends.domino_trainer_backend import DominoTrainingModel
+    from verl_speco.models.domino import DominoDraftModel
+
+    torch.manual_seed(0)
+    config = _tiny_domino_config()
+    model = DominoTrainingModel(
+        draft_model=DominoDraftModel(config),
+        block_size=config.block_size,
+        num_anchors=config.num_anchors,
+        pure_draft_prefix_len=config.pure_draft_prefix_len,
+    )
+    bsz, seq_len = 2, 16
+    input_ids = torch.randint(0, config.vocab_size, (bsz, seq_len))
+    hidden_states_list = [
+        torch.randn(bsz, seq_len, config.target_hidden_size)
+        for _ in config.target_layer_ids
+    ]
+    loss_mask = torch.ones(bsz, seq_len, dtype=torch.long)
+    lm_head_weight = torch.randn(config.vocab_size, config.hidden_size)
+
+    for last_hidden in (None, torch.randn(bsz, seq_len, config.target_hidden_size)):
+        model(
+            input_ids,
+            hidden_states_list,
+            loss_mask,
+            lm_head_weight,
+            target_last_hidden_states=last_hidden,
+        )
+
+
+def test_domino_trailing_label_keeps_final_context_anchor() -> None:
+    """A one-row context with a trailing label token must keep one valid
+    anchor: Domino supervises the token after the anchor."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    import torch
+
+    from verl_speco.backends.domino_trainer_backend import DominoTrainingModel
+    from verl_speco.models.domino import DominoDraftModel
+
+    torch.manual_seed(0)
+    config = _tiny_domino_config()
+    model = DominoTrainingModel(
+        draft_model=DominoDraftModel(config),
+        block_size=config.block_size,
+        num_anchors=config.num_anchors,
+        pure_draft_prefix_len=config.pure_draft_prefix_len,
+    )
+    hidden_states_list = [
+        torch.randn(1, 1, config.target_hidden_size) for _ in config.target_layer_ids
+    ]
+    input_ids = torch.randint(0, config.vocab_size, (1, 1))
+    loss_mask = torch.ones(1, 1, dtype=torch.long)
+    label_ids = torch.randint(0, config.vocab_size, (1, 2))
+    label_mask = torch.ones(1, 2, dtype=torch.long)
+    lm_head_weight = torch.randn(config.vocab_size, config.hidden_size)
+
+    _, _, _, _, count_pp, _ = model(
+        input_ids,
+        hidden_states_list,
+        loss_mask,
+        lm_head_weight,
+        label_ids=label_ids,
+        label_mask=label_mask,
+    )
+    assert float(count_pp.sum()) > 0
+
+
 def test_domino_lambda_base_schedule() -> None:
     # get_lambda_base is pure-python, but its module (domino_trainer_backend)
     # subclasses the torch-based DFlash backend at import time, so it cannot be
@@ -193,6 +268,19 @@ def test_domino_backend_is_block_drafter_metadata() -> None:
         OmegaConf.create({}),
     )
     assert backend.model_type == "domino"
+
+
+@pytest.mark.parametrize("key", ["dflash_lk_loss_alpha", "dspark_lk_loss_alpha"])
+def test_domino_backend_rejects_lk_before_building_model(key) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from omegaconf import OmegaConf
+
+    from verl_speco.backends.domino_trainer_backend import DominoTrainerBackend
+
+    config = OmegaConf.create({"rollout": {"drafter": {"training": {key: 0.5}}}})
+    with pytest.raises(ValueError, match=f"Domino does not support LK loss.*{key}"):
+        DominoTrainerBackend(config, OmegaConf.create({}))
 
 
 def test_domino_config_from_file_routes_to_domino(tmp_path) -> None:

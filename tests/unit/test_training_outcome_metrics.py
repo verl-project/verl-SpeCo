@@ -32,6 +32,17 @@ def _plan() -> TrainingPlan:
     )
 
 
+def test_from_execution_forwards_eagle3_lk_metrics() -> None:
+    plan = _plan()
+    outcome = TrainingOutcome.from_execution(
+        ExecutionOutcome(raw_results=[_result(**{"eagle3/lk/acceptance": 0.7,
+                                                "eagle3/lk_loss": 0.4})], elapsed_sec=1.0),
+        runtime_state=_running_state(plan), plan=plan,
+    )
+    assert outcome.metrics["eagle3/lk/acceptance"] == 0.7
+    assert outcome.metrics["eagle3/lk_loss"] == 0.4
+
+
 def _running_state(plan: TrainingPlan) -> DrafterRuntimeState:
     state = DrafterRuntimeState()
     state.submit(plan, started_at=0.0)
