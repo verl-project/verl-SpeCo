@@ -318,7 +318,7 @@ def _apply_drafter_config_at_scheduler_boundary(server_args: Any) -> None:
     actual_algorithm = str(
         getattr(server_args, "speculative_algorithm", "") or ""
     ).upper()
-    logger.warning(
+    logger.info(
         "[speco sglang launch] requested_algorithm=%s "
         "server_args_algorithm=%s draft_model=%s "
         "draft_attention_backend=%s prefill_attention_backend=%s "
@@ -1551,13 +1551,24 @@ async def _sgl_http_update_weights_from_tensor(
         if field in request_fields:
             payload[field] = getattr(update_weights_request, field)
 
-    url = f"http://{server_args.host}:{server_args.port}/update_weights_from_tensor"
+    host = str(server_args.host)
+    if host in ("0.0.0.0", "::", ""):
+        host = "127.0.0.1"
+    elif ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    url = f"http://{host}:{server_args.port}/update_weights_from_tensor"
+    post_kwargs: dict[str, Any] = {"json": payload}
+    api_key = getattr(server_args, "api_key", None)
+    if api_key:
+        post_kwargs["headers"] = {"Authorization": f"Bearer {api_key}"}
     async with get_session() as session:
-        async with session.post(url, json=payload) as response:
+        async with session.post(url, **post_kwargs) as response:
             try:
                 result = await response.json()
             except Exception:  # noqa: BLE001
                 result = {"message": await response.text()}
+            if not isinstance(result, dict):
+                result = {"message": str(result)}
             if response.status >= 400:
                 return {
                     "success": False,

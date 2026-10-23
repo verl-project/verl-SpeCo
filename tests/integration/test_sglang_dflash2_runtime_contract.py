@@ -137,8 +137,8 @@ def test_sglang_weight_update_preserves_http_error_message_and_route_fields() ->
         async def __aexit__(self, *args):
             return False
 
-        def post(self, url, *, json):
-            posted.update(url=url, json=json)
+        def post(self, url, *, json, headers=None):
+            posted.update(url=url, json=json, headers=headers)
             return Response()
 
     request = types.SimpleNamespace(
