@@ -321,14 +321,6 @@ class TrainingOutcome:
                 len(publish_leaders) == 1 and publish_leaders[0].snapshot_ready
             ),
         }
-        for key in ("drafter/optimizer_steps_total", "drafter/current_lr"):
-            values = [
-                value
-                for result in normalized_results
-                if (value := _metric_float(result.get(key))) is not None
-            ]
-            if values:
-                metrics[key] = max(values)
         # Surface per-block drafter training scalars (e.g. dspark/confidence_*)
         # computed by SpecoWorker.get_training_metrics() instead of dropping them.
         for block_key, block_value in _forward_block_metrics(

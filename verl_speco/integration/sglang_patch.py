@@ -28,11 +28,11 @@ from typing import Any, Callable, Iterable, TypeGuard, cast
 import torch
 import sglang.srt.entrypoints.engine
 from sglang.srt.utils import MultiprocessingSerializer
+
+from verl_speco.integration.drafter_config_env import get_drafter_config_env
 from verl_speco.integration.sglang_adapter import (
     _call_flashinfer_plan_with_abi_compat,
 )
-
-from verl_speco.integration.drafter_config_env import get_drafter_config_env
 
 try:
     import triton

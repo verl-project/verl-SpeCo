@@ -27,6 +27,7 @@ import contextvars
 import dataclasses
 import functools
 import hashlib
+import importlib
 import inspect
 import json
 import logging
@@ -125,6 +126,8 @@ _HIDDEN_STATE_WINDOW_END_PARAM = "_verl_hidden_state_window_end"
 _HIDDEN_STATE_WINDOW_START_OFFSET_PARAM = "_verl_hidden_state_window_start_offset"
 _HIDDEN_STATE_WINDOW_MIN_ROWS_PARAM = "_verl_hidden_state_window_min_rows"
 _VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS"
+# Shared, backend-neutral transport keys; the "vllm" prefix is historical and
+# must match SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX read by the trainer.
 _SPECO_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
 
 _SERVER_ARGS_PATCHED = False
@@ -217,8 +220,6 @@ def _install_verl_server_args_fields_compat(upstream_module: Any) -> None:
 
 def _install_verl_launch_subprocesses_compat() -> None:
     """Inject SPECO args at launch and expose the legacy verl launcher shape."""
-    import importlib
-
     http_server = importlib.import_module("sglang.srt.entrypoints.http_server")
 
     engine = getattr(http_server, "Engine", None)
