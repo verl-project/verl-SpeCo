@@ -58,6 +58,7 @@ def _prepare_batch(entries):
     from verl_speco.trainer.standalone_sample_cleanup import cleanup_standalone_samples
 
     cleanup_standalone_samples(_STORE, entries)
+    batch["_speco_worker_finished_at"] = time.monotonic()
     return batch, time.perf_counter() - started
 
 
@@ -145,6 +146,7 @@ class ReferenceBatchPrefetchIterator(TQPrefetchIterator):
                     assignment = next(source)
                     if assignment is None:
                         raise RuntimeError("Missing file batch assignment")
+                    assignment.delivery_times["_worker_submitted_at"] = time.monotonic()
                     result = self._pool.apply_async(
                         _prepare_batch, (assignment.file_entries,)
                     )
@@ -203,6 +205,18 @@ class ReferenceBatchPrefetchIterator(TQPrefetchIterator):
                             ) from None
                 else:
                     return
+                received_at = time.monotonic()
+                delivery_times = dict(assignment.delivery_times)
+                submitted_at = delivery_times.pop("_worker_submitted_at")
+                delivery_times["loader_worker_result_wait_time"] = max(
+                    0.0, received_at - submitted_at - seconds
+                )
+                finished_at = prepared.pop("_speco_worker_finished_at", None)
+                if finished_at is not None:
+                    delivery_times["loader_ipc_collect_time"] = (
+                        received_at - finished_at
+                    )
+                delivery_times["_pin_queued_at"] = time.monotonic()
                 with self._condition:
                     self._pin_batches.append(
                         replace(
@@ -211,6 +225,7 @@ class ReferenceBatchPrefetchIterator(TQPrefetchIterator):
                             file_entries=None,
                             batch_prepare_seconds=seconds,
                             cleanup_after_load=True,
+                            delivery_times=delivery_times,
                         )
                     )
                     self._condition.notify_all()

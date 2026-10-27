@@ -164,6 +164,11 @@ def test_process_workers_prepare_different_batches_and_keep_fifo(tmp_path, monke
             assert batch.prepared_batch["input_ids"].tolist() == [[0, 1, 2, 3]]
             assert batch.prepared_batch["hidden_states"].device.type == "cpu"
             assert batch.batch_prepare_seconds > 0
+            for key in ("loader_worker_result_wait_time", "loader_ipc_collect_time",
+                        "loader_pin_queue_time", "loader_pin_time", "loader_ready_queue_time"):
+                assert batch.delivery_times[key] >= 0
+            assert not any(key.startswith("_") for key in batch.delivery_times)
+            assert "_speco_worker_finished_at" not in batch.prepared_batch
         with pytest.raises(StopIteration):
             next(source)
         assert not any(path.exists() for path in paths)
@@ -462,3 +467,49 @@ def test_driver_receives_metadata_once_before_producer_completion(tmp_path, monk
     assert len(submitted) == 1 and submitted[0]["global_keys"] == [entry.key]
     assert submitted[0]["assignments"][0][0]["tag"] == entry.tag
     assert not path.exists()
+
+
+@pytest.mark.parametrize("backend", ["file", "mooncake"])
+def test_cleanup_discards_invalid_training_values_using_valid_reference(tmp_path, backend):
+    from types import SimpleNamespace
+    from verl_speco.transport.drafter_sample_protocol import validate_reference_tag
+
+    entry, path = _entry(tmp_path)
+    entry.tag["request"]["loss_mask"][1] = float("nan")
+    entry.tag["request"]["feature_positions"][-1] = 99
+    with pytest.raises(ValueError):
+        validate_reference_tag(entry.tag)
+    if backend == "file":
+        store = SimpleNamespace(uses_transfer_queue=False)
+        assert cleanup_standalone_samples(store, [entry]) == []
+        assert not path.exists()
+    else:
+        entry.tag["backend"] = "mooncake"
+        entry.tag.pop("hidden_states_path")
+        entry.tag["handle"] = "discarded-handle"
+        released = []
+        store = SimpleNamespace(
+            uses_transfer_queue=False,
+            hidden_states_store=SimpleNamespace(backend="mooncake", release=released.append),
+        )
+        assert cleanup_standalone_samples(store, [entry]) == []
+        assert released == ["discarded-handle"]
+
+
+@pytest.mark.parametrize("failure", ["ambiguous", "backend_mismatch"])
+def test_cleanup_checks_reference_before_deleting(tmp_path, failure):
+    from types import SimpleNamespace
+
+    entry, path = _entry(tmp_path)
+    released = []
+    store = SimpleNamespace(
+        uses_transfer_queue=False,
+        hidden_states_store=SimpleNamespace(backend="file", release=released.append),
+    )
+    if failure == "ambiguous":
+        entry.tag["handle"] = "wrong"
+    else:
+        store.hidden_states_store.backend = "mooncake"
+    with pytest.raises(ValueError):
+        cleanup_standalone_samples(store, [entry])
+    assert released == [] and path.exists()

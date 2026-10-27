@@ -498,6 +498,10 @@ def test_reference_producer_never_reads_or_normalizes_hidden(tmp_path, monkeypat
             assert timing["publish_transport"] == 0.01  # Full RPC latency, not divided by two.
             assert timing["publish_attempts"] == 2
             assert timing["metadata_submit"] > 0
+            parts = [timing[name] for name in ("metadata_build", "publish_enqueue", "publish_residence", "publish_batch_wait")]
+            assert all(value >= 0 for value in parts)
+            assert sum(parts) == pytest.approx(timing["publish_queue"], abs=0.005)
+            assert timing["metadata_ready_delay"] >= 0
             assert timing["active"] + timing["backpressure"] <= timing["e2e"] + 1e-5
             assert not any(key.startswith("tq_") for key in timing)
         return
