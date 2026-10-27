@@ -1721,6 +1721,10 @@ def _standalone_step_metrics(
             metrics["train/avg_loss"] = avg_loss
         if avg_acc is not None:
             metrics["train/avg_acc"] = avg_acc
+        if f"{prefix}/mean_acceptance_length" in raw_metrics:
+            metrics["train/mean_accept_length"] = float(
+                raw_metrics[f"{prefix}/mean_acceptance_length"]
+            )
         if f"{prefix}/simulated_acc_len" in raw_metrics:
             metrics["train/simulated_acc_len"] = float(
                 raw_metrics[f"{prefix}/simulated_acc_len"]
@@ -1757,7 +1761,7 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         ("train/avg_acc", "avg_acc"),
         ("train/top1_acc", "top1"),
         ("train/top5_acc", "top5"),
-        ("train/simulated_acc_len", "sim_acc_len"),
+        ("train/mean_accept_length", "mean_accept_length"),
         ("train/lr", "lr"),
         ("perf/step_time", "step_time"),
         ("perf/loader_plan_wait_time", "loader_plan_wait_time"),
