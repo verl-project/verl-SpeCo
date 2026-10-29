@@ -573,6 +573,12 @@ actor_rollout_ref:
             # CPU before PPO and rollout wake-up; enable only with enough memory
             # for both the main workload and the resident drafter trainer.
             keep_hot_between_plans: false
+            # Compatibility key only: V1 safe-point head preparation was removed.
+            # Training prepares and validates its pinned head on demand.
+            v1_head_preparation_enable: false
+            # Driver boundary timestamps; correlate with worker cleanup logs.
+            # These report RPC/event lifecycle, not hardware utilization fences.
+            boundary_diagnostics_enable: false
             # Experimental: enable only after validating an equal-topology
             # subgroup state handoff and its end-to-end cost on the target host.
             writer_migration_enable: false

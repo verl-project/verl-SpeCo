@@ -24,6 +24,8 @@ import tempfile
 import time
 from typing import Any, cast
 
+from verl_speco.trainer.v1.bubble_mixin import V1BubbleMixin
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,7 +51,7 @@ def _remotify_like(original, cls):
     return ray.remote(cls) if hasattr(original, "__ray_actor_class__") else cls
 
 
-class SpecoV1Mixin:
+class SpecoV1Mixin(V1BubbleMixin):
     """Add SPECO worker/runtime wiring while preserving the V1 PPO loop.
 
     Phase 1 deliberately does not alter V1's ``KVBatchMeta`` pipeline.  The
@@ -379,7 +381,7 @@ class SpecoV1Mixin:
         import ray
         from uuid import uuid4
 
-        servers = list(self.llm_server_manager.server_handles)
+        servers = self._speco_v1_probe_servers()
         if not servers:
             raise RuntimeError("V1 paired probes require initialized rollout servers")
         max_tokens = int(self._speco_freeze_probe_config().get("max_new_tokens", 2048))
@@ -413,6 +415,16 @@ class SpecoV1Mixin:
             wall_seconds += time.perf_counter() - started
             for index, output in enumerate(outputs):
                 fields = getattr(output, "extra_fields", {}) or {}
+                expected_revision = getattr(
+                    self, "_speco_v1_probe_expected_revision", None
+                )
+                if expected_revision is not None and (
+                    fields.get("_speco_drafter_revision_min") != expected_revision
+                    or fields.get("_speco_drafter_revision_max") != expected_revision
+                ):
+                    raise RuntimeError(
+                        "V1 Bubble probe has missing or mixed serving revisions"
+                    )
                 accept = fields.get("_verl_request_mean_accept_len")
                 if accept is None:
                     rounds = fields.get("spec_num_verify_steps", 0) or 0
@@ -484,6 +496,27 @@ class SpecoV1Mixin:
             "feature_store": feature_store,
         }
         async_evidence = getattr(self, "_speco_v1_async_checkpoint_evidence", None)
+        if self._speco_rollout_idle_worker_enabled():
+            session = self._speco_bubble_session()
+            if (
+                session.pending
+                or session.receipts
+                or self._speco_checkpoint_pending_quota()
+            ):
+                raise RuntimeError(
+                    "Cannot commit a Bubble checkpoint before quota/publication completion"
+                )
+            policy = getattr(self, "_speco_freeze_policy", None)
+            manifest["bubble"] = {
+                "quota_complete": True,
+                "writer_group": list(
+                    self._speco_get_drafter_scheduler().idle_writer_group() or ()
+                ),
+                "published_plan_ids": sorted(session.published_ids),
+                "policy_drafter_version": policy.drafter_version
+                if policy is not None
+                else None,
+            }
         if async_evidence is not None:
             manifest["async_rollout_checkpoint"] = async_evidence
         fd, temporary_path = tempfile.mkstemp(
@@ -501,7 +534,9 @@ class SpecoV1Mixin:
         return manifest_path
 
     def _speco_restore_v1_feature_store_checkpoint(self) -> None:
-        if not self._speco_feature_store_checkpoint_configured():
+        feature_store_configured = self._speco_feature_store_checkpoint_configured()
+        bubble = self._speco_rollout_idle_worker_enabled()
+        if not feature_store_configured and not bubble:
             return
         resume_step = self._speco_resume_global_step_hint()
         if resume_step is None:
@@ -527,6 +562,28 @@ class SpecoV1Mixin:
             raise RuntimeError(
                 f"V1 SPECO checkpoint manifest does not match resumed step {resume_step}"
             )
+        if bubble:
+            state = manifest.get("bubble", {})
+            if state.get("quota_complete") is not True:
+                raise RuntimeError(
+                    "V1 Bubble checkpoint has no completed quota boundary"
+                )
+            scheduler = self._speco_get_drafter_scheduler()
+            writer = tuple(str(rank) for rank in state.get("writer_group", []))
+            if writer:
+                if writer not in scheduler._metadata_idle_training_groups:
+                    raise RuntimeError(
+                        "V1 Bubble checkpoint writer does not match the current collectives"
+                    )
+                scheduler._idle_worker_writer_group = writer
+            self._speco_last_published_drafter_step = manifest["drafter_version"]
+            self._speco_published_drafter_version = manifest["drafter_version"]
+            self._speco_bubble_session().published_ids.update(
+                state.get("published_plan_ids", [])
+            )
+            self._speco_v1_restored_policy_version = state.get("policy_drafter_version")
+        if not feature_store_configured:
+            return
         states = manifest.get("feature_store")
         if not isinstance(states, list) or not states:
             raise RuntimeError(
@@ -601,14 +658,22 @@ class SpecoV1Mixin:
             return
         from verl_speco.trainer.scheduler import DrafterScheduleConfig
 
-        if (
+        bubble = (
             DrafterScheduleConfig.from_mapping(training).execution_strategy.value
             == "rollout_idle_worker"
-        ):
+        )
+        mode = str(config.trainer.v1.get("trainer_mode", "sync"))
+        local_updates = int(
+            (config.trainer.v1.get(mode, {}) or {}).get("parameter_sync_step", 1)
+        )
+        if bubble and mode in {"sync", "colocate_async"} and local_updates > 1:
+            # These native modes update pi after each local batch. Unlike
+            # separate_async, they do not restore a stable pi_old for capture.
+            # A global-step head key would alias distinct policy snapshots.
             raise ValueError(
-                "verl V1 does not support Bubble Time (rollout_idle_worker): "
-                "the rollout idle event bus lifecycle is not integrated; "
-                "use scheduler.execution.strategy=sync or the legacy trainer"
+                f"V1 Bubble {mode} requires parameter_sync_step=1: multiple local "
+                "actor updates would mix policy/head snapshots under one quota "
+                "version; separate_async retains its fixed old-policy context"
             )
         if bool(training.get("collect_hidden_states_from_sgl", False)):
             raise ValueError(
@@ -632,15 +697,20 @@ class SpecoV1Mixin:
                 "Phase-1 V1 online SPECO training supports rollout.name=vllm only"
             )
         freeze = training.get("drafter_convergence_freeze", {}) or {}
-        if freeze.get("enabled", False) and str(
-            config.trainer.v1.get("trainer_mode", "sync")
-        ) not in {"sync", "colocate_async"}:
+        if (
+            not bubble
+            and freeze.get("enabled", False)
+            and str(config.trainer.v1.get("trainer_mode", "sync"))
+            not in {"sync", "colocate_async"}
+        ):
             raise ValueError(
                 "V1 marginal-utility freeze requires sync or colocate_async for fixed-target paired probes"
             )
 
     def _setup(self):
         self._speco_validate_v1_training_config(self.config)
+        if self._speco_rollout_idle_worker_enabled():
+            self._speco_v1_log_runtime_provenance()
         from verl_speco.integration.vllm_runtime import (
             configure_vllm_runtime_from_config,
         )
@@ -650,6 +720,9 @@ class SpecoV1Mixin:
         # fixed without the draft-publication facade.
         self._speco_install_v1_standalone_publish_worker()
         self._speco_init_state()
+        if self._speco_rollout_idle_worker_enabled():
+            self._speco_configure_rollout_idle_event_bus()
+            self._speco_bubble_session()
         if self._speco_online_enabled_from_config(self.config):
             # Resolve a resumed draft checkpoint before V1 creates the rollout
             # server.  The server reads drafter.model_path during construction.
@@ -687,6 +760,8 @@ class SpecoV1Mixin:
         detached actor's own weight lifecycle.  The standalone rollout workers
         are the replicas that serve the next batch, so publish directly to them.
         """
+        if self._speco_v1_separate_bubble():
+            return self._speco_v1_bubble_publish_method(method_name)
         mode = str(self.config.trainer.v1.get("trainer_mode", "sync")).lower()
         if mode != "separate_async":
             from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
@@ -797,6 +872,36 @@ class SpecoV1Mixin:
         }
 
     def on_step_end(self):
+        if self._speco_rollout_idle_worker_enabled():
+            started = time.perf_counter()
+            upstream_seconds = 0.0
+            parent = super().on_step_end
+
+            def timed_parent():
+                nonlocal upstream_seconds
+                upstream_started = time.perf_counter()
+                try:
+                    return parent()
+                finally:
+                    upstream_seconds += time.perf_counter() - upstream_started
+
+            try:
+                return self._speco_v1_bubble_step_end(timed_parent)
+            finally:
+                if getattr(self, "_speco_pending_request_accept_len_payloads", None):
+                    self._speco_flush_request_accept_len_payloads()
+                elapsed = time.perf_counter() - started
+                self._speco_v1_record_timing(
+                    "drafter_v1_upstream_step_end", upstream_seconds
+                )
+                self._speco_v1_record_timing("drafter_v1_step_end_total", elapsed)
+                checkpoint_seconds = self._speco_v1_timings.get(
+                    "drafter_v1_checkpoint", 0.0
+                )
+                self._speco_v1_record_timing(
+                    "drafter_v1_publish_blocking",
+                    elapsed - upstream_seconds - checkpoint_seconds,
+                )
         try:
             lifecycle_started = time.perf_counter()
             self._speco_prefetch_sync_cpu_snapshot()
@@ -837,20 +942,102 @@ class SpecoV1Mixin:
                 self._speco_colocate_admission_closed = False
 
     def _save_checkpoint(self):
+        if self._speco_rollout_idle_worker_enabled():
+            session = self._speco_bubble_session()
+            session.close("v1_checkpoint")
+            if self._speco_checkpoint_pending_quota() or session.pending:
+                self._speco_deferred_checkpoint_step = int(self.global_steps)
+                return None
+            if not getattr(self, "_speco_colocate_admission_closed", False):
+                with self._speco_v1_quiescent_boundary(charge_cost=False):
+                    managers = [self.checkpoint_manager]
+                    if self._speco_v1_separate_bubble():
+                        managers.append(self.standalone_checkpoint_manager)
+                    for manager in managers:
+                        manager.sleep_replicas()
+                    result = self._save_checkpoint()
+                    for manager in self._speco_v1_active_checkpoint_managers():
+                        manager.update_weights(self.global_steps)
+                    return result
+            if self._speco_v1_async_rollout_enabled():
+                from verl.trainer.ppo.v1.trainer_base import _tq_supports_checkpoint
+
+                if not _tq_supports_checkpoint():
+                    raise RuntimeError(
+                        "V1 Bubble async checkpoint requires TransferQueue snapshot/reissue support"
+                    )
         if (
             getattr(self, "_speco_last_checkpoint_saved_step", None)
             == self.global_steps
         ):
             return None
+        if self._speco_rollout_idle_worker_enabled():
+            from verl_speco.trainer.v1.checkpoint_commit import (
+                commit_latest,
+                defer_native_checkpoint_commit,
+            )
+
+            # Worker configs were serialized during setup. This scope defers
+            # the native driver's pointer/retention only, not worker writes.
+            with defer_native_checkpoint_commit(
+                self.config, use_critic=self.use_critic
+            ):
+                result = self._speco_save_v1_checkpoint_components()
+            commit_latest(self.config.trainer.default_local_dir, self.global_steps)
+        else:
+            result = self._speco_save_v1_checkpoint_components()
+        self._speco_last_checkpoint_saved_step = self.global_steps
+        self._speco_deferred_checkpoint_step = None
+        if self._speco_rollout_idle_worker_enabled():
+            self._speco_finalize_v1_checkpoint_retention()
+        return result
+
+    def _speco_finalize_v1_checkpoint_retention(self):
+        from verl_speco.trainer.v1.checkpoint_commit import (
+            committed_steps,
+            prune_checkpoint_roles,
+        )
+        from verl.trainer.ppo.utils import Role
+
+        root = str(self.config.trainer.default_local_dir)
+        steps = committed_steps(root, int(self.global_steps))
+        groups = [(self.actor_rollout_wg, "actor", "max_actor_ckpt_to_keep")]
+        if self.use_critic:
+            groups.append((self.critic_wg, str(Role.Critic), "max_critic_ckpt_to_keep"))
+        refs = []
+        for group, role, setting in groups:
+            keep = (
+                1
+                if self.config.trainer.get("remove_previous_ckpt_in_save", False)
+                else self.config.trainer.get(setting)
+            )
+            if not isinstance(keep, int) or keep <= 0 or len(steps) <= keep:
+                continue
+            refs.extend(
+                worker.execute_with_func_generator.remote(
+                    prune_checkpoint_roles,
+                    root,
+                    steps[:-keep],
+                    role,
+                )
+                for worker in group.workers
+            )
+        self._ray_get_if_needed(refs)
+
+    def _speco_save_v1_checkpoint_components(self):
         drafter_results = None
         if self._speco_online_enabled_from_config(self.config):
             self._speco_wait_pending_drafter_publish()
             drafter_results = self._speco_save_drafter_checkpoint(wait=True)
             self._speco_freeze_save_state()
         result = super()._save_checkpoint()
-        if getattr(
-            self, "_speco_colocate_admission_closed", False
-        ) and self._speco_freeze_branch_config().get("enabled", False):
+        if getattr(self, "_speco_colocate_admission_closed", False) and (
+            self._speco_freeze_branch_config().get("enabled", False)
+            or (
+                self._speco_rollout_idle_worker_enabled()
+                and self._speco_v1_async_rollout_enabled()
+            )
+        ):
             queue_path = os.path.join(
                 self._speco_v1_checkpoint_directory(), "transfer_queue"
             )
@@ -869,10 +1056,29 @@ class SpecoV1Mixin:
                 drafter_results=drafter_results,
                 feature_store=feature_store,
             )
-        self._speco_last_checkpoint_saved_step = self.global_steps
         return result
 
     def on_sample_end(self):
+        if self._speco_rollout_idle_worker_enabled():
+            started = time.perf_counter()
+            if not self._speco_v1_separate_bubble():
+                if (
+                    str(self.config.trainer.v1.get("trainer_mode", "sync"))
+                    == "colocate_async"
+                ):
+                    self._speco_v1_admission("speco_close_rollout_admission")
+                    self._speco_colocate_admission_closed = True
+                    self._speco_v1_training_admission_owned = True
+                # A final in-flight optimizer step can finish only during this
+                # drain. Retain its outcome instead of dropping the returned
+                # worker timings/trained flags before PPO logs this step.
+                self._speco_record_rollout_idle_metrics(
+                    self._speco_bubble_session().close("v1_sample_end")
+                )
+            self._speco_v1_record_timing(
+                "drafter_v1_sample_end", time.perf_counter() - started
+            )
+            return super().on_sample_end()
         if not self._speco_colocate_probe_boundary_enabled():
             return super().on_sample_end()
         self._speco_rollout_admission_rpc("speco_close_rollout_admission")
@@ -899,7 +1105,7 @@ class SpecoV1Mixin:
     def _speco_rollout_admission_rpc(self, method, *args):
         import ray
 
-        servers = list(self.llm_server_manager.server_handles)
+        servers = self._speco_v1_probe_servers()
         if not servers:
             raise RuntimeError(
                 "V1 async probe boundary requires initialized rollout servers"
@@ -1000,6 +1206,8 @@ class SpecoV1Mixin:
         return shutdown_count
 
     def _init_v1_speco_drafter_workers(self):
+        if self._speco_v1_separate_bubble():
+            return self._speco_init_v1_standalone_bubble_workers()
         from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
         from verl.trainer.ppo.utils import Role
         from verl_speco.workers import SpecoWorker
@@ -1021,6 +1229,7 @@ class SpecoV1Mixin:
             config=self.config.actor_rollout_ref,
             role="drafter",
             device_name=self.config.trainer.device,
+            require_resource_identity=self._speco_rollout_idle_worker_enabled(),
         )
         worker_group = RayWorkerGroup(
             resource_pool=resource_pool,
@@ -1143,17 +1352,29 @@ class SpecoV1Mixin:
             self._speco_populate_request_accept_len_records(evidence)
 
     def _compute_old_log_prob(self, batch, metrics):
+        evidence = None
+        if self._speco_rollout_idle_worker_enabled():
+            _, evidence = self._speco_v1_batch_data(batch)
+            # Bubble bypasses the inline actor-update logger. Observe every
+            # local batch, including frozen steps with feature capture off.
+            self._speco_log_request_accept_len_variance_from_batch(
+                evidence, source="v1_oldlogprob"
+            )
         policy = getattr(self, "_speco_freeze_policy", None)
         if (
             policy is not None
             and getattr(self, "_speco_v1_evidence_step", None) != self.global_steps
         ):
-            _, evidence = self._speco_v1_batch_data(batch)
+            if evidence is None:
+                _, evidence = self._speco_v1_batch_data(batch)
             metrics["drafter/request_padding_rows"] = evidence.meta_info[
                 "speco_v1_padding_rows"
             ]
             self._speco_populate_request_accept_len_records(evidence)
-            if self._speco_colocate_probe_boundary_enabled():
+            if (
+                self._speco_colocate_probe_boundary_enabled()
+                or self._speco_rollout_idle_worker_enabled()
+            ):
                 self._speco_observe_async_revision_evidence(evidence, metrics)
             else:
                 self._speco_observe_rollout_evidence(evidence, policy.drafter_version)
@@ -1396,17 +1617,23 @@ class SpecoV1Mixin:
         """
         worker = self.actor_rollout_wg
         if self.config.trainer.v1.get("trainer_mode", "sync") != "separate_async":
-            return worker.compute_log_prob(control)
+            output = worker.compute_log_prob(control)
+            self._speco_v1_cache_old_policy_head()
+            return output
 
         local_step = self.local_trigger_step
         if local_step == 0:
             worker.save_model_to_cpu(0)
-            return worker.compute_log_prob(control)
+            output = worker.compute_log_prob(control)
+            self._speco_v1_cache_old_policy_head()
+            return output
 
         worker.save_model_to_cpu(local_step)
         try:
             worker.restore_model_from_cpu(0)
-            return worker.compute_log_prob(control)
+            output = worker.compute_log_prob(control)
+            self._speco_v1_cache_old_policy_head()
+            return output
         finally:
             # Restore before releasing the only copy of the training weights;
             # if restoration fails, leave that snapshot available for recovery.
@@ -1495,10 +1722,13 @@ class SpecoV1Mixin:
 
         total_drafts = 0.0
         total_accepted = 0.0
-        real_requests = 0
         requests_with_stats = 0
         tags = list(getattr(batch, "tags", None) or [])
-        for index, fields in enumerate(extra_fields):
+        real_requests = sum(
+            not (index < len(tags) and tags[index].get("is_padding", False))
+            for index in range(len(batch.keys))
+        )
+        for index, fields in enumerate(extra_fields[: len(batch.keys)]):
             if index < len(tags) and bool(tags[index].get("is_padding", False)):
                 continue
             # TransferQueue returns object-backed values for ``extra_fields``
@@ -1506,7 +1736,6 @@ class SpecoV1Mixin:
             # through ``.data`` rather than being dict instances themselves.
             # The initial bridge only covered plain dicts, silently dropping
             # every real rollout counter.
-            real_requests += 1
             fields = getattr(fields, "data", fields)
             if not isinstance(fields, dict):
                 continue
@@ -1518,18 +1747,21 @@ class SpecoV1Mixin:
             total_drafts += drafts
             total_accepted += accepted
 
-        if total_drafts <= 0.0:
-            return self._speco_v1_spec_decode_sidecar_metrics()
-        return {
-            "drafter/spec_decode/mean_acceptance_length": 1.0
-            + total_accepted / total_drafts,
-            "drafter/spec_decode/num_verify_steps": total_drafts,
-            "drafter/spec_decode/num_accepted_tokens": total_accepted,
+        coverage = {
             "drafter/spec_decode/requests_with_stats": requests_with_stats,
             "drafter/spec_decode/requests_missing_stats": real_requests
             - requests_with_stats,
             "drafter/spec_decode/request_stats_coverage": requests_with_stats
             / max(real_requests, 1),
+        }
+        if total_drafts <= 0.0:
+            return {**coverage, **self._speco_v1_spec_decode_sidecar_metrics()}
+        return {
+            **coverage,
+            "drafter/spec_decode/mean_acceptance_length": 1.0
+            + total_accepted / total_drafts,
+            "drafter/spec_decode/num_verify_steps": total_drafts,
+            "drafter/spec_decode/num_accepted_tokens": total_accepted,
         }
 
     def _compute_metrics(self, batch, metrics, timing_raw, global_steps, epoch):
@@ -1538,6 +1770,14 @@ class SpecoV1Mixin:
             batch, metrics, timing_raw, global_steps, epoch
         )
         metrics.update(self._speco_v1_spec_decode_metrics(batch))
+        if self.__dict__.get("_speco_v1_timing_step") == global_steps:
+            metrics.update(self._speco_v1_timing_metrics())
+        scheduler = self.__dict__.get("_drafter_scheduler")
+        if scheduler is not None and self._speco_rollout_idle_worker_enabled():
+            # Event/collection metrics may have been captured before a later
+            # completion repaid quota (or this step registered a new quota).
+            with self._speco_bubble_training_lock():
+                metrics.update(scheduler.training_quota_metrics(global_steps))
         if getattr(self, "_speco_freeze_policy", None) is not None:
             metrics.update(self._speco_freeze_metrics())
         if getattr(self, "_speco_ci_result", None) is not None:
@@ -1549,6 +1789,10 @@ class SpecoV1Mixin:
     def _update_actor(self, batch, metrics):
         if not self._speco_online_enabled_from_config(self.config):
             return super()._update_actor(batch, metrics)
+        if self._speco_rollout_idle_worker_enabled():
+            return self._speco_v1_bubble_update_actor(
+                batch, metrics, super()._update_actor
+            )
 
         metrics["timing_s/drafter"] = 0.0
         self._speco_v1_drafter_hook_cost_seconds = 0.0
@@ -1696,9 +1940,45 @@ class SpecoV1Mixin:
             return
         self._speco_init_ci_result()
         if self._speco_online_enabled_from_config(self.config):
-            self._speco_activate_drafter_training_model_before_fit()
+            if self._speco_rollout_idle_worker_enabled():
+                with self._speco_v1_quiescent_boundary():
+                    managers = [self.checkpoint_manager]
+                    if self._speco_v1_separate_bubble():
+                        managers.append(self.standalone_checkpoint_manager)
+                    for manager in managers:
+                        manager.sleep_replicas()
+                    self._speco_activate_drafter_training_model_before_fit()
+                    for manager in managers:
+                        manager.update_weights(self.global_steps)
+            else:
+                self._speco_activate_drafter_training_model_before_fit()
             self._speco_freeze_policy = self._speco_init_freeze_policy()
+            restored_policy_version = getattr(
+                self, "_speco_v1_restored_policy_version", None
+            )
+            if restored_policy_version is not None and (
+                self._speco_freeze_policy is None
+                or self._speco_freeze_policy.drafter_version != restored_policy_version
+            ):
+                raise RuntimeError(
+                    "V1 Bubble checkpoint and freeze-policy revisions disagree"
+                )
             self._speco_validate_freeze_branch_config()
+            if (
+                self._speco_rollout_idle_worker_enabled()
+                and self._speco_freeze_policy is not None
+            ):
+                import ray
+
+                ray.get(
+                    [
+                        server.speco_set_serving_drafter_revision.remote(
+                            self._speco_freeze_policy.drafter_version
+                        )
+                        for _, manager in self._speco_v1_serving_managers()
+                        for server in manager.server_handles
+                    ]
+                )
             if self._speco_colocate_probe_boundary_enabled():
                 if self._speco_freeze_policy is None:
                     raise RuntimeError("V1 async freeze requires an initialized policy")
@@ -1724,6 +2004,8 @@ class SpecoV1Mixin:
         return super()._reissue_inflight_prompts(*args, **kwargs)
 
     def on_train_begin(self):
+        if self._speco_rollout_idle_worker_enabled():
+            self._speco_bubble_session().start()
         if bool(getattr(self, "_speco_prefit_on_train_begin_consumed", False)):
             self._speco_prefit_on_train_begin_consumed = False
             logger.info(
@@ -1771,6 +2053,8 @@ class SpecoV1Mixin:
             completed = True
             return result
         finally:
+            if self._speco_rollout_idle_worker_enabled():
+                self._speco_bubble_session().close("v1_fit_exit")
             if self._speco_v1_async_rollout_enabled():
                 # ``fit`` may return or raise while async agent-loop actors
                 # still own vLLM requests or output handlers.  Drain them

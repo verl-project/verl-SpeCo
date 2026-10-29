@@ -514,6 +514,22 @@ def test_reclaim_runs_between_atomic_optimizer_steps(worker_class):
     assert callbacks == [None]
 
 
+def test_standalone_training_offloads_before_returning_lease_completion(worker_class):
+    worker, plan, _ = _prepared_worker(worker_class)
+    worker._speco_require_lease_offload = True
+    parked = []
+
+    async def park(*, strict):
+        assert strict
+        parked.append(True)
+
+    worker.trainer.release_training_memory_after_activation = park
+    result = asyncio.run(worker.train_drafter(plan))
+    assert result["trained"]
+    assert parked == [True]
+    assert result["training_residency_retained"] == 0
+
+
 @pytest.mark.parametrize("reclaim", [False, True])
 def test_conditional_multistep_plan_checks_remaining_time_and_reclaim(
     worker_class, monkeypatch, reclaim
@@ -1095,8 +1111,14 @@ def test_sync_cuda_first_step_diagnostics_preserve_training_and_rng(
 @pytest.mark.parametrize("device", ["cuda", "npu"])
 def test_cleanup_allocator_observation_preserves_sync_and_reclaim(device):
     subject = _load_methods(
-        "verl_speco/trainer/base_trainer.py", "DrafterBaseTrainer", {"cleanup_training"},
-        {"device_name": device, "asyncio": asyncio, "logger": logging.getLogger(__name__)},
+        "verl_speco/trainer/base_trainer.py",
+        "DrafterBaseTrainer",
+        {"cleanup_training"},
+        {
+            "device_name": device,
+            "asyncio": asyncio,
+            "logger": logging.getLogger(__name__),
+        },
     )
     events = []
     trainer = subject()
@@ -1112,7 +1134,8 @@ def test_cleanup_allocator_observation_preserves_sync_and_reclaim(device):
     trainer.device_module = SimpleNamespace(
         synchronize=lambda: events.append("sync"),
         empty_cache=lambda: events.append("reclaim"),
-        memory_stats=lambda: events.append("stats") or {"reserved_bytes.all.current": 42},
+        memory_stats=lambda: events.append("stats")
+        or {"reserved_bytes.all.current": 42},
     )
     asyncio.run(trainer.cleanup_training(clear_data=False))
     assert events.count("sync") == events.count("reclaim") == 1

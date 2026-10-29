@@ -7,6 +7,8 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 from __future__ import annotations
 
+from dataclasses import replace
+
 from verl_speco.trainer.scheduler import (
     DrafterExecutionStrategy,
     DrafterRuntimeState,
@@ -36,9 +38,14 @@ def _plan() -> TrainingPlan:
 def test_from_execution_forwards_eagle3_lk_metrics() -> None:
     plan = _plan()
     outcome = TrainingOutcome.from_execution(
-        ExecutionOutcome(raw_results=[_result(**{"eagle3/lk/acceptance": 0.7,
-                                                "eagle3/lk_loss": 0.4})], elapsed_sec=1.0),
-        runtime_state=_running_state(plan), plan=plan,
+        ExecutionOutcome(
+            raw_results=[
+                _result(**{"eagle3/lk/acceptance": 0.7, "eagle3/lk_loss": 0.4})
+            ],
+            elapsed_sec=1.0,
+        ),
+        runtime_state=_running_state(plan),
+        plan=plan,
     )
     assert outcome.metrics["eagle3/lk/acceptance"] == 0.7
     assert outcome.metrics["eagle3/lk_loss"] == 0.4
@@ -201,3 +208,32 @@ def test_gpu_transfer_metrics_use_rank_max_and_reject_invalid_values() -> None:
         "drafter/gpu_model_offload_reused_bytes": 2048,
         "drafter/gpu_head_restore_cache_hit": 1,
     }
+
+
+def test_preflight_failure_keeps_reason_and_logs_worker_control_step(caplog):
+    plan = replace(_plan(), worker_snapshots={"2": {}})
+    state = DrafterRuntimeState()
+    state.submit(plan, started_at=0)
+    outcome = TrainingOutcome.from_execution(
+        ExecutionOutcome(
+            raw_results=[
+                {
+                    "worker_id": "2",
+                    "participating": True,
+                    "ready": False,
+                    "reason": "stale_training_plan",
+                    "source_global_step": 11,
+                    "worker_global_step": 8,
+                }
+            ],
+            elapsed_sec=0.1,
+            launched=False,
+            reason="worker_preflight_failed",
+        ),
+        runtime_state=state,
+        plan=plan,
+    )
+    assert outcome.reason == "worker_preflight_failed"
+    assert not outcome.trained and outcome.successful_steps == 0
+    assert "stale_training_plan" in caplog.text
+    assert "worker_global_step" in caplog.text

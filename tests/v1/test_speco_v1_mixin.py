@@ -215,6 +215,7 @@ def test_v1_metrics_report_speco_mean_acceptance_length(monkeypatch):
 
 
 def test_v1_metrics_fall_back_to_engine_core_acceptance_sidecars(monkeypatch, tmp_path):
+    monkeypatch.delenv("VERL_SPECO_DRAFTER_CONFIG", raising=False)
     stats_dir = tmp_path / ".spec_decode_stats"
     stats_dir.mkdir()
     (stats_dir / "engine-10.counters").write_text("4 6 28\n", encoding="ascii")
@@ -236,7 +237,46 @@ def test_v1_metrics_fall_back_to_engine_core_acceptance_sidecars(monkeypatch, tm
     ] == pytest.approx(1 + 9 / 7)
     # Cumulative files are differenced, so the same snapshot is not reused by
     # the next global step.
-    assert trainer._speco_v1_spec_decode_metrics(batch) == {}
+    assert trainer._speco_v1_spec_decode_metrics(batch) == {
+        "drafter/spec_decode/requests_with_stats": 0,
+        "drafter/spec_decode/requests_missing_stats": 1,
+        "drafter/spec_decode/request_stats_coverage": 0,
+    }
+
+
+def test_acceptance_uses_exact_request_counters_with_coverage(monkeypatch):
+    cells = [
+        {
+            "_speco_vllm_request_verify_rounds": 2,
+            "_speco_vllm_request_accepted_tokens": 6,
+        },
+        {
+            "spec_num_verify_steps": 4,
+            "spec_num_accepted_tokens": 2,
+            "_speco_vllm_request_verify_rounds": 99,
+            "_speco_vllm_request_accepted_tokens": 99,
+        },
+        {"spec_num_verify_steps": float("nan"), "spec_num_accepted_tokens": 3},
+        {"spec_num_verify_steps": 100, "spec_num_accepted_tokens": 100},
+    ]
+    monkeypatch.setitem(
+        sys.modules,
+        "transfer_queue",
+        types.SimpleNamespace(kv_batch_get=lambda **kwargs: {"extra_fields": cells}),
+    )
+    batch = types.SimpleNamespace(
+        keys=list(range(4)),
+        partition_id="train",
+        tags=[{}, {}, {}, {"is_padding": True}],
+    )
+    metrics = SpecoV1Mixin()._speco_v1_spec_decode_metrics(batch)
+    assert metrics["drafter/spec_decode/mean_acceptance_length"] == pytest.approx(
+        1 + 8 / 6
+    )
+    assert metrics["drafter/spec_decode/num_verify_steps"] == 6
+    assert metrics["drafter/spec_decode/num_accepted_tokens"] == 8
+    assert metrics["drafter/spec_decode/requests_missing_stats"] == 1
+    assert metrics["drafter/spec_decode/request_stats_coverage"] == pytest.approx(2 / 3)
 
 
 def test_online_training_rejects_rollout_correction_bypass():
@@ -251,8 +291,25 @@ def test_online_training_accepts_all_v1_modes(mode):
 
 @pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
 @pytest.mark.parametrize("nested", [True, False])
-def test_online_training_rejects_bubble_before_worker_setup(mode, nested):
+def test_online_training_accepts_bubble_configuration(mode, nested):
     config = _config(mode=mode)
+    training = config.actor_rollout_ref.rollout.drafter.training
+    if nested:
+        training["scheduler"] = {"execution": {"strategy": "rollout_idle_worker"}}
+    else:
+        training["execution_strategy"] = "rollout_idle_worker"
+
+    trainer = SpecoV1Mixin()
+    trainer.config = config
+    trainer._speco_validate_v1_training_config(config)
+    assert trainer._speco_rollout_idle_worker_enabled()
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_bubble_rejects_local_policy_head_aliasing_before_worker_creation(mode, nested):
+    config = _config(mode=mode)
+    config.trainer.v1[mode] = {"parameter_sync_step": 2}
     training = config.actor_rollout_ref.rollout.drafter.training
     if nested:
         training["scheduler"] = {"execution": {"strategy": "rollout_idle_worker"}}
@@ -261,12 +318,28 @@ def test_online_training_rejects_bubble_before_worker_setup(mode, nested):
 
     class Harness(SpecoV1Mixin):
         def _speco_install_v1_standalone_publish_worker(self):
-            pytest.fail("unsupported configuration must fail before worker setup")
+            pytest.fail("reject head aliasing before creating workers")
 
     trainer = Harness()
     trainer.config = config
-    with pytest.raises(ValueError, match="V1 does not support Bubble Time"):
+    with pytest.raises(ValueError, match="requires parameter_sync_step=1"):
         trainer._setup()
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+@pytest.mark.parametrize("bubble", [False, True])
+def test_local_update_limit_only_applies_to_bubble_without_fixed_old_policy(
+    mode, bubble
+):
+    config = _config(mode=mode)
+    config.trainer.v1[mode] = {
+        "parameter_sync_step": 1 if bubble and mode != "separate_async" else 4
+    }
+    if bubble:
+        config.actor_rollout_ref.rollout.drafter.training["scheduler"] = {
+            "execution": {"strategy": "rollout_idle_worker"}
+        }
+    SpecoV1Mixin._speco_validate_v1_training_config(config)
 
 
 @pytest.fixture
@@ -312,6 +385,20 @@ def test_collection_forward_does_not_snapshot_other_modes(mode, old_policy_train
     assert trainer.actor_rollout_wg.observed_weights == [10]
     assert trainer.actor_rollout_wg.snapshots == {}
     assert trainer.actor_rollout_wg.restored_slots == []
+
+
+def test_bubble_head_export_is_fenced_before_restoring_current_policy(
+    old_policy_trainer,
+):
+    trainer = old_policy_trainer
+    trainer.local_trigger_step = 1
+    worker = trainer.actor_rollout_wg
+    worker.weight, worker.snapshots = 20, {0: 10}
+    heads = []
+    trainer._speco_v1_cache_old_policy_head = lambda: heads.append(worker.weight)
+    assert trainer._speco_compute_collection_log_prob("batch") == 10
+    assert heads == [10]
+    assert worker.weight == 20
 
 
 @pytest.mark.parametrize(
@@ -819,6 +906,40 @@ def test_joint_checkpoint_manifest_records_drafter_and_feature_store(tmp_path):
     assert payload["feature_store"] == [{"saved": True, "cursor": {"version": 1}}]
 
 
+def test_bubble_manifest_restores_writer_and_versions_without_feature_store(tmp_path):
+    trainer = SpecoV1Mixin()
+    trainer.config = _config(mode="separate_async")
+    trainer.config.trainer.default_local_dir = str(tmp_path)
+    trainer.config.actor_rollout_ref.rollout.drafter.training["scheduler"] = {
+        "execution": {"strategy": "rollout_idle_worker"}
+    }
+    trainer.global_steps = 7
+    trainer.trainer_mode = "separate_async"
+    trainer._speco_last_published_drafter_step = 5
+    trainer._speco_freeze_policy = types.SimpleNamespace(drafter_version=3)
+    scheduler = types.SimpleNamespace(
+        _training_quota_debt_steps=0,
+        _training_quota_collection_step=None,
+        _metadata_idle_training_groups=[("2",)],
+        _idle_worker_writer_group=("2",),
+    )
+    scheduler.idle_writer_group = lambda: scheduler._idle_worker_writer_group
+    trainer._speco_get_drafter_scheduler = lambda: scheduler
+    trainer._speco_bubble_session().published_ids.add("published-once")
+    trainer._speco_write_v1_joint_checkpoint_manifest(
+        drafter_results=[], feature_store=[]
+    )
+    trainer._speco_bubble_session().published_ids.clear()
+    trainer._speco_last_published_drafter_step = 0
+    scheduler._idle_worker_writer_group = None
+    trainer._speco_resume_global_step_hint = lambda: 7
+    trainer._speco_restore_v1_feature_store_checkpoint()
+    assert scheduler._idle_worker_writer_group == ("2",)
+    assert trainer._speco_last_published_drafter_step == 5
+    assert trainer._speco_v1_restored_policy_version == 3
+    assert trainer._speco_bubble_session().published_ids == {"published-once"}
+
+
 @pytest.mark.parametrize("writer_index", [1, 3])
 def test_feature_store_resume_deduplicates_shared_worker_cursors(
     tmp_path, writer_index
@@ -996,7 +1117,10 @@ def test_collect_only_resume_skips_drafter_checkpoint_resolution():
     SpecoRayPPOTrainer._speco_prepare_drafter_checkpoint_for_worker_init(Harness())
 
 
-def test_setup_resolves_drafter_before_upstream_and_creates_worker_after(monkeypatch):
+@pytest.mark.parametrize("bubble", [False, True])
+def test_setup_resolves_drafter_before_upstream_and_creates_worker_after(
+    monkeypatch, bubble
+):
     events = []
     runtime = types.ModuleType("verl_speco.integration.vllm_runtime")
     runtime.configure_vllm_runtime_from_config = lambda config: events.append(
@@ -1021,17 +1145,27 @@ def test_setup_resolves_drafter_before_upstream_and_creates_worker_after(monkeyp
         def _speco_init_state(self):
             events.append("state")
 
+        def _speco_configure_rollout_idle_event_bus(self):
+            events.append("bus")
+
         def _speco_prepare_drafter_checkpoint_for_worker_init(self):
             events.append("resume")
 
         def _init_v1_speco_drafter_workers(self):
             events.append("workers")
 
-    assert Harness()._setup() == "ready"
+    trainer = Harness()
+    if bubble:
+        trainer.config = _config()
+        trainer.config.actor_rollout_ref.rollout.drafter.training["scheduler"] = {
+            "execution": {"strategy": "rollout_idle_worker"}
+        }
+    assert trainer._setup() == "ready"
     assert events == [
         "validate",
         "install_standalone_publish_worker",
         "state",
+        *(["bus"] if bubble else []),
         "resume",
         "configure",
         "upstream",

@@ -2633,6 +2633,26 @@ class DrafterScheduler:
             "bubble/critical_path_topup_optimizer_steps_total": self._critical_path_topup_optimizer_steps_total,
         }
 
+    def training_quota_metrics(self, global_step: int) -> dict[str, int]:
+        """Read current quota state after asynchronous completions are drained."""
+        age = int(self._training_quota_age_steps(global_step))
+        return {
+            **self.training_work_metrics(),
+            "bubble/training_quota_debt_steps": int(self._training_quota_debt_steps),
+            "bubble/training_quota_debt_age_steps": age,
+            "bubble/training_quota_completion_lag_steps": age,
+            "bubble/training_quota_data_version": int(
+                self._training_quota_data_version
+                if self._training_quota_data_version is not None
+                else -1
+            ),
+            "bubble/training_quota_collection_step": int(
+                self._training_quota_collection_step
+                if self._training_quota_collection_step is not None
+                else -1
+            ),
+        }
+
     def idle_worker_metrics(self) -> dict[str, float | int]:
         complete_groups = 0
         for group in self._metadata_idle_training_groups:
@@ -5191,12 +5211,29 @@ class DrafterScheduler:
             not outcome.trained
             or int(outcome.successful_steps) != int(plan.max_batches)
         ):
+            worker_failures = [
+                {
+                    key: result.get(key)
+                    for key in (
+                        "worker_id",
+                        "reason",
+                        "source_global_step",
+                        "worker_global_step",
+                        "data_version",
+                        "target_version",
+                    )
+                }
+                for result in outcome.raw_results
+                if isinstance(result, dict)
+                and result.get("reason") not in ("ready", "not_in_training_group")
+            ]
             raise RuntimeError(
                 "Bubble training quota top-up did not complete its requested "
                 "optimizer steps: "
                 f"requested={plan.max_batches} "
                 f"completed={outcome.successful_steps} "
-                f"reason={outcome.reason} plan_id={plan.plan_id}"
+                f"reason={outcome.reason} plan_id={plan.plan_id} "
+                f"worker_failures={worker_failures}"
             )
         if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
             completed_final_plan = bool(

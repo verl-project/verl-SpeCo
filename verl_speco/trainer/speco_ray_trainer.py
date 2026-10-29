@@ -1749,6 +1749,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             economics.get("enabled", False)
             and self._speco_drafter_schedule_config().execution_strategy
             is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            and not getattr(self, "_speco_bubble_roi_supported", lambda: False)()
         ):
             raise ValueError(
                 "Bubble Time (rollout_idle_worker) with "
@@ -1757,7 +1758,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "set economics.enabled=false or scheduler.execution.strategy=sync"
             )
         # shortcut: reject async ROI gating until completion waits are attributed correctly.
-        if training_cfg.get("publish_async", False) and economics.get("enabled", False):
+        if (
+            training_cfg.get("publish_async", False)
+            and economics.get("enabled", False)
+            and not getattr(self, "_speco_bubble_roi_supported", lambda: False)()
+        ):
             raise ValueError(
                 "publish_async=true with drafter_convergence_freeze.economics.enabled=true "
                 "is not supported while async publish completion-cost accounting is pending; "

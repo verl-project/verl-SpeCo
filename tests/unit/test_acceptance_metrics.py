@@ -121,12 +121,15 @@ def test_no_valid_request_stats_preserves_existing_fallback(monkeypatch):
     )
     marker = {"sidecar": 1}
     trainer = SimpleNamespace(_speco_v1_spec_decode_sidecar_metrics=lambda: marker)
-    assert (
-        SpecoV1Mixin._speco_v1_spec_decode_metrics(
-            trainer, SimpleNamespace(keys=[1], partition_id="p", tags=[{}])
-        )
-        is marker
+    metrics = SpecoV1Mixin._speco_v1_spec_decode_metrics(
+        trainer, SimpleNamespace(keys=[1], partition_id="p", tags=[{}])
     )
+    assert metrics == {
+        **marker,
+        "drafter/spec_decode/requests_with_stats": 0,
+        "drafter/spec_decode/requests_missing_stats": 1,
+        "drafter/spec_decode/request_stats_coverage": 0,
+    }
 
 
 def test_engine_aggregate_is_not_counted_as_an_exact_request():
@@ -188,3 +191,62 @@ def test_gpu_style_staged_summary_reaches_native_fields_and_trainer(monkeypatch)
     )
     assert metrics["drafter/spec_decode/mean_acceptance_length"] == 2.5
     assert metrics["drafter/spec_decode/request_stats_coverage"] == 1
+
+
+def test_request_summary_replaces_engine_fallback_before_tool_turn_accumulation():
+    fields = {
+        "spec_num_verify_steps": 99,
+        "spec_num_accepted_tokens": 100,
+        "_speco_acceptance_engine_fallback": True,
+        "_speco_vllm_request_verify_rounds": 4,
+        "_speco_vllm_request_accepted_tokens": 0,
+    }
+    assert request_acceptance_counters(fields) == (4, 0)
+    assert bridge_request_acceptance_counters(fields)
+    assert fields["spec_num_verify_steps"] == 4
+    assert fields["spec_num_accepted_tokens"] == 0
+    assert fields["_verl_request_mean_accept_len"] == 1
+    assert "_speco_acceptance_engine_fallback" not in fields
+    assert bridge_request_acceptance_counters(fields)  # Replacement is idempotent.
+    assert fields["spec_num_verify_steps"] == 4
+
+
+@pytest.mark.parametrize(
+    "rounds,accepted", [(0, 3), (-1, 0), (float("nan"), 1), (2, -1)]
+)
+def test_invalid_counters_never_make_an_acceptance_metric(rounds, accepted):
+    fields = {
+        "_speco_vllm_request_verify_rounds": rounds,
+        "_speco_vllm_request_accepted_tokens": accepted,
+    }
+    assert request_acceptance_counters(fields) is None
+    assert not bridge_request_acceptance_counters(fields)
+
+
+def test_aggregate_fallback_is_not_a_request_counter():
+    assert (
+        request_acceptance_counters(
+            {
+                "spec_num_verify_steps": 4,
+                "spec_num_accepted_tokens": 12,
+                "_speco_acceptance_engine_fallback": True,
+            }
+        )
+        is None
+    )
+
+
+def test_counter_validation_does_not_trigger_device_scalar_reads():
+    class DeviceScalar:
+        def __float__(self):
+            pytest.fail("metrics must not read device scalars")
+
+    assert (
+        request_acceptance_counters(
+            {
+                "spec_num_verify_steps": DeviceScalar(),
+                "spec_num_accepted_tokens": 1,
+            }
+        )
+        is None
+    )
