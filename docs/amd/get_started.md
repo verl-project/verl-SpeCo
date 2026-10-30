@@ -1,5 +1,7 @@
 # Getting Started on AMD GPUs (ROCm)
 
+Last updated: 10/30/2026
+
 This guide takes you from a bare AMD GPU node to a verified verl-SpeCo run:
 GRPO on Qwen3-8B with a DFlash drafter co-trained during rollout. The run
 includes a full drafter **collect → train → publish** cycle every step. Two
@@ -186,6 +188,8 @@ always override them:
 
 ```bash
 cd /workspace/verl-SpeCo
+# Keep the launcher's exit status through `| tee`.
+set -o pipefail
 
 # SGLang
 CUDA_VISIBLE_DEVICES=0,1 \
@@ -197,7 +201,7 @@ SPECO_TOTAL_TRAINING_STEPS=8 \
   bash examples/run_qwen3-8b_drafter_dflash_sglang_rocm.sh 2>&1 | tee /tmp/speco_rocm_sglang.log
 
 # vLLM (same variables, different script)
-CUDA_VISIBLE_DEVICES=2,3 \
+CUDA_VISIBLE_DEVICES=0,1 \
 MODEL_PATH=/models/Qwen3-8B \
 DRAFTER_PATH=/models/Qwen3-8B-DFlash-b16 \
 TRAIN_FILE=/data/gsm8k/train.parquet \
@@ -206,8 +210,9 @@ SPECO_TOTAL_TRAINING_STEPS=8 \
   bash examples/run_qwen3-8b_drafter_dflash_vllm_rocm.sh 2>&1 | tee /tmp/speco_rocm_vllm.log
 ```
 
-The two runs can share a node if they use disjoint GPUs, as above. If you run
-them in separate containers, keep the GPU sets disjoint.
+Run them one after the other on the same 2 GPUs. To run both at once on a
+node with 4 or more GPUs, give the vLLM run `CUDA_VISIBLE_DEVICES=2,3`; the two
+GPU sets must not overlap, also when the runs are in separate containers.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |

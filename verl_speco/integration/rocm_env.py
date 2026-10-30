@@ -61,6 +61,7 @@ def neutralize_hip_visible_devices(*, context: str = "") -> bool:
     stripped = os.environ.pop("HIP_VISIBLE_DEVICES", None) is not None
     if stripped and context:
         logger.warning(
-            "Stripped HIP_VISIBLE_DEVICES %s to keep spawned workers CUDA-native.", context
+            "Stripped HIP_VISIBLE_DEVICES %s to keep spawned workers CUDA-native.",
+            context,
         )
     return stripped
