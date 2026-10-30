@@ -113,4 +113,4 @@ python3 -m verl_speco.main \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
     trainer.total_training_steps=${SPECO_TOTAL_TRAINING_STEPS:-3} \
-    trainer.total_epochs=1 $@
+    trainer.total_epochs=1 "$@"

@@ -6498,7 +6498,7 @@ def patch_sglang_stream_accumulator_hidden_states() -> None:
     )
     patched_method = namespace[original_method.__name__]
     patched_method = wraps(original_method)(patched_method)
-    patched_method._verl_patched_stream_accumulator_hidden_states = True
+    setattr(patched_method, "_verl_patched_stream_accumulator_hidden_states", True)
     setattr(accumulator_cls, "accept", patched_method)
     _SGLANG_STREAM_ACCUMULATOR_HIDDEN_STATES_PATCHED = True
     logger.warning("SGLang stream accumulator hidden-state alignment patch active")
