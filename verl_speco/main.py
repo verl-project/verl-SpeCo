@@ -192,6 +192,10 @@ def configure_compile_cache_runtime_env(config) -> dict[str, str]:
 def run(config) -> None:
     """Resolve SPECO/verl compatibility, device and the task-runner dispatch."""
 
+    from verl_speco.integration.rocm_env import neutralize_hip_visible_devices
+
+    neutralize_hip_visible_devices()
+
     from verl.trainer import main_ppo
     from verl.utils.device import auto_set_device
 
