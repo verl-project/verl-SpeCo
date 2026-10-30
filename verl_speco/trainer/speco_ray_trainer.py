@@ -4758,6 +4758,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             accept_len_var=accept_len_var,
         )
         if payload:
+            # Retain the exact input for offline distribution analysis; the legacy
+            # accept_lens/summary fields remain rounded for compatibility.
+            payload["accept_lens_full_precision"] = [
+                float(value)
+                for value in request_accept_lens
+                if value is not None and math.isfinite(float(value))
+            ]
             self._speco_pending_request_accept_len_payloads.append(payload)
         return bool(records)
 

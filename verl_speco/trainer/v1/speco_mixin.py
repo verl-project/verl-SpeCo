@@ -1093,7 +1093,28 @@ class SpecoV1Mixin:
             # freeze windows use per-request, per-serving-revision projections.
             self._speco_populate_request_accept_len_records(evidence)
 
+    def _speco_v1_log_request_accept_len_distribution(self, batch):
+        """Use the existing JSONL interface without altering sampling/freeze state."""
+        if not os.getenv("VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH"):
+            return
+        if getattr(self, "_speco_v1_accept_len_logged_step", None) == self.global_steps:
+            return
+        _, evidence = self._speco_v1_batch_data(batch)
+        previous_records = self._speco_last_request_accept_len_records
+        previous_var = self._speco_last_request_accept_len_var
+        try:
+            recorded = self._speco_log_request_accept_len_variance_from_batch(
+                evidence, source="v1_rollout"
+            )
+            if recorded:
+                self._speco_flush_request_accept_len_payloads()
+                self._speco_v1_accept_len_logged_step = self.global_steps
+        finally:
+            self._speco_last_request_accept_len_records = previous_records
+            self._speco_last_request_accept_len_var = previous_var
+
     def _compute_old_log_prob(self, batch, metrics):
+        self._speco_v1_log_request_accept_len_distribution(batch)
         policy = getattr(self, "_speco_freeze_policy", None)
         if (
             policy is not None
