@@ -197,9 +197,9 @@ TEMPLATE_REGISTRY.register(
 TEMPLATE_REGISTRY.register(
     name="deepseek-r1-distill",
     template=ChatTemplate(
-        assistant_header="<锝淎ssistant锝?",
-        user_header="<锝淯ser锝?",
-        end_of_turn_token=None,
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
+        end_of_turn_token="<｜end▁of▁sentence｜>",
         system_prompt=None,
     ),
 )
@@ -265,10 +265,10 @@ TEMPLATE_REGISTRY.register(
 TEMPLATE_REGISTRY.register(
     name="deepseek-v3",
     template=ChatTemplate(
-        assistant_header="<锝淎ssistant锝?",
-        user_header="<锝淯ser锝?",
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
         system_prompt="You are a helpful assistant.",
-        end_of_turn_token="<锝渆nd鈻乷f鈻乻entence锝?",
+        end_of_turn_token="<｜end▁of▁sentence｜>",
     ),
 )
 
@@ -285,10 +285,10 @@ TEMPLATE_REGISTRY.register(
 TEMPLATE_REGISTRY.register(
     name="deepseek-v32",
     template=ChatTemplate(
-        assistant_header="<锝淎ssistant锝?",
-        user_header="<锝淯ser锝?",
+        assistant_header="<｜Assistant｜>",
+        user_header="<｜User｜>",
         system_prompt="",
-        end_of_turn_token="<锝渆nd鈻乷f鈻乻entence锝?",
+        end_of_turn_token="<｜end▁of▁sentence｜>",
         parser_type="thinking",
         enable_thinking=True,
     ),
