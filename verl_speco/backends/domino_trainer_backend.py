@@ -56,6 +56,9 @@ from verl_speco.backends.dflash_trainer_backend import (
     _document_boundary_validity,
 )
 from verl_speco.backends.lr_scheduler import _RESUME_OPTIMIZER_STEPS_KEY
+from verl_speco.integration.oldlogprob_layer_ids import (
+    resolve_drafter_hidden_states_layout,
+)
 from verl_speco.models.dflash import resolve_rope_theta
 from verl_speco.models.domino import DominoConfig, DominoDraftModel
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
@@ -232,6 +235,7 @@ class DominoTrainingModel(DFlashTrainingModel):
         hidden_states_list,
         loss_mask,
         lm_head_weight,
+        target_last_hidden_states=None,
         document_ids=None,
         label_ids=None,
         label_mask=None,
@@ -469,6 +473,10 @@ class DominoTrainingModel(DFlashTrainingModel):
 
 
 class DominoTrainerBackend(DFlashTrainerBackend):
+    def __init__(self, config, target_model_config):
+        resolve_drafter_hidden_states_layout("DOMINO", config.rollout.drafter.training)
+        super().__init__(config, target_model_config)
+
     @property
     def model_type(self):
         return "domino"

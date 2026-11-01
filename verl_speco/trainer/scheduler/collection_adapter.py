@@ -80,16 +80,17 @@ class SGLangCollectionAdapter:
         collection_id: str = "",
         owners: Sequence[int] | None = None,
     ) -> CollectionPayload:
-        if owners is not None:
-            raise ValueError("SGLang collection owners are read from replica_rank")
         replica_owners = []
-        for sample in samples:
-            replica_rank = sample.get("replica_rank")
-            if replica_rank is None:
-                raise ValueError(
-                    "drafter_sample is missing replica_rank for owner routing"
-                )
-            replica_owners.append(int(replica_rank))
+        if owners is not None:
+            replica_owners = [int(owner) for owner in owners]
+        else:
+            for sample in samples:
+                replica_rank = sample.get("replica_rank")
+                if replica_rank is None:
+                    raise ValueError(
+                        "drafter_sample is missing replica_rank for owner routing"
+                    )
+                replica_owners.append(int(replica_rank))
         return _build_payload(
             source=self.source,
             samples=samples,

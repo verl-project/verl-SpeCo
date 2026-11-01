@@ -250,6 +250,7 @@ class SpecoV1Mixin:
     def _speco_finalize_v1_drafter_publish(self) -> dict[str, Any]:
         if not getattr(self, "_speco_v1_pending_training", False):
             return {}
+        publish_started = time.perf_counter()
         training_plan = getattr(self, "_speco_v1_training_plan", None)
         try:
             policy = getattr(self, "_speco_freeze_policy", None)
@@ -304,6 +305,17 @@ class SpecoV1Mixin:
                 if run_probe:
                     self._speco_freeze_log_probe(probe, probe_error)
                 metrics.update(self._speco_freeze_metrics())
+            # Non-overlapping host hook time only. Old-logprob collection has
+            # its own stage timings and must not be counted a second time.
+            publish_elapsed = max(0.0, time.perf_counter() - publish_started)
+            publish_elapsed += float(
+                metrics.get("timing_s/drafter_sync_snapshot_prefetch_submit", 0.0)
+            )
+            metrics["timing_s/drafter_v1_publish_blocking"] = publish_elapsed
+            metrics["timing_s/drafter"] = (
+                float(self.__dict__.get("_speco_v1_drafter_hook_cost_seconds", 0.0))
+                + publish_elapsed
+            )
             return metrics
         finally:
             # A failed publish raises after the legacy facade has restored the
@@ -587,6 +599,17 @@ class SpecoV1Mixin:
             drafter.get("enable_drafter_training", False)
         ):
             return
+        from verl_speco.trainer.scheduler import DrafterScheduleConfig
+
+        if (
+            DrafterScheduleConfig.from_mapping(training).execution_strategy.value
+            == "rollout_idle_worker"
+        ):
+            raise ValueError(
+                "verl V1 does not support Bubble Time (rollout_idle_worker): "
+                "the rollout idle event bus lifecycle is not integrated; "
+                "use scheduler.execution.strategy=sync or the legacy trainer"
+            )
         if bool(training.get("collect_hidden_states_from_sgl", False)):
             raise ValueError(
                 "verl V1 online SPECO training currently requires "
@@ -617,6 +640,7 @@ class SpecoV1Mixin:
             )
 
     def _setup(self):
+        self._speco_validate_v1_training_config(self.config)
         from verl_speco.integration.vllm_runtime import (
             configure_vllm_runtime_from_config,
         )
@@ -625,7 +649,6 @@ class SpecoV1Mixin:
         # construction, otherwise its CheckpointEngineWorker actors are already
         # fixed without the draft-publication facade.
         self._speco_install_v1_standalone_publish_worker()
-        self._speco_validate_v1_training_config(self.config)
         self._speco_init_state()
         if self._speco_online_enabled_from_config(self.config):
             # Resolve a resumed draft checkpoint before V1 creates the rollout
@@ -744,13 +767,64 @@ class SpecoV1Mixin:
         )
         return result
 
+    def _speco_prefetch_sync_cpu_snapshot(self):
+        """Fetch one immutable host snapshot while upstream synchronizes actors."""
+        if (
+            not getattr(self, "_speco_v1_pending_training", False)
+            or str(getattr(self, "device_name", "")) != "cuda"
+            or self._speco_rollout_idle_worker_enabled()
+            or not self._speco_drafter_schedule_config().publish_async
+        ):
+            return
+        if not self._speco_drafter_training_config().get(
+            "gpu_publish_snapshot_prefetch", False
+        ):
+            return
+        if getattr(self, "_speco_publish_snapshot_prefetch", None) is not None:
+            raise RuntimeError("Previous publish snapshot prefetch was not consumed")
+        worker_group = self._require_speco_worker_group()
+        export = getattr(worker_group, "maybe_publish_async", None)
+        if not callable(export):
+            return
+        started = time.perf_counter()
+        refs = export(source_step=int(self.global_steps), sync_cpu_only=True)
+        self._speco_publish_snapshot_prefetch = {
+            "refs": refs,
+            "source_step": int(self.global_steps),
+            "sync_cpu_only": True,
+            "submitted_at": started,
+            "submit_sec": time.perf_counter() - started,
+        }
+
     def on_step_end(self):
         try:
+            lifecycle_started = time.perf_counter()
+            self._speco_prefetch_sync_cpu_snapshot()
+            prefetch_submitted = bool(
+                (self.__dict__.get("_speco_publish_snapshot_prefetch") or {}).get(
+                    "sync_cpu_only", False
+                )
+            )
+            upstream_started = time.perf_counter()
             result = super().on_step_end()
+            upstream_elapsed = time.perf_counter() - upstream_started
             # Native colocate_async resumes the engine during target sync.
             # Keep ordinary requests behind admission until both probe arms
             # and the drafter publication have settled at that fixed target.
             publish_metrics = self._speco_finalize_v1_drafter_publish()
+            if self.__dict__.get("device_name") == "cuda":
+                # Inclusive lifecycle spans: do not sum with update_weights.
+                publish_metrics.update(
+                    {
+                        "timing_s/drafter_v1_upstream_step_end": upstream_elapsed,
+                        "drafter/sync_snapshot_prefetch_submitted": int(
+                            prefetch_submitted
+                        ),
+                        "timing_s/drafter_v1_step_end_total": (
+                            time.perf_counter() - lifecycle_started
+                        ),
+                    }
+                )
             if publish_metrics:
                 self._pending_sync_metrics = {
                     **(getattr(self, "_pending_sync_metrics", None) or {}),
@@ -1088,6 +1162,22 @@ class SpecoV1Mixin:
         if not self._speco_oldlogprob_collection_enabled():
             return super()._compute_old_log_prob(batch, metrics)
 
+        collection_started = time.perf_counter()
+        # Reset only diagnostics; never reuse sums from a previous collection.
+        for name in (
+            "select",
+            "sp_merge",
+            "concat",
+            "cpu_copy",
+            "ray_put",
+            "context_build",
+            "control_copy",
+        ):
+            setattr(self, f"_speco_last_oldlogprob_{name}_elapsed_sec", 0.0)
+        self._speco_last_oldlogprob_control_bytes = 0
+        self._speco_last_oldlogprob_bulk_host_contexts = 0
+        self._speco_last_oldlogprob_collect_rpc_elapsed_sec = 0.0
+
         import transfer_queue as tq
         import torch
         from verl.utils import tensordict_utils as tu
@@ -1154,11 +1244,14 @@ class SpecoV1Mixin:
             compute_loss=False,
             temperature=self.config.actor_rollout_ref.rollout.temperature,
         )
+        prepared_at = time.perf_counter()
         output = self._speco_compute_collection_log_prob(control)
+        computed_at = time.perf_counter()
         output_data = output
         collected = self._speco_collect_oldlogprob_features(
             data_proto, collect_plan, output_data
         )
+        collected_at = time.perf_counter()
         self._speco_v1_state["features_collected"] = int(
             self._speco_v1_state.get("features_collected", 0) + collected
         )
@@ -1249,6 +1342,48 @@ class SpecoV1Mixin:
             loss_scale_factor=actor_config.loss_scale_factor,
         )
         metrics["actor/entropy"] = entropy_agg.detach().item()
+        finished_at = time.perf_counter()
+        metrics.update(
+            {
+                "timing_s/oldlogprob_prepare": prepared_at - collection_started,
+                "timing_s/oldlogprob_compute_with_capture": computed_at - prepared_at,
+                "timing_s/oldlogprob_collect": collected_at - computed_at,
+                "timing_s/oldlogprob_restore": finished_at - collected_at,
+                "timing_s/oldlogprob_collection_path_total": finished_at
+                - collection_started,
+                "timing_s/oldlogprob_collect_rpc": self._speco_last_oldlogprob_collect_rpc_elapsed_sec,
+                "oldlogprob/host_control_bytes": self._speco_last_oldlogprob_control_bytes,
+                "oldlogprob/bulk_host_contexts": self._speco_last_oldlogprob_bulk_host_contexts,
+            }
+        )
+        # Returned worker timings are sums and overlap the compute interval above.
+        worker_sums = {}
+        for name in (
+            "select",
+            "sp_merge",
+            "concat",
+            "cpu_copy",
+            "ray_put",
+            "context_build",
+            "control_copy",
+        ):
+            value = self.__dict__.get(f"_speco_last_oldlogprob_{name}_elapsed_sec", 0.0)
+            metrics[f"timing_s/oldlogprob_worker_{name}_sum"] = value
+            worker_sums[name] = value
+        logger.warning(
+            "[SPECO V1 collection timing] step=%s prepare_s=%.6f compute_with_capture_s=%.6f "
+            "collect_s=%.6f restore_s=%.6f total_s=%.6f host_control_bytes=%s bulk_host_contexts=%s "
+            "worker_sums_sec=%s timing_mode=host_wall_no_device_sync",
+            getattr(self, "global_steps", None),
+            prepared_at - collection_started,
+            computed_at - prepared_at,
+            collected_at - computed_at,
+            finished_at - collected_at,
+            finished_at - collection_started,
+            self._speco_last_oldlogprob_control_bytes,
+            self._speco_last_oldlogprob_bulk_host_contexts,
+            worker_sums,
+        )
         return updated_batch
 
     def _speco_compute_collection_log_prob(self, control):
@@ -1282,9 +1417,16 @@ class SpecoV1Mixin:
         """Read cumulative EngineCore counters when RequestOutput has no stats."""
 
         from verl_speco.integration.vllm_runtime import (
+            _drafter_config_from_config,
+            _vllm_acceptance_sidecar_enabled,
             SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY,
             read_vllm_spec_decode_sidecar_totals,
         )
+
+        if not _vllm_acceptance_sidecar_enabled(
+            _drafter_config_from_config(self.config)
+        ):
+            return {}
 
         run_dir = getattr(
             getattr(getattr(self, "config", None), "trainer", None),
@@ -1347,8 +1489,14 @@ class SpecoV1Mixin:
         if not isinstance(extra_fields, list):
             return self._speco_v1_spec_decode_sidecar_metrics()
 
+        from verl_speco.integration.acceptance_metrics import (
+            request_acceptance_counters,
+        )
+
         total_drafts = 0.0
         total_accepted = 0.0
+        real_requests = 0
+        requests_with_stats = 0
         tags = list(getattr(batch, "tags", None) or [])
         for index, fields in enumerate(extra_fields):
             if index < len(tags) and bool(tags[index].get("is_padding", False)):
@@ -1358,24 +1506,30 @@ class SpecoV1Mixin:
             # through ``.data`` rather than being dict instances themselves.
             # The initial bridge only covered plain dicts, silently dropping
             # every real rollout counter.
+            real_requests += 1
             fields = getattr(fields, "data", fields)
             if not isinstance(fields, dict):
                 continue
-            try:
-                # These are the native verl rollout fields.  In particular,
-                # ToolAgentLoop knows to accumulate them across tool turns.
-                drafts = float(fields.get("spec_num_verify_steps", 0.0) or 0.0)
-                accepted = float(fields.get("spec_num_accepted_tokens", 0.0) or 0.0)
-            except (TypeError, ValueError):
+            counters = request_acceptance_counters(fields)
+            if counters is None:
                 continue
-            total_drafts += max(0.0, drafts)
-            total_accepted += max(0.0, accepted)
+            drafts, accepted = counters
+            requests_with_stats += 1
+            total_drafts += drafts
+            total_accepted += accepted
 
         if total_drafts <= 0.0:
             return self._speco_v1_spec_decode_sidecar_metrics()
         return {
             "drafter/spec_decode/mean_acceptance_length": 1.0
             + total_accepted / total_drafts,
+            "drafter/spec_decode/num_verify_steps": total_drafts,
+            "drafter/spec_decode/num_accepted_tokens": total_accepted,
+            "drafter/spec_decode/requests_with_stats": requests_with_stats,
+            "drafter/spec_decode/requests_missing_stats": real_requests
+            - requests_with_stats,
+            "drafter/spec_decode/request_stats_coverage": requests_with_stats
+            / max(real_requests, 1),
         }
 
     def _compute_metrics(self, batch, metrics, timing_raw, global_steps, epoch):
@@ -1396,6 +1550,9 @@ class SpecoV1Mixin:
         if not self._speco_online_enabled_from_config(self.config):
             return super()._update_actor(batch, metrics)
 
+        metrics["timing_s/drafter"] = 0.0
+        self._speco_v1_drafter_hook_cost_seconds = 0.0
+
         # A V1 global step can contain several local actor updates when
         # ``parameter_sync_step > 1``.  Those updates all share one global
         # weight version and one drafter publication boundary, so training the
@@ -1405,14 +1562,34 @@ class SpecoV1Mixin:
         # the final actor update.
         parameter_sync_step = max(int(getattr(self, "parameter_sync_step", 1)), 1)
         local_trigger_step = int(getattr(self, "local_trigger_step", 0))
+        if local_trigger_step == 0:
+            self._speco_v1_actor_update_seconds = 0.0
         if local_trigger_step < parameter_sync_step - 1:
             metrics["drafter/training_deferred_to_global_step_end"] = 1
-            return super()._update_actor(batch, metrics)
+            actor_started = time.perf_counter()
+            result = super()._update_actor(batch, metrics)
+            self._speco_v1_actor_update_seconds = self.__dict__.get(
+                "_speco_v1_actor_update_seconds", 0.0
+            ) + max(0.0, time.perf_counter() - actor_started)
+            metrics["timing_s/actor_update_without_drafter"] = (
+                self._speco_v1_actor_update_seconds
+            )
+            return result
 
+        before_started = time.perf_counter()
         event = self._speco_on_before_actor_update()
         plan = event.training_plan
         metrics.update(event.metrics or {})
+        before_elapsed = max(0.0, time.perf_counter() - before_started)
+        actor_started = time.perf_counter()
         result = super()._update_actor(batch, metrics)
+        after_started = time.perf_counter()
+        self._speco_v1_actor_update_seconds = self.__dict__.get(
+            "_speco_v1_actor_update_seconds", 0.0
+        ) + max(0.0, after_started - actor_started)
+        metrics["timing_s/actor_update_without_drafter"] = (
+            self._speco_v1_actor_update_seconds
+        )
         pending_sync = getattr(self, "_pending_target_lm_head_sync", None)
         if pending_sync is not None:
             metrics.update(self._speco_finish_target_lm_head_weight_sync(pending_sync))
@@ -1438,6 +1615,11 @@ class SpecoV1Mixin:
         if getattr(self, "_speco_freeze_policy", None) is not None:
             self._speco_maybe_save_freeze_branch_checkpoint()
             self._speco_flush_request_accept_len_payloads()
+        after_elapsed = max(0.0, time.perf_counter() - after_started)
+        self._speco_v1_drafter_hook_cost_seconds = before_elapsed + after_elapsed
+        metrics["timing_s/drafter_v1_before_actor"] = before_elapsed
+        metrics["timing_s/drafter_v1_after_actor"] = after_elapsed
+        metrics["timing_s/drafter"] = self._speco_v1_drafter_hook_cost_seconds
         return result
 
     def _speco_async_prefit_rollout_warmup_enabled(self) -> bool:

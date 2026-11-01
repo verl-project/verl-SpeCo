@@ -13,6 +13,10 @@ training, and hot-update logic through `verl_speco`.
 - **Drafter Co-Training in the RL loop**: collects hidden states during rollout or
   old-logprob computation, trains a drafter periodically, and publishes updated
   drafter weights back to the rollout engine.
+- **Bubble Time drafter training**: can run drafter optimizer steps on rollout
+  idle workers, then publish the trained drafter back to all rollout replicas,
+  so the generation benefit is preserved while less drafter training time lands
+  on the critical path.
 - **Multiple drafter backends**: includes EAGLE-1, EAGLE-2, EAGLE3, DFlash,
   DSpark, Domino, and P-EAGLE trainer backends under `verl_speco.backends`.
 - **vLLM and SGLang integration**: supports EAGLE-1, EAGLE-2, EAGLE3, DFlash,
@@ -35,12 +39,17 @@ For the online drafter collection, training, and publish scheduling boundary,
 including how to add a new execution or collection strategy, see the
 [Drafter Scheduler guide](docs/drafter_scheduler.md).
 
+For the rollout-idle Bubble Time execution path, including the quota lifecycle,
+safe writer switching, key metrics, and recommended configuration, see
+[Bubble Time drafter training](docs/bubble_time_drafter_training.md).
+For a paired 4-GPU DSpark/vLLM launch, use the
+[Bubble/Sync example](examples/bubble_time/run_qwen3-8b_drafter_dspark_vllm.sh).
+
 ## Performance Preview
 
-The current results focus on EAGLE3 with the vLLM rollout engine, where
-verl-SpeCo supports both GPU and NPU deployments. The figures below show a
-Qwen3-8B EAGLE3 run on vLLM-Ascend/NPU; DFlash support is available, and DFlash
-figures will be added in a later update.
+The current results cover both NPU EAGLE3 co-training and GPU DFlash Bubble
+Time training. Bubble Time uses rollout idle windows to repay drafter-training
+quota instead of reducing the requested drafter optimizer work.
 
 On Qwen3-8B with an EAGLE3 drafter on vLLM-Ascend/NPU, a 100-step run shows
 that co-training increases mean acceptance length over the fixed-drafter setting
@@ -55,6 +64,19 @@ faster end-to-end training without accuracy regression.
 | --- | --- |
 | ![Qwen3-8B EAGLE3 step time on vLLM-Ascend](docs/assets/qwen3-8b_eagle3_npu_step.png) | ![Qwen3-8B EAGLE3 critic reward on vLLM-Ascend](docs/assets/qwen3-8b_eagle3_npu_critic-reward.png) |
 
+On a Qwen3-4B DFlash GPU run, Bubble Time kept the drafter training quota
+aligned with the synchronous path while moving most drafter work off the main
+critical path. Excluding checkpoint-save steps, the observed end-to-end step
+time improved by about 6.7% compared with synchronous drafter training, with
+similar speculative-decoding acceptance length.
+
+| Metric | Sync drafter training | Bubble Time | Change |
+| --- | ---: | ---: | ---: |
+| End-to-end step time, excluding checkpoint-save steps | 123.52 s | 115.23 s | 6.7% faster |
+| Drafter time on the critical path | 8.33 s | 2.08 s | 75.0% lower |
+| Generation time | 49.47 s | 47.43 s | 4.1% faster |
+| Mean acceptance length | 3.30 | 3.25 | Similar |
+
 ## Draft Model Support
 
 | Draft model | Rollout engines | Training engine | Status |
@@ -64,7 +86,7 @@ faster end-to-end training without accuracy regression.
 | EAGLE3 | vLLM, SGLang | FSDP | Available |
 | DFlash | vLLM, SGLang | FSDP | Available |
 | DFlash2 | vLLM via DFlash, SGLang via DFLASH | FSDP | Available |
-| DSpark | vLLM | FSDP | Available |
+| DSpark | vLLM, SGLang | FSDP | SGLang adapter tested; GPU rollout unverified |
 | Domino | vLLM, SGLang via DFlash | FSDP | Available |
 | P-EAGLE | Not wired in this overlay | FSDP | Training only |
 
@@ -80,6 +102,11 @@ Domino is trained with `speculative_algorithm=DOMINO`, but it is served as a
 DFlash projector sub-mode. For rollout, use `speculative_algorithm=DFLASH`
 with a Domino checkpoint on an engine version that supports the Domino
 projector.
+
+Domino training does not support LK loss. Keep `dflash_lk_loss_alpha` and
+`dspark_lk_loss_alpha` at zero when selecting `DOMINO`; positive values are
+rejected during layout resolution and backend initialization. Use the DFlash
+or DSpark training backend for LK loss.
 
 P-EAGLE training is available, but its vLLM parallel-drafting rollout runtime
 is not wired into this overlay yet. Keep rollout drafter serving disabled and
@@ -97,7 +124,7 @@ drafter backend you use.
 | EAGLE3 | &gt;= 0.18.0 | &gt;= 0.18.0 | &gt;= 0.5.10 |
 | DFlash | &gt;= 0.20.2 | &gt;= 0.20.2 | &gt;= 0.5.12 |
 | DFlash2 | &gt;= 0.28.0 (served as DFlash) | - | [main](https://github.com/sgl-project/sglang) (served as DFLASH; no tagged release up to 0.5.18) |
-| DSpark | GPU: [main](https://github.com/vllm-project/vllm/tree/main)<br>NPU: [`58d3918`](https://github.com/vllm-project/vllm/tree/58d3918e3ea0a544ffedadad2ba84559e9c51d8f) | NPU: [`6af9257`](https://github.com/vllm-project/vllm-ascend/tree/6af9257e449ca139ccd228f0d71ca7d2c09909c9)<br>NPU (MRV2): [`27a9476`](https://github.com/vllm-project/vllm-ascend/tree/27a94764b5ead50ed3e42ab52a257c2173032750) | - |
+| DSpark | GPU: [main](https://github.com/vllm-project/vllm/tree/main)<br>NPU: [`58d3918`](https://github.com/vllm-project/vllm/tree/58d3918e3ea0a544ffedadad2ba84559e9c51d8f) | NPU: [`6af9257`](https://github.com/vllm-project/vllm-ascend/tree/6af9257e449ca139ccd228f0d71ca7d2c09909c9)<br>NPU (MRV2): [`27a9476`](https://github.com/vllm-project/vllm-ascend/tree/27a94764b5ead50ed3e42ab52a257c2173032750) | [`76e06fe`](https://github.com/sgl-project/sglang/tree/76e06febab732d28a61b75a61b7835284568cdfb) (adapter-tested; GPU rollout unverified) |
 | Domino | DFlash-compatible runtime with Domino projector support | Runtime-specific | Runtime-specific |
 | P-EAGLE | Not wired | Not wired | Not wired |
 
@@ -148,6 +175,14 @@ acceptance head against `alpha = sum_v min(p_v, q_v) = 1 - TV`, matching
 `architectures=["Qwen3DSparkModel"]` and use `sample_from_anchor=true` (or omit
 it for the native default); the fixed verification length must not exceed the
 checkpoint's training `block_size`.
+
+For DSpark on this SGLang checkout, set `actor_rollout_ref.rollout.name=sglang`
+and `actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK` with a
+DSpark checkpoint in `drafter.model_path`. Keep `rollout.spec_steps=1` and
+`rollout.spec_topk=1`. Set `rollout.spec_verify_tokens` to the trained DSpark
+`block_size` (gamma); the adapter passes gamma + 1 to SGLang's
+`speculative_num_draft_tokens`. Collect training hidden states through
+`training.collect_hidden_states_from_old_logprob=true` as in the vLLM example.
 
 ### verl V1 runner (Phase 1)
 

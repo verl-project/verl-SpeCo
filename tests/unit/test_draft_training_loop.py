@@ -276,6 +276,8 @@ def test_standalone_global_loss_and_selector_aggregation(prefix):
             f"{prefix}/selector_token_count": 15.0,
         },
         _training_metric_steps=2, optimizer_steps_total=10, optimizer=None,
+        _training_sample_draws=6,
+        _training_unique_sample_ids={1, 2, 3},
         _block_drafter_metric_prefix=lambda: prefix,
         _block_drafter_config_value=lambda name, default: 0,
     )
@@ -283,6 +285,8 @@ def test_standalone_global_loss_and_selector_aggregation(prefix):
     assert metrics[f"{prefix}/loss"] == 3.0
     assert metrics[f"{prefix}/selector_loss"] == 0.4
     assert metrics[f"{prefix}/selector_accuracy"] == 0.6
+    assert metrics["drafter/train_sample_draws"] == 6.0
+    assert metrics["drafter/train_unique_samples"] == 3.0
 
 
 @pytest.mark.parametrize("prefix", ["eagle3", "dflash", "dspark", "dflash2"])

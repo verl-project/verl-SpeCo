@@ -12,6 +12,7 @@ from typing import Any, Optional, cast
 import pytest
 import torch
 import verl_speco.trainer.target_feature_replay as replay
+from verl_speco.backends.target_hidden import gather_aligned_target_hidden
 
 
 def _load_class(path, name, methods=None, extra=None):
@@ -68,7 +69,8 @@ def test_prepared_batch_runs_actual_optimizer_step_without_old_prepare_state(bat
     from contextlib import nullcontext
 
     cls = _load_class("verl_speco/trainer/base_trainer.py", "DrafterBaseTrainer",
-                      {"_training_step_on_batch"}, {"time": time, "device_name": "cpu"})
+                      {"_training_step_on_batch", "_clip_training_grad_norm"},
+                      {"time": time, "device_name": "cpu"})
     trainer = cls()
     trainer.model = torch.nn.Linear(2, 1, bias=False)
     with torch.no_grad():
@@ -282,7 +284,8 @@ def test_dspark_forward_selects_target_positions_before_norm(apply_norm):
                and any(isinstance(t, ast.Name) and t.id == "weight_mask" for t in n.targets))
     forward.body = forward.body[:end] + [ast.parse("return aligned_target_hidden, eval_mask").body[0]]
     namespace = {
-        "torch": torch, "Optional": Optional, 
+        "torch": torch, "Optional": Optional,
+        "gather_aligned_target_hidden": gather_aligned_target_hidden,
         "_resolve_sliding_windows": lambda config: None,
         "build_dflash_attention_masks": lambda **kwargs: (None, None),
     }

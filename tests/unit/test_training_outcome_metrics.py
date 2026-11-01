@@ -16,6 +16,7 @@ from verl_speco.trainer.scheduler.execution_strategy import ExecutionOutcome
 from verl_speco.trainer.scheduler.training_outcome import (
     TrainingOutcome,
     _forward_block_metrics,
+    _forward_residency_metrics,
 )
 
 
@@ -30,6 +31,17 @@ def _plan() -> TrainingPlan:
         publish_after_success=False,
         plan_id="plan-4",
     )
+
+
+def test_from_execution_forwards_eagle3_lk_metrics() -> None:
+    plan = _plan()
+    outcome = TrainingOutcome.from_execution(
+        ExecutionOutcome(raw_results=[_result(**{"eagle3/lk/acceptance": 0.7,
+                                                "eagle3/lk_loss": 0.4})], elapsed_sec=1.0),
+        runtime_state=_running_state(plan), plan=plan,
+    )
+    assert outcome.metrics["eagle3/lk/acceptance"] == 0.7
+    assert outcome.metrics["eagle3/lk_loss"] == 0.4
 
 
 def _running_state(plan: TrainingPlan) -> DrafterRuntimeState:
@@ -88,6 +100,45 @@ def test_from_execution_forwards_confidence_metrics() -> None:
     assert "unrelated/metric" not in outcome.metrics
 
 
+def test_residency_stages_reach_driver_as_max_without_changing_rpc_time():
+    plan = _plan()
+    raw = [
+        _result(
+            **{
+                "timing_s/drafter_cleanup_offload_model": 2.0,
+                "timing_s/drafter_activation_load_optimizer": 1.0,
+            }
+        ),
+        _result(
+            **{
+                "timing_s/drafter_cleanup_offload_model": 3.0,
+                "timing_s/drafter_activation_load_optimizer": 0.5,
+            }
+        ),
+    ]
+    outcome = TrainingOutcome.from_execution(
+        ExecutionOutcome(raw_results=raw, elapsed_sec=8.0),
+        runtime_state=_running_state(plan),
+        plan=plan,
+    )
+    assert outcome.metrics["timing_s/drafter_cleanup_offload_model"] == 3.0
+    assert outcome.metrics["timing_s/drafter_activation_load_optimizer"] == 1.0
+    assert outcome.metrics["timing_s/drafter_train_rpc"] == 8.0
+    assert (
+        _forward_residency_metrics(
+            [
+                {
+                    "timing_s/drafter_cleanup_negative": -1,
+                    "timing_s/drafter_cleanup_nan": float("nan"),
+                    "timing_s/drafter_cleanup_invalid": "invalid",
+                    "unrelated": 10,
+                }
+            ]
+        )
+        == {}
+    )
+
+
 def test_from_execution_keeps_summary_metrics() -> None:
     """Forwarding block scalars must not clobber the drafter/* summary keys."""
     plan = _plan()
@@ -127,3 +178,26 @@ def test_forward_block_metrics_skips_non_numeric_and_unprefixed() -> None:
         ]
     )
     assert metrics == {"dspark/l1_loss": 0.2}
+
+
+def test_gpu_transfer_metrics_use_rank_max_and_reject_invalid_values() -> None:
+    metrics = _forward_residency_metrics(
+        [
+            {
+                "timing_s/drafter_gpu_model_offload_copy_wait": 0.5,
+                "drafter/gpu_model_offload_reused_bytes": 1024,
+                "drafter/gpu_head_restore_cache_hit": 1,
+            },
+            {
+                "timing_s/drafter_gpu_model_offload_copy_wait": 0.7,
+                "drafter/gpu_model_offload_reused_bytes": 2048,
+                "drafter/gpu_head_restore_cache_hit": 0,
+                "drafter/gpu_invalid": float("nan"),
+            },
+        ]
+    )
+    assert metrics == {
+        "timing_s/drafter_gpu_model_offload_copy_wait": 0.7,
+        "drafter/gpu_model_offload_reused_bytes": 2048,
+        "drafter/gpu_head_restore_cache_hit": 1,
+    }

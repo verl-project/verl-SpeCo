@@ -155,3 +155,28 @@ def test_async_publish_economics_config_guard(
     else:
         policy = t._speco_init_freeze_policy()
         assert (policy is not None) == freeze_enabled
+
+
+@_trainer_skip
+@pytest.mark.parametrize("publish_async", [False, True])
+@pytest.mark.parametrize("economics_enabled", [False, True])
+@pytest.mark.parametrize("freeze_enabled", [False, True])
+def test_bubble_economics_requires_paired_probes_and_quota_costs(
+    publish_async, economics_enabled, freeze_enabled
+) -> None:
+    OmegaConf = pytest.importorskip("omegaconf").OmegaConf
+    trainer = SpecoRayPPOTrainer.__new__(SpecoRayPPOTrainer)
+    trainer._speco_drafter_training_config = lambda: OmegaConf.create({
+        "scheduler": {"execution": {"strategy": "rollout_idle_worker"}},
+        "publish_async": publish_async,
+        "drafter_convergence_freeze": {
+            "enabled": freeze_enabled,
+            "economics": {"enabled": economics_enabled},
+        },
+    })
+    trainer._speco_freeze_load_state = lambda policy: None
+    if freeze_enabled and economics_enabled:
+        with pytest.raises(ValueError, match="Bubble Time.*economics.enabled=true"):
+            trainer._speco_init_freeze_policy()
+    else:
+        assert (trainer._speco_init_freeze_policy() is not None) == freeze_enabled

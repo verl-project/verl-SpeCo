@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
+from verl_speco.integration.phase_timing import phase_span, phase_timing_enabled
 from verl_speco.trainer.scheduler.schedule_types import (
     CollectionPayload,
     CollectionWorkerResult,
@@ -39,9 +42,33 @@ class CallbackDrafterCollectionExecutor:
     rollback_submit: Callable[[list[list[dict]]], Any]
     finalize_submit: Callable[[list[list[dict]]], Any]
     resolve: Callable[[Any], Any]
+    phase_timing: bool = False
+
+    def _call(self, phase, submit, request, **labels):
+        enabled = self.phase_timing or phase_timing_enabled()
+        if not enabled:
+            return self.resolve(submit(request))
+        # One existing phase record includes both submission and awaited work.
+        # Mutate the nested labels while inside the span; phase_span serializes
+        # them on exit, including partial timing when an exception propagates.
+        stages = {}
+        started = time.perf_counter()
+        with phase_span(
+            f"collection_{phase}", enabled=enabled, stages=stages, **labels
+        ):
+            try:
+                refs = submit(request)
+            finally:
+                stages["submit_s"] = time.perf_counter() - started
+            submitted_at = time.perf_counter()
+            try:
+                result = self.resolve(refs)
+            finally:
+                stages["wait_s"] = time.perf_counter() - submitted_at
+        return result
 
     def set_global_step(self, global_step: object) -> None:
-        self.resolve(self.set_step(global_step))
+        self._call("set_step", self.set_step, global_step, source_step=str(global_step))
 
     @staticmethod
     def _control_buckets(
@@ -70,11 +97,27 @@ class CallbackDrafterCollectionExecutor:
 
     def stage(self, payload: CollectionPayload) -> list[CollectionWorkerResult]:
         requests = self._control_buckets(payload, include_samples=True)
-        return self._normalize(self.resolve(self.stage_submit(requests)) or [])
+        return self._normalize(
+            self._call(
+                "stage",
+                self.stage_submit,
+                requests,
+                collection_id=payload.collection_id,
+            )
+            or []
+        )
 
     def commit(self, payload: CollectionPayload) -> list[CollectionWorkerResult]:
         requests = self._control_buckets(payload, include_samples=False)
-        return self._normalize(self.resolve(self.commit_submit(requests)) or [])
+        return self._normalize(
+            self._call(
+                "commit",
+                self.commit_submit,
+                requests,
+                collection_id=payload.collection_id,
+            )
+            or []
+        )
 
     def abort(self, payload: CollectionPayload) -> None:
         requests = self._control_buckets(payload, include_samples=False)
@@ -86,4 +129,12 @@ class CallbackDrafterCollectionExecutor:
 
     def finalize(self, payload: CollectionPayload) -> list[CollectionWorkerResult]:
         requests = self._control_buckets(payload, include_samples=False)
-        return self._normalize(self.resolve(self.finalize_submit(requests)) or [])
+        return self._normalize(
+            self._call(
+                "finalize",
+                self.finalize_submit,
+                requests,
+                collection_id=payload.collection_id,
+            )
+            or []
+        )

@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -328,31 +329,82 @@ class NativeVLLMDraftWeightSyncClient:
                 self.decision.reason if self.decision else "native",
             )
 
+        started = time.perf_counter()
+        phase_times = {}
+        completed = False
+
+        async def measured(name, method, *args, **kwargs):
+            phase_started = time.perf_counter()
+            from verl_speco.integration.lifecycle_timing import lifecycle_span
+
+            try:
+                with lifecycle_span(rollout, f"draft_publish_{name}"):
+                    return await method(*args, **kwargs)
+            finally:
+                phase_times[name] = time.perf_counter() - phase_started
+
         generation_paused = False
         try:
             if pause_generation:
-                await _maybe_call_vllm_server_method(
-                    rollout, "abort_all_requests", reset_prefix_cache=flush_before
+                await measured(
+                    "pause_s",
+                    _maybe_call_vllm_server_method,
+                    rollout,
+                    "abort_all_requests",
+                    reset_prefix_cache=flush_before,
                 )
                 generation_paused = True
             elif flush_before:
-                await _maybe_call_vllm_server_method(rollout, "clear_kv_cache")
+                await measured(
+                    "cache_before_s",
+                    _maybe_call_vllm_server_method,
+                    rollout,
+                    "clear_kv_cache",
+                )
 
-            await rollout.start_draft_weight_update()
+            await measured("session_start_s", rollout.start_draft_weight_update)
             try:
-                await rollout.update_weights(weights, global_steps=global_steps)
+                await measured(
+                    "transfer_and_load_s",
+                    rollout.update_weights,
+                    weights,
+                    global_steps=global_steps,
+                )
             finally:
-                await rollout.finish_weight_update()
+                await measured("session_finish_s", rollout.finish_weight_update)
 
             if flush_after:
-                await _maybe_call_vllm_server_method(rollout, "clear_kv_cache")
-            if global_steps is not None:
-                await _maybe_call_vllm_server_method(
-                    rollout, "set_global_steps", global_steps
+                await measured(
+                    "cache_after_s",
+                    _maybe_call_vllm_server_method,
+                    rollout,
+                    "clear_kv_cache",
                 )
+            if global_steps is not None:
+                await measured(
+                    "set_step_s",
+                    _maybe_call_vllm_server_method,
+                    rollout,
+                    "set_global_steps",
+                    global_steps,
+                )
+            completed = True
         finally:
             if generation_paused:
-                await _maybe_call_vllm_server_method(rollout, "resume_generation")
+                await measured(
+                    "resume_s",
+                    _maybe_call_vllm_server_method,
+                    rollout,
+                    "resume_generation",
+                )
+            if is_rank_zero:
+                logger.warning(
+                    "[speco vllm native draft update] finished global_steps=%s completed=%s elapsed_s=%.6f phases=%s",
+                    global_steps,
+                    completed,
+                    time.perf_counter() - started,
+                    phase_times,
+                )
 
 
 def _default_compat_attacher(rollout: Any) -> None:

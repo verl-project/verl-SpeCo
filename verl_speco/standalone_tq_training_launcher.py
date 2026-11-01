@@ -75,6 +75,12 @@ _DSPARK_L1_LOSS_ALPHA_KEY = (
 _DSPARK_CONFIDENCE_LOSS_ALPHA_KEY = (
     "actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha"
 )
+_DFLASH_LK_LOSS_ALPHA_KEY = (
+    "actor_rollout_ref.rollout.drafter.training.dflash_lk_loss_alpha"
+)
+_DSPARK_LK_LOSS_ALPHA_KEY = (
+    "actor_rollout_ref.rollout.drafter.training.dspark_lk_loss_alpha"
+)
 _DSPARK_CE_TARGET_SOURCE_KEY = (
     "actor_rollout_ref.rollout.drafter.training.ce_target_source"
 )
@@ -1004,6 +1010,14 @@ def build_pipeline_commands(
         )
         or "0.0"
     )
+    dspark_lk_loss_alpha = _strip_quotes(
+        _find_override(training_args, _DSPARK_LK_LOSS_ALPHA_KEY, normalize_key=True)
+        or "0.0"
+    )
+    dflash_lk_loss_alpha = _strip_quotes(
+        _find_override(training_args, _DFLASH_LK_LOSS_ALPHA_KEY, normalize_key=True)
+        or "0.0"
+    )
     ce_target_source = _strip_quotes(
         _find_override(training_args, _DSPARK_CE_TARGET_SOURCE_KEY, normalize_key=True)
         or "labels"
@@ -1012,6 +1026,8 @@ def build_pipeline_commands(
         [
             f"{_DSPARK_L1_LOSS_ALPHA_KEY}={dspark_l1_loss_alpha}",
             f"{_DSPARK_CONFIDENCE_LOSS_ALPHA_KEY}={dspark_confidence_loss_alpha}",
+            f"{_DSPARK_LK_LOSS_ALPHA_KEY}={dspark_lk_loss_alpha}",
+            f"{_DFLASH_LK_LOSS_ALPHA_KEY}={dflash_lk_loss_alpha}",
             f"{_DSPARK_CE_TARGET_SOURCE_KEY}={ce_target_source}",
         ]
     )
@@ -1019,6 +1035,8 @@ def build_pipeline_commands(
         config.algorithm,
         {
             "dspark_l1_loss_alpha": float(dspark_l1_loss_alpha),
+            "dspark_lk_loss_alpha": float(dspark_lk_loss_alpha),
+            "dflash_lk_loss_alpha": float(dflash_lk_loss_alpha),
             "dspark_confidence_loss_alpha": float(dspark_confidence_loss_alpha),
             "ce_target_source": ce_target_source,
         },

@@ -95,7 +95,7 @@ jobs:
           uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install --system -r ci/requirements-ci.txt -r ci/requirements-unit.txt
 
-      - name: Run all unit tests and CPU distributed regression
+      - name: Run all unit and integration tests with torch
         env:
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/.ci/upstream-verl
           VERL_SPECO_UPSTREAM_ROOT: ${{ github.workspace }}/.ci/upstream-verl
@@ -103,7 +103,7 @@ jobs:
           python -m pytest
           tests/unit
           tests/v1
-          tests/integration/test_drafter_ddp_distributed.py
+          tests/integration
           -q -ra
 
   drafter-models:

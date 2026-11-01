@@ -369,6 +369,115 @@ def test_dflash_trailing_label_token_is_supervised() -> None:
     assert 12 in captured["targets"].tolist()
 
 
+def _collection_trainer(model_type: str) -> DrafterBaseTrainer:
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(model_type=model_type)
+    trainer.config = OmegaConf.create(
+        {"rollout": {"drafter": {"training": {"use_logits": False}}}}
+    )
+    trainer.copy_stream = None
+    trainer.rank = 0
+    trainer.pad_token_id = 0
+    trainer.model_config = None
+    trainer.current_rl_step = 0
+    trainer.use_data_buffer = False
+    trainer.collected_data = []
+    trainer.buffer_version = 0
+    return trainer
+
+
+def _collect_two_response_tokens(model_type: str) -> dict:
+    trainer = _collection_trainer(model_type)
+    trainer.collect_online_data(
+        {
+            "input_ids": torch.tensor([[10, 11, 12]]),
+            "prompts": torch.tensor([[10]]),
+            "responses": torch.tensor([[11, 12]]),
+        },
+        torch.randn(1, 2, 4),
+    )
+    assert len(trainer.collected_data) == 1
+    return trainer.collected_data[0]
+
+
+def test_dflash_collection_keeps_trailing_label_for_sampler() -> None:
+    """One prompt token + two response tokens + two hidden rows must keep the
+    trailing label so the DFlash anchor sampler still finds a valid anchor."""
+    item = _collect_two_response_tokens("dflash")
+    assert item["input_ids"].tolist() == [10, 11, 12]
+    assert item["hidden_states"].size(0) == 2
+
+    config = DFlashConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=16,
+        num_target_layers=4,
+        num_context_layers=1,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1],
+        mask_token_id=15,
+    )
+    model = DFlashTrainingModel(
+        draft_model=DFlashDraftModel(config), block_size=2, num_anchors=2
+    )
+    label_mask = (item["loss_mask"] > 0).float().unsqueeze(0)
+    _, keep = model._sample_anchor_positions(
+        item["input_ids"].numel(), label_mask, torch.device("cpu")
+    )
+    assert int(keep.sum()) >= 1
+
+
+def test_dspark_collection_keeps_context_aligned_with_hidden_rows() -> None:
+    item = _collect_two_response_tokens("dspark")
+    assert item["input_ids"].tolist() == [10, 11]
+    assert item["next_token_ids"].tolist() == [11, 12]
+
+
+def test_dflash_raw_target_hidden_requires_standalone_reference_source() -> None:
+    config = DFlashConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=16,
+        num_target_layers=4,
+        num_context_layers=1,
+        target_hidden_size=8,
+        target_num_hidden_layers=4,
+        target_layer_ids=[1],
+        mask_token_id=15,
+    )
+    norm = nn.LayerNorm(8)
+    model = DFlashTrainingModel(
+        draft_model=DFlashDraftModel(config),
+        block_size=2,
+        num_anchors=2,
+        lk_loss_alpha=1.0,
+        verifier_norm=norm,
+        target_hidden_clip_value=1.0e4,
+    )
+    model.eval()
+    kwargs = dict(
+        input_ids=torch.tensor([[10, 11, 12]]),
+        hidden_states_list=[torch.randn(1, 3, 8)],
+        loss_mask=torch.ones(1, 3),
+        lm_head_weight=torch.randn(config.vocab_size, 8),
+        target_last_hidden_states=torch.randn(1, 3, 8),
+        target_hidden_is_raw=True,
+    )
+    with pytest.raises(ValueError, match="standalone vLLM"):
+        model(**kwargs, hidden_source="co_train")
+    outputs = model(**kwargs, hidden_source="standalone_vllm_reference")
+    assert torch.isfinite(outputs[0])
+
+
 class _RecordingLayer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -510,6 +619,8 @@ def test_pack_block_drafter_chunks_marks_padding_with_sentinel() -> None:
         attn_mask,
         document_ids,
         target,
+        next_token_ids,
+        next_token_loss_mask,
         num_packed,
     ) = packed
     # Sample 0 (len 3) pads to 4, sample 1 (len 5) pads to 8.
@@ -518,6 +629,8 @@ def test_pack_block_drafter_chunks_marks_padding_with_sentinel() -> None:
     assert loss_mask[0].tolist() == [1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0]
     assert document_ids[0].tolist() == [0, 0, 0, -1, 1, 1, 1, 1, 1, -1, -1, -1]
     assert target is None
+    assert next_token_ids is None
+    assert next_token_loss_mask is None
     assert num_packed == 2
 
 
@@ -536,9 +649,18 @@ def test_pack_block_drafter_chunks_skips_oversized_without_dropping_rest() -> No
     )
 
     assert packed is not None
-    input_ids, _loss_mask, _base_h, _position_ids, _attn, document_ids, _, num_packed = (
-        packed
-    )
+    (
+        input_ids,
+        _loss_mask,
+        _base_h,
+        _position_ids,
+        _attn,
+        document_ids,
+        _,
+        _,
+        _,
+        num_packed,
+    ) = packed
     assert num_packed == 2
     assert input_ids.shape == (1, 12)
     # The oversized middle sample is skipped, not the whole remainder.
@@ -725,6 +847,26 @@ def test_pack_block_drafter_batch_exposes_document_ids() -> None:
         assert num_packed == 2
 
 
+def test_pack_block_drafter_batch_keeps_aligned_next_token_labels() -> None:
+    trainer = _packing_trainer(block_size=4)
+    trainer.backend = SimpleNamespace(model_type="dspark")
+
+    fields, num_packed = trainer._pack_block_drafter_batch(
+        input_id_chunks=[torch.tensor([10, 11, 12])],
+        loss_mask_chunks=[torch.ones(3)],
+        hidden_state_chunks=[torch.zeros(3, 2)],
+        position_id_chunks=[torch.arange(3)],
+        target_last_hidden_state_chunks=[],
+        next_token_id_chunks=[torch.tensor([11, 12, 13])],
+        next_token_loss_mask_chunks=[torch.ones(3)],
+    )
+
+    assert num_packed == 1
+    assert fields["input_ids"][0].tolist() == [10, 11, 12, 0]
+    assert fields["next_token_ids"][0].tolist() == [11, 12, 13, 0]
+    assert fields["next_token_loss_mask"][0].tolist() == [1, 1, 1, 0]
+
+
 def test_prepare_training_batch_carries_document_ids_to_final_batch() -> None:
     seq_len, hidden = 8, 4
     ids = torch.arange(seq_len, dtype=torch.long)
@@ -745,6 +887,8 @@ def test_prepare_training_batch_carries_document_ids_to_final_batch() -> None:
 
     trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
     trainer.backend = _FakeBackend()
+    trainer._active_training_reservation_id = None
+    trainer._bubble_time_enabled = False
     trainer.batch_size = 1
     trainer.current_rl_step = 0
     trainer.training_steps = 0
@@ -771,3 +915,185 @@ def test_prepare_training_batch_carries_document_ids_to_final_batch() -> None:
 
     assert batch is not None
     assert batch["document_ids"][0].tolist() == [0] * seq_len
+
+
+def test_prepare_dspark_batch_keeps_trailing_label_out_of_context() -> None:
+    ids = torch.tensor([10, 11])
+    next_ids = torch.tensor([11, 12])
+    hidden_states = torch.randn(2, 4)
+    loss_mask = torch.ones(2)
+
+    class _FakeBackend:
+        model_type = "dspark"
+
+        def preprocess_individual_items(self, items, dev, model_config):
+            return {
+                "ids": [ids],
+                "h_states": [hidden_states],
+                "masks": [loss_mask],
+                "position_ids": [torch.arange(2)],
+                "target_last_h_states": [None],
+                "next_token_ids": [next_ids],
+                "next_token_masks": [loss_mask],
+            }
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = _FakeBackend()
+    trainer.batch_size = 1
+    trainer.current_rl_step = 0
+    trainer.training_steps = 0
+    trainer.use_data_buffer = False
+    trainer.collected_data = [{"step": 0, "hidden_states": hidden_states}]
+    trainer.config = OmegaConf.create(
+        {
+            "rollout": {
+                "drafter": {
+                    "training": {
+                        "dspark_block_size": 2,
+                        "dspark_l1_loss_alpha": 0.0,
+                        "dspark_lk_loss_alpha": 0.0,
+                        "packing": {"enable": False},
+                    }
+                }
+            }
+        }
+    )
+    trainer.use_ulysses_sp = False
+    trainer.rank = 0
+    trainer.model_config = None
+    trainer.model = nn.Linear(2, 2)
+
+    batch = trainer._prepare_training_batch()
+
+    assert batch is not None
+    assert batch["input_ids"].tolist() == [[10, 11]]
+    assert batch["hidden_states"].shape[1] == 2
+    assert batch["next_token_ids"].tolist() == [[11, 12]]
+
+
+def _eagle3_lk_replay_trainer(*, synced_step=3, **item_overrides):
+    ids = torch.arange(5, dtype=torch.long)
+    hidden_states = torch.randn(5, 4)
+    last_hidden_states = torch.randn(5, 4)
+    loss_mask = torch.ones(5)
+
+    class _FakeBackend:
+        model_type = "eagle3"
+
+        def preprocess_individual_items(self, items, dev, model_config):
+            return {
+                "ids": [ids],
+                "h_states": [hidden_states],
+                "masks": [loss_mask],
+                "position_ids": [torch.arange(5)],
+                "last_h_states": [last_hidden_states],
+                "target_logz": [items[0].get("target_logz")],
+            }
+
+    item = {
+        "step": 3,
+        "global_step": 3,
+        "hidden_states": hidden_states,
+        "target_logz": torch.ones(5),
+        "target_logz_temperature": 1.0,
+        **item_overrides,
+    }
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = _FakeBackend()
+    trainer.batch_size = 1
+    trainer.current_rl_step = 3
+    trainer.training_steps = 0
+    trainer.use_data_buffer = False
+    trainer._bubble_time_enabled = False
+    trainer.collected_data = [item]
+    trainer.config = OmegaConf.create(
+        {
+            "rollout": {
+                "drafter": {
+                    "training": {
+                        "use_logits": False,
+                        "eagle3_lk_loss_alpha": 1.0,
+                        "lk_temperature": 1.0,
+                    }
+                }
+            }
+        }
+    )
+    trainer.use_ulysses_sp = False
+    trainer.rank = 0
+    trainer.model_config = None
+    trainer.model = nn.Linear(2, 2)
+    trainer._target_lm_head_weight_step = synced_step
+    return trainer
+
+
+def test_eagle3_lk_replay_rejects_missing_synced_target_snapshot() -> None:
+    trainer = _eagle3_lk_replay_trainer(synced_step=None)
+
+    with pytest.raises(ValueError, match="synchronized target LM-head snapshot"):
+        trainer._prepare_training_batch()
+
+
+def test_eagle3_lk_replay_rejects_temperature_mismatch() -> None:
+    trainer = _eagle3_lk_replay_trainer(target_logz_temperature=0.5)
+
+    with pytest.raises(ValueError, match="temperature mismatch"):
+        trainer._prepare_training_batch()
+
+
+def test_eagle3_lk_replay_rejects_missing_target_logz() -> None:
+    trainer = _eagle3_lk_replay_trainer(target_logz=None)
+
+    with pytest.raises(ValueError, match="missing target_logz"):
+        trainer._prepare_training_batch()
+
+
+def test_prepare_training_batch_packing_keeps_trailing_label_row() -> None:
+    seq_len, hidden = 8, 4
+    ids = torch.arange(seq_len + 1, dtype=torch.long)
+    hidden_states = torch.randn(seq_len, hidden)
+    loss_mask = torch.ones(seq_len + 1)
+
+    class _FakeBackend:
+        model_type = "dflash"
+
+        def preprocess_individual_items(self, items, dev, model_config):
+            return {
+                "ids": [ids],
+                "h_states": [hidden_states],
+                "masks": [loss_mask],
+                "position_ids": [torch.arange(seq_len, dtype=torch.long)],
+            }
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = _FakeBackend()
+    trainer._active_training_reservation_id = None
+    trainer._bubble_time_enabled = False
+    trainer.batch_size = 1
+    trainer.current_rl_step = 0
+    trainer.training_steps = 0
+    trainer.use_data_buffer = False
+    trainer.collected_data = [{"step": 0, "hidden_states": hidden_states}]
+    trainer.config = OmegaConf.create(
+        {
+            "rollout": {
+                "drafter": {
+                    "training": {
+                        "dflash_block_size": 4,
+                        "packing": {"enable": True, "max_packed_len": 0},
+                    }
+                }
+            }
+        }
+    )
+    trainer.use_ulysses_sp = False
+    trainer.rank = 0
+    trainer.model_config = None
+    trainer.model = nn.Linear(2, 2)
+
+    batch = trainer._prepare_training_batch()
+
+    assert batch is not None
+    assert batch["input_ids"][0].tolist() == list(range(seq_len + 1)) + [0, 0, 0]
+    assert batch["document_ids"][0].tolist() == [0] * (seq_len + 1) + [-1] * 3
+    assert batch["hidden_states"][0, seq_len:].abs().sum().item() == 0

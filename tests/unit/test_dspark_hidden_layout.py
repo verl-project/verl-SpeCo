@@ -16,6 +16,23 @@ _spec.loader.exec_module(_module)
 resolve_drafter_hidden_states_layout = _module.resolve_drafter_hidden_states_layout
 
 
+@pytest.mark.parametrize("algorithm", ["DOMINO", "domino"])
+@pytest.mark.parametrize("key", ["dflash_lk_loss_alpha", "dspark_lk_loss_alpha"])
+def test_domino_rejects_lk_loss(algorithm, key):
+    with pytest.raises(ValueError, match=f"Domino does not support LK loss.*{key}"):
+        resolve_drafter_hidden_states_layout(algorithm, {key: 0.5})
+
+
+@pytest.mark.parametrize("alpha", [0.0, None, "0.0"])
+def test_domino_without_lk_keeps_aux_layout(alpha):
+    assert (
+        resolve_drafter_hidden_states_layout(
+            "DOMINO", {"dflash_lk_loss_alpha": alpha, "dspark_lk_loss_alpha": alpha}
+        )
+        == "dflash_aux"
+    )
+
+
 @pytest.mark.parametrize(
     "alpha,source,expected",
     [

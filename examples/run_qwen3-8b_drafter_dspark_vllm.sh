@@ -111,4 +111,4 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     trainer.total_training_steps=100 \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
-    trainer.total_epochs=6 $@
+    trainer.total_epochs=6 "$@"

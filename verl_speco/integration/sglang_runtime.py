@@ -22,14 +22,17 @@ actors that own the HTTP server and rollout adapter.
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextvars
+import dataclasses
 import functools
 import hashlib
+import importlib
 import inspect
 import json
 import logging
 import os
 import time
-import dataclasses
 from typing import Any, Optional, cast
 
 from verl_speco.integration.drafter_config_env import (
@@ -49,10 +52,18 @@ from verl_speco.integration.sglang_adapter import (
     DRAFTER_RAW_TOP_LOGPROBS_PARAM,
     DRAFTER_RETURN_LAST_HIDDEN_PARAM,
     SGLANG_EAGLE_UPDATE_WEIGHTS_PATCH,
+    SGLANG_FLASHINFER_PLAN_ABI_PATCH,
     SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCH,
     SGLANG_NPU_EAGLE_TARGET_SAMPLING_PATCH,
     SGLANG_QWEN3_ROPE_COMPAT_PATCH,
     sglang_needs_qwen3_rope_compat_patch,
+)
+from verl_speco.integration.rollout_idle_events import (
+    SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV,
+    acquire_rollout_resource_lease,
+    emit_rollout_drafter_sample,
+    emit_rollout_idle_event,
+    release_rollout_resource_lease,
 )
 from verl_speco.trainer.scheduler import (
     CollectionPlan,
@@ -115,9 +126,37 @@ _HIDDEN_STATE_WINDOW_END_PARAM = "_verl_hidden_state_window_end"
 _HIDDEN_STATE_WINDOW_START_OFFSET_PARAM = "_verl_hidden_state_window_start_offset"
 _HIDDEN_STATE_WINDOW_MIN_ROWS_PARAM = "_verl_hidden_state_window_min_rows"
 _VERL_DRAFTER_RAW_TOP_LOGPROBS_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS"
+# Shared, backend-neutral transport keys; the "vllm" prefix is historical and
+# must match SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX read by the trainer.
+_SPECO_SPEC_DECODE_EXTRA_PREFIX = "_speco_vllm_spec_decode"
 
 _SERVER_ARGS_PATCHED = False
 _SGLANG_REPLICA_PATCHED = False
+_VERL_SGLANG_LAUNCH = contextvars.ContextVar("speco_verl_sglang_launch", default=False)
+
+
+def _sglang_spec_decode_extra_fields(meta_info: Any) -> dict[str, float]:
+    """Map SGLang request counters onto SpeCo's backend-neutral transport."""
+
+    if not isinstance(meta_info, dict):
+        return {}
+    try:
+        verification_steps = float(meta_info.get("spec_verify_ct", 0) or 0)
+        accepted_drafts = float(
+            meta_info.get(
+                "spec_num_correct_drafts",
+                meta_info.get("spec_accepted_drafts", 0),
+            )
+            or 0
+        )
+    except (TypeError, ValueError, OverflowError):
+        return {}
+    if verification_steps <= 0:
+        return {}
+    return {
+        f"{_SPECO_SPEC_DECODE_EXTRA_PREFIX}_drafts": verification_steps,
+        f"{_SPECO_SPEC_DECODE_EXTRA_PREFIX}_accepted_tokens": max(accepted_drafts, 0.0),
+    }
 
 
 def _record_field_names(cls: Any) -> frozenset[str]:
@@ -142,6 +181,169 @@ def _record_field_names(cls: Any) -> frozenset[str]:
     if dataclasses.is_dataclass(cls):
         return frozenset(field.name for field in dataclasses.fields(cls))
     return frozenset()
+
+
+def _install_verl_server_args_fields_compat(upstream_module: Any) -> None:
+    """Teach older verl launch code how to inspect current SGLang records."""
+    dataclasses_module = getattr(upstream_module, "dataclasses", None)
+    server_args = getattr(upstream_module, "ServerArgs", None)
+    if dataclasses_module is None or server_args is None:
+        return
+    compat_dataclasses_module: Any = dataclasses_module
+    try:
+        compat_dataclasses_module.fields(server_args)
+        return
+    except TypeError:
+        field_names = _record_field_names(server_args)
+    if not field_names:
+        return
+
+    class _DataclassesCompatProxy:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(compat_dataclasses_module, name)
+
+        @staticmethod
+        def fields(class_or_instance: Any) -> Any:
+            candidate = (
+                class_or_instance
+                if isinstance(class_or_instance, type)
+                else type(class_or_instance)
+            )
+            if candidate is server_args:
+                return tuple(
+                    type("RecordField", (), {"name": name}) for name in field_names
+                )
+            return compat_dataclasses_module.fields(class_or_instance)
+
+    upstream_module.dataclasses = _DataclassesCompatProxy()
+
+
+def _install_verl_launch_subprocesses_compat() -> None:
+    """Inject SPECO args at launch and expose the legacy verl launcher shape."""
+    http_server = importlib.import_module("sglang.srt.entrypoints.http_server")
+
+    engine = getattr(http_server, "Engine", None)
+    if engine is None:
+        return
+    engine_cls: Any = engine
+    launcher = getattr(engine_cls, "_launch_subprocesses", None)
+    if not callable(launcher):
+        return
+
+    if not getattr(engine_cls, "_speco_patched_launch_subprocesses", False):
+        original_launcher = launcher
+
+        def speco_engine_launch_subprocesses(cls, *args, **kwargs):
+            del cls
+            try:
+                bound = inspect.signature(original_launcher).bind_partial(
+                    *args, **kwargs
+                )
+                server_args = bound.arguments.get("server_args")
+            except (TypeError, ValueError):
+                server_args = kwargs.get("server_args")
+            _apply_drafter_config_at_scheduler_boundary(server_args)
+            result = original_launcher(*args, **kwargs)
+            # verl unpacks the third item as scheduler_info, while native
+            # Engine callers still need SGLang's original tuple unchanged.
+            if _VERL_SGLANG_LAUNCH.get():
+                return _verl_sglang_launch_result(result)
+            return result
+
+        setattr(engine_cls, "_speco_original_launch_subprocesses", original_launcher)
+        setattr(
+            engine_cls,
+            "_launch_subprocesses",
+            classmethod(speco_engine_launch_subprocesses),
+        )
+        setattr(engine_cls, "_speco_patched_launch_subprocesses", True)
+        launcher = getattr(engine_cls, "_launch_subprocesses")
+
+    if callable(getattr(http_server, "_launch_subprocesses", None)):
+        return
+
+    def _launch_subprocesses(*args, **kwargs):
+        kwargs.setdefault(
+            "init_tokenizer_manager_func",
+            getattr(engine_cls, "init_tokenizer_manager_func", None)
+            or http_server.init_tokenizer_manager,
+        )
+        kwargs.setdefault(
+            "run_scheduler_process_func",
+            getattr(engine_cls, "run_scheduler_process_func", None)
+            or http_server.run_scheduler_process,
+        )
+        kwargs.setdefault(
+            "run_detokenizer_process_func",
+            getattr(engine_cls, "run_detokenizer_process_func", None)
+            or http_server.run_detokenizer_process,
+        )
+        return _verl_sglang_launch_result(launcher(*args, **kwargs))
+
+    setattr(http_server, "_launch_subprocesses", _launch_subprocesses)
+
+
+def _verl_sglang_launch_result(result):
+    if len(result) >= 4 and hasattr(result[3], "scheduler_infos"):
+        scheduler_infos = result[3].scheduler_infos
+        scheduler_info = scheduler_infos[0] if scheduler_infos else {}
+        return result[:2] + (scheduler_info,) + result[2:]
+    return result
+
+
+def _apply_drafter_config_at_scheduler_boundary(server_args: Any) -> None:
+    """Mutate the constructed ServerArgs before SGLang resolves and publishes it."""
+
+    drafter_cfg = _load_env_drafter_config()
+    if not drafter_cfg or server_args is None:
+        return
+
+    overrides = _server_args_overrides_from_drafter(
+        drafter_cfg, set(_record_field_names(type(server_args)))
+    )
+    for key, value in overrides.items():
+        if key == "custom_weight_loader":
+            current = list(getattr(server_args, key, None) or [])
+            value = current + [item for item in value if item not in current]
+        try:
+            setattr(server_args, key, value)
+        except (AttributeError, TypeError) as exc:
+            raise RuntimeError(
+                "SPECO could not apply SGLang ServerArgs override "
+                f"{key}={value!r} before scheduler launch"
+            ) from exc
+
+    requested_algorithm = str(
+        drafter_cfg.get("speculative_algorithm", "") or ""
+    ).upper()
+    actual_algorithm = str(
+        getattr(server_args, "speculative_algorithm", "") or ""
+    ).upper()
+    logger.info(
+        "[speco sglang launch] requested_algorithm=%s "
+        "server_args_algorithm=%s draft_model=%s "
+        "draft_attention_backend=%s prefill_attention_backend=%s "
+        "decode_attention_backend=%s server_args_type=%s resolution_finished=%s",
+        requested_algorithm,
+        actual_algorithm or None,
+        getattr(server_args, "speculative_draft_model_path", None),
+        getattr(server_args, "speculative_draft_attention_backend", None),
+        getattr(server_args, "prefill_attention_backend", None),
+        getattr(server_args, "decode_attention_backend", None),
+        type(server_args).__name__,
+        bool(getattr(server_args, "_resolution_finished", False)),
+    )
+    expected_algorithm = (
+        "DFLASH" if requested_algorithm == "DFLASH2" else requested_algorithm
+    )
+    if expected_algorithm and actual_algorithm != expected_algorithm:
+        raise RuntimeError(
+            "SPECO SGLang speculative configuration was lost before "
+            "scheduler launch: "
+            f"requested_algorithm={requested_algorithm!r}, "
+            f"server_args_algorithm={actual_algorithm or None!r}, "
+            f"supported_fields={sorted(_record_field_names(type(server_args)))}"
+        )
 
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
@@ -170,6 +372,121 @@ def _plain_container(value: Any):
     if isinstance(value, (list, tuple)):
         return [_plain_container(item) for item in value]
     return value
+
+
+def _rollout_idle_worker_config(drafter_cfg: dict[str, Any]) -> dict[str, Any]:
+    training_cfg = drafter_cfg.get("training") or {}
+    scheduler_cfg = training_cfg.get("scheduler") or {}
+    idle_cfg = scheduler_cfg.get("idle_worker") or {}
+    execution_cfg = scheduler_cfg.get("execution") or {}
+    strategy = (
+        str(
+            execution_cfg.get(
+                "strategy", training_cfg.get("execution_strategy", "sync")
+            )
+            or "sync"
+        )
+        .strip()
+        .lower()
+    )
+    if strategy != "rollout_idle_worker":
+        return {}
+    return dict(idle_cfg)
+
+
+def _rollout_idle_event_bus_name(drafter_cfg: dict[str, Any]) -> str | None:
+    idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+    if not idle_cfg:
+        return ""
+    return str(
+        idle_cfg.get("event_bus_name")
+        or os.getenv(SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV)
+        or ""
+    )
+
+
+def _rollout_idle_worker_id_for_replica(
+    drafter_cfg: dict[str, Any],
+    replica_rank: int,
+) -> str:
+    idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+    flattened = [
+        str(worker_id)
+        for group in idle_cfg.get("training_groups") or []
+        for worker_id in group
+    ]
+    if 0 <= int(replica_rank) < len(flattened):
+        return flattened[int(replica_rank)]
+    return str(replica_rank)
+
+
+def _rollout_idle_worker_ids_for_replica(
+    drafter_cfg: dict[str, Any],
+    replica_rank: int,
+) -> tuple[str, ...]:
+    """Resolve the complete colocated training group owned by a replica."""
+
+    idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+    groups = idle_cfg.get("training_groups") or []
+    if 0 <= int(replica_rank) < len(groups):
+        group = tuple(str(worker_id) for worker_id in groups[int(replica_rank)] or ())
+        if group:
+            return group
+    return (_rollout_idle_worker_id_for_replica(drafter_cfg, replica_rank),)
+
+
+def _emit_rollout_idle_worker_event(
+    *,
+    drafter_cfg: dict[str, Any],
+    replica_rank: int,
+    event_type: str,
+    memory_released: bool = False,
+    release_source: str = "",
+    idle_confidence: str = "speculative",
+) -> bool:
+    bus_name = _rollout_idle_event_bus_name(drafter_cfg)
+    if not bus_name:
+        return False
+    event_ts = time.time()
+    # Runtime callbacks prove that a replica has released resources, but they
+    # cannot know when the next rollout request will reclaim them.  Leave the
+    # deadline unknown and let the scheduler admit work from observed history;
+    # reclaim remains the hard stop signal.
+    must_be_ready_at = None
+    worker_id = _rollout_idle_worker_id_for_replica(drafter_cfg, replica_rank)
+    deadline_source = "runtime_unknown"
+    emitted = emit_rollout_idle_event(
+        bus_name,
+        {
+            "event_type": event_type,
+            "worker_id": worker_id,
+            "replica_rank": int(replica_rank),
+            "memory_released": memory_released,
+            "release_source": release_source,
+            "idle_confidence": idle_confidence,
+            "must_be_ready_at": must_be_ready_at,
+            "event_ts": event_ts,
+        },
+    )
+    logger.warning(
+        "[BubbleTime] emit_rollout_idle_event runtime=sglang bus=%s type=%s "
+        "worker_id=%s replica_rank=%s memory_released=%s release_source=%s deadline_in_s=%s "
+        "deadline_source=%s emitted=%s",
+        bus_name,
+        event_type,
+        worker_id,
+        replica_rank,
+        memory_released,
+        release_source,
+        (
+            None
+            if must_be_ready_at is None
+            else round(max(must_be_ready_at - event_ts, 0.0), 3)
+        ),
+        deadline_source,
+        emitted,
+    )
+    return emitted
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -728,6 +1045,55 @@ def _validate_sglang_dflash2_block_size(
         )
 
 
+def _validate_sglang_dspark_config(drafter_cfg: dict[str, Any]) -> int:
+    """Check the SpeCo gamma against the local SGLang DSpark checkpoint."""
+    model_path = drafter_cfg.get("model_path")
+    if not model_path:
+        raise ValueError("SGLang DSpark requires drafter.model_path")
+    gamma = _positive_int_or_none(
+        (drafter_cfg.get("rollout") or {}).get("spec_verify_tokens")
+    )
+    if gamma is None:
+        raise ValueError("SGLang DSpark requires positive rollout.spec_verify_tokens")
+    rollout_cfg = drafter_cfg.get("rollout") or {}
+    for key in ("spec_steps", "spec_topk"):
+        value = rollout_cfg.get(key)
+        if value is not None and int(value) != 1:
+            raise ValueError(f"SGLang DSpark requires rollout.{key}=1, got {value}")
+
+    config_path = os.path.join(os.fspath(model_path), "config.json")
+    if os.path.isfile(config_path):
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+        architectures = config.get("architectures") or []
+        if isinstance(architectures, str):
+            architectures = [architectures]
+        if not (
+            any("dspark" in str(name).lower() for name in architectures)
+            or config.get("dspark_config") is not None
+            or config.get("markov_head_type") is not None
+        ):
+            raise ValueError(
+                f"SGLang DSpark requires a DSpark checkpoint: {config_path}"
+            )
+        if config.get("sample_from_anchor", True) is not True:
+            raise ValueError(
+                "SGLang DSpark requires sample_from_anchor=true for SpeCo training"
+            )
+        block_size = (
+            config.get("dspark_block_size")
+            or (config.get("dspark_config") or {}).get("block_size")
+            or (config.get("dflash_config") or {}).get("block_size")
+            or config.get("block_size")
+        )
+        if block_size is not None and gamma != int(block_size):
+            raise ValueError(
+                "SGLang DSpark requires rollout.spec_verify_tokens to equal the "
+                f"checkpoint block_size: got {gamma}, expected {block_size}"
+            )
+    return gamma
+
+
 def _server_args_overrides_from_drafter(
     drafter_cfg: dict[str, Any], supported_fields: set[str]
 ) -> dict[str, Any]:
@@ -809,7 +1175,12 @@ def _server_args_overrides_from_drafter(
         "enable_weights_cpu_backup": True,
         "enable_draft_weights_cpu_backup": True,
     }
-
+    if algorithm == "DSPARK":
+        # SPECO counts the gamma drafted positions; SGLang also counts the
+        # target's bonus-token verification slot.
+        overrides["speculative_num_draft_tokens"] = (
+            _validate_sglang_dspark_config(drafter_cfg) + 1
+        )
     cuda_graph_max_bs = rollout_cfg.get("cuda_graph_max_bs")
     if cuda_graph_max_bs is not None:
         overrides["cuda_graph_max_bs"] = cuda_graph_max_bs
@@ -856,6 +1227,8 @@ def _default_sglang_verl_patches(drafter_cfg: dict[str, Any]) -> set[str]:
 
     if drafter_cfg.get("enable"):
         patches.add(SGLANG_EAGLE_UPDATE_WEIGHTS_PATCH)
+    if str(drafter_cfg.get("speculative_algorithm", "")).upper() == "DSPARK":
+        patches.add(SGLANG_FLASHINFER_PLAN_ABI_PATCH)
     if drafter_cfg.get("enable") and drafter_cfg.get("enable_drafter_training"):
         training_cfg = drafter_cfg.get("training") or {}
         if training_cfg.get("collect_hidden_states_from_sgl"):
@@ -960,7 +1333,7 @@ def _is_sglang_draft_model(model) -> bool:
         any(
             token in str(name).lower()
             for name in names
-            for token in ("eagle", "dflash")
+            for token in ("eagle", "dflash", "dspark")
         )
         or getattr(config, "draft_vocab_size", None) is not None
     )
@@ -980,6 +1353,32 @@ def speco_sglang_draft_weight_loader(model, named_tensors):
     if not _is_sglang_draft_model(model):
         return
     return model.load_weights(named_tensors)
+
+
+def _sglang_draft_param_name(name: str, algorithm: str) -> str:
+    """Translate trainer parameter names to the SGLang draft namespace."""
+
+    if algorithm == "DSPARK":
+        translated = name
+        strip_prefixes = (
+            "module.",
+            "_orig_mod.",
+            "draft_model.",
+            "model.draft_model.",
+            "model.",
+        )
+        changed = True
+        while changed:
+            changed = False
+            for prefix in strip_prefixes:
+                if translated.startswith(prefix):
+                    translated = translated[len(prefix) :]
+                    changed = True
+        return translated.replace("midlayer.", "layers.0.")
+
+    from verl_speco.integration.vllm_runtime import _dflash2_engine_param_name
+
+    return _dflash2_engine_param_name(name)
 
 
 @functools.lru_cache(maxsize=1)
@@ -1101,7 +1500,9 @@ async def _sgl_update_weights_with_route(
     ):
         if value is not None and field in request_fields:
             setattr(update_weights_request, field, value)
-    result = await engine.update_weights_from_tensor(update_weights_request)
+    result = await _sgl_http_update_weights_from_tensor(
+        engine, update_weights_request, request_fields=request_fields
+    )
     if isinstance(result, dict):
         success = result.get("success")
         status = str(result.get("status", "")).lower()
@@ -1123,6 +1524,64 @@ async def _sgl_update_weights_with_route(
     return result
 
 
+async def _sgl_http_update_weights_from_tensor(
+    engine, update_weights_request, *, request_fields: frozenset[str]
+):
+    """Preserve SGLang's failed-update message and optional route fields."""
+
+    get_session = getattr(engine, "_get_session", None)
+    server_args = getattr(engine, "server_args", None)
+    if not callable(get_session) or server_args is None:
+        return await engine.update_weights_from_tensor(update_weights_request)
+
+    payload = {
+        "serialized_named_tensors": [
+            base64.b64encode(value).decode("utf-8")
+            for value in update_weights_request.serialized_named_tensors
+        ],
+        "load_format": update_weights_request.load_format,
+        "flush_cache": update_weights_request.flush_cache,
+    }
+    for field in (
+        "abort_all_requests",
+        "disable_draft_model",
+        "disable_target_model",
+        "weight_version",
+        "torch_empty_cache",
+    ):
+        if field in request_fields:
+            payload[field] = getattr(update_weights_request, field)
+
+    host = str(server_args.host)
+    if host in ("0.0.0.0", "::", ""):
+        host = "127.0.0.1"
+    elif ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    url = f"http://{host}:{server_args.port}/update_weights_from_tensor"
+    post_kwargs: dict[str, Any] = {"json": payload}
+    api_key = getattr(server_args, "admin_api_key", None) or getattr(
+        server_args, "api_key", None
+    )
+    if api_key:
+        post_kwargs["headers"] = {"Authorization": f"Bearer {api_key}"}
+    async with get_session() as session:
+        async with session.post(url, **post_kwargs) as response:
+            try:
+                result = await response.json()
+            except Exception:  # noqa: BLE001
+                result = {"message": await response.text()}
+            if not isinstance(result, dict):
+                result = {"message": str(result)}
+            if response.status >= 400:
+                return {
+                    "success": False,
+                    "message": result.get("message")
+                    or result.get("detail")
+                    or f"HTTP {response.status}",
+                }
+            return result
+
+
 def _supports_sglang_custom_weight_loader() -> bool:
     try:
         from sglang.srt.server_args import ServerArgs
@@ -1130,6 +1589,17 @@ def _supports_sglang_custom_weight_loader() -> bool:
         return "custom_weight_loader" in _record_field_names(ServerArgs)
     except Exception:  # noqa: BLE001
         return False
+
+
+def _sglang_route_load_format(disable_field: str, route_marker: str) -> str | None:
+    """Use a marker only when this SGLang request cannot route natively."""
+    from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
+
+    if disable_field in _record_field_names(UpdateWeightsFromTensorReqInput):
+        return None
+    if _supports_sglang_custom_weight_loader():
+        return route_marker
+    return None
 
 
 def _speculative_weight_sync_guard_disabled() -> bool:
@@ -1234,9 +1704,9 @@ async def speco_update_target_weights(
                 device_mesh=self.device_mesh,
                 disable_draft_model=True,
                 disable_target_model=False,
-                load_format=SPECO_TARGET_WEIGHT_LOADER
-                if _supports_sglang_custom_weight_loader()
-                else None,
+                load_format=_sglang_route_load_format(
+                    "disable_draft_model", SPECO_TARGET_WEIGHT_LOADER
+                ),
                 stage_cpu_tensors_to_device=False,
                 flush_cache=not engine_has_flush_cache,
                 abort_all_requests=False,
@@ -1296,19 +1766,11 @@ async def speco_update_draft_weights(
             if flush_before and engine_has_flush_cache:
                 await _maybe_call_sglang_engine_method(self._engine, "flush_cache")
 
-        # DFlash2 keeps the selector codebooks in nn.Embedding modules on the
-        # trainer while SGLang's draft holds them as bare parameters; SGLang's
-        # load_weights silently drops unresolved names, so rename here (the
-        # SGLang publish path otherwise forwards trainer names verbatim).
-        from verl_speco.integration.vllm_runtime import (
-            _dflash2_engine_param_name,
-            _ipc_safe_allocator,
-        )
+        from verl_speco.integration.vllm_runtime import _ipc_safe_allocator
 
-        # The rename only rewrites the two DFlash2 codebook suffixes, so it is a
-        # no-op for every other drafter family.
+        algorithm = str(drafter_cfg.get("speculative_algorithm", "") or "").upper()
         named_weights = (
-            (_dflash2_engine_param_name(name), tensor)
+            (_sglang_draft_param_name(name, algorithm), tensor)
             for name, tensor in weights.items()
         )
 
@@ -1328,9 +1790,9 @@ async def speco_update_draft_weights(
                     device_mesh=self.device_mesh,
                     disable_draft_model=False,
                     disable_target_model=True,
-                    load_format=SPECO_DRAFT_WEIGHT_LOADER
-                    if _supports_sglang_custom_weight_loader()
-                    else None,
+                    load_format=_sglang_route_load_format(
+                        "disable_target_model", SPECO_DRAFT_WEIGHT_LOADER
+                    ),
                     stage_cpu_tensors_to_device=True,
                     flush_cache=bool(flush_after and not engine_has_flush_cache),
                     abort_all_requests=False,
@@ -1390,6 +1852,7 @@ class _SpecoSGLangHttpServerMixin:
     model_config: Any
     replica_rank: int
     tokenizer_manager: Any
+    _speco_last_collection_plan: CollectionPlan | None
     _speco_last_collection_skip_reason: str | None
 
     async def launch_server(self, *args, **kwargs):
@@ -1400,7 +1863,16 @@ class _SpecoSGLangHttpServerMixin:
         self._drafter_collection_tokens = 0
         self._speco_collection_skip_log_keys = set()
         self._speco_hidden_missing_log_keys = set()
-        return await cast(Any, super()).launch_server(*args, **kwargs)
+        upstream_launch_server = cast(Any, super()).launch_server
+        upstream_module = inspect.getmodule(upstream_launch_server)
+        if upstream_module is not None:
+            _install_verl_server_args_fields_compat(upstream_module)
+        _install_verl_launch_subprocesses_compat()
+        launch_token = _VERL_SGLANG_LAUNCH.set(True)
+        try:
+            return await upstream_launch_server(*args, **kwargs)
+        finally:
+            _VERL_SGLANG_LAUNCH.reset(launch_token)
 
     def _speco_drafter_cfg(self) -> dict[str, Any]:
         cached_cfg = getattr(self, "_speco_drafter_config", None)
@@ -1659,25 +2131,187 @@ class _SpecoSGLangHttpServerMixin:
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
     ):
+        drafter_cfg = self._speco_drafter_cfg()
+        replica_rank = int(self.replica_rank)
+        lease_lock = getattr(self, "_speco_rollout_lease_lock", None)
+        if lease_lock is None:
+            lease_lock = asyncio.Lock()
+            self._speco_rollout_lease_lock = lease_lock
+        async with lease_lock:
+            active_requests = int(
+                getattr(self, "_speco_rollout_active_requests", 0) or 0
+            )
+            # Collection may be disabled for validation/quota backpressure,
+            # but those requests still use the same rollout devices and must
+            # participate in the resource lease.
+            self._speco_rollout_cycle_reported = True
+            if active_requests == 0:
+                self._speco_rollout_release_verified = True
+                bus_name = _rollout_idle_event_bus_name(drafter_cfg)
+                lease_workers = _rollout_idle_worker_ids_for_replica(
+                    drafter_cfg,
+                    replica_rank,
+                )
+                lease_acquired, lease_wait_s = await acquire_rollout_resource_lease(
+                    bus_name,
+                    worker_ids=lease_workers,
+                    event={
+                        "worker_id": _rollout_idle_worker_id_for_replica(
+                            drafter_cfg, replica_rank
+                        ),
+                        "replica_rank": replica_rank,
+                        "memory_released": False,
+                        "idle_confidence": "confirmed",
+                        "release_source": "runtime_request_started",
+                    },
+                )
+                self._speco_rollout_resource_lease_active = lease_acquired
+                self._speco_rollout_resource_lease_workers = lease_workers
+                if lease_acquired:
+                    logger.warning(
+                        "[BubbleTime] rollout_resource_lease_acquired "
+                        "runtime=sglang replica_rank=%s workers=%s wait_s=%.4f",
+                        replica_rank,
+                        lease_workers,
+                        lease_wait_s,
+                    )
+                else:
+                    # Compatibility fallback for an event bus created by an
+                    # older process. Such events remain speculative and cannot
+                    # admit training without the atomic lease protocol.
+                    logger.warning(
+                        "[BubbleTime] rollout_resource_lease_unavailable "
+                        "runtime=sglang replica_rank=%s workers=%s "
+                        "fallback=speculative_event",
+                        replica_rank,
+                        lease_workers,
+                    )
+                    _emit_rollout_idle_worker_event(
+                        drafter_cfg=drafter_cfg,
+                        replica_rank=replica_rank,
+                        event_type="GENERATION_STARTED",
+                    )
+            self._speco_rollout_active_requests = active_requests + 1
+        request_completed = False
+        request_completed_ts = None
+        try:
+            output = await self._speco_generate_request(
+                prompt_ids,
+                sampling_params,
+                request_id,
+                image_data=image_data,
+                video_data=video_data,
+            )
+            request_completed = True
+            request_completed_ts = time.time()
+            return output
+        finally:
+            if not request_completed:
+                self._speco_rollout_release_verified = False
+            async with lease_lock:
+                remaining_requests = max(
+                    int(getattr(self, "_speco_rollout_active_requests", 1) or 1) - 1,
+                    0,
+                )
+                self._speco_rollout_active_requests = remaining_requests
+                cycle_reported = bool(
+                    getattr(self, "_speco_rollout_cycle_reported", False)
+                )
+                if cycle_reported and remaining_requests == 0:
+                    release_verified = bool(
+                        getattr(self, "_speco_rollout_release_verified", False)
+                    )
+                    lease_active = bool(
+                        getattr(self, "_speco_rollout_resource_lease_active", False)
+                    )
+                    released = False
+                    if lease_active:
+                        released = await release_rollout_resource_lease(
+                            _rollout_idle_event_bus_name(drafter_cfg),
+                            worker_ids=tuple(
+                                getattr(
+                                    self,
+                                    "_speco_rollout_resource_lease_workers",
+                                    (),
+                                )
+                            ),
+                            event={
+                                "worker_id": _rollout_idle_worker_id_for_replica(
+                                    drafter_cfg, replica_rank
+                                ),
+                                "replica_rank": replica_rank,
+                                "memory_released": release_verified,
+                                "request_completed_ts": request_completed_ts,
+                                "release_source": (
+                                    "runtime_request_finalized"
+                                    if release_verified
+                                    else "runtime_request_failed"
+                                ),
+                            },
+                        )
+                    if not released:
+                        if lease_active:
+                            logger.warning(
+                                "[BubbleTime] rollout_resource_lease_release_failed "
+                                "runtime=sglang replica_rank=%s workers=%s "
+                                "fallback=speculative_event",
+                                replica_rank,
+                                tuple(
+                                    getattr(
+                                        self,
+                                        "_speco_rollout_resource_lease_workers",
+                                        (),
+                                    )
+                                ),
+                            )
+                        _emit_rollout_idle_worker_event(
+                            drafter_cfg=drafter_cfg,
+                            replica_rank=replica_rank,
+                            event_type="WORKER_IDLE",
+                            memory_released=release_verified,
+                            release_source=(
+                                "runtime_request_finalized"
+                                if release_verified
+                                else "runtime_request_failed"
+                            ),
+                        )
+                    self._speco_rollout_resource_lease_active = False
+                    self._speco_rollout_cycle_reported = False
+                    self._speco_rollout_release_verified = False
+
+    async def _speco_generate_request(
+        self,
+        prompt_ids: torch.Tensor,
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+    ):
         from sglang.srt.managers.io_struct import GenerateReqInput
         from verl.workers.rollout.replica import TokenOutput
         from verl.workers.rollout.sglang_rollout.utils import SGLANG_LORA_NAME
 
         drafter_cfg = self._speco_drafter_cfg()
         training_cfg = drafter_cfg.get("training") or {}
+
         uses_dflash_aux_hidden = _drafter_uses_dflash_aux_hidden(drafter_cfg)
-        if not bool(
+        collect_hidden_states = bool(
             drafter_cfg.get("enable")
             and drafter_cfg.get("enable_drafter_training")
             and training_cfg.get("collect_hidden_states_from_sgl")
-        ):
-            return await cast(Any, super()).generate(
+        )
+        is_dspark = bool(drafter_cfg.get("enable")) and (
+            str(drafter_cfg.get("speculative_algorithm", "") or "").upper() == "DSPARK"
+        )
+        if not (collect_hidden_states or is_dspark):
+            output = await cast(Any, super()).generate(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(sampling_params),
                 request_id,
                 image_data=image_data,
                 video_data=video_data,
             )
+            return output
 
         original_sampling_params = sampling_params
         request_global_steps = original_sampling_params.get("_verl_global_steps")
@@ -1691,13 +2325,17 @@ class _SpecoSGLangHttpServerMixin:
             if request_global_steps is not None
             else self.global_steps
         )
-        collection_plan = _plan_sglang_drafter_collection(
-            global_step=collection_global_steps,
-            drafter_cfg=drafter_cfg,
-            validation=skip_drafter_collection,
+        collection_plan = (
+            _plan_sglang_drafter_collection(
+                global_step=collection_global_steps,
+                drafter_cfg=drafter_cfg,
+                validation=skip_drafter_collection,
+            )
+            if collect_hidden_states
+            else None
         )
         self._speco_last_collection_plan = collection_plan
-        if not collection_plan.collect:
+        if collection_plan is not None and not collection_plan.collect:
             self._speco_log_collection_skip_once(
                 {
                     "source_disabled": "hidden_collection_disabled",
@@ -1710,13 +2348,17 @@ class _SpecoSGLangHttpServerMixin:
                 max_new_tokens=None,
                 hidden_window_plan=None,
             )
-            return await cast(Any, super()).generate(
-                prompt_ids,
-                self._speco_strip_internal_sampling_params(original_sampling_params),
-                request_id,
-                image_data=image_data,
-                video_data=video_data,
-            )
+            if not is_dspark:
+                output = await cast(Any, super()).generate(
+                    prompt_ids,
+                    self._speco_strip_internal_sampling_params(
+                        original_sampling_params
+                    ),
+                    request_id,
+                    image_data=image_data,
+                    video_data=video_data,
+                )
+                return output
 
         sampling_params = self._speco_strip_internal_sampling_params(
             original_sampling_params
@@ -1750,20 +2392,28 @@ class _SpecoSGLangHttpServerMixin:
             "sampling_params": sampling_params,
             "return_logprob": return_logprob,
             "image_data": image_data,
+            "video_data": video_data,
         }
         if self.config.enable_rollout_routing_replay:
             request["return_routed_experts"] = True
 
         should_collect = False
         hidden_window_plan = {"mode": "front", "estimated_rows": 0, "min_rows": 0}
-        should_collect, hidden_window_plan, _ = self._speco_request_hidden_state_params(
-            sampling_params,
-            prompt_len=len(prompt_ids),
-            request_id=request_id,
-            collection_global_steps=collection_global_steps,
-            max_new_tokens=max_new_tokens,
-        )
-        if not should_collect:
+        if collection_plan is not None and collection_plan.collect:
+            should_collect, hidden_window_plan, _ = (
+                self._speco_request_hidden_state_params(
+                    sampling_params,
+                    prompt_len=len(prompt_ids),
+                    request_id=request_id,
+                    collection_global_steps=collection_global_steps,
+                    max_new_tokens=max_new_tokens,
+                )
+            )
+        if (
+            collection_plan is not None
+            and collection_plan.collect
+            and not should_collect
+        ):
             self._speco_log_collection_skip_once(
                 getattr(self, "_speco_last_collection_skip_reason", "unknown"),
                 collection_global_steps=collection_global_steps,
@@ -1772,14 +2422,19 @@ class _SpecoSGLangHttpServerMixin:
                 max_new_tokens=max_new_tokens,
                 hidden_window_plan=hidden_window_plan,
             )
-            return await cast(Any, super()).generate(
-                prompt_ids,
-                self._speco_strip_internal_sampling_params(original_sampling_params),
-                request_id,
-                image_data=image_data,
-                video_data=video_data,
-            )
-        request["return_hidden_states"] = True
+            if not is_dspark:
+                output = await cast(Any, super()).generate(
+                    prompt_ids,
+                    self._speco_strip_internal_sampling_params(
+                        original_sampling_params
+                    ),
+                    request_id,
+                    image_data=image_data,
+                    video_data=video_data,
+                )
+                return output
+        if should_collect:
+            request["return_hidden_states"] = True
 
         generate_request = GenerateReqInput(**request)
         if self.model_config.lora_rank > 0:
@@ -2280,6 +2935,27 @@ class _SpecoSGLangHttpServerMixin:
                         "global_step": collection_global_steps,
                         "replica_rank": self.replica_rank,
                     }
+                    sample_id = (
+                        f"{collection_global_steps}:{self.replica_rank}:{request_id}"
+                    )
+                    drafter_sample["_speco_sample_id"] = sample_id
+                    direct_event_emitted = emit_rollout_drafter_sample(
+                        _rollout_idle_event_bus_name(drafter_cfg),
+                        drafter_sample,
+                        sample_id=sample_id,
+                        replica_rank=int(self.replica_rank),
+                        global_step=collection_global_steps,
+                    )
+                    drafter_sample["_speco_direct_event_emitted"] = direct_event_emitted
+                    logger.debug(
+                        "[BubbleTime] emit_drafter_sample runtime=sglang "
+                        "sample_id=%s replica_rank=%s global_step=%s "
+                        "local_hidden_buffer=True emitted=%s",
+                        sample_id,
+                        self.replica_rank,
+                        collection_global_steps,
+                        direct_event_emitted,
+                    )
             else:
                 self._speco_log_missing_hidden_states_once(
                     collection_global_steps=collection_global_steps,
@@ -2287,26 +2963,30 @@ class _SpecoSGLangHttpServerMixin:
                     hidden_states_raw_type=hidden_states_raw_type,
                     hidden_states_raw_len=hidden_states_raw_len,
                 )
-            extra_fields = {
+            sample_extra_fields: dict[str, Any] = {
                 "global_steps": collection_global_steps,
                 "drafter_sample": drafter_sample,
             }
+            sample_extra_fields.update(_sglang_spec_decode_extra_fields(meta_info))
             output = TokenOutput(
                 token_ids=token_ids,
                 log_probs=log_probs,
                 routed_experts=routed_experts,
                 stop_reason=finish_reason,
-                extra_fields=extra_fields,
+                extra_fields=sample_extra_fields,
             )
             return output
 
-        return TokenOutput(
+        extra_fields: dict[str, Any] = {"global_steps": collection_global_steps}
+        extra_fields.update(_sglang_spec_decode_extra_fields(meta_info))
+        output = TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
             stop_reason=finish_reason,
-            extra_fields={"global_steps": collection_global_steps},
+            extra_fields=extra_fields,
         )
+        return output
 
 
 def _build_speco_http_server_class(upstream_module):

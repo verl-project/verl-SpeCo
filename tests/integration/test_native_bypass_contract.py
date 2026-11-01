@@ -44,6 +44,28 @@ def _config(*, enable=False, training=False) -> object:
     )
 
 
+def test_drafter_diagnostic_env_only_forwards_explicit_switches(monkeypatch) -> None:
+    from verl_speco.main import drafter_diagnostic_env
+
+    monkeypatch.delenv("VERL_DRAFTER_MEMORY_DIAGNOSTICS", raising=False)
+    monkeypatch.delenv("VERL_DRAFTER_KEEP_HOT_TRIM_CACHE", raising=False)
+    monkeypatch.delenv("VERL_SPECO_PHASE_TIMING", raising=False)
+    monkeypatch.delenv("VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL", raising=False)
+    assert drafter_diagnostic_env() == {}
+    monkeypatch.setenv("VERL_DRAFTER_MEMORY_DIAGNOSTICS", "true")
+    monkeypatch.setenv("VERL_DRAFTER_KEEP_HOT_TRIM_CACHE", "false")
+    monkeypatch.setenv("UNRELATED_SECRET", "not-forwarded")
+    assert drafter_diagnostic_env() == {
+        "VERL_DRAFTER_MEMORY_DIAGNOSTICS": "true",
+        "VERL_DRAFTER_KEEP_HOT_TRIM_CACHE": "false",
+    }
+    monkeypatch.setenv("VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL", "true")
+    assert (
+        drafter_diagnostic_env()["VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL"]
+        == "true"
+    )
+
+
 def test_should_bypass_true_when_drafter_disabled() -> None:
     from verl_speco.main import should_bypass_speco
 
@@ -158,21 +180,53 @@ def test_native_bypass_selects_required_upstream_runner(monkeypatch, use_v1) -> 
     assert "verl_speco.integration.task_runner" not in sys.modules
 
 
-def test_run_uses_speco_task_runner_when_drafter_enabled(monkeypatch) -> None:
+@pytest.mark.parametrize("diagnostic_enabled", [False, True])
+def test_run_uses_speco_task_runner_when_drafter_enabled(
+    monkeypatch, diagnostic_enabled
+) -> None:
     pytest.importorskip("verl", reason="dispatch contract needs verl")
     pytest.importorskip("ray", reason="dispatch contract needs ray")
 
-    from verl_speco.main import run
+    import ray
+    from verl_speco import main
+
+    env = {"VERL_SPECO_PHASE_TIMING": "1"} if diagnostic_enabled else {}
+    monkeypatch.setattr(main, "configure_compile_cache_runtime_env", lambda config: {})
+    monkeypatch.setattr(main, "drafter_diagnostic_env", lambda: env)
+    actors, options = [], []
+    sentinel = object()
+
+    class Actor:
+        def options(self, **kwargs):
+            options.append(kwargs)
+            return sentinel
+
+    actor = Actor()
+
+    def remote(**kwargs):
+        assert kwargs == {"num_cpus": 1}
+
+        def wrap(cls):
+            actors.append(cls)
+            return actor
+
+        return wrap
 
     calls = _patch_verl_entry(monkeypatch)
-    run(_config(enable=True))
+    from verl_speco.integration.task_runner import SpecoTaskRunner
+
+    # Import real runner classes before spying on entrypoint actor creation.
+    monkeypatch.setattr(ray, "remote", remote)
+    main.run(_config(enable=True))
 
     assert len(calls) == 1
     task_runner_class = calls[0]
     assert task_runner_class is not None
-    from verl_speco.integration.task_runner import SpecoTaskRunner
-
-    assert getattr(task_runner_class, "__ray_actor_class__", None) is SpecoTaskRunner
+    assert actors == [SpecoTaskRunner]
+    assert task_runner_class is (sentinel if diagnostic_enabled else actor)
+    assert options == (
+        [{"runtime_env": {"env_vars": env}}] if diagnostic_enabled else []
+    )
 
 
 def test_run_bypass_propagates_training_without_rollout_error(monkeypatch) -> None:

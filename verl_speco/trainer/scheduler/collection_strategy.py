@@ -34,6 +34,7 @@ class CollectionOutcome:
     elapsed_sec: float = 0.0
     worker_results: list[CollectionWorkerResult] | None = None
     finalized: bool = False
+    committed_unfinalized: bool = False
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
         "collection_completed": 1,
@@ -58,12 +59,29 @@ class CollectionOutcome:
             ),
             "drafter/collection_worker_results": len(worker_results),
             "drafter/collection_finalized": int(self.finalized),
+            "drafter/collection_committed_unfinalized": int(self.committed_unfinalized),
             "drafter/collection_expired_stages": sum(
                 result.expired_stages for result in worker_results
             ),
             "drafter/raw_drafter_samples": self.raw_samples,
             "timing_s/drafter_collection_rpc": self.elapsed_sec,
         }
+
+
+class CollectionFinalizeError(RuntimeError):
+    """An ambiguous post-commit failure must stop downstream training."""
+
+    def __init__(self, collection_id: str, outcome: CollectionOutcome):
+        self.collection_id = collection_id
+        self.outcome = outcome
+        super().__init__(
+            f"Drafter collection {collection_id}: collection_finalize_failed; "
+            "committed but not fully finalized. Training must stop; recover "
+            "from a consistent checkpoint before retrying."
+        )
+
+    def __reduce__(self):
+        return type(self), (self.collection_id, self.outcome)
 
 
 class DrafterCollectionStrategy(Protocol):
@@ -118,22 +136,14 @@ class SyncCollectionStrategy:
             executor.abort(payload)
             raise
 
-        expected_nonempty_by_owner = {
-            str(owner): len(bucket)
-            for owner, bucket in enumerate(payload.buckets)
-            if bucket
+        expected_by_owner = {
+            str(owner): len(bucket) for owner, bucket in enumerate(payload.buckets)
         }
         staged_by_owner = {result.worker_id: result.staged_samples for result in staged}
         stage_ids = [result.worker_id for result in staged]
-        routing_complete = all(
-            staged_by_owner.get(owner) == expected
-            for owner, expected in expected_nonempty_by_owner.items()
-        ) and all(
-            result.worker_id in expected_nonempty_by_owner or result.staged_samples == 0
-            for result in staged
-        )
         stage_valid = (
             len(stage_ids) == len(set(stage_ids))
+            and set(stage_ids) == set(expected_by_owner)
             and all(
                 result.collection_id == plan.collection_id
                 and result.worker_incarnation
@@ -142,9 +152,35 @@ class SyncCollectionStrategy:
                 and result.reason == "collection_staged"
                 for result in staged
             )
-            and routing_complete
+            and staged_by_owner == expected_by_owner
         )
         if not stage_valid:
+            staged_summary = [
+                {
+                    "worker_id": result.worker_id,
+                    "reason": result.reason,
+                    "staged_samples": result.staged_samples,
+                    "source_global_step": result.source_global_step,
+                    "buffer_version_before": result.buffer_version_before,
+                    "buffer_version_after": result.buffer_version_after,
+                    "has_incarnation": bool(result.worker_incarnation),
+                }
+                for result in staged
+            ]
+            logger.warning(
+                "Drafter collection stage validation failed: collection_id=%s "
+                "expected_by_owner=%s staged_results=%s",
+                plan.collection_id,
+                expected_by_owner,
+                staged_summary,
+            )
+            print(
+                "[BubbleTime] collection_stage_validation_failed: "
+                f"collection_id={plan.collection_id} "
+                f"expected_by_owner={expected_by_owner} "
+                f"staged_results={staged_summary}",
+                flush=True,
+            )
             executor.abort(payload)
             return CollectionOutcome(
                 attempted=True,
@@ -217,15 +253,48 @@ class SyncCollectionStrategy:
         finalized = False
         if reason == "collection_completed":
             try:
-                executor.finalize(payload)
+                final_results = executor.finalize(payload)
+                final_ids = [result.worker_id for result in final_results]
+                committed_identities = {
+                    result.worker_id: result.worker_incarnation for result in results
+                }
+                if (
+                    len(final_ids) != len(set(final_ids))
+                    or set(final_ids) != set(expected_by_owner)
+                    or not all(
+                        result.reason == "collection_finalized"
+                        and result.collection_id == plan.collection_id
+                        and result.worker_incarnation
+                        == committed_identities.get(result.worker_id)
+                        and result.source_global_step
+                        == _as_int(plan.source_global_step)
+                        for result in final_results
+                    )
+                ):
+                    raise RuntimeError(
+                        "Incomplete or inconsistent collection finalize ACK"
+                    )
                 finalized = True
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "Failed to finalize committed drafter collection %s",
                     plan.collection_id,
                 )
-                executor.rollback(payload)
-                reason = "collection_finalize_failed"
+                # Some owners may already have discarded their rollback
+                # journals. Rolling back only the remaining owners would split
+                # the dataset. Preserve evidence and fail closed instead.
+                outcome = CollectionOutcome(
+                    attempted=True,
+                    collected=False,
+                    reason="collection_finalize_failed",
+                    source_global_step=plan.source_global_step,
+                    raw_samples=payload.raw_samples,
+                    elapsed_sec=time.perf_counter() - started_at,
+                    worker_results=results,
+                    finalized=False,
+                    committed_unfinalized=True,
+                )
+                raise CollectionFinalizeError(plan.collection_id, outcome) from exc
         else:
             executor.rollback(payload)
         return CollectionOutcome(

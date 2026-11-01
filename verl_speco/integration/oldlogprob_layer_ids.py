@@ -80,14 +80,24 @@ def resolve_drafter_hidden_states_layout(algorithm: Any, training_cfg: Any) -> s
     DFlash-family drafters (DFlash, DSpark, Domino) consume the raw aux context
     layers, while EAGLE-family drafters also need the final hidden state to
     rebuild the target distribution. DSpark additionally needs the final hidden
-    for its L1 loss, its confidence-loss acceptance target, or target-argmax CE.
+    for L1/LK losses, confidence acceptance targets, or target-argmax CE.
+    DFlash also needs the final hidden state when LK loss is enabled.
+    Domino does not support LK loss and rejects enabled LK settings.
     """
 
     algorithm = str(algorithm or "").strip().upper()
+    if algorithm == "DOMINO":
+        for key in ("dflash_lk_loss_alpha", "dspark_lk_loss_alpha"):
+            if float(_get_nested(training_cfg, (key,), 0.0) or 0.0) > 0:
+                raise ValueError(
+                    f"Domino does not support LK loss; set {key}=0 "
+                    "or select the DFLASH/DSPARK training backend for LK."
+                )
     if algorithm not in DFLASH_FAMILY_ALGORITHMS:
         return "eagle3_aux_plus_last"
     if algorithm == "DSPARK" and (
         float(_get_nested(training_cfg, ("dspark_l1_loss_alpha",), 0.9) or 0.0) > 0
+        or float(_get_nested(training_cfg, ("dspark_lk_loss_alpha",), 0.0) or 0.0) > 0
         or float(
             _get_nested(training_cfg, ("dspark_confidence_loss_alpha",), 0.0) or 0.0
         )
@@ -96,6 +106,11 @@ def resolve_drafter_hidden_states_layout(algorithm: Any, training_cfg: Any) -> s
             _get_nested(training_cfg, ("ce_target_source",), "labels") or "labels"
         ).lower()
         == "target_argmax"
+    ):
+        return "dflash_aux_plus_last"
+    if (
+        algorithm == "DFLASH"
+        and float(_get_nested(training_cfg, ("dflash_lk_loss_alpha",), 0.0) or 0.0) > 0
     ):
         return "dflash_aux_plus_last"
     return "dflash_aux"
