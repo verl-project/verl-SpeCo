@@ -541,6 +541,12 @@ co-training loop online. Enabling it is optional and non-invasive: when it is
 off (or unavailable) every SPECO hook degrades to a no-op, so it never changes
 training results or requires `rl_insight` at import time.
 
+RL-Insight requires a verl release that provides `RLInsightLogger` and the
+`rl_insight` tracking backend. Use `release/v0.9.0` or newer; the default
+`release/v0.8.0` baseline in `REQUIRED_VERL.txt` does not support it, and SPECO
+fails fast with an actionable error instead of the upstream `Tracking`
+assertion.
+
 ### Enable
 
 Start the RL-Insight server (Prometheus + Tempo + Grafana) on a reachable host
@@ -558,12 +564,16 @@ python3 -m verl_speco.main \
 
 `verl` sets `VERL_RL_INSIGHT_ENABLE=1` and forwards it to all Ray workers as soon
 as `rl_insight` is in `trainer.logger`. SPECO additionally forwards
-`trainer.project_name`, `trainer.experiment_name` and the driver's
-`RL_INSIGHT_SERVER_URL` to every Ray worker through the job runtime env, so
-per-rank worker metrics and traces carry the same `project`/`experiment_name`
-labels as the trainer even on multi-node clusters. Keep `RL_INSIGHT_SERVER_URL`
+`trainer.project_name`, `trainer.experiment_name`, the resolved
+`trainer.rl_insight` overrides and the driver's `RL_INSIGHT_SERVER_URL` to every
+Ray worker through the job runtime env, so per-rank worker metrics and traces
+carry the same labels and use the same monitoring backend/namespace as the
+trainer even on multi-node clusters. This means a server URL configured only
+through `trainer.rl_insight.server.url` (without exporting
+`RL_INSIGHT_SERVER_URL`) also reaches the workers. Keep `RL_INSIGHT_SERVER_URL`
 exported in the driver environment (or add it to the runtime-env file passed to
-`ray job submit`); the values are only forwarded when present.
+`ray job submit`) when you prefer environment-based configuration; values are
+only forwarded when present.
 
 The EAGLE3 example scripts enable this automatically when
 `RL_INSIGHT_SERVER_URL` is exported; leaving it unset keeps the default logging.
@@ -596,7 +606,10 @@ Trace timelines (Grafana/Tempo) use a lane per trainer
 (`speco_trainer`) and per worker (`drafter_worker_<rank>`) for the phases
 `drafter/collect`, `drafter/prepare`, `drafter/train`, `drafter/publish`,
 `drafter/worker_train_loop`, `drafter/worker_publish_snapshot`, and
-`drafter/worker_cleanup`.
+`drafter/worker_cleanup`. The trainer-side phases are emitted by both the
+legacy `SpecoRayPPOTrainer` and the V1 trainer
+(`trainer.use_v1=true`/`speco_v1_trainer`); V1 reports its old-logprob feature
+collection as `drafter/collect`.
 
 ### Dashboard
 

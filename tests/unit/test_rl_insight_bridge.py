@@ -93,6 +93,35 @@ def test_init_forwards_project_and_experiment_from_env(monkeypatch):
     ]
 
 
+def test_init_forwards_worker_config_from_env(monkeypatch):
+    import json
+
+    fake = _enable(monkeypatch, _FakeRLInsight())
+    worker_config = {
+        "server": {
+            "url": "http://configured:18080",
+            "backend": "ray",
+            "namespace": "speco-test",
+        }
+    }
+    monkeypatch.setenv(bridge.CONFIG_ENV, json.dumps(worker_config))
+
+    bridge.log_scalar_metrics("p_", {"a/b": 1.0})
+
+    assert fake.init_kwargs == [
+        {"project": None, "experiment_name": None, "config": worker_config}
+    ]
+
+
+def test_init_ignores_malformed_worker_config(monkeypatch):
+    fake = _enable(monkeypatch, _FakeRLInsight())
+    monkeypatch.setenv(bridge.CONFIG_ENV, "{not-json")
+
+    bridge.log_scalar_metrics("p_", {"a/b": 1.0})
+
+    assert fake.init_kwargs == [{"project": None, "experiment_name": None}]
+
+
 def test_init_without_server_url_marks_unavailable(monkeypatch):
     fake = _enable(monkeypatch, _FakeRLInsight(enabled=False))
 

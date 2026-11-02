@@ -22,6 +22,7 @@ used by ``tests/examples/test_ci_result.py``.
 
 import ast
 import asyncio
+import json
 import logging
 import time
 from contextlib import nullcontext
@@ -33,6 +34,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = ROOT / "verl_speco/workers/speco_worker.py"
 TRAINER = ROOT / "verl_speco/trainer/speco_ray_trainer.py"
+V1_MIXIN = ROOT / "verl_speco/trainer/v1/speco_mixin.py"
 
 WORKER_SPANS = ["drafter/worker_train_loop", "drafter/worker_publish_snapshot", "drafter/worker_cleanup"]
 TRAINER_SPANS = ["drafter/collect", "drafter/prepare", "drafter/train", "drafter/publish"]
@@ -243,6 +245,7 @@ def test_forward_rl_insight_worker_env_injects_project_and_experiment(monkeypatc
     omegaconf = pytest.importorskip("omegaconf")
     from verl_speco import main
 
+    monkeypatch.setattr(main, "_rl_insight_backend_supported", lambda: True)
     monkeypatch.setenv("RL_INSIGHT_SERVER_URL", "http://server:18080")
     config = omegaconf.OmegaConf.create(
         {
@@ -277,3 +280,90 @@ def test_forward_rl_insight_worker_env_is_noop_without_logger(monkeypatch):
     main._forward_rl_insight_worker_env(config)
 
     assert "runtime_env" not in config.ray_kwargs.ray_init
+
+
+def test_forward_rl_insight_worker_env_forwards_resolved_config(monkeypatch):
+    omegaconf = pytest.importorskip("omegaconf")
+    from verl_speco import main
+    from verl_speco.rl_insight_bridge import CONFIG_ENV
+
+    monkeypatch.setattr(main, "_rl_insight_backend_supported", lambda: True)
+    monkeypatch.delenv("RL_INSIGHT_SERVER_URL", raising=False)
+    config = omegaconf.OmegaConf.create(
+        {
+            "trainer": {
+                "logger": ["console", "rl_insight"],
+                "project_name": "proj",
+                "experiment_name": "exp",
+                "rl_insight": {
+                    "server": {
+                        "url": "http://configured:18080",
+                        "backend": "ray",
+                        "namespace": "speco-test",
+                    }
+                },
+            },
+            "ray_kwargs": {"ray_init": {}},
+        }
+    )
+
+    main._forward_rl_insight_worker_env(config)
+
+    env_vars = config.ray_kwargs.ray_init.runtime_env.env_vars
+    forwarded = json.loads(env_vars[CONFIG_ENV])
+    assert forwarded == {
+        "server": {
+            "url": "http://configured:18080",
+            "backend": "ray",
+            "namespace": "speco-test",
+        }
+    }
+    assert "RL_INSIGHT_SERVER_URL" not in env_vars
+
+
+def test_forward_rl_insight_worker_env_rejects_unsupported_backend(monkeypatch):
+    omegaconf = pytest.importorskip("omegaconf")
+    from verl_speco import main
+
+    monkeypatch.setattr(main, "_rl_insight_backend_supported", lambda: False)
+    config = omegaconf.OmegaConf.create(
+        {"trainer": {"logger": ["console", "rl_insight"]}}
+    )
+
+    with pytest.raises(RuntimeError, match="release/v0.9.0"):
+        main._forward_rl_insight_worker_env(config)
+
+
+def test_v1_mixin_emits_all_trainer_phase_spans():
+    tree = ast.parse(V1_MIXIN.read_text(encoding="utf-8"))
+
+    lane_value = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            getattr(target, "id", None) == "_SPECO_RL_INSIGHT_TRAINER_LANE"
+            for target in node.targets
+        ):
+            lane_value = ast.literal_eval(node.value)
+    assert lane_value == "speco_trainer"
+
+    spans = {}
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_rl_insight_trace_state"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and node.args[0].value.startswith("drafter/")
+        ):
+            continue
+        uses_trainer_lane = any(
+            keyword.arg == "state_lane_id"
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "_SPECO_RL_INSIGHT_TRAINER_LANE"
+            for keyword in node.keywords
+        )
+        spans[node.args[0].value] = uses_trainer_lane
+
+    assert spans == {name: True for name in TRAINER_SPANS}

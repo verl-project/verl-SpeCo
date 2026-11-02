@@ -24,7 +24,13 @@ import tempfile
 import time
 from typing import Any, cast
 
+from verl_speco.rl_insight_bridge import trace_state as _rl_insight_trace_state
+
 logger = logging.getLogger(__name__)
+
+# RL-Insight trace lane for the trainer-side phases owned by the V1 lifecycle.
+# Keep in sync with the legacy SpecoRayPPOTrainer lane.
+_SPECO_RL_INSIGHT_TRAINER_LANE = "speco_trainer"
 
 
 def _plain_config(value):
@@ -815,7 +821,17 @@ class SpecoV1Mixin:
             # Native colocate_async resumes the engine during target sync.
             # Keep ordinary requests behind admission until both probe arms
             # and the drafter publication have settled at that fixed target.
-            publish_metrics = self._speco_finalize_v1_drafter_publish()
+            if getattr(self, "_speco_v1_pending_training", False):
+                with _rl_insight_trace_state(
+                    "drafter/publish",
+                    state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                    global_step=getattr(self, "global_steps", None),
+                    trained=1,
+                    deferred=True,
+                ):
+                    publish_metrics = self._speco_finalize_v1_drafter_publish()
+            else:
+                publish_metrics = self._speco_finalize_v1_drafter_publish()
             if self.__dict__.get("device_name") == "cuda":
                 # Inclusive lifecycle spans: do not sum with update_weights.
                 publish_metrics.update(
@@ -1250,13 +1266,18 @@ class SpecoV1Mixin:
             temperature=self.config.actor_rollout_ref.rollout.temperature,
         )
         prepared_at = time.perf_counter()
-        output = self._speco_compute_collection_log_prob(control)
-        computed_at = time.perf_counter()
-        output_data = output
-        collected = self._speco_collect_oldlogprob_features(
-            data_proto, collect_plan, output_data
-        )
-        collected_at = time.perf_counter()
+        with _rl_insight_trace_state(
+            "drafter/collect",
+            state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+            global_step=getattr(self, "global_steps", None),
+        ):
+            output = self._speco_compute_collection_log_prob(control)
+            computed_at = time.perf_counter()
+            output_data = output
+            collected = self._speco_collect_oldlogprob_features(
+                data_proto, collect_plan, output_data
+            )
+            collected_at = time.perf_counter()
         self._speco_v1_state["features_collected"] = int(
             self._speco_v1_state.get("features_collected", 0) + collected
         )
@@ -1647,7 +1668,12 @@ class SpecoV1Mixin:
             return result
 
         before_started = time.perf_counter()
-        event = self._speco_on_before_actor_update()
+        with _rl_insight_trace_state(
+            "drafter/prepare",
+            state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+            global_step=getattr(self, "global_steps", None),
+        ):
+            event = self._speco_on_before_actor_update()
         plan = event.training_plan
         metrics.update(event.metrics or {})
         before_elapsed = max(0.0, time.perf_counter() - before_started)
@@ -1667,7 +1693,17 @@ class SpecoV1Mixin:
         if plan is not None:
             if plan.launch:
                 started = time.perf_counter()
-                trained, train_metrics = self._speco_train_drafter(plan)
+                execution_strategy = getattr(plan, "execution_strategy", "")
+                with _rl_insight_trace_state(
+                    "drafter/train",
+                    state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                    global_step=getattr(self, "global_steps", None),
+                    strategy=str(
+                        getattr(execution_strategy, "value", execution_strategy)
+                    ),
+                    max_batches=int(getattr(plan, "max_batches", 0)),
+                ):
+                    trained, train_metrics = self._speco_train_drafter(plan)
                 self._speco_v1_train_cost_seconds = time.perf_counter() - started
             else:
                 trained = False

@@ -29,6 +29,7 @@ imports the package on first use so importing ``verl_speco`` never pulls in
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -43,11 +44,13 @@ logger = logging.getLogger(__name__)
 ENABLE_ENV = "VERL_RL_INSIGHT_ENABLE"
 PROJECT_ENV = "VERL_RL_INSIGHT_PROJECT_NAME"
 EXPERIMENT_ENV = "VERL_RL_INSIGHT_EXPERIMENT_NAME"
+CONFIG_ENV = "VERL_RL_INSIGHT_CONFIG_JSON"
 
 __all__ = [
     "ENABLE_ENV",
     "PROJECT_ENV",
     "EXPERIMENT_ENV",
+    "CONFIG_ENV",
     "log_scalar_metrics",
     "trace_state",
     "reset_for_tests",
@@ -84,6 +87,22 @@ def _module_is_enabled() -> bool:
     return bool(getattr(state, "enabled", True))
 
 
+def _config_from_env() -> dict[str, Any] | None:
+    """Parse the ``trainer.rl_insight`` override forwarded to workers."""
+
+    raw = os.getenv(CONFIG_ENV)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[speco][rl-insight] invalid %s; using monitor defaults", CONFIG_ENV
+        )
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _ensure_ready() -> bool:
     """Lazily initialize rl-insight once; return False unless it is truly active.
 
@@ -92,29 +111,35 @@ def _ensure_ready() -> bool:
     to a no-op.
 
     Initialization forwards the resolved project/experiment names from
-    ``VERL_RL_INSIGHT_PROJECT_NAME`` / ``VERL_RL_INSIGHT_EXPERIMENT_NAME``. This
-    is what gives Ray worker processes, which never build
-    ``Tracking``/``RLInsightLogger``, the same ``project``/``experiment_name``
-    labels as the trainer: rl-insight stores labels per process at init time and
-    merges them into every event, and the shared hub does not add them. In the
-    intended flow the trainer process builds ``Tracking``/``RLInsightLogger``
-    first, so the duplicate call here is ignored by rl-insight and the labels
-    already set by that first init win.
+    ``VERL_RL_INSIGHT_PROJECT_NAME`` / ``VERL_RL_INSIGHT_EXPERIMENT_NAME`` and
+    the ``trainer.rl_insight`` overrides from ``VERL_RL_INSIGHT_CONFIG_JSON``.
+    Together they give Ray worker processes, which never build
+    ``Tracking``/``RLInsightLogger``, the same labels and monitoring backend
+    configuration as the trainer: rl-insight stores labels per process at init
+    time and merges them into every event, and the shared hub does not add
+    them. In the intended flow the trainer process builds
+    ``Tracking``/``RLInsightLogger`` first, so the duplicate call here is
+    ignored by rl-insight and the configuration already set by that first init
+    wins.
     """
     global _init_state
     if os.getenv(ENABLE_ENV) != "1" or _init_state == "unavailable":
         return False
     if _init_state == "ready":
         return True
+    init_kwargs: dict[str, Any] = {
+        "project": os.getenv(PROJECT_ENV) or None,
+        "experiment_name": os.getenv(EXPERIMENT_ENV) or None,
+    }
+    config = _config_from_env()
+    if config is not None:
+        init_kwargs["config"] = config
     try:
         # verl's Tracking/RLInsightLogger may already have initialized the same
         # process; rl-insight warns and ignores the duplicate, which is benign.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            _get_module().init(
-                project=os.getenv(PROJECT_ENV) or None,
-                experiment_name=os.getenv(EXPERIMENT_ENV) or None,
-            )
+            _get_module().init(**init_kwargs)
     except Exception:
         _init_state = "unavailable"
         logger.warning(
