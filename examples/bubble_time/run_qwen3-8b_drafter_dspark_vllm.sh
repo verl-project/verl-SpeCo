@@ -66,11 +66,7 @@ exec bash "${script_dir}/../run_qwen3-8b_drafter_dspark_vllm.sh" \
     actor_rollout_ref.rollout.drafter.training.scheduler.training_quota.allow_critical_path_fallback=true \
     actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.keep_hot_between_plans=${keep_hot} \
     actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.historical_window_readmission=true \
-    actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.writer_migration_enable=false \
-    actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.full_collective_fallback=false \
     actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.early_publish_staging=false \
-    actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.head_reference_transport=true \
-    actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.calibrated_budgets=true \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.logger='["console"]' \

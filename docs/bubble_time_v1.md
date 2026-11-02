@@ -1,12 +1,48 @@
 # Bubble Time 与 V1
 
-Last updated: 2026-10-27
+Last updated: 2026-11-02
 
 适配基线为上游 `release/v0.9.0`。PPO 主循环仍由上游 V1 trainer 执行；
 本仓库仅提供生命周期 hook、独立池 worker、数据采集和发布协议。
 V1 rollout 后端仍限于 vLLM。
 
 ## 配置
+
+V1 三种模式在采样结束、Actor/PPO 前以及补训后的资源归还边界强制将 drafter
+训练状态卸载到 CPU，即使 `keep_hot_between_plans=true`。该开关只允许在资源
+仍归训练所有的窗口内保留驻留状态；不能跨 PPO 或 serving 边界占用共享 GPU。
+卸载不清空 optimizer、replay、quota 或固定 writer；严格卸载失败会停止边界推进。
+
+CUDA Bubble 的已完成发布快照可使用 NumPy/Ray 无损传输；不支持的布局回退 Torch。
+仅改变 CPU 序列化路径，不改变 quota、版本或 stage/commit ACK；Bubble 仍立即执行
+原有 host 回收。与其他搬运优化共用 `gpu_transfer_optimizations` 开关。
+
+定位首次训练与 idle 拒绝原因时可设置以下环境变量（默认均关闭，传入 Ray worker）：
+
+```bash
+export VERL_SPECO_DIAGNOSTIC_GPU_FIRST_STEPS=true
+export VERL_SPECO_DIAGNOSTIC_IDLE_REJECTIONS=true
+```
+
+第一个开关只对 CUDA Bubble worker 最初两个 optimizer steps 的补训阶段增加
+同步计时，并记录编译缓存信息与计数变化。日志的 `timing_mode=device_synchronized`
+表示诊断运行，会引入同步开销，不能直接作为性能对照。idle 训练不增加同步。
+第二个开关每 RL step、每拒绝原因至多输出一次 `idle_rejection`，包含缓存中的
+组成员状态、显存释放状态、租约、匹配 quota 的 head ACK、deadline 与窗口预算。
+缺失状态标记 unknown，不查询 worker，也不修改调度或租约。
+
+Bubble 的 CUDA 搬运路径复用 `gpu_transfer_optimizations`（默认 true）：
+FSDP2 模型批量恢复、模型和 optimizer 的 CPU 缓冲池，以及不可变 target head
+的 CPU 存储复用。操作仍在原有训练激活与回收边界内执行；回收完成前等待拷贝，
+不保留 GPU 缓冲。head 版本变化或内容变化会使缓存失效，不提前准备 head。
+NPU 路径不变。设 `actor_rollout_ref.rollout.drafter.training.gpu_transfer_optimizations=false`
+可恢复原有搬运路径。
+
+这主要减少初始化后的恢复与首次训练结束时的卸载开销；CPU 缓冲首次仍需分配，
+不会消除模型构建、编译、Adam 状态初始化或 Bubble 的 quota/发布成本，因此不能
+直接保证首次训练达到普通 Sync 的相同耗时。对照首次完成完整 quota 的边界，结合
+`drafter/gpu_head_restore_cache_hit`、`drafter/gpu_model_load_used_batched_load`、
+`drafter/gpu_optimizer_offload_used_pool` 和原有阶段耗时判断是否启用及收益。
 
 V1 已移除 step-end 的提前准备 head 路径。训练 preflight 仍选择并应用 quota
 绑定的 head；保留控制步同步、版本检查、quota、writer、资源租约及发布规则。
@@ -176,3 +212,66 @@ CPU 合约通过不代表 GPU 功能验收完成。当前开发环境无可用 C
 并核对共享 GPU 无越界重叠、完整 quota 只执行一次、发布和恢复版本一致。
 separate_async 还须覆盖跨节点 CPU/Ray 传输及 hybrid replica 重新入池。
 减少训练或遗留 quota 的结果不能作为等工作量加速证据。
+
+
+## 排查采样阶段性能差异
+
+同卡、同代码的普通训练与 Bubble 对照均设置：
+
+```bash
+export VERL_SPECO_PHASE_TIMING=true
+export VERL_SPECO_DIAGNOSTIC_ROLLOUT_PERF=true
+export VERL_SPECO_DIAGNOSTIC_GPU_FIRST_STEPS=false
+```
+
+`rollout_perf_snapshot` 记录 drafter pre-fit 激活前、激活后、最终卸载后，以及
+vLLM 首次 generate 前的元数据：进程 RSS/锁页/线程数、CPU affinity、PyTorch
+线程数、GPU UUID、进程 allocator 与整卡可用显存、训练组和驻留状态。vLLM
+worker 另记录可访问的 cache/scheduler 配置和 KV block 数；缺少字段明确列入
+unavailable，不猜测数值。首次采样前每 replica 仅进行一次额外 worker 快照 RPC，
+耗时单独记录为 `rollout_perf_snapshot_rpc`，不要把它误认为稳定 decode 开销。
+
+`rollout_perf_execution` 只汇总每 replica 前三个请求执行 episode：提交跨度、
+最大提交间隔、前端执行并发峰值/时间加权平均、执行墙钟和并行请求耗时之和。
+前端并发不是 engine scheduler 的 running/waiting 数，日志明确标记后者不可用。
+已有 `replica_episode` 增加全部有效请求的 decode/prefill/queue/TTFT 累计和最大值，
+避免只看最慢单请求；累计并行耗时不能当作端到端耗时。
+
+以上诊断默认关闭，不增加 token 级日志，不同步 GPU、不读取张量内容、不初始化
+尚未初始化的 CUDA。快照失败只记录失败类型，不改变训练、租约或发布流程。
+先跑三步比较第 2～3 步，统一 GPU、seed、参数和诊断开关，保存完整启动日志。
+
+### V1 发布快照预取
+
+可通过以下配置启用发布准备与原生 target 权重同步的重叠：
+
+```bash
+actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.early_publish_staging=true
+```
+
+该路径同时要求 `publish_async=true`。V1 在关闭生成准入、quota 已完成且只有一个
+当前 step 的待发布计划时，在 target 同步前提交 `maybe_publish_async`。worker 只
+消费已有的 CPU 快照并序列化到 Ray object store，不触发 GPU 导出或应用 rollout
+权重。同步后的正常发布流程消费同一份 ObjectRef，避免再次获取、打包同一快照。
+缓存未命中时，仍在同步后的原安全点执行导出；版本不匹配直接报错。
+
+预取前复用调度器的正式发布计划检查；发布间隔未到时不消费 worker 快照。
+预取结果绑定 source step 和 plan ID，防止同一步内误复用另一计划的权重。
+
+权重应用、freeze probe 和发布 ACK 的顺序保持不变，快照准备不会越过未完成的
+训练 quota。没有收益保证：CPU/内存带宽竞争也可能影响 target 同步，需要完整
+训练对照验证。关注 `bubble/publish_snapshot_prefetch_submitted`、
+`bubble/publish_snapshot_prefetch_consumed` 和
+`timing_s/drafter_publish_snapshot_prefetch_wait`，并比较整步耗时及 rollout 耗时。
+
+### 日志与配置精简
+
+常规运行不再逐次打印 idle 决策、head 未就绪拒绝和快照预取 worker 的成功日志；
+这些细节降为 debug，训练计划启动使用 info，未启动计划使用 debug。
+OOM、训练失败、发布 ACK/版本错误仍保留。`memory_park_breakdown` 只在启用
+`VERL_SPECO_PHASE_TIMING` 或 `VERL_DRAFTER_MEMORY_DIAGNOSTICS` 时输出，
+阶段计时指标始终保留。诊断时仍可启用按 step/reason 去重的 idle 拒绝汇总。
+
+Bubble 示例省略 `writer_migration_enable=false`、`full_collective_fallback=false`、
+`head_reference_transport=true` 和 `calibrated_budgets=true`，沿用配置默认值。
+`v1_head_preparation_enable` 虽然已无作用，仍作为旧命令的兼容键保留。

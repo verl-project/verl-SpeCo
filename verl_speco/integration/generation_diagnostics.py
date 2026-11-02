@@ -489,6 +489,34 @@ def record_request(owner, trace, *, failed):
         owner._speco_generation_request_summary = summary
     summary["requests"] += 1
     summary["failed"] += int(failed)
+    from verl_speco.integration.rollout_performance import enabled as perf_enabled
+
+    if perf_enabled():
+        timing = trace.get("engine_timing", {})
+        if timing:
+            summary["engine_timing_requests"] = (
+                summary.get("engine_timing_requests", 0) + 1
+            )
+        for name in (
+            "decode_span_s",
+            "prefill_span_s",
+            "queue_s",
+            "time_to_first_token_s",
+        ):
+            value = timing.get(name)
+            if isinstance(value, (int, float)):
+                summary[f"engine_{name}_sum"] = (
+                    summary.get(f"engine_{name}_sum", 0.0) + value
+                )
+                summary[f"engine_{name}_max"] = max(
+                    summary.get(f"engine_{name}_max", 0.0), value
+                )
+        for name in ("accepted_tokens", "verify_rounds"):
+            value = trace.get(name)
+            if isinstance(value, (int, float)):
+                summary[f"request_{name}_sum"] = (
+                    summary.get(f"request_{name}_sum", 0.0) + value
+                )
     timing_state = trace.get("engine_timing_status", {}).get("state")
     if timing_state is not None:
         counts = summary.setdefault("engine_timing_status_counts", {})
@@ -528,3 +556,51 @@ def flush_requests(owner):
             replica_rank=getattr(owner, "replica_rank", None),
             **summary,
         )
+
+
+def report_idle_rejection(owner, plan):
+    """At most one cached-state snapshot per step/reason; no RPCs or lease changes."""
+    if os.getenv("VERL_SPECO_DIAGNOSTIC_IDLE_REJECTIONS", "").lower() not in {
+        "1",
+        "true",
+        "yes",
+    } or getattr(plan, "launch", False):
+        return
+    step = getattr(owner, "global_steps", None)
+    if getattr(owner, "_idle_rejection_diagnostic_step", None) != step:
+        owner._idle_rejection_diagnostic_step = step
+        owner._idle_rejection_diagnostic_reasons = set()
+    reason = str(getattr(plan, "reason", "unknown"))
+    seen = getattr(owner, "_idle_rejection_diagnostic_reasons", set())
+    if reason in seen:
+        return
+    seen.add(reason)
+    owner._idle_rejection_diagnostic_reasons = seen
+    snapshot = idle_snapshot(owner)
+    now = time.time()
+    scheduler = getattr(owner, "_drafter_scheduler", None)
+    states = getattr(scheduler, "_idle_workers", {})
+    ready = getattr(owner, "_speco_ready_target_lm_head_workers", {})
+    version = snapshot["control"]["quota_data_version"]
+    ready_workers = set(ready.get(version, ()))
+    for group in snapshot["replicas"]:
+        group["head_ready_workers"] = [
+            w for w in group["workers"] if w in ready_workers
+        ]
+        group["worker_deadline_remaining_s"] = [
+            None
+            if getattr(states.get(w), "must_be_ready_at", None) is None
+            else max(float(states[w].must_be_ready_at) - now, 0.0)
+            for w in group["workers"]
+        ]
+    emit_summary(
+        "idle_rejection",
+        step=step,
+        reason=reason,
+        snapshot=snapshot,
+        lease=getattr(owner, "_speco_rollout_training_lease", None),
+        usable_window_s=getattr(plan, "idle_usable_window_sec", None),
+        startup_reserve_s=getattr(plan, "idle_startup_reserve_sec", None),
+        tail_reserve_s=getattr(plan, "idle_tail_reserve_sec", None),
+        trainable_batches=getattr(plan, "idle_trainable_batches", None),
+    )

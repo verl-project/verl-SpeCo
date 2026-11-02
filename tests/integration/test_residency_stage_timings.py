@@ -18,6 +18,7 @@ import asyncio
 import copy
 import json
 import logging
+import os
 import time
 from concurrent.futures import Future
 from contextlib import contextmanager
@@ -31,9 +32,10 @@ torch = pytest.importorskip("torch")
 
 def _trainer(events, *, fail_offload=False, skip=False, device="cuda"):
     path = Path(__file__).parents[2] / "verl_speco" / "trainer" / "base_trainer.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     cls = next(
         node
-        for node in ast.parse(path.read_text(encoding="utf-8")).body
+        for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == "DrafterBaseTrainer"
     )
     cls.body = [
@@ -45,11 +47,19 @@ def _trainer(events, *, fail_offload=False, skip=False, device="cuda"):
             "_residency_stage",
             "activate_training_model",
             "cleanup_training",
+            "release_training_memory_after_activation",
             "_record_gpu_transfer",
         }
     ]
     cls.bases, cls.decorator_list = [], []
     module = ast.parse("from __future__ import annotations")
+    module.body.append(
+        next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_env_flag_enabled"
+        )
+    )
     module.body.append(cls)
 
     offload_cache_flags = []
@@ -61,6 +71,7 @@ def _trainer(events, *, fail_offload=False, skip=False, device="cuda"):
             raise RuntimeError("offload failure")
 
     namespace = {
+        "os": os,
         "logging": logging,
         "json": json,
         "time": time,
@@ -274,14 +285,14 @@ def test_activation_stops_after_batched_copy_failure(monkeypatch):
     assert "injected batched copy failure" in str(trainer.last_activation_error)
 
 
-def test_bubble_activation_keeps_legacy_restore_and_stage_names(monkeypatch):
+def test_bubble_activation_rollback_keeps_legacy_restore_and_stage_names(monkeypatch):
     from verl_speco.trainer import gpu_transfer
 
     events = []
     trainer = _trainer(events)
     trainer._bubble_time_enabled = True
     trainer._training_active = False
-    trainer._gpu_model_offload_reuse = True
+    trainer._gpu_model_offload_reuse = False
     trainer._drafter_strategy = lambda: "fsdp2"
     trainer.training_device_mesh = object()
     monkeypatch.setattr(
@@ -295,3 +306,99 @@ def test_bubble_activation_keeps_legacy_restore_and_stage_names(monkeypatch):
         trainer._last_activation_stage_timings
     )
     assert "load_model" not in trainer._last_activation_stage_timings
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("supported", [False, True])
+def test_bubble_activation_uses_batched_load_inside_existing_boundary(
+    monkeypatch, enabled, supported
+):
+    from verl_speco.trainer import gpu_transfer
+
+    events = []
+    trainer = _trainer(events)
+    trainer._bubble_time_enabled = True
+    trainer._training_active = False
+    trainer.is_offload_param = True
+    trainer._gpu_model_offload_reuse = enabled
+    trainer._drafter_strategy = lambda: "fsdp2"
+    trainer.training_device_mesh = object()
+
+    def load(model, device, **kwargs):
+        assert model is trainer.model
+        events.append("batched_load")
+        return supported, {"copied_bytes": 16}
+
+    monkeypatch.setattr(gpu_transfer, "load_model_from_host", load)
+    assert asyncio.run(trainer.activate_training_model())
+    assert ("batched_load" in events) == enabled
+    assert ("load_model" in events) == (not enabled or not supported)
+    assert events.index("apply_head") < events.index(
+        "batched_load" if enabled else "load_model"
+    )
+    assert trainer._training_active
+
+
+@pytest.mark.parametrize("used", [False, True])
+@pytest.mark.parametrize("diagnostics", [False, True])
+def test_bubble_strict_parking_uses_model_pool_before_final_reclaim(
+    monkeypatch, caplog, used, diagnostics
+):
+    from verl_speco.trainer import gpu_transfer
+
+    monkeypatch.setenv("VERL_SPECO_PHASE_TIMING", str(diagnostics).lower())
+    monkeypatch.delenv("VERL_DRAFTER_MEMORY_DIAGNOSTICS", raising=False)
+    events = []
+    trainer = _trainer(events)
+    trainer._bubble_time_enabled = True
+    trainer._gpu_model_offload_reuse = True
+    trainer._gpu_offload_pool_max_bytes = 1024
+    trainer._drafter_strategy = lambda: "fsdp2"
+    trainer.training_device_mesh = object()
+
+    def offload(model, **kwargs):
+        events.append("pool_wait")
+        return used, {"copied_bytes": 16}
+
+    monkeypatch.setattr(
+        gpu_transfer,
+        "ModelHostBufferPool",
+        lambda *a, **k: SimpleNamespace(offload=offload),
+    )
+    assert asyncio.run(trainer.release_training_memory_after_activation(strict=True))
+    assert events.index("pool_wait") < events.index("offload_optimizer")
+    assert (
+        events.index("head_cpu")
+        < events.index("synchronize")
+        < events.index("empty_cache")
+    )
+    assert ("offload_model" in events) == (not used)
+    assert not trainer._training_device_resident
+    assert ("memory_park_breakdown" in caplog.text) == diagnostics
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_bubble_pool_copy_failure_cannot_release_residency(monkeypatch, strict):
+    from verl_speco.trainer import gpu_transfer
+
+    events = []
+    trainer = _trainer(events)
+    trainer._bubble_time_enabled = True
+    trainer._gpu_model_offload_reuse = True
+    trainer._gpu_offload_pool_max_bytes = 1024
+    trainer._drafter_strategy = lambda: "fsdp2"
+    trainer.training_device_mesh = object()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("copy wait failed")
+
+    monkeypatch.setattr(
+        gpu_transfer,
+        "ModelHostBufferPool",
+        lambda *a, **k: SimpleNamespace(offload=fail),
+    )
+    with pytest.raises(RuntimeError, match="offload_model"):
+        asyncio.run(trainer.release_training_memory_after_activation(strict=strict))
+    assert trainer._training_device_resident
+    assert "offload_model" not in events
+    assert "synchronize" in events and "offload_optimizer" in events

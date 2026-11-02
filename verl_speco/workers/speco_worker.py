@@ -1785,6 +1785,9 @@ class SpecoWorker(Worker):
 
         with _preserve_process_rng_state(self.device_name):
             start_ts = time.time()
+            from verl_speco.integration.rollout_performance import safe_runtime_snapshot
+
+            safe_runtime_snapshot(self, "drafter_worker", "before_prefit_activation")
             activation_ts = time.time()
             result["activated"] = bool(await self.trainer.activate_training_model())
             if not result["activated"]:
@@ -1797,6 +1800,7 @@ class SpecoWorker(Worker):
                     or {"type": "ActivationError", "message": "activation_failed"}
                 ]
             result["activation_elapsed_sec"] = time.time() - activation_ts
+            safe_runtime_snapshot(self, "drafter_worker", "after_prefit_activation")
             release_ts = time.time()
             await self.trainer.release_training_memory_after_activation()
             result["release_elapsed_sec"] = time.time() - release_ts
@@ -1821,6 +1825,7 @@ class SpecoWorker(Worker):
                 result["park_elapsed_sec"] = time.perf_counter() - park_ts
                 result["training_group_ranks"] = list(self.training_group_ranks)
                 result["activated"] = restored
+            safe_runtime_snapshot(self, "drafter_worker", "after_prefit_park")
             result["elapsed_sec"] = time.time() - start_ts
             result["reason"] = (
                 "activated" if result["activated"] else "activation_failed"
@@ -2877,6 +2882,14 @@ class SpecoWorker(Worker):
                             return False
                         return True
 
+                    from verl_speco.trainer.performance_diagnostics import (
+                        gpu_first_step_diagnostics_enabled,
+                    )
+
+                    diagnostic_step = gpu_first_step_diagnostics_enabled(
+                        self, execution_strategy, coordinated_idle
+                    )
+                    self.trainer._diagnostic_gpu_stage_sync = diagnostic_step
                     first_step_timings = (
                         dict(getattr(self.trainer, "_training_metric_sums", {}))
                         if (
@@ -2886,11 +2899,13 @@ class SpecoWorker(Worker):
                                 and getattr(self, "device_name", "") == "cuda"
                             )
                         )
-                        and batch_index == 0
+                        and (batch_index == 0 or diagnostic_step)
                         else None
                     )
                     compile_before = None
-                    if first_step_timings is not None and execution_strategy == "sync":
+                    if first_step_timings is not None and (
+                        execution_strategy == "sync" or diagnostic_step
+                    ):
                         from verl_speco.trainer.performance_diagnostics import (
                             compilation_metadata,
                         )
@@ -2916,6 +2931,8 @@ class SpecoWorker(Worker):
                     except Exception as error:  # noqa: BLE001
                         step_error = error
                         step_ok = False
+                    finally:
+                        self.trainer._diagnostic_gpu_stage_sync = False
                     first_step_elapsed = None
                     if first_step_timings is not None:
                         first_step_elapsed = (
@@ -2930,11 +2947,12 @@ class SpecoWorker(Worker):
                             ).items()
                             if key.startswith("timing_s/drafter_")
                         }
-                        result["first_optimizer_step_stage_sec"] = stage_times
+                        if batch_index == 0:
+                            result["first_optimizer_step_stage_sec"] = stage_times
                         logger.warning(
                             "%s optimizer_first_step_breakdown: plan_id=%s "
                             "rank=%s success=%s elapsed_s=%.4f stages_sec=%s "
-                            "timing_mode=host_wall_no_device_sync",
+                            "timing_mode=%s optimizer_steps_total=%s",
                             "[drafter]"
                             if execution_strategy == "sync"
                             else "[BubbleTime]",
@@ -2943,6 +2961,10 @@ class SpecoWorker(Worker):
                             step_ok,
                             first_step_elapsed,
                             stage_times,
+                            "device_synchronized"
+                            if diagnostic_step
+                            else "host_wall_no_device_sync",
+                            getattr(self.trainer, "optimizer_steps_total", None),
                         )
                     if compile_before is not None:
                         compile_after = compilation_metadata()
@@ -2954,7 +2976,7 @@ class SpecoWorker(Worker):
                         }
                         logger.warning(
                             "[drafter first step compile] rank=%s plan=%s success=%s elapsed_s=%.6f "
-                            "cache_env=%s counter_delta=%s timing_mode=host_wall_no_device_sync",
+                            "cache_env=%s counter_delta=%s timing_mode=%s",
                             self.rank,
                             plan_id,
                             step_ok,
@@ -2965,6 +2987,9 @@ class SpecoWorker(Worker):
                                 if key != "counters"
                             },
                             delta,
+                            "device_synchronized"
+                            if diagnostic_step
+                            else "host_wall_no_device_sync",
                         )
                     training_error = getattr(self.trainer, "last_training_error", None)
                     if training_error is not None:
@@ -3439,7 +3464,7 @@ class SpecoWorker(Worker):
             return None
         started = time.perf_counter()
         result = self.maybe_publish(cached_snapshot_only=True)
-        logger.warning(
+        logger.debug(
             "[BubbleTime] publish_snapshot_prefetch_worker: rank=%s source_step=%s "
             "elapsed_s=%.4f cached=%s",
             self.rank,
@@ -3521,17 +3546,15 @@ class SpecoWorker(Worker):
             from verl_speco.integration.rollout_publish import _get_nested
             from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
 
-            numpy_transport = (
-                getattr(self, "device_name", "") == "cuda"
-                and self._last_trained_execution_strategy != "rollout_idle_worker"
-                and gpu_transfer_enabled(
-                    _get_nested(
-                        getattr(self, "config", None),
-                        ("rollout", "drafter", "training"),
-                        None,
-                    ),
-                    "gpu_publish_numpy_transport",
-                )
+            numpy_transport = getattr(
+                self, "device_name", ""
+            ) == "cuda" and gpu_transfer_enabled(
+                _get_nested(
+                    getattr(self, "config", None),
+                    ("rollout", "drafter", "training"),
+                    None,
+                ),
+                "gpu_publish_numpy_transport",
             )
             wire = None
             wire_bytes = None

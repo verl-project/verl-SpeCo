@@ -3154,7 +3154,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 and required_target_version is not None
                 and not target_lm_head_ready_for_workers
             ):
-                print(
+                logger.debug(
                     "[BubbleTime] idle_launch_blocked: "
                     f"plan_id={plan.plan_id} reason=target_lm_head_not_ready "
                     f"required_target_version={required_target_version} "
@@ -3162,7 +3162,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     f"ready_workers={ready_target_workers} "
                     "ready_versions="
                     f"{tuple(sorted(self._speco_ready_target_lm_head_versions))}",
-                    flush=True,
                 )
                 plan = replace(
                     plan,
@@ -3194,7 +3193,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             from verl_speco.integration.generation_diagnostics import record_admission
 
             record_admission(plan)
-            print(
+            from verl_speco.integration.generation_diagnostics import (
+                report_idle_rejection,
+            )
+
+            report_idle_rejection(self, plan)
+            logger.debug(
                 "[BubbleTime] idle_launch_decision: "
                 f"launch={getattr(plan, 'launch', False)} "
                 f"reason={getattr(plan, 'reason', None)} "
@@ -3215,7 +3219,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 f"{max(float(getattr(plan, 'deadline_ts', 0.0) or 0.0) - time.time(), 0.0):.3f} "
                 f"idle_workers={metrics.get('bubble/idle_workers', 0)} "
                 f"idle_groups={metrics.get('bubble/idle_training_groups', 0)}",
-                flush=True,
             )
             if plan is None or not plan.launch:
                 if plan is not None:
@@ -4197,7 +4200,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         metrics: dict[str, Any] | None = None,
     ) -> None:
         metrics = metrics or {}
-        log = logger.warning if plan.launch else logger.info
+        log = logger.info if plan.launch else logger.debug
         log(
             "[DrafterScheduler] step=%s strategy=%s launch=%s reason=%s "
             "interval_matched=%s max_batches=%s publish_after_success=%s "

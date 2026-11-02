@@ -630,16 +630,14 @@ class DrafterBaseTrainer:
         )
         from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
 
-        self._gpu_head_host_reuse = (
-            not self._bubble_time_enabled
-            and gpu_transfer_enabled(training_cfg, "gpu_head_host_reuse")
+        # These caches retain CPU storage only. Bubble uses them inside its
+        # existing activation/cleanup lease; no accelerator state survives reclaim.
+        self._gpu_head_host_reuse = gpu_transfer_enabled(
+            training_cfg, "gpu_head_host_reuse"
         )
-        self._gpu_optimizer_host_reuse = (
-            not self._bubble_time_enabled and gpu_transfer_enabled(training_cfg)
-        )
-        self._gpu_model_offload_reuse = (
-            not self._bubble_time_enabled
-            and gpu_transfer_enabled(training_cfg, "gpu_model_offload_reuse")
+        self._gpu_optimizer_host_reuse = gpu_transfer_enabled(training_cfg)
+        self._gpu_model_offload_reuse = gpu_transfer_enabled(
+            training_cfg, "gpu_model_offload_reuse"
         )
         self._gpu_offload_pool_max_bytes = int(
             float(training_cfg.get("gpu_offload_pool_max_gib", 8)) * 1024**3
@@ -888,7 +886,6 @@ class DrafterBaseTrainer:
             if (
                 device_name == "cuda"
                 and self._drafter_strategy() == "fsdp2"
-                and not self.__dict__.get("_bubble_time_enabled", False)
                 and self.__dict__.get("_gpu_optimizer_host_reuse", False)
             ):
                 from verl_speco.trainer.gpu_transfer import OptimizerHostBufferPool
@@ -2855,7 +2852,6 @@ class DrafterBaseTrainer:
                     used_batched_load = False
                     if (
                         device_name == "cuda"
-                        and not getattr(self, "_bubble_time_enabled", False)
                         and getattr(self, "_gpu_model_offload_reuse", False)
                         and self._drafter_strategy() == "fsdp2"
                         and self.training_device_mesh is not None
@@ -6995,13 +6991,17 @@ class DrafterBaseTrainer:
                     self._sampling_micro_index = micro_index
                     # Only this micro-batch resides on device. Replay sampling
                     # has its own deterministic RNG/cursor, independent of forward.
-                    prepare_started = time.perf_counter()
+                    from verl_speco.trainer.performance_diagnostics import (
+                        training_stage_clock,
+                    )
+
+                    prepare_started = training_stage_clock(self)
                     batch = self._prepare_training_batch_for_step(
                         min_sample_step=min_sample_step, max_sample_step=max_sample_step
                     )
                     self.record_training_timing(
                         "timing_s/drafter_prepare_batch",
-                        time.perf_counter() - prepare_started,
+                        training_stage_clock(self) - prepare_started,
                     )
                     if batch is None:
                         self.optimizer.zero_grad(set_to_none=True)
@@ -7085,7 +7085,9 @@ class DrafterBaseTrainer:
             )
             return False
 
-        prepare_ts = time.time()
+        from verl_speco.trainer.performance_diagnostics import training_stage_clock
+
+        prepare_ts = training_stage_clock(self)
         bubble = getattr(self, "_bubble_time_enabled", False)
         if bubble:
             batch = self._prepare_training_batch_for_step(
@@ -7098,7 +7100,7 @@ class DrafterBaseTrainer:
                 min_sample_step=min_sample_step, max_sample_step=max_sample_step
             )
         self.record_training_timing(
-            "timing_s/drafter_prepare_batch", time.time() - prepare_ts
+            "timing_s/drafter_prepare_batch", training_stage_clock(self) - prepare_ts
         )
         if not bubble and not self._sync_batch_readiness(batch is not None):
             return False
@@ -7180,7 +7182,9 @@ class DrafterBaseTrainer:
         sample_count = int(batch.get("_speco_sample_count", 0) or 0)
 
         # Forward pass.
-        forward_ts = time.time()
+        from verl_speco.trainer.performance_diagnostics import training_stage_clock
+
+        forward_ts = training_stage_clock(self)
         with self._ulysses_group_context():
             with torch.amp.autocast(device_type=device_name, dtype=torch.bfloat16):
                 pad_size = int(
@@ -7203,11 +7207,11 @@ class DrafterBaseTrainer:
                         self._record_dflash_training_metrics(loss_dict) or {}
                     )
         self.record_training_timing(
-            "timing_s/drafter_forward_loss", time.time() - forward_ts
+            "timing_s/drafter_forward_loss", training_stage_clock(self) - forward_ts
         )
 
         # Reduce scalar loss statistics once across SP/DP groups.
-        reduce_ts = time.time()
+        reduce_ts = training_stage_clock(self)
         if getattr(self, "combine_standalone_metrics", False):
             statistics = self._reduce_standalone_step_statistics(loss_dict)
             step_accuracy = getattr(self, "_last_step_metrics", None) or {}
@@ -7215,7 +7219,7 @@ class DrafterBaseTrainer:
             statistics = self._reduce_loss_metrics(l_v, l_p, l_n)
         global_vloss, global_ploss, global_tokens, reduce_world_size = statistics
         self.record_training_timing(
-            "timing_s/drafter_reduce_loss", time.time() - reduce_ts
+            "timing_s/drafter_reduce_loss", training_stage_clock(self) - reduce_ts
         )
 
         if float(global_tokens.detach().float().item()) <= 0:
@@ -7273,17 +7277,17 @@ class DrafterBaseTrainer:
         local_loss = local_loss_sum * float(reduce_world_size)
         if accumulation_steps == 1:
             local_loss = local_loss / denom
-        backward_ts = time.time()
+        backward_ts = training_stage_clock(self)
         local_loss.backward()
         self.record_training_timing(
-            "timing_s/drafter_backward", time.time() - backward_ts
+            "timing_s/drafter_backward", training_stage_clock(self) - backward_ts
         )
 
         # 更新权重
         if accumulation_index + 1 < accumulation_steps:
             return True
 
-        optimizer_ts = time.time()
+        optimizer_ts = training_stage_clock(self)
         if accumulation_steps > 1:
             accumulation_denom = float(max(self._current_accumulation_valid_tokens, 1))
             for parameter in self.model.parameters():
@@ -7305,7 +7309,7 @@ class DrafterBaseTrainer:
         self._last_optimizer_valid_tokens = int(self._current_accumulation_valid_tokens)
         self.optimizer.zero_grad(set_to_none=True)
         self.record_training_timing(
-            "timing_s/drafter_optimizer", time.time() - optimizer_ts
+            "timing_s/drafter_optimizer", training_stage_clock(self) - optimizer_ts
         )
 
         self.training_steps += 1
@@ -7907,10 +7911,41 @@ class DrafterBaseTrainer:
             operations.append(
                 ("clear_gradients", lambda: self.optimizer.zero_grad(set_to_none=True))
             )
+
+        pooled_model_transition = False
+
+        def offload_model():
+            nonlocal pooled_model_transition
+            if (
+                device_name == "cuda"
+                and getattr(self, "_gpu_model_offload_reuse", False)
+                and self._drafter_strategy() == "fsdp2"
+                and self.training_device_mesh is not None
+            ):
+                from verl_speco.trainer.gpu_transfer import ModelHostBufferPool
+
+                pool = getattr(self, "_gpu_model_host_pool", None)
+                if pool is None:
+                    pool = self._gpu_model_host_pool = ModelHostBufferPool(
+                        self._gpu_offload_pool_max_bytes, pinned=True
+                    )
+                pooled_model_transition = True
+                used, stats = pool.offload(self.model, device_module=self.device_module)
+                pooled_model_transition = False
+                self._record_gpu_transfer(
+                    "model_offload", {"used_pool": int(used), **stats}
+                )
+                if used:
+                    return
+            # Reclaim once after model, optimizer and head transfers finish.
+            # A pooled copy failure propagates; only a clean decline falls back.
+            if device_name == "cuda":
+                offload_fsdp_model_to_cpu(self.model, empty_cache=False)
+            else:
+                offload_fsdp_model_to_cpu(self.model)
+
         if self.model is not None:
-            operations.append(
-                ("offload_model", lambda: offload_fsdp_model_to_cpu(self.model))
-            )
+            operations.append(("offload_model", offload_model))
         if self.optimizer is not None:
             operations.append(
                 ("offload_optimizer", lambda: self._offload_optimizer_state_to_cpu())
@@ -7937,13 +7972,23 @@ class DrafterBaseTrainer:
                 failures.append((stage, error))
                 # Preserve the existing fatal NPU optimizer and device/stream
                 # errors even for best-effort warmup cleanup.
-                fatal_failure |= stage in {
-                    "device_synchronize",
-                    "empty_cache",
-                    "park_hccl",
-                } or (
-                    stage == "offload_optimizer"
-                    and self._use_blocking_npu_optimizer_offload()
+                fatal_failure |= (
+                    stage
+                    in {
+                        "device_synchronize",
+                        "empty_cache",
+                        "park_hccl",
+                    }
+                    or (
+                        stage == "offload_optimizer"
+                        and (
+                            self._use_blocking_npu_optimizer_offload()
+                            or getattr(
+                                self.optimizer, "_speco_host_transition_failed", False
+                            )
+                        )
+                    )
+                    or (stage == "offload_model" and pooled_model_transition)
                 )
                 logger.warning(
                     "Drafter parking failed: stage=%s strict=%s error=%s",
@@ -7954,7 +7999,7 @@ class DrafterBaseTrainer:
             finally:
                 stage_timings[stage] = time.perf_counter() - operation_started
         self._last_memory_park_stage_timings = stage_timings
-        if getattr(self, "_bubble_time_enabled", False) or _env_flag_enabled(
+        if _env_flag_enabled("VERL_SPECO_PHASE_TIMING") or _env_flag_enabled(
             "VERL_DRAFTER_MEMORY_DIAGNOSTICS"
         ):
             logger.warning(

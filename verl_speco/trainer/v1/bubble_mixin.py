@@ -203,14 +203,12 @@ class V1BubbleMixin:
         self.attach_speco_worker_group(create_standalone_bubble_group(self))
 
     def _speco_park_drafter_training_memory(self, boundary):
-        from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
-
-        if not self._speco_v1_separate_bubble():
-            return SpecoRayPPOTrainer._speco_park_drafter_training_memory(
-                self, boundary
-            )
-        # Standalone GPUs belong to serving outside the lease, including when
-        # the shared configuration requests a hot model between training plans.
+        if not self._speco_rollout_idle_worker_enabled():
+            return {}
+        # All V1 modes return leased GPUs to serving or PPO at these boundaries.
+        # keep_hot_between_plans is only valid inside a resource-owned window;
+        # it must not bypass parking across actor updates or rollout admission.
+        # Preserve CPU optimizer/replay state and the fixed quota writer.
         started = time.perf_counter()
         results = self._ray_get_if_needed(
             self._require_speco_worker_group().park_drafter_training_model()
@@ -607,6 +605,73 @@ class V1BubbleMixin:
             metrics.update(self._speco_freeze_metrics())
         return metrics
 
+    def _speco_v1_prefetch_publish_snapshot(self) -> dict[str, Any]:
+        """Serialize cached CPU weights while native target synchronization runs.
+
+        Do not stage/apply rollout weights here: paired probes and publication
+        ACKs still belong to the post-target-sync transaction. The shared
+        publisher consumes these same refs instead of exporting a second time.
+        """
+        config = self._speco_drafter_schedule_config()
+        if not config.idle_worker_early_publish_staging or not config.publish_async:
+            return {}
+        session = self._speco_bubble_session()
+        scheduler = self._speco_get_drafter_scheduler()
+        if (
+            len(session.pending) != 1
+            or scheduler._training_quota_debt_steps > 0
+            or not getattr(self, "_speco_colocate_admission_closed", False)
+            or getattr(self, "_pending_drafter_publish_refs", None)
+            or getattr(self, "_speco_validation_in_progress", False)
+            or getattr(self, "_speco_checkpoint_in_progress", False)
+        ):
+            return {}
+        plan, outcome = session.pending[0]
+        if (
+            not outcome.trained
+            or not plan.launch
+            or not plan.publish_after_success
+            or int(plan.source_global_step) != int(self.global_steps)
+        ):
+            return {}
+        publish_plan = scheduler.plan_publish(
+            global_step=self.global_steps,
+            drafter_trained=outcome.trained,
+            config=config,
+            training_plan=plan,
+        )
+        if not publish_plan.publish:
+            return {}
+        prefetched = getattr(self, "_speco_publish_snapshot_prefetch", None)
+        if prefetched is not None:
+            if (
+                int(prefetched["source_step"]) != int(plan.source_global_step)
+                or prefetched.get("plan_id", plan.plan_id) != plan.plan_id
+            ):
+                raise RuntimeError(
+                    "Bubble snapshot prefetch belongs to another publication"
+                )
+            return {}
+        export = getattr(
+            self._require_speco_worker_group(), "maybe_publish_async", None
+        )
+        if not callable(export):
+            return {}
+        started = time.perf_counter()
+        # This RPC can only consume a cached CPU snapshot. On a cache miss the
+        # original publisher exports at the safe point after native target sync.
+        refs = export(source_step=int(plan.source_global_step))
+        self._speco_publish_snapshot_prefetch = {
+            "refs": refs,
+            "source_step": int(plan.source_global_step),
+            "plan_id": plan.plan_id,
+        }
+        return {
+            "bubble/publish_snapshot_prefetch_submitted": 1,
+            "timing_s/drafter_publish_snapshot_prefetch_submit": time.perf_counter()
+            - started,
+        }
+
     def _speco_v1_bubble_step_end(self, parent):
         boundary_started = time.perf_counter()
         session = self._speco_bubble_session()
@@ -711,6 +776,7 @@ class V1BubbleMixin:
                 metrics.update(self._speco_park_drafter_training_memory("v1_topup"))
             # The native mode owns actor target synchronization. Admission is
             # closed across both probe arms, even if native code resumes engines.
+            metrics.update(self._speco_v1_prefetch_publish_snapshot())
             result = parent()
             metrics.update(self._speco_v1_publish_bubble())
         metrics.update(self._speco_v1_finish_receipts())

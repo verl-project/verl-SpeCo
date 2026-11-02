@@ -326,6 +326,7 @@ def test_real_mode_final_quota_cannot_enable_critical_path_fallback(mode):
 @pytest.mark.parametrize("final", [False, True])
 def test_explicit_topup_preserves_bounded_and_final_completion_policy(mode, final):
     from verl_speco.trainer.bubble_lifecycle import BubbleLifecycle
+    from verl_speco.trainer.scheduler import DrafterScheduleConfig
 
     trainer = TRAINERS[mode].__new__(TRAINERS[mode])
     trainer.config = config(mode)
@@ -350,7 +351,7 @@ def test_explicit_topup_preserves_bounded_and_final_completion_policy(mode, fina
         _training_quota_debt_steps=3, training_work_metrics=lambda: {}
     )
     trainer._speco_get_drafter_scheduler = lambda: scheduler
-    trainer._speco_drafter_schedule_config = lambda: SimpleNamespace(
+    trainer._speco_drafter_schedule_config = lambda: DrafterScheduleConfig(
         training_quota_allow_critical_path_fallback=True,
     )
     trainer._speco_drafter_schedule_context = lambda: object()
@@ -393,3 +394,47 @@ def test_explicit_topup_preserves_bounded_and_final_completion_policy(mode, fina
     assert calls == (["plan-3", "plan-2", "plan-1"] if final else ["regular-topup"])
     assert publications == (["plan-1"] if final else [])
     assert scheduler._training_quota_debt_steps == (0 if final else 2)
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+@pytest.mark.parametrize("boundary", ["v1_before_actor", "v1_topup"])
+def test_v1_parks_hot_writer_at_shared_resource_boundaries(mode, boundary):
+    trainer = TRAINERS[mode].__new__(TRAINERS[mode])
+    trainer.config = config(mode)
+    trainer.config.actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker = {
+        "keep_hot_between_plans": True
+    }
+    calls = []
+    scheduler = SimpleNamespace(
+        _idle_worker_hot_prewarmed_groups={("2", "3")},
+        _idle_worker_writer_group=("2", "3"),
+        _training_quota_debt_steps=7,
+        record_memory_park_elapsed=lambda seconds: calls.append(("elapsed", seconds)),
+    )
+    trainer._speco_get_drafter_scheduler = lambda: scheduler
+    trainer._require_speco_worker_group = lambda: SimpleNamespace(
+        park_drafter_training_model=lambda: calls.append("park")
+        or [{"parked": True, "elapsed_sec": 0.25}]
+    )
+    trainer._ray_get_if_needed = lambda value: value
+    metrics = trainer._speco_park_drafter_training_memory(boundary)
+    assert calls == ["park", ("elapsed", 0.25)]
+    assert scheduler._idle_worker_hot_prewarmed_groups == set()
+    assert scheduler._idle_worker_writer_group == ("2", "3")
+    assert scheduler._training_quota_debt_steps == 7
+    assert f"timing_s/drafter_memory_park_{boundary}" in metrics
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+def test_v1_parking_failure_prevents_boundary_completion(mode):
+    trainer = TRAINERS[mode].__new__(TRAINERS[mode])
+    trainer.config = config(mode)
+
+    def fail():
+        raise RuntimeError("strict offload failed")
+
+    trainer._require_speco_worker_group = lambda: SimpleNamespace(
+        park_drafter_training_model=fail
+    )
+    with pytest.raises(RuntimeError, match="strict offload failed"):
+        trainer._speco_park_drafter_training_memory("v1_before_actor")

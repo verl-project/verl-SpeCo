@@ -3333,3 +3333,38 @@ def test_ipc_npu_handle_remaps_only_receiver_device(monkeypatch, serialized, dev
     if device_id is not None:
         with pytest.raises(ValueError, match="NPU IPC"):
             vllm_runtime._speco_rebuild_ipc_compat((func, (1, 2, 3)), device_id)
+
+
+@pytest.mark.parametrize("snapshot_fails", [False, True])
+def test_performance_snapshot_runs_once_and_cannot_fail_generation(
+    monkeypatch, snapshot_fails
+):
+    from verl_speco.integration import rollout_performance as perf
+    from verl_speco.integration import generation_diagnostics as diagnostics
+
+    monkeypatch.setenv("VERL_SPECO_DIAGNOSTIC_ROLLOUT_PERF", "true")
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: _drafter())
+    monkeypatch.setattr(perf, "safe_runtime_snapshot", lambda *args: {})
+    monkeypatch.setattr(diagnostics, "emit_summary", lambda *args, **kwargs: None)
+    calls = []
+
+    class Upstream:
+        async def generate(self, request_id):
+            return SimpleNamespace(extra_fields={}, request_id=request_id)
+
+    class Server(_SpecoVLLMHttpServerMixin, Upstream):
+        async def collective_rpc(self, method):
+            calls.append(method)
+            await asyncio.sleep(0)
+            if snapshot_fails:
+                raise RuntimeError("diagnostic unavailable")
+            return [{"kv_cache_config": {"num_blocks": 10}}]
+
+    async def run():
+        server = Server()
+        outputs = await asyncio.gather(server.generate("a"), server.generate("b"))
+        assert [result.request_id for result in outputs] == ["a", "b"]
+        await server.generate("c")
+
+    asyncio.run(run())
+    assert calls == ["speco_performance_snapshot"]
