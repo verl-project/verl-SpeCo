@@ -58,6 +58,10 @@ from verl_speco.integration.sglang_adapter import (
     SGLANG_QWEN3_ROPE_COMPAT_PATCH,
     sglang_needs_qwen3_rope_compat_patch,
 )
+from verl_speco.integration.sglang_patch_controls import (
+    DISABLE_SGLANG_PATCH_ENV,
+    sglang_verl_patches_disabled,
+)
 from verl_speco.integration.rollout_idle_events import (
     SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV,
     acquire_rollout_resource_lease,
@@ -1278,11 +1282,18 @@ def _install_amdgpu_memory_capacity_patch() -> None:
     (the trailing awk stage masks an upstream failure), producing
     ``ValueError: could not convert string to float: ''`` in ``ServerArgs.__post_init__`` and
     killing the whole job. Fall back to torch's device total memory (in MiB) whenever the
-    original probe raises or yields nothing.
+    original probe raises or yields nothing. Like every other verl SGLang patch, this is
+    skipped when ``VERL_DISABLE_SGLANG_PATCH`` is set.
     """
 
     global _AMDGPU_MEM_CAPACITY_PATCHED
     if _AMDGPU_MEM_CAPACITY_PATCHED:
+        return
+    if sglang_verl_patches_disabled():
+        logger.warning(
+            "Skip SGLang AMD GPU memory-capacity patch because %s is set.",
+            DISABLE_SGLANG_PATCH_ENV,
+        )
         return
 
     try:
