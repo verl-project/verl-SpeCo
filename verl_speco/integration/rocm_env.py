@@ -23,45 +23,74 @@ import os
 logger = logging.getLogger(__name__)
 
 
+def _visible_devices(name: str) -> str | None:
+    # Matches vllm's _sync_hip_cuda_env_vars(): an empty mask counts as unset.
+    return os.environ.get(name) or None
+
+
+def _is_rocm() -> bool:
+    try:
+        import torch
+
+        return bool(getattr(torch.version, "hip", None))
+    except Exception:
+        return os.environ.get("HIP_PLATFORM") == "amd"
+
+
 def neutralize_hip_visible_devices(*, context: str = "") -> bool:
-    """Strip HIP_VISIBLE_DEVICES on ROCm so Ray stays CUDA-native.
+    """Fold HIP_VISIBLE_DEVICES into CUDA_VISIBLE_DEVICES on ROCm so Ray stays CUDA-native.
 
     vllm's ROCm platform module (``vllm/platforms/rocm.py``) runs a one-time
-    ``_sync_hip_cuda_env_vars()`` at import that copies CUDA_VISIBLE_DEVICES into
-    HIP_VISIBLE_DEVICES. If that HIP value is present when Ray initializes, Ray's AMD
-    accelerator manager switches to HIP-keyword mode and rewrites only HIP per GPU worker,
+    ``_sync_hip_cuda_env_vars()`` at import that copies a HIP-only mask into
+    CUDA_VISIBLE_DEVICES (and, in the vLLM bundled in the ROCm image, a CUDA-only mask into
+    HIP_VISIBLE_DEVICES). If HIP_VISIBLE_DEVICES is still present when Ray initializes, Ray's
+    AMD accelerator manager switches to HIP-keyword mode and rewrites only HIP per GPU worker,
     leaving each worker's CUDA_VISIBLE_DEVICES at the full stale mask. The ROCm HIP runtime
     then aborts every GPU worker at ``import torch`` with "Conflicting visibility ... between
     HIP_VISIBLE_DEVICES and CUDA_VISIBLE_DEVICES". The same mismatch aborts spawned SGLang TP
     subprocesses at ``import ray`` (``ValueError: Inconsistent values ...``), because each
     respawn re-executes Ray's ``default_worker.py`` before any SGLang code runs.
 
-    Pre-triggering the sync (so its module body is cached and cannot re-run) and then popping
-    HIP_VISIBLE_DEVICES leaves the process -- and every subprocess it spawns -- with
-    CUDA_VISIBLE_DEVICES only, so Ray assigns each worker a single physical GPU via CUDA and
-    never introduces a conflicting HIP mask. No-op on non-ROCm builds.
+    The masks are normalized here, independently of whether vllm imports:
 
-    ``context`` is an optional label (e.g. "in SGLang server actor"); when set and a value is
-    actually stripped, that is logged at WARNING so the env fix-up is visible. Returns whether
+    * only HIP_VISIBLE_DEVICES set: copy it to CUDA_VISIBLE_DEVICES, then drop HIP;
+    * both set to the same value: drop HIP;
+    * both set to different values: raise ``ValueError`` (the intended devices are ambiguous);
+    * only CUDA_VISIBLE_DEVICES set, or neither: keep CUDA as is (dropping any HIP copy that
+      importing vLLM just added).
+
+    The device restriction is therefore always kept, as CUDA_VISIBLE_DEVICES only, so Ray
+    assigns each worker a single physical GPU via CUDA and never introduces a conflicting HIP
+    mask. vllm's ROCm platform is still imported first so its import-time sync runs once,
+    against the original environment, and cannot re-run later. No-op on non-ROCm builds.
+
+    ``context`` is an optional label (e.g. "in SGLang server actor"); when set and HIP is
+    actually removed, that is logged at WARNING so the env fix-up is visible. Returns whether
     HIP_VISIBLE_DEVICES was present and removed.
     """
 
-    try:
-        import torch
-
-        is_rocm = bool(getattr(torch.version, "hip", None))
-    except Exception:
-        is_rocm = os.environ.get("HIP_PLATFORM") == "amd"
-    if not is_rocm:
+    if not _is_rocm():
         return False
+    hip_mask = _visible_devices("HIP_VISIBLE_DEVICES")
+    cuda_mask = _visible_devices("CUDA_VISIBLE_DEVICES")
+    if hip_mask is not None and cuda_mask is not None and hip_mask != cuda_mask:
+        raise ValueError(
+            "Conflicting GPU visibility masks on ROCm: "
+            f"HIP_VISIBLE_DEVICES={hip_mask!r} vs CUDA_VISIBLE_DEVICES={cuda_mask!r}. "
+            "Set only CUDA_VISIBLE_DEVICES (or make both identical)."
+        )
     try:
         import vllm.platforms.rocm  # noqa: F401  # runs the one-time HIP/CUDA sync
     except Exception as exc:  # noqa: BLE001
         logger.debug("vllm ROCm platform import failed during HIP env sync: %s", exc)
+    if hip_mask is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = hip_mask
     stripped = os.environ.pop("HIP_VISIBLE_DEVICES", None) is not None
     if stripped and context:
         logger.warning(
-            "Stripped HIP_VISIBLE_DEVICES %s to keep spawned workers CUDA-native.",
+            "Moved HIP_VISIBLE_DEVICES=%r to CUDA_VISIBLE_DEVICES %s to keep spawned "
+            "workers CUDA-native.",
+            hip_mask or "",
             context,
         )
     return stripped
