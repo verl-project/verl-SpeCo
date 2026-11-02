@@ -889,6 +889,8 @@ def test_vllm_generate_preserves_unscored_request_ids_and_transport_keys(
     scored = outputs["scored-request"].extra_fields
     unscored = outputs["unscored-request"].extra_fields
     assert scored.keys() == unscored.keys()
+    assert scored["_speco_acceptance_engine_fallback"] is False
+    assert unscored["_speco_acceptance_engine_fallback"] is False
     assert scored["_speco_vllm_request_id"] == "scored-request"
     assert scored["_verl_request_mean_accept_len"] == 4.0
     assert unscored["_speco_vllm_request_id"] == "unscored-request"
@@ -2304,6 +2306,7 @@ def test_vllm_http_server_transports_final_request_acceptance_stats() -> None:
     elapsed = output.extra_fields.pop("_speco_vllm_request_elapsed_sec")
     assert elapsed >= 0
     assert output.extra_fields == {
+        "_speco_acceptance_engine_fallback": False,
         "global_steps": 1,
         "spec_num_draft_tokens": 28.0,
         "spec_num_accepted_tokens": 9.0,
@@ -2552,6 +2555,7 @@ def test_vllm_http_server_transports_stats_with_positional_request_id() -> None:
     elapsed = output.extra_fields.pop("_speco_vllm_request_elapsed_sec")
     assert elapsed >= 0
     assert output.extra_fields == {
+        "_speco_acceptance_engine_fallback": False,
         "global_steps": 1,
         "spec_num_draft_tokens": 21.0,
         "spec_num_accepted_tokens": 5.0,

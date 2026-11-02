@@ -4273,6 +4273,9 @@ async def _speco_generate_with_request_stats_unblocked(
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
             revision_after = int(getattr(self, "_speco_serving_drafter_revision", 0))
+            # Unscored requests must carry the same provenance key as requests
+            # with exact counters or an engine fallback before batch merging.
+            extra_fields.setdefault("_speco_acceptance_engine_fallback", False)
             extra_fields["_speco_drafter_revision_min"] = min(
                 revision_before, revision_after
             )

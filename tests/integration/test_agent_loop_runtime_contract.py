@@ -35,7 +35,7 @@ def test_agent_loop_preserves_spec_decode_metric_fields() -> None:
 
 @pytest.mark.parametrize("fallback_first", [False, True])
 def test_mixed_acceptance_sources_have_concat_compatible_fields(fallback_first):
-    import numpy as np
+    np = pytest.importorskip("numpy")
 
     from verl_speco.integration.acceptance_metrics import (
         bridge_request_acceptance_counters,
