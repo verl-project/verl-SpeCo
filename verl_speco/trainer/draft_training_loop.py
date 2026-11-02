@@ -511,11 +511,13 @@ async def _run_standalone_draft_training_async(
         while max_steps <= 0 or optimizer_step < max_steps:
             current_stage = "load_next_batch"
             load_started = time.perf_counter()
+            fetch_timings: dict[str, float] = {}
             loaded_batch = _next_batch_across_ranks(
                 sample_iterator,
                 rank=rank,
                 device=trainer.runtime_device,
                 require_prepared=feature_store_type == "ray_reference",
+                timings=fetch_timings,
             )
             batch_ready_wait_seconds = time.perf_counter() - load_started
             if loaded_batch is None:
@@ -719,6 +721,13 @@ async def _run_standalone_draft_training_async(
             step_metrics["perf/batch_finalize_time"] = tq_clear_seconds
             if tq_local_batch is not None:
                 step_metrics["perf/batch_ready_wait_time"] = batch_ready_wait_seconds
+                step_metrics.update(
+                    (f"perf/{key}", value) for key, value in fetch_timings.items()
+                )
+                step_metrics.update(
+                    (f"perf/{key}", value)
+                    for key, value in tq_local_batch.delivery_times.items()
+                )
                 step_metrics["perf/loader_plan_wait_time"] = float(
                     tq_local_batch.command_wait_seconds
                 )
@@ -1764,6 +1773,21 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         ("perf/loader_tq_get_time", "loader_tq_get_time"),
         ("perf/loader_batch_prepare_time", "loader_batch_prepare_time"),
         ("perf/batch_ready_wait_time", "batch_ready_wait_time"),
+        *[
+            (f"perf/{key}", key)
+            for key in (
+                "local_batch_wait_time",
+                "rank_ready_sync_time",
+                "metadata_event_age_time",
+                "scheduler_ready_wait_time",
+                "command_delivery_time",
+                "loader_worker_result_wait_time",
+                "loader_ipc_collect_time",
+                "loader_pin_queue_time",
+                "loader_pin_time",
+                "loader_ready_queue_time",
+            )
+        ],
         ("perf/batch_prepare_time", "batch_prepare_time"),
         ("perf/train_time", "train_time"),
         ("perf/batch_finalize_time", "batch_finalize_time"),
@@ -2012,6 +2036,7 @@ def _next_batch_across_ranks(
     rank: int,
     device: torch.device,
     require_prepared: bool = False,
+    timings: dict[str, float] | None = None,
 ) -> Any | None:
     """Fetch one batch and make producer failures visible to every rank.
 
@@ -2020,6 +2045,7 @@ def _next_batch_across_ranks(
     any rank is allowed to enter model collectives.  This prevents healthy
     ranks from waiting in FSDP after another rank has already started cleanup.
     """
+    wait_started = time.perf_counter() if timings is not None else 0.0
     samples: Any | None = None
     local_error: BaseException | None = None
     exhausted = False
@@ -2036,6 +2062,7 @@ def _next_batch_across_ranks(
     except BaseException as exc:  # noqa: BLE001
         local_error = exc
 
+    sync_started = time.perf_counter() if timings is not None else 0.0
     state = torch.tensor(
         [1 if local_error is not None else 0, 1 if exhausted else 0],
         dtype=torch.int32,
@@ -2046,6 +2073,9 @@ def _next_batch_across_ranks(
 
     any_failed = bool(state[0].item())
     any_exhausted = bool(state[1].item())
+    if timings is not None:
+        timings["local_batch_wait_time"] = sync_started - wait_started
+        timings["rank_ready_sync_time"] = time.perf_counter() - sync_started
     if any_failed:
         if local_error is not None:
             raise RuntimeError(

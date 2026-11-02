@@ -91,28 +91,23 @@ def test_prefill_reference_transfers_handle_without_reading(monkeypatch):
 
 
 def test_request_generate_returns_store_handle() -> None:
-    class Completions:
-        async def create(self, **kwargs):
-            return SimpleNamespace(
-                choices=[
-                    SimpleNamespace(prompt_token_ids=[1, 2], token_ids=[3, 4])
-                ],
-                kv_transfer_params={"handle": "hs-123"},
+    import httpx
+
+    async def run():
+        def respond(request):
+            return httpx.Response(200, json={
+                "choices": [{"prompt_token_ids": [1, 2], "token_ids": [3, 4]}],
+                "kv_transfer_params": {"handle": "hs-123"},
+            })
+        async with httpx.AsyncClient(
+            base_url="http://vllm:8000/v1/", transport=httpx.MockTransport(respond)
+        ) as client:
+            return await request_generate(
+                VllmEndpoint("http://vllm:8000/v1", 1), client, [1, 2],
+                model="target", max_tokens=8, timeout=30,
             )
 
-    client = SimpleNamespace(completions=Completions())
-
-    response = asyncio.run(
-        request_generate(
-            VllmEndpoint("http://vllm:8000/v1", 1),
-            client,
-            [1, 2],
-            model="target",
-            max_tokens=8,
-            timeout=30,
-        )
-    )
-
+    response = asyncio.run(run())
     assert response.handle == "hs-123"
     assert response.hidden_states_path is None
     assert response.reference == "hs-123"
@@ -134,38 +129,81 @@ def test_load_and_delete_route_handles_through_the_store() -> None:
     assert store.released == ["hs-9"]
 
 
-def test_request_generate_only_requests_generated_token_ids() -> None:
-    calls = []
+@pytest.mark.parametrize("generate", [False, True])
+@pytest.mark.parametrize("suffix", ["", "/"])
+def test_direct_http_request_body_and_client_lifecycle(monkeypatch, generate, suffix):
+    import json
+    import httpx
 
-    class Completions:
-        async def create(self, **kwargs):
-            calls.append(kwargs)
-            return SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        prompt_token_ids=[1, 2],
-                        token_ids=[3, 4],
-                    )
-                ],
-                kv_transfer_params={"hidden_states_path": "/tmp/result.safetensors"},
+    calls = []
+    original_client = httpx.AsyncClient
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json={
+            "choices": [{"prompt_token_ids": [1, 2], "token_ids": [3, 4]}],
+            "kv_transfer_params": {"hidden_states_path": "/tmp/result.safetensors"},
+        })
+
+    def create_client(**kwargs):
+        assert kwargs["limits"].max_connections == 32
+        assert kwargs["limits"].max_keepalive_connections == 32
+        return original_client(**kwargs, transport=httpx.MockTransport(respond))
+
+    monkeypatch.setattr(httpx, "AsyncClient", create_client)
+
+    async def run():
+        pool = VllmFeatureClientPool(
+            [VllmEndpoint("http://vllm:8000/v1" + suffix, 32)], model="target",
+            max_inflight_requests=32, request_timeout=30,
+        )
+        await pool.start()
+        client = pool._states[0].client
+        request = SimpleNamespace(prompt_token_ids=[1, 2], max_tokens=128)
+        try:
+            for _ in range(2):
+                response = await (pool.generate_reference(request) if generate
+                                  else pool.prefill_reference(request))
+                assert response.hidden_states_path == "/tmp/result.safetensors"
+                if generate:
+                    assert response.generated_token_ids == (3, 4)
+                assert pool._states[0].client is client
+        finally:
+            await pool.close()
+        assert client.is_closed
+
+    asyncio.run(run())
+    assert len(calls) == 2
+    for request in calls:
+        assert request.method == "POST"
+        assert str(request.url) == "http://vllm:8000/v1/completions"
+        assert request.headers["Authorization"] == "Bearer EMPTY"
+        assert json.loads(request.content) == {
+            "model": "target", "prompt": [1, 2],
+            "max_tokens": 128 if generate else 1, "return_token_ids": True,
+        }
+
+
+def test_direct_http_errors_keep_status_and_response_body():
+    import httpx
+
+    async def run():
+        async with httpx.AsyncClient(
+            base_url="http://vllm:8000/v1/",
+            transport=httpx.MockTransport(lambda request: httpx.Response(
+                503, text="server busy", headers={"x-request-id": "req-7"}
+            )),
+        ) as client:
+            with pytest.raises(httpx.HTTPStatusError) as error:
+                await client_module.request_prefill(
+                    VllmEndpoint("http://vllm:8000/v1", 1), client, [1, 2],
+                    model="target", timeout=30,
+                )
+            assert client_module._http_error_detail(error.value) == (
+                503, "req-7", "server busy"
             )
 
-    client = SimpleNamespace(completions=Completions())
-
-    response = asyncio.run(
-        request_generate(
-            VllmEndpoint("http://vllm:8000/v1", 1),
-            client,
-            [1, 2],
-            model="target",
-            max_tokens=128,
-            timeout=30,
-        )
-    )
-
-    assert response.generated_token_ids == (3, 4)
-    assert calls[0]["max_tokens"] == 128
-    assert calls[0]["extra_body"] == {"return_token_ids": True}
+    asyncio.run(run())
 
 
 def test_pool_retry_fails_over_to_another_endpoint(monkeypatch) -> None:
@@ -291,3 +329,46 @@ def test_success_logging_is_rate_limited_per_endpoint_counter() -> None:
         success_log_interval=0,
     )
     assert disabled._should_log_success(1) is False
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_http_diagnostics_exclude_endpoint_wait_and_release_on_cancel(monkeypatch, cancel):
+    clock = [0.0]
+    monkeypatch.setattr(client_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    endpoint = VllmEndpoint("http://vllm:8000/v1", 1)
+    store = _RecordingStore()
+    store.backend = "file"
+    pool = VllmFeatureClientPool([endpoint], model="target", max_inflight_requests=1,
+                                 request_timeout=10, hidden_states_store=store)
+
+    async def exercise():
+        entered, finish = asyncio.Event(), asyncio.Event()
+        async def prefill(*args, **kwargs):
+            entered.set()
+            await finish.wait()
+            return VllmResponse("/tmp/hidden", endpoint.base_url)
+        monkeypatch.setattr(client_module, "request_prefill", prefill)
+        semaphore = asyncio.Semaphore(0)
+        pool._states = [client_module._EndpointState(endpoint, object(), semaphore)]
+        task = asyncio.create_task(pool.prefill_reference(SimpleNamespace(prompt_token_ids=[1])))
+        await asyncio.sleep(0)
+        clock[0] = 3.0
+        assert pool.diagnostics.http_inflight == 0
+        semaphore.release()
+        await asyncio.wait_for(entered.wait(), 2)
+        assert pool.diagnostics.http_inflight == 1
+        clock[0] = 8.0
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            finish.set()
+            response = await task
+            assert response.timings["endpoint_wait"] == 3.0
+            assert response.timings["http"] == 5.0
+            assert response.timings["global_wait"] >= 0
+        assert pool.diagnostics.http_inflight == 0
+        assert pool.diagnostics.snapshot()["http_calls"] == 1
+
+    asyncio.run(exercise())

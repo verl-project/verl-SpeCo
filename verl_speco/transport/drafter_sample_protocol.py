@@ -144,14 +144,20 @@ def make_reference_tag(
         "request": dict(request),
         "feature_contract": dict(feature_contract),
     }
-    validate_reference_tag(tag)
-    # Return an owned metadata tree, with no tensors or mutable caller aliases.
-    return deepcopy(tag)
+    validate_reference_envelope(tag)
+    # Numeric arrays need only a container copy; nested metadata remains owned.
+    tag["request"] = {
+        name: value.copy() if name in _REQUEST_ARRAYS else deepcopy(value)
+        for name, value in tag["request"].items()
+    }
+    tag["transfer_params"] = deepcopy(tag["transfer_params"])
+    tag["feature_contract"] = deepcopy(tag["feature_contract"])
+    return tag
 
 
-def validate_reference_tag(tag: Mapping[str, Any]) -> None:
-    """Reject incomplete or incompatible metadata before opening any file."""
-    SampleMetadata.from_dict(tag).validate()
+def validate_reference_envelope(tag: Mapping[str, Any]) -> None:
+    """Check routing and array structure without scanning per-token values."""
+    SampleMetadata.from_dict(tag)
     if tag.get("record_type") != "sample" or tag.get("status") != "ready":
         raise ValueError("Hidden reference must be a ready sample")
     if tag.get("payload_kind") != REFERENCE_KIND:
@@ -180,13 +186,6 @@ def validate_reference_tag(tag: Mapping[str, Any]) -> None:
         value = request.get(name)
         if not isinstance(value, list) or not value:
             raise ValueError(f"Hidden reference request requires non-empty {name} list")
-        if any(
-            isinstance(item, bool) or not isinstance(item, (int, float))
-            for item in value
-        ):
-            raise ValueError(f"Hidden reference {name} must contain numbers")
-        if name != "loss_mask" and any(not isinstance(item, int) for item in value):
-            raise ValueError(f"Hidden reference {name} must contain integers")
     if not (
         len(request["input_ids"])
         == len(request["loss_mask"])
@@ -195,14 +194,29 @@ def validate_reference_tag(tag: Mapping[str, Any]) -> None:
         raise ValueError("Hidden reference token/mask/position lengths differ")
     if len(request["feature_positions"]) != len(request["draft_position_ids"]):
         raise ValueError("Hidden reference feature/draft position lengths differ")
-    if any(
-        p < 0 or p >= len(request["input_ids"]) for p in request["feature_positions"]
-    ):
-        raise ValueError("Hidden reference feature positions are out of range")
     if not isinstance(request.get("source_metadata"), dict):
         raise ValueError("Hidden reference requires source_metadata mapping")
     if not isinstance(tag.get("feature_contract"), dict) or not tag["feature_contract"]:
         raise ValueError("Hidden reference requires feature_contract mapping")
+
+
+def validate_reference_tag(tag: Mapping[str, Any]) -> None:
+    """Fully validate metadata once in CPU preparation, before opening hidden data."""
+    validate_reference_envelope(tag)
+    request = tag["request"]
+    for name in _REQUEST_ARRAYS:
+        value = request[name]
+        if any(
+            isinstance(item, bool) or not isinstance(item, (int, float))
+            for item in value
+        ):
+            raise ValueError(f"Hidden reference {name} must contain numbers")
+        if name != "loss_mask" and any(not isinstance(item, int) for item in value):
+            raise ValueError(f"Hidden reference {name} must contain integers")
+    if any(
+        p < 0 or p >= len(request["input_ids"]) for p in request["feature_positions"]
+    ):
+        raise ValueError("Hidden reference feature positions are out of range")
     _validate_plain_metadata(dict(tag))
 
 
@@ -578,6 +592,7 @@ __all__ = [
     "make_eos_record",
     "make_ready_tag",
     "make_reference_tag",
+    "validate_reference_envelope",
     "validate_reference_tag",
     "make_sample_key",
     "parse_ready_tag",
