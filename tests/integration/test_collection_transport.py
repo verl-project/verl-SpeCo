@@ -14,6 +14,7 @@ from typing import Any, cast
 import pytest
 
 torch = pytest.importorskip("torch")
+from verl_speco.integration.opd_cotrain import ensure_student_only_feature_payload
 from verl_speco.integration.tensor_wire import encode_cpu_tensors
 
 
@@ -58,6 +59,7 @@ def production():
         "cast": cast,
         "logger": logging.getLogger("collection-test"),
         "_is_ray_object_ref": lambda ref: isinstance(ref, Ref),
+        "ensure_student_only_feature_payload": ensure_student_only_feature_payload,
     }
     exec(  # noqa: S102 - run isolated production methods without optional dependencies
         compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace
@@ -142,6 +144,31 @@ def test_corrupt_wire_raises_before_storage(production):
     wire["_speco_cpu_tensor_wire_v1"]["hidden"]["shape"] = (100, 4)
     with pytest.raises(ValueError, match="layout"):
         asyncio.run(production._resolve_hidden_state_chunks([chunk(Ref(wire))]))
+
+
+@pytest.mark.parametrize("teacher_key", ["teacher_ids", "teacher_logprobs"])
+def test_commit_rejects_teacher_tensors_before_resolving_or_storing(
+    production, teacher_key
+):
+    ref = Ref(encode_cpu_tensors({"hidden": torch.ones(3, 4)}))
+    stored = []
+    worker = SimpleNamespace(
+        trainer=SimpleNamespace(buffer_version=4),
+        _collection_worker_result=lambda **kwargs: dict(
+            accepted_samples=0, rejected_samples=0, **kwargs
+        ),
+        _store_rollout_sample=lambda **kwargs: stored.append(kwargs),
+    )
+    sample = {
+        teacher_key: torch.ones(3),
+        "hidden_states_ref_chunks": [chunk(ref)],
+    }
+
+    with pytest.raises(ValueError, match="forbidden Teacher tensors: " + teacher_key):
+        asyncio.run(production._commit_rollout_features(worker, "teacher", [sample]))
+
+    assert ref.awaits == 0
+    assert stored == []
 
 
 def test_commit_cache_is_local_and_keeps_sample_order_and_accounting(

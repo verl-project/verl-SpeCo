@@ -45,6 +45,7 @@ on:
           - examples/run_qwen3-8b_drafter_eagle3_vllm.sh
           - examples/run_qwen3-8b_drafter_eagle3_vllm_npu.sh
           - examples/run_qwen3-8b_drafter_separate_training.sh
+          - examples/run_qwen3-8b_opd_actor_fsdp2_drafter_dspark_vllm.sh
           - examples/run_qwen3.6-35b-a3b_drafter_dspark_separate_training.sh
           - examples/run_qwen3-8b_v1_hard_freeze_longrun_drafter_dspark_vllm_npu.sh
           - examples/run_qwen3-8b_v1_hard_freeze_smoke_drafter_dspark_vllm_npu.sh

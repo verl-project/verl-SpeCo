@@ -319,3 +319,40 @@ def test_nonzero_rank_uses_broadcast_assignment_without_listing(monkeypatch) -> 
     assert batch.local_keys == [entries[1].key]
     assert batch.global_keys is None
     assert store.get_calls == [[entries[1].key]]
+
+
+@pytest.mark.parametrize("sender_node,receiver_node,started,expected", [
+    ("driver-node", "consumer-node", 10000.0, None),
+    ("same-node", "same-node", 99.0, 1.0),
+    (None, "consumer-node", 10000.0, None),
+    (None, None, 10000.0, None),
+])
+def test_command_delivery_requires_shared_ray_clock(
+    monkeypatch, sender_node, receiver_node, started, expected,
+):
+    from queue import Queue
+    import time
+    import verl_speco.trainer.tq_sample_source as module
+
+    entry = _entry(0)
+    store = _FakeStore([entry], eos=False)
+    commands = Queue()
+    commands.put({
+        "kind": "batch", "assignments": [[{"key": entry.key, "tag": entry.tag}]],
+        "dispatched_at": started, "clock_node_id": sender_node,
+        "delivery_times": {"scheduler_ready_wait_time": 0.2},
+    })
+    monkeypatch.setattr(module, "current_ray_node_id", lambda: receiver_node)
+    monkeypatch.setattr(module, "time", SimpleNamespace(
+        monotonic=lambda: 100.0, perf_counter=time.perf_counter, sleep=time.sleep,
+    ))
+    loader = TQFeatureDataLoader(
+        store, batch_size=1, rank=0, world_size=1, scheduled_commands=commands,
+    )
+    batch = next(iter(loader))
+    assert batch.local_keys == [entry.key]
+    assert batch.delivery_times["scheduler_ready_wait_time"] == 0.2
+    if expected is None:
+        assert "command_delivery_time" not in batch.delivery_times
+    else:
+        assert batch.delivery_times["command_delivery_time"] == expected

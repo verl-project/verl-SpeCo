@@ -39,9 +39,11 @@ def test_batch_timing_records_serial_and_prefetch_wait(depth, ready_wait, file_p
                "perf/batch_finalize_time": 0.06}
     namespace = dict(step_metrics=metrics, tq_local_batch=SimpleNamespace(
                          command_wait_seconds=10, prepared_batch={} if file_path else None,
-                         batch_prepare_seconds=0.3),
+                         batch_prepare_seconds=0.3, delivery_times={"command_delivery_time": 0.02}),
                      tq_prefetch=object() if depth else None,
-                     batch_ready_wait_seconds=ready_wait, tq_get_seconds=0.3)
+                     batch_ready_wait_seconds=ready_wait, tq_get_seconds=0.3,
+                     fetch_timings={"local_batch_wait_time": ready_wait * 0.75,
+                                    "rank_ready_sync_time": ready_wait * 0.25})
     exec(compile(ast.Module(body=[metrics_block], type_ignores=[]), str(path), "exec"), namespace)
     selected = _select_standalone_tracking_metrics(metrics)
     assert selected["perf/batch_ready_wait_time"] == ready_wait

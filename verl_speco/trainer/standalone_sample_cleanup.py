@@ -11,7 +11,7 @@ from typing import Any
 
 from verl_speco.producer.hidden_states_store import FileHiddenStatesStore
 from verl_speco.trainer.tq_retry import retry_io
-from verl_speco.transport.drafter_sample_protocol import validate_reference_tag
+from verl_speco.transport.drafter_sample_protocol import validate_reference_envelope
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ def cleanup_standalone_samples(
         hidden_store = FileHiddenStatesStore()
     for entry in entries:
         if entry.tag.get("payload_kind") == "vllm_reference":
-            validate_reference_tag(entry.tag)
+            validate_reference_envelope(entry.tag)
             if entry.tag["backend"] != hidden_store.backend:
                 raise ValueError("Cleanup reference backend does not match store")
             references.append(

@@ -30,5 +30,6 @@
   "gpu-eagle3": "examples/run_qwen3-8b_drafter_eagle3_vllm.sh",
   "eagle3": "examples/run_qwen3-8b_drafter_eagle3_vllm_npu.sh",
   "gpu-eagle3-offline": "examples/run_qwen3-8b_drafter_separate_training.sh",
+  "gpu-opd-dspark": "examples/run_qwen3-8b_opd_actor_fsdp2_drafter_dspark_vllm.sh",
   "npu-dspark35b-separate": "examples/run_qwen3.6-35b-a3b_drafter_dspark_separate_training.sh"
 }

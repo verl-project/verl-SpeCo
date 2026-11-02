@@ -28,8 +28,13 @@ def test_plain_reference_metadata_roundtrip_and_owned_values():
         SampleMetadata.from_dict(tag), path=tag["hidden_states_path"],
         request=tag["request"], feature_contract=tag["feature_contract"],
     )
-    tag["request"]["loss_mask"][0] = 1
-    assert copied["request"]["loss_mask"] == [0, 1, 1]
+    for name in (
+        "input_ids", "loss_mask", "position_ids", "feature_positions",
+        "draft_position_ids", "vllm_prompt_token_ids",
+    ):
+        expected = list(tag["request"][name])
+        tag["request"][name][0] = 99
+        assert copied["request"][name] == expected
 
 
 @pytest.mark.parametrize("field,value", [
@@ -69,4 +74,38 @@ def test_mooncake_metadata_preserves_manifest_and_rejects_ambiguity():
     copied["transfer_params"]["handle"] = "hs-1"
     copied["hidden_states_path"] = "/wrong"
     with pytest.raises(ValueError, match="exactly one"):
+        validate_reference_tag(copied)
+
+
+def test_reference_tag_owns_nested_source_metadata_and_feature_contract():
+    tag = _tag()
+    tag["request"]["source_metadata"] = {"nested": {"values": [1, 2]}}
+    tag["feature_contract"]["target_layer_ids"] = [0, 1]
+    copied = make_reference_tag(
+        SampleMetadata.from_dict(tag), path=tag["hidden_states_path"],
+        request=tag["request"], feature_contract=tag["feature_contract"],
+    )
+    tag["request"]["source_metadata"]["nested"]["values"][0] = 99
+    tag["feature_contract"]["target_layer_ids"][0] = 99
+    assert copied["request"]["source_metadata"]["nested"]["values"] == [1, 2]
+    assert copied["feature_contract"]["target_layer_ids"] == [0, 1]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("input_ids", [False, 2, 3]),
+    ("position_ids", [0.5, 1, 2]),
+    ("loss_mask", [0, float("nan"), 1]),
+    ("feature_positions", [1, 9]),
+])
+def test_value_validation_is_deferred_until_full_validation(field, value):
+    from verl_speco.transport.drafter_sample_protocol import validate_reference_envelope
+
+    tag = _tag()
+    tag["request"][field] = value
+    copied = make_reference_tag(
+        SampleMetadata.from_dict(tag), path=tag["hidden_states_path"],
+        request=tag["request"], feature_contract=tag["feature_contract"],
+    )
+    validate_reference_envelope(copied)
+    with pytest.raises(ValueError):
         validate_reference_tag(copied)
