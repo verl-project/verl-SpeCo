@@ -27,14 +27,15 @@ logger = logging.getLogger(__file__)
 
 _PATCHED = False
 _DEFAULT_EXTRA_KEYS = {
-    "_speco_vllm_spec_decode_accepted_tokens",
-    "_speco_vllm_spec_decode_drafts",
-    "turn_scores",
-    "tool_rewards",
-    "min_global_steps",
-    "max_global_steps",
-    "extras",
-    "drafter_sample",
+    "_speco_vllm_spec_decode_accepted_tokens": None,
+    "_speco_vllm_spec_decode_drafts": None,
+    "turn_scores": None,
+    "tool_rewards": None,
+    "min_global_steps": None,
+    "max_global_steps": None,
+    "extras": None,
+    "drafter_sample": None,
+    "_speco_acceptance_engine_fallback": False,
 }
 _CURRENT_GLOBAL_STEPS = contextvars.ContextVar(
     "speco_current_global_steps", default=None
@@ -122,7 +123,7 @@ def _ensure_extra_field_defaults(result: Any) -> Any:
             values: np.ndarray[Any, np.dtype[np.object_]] = np.empty(
                 batch_len, dtype=object
             )
-            values[:] = [None for _ in range(batch_len)]
+            values[:] = [_DEFAULT_EXTRA_KEYS[key] for _ in range(batch_len)]
             non_tensor_batch[key] = values
     return result
 
@@ -176,7 +177,7 @@ def _speco_default_agent_loop_extra_fields(output: Any) -> Any:
     extra_fields = getattr(output, "extra_fields", None)
     if isinstance(extra_fields, dict):
         for key in _DEFAULT_EXTRA_KEYS:
-            extra_fields.setdefault(key, None)
+            extra_fields.setdefault(key, _DEFAULT_EXTRA_KEYS[key])
     return output
 
 
@@ -640,14 +641,14 @@ def install_agent_loop_runtime_patch() -> bool:
             extra_fields = getattr(output, "extra_fields", None)
             if isinstance(extra_fields, dict):
                 for key in _DEFAULT_EXTRA_KEYS:
-                    extra_fields.setdefault(key, None)
+                    extra_fields.setdefault(key, _DEFAULT_EXTRA_KEYS[key])
             result = agent_loop_postprocess(self, output, validate, **kwargs)
             if inspect.isawaitable(result):
                 result = await result
             extra_fields = getattr(result, "extra_fields", None)
             if isinstance(extra_fields, dict):
                 for key in _DEFAULT_EXTRA_KEYS:
-                    extra_fields.setdefault(key, None)
+                    extra_fields.setdefault(key, _DEFAULT_EXTRA_KEYS[key])
             return result
 
         worker_cls._agent_loop_postprocess = speco_agent_loop_postprocess
@@ -663,7 +664,7 @@ def install_agent_loop_runtime_patch() -> bool:
                 extra_fields = getattr(input_item, "extra_fields", None)
                 if isinstance(extra_fields, dict):
                     for key in _DEFAULT_EXTRA_KEYS:
-                        extra_fields.setdefault(key, None)
+                        extra_fields.setdefault(key, _DEFAULT_EXTRA_KEYS[key])
             signature = inspect.signature(postprocess)
             kwargs = {}
             if "input_non_tensor_batch" in signature.parameters:

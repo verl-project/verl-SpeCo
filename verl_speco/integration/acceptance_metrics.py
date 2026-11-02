@@ -59,7 +59,7 @@ def bridge_request_acceptance_counters(fields):
     if pair is None:
         return False
     rounds, accepted = pair
-    fields.pop("_speco_acceptance_engine_fallback", None)
+    fields["_speco_acceptance_engine_fallback"] = False
     fields["spec_num_verify_steps"] = rounds
     fields["spec_num_accepted_tokens"] = accepted
     draft_tokens = fields.get("_speco_vllm_request_draft_tokens")

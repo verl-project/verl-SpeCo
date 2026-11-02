@@ -141,7 +141,7 @@ def test_engine_aggregate_is_not_counted_as_an_exact_request():
     assert request_acceptance_counters(fields) is None
     fields.update(private(2, 3))
     assert bridge_request_acceptance_counters(fields)
-    assert "_speco_acceptance_engine_fallback" not in fields
+    assert fields["_speco_acceptance_engine_fallback"] is False
     assert request_acceptance_counters(fields) == (2, 3)
 
 
@@ -206,7 +206,7 @@ def test_request_summary_replaces_engine_fallback_before_tool_turn_accumulation(
     assert fields["spec_num_verify_steps"] == 4
     assert fields["spec_num_accepted_tokens"] == 0
     assert fields["_verl_request_mean_accept_len"] == 1
-    assert "_speco_acceptance_engine_fallback" not in fields
+    assert fields["_speco_acceptance_engine_fallback"] is False
     assert bridge_request_acceptance_counters(fields)  # Replacement is idempotent.
     assert fields["spec_num_verify_steps"] == 4
 
