@@ -30,6 +30,25 @@ import sglang.srt.entrypoints.engine
 from sglang.srt.utils import MultiprocessingSerializer
 
 from verl_speco.integration.drafter_config_env import get_drafter_config_env
+from verl_speco.integration.sglang_hidden_state_stream import (
+    VERL_HIDDEN_STATES_STREAM_FINAL_ATTR as _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR,
+)
+from verl_speco.integration.sglang_hidden_state_stream import (
+    patch_sglang_accumulator_accept_source,
+    sglang_accumulator_patch_globals,
+)
+from verl_speco.integration.sglang_hidden_state_stream import (
+    sglang_req_should_stream_hidden_states as _sglang_req_should_stream_hidden_states,
+)
+from verl_speco.integration.sglang_patch_controls import (
+    DISABLE_SGLANG_PATCH_ENV as _DISABLE_SGLANG_PATCH_ENV,
+)
+from verl_speco.integration.sglang_patch_controls import (
+    env_flag_enabled as _env_flag_enabled,
+)
+from verl_speco.integration.sglang_patch_controls import (
+    sglang_verl_patches_disabled as _sglang_verl_patches_disabled,
+)
 from verl_speco.integration.sglang_adapter import (
     _call_flashinfer_plan_with_abi_compat,
 )
@@ -67,7 +86,6 @@ _DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_TOPK_ENV = (
 _DRAFTER_RAW_TOP_LOGPROBS_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS"
 _DRAFTER_RAW_TOP_LOGPROBS_TOPK_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS_TOPK"
 _SGLANG_RETURN_ORIGINAL_LOGPROB_ENV = "SGLANG_RETURN_ORIGINAL_LOGPROB"
-_DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
 _SGLANG_BASE_COMPAT_PATCHES_ENV = "VERL_SGLANG_BASE_COMPAT_PATCHES"
 
@@ -113,7 +131,6 @@ _VERL_HIDDEN_STATE_PROMPT_LEN_PARAM = "_verl_prompt_len"
 _VERL_HIDDEN_STATE_WINDOW_START_PARAM = "_verl_hidden_state_window_start"
 _VERL_HIDDEN_STATE_WINDOW_END_PARAM = "_verl_hidden_state_window_end"
 _VERL_HIDDEN_STATE_METADATA_MARKER = "__verl_hidden_state_metadata__"
-_VERL_HIDDEN_STATES_STREAM_FINAL_ATTR = "_verl_hidden_states_stream_final"
 _VERL_DRAFTER_RETURN_LAST_HIDDEN_PARAM = "_verl_drafter_return_last_hidden"
 _VERL_DRAFTER_RAW_TOP_LOGPROBS_PARAM = "_verl_drafter_raw_top_logprobs"
 _VERL_DRAFTER_RAW_TOP_LOGPROBS_REQUESTED_ATTR = (
@@ -915,18 +932,6 @@ def _is_sglang_npu_backend() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def _env_flag_enabled(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "on", "yes", "y"}:
-        return True
-    if normalized in {"0", "false", "off", "no", "n", ""}:
-        return False
-    return default
-
-
 def _sglang_npu_eagle_force_fp32_sampling_enabled() -> bool:
     return _env_flag_enabled(_EAGLE_FORCE_FP32_SAMPLING_ENV, default=False)
 
@@ -1147,10 +1152,6 @@ def _triton_ascend_available() -> bool:
 
 def _sglang_npu_eagle_top_k_renorm_fast_path_enabled() -> bool:
     return _env_flag_enabled(_EAGLE_TOP_K_RENORM_FAST_PATH_ENV, default=False)
-
-
-def _sglang_verl_patches_disabled() -> bool:
-    return _env_flag_enabled(_DISABLE_SGLANG_PATCH_ENV, default=False)
 
 
 def _normalize_sglang_patch_selection(raw_value: str | None) -> set[str] | None:
@@ -4476,15 +4477,6 @@ def _finish_sglang_hidden_state_capture(req, batch=None) -> None:
     _refresh_sglang_batch_return_hidden_states(batch)
 
 
-def _sglang_req_should_stream_hidden_states(req) -> bool:
-    if getattr(req, _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR, False):
-        try:
-            return bool(req.finished())
-        except Exception:  # noqa: BLE001
-            return False
-    return bool(getattr(req, "return_hidden_states", False))
-
-
 def _append_sglang_hidden_state_chunk_with_budget(
     req,
     chunk,
@@ -5553,13 +5545,6 @@ _SGLANG_STREAM_HIDDEN_STATES_PATTERN = re.compile(
     r"(?P=indent)[ \t]+[ \t]+output_hidden_states\s*=\s*\[\]\r?\n"
     r"(?P=indent)[ \t]+output_hidden_states\.append\(req\.hidden_states\)\r?\n",
 )
-# Newer SGLang moved stream output into
-# scheduler_components/output_streamer._GenerationStreamAccumulator.accept, whose
-# hidden-state block is `if req.return_hidden_states: self.output_hidden_states.append(...)`.
-_SGLANG_ACCUMULATOR_HIDDEN_STATES_PATTERN = re.compile(
-    r"(?ms)^(?P<indent>[ \t]+)if\s+req\.return_hidden_states\s*:\r?\n"
-    r"(?P=indent)[ \t]+self\.output_hidden_states\.append\(req\.hidden_states\)\r?\n",
-)
 
 
 def _replace_sglang_hidden_states_list_output(source: str) -> tuple[str, int]:
@@ -6427,30 +6412,13 @@ def patch_sglang_dflash_verify_hidden_states() -> None:
     logger.warning("SGLang DFlash verify hidden-state patch active")
 
 
-def _render_sglang_accumulator_hidden_states(match: re.Match[str]) -> str:
-    indent = match.group("indent")
-    inner = indent + "    "
-    return (
-        f"{indent}if _sglang_req_should_stream_hidden_states(req):\n"
-        f"{inner}if not self.output_hidden_states:\n"
-        f"{inner}    self.output_hidden_states = [[] for _ in range(len(self.rids) - 1)]\n"
-        f"{inner}self.output_hidden_states.append(req.hidden_states)\n"
-        f"{indent}elif self.output_hidden_states:\n"
-        f"{inner}self.output_hidden_states.append([])\n"
-    )
-
-
 def patch_sglang_stream_accumulator_hidden_states() -> None:
-    """Keep ``_GenerationStreamAccumulator.output_hidden_states`` aligned with ``rids``.
+    """Fix hidden-state delivery in ``_GenerationStreamAccumulator.accept``.
 
-    Newer SGLang moved stream output into
-    ``sglang.srt.managers.scheduler_components.output_streamer._GenerationStreamAccumulator``,
-    whose ``accept`` appends to ``output_hidden_states`` only for requests that set
-    ``return_hidden_states``. The tokenizer manager then indexes
-    ``output_hidden_states[i]`` by full-batch position, so a partial (drafter-only)
-    collection produces a list shorter than ``rids`` and raises ``IndexError``. This
-    patch pads non-collected positions with ``[]`` so the list length always matches
-    ``rids`` (or stays empty -> ``None`` and the consumer guard short-circuits).
+    Keeps ``output_hidden_states`` aligned with ``rids`` in mixed batches and delivers
+    collected chunks when a request finishes after its capture window completed. Handles
+    both the SGLang build in the ROCm image and public SGLang 0.5.16; see
+    ``verl_speco.integration.sglang_hidden_state_stream`` for the source shapes.
     """
     global _SGLANG_STREAM_ACCUMULATOR_HIDDEN_STATES_PATCHED
     if _SGLANG_STREAM_ACCUMULATOR_HIDDEN_STATES_PATCHED:
@@ -6476,20 +6444,16 @@ def patch_sglang_stream_accumulator_hidden_states() -> None:
         logger.warning("Skip SGLang stream accumulator hidden-state patch: %s", exc)
         return
 
-    patched_source, count = _SGLANG_ACCUMULATOR_HIDDEN_STATES_PATTERN.subn(
-        _render_sglang_accumulator_hidden_states, source, count=1
-    )
-    if count <= 0 or patched_source == source:
+    patched_source = patch_sglang_accumulator_accept_source(source)
+    if patched_source is None:
         logger.warning(
-            "SGLang stream accumulator hidden-state append block not found; "
-            "drafter hidden-state alignment patch not applied."
+            "SGLang stream accumulator hidden-state block matches neither the ROCm image "
+            "build nor SGLang 0.5.16; drafter hidden states may be dropped or misaligned."
         )
         return
 
     globals_dict = original_method.__globals__
-    globals_dict["_sglang_req_should_stream_hidden_states"] = (
-        _sglang_req_should_stream_hidden_states
-    )
+    globals_dict.update(sglang_accumulator_patch_globals())
     namespace: dict[str, Any] = {}
     exec(  # noqa: S102
         "from __future__ import annotations\n" + patched_source,
