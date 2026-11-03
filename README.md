@@ -135,9 +135,11 @@ and the strided decode layout (0.5.14 onwards). The regression tests run the
 patch on the vendored upstream sources in `tests/integration/sglang_sources/`.
 If no known layout is found, collection fails when the SGLang server starts
 instead of training on misaligned rows. SGLang 0.5.14 removed the spec-v1
-DFlash worker, and its DFlash v2 worker returns no hidden states, so SGLang
-DFlash training with hidden-state collection needs 0.5.12 or 0.5.13 and fails
-closed on 0.5.14 onwards. On those versions, set
+DFlash worker. Its DFlash v2 worker writes the target hidden states into the
+draft KV cache and then drops them, so the overlay also patches
+`DFlashWorkerV2` to return them when a request asks for them. If neither the
+spec-v1 verify nor the v2 worker can be patched, DFlash collection fails
+closed; set
 `actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_sgl=false`
 to capture the hidden states from the FSDP forward instead.
 

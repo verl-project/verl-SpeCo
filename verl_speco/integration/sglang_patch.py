@@ -6570,17 +6570,20 @@ def patch_sglang_dflash_verify_hidden_states() -> None:
 
     original_method = getattr(verify_cls, "verify", None)
     if original_method is None:
+        # sgl-project/sglang 3ffe725 (#27977, v0.5.14 onwards) removed the spec-v1
+        # DFlash verify. The spec-v2 worker keeps the target hidden states only
+        # until it has written them into the draft KV cache; patch it instead.
+        if patch_sglang_dflash_v2_worker_hidden_states():
+            _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = True
+            return
         if _sglang_drafter_collects_hidden_states_from_sgl(algorithm="DFLASH"):
-            # sgl-project/sglang 3ffe725 (#27977, v0.5.14 onwards) removed the spec-v1
-            # DFlash verify; the spec-v2 DFlash worker drops the target hidden
-            # states (logits_output.hidden_states = None) before the scheduler
-            # sees them, so nothing would be collected.
             raise RuntimeError(
                 "Cannot collect DFlash drafter hidden states from this SGLang build: "
-                "DFlashVerifyInput.verify is missing (spec-v2-only DFlash, SGLang "
-                "v0.5.14 onwards), and its DFlash worker does not return target hidden "
-                "states. Set drafter training.collect_hidden_states_from_sgl=False to "
-                "collect them from the FSDP forward instead."
+                "DFlashVerifyInput.verify is missing and the spec-v2 DFlash worker "
+                "(sglang.srt.speculative.dflash_worker_v2.DFlashWorkerV2) could not "
+                "be patched to return the target hidden states. Set drafter "
+                "training.collect_hidden_states_from_sgl=False to collect them from "
+                "the FSDP forward instead."
             )
         logger.debug(
             "Skip SGLang DFlash verify hidden-state patch: DFlashVerifyInput.verify missing"
@@ -6595,6 +6598,94 @@ def patch_sglang_dflash_verify_hidden_states() -> None:
     setattr(verify_cls, "verify", patched_method)
     _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = True
     logger.warning("SGLang DFlash verify hidden-state patch active")
+
+
+_SGLANG_DFLASH_V2_TARGET_HIDDEN_ATTR = "_verl_dflash_v2_target_hidden"
+
+
+def patch_sglang_dflash_v2_worker_hidden_states() -> bool:
+    """Return the DFlash spec-v2 target hidden states to the output processor.
+
+    ``DFlashWorkerV2.forward_batch_generation`` (sgl-project/sglang v0.5.14 onwards)
+    captures the target's DFlash aux hidden states, writes them into the draft KV
+    cache through ``_append_target_hidden_to_draft_kv_by_loc`` and then sets
+    ``logits_output.hidden_states = None``. For a batch with a request that asks
+    for DFlash aux hidden states, this keeps the tensor passed to that method and
+    puts it back on the result:
+
+    - prefill: ``[sum(extend_lens), D]``, packed per request in batch order;
+    - decode: ``[bs * block_size, D]``, request ``i`` at ``i * block_size``, which
+      is the strided layout the batch result processor slices with
+      ``speculative_num_draft_tokens = block_size`` and ``accept_lens``.
+
+    Returns True when the worker is patched (or already was).
+    """
+    try:
+        module = importlib.import_module("sglang.srt.speculative.dflash_worker_v2")
+        worker_cls = getattr(module, "DFlashWorkerV2")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang DFlash v2 hidden-state patch: %s", exc)
+        return False
+    append_method = getattr(
+        worker_cls, "_append_target_hidden_to_draft_kv_by_loc", None
+    )
+    forward_method = getattr(worker_cls, "forward_batch_generation", None)
+    if append_method is None or forward_method is None:
+        logger.debug(
+            "Skip SGLang DFlash v2 hidden-state patch: DFlashWorkerV2 has no "
+            "_append_target_hidden_to_draft_kv_by_loc / forward_batch_generation"
+        )
+        return False
+    if getattr(forward_method, "_verl_patched_dflash_v2_hidden_states", False):
+        return True
+
+    @wraps(append_method)
+    def append_target_hidden(self, *args, **kwargs):
+        if getattr(self, _SGLANG_DFLASH_V2_TARGET_HIDDEN_ATTR, None) is not None:
+            target_hidden = kwargs.get("target_hidden", args[0] if args else None)
+            setattr(self, _SGLANG_DFLASH_V2_TARGET_HIDDEN_ATTR, [target_hidden])
+        return append_method(self, *args, **kwargs)
+
+    @wraps(forward_method)
+    def forward_batch_generation(self, *args, **kwargs):
+        # v0.5.14 names the argument model_worker_batch; later releases, batch.
+        batch = (
+            args[0] if args else kwargs.get("batch", kwargs.get("model_worker_batch"))
+        )
+        if not _sglang_forward_batch_requests_dflash_aux_hidden(batch):
+            return forward_method(self, *args, **kwargs)
+        # A one-slot list marks "capture on"; the append wrapper fills it.
+        setattr(self, _SGLANG_DFLASH_V2_TARGET_HIDDEN_ATTR, [None])
+        try:
+            result = forward_method(self, *args, **kwargs)
+            captured = getattr(self, _SGLANG_DFLASH_V2_TARGET_HIDDEN_ATTR)[0]
+        finally:
+            setattr(self, _SGLANG_DFLASH_V2_TARGET_HIDDEN_ATTR, None)
+        logits_output = getattr(result, "logits_output", None)
+        if logits_output is None:
+            return result
+        if captured is None:
+            logger.warning(
+                "SGLang DFlash v2 hidden states requested but not captured: "
+                "forward_mode=%s",
+                getattr(batch, "forward_mode", None),
+            )
+            return result
+        if getattr(logits_output, "hidden_states", None) is None:
+            logits_output.hidden_states = _normalize_sglang_dflash_aux_hidden_states(
+                captured
+            )
+        return result
+
+    for wrapper in (append_target_hidden, forward_batch_generation):
+        setattr(wrapper, "_verl_patched_dflash_v2_hidden_states", True)
+    setattr(worker_cls, _SGLANG_DFLASH_V2_TARGET_HIDDEN_ATTR, None)
+    setattr(
+        worker_cls, "_append_target_hidden_to_draft_kv_by_loc", append_target_hidden
+    )
+    setattr(worker_cls, "forward_batch_generation", forward_batch_generation)
+    logger.warning("SGLang DFlash v2 worker hidden-state patch active")
+    return True
 
 
 # Output processors that append per-request hidden-state chunks, oldest first.
