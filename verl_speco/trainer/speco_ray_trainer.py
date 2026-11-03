@@ -1633,6 +1633,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         scheduler = getattr(self, "_drafter_scheduler", None)
         if scheduler is None:
             scheduler = DrafterScheduler()
+            controller = scheduler.configure_adaptive(
+                self._speco_drafter_schedule_config()
+            )
+            if controller is not None:
+                _, resume_folder = self._speco_freeze_state_resume_path()
+                if resume_folder:
+                    controller.restore(Path(resume_folder) / "adaptive_schedule.json")
             self._drafter_scheduler = scheduler
         return scheduler
 

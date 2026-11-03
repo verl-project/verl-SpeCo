@@ -745,3 +745,62 @@ def test_first_adaptive_interval_excludes_all_warmup_trends(early):
     controller.decide_budget(10, 5)
     assert controller.last_interval_trend == pytest.approx(-0.05)
     assert controller.state.budget == 25  # First full interval acts immediately.
+
+
+def test_trainer_resume_restores_adaptive_state_before_first_decision(tmp_path):
+    import os
+    from pathlib import Path
+
+    from test_bubble_review_regressions import _methods
+    from verl_speco.trainer.scheduler.adaptive_schedule import AdaptiveScheduleState
+
+    def get_nested(value, keys, default=None):
+        for key in keys:
+            value = value.get(key, default)
+            if value is default:
+                break
+        return value
+
+    trainer_cls = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
+        {"_speco_get_drafter_scheduler", "_speco_freeze_state_resume_path"},
+        DrafterScheduler=DrafterScheduler,
+        Path=Path,
+        _get_nested=get_nested,
+        os=os,
+    )
+    cfg = schedule_config()
+    saved_state = AdaptiveScheduleState(
+        budget=0,
+        fast=2.0,
+        slow=2.5,
+        observations=3,
+        last_valid_feedback_step=10,
+        interval_trend_history=[[10, 2.0]],
+        warmup_acceptance_history=[2.0, 2.0],
+        warmup_ended_after=5,
+    )
+    checkpoint = tmp_path / "selected" / "global_step_10"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "adaptive_schedule.json").write_text(json.dumps({
+        "schema": 5,
+        "fingerprint": cfg.adaptive_schedule.fingerprint(),
+        "state": asdict(saved_state),
+    }), encoding="utf-8")
+    trainer = trainer_cls()
+    trainer._speco_freeze_state_sidecar = "freeze_policy_state.json"
+    trainer.config = {"trainer": {
+        "resume_mode": "resume_path",
+        "resume_from_path": str(checkpoint),
+        "default_local_dir": str(tmp_path / "other_output"),
+    }}
+    trainer._speco_drafter_schedule_config = lambda: cfg
+
+    scheduler = trainer._speco_get_drafter_scheduler()
+    controller = scheduler.configure_adaptive(cfg)
+    assert controller.state == saved_state
+    assert controller.training_steps(11) == 0
+    controller.state.budget = 3
+    assert trainer._speco_get_drafter_scheduler() is scheduler
+    assert controller.state.budget == 3
