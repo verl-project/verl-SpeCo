@@ -371,10 +371,9 @@ For verl 0.9, use the corresponding files under `docker/verl0.9.0`. The Ascend
 Dockerfile also defaults to 0.8 and accepts
 `--build-arg VERL_REF=release/v0.9.0` for an explicit 0.9 image.
 
-For AMD ROCm GPUs, use the images built from `docker/rocm/Dockerfile.sglang`
-(SGLang 0.5.12, the same release as the GPU SGLang image) and
-`docker/rocm/Dockerfile.vllm` (vLLM on verl's ROCm image). See
-[docs/amd/get_started.md](docs/amd/get_started.md).
+For AMD ROCm GPUs, use the image built from `docker/rocm/Dockerfile.rocm`
+(verl's ROCm 7.14 image with SGLang 0.5.12 and vLLM 0.22.1rc1; one image for
+both engines). See [docs/amd/get_started.md](docs/amd/get_started.md).
 
 Install the rollout engine and accelerator runtime that match the script you
 intend to run, for example vLLM on GPU, SGLang on GPU, or vLLM-Ascend on NPU.
