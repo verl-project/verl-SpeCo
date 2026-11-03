@@ -21,7 +21,7 @@ import os
 import re
 import sys
 import textwrap
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 from typing import Any, Callable, Iterable, TypeGuard, cast
 
@@ -806,7 +806,14 @@ def _patch_sglang_scheduler_weight_update_dispatch() -> bool:
             draft_weight_loader is not None
             and getattr(recv_req, "load_format", None) == draft_weight_loader
         ):
-            with self._observe_weight_load("tensor"):
+            # Older SGLang builds (e.g. 0.5.16 in the ROCm image) have neither
+            # load observation nor weight versions on the manager.
+            observe_weight_load = getattr(self, "_observe_weight_load", None)
+            with (
+                observe_weight_load("tensor")
+                if observe_weight_load is not None
+                else nullcontext()
+            ):
                 scheduler = getattr(self, "scheduler", None)
                 draft_worker = getattr(self, "draft_worker", None) or getattr(
                     scheduler, "draft_worker", None
@@ -838,7 +845,11 @@ def _patch_sglang_scheduler_weight_update_dispatch() -> bool:
                     )(draft_worker, recv_req)
                 if success:
                     self.flush_cache_after_weight_update(recv_req)
-                    self.record_weight_version_after_update(recv_req.weight_version)
+                    record_weight_version = getattr(
+                        self, "record_weight_version_after_update", None
+                    )
+                    if record_weight_version is not None:
+                        record_weight_version(recv_req.weight_version)
                 else:
                     logger.error(message)
                 torch.distributed.barrier(group=self.tp_cpu_group)
