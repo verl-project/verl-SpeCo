@@ -3908,6 +3908,7 @@ class DrafterScheduler:
                 ),
             ),
             require_interval=False,
+            quota_topup=True,
         )
         if full_collective_fallback and not plan.launch:
             # Single-writer collection may intentionally leave the other
@@ -3936,6 +3937,7 @@ class DrafterScheduler:
                     ),
                 ),
                 require_interval=False,
+                quota_topup=True,
             )
         if not plan.launch:
             if (
@@ -4528,6 +4530,7 @@ class DrafterScheduler:
         *,
         require_interval: bool = True,
         idle_continuation: bool = False,
+        quota_topup: bool = False,
     ) -> TrainingPlan:
         controller = self.configure_adaptive(config)
         interval_matched = self.training_opportunity(context.global_step, config).due
@@ -4550,7 +4553,8 @@ class DrafterScheduler:
         )
         budget = (
             AdaptiveTrainingBudgetPolicy(controller).make_budget(context, config)
-            if controller is not None
+            # Existing quota debt must retain its exact top-up budget.
+            if controller is not None and not quota_topup
             else self.sync_budget_policy.make_budget(context, config)
         )
         gradient_accumulation_steps = 1
