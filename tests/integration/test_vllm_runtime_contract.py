@@ -2773,7 +2773,7 @@ def test_vllm_length_stats_accumulate_rounds_and_accepted_tokens():
                 num_drafts=rounds, num_accepted_tokens=accepted,
             )
         ))
-    assert stats == {"drafts": 100, "accepted_tokens": 200}
+    assert stats == {"drafts": 100, "draft_tokens": 0, "accepted_tokens": 200}
 
 
 def test_trainer_drains_async_publish_before_checkpoint_and_validation() -> None:
