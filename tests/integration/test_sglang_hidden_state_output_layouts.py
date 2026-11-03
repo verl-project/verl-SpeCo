@@ -30,6 +30,12 @@ provenance header of each file):
 * ``batch_result_processor_v0_5_16``: the v0.5.16 tag. All decode uses the
   strided extend.
 
+* ``dflash_worker_v2_v0_5_16``: the v0.5.16 DFlash spec-v2 worker (the only
+  DFlash worker from v0.5.14 on). It drops the target hidden states after
+  writing them into the draft KV cache; the tests run its real
+  ``forward_batch_generation`` with the patch and feed the result to the real
+  v0.5.16 processor.
+
 Every layout slices ``len(req.origin_input_ids)`` prefill rows per request,
 which ignores prefix-cache hits.
 
@@ -694,11 +700,12 @@ def test_unmatched_new_layout_fails_closed(monkeypatch, tmp_path, stub_sglang) -
         ({**_DFLASH_COLLECT_CONFIG, "training": {}}, False),
     ],
 )
-def test_dflash_collection_fails_closed_without_spec_v1_verify(
+def test_dflash_collection_fails_closed_without_spec_v1_or_v2_worker(
     monkeypatch, stub_sglang, config, raises
 ) -> None:
-    # SGLang v0.5.16 only has the spec-v2 DFlash worker: DFlashVerifyInput has
-    # no verify(), and the worker sets logits_output.hidden_states = None.
+    # No spec-v1 DFlashVerifyInput.verify (v0.5.14 onwards) and no patchable
+    # spec-v2 worker either.
+    monkeypatch.setitem(sys.modules, "sglang.srt.speculative.dflash_worker_v2", None)
     dflash_info = types.ModuleType(_DFLASH_INFO_MODULE)
     dflash_info.DFlashVerifyInput = type("DFlashVerifyInput", (), {})
     monkeypatch.setitem(sys.modules, _DFLASH_INFO_MODULE, dflash_info)
@@ -706,7 +713,7 @@ def test_dflash_collection_fails_closed_without_spec_v1_verify(
     sglang_patch = _fresh_sglang_patch(monkeypatch)
 
     if raises:
-        with pytest.raises(RuntimeError, match="DFlashVerifyInput.verify is missing"):
+        with pytest.raises(RuntimeError, match="DFlashVerifyInput.verify is missing and the spec-v2"):
             sglang_patch.patch_sglang_dflash_verify_hidden_states()
     else:
         sglang_patch.patch_sglang_dflash_verify_hidden_states()
@@ -732,3 +739,337 @@ def test_block_drafter_sample_requires_contiguous_positions(
 
     tensor = None if positions is None else torch.tensor(positions)
     assert _block_drafter_hidden_alignment_failure(tensor, rows) == reason
+
+
+# --- DFlash spec-v2 worker (v0.5.14 onwards) --------------------------------
+
+_DFLASH_V2_MODULE = "sglang.srt.speculative.dflash_worker_v2"
+_DFLASH_V2_SOURCE = "dflash_worker_v2_v0_5_16.py.txt"
+_DFLASH_V2_CLASS = "DFlashWorkerV2"
+
+
+def _dflash_aux_req(request_id: int, prompt_len: int, cached: int) -> _Req:
+    req = _Req(request_id, prompt_len, cached)
+    req.sampling_params = types.SimpleNamespace(
+        custom_params={"_verl_dflash_return_aux_hidden": True}
+    )
+    return req
+
+
+def test_vendored_dflash_v2_source_is_verbatim() -> None:
+    test_vendored_source_is_verbatim(_DFLASH_V2_SOURCE)
+
+
+def test_dflash_v2_worker_drops_hidden_states_after_draft_kv_append() -> None:
+    """Pin the upstream contract the spec-v2 patch relies on.
+
+    ``forward_batch_generation`` hands the target hidden states to
+    ``_append_target_hidden_to_draft_kv_by_loc(target_hidden=...)`` once for
+    prefill and once for decode, then sets ``logits_output.hidden_states = None``.
+    The decode result reports ``accept_lens=commit_lens`` and
+    ``speculative_num_draft_tokens=int(self.block_size)``, which is the stride
+    the batch result processor slices the restored tensor with.
+    """
+    source = _method_source(_DFLASH_V2_SOURCE, _DFLASH_V2_CLASS, "forward_batch_generation")
+    tree = ast.parse(source)
+    appends = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_append_target_hidden_to_draft_kv_by_loc"
+    ]
+    assert len(appends) == 2
+    assert all(
+        any(keyword.arg == "target_hidden" for keyword in call.keywords)
+        for call in appends
+    )
+    assert source.count("logits_output.hidden_states = None") == 2
+    assert "accept_lens=commit_lens" in source
+    assert "speculative_num_draft_tokens=int(self.block_size)" in source
+
+    _, body = _vendored(_DFLASH_V2_SOURCE)
+    assert "def _append_target_hidden_to_draft_kv_by_loc(" in body
+    assert body.count("._append_target_hidden_to_draft_kv_by_loc(") == 2
+
+
+def _install_dflash_v2(monkeypatch, tmp_path):
+    _, body = _vendored(_DFLASH_V2_SOURCE)
+    source = _stub_sglang_imports(body)
+    # DFlashWorkerV2 subclasses BaseSpecWorker; a stub instance cannot be a base.
+    source = source.replace(
+        "BaseSpecWorker = _SGLangStub(name='BaseSpecWorker')\n",
+        "BaseSpecWorker = object\n",
+    )
+    assert "BaseSpecWorker = object\n" in source
+    module = _load_module(
+        monkeypatch, tmp_path, _DFLASH_V2_MODULE, source, "dflash_worker_v2_v0_5_16"
+    )
+
+    class _DraftInput:
+        bonus_tokens = None
+        reserved_seq_lens_cpu = None
+
+    class _VerifyInput:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        def prepare_for_verify(self, batch, target_worker):
+            return MagicMock(), None
+
+    module.DFlashDraftInputV2 = _DraftInput
+    module.DFlashVerifyInput = _VerifyInput
+    module.GenerationBatchResult = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    module.compute_position = lambda *args, **kwargs: (None, None)
+    # The draft KV write is not under test; record what the worker passes.
+    kv_writes = []
+    monkeypatch.setattr(
+        module.DFlashWorkerV2,
+        "_append_target_hidden_to_draft_kv_by_loc",
+        lambda self, **kwargs: kv_writes.append(kwargs),
+    )
+    for name in (
+        "_validate_phase1_sampling_support",
+        "_ensure_draft_block_buffers",
+    ):
+        monkeypatch.setattr(module.DFlashWorkerV2, name, lambda self, *a, **k: None)
+    monkeypatch.setattr(
+        module.DFlashWorkerV2,
+        "_make_next_draft_input_prefill",
+        lambda self, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        module.DFlashWorkerV2,
+        "_make_next_draft_input_decode",
+        lambda self, **kwargs: None,
+    )
+    # CPU tensors cannot record a CUDA stream.
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None, raising=False)
+    return module, _DraftInput, kv_writes
+
+
+class _Mode:
+    def __init__(self, extend: bool) -> None:
+        self.extend = extend
+
+    def is_extend(self) -> bool:
+        return self.extend
+
+    def is_idle(self) -> bool:
+        return False
+
+
+def _dflash_v2_worker(module, *, bs: int, prefill_hidden=None, verify_hidden=None):
+    worker = module.DFlashWorkerV2.__new__(module.DFlashWorkerV2)
+    block = _STRIDE
+    worker.device = "cpu"
+    worker.block_size = block
+    worker._mask_token_id = 0
+    worker._use_triton_prepare_block = False
+    worker._use_triton_accept_bonus = False
+    worker._need_mamba_verify_commit = False
+    worker.use_compact_draft_cache = False
+    worker._draft_sampler = None
+    worker._draft_block_spec_info = None
+    worker._block_pos_offsets = torch.arange(block)
+    worker._draft_block_ids_buf = torch.zeros((bs, block), dtype=torch.long)
+    worker._draft_block_positions_buf = torch.zeros((bs, block), dtype=torch.long)
+    worker._draft_block_tokens_buf = torch.zeros((bs, block), dtype=torch.long)
+    worker._draft_verify_out_cache_loc_buf = torch.zeros((bs, block), dtype=torch.long)
+    worker._draft_block_end_buf = torch.zeros(bs, dtype=torch.long)
+    worker._draft_seq_lens_cpu_buf = torch.zeros(bs, dtype=torch.int32)
+    worker._greedy_sample_from_vocab_parallel_head = lambda hidden_states, lm_head: (
+        torch.zeros(hidden_states.shape[0], dtype=torch.long)
+    )
+
+    target_model = MagicMock()
+    target_model.get_input_embeddings.return_value = lambda ids: torch.zeros(
+        (*ids.shape, 2)
+    )
+    worker.target_worker = MagicMock()
+    worker.target_worker.model_runner.model = target_model
+    worker.model_runner = MagicMock()
+    worker.draft_model_runner = MagicMock()
+    worker.draft_model_runner.forward.return_value = types.SimpleNamespace(
+        logits_output=types.SimpleNamespace(hidden_states=torch.zeros((bs * block, 2))),
+        can_run_graph=False,
+    )
+
+    def target_forward(*args, **kwargs):
+        if "capture_hidden_mode" in kwargs:
+            return types.SimpleNamespace(
+                logits_output=types.SimpleNamespace(
+                    hidden_states=prefill_hidden, customized_info=None
+                ),
+                next_token_ids=torch.zeros(bs, dtype=torch.long),
+            )
+        return types.SimpleNamespace(
+            logits_output=types.SimpleNamespace(
+                hidden_states=verify_hidden,
+                next_token_logits=torch.zeros((bs * block, 8)),
+                customized_info=None,
+            ),
+            can_run_cuda_graph=False,
+        )
+
+    worker.target_worker.forward_batch_generation.side_effect = target_forward
+    module.assign_extend_cache_locs_func = lambda **kwargs: torch.zeros(
+        bs * block, dtype=torch.long
+    )
+    return worker
+
+
+def _dflash_v2_batch(reqs, draft_input_cls, *, extend: bool, prefix_lens=None):
+    batch = _Batch(reqs, extend_lens=[req.extend_input_len for req in reqs])
+    batch.is_spec_v2 = True
+    batch.forward_mode = _Mode(extend)
+    batch.is_extend_in_batch = extend
+    batch.return_logprob = False
+    batch.prefix_lens = [len(req.origin_input_ids) - req.extend_input_len for req in reqs]
+    batch.out_cache_loc = torch.zeros(sum(batch.extend_lens), dtype=torch.long)
+    batch.sampling_info = None
+    batch.req_pool_indices = torch.arange(len(reqs))
+    batch.seq_lens_cpu = None
+    batch.seq_lens_sum = 0
+    if extend:
+        batch.seq_lens = torch.tensor([len(req.origin_input_ids) for req in reqs])
+    else:
+        batch.seq_lens = torch.tensor(prefix_lens)
+        draft_input = draft_input_cls()
+        draft_input.bonus_tokens = torch.zeros(len(reqs), dtype=torch.long)
+        batch.spec_info = draft_input
+    return batch
+
+
+def test_dflash_v2_worker_returns_hidden_states_per_request(
+    monkeypatch, tmp_path, stub_sglang
+) -> None:
+    """Real v0.5.16 DFlash spec-v2 worker feeding the real v0.5.16 processor."""
+    monkeypatch.setenv("VERL_SPECO_DRAFTER_CONFIG", json.dumps(_DFLASH_COLLECT_CONFIG))
+    sglang_patch = _import_sglang_patch(monkeypatch)
+    processor_module = _install_vendored(
+        monkeypatch, tmp_path, _NEW_MODULE, _V0_5_16_SOURCE
+    )
+    worker_module, draft_input_cls, kv_writes = _install_dflash_v2(monkeypatch, tmp_path)
+    sglang_patch.patch_sglang_hidden_states_tensor_output()
+    assert sglang_patch.patch_sglang_dflash_v2_worker_hidden_states()
+    processor_cls = processor_module.SchedulerBatchResultProcessor
+
+    reqs = [_dflash_aux_req(0, 6, 0), _dflash_aux_req(1, 9, 5), _dflash_aux_req(2, 3, 0)]
+    prefill_rows = torch.tensor(
+        [
+            _ref_row(req.request_id, pos)
+            for req in reqs
+            for pos in range(
+                len(req.origin_input_ids) - req.extend_input_len,
+                len(req.origin_input_ids),
+            )
+        ]
+    )
+    worker = _dflash_v2_worker(worker_module, bs=len(reqs), prefill_hidden=prefill_rows)
+    batch = _dflash_v2_batch(reqs, draft_input_cls, extend=True)
+    result = worker.forward_batch_generation(batch)
+    # The worker wrote the same tensor into the draft KV cache.
+    assert kv_writes[-1]["target_hidden"] is prefill_rows
+    assert torch.equal(result.logits_output.hidden_states, prefill_rows)
+    result.extend_input_len_per_req = None
+    result.extend_logprob_start_len_per_req = None
+    result.copy_done = None
+    result.routed_experts_output = None
+    result.indexer_topk_output = None
+    result.can_run_cuda_graph = False
+    processor_cls.process_batch_result_prefill(_processor_self(), batch, result)
+
+    next_positions = {req.request_id: len(req.origin_input_ids) for req in reqs}
+    for commit_lens in ([3, 1, 4], [1, 4, 2], [2, 2, 1]):
+        # [bs * block_size, D]: request i owns rows i * block_size onward, at
+        # positions seq_len .. seq_len + block_size - 1. Rows past the commit
+        # length are rejected drafts.
+        rows = [_FILLER_ROW] * (_STRIDE * len(reqs))
+        for index, (req, commit) in enumerate(zip(reqs, commit_lens, strict=True)):
+            for offset in range(commit):
+                rows[index * _STRIDE + offset] = _ref_row(
+                    req.request_id, next_positions[req.request_id] + offset
+                )
+        verify_hidden = torch.tensor(rows)
+        worker = _dflash_v2_worker(
+            worker_module, bs=len(reqs), verify_hidden=verify_hidden
+        )
+        accept = torch.tensor([commit - 1 for commit in commit_lens])
+        worker_module.compute_dflash_correct_drafts_and_bonus = (
+            lambda candidates, target_predict, accept=accept: (
+                accept,
+                torch.zeros(len(accept), dtype=torch.long),
+            )
+        )
+        batch = _dflash_v2_batch(
+            reqs,
+            draft_input_cls,
+            extend=False,
+            prefix_lens=[next_positions[req.request_id] for req in reqs],
+        )
+        result = worker.forward_batch_generation(batch)
+        assert kv_writes[-1]["commit_lens"].tolist() == commit_lens
+        assert torch.equal(result.logits_output.hidden_states, verify_hidden)
+        assert result.speculative_num_draft_tokens == _STRIDE
+        for req, commit in zip(reqs, commit_lens, strict=True):
+            next_positions[req.request_id] += commit
+        processor_cls.process_batch_result_decode(
+            _processor_self([[0] * commit for commit in commit_lens]),
+            batch,
+            _Result(
+                result.logits_output,
+                accept_lens=result.accept_lens.tolist(),
+                speculative_num_draft_tokens=result.speculative_num_draft_tokens,
+            ),
+        )
+
+    for req in reqs:
+        cached = len(req.origin_input_ids) - req.extend_input_len
+        expected_positions = list(range(cached, next_positions[req.request_id]))
+        expected_rows = torch.tensor(
+            [_ref_row(req.request_id, pos) for pos in expected_positions]
+        )
+        rows, positions = _collected(req)
+        assert positions.tolist() == expected_positions, req.rid
+        assert torch.equal(rows, expected_rows), req.rid
+
+
+def test_dflash_v2_worker_keeps_upstream_behaviour_without_request(
+    monkeypatch, tmp_path, stub_sglang
+) -> None:
+    monkeypatch.setenv("VERL_SPECO_DRAFTER_CONFIG", json.dumps(_DFLASH_COLLECT_CONFIG))
+    sglang_patch = _import_sglang_patch(monkeypatch)
+    worker_module, draft_input_cls, kv_writes = _install_dflash_v2(monkeypatch, tmp_path)
+    assert sglang_patch.patch_sglang_dflash_v2_worker_hidden_states()
+    # Patching twice keeps a single wrapper.
+    forward = worker_module.DFlashWorkerV2.forward_batch_generation
+    assert sglang_patch.patch_sglang_dflash_v2_worker_hidden_states()
+    assert worker_module.DFlashWorkerV2.forward_batch_generation is forward
+
+    reqs = [_Req(0, 4, 0), _dflash_aux_req(1, 3, 0)]
+    reqs[1].return_hidden_states = False  # asked for aux, but not for hidden states
+    prefill_rows = torch.ones((7, _HIDDEN_DIM))
+    worker = _dflash_v2_worker(worker_module, bs=2, prefill_hidden=prefill_rows)
+    result = worker.forward_batch_generation(
+        _dflash_v2_batch(reqs, draft_input_cls, extend=True)
+    )
+    assert kv_writes[-1]["target_hidden"] is prefill_rows
+    assert result.logits_output.hidden_states is None
+    assert getattr(worker, "_verl_dflash_v2_target_hidden") is None
+
+
+def test_dflash_verify_patch_uses_v2_worker_without_spec_v1_verify(
+    monkeypatch, tmp_path, stub_sglang
+) -> None:
+    dflash_info = types.ModuleType(_DFLASH_INFO_MODULE)
+    dflash_info.DFlashVerifyInput = type("DFlashVerifyInput", (), {})
+    monkeypatch.setitem(sys.modules, _DFLASH_INFO_MODULE, dflash_info)
+    monkeypatch.setenv("VERL_SPECO_DRAFTER_CONFIG", json.dumps(_DFLASH_COLLECT_CONFIG))
+    sglang_patch = _fresh_sglang_patch(monkeypatch)
+    worker_module, _, _ = _install_dflash_v2(monkeypatch, tmp_path)
+
+    sglang_patch.patch_sglang_dflash_verify_hidden_states()
+
+    assert sglang_patch._SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED
+    assert worker_module.DFlashWorkerV2.forward_batch_generation._verl_patched_dflash_v2_hidden_states
