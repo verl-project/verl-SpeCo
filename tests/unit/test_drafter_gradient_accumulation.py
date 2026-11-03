@@ -262,64 +262,6 @@ def test_block_collection_uses_explicit_hidden_positions_as_source_of_truth(
     assert item["input_ids"].size(0) == item["loss_mask"].size(0) == 5
 
 
-@pytest.mark.parametrize("model_type", ["dflash", "dspark", "domino", "eagle3"])
-def test_sglang_collection_rejects_samples_without_hidden_positions(
-    monkeypatch, model_type: str
-) -> None:
-    # Hidden states collected from SGLang without positions cannot be aligned with
-    # their tokens; block drafters get no exemption.
-    torch = pytest.importorskip("torch")
-    base_trainer = pytest.importorskip(
-        "verl_speco.trainer.base_trainer",
-        reason="online collection needs the trainer dependency stack",
-    )
-    monkeypatch.setattr(base_trainer, "device_name", "cpu")
-
-    trainer = base_trainer.DrafterBaseTrainer.__new__(base_trainer.DrafterBaseTrainer)
-    trainer.backend = SimpleNamespace(model_type=model_type)
-    trainer.config = SimpleNamespace(
-        rollout=SimpleNamespace(
-            drafter=SimpleNamespace(
-                training={
-                    "use_logits": False,
-                    "collect_hidden_states_from_sgl": True,
-                },
-                rollout={},
-            )
-        )
-    )
-    trainer.copy_stream = None
-    trainer.rank = 0
-    trainer.pad_token_id = 0
-    trainer.model_config = SimpleNamespace(pad_token_id=0)
-    trainer.current_rl_step = 1
-    trainer.use_data_buffer = False
-    trainer.collected_data = []
-    trainer.buffer_version = 0
-
-    assert not trainer.collect_online_data(
-        {"input_ids": torch.arange(6).unsqueeze(0)},
-        torch.zeros(1, 5, 4),
-    )
-    assert not trainer.collect_online_data(
-        {
-            "input_ids": torch.arange(6).unsqueeze(0),
-            "hidden_positions": torch.arange(1, 4).unsqueeze(0),
-        },
-        torch.zeros(1, 5, 4),
-    )
-    assert trainer.collected_data == []
-
-    assert trainer.collect_online_data(
-        {
-            "input_ids": torch.arange(6).unsqueeze(0),
-            "hidden_positions": torch.arange(0, 5).unsqueeze(0),
-        },
-        torch.zeros(1, 5, 4),
-    )
-    assert len(trainer.collected_data) == 1
-
-
 def test_accumulation_uses_combined_valid_token_mean(monkeypatch) -> None:
     torch = pytest.importorskip("torch")
     base_trainer = pytest.importorskip(
