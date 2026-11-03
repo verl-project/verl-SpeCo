@@ -155,6 +155,7 @@ def _oldlogprob_plan_batch(batch_size: int, *, non_tensor_batch=None):
 
 def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
     trainer = SpecoRayPPOTrainer.__new__(SpecoRayPPOTrainer)
+    trainer._speco_freeze_state_sidecar = "speco_drafter_freeze_state.json"
     trainer.global_steps = step
     trainer.config = SimpleNamespace(
         actor_rollout_ref=SimpleNamespace(
