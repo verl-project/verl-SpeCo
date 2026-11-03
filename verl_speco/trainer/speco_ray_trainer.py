@@ -543,7 +543,8 @@ def _speco_vllm_spec_decode_stats_from_batch(
     total_drafts = float(sum(drafts))
     total_accepted_tokens = float(sum(accepted_tokens))
     if (
-        math.isfinite(total_drafts)
+        len(drafts) == len(accepted_tokens)
+        and math.isfinite(total_drafts)
         and math.isfinite(total_accepted_tokens)
         and total_drafts > 0.0
         and total_accepted_tokens >= 0.0
@@ -9432,9 +9433,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     self._speco_freeze_save_state()
                 with boundary_stage(timings, "upstream_save"):
                     result = super()._save_checkpoint()
-            controller = self._speco_get_drafter_scheduler().configure_adaptive(
-                self._speco_drafter_schedule_config()
-            )
+            scheduler = getattr(self, "_drafter_scheduler", None)
+            controller = getattr(scheduler, "adaptive_controller", None)
             if controller is not None:
                 root = _get_nested(self.config, ("trainer", "default_local_dir"), None)
                 if root:

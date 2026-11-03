@@ -90,7 +90,12 @@ def test_adaptive_checkpoint_round_trip_through_trainer_hooks(tmp_path, monkeypa
     trainer._save_checkpoint()
     assert (tmp_path / "global_step_7" / "adaptive_schedule.json").is_file()
     resumed = _trainer(cfg, step=7)
-    resumed.config.trainer = trainer.config.trainer
+    resumed.config.trainer = SimpleNamespace(
+        default_local_dir=str(tmp_path), resume_mode="resume_path",
+        resume_from_path=str(tmp_path / "global_step_7"),
+    )
+    # The fixture initializes the scheduler before the resume settings are assigned.
+    del resumed._drafter_scheduler
     assert resumed._speco_get_drafter_scheduler().adaptive_controller.state == controller.state
 
 

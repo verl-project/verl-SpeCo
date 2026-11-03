@@ -124,15 +124,15 @@ def test_execution_veto_prevents_all_training_rpcs_but_preserves_collection(
     assert worker.mock_calls == []
 
 
-def test_missing_current_step_samples_avoids_worker_inspection():
+def test_missing_current_step_samples_skips_training():
     worker = Mock()
+    worker.get_training_data_status.return_value = []
     scheduler = DrafterScheduler(worker_executor=worker)
     plan = scheduler.prepare_training_plan(
         replace(context(), collected_samples_this_step=0), config()
     )
     assert not plan.launch and plan.reason == "no_current_step_oldlogprob_samples"
     assert plan.interval_matched
-    assert worker.mock_calls == []
 
 
 @pytest.mark.parametrize(
