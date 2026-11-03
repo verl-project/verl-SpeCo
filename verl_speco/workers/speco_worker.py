@@ -1407,7 +1407,7 @@ class SpecoWorker(Worker):
     @register(
         dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
     )
-    def collect_rollout_features(self, samples: list[dict]):
+    async def collect_rollout_features(self, samples: list[dict]):
         # [SFT-VERIFY] 验证数据收集
         logger.warning(
             f"[SFT-VERIFY] Rank={self.rank}: received {len(samples)} samples, trainer_exists={self.trainer is not None}, in_drafter_train_group={self.in_drafter_train_group}"
@@ -1479,14 +1479,16 @@ class SpecoWorker(Worker):
                     if torch.is_tensor(hidden_positions):
                         hidden_positions = cast(torch.Tensor, hidden_positions)
                         expected_rows = int(hidden_positions.numel())
-                    hidden = _resolve_hidden_state_chunks(
+                    hidden = await _resolve_hidden_state_chunks(
                         hidden_chunks, expected_rows=expected_rows
                     )
                 else:
-                    hidden = _resolve_ray_object_ref(sample.get("hidden_states_ref"))
+                    hidden = await _resolve_ray_object_ref(
+                        sample.get("hidden_states_ref")
+                    )
             target_logprobs = sample.get("target_logprobs")
             if target_logprobs is None:
-                target_logprobs = _resolve_ray_object_ref(
+                target_logprobs = await _resolve_ray_object_ref(
                     sample.get("target_logprobs_ref")
                 )
             if hidden is None:
