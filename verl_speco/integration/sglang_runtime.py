@@ -597,13 +597,18 @@ def _nonnegative_int(value: Any, default: int = 0) -> int:
 def _block_drafter_hidden_alignment_failure(
     hidden_positions: Any, hidden_rows: int
 ) -> str | None:
-    """Return why a block-drafter (DFlash) hidden-state sample is unusable.
+    """Return why a block-drafter (DFlash) hidden-state sample is malformed.
 
-    Block drafters consume a contiguous run of target hidden states. Every row
-    collected by the SGLang output patch carries its token position; a sample
-    without positions, with a different number of positions than rows, or with
-    a position gap was not split per request and would train the drafter on
-    hidden states that belong to other tokens or requests.
+    This is a structural check only. It rejects a sample that has no hidden
+    positions, a different number of positions than hidden rows, or a gap in
+    the positions. SGLang's native collection attaches no positions, so this
+    catches samples that bypassed the SGLang output patch.
+
+    It does not prove that each row belongs to this request or to the token at
+    its position: the positions are assigned by the same code that slices the
+    rows, so wrong rows with consistent positions pass. Row ownership is
+    covered by the per-request tests of the output patch on real SGLang
+    processor sources.
     """
 
     if not torch.is_tensor(hidden_positions):
