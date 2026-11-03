@@ -42,6 +42,7 @@ from verl_speco.integration.sglang_hidden_state_capture import (
     SGLangHiddenStateCapturePatchError,
     install_sglang_output_processor_capture_patches,
     patch_sglang_output_processor_method_source,
+    sglang_prefill_extend_rows,
 )
 from verl_speco.integration.sglang_patch_controls import DISABLE_SGLANG_PATCH_ENV
 
@@ -174,9 +175,12 @@ class _Recorder:
     def __init__(self) -> None:
         self.calls: list[tuple[Any, ...]] = []
 
-    def prefill(self, req, logits_output, offset, extend_input_len, batch):
-        self.calls.append(("prefill", req.rid, offset, extend_input_len))
-        return offset + extend_input_len
+    def prefill(
+        self, req, logits_output, offset, extend_input_len, batch, *, req_index=None
+    ):
+        rows = sglang_prefill_extend_rows(req, extend_input_len, batch, req_index)
+        self.calls.append(("prefill", req.rid, offset, rows))
+        return offset + rows
 
     def decode(self, req, logits_output, result, i, offset, batch):
         self.calls.append(("decode", req.rid, i, offset))
@@ -212,10 +216,18 @@ class _Unreachable:
         raise AssertionError("native SGLang hidden-state capture ran")
 
 
-def _req(rid: str, *, prompt_len: int, collect: bool = True, stream: bool = True):
+def _req(
+    rid: str,
+    *,
+    prompt_len: int,
+    collect: bool = True,
+    stream: bool = True,
+    extend_input_len: int | None = None,
+):
     return SimpleNamespace(
         rid=rid,
         origin_input_ids=list(range(prompt_len)),
+        extend_input_len=extend_input_len,
         return_hidden_states=collect,
         stream_hidden_states=stream,
         hidden_states=[],
@@ -255,6 +267,53 @@ def test_prefill_uses_extend_rows_not_full_prompt(processor_cls) -> None:
         ("prefill", "skip", 3, 4),
         ("prefill", "b", 7, 5),
     ]
+
+
+@pytest.mark.parametrize("processor_cls", PROCESSORS)
+@pytest.mark.parametrize("overlap_copy", [False, True])
+def test_prefill_without_logprob_lengths_uses_batch_extend_lens(
+    processor_cls, overlap_copy
+) -> None:
+    # SGLang sets extend_input_len_per_req only for logprob batches, and DFlash rejects
+    # logprobs. The batch's extend_lens (dropped by the overlap-schedule copy, where the
+    # request's extend_input_len is still set) give the real rows per request.
+    recorder = _Recorder()
+    prefill = _patched(processor_cls, "process_batch_result_prefill", recorder)
+    reqs = [
+        _req("a", prompt_len=94, extend_input_len=40),
+        _req("b", prompt_len=88, extend_input_len=88),
+        _req("c", prompt_len=88, extend_input_len=24),
+    ]
+    batch = SimpleNamespace(
+        reqs=reqs, extend_lens=None if overlap_copy else [40, 88, 24]
+    )
+    result = SimpleNamespace(
+        logits_output=SimpleNamespace(hidden_states=_Unreachable()),
+        extend_input_len_per_req=None,
+    )
+
+    prefill(processor_cls(), batch, result)
+
+    assert recorder.calls == [
+        ("prefill", "a", 0, 40),
+        ("prefill", "b", 40, 88),
+        ("prefill", "c", 128, 24),
+    ]
+
+
+def test_prefill_extend_rows_order() -> None:
+    req = _req("a", prompt_len=94, extend_input_len=30)
+    other = _req("b", prompt_len=10, extend_input_len=10)
+    batch = SimpleNamespace(reqs=[req, other], extend_lens=[40, 10])
+
+    assert sglang_prefill_extend_rows(req, 7, batch, 0) == 7
+    assert sglang_prefill_extend_rows(req, None, batch, 0) == 40
+    # Batch lists that do not line up with this request are not trusted.
+    assert sglang_prefill_extend_rows(req, None, batch, 1) == 30
+    assert (
+        sglang_prefill_extend_rows(req, None, SimpleNamespace(reqs=[req]), 0) == 30
+    )
+    assert sglang_prefill_extend_rows(_req("c", prompt_len=12), None, None) == 12
 
 
 @pytest.mark.parametrize("processor_cls", PROCESSORS)

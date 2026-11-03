@@ -36,6 +36,7 @@ from verl_speco.integration.sglang_hidden_state_capture import (
 from verl_speco.integration.sglang_hidden_state_capture import (
     install_sglang_output_processor_capture_patches,
     patch_sglang_output_processor_method_source,
+    sglang_prefill_extend_rows,
 )
 from verl_speco.integration.sglang_hidden_state_stream import (
     VERL_HIDDEN_STATES_STREAM_FINAL_ATTR as _VERL_HIDDEN_STATES_STREAM_FINAL_ATTR,
@@ -4678,12 +4679,15 @@ def _append_sglang_hidden_state_chunk_with_budget(
 
 
 def _append_sglang_prefill_hidden_states(
-    req, logits_output, hidden_state_offset: int, extend_input_len: int, batch=None
+    req,
+    logits_output,
+    hidden_state_offset: int,
+    extend_input_len: int | None,
+    batch=None,
+    *,
+    req_index: int | None = None,
 ) -> int:
-    try:
-        rows = max(int(extend_input_len), 0)
-    except (TypeError, ValueError):
-        rows = len(getattr(req, "origin_input_ids", []) or [])
+    rows = sglang_prefill_extend_rows(req, extend_input_len, batch, req_index)
     if rows <= 0:
         return hidden_state_offset
 
