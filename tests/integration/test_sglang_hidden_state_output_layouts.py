@@ -30,6 +30,10 @@ provenance header of each file):
 * ``batch_result_processor_v0_5_16``: the v0.5.16 tag. All decode uses the
   strided extend.
 
+* ``output_streamer_v0_5_16``: the v0.5.16 ``SchedulerOutputStreamer``. From
+  v0.5.13 it sends ``req.hidden_states`` only while ``req.return_hidden_states``
+  is set, sliced to ``req.finished_len`` entries.
+
 * ``dflash_worker_v2_v0_5_16``: the v0.5.16 DFlash spec-v2 worker (the only
   DFlash worker from v0.5.14 on). It drops the target hidden states after
   writing them into the draft KV cache; the tests run its real
@@ -68,6 +72,8 @@ torch = pytest.importorskip("torch")
 _NEW_MODULE = "sglang.srt.managers.scheduler_components.batch_result_processor"
 _OLD_MODULE = "sglang.srt.managers.scheduler_output_processor_mixin"
 _DFLASH_INFO_MODULE = "sglang.srt.speculative.dflash_info"
+_STREAMER_MODULE = "sglang.srt.managers.scheduler_components.output_streamer"
+_STREAMER_SOURCE = "output_streamer_v0_5_16.py.txt"
 
 _SOURCES_DIR = Path(__file__).parent / "sglang_sources"
 _HEADER_END = "# --- end of verl-SpeCo header ---\n"
@@ -80,7 +86,13 @@ _MIXIN_SOURCE = "scheduler_output_processor_mixin_v0_5_12.py.txt"
 _MIXIN_SOURCES = (_MIXIN_V0_5_9_SOURCE, _MIXIN_V0_5_10_SOURCE, _MIXIN_SOURCE)
 _NEW_CLASS = "SchedulerBatchResultProcessor"
 _MIXIN_CLASS = "SchedulerOutputProcessorMixin"
-_ALL_SOURCES = (_IMAGE_SOURCE, _V0_5_14_SOURCE, _V0_5_16_SOURCE, *_MIXIN_SOURCES)
+_ALL_SOURCES = (
+    _IMAGE_SOURCE,
+    _V0_5_14_SOURCE,
+    _V0_5_16_SOURCE,
+    _STREAMER_SOURCE,
+    *_MIXIN_SOURCES,
+)
 
 _STUBBED = (
     "sglang",
@@ -190,6 +202,7 @@ def stub_sglang(monkeypatch):
     monkeypatch.setitem(sys.modules, _OLD_MODULE, None)
     monkeypatch.setitem(sys.modules, _NEW_MODULE, None)
     monkeypatch.setitem(sys.modules, _DFLASH_INFO_MODULE, None)
+    monkeypatch.setitem(sys.modules, _STREAMER_MODULE, None)
     monkeypatch.delenv("VERL_SPECO_DRAFTER_CONFIG", raising=False)
     monkeypatch.delenv("VERL_SPECO_SGLANG_DRAFTER_CONFIG", raising=False)
     return stubs
@@ -392,6 +405,12 @@ def test_installer_patches_real_layout(
     sglang_patch = _import_sglang_patch(monkeypatch)
     monkeypatch.setenv("VERL_SPECO_DRAFTER_CONFIG", json.dumps(_DFLASH_COLLECT_CONFIG))
     module = _install_vendored(monkeypatch, tmp_path, module_name, file_name)
+    streamer_module = None
+    if module_name == _NEW_MODULE:
+        # 0801cc05 and v0.5.14 share the streamer method the patch wraps.
+        streamer_module = _install_vendored(
+            monkeypatch, tmp_path, _STREAMER_MODULE, _STREAMER_SOURCE
+        )
 
     sglang_patch.patch_sglang_hidden_states_tensor_output()
 
@@ -399,6 +418,20 @@ def test_installer_patches_real_layout(
     for name in methods:
         assert getattr(cls, name)._verl_patched_hidden_states_tensor_output
     assert sglang_patch._SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED
+    if streamer_module is not None:
+        streamer = streamer_module.SchedulerOutputStreamer._stream_output_generation
+        assert streamer._verl_patched_stream_final_hidden_states
+
+
+def test_new_layout_without_streamer_fails_closed_when_collecting(
+    monkeypatch, tmp_path, stub_sglang
+) -> None:
+    sglang_patch = _import_sglang_patch(monkeypatch)
+    monkeypatch.setenv("VERL_SPECO_DRAFTER_CONFIG", json.dumps(_DFLASH_COLLECT_CONFIG))
+    _install_vendored(monkeypatch, tmp_path, _NEW_MODULE, _V0_5_16_SOURCE)
+
+    with pytest.raises(RuntimeError, match="output streamer hidden-state patch"):
+        sglang_patch.patch_sglang_hidden_states_tensor_output()
 
 
 # --- deterministic per-request alignment ------------------------------------
@@ -643,6 +676,118 @@ def test_real_processor_collects_exact_rows_per_request(
         rows, positions = _collected(req)
         assert positions.tolist() == expected_positions, req.rid
         assert torch.equal(rows, expected_rows), req.rid
+
+
+def _finish_for_streaming(req, finished_len: int) -> None:
+    """Give a ``_Req`` the fields the v0.5.16 streamer reads, finished."""
+    req.finished = lambda: True
+    req.finished_output = False
+    req.finished_len = finished_len
+    req.finished_reason = None
+    req.stream = False
+    req.http_worker_ipc = None
+    req.decoded_text = ""
+    req.init_incremental_detokenize = lambda: ([], 0)
+    req.send_decode_id_offset = 0
+    req.send_token_offset = 0
+    req.send_output_token_logprobs_offset = 0
+    req.output_ids_through_stop = req.output_ids[:finished_len]
+    req.sampling_params = MagicMock()
+    req.reasoning_tokens = 0
+    req.cached_tokens = 0
+    req.cached_tokens_device = 0
+    req.cached_tokens_host = 0
+    req.cached_tokens_storage = 0
+    req.mm_image_tokens = req.mm_audio_tokens = req.mm_video_tokens = 0
+    req.retraction_count = 0
+    req.return_routed_experts = False
+    req.return_indexer_topk = False
+    req.customized_info = None
+    for name in (
+        "spec_verify_ct",
+        "spec_num_correct_drafts",
+        "spec_num_block_accept_tokens",
+        "spec_num_cap_tokens",
+        "spec_correct_drafts_histogram",
+        "spec_cap_lens_histogram",
+    ):
+        setattr(req, name, 0)
+
+
+def test_streamer_returns_hidden_states_of_request_whose_budget_filled(
+    monkeypatch, tmp_path, stub_sglang
+) -> None:
+    """Real v0.5.16 processor and streamer, one request capped by a row budget.
+
+    Reaching the budget stops the capture by clearing ``return_hidden_states``,
+    which the v0.5.16 streamer reads when it sends the final output.
+    """
+    sglang_patch = _import_sglang_patch(monkeypatch)
+    module = _install_vendored(monkeypatch, tmp_path, _NEW_MODULE, _V0_5_16_SOURCE)
+    streamer_module = _install_vendored(
+        monkeypatch, tmp_path, _STREAMER_MODULE, _STREAMER_SOURCE
+    )
+    sglang_patch.patch_sglang_hidden_states_tensor_output()
+    cls = module.SchedulerBatchResultProcessor
+
+    capped, uncapped = _Req(0, 6, 0), _Req(1, 4, 0)
+    capped._verl_hidden_state_max_rows = 8
+    reqs = [capped, uncapped]
+    _run_prefill(cls, reqs, extend_lens_on_batch=True)
+    next_positions = {req.request_id: len(req.origin_input_ids) for req in reqs}
+    for commit_lens in ([3, 1], [2, 4]):
+        _run_decode_step(cls, reqs, commit_lens, next_positions, mode="strided")
+    # The budget is full after the first decode step.
+    assert capped.return_hidden_states is False
+    assert uncapped.return_hidden_states is True
+
+    # A stop token on the second output token: one entry per token would keep
+    # only the first two chunks.
+    for req in reqs:
+        _finish_for_streaming(req, finished_len=2)
+    capped_chunks = list(capped.hidden_states)
+    assert len(uncapped.hidden_states) == 3
+
+    def stream(method):
+        sent = MagicMock()
+        streamer = streamer_module.SchedulerOutputStreamer(
+            send_to_detokenizer=sent,
+            tree_cache=MagicMock(),
+            ps=MagicMock(),
+            server_args=MagicMock(stream_interval=1),
+            is_generation=True,
+            spec_algorithm=_SpecAlgorithm(True),
+            disaggregation_mode=MagicMock(),
+            enable_hicache_storage=lambda: False,
+        )
+        for req in reqs:
+            req.finished_output = False
+        method(streamer, reqs, False)
+        return streamer_module.BatchTokenIDOutput.call_args.kwargs[
+            "output_hidden_states"
+        ]
+
+    patched = streamer_module.SchedulerOutputStreamer._stream_output_generation
+    # Upstream v0.5.16 drops the capped request and slices the other.
+    upstream = stream(patched.__wrapped__)
+    assert upstream[0] is None
+    assert len(upstream[1]) == 2
+
+    sent_hidden = stream(patched)
+    assert type(sent_hidden[0]) is list and type(sent_hidden[1]) is list
+    for req, chunks in zip(reqs, sent_hidden, strict=True):
+        rows, positions = _collected(types.SimpleNamespace(hidden_states=chunks))
+        stop = 8 if req is capped else next_positions[req.request_id]
+        expected_positions = list(range(0, stop))
+        assert positions.tolist() == expected_positions, req.rid
+        assert torch.equal(
+            rows,
+            torch.tensor([_ref_row(req.request_id, pos) for pos in expected_positions]),
+        ), req.rid
+    # The request keeps its own state.
+    assert capped.return_hidden_states is False
+    assert type(capped.hidden_states) is list
+    assert capped.hidden_states == capped_chunks
 
 
 # --- installer behavior -----------------------------------------------------
@@ -950,6 +1095,7 @@ def test_dflash_v2_worker_returns_hidden_states_per_request(
     processor_module = _install_vendored(
         monkeypatch, tmp_path, _NEW_MODULE, _V0_5_16_SOURCE
     )
+    _install_vendored(monkeypatch, tmp_path, _STREAMER_MODULE, _STREAMER_SOURCE)
     worker_module, draft_input_cls, kv_writes = _install_dflash_v2(monkeypatch, tmp_path)
     sglang_patch.patch_sglang_hidden_states_tensor_output()
     assert sglang_patch.patch_sglang_dflash_v2_worker_hidden_states()

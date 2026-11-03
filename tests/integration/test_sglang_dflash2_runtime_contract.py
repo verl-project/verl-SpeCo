@@ -995,3 +995,85 @@ def test_engine_launcher_applies_drafter_config_when_constructor_bypasses_init(
     assert server_args.speculative_draft_model_path == "/models/dspark"
     assert server_args.speculative_num_draft_tokens == 8
     assert server_args.enable_draft_weights_cpu_backup is True
+
+
+# SGLang v0.5.14+ validates DFLASH requests with ``validate_dflash_request(req,
+# enable_overlap)`` and aborts ``return_hidden_states`` requests while the overlap
+# scheduler is on (v0.5.16: python/sglang/srt/speculative/dflash_utils.py:796).
+# Through v0.5.13 the validator takes only ``req``.
+def _validate_dflash_request_v0_5_16(req, enable_overlap):
+    if enable_overlap and req.return_hidden_states:
+        return "DFLASH speculative decoding does not support return_hidden_states yet."
+    return None
+
+
+def _validate_dflash_request_v0_5_12(req):
+    return None
+
+
+_OVERLAP_SUPPORTED_FIELDS = _SUPPORTED_FIELDS | {"disable_overlap_schedule"}
+
+
+def _install_dflash_validator(monkeypatch, validator) -> None:
+    dflash_utils = types.ModuleType("sglang.srt.speculative.dflash_utils")
+    dflash_utils.validate_dflash_request = validator
+    _install_fake_sglang_modules(
+        monkeypatch, **{"sglang.srt.speculative.dflash_utils": dflash_utils}
+    )
+
+
+def _dflash_drafter(collect: bool) -> dict:
+    return {
+        "enable": True,
+        "enable_drafter_training": True,
+        "speculative_algorithm": "DFLASH",
+        "model_path": "/models/dflash",
+        "rollout": {"spec_steps": 1, "spec_topk": 1, "spec_verify_tokens": 16},
+        "training": {"collect_hidden_states_from_sgl": collect},
+    }
+
+
+def test_dflash_collection_turns_overlap_off_when_sglang_rejects_it(
+    monkeypatch,
+) -> None:
+    _install_dflash_validator(monkeypatch, _validate_dflash_request_v0_5_16)
+
+    overrides = _server_args_overrides_from_drafter(
+        _dflash_drafter(collect=True), _OVERLAP_SUPPORTED_FIELDS
+    )
+
+    assert overrides["enable_return_hidden_states"] is True
+    assert overrides["disable_overlap_schedule"] is True
+    # With the overlap scheduler off, SGLang's own check lets the request through.
+    req = types.SimpleNamespace(return_hidden_states=True)
+    assert _validate_dflash_request_v0_5_16(req, enable_overlap=False) is None
+
+
+def test_dflash_collection_keeps_overlap_on_sglang_without_the_rule(
+    monkeypatch,
+) -> None:
+    _install_dflash_validator(monkeypatch, _validate_dflash_request_v0_5_12)
+
+    overrides = _server_args_overrides_from_drafter(
+        _dflash_drafter(collect=True), _OVERLAP_SUPPORTED_FIELDS
+    )
+
+    assert overrides["enable_return_hidden_states"] is True
+    assert "disable_overlap_schedule" not in overrides
+
+
+def test_dflash_without_collection_keeps_overlap(monkeypatch) -> None:
+    _install_dflash_validator(monkeypatch, _validate_dflash_request_v0_5_16)
+
+    overrides = _server_args_overrides_from_drafter(
+        _dflash_drafter(collect=False), _OVERLAP_SUPPORTED_FIELDS
+    )
+
+    assert overrides["enable_return_hidden_states"] is False
+    assert "disable_overlap_schedule" not in overrides
+
+
+def test_dflash_overlap_probe_is_false_without_sglang(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "sglang.srt.speculative.dflash_utils", None)
+
+    assert sglang_runtime._sglang_dflash_rejects_hidden_states_with_overlap() is False

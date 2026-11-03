@@ -820,7 +820,13 @@ def _patch_sglang_scheduler_weight_update_dispatch() -> bool:
                     )(draft_worker, recv_req)
                 if success:
                     self.flush_cache_after_weight_update(recv_req)
-                    self.record_weight_version_after_update(recv_req.weight_version)
+                    # Newer SGLang main records the weight version here; the
+                    # v0.5.13-v0.5.16 releases have no such hook.
+                    record_weight_version = getattr(
+                        self, "record_weight_version_after_update", None
+                    )
+                    if record_weight_version is not None:
+                        record_weight_version(recv_req.weight_version)
                 else:
                     logger.error(message)
                 torch.distributed.barrier(group=self.tp_cpu_group)
@@ -6714,6 +6720,86 @@ _SGLANG_HIDDEN_STATE_OUTPUT_LAYOUTS: tuple[tuple[str, str, tuple[str, ...]], ...
 )
 
 
+class _SGLangHiddenStateChunkList(list):
+    """A request's hidden-state chunks, kept whole by the streamer's slice.
+
+    v0.5.16 sends ``req.hidden_states[: req.finished_len]``, which assumes one
+    entry per output token. Here an entry is a chunk with its own positions (a
+    prefill chunk covers the whole prompt), so a slice by token count could drop
+    chunks. A slice returns every chunk as a plain list, which is what SGLang up
+    to v0.5.12 sent.
+    """
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return list(self)
+        return list.__getitem__(self, index)
+
+
+def patch_sglang_output_streamer_final_hidden_states() -> bool:
+    """Stream a request's hidden states once, when it finishes.
+
+    The window and row budget stop a request's capture by setting
+    ``req.return_hidden_states = False`` (see
+    ``_finish_sglang_hidden_state_capture``). Up to v0.5.12 the patched
+    ``stream_output_generation`` still sent the captured chunks of such a request
+    on its final output. From v0.5.13 (sgl-project/sglang #25637) streaming lives
+    in ``SchedulerOutputStreamer._stream_output_generation``, which sends
+    ``req.hidden_states`` only while ``req.return_hidden_states`` is True, so a
+    request whose window filled before it finished came back with no hidden
+    states. This wrapper sets ``return_hidden_states`` for the duration of the
+    call to what ``_sglang_req_should_stream_hidden_states`` decides: True on the
+    final output of a request with a window or row budget, False before that.
+    From v0.5.14 the streamer also slices ``req.hidden_states`` to
+    ``req.finished_len`` entries; the chunks it sends are wrapped in
+    ``_SGLangHiddenStateChunkList`` so that slice keeps them all.
+
+    Returns True when the streamer is patched (or already was).
+    """
+    try:
+        module = importlib.import_module(
+            "sglang.srt.managers.scheduler_components.output_streamer"
+        )
+        streamer_cls = getattr(module, "SchedulerOutputStreamer")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang output streamer hidden-state patch: %s", exc)
+        return False
+    original_method = getattr(streamer_cls, "_stream_output_generation", None)
+    if original_method is None:
+        return False
+    if getattr(original_method, "_verl_patched_stream_final_hidden_states", False):
+        return True
+
+    @wraps(original_method)
+    def stream_output_generation(self, reqs, *args, **kwargs):
+        overridden = []
+        for req in reqs or ():
+            current = getattr(req, "return_hidden_states", False)
+            stream_now = _sglang_req_should_stream_hidden_states(req)
+            if not current and not stream_now:
+                continue
+            hidden_states = getattr(req, "hidden_states", None)
+            overridden.append((req, current, hidden_states))
+            req.return_hidden_states = stream_now
+            if stream_now and isinstance(hidden_states, list):
+                req.hidden_states = _SGLangHiddenStateChunkList(hidden_states)
+        try:
+            return original_method(self, reqs, *args, **kwargs)
+        finally:
+            for req, current, hidden_states in overridden:
+                req.return_hidden_states = current
+                req.hidden_states = hidden_states
+
+    setattr(stream_output_generation, "_verl_patched_stream_final_hidden_states", True)
+    setattr(streamer_cls, "_stream_output_generation", stream_output_generation)
+    logger.warning(
+        "SGLang output streamer hidden-state patch active for %s.%s",
+        streamer_cls.__module__,
+        streamer_cls.__name__,
+    )
+    return True
+
+
 def _sglang_drafter_collects_hidden_states_from_sgl(
     algorithm: str | None = None,
 ) -> bool:
@@ -6813,6 +6899,18 @@ def patch_sglang_hidden_states_tensor_output() -> None:
         setattr(processor_cls, method_name, patched_method)
         patched_methods.append(method_name)
         active_methods.append(method_name)
+
+    if (
+        "stream_output_generation" not in method_names
+        and not patch_sglang_output_streamer_final_hidden_states()
+        and _sglang_drafter_collects_hidden_states_from_sgl()
+    ):
+        raise RuntimeError(
+            "Cannot install the SGLang output streamer hidden-state patch: "
+            "SchedulerOutputStreamer._stream_output_generation was not found. "
+            "Requests whose hidden-state window fills before they finish would "
+            "return no hidden states."
+        )
 
     missing_methods = sorted(set(method_names).difference(active_methods))
     if missing_methods:
