@@ -366,14 +366,14 @@ Log lines from the reference runs:
 # SGLang
 (SpecoSGLangHttpServer) Decode batch, #running-req: 32, ... accept len: 3.37, accept rate: 0.16, cuda graph: True, gen throughput (token/s): 4456.38
 (SpecoWorker) [drafter logits quality] valid_tokens=3833 top1_acc=0.306548 top5_acc=0.559875 ...
-(SpecoWorker) [drafter loss] step=8 drafter_step=4 optimizer_step_total=32 samples=4 loss_tokens=7666 lr=1.000e-05 loss=2.3069 vloss=0.0000 ploss=2.3069
+(SpecoWorker) [drafter loss] rl_step=8 drafter_step=4 optimizer_step_total=32 samples=4 loss_tokens=7666 lr=1.000e-05 loss=2.3069 vloss=0.0000 ploss=2.3069 ...
 (SpecoSGLangHttpServer) [speco sglang draft update] done global_steps=8 buckets=5 bucket_mb=512 elapsed_sec=0.509
 (SpecoTaskRunner) Training Progress: 100%|██████████| 8/8 [03:30<00:00, 22.54s/it]
 
 # vLLM
 (SpecoVLLMHttpServer) [speco draft ipc] streamed 58 translated weights in 5 buckets into DFlashQwen3Model (method=dflash), ...
 (SpecoWorker) [drafter logits quality] valid_tokens=3834 top1_acc=0.225352 top5_acc=0.470266 ...
-(SpecoWorker) [drafter loss] step=8 drafter_step=4 optimizer_step_total=32 samples=4 loss_tokens=7668 lr=1.000e-05 loss=2.7830 vloss=0.0000 ploss=2.7830
+(SpecoWorker) [drafter loss] rl_step=8 drafter_step=4 optimizer_step_total=32 samples=4 loss_tokens=7668 lr=1.000e-05 loss=2.7830 vloss=0.0000 ploss=2.7830 ...
 (SpecoTaskRunner) Training Progress: 100%|██████████| 8/8 [03:22<00:00, 20.85s/it]
 ```
 
