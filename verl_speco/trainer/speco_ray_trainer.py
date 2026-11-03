@@ -23,6 +23,7 @@ import time
 import threading
 import uuid
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from dataclasses import replace
 from types import MethodType
 from typing import Any, cast
@@ -105,6 +106,7 @@ from verl_speco.integration.vllm_runtime import (
 from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
 from verl_speco.trainer.hard_sample_selection import partition_hard_candidates
 from verl_speco.trainer.scheduler import (
+    AcceptanceFeedback,
     AfterActorUpdateContext,
     AfterWeightUpdateContext,
     BeforeActorUpdateContext,
@@ -139,6 +141,7 @@ SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC = (
     "drafter/spec_decode/mean_acceptance_length"
 )
 _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY = "_speco_vllm_spec_decode_drafts"
+_SPECO_VLLM_INVALID_FEEDBACK_KEY = "_speco_vllm_invalid_acceptance_feedback"
 _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY = "_speco_vllm_spec_decode_accepted_tokens"
 _SPECO_VLLM_REQUEST_VERIFY_ROUNDS_KEY = "_speco_vllm_request_verify_rounds"
 _SPECO_VLLM_REQUEST_ACCEPTED_TOKENS_KEY = "_speco_vllm_request_accepted_tokens"
@@ -408,7 +411,7 @@ def _speco_float_values(values: Any) -> list[float]:
         try:
             normalized.append(float(value))
         except (TypeError, ValueError):
-            continue
+            normalized.append(float("nan"))
     return normalized
 
 
@@ -540,7 +543,8 @@ def _speco_vllm_spec_decode_stats_from_batch(
     total_drafts = float(sum(drafts))
     total_accepted_tokens = float(sum(accepted_tokens))
     if (
-        math.isfinite(total_drafts)
+        len(drafts) == len(accepted_tokens)
+        and math.isfinite(total_drafts)
         and math.isfinite(total_accepted_tokens)
         and total_drafts > 0.0
         and total_accepted_tokens >= 0.0
@@ -609,6 +613,13 @@ def _speco_vllm_spec_decode_stats_from_batch(
     return {
         _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY: total_drafts,
         _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY: total_accepted_tokens,
+        _SPECO_VLLM_INVALID_FEEDBACK_KEY: float(
+            len(drafts) != len(accepted_tokens)
+            or not all(
+                math.isfinite(value) and value >= 0
+                for value in drafts + accepted_tokens
+            )
+        ),
     }
 
 
@@ -767,6 +778,7 @@ def _speco_merge_rollout_stats(
         _SPECO_STUDENT_DECODE_COUNT_KEY: 0.0,
         _SPECO_TEACHER_PREFILL_TOTAL_KEY: 0.0,
         _SPECO_TEACHER_PREFILL_COUNT_KEY: 0.0,
+        _SPECO_VLLM_INVALID_FEEDBACK_KEY: 0.0,
     }
     for key in totals:
         totals[key] = float((existing or {}).get(key, 0.0) or 0.0) + float(
@@ -1622,8 +1634,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         scheduler = getattr(self, "_drafter_scheduler", None)
         if scheduler is None:
             scheduler = DrafterScheduler()
+            self._speco_restore_adaptive_state(scheduler)
             self._drafter_scheduler = scheduler
         return scheduler
+
+    def _speco_restore_adaptive_state(self, scheduler: DrafterScheduler) -> None:
+        """Initialize adaptive scheduling and restore its selected checkpoint."""
+        controller = scheduler.configure_adaptive(self._speco_drafter_schedule_config())
+        if controller is not None:
+            _, resume_folder = self._speco_freeze_state_resume_path()
+            if resume_folder:
+                controller.restore(Path(resume_folder) / "adaptive_schedule.json")
 
     def _speco_get_drafter_runtime_state(self) -> DrafterRuntimeState:
         runtime_state = getattr(self, "_drafter_runtime_state", None)
@@ -4135,6 +4156,33 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 self._speco_get_drafter_runtime_state().status
                 in {DrafterRuntimeStatus.SUBMITTED, DrafterRuntimeStatus.RUNNING}
             ),
+            acceptance_feedback=self._speco_acceptance_feedback(),
+        )
+
+    def _speco_acceptance_feedback(self) -> AcceptanceFeedback | None:
+        """Use only this training rollout's weighted, non-validation counts.
+
+        Use the same weighted mean acceptance length as the rollout metric.
+        Verification rounds supply the feedback sample count, not a rate denominator.
+        Backends without these counts retain their budget and capped warmup.
+        """
+        if getattr(self, "_speco_last_rollout_metrics_step", None) != self.global_steps:
+            return None
+        stats = getattr(self, "_speco_last_rollout_metrics", None) or {}
+        if stats.get(_SPECO_VLLM_INVALID_FEEDBACK_KEY, 0):
+            return None
+        rounds = _speco_metric_float(stats.get(_SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY))
+        accepted = _speco_metric_float(
+            stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY)
+        )
+        metrics = _speco_rollout_metrics_from_stats(stats)
+        length = metrics.get(SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC)
+        if rounds is None or accepted is None or length is None:
+            return None
+        return AcceptanceFeedback(
+            step=int(self.global_steps),
+            sample_count=rounds,
+            mean_acceptance_length=length,
         )
 
     def _speco_on_before_actor_update(
@@ -9322,6 +9370,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ):
             self._save_checkpoint()
 
+    def _speco_save_adaptive_state(self) -> None:
+        """Persist the active controller alongside the completed checkpoint."""
+        scheduler = getattr(self, "_drafter_scheduler", None)
+        controller = getattr(scheduler, "adaptive_controller", None)
+        if controller is not None:
+            root = _get_nested(self.config, ("trainer", "default_local_dir"), None)
+            if root:
+                controller.save(
+                    Path(root)
+                    / f"global_step_{self.global_steps}"
+                    / "adaptive_schedule.json"
+                )
+
     def _save_checkpoint(self):
         if self._speco_checkpoint_pending_quota():
             # Do not serialize orphaned replay pins or silently discard debt on
@@ -9387,6 +9448,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     self._speco_freeze_save_state()
                 with boundary_stage(timings, "upstream_save"):
                     result = super()._save_checkpoint()
+            self._speco_save_adaptive_state()
             self._speco_last_checkpoint_saved_step = self.global_steps
             requested_step = getattr(self, "_speco_deferred_checkpoint_step", None)
             if requested_step is not None:

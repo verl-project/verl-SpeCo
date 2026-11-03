@@ -39,6 +39,7 @@ def driver(monkeypatch):
             return "saved"
 
     names = {
+        "_speco_save_adaptive_state",
         "_save_checkpoint",
         "_speco_checkpoint_pending_quota",
         "_speco_retry_deferred_checkpoint",

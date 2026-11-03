@@ -5411,3 +5411,33 @@ def test_runtime_deadline_idle_plan_keeps_hard_deadline() -> None:
     assert plan.idle_window_source == "runtime_deadline"
     assert plan.max_batches == 10
     assert plan.deadline_ts is not None
+
+
+@pytest.mark.parametrize("adaptive_steps", [20, 0])
+def test_overdue_quota_topup_preserves_debt_with_adaptive_budget(adaptive_steps):
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    scheduler._idle_worker_writer_group = ("0", "1")
+    scheduler._idle_optimizer_initialized_groups.add(("0", "1"))
+    scheduler._training_quota_debt_steps = 3
+    scheduler._training_quota_oldest_cycle_step = 7
+    scheduler._training_quota_data_version = 10
+    scheduler._training_quota_collection_step = 7
+    config = replace(
+        _idle_config(),
+        training_quota_enable=True,
+        training_quota_target_steps=20,
+        training_quota_max_completion_lag_steps=3,
+    )
+    config = replace(
+        config, adaptive_schedule=replace(config.adaptive_schedule, enable=True)
+    )
+    controller = scheduler.configure_adaptive(config)
+    controller.training_steps = lambda step: adaptive_steps
+
+    plan = scheduler._plan_training_quota_topup(_context(), config)
+
+    assert plan is not None and plan.launch
+    assert plan.max_batches == 3
+    assert plan.planned_optimizer_steps == 3
+    assert plan.required_target_version == 10
+    assert plan.reason == "quota_forced_completion_ready"

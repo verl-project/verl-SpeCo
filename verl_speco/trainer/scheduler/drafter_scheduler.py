@@ -55,8 +55,17 @@ from verl_speco.trainer.scheduler.execution_strategy import (
     RolloutIdleWorkerExecutionStrategy,
     SyncExecutionStrategy,
 )
-from verl_speco.trainer.scheduler.training_budget import SyncTrainingBudgetPolicy
+from verl_speco.trainer.scheduler.training_budget import (
+    SyncTrainingBudgetPolicy,
+    AdaptiveTrainingBudgetPolicy,
+)
+from verl_speco.trainer.scheduler.adaptive_schedule import AdaptiveScheduleController
 from verl_speco.trainer.scheduler.training_trigger import IntervalAndBufferTrigger
+from verl_speco.trainer.scheduler.training_opportunity import (
+    TrainingOpportunity,
+    training_opportunity,
+    step_matches_interval,
+)
 from verl_speco.trainer.scheduler.worker_executor import DrafterWorkerExecutor
 from verl_speco.trainer.scheduler.publish_executor import DrafterPublishExecutor
 from verl_speco.trainer.scheduler.publish_strategy import PublishExecutionStrategy
@@ -207,25 +216,8 @@ def _idle_state_summary(
     return summary
 
 
-def step_matches_interval(
-    global_step: Any,
-    interval_steps: Any,
-    *,
-    default_interval: int = 1,
-) -> bool:
-    """Match the released ``speco_step_matches_interval`` semantics exactly."""
-
-    try:
-        interval = int(default_interval if interval_steps is None else interval_steps)
-    except (TypeError, ValueError):
-        return False
-    if interval <= 0 or global_step is None:
-        return False
-    try:
-        step = int(global_step)
-    except (TypeError, ValueError):
-        return False
-    return step > 0 and step % interval == 0
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class DrafterScheduler:
@@ -246,6 +238,8 @@ class DrafterScheduler:
     ) -> None:
         self.trigger_policy = IntervalAndBufferTrigger()
         self.sync_budget_policy = SyncTrainingBudgetPolicy()
+        self.adaptive_controller: AdaptiveScheduleController | None = None
+        self._adaptive_pending_publish_step: int | None = None
         self.sync_execution_strategy = SyncExecutionStrategy()
         self._worker_executor = worker_executor
         self.data_status_policy = ConservativeTrainingDataStatusPolicy()
@@ -3222,7 +3216,23 @@ class DrafterScheduler:
     ) -> TrainingPlan:
         """Build a plan while avoiding worker RPCs for cheap skip conditions."""
 
-        interval_matched = self.training_interval_matched(context.global_step, config)
+        controller = self.configure_adaptive(config)
+        if controller is not None:
+            controller.observe(
+                context.acceptance_feedback,
+                current_step=_as_int(context.global_step),
+                training_interval_steps=_as_int(config.training_interval_steps),
+            )
+        interval_matched = self.training_opportunity(context.global_step, config).due
+        if (
+            controller is not None
+            and interval_matched
+            and context.training_mode != "collect_only"
+            and context.pending_training_count <= 0
+        ):
+            controller.decide_budget(
+                _as_int(context.global_step), _as_int(config.training_interval_steps)
+            )
         if config.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
             return self.prepare_idle_worker_training_plan(
                 context,
@@ -3238,17 +3248,7 @@ class DrafterScheduler:
         data_status = context.data_status or self.inspect_training_data(
             global_step=context.global_step, config=config
         )
-        return self.plan_training(
-            DrafterScheduleContext(
-                global_step=context.global_step,
-                training_mode=context.training_mode,
-                collected_samples_this_step=context.collected_samples_this_step,
-                oldlogprob_collection_requested=context.oldlogprob_collection_requested,
-                data_status=data_status,
-                pending_training_count=context.pending_training_count,
-            ),
-            config,
-        )
+        return self.plan_training(replace(context, data_status=data_status), config)
 
     def idle_continuation_for_episode(
         self,
@@ -3908,6 +3908,7 @@ class DrafterScheduler:
                 ),
             ),
             require_interval=False,
+            quota_topup=True,
         )
         if full_collective_fallback and not plan.launch:
             # Single-writer collection may intentionally leave the other
@@ -3936,6 +3937,7 @@ class DrafterScheduler:
                     ),
                 ),
                 require_interval=False,
+                quota_topup=True,
             )
         if not plan.launch:
             if (
@@ -4178,7 +4180,14 @@ class DrafterScheduler:
     def wait_pending_publish(self) -> int:
         if self._publish_executor is None:
             return 0
-        return self._publish_executor.wait_pending()
+        waited = self._publish_executor.wait_pending()
+        if self._adaptive_pending_publish_step is not None:
+            if self.adaptive_controller is not None:
+                self.adaptive_controller.record_publish(
+                    self._adaptive_pending_publish_step
+                )
+            self._adaptive_pending_publish_step = None
+        return waited
 
     @staticmethod
     def should_collect(
@@ -4205,10 +4214,10 @@ class DrafterScheduler:
         context: DrafterCollectionContext,
         config: DrafterScheduleConfig,
     ) -> CollectionPlan:
-        collect_interval_matched = self.should_collect(context.global_step, config)
-        training_interval_matched = self.training_interval_matched(
-            context.global_step, config
-        )
+        self.configure_adaptive(config)
+        opportunity = self.training_opportunity(context.global_step, config)
+        collect_interval_matched = opportunity.collection_due
+        training_interval_matched = opportunity.due
         common: Any = {
             "collection_id": self._next_collection_id(
                 context.source, context.global_step
@@ -4321,6 +4330,15 @@ class DrafterScheduler:
         if getattr(context, "drafter_frozen", False) and plan.launch:
             plan = replace(plan, launch=False, reason="drafter_convergence_frozen")
         metrics: dict[str, Any] = dict(plan.metrics())
+        if (
+            self.adaptive_controller is not None
+            and context.config.adaptive_schedule.enable
+        ):
+            metrics.update(
+                self.adaptive_controller.metrics(
+                    _as_int(context.schedule_context.global_step)
+                )
+            )
         metrics.update(
             {
                 "scheduler/train_requested": int(plan.launch),
@@ -4412,6 +4430,28 @@ class DrafterScheduler:
             plan=plan,
         )
         self._record_training_outcome(plan, outcome)
+        if self.adaptive_controller is not None and outcome.trained:
+            controller = self.adaptive_controller
+            step = _as_int(plan.source_global_step)
+            controller.record_training(step, outcome.successful_steps)
+            outcome.metrics["drafter/adaptive_budget_steps"] = plan.max_batches
+            if controller.warmup_active(step):
+                logger.info(
+                    "[adaptive_schedule] step=%s warmup=true budget=%s reason=warmup_budget",
+                    step,
+                    plan.max_batches,
+                )
+            else:
+                logger.info(
+                    "[adaptive_schedule] step=%s warmup=false interval_trend=%s budget=%s->%s reason=%s",
+                    step,
+                    f"{controller.last_interval_trend:.3f}"
+                    if controller.last_interval_trend is not None
+                    else "n/a",
+                    controller.last_budget_before,
+                    plan.max_batches,
+                    controller.last_reason,
+                )
         return SchedulerEventOutcome(
             training_plan=plan,
             training_execution=outcome,
@@ -4427,6 +4467,13 @@ class DrafterScheduler:
             training_plan=context.training_plan,
         )
         outcome = self.execute_publish_plan(plan)
+        if outcome.published and self.adaptive_controller is not None:
+            if plan.asynchronous:
+                self._adaptive_pending_publish_step = _as_int(plan.source_global_step)
+            else:
+                self.adaptive_controller.record_publish(
+                    _as_int(plan.source_global_step)
+                )
         return SchedulerEventOutcome(
             training_plan=context.training_plan,
             publish_plan=plan,
@@ -4447,6 +4494,34 @@ class DrafterScheduler:
     ) -> bool:
         return step_matches_interval(global_step, config.training_interval_steps)
 
+    def configure_adaptive(
+        self, config: DrafterScheduleConfig
+    ) -> AdaptiveScheduleController | None:
+        if not config.adaptive_schedule.enable:
+            self.adaptive_controller = None
+            self._adaptive_pending_publish_step = None
+            return None
+        if (
+            self.adaptive_controller is None
+            or self.adaptive_controller.config != config.adaptive_schedule
+        ):
+            self.adaptive_controller = AdaptiveScheduleController(
+                config.adaptive_schedule
+            )
+        return self.adaptive_controller
+
+    def training_opportunity(
+        self, step: object, config: DrafterScheduleConfig
+    ) -> TrainingOpportunity:
+        """Read-only evaluation; configuration happens at planning entry points."""
+        controller = self.adaptive_controller
+        ended_after = (
+            controller.state.warmup_ended_after
+            if controller is not None and controller.config == config.adaptive_schedule
+            else None
+        )
+        return training_opportunity(step, config, startup_ended_after=ended_after)
+
     def plan_training(
         self,
         context: DrafterScheduleContext,
@@ -4455,8 +4530,10 @@ class DrafterScheduler:
         *,
         require_interval: bool = True,
         idle_continuation: bool = False,
+        quota_topup: bool = False,
     ) -> TrainingPlan:
-        interval_matched = self.training_interval_matched(context.global_step, config)
+        controller = self.configure_adaptive(config)
+        interval_matched = self.training_opportunity(context.global_step, config).due
         execution_strategy = (
             DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
             if resources is not None
@@ -4474,7 +4551,12 @@ class DrafterScheduler:
             config,
             interval_matched=interval_matched if require_interval else True,
         )
-        budget = self.sync_budget_policy.make_budget(context, config)
+        budget = (
+            AdaptiveTrainingBudgetPolicy(controller).make_budget(context, config)
+            # Existing quota debt must retain its exact top-up budget.
+            if controller is not None and not quota_topup
+            else self.sync_budget_policy.make_budget(context, config)
+        )
         gradient_accumulation_steps = 1
         planned_optimizer_steps = budget.max_batches
         idle_tail_reserve_sec = (

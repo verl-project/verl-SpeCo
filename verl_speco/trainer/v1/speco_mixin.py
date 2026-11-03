@@ -189,6 +189,10 @@ class SpecoV1Mixin:
         self._speco_pending_request_accept_len_payloads = []
         self._speco_last_request_accept_len_var = 0.0
         self._speco_v1_evidence_step = None
+        drafter = self.config.actor_rollout_ref.rollout.get("drafter", {}) or {}
+        adaptive = (drafter.get("training") or {}).get("adaptive_schedule") or {}
+        if adaptive.get("enable", False):
+            self._speco_restore_adaptive_state(self._drafter_scheduler)
 
     def __getattr__(self, name):
         """Lazily expose the stable SPECO facade implemented by the legacy adapter.
@@ -869,6 +873,7 @@ class SpecoV1Mixin:
                 drafter_results=drafter_results,
                 feature_store=feature_store,
             )
+            self._speco_save_adaptive_state()
         self._speco_last_checkpoint_saved_step = self.global_steps
         return result
 
@@ -1460,6 +1465,69 @@ class SpecoV1Mixin:
             "drafter/spec_decode/mean_acceptance_length": 1.0 + accepted / drafts,
         }
 
+    def _speco_v1_collect_acceptance_feedback(self, batch: Any) -> None:
+        """Collect adaptive feedback once per request before global-step planning."""
+        if getattr(batch, "keys", None) is None:
+            return
+        drafter = self.config.actor_rollout_ref.rollout.get("drafter", {}) or {}
+        training = drafter.get("training", {}) or {}
+        adaptive = training.get("adaptive_schedule", {}) or {}
+        if not adaptive.get("enable", False):
+            return
+        step = getattr(self, "global_steps", None)
+        if step is None:
+            return
+        if self.__dict__.get("_speco_last_rollout_metrics_step") != step:
+            self._speco_last_rollout_metrics_step = step
+            self._speco_last_rollout_metrics: dict[str, float] = {}
+            self._speco_v1_feedback_seen: set[tuple[Any, Any]] = set()
+        try:
+            import transfer_queue as tq
+
+            extra_fields = tq.kv_batch_get(
+                keys=batch.keys,
+                partition_id=batch.partition_id,
+                select_fields=["extra_fields"],
+            ).get("extra_fields")
+        except ImportError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("SPECO V1 could not read acceptance feedback: %s", exc)
+            return
+        if hasattr(extra_fields, "tolist"):
+            extra_fields = extra_fields.tolist()
+        if not isinstance(extra_fields, list):
+            return
+        from verl_speco.integration.acceptance_metrics import (
+            request_acceptance_counters,
+        )
+
+        tags = list(getattr(batch, "tags", None) or [])
+        for index, (key, fields) in enumerate(zip(batch.keys, extra_fields)):
+            if index < len(tags) and bool(tags[index].get("is_padding", False)):
+                continue
+            identity = (batch.partition_id, key)
+            if identity in self._speco_v1_feedback_seen:
+                continue
+            fields = getattr(fields, "data", fields)
+            counters = (
+                request_acceptance_counters(fields)
+                if isinstance(fields, dict)
+                else None
+            )
+            if counters is None:
+                continue
+            self._speco_v1_feedback_seen.add(identity)
+            stats = self._speco_last_rollout_metrics
+            for name, value in zip(
+                (
+                    "_speco_vllm_spec_decode_drafts",
+                    "_speco_vllm_spec_decode_accepted_tokens",
+                ),
+                counters,
+            ):
+                stats[name] = stats.get(name, 0.0) + value
+
     def _speco_v1_spec_decode_metrics(self, batch: Any) -> dict[str, float]:
         """Aggregate SpeCo's vLLM acceptance counters for one V1 global step.
 
@@ -1549,6 +1617,8 @@ class SpecoV1Mixin:
     def _update_actor(self, batch, metrics):
         if not self._speco_online_enabled_from_config(self.config):
             return super()._update_actor(batch, metrics)
+
+        self._speco_v1_collect_acceptance_feedback(batch)
 
         metrics["timing_s/drafter"] = 0.0
         self._speco_v1_drafter_hook_cost_seconds = 0.0
