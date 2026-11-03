@@ -1634,15 +1634,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         scheduler = getattr(self, "_drafter_scheduler", None)
         if scheduler is None:
             scheduler = DrafterScheduler()
-            controller = scheduler.configure_adaptive(
-                self._speco_drafter_schedule_config()
-            )
-            if controller is not None:
-                _, resume_folder = self._speco_freeze_state_resume_path()
-                if resume_folder:
-                    controller.restore(Path(resume_folder) / "adaptive_schedule.json")
+            self._speco_restore_adaptive_state(scheduler)
             self._drafter_scheduler = scheduler
         return scheduler
+
+    def _speco_restore_adaptive_state(self, scheduler: DrafterScheduler) -> None:
+        """Initialize adaptive scheduling and restore its selected checkpoint."""
+        controller = scheduler.configure_adaptive(
+            self._speco_drafter_schedule_config()
+        )
+        if controller is not None:
+            _, resume_folder = self._speco_freeze_state_resume_path()
+            if resume_folder:
+                controller.restore(Path(resume_folder) / "adaptive_schedule.json")
 
     def _speco_get_drafter_runtime_state(self) -> DrafterRuntimeState:
         runtime_state = getattr(self, "_drafter_runtime_state", None)
@@ -9368,6 +9372,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ):
             self._save_checkpoint()
 
+    def _speco_save_adaptive_state(self) -> None:
+        """Persist the active controller alongside the completed checkpoint."""
+        scheduler = getattr(self, "_drafter_scheduler", None)
+        controller = getattr(scheduler, "adaptive_controller", None)
+        if controller is not None:
+            root = _get_nested(self.config, ("trainer", "default_local_dir"), None)
+            if root:
+                controller.save(
+                    Path(root)
+                    / f"global_step_{self.global_steps}"
+                    / "adaptive_schedule.json"
+                )
+
     def _save_checkpoint(self):
         if self._speco_checkpoint_pending_quota():
             # Do not serialize orphaned replay pins or silently discard debt on
@@ -9433,16 +9450,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     self._speco_freeze_save_state()
                 with boundary_stage(timings, "upstream_save"):
                     result = super()._save_checkpoint()
-            scheduler = getattr(self, "_drafter_scheduler", None)
-            controller = getattr(scheduler, "adaptive_controller", None)
-            if controller is not None:
-                root = _get_nested(self.config, ("trainer", "default_local_dir"), None)
-                if root:
-                    controller.save(
-                        Path(root)
-                        / f"global_step_{self.global_steps}"
-                        / "adaptive_schedule.json"
-                    )
+            self._speco_save_adaptive_state()
             self._speco_last_checkpoint_saved_step = self.global_steps
             requested_step = getattr(self, "_speco_deferred_checkpoint_step", None)
             if requested_step is not None:

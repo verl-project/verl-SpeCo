@@ -189,6 +189,10 @@ class SpecoV1Mixin:
         self._speco_pending_request_accept_len_payloads = []
         self._speco_last_request_accept_len_var = 0.0
         self._speco_v1_evidence_step = None
+        drafter = self.config.actor_rollout_ref.rollout.get("drafter", {}) or {}
+        adaptive = (drafter.get("training") or {}).get("adaptive_schedule") or {}
+        if adaptive.get("enable", False):
+            self._speco_restore_adaptive_state(self._drafter_scheduler)
 
     def __getattr__(self, name):
         """Lazily expose the stable SPECO facade implemented by the legacy adapter.
@@ -869,6 +873,7 @@ class SpecoV1Mixin:
                 drafter_results=drafter_results,
                 feature_store=feature_store,
             )
+            self._speco_save_adaptive_state()
         self._speco_last_checkpoint_saved_step = self.global_steps
         return result
 

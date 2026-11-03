@@ -764,7 +764,7 @@ def test_trainer_resume_restores_adaptive_state_before_first_decision(tmp_path):
     trainer_cls = _methods(
         "verl_speco/trainer/speco_ray_trainer.py",
         "SpecoRayPPOTrainer",
-        {"_speco_get_drafter_scheduler", "_speco_freeze_state_resume_path"},
+        {"_speco_get_drafter_scheduler", "_speco_restore_adaptive_state", "_speco_freeze_state_resume_path"},
         DrafterScheduler=DrafterScheduler,
         Path=Path,
         _get_nested=get_nested,
