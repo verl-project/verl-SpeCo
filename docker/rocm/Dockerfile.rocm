@@ -1,0 +1,47 @@
+# AMD ROCm (MI300X / MI355X) image for verl-SpeCo, one image for both SGLang and vLLM rollout.
+#
+# The base is verl's ROCm release image (verl docs/amd_tutorial/amd_quick_start.rst, built from
+# verl docker/rocm/Dockerfile.rocm): ROCm 7.14, Python 3.12, torch 2.12.0+rocm7.14,
+# vLLM 0.22.1rc1 (18d87a87d), aiter b5e03ed19, sglang-kernel 0.4.2.post2, verl 0.9.0.dev (7b19203c).
+#
+# The base image builds SGLang from a newer source commit than the release verl-SpeCo supports.
+# This file replaces it with SGLang v0.5.12, installed from source the same way as verl's
+# Dockerfile.rocm (same ROCm layernorm fix, Rust gRPC extension disabled). v0.5.12 pins
+# sglang-kernel==0.4.2.post2, the version already built in the base image, so the kernel package
+# is reused as is.
+#
+# Build from the repo root:
+#   docker build -f docker/rocm/Dockerfile.rocm -t verl-speco:rocm .
+ARG BASE_IMAGE=amdagi/verl-dev:rocm7.14_torch2.12_release_0724@sha256:919a8a9b462b3e637e3e50bd704b4d987846619ddb35e10b4f15643db179f0e6
+FROM ${BASE_IMAGE}
+
+# SGLang v0.5.12 (tag commit 127b9e3283f7c2a43234b852ff5c9f1796d53624).
+ARG SGLANG_TAG="127b9e3283f7c2a43234b852ff5c9f1796d53624"
+RUN cd /workspace && rm -rf sglang && git clone https://github.com/sgl-project/sglang.git && \
+    cd sglang && git checkout ${SGLANG_TAG} && \
+    # [Bugfix][ROCm] Fix vllm fused_add_rms_norm 6-arg crash on non-AITER path
+    # Ref: https://github.com/sgl-project/sglang/pull/32034 (same patch as verl's Dockerfile.rocm)
+    sed -zi 's/            out = torch.empty_like(x)\n            residual_out = torch.empty_like(x)\n            if post_residual_addition is not None:\n                residual = residual + post_residual_addition\n            fused_add_rms_norm(\n                out, x, residual_out, residual, self.weight.data, self.variance_epsilon\n            )\n            return out, residual_out/            if post_residual_addition is not None:\n                residual = residual + post_residual_addition\n            residual = residual.contiguous()\n            fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)\n            return x, residual/' \
+      python/sglang/srt/layers/layernorm.py && \
+    sed -zi 's/                out = torch.empty_like(x)\n                residual_out = torch.empty_like(x)\n                if post_residual_addition is not None:\n                    residual = residual + post_residual_addition\n                fused_add_rms_norm(\n                    out, x, residual_out, residual, w, self.variance_epsilon\n                )\n                return out, residual_out/                if post_residual_addition is not None:\n                    residual = residual + post_residual_addition\n                residual = residual.contiguous()\n                fused_add_rms_norm(x, residual, w, self.variance_epsilon)\n                return x, residual/' \
+      python/sglang/srt/layers/layernorm.py && \
+    grep -q "fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)" python/sglang/srt/layers/layernorm.py && \
+    grep -q "fused_add_rms_norm(x, residual, w, self.variance_epsilon)" python/sglang/srt/layers/layernorm.py && \
+    sed -i 's|^\[\[tool.setuptools-rust.ext-modules\]\]|# [[tool.setuptools-rust.ext-modules]]|; s|^target = "sglang.srt.grpc._core"|# target = "sglang.srt.grpc._core"|; s|^path = "../rust/sglang-grpc/Cargo.toml"|# path = "../rust/sglang-grpc/Cargo.toml"|; s|^binding = "PyO3"|# binding = "PyO3"|' python/pyproject.toml && \
+    pip install --no-cache-dir --no-build-isolation --no-deps -e ./python && \
+    python -c "import importlib.metadata as md, sgl_kernel; \
+v = md.version('sglang'); k = md.version('sglang-kernel'); print('sglang', v, 'sglang-kernel', k); \
+assert v == '0.5.12', v; assert k == '0.4.2.post2', k"
+
+COPY . /workspace/verl-SpeCo
+WORKDIR /workspace/verl-SpeCo
+# --no-deps keeps the base image's ROCm torch, vLLM, SGLang kernels and verl untouched.
+RUN pip install --no-cache-dir --no-deps -e . \
+    && python -c "import importlib.metadata as md, torch, verl, verl_speco; \
+assert torch.version.hip, 'expected a ROCm torch build'; \
+print('torch', torch.__version__, 'hip', torch.version.hip); \
+print('vllm', md.version('vllm'), 'sglang', md.version('sglang')); \
+print('verl', verl.__version__, verl.__file__); \
+print('verl_speco', verl_speco.__version__)"
+
+CMD ["/bin/bash"]

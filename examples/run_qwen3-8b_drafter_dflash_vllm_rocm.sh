@@ -2,7 +2,7 @@ set -x
 # Minimal ROCm/MI355X smoke: GRPO + DFlash drafter co-training on the native vLLM
 # DFlash proposer. Same sizes as run_qwen3-8b_drafter_dflash_sglang_rocm.sh so a
 # couple of real global steps (incl. a drafter collect+train+publish) finish quickly.
-# Run inside the image built from docker/rocm/Dockerfile.vllm; see docs/amd/get_started.md.
+# Run inside the image built from docker/rocm/Dockerfile.rocm; see docs/amd/get_started.md.
 
 project_name='verl_speco_rocm_smoke'
 exp_name='qwen3_8b_dflash_drafter_vllm_rocm'
