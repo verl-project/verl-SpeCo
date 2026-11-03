@@ -301,11 +301,18 @@ def test_online_training_accepts_bubble_configuration(mode, nested):
 
     trainer = SpecoV1Mixin()
     trainer.config = config
-    trainer._speco_validate_v1_training_config(config)
-    assert trainer._speco_rollout_idle_worker_enabled()
+    if mode != "sync":
+        with pytest.raises(ValueError, match="supports only trainer_mode=sync"):
+            trainer._speco_validate_v1_training_config(config)
+        with pytest.raises(ValueError, match="supports only trainer_mode=sync"):
+            trainer._speco_rollout_idle_worker_enabled()
+    else:
+        trainer._speco_validate_v1_training_config(config)
+        assert trainer._speco_rollout_idle_worker_enabled()
 
 
-@pytest.mark.parametrize("mode", ["sync", "colocate_async"])
+
+@pytest.mark.parametrize("mode", ["sync"])
 @pytest.mark.parametrize("nested", [False, True])
 def test_bubble_rejects_local_policy_head_aliasing_before_worker_creation(mode, nested):
     config = _config(mode=mode)
@@ -326,6 +333,26 @@ def test_bubble_rejects_local_policy_head_aliasing_before_worker_creation(mode, 
         trainer._setup()
 
 
+@pytest.mark.parametrize("mode", ["colocate_async", "separate_async"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_async_bubble_rejected_before_worker_creation(mode, nested):
+    config = _config(mode=mode)
+    training = config.actor_rollout_ref.rollout.drafter.training
+    if nested:
+        training["scheduler"] = {"execution": {"strategy": "rollout_idle_worker"}}
+    else:
+        training["execution_strategy"] = "rollout_idle_worker"
+
+    class Harness(SpecoV1Mixin):
+        def _speco_install_v1_standalone_publish_worker(self):
+            pytest.fail("async Bubble must fail before creating workers")
+
+    trainer = Harness()
+    trainer.config = config
+    with pytest.raises(ValueError, match="supports only trainer_mode=sync"):
+        trainer._setup()
+
+
 @pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
 @pytest.mark.parametrize("bubble", [False, True])
 def test_local_update_limit_only_applies_to_bubble_without_fixed_old_policy(
@@ -339,7 +366,11 @@ def test_local_update_limit_only_applies_to_bubble_without_fixed_old_policy(
         config.actor_rollout_ref.rollout.drafter.training["scheduler"] = {
             "execution": {"strategy": "rollout_idle_worker"}
         }
-    SpecoV1Mixin._speco_validate_v1_training_config(config)
+    if bubble and mode != "sync":
+        with pytest.raises(ValueError, match="supports only trainer_mode=sync"):
+            SpecoV1Mixin._speco_validate_v1_training_config(config)
+    else:
+        SpecoV1Mixin._speco_validate_v1_training_config(config)
 
 
 @pytest.fixture
@@ -908,13 +939,13 @@ def test_joint_checkpoint_manifest_records_drafter_and_feature_store(tmp_path):
 
 def test_bubble_manifest_restores_writer_and_versions_without_feature_store(tmp_path):
     trainer = SpecoV1Mixin()
-    trainer.config = _config(mode="separate_async")
+    trainer.config = _config(mode="sync")
     trainer.config.trainer.default_local_dir = str(tmp_path)
     trainer.config.actor_rollout_ref.rollout.drafter.training["scheduler"] = {
         "execution": {"strategy": "rollout_idle_worker"}
     }
     trainer.global_steps = 7
-    trainer.trainer_mode = "separate_async"
+    trainer.trainer_mode = "sync"
     trainer._speco_last_published_drafter_step = 5
     trainer._speco_freeze_policy = types.SimpleNamespace(drafter_version=3)
     scheduler = types.SimpleNamespace(

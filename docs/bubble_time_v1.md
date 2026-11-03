@@ -1,14 +1,16 @@
 # Bubble Time 与 V1
 
-Last updated: 2026-11-02
+Last updated: 2026-11-03
 
 适配基线为上游 `release/v0.9.0`。PPO 主循环仍由上游 V1 trainer 执行；
-本仓库仅提供生命周期 hook、独立池 worker、数据采集和发布协议。
-V1 rollout 后端仍限于 vLLM。
+本仓库仅提供sync 生命周期 hook、数据采集和发布协议。
+V1 rollout 后端仍限于 vLLM。Bubble 仅支持 `trainer_mode=sync`；
+`colocate_async`、`separate_async` 与 Bubble 同时启用时会在 worker 创建前报错。
+关闭 Bubble 后，三种 V1 模式沿用原有逻辑。
 
 ## 配置
 
-V1 三种模式在采样结束、Actor/PPO 前以及补训后的资源归还边界强制将 drafter
+V1 sync 模式在采样结束、Actor/PPO 前以及补训后的资源归还边界强制将 drafter
 训练状态卸载到 CPU，即使 `keep_hot_between_plans=true`。该开关只允许在资源
 仍归训练所有的窗口内保留驻留状态；不能跨 PPO 或 serving 边界占用共享 GPU。
 卸载不清空 optimizer、replay、quota 或固定 writer；严格卸载失败会停止边界推进。
@@ -58,7 +60,7 @@ actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.boundary_diagno
 必要时设置 true，记录回收与 Actor 边界。回收开始日志在关闭训练启动入口、
 停止事件线程之后输出，避免日志等待期间启动新训练。结合已有 worker
 `training_cleanup_boundary` 的 plan/rank 时间检查顺序；这些日志不是 GPU
-硬件同步或带宽无竞争的证明。separate_async 的独立池训练与 Actor 可以合法重叠。
+硬件同步或带宽无竞争的证明。
 
 Bubble V1 在创建 rollout worker 前输出一次 `[BubbleTime] v1_runtime:` JSON，
 包括驱动实际模块的绝对路径及 SHA256、Git 提交号、运行模式、预热请求值、
@@ -73,17 +75,16 @@ Bubble V1 在创建 rollout worker 前输出一次 `[BubbleTime] v1_runtime:` JS
 使用 `--config-name=speco_v1_trainer`，沿用以下配置：
 
 ```text
-trainer.v1.trainer_mode=sync|colocate_async|separate_async
+trainer.v1.trainer_mode=sync
 actor_rollout_ref.rollout.drafter.training.scheduler.execution.strategy=rollout_idle_worker
 actor_rollout_ref.rollout.drafter.training.scheduler.training_quota.enable=true
 actor_rollout_ref.rollout.drafter.training.scheduler.training_quota.allow_critical_path_fallback=false
 ```
 
-Bubble 的 `sync` 和 `colocate_async` 当前要求各自模式配置中的
-`parameter_sync_step=1`。上游这两种模式在每个 local batch 后更新 Actor，
+Bubble 的 `sync` 当前要求模式配置中的
+`parameter_sync_step=1`。上游 sync在每个 local batch 后更新 Actor，
 因此多个 local update 的特征不能共用一个 global-step head/quota 版本。
 在独立 policy snapshot 标识接入前，启动时拒绝大于 1 的配置，避免静默混用 head。
-`separate_async` 使用上游固定旧策略快照，可继续配置多个 local update。
 普通非 Bubble 训练不受此限制；不通过额外恢复 Actor 权重来改变 PPO 行为。
 
 启用 ROI 时，设置
@@ -116,11 +117,10 @@ driver 耗时；不包含 PPO actor 更新、上游 actor target 同步、联合
 `timing_s/oldlogprob_*` 提供准备、计算、采集和恢复耗时。
 同一 global step 内多个 local batch 的 Bubble 时间累加后，在最终指标阶段输出。
 
-sync/colocate_async 在每轮采样和事件处理前更新 drafter worker 的控制 RL step，
+sync 在每轮采样和事件处理前更新 drafter worker 的控制 RL step，
 即使该轮因已有 quota 而跳过特征采集，也不能让 worker 停留在上次采集的 step。
 控制 step 与 quota 的数据/head 版本独立：例如 step 11 补齐 step 8 的 quota，
 计划的执行 step 为 11，训练数据和 head 仍固定为版本 8。
-separate_async 不采用这个全组同步，以免干扰跨步运行的后台训练。
 预检失败保留 `worker_preflight_failed`，日志包含 worker 原因及两侧 step，
 不会将未执行的预检失败误报为训练结果不一致。
 
@@ -131,26 +131,14 @@ SpeCo 精确请求计数；engine 汇总 fallback 不冒充单个请求数据。
 `request_stats_coverage` 等指标暴露计算分母与请求覆盖率。
 请求数据不足且没有启用可用 sidecar 时保留覆盖率，不伪造 acceptlen 数值。
 
-`separate_async` 固定将 drafter 训练 worker 放到独立 rollout placement groups，
-不新增部署模式。分配 GPU 时复用已有资源池，不申请额外 GPU。
-worker 在训练 RPC 返回、资源租约释放之前完成 offload；optimizer writer 仍保留。
-
 ## 边界
 
 | 模式 | Bubble 可运行阶段 | PPO/同步边界 |
 | --- | --- | --- |
 | sync | rollout 的已确认空闲窗口 | sample end 停线程、回收训练组，再进入上游 sleep/old-logprob |
-| colocate_async | 预取期间的已确认空闲窗口 | 先关闭 admission，再回收、abort/sleep；发布完成后恢复 |
-| separate_async | 独立 rollout 池的已确认空闲窗口，可与 actor 更新重叠 | target 同步前回收冲突训练资源；有发布、探测、保存时进入受控暂停 |
-
-独立池的训练 rank 与 rollout replica rank 分开处理。初始化根据 node、实际设备和
-collective 元数据校验归属。每个独立 replica 的发布 ACK 使用独立命名空间，
-避免不同 replica 的本地 rank 0 相互覆盖。休眠 hybrid replica 重新加入 balancer 前，
-先补齐已确认的 drafter 权重及 serving revision。
 
 old-logprob 特征继续使用每份采集计划独立、重试稳定的样本 ID。
-separate_async 在上游旧策略 CPU-slot 恢复上下文内完成不可变 head 导出，
-随后才恢复当前 actor。head 的 CPU 分发、版本 ACK 和 quota 保护继续使用共享协议。
+sync 在 old-logprob 采集后完成不可变 head 导出。head 的 CPU 分发、版本 ACK 和 quota 保护继续使用共享协议。
 
 ROI 事务顺序为：关闭普通请求 → 固定 actor target → before-arm →
 drafter 发布并等待完整 ACK → 更新 serving revision → after-arm → 恢复请求。
@@ -164,7 +152,6 @@ worker 时间区间使用集群 wall clock；验收机器应保持时钟同步�
 
 未完成 quota 或未确认发布会延迟 checkpoint。发布和 ROI 状态提交后，
 在关闭 admission 的边界使用实际 RL step 保存联合恢复点。
-异步 Bubble 保存要求 TransferQueue 支持 snapshot/reissue；不支持时明确报错。
 最后一步仍有 quota 且未允许关键路径补齐时明确失败，不保存不完整结果。
 
 联合保存要求 actor 和已启用 critic 的 `checkpoint.async_save=false`，
@@ -175,7 +162,6 @@ worker 时间区间使用集群 wall clock；验收机器应保持时钟同步�
 组件保存或 latest 提交失败时，旧指针和旧模型 checkpoint 均保留，允许重试。
 
 generation 启动事件使用注册的真实 replica 分组，不再根据 rollout DP 数量推断 rank。
-separate_async 的事件总线只管理独立池，hybrid 请求与同号训练 rank 的租约相互隔离。
 head 传输成本在同步返回或预取轮询收到完整版本 ACK 后统一记账；
 同一传输重复完成不重复计费，同一版本再次分发则按新增传输计费。
 
@@ -202,15 +188,14 @@ PYTHONPATH="$PWD:$LEGACY_VERL" python -m pytest \
 
 CPU 合约通过不代表 GPU 功能验收完成。当前开发环境无可用 CUDA GPU，以下项目仍须实测。
 
-| 负载 | sync | colocate_async | separate_async |
-| --- | --- | --- | --- |
-| DSpark：Bubble / 普通 drafter 等工作量对照 | 待测 | 待测 | 待测 |
-| DFlash：Bubble / 普通 drafter 等工作量对照 | 待测 | 待测 | 待测 |
-| ROI 探测、冻结、漂移恢复、checkpoint 恢复 | 待测 | 待测 | 待测 |
+| 负载 | sync |
+| --- | --- |
+| DSpark：Bubble / 普通 drafter 等工作量对照 | 待测 |
+| DFlash：Bubble / 普通 drafter 等工作量对照 | 待测 |
+| ROI 探测、冻结、漂移恢复、checkpoint 恢复 | 待测 |
 
 每组必须记录 optimizer 工作量、发布次数、未偿 quota、probe 暂停和端到端耗时，
 并核对共享 GPU 无越界重叠、完整 quota 只执行一次、发布和恢复版本一致。
-separate_async 还须覆盖跨节点 CPU/Ray 传输及 hybrid replica 重新入池。
 减少训练或遗留 quota 的结果不能作为等工作量加速证据。
 
 

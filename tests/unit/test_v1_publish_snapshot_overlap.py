@@ -81,7 +81,6 @@ def _driver():
     driver._speco_colocate_admission_closed = True
     driver._speco_wait_target_lm_head_prefetch = lambda: None
     driver._speco_v1_finish_receipts = lambda: {}
-    driver._speco_v1_separate_bubble = lambda: False
     driver._ray_get_if_needed = lambda refs: refs
     driver._first_non_null = lambda values: next(
         (v for v in values if v is not None), None

@@ -8,7 +8,6 @@ import pytest
 
 from verl_speco.integration.resource_identity import map_training_replicas
 from verl_speco.trainer.bubble_lifecycle import BubbleLifecycle, QuotaCostLedger
-from verl_speco.trainer.v1.bubble_workers import normalize_publish_ack
 
 
 def test_cost_ledger_deduplicates_completion_and_uses_maximum_rank_cost():
@@ -109,20 +108,6 @@ def test_same_device_number_on_different_nodes_is_independent():
     assert len(map_training_replicas(records, {7: records})) == 2
 
 
-def test_publish_rank_domains_do_not_alias():
-    ack = {"worker_id": "0", "published": True, "published_version": 9}
-    assert normalize_publish_ack(ack, "hybrid", 0)["worker_id"] == "hybrid:0"
-    assert normalize_publish_ack(ack, "standalone", 0)["worker_id"] == "standalone:0"
-    with pytest.raises(RuntimeError):
-        normalize_publish_ack(ack, "standalone", 1)
-    assert (
-        normalize_publish_ack({"worker_rank": 0}, "standalone:7", 0)["worker_id"]
-        == "standalone:7:0"
-    )
-    assert (
-        normalize_publish_ack({"worker_rank": 0}, "standalone:8", 0)["worker_id"]
-        == "standalone:8:0"
-    )
 
 
 def test_completion_queue_is_idempotent_and_owns_its_cost_snapshot():

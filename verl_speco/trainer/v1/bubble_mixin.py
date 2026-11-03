@@ -32,7 +32,7 @@ class V1BubbleMixin:
         if actor is None:
             return False
         drafter = actor.rollout.get("drafter", {}) or {}
-        return bool(
+        enabled = bool(
             drafter.get("enable", False)
             and drafter.get("enable_drafter_training", False)
             and DrafterScheduleConfig.from_mapping(
@@ -40,6 +40,12 @@ class V1BubbleMixin:
             ).execution_strategy.value
             == "rollout_idle_worker"
         )
+        if (
+            enabled
+            and str(self.config.trainer.v1.get("trainer_mode", "sync")) != "sync"
+        ):
+            raise ValueError("V1 Bubble Time supports only trainer_mode=sync")
+        return enabled
 
     def _speco_bubble_session(self) -> BubbleLifecycle:
         session = self.__dict__.get("_speco_bubble_lifecycle")
@@ -78,134 +84,20 @@ class V1BubbleMixin:
             )
         return metrics
 
-    def _speco_v1_separate_bubble(self) -> bool:
-        return (
-            self._speco_rollout_idle_worker_enabled()
-            and str(self.config.trainer.v1.get("trainer_mode", "sync"))
-            == "separate_async"
-        )
-
     def _speco_v1_serving_managers(self):
         managers = [("hybrid", self.llm_server_manager)]
-        if str(self.config.trainer.v1.get("trainer_mode", "sync")) == "separate_async":
-            managers.append(("standalone", self.standalone_server_manager))
         return managers
 
     def _speco_v1_probe_servers(self):
-        if self._speco_v1_separate_bubble():
-            return list(self.standalone_server_manager.server_handles)
         return list(self.llm_server_manager.server_handles)
 
-    def _speco_v1_publish_managers(self):
-        managers = self._speco_v1_serving_managers()
-        if (
-            self._speco_v1_separate_bubble()
-            and getattr(self.current_mode, "value", None) == "trainer"
-        ):
-            return [item for item in managers if item[0] == "standalone"]
-        return managers
-
     def _speco_v1_active_checkpoint_managers(self):
-        if not self._speco_v1_separate_bubble():
-            return [self.checkpoint_manager]
-        managers = [self.standalone_checkpoint_manager]
-        if getattr(self.current_mode, "value", None) != "trainer":
-            managers.insert(0, self.checkpoint_manager)
-        return managers
-
-    def _speco_v1_bubble_publish_method(self, method_name):
-        import ray
-        from verl.single_controller.ray.base import RayClassWithInitArgs, RayWorkerGroup
-        from verl_speco.trainer.v1.bubble_workers import normalize_publish_ack
-
-        normalizer = ray.remote(num_cpus=0)(normalize_publish_ack)
-        endpoints = []
-        expected = set()
-        for name, manager in self._speco_v1_publish_managers():
-            replicas = manager.get_replicas()
-            if not replicas or any(not replica.workers for replica in replicas):
-                raise RuntimeError(
-                    "Bubble publication has an empty serving worker domain"
-                )
-            if name == "hybrid":
-                operation = self._speco_actor_rollout_method(method_name)
-                count = sum(len(replica.workers) for replica in replicas)
-                endpoints.append((name, count, operation))
-                expected.update(f"{name}:{rank}" for rank in range(count))
-            else:
-                for replica in replicas:
-                    namespace = f"{name}:{replica.replica_rank}"
-                    group = RayWorkerGroup(
-                        worker_handles=replica.workers,
-                        ray_cls_with_init=RayClassWithInitArgs(
-                            cls=self._speco_v1_standalone_publish_worker_cls(),
-                        ),
-                    )
-                    endpoints.append(
-                        (namespace, len(replica.workers), getattr(group, method_name))
-                    )
-                    expected.update(
-                        f"{namespace}:{rank}" for rank in range(len(replica.workers))
-                    )
-        self._speco_v1_publish_expected = expected
-
-        def submit(*args, **kwargs):
-            refs = []
-            for name, count, operation in endpoints:
-                responses = operation(*args, **kwargs)
-                if not isinstance(responses, (list, tuple)) or len(responses) != count:
-                    raise RuntimeError(
-                        "Bubble publish RPC returned an incomplete worker domain"
-                    )
-                refs.extend(
-                    normalizer.remote(response, name, rank)
-                    for rank, response in enumerate(responses)
-                )
-            return refs
-
-        return submit
-
-    def _speco_validate_bubble_publish_acks(
-        self, acknowledgements, source_version, *, staged=False
-    ):
-        if not self._speco_v1_separate_bubble():
-            from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
-
-            return SpecoRayPPOTrainer._speco_validate_bubble_publish_acks(
-                self,
-                acknowledgements,
-                source_version,
-                staged=staged,
-            )
-        acks = self._speco_get_drafter_scheduler()._flatten_publish_acknowledgements(
-            acknowledgements
-        )
-        seen = set()
-        for ack in acks:
-            identity = str(ack.get("worker_id"))
-            if (
-                identity in seen
-                or ack.get("staged_version" if staged else "published_version")
-                != source_version
-                or not ack.get("staged" if staged else "published")
-                or (staged and ack.get("published"))
-            ):
-                raise RuntimeError("Invalid or duplicate separate Bubble publish ACK")
-            seen.add(identity)
-        if not seen or seen != self._speco_v1_publish_expected:
-            raise RuntimeError(
-                "Separate Bubble publish ACKs do not cover all serving workers"
-            )
-
-    def _speco_init_v1_standalone_bubble_workers(self):
-        from verl_speco.trainer.v1.bubble_workers import create_standalone_bubble_group
-
-        self.attach_speco_worker_group(create_standalone_bubble_group(self))
+        return [self.checkpoint_manager]
 
     def _speco_park_drafter_training_memory(self, boundary):
         if not self._speco_rollout_idle_worker_enabled():
             return {}
-        # All V1 modes return leased GPUs to serving or PPO at these boundaries.
+        # V1 sync returns leased GPUs to serving or PPO at these boundaries.
         # keep_hot_between_plans is only valid inside a resource-owned window;
         # it must not bypass parking across actor updates or rollout admission.
         # Preserve CPU optimizer/replay state and the fixed quota writer.
@@ -239,32 +131,9 @@ class V1BubbleMixin:
             replica.replica_rank: ray.get(
                 [worker.speco_resource_identity.remote() for worker in replica.workers]
             )
-            for replica in (
-                self.standalone_server_manager
-                if self._speco_v1_separate_bubble()
-                else self.llm_server_manager
-            ).get_replicas()
+            for replica in self.llm_server_manager.get_replicas()
         }
         return map_training_replicas(records, replicas)
-
-    def _speco_register_drafter_training_resource_metadata(self):
-        from verl_speco.integration.rollout_idle_events import (
-            configure_rollout_resource_groups,
-        )
-        from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
-
-        metrics = SpecoRayPPOTrainer._speco_register_drafter_training_resource_metadata(
-            self
-        )
-        if self._speco_v1_separate_bubble() and not configure_rollout_resource_groups(
-            self._speco_rollout_idle_event_bus_name(),
-            self._speco_get_drafter_scheduler().rollout_idle_replica_groups(),
-            strict_groups=True,
-        ):
-            raise RuntimeError(
-                "Separate V1 Bubble requires isolated standalone resource leases"
-            )
-        return metrics
 
     def _speco_v1_admission(self, method: str) -> None:
         import ray
@@ -291,8 +160,6 @@ class V1BubbleMixin:
         completed = False
         try:
             managers = [self.checkpoint_manager]
-            if self._speco_v1_separate_bubble():
-                managers.append(self.standalone_checkpoint_manager)
             for manager in managers:
                 # Abort partial requests so the idle wait cannot wait forever
                 # on a paused request; TQ retains the upstream retry ownership.
@@ -307,14 +174,10 @@ class V1BubbleMixin:
             yield
             completed = True
         finally:
-            if completed and (
-                not already_closed
-                or getattr(self, "_speco_v1_training_admission_owned", False)
-            ):
+            if completed and not already_closed:
                 resume_wall_started = time.time()
                 self._speco_v1_admission("speco_resume_rollout_admission")
                 self._speco_colocate_admission_closed = False
-                self._speco_v1_training_admission_owned = False
                 receipts = self._speco_bubble_session().receipts
                 self._speco_v1_last_pause_seconds = time.perf_counter() - pause_started
                 if receipts and charge_cost:
@@ -324,68 +187,10 @@ class V1BubbleMixin:
                         time.time(),
                     )
 
-    def switch_to_rollout(self):
-        if not self._speco_v1_separate_bubble():
-            return super().switch_to_rollout()
-        from verl.trainer.ppo.v1.trainer_separate_async import HybridEngineMode
-
-        # Keep hybrid replicas out of the balancer until the last acknowledged
-        # drafter snapshot has been applied as well as the actor target.
-        with self._speco_v1_quiescent_boundary():
-            self.checkpoint_manager.update_weights(self.global_steps)
-            payload = getattr(self, "_speco_last_published_drafter_payload", None)
-            version = getattr(self, "_speco_last_published_drafter_step", None)
-            if payload is not None:
-                acknowledgements = self._ray_get_if_needed(
-                    self._speco_actor_rollout_method("update_draft_weights")(
-                        payload,
-                        global_steps=version,
-                    ),
-                )
-                expected = {
-                    str(rank) for rank in range(self.actor_rollout_wg.world_size)
-                }
-                items = self._speco_get_drafter_scheduler()._flatten_publish_acknowledgements(
-                    acknowledgements
-                )
-                if (
-                    len(items) != len(expected)
-                    or {
-                        str(item.get("worker_id", item.get("worker_rank")))
-                        for item in items
-                    }
-                    != expected
-                    or any(
-                        not item.get("published")
-                        or item.get("published_version") != version
-                        for item in items
-                    )
-                ):
-                    raise RuntimeError(
-                        "Hybrid rollout cannot rejoin with stale drafter weights"
-                    )
-            policy = getattr(self, "_speco_freeze_policy", None)
-            if policy is not None:
-                import ray
-
-                ray.get(
-                    [
-                        server.speco_set_serving_drafter_revision.remote(
-                            policy.drafter_version
-                        )
-                        for server in self.llm_server_manager.server_handles
-                    ]
-                )
-            self.checkpoint_manager.resume_generation_replicas()
-            self.current_mode = HybridEngineMode.ROLLOUT
-            self.add_replicas_to_balancer()
-        self._speco_bubble_session().start()
-
     def _speco_v1_cache_old_policy_head(self) -> None:
         if not self._speco_rollout_idle_worker_enabled():
             return
-        # Called inside separate_async's pi_old save/restore context. Materialize
-        # the export before pi_old is restored away, not at the next actor hook.
+        # Materialize the sync collection head before the next actor update.
         wall_started = time.time()
         metrics, pending = self._speco_start_target_lm_head_weight_sync(None)
         if pending is not None:
@@ -553,7 +358,7 @@ class V1BubbleMixin:
                             server.speco_set_serving_drafter_revision.remote(
                                 version_before + 1
                             )
-                            for _, manager in self._speco_v1_publish_managers()
+                            for _, manager in self._speco_v1_serving_managers()
                             for server in manager.server_handles
                         ]
                     )
@@ -707,20 +512,11 @@ class V1BubbleMixin:
                 **(getattr(self, "_pending_sync_metrics", None) or {}),
                 **metrics,
             }
-            if (
-                self.global_steps < self.total_training_steps
-                and self._speco_v1_separate_bubble()
-            ):
-                session.start()
             return result
         with self._speco_v1_quiescent_boundary():
             self._speco_wait_target_lm_head_prefetch()
             if topup_plan is not None:
-                for manager in (
-                    [self.checkpoint_manager, self.standalone_checkpoint_manager]
-                    if self._speco_v1_separate_bubble()
-                    else [self.checkpoint_manager]
-                ):
+                for manager in [self.checkpoint_manager]:
                     manager.sleep_replicas()
                 metrics.update(scheduler.prepare_training_execution(topup_plan))
                 started = time.perf_counter()
@@ -747,8 +543,6 @@ class V1BubbleMixin:
                         "Final V1 Bubble quota remains incomplete; critical-path fallback is disabled"
                     )
                 managers = [self.checkpoint_manager]
-                if self._speco_v1_separate_bubble():
-                    managers.append(self.standalone_checkpoint_manager)
                 for manager in managers:
                     manager.sleep_replicas()
                 event = self._speco_on_before_actor_update(force_quota_completion=True)
@@ -791,11 +585,7 @@ class V1BubbleMixin:
             # Persist the acknowledged version and its ROI observation together.
             # The first boundary includes resume costs before committing policy.
             with self._speco_v1_quiescent_boundary(charge_cost=False):
-                for manager in (
-                    [self.checkpoint_manager, self.standalone_checkpoint_manager]
-                    if self._speco_v1_separate_bubble()
-                    else [self.checkpoint_manager]
-                ):
+                for manager in [self.checkpoint_manager]:
                     manager.sleep_replicas()
                 checkpoint_started = time.perf_counter()
                 self._save_checkpoint()
@@ -815,11 +605,6 @@ class V1BubbleMixin:
             **(getattr(self, "_pending_sync_metrics", None) or {}),
             **metrics,
         }
-        if (
-            self.global_steps < self.total_training_steps
-            and self._speco_v1_separate_bubble()
-        ):
-            session.start()
         return result
 
     def _speco_v1_idle_option(self, name, default):
@@ -893,9 +678,7 @@ class V1BubbleMixin:
 
     def _speco_v1_bubble_update_actor(self, batch, metrics, update):
         started = time.perf_counter()
-        separate = self._speco_v1_separate_bubble()
-        if not separate:
-            metrics.update(self._speco_bubble_session().close("v1_before_actor"))
+        metrics.update(self._speco_bubble_session().close("v1_before_actor"))
         # Export was fenced inside the old-policy collection context.
         if self._pending_target_lm_head_sync is not None:
             metrics.update(self._speco_poll_target_lm_head_prefetch())
@@ -943,11 +726,7 @@ class V1BubbleMixin:
 
     def step(self, metrics, timing_raw):
         if self._speco_rollout_idle_worker_enabled():
-            if not self._speco_v1_separate_bubble():
-                # Collection can be skipped while a quota remains outstanding.
-                # Advance the worker's control step before opening events, but
-                # leave the quota's data/head version pinned to its collection.
-                self._speco_set_drafter_global_step()
+            self._speco_set_drafter_global_step()
             self._speco_bubble_session().start()
         return super().step(metrics, timing_raw)
 

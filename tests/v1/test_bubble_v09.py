@@ -143,7 +143,7 @@ def test_sync_bubble_logs_each_local_batch_even_without_feature_collection(
     assert not trainer._speco_pending_request_accept_len_payloads
 
 
-@pytest.mark.parametrize("mode", list(("sync", "colocate_async", "separate_async")))
+@pytest.mark.parametrize("mode", ["sync"])
 def test_real_native_step_obeys_bubble_resource_boundary(mode):
     trainer = TRAINERS[mode].__new__(TRAINERS[mode])
     trainer.config = config(mode)
@@ -205,7 +205,7 @@ def test_real_native_step_obeys_bubble_resource_boundary(mode):
         )
 
 
-@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+@pytest.mark.parametrize("mode", ["sync"])
 @pytest.mark.parametrize("checkpoint", [False, True])
 def test_real_mode_step_end_holds_target_across_probe_pair(mode, checkpoint):
     from verl_speco.trainer.bubble_lifecycle import BubbleLifecycle
@@ -293,7 +293,7 @@ def test_real_mode_step_end_holds_target_across_probe_pair(mode, checkpoint):
         assert events.index("publish") < events.index("checkpoint")
 
 
-@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+@pytest.mark.parametrize("mode", ["sync"])
 def test_real_mode_final_quota_cannot_enable_critical_path_fallback(mode):
     trainer = TRAINERS[mode].__new__(TRAINERS[mode])
     trainer.config = config(mode)
@@ -322,7 +322,7 @@ def test_real_mode_final_quota_cannot_enable_critical_path_fallback(mode):
     assert trainer._speco_colocate_admission_closed
 
 
-@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+@pytest.mark.parametrize("mode", ["sync"])
 @pytest.mark.parametrize("final", [False, True])
 def test_explicit_topup_preserves_bounded_and_final_completion_policy(mode, final):
     from verl_speco.trainer.bubble_lifecycle import BubbleLifecycle
@@ -396,7 +396,7 @@ def test_explicit_topup_preserves_bounded_and_final_completion_policy(mode, fina
     assert scheduler._training_quota_debt_steps == (0 if final else 2)
 
 
-@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+@pytest.mark.parametrize("mode", ["sync"])
 @pytest.mark.parametrize("boundary", ["v1_before_actor", "v1_topup"])
 def test_v1_parks_hot_writer_at_shared_resource_boundaries(mode, boundary):
     trainer = TRAINERS[mode].__new__(TRAINERS[mode])
@@ -425,7 +425,7 @@ def test_v1_parks_hot_writer_at_shared_resource_boundaries(mode, boundary):
     assert f"timing_s/drafter_memory_park_{boundary}" in metrics
 
 
-@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+@pytest.mark.parametrize("mode", ["sync"])
 def test_v1_parking_failure_prevents_boundary_completion(mode):
     trainer = TRAINERS[mode].__new__(TRAINERS[mode])
     trainer.config = config(mode)

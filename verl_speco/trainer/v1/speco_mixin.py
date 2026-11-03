@@ -663,17 +663,21 @@ class SpecoV1Mixin(V1BubbleMixin):
             == "rollout_idle_worker"
         )
         mode = str(config.trainer.v1.get("trainer_mode", "sync"))
+        if bubble and mode != "sync":
+            raise ValueError(
+                "V1 Bubble Time supports only trainer_mode=sync; "
+                "disable rollout_idle_worker for async training"
+            )
         local_updates = int(
             (config.trainer.v1.get(mode, {}) or {}).get("parameter_sync_step", 1)
         )
-        if bubble and mode in {"sync", "colocate_async"} and local_updates > 1:
-            # These native modes update pi after each local batch. Unlike
-            # separate_async, they do not restore a stable pi_old for capture.
+        if bubble and local_updates > 1:
+            # Sync updates pi after each local batch.
             # A global-step head key would alias distinct policy snapshots.
             raise ValueError(
                 f"V1 Bubble {mode} requires parameter_sync_step=1: multiple local "
                 "actor updates would mix policy/head snapshots under one quota "
-                "version; separate_async retains its fixed old-policy context"
+                "version"
             )
         if bool(training.get("collect_hidden_states_from_sgl", False)):
             raise ValueError(
@@ -760,8 +764,6 @@ class SpecoV1Mixin(V1BubbleMixin):
         detached actor's own weight lifecycle.  The standalone rollout workers
         are the replicas that serve the next batch, so publish directly to them.
         """
-        if self._speco_v1_separate_bubble():
-            return self._speco_v1_bubble_publish_method(method_name)
         mode = str(self.config.trainer.v1.get("trainer_mode", "sync")).lower()
         if mode != "separate_async":
             from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
@@ -951,21 +953,12 @@ class SpecoV1Mixin(V1BubbleMixin):
             if not getattr(self, "_speco_colocate_admission_closed", False):
                 with self._speco_v1_quiescent_boundary(charge_cost=False):
                     managers = [self.checkpoint_manager]
-                    if self._speco_v1_separate_bubble():
-                        managers.append(self.standalone_checkpoint_manager)
                     for manager in managers:
                         manager.sleep_replicas()
                     result = self._save_checkpoint()
                     for manager in self._speco_v1_active_checkpoint_managers():
                         manager.update_weights(self.global_steps)
                     return result
-            if self._speco_v1_async_rollout_enabled():
-                from verl.trainer.ppo.v1.trainer_base import _tq_supports_checkpoint
-
-                if not _tq_supports_checkpoint():
-                    raise RuntimeError(
-                        "V1 Bubble async checkpoint requires TransferQueue snapshot/reissue support"
-                    )
         if (
             getattr(self, "_speco_last_checkpoint_saved_step", None)
             == self.global_steps
@@ -1061,20 +1054,9 @@ class SpecoV1Mixin(V1BubbleMixin):
     def on_sample_end(self):
         if self._speco_rollout_idle_worker_enabled():
             started = time.perf_counter()
-            if not self._speco_v1_separate_bubble():
-                if (
-                    str(self.config.trainer.v1.get("trainer_mode", "sync"))
-                    == "colocate_async"
-                ):
-                    self._speco_v1_admission("speco_close_rollout_admission")
-                    self._speco_colocate_admission_closed = True
-                    self._speco_v1_training_admission_owned = True
-                # A final in-flight optimizer step can finish only during this
-                # drain. Retain its outcome instead of dropping the returned
-                # worker timings/trained flags before PPO logs this step.
-                self._speco_record_rollout_idle_metrics(
-                    self._speco_bubble_session().close("v1_sample_end")
-                )
+            self._speco_record_rollout_idle_metrics(
+                self._speco_bubble_session().close("v1_sample_end")
+            )
             self._speco_v1_record_timing(
                 "drafter_v1_sample_end", time.perf_counter() - started
             )
@@ -1206,8 +1188,6 @@ class SpecoV1Mixin(V1BubbleMixin):
         return shutdown_count
 
     def _init_v1_speco_drafter_workers(self):
-        if self._speco_v1_separate_bubble():
-            return self._speco_init_v1_standalone_bubble_workers()
         from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
         from verl.trainer.ppo.utils import Role
         from verl_speco.workers import SpecoWorker
@@ -1943,8 +1923,6 @@ class SpecoV1Mixin(V1BubbleMixin):
             if self._speco_rollout_idle_worker_enabled():
                 with self._speco_v1_quiescent_boundary():
                     managers = [self.checkpoint_manager]
-                    if self._speco_v1_separate_bubble():
-                        managers.append(self.standalone_checkpoint_manager)
                     for manager in managers:
                         manager.sleep_replicas()
                     self._speco_activate_drafter_training_model_before_fit()

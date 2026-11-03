@@ -55,7 +55,7 @@ def trainer_for(mode):
     return trainer
 
 
-@pytest.mark.parametrize("mode", ["sync", "colocate_async"])
+@pytest.mark.parametrize("mode", ["sync"])
 @pytest.mark.parametrize("requested", [None, False, True])
 def test_step_end_never_prepares_head_even_with_legacy_flag(
     monkeypatch, mode, requested
@@ -97,7 +97,7 @@ def test_step_end_never_prepares_head_even_with_legacy_flag(
     assert not session.costs.events
 
 
-@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+@pytest.mark.parametrize("mode", ["sync"])
 @pytest.mark.parametrize("git_available", [False, True])
 def test_runtime_provenance_survives_logger_filters(
     monkeypatch, capsys, mode, git_available
@@ -135,7 +135,7 @@ def test_runtime_provenance_survives_logger_filters(
         assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+@pytest.mark.parametrize("mode", ["sync"])
 def test_runtime_provenance_precedes_worker_setup(mode):
     trainer = trainer_for(mode)
     events = []
@@ -228,7 +228,7 @@ def test_final_metrics_override_stale_event_quota_snapshot(monkeypatch):
     assert metrics["bubble/training_quota_data_version"] == 40
 
 
-@pytest.mark.parametrize("mode", ["sync", "colocate_async"])
+@pytest.mark.parametrize("mode", ["sync"])
 def test_sample_end_keeps_training_outcome_from_forced_drain(monkeypatch, mode):
     trainer = trainer_for(mode)
     result = {
@@ -386,7 +386,7 @@ def test_resource_identity_survives_native_colocated_worker_export(monkeypatch, 
     assert result[0]["device_ids"] == ("3",)
 
 
-@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+@pytest.mark.parametrize("mode", ["sync"])
 def test_generation_start_uses_authoritative_replica_groups(mode):
     trainer = trainer_for(mode)
     scheduler = trainer._drafter_scheduler
@@ -414,43 +414,9 @@ def test_generation_start_uses_authoritative_replica_groups(mode):
     }
 
 
-@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
-def test_only_separate_pool_enables_strict_resource_scope(monkeypatch, mode):
-    from verl_speco.integration import rollout_idle_events
-    from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
-
-    trainer = trainer_for(mode)
-    trainer._drafter_scheduler.register_idle_training_resource_metadata(
-        [
-            {
-                "in_drafter_train_group": True,
-                "replica_rank": 7,
-                "training_group_ranks": [0, 1],
-                "full_collective_ranks": [0, 1],
-            },
-        ]
-    )
-    monkeypatch.setattr(
-        SpecoRayPPOTrainer,
-        "_speco_register_drafter_training_resource_metadata",
-        lambda self: {},
-    )
-    trainer._speco_rollout_idle_event_bus_name = lambda: "standalone-bus"
-    calls = []
-    monkeypatch.setattr(
-        rollout_idle_events,
-        "configure_rollout_resource_groups",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or True,
-    )
-    trainer._speco_register_drafter_training_resource_metadata()
-    assert calls == (
-        [(("standalone-bus", {7: ("0", "1")}), {"strict_groups": True})]
-        if mode == "separate_async"
-        else []
-    )
 
 
-@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+@pytest.mark.parametrize("mode", ["sync"])
 @pytest.mark.parametrize("bad_ack", [False, True])
 def test_head_poll_counts_transfer_only_after_complete_validated_ack(
     monkeypatch, mode, bad_ack
