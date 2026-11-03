@@ -16,7 +16,10 @@
 The processors under test are vendored verbatim in ``sglang_sources/`` (see the
 provenance header of each file):
 
-* ``scheduler_output_processor_mixin_v0_5_12``: the mixin layout, up to v0.5.12.
+* ``scheduler_output_processor_mixin_v0_5_9`` / ``_v0_5_10`` / ``_v0_5_12``:
+  the scheduler mixin layout, up to v0.5.12. Prefill slices
+  ``len(req.origin_input_ids)`` rows inline; decode appends ``hidden_states[i]``;
+  ``stream_output_generation`` streams ``req.hidden_states``.
 * ``batch_result_processor_0801cc05``: sgl-project/sglang main at 0801cc05, the
   build in the ROCm image (it reports 0.5.16). Decode appends
   ``hidden_states[i]`` per request, while DFlash verify packs the committed rows
@@ -27,13 +30,14 @@ provenance header of each file):
 * ``batch_result_processor_v0_5_16``: the v0.5.16 tag. All decode uses the
   strided extend.
 
-Both batch-result processors slice ``len(req.origin_input_ids)`` prefill rows per
-request, which ignores prefix-cache hits.
+Every layout slices ``len(req.origin_input_ids)`` prefill rows per request,
+which ignores prefix-cache hits.
 
 The per-request tests run the real, patched ``process_batch_result_prefill`` and
 ``process_batch_result_decode`` on hidden states whose every row encodes its
-(request, position), and compare each request's collected rows and positions to
-the exact reference.
+(request, position). Each request's collected chunks then go through the
+runtime's chunk decoding and the block-drafter position check, and the rows and
+positions are compared to the exact reference.
 """
 
 from __future__ import annotations
@@ -64,8 +68,13 @@ _HEADER_END = "# --- end of verl-SpeCo header ---\n"
 _IMAGE_SOURCE = "batch_result_processor_0801cc05.py.txt"
 _V0_5_14_SOURCE = "batch_result_processor_v0_5_14.py.txt"
 _V0_5_16_SOURCE = "batch_result_processor_v0_5_16.py.txt"
+_MIXIN_V0_5_9_SOURCE = "scheduler_output_processor_mixin_v0_5_9.py.txt"
+_MIXIN_V0_5_10_SOURCE = "scheduler_output_processor_mixin_v0_5_10.py.txt"
 _MIXIN_SOURCE = "scheduler_output_processor_mixin_v0_5_12.py.txt"
-_ALL_SOURCES = (_IMAGE_SOURCE, _V0_5_14_SOURCE, _V0_5_16_SOURCE, _MIXIN_SOURCE)
+_MIXIN_SOURCES = (_MIXIN_V0_5_9_SOURCE, _MIXIN_V0_5_10_SOURCE, _MIXIN_SOURCE)
+_NEW_CLASS = "SchedulerBatchResultProcessor"
+_MIXIN_CLASS = "SchedulerOutputProcessorMixin"
+_ALL_SOURCES = (_IMAGE_SOURCE, _V0_5_14_SOURCE, _V0_5_16_SOURCE, *_MIXIN_SOURCES)
 
 _STUBBED = (
     "sglang",
@@ -268,11 +277,26 @@ def _method_source(file_name: str, class_name: str, method_name: str) -> str:
             "process_batch_result_decode",
             {"_append_sglang_strided_decode_hidden_states(": 1},
         ),
+        *(
+            (
+                file_name,
+                "SchedulerOutputProcessorMixin",
+                "process_batch_result_prefill",
+                {"_append_sglang_prefill_hidden_states(": 1},
+            )
+            for file_name in _MIXIN_SOURCES
+        ),
         (
-            _MIXIN_SOURCE,
+            _MIXIN_V0_5_9_SOURCE,
             "SchedulerOutputProcessorMixin",
-            "process_batch_result_prefill",
-            {"_append_sglang_prefill_hidden_states(": 1},
+            "process_batch_result_decode",
+            {"_append_sglang_decode_hidden_states(": 1},
+        ),
+        (
+            _MIXIN_V0_5_10_SOURCE,
+            "SchedulerOutputProcessorMixin",
+            "process_batch_result_decode",
+            {"_append_sglang_decode_hidden_states(": 1},
         ),
         (
             _MIXIN_SOURCE,
@@ -301,6 +325,25 @@ def test_rewrite_replaces_every_native_hidden_state_site(
     compile(patched, file_name, "exec")
 
 
+@pytest.mark.parametrize("file_name", _MIXIN_SOURCES)
+def test_rewrite_streams_hidden_states_of_every_request(
+    monkeypatch, stub_sglang, file_name
+) -> None:
+    sglang_patch = _import_sglang_patch(monkeypatch)
+    source = _method_source(
+        file_name, "SchedulerOutputProcessorMixin", "stream_output_generation"
+    )
+    patched = sglang_patch._patch_sglang_stream_hidden_states_source(source)
+
+    assert patched is not None
+    # req.hidden_states (the per-request chunks, with their positions) is
+    # streamed unchanged; requests without hidden states get an empty entry so
+    # the list stays aligned with rids.
+    assert patched.count("output_hidden_states.append(req.hidden_states)") == 1
+    assert patched.count("output_hidden_states.append([])") == 1
+    compile(patched, file_name, "exec")
+
+
 @pytest.mark.parametrize(
     ("file_name", "module_name", "class_name", "methods"),
     [
@@ -322,15 +365,18 @@ def test_rewrite_replaces_every_native_hidden_state_site(
             "SchedulerBatchResultProcessor",
             ("process_batch_result_prefill", "process_batch_result_decode"),
         ),
-        (
-            _MIXIN_SOURCE,
-            _OLD_MODULE,
-            "SchedulerOutputProcessorMixin",
+        *(
             (
-                "process_batch_result_prefill",
-                "process_batch_result_decode",
-                "stream_output_generation",
-            ),
+                file_name,
+                _OLD_MODULE,
+                "SchedulerOutputProcessorMixin",
+                (
+                    "process_batch_result_prefill",
+                    "process_batch_result_decode",
+                    "stream_output_generation",
+                ),
+            )
+            for file_name in _MIXIN_SOURCES
         ),
     ],
 )
@@ -353,8 +399,10 @@ def test_installer_patches_real_layout(
 
 
 def _ref_row(request_id: int, position: int) -> list[float]:
-    # Every row encodes the (request, position) it belongs to.
-    return [float(request_id * 1000 + position)] * _HIDDEN_DIM
+    # Every row encodes the (request, position) it belongs to. Values stay
+    # below 256 so they are exact after the runtime's bfloat16 conversion.
+    assert 0 <= position < 64
+    return [float(request_id * 64 + position)] * _HIDDEN_DIM
 
 
 _FILLER_ROW = [-1.0] * _HIDDEN_DIM
@@ -375,11 +423,18 @@ class _Req:
         self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None
+        # Scheduler mixin (v0.5.12 and older) fields.
+        self.is_chunked = 0
+        self.multimodal_inputs = None
+        self.session = None
 
     def finished(self) -> bool:
         return False
 
     def update_finish_state(self, *args) -> None:
+        return None
+
+    def check_finished(self, *args) -> None:
         return None
 
 
@@ -436,12 +491,24 @@ def _processor_self(next_token_ids=None):
 
 
 def _collected(req):
+    """Decode req.hidden_states the way the rollout server does."""
+    from verl_speco.integration.sglang_runtime import (
+        _block_drafter_hidden_alignment_failure,
+        _hidden_state_chunk_to_tensor_and_metadata,
+        _iter_hidden_state_chunks,
+    )
+
     rows, positions = [], []
-    for item in req.hidden_states:
-        assert isinstance(item, dict), type(item)
-        rows.append(item["hidden_states"])
-        positions.append(item["positions"])
-    return torch.cat(rows, dim=0), torch.cat(positions, dim=0)
+    for chunk in _iter_hidden_state_chunks(req.hidden_states):
+        tensor, metadata = _hidden_state_chunk_to_tensor_and_metadata(chunk)
+        assert tensor is not None
+        assert torch.is_tensor(metadata.get("positions")), metadata
+        rows.append(tensor)
+        positions.append(metadata["positions"])
+    rows_t = torch.cat(rows, dim=0)
+    positions_t = torch.cat(positions, dim=0).to(torch.long)
+    assert _block_drafter_hidden_alignment_failure(positions_t, rows_t.shape[0]) is None
+    return rows_t, positions_t
 
 
 def _run_prefill(cls, reqs, *, extend_lens_on_batch: bool) -> None:
@@ -481,19 +548,29 @@ def _run_decode_step(cls, reqs, commit_lens, next_positions, *, mode: str) -> No
             "speculative_num_draft_tokens": _STRIDE if spec else None,
         }
     else:
-        # SPECO's DFlash verify patch packs only committed rows:
-        # [sum(commit_lens), D].
+        # Spec-v1 verify output with only the committed rows, packed as
+        # [sum(commit_lens), D]: SPECO's DFlash verify patch ("packed") or
+        # SGLang's EAGLE verify ("packed_eagle").
         rows = [
             _ref_row(req.request_id, next_positions[req.request_id] + offset)
             for req, commit in zip(reqs, commit_lens, strict=True)
             for offset in range(commit)
         ]
         logits_output = types.SimpleNamespace(
-            hidden_states=torch.tensor(rows),
-            customized_info=None,
-            _verl_dflash_aux_hidden_states=True,
+            hidden_states=torch.tensor(rows), customized_info=None
         )
-        extra = {"num_correct_drafts_per_req_cpu": [n - 1 for n in commit_lens]}
+        if mode == "packed":
+            logits_output._verl_dflash_aux_hidden_states = True
+        drafts = [n - 1 for n in commit_lens]
+        extra = {
+            # v0.5.12 and later name the per-request draft count
+            # num_correct_drafts_per_req_cpu; older releases use
+            # accept_length_per_req_cpu.
+            "num_correct_drafts_per_req_cpu": drafts,
+            "accept_length_per_req_cpu": drafts,
+            "num_accepted_tokens": sum(drafts),
+            "next_token_ids": torch.zeros(sum(commit_lens), dtype=torch.long),
+        }
     for req, commit in zip(reqs, commit_lens, strict=True):
         next_positions[req.request_id] += commit
     next_token_ids = [[0] * commit for commit in commit_lens]
@@ -505,24 +582,35 @@ def _run_decode_step(cls, reqs, commit_lens, next_positions, *, mode: str) -> No
 
 
 @pytest.mark.parametrize(
-    ("file_name", "mode"),
+    ("file_name", "module_name", "class_name", "mode"),
     [
+        (_MIXIN_V0_5_9_SOURCE, _OLD_MODULE, _MIXIN_CLASS, "packed_eagle"),
+        (_MIXIN_V0_5_10_SOURCE, _OLD_MODULE, _MIXIN_CLASS, "packed_eagle"),
+        (_MIXIN_SOURCE, _OLD_MODULE, _MIXIN_CLASS, "packed_eagle"),
+        (_MIXIN_SOURCE, _OLD_MODULE, _MIXIN_CLASS, "packed"),
         # The image build; DFlash runs spec-v1 with SPECO's verify patch.
-        (_IMAGE_SOURCE, "packed"),
-        (_V0_5_14_SOURCE, "strided"),
-        (_V0_5_14_SOURCE, "non_spec"),
-        (_V0_5_16_SOURCE, "strided"),
-        (_V0_5_16_SOURCE, "non_spec"),
+        (_IMAGE_SOURCE, _NEW_MODULE, _NEW_CLASS, "packed"),
+        (_V0_5_14_SOURCE, _NEW_MODULE, _NEW_CLASS, "strided"),
+        (_V0_5_14_SOURCE, _NEW_MODULE, _NEW_CLASS, "non_spec"),
+        (_V0_5_16_SOURCE, _NEW_MODULE, _NEW_CLASS, "strided"),
+        (_V0_5_16_SOURCE, _NEW_MODULE, _NEW_CLASS, "non_spec"),
     ],
 )
 @pytest.mark.parametrize("extend_lens_on_batch", [True, False])
 def test_real_processor_collects_exact_rows_per_request(
-    monkeypatch, tmp_path, stub_sglang, file_name, mode, extend_lens_on_batch
+    monkeypatch,
+    tmp_path,
+    stub_sglang,
+    file_name,
+    module_name,
+    class_name,
+    mode,
+    extend_lens_on_batch,
 ) -> None:
     sglang_patch = _import_sglang_patch(monkeypatch)
-    module = _install_vendored(monkeypatch, tmp_path, _NEW_MODULE, file_name)
+    module = _install_vendored(monkeypatch, tmp_path, module_name, file_name)
     sglang_patch.patch_sglang_hidden_states_tensor_output()
-    cls = module.SchedulerBatchResultProcessor
+    cls = getattr(module, class_name)
 
     # Request 1 hits 5 of its 9 prompt tokens in the prefix cache, so the packed
     # prefill tensor holds only its last 4 rows. Without logprobs (DFlash),

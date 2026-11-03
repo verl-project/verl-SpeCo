@@ -6571,14 +6571,14 @@ def patch_sglang_dflash_verify_hidden_states() -> None:
     original_method = getattr(verify_cls, "verify", None)
     if original_method is None:
         if _sglang_drafter_collects_hidden_states_from_sgl(algorithm="DFLASH"):
-            # sgl-project/sglang 3ffe725 (#27977, in v0.5.16) removed the spec-v1
+            # sgl-project/sglang 3ffe725 (#27977, v0.5.14 onwards) removed the spec-v1
             # DFlash verify; the spec-v2 DFlash worker drops the target hidden
             # states (logits_output.hidden_states = None) before the scheduler
             # sees them, so nothing would be collected.
             raise RuntimeError(
                 "Cannot collect DFlash drafter hidden states from this SGLang build: "
-                "DFlashVerifyInput.verify is missing (spec-v2-only DFlash, e.g. "
-                "SGLang v0.5.16), and its DFlash worker does not return target hidden "
+                "DFlashVerifyInput.verify is missing (spec-v2-only DFlash, SGLang "
+                "v0.5.14 onwards), and its DFlash worker does not return target hidden "
                 "states. Set drafter training.collect_hidden_states_from_sgl=False to "
                 "collect them from the FSDP forward instead."
             )
