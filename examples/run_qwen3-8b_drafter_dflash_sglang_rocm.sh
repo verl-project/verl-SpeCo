@@ -2,7 +2,7 @@ set -x
 # Minimal ROCm/MI355X smoke: GRPO + DFlash drafter co-training on SGLang.
 # Small sizes to complete a couple of real global steps (incl. a drafter
 # collect+train+publish) quickly. Outputs go to /dev/shm because host disk is full.
-# Run inside the image built from docker/rocm/Dockerfile.sglang (SGLang 0.5.12); see docs/amd/get_started.md.
+# Run inside the image built from docker/rocm/Dockerfile.rocm (SGLang 0.5.12); see docs/amd/get_started.md.
 
 project_name='verl_speco_rocm_smoke'
 exp_name='qwen3_8b_dflash_drafter_rocm'
@@ -22,6 +22,10 @@ DRAFTER_PATH=${DRAFTER_PATH:-/path/to/Qwen3-8B-DFlash-b16}
 TRAIN_FILE=${TRAIN_FILE:-/path/to/gsm8k/train.parquet}
 TEST_FILE=${TEST_FILE:-/path/to/gsm8k/test.parquet}
 CKPTS_DIR=${CKPTS_DIR:-/dev/shm/verl_speco_ckpt}
+# SGLang attention backend. The ROCm image sets SGLANG_ATTENTION_BACKEND=triton, as verl's ROCm
+# image does; aiter also works (set SGLANG_ATTENTION_BACKEND=aiter). Set it explicitly because
+# verl otherwise picks flashinfer for SGLang >= 0.5.12, which does not exist on ROCm.
+sglang_attention_backend=${SGLANG_ATTENTION_BACKEND:-triton}
 
 # ROCm + Ray GPU isolation. Set ONLY CUDA_VISIBLE_DEVICES (no HIP var, no NOSET flags):
 #  - Ray 2.56's AMD accelerator manager (amd_gpu.py) uses CUDA_VISIBLE_DEVICES as its
@@ -88,7 +92,7 @@ python3 -m verl_speco.main \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.calculate_log_probs=False \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.log_level=info \
-    ++actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=triton \
+    ++actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=${sglang_attention_backend} \
     ++actor_rollout_ref.rollout.engine_kwargs.sglang.disable_custom_all_reduce=True \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.rollout.n=4 \
