@@ -4666,13 +4666,61 @@ def _append_sglang_hidden_state_chunk_with_budget(
         _finish_sglang_hidden_state_capture(req, batch)
 
 
-def _append_sglang_prefill_hidden_states(
-    req, logits_output, hidden_state_offset: int, extend_input_len: int, batch=None
-) -> int:
+def _sglang_non_negative_int_or_none(value) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
     try:
-        rows = max(int(extend_input_len), 0)
+        value = int(value)
     except (TypeError, ValueError):
-        rows = len(getattr(req, "origin_input_ids", []) or [])
+        return None
+    return value if value >= 0 else None
+
+
+def _sglang_prefill_extend_rows(
+    req, extend_input_len, batch=None, req_index: int | None = None
+) -> int:
+    """Rows a request owns in a prefill batch's packed hidden-state tensor.
+
+    SGLang fills ``result.extend_input_len_per_req`` only when the batch returns
+    logprobs, which DFlash rejects. SGLang's own fallback, the full prompt
+    length, over-counts every request with a prefix-cache hit and shifts the
+    rows of all later requests in the batch. Prefer, in order: the per-request
+    value SGLang passed, the batch's ``extend_lens`` (what the forward pass uses
+    to pack the tensor; the overlap-schedule batch copy drops it), the request's
+    ``extend_input_len``, and only then the prompt length.
+    """
+    rows = _sglang_non_negative_int_or_none(extend_input_len)
+    if rows is not None:
+        return rows
+    extend_lens = getattr(batch, "extend_lens", None) if batch is not None else None
+    reqs = getattr(batch, "reqs", None) if batch is not None else None
+    if (
+        req_index is not None
+        and isinstance(extend_lens, (list, tuple))
+        and reqs is not None
+        and len(extend_lens) == len(reqs)
+        and 0 <= req_index < len(extend_lens)
+        and reqs[req_index] is req
+    ):
+        rows = _sglang_non_negative_int_or_none(extend_lens[req_index])
+        if rows is not None:
+            return rows
+    rows = _sglang_non_negative_int_or_none(getattr(req, "extend_input_len", None))
+    if rows is not None:
+        return rows
+    return len(getattr(req, "origin_input_ids", None) or [])
+
+
+def _append_sglang_prefill_hidden_states(
+    req,
+    logits_output,
+    hidden_state_offset: int,
+    extend_input_len: int | None,
+    batch=None,
+    *,
+    req_index: int | None = None,
+) -> int:
+    rows = _sglang_prefill_extend_rows(req, extend_input_len, batch, req_index)
     if rows <= 0:
         return hidden_state_offset
 
@@ -4965,6 +5013,57 @@ def _append_sglang_decode_hidden_states(
             batch=batch,
         )
     return hidden_state_offset
+
+
+def _append_sglang_strided_decode_hidden_states(
+    req, logits_output, start: int, rows: int, batch=None
+) -> None:
+    """Collect one request's decode rows from a strided hidden-state tensor.
+
+    Since sgl-project/sglang e4fd613 (#28496, v0.5.14 onwards) decode slices request
+    ``i``'s rows as ``hidden_states[i * stride : i * stride + accept_len]``, with
+    ``stride = speculative_num_draft_tokens or 1``, instead of appending
+    ``hidden_states[i]``. The caller passes that ``start`` and ``rows``; this
+    keeps the slice and attaches positions that continue after the request's
+    previous rows.
+    """
+    if not getattr(req, "return_hidden_states", False):
+        return
+    hidden_states = getattr(logits_output, "hidden_states", None)
+    if hidden_states is None:
+        return
+    start = max(int(start), 0)
+    rows = max(int(rows), 0)
+    end = start + rows
+    if (
+        not _is_torch_tensor(hidden_states)
+        or hidden_states.dim() < 2
+        or end > int(hidden_states.shape[0])
+    ):
+        raise RuntimeError(
+            "SGLang decode hidden states are incomplete for committed tokens: "
+            f"shape={tuple(getattr(hidden_states, 'shape', ()))}, "
+            f"start={start}, rows={rows}."
+        )
+    if rows <= 0:
+        return
+    chunk = hidden_states[start:end]
+    chunk = _sglang_concat_last_hidden_for_drafter(
+        req,
+        logits_output,
+        chunk,
+        _slice_sglang_drafter_last_hidden_output(logits_output, slice(start, end)),
+    )
+    chunk_rows = _sglang_hidden_chunk_rows(chunk)
+    _append_sglang_hidden_state_chunk_with_budget(
+        req,
+        chunk,
+        position_start=None,
+        extra_metadata=_sglang_hidden_debug_metadata_for_req(
+            req, logits_output, start, end, chunk_rows
+        ),
+        batch=batch,
+    )
 
 
 def _sglang_batch_requests_hidden_states(batch) -> bool:
@@ -5538,6 +5637,32 @@ _SGLANG_DECODE_HIDDEN_STATES_APPEND_PATTERN = re.compile(
     r".*?"
     r"^(?P=indent)[ \t]+\)\r?\n",
 )
+# sgl-project/sglang e4fd613 (#28496, v0.5.14 onwards) slices each request's rows
+# from a [bs * stride, D] tensor:
+#     req.hidden_states.extend(
+#         logits_output.hidden_states[start : start + accept_len].cpu().tolist()
+#     )
+# Only this statement is rewritten; the guard and the start/accept_len
+# assignments above it stay.
+_SGLANG_DECODE_HIDDEN_STATES_STRIDED_EXTEND_PATTERN = re.compile(
+    r"(?m)^(?P<indent>[ \t]+)req\.hidden_states\.extend\(\s*"
+    r"logits_output\.hidden_states\[\s*(?P<start>[A-Za-z_]\w*)\s*:\s*"
+    r"(?P=start)\s*\+\s*(?P<rows>[A-Za-z_]\w*)\s*\]\s*"
+    r"(?:\.cpu\(\)\s*(?:\.clone\(\)\s*)?\.tolist\(\)"
+    r"|\.detach\(\)\.to\(\"cpu\",\s*copy=True\))\s*"
+    r"\)[ \t]*\r?\n",
+)
+# v0.5.14 also keeps a per-row append for non-speculative decode, nested in
+# an ``if not is_spec:`` branch under the guard instead of directly after it:
+#     req.hidden_states.append(logits_output.hidden_states[i].cpu().clone().tolist())
+# It is rewritten as a one-row strided slice.
+_SGLANG_DECODE_HIDDEN_STATES_ROW_APPEND_PATTERN = re.compile(
+    r"(?m)^(?P<indent>[ \t]+)req\.hidden_states\.append\(\s*"
+    r"logits_output\.hidden_states\[\s*(?P<start>[A-Za-z_]\w*)\s*\]\s*"
+    r"(?:\.cpu\(\)\s*(?:\.clone\(\)\s*)?\.tolist\(\)"
+    r"|\.detach\(\)\.to\(\"cpu\",\s*copy=True\))\s*"
+    r"\)[ \t]*\r?\n",
+)
 _SGLANG_PREFILL_HIDDEN_STATES_APPEND_PATTERN = re.compile(
     r"(?ms)^(?P<indent>[ \t]+)if\s*(?:\(\s*)?req\.return_hidden_states\s+"
     r"and\s+logits_output\.hidden_states\s+is\s+not\s+None\s*(?:\))?\s*:\r?\n"
@@ -5546,9 +5671,9 @@ _SGLANG_PREFILL_HIDDEN_STATES_APPEND_PATTERN = re.compile(
     r"(?:\.detach\(\)\.to\(\"cpu\",\s*copy=True\)|\.cpu\(\)\s*\.clone\(\)\s*\.tolist\(\))\r?\n"
     r"(?P=indent)[ \t]+\)\r?\n",
 )
-# SGLang 0.5.16 moved the prefill slice into
-# SchedulerBatchResultProcessor._append_prefill_hidden_states, which slices
-# len(req.origin_input_ids) rows and ignores prefix-cache hits.
+# SchedulerBatchResultProcessor (sgl-project/sglang 99ad2b0 onwards, including
+# v0.5.16) moved the prefill slice into _append_prefill_hidden_states, which
+# slices len(req.origin_input_ids) rows and ignores prefix-cache hits.
 _SGLANG_PREFILL_HIDDEN_STATES_HELPER_CALL_PATTERN = re.compile(
     r"(?ms)^(?P<indent>[ \t]+)if\s*(?:\(\s*)?req\.return_hidden_states\s+"
     r"and\s+logits_output\.hidden_states\s+is\s+not\s+None\s*(?:\))?\s*:\r?\n"
@@ -5595,8 +5720,23 @@ def _render_sglang_prefill_hidden_states_append(match: re.Match) -> str:
         f"{indent}    (\n"
         f"{indent}        extend_input_len_per_req[i]\n"
         f"{indent}        if extend_input_len_per_req is not None\n"
-        f"{indent}        else len(req.origin_input_ids)\n"
+        f"{indent}        else None\n"
         f"{indent}    ),\n"
+        f"{indent}    batch,\n"
+        f"{indent}    req_index=i,\n"
+        f"{indent})\n"
+    )
+
+
+def _render_sglang_strided_decode_hidden_states(match: re.Match) -> str:
+    indent = match.group("indent")
+    rows = match.groupdict().get("rows") or "1"
+    return (
+        f"{indent}_append_sglang_strided_decode_hidden_states(\n"
+        f"{indent}    req,\n"
+        f"{indent}    logits_output,\n"
+        f"{indent}    {match.group('start')},\n"
+        f"{indent}    {rows},\n"
         f"{indent}    batch,\n"
         f"{indent})\n"
     )
@@ -5634,14 +5774,25 @@ def _insert_sglang_decode_hidden_state_offset(source: str) -> str | None:
 
 
 def _patch_sglang_decode_hidden_states_source(source: str) -> str | None:
-    patched_source, hidden_block_count = (
-        _SGLANG_DECODE_HIDDEN_STATES_APPEND_PATTERN.subn(
-            _render_sglang_decode_hidden_states_append,
-            source,
+    patched_source, append_count = _SGLANG_DECODE_HIDDEN_STATES_APPEND_PATTERN.subn(
+        _render_sglang_decode_hidden_states_append,
+        source,
+    )
+    patched_source, strided_count = (
+        _SGLANG_DECODE_HIDDEN_STATES_STRIDED_EXTEND_PATTERN.subn(
+            _render_sglang_strided_decode_hidden_states,
+            patched_source,
         )
     )
-    if hidden_block_count <= 0:
+    patched_source, row_count = _SGLANG_DECODE_HIDDEN_STATES_ROW_APPEND_PATTERN.subn(
+        _render_sglang_strided_decode_hidden_states,
+        patched_source,
+    )
+    strided_count += row_count
+    if append_count <= 0 and strided_count <= 0:
         return None
+    if append_count <= 0:
+        return patched_source
     return _insert_sglang_decode_hidden_state_offset(patched_source)
 
 
@@ -5732,6 +5883,9 @@ def _make_sglang_hidden_states_tensor_output_patch(original_method):
     )
     globals_dict["_append_sglang_decode_hidden_states"] = (
         _append_sglang_decode_hidden_states
+    )
+    globals_dict["_append_sglang_strided_decode_hidden_states"] = (
+        _append_sglang_strided_decode_hidden_states
     )
     globals_dict["_sglang_req_should_stream_hidden_states"] = (
         _sglang_req_should_stream_hidden_states
@@ -6416,6 +6570,18 @@ def patch_sglang_dflash_verify_hidden_states() -> None:
 
     original_method = getattr(verify_cls, "verify", None)
     if original_method is None:
+        if _sglang_drafter_collects_hidden_states_from_sgl(algorithm="DFLASH"):
+            # sgl-project/sglang 3ffe725 (#27977, in v0.5.16) removed the spec-v1
+            # DFlash verify; the spec-v2 DFlash worker drops the target hidden
+            # states (logits_output.hidden_states = None) before the scheduler
+            # sees them, so nothing would be collected.
+            raise RuntimeError(
+                "Cannot collect DFlash drafter hidden states from this SGLang build: "
+                "DFlashVerifyInput.verify is missing (spec-v2-only DFlash, e.g. "
+                "SGLang v0.5.16), and its DFlash worker does not return target hidden "
+                "states. Set drafter training.collect_hidden_states_from_sgl=False to "
+                "collect them from the FSDP forward instead."
+            )
         logger.debug(
             "Skip SGLang DFlash verify hidden-state patch: DFlashVerifyInput.verify missing"
         )
@@ -6431,9 +6597,10 @@ def patch_sglang_dflash_verify_hidden_states() -> None:
     logger.warning("SGLang DFlash verify hidden-state patch active")
 
 
-# Output processors that append per-request hidden-state chunks, newest last.
-# SGLang 0.5.16 moved them from the scheduler mixin into
-# scheduler_components.batch_result_processor; its streaming side is a
+# Output processors that append per-request hidden-state chunks, oldest first.
+# sgl-project/sglang 99ad2b0 (#25637, 2026-05-18) moved them from the scheduler
+# mixin (up to v0.5.12) into scheduler_components.batch_result_processor
+# (v0.5.13 onwards, and dev builds such as 0801cc05); its streaming side is a
 # separate accumulator and is not patched here.
 _SGLANG_HIDDEN_STATE_OUTPUT_LAYOUTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
@@ -6456,7 +6623,9 @@ _SGLANG_HIDDEN_STATE_OUTPUT_LAYOUTS: tuple[tuple[str, str, tuple[str, ...]], ...
 )
 
 
-def _sglang_drafter_collects_hidden_states_from_sgl() -> bool:
+def _sglang_drafter_collects_hidden_states_from_sgl(
+    algorithm: str | None = None,
+) -> bool:
     raw = get_drafter_config_env()
     if not raw:
         return False
@@ -6467,6 +6636,11 @@ def _sglang_drafter_collects_hidden_states_from_sgl() -> bool:
     except Exception:  # noqa: BLE001
         return False
     if not isinstance(loaded, dict) or not loaded.get("enable"):
+        return False
+    if (
+        algorithm is not None
+        and str(loaded.get("speculative_algorithm") or "").upper() != algorithm
+    ):
         return False
     training = loaded.get("training")
     return isinstance(training, dict) and bool(
