@@ -131,13 +131,18 @@ drafter backend you use.
 SGLang drafter training reads per-request hidden states from the scheduler
 output processor. The overlay patches the `SchedulerOutputProcessorMixin`
 layout (0.5.9 to 0.5.12), the `SchedulerBatchResultProcessor` layout (0.5.13),
-and the strided decode layout (0.5.14 onwards). The regression tests run the
+and the strided decode layout (0.5.14 onwards). From 0.5.13 it also patches the
+output streamer, which otherwise drops the hidden states of a request whose
+collection window filled before the request finished. The regression tests run the
 patch on the vendored upstream sources in `tests/integration/sglang_sources/`.
 If no known layout is found, collection fails when the SGLang server starts
 instead of training on misaligned rows. SGLang 0.5.14 removed the spec-v1
 DFlash worker. Its DFlash v2 worker writes the target hidden states into the
 draft KV cache and then drops them, so the overlay also patches
-`DFlashWorkerV2` to return them when a request asks for them. If neither the
+`DFlashWorkerV2` to return them when a request asks for them. From 0.5.14,
+SGLang also aborts DFlash requests for hidden states while the overlap
+scheduler is on, so DFlash collection starts SGLang with
+`disable_overlap_schedule=True` on those versions. If neither the
 spec-v1 verify nor the v2 worker can be patched, DFlash collection fails
 closed; set
 `actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_sgl=false`
