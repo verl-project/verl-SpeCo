@@ -1479,8 +1479,8 @@ class SpecoV1Mixin:
             return
         if self.__dict__.get("_speco_last_rollout_metrics_step") != step:
             self._speco_last_rollout_metrics_step = step
-            self._speco_last_rollout_metrics = {}
-            self._speco_v1_feedback_seen = set()
+            self._speco_last_rollout_metrics: dict[str, float] = {}
+            self._speco_v1_feedback_seen: set[tuple[Any, Any]] = set()
         try:
             import transfer_queue as tq
 
@@ -1498,7 +1498,9 @@ class SpecoV1Mixin:
             extra_fields = extra_fields.tolist()
         if not isinstance(extra_fields, list):
             return
-        from verl_speco.integration.acceptance_metrics import request_acceptance_counters
+        from verl_speco.integration.acceptance_metrics import (
+            request_acceptance_counters,
+        )
 
         tags = list(getattr(batch, "tags", None) or [])
         for index, (key, fields) in enumerate(zip(batch.keys, extra_fields)):
@@ -1508,13 +1510,20 @@ class SpecoV1Mixin:
             if identity in self._speco_v1_feedback_seen:
                 continue
             fields = getattr(fields, "data", fields)
-            counters = request_acceptance_counters(fields) if isinstance(fields, dict) else None
+            counters = (
+                request_acceptance_counters(fields)
+                if isinstance(fields, dict)
+                else None
+            )
             if counters is None:
                 continue
             self._speco_v1_feedback_seen.add(identity)
             stats = self._speco_last_rollout_metrics
             for name, value in zip(
-                ("_speco_vllm_spec_decode_drafts", "_speco_vllm_spec_decode_accepted_tokens"),
+                (
+                    "_speco_vllm_spec_decode_drafts",
+                    "_speco_vllm_spec_decode_accepted_tokens",
+                ),
                 counters,
             ):
                 stats[name] = stats.get(name, 0.0) + value

@@ -1640,9 +1640,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_restore_adaptive_state(self, scheduler: DrafterScheduler) -> None:
         """Initialize adaptive scheduling and restore its selected checkpoint."""
-        controller = scheduler.configure_adaptive(
-            self._speco_drafter_schedule_config()
-        )
+        controller = scheduler.configure_adaptive(self._speco_drafter_schedule_config())
         if controller is not None:
             _, resume_folder = self._speco_freeze_state_resume_path()
             if resume_folder:
