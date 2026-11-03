@@ -167,11 +167,60 @@ def _render_prefill_hidden_states_append(match: re.Match[str]) -> str:
         f"{indent}    (\n"
         f"{indent}        extend_input_len_per_req[i]\n"
         f"{indent}        if extend_input_len_per_req is not None\n"
-        f"{indent}        else len(req.origin_input_ids)\n"
+        f"{indent}        else None\n"
         f"{indent}    ),\n"
         f"{indent}    batch,\n"
+        f"{indent}    req_index=i,\n"
         f"{indent})\n"
     )
+
+
+def _non_negative_int_or_none(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def sglang_prefill_extend_rows(
+    req: Any,
+    extend_input_len: Any,
+    batch: Any = None,
+    req_index: int | None = None,
+) -> int:
+    """Rows a request owns in a prefill batch's hidden-state tensor.
+
+    SGLang only fills ``result.extend_input_len_per_req`` when the batch returns
+    logprobs, which DFlash rejects, and SGLang's own fallback (the full prompt length)
+    over-counts every request with a prefix-cache hit and shifts the rows of all later
+    requests in the batch. Prefer, in order: the per-request list SGLang passed, the
+    batch's ``extend_lens`` (what the forward pass and DFlash use to split the tensor;
+    the copy made for overlap scheduling drops it), the request's ``extend_input_len``,
+    and finally the prompt length.
+    """
+    rows = _non_negative_int_or_none(extend_input_len)
+    if rows is not None:
+        return rows
+    extend_lens = getattr(batch, "extend_lens", None) if batch is not None else None
+    reqs = getattr(batch, "reqs", None) if batch is not None else None
+    if (
+        req_index is not None
+        and isinstance(extend_lens, (list, tuple))
+        and reqs is not None
+        and len(extend_lens) == len(reqs)
+        and 0 <= req_index < len(extend_lens)
+        and reqs[req_index] is req
+    ):
+        rows = _non_negative_int_or_none(extend_lens[req_index])
+        if rows is not None:
+            return rows
+    rows = _non_negative_int_or_none(getattr(req, "extend_input_len", None))
+    if rows is not None:
+        return rows
+    return len(getattr(req, "origin_input_ids", None) or [])
 
 
 def _render_stream_hidden_states(match: re.Match[str]) -> str:
