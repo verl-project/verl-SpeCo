@@ -2,6 +2,7 @@ set -x
 # Minimal ROCm/MI355X smoke: GRPO + DFlash drafter co-training on SGLang.
 # Small sizes to complete a couple of real global steps (incl. a drafter
 # collect+train+publish) quickly. Outputs go to /dev/shm because host disk is full.
+# Run inside the image built from docker/rocm/Dockerfile.sglang (SGLang 0.5.12); see docs/amd/get_started.md.
 
 project_name='verl_speco_rocm_smoke'
 exp_name='qwen3_8b_dflash_drafter_rocm'
@@ -11,11 +12,15 @@ train_sp=1
 ngpus=2
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-32}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
+# Multi-node: start Ray on every node first (`ray start --head` / `ray start --address`),
+# then run this script on the head node with RAY_ADDRESS=<head-ip>:<port> and
+# SPECO_NNODES=<number of nodes>. Each node contributes ngpus GPUs.
+nnodes=${SPECO_NNODES:-1}
 
-MODEL_PATH=${MODEL_PATH:-/group/amdneuralopt/huggingface/pretrained_models/Qwen/Qwen3-8B}
-DRAFTER_PATH=${DRAFTER_PATH:-/home/zhenchen/.cache/huggingface/hub/models--z-lab--Qwen3-8B-DFlash-b16/snapshots/9b41424b7109f9c5413454f481b09a82b85333f4}
-TRAIN_FILE=${TRAIN_FILE:-/home/zhenchen/data/gsm8k/train.parquet}
-TEST_FILE=${TEST_FILE:-/home/zhenchen/data/gsm8k/test.parquet}
+MODEL_PATH=${MODEL_PATH:-/path/to/Qwen3-8B}
+DRAFTER_PATH=${DRAFTER_PATH:-/path/to/Qwen3-8B-DFlash-b16}
+TRAIN_FILE=${TRAIN_FILE:-/path/to/gsm8k/train.parquet}
+TEST_FILE=${TEST_FILE:-/path/to/gsm8k/test.parquet}
 CKPTS_DIR=${CKPTS_DIR:-/dev/shm/verl_speco_ckpt}
 
 # ROCm + Ray GPU isolation. Set ONLY CUDA_VISIBLE_DEVICES (no HIP var, no NOSET flags):
@@ -32,16 +37,26 @@ CKPTS_DIR=${CKPTS_DIR:-/dev/shm/verl_speco_ckpt}
 #    with no HIP var present there is no "Conflicting visibility between HIP and CUDA" abort
 #    that occurs when Ray injects HIP while the server sets CUDA.
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
+
+if [ "${nnodes}" -gt 1 ]; then
+    # Joining an existing cluster: ray.init() rejects resource and _system_config/_temp_dir
+    # options when it connects to a running cluster, so pass none of them.
+    ray_args=(ray_kwargs.ray_init.num_cpus=null)
+else
+    ray_args=(
+        ray_kwargs.ray_init.num_cpus=${ray_num_cpus}
+        +ray_kwargs.ray_init._system_config.prestart_worker_first_driver=false
+        +ray_kwargs.ray_init._system_config.num_workers_soft_limit=${ray_worker_soft_limit}
+        +ray_kwargs.ray_init._temp_dir=/dev/shm/ray
+    )
+fi
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PYTHONUNBUFFERED=1
 
 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \
-    ray_kwargs.ray_init.num_cpus=${ray_num_cpus} \
-    +ray_kwargs.ray_init._system_config.prestart_worker_first_driver=false \
-    +ray_kwargs.ray_init._system_config.num_workers_soft_limit=${ray_worker_soft_limit} \
-    +ray_kwargs.ray_init._temp_dir=/dev/shm/ray \
+    "${ray_args[@]}" \
     data.train_files=${TRAIN_FILE} \
     data.val_files=${TEST_FILE} \
     data.train_batch_size=8 \
@@ -73,7 +88,7 @@ python3 -m verl_speco.main \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.calculate_log_probs=False \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.log_level=info \
-    ++actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=aiter \
+    ++actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=triton \
     ++actor_rollout_ref.rollout.engine_kwargs.sglang.disable_custom_all_reduce=True \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.rollout.n=4 \
@@ -112,7 +127,7 @@ python3 -m verl_speco.main \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${exp_name} \
     trainer.n_gpus_per_node=${ngpus} \
-    trainer.nnodes=1 \
+    trainer.nnodes=${nnodes} \
     trainer.default_local_dir=${CKPTS_DIR} \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \

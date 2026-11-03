@@ -2,6 +2,7 @@ set -x
 # Minimal ROCm/MI355X smoke: GRPO + DFlash drafter co-training on the native vLLM
 # DFlash proposer. Same sizes as run_qwen3-8b_drafter_dflash_sglang_rocm.sh so a
 # couple of real global steps (incl. a drafter collect+train+publish) finish quickly.
+# Run inside the image built from docker/rocm/Dockerfile.vllm; see docs/amd/get_started.md.
 
 project_name='verl_speco_rocm_smoke'
 exp_name='qwen3_8b_dflash_drafter_vllm_rocm'
@@ -11,6 +12,10 @@ train_sp=1
 ngpus=2
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-32}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
+# Multi-node: start Ray on every node first (`ray start --head` / `ray start --address`),
+# then run this script on the head node with RAY_ADDRESS=<head-ip>:<port> and
+# SPECO_NNODES=<number of nodes>. Each node contributes ngpus GPUs.
+nnodes=${SPECO_NNODES:-1}
 
 MODEL_PATH=${MODEL_PATH:-/path/to/Qwen3-8B}
 DRAFTER_PATH=${DRAFTER_PATH:-/path/to/Qwen3-8B-DFlash-b16}
@@ -21,16 +26,26 @@ CKPTS_DIR=${CKPTS_DIR:-/dev/shm/verl_speco_ckpt}
 # ROCm + Ray GPU isolation: set ONLY CUDA_VISIBLE_DEVICES, never HIP_VISIBLE_DEVICES.
 # See run_qwen3-8b_drafter_dflash_sglang_rocm.sh for the full rationale.
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
+
+if [ "${nnodes}" -gt 1 ]; then
+    # Joining an existing cluster: ray.init() rejects resource and _system_config/_temp_dir
+    # options when it connects to a running cluster, so pass none of them.
+    ray_args=(ray_kwargs.ray_init.num_cpus=null)
+else
+    ray_args=(
+        ray_kwargs.ray_init.num_cpus=${ray_num_cpus}
+        +ray_kwargs.ray_init._system_config.prestart_worker_first_driver=false
+        +ray_kwargs.ray_init._system_config.num_workers_soft_limit=${ray_worker_soft_limit}
+        +ray_kwargs.ray_init._temp_dir=/dev/shm/ray
+    )
+fi
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PYTHONUNBUFFERED=1
 
 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \
-    ray_kwargs.ray_init.num_cpus=${ray_num_cpus} \
-    +ray_kwargs.ray_init._system_config.prestart_worker_first_driver=false \
-    +ray_kwargs.ray_init._system_config.num_workers_soft_limit=${ray_worker_soft_limit} \
-    +ray_kwargs.ray_init._temp_dir=/dev/shm/ray \
+    "${ray_args[@]}" \
     data.train_files=${TRAIN_FILE} \
     data.val_files=${TEST_FILE} \
     data.train_batch_size=8 \
@@ -108,7 +123,7 @@ python3 -m verl_speco.main \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${exp_name} \
     trainer.n_gpus_per_node=${ngpus} \
-    trainer.nnodes=1 \
+    trainer.nnodes=${nnodes} \
     trainer.default_local_dir=${CKPTS_DIR} \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
