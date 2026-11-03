@@ -5546,6 +5546,16 @@ _SGLANG_PREFILL_HIDDEN_STATES_APPEND_PATTERN = re.compile(
     r"(?:\.detach\(\)\.to\(\"cpu\",\s*copy=True\)|\.cpu\(\)\s*\.clone\(\)\s*\.tolist\(\))\r?\n"
     r"(?P=indent)[ \t]+\)\r?\n",
 )
+# SGLang 0.5.16 moved the prefill slice into
+# SchedulerBatchResultProcessor._append_prefill_hidden_states, which slices
+# len(req.origin_input_ids) rows and ignores prefix-cache hits.
+_SGLANG_PREFILL_HIDDEN_STATES_HELPER_CALL_PATTERN = re.compile(
+    r"(?ms)^(?P<indent>[ \t]+)if\s*(?:\(\s*)?req\.return_hidden_states\s+"
+    r"and\s+logits_output\.hidden_states\s+is\s+not\s+None\s*(?:\))?\s*:\r?\n"
+    r"(?P=indent)[ \t]+hidden_state_offset\s*=\s*self\._append_prefill_hidden_states\(\r?\n"
+    r".*?"
+    r"^(?P=indent)[ \t]+\)\r?\n",
+)
 _SGLANG_STREAM_HIDDEN_STATES_PATTERN = re.compile(
     r"(?ms)^(?P<indent>[ \t]+)if\s+req\.return_hidden_states\s*:\r?\n"
     r"(?P=indent)[ \t]+if\s+output_hidden_states\s+is\s+None\s*:\r?\n"
@@ -5636,16 +5646,18 @@ def _patch_sglang_decode_hidden_states_source(source: str) -> str | None:
 
 
 def _patch_sglang_prefill_hidden_states_source(source: str) -> str | None:
-    patched_source, hidden_block_count = (
-        _SGLANG_PREFILL_HIDDEN_STATES_APPEND_PATTERN.subn(
+    for pattern in (
+        _SGLANG_PREFILL_HIDDEN_STATES_APPEND_PATTERN,
+        _SGLANG_PREFILL_HIDDEN_STATES_HELPER_CALL_PATTERN,
+    ):
+        patched_source, hidden_block_count = pattern.subn(
             _render_sglang_prefill_hidden_states_append,
             source,
             count=1,
         )
-    )
-    if hidden_block_count <= 0:
-        return None
-    return patched_source
+        if hidden_block_count > 0:
+            return patched_source
+    return None
 
 
 def _patch_sglang_stream_hidden_states_source(source: str) -> str | None:
@@ -6419,6 +6431,49 @@ def patch_sglang_dflash_verify_hidden_states() -> None:
     logger.warning("SGLang DFlash verify hidden-state patch active")
 
 
+# Output processors that append per-request hidden-state chunks, newest last.
+# SGLang 0.5.16 moved them from the scheduler mixin into
+# scheduler_components.batch_result_processor; its streaming side is a
+# separate accumulator and is not patched here.
+_SGLANG_HIDDEN_STATE_OUTPUT_LAYOUTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "sglang.srt.managers.scheduler_output_processor_mixin",
+        "SchedulerOutputProcessorMixin",
+        (
+            "process_batch_result_prefill",
+            "process_batch_result_decode",
+            "stream_output_generation",
+        ),
+    ),
+    (
+        "sglang.srt.managers.scheduler_components.batch_result_processor",
+        "SchedulerBatchResultProcessor",
+        (
+            "process_batch_result_prefill",
+            "process_batch_result_decode",
+        ),
+    ),
+)
+
+
+def _sglang_drafter_collects_hidden_states_from_sgl() -> bool:
+    raw = get_drafter_config_env()
+    if not raw:
+        return False
+    try:
+        import json
+
+        loaded = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(loaded, dict) or not loaded.get("enable"):
+        return False
+    training = loaded.get("training")
+    return isinstance(training, dict) and bool(
+        training.get("collect_hidden_states_from_sgl", False)
+    )
+
+
 def patch_sglang_hidden_states_tensor_output() -> None:
     """Return SGLang hidden-state chunks as CPU tensors instead of Python lists."""
     global _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED
@@ -6441,22 +6496,38 @@ def patch_sglang_hidden_states_tensor_output() -> None:
     if _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED:
         return
 
-    try:
-        module = importlib.import_module(
-            "sglang.srt.managers.scheduler_output_processor_mixin"
+    processor_cls = None
+    method_names: tuple[str, ...] = ()
+    layout_errors = []
+    for module_name, class_name, layout_methods in _SGLANG_HIDDEN_STATE_OUTPUT_LAYOUTS:
+        try:
+            module = importlib.import_module(module_name)
+            processor_cls = getattr(module, class_name)
+        except Exception as exc:  # noqa: BLE001
+            layout_errors.append(f"{module_name}.{class_name}: {exc}")
+            processor_cls = None
+            continue
+        method_names = layout_methods
+        break
+
+    if processor_cls is None:
+        if _sglang_drafter_collects_hidden_states_from_sgl():
+            raise RuntimeError(
+                "Cannot install the SGLang hidden-state output patch: no known "
+                "SGLang output processor layout was found "
+                f"({'; '.join(layout_errors)}). Drafter training with "
+                "collect_hidden_states_from_sgl=true would receive hidden states "
+                "that are not aligned with the request tokens."
+            )
+        logger.debug(
+            "Skip SGLang hidden-state tensor output patch: %s",
+            "; ".join(layout_errors),
         )
-        processor_cls = getattr(module, "SchedulerOutputProcessorMixin")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Skip SGLang hidden-state tensor output patch: %s", exc)
         return
 
     patched_methods = []
     active_methods = []
-    for method_name in (
-        "process_batch_result_prefill",
-        "process_batch_result_decode",
-        "stream_output_generation",
-    ):
+    for method_name in method_names:
         original_method = getattr(processor_cls, method_name, None)
         if original_method is None or getattr(
             original_method,
@@ -6478,22 +6549,21 @@ def patch_sglang_hidden_states_tensor_output() -> None:
         patched_methods.append(method_name)
         active_methods.append(method_name)
 
-    required_methods = {
-        "process_batch_result_prefill",
-        "process_batch_result_decode",
-        "stream_output_generation",
-    }
-    missing_methods = sorted(required_methods.difference(active_methods))
+    missing_methods = sorted(set(method_names).difference(active_methods))
     if missing_methods:
         raise RuntimeError(
-            "Failed to install required SGLang hidden-state tensor output patch methods: "
-            f"{', '.join(missing_methods)}. EAGLE drafter training requires full hidden states."
+            "Failed to install required SGLang hidden-state tensor output patch methods "
+            f"on {processor_cls.__module__}.{processor_cls.__name__}: "
+            f"{', '.join(missing_methods)}. Drafter training requires hidden states "
+            "split per request."
         )
 
     if active_methods:
         _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = True
         logger.warning(
-            "SGLang hidden-state tensor output patch active for %s%s",
+            "SGLang hidden-state tensor output patch active for %s.%s: %s%s",
+            processor_cls.__module__,
+            processor_cls.__name__,
             ", ".join(active_methods),
             f" (newly patched: {', '.join(patched_methods)})"
             if patched_methods

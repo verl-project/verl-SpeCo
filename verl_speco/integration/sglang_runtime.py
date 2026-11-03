@@ -594,6 +594,30 @@ def _nonnegative_int(value: Any, default: int = 0) -> int:
         return max(int(default), 0)
 
 
+def _block_drafter_hidden_alignment_failure(
+    hidden_positions: Any, hidden_rows: int
+) -> str | None:
+    """Return why a block-drafter (DFlash) hidden-state sample is unusable.
+
+    Block drafters consume a contiguous run of target hidden states. Every row
+    collected by the SGLang output patch carries its token position; a sample
+    without positions, with a different number of positions than rows, or with
+    a position gap was not split per request and would train the drafter on
+    hidden states that belong to other tokens or requests.
+    """
+
+    if not torch.is_tensor(hidden_positions):
+        return "hidden_positions_missing_or_mismatched"
+    positions = hidden_positions.reshape(-1)
+    if int(positions.numel()) != int(hidden_rows):
+        return "hidden_positions_missing_or_mismatched"
+    if int(positions.numel()) > 1 and not bool(
+        (positions[1:] == positions[:-1] + 1).all()
+    ):
+        return "hidden_positions_not_contiguous"
+    return None
+
+
 def _expected_full_hidden_rows(prompt_len: int, output_len: int) -> int:
     return max(int(prompt_len) + int(output_len) - 1, 0)
 
@@ -2728,7 +2752,13 @@ class _SpecoSGLangHttpServerMixin:
                     )
                 hidden_kept_len = int(hidden_states.size(0))
                 fail_closed_alignment_reason = None
-                if not uses_dflash_aux_hidden:
+                if uses_dflash_aux_hidden:
+                    fail_closed_alignment_reason = (
+                        _block_drafter_hidden_alignment_failure(
+                            hidden_positions, hidden_kept_len
+                        )
+                    )
+                else:
                     if (
                         hidden_positions is None
                         or int(hidden_positions.numel()) != hidden_kept_len
