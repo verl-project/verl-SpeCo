@@ -35,6 +35,7 @@ def _trainer_helpers():
         "_speco_merge_rollout_stats",
     }
     constants = {
+        "_SPECO_VLLM_INVALID_FEEDBACK_KEY",
         "_SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY",
         "_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY",
         "_SPECO_VLLM_REQUEST_VERIFY_ROUNDS_KEY",

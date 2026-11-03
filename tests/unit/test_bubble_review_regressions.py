@@ -186,6 +186,7 @@ def test_schedule_context_does_not_reuse_previous_bubble_collection(
     driver = cls()
     driver.global_steps = 5
     driver._speco_last_collected_step = collected_step
+    driver._speco_acceptance_feedback = lambda: None
     driver._speco_last_collected_samples = 32
     driver._speco_rollout_idle_worker_enabled = lambda: bubble
     driver._speco_drafter_training_mode = lambda: "online"
