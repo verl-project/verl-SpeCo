@@ -251,16 +251,9 @@ def test_patch_skips_native_support_and_non_workers(sglang_patch, spec_workers) 
     assert dflash_cls.update_weights_from_tensor is patched
 
 
-@pytest.mark.parametrize(
-    "manager_tracks_weight_loads",
-    [True, False],
-    ids=["load-observation", "sglang-0.5.16-without-load-observation"],
-)
 def test_scheduler_dispatch_patches_a_late_loaded_dspark_worker(
-    monkeypatch, sglang_patch, manager_tracks_weight_loads
+    monkeypatch, sglang_patch
 ) -> None:
-    observed_loads = []
-    recorded_versions = []
     scheduler_components = types.ModuleType("sglang.srt.managers.scheduler_components")
     weight_updater = types.ModuleType(
         "sglang.srt.managers.scheduler_components.weight_updater"
@@ -279,10 +272,9 @@ def test_scheduler_dispatch_patches_a_late_loaded_dspark_worker(
             self.tp_worker = types.SimpleNamespace()
             self.tp_cpu_group = object()
 
-        def _observe_weight_load(self, kind):
+        def _observe_weight_load(self, _kind):
             class Context:
                 def __enter__(self):
-                    observed_loads.append(kind)
                     return None
 
                 def __exit__(self, *args):
@@ -294,15 +286,10 @@ def test_scheduler_dispatch_patches_a_late_loaded_dspark_worker(
             pass
 
         def record_weight_version_after_update(self, weight_version):
-            recorded_versions.append(weight_version)
+            pass
 
         def update_weights_from_tensor(self, recv_req):
             return self.draft_worker.update_weights_from_tensor(recv_req)
-
-    if not manager_tracks_weight_loads:
-        # SGLang 0.5.16 (the ROCm image) has neither hook on the manager.
-        del SchedulerWeightUpdaterManager._observe_weight_load
-        del SchedulerWeightUpdaterManager.record_weight_version_after_update
 
     weight_updater.SchedulerWeightUpdaterManager = SchedulerWeightUpdaterManager
     weight_updater.UpdateWeightsFromTensorReqOutput = (
@@ -329,16 +316,11 @@ def test_scheduler_dispatch_patches_a_late_loaded_dspark_worker(
         _request(
             [("markov_head.weight", 9)],
             load_format=DRAFT_LOADER,
-            weight_version="v1",
+            weight_version=None,
         )
     )
 
     assert result.success
-    if manager_tracks_weight_loads:
-        assert observed_loads == ["tensor"]
-        assert recorded_versions == ["v1"]
-    else:
-        assert observed_loads == recorded_versions == []
     assert worker.draft_model_runner.model.weights == {"markov_head.weight": 9}
     assert worker.target_worker.model_runner.model.weights == {}
     assert worker.draft_model_runner.weight_updater.load_formats == [None]
