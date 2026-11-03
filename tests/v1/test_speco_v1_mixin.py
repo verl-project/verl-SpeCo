@@ -1087,3 +1087,91 @@ def test_checkpoint_result_flattening_is_available_on_v1_trainer() -> None:
         {"saved": False},
         {"saved": True},
     ]
+
+
+def test_v1_adaptive_budget_uses_deduplicated_local_rollout_counts(monkeypatch):
+    from pathlib import Path
+    from unittest.mock import Mock
+
+    from verl_speco.trainer.scheduler import (
+        AcceptanceFeedback, AdaptiveScheduleConfig, DrafterScheduleConfig,
+        DrafterScheduleContext, DrafterScheduler,
+    )
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "unit"))
+    from test_bubble_review_regressions import _methods
+
+    drafts_key = "_speco_vllm_spec_decode_drafts"
+    accepted_key = "_speco_vllm_spec_decode_accepted_tokens"
+    facade = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py", "SpecoRayPPOTrainer",
+        {"_speco_acceptance_feedback"},
+        AcceptanceFeedback=AcceptanceFeedback,
+        _SPECO_VLLM_INVALID_FEEDBACK_KEY="_speco_vllm_invalid_acceptance_feedback",
+        _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY=drafts_key,
+        _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY=accepted_key,
+        SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC="length",
+        _speco_metric_float=lambda value: float(value) if value is not None else None,
+        _speco_rollout_metrics_from_stats=lambda stats: {
+            "length": 1 + stats[accepted_key] / stats[drafts_key]
+        },
+    )
+    records = {}
+    monkeypatch.setitem(sys.modules, "transfer_queue", types.SimpleNamespace(
+        kv_batch_get=lambda keys, **kwargs: {"extra_fields": [records[k] for k in keys]}
+    ))
+    cfg = DrafterScheduleConfig(
+        training_interval_steps=1,
+        adaptive_schedule=AdaptiveScheduleConfig(
+            enable=True, warmup_max_steps=0,
+            ema_fast_alpha=1.0, ema_slow_alpha=0.01,
+        ),
+    )
+    scheduler = DrafterScheduler(worker_executor=Mock(
+        get_training_data_status=Mock(return_value=[])
+    ))
+    controller = scheduler.configure_adaptive(cfg)
+    controller.state.budget = 5
+    observed = []
+
+    class Upstream:
+        def _update_actor(self, batch, metrics):
+            return None
+
+    class Harness(SpecoV1Mixin, facade, Upstream):
+        _speco_freeze_policy = None
+        config = _config()
+        parameter_sync_step = 3
+
+        def _speco_on_before_actor_update(self):
+            feedback = self._speco_acceptance_feedback()
+            observed.append(feedback)
+            scheduler.prepare_training_plan(DrafterScheduleContext(
+                global_step=self.global_steps, training_mode="online",
+                collected_samples_this_step=1, oldlogprob_collection_requested=True,
+                acceptance_feedback=feedback,
+            ), cfg)
+            return types.SimpleNamespace(training_plan=None, metrics={})
+
+    trainer = Harness()
+    trainer.config.actor_rollout_ref.rollout.drafter.training["adaptive_schedule"] = {"enable": True}
+    for step, accepted in [(1, 140), (2, 0)]:
+        trainer.global_steps = step
+        for key in ("a", "b", "c", "padding"):
+            records[key] = {"spec_num_verify_steps": 20,
+                            "spec_num_accepted_tokens": accepted,
+                            "spec_num_draft_tokens": 140}
+        for local, keys in enumerate([
+            ["a", "b"], ["b", "c"], ["a", "padding"],
+        ]):
+            trainer.local_trigger_step = local
+            batch = types.SimpleNamespace(
+                keys=keys, partition_id="train",
+                tags=[{"is_padding": k == "padding"} for k in keys],
+            )
+            trainer._update_actor(batch, {})
+            trainer._speco_v1_spec_decode_metrics(batch)
+        assert observed[-1].sample_count == 60
+        assert observed[-1].mean_acceptance_length == 1 + accepted / 20
+    assert len(observed) == 2
+    assert controller.state.budget > 5
