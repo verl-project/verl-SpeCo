@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import json
+import math
 import os
 import glob
 import time
@@ -20,6 +21,7 @@ import asyncio
 import random
 import fnmatch
 import shutil
+from uuid import uuid4
 from collections import deque
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
@@ -68,6 +70,15 @@ _ALIGNMENT_DEBUG_MAX_SAMPLES_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_MAX_SAMPLES_PER
 _ALIGNMENT_DEBUG_TOKEN_WINDOW_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_TOKEN_WINDOW"
 _ALIGNMENT_DEBUG_RANKS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_RANKS"
 _LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
+
+
+def _training_sample_uid(source_item: dict[str, Any]) -> str:
+    """Keep sample identity stable across draws and independent of object lifetime."""
+    sample_uid = source_item.get("_speco_sample_uid")
+    if sample_uid is None:
+        sample_uid = uuid4().hex
+        source_item["_speco_sample_uid"] = sample_uid
+    return str(sample_uid)
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -692,6 +703,22 @@ class DrafterBaseTrainer:
         self.skip_heavy_cleanup_after_drafter_training = bool(
             training_cfg.get("skip_heavy_cleanup_after_drafter_training", False)
         )
+        from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
+
+        self._gpu_head_host_reuse = (
+            not self._bubble_time_enabled
+            and gpu_transfer_enabled(training_cfg, "gpu_head_host_reuse")
+        )
+        self._gpu_optimizer_host_reuse = (
+            not self._bubble_time_enabled and gpu_transfer_enabled(training_cfg)
+        )
+        self._gpu_model_offload_reuse = (
+            not self._bubble_time_enabled
+            and gpu_transfer_enabled(training_cfg, "gpu_model_offload_reuse")
+        )
+        self._gpu_offload_pool_max_bytes = int(
+            float(training_cfg.get("gpu_offload_pool_max_gib", 8)) * 1024**3
+        )
         self.park_hccl_after_drafter_training = bool(
             training_cfg.get("park_hccl_after_drafter_training", False)
         )
@@ -912,23 +939,110 @@ class DrafterBaseTrainer:
     def _offload_optimizer_state_to_cpu(self) -> None:
         if self.optimizer is None or not self.optimizer.state:
             return
-        if not self._use_blocking_npu_optimizer_offload():
-            offload_fsdp_optimizer(self.optimizer)
-            return
+        first_offload = (
+            device_name in {"npu", "cuda"}
+            and self._drafter_strategy() == "fsdp2"
+            and not getattr(
+                self.optimizer, "_speco_first_blocking_optimizer_offload_done", False
+            )
+        )
+        diagnostic = (
+            device_name == "cuda"
+            and not self.__dict__.get("_bubble_time_enabled", False)
+            and logger.isEnabledFor(logging.DEBUG)
+        )
+        before = None
+        if diagnostic:
+            from verl_speco.trainer.performance_diagnostics import (
+                optimizer_state_metadata,
+            )
 
-        # Ascend may surface asynchronous optimizer D2H failures only at the
-        # later device synchronize. Use blocking copies for this long-lived
-        # state so failures are attributed to the actual transfer and no AICPU
-        # work remains pending when activation cleanup reclaims the device.
-        for state in self.optimizer.state.values():
-            if not isinstance(state, dict):
-                continue
-            for key, value in state.items():
-                local_value = (
-                    self._tensor_local_shard(value) if torch.is_tensor(value) else None
+            before = optimizer_state_metadata(self.optimizer)
+        started = time.perf_counter()
+        try:
+            if (
+                device_name == "cuda"
+                and self._drafter_strategy() == "fsdp2"
+                and not self.__dict__.get("_bubble_time_enabled", False)
+                and self.__dict__.get("_gpu_optimizer_host_reuse", False)
+            ):
+                from verl_speco.trainer.gpu_transfer import OptimizerHostBufferPool
+
+                model_pool = self.__dict__.get("_gpu_model_host_pool")
+                model_bytes = (
+                    sum(entry[2] for entry in model_pool.entries.values())
+                    if model_pool is not None
+                    else 0
                 )
-                if local_value is not None and local_value.device.type != "cpu":
-                    state[key] = value.to("cpu", non_blocking=False)
+                budget = max(self._gpu_offload_pool_max_bytes - model_bytes, 0)
+                pool = getattr(self.optimizer, "_speco_host_buffer_pool", None)
+                if pool is None:
+                    pool = OptimizerHostBufferPool()
+                    self.optimizer._speco_host_buffer_pool = pool
+                try:
+                    used, stats = pool.offload(
+                        self.optimizer,
+                        max_bytes=budget,
+                        device_module=self.device_module,
+                    )
+                except Exception:
+                    # A copy/wait failure must never fall through to a second
+                    # offload or allow cleanup to report a safe boundary.
+                    self.optimizer._speco_host_transition_failed = True
+                    raise
+                self._record_gpu_transfer(
+                    "optimizer_offload",
+                    {
+                        "used_pool": int(used),
+                        "first_blocking": int(first_offload),
+                        "model_pool_bytes": model_bytes,
+                        **stats,
+                    },
+                )
+                if used:
+                    # The pool has completed every copy before exposing CPU
+                    # state, preserving PR130's first-success completion fence.
+                    if first_offload:
+                        self.optimizer._speco_first_blocking_optimizer_offload_done = (
+                            True
+                        )
+                    return
+            if not first_offload and not self._use_blocking_npu_optimizer_offload():
+                offload_fsdp_optimizer(self.optimizer)
+                return
+
+            # Complete FSDP2's first accelerator-state transfer before activation
+            # cleanup; later calls retain verl's asynchronous path. Keep VeOmni's
+            # existing NPU safety policy blocking on every call.
+            offloaded = False
+            for state in self.optimizer.state.values():
+                if not isinstance(state, dict):
+                    continue
+                for key, value in state.items():
+                    local_value = (
+                        self._tensor_local_shard(value)
+                        if torch.is_tensor(value)
+                        else None
+                    )
+                    if local_value is not None and local_value.device.type != "cpu":
+                        state[key] = value.to("cpu", non_blocking=False)
+                        offloaded = True
+            # Empty/CPU-only initialization and failed copies must not consume the
+            # first-offload marker. A replacement optimizer gets its own lifecycle.
+            if first_offload and offloaded:
+                self.optimizer._speco_first_blocking_optimizer_offload_done = True
+        finally:
+            if before is not None:
+                logger.debug(
+                    "[drafter optimizer transfer] action=offload rank=%s step=%s first_blocking=%s "
+                    "elapsed_s=%.6f before=%s after=%s timing_mode=host_wall_no_device_sync",
+                    getattr(self, "rank", None),
+                    getattr(self, "current_rl_step", None),
+                    first_offload,
+                    time.perf_counter() - started,
+                    before,
+                    optimizer_state_metadata(self.optimizer),
+                )
 
     def _drafter_strategy(self) -> str:
         """Drafter parallelism strategy (see :func:`resolve_drafter_strategy`)."""
@@ -1089,10 +1203,11 @@ class DrafterBaseTrainer:
     def _online_input_tail_rows(self) -> int:
         """Return input rows retained beyond each collected hidden-state row.
 
-        EAGLE-family objectives consume one look-ahead token, while block
-        drafters align input ids, hidden states, and loss-mask rows one-to-one.
+        EAGLE-family objectives and DFlash-style block drafters keep one trailing
+        label row. DSpark aligns input ids, hidden states, and loss-mask rows
+        one-to-one and carries its trailing label separately.
         """
-        return 0 if self._is_block_drafter_backend() else 1
+        return 0 if getattr(self.backend, "model_type", None) == "dspark" else 1
 
     def _packing_enabled(self) -> bool:
         """Document-aware packing is opt-in for the block-drafter family."""
@@ -1126,7 +1241,7 @@ class DrafterBaseTrainer:
         if cached is None:
             from verl_speco.backends.dsv4_ep_utils import is_ep_active
 
-            cached = bool(is_ep_active(getattr(self, "config", None)))
+            cached = bool(is_ep_active(self.config))
             self._is_ep_active_cache = cached
         return cached
 
@@ -1169,6 +1284,8 @@ class DrafterBaseTrainer:
     def reset_training_metrics(self) -> None:
         self._training_metric_sums = {}
         self._training_metric_steps = 0
+        self._training_sample_draws = 0
+        self._training_unique_sample_ids: set[str] = set()
 
     def get_training_metrics(self) -> dict[str, float]:
         sums = dict(self._training_metric_sums)
@@ -1230,6 +1347,18 @@ class DrafterBaseTrainer:
             metrics[f"{prefix}/l1_loss"] = (
                 sums.get(f"{prefix}/l1_loss_sum", 0.0) / l1_tokens
             )
+        lk_tokens = sums.get(f"{prefix}/lk_weighted_token_count", 0.0)
+        if lk_tokens > 0:
+            metrics[f"{prefix}/lk_loss"] = (
+                sums.get(f"{prefix}/lk_loss_sum", 0.0) / lk_tokens
+            )
+        lk_diagnostic_tokens = sums.get(f"{prefix}/lk_diagnostic_token_count", 0.0)
+        if lk_diagnostic_tokens > 0:
+            for metric_name in ("acceptance", "kl_weight", "forward_kl", "tv"):
+                metrics[f"{prefix}/lk/{metric_name}"] = (
+                    sums.get(f"{prefix}/lk_{metric_name}_sum", 0.0)
+                    / lk_diagnostic_tokens
+                )
         confidence_tokens = sums.get(f"{prefix}/confidence_weighted_token_count", 0.0)
         if confidence_tokens > 0:
             metrics[f"{prefix}/confidence_loss"] = (
@@ -1247,6 +1376,8 @@ class DrafterBaseTrainer:
             f"{prefix}/weighted_token_count",
             f"{prefix}/ce_weighted_token_count",
             f"{prefix}/l1_weighted_token_count",
+            f"{prefix}/lk_weighted_token_count",
+            f"{prefix}/lk_diagnostic_token_count",
             f"{prefix}/confidence_weighted_token_count",
             f"{prefix}/quality_token_count",
             f"{prefix}/accepted_length_sum",
@@ -1259,6 +1390,12 @@ class DrafterBaseTrainer:
             if key in sums:
                 metrics[key] = sums[key] / steps
         metrics[f"{prefix}/metric_steps"] = float(self._training_metric_steps)
+        metrics["drafter/train_sample_draws"] = float(
+            getattr(self, "_training_sample_draws", 0)
+        )
+        metrics["drafter/train_unique_samples"] = float(
+            len(getattr(self, "_training_unique_sample_ids", ()))
+        )
         metrics["drafter/optimizer_steps_total"] = float(self.optimizer_steps_total)
         if self.optimizer is not None and self.optimizer.param_groups:
             metrics["drafter/current_lr"] = float(self.optimizer.param_groups[0]["lr"])
@@ -1351,6 +1488,13 @@ class DrafterBaseTrainer:
             "selector_token_count": f"{prefix}/selector_token_count",
             "selector_coverage_count": f"{prefix}/selector_coverage_count",
             "selector_active_count": f"{prefix}/selector_active_count",
+            "lk_loss_sum": f"{prefix}/lk_loss_sum",
+            "lk_weighted_token_count": f"{prefix}/lk_weighted_token_count",
+            "lk_diagnostic_token_count": f"{prefix}/lk_diagnostic_token_count",
+            "lk_acceptance_sum": f"{prefix}/lk_acceptance_sum",
+            "lk_kl_weight_sum": f"{prefix}/lk_kl_weight_sum",
+            "lk_forward_kl_sum": f"{prefix}/lk_forward_kl_sum",
+            "lk_tv_sum": f"{prefix}/lk_tv_sum",
             "sanitized_rows": f"{prefix}/sanitized_rows",
             "masked_rows": f"{prefix}/masked_rows",
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
@@ -1387,14 +1531,63 @@ class DrafterBaseTrainer:
                 key, 0.0
             ) + float(value)
 
-    def _record_dflash_training_metrics(self, loss_dict: dict[str, Any]) -> None:
+    def _summarize_step_metrics(
+        self, keys: list[str], values: list[float]
+    ) -> dict[str, Any]:
+        prefix = self._block_drafter_metric_prefix()
+        current = dict(zip(keys, values, strict=True))
+
+        def scalar(name: str) -> float:
+            return float(current.get(f"{prefix}/{name}", 0.0))
+
+        def vector(name: str) -> list[float]:
+            out: list[float] = []
+            while f"{prefix}/{name}/{len(out)}" in current:
+                out.append(float(current[f"{prefix}/{name}/{len(out)}"]))
+            return out
+
+        quality_tokens = scalar("quality_token_count")
+        eval_tokens = scalar("eval_token_count")
+        return {
+            "accuracy": (
+                scalar("correct_count") / eval_tokens
+                if eval_tokens > 0
+                else float("nan")
+            ),
+            "top1_acc": (
+                scalar("top1_correct_count") / quality_tokens
+                if quality_tokens > 0
+                else float("nan")
+            ),
+            "top5_acc": (
+                scalar("top5_correct_count") / quality_tokens
+                if quality_tokens > 0
+                else float("nan")
+            ),
+            "acc_per_position": [
+                correct / count if count > 0 else float("nan")
+                for correct, count in zip(
+                    vector("correct_per_position"),
+                    vector("count_per_position"),
+                    strict=False,
+                )
+            ],
+        }
+
+    def _record_dflash_training_metrics(
+        self, loss_dict: dict[str, Any]
+    ) -> dict[str, Any]:
+        self._last_step_metrics = {}
         if not isinstance(loss_dict.get("diagnostics"), dict):
-            return
+            return {}
         self._training_metric_steps += 1
         keys, values = self._pack_training_diagnostics(loss_dict)
-        if values is not None:
-            reduced = self._reduce_training_metric(values).cpu().tolist()
-            self._accumulate_training_diagnostics(keys, reduced)
+        if values is None:
+            return {}
+        reduced = self._reduce_training_metric(values).cpu().tolist()
+        self._accumulate_training_diagnostics(keys, reduced)
+        self._last_step_metrics = self._summarize_step_metrics(keys, reduced)
+        return self._last_step_metrics
 
     def _reduce_standalone_step_statistics(self, loss_dict: dict[str, Any]):
         loss_values = torch.stack(
@@ -1420,7 +1613,9 @@ class DrafterBaseTrainer:
             torch.cat([loss_values, diagnostics])
         )
         self._training_metric_steps += 1
-        self._accumulate_training_diagnostics(keys, reduced[3:].cpu().tolist())
+        diagnostic_values = reduced[3:].cpu().tolist()
+        self._accumulate_training_diagnostics(keys, diagnostic_values)
+        self._last_step_metrics = self._summarize_step_metrics(keys, diagnostic_values)
         return reduced[0], reduced[1], reduced[2], world_size
 
     def _get_sp_group(self):
@@ -2764,18 +2959,70 @@ class DrafterBaseTrainer:
             self._pending_full_checkpoint_future = None
         return {"waited": True, "completed": True, "reason": "completed"}
 
+    @contextmanager
+    def _residency_stage(self, phase: str, stage: str):
+        """Measure host wall time without adding device or distributed fences.
+
+        Transfers may be asynchronous: their queued work can be charged to a
+        later existing synchronization. These are diagnostic spans, not isolated
+        device transfer durations, and must not change exception handling.
+        """
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            timings = getattr(self, f"_last_{phase}_stage_timings")
+            timings[stage] = timings.get(stage, 0.0) + time.perf_counter() - started
+
+    def _record_gpu_transfer(self, scope, stats):
+        metrics = getattr(self, "_gpu_transfer_metrics", None)
+        if metrics is None:
+            metrics = self._gpu_transfer_metrics = {}
+        for key, value in stats.items():
+            if isinstance(value, (int, float)):
+                name = (
+                    f"timing_s/drafter_gpu_{scope}_{key[:-2]}"
+                    if key.endswith("_s")
+                    else f"drafter/gpu_{scope}_{key}"
+                )
+                metrics[name] = value
+        # Numeric step metrics above remain available without duplicating their
+        # successful payloads in every rank's warning log. Keep fallbacks visible.
+        fallback = stats.get("fallback_reason") not in (None, "none")
+        level = logging.WARNING if fallback else logging.DEBUG
+        if logger.isEnabledFor(level):
+            logger.log(
+                level,
+                "[drafter gpu transfer] rank=%s step=%s scope=%s details=%s",
+                self.rank,
+                getattr(self, "current_rl_step", None),
+                scope,
+                json.dumps(stats, sort_keys=True),
+            )
+
     async def activate_training_model(self) -> bool:
         # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态
         start_ts = time.time()
         self.last_activation_error = None
-        activation_stage = "enter"
         self._last_activation_stage_timings: dict[str, float] = {}
+        self._gpu_transfer_metrics = {}
+        activation_stage = "enter"
 
         def timed(stage, operation):
             started = time.perf_counter()
             try:
                 return operation()
             finally:
+                if getattr(self, "_bubble_time_enabled", False):
+                    stage = {
+                        "apply_active_head": "head_apply",
+                        "apply_host_head": "host_head_apply",
+                        "build_model": "model_build",
+                        "load_model": "model_restore",
+                        "load_optimizer": "optimizer_restore",
+                        "load_target_head": "head_move",
+                        "apply_device_head": "head_apply",
+                    }.get(stage, stage)
                 self._last_activation_stage_timings[stage] = (
                     time.perf_counter() - started
                 )
@@ -2789,7 +3036,7 @@ class DrafterBaseTrainer:
             )
 
             if self._training_active and self.model is not None:
-                timed("head_apply", self._apply_pending_target_lm_head_weight)
+                timed("apply_active_head", self._apply_pending_target_lm_head_weight)
                 logger.debug(
                     f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] activate_training_model reused active model "
                     f"elapsed={time.time() - start_ts:.2f}s"
@@ -2800,14 +3047,14 @@ class DrafterBaseTrainer:
             # Apply them before loading drafter model/optimizer state to keep
             # accelerator memory peaks low during activation.
             activation_stage = "apply_pending_target_head_on_host"
-            timed("host_head_apply", self._apply_pending_target_lm_head_weight)
+            timed("apply_host_head", self._apply_pending_target_lm_head_weight)
 
             if self.model is None:
                 logger.debug(
                     "Draft Model not initialized, calling build_draft_model during activation..."
                 )
                 activation_stage = "build_draft_model"
-                timed("model_build", self._build_draft_model)
+                timed("build_model", self._build_draft_model)
 
             # 只有当配置了 offload 或者当前模型不在 CUDA 上时执行加载
             first_param = next(self.model.parameters(), None)
@@ -2818,7 +3065,31 @@ class DrafterBaseTrainer:
             if self.is_offload_param or not is_on_cuda:
                 # 调用工具将 FSDP 分片移动到 GPU
                 activation_stage = "load_draft_model"
-                timed("model_restore", lambda: load_fsdp_model_to_gpu(self.model))
+
+                def restore_model():
+                    used_batched_load = False
+                    if (
+                        device_name == "cuda"
+                        and not getattr(self, "_bubble_time_enabled", False)
+                        and getattr(self, "_gpu_model_offload_reuse", False)
+                        and self._drafter_strategy() == "fsdp2"
+                        and self.training_device_mesh is not None
+                    ):
+                        from verl_speco.trainer.gpu_transfer import load_model_from_host
+
+                        used_batched_load, stats = load_model_from_host(
+                            self.model,
+                            self.runtime_device,
+                            device_module=self.device_module,
+                        )
+                        self._record_gpu_transfer(
+                            "model_load",
+                            {"used_batched_load": int(used_batched_load), **stats},
+                        )
+                    if not used_batched_load:
+                        load_fsdp_model_to_gpu(self.model)
+
+                timed("load_model", restore_model)
                 logger.debug("Loaded drafter model to GPU for training")
 
             if self.optimizer is not None and (
@@ -2828,18 +3099,47 @@ class DrafterBaseTrainer:
                 # 获取 device_id,否则在多卡环境优化器状态可能全部挤在 cuda:0 导致 OOM
                 current_dev_id = get_device_id()
                 activation_stage = "load_draft_optimizer"
-                timed(
-                    "optimizer_restore",
-                    lambda: load_fsdp_optimizer(
-                        optimizer=self.optimizer, device_id=current_dev_id
-                    ),
-                )
+
+                def restore_optimizer():
+                    diagnostic = (
+                        device_name == "cuda"
+                        and not self.__dict__.get("_bubble_time_enabled", False)
+                        and logger.isEnabledFor(logging.DEBUG)
+                    )
+                    before = None
+                    if diagnostic:
+                        from verl_speco.trainer.performance_diagnostics import (
+                            optimizer_state_metadata,
+                        )
+
+                        before = optimizer_state_metadata(self.optimizer)
+                    started = time.perf_counter()
+                    try:
+                        return load_fsdp_optimizer(
+                            optimizer=self.optimizer, device_id=current_dev_id
+                        )
+                    finally:
+                        if before is not None:
+                            logger.debug(
+                                "[drafter optimizer transfer] action=load rank=%s step=%s "
+                                "elapsed_s=%.6f before=%s after=%s timing_mode=host_wall_no_device_sync",
+                                self.rank,
+                                getattr(self, "current_rl_step", None),
+                                time.perf_counter() - started,
+                                before,
+                                optimizer_state_metadata(self.optimizer),
+                            )
+
+                timed("load_optimizer", restore_optimizer)
                 logger.debug("Loaded drafter optimizer to GPU for training")
 
             activation_stage = "load_target_lm_head"
-            timed("head_move", lambda: self._move_target_lm_head(self.runtime_device))
+            timed(
+                "load_target_head",
+                lambda: self._move_target_lm_head(self.runtime_device),
+            )
             activation_stage = "apply_pending_target_head_on_device"
-            timed("head_apply", self._apply_pending_target_lm_head_weight)
+            timed("apply_device_head", self._apply_pending_target_lm_head_weight)
 
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
             self._training_initialized = True
@@ -3296,6 +3596,67 @@ class DrafterBaseTrainer:
             target_head = getattr(self.backend, attribute, None)
             if target_head is None:
                 continue
+            cache_enabled = device_name == "cuda" and getattr(
+                self, "_gpu_head_host_reuse", False
+            )
+            if cache_enabled:
+                from verl_speco.trainer.gpu_transfer import FrozenHeadHostCache
+
+                cache = getattr(self, "_gpu_head_host_cache", None)
+                if cache is None:
+                    cache = self._gpu_head_host_cache = FrozenHeadHostCache()
+                head = self._target_lm_head_module()
+                parameters = list(target_head.parameters())
+                eligible = (
+                    head is not None
+                    and len(parameters) == 1
+                    and parameters[0] is head.weight
+                    and not head.weight.requires_grad
+                    and not list(target_head.buffers())
+                )
+                version = self._target_lm_head_weight_step
+                destination = torch.device(device)
+                if eligible and destination.type == "cpu":
+                    reused, reason, avoided = cache.restore(head.weight, version)
+                    self._record_gpu_transfer(
+                        "head_restore",
+                        {
+                            "cache_hit": int(reused),
+                            "avoided_d2h_bytes": avoided,
+                            "fallback_reason": reason,
+                            "version": version,
+                            "dtype": str(head.weight.dtype),
+                        },
+                    )
+                    if reused:
+                        return True
+                elif eligible and destination.type == "cuda":
+                    captured = cache.capture(head.weight, version)
+                    target_head.to(device)
+                    if captured:
+                        cache.arm(head.weight)
+                    self._record_gpu_transfer(
+                        "head_capture",
+                        {
+                            "captured": int(captured),
+                            "version": version,
+                            "host_bytes": head.weight.numel()
+                            * head.weight.element_size()
+                            if captured
+                            else 0,
+                            "dtype": str(head.weight.dtype),
+                        },
+                    )
+                    return True
+                else:
+                    cache.clear()
+                    self._record_gpu_transfer(
+                        "head_restore",
+                        {
+                            "cache_hit": 0,
+                            "fallback_reason": "unsupported_or_trainable_head",
+                        },
+                    )
             target_head.to(device)
             logger.debug(
                 "[Rank %s] Moved %s to %s",
@@ -3319,6 +3680,9 @@ class DrafterBaseTrainer:
         source_weight = self._pending_target_lm_head_weight
         source_row_indices = self._pending_target_lm_head_row_indices
         source_vocab_size = self._pending_target_lm_head_source_vocab_size
+        cache = getattr(self, "_gpu_head_host_cache", None)
+        if cache is not None:
+            cache.clear()
         if source_row_indices is not None:
             if source_weight.dim() != 2:
                 raise ValueError(
@@ -3416,6 +3780,27 @@ class DrafterBaseTrainer:
                     target_weight.dtype,
                     time.perf_counter() - copy_started,
                 )
+        elif (
+            device_name == "cuda"
+            and getattr(self, "_gpu_head_host_reuse", False)
+            and target_weight.device.type == "cpu"
+            and source_weight.device.type == "cpu"
+        ):
+            copy_started = time.perf_counter()
+            # copy_ performs the same dtype conversion without a full-size .to()
+            # temporary, retaining ownership of the backend's CPU head storage.
+            target_weight.copy_(source_weight)
+            self._record_gpu_transfer(
+                "head_apply",
+                {
+                    "elapsed_s": time.perf_counter() - copy_started,
+                    "bytes": target_weight.numel() * target_weight.element_size(),
+                    "direct_cpu_copy": 1,
+                    "version": self._target_lm_head_weight_step,
+                    "source_dtype": str(source_weight.dtype),
+                    "target_dtype": str(target_weight.dtype),
+                },
+            )
         else:
             target_weight.copy_(
                 source_weight.to(
@@ -3611,6 +3996,11 @@ class DrafterBaseTrainer:
             source_tensors.append(hidden_raw_target_logprobs_positions)
         else:
             hidden_raw_target_logprobs_positions = None
+        target_logz = batch.get("target_logz")
+        if isinstance(target_logz, torch.Tensor):
+            source_tensors.append(target_logz)
+        else:
+            target_logz = None
         if target_logprobs is not None:
             source_tensors.append(target_logprobs)
         if "responses" in batch and batch["responses"] is not None:
@@ -3647,6 +4037,11 @@ class DrafterBaseTrainer:
                     if hidden_raw_target_logprobs_positions is not None
                     else None
                 )
+                cpu_target_logz = (
+                    target_logz.to("cpu", dtype=torch.float32, non_blocking=True)
+                    if target_logz is not None
+                    else None
+                )
                 cpu_responses = (
                     batch["responses"].to("cpu", non_blocking=True)
                     if batch.get("responses") is not None
@@ -3678,6 +4073,11 @@ class DrafterBaseTrainer:
                 if hidden_raw_target_logprobs_positions is not None
                 else None
             )
+            cpu_target_logz = (
+                target_logz.to("cpu", dtype=torch.float32)
+                if target_logz is not None
+                else None
+            )
             cpu_responses = (
                 batch["responses"].to("cpu")
                 if batch.get("responses") is not None
@@ -3686,6 +4086,12 @@ class DrafterBaseTrainer:
             cpu_prompts = (
                 batch["prompts"].to("cpu") if batch.get("prompts") is not None else None
             )
+
+        if cpu_target_logz is not None:
+            while cpu_target_logz.dim() > 2 and cpu_target_logz.size(-1) == 1:
+                cpu_target_logz = cpu_target_logz.squeeze(-1)
+            if cpu_target_logz.dim() == 1:
+                cpu_target_logz = cpu_target_logz.unsqueeze(0)
 
         batch_size = cpu_input_ids.size(0)
 
@@ -3699,8 +4105,19 @@ class DrafterBaseTrainer:
             getattr(model_config, "pad_token_id", self.pad_token_id)
             or self.pad_token_id
         )
+        # Only DSpark carries its trailing label separately (``next_token_ids``),
+        # so it alone keeps context tokens aligned one-to-one with hidden rows.
+        # Every other drafter (including DFlash, DFlash2 and Domino) keeps the
+        # trailing label row in ``input_ids`` (one row longer than the hidden
+        # window), which the block-drafter batch builder exposes as label_ids.
+        model_type = getattr(self.backend, "model_type", None)
         accepted_any = False
         input_tail_rows = self._online_input_tail_rows()
+        # DSpark keeps context tokens aligned one-to-one with hidden rows, but
+        # its labels are shifted by one token. Reserve the trailing token
+        # separately instead of exposing it as an extra context row.
+        shifted_block_labels = model_type == "dspark"
+        required_trailing_rows = max(input_tail_rows, 1 if shifted_block_labels else 0)
         for i in range(batch_size):
             # Legacy samples without explicit positions were collected from a
             # next-token hidden-state stream and use ``input_len - 1`` as the
@@ -3827,7 +4244,9 @@ class DrafterBaseTrainer:
                     selected_hidden_row_end,
                     hidden_seq_length,
                     max(
-                        input_seq_length - hidden_position_start - input_tail_rows,
+                        input_seq_length
+                        - hidden_position_start
+                        - required_trailing_rows,
                         0,
                     ),
                 )
@@ -3850,7 +4269,10 @@ class DrafterBaseTrainer:
                 hidden_start = 0
                 hidden_feature_length = min(
                     hidden_seq_length,
-                    max(input_seq_length - feature_start - input_tail_rows, 0),
+                    max(
+                        input_seq_length - feature_start - required_trailing_rows,
+                        0,
+                    ),
                 )
                 hidden_end = hidden_feature_length
                 feature_end = min(
@@ -4081,6 +4503,11 @@ class DrafterBaseTrainer:
                 "loss_mask": full_loss_mask[feature_start:feature_end],
                 "position_ids": item_position_ids,
                 "target_logprobs": target_logprobs_item,
+                "target_logz": (
+                    cpu_target_logz[i, hidden_start:hidden_end].reshape(-1)
+                    if cpu_target_logz is not None
+                    else None
+                ),
                 "responses": cpu_responses[i] if cpu_responses is not None else None,
                 "prompts": cpu_prompts[i] if cpu_prompts is not None else None,
                 "_verl_feature_start": feature_start,
@@ -4163,6 +4590,13 @@ class DrafterBaseTrainer:
                 "hidden_last_hidden_filter": batch.get("hidden_last_hidden_filter"),
                 "hidden_last_hidden_select": batch.get("hidden_last_hidden_select"),
                 "global_step": _batch_item_int(batch.get("global_step"), i),
+                "target_logz_temperature": (
+                    float(
+                        self.config.rollout.drafter.training.get("lk_temperature", 1.0)
+                    )
+                    if cpu_target_logz is not None
+                    else None
+                ),
                 "source_replica_rank": _batch_item_int(
                     batch.get("source_replica_rank"), i
                 ),
@@ -4172,6 +4606,19 @@ class DrafterBaseTrainer:
                     else None
                 ),
             }
+            if shifted_block_labels:
+                if not 0 <= feature_start < feature_end < input_seq_length:
+                    raise ValueError(
+                        "DSpark next-token labels require a trailing input row: "
+                        f"feature_start={feature_start}, feature_end={feature_end}, "
+                        f"input_seq_length={input_seq_length}"
+                    )
+                data_item["next_token_ids"] = cpu_input_ids[
+                    i, feature_start + 1 : feature_end + 1
+                ]
+                data_item["next_token_loss_mask"] = full_loss_mask[
+                    feature_start + 1 : feature_end + 1
+                ]
 
             if alignment_debug_enabled():
                 sample_index = self._alignment_debug_sample_index(
@@ -4454,6 +4901,18 @@ class DrafterBaseTrainer:
                     )
             batch["loss_mask"] = batch["loss_mask"].masked_fill(bad_target_rows, 0.0)
 
+        if "next_token_loss_mask" in batch:
+            next_mask = torch.nan_to_num(
+                batch["next_token_loss_mask"].float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            next_mask = torch.where(
+                next_mask > 0, torch.ones_like(next_mask), torch.zeros_like(next_mask)
+            )
+            batch["next_token_loss_mask"] = next_mask * batch["loss_mask"]
+
         if "label_mask" in batch:
             # ``label_mask`` weights the drafter loss: gate context labels by
             # their own column and tail labels by the last context row.
@@ -4649,6 +5108,8 @@ class DrafterBaseTrainer:
         hidden_state_chunks: list[torch.Tensor],
         position_id_chunks: list[torch.Tensor],
         target_last_hidden_state_chunks: list[torch.Tensor],
+        next_token_id_chunks: list[torch.Tensor] | None = None,
+        next_token_loss_mask_chunks: list[torch.Tensor] | None = None,
     ) -> (
         tuple[
             torch.Tensor,
@@ -4657,6 +5118,8 @@ class DrafterBaseTrainer:
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
+            torch.Tensor | None,
+            torch.Tensor | None,
             torch.Tensor | None,
             int,
         ]
@@ -4684,6 +5147,17 @@ class DrafterBaseTrainer:
                 len(input_id_chunks),
             )
             return None
+        has_next_token_labels = bool(next_token_id_chunks)
+        if has_next_token_labels and (
+            next_token_loss_mask_chunks is None
+            or len(next_token_id_chunks or []) != len(input_id_chunks)
+            or len(next_token_loss_mask_chunks) != len(input_id_chunks)
+        ):
+            logger.warning(
+                "[%s] dropping packed batch with partial next-token labels",
+                self._block_drafter_metric_prefix(),
+            )
+            return None
 
         ids_out: list[torch.Tensor] = []
         mask_out: list[torch.Tensor] = []
@@ -4691,6 +5165,8 @@ class DrafterBaseTrainer:
         position_out: list[torch.Tensor] = []
         doc_out: list[torch.Tensor] = []
         target_hidden_out: list[torch.Tensor] = []
+        next_ids_out: list[torch.Tensor] = []
+        next_mask_out: list[torch.Tensor] = []
         total = 0
         skipped = 0
         for idx, (ids, mask, hidden, position) in enumerate(
@@ -4720,6 +5196,18 @@ class DrafterBaseTrainer:
                         ),
                     ]
                 )
+            if has_next_token_labels:
+                next_ids = cast(list[torch.Tensor], next_token_id_chunks)[idx]
+                next_mask = cast(list[torch.Tensor], next_token_loss_mask_chunks)[idx]
+                if pad:
+                    next_ids = torch.cat(
+                        [next_ids, torch.zeros(pad, dtype=next_ids.dtype, device=dev)]
+                    )
+                    next_mask = torch.cat(
+                        [next_mask, torch.zeros(pad, dtype=next_mask.dtype, device=dev)]
+                    )
+                next_ids_out.append(next_ids)
+                next_mask_out.append(next_mask)
             ids_out.append(ids)
             mask_out.append(mask)
             hidden_out.append(hidden)
@@ -4770,8 +5258,68 @@ class DrafterBaseTrainer:
                 if target_hidden_out
                 else None
             ),
+            (
+                torch.cat(next_ids_out).unsqueeze(0).contiguous()
+                if next_ids_out
+                else None
+            ),
+            (
+                torch.cat(next_mask_out).unsqueeze(0).contiguous()
+                if next_mask_out
+                else None
+            ),
             len(ids_out),
         )
+
+    @staticmethod
+    def _extend_chunks_with_trailing_labels(
+        input_id_chunks: list[torch.Tensor],
+        loss_mask_chunks: list[torch.Tensor],
+        hidden_state_chunks: list[torch.Tensor],
+        position_id_chunks: list[torch.Tensor],
+        target_last_hidden_state_chunks: list[torch.Tensor],
+        label_id_chunks: list[torch.Tensor],
+        label_mask_chunks: list[torch.Tensor],
+    ) -> tuple[
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[torch.Tensor],
+    ]:
+        """Append each sample's trailing label rows to its context chunks."""
+
+        def zeros_like_rows(chunk: torch.Tensor, n: int) -> torch.Tensor:
+            return torch.zeros(
+                (n, *chunk.shape[1:]), dtype=chunk.dtype, device=chunk.device
+            )
+
+        ids_out, mask_out, hidden_out, pos_out, target_out = [], [], [], [], []
+        for idx, ids in enumerate(input_id_chunks):
+            ext = max(int(label_id_chunks[idx].size(0)) - int(ids.size(0)), 0)
+            if ext == 0:
+                ids_out.append(ids)
+                mask_out.append(loss_mask_chunks[idx])
+                hidden_out.append(hidden_state_chunks[idx])
+                pos_out.append(position_id_chunks[idx])
+                if target_last_hidden_state_chunks:
+                    target_out.append(target_last_hidden_state_chunks[idx])
+                continue
+            real = int(ids.size(0))
+            ids_out.append(torch.cat([ids, label_id_chunks[idx][real : real + ext]]))
+            mask_out.append(
+                torch.cat(
+                    [loss_mask_chunks[idx], label_mask_chunks[idx][real : real + ext]]
+                )
+            )
+            hidden = hidden_state_chunks[idx]
+            hidden_out.append(torch.cat([hidden, zeros_like_rows(hidden, ext)]))
+            pos = position_id_chunks[idx]
+            pos_out.append(torch.cat([pos, zeros_like_rows(pos, ext)]))
+            if target_last_hidden_state_chunks:
+                target = target_last_hidden_state_chunks[idx]
+                target_out.append(torch.cat([target, zeros_like_rows(target, ext)]))
+        return ids_out, mask_out, hidden_out, pos_out, target_out
 
     def _pack_block_drafter_batch(
         self,
@@ -4780,6 +5328,8 @@ class DrafterBaseTrainer:
         hidden_state_chunks: list[torch.Tensor],
         position_id_chunks: list[torch.Tensor],
         target_last_hidden_state_chunks: list[torch.Tensor],
+        next_token_id_chunks: list[torch.Tensor] | None = None,
+        next_token_loss_mask_chunks: list[torch.Tensor] | None = None,
     ) -> tuple[dict[str, torch.Tensor], int] | None:
         """Packing glue: pack the per-sample chunks into the training batch fields.
 
@@ -4795,6 +5345,8 @@ class DrafterBaseTrainer:
             hidden_state_chunks,
             position_id_chunks,
             target_last_hidden_state_chunks,
+            next_token_id_chunks,
+            next_token_loss_mask_chunks,
         )
         if packed is None:
             return None
@@ -4806,6 +5358,8 @@ class DrafterBaseTrainer:
             attn_mask,
             document_ids,
             target_last_hidden_states,
+            next_token_ids,
+            next_token_loss_mask,
             num_packed,
         ) = packed
         fields: dict[str, torch.Tensor] = {
@@ -4818,6 +5372,9 @@ class DrafterBaseTrainer:
         }
         if target_last_hidden_states is not None:
             fields["target_last_hidden_states"] = target_last_hidden_states
+        if next_token_ids is not None:
+            fields["next_token_ids"] = next_token_ids
+            fields["next_token_loss_mask"] = cast(torch.Tensor, next_token_loss_mask)
         return fields, num_packed
 
     def _prepare_training_batch(
@@ -4963,6 +5520,7 @@ class DrafterBaseTrainer:
         )
         items_seen = len(items)
         items_used = 0
+        used_sample_ids: list[str] = []
         items_dropped_short = 0
         items_dropped_missing_target = 0
         packed_tokens_before_shift = 0
@@ -4978,8 +5536,11 @@ class DrafterBaseTrainer:
         hidden_state_chunks = []
         position_id_chunks = []
         last_hidden_state_chunks = []
+        target_logz_chunks = []
         target_logprob_chunks = []
         target_last_hidden_state_chunks = []
+        next_token_id_chunks = []
+        next_token_loss_mask_chunks = []
         label_id_chunks = []
         label_mask_chunks = []
 
@@ -4988,11 +5549,25 @@ class DrafterBaseTrainer:
         mask_list = preprocessed_lists["masks"]
         position_list = preprocessed_lists.get("position_ids")
         target_last_h_list = preprocessed_lists.get("target_last_h_states")
-        dspark_target_hidden_required = (
-            self.backend.model_type in ("dspark", "dsv4_dspark")
+        target_logz_list = preprocessed_lists.get("target_logz")
+        next_token_ids_list = preprocessed_lists.get("next_token_ids")
+        next_token_masks_list = preprocessed_lists.get("next_token_masks")
+        eagle3_exact_lk_enabled = (
+            self.backend.model_type == "eagle3"
+            and not use_logits
+            and float(
+                self.config.rollout.drafter.training.get("eagle3_lk_loss_alpha", 0.0)
+                or 0.0
+            )
+            > 0
+        )
+        eagle3_lk_temperature = float(
+            self.config.rollout.drafter.training.get("lk_temperature", 1.0) or 1.0
+        )
+        block_distribution_loss_enabled = (
+            self.backend.model_type in {"dspark", "dsv4_dspark", "dflash"}
             and resolve_drafter_hidden_states_layout(
-                "DSV4_DSPARK" if self.backend.model_type == "dsv4_dspark" else "DSPARK",
-                self.config.rollout.drafter.training,
+                self.backend.model_type.upper(), self.config.rollout.drafter.training
             )
             == "dflash_aux_plus_last"
         )
@@ -5006,9 +5581,59 @@ class DrafterBaseTrainer:
         ):
             source_item = items[item_idx] if item_idx < len(items) else {}
             uses_shifted_eagle_inputs = self.backend.model_type == "eagle3"
+            if eagle3_exact_lk_enabled:
+                synced_step = getattr(self, "_target_lm_head_weight_step", None)
+                sample_step = source_item.get("global_step", source_item.get("step"))
+                if synced_step is None:
+                    raise ValueError(
+                        "EAGLE3 LK requires a synchronized target LM-head snapshot "
+                        "before consuming target_logz"
+                    )
+                if sample_step is None:
+                    raise ValueError(
+                        "EAGLE3 LK sample is missing the target snapshot global_step"
+                    )
+                if int(sample_step) != int(synced_step):
+                    raise ValueError(
+                        "EAGLE3 LK target snapshot mismatch: "
+                        f"sample_step={int(sample_step)} synced_step={int(synced_step)}"
+                    )
+                sample_temperature = source_item.get("target_logz_temperature")
+                if sample_temperature is None:
+                    raise ValueError(
+                        "EAGLE3 LK sample is missing target_logz_temperature"
+                    )
+                sample_temperature = float(sample_temperature)
+                if not math.isfinite(sample_temperature) or not math.isclose(
+                    sample_temperature,
+                    eagle3_lk_temperature,
+                    rel_tol=1e-6,
+                    abs_tol=1e-8,
+                ):
+                    raise ValueError(
+                        "EAGLE3 LK target_logz temperature mismatch: "
+                        f"sample={sample_temperature!r} configured={eagle3_lk_temperature!r}"
+                    )
             target_last_h_states = (
                 target_last_h_list[item_idx]
                 if target_last_h_list is not None and item_idx < len(target_last_h_list)
+                else None
+            )
+            target_logz_item = (
+                target_logz_list[item_idx]
+                if target_logz_list is not None and item_idx < len(target_logz_list)
+                else None
+            )
+            next_token_ids_item = (
+                next_token_ids_list[item_idx]
+                if next_token_ids_list is not None
+                and item_idx < len(next_token_ids_list)
+                else None
+            )
+            next_token_mask_item = (
+                next_token_masks_list[item_idx]
+                if next_token_masks_list is not None
+                and item_idx < len(next_token_masks_list)
                 else None
             )
             seq_len_limits = [
@@ -5020,11 +5645,19 @@ class DrafterBaseTrainer:
             if torch.is_tensor(target_last_h_states):
                 target_last_h_states = cast(torch.Tensor, target_last_h_states)
                 seq_len_limits.append(target_last_h_states.size(0))
+            if torch.is_tensor(next_token_ids_item) and torch.is_tensor(
+                next_token_mask_item
+            ):
+                next_ids_tensor = cast(torch.Tensor, next_token_ids_item)
+                next_mask_tensor = cast(torch.Tensor, next_token_mask_item)
+                seq_len_limits.extend(
+                    [next_ids_tensor.size(0), next_mask_tensor.size(0)]
+                )
             seq_len = min(seq_len_limits)
             if seq_len < 1:
                 items_dropped_short += 1
                 continue
-            if dspark_target_hidden_required and not torch.is_tensor(
+            if block_distribution_loss_enabled and not torch.is_tensor(
                 target_last_h_states
             ):
                 items_dropped_missing_target += 1
@@ -5055,6 +5688,12 @@ class DrafterBaseTrainer:
                     item_position_ids.size(0),
                     max(last_h_states.size(0) - 1, 0),
                 ]
+                if torch.is_tensor(target_logz_item):
+                    train_seq_len_limits.append(
+                        max(cast(torch.Tensor, target_logz_item).size(0) - 1, 0)
+                    )
+                elif eagle3_exact_lk_enabled:
+                    raise ValueError("EAGLE3 LK sample is missing target_logz")
                 train_seq_len = min(train_seq_len_limits)
             elif self.backend.model_type == "peagle":
                 # P-EAGLE mirrors the reference target-wrapper shift: row p pairs
@@ -5079,6 +5718,7 @@ class DrafterBaseTrainer:
                 continue
 
             items_used += 1
+            used_sample_ids.append(_training_sample_uid(source_item))
             packed_tokens_before_shift += train_seq_len
             if self.backend.model_type == "peagle":
                 packed_loss_tokens += int(
@@ -5374,13 +6014,21 @@ class DrafterBaseTrainer:
                 block_label_len = min(ids.size(0), item_loss_mask.size(0))
                 if block_label_len > train_seq_len:
                     trailing_label_rows += 1
-                if not packing_enabled:
-                    label_id_chunks.append(ids[:block_label_len])
-                    label_mask_chunks.append(item_loss_mask[:block_label_len])
+                label_id_chunks.append(ids[:block_label_len])
+                label_mask_chunks.append(item_loss_mask[:block_label_len])
             elif uses_shifted_eagle_inputs:
                 loss_mask_chunks.append(item_loss_mask[2 : 2 + train_seq_len])
             else:
                 loss_mask_chunks.append(item_loss_mask[1 : 1 + train_seq_len])
+            if torch.is_tensor(next_token_ids_item) and torch.is_tensor(
+                next_token_mask_item
+            ):
+                next_token_id_chunks.append(
+                    cast(torch.Tensor, next_token_ids_item)[:train_seq_len]
+                )
+                next_token_loss_mask_chunks.append(
+                    cast(torch.Tensor, next_token_mask_item)[:train_seq_len]
+                )
 
             if self.backend.model_type == "eagle3":
                 if use_logits:
@@ -5394,11 +6042,15 @@ class DrafterBaseTrainer:
                     last_hidden_state_chunks.append(
                         last_h_states[1 : 1 + train_seq_len]
                     )
+                    if torch.is_tensor(target_logz_item):
+                        target_logz_chunks.append(
+                            cast(torch.Tensor, target_logz_item)[1 : 1 + train_seq_len]
+                        )
             elif self.backend.model_type == "peagle":
                 # Reference-shifted: last_hidden[p+1] scores x[p+2], the token
                 # after the drafted input token x[p+1] at row p.
                 last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
-            elif dspark_target_hidden_required and torch.is_tensor(
+            elif block_distribution_loss_enabled and torch.is_tensor(
                 target_last_h_states
             ):
                 target_last_h_states = cast(torch.Tensor, target_last_h_states)
@@ -5413,13 +6065,26 @@ class DrafterBaseTrainer:
         label_mask = None
         document_ids = None
         if packing_enabled:
-            # Packing carries context chunks only, so it cannot represent the
-            # trailing label token; refuse instead of dropping supervision.
             if trailing_label_rows:
-                raise NotImplementedError(
-                    "Document-aware packing does not support the trailing drafter "
-                    f"label token ({trailing_label_rows} sample(s) carry one); disable "
-                    "rollout.drafter.training.packing.enable for block drafters."
+                # Extend each document by its trailing label rows so they stay
+                # inside the document (same document id). The packed input ids
+                # and loss mask then double as label ids/mask; the extra rows
+                # have zero hidden states and are never attended as context
+                # (context keys precede the anchor).
+                (
+                    input_id_chunks,
+                    loss_mask_chunks,
+                    hidden_state_chunks,
+                    position_id_chunks,
+                    target_last_hidden_state_chunks,
+                ) = self._extend_chunks_with_trailing_labels(
+                    input_id_chunks,
+                    loss_mask_chunks,
+                    hidden_state_chunks,
+                    position_id_chunks,
+                    target_last_hidden_state_chunks,
+                    label_id_chunks,
+                    label_mask_chunks,
                 )
             packed = self._pack_block_drafter_batch(
                 input_id_chunks,
@@ -5427,6 +6092,8 @@ class DrafterBaseTrainer:
                 hidden_state_chunks,
                 position_id_chunks,
                 target_last_hidden_state_chunks,
+                next_token_id_chunks,
+                next_token_loss_mask_chunks,
             )
             if packed is None:
                 return None
@@ -5438,6 +6105,8 @@ class DrafterBaseTrainer:
             attn_mask = packed_fields["attention_mask"]
             document_ids = packed_fields.get("document_ids")
             target_last_hidden_states = packed_fields.get("target_last_hidden_states")
+            next_token_ids = packed_fields.get("next_token_ids")
+            next_token_loss_mask = packed_fields.get("next_token_loss_mask")
             items_used = num_packed
         elif self._is_block_drafter_backend():
             max_train_len = max(chunk.size(0) for chunk in input_id_chunks)
@@ -5487,6 +6156,15 @@ class DrafterBaseTrainer:
                 label_ids[row_idx, :row_len] = label_chunk
                 label_mask[row_idx, :row_len] = label_mask_chunk
             attn_mask = torch.zeros_like(input_ids, dtype=torch.long, device=dev)
+            next_token_ids = None
+            next_token_loss_mask = None
+            if next_token_id_chunks:
+                if len(next_token_id_chunks) != len(input_id_chunks):
+                    raise ValueError(
+                        "Block drafter batch has partial next-token label tensors"
+                    )
+                next_token_ids = torch.zeros_like(input_ids)
+                next_token_loss_mask = torch.zeros_like(loss_mask)
             for row_idx, (ids_chunk, mask_chunk, h_chunk, pos_chunk) in enumerate(
                 zip(
                     input_id_chunks,
@@ -5501,11 +6179,16 @@ class DrafterBaseTrainer:
                 base_h[row_idx, :row_len] = h_chunk
                 position_ids[row_idx, :row_len] = pos_chunk
                 attn_mask[row_idx, :row_len] = 1
+                if next_token_ids is not None and next_token_loss_mask is not None:
+                    next_token_ids[row_idx, :row_len] = next_token_id_chunks[row_idx]
+                    cast(torch.Tensor, next_token_loss_mask)[row_idx, :row_len] = (
+                        next_token_loss_mask_chunks[row_idx]
+                    )
             target_last_hidden_states = None
             if target_last_hidden_state_chunks:
                 if len(target_last_hidden_state_chunks) != len(input_id_chunks):
                     logger.warning(
-                        "[dspark-trainer] dropping batch with partial target_last_hidden_states: "
+                        "[block-drafter] dropping batch with partial target_last_hidden_states: "
                         "target_rows=%s batch_rows=%s",
                         len(target_last_hidden_state_chunks),
                         len(input_id_chunks),
@@ -5547,6 +6230,16 @@ class DrafterBaseTrainer:
                 last_hidden_states = (
                     torch.cat(last_hidden_state_chunks, dim=0).unsqueeze(0).contiguous()
                 )
+                target_logz = None
+                if eagle3_exact_lk_enabled:
+                    if len(target_logz_chunks) != len(last_hidden_state_chunks):
+                        return None
+                    target_logz = (
+                        torch.cat(target_logz_chunks, dim=0)
+                        .unsqueeze(0)
+                        .float()
+                        .contiguous()
+                    )
         elif self.backend.model_type == "peagle":
             if not last_hidden_state_chunks:
                 return None
@@ -5561,6 +6254,9 @@ class DrafterBaseTrainer:
             "loss_mask": loss_mask,
             "position_ids": position_ids,
         }
+        if self._is_block_drafter_backend() and next_token_ids is not None:
+            batch["next_token_ids"] = next_token_ids
+            batch["next_token_loss_mask"] = next_token_loss_mask
         if label_ids is not None:
             batch["label_ids"] = label_ids
             batch["label_mask"] = label_mask
@@ -5569,6 +6265,8 @@ class DrafterBaseTrainer:
                 batch["target_logprobs"] = target_logprobs
             else:
                 batch["last_hidden_states"] = last_hidden_states
+                if target_logz is not None:
+                    batch["target_logz"] = target_logz
         elif self.backend.model_type == "peagle":
             batch["last_hidden_states"] = last_hidden_states
             # Preserve the per-document chunk lengths so the P-EAGLE COD mask can
@@ -5581,7 +6279,7 @@ class DrafterBaseTrainer:
                 device=dev,
             )
         elif (
-            self.backend.model_type in ("dspark", "dsv4_dspark")
+            self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
             and target_last_hidden_state_chunks
         ):
             batch["target_last_hidden_states"] = target_last_hidden_states
@@ -5595,11 +6293,15 @@ class DrafterBaseTrainer:
         base_h = batch["hidden_states"]
         loss_mask = batch["loss_mask"]
         position_ids = batch["position_ids"]
+        if self._is_block_drafter_backend():
+            next_token_ids = batch.get("next_token_ids")
+            next_token_loss_mask = batch.get("next_token_loss_mask")
         if self.backend.model_type == "eagle3":
             if use_logits:
                 target_logprobs = batch["target_logprobs"]
             else:
                 last_hidden_states = batch["last_hidden_states"]
+                target_logz = batch.get("target_logz")
         elif self.backend.model_type == "peagle":
             # Carry the sanitized P-EAGLE tensors across the batch rebuild below.
             # They are not padded/sliced here: the backend rejects Ulysses SP in
@@ -5608,7 +6310,7 @@ class DrafterBaseTrainer:
             peagle_last_hidden_states = batch["last_hidden_states"]
             peagle_seq_lengths = batch["seq_lengths"]
         elif (
-            self.backend.model_type in ("dspark", "dsv4_dspark")
+            self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
             and "target_last_hidden_states" in batch
         ):
             target_last_hidden_states = batch["target_last_hidden_states"]
@@ -5650,8 +6352,12 @@ class DrafterBaseTrainer:
                         last_hidden_states = torch.nn.functional.pad(
                             last_hidden_states, (0, 0, 0, pad_size), value=0.0
                         )
+                        if torch.is_tensor(target_logz):
+                            target_logz = torch.nn.functional.pad(
+                                target_logz, (0, pad_size), value=0.0
+                            )
                 elif (
-                    self.backend.model_type in ("dspark", "dsv4_dspark")
+                    self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
                     and "target_last_hidden_states" in batch
                 ):
                     target_last_hidden_states = torch.nn.functional.pad(
@@ -5671,8 +6377,12 @@ class DrafterBaseTrainer:
                     last_hidden_states = slice_input_tensor(
                         last_hidden_states, dim=1, padding=False
                     )
+                    if torch.is_tensor(target_logz):
+                        target_logz = slice_input_tensor(
+                            target_logz, dim=1, padding=False
+                        )
             elif (
-                self.backend.model_type in ("dspark", "dsv4_dspark")
+                self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
                 and "target_last_hidden_states" in batch
             ):
                 target_last_hidden_states = slice_input_tensor(
@@ -5691,6 +6401,9 @@ class DrafterBaseTrainer:
             "loss_mask": loss_mask,
             "position_ids": position_ids,
         }
+        if self._is_block_drafter_backend() and next_token_ids is not None:
+            batch["next_token_ids"] = next_token_ids
+            batch["next_token_loss_mask"] = next_token_loss_mask
         if label_ids is not None:
             batch["label_ids"] = label_ids
             batch["label_mask"] = label_mask
@@ -5700,17 +6413,21 @@ class DrafterBaseTrainer:
                 batch["target_logprobs"] = target_logprobs
             else:
                 batch["last_hidden_states"] = last_hidden_states
+                if torch.is_tensor(target_logz):
+                    batch["target_logz"] = target_logz
         elif self.backend.model_type == "peagle":
             batch["last_hidden_states"] = peagle_last_hidden_states
             batch["seq_lengths"] = peagle_seq_lengths
         elif (
-            self.backend.model_type in ("dspark", "dsv4_dspark")
+            self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
             and target_last_hidden_state_chunks
         ):
             batch["target_last_hidden_states"] = target_last_hidden_states
         if document_ids is not None:
             batch["document_ids"] = document_ids
         batch["_speco_pad_size"] = pad_size_for_batch
+        batch["_speco_sample_count"] = items_used
+        batch["_speco_sample_ids"] = tuple(used_sample_ids)
 
         if alignment_debug_enabled():
             final_target = None
@@ -6293,6 +7010,38 @@ class DrafterBaseTrainer:
     def _mark_buffer_changed(self) -> None:
         self.buffer_version += 1
 
+    def get_training_data_stats(self) -> dict[str, Any]:
+        """Describe the sample pool used by the next online training trigger."""
+        sample_last_n_steps = int(
+            self.config.rollout.drafter.training.get("sample_last_n_steps", 2)
+        )
+        if self.use_data_buffer:
+            all_items = self.data_buffer.get_all_data()
+            eligible_items = self.data_buffer.get_data_from_last_n_steps(
+                sample_last_n_steps
+            )
+        else:
+            all_items = list(self.collected_data)
+            eligible_items = [
+                item
+                for item in all_items
+                if int(item.get("step", self.current_rl_step))
+                == int(self.current_rl_step)
+            ]
+
+        step_counts: dict[int, int] = {}
+        for item in eligible_items:
+            source_step = int(item.get("step", self.current_rl_step))
+            step_counts[source_step] = step_counts.get(source_step, 0) + 1
+
+        return {
+            "buffer_total": len(all_items),
+            "eligible_samples": len(eligible_items),
+            "eligible_step_counts": step_counts,
+            "sample_last_n_steps": sample_last_n_steps,
+            "batch_size": int(self.batch_size),
+        }
+
     def add_feature_sample(self, sample: DraftFeatureSample | dict[str, Any]) -> None:
         """Append a normalized standalone sample to the in-memory training buffer."""
         if isinstance(sample, DraftFeatureSample):
@@ -6650,6 +7399,7 @@ class DrafterBaseTrainer:
             self._current_accumulation_valid_tokens = 0
             self._current_accumulation_vloss_sum = 0.0
             self._current_accumulation_ploss_sum = 0.0
+        sample_count = int(batch.get("_speco_sample_count", 0) or 0)
 
         # Forward pass.
         forward_ts = time.time()
@@ -6669,8 +7419,11 @@ class DrafterBaseTrainer:
                 l_v = loss_dict["total_local_vloss"]
                 l_p = loss_dict["total_local_ploss"]
                 l_n = loss_dict["local_num_tokens"]
+                step_accuracy: dict[str, Any] = {}
                 if not getattr(self, "combine_standalone_metrics", False):
-                    self._record_dflash_training_metrics(loss_dict)
+                    step_accuracy = (
+                        self._record_dflash_training_metrics(loss_dict) or {}
+                    )
         self.record_training_timing(
             "timing_s/drafter_forward_loss", time.time() - forward_ts
         )
@@ -6679,6 +7432,7 @@ class DrafterBaseTrainer:
         reduce_ts = time.time()
         if getattr(self, "combine_standalone_metrics", False):
             statistics = self._reduce_standalone_step_statistics(loss_dict)
+            step_accuracy = getattr(self, "_last_step_metrics", None) or {}
         else:
             statistics = self._reduce_loss_metrics(l_v, l_p, l_n)
         global_vloss, global_ploss, global_tokens, reduce_world_size = statistics
@@ -6802,15 +7556,34 @@ class DrafterBaseTrainer:
         )
 
         self.training_steps += 1
+        self._training_sample_draws = (
+            getattr(self, "_training_sample_draws", 0) + sample_count
+        )
+        if not hasattr(self, "_training_unique_sample_ids"):
+            self._training_unique_sample_ids = set()
+        self._training_unique_sample_ids.update(batch.get("_speco_sample_ids", ()))
+        acc_per_position = ",".join(
+            f"{idx}:{value:.4f}"
+            for idx, value in enumerate(step_accuracy.get("acc_per_position", []))
+        )
         if self._is_checkpoint_leader():
             logger.info(
-                "[drafter loss] step=%s optimizer_step_total=%s lr=%.3e loss=%.4f vloss=%.4f ploss=%.4f",
+                "[drafter loss] rl_step=%s drafter_step=%s optimizer_step_total=%s "
+                "samples=%s loss_tokens=%s lr=%.3e loss=%.4f vloss=%.4f ploss=%.4f "
+                "acc=%.4f top1_acc=%.4f top5_acc=%.4f acc_pos=[%s]",
+                step,
                 self.training_steps,
                 self.optimizer_steps_total,
+                sample_count,
+                int(global_tokens.detach().item()),
                 current_lr,
                 float(loss.item()),
                 float(vloss.item()),
                 float(ploss.item()),
+                float(step_accuracy.get("accuracy", float("nan"))),
+                float(step_accuracy.get("top1_acc", float("nan"))),
+                float(step_accuracy.get("top5_acc", float("nan"))),
+                acc_per_position,
             )
         return True
 
@@ -6850,6 +7623,43 @@ class DrafterBaseTrainer:
             load_fsdp_model_to_gpu(self.model)
 
         try:
+            training_cfg = self.config.rollout.drafter.training
+            if (
+                device_name == "cuda"
+                and not getattr(self, "_bubble_time_enabled", False)
+                and self.training_device_mesh is not None
+                and not isinstance(self.model, FSDP)
+                and not self._is_ddp_wrapped()
+                and dist.is_initialized()
+                and training_cfg.get("publish_trainable_only_export", True)
+            ):
+                from verl_speco.trainer.publish_state import export_fsdp2_publish_state
+
+                dtype = {
+                    "float32": torch.float32,
+                    "fp32": torch.float32,
+                    "float16": torch.float16,
+                    "fp16": torch.float16,
+                    "bfloat16": torch.bfloat16,
+                    "bf16": torch.bfloat16,
+                }.get(training_cfg.get("publish_dtype"))
+                from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
+
+                publish_stats: dict[str, Any] = {}
+                snapshot = export_fsdp2_publish_state(
+                    self.model,
+                    is_frozen=self._is_frozen_publish_param,
+                    trains_lm_head=getattr(self.backend, "trains_draft_lm_head", False),
+                    patterns=training_cfg.get("publish_param_name_patterns"),
+                    dtype=dtype,
+                    cast_before_copy=gpu_transfer_enabled(
+                        training_cfg, "gpu_publish_cast_before_copy"
+                    ),
+                    diagnostics=publish_stats,
+                )
+                if snapshot is not None:
+                    self._record_gpu_transfer("publish_snapshot", publish_stats)
+                    return snapshot or None
             trainable_state = self._get_trainable_state_dict()
             if not trainable_state:
                 return None
@@ -7136,6 +7946,7 @@ class DrafterBaseTrainer:
     ):
         # First set training as inactive to prevent further steps
         self._training_active = False
+        self._last_cleanup_stage_timings: dict[str, float] = {}
         self._last_keep_hot_cache_trim_elapsed_sec = 0.0
 
         # Wait for any pending async checkpoint save to complete
@@ -7146,7 +7957,10 @@ class DrafterBaseTrainer:
             try:
                 # Run the blocking .result() call in executor to avoid blocking the event loop
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self._pending_checkpoint_future.result)
+                with self._residency_stage("cleanup", "checkpoint_wait"):
+                    await loop.run_in_executor(
+                        None, self._pending_checkpoint_future.result
+                    )
                 logger.debug(f"[Rank {self.rank}] Pending checkpoint save completed")
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Pending checkpoint save failed: {e}")
@@ -7156,7 +7970,8 @@ class DrafterBaseTrainer:
                 f"[Rank {self.rank}] Waiting for pending full drafter checkpoint save to complete..."
             )
             try:
-                await asyncio.wrap_future(self._pending_full_checkpoint_future)
+                with self._residency_stage("cleanup", "full_checkpoint_wait"):
+                    await asyncio.wrap_future(self._pending_full_checkpoint_future)
                 logger.debug(
                     f"[Rank {self.rank}] Pending full drafter checkpoint save completed"
                 )
@@ -7165,7 +7980,8 @@ class DrafterBaseTrainer:
             self._pending_full_checkpoint_future = None
         if self.optimizer is not None:
             try:
-                self.optimizer.zero_grad(set_to_none=True)
+                with self._residency_stage("cleanup", "zero_grad"):
+                    self.optimizer.zero_grad(set_to_none=True)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to clear drafter gradients during cleanup: {e}")
         # Training and publish collectives have completed before cleanup. These
@@ -7222,37 +8038,104 @@ class DrafterBaseTrainer:
             return
 
         if self.model is not None:
+            pooled_offload = False
             try:
-                offload_fsdp_model_to_cpu(self.model)
+                with self._residency_stage("cleanup", "offload_model"):
+                    if (
+                        device_name == "cuda"
+                        and getattr(self, "_gpu_model_offload_reuse", False)
+                        and self._drafter_strategy() == "fsdp2"
+                        and self.training_device_mesh is not None
+                    ):
+                        from verl_speco.trainer.gpu_transfer import ModelHostBufferPool
+
+                        pool = getattr(self, "_gpu_model_host_pool", None)
+                        if pool is None:
+                            pool = self._gpu_model_host_pool = ModelHostBufferPool(
+                                self._gpu_offload_pool_max_bytes,
+                                pinned=True,
+                            )
+                        pooled_offload = True
+                        used_pool, stats = pool.offload(
+                            self.model, device_module=self.device_module
+                        )
+                        self._record_gpu_transfer(
+                            "model_offload", {"used_pool": int(used_pool), **stats}
+                        )
+                        if not used_pool:
+                            pooled_offload = False
+                            offload_fsdp_model_to_cpu(self.model, empty_cache=False)
+                    elif device_name == "cuda":
+                        # Reclaim once after all offloads and the existing
+                        # synchronization, rather than inside the model helper.
+                        offload_fsdp_model_to_cpu(self.model, empty_cache=False)
+                    else:
+                        offload_fsdp_model_to_cpu(self.model)
                 logger.debug("Offloaded drafter model to CPU after training")
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
+                if pooled_offload:
+                    raise RuntimeError(
+                        "GPU pooled model offload failed; refusing partial residency state"
+                    ) from e
                 logger.debug(f"Failed to offload drafter model during cleanup: {e}")
         if self.optimizer is not None:
             try:
-                self._offload_optimizer_state_to_cpu()
+                with self._residency_stage("cleanup", "offload_optimizer"):
+                    self._offload_optimizer_state_to_cpu()
                 logger.debug("Offloaded drafter optimizer state to CPU after training")
             except Exception as e:  # noqa: BLE001
+                if getattr(self.optimizer, "_speco_host_transition_failed", False):
+                    raise RuntimeError(
+                        "GPU optimizer offload did not complete; refusing unsafe cleanup"
+                    ) from e
                 if self._use_blocking_npu_optimizer_offload():
                     raise RuntimeError(
                         "NPU VeOmni drafter optimizer blocking offload failed during cleanup"
                     ) from e
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
         try:
-            self._move_target_lm_head("cpu")
+            with self._residency_stage("cleanup", "offload_target_head"):
+                self._move_target_lm_head("cpu")
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Failed to offload drafter target head during cleanup: {e}")
         if clear_data:
-            self.collected_data.clear()
-            self.data_buffer.clear()  # Clear the cross-step data buffer
-            self._mark_buffer_changed()
+            with self._residency_stage("cleanup", "clear_data"):
+                self.collected_data.clear()
+                self.data_buffer.clear()  # Clear the cross-step data buffer
+                self._mark_buffer_changed()
         if self._full_checkpoint_executor is not None:
-            self._full_checkpoint_executor.shutdown(wait=False)
+            with self._residency_stage("cleanup", "executor_shutdown"):
+                self._full_checkpoint_executor.shutdown(wait=False)
             self._full_checkpoint_executor = None
         if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
+            allocator_stages = {}
+            if device_name == "cuda":
+                from verl_speco.trainer.performance_diagnostics import (
+                    allocator_metadata,
+                )
+
+                allocator_stages["before_sync"] = allocator_metadata(self.device_module)
             if hasattr(self.device_module, "synchronize"):
-                self.device_module.synchronize()
-            self.device_module.empty_cache()
-        self._park_idle_drafter_hccl()
+                with self._residency_stage("cleanup", "device_synchronize"):
+                    self.device_module.synchronize()
+            if device_name == "cuda":
+                allocator_stages["after_sync"] = allocator_metadata(self.device_module)
+            with self._residency_stage("cleanup", "empty_cache"):
+                self.device_module.empty_cache()
+            if device_name == "cuda":
+                allocator_stages["after_reclaim"] = allocator_metadata(
+                    self.device_module
+                )
+                self._record_gpu_transfer(
+                    "cleanup_allocator",
+                    {
+                        f"{stage}_{key}": value
+                        for stage, values in allocator_stages.items()
+                        for key, value in values.items()
+                    },
+                )
+        with self._residency_stage("cleanup", "park_hccl"):
+            self._park_idle_drafter_hccl()
         self._training_initialized = False
         self._training_active = False
         self._last_ckpt_step = -1

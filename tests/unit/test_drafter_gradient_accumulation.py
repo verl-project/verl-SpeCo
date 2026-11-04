@@ -163,10 +163,10 @@ def test_quota_cycle_reuses_full_snapshot_across_bubble_plans() -> None:
 @pytest.mark.parametrize(
     ("model_type", "expected_input_rows"),
     [
-        ("dflash", 5),
-        ("dflash2", 5),
+        ("dflash", 6),
+        ("dflash2", 6),
         ("dspark", 5),
-        ("domino", 5),
+        ("domino", 6),
         ("eagle3", 6),
     ],
 )
@@ -211,7 +211,7 @@ def test_online_collection_uses_backend_specific_input_alignment(
     assert item["input_ids"].size(0) == expected_input_rows
     assert item["hidden_states"].size(0) == 5
     assert item["loss_mask"].size(0) == expected_input_rows
-    if model_type in {"dflash", "dflash2", "dspark", "domino"}:
+    if model_type == "dspark":
         assert item["input_ids"].tolist() == [0, 1, 2, 3, 4]
 
 
@@ -256,9 +256,10 @@ def test_block_collection_uses_explicit_hidden_positions_as_source_of_truth(
     )
 
     item = trainer.collected_data[0]
+    # DFlash keeps its trailing label row: one more input row than hidden rows.
     assert item["input_ids"].tolist() == [1, 2, 3, 4, 5]
-    assert item["input_ids"].size(0) == item["hidden_states"].size(0) == 5
-    assert item["loss_mask"].size(0) == 5
+    assert item["hidden_states"].size(0) == 4
+    assert item["input_ids"].size(0) == item["loss_mask"].size(0) == 5
 
 
 def test_accumulation_uses_combined_valid_token_mean(monkeypatch) -> None:

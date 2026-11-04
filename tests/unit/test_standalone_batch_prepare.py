@@ -37,7 +37,7 @@ def _contract(algorithm="DSPARK", *, reuse_final=False):
 
 def _sample(tmp_path, contract, *, length=5, index=0, positions=None, hidden_offset=0):
     path = tmp_path / f"sample-{index}.safetensors"
-    layers = 2 if contract.algorithm == "DFLASH" or contract.vllm_aux_hidden_state_layer_ids == [1, 4] else 3
+    layers = 2 if contract.hidden_states_layout == "dflash_aux" or contract.vllm_aux_hidden_state_layer_ids == [1, 4] else 3
     hidden = torch.arange(length * layers * 2).reshape(length, layers, 2).float()
     save_file({"token_ids": torch.arange(length), "hidden_states": hidden[hidden_offset:]}, path)
     values = asdict(contract)
@@ -94,6 +94,16 @@ def test_dflash_window_and_suffix_alignment(tmp_path):
     assert batch["loss_mask"].tolist() == [[0, 1, 1]]
     torch.testing.assert_close(batch["hidden_states"][0], hidden[5:8].flatten(1).bfloat16())
     assert "last_hidden_state_norm" not in batch
+
+
+def test_dflash_aux_plus_last_reference_batch_keeps_raw_final(tmp_path):
+    contract = replace(_contract("DFLASH"), hidden_states_layout="dflash_aux_plus_last")
+    tag, hidden = _sample(tmp_path, contract)
+    batch = prepare_standalone_cpu_batch([tag], contract, pin_memory=False)
+    torch.testing.assert_close(batch["hidden_states"][0], hidden[:, :2].flatten(1).bfloat16())
+    torch.testing.assert_close(batch["target_last_hidden_states"][0], hidden[:, 2].bfloat16())
+    assert batch["last_hidden_state_norm"] == "raw_target_residual"
+    assert batch["hidden_source"] == "standalone_vllm_reference"
 
 
 def _old_pack(chunks, block_size, limit):
@@ -422,3 +432,28 @@ def test_dsv4_dspark_shares_dspark_layouts(tmp_path):
     torch.testing.assert_close(batch["hidden_states"][0], ah[:, :2].flatten(1).bfloat16())
     torch.testing.assert_close(batch["target_last_hidden_states"][0], ah[:, 2].bfloat16())
     assert batch["last_hidden_state_norm"] == "raw_target_residual"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("input_ids", [False, 1, 2, 3, 4]),
+    ("position_ids", [0.5, 1, 2, 3, 4]),
+    ("loss_mask", [0, float("inf"), 1, 1, 1]),
+    ("feature_positions", [0, 1, 2, 3, 99]),
+    ("loss_mask", [1]),
+])
+def test_invalid_reference_rejected_before_any_hidden_read(tmp_path, field, value):
+    contract = _contract()
+    valid, _ = _sample(tmp_path, contract)
+    invalid, _ = _sample(tmp_path, contract, index=1)
+    invalid["request"][field] = value
+
+    class UnreadStore:
+        backend = "file"
+
+        def load(self, *args, **kwargs):
+            pytest.fail("all references must be validated before reading hidden data")
+
+    with pytest.raises(ValueError):
+        prepare_standalone_cpu_batch(
+            [valid, invalid], contract, pin_memory=False, hidden_states_store=UnreadStore(),
+        )

@@ -26,6 +26,7 @@ from verl.trainer.ppo.utils import (
     need_reference_policy,
 )
 from verl.utils.config import validate_config
+from verl_speco.integration.opd_cotrain import validate_sync_opd_cotrain_config
 
 try:
     from verl.trainer.main_ppo_v0 import BaseTaskRunner as _TaskRunnerBase
@@ -171,6 +172,7 @@ class SpecoTaskRunner(_TaskRunnerBase):
         return _remotify_like_worker_mapping_value(worker_cls, wrapped_cls)
 
     def run(self, config):
+        validate_sync_opd_cotrain_config(config)
         from verl_speco.integration.compat import check_compatible_verl
 
         check_compatible_verl()

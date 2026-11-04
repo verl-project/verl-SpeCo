@@ -201,6 +201,8 @@ def test_worker_retains_error_when_second_batch_succeeds():
         async def cleanup_training(self, **kwargs):
             pass
 
+        def get_training_data_stats(self):
+            return {"buffer_total": 2, "eligible_samples": 2}
         def release_training_data_reservation(self, plan_id):
             return 0
 
@@ -211,6 +213,7 @@ def test_worker_retains_error_when_second_batch_succeeds():
         rank=0,
         worker_incarnation="worker-0",
         is_global_publish_leader=True,
+        is_drafter_group_leader=False,
         enable_drafter=True,
         in_drafter_train_group=True,
         trainer=Trainer(),
@@ -225,6 +228,8 @@ def test_worker_retains_error_when_second_batch_succeeds():
         _should_keep_drafter_training_hot=lambda *args, **kwargs: False,
         last_global_step=1,
         device_name="cpu",
+        _speco_rl_insight_labels=lambda: {},
+        _speco_emit_rl_insight_worker_metrics=lambda *args, **kwargs: None,
     )
     method = _method(
         "verl_speco/workers/speco_worker.py",
@@ -234,6 +239,7 @@ def test_worker_retains_error_when_second_batch_succeeds():
             "time": time,
             "logger": logging.getLogger(__name__),
             "_preserve_process_rng_state": lambda device: nullcontext(),
+            "_rl_insight_trace_state": lambda *args, **kwargs: nullcontext(),
         },
     )
     plan = {
@@ -246,6 +252,8 @@ def test_worker_retains_error_when_second_batch_succeeds():
     result = asyncio.run(method(worker, plan))
     assert result["trained"] is True
     assert result["successful_steps"] == 1
+    assert result["train_buffer_total"] == 2
+    assert result["train_eligible_samples"] == 2
     assert result["errors"] == [
         {"type": "RuntimeError", "message": "first batch failed"}
     ]

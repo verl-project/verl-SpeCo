@@ -65,7 +65,7 @@ def prepare_standalone_cpu_batch(
         "DSPARK": {"dflash_aux", "dflash_aux_plus_last"},
         # DSV4-Flash DSpark shares the DSpark block-drafter context layouts.
         "DSV4_DSPARK": {"dflash_aux", "dflash_aux_plus_last"},
-        "DFLASH": {"dflash_aux"},
+        "DFLASH": {"dflash_aux", "dflash_aux_plus_last"},
         "EAGLE3": {"eagle3_aux_plus_last"},
     }
     if feature_contract.hidden_states_layout not in valid_layouts[algorithm]:

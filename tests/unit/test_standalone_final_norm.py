@@ -12,6 +12,7 @@ from typing import Any, Optional, cast
 import pytest
 import torch
 import verl_speco.trainer.target_feature_replay as replay
+from verl_speco.backends.target_hidden import gather_aligned_target_hidden
 
 
 def _load_class(path, name, methods=None, extra=None):
@@ -286,7 +287,8 @@ def test_dspark_forward_selects_target_positions_before_norm(apply_norm):
                and any(isinstance(t, ast.Name) and t.id == "weight_mask" for t in n.targets))
     forward.body = forward.body[:end] + [ast.parse("return aligned_target_hidden, eval_mask").body[0]]
     namespace = {
-        "torch": torch, "Optional": Optional, 
+        "torch": torch, "Optional": Optional,
+        "gather_aligned_target_hidden": gather_aligned_target_hidden,
         "_resolve_sliding_windows": lambda config: None,
         "build_dflash_attention_masks": lambda **kwargs: (None, None),
     }

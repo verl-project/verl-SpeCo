@@ -192,7 +192,8 @@ def test_v1_metrics_report_speco_mean_acceptance_length(monkeypatch):
             metrics["upstream/metrics"] = 1
 
     class Harness(SpecoV1Mixin, Upstream):
-        pass
+        # Isolate metrics from the legacy Ray facade in CPU-only tests.
+        _speco_freeze_policy = None
 
     batch = types.SimpleNamespace(
         keys=["a", "b", "padding"],
@@ -1086,3 +1087,239 @@ def test_checkpoint_result_flattening_is_available_on_v1_trainer() -> None:
         {"saved": False},
         {"saved": True},
     ]
+
+
+def test_v1_adaptive_budget_uses_deduplicated_local_rollout_counts(monkeypatch):
+    from pathlib import Path
+    from unittest.mock import Mock
+
+    from verl_speco.trainer.scheduler import (
+        AcceptanceFeedback, AdaptiveScheduleConfig, DrafterScheduleConfig,
+        DrafterScheduleContext, DrafterScheduler,
+    )
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "unit"))
+    from test_bubble_review_regressions import _methods
+
+    drafts_key = "_speco_vllm_spec_decode_drafts"
+    accepted_key = "_speco_vllm_spec_decode_accepted_tokens"
+    facade = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py", "SpecoRayPPOTrainer",
+        {"_speco_acceptance_feedback"},
+        AcceptanceFeedback=AcceptanceFeedback,
+        _SPECO_VLLM_INVALID_FEEDBACK_KEY="_speco_vllm_invalid_acceptance_feedback",
+        _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY=drafts_key,
+        _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY=accepted_key,
+        SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC="length",
+        _speco_metric_float=lambda value: float(value) if value is not None else None,
+        _speco_rollout_metrics_from_stats=lambda stats: {
+            "length": 1 + stats[accepted_key] / stats[drafts_key]
+        },
+    )
+    records = {}
+    monkeypatch.setitem(sys.modules, "transfer_queue", types.SimpleNamespace(
+        kv_batch_get=lambda keys, **kwargs: {"extra_fields": [records[k] for k in keys]}
+    ))
+    cfg = DrafterScheduleConfig(
+        training_interval_steps=1,
+        adaptive_schedule=AdaptiveScheduleConfig(
+            enable=True, warmup_max_steps=0,
+            ema_fast_alpha=1.0, ema_slow_alpha=0.01,
+        ),
+    )
+    scheduler = DrafterScheduler(worker_executor=Mock(
+        get_training_data_status=Mock(return_value=[])
+    ))
+    controller = scheduler.configure_adaptive(cfg)
+    controller.state.budget = 5
+    observed = []
+
+    class Upstream:
+        def _update_actor(self, batch, metrics):
+            return None
+
+    class Harness(SpecoV1Mixin, facade, Upstream):
+        _speco_freeze_policy = None
+        config = _config()
+        parameter_sync_step = 3
+
+        def _speco_on_before_actor_update(self):
+            feedback = self._speco_acceptance_feedback()
+            observed.append(feedback)
+            scheduler.prepare_training_plan(DrafterScheduleContext(
+                global_step=self.global_steps, training_mode="online",
+                collected_samples_this_step=1, oldlogprob_collection_requested=True,
+                acceptance_feedback=feedback,
+            ), cfg)
+            return types.SimpleNamespace(training_plan=None, metrics={})
+
+    trainer = Harness()
+    trainer.config.actor_rollout_ref.rollout.drafter.training["adaptive_schedule"] = {"enable": True}
+    for step, accepted in [(1, 140), (2, 0)]:
+        trainer.global_steps = step
+        for key in ("a", "b", "c", "padding"):
+            records[key] = {"spec_num_verify_steps": 20,
+                            "spec_num_accepted_tokens": accepted,
+                            "spec_num_draft_tokens": 140}
+        for local, keys in enumerate([
+            ["a", "b"], ["b", "c"], ["a", "padding"],
+        ]):
+            trainer.local_trigger_step = local
+            batch = types.SimpleNamespace(
+                keys=keys, partition_id="train",
+                tags=[{"is_padding": k == "padding"} for k in keys],
+            )
+            trainer._update_actor(batch, {})
+            trainer._speco_v1_spec_decode_metrics(batch)
+        assert observed[-1].sample_count == 60
+        assert observed[-1].mean_acceptance_length == 1 + accepted / 20
+    assert len(observed) == 2
+    assert controller.state.budget > 5
+
+
+def test_v1_checkpoint_saves_and_resumes_adaptive_state(monkeypatch, tmp_path):
+    import os
+    from dataclasses import asdict
+    from pathlib import Path
+
+    from verl_speco.integration.vllm_runtime import _get_nested
+    from verl_speco.trainer.scheduler import AdaptiveScheduleConfig, DrafterScheduleConfig, DrafterScheduler
+    from verl_speco.trainer.scheduler.adaptive_schedule import AdaptiveScheduleState
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "unit"))
+    from test_bubble_review_regressions import _methods
+
+    facade = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py", "SpecoRayPPOTrainer",
+        {"_speco_save_adaptive_state", "_speco_get_drafter_scheduler",
+         "_speco_restore_adaptive_state",
+         "_speco_freeze_state_resume_path"},
+        Path=Path, os=os, _get_nested=_get_nested, DrafterScheduler=DrafterScheduler,
+    )
+    cfg = DrafterScheduleConfig(adaptive_schedule=AdaptiveScheduleConfig(enable=True))
+    checkpoint = tmp_path / "global_step_10"
+
+    class Parent:
+        def _save_checkpoint(self):
+            checkpoint.mkdir()
+            return "saved"
+
+    class Harness(SpecoV1Mixin, facade, Parent):
+        global_steps = 10
+        _speco_last_checkpoint_saved_step = None
+        _speco_colocate_admission_closed = False
+        _speco_freeze_state_sidecar = "freeze_policy_state.json"
+
+        def _speco_drafter_schedule_config(self):
+            return cfg
+
+        def _speco_wait_pending_drafter_publish(self):
+            pass
+
+        def _speco_save_drafter_checkpoint(self, **kwargs):
+            return []
+
+        def _speco_freeze_save_state(self):
+            pass
+
+        def _speco_snapshot_v1_feature_store_checkpoint(self):
+            return None
+
+        def _speco_write_v1_joint_checkpoint_manifest(self, **kwargs):
+            pass
+
+    trainer = Harness()
+    trainer.config = _config()
+    trainer.config.trainer.update(default_local_dir=str(tmp_path), resume_mode="disable")
+    trainer.config.actor_rollout_ref.rollout.drafter.training["adaptive_schedule"] = {"enable": True}
+    trainer._speco_init_state()
+    controller = trainer._speco_get_drafter_scheduler().adaptive_controller
+    controller.state = AdaptiveScheduleState(
+        budget=0, fast=2.0, slow=2.5, observations=3,
+        last_valid_feedback_step=10, interval_trend_history=[[10, 2.0]],
+        warmup_acceptance_history=[2.0, 2.0], warmup_ended_after=5,
+    )
+    expected = asdict(controller.state)
+    assert trainer._save_checkpoint() == "saved"
+    assert (checkpoint / "adaptive_schedule.json").is_file()
+
+    resumed = Harness()
+    resumed.config = _config()
+    resumed.config.trainer.update(
+        default_local_dir=str(tmp_path), resume_mode="resume_path",
+        resume_from_path=str(checkpoint),
+    )
+    resumed.config.actor_rollout_ref.rollout.drafter.training["adaptive_schedule"] = {"enable": True}
+    resumed._speco_init_state()
+    restored = resumed._speco_get_drafter_scheduler().adaptive_controller
+    assert asdict(restored.state) == expected
+    assert restored.training_steps(11) == 0
+
+
+def test_v1_emits_trainer_phase_spans_for_prepare_train_and_publish(monkeypatch):
+    from contextlib import nullcontext
+
+    import verl_speco.trainer.v1.speco_mixin as mixin
+
+    spans = []
+
+    def fake_trace(state_name, *, state_lane_id=None, **labels):
+        spans.append((state_name, state_lane_id, labels))
+        return nullcontext()
+
+    monkeypatch.setattr(mixin, "_rl_insight_trace_state", fake_trace)
+
+    class Plan:
+        launch = True
+        reason = "training_ready"
+        execution_strategy = "sync"
+        max_batches = 4
+
+    class Event:
+        training_plan = Plan()
+        metrics = {}
+
+    class Upstream:
+        def _update_actor(self, batch, metrics):
+            return "updated"
+
+        def on_step_end(self):
+            return "upstream"
+
+    class Harness(SpecoV1Mixin, Upstream):
+        config = _config()
+        global_steps = 12
+        _speco_freeze_policy = None
+        _speco_v1_pending_training = False
+
+        def _speco_online_enabled_from_config(self, config):
+            return True
+
+        def _speco_on_before_actor_update(self):
+            return Event()
+
+        def _speco_train_drafter(self, plan):
+            self._speco_v1_pending_training = True
+            return True, {"drafter/trained": 1}
+
+        def _speco_publish_drafter_weights(self, *args, **kwargs):
+            return {"drafter/published": 1}
+
+        def _speco_wait_pending_drafter_publish(self):
+            return 0
+
+        def _speco_flush_request_accept_len_payloads(self):
+            pass
+
+    trainer = Harness()
+    assert trainer._update_actor(None, {}) == "updated"
+    assert [span[0] for span in spans] == ["drafter/prepare", "drafter/train"]
+    assert {span[1] for span in spans} == {"speco_trainer"}
+    assert spans[1][2]["strategy"] == "sync"
+    assert spans[1][2]["max_batches"] == 4
+
+    spans.clear()
+    assert trainer.on_step_end() == "upstream"
+    assert [span[0] for span in spans] == ["drafter/publish"]
+    assert spans[0][1] == "speco_trainer"
+    assert spans[0][2]["deferred"] is True

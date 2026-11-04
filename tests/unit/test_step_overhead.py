@@ -27,7 +27,8 @@ def _trainer():
     tree = ast.parse(path.read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DrafterBaseTrainer")
     names = {
-        "_pack_training_diagnostics", "_accumulate_training_diagnostics", "_record_dflash_training_metrics",
+        "_pack_training_diagnostics", "_accumulate_training_diagnostics", "_summarize_step_metrics",
+        "_record_dflash_training_metrics",
         "_reduce_training_metric", "_reduce_loss_statistics", "_reduce_loss_metrics",
         "_reduce_standalone_step_statistics", "_training_step_on_batch", "_clip_training_grad_norm",
         "_sanitize_sequence_tensor", "_mask_loss_for_bad_inputs", "_sanitize_training_batch",

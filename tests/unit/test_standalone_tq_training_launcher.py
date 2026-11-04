@@ -217,6 +217,80 @@ def test_confidence_only_expected_layout_matches_producer(l1_prefix, confidence_
     assert producer_layout == "dflash_aux_plus_last"
 
 
+@pytest.mark.parametrize("prefix", ["", "+", "++"])
+@pytest.mark.parametrize(
+    "algorithm,lk_key,extra",
+    [
+        ("DFLASH", "dflash_lk_loss_alpha", []),
+        (
+            "DSPARK",
+            "dspark_lk_loss_alpha",
+            ["actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=0"],
+        ),
+    ],
+)
+def test_lk_loss_forwarded_to_producer_and_consumer_layout(
+    prefix, algorithm, lk_key, extra
+):
+    key = f"actor_rollout_ref.rollout.drafter.training.{lk_key}"
+    args = [
+        item
+        for item in _training_args()
+        if "speculative_algorithm" not in item
+    ] + [
+        f"actor_rollout_ref.rollout.drafter.speculative_algorithm={algorithm}",
+        *extra,
+        f"{prefix}{key}=0.5",
+    ]
+    commands = build_pipeline_commands(
+        resolve_pipeline_config(args, environ={}),
+        args,
+        ray_address="10.0.0.1:6379",
+        python_executable="python",
+    )
+    assert f"{key}=0.5" in commands.producer_overrides
+    assert any(
+        item.endswith("expected_feature.hidden_states_layout=dflash_aux_plus_last")
+        for item in commands.consumer_overrides
+    )
+
+
+@pytest.mark.parametrize("key", ["dflash_lk_loss_alpha", "dspark_lk_loss_alpha"])
+def test_domino_launcher_rejects_lk_loss(key) -> None:
+    args = [item for item in _training_args() if "speculative_algorithm" not in item]
+    args.extend(
+        [
+            "actor_rollout_ref.rollout.drafter.speculative_algorithm=DOMINO",
+            f"actor_rollout_ref.rollout.drafter.training.{key}=0.5",
+        ]
+    )
+    with pytest.raises(ValueError, match=f"Domino does not support LK loss.*{key}"):
+        build_pipeline_commands(
+            resolve_pipeline_config(args, environ={}),
+            args,
+            ray_address="10.0.0.1:6379",
+            python_executable="python",
+        )
+
+
+def test_dflash_without_lk_expects_dflash_aux_layout() -> None:
+    args = [
+        item
+        for item in _training_args()
+        if "speculative_algorithm" not in item
+    ] + ["actor_rollout_ref.rollout.drafter.speculative_algorithm=DFLASH"]
+    commands = build_pipeline_commands(
+        resolve_pipeline_config(args, environ={}),
+        args,
+        ray_address="10.0.0.1:6379",
+        python_executable="python",
+    )
+    assert any(
+        item.endswith("expected_feature.hidden_states_layout=dflash_aux")
+        for item in commands.consumer_overrides
+    )
+
+
 def test_producer_max_samples_uses_remaining_total_steps() -> None:
     args = [
         *_training_args(),

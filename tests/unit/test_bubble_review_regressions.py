@@ -7,6 +7,7 @@ import asyncio
 import logging
 import random
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -54,6 +55,11 @@ def _methods(path, class_name, names, **namespace):
     )
     namespace.setdefault("logger", logging.getLogger(__name__))
     namespace.setdefault("__file__", str(path))
+    namespace.setdefault(
+        "_rl_insight_trace_state", lambda *args, **kwargs: nullcontext()
+    )
+    namespace.setdefault("_rl_insight_log_scalar_metrics", lambda *args, **kwargs: None)
+    namespace.setdefault("_SPECO_RL_INSIGHT_TRAINER_LANE", "speco_trainer")
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace["Subject"]
 
@@ -186,6 +192,7 @@ def test_schedule_context_does_not_reuse_previous_bubble_collection(
     driver = cls()
     driver.global_steps = 5
     driver._speco_last_collected_step = collected_step
+    driver._speco_acceptance_feedback = lambda: None
     driver._speco_last_collected_samples = 32
     driver._speco_rollout_idle_worker_enabled = lambda: bubble
     driver._speco_drafter_training_mode = lambda: "online"

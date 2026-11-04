@@ -61,8 +61,8 @@ def sglang_patch(monkeypatch):
     sys.modules["sglang.srt.utils"].MultiprocessingSerializer = types.SimpleNamespace(
         deserialize=lambda payload: payload
     )
-    sys.modules["sglang.srt.utils.patch_torch"].monkey_patch_torch_reductions = lambda: (
-        None
+    sys.modules["sglang.srt.utils.patch_torch"].monkey_patch_torch_reductions = (
+        lambda: (None)
     )
     for name in (
         "sglang.srt.speculative.eagle_worker",
@@ -251,6 +251,81 @@ def test_patch_skips_native_support_and_non_workers(sglang_patch, spec_workers) 
     assert dflash_cls.update_weights_from_tensor is patched
 
 
+def test_scheduler_dispatch_patches_a_late_loaded_dspark_worker(
+    monkeypatch, sglang_patch
+) -> None:
+    scheduler_components = types.ModuleType("sglang.srt.managers.scheduler_components")
+    weight_updater = types.ModuleType(
+        "sglang.srt.managers.scheduler_components.weight_updater"
+    )
+
+    class SchedulerWeightUpdaterManager:
+        def __init__(self, draft_worker):
+            # The manager can hold a stale None across SGLang lifecycle changes;
+            # the owning scheduler remains the source of truth.
+            self.draft_worker = None
+            self.scheduler = types.SimpleNamespace(
+                draft_worker=draft_worker,
+                model_worker=draft_worker,
+                spec_algorithm="DSPARK",
+            )
+            self.tp_worker = types.SimpleNamespace()
+            self.tp_cpu_group = object()
+
+        def _observe_weight_load(self, _kind):
+            class Context:
+                def __enter__(self):
+                    return None
+
+                def __exit__(self, *args):
+                    return False
+
+            return Context()
+
+        def flush_cache_after_weight_update(self, recv_req):
+            pass
+
+        def record_weight_version_after_update(self, weight_version):
+            pass
+
+        def update_weights_from_tensor(self, recv_req):
+            return self.draft_worker.update_weights_from_tensor(recv_req)
+
+    weight_updater.SchedulerWeightUpdaterManager = SchedulerWeightUpdaterManager
+    weight_updater.UpdateWeightsFromTensorReqOutput = (
+        lambda **kwargs: types.SimpleNamespace(**kwargs)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.managers.scheduler_components",
+        scheduler_components,
+    )
+    monkeypatch.setitem(sys.modules, weight_updater.__name__, weight_updater)
+    monkeypatch.setattr(
+        sglang_patch.torch.distributed, "barrier", lambda **kwargs: None
+    )
+
+    # This worker was not importable during the initial startup scan.
+    late_dspark_cls = _spec_worker_class("DSparkWorkerV2")
+    sglang_patch._SGLANG_EAGLE_UPDATE_PATCHED = True
+    sglang_patch.patch_sglang_eagle_update_weights_from_tensor()
+
+    worker = late_dspark_cls()
+    manager = SchedulerWeightUpdaterManager(worker)
+    result = manager.update_weights_from_tensor(
+        _request(
+            [("markov_head.weight", 9)],
+            load_format=DRAFT_LOADER,
+            weight_version=None,
+        )
+    )
+
+    assert result.success
+    assert worker.draft_model_runner.model.weights == {"markov_head.weight": 9}
+    assert worker.target_worker.model_runner.model.weights == {}
+    assert worker.draft_model_runner.weight_updater.load_formats == [None]
+
+
 def test_runner_update_prefers_the_runner_level_method(sglang_patch) -> None:
     calls = []
     runner = types.SimpleNamespace(
@@ -266,3 +341,218 @@ def test_runner_update_prefers_the_runner_level_method(sglang_patch) -> None:
         "ok",
     )
     assert calls == [("runner", "x")]
+
+
+def _fake_dspark_model(torch, *, with_stacked, with_bias=False):
+    """Minimal DSparkDraftMixin stand-in holding the cached KV-write copies."""
+    q_size, kv_size, hidden, n_layers = 4, 2, 3, 2
+
+    def layer():
+        attn = types.SimpleNamespace(
+            q_size=q_size,
+            kv_size=kv_size,
+            qkv_proj=types.SimpleNamespace(
+                weight=torch.zeros(q_size + 2 * kv_size, hidden),
+                bias=torch.zeros(q_size + 2 * kv_size) if with_bias else None,
+            ),
+            k_norm=types.SimpleNamespace(weight=torch.ones(kv_size)),
+        )
+        return types.SimpleNamespace(self_attn=attn)
+
+    model = types.SimpleNamespace(
+        layers=[layer() for _ in range(n_layers)],
+        _fused_kv_write_cache=None,
+        _stacked_ctx_kv_cache=None,
+    )
+    kv_rows = n_layers * 2 * kv_size
+    # The real writer builds these caches under torch.inference_mode(), which
+    # makes them inference tensors that reject in-place updates elsewhere.
+    with torch.inference_mode():
+        model._fused_kv_write_cache = (
+            1,
+            (torch.zeros(kv_rows, hidden), None, torch.ones(n_layers, kv_size)),
+        )
+        if with_stacked:
+            model._stacked_ctx_kv_cache = {
+                "weight": torch.zeros(kv_rows, hidden),
+                "bias": torch.zeros(kv_rows) if with_bias else None,
+                "k_norm_weight": torch.ones(n_layers, kv_size),
+            }
+    return model
+
+
+@pytest.mark.parametrize("with_stacked", [False, True], ids=["fused", "fused+stacked"])
+def test_draft_publish_refreshes_dspark_ctx_kv_caches(
+    sglang_patch, with_stacked
+) -> None:
+    """The cached cat/stack copies must follow an in-place weight update."""
+    import torch
+
+    model = _fake_dspark_model(torch, with_stacked=with_stacked, with_bias=with_stacked)
+    w_all, _, knw = model._fused_kv_write_cache[1]
+    w_all_ptr, knw_ptr = w_all.data_ptr(), knw.data_ptr()
+
+    def update(named_tensors, load_format):
+        for layer in model.layers:
+            attn = layer.self_attn
+            attn.qkv_proj.weight.fill_(5.0)
+            if attn.qkv_proj.bias is not None:
+                attn.qkv_proj.bias.fill_(6.0)
+            attn.k_norm.weight.fill_(7.0)
+        return True, "ok"
+
+    runner = types.SimpleNamespace(update_weights_from_tensor=update, model=model)
+    assert sglang_patch._runner_update_weights_from_tensor(runner, [], None) == (
+        True,
+        "ok",
+    )
+
+    # K/V rows only (Q rows are not cached), refreshed without moving the buffers.
+    assert torch.all(w_all == 5.0) and torch.all(knw == 7.0)
+    assert w_all.data_ptr() == w_all_ptr and knw.data_ptr() == knw_ptr
+    if with_stacked:
+        stacked = model._stacked_ctx_kv_cache
+        assert torch.all(stacked["weight"] == 5.0)
+        assert torch.all(stacked["bias"] == 6.0)
+        assert torch.all(stacked["k_norm_weight"] == 7.0)
+
+
+def test_failed_update_and_cacheless_models_skip_the_refresh(sglang_patch) -> None:
+    import torch
+
+    model = _fake_dspark_model(torch, with_stacked=False)
+    w_all = model._fused_kv_write_cache[1][0]
+    failing = types.SimpleNamespace(
+        update_weights_from_tensor=lambda named_tensors, load_format: (False, "no"),
+        model=model,
+    )
+    assert sglang_patch._runner_update_weights_from_tensor(failing, [], None) == (
+        False,
+        "no",
+    )
+    assert torch.all(w_all == 0.0)
+
+    # Target models and runners without a model carry no such cache.
+    sglang_patch._refresh_dspark_ctx_kv_caches(_FakeModel())
+    sglang_patch._refresh_dspark_ctx_kv_caches(None)
+
+
+@pytest.fixture
+def confidence_model():
+    import torch
+
+    class DSparkModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Parameter(torch.zeros(2))
+            self.confidence_head = torch.nn.Module()
+            self.confidence_head.proj = torch.nn.Linear(2, 1)
+
+        def _load_confidence_weights(self, *, confidence_weights, params_dict):
+            # SGLang 76e06fe validates completeness on every load_weights call.
+            loaded_names = set()
+            for name, weight in confidence_weights:
+                if name not in params_dict:
+                    raise ValueError(f"unexpected confidence weight {name}")
+                param = params_dict[name]
+                if param.shape != weight.shape:
+                    raise ValueError("confidence shape mismatch")
+                param.data.copy_(weight)
+                loaded_names.add(name)
+            required = {n for n in params_dict if n.startswith("confidence_head.")}
+            if required - loaded_names:
+                raise ValueError("checkpoint is missing confidence weights")
+
+        def load_weights(self, named_tensors):
+            confidence_weights = []
+            for name, weight in named_tensors:
+                if name.startswith("confidence_head."):
+                    confidence_weights.append((name, weight))
+                else:
+                    self.backbone.data.copy_(weight)
+            self._load_confidence_weights(
+                confidence_weights=confidence_weights,
+                params_dict=dict(self.named_parameters()),
+            )
+
+    return DSparkModel()
+
+
+@pytest.mark.parametrize("runner_level", [False, True])
+def test_dspark_confidence_head_supports_multiple_publish_buckets(
+    sglang_patch, confidence_model, runner_level
+) -> None:
+    import torch
+
+    model = confidence_model
+    original_load = model._load_confidence_weights
+
+    def update(named_tensors, load_format):
+        model.load_weights(named_tensors)
+        return True, "ok"
+
+    runner = types.SimpleNamespace(model=model)
+    if runner_level:
+        runner.update_weights_from_tensor = update
+    else:
+        runner.weight_updater = types.SimpleNamespace(update_weights_from_tensor=update)
+
+    # Even the head itself may straddle two buckets. Repeat the publish to
+    # ensure the first bucket retains the previously served head until updated.
+    for value in (3.0, 7.0):
+        old_weight = model.confidence_head.proj.weight.detach().clone()
+        for index, (name, param) in enumerate(model.named_parameters()):
+            assert sglang_patch._runner_update_weights_from_tensor(
+                runner, [(name, torch.full_like(param, value))], None
+            ) == (True, "ok")
+            assert model._load_confidence_weights == original_load
+            assert "_load_confidence_weights" not in vars(model)
+            if index == 0:
+                assert torch.equal(model.confidence_head.proj.weight, old_weight)
+        assert all(torch.all(p == value) for p in model.parameters())
+
+    # A subsequent checkpoint load must still reject missing head parameters.
+    with pytest.raises(ValueError, match="missing confidence weights"):
+        model.load_weights([("backbone", torch.zeros_like(model.backbone))])
+
+
+@pytest.mark.parametrize("failure", ["unknown_name", "shape", "exception", "false"])
+def test_dspark_partial_confidence_load_restores_validation_on_failure(
+    sglang_patch, confidence_model, failure
+) -> None:
+    import torch
+
+    model = confidence_model
+    # Also exercise a pre-existing instance override, not just a class method.
+    original_load = model._load_confidence_weights
+    model._load_confidence_weights = original_load
+
+    def update(named_tensors, load_format):
+        if failure == "exception":
+            raise RuntimeError("weight update failed")
+        if failure == "false":
+            return False, "weight update failed"
+        model.load_weights(named_tensors)
+        return True, "ok"
+
+    runner = types.SimpleNamespace(model=model, update_weights_from_tensor=update)
+    name = (
+        "confidence_head.unknown"
+        if failure == "unknown_name"
+        else "confidence_head.proj.weight"
+    )
+    bucket = [(name, torch.zeros(9))]
+    if failure == "false":
+        assert sglang_patch._runner_update_weights_from_tensor(
+            runner, bucket, None
+        ) == (False, "weight update failed")
+    else:
+        error = RuntimeError if failure == "exception" else ValueError
+        match = {
+            "unknown_name": "unexpected",
+            "shape": "shape",
+            "exception": "weight update failed",
+        }[failure]
+        with pytest.raises(error, match=match):
+            sglang_patch._runner_update_weights_from_tensor(runner, bucket, None)
+    assert vars(model)["_load_confidence_weights"] is original_load

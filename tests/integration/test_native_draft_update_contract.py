@@ -108,9 +108,9 @@ def test_patch_vllm_server_adapter_update_does_not_inject_update_draft_weights(
 
     patch_vllm_server_adapter_update()
 
-    assert not callable(
-        getattr(ServerAdapter, "update_draft_weights", None)
-    ), "patch_vllm_server_adapter_update must NOT inject update_draft_weights"
+    assert not callable(getattr(ServerAdapter, "update_draft_weights", None)), (
+        "patch_vllm_server_adapter_update must NOT inject update_draft_weights"
+    )
 
 
 def test_production_attach_after_init_selects_compat_on_stock_adapter(
@@ -126,12 +126,16 @@ def test_production_attach_after_init_selects_compat_on_stock_adapter(
     from verl_speco.integration import native_draft_update as ndu_mod
 
     compat_calls: list = []
-    monkeypatch.setattr(ndu_mod, "_default_compat_attacher", lambda r: compat_calls.append(r))
+    monkeypatch.setattr(
+        ndu_mod, "_default_compat_attacher", lambda r: compat_calls.append(r)
+    )
 
     caplog.set_level("WARNING", logger="verl_speco.integration.native_draft_update")
     adapter = ServerAdapter.__new__(ServerAdapter)
 
-    ndu_mod.attach_draft_weight_updater({"speco": {"runtime": {"weight_update_mode": "auto"}}}, adapter)
+    ndu_mod.attach_draft_weight_updater(
+        {"speco": {"runtime": {"weight_update_mode": "auto"}}}, adapter
+    )
 
     # The selector ran (not short-circuited by a pre-injected method).
     assert len(compat_calls) == 1
@@ -156,9 +160,7 @@ def test_select_auto_falls_back_when_native_unavailable() -> None:
 
 
 def test_select_auto_uses_native_when_available() -> None:
-    decision = ndu.select_draft_update_strategy(
-        _config("auto"), _full_native_rollout()
-    )
+    decision = ndu.select_draft_update_strategy(_config("auto"), _full_native_rollout())
     assert decision.path == "native"
     assert decision.native_available is True
 
@@ -323,9 +325,11 @@ def test_attach_auto_available_installs_native_client(monkeypatch) -> None:
         "verl_speco.integration.vllm_runtime._load_env_drafter_config",
         lambda: {"training": {}},
     )
-    monkeypatch.setattr(ndu, "_default_compat_attacher", lambda _: pytest.fail(
-        "compat attacher must not run when native is available"
-    ))
+    monkeypatch.setattr(
+        ndu,
+        "_default_compat_attacher",
+        lambda _: pytest.fail("compat attacher must not run when native is available"),
+    )
     rollout = _full_native_rollout()
 
     ndu.attach_draft_weight_updater(_config("auto"), rollout)
@@ -336,9 +340,13 @@ def test_attach_auto_available_installs_native_client(monkeypatch) -> None:
 
 
 def test_attach_native_unavailable_fails_fast(monkeypatch) -> None:
-    monkeypatch.setattr(ndu, "_default_compat_attacher", lambda _: pytest.fail(
-        "compat attacher must not run when native mode fails fast"
-    ))
+    monkeypatch.setattr(
+        ndu,
+        "_default_compat_attacher",
+        lambda _: pytest.fail(
+            "compat attacher must not run when native mode fails fast"
+        ),
+    )
     with pytest.raises(RuntimeError, match="native draft update requested"):
         ndu.attach_draft_weight_updater(_config("native"), SimpleNamespace())
 
@@ -501,3 +509,27 @@ def test_draft_update_fallback_only_triggers_in_speculation_mode() -> None:
     asyncio.run(worker.update_draft_weights({"w": 1}, global_steps=1))
 
     assert rollout_calls == []
+
+
+def test_native_publish_phase_log_preserves_lifecycle(monkeypatch, caplog):
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._load_env_drafter_config",
+        lambda: {"training": {}},
+    )
+    caplog.set_level("WARNING", logger="verl_speco.integration.native_draft_update")
+    rollout = _full_native_rollout()
+    asyncio.run(
+        ndu.NativeVLLMDraftWeightSyncClient(rollout).update({"w": 1}, global_steps=7)
+    )
+    assert rollout.calls == _expected_lifecycle(7)
+    assert "completed=True" in caplog.text
+    for phase in [
+        "pause_s",
+        "session_start_s",
+        "transfer_and_load_s",
+        "session_finish_s",
+        "cache_after_s",
+        "set_step_s",
+        "resume_s",
+    ]:
+        assert phase in caplog.text

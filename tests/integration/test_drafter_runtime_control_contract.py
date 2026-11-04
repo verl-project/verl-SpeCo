@@ -34,6 +34,71 @@ _base_trainer = pytest.importorskip("verl_speco.trainer.base_trainer")
 DrafterBaseTrainer = _base_trainer.DrafterBaseTrainer
 
 
+def test_adaptive_feedback_uses_only_current_step_weighted_counts():
+    trainer = _trainer({}, step=8)
+    prefix = _speco_ray_trainer.SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX
+    for rounds, accepted in ((1, 1), (99, 199)):
+        trainer._speco_store_rollout_metrics(SimpleNamespace(non_tensor_batch={
+            f"{prefix}_drafts": [rounds],
+            f"{prefix}_accepted_tokens": [accepted],
+        }))
+    feedback = trainer._speco_drafter_schedule_context().acceptance_feedback
+    assert feedback.step == 8
+    assert feedback.sample_count == 100
+    assert feedback.mean_acceptance_length == 3.0
+    from verl_speco.trainer.scheduler import AdaptiveScheduleConfig
+
+    assert feedback.valid(AdaptiveScheduleConfig())
+    trainer.global_steps = 9
+    assert trainer._speco_acceptance_feedback() is None
+
+
+def test_adaptive_warmup_relaxes_trainer_collection_interval():
+    from verl_speco.trainer.scheduler import DrafterCollectionSource
+
+    trainer = _trainer({
+        "collect_hidden_states_from_old_logprob": True,
+        "collect_interval_steps": 5,
+        "training_interval_steps": 5,
+        "adaptive_schedule": {"enable": True, "warmup_max_steps": 3},
+    })
+    assert trainer._speco_plan_drafter_collection(DrafterCollectionSource.OLD_LOGPROB).collect
+    trainer.global_steps = 4
+    assert not trainer._speco_plan_drafter_collection(DrafterCollectionSource.OLD_LOGPROB).collect
+
+
+@pytest.mark.parametrize("accepted", [None, ["bad"], [-1], [float("nan")]])
+def test_adaptive_feedback_rejects_missing_or_corrupt_token_counts(accepted):
+    trainer = _trainer({}, step=1)
+    prefix = _speco_ray_trainer.SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX
+    trainer._speco_store_rollout_metrics(SimpleNamespace(non_tensor_batch={
+        f"{prefix}_drafts": [100], f"{prefix}_accepted_tokens": accepted,
+    }))
+    assert trainer._speco_acceptance_feedback() is None
+
+
+def test_adaptive_checkpoint_round_trip_through_trainer_hooks(tmp_path, monkeypatch):
+    cfg = {"adaptive_schedule": {"enable": True}}
+    trainer = _trainer(cfg, step=7)
+    trainer.config.trainer = SimpleNamespace(default_local_dir=str(tmp_path), resume_mode="auto")
+    trainer._speco_wait_pending_drafter_publish = lambda: 0
+    trainer._speco_save_drafter_checkpoint = lambda **kwargs: None
+    monkeypatch.setattr(_speco_ray_trainer.RayPPOTrainer, "_save_checkpoint", lambda self: None)
+    controller = trainer._speco_get_drafter_scheduler().configure_adaptive(trainer._speco_drafter_schedule_config())
+    controller.state.budget = 17
+    controller.state.warmup_ended_after = 6
+    trainer._save_checkpoint()
+    assert (tmp_path / "global_step_7" / "adaptive_schedule.json").is_file()
+    resumed = _trainer(cfg, step=7)
+    resumed.config.trainer = SimpleNamespace(
+        default_local_dir=str(tmp_path), resume_mode="resume_path",
+        resume_from_path=str(tmp_path / "global_step_7"),
+    )
+    # The fixture initializes the scheduler before the resume settings are assigned.
+    del resumed._drafter_scheduler
+    assert resumed._speco_get_drafter_scheduler().adaptive_controller.state == controller.state
+
+
 class _FakeOldLogProbBatch:
     non_tensor_batch = {}
 
@@ -90,6 +155,7 @@ def _oldlogprob_plan_batch(batch_size: int, *, non_tensor_batch=None):
 
 def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
     trainer = SpecoRayPPOTrainer.__new__(SpecoRayPPOTrainer)
+    trainer._speco_freeze_state_sidecar = "speco_drafter_freeze_state.json"
     trainer.global_steps = step
     trainer.config = SimpleNamespace(
         actor_rollout_ref=SimpleNamespace(
@@ -265,6 +331,7 @@ def test_bubble_oldlogprob_collection_uses_only_collection_interval(
 def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     trainer = _trainer({"training_interval_steps": 5}, step=4)
     trainer._speco_last_collected_samples = 10
+    trainer.attach_speco_worker_group(SimpleNamespace())
     scheduler = trainer._speco_get_drafter_scheduler()
     config = trainer._speco_drafter_schedule_config()
 
@@ -293,6 +360,7 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
         step=5,
     )
     trainer._speco_last_collected_samples = 1
+    trainer.attach_speco_worker_group(SimpleNamespace())
     trainer.actor_rollout_wg = _FakeRolloutWorkerGroup()
     trainer._compute_old_log_prob = lambda batch: batch
     events = []
@@ -330,6 +398,7 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
     assert output.meta_info["metrics"]["drafter/trained"] == 1
     assert output.meta_info["metrics"]["drafter/scheduler_used"] == 1
     assert output.meta_info["metrics"]["drafter/schedule_strategy"] == 0
+    assert output.meta_info["metrics"]["drafter/schedule_reason"] == 10
     assert output.meta_info["metrics"]["drafter/schedule_launch"] == 1
 
 
@@ -395,6 +464,24 @@ def test_oldlogprob_collection_accepts_supported_actor_backends(strategy: str) -
     trainer.config.actor_rollout_ref.actor.strategy = strategy
 
     assert trainer._speco_oldlogprob_collection_enabled() is True
+
+
+def test_oldlogprob_collection_rejects_megatron_eagle3_lk() -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_hidden_states_from_sgl": False,
+            "use_logits": False,
+            "old_logprob_hidden_capture_impl": "forward_hook",
+            "eagle3_lk_loss_alpha": 1.0,
+            "lk_temperature": 1.0,
+        }
+    )
+    trainer.config.actor_rollout_ref.actor.strategy = "megatron"
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "EAGLE3"
+
+    with pytest.raises(ValueError, match="Megatron old-logprob path.*target_logz"):
+        trainer._speco_oldlogprob_collection_enabled()
 
 
 def test_oldlogprob_collection_rejects_unknown_actor_backend() -> None:
@@ -571,6 +658,48 @@ def test_dspark_l1_oldlogprob_layout_collects_final_hidden() -> None:
     trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DSPARK"
 
     assert trainer._speco_oldlogprob_hidden_layout() == "dflash_aux_plus_last"
+
+
+def test_dspark_lk_oldlogprob_layout_collects_final_hidden() -> None:
+    trainer = _trainer(
+        {"dspark_l1_loss_alpha": 0.0, "dspark_lk_loss_alpha": 1.0}, step=1
+    )
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DSPARK"
+
+    assert trainer._speco_oldlogprob_hidden_layout() == "dflash_aux_plus_last"
+    assert trainer._speco_get_drafter_target_lm_head_row_selection() is None
+
+
+def test_dflash_lk_oldlogprob_layout_collects_final_hidden() -> None:
+    trainer = _trainer({"dflash_lk_loss_alpha": 1.0}, step=1)
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "DFLASH"
+
+    assert trainer._speco_oldlogprob_hidden_layout() == "dflash_aux_plus_last"
+    assert trainer._speco_get_drafter_target_lm_head_row_selection() is None
+
+
+def test_eagle3_lk_uses_t2d_row_restricted_target_head_sync() -> None:
+    trainer = _trainer(
+        {
+            "use_logits": False,
+            "eagle3_lk_loss_alpha": 1.0,
+            "target_lm_head_row_restricted_sync": True,
+        },
+        step=1,
+    )
+    trainer.config.actor_rollout_ref.rollout.drafter.speculative_algorithm = "EAGLE3"
+    trainer.speco_get_drafter_target_lm_head_row_indices = lambda: [
+        {
+            "row_indices": torch.tensor([1, 3, 5]),
+            "source_vocab_size": 8,
+        }
+    ]
+
+    selection = trainer._speco_get_drafter_target_lm_head_row_selection()
+
+    assert selection["selected_rows"] == 3
+    assert selection["source_vocab_size"] == 8
+    torch.testing.assert_close(selection["row_indices"], torch.tensor([1, 3, 5]))
 
 
 def test_dspark_default_oldlogprob_layout_collects_final_hidden() -> None:
@@ -1663,8 +1792,9 @@ def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:
     trainer._ray_get_if_needed = lambda value: waited.append(value) or value
     trainer._speco_get_published_drafter_weights = lambda: {"weights": 1}
     trainer._speco_actor_rollout_method = lambda name: (
-        lambda payload, global_steps=None: calls.append((name, payload, global_steps))
-        or ["new-ref"]
+        lambda payload, global_steps=None: (
+            calls.append((name, payload, global_steps)) or ["new-ref"]
+        )
     )
 
     metrics = trainer._speco_publish_drafter_weights(True)
@@ -1674,6 +1804,12 @@ def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:
     assert trainer._pending_drafter_publish_refs == ["new-ref"]
     assert metrics["drafter/publish_attempted"] == 1
     assert metrics["drafter/published"] == 1
+    for key in (
+        "timing_s/drafter_publish_fetch_snapshot",
+        "timing_s/drafter_publish_update_weights",
+        "timing_s/drafter_publish_wait_pending",
+    ):
+        assert metrics[key] >= 0
 
 
 def test_disabled_or_untrained_drafter_does_not_publish() -> None:

@@ -19,3 +19,4 @@ einops
 cachetools
 fastapi
 uvicorn
+httpx

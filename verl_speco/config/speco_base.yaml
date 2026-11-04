@@ -162,6 +162,7 @@ actor_rollout_ref:
         draft_tensor_parallel_size: null
         max_model_len: null
         enforce_eager: null
+        draft_sample_method: greedy
         speculative_config_overrides: {}
         # RL rollout assumes exact target-distribution verification. Set this
         # only when intentionally opting into a lossy acceptance method.
@@ -202,10 +203,34 @@ actor_rollout_ref:
         training_interval_steps: 5
         min_trainable_batches: 1
         require_full_batch: false
+        # Optional synchronous co-training policy; never freezes training.
+        adaptive_schedule:
+          enable: false
+          warmup_train_steps: 20
+          warmup_max_steps: 20
+          warmup_window_size: 5
+          warmup_min_improvement: 0.1
+          warmup_patience: 3
+          min_train_steps: 0
+          max_train_steps: 25
+          max_step_change: 20
+          ema_fast_alpha: 0.3
+          ema_slow_alpha: 0.05
+          trend_tolerance: 0.02
+          min_feedback_samples: 32
         publish_interval_steps: 0
         # Async publish with freeze economics.enabled=true is rejected pending cost accounting.
         publish_async: false
         publish_dtype: null
+        # GPU FSDP2 hot publish: select entries before gathering; checkpoints
+        # keep their full-state path. Set false for a legacy-path A/B comparison.
+        publish_trainable_only_export: true
+        # One rollback switch for CUDA host reuse and lossless transport.
+        gpu_transfer_optimizations: true
+        # Experimental CPU snapshot overlap; opt in only after end-to-end A/B.
+        gpu_publish_snapshot_prefetch: false
+        # Shared retained CPU model/optimizer buffer budget per rank; head cache is extra.
+        gpu_offload_pool_max_gib: 8
         publish_param_name_patterns: null
         draft_update_use_shm: null
         draft_update_weights_bucket_megabytes: null
@@ -285,6 +310,27 @@ actor_rollout_ref:
         group_by_length: false
         # Samples per grouping megabatch, as a multiple of batch_size_per_gpu.
         group_by_length_megabatch: 8
+        # Temperature used for both target and draft distributions in LK losses.
+        # Set this to actor_rollout_ref.rollout.temperature for probabilistic drafts.
+        lk_temperature: 1.0
+        # null enables actor-side full-vocabulary logZ capture automatically when
+        # EAGLE3 LK is active; set true for collect-only fixed-data ablations.
+        capture_target_logz: null
+        # Max tolerated log-prob excess when checking actor logZ against drafter-side
+        # target logits. Loose by default to absorb bf16 noise; raises ValueError.
+        lk_target_logz_tolerance: 0.05
+        # Rows per chunk when computing DFlash/DSpark LK terms (bounds [rows, vocab]
+        # fp32 temporaries; 0 disables chunking). Chunks are recomputed in backward.
+        lk_chunk_size: 1024
+        eagle3_ce_loss_alpha: 1.0
+        eagle3_lk_loss_alpha: 0.0
+        # alpha: -log acceptance; adaptive_hybrid: lambda * KL + (1-lambda) * TV.
+        eagle3_lk_loss_type: alpha
+        # Paper default for lambda = exp(-eta * stop_gradient(mean_acceptance)).
+        eagle3_lk_hybrid_eta: 3.0
+        # Aggregate adaptive diagnostics on GPU and copy them once every N
+        # compute_loss calls (micro-batches, not optimizer steps).
+        eagle3_lk_telemetry_interval_steps: 20
         # Hard-label CE target source for backends that support it.
         # labels keeps SpeCo's teacher-forced behavior; target_argmax matches
         # speculators-style CE against the target model top-1 token.
@@ -305,6 +351,15 @@ actor_rollout_ref:
         dflash_max_window: 512
         dflash_loss_mode: full_vocab
         dflash_sampled_ce_negatives: 0
+        # LK recomputes full-vocab draft logits per chunk, so it also works with
+        # restricted_ce/sampled_ce, but then costs an extra full-vocab projection.
+        dflash_ce_loss_alpha: 1.0
+        dflash_lk_loss_alpha: 0.0
+        # alpha: -log acceptance; adaptive_hybrid: lambda * KL + (1-lambda) * TV.
+        dflash_lk_loss_type: alpha
+        dflash_lk_hybrid_eta: 3.0
+        dflash_per_position_loss_weight: fixed_exp_decay
+        dflash_dpace_alpha: 0.5
         dspark_block_size: 7
         dspark_num_anchors: 32
         dspark_loss_decay_gamma: 7.0
@@ -331,6 +386,9 @@ actor_rollout_ref:
         dspark_max_window: 0
         dspark_loss_mode: full_vocab
         dspark_sampled_ce_negatives: 0
+        # D-PACE reweights CE across draft positions; L1/LK keep their loss decay.
+        dspark_per_position_loss_weight: fixed_exp_decay
+        dspark_dpace_alpha: 0.5
         dspark_markov_rank: 256
         dspark_markov_head_type: vanilla
         dspark_confidence_head_alpha: 0.0
@@ -351,6 +409,10 @@ actor_rollout_ref:
         # auto | fused | eager. Fused uses the native CUDA/Ascend Triton kernel.
         dspark_distribution_loss_impl: auto
         # Only used by the eager fallback/reference implementation.
+        dspark_lk_loss_alpha: 0.0
+        # alpha: -log acceptance; adaptive_hybrid: lambda * KL + (1-lambda) * TV.
+        dspark_lk_loss_type: alpha
+        dspark_lk_hybrid_eta: 3.0
         dspark_l1_chunk_size: 0
         dspark_debug_log: false
         dspark_debug_log_first_n: 2

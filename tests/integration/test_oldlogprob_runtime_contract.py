@@ -14,16 +14,20 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from verl_speco.integration import oldlogprob_runtime
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
+    OLD_LOGPROB_TARGET_LOGZ_TEMPERATURE_KEY,
+    _compute_oldlogprob_target_logz,
     _find_layers_and_final_norm,
     _hidden_state_capture_target,
     _install_oldlogprob_fsdp_batch_postprocess_patch,
+    _put_oldlogprob_hidden_refs,
     _resolve_hidden_state,
     _select_and_merge_concatenated_hidden,
     _to_cpu_transfer_tensor,
@@ -46,7 +50,9 @@ def test_fsdp2_runtime_install_does_not_import_veomni(monkeypatch) -> None:
         raise AssertionError(f"unexpected backend import: {name}")
 
     monkeypatch.setattr(oldlogprob_runtime, "_PATCHED", True)
-    monkeypatch.setattr(oldlogprob_runtime.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(
+        oldlogprob_runtime.importlib, "import_module", fake_import_module
+    )
     monkeypatch.setattr(
         oldlogprob_runtime,
         "_install_oldlogprob_fsdp_batch_postprocess_patch",
@@ -156,9 +162,10 @@ def test_decoder_ids_keep_hf_embedding_offset_for_dflash_and_eagle12() -> None:
     torch = pytest.importorskip("torch")
     hidden_states = tuple(torch.tensor([index]) for index in range(37))
 
-    assert int(
-        _resolve_hidden_state(hidden_states, 2, layer_id_space="decoder").item()
-    ) == 3
+    assert (
+        int(_resolve_hidden_state(hidden_states, 2, layer_id_space="decoder").item())
+        == 3
+    )
     assert _hidden_state_capture_target(2, 36, layer_id_space="decoder") == (
         "layer",
         2,
@@ -367,13 +374,186 @@ def test_veomni_batch_postprocess_keeps_router_replay_output() -> None:
     )
 
     assert result["model_output"]["routed_experts"] == "routes"
-    assert result["model_output"][OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY] == [
-        "hidden-ref"
-    ]
+    assert result["model_output"][OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY] == ["hidden-ref"]
+
+
+def test_oldlogprob_target_logz_is_temperature_aware() -> None:
+    torch = pytest.importorskip("torch")
+    logits = torch.tensor([[[1.0, 2.0, 3.0], [0.0, 1.0, 2.0]]])
+    micro_batch = {OLD_LOGPROB_TARGET_LOGZ_TEMPERATURE_KEY: 0.5}
+
+    actual = _compute_oldlogprob_target_logz({"logits": logits}, micro_batch)
+
+    torch.testing.assert_close(
+        actual,
+        torch.logsumexp(logits.float() / 0.5, dim=-1, keepdim=True),
+    )
+
+
+def test_oldlogprob_target_logz_is_disabled_without_temperature() -> None:
+    torch = pytest.importorskip("torch")
+    logits = torch.randn(1, 2, 4)
+
+    assert _compute_oldlogprob_target_logz({"logits": logits}, {}) is None
+
+
+@pytest.mark.parametrize("capture_impl", ["forward_hook", "output_hidden_states"])
+@pytest.mark.parametrize("inplace_scaling", [True, False])
+@pytest.mark.parametrize("collect_logz", [True, False])
+@pytest.mark.parametrize("lk_temperature", [0.6, 1.0])
+def test_fsdp_logz_capture_precedes_upstream_temperature_scaling(
+    monkeypatch, capture_impl, inplace_scaling, collect_logz, lk_temperature
+) -> None:
+    torch = pytest.importorskip("torch")
+    from verl_speco.backends.lk_loss import (
+        full_vocab_subset_probs,
+        negative_log_acceptance_loss,
+    )
+
+    raw_logits = torch.tensor(
+        [
+            [
+                [30.0, 29.0, 28.0],
+                [31.0, 29.0, 28.0],
+                [28.0, 30.0, 29.0],
+                [32.0, 29.0, 28.0],
+            ]
+        ]
+    )
+    temperature = 0.6
+
+    class FakeEngine:
+        def prepare_model_inputs(self, micro_batch):
+            return {}, {}
+
+        def prepare_model_outputs(
+            self, output, output_args, micro_batch, logits_processor_func
+        ):
+            logits = output.logits.squeeze(0)
+            if inplace_scaling:
+                logits.div_(temperature)
+            else:
+                logits = logits / temperature
+            return {"log_probs": torch.log_softmax(logits, dim=-1)}
+
+    module = SimpleNamespace(FSDPEngineWithLMHead=FakeEngine)
+    monkeypatch.setattr(oldlogprob_runtime, "_PATCHED", False)
+    monkeypatch.setattr(
+        oldlogprob_runtime.importlib, "import_module", lambda name: module
+    )
+    for name in (
+        "_install_oldlogprob_fsdp_batch_postprocess_patch",
+        "_install_oldlogprob_backend_batch_postprocess_patch",
+        "_install_oldlogprob_training_worker_postprocess_patch",
+    ):
+        monkeypatch.setattr(oldlogprob_runtime, name, lambda *args: True)
+    monkeypatch.setattr(
+        oldlogprob_runtime,
+        "_put_oldlogprob_hidden_refs",
+        lambda payload, batch: payload,
+    )
+    monkeypatch.setattr(
+        oldlogprob_runtime, "_build_selection_context", lambda *args: {}
+    )
+    monkeypatch.setattr(
+        oldlogprob_runtime,
+        "_timing_tensor_from_context",
+        lambda context, device: torch.zeros(1, 1, device=device),
+    )
+    monkeypatch.setattr(
+        oldlogprob_runtime, "_oldlogprob_aux_layer_ids_from_batch", lambda batch: [0]
+    )
+    monkeypatch.setattr(
+        oldlogprob_runtime,
+        "_select_and_merge_concatenated_hidden",
+        lambda context, tensors, **kwargs: (
+            torch.cat([t.unsqueeze(0) if t.dim() == 2 else t for t in tensors], dim=-1)[
+                :, 1:3
+            ],
+            torch.tensor([True]),
+        ),
+    )
+    assert oldlogprob_runtime.install_oldlogprob_hidden_runtime_patch(
+        actor_backend="fsdp2"
+    )
+    engine = FakeEngine()
+    hidden = torch.zeros(1, 4, 2)
+    if capture_impl == "forward_hook":
+        engine._speco_oldlogprob_hidden_context = {
+            "aux_keys": ["aux"],
+            "final_key": "final",
+            "captures": {"aux": hidden, "final": hidden},
+            "handles": [],
+        }
+    batch = {
+        oldlogprob_runtime.OLD_LOGPROB_COLLECT_MASK_KEY: torch.tensor([True]),
+        oldlogprob_runtime.OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY: capture_impl,
+    }
+    if collect_logz:
+        batch[OLD_LOGPROB_TARGET_LOGZ_TEMPERATURE_KEY] = lk_temperature
+    output = SimpleNamespace(logits=raw_logits.clone(), hidden_states=(hidden, hidden))
+    result = engine.prepare_model_outputs(output, {}, batch, None)
+    torch.testing.assert_close(
+        result["log_probs"], torch.log_softmax(raw_logits.squeeze(0) / temperature, -1)
+    )
+    if collect_logz:
+        logz = result[oldlogprob_runtime.OLD_LOGPROB_TARGET_LOGZ_KEY]
+        torch.testing.assert_close(
+            logz, torch.logsumexp(raw_logits[:, 1:3] / lk_temperature, -1, keepdim=True)
+        )
+        target = full_vocab_subset_probs(
+            raw_logits[:, 1:3], logz.squeeze(-1), temperature=lk_temperature
+        )
+        torch.testing.assert_close(target.sum(-1), torch.ones(1, 2))
+        draft_logits = torch.zeros_like(target, requires_grad=True)
+        loss = negative_log_acceptance_loss(
+            torch.softmax(draft_logits / lk_temperature, -1), target
+        ).mean()
+        loss.backward()
+        assert loss.item() < 13.0
+        assert draft_logits.grad.abs().max().item() > 0
+    else:
+        assert oldlogprob_runtime.OLD_LOGPROB_TARGET_LOGZ_KEY not in result
+    assert not hasattr(engine, "_speco_oldlogprob_hidden_context")
+
+
+def test_oldlogprob_object_ref_payload_keeps_fp32_target_logz(monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    fake_ray = ModuleType("ray")
+    fake_ray.put = lambda value: value
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setattr(oldlogprob_runtime, "_BATCH_POSTPROCESS_PATCHED", True)
+    monkeypatch.setattr(oldlogprob_runtime, "_POSTPROCESS_PATCHED", True)
+    hidden = torch.randn(1, 2, 4, dtype=torch.bfloat16)
+    target_logz = torch.tensor([[[2.25], [3.5]]], dtype=torch.float32)
+    micro_batch = {
+        "speco_oldlogprob_collect_mask": torch.tensor([True]),
+        "speco_oldlogprob_hidden_position_mask": torch.tensor([[True, True]]),
+        "speco_oldlogprob_owner_rank": torch.tensor([0]),
+        "speco_oldlogprob_hidden_object_ref": True,
+    }
+
+    result = _put_oldlogprob_hidden_refs(
+        {
+            "speco_oldlogprob_hidden_states": hidden,
+            "speco_oldlogprob_target_logz": target_logz,
+            "speco_oldlogprob_sp_size": 1,
+            "speco_oldlogprob_sp_rank": 0,
+        },
+        micro_batch,
+    )
+
+    payload = result["speco_oldlogprob_hidden_chunk_refs"][0]
+    assert payload["hidden_states"].dtype == torch.bfloat16
+    assert payload["target_logz"].dtype == torch.float32
+    torch.testing.assert_close(
+        payload["target_logz"].reshape(-1), target_logz.reshape(-1)
+    )
 
 
 def test_row_refs_survive_dynamic_batch_and_dp_concat(monkeypatch):
     import importlib
+
     torch = pytest.importorskip("torch")
     from verl.utils import tensordict_utils as tu
     from tensordict import TensorDict
@@ -381,17 +561,23 @@ def test_row_refs_survive_dynamic_batch_and_dp_concat(monkeypatch):
     refs_key = oldlogprob_runtime.OLD_LOGPROB_HIDDEN_REFS_KEY
     meta_key = oldlogprob_runtime.OLD_LOGPROB_HIDDEN_REF_META_KEY
     chunk_key = oldlogprob_runtime.OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY
+
     class Worker:
         def _postprocess_output(self, output):
-            return TensorDict({"log_probs": torch.arange(3).reshape(3, 1)}, batch_size=[3])
+            return TensorDict(
+                {"log_probs": torch.arange(3).reshape(3, 1)}, batch_size=[3]
+            )
+
     module = SimpleNamespace(TrainingWorker=Worker)
     real_import = importlib.import_module
+
     def fake_import(name):
         if name == "verl.workers.engine_workers":
             return module
         if name == "verl.workers.engine.utils":
             return SimpleNamespace()
         return real_import(name)
+
     monkeypatch.setattr(oldlogprob_runtime.importlib, "import_module", fake_import)
     monkeypatch.setattr(oldlogprob_runtime, "_POSTPROCESS_PATCHED", False)
     assert oldlogprob_runtime._install_oldlogprob_training_worker_postprocess_patch()
@@ -401,14 +587,29 @@ def test_row_refs_survive_dynamic_batch_and_dp_concat(monkeypatch):
         indices = [[2, 0], [1]]
         micro_outputs = []
         for rows in indices:
-            micro_outputs.append({"model_output": {
-                refs_key: [f"ref-{offset + i}" for i in rows],
-                meta_key: [{"source_batch_index": offset + i, "owner": (offset + i) % 2,
-                            "chunk_start": i * 2, "chunk_length": 2} for i in rows],
-            }})
-        extracted = oldlogprob_runtime._extract_oldlogprob_non_tensor_model_output(micro_outputs, indices)
+            micro_outputs.append(
+                {
+                    "model_output": {
+                        refs_key: [f"ref-{offset + i}" for i in rows],
+                        meta_key: [
+                            {
+                                "source_batch_index": offset + i,
+                                "owner": (offset + i) % 2,
+                                "chunk_start": i * 2,
+                                "chunk_length": 2,
+                            }
+                            for i in rows
+                        ],
+                    }
+                }
+            )
+        extracted = oldlogprob_runtime._extract_oldlogprob_non_tensor_model_output(
+            micro_outputs, indices
+        )
         for key in (refs_key, meta_key):
-            extracted[key] = oldlogprob_runtime._restore_non_tensor_dynamic_batch(extracted[key], indices)
+            extracted[key] = oldlogprob_runtime._restore_non_tensor_dynamic_batch(
+                extracted[key], indices
+            )
         extracted[chunk_key] = ["worker-local-chunk"]
         outputs.append(Worker()._postprocess_output({"model_output": extracted}))
     merged = tu.concat_tensordict(outputs)
@@ -421,6 +622,7 @@ def test_row_refs_survive_dynamic_batch_and_dp_concat(monkeypatch):
 
 def test_pp_whole_refs_survive_postprocess_dp_concat_and_row_reordering(monkeypatch):
     import importlib
+
     ray = pytest.importorskip("ray")
     torch = pytest.importorskip("torch")
     pytest.importorskip("tensordict")
@@ -450,17 +652,37 @@ def test_pp_whole_refs_survive_postprocess_dp_concat_and_row_reordering(monkeypa
     stored = {}
     for shard_index in range(2):
         ref = f"whole-{shard_index}"
-        stored[ref] = torch.arange(24, dtype=torch.float32).reshape(3, 2, 4) + 100 * shard_index
-        outputs.append(Worker()._postprocess_output({"model_output": {
-            refs_key: ref,
-            meta_key: {"num_samples": 3, "shape": (3, 2, 4)},
-        }}))
+        stored[ref] = (
+            torch.arange(24, dtype=torch.float32).reshape(3, 2, 4) + 100 * shard_index
+        )
+        outputs.append(
+            Worker()._postprocess_output(
+                {
+                    "model_output": {
+                        refs_key: ref,
+                        meta_key: {"num_samples": 3, "shape": (3, 2, 4)},
+                    }
+                }
+            )
+        )
     order = torch.tensor([4, 1, 5, 0, 3, 2])
     merged = tu.concat_tensordict(outputs)[order]
     assert tu.get(merged, refs_key) == [
-        "whole-1", "whole-0", "whole-1", "whole-0", "whole-1", "whole-0"
+        "whole-1",
+        "whole-0",
+        "whole-1",
+        "whole-0",
+        "whole-1",
+        "whole-0",
     ]
-    assert [meta["row_index"] for meta in tu.get(merged, meta_key)] == [1, 1, 2, 0, 0, 2]
+    assert [meta["row_index"] for meta in tu.get(merged, meta_key)] == [
+        1,
+        1,
+        2,
+        0,
+        0,
+        2,
+    ]
     calls = []
 
     def get(refs):
@@ -471,7 +693,8 @@ def test_pp_whole_refs_survive_postprocess_dp_concat_and_row_reordering(monkeypa
     trainer = SpecoRayPPOTrainer.__new__(SpecoRayPPOTrainer)
     hidden_rows = trainer._speco_materialize_oldlogprob_whole_refs(merged)
     torch.testing.assert_close(
-        torch.stack(hidden_rows), torch.cat([stored["whole-0"], stored["whole-1"]])[order]
+        torch.stack(hidden_rows),
+        torch.cat([stored["whole-0"], stored["whole-1"]])[order],
     )
     assert calls == [["whole-1", "whole-0"]]
     assert tu.get(merged, refs_key) is None
@@ -485,20 +708,26 @@ def test_hidden_export_preserves_source_owner_and_hidden_slices(monkeypatch):
     monkeypatch.setattr(runtime, "_BATCH_POSTPROCESS_PATCHED", True)
     monkeypatch.setattr(runtime, "_POSTPROCESS_PATCHED", True)
     stored = {}
+
     def put(value):
         ref = f"ref-{len(stored)}"
         stored[ref] = value
         return ref
+
     monkeypatch.setattr(ray, "put", put)
     hidden = torch.arange(24, dtype=torch.float32).reshape(3, 2, 4)
     batch = {
         runtime.OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY: True,
         runtime.OLD_LOGPROB_COLLECT_MASK_KEY: torch.tensor([True, False, True]),
-        runtime.OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY: torch.ones(3, 2, dtype=torch.bool),
+        runtime.OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY: torch.ones(
+            3, 2, dtype=torch.bool
+        ),
         runtime.OLD_LOGPROB_OWNER_RANK_KEY: torch.tensor([1, -1, 1]),
         runtime.OLD_LOGPROB_SOURCE_BATCH_INDICES_KEY: torch.tensor([205, 11, 93]),
     }
-    output = runtime._put_oldlogprob_hidden_refs({runtime.OLD_LOGPROB_HIDDEN_STATES_KEY: hidden}, batch)
+    output = runtime._put_oldlogprob_hidden_refs(
+        {runtime.OLD_LOGPROB_HIDDEN_STATES_KEY: hidden}, batch
+    )
     refs = output[runtime.OLD_LOGPROB_HIDDEN_REFS_KEY]
     metas = output[runtime.OLD_LOGPROB_HIDDEN_REF_META_KEY]
     assert refs[1] is None and metas[1] is None
@@ -506,4 +735,6 @@ def test_hidden_export_preserves_source_owner_and_hidden_slices(monkeypatch):
         meta = metas[row]
         assert meta["source_batch_index"] == source and meta["owner"] == 1
         start, length = meta["chunk_start"], meta["chunk_length"]
-        torch.testing.assert_close(stored[refs[row]][start:start + length], hidden[row])
+        torch.testing.assert_close(
+            stored[refs[row]][start : start + length], hidden[row]
+        )

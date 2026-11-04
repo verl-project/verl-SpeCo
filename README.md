@@ -86,7 +86,7 @@ similar speculative-decoding acceptance length.
 | EAGLE3 | vLLM, SGLang | FSDP | Available |
 | DFlash | vLLM, SGLang | FSDP | Available |
 | DFlash2 | vLLM via DFlash, SGLang via DFLASH | FSDP | Available |
-| DSpark | vLLM | FSDP | Available |
+| DSpark | vLLM, SGLang | FSDP | SGLang adapter tested; GPU rollout unverified |
 | Domino | vLLM, SGLang via DFlash | FSDP | Available |
 | P-EAGLE | Not wired in this overlay | FSDP | Training only |
 
@@ -102,6 +102,11 @@ Domino is trained with `speculative_algorithm=DOMINO`, but it is served as a
 DFlash projector sub-mode. For rollout, use `speculative_algorithm=DFLASH`
 with a Domino checkpoint on an engine version that supports the Domino
 projector.
+
+Domino training does not support LK loss. Keep `dflash_lk_loss_alpha` and
+`dspark_lk_loss_alpha` at zero when selecting `DOMINO`; positive values are
+rejected during layout resolution and backend initialization. Use the DFlash
+or DSpark training backend for LK loss.
 
 P-EAGLE training is available, but its vLLM parallel-drafting rollout runtime
 is not wired into this overlay yet. Keep rollout drafter serving disabled and
@@ -119,7 +124,7 @@ drafter backend you use.
 | EAGLE3 | &gt;= 0.18.0 | &gt;= 0.18.0 | &gt;= 0.5.10 |
 | DFlash | &gt;= 0.20.2 | &gt;= 0.20.2 | &gt;= 0.5.12 |
 | DFlash2 | &gt;= 0.28.0 (served as DFlash) | - | [main](https://github.com/sgl-project/sglang) (served as DFLASH; no tagged release up to 0.5.18) |
-| DSpark | GPU: [main](https://github.com/vllm-project/vllm/tree/main)<br>NPU: [`58d3918`](https://github.com/vllm-project/vllm/tree/58d3918e3ea0a544ffedadad2ba84559e9c51d8f) | NPU: [`6af9257`](https://github.com/vllm-project/vllm-ascend/tree/6af9257e449ca139ccd228f0d71ca7d2c09909c9)<br>NPU (MRV2): [`27a9476`](https://github.com/vllm-project/vllm-ascend/tree/27a94764b5ead50ed3e42ab52a257c2173032750) | - |
+| DSpark | GPU: [main](https://github.com/vllm-project/vllm/tree/main)<br>NPU: [`58d3918`](https://github.com/vllm-project/vllm/tree/58d3918e3ea0a544ffedadad2ba84559e9c51d8f) | NPU: [`6af9257`](https://github.com/vllm-project/vllm-ascend/tree/6af9257e449ca139ccd228f0d71ca7d2c09909c9)<br>NPU (MRV2): [`27a9476`](https://github.com/vllm-project/vllm-ascend/tree/27a94764b5ead50ed3e42ab52a257c2173032750) | [`76e06fe`](https://github.com/sgl-project/sglang/tree/76e06febab732d28a61b75a61b7835284568cdfb) (adapter-tested; GPU rollout unverified) |
 | Domino | DFlash-compatible runtime with Domino projector support | Runtime-specific | Runtime-specific |
 | P-EAGLE | Not wired | Not wired | Not wired |
 
@@ -170,6 +175,14 @@ acceptance head against `alpha = sum_v min(p_v, q_v) = 1 - TV`, matching
 `architectures=["Qwen3DSparkModel"]` and use `sample_from_anchor=true` (or omit
 it for the native default); the fixed verification length must not exceed the
 checkpoint's training `block_size`.
+
+For DSpark on this SGLang checkout, set `actor_rollout_ref.rollout.name=sglang`
+and `actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK` with a
+DSpark checkpoint in `drafter.model_path`. Keep `rollout.spec_steps=1` and
+`rollout.spec_topk=1`. Set `rollout.spec_verify_tokens` to the trained DSpark
+`block_size` (gamma); the adapter passes gamma + 1 to SGLang's
+`speculative_num_draft_tokens`. Collect training hidden states through
+`training.collect_hidden_states_from_old_logprob=true` as in the vLLM example.
 
 ### verl V1 runner (Phase 1)
 
@@ -520,6 +533,95 @@ The online PPO entrypoint composes them through
 [`speco_trainer.yaml`](./verl_speco/config/speco_trainer.yaml), while standalone
 feature-store training uses
 [`draft_trainer.yaml`](./verl_speco/config/draft_trainer.yaml).
+
+## Online Monitoring with RL-Insight
+
+[RL-Insight](https://github.com/verl-project/rl-insight) can observe the drafter
+co-training loop online. Enabling it is optional and non-invasive: when it is
+off (or unavailable) every SPECO hook degrades to a no-op, so it never changes
+training results or requires `rl_insight` at import time.
+
+RL-Insight requires a verl release that provides `RLInsightLogger` and the
+`rl_insight` tracking backend. Use `release/v0.9.0` or newer; the default
+`release/v0.8.0` baseline in `REQUIRED_VERL.txt` does not support it, and SPECO
+fails fast with an actionable error instead of the upstream `Tracking`
+assertion.
+
+### Enable
+
+Start the RL-Insight server (Prometheus + Tempo + Grafana) on a reachable host
+and follow the upstream
+[`verl` integration guide](https://github.com/verl-project/verl/blob/main/docs/advance/rl_insight.md),
+then point the training job at it:
+
+```bash
+export RL_INSIGHT_SERVER_URL="http://<server-ip>:18080"
+python3 -m verl_speco.main \
+    trainer.logger='["console","rl_insight"]' \
+    actor_rollout_ref.rollout.disable_log_stats=False \
+    ...
+```
+
+`verl` sets `VERL_RL_INSIGHT_ENABLE=1` and forwards it to all Ray workers as soon
+as `rl_insight` is in `trainer.logger`. SPECO additionally forwards
+`trainer.project_name`, `trainer.experiment_name`, the resolved
+`trainer.rl_insight` overrides and the driver's `RL_INSIGHT_SERVER_URL` to every
+Ray worker through the job runtime env, so per-rank worker metrics and traces
+carry the same labels and use the same monitoring backend/namespace as the
+trainer even on multi-node clusters. This means a server URL configured only
+through `trainer.rl_insight.server.url` (without exporting
+`RL_INSIGHT_SERVER_URL`) also reaches the workers. Keep `RL_INSIGHT_SERVER_URL`
+exported in the driver environment (or add it to the runtime-env file passed to
+`ray job submit`) when you prefer environment-based configuration; values are
+only forwarded when present.
+
+The EAGLE3 example scripts enable this automatically when
+`RL_INSIGHT_SERVER_URL` is exported; leaving it unset keeps the default logging.
+
+### What is monitored
+
+Trainer-side scalars (exported as Prometheus gauges; `/` becomes `_`):
+
+- drafter training: `drafter_trained`, `drafter_train_successful_steps_max`,
+  `drafter_train_buffer_size_*`, `drafter_train_*_consistent`
+- served and predicted acceptance: `drafter_spec_decode_mean_acceptance_length`,
+  and the per-algorithm `*_mean_acceptance_length` / `*_simulated_acc_len`
+- scheduler decisions: `drafter_schedule_launch`,
+  `drafter_schedule_interval_matched`, `drafter_collection_plan_*`,
+  `drafter_data_*`
+- freeze/economics gate: `drafter_freeze_would_freeze`,
+  `drafter_freeze_active_enforced`, `drafter_published`
+- timing: `timing_s_drafter`, `timing_s_drafter_train_rpc`,
+  `timing_s_drafter_publish_*`, `timing_s_drafter_outer_unaccounted`
+
+Per-rank worker signals emitted from `SpecoWorker` (labels
+`worker_rank`/`replica_rank`/`publish_leader`, prefix `speco_drafter_worker_`):
+
+- drafter training metrics such as `speco_drafter_worker_<algo>_loss`,
+  `_top1_acc`, `_mean_acceptance_length`, `_simulated_acc_len`
+- phase wall times `speco_drafter_worker_training_loop_elapsed_sec`,
+  `_publish_snapshot_elapsed_sec`, `_cleanup_elapsed_sec`
+
+Trace timelines (Grafana/Tempo) use a lane per trainer
+(`speco_trainer`) and per worker (`drafter_worker_<rank>`) for the phases
+`drafter/collect`, `drafter/prepare`, `drafter/train`, `drafter/publish`,
+`drafter/worker_train_loop`, `drafter/worker_publish_snapshot`, and
+`drafter/worker_cleanup`. The trainer-side phases are emitted by both the
+legacy `SpecoRayPPOTrainer` and the V1 trainer
+(`trainer.use_v1=true`/`speco_v1_trainer`); V1 reports its old-logprob feature
+collection as `drafter/collect`.
+
+### Dashboard
+
+The metrics and traces above are everything needed to build a Grafana dashboard.
+A companion `verl-SpeCo Drafter Co-Training` dashboard is maintained with the
+RL-Insight project (not bundled in this repository); panels cover acceptance
+length, training activity, the freeze gate, collection/buffer state, the
+per-rank loss/accuracy curves, phase timing, and bubble opportunity. Grafana
+dashboard JSON is schema-versioned, so import the dashboard with the RL-Insight
+revision that provides it (and a Grafana version compatible with that schema).
+If your RL-Insight revision does not bundle it yet, the signals listed above are
+sufficient to assemble the same panels.
 
 ## Testing
 

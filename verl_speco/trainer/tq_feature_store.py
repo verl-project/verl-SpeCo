@@ -179,7 +179,6 @@ class TQFeatureStore:
         from verl_speco.transport.drafter_sample_protocol import (
             SampleMetadata,
             make_sample_key,
-            validate_reference_tag,
         )
         import torch
 
@@ -188,7 +187,6 @@ class TQFeatureStore:
             raise ValueError("Cannot prepare an empty file batch")
         expected = self.expected_config
         for entry in entries:
-            validate_reference_tag(entry.tag)
             meta = SampleMetadata.from_dict(entry.tag)
             if meta.run_id != self.run_id or entry.key != make_sample_key(meta):
                 raise ValueError("Hidden reference identity mismatch")

@@ -23,6 +23,7 @@ import time
 import threading
 import uuid
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from dataclasses import replace
 from types import MethodType
 from typing import Any, cast
@@ -38,9 +39,18 @@ from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 from verl_speco.integration.agent_loop_runtime import (
     SPECO_AGENT_LOOP_MANAGER_CLASS,
+    SPECO_STUDENT_DECODE_TIME_KEY,
+    SPECO_TEACHER_PREFILL_TIME_KEY,
     install_agent_loop_runtime_patch,
 )
-from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
+from verl_speco.integration.opd_cotrain import (
+    detach_student_feature,
+    student_policy_batch_keys,
+)
+from verl_speco.integration.rollout_publish import (
+    resolve_drafter_publish_payload,
+    target_lm_head_export_metrics,
+)
 from verl_speco.integration.rollout_idle_events import (
     DRAFTER_SAMPLE_READY_EVENT,
     SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV,
@@ -69,6 +79,7 @@ from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY,
     OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY,
     OLD_LOGPROB_OWNER_RANK_KEY,
+    OLD_LOGPROB_TARGET_LOGZ_TEMPERATURE_KEY,
     OLD_LOGPROB_TIMING_KEY,
 )
 from verl_speco.integration.oldlogprob_layer_ids import (
@@ -92,9 +103,11 @@ from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
     configure_vllm_runtime_from_config,
 )
+from verl_speco.rl_insight_bridge import trace_state as _rl_insight_trace_state
 from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
 from verl_speco.trainer.hard_sample_selection import partition_hard_candidates
 from verl_speco.trainer.scheduler import (
+    AcceptanceFeedback,
     AfterActorUpdateContext,
     AfterWeightUpdateContext,
     BeforeActorUpdateContext,
@@ -129,6 +142,7 @@ SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC = (
     "drafter/spec_decode/mean_acceptance_length"
 )
 _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY = "_speco_vllm_spec_decode_drafts"
+_SPECO_VLLM_INVALID_FEEDBACK_KEY = "_speco_vllm_invalid_acceptance_feedback"
 _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY = "_speco_vllm_spec_decode_accepted_tokens"
 _SPECO_VLLM_REQUEST_VERIFY_ROUNDS_KEY = "_speco_vllm_request_verify_rounds"
 _SPECO_VLLM_REQUEST_ACCEPTED_TOKENS_KEY = "_speco_vllm_request_accepted_tokens"
@@ -140,6 +154,12 @@ _SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY = "_verl_request_mean_accept_len"
 _SPECO_VLLM_REQUEST_IS_HARD_KEY = "_verl_is_hard"
 _SPECO_VLLM_REQUEST_HARD_SCORE_KEY = "_verl_hard_score"
 _SPECO_VLLM_REQUEST_ID_KEY = "_speco_vllm_request_id"
+_SPECO_STUDENT_DECODE_TOTAL_KEY = "_speco_student_decode_total"
+_SPECO_STUDENT_DECODE_COUNT_KEY = "_speco_student_decode_count"
+_SPECO_STUDENT_DECODE_MAX_KEY = "_speco_student_decode_max"
+_SPECO_TEACHER_PREFILL_TOTAL_KEY = "_speco_teacher_prefill_total"
+_SPECO_TEACHER_PREFILL_COUNT_KEY = "_speco_teacher_prefill_count"
+_SPECO_TEACHER_PREFILL_MAX_KEY = "_speco_teacher_prefill_max"
 _SPECO_DRAFTER_TIMING_DEDUCTED_KEY = "_speco_drafter_timing_deducted_from_update_actor"
 _SPECO_BOOTSTRAP_FALLBACK_IDLE_WINDOW_SEC = 10.0
 # Meta-info markers carried by fixed paired-probe batches (RFC sec. 6).
@@ -158,6 +178,9 @@ _DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
 # tensor cache; it prevents stale readiness markers from authorizing a version
 # that the worker has already evicted.
 _SPECO_TARGET_LM_HEAD_READY_VERSION_LIMIT = 2
+# RL-Insight trace lane for the drafter co-training phases owned by the trainer
+# process. Worker-side phases use per-rank lanes inside SpecoWorker.
+_SPECO_RL_INSIGHT_TRAINER_LANE = "speco_trainer"
 
 _DRAFTER_CHECKPOINT_PATH_PLACEHOLDERS = {
     None,
@@ -182,10 +205,14 @@ _POLICY_MODEL_NON_TENSOR_KEYS = {
 
 def _select_policy_model_batch(batch: DataProto) -> DataProto:
     """Keep rollout/drafter side-channel data out of policy-model forward paths."""
+    batch_keys = student_policy_batch_keys(batch.batch.keys())
     non_tensor_batch_keys = [
         key for key in _POLICY_MODEL_NON_TENSOR_KEYS if key in batch.non_tensor_batch
     ]
-    return batch.select(non_tensor_batch_keys=non_tensor_batch_keys)
+    return batch.select(
+        batch_keys=batch_keys,
+        non_tensor_batch_keys=non_tensor_batch_keys,
+    )
 
 
 def _get_nested(config, path, default=None):
@@ -388,7 +415,7 @@ def _speco_float_values(values: Any) -> list[float]:
         try:
             normalized.append(float(value))
         except (TypeError, ValueError):
-            continue
+            normalized.append(float("nan"))
     return normalized
 
 
@@ -520,7 +547,8 @@ def _speco_vllm_spec_decode_stats_from_batch(
     total_drafts = float(sum(drafts))
     total_accepted_tokens = float(sum(accepted_tokens))
     if (
-        math.isfinite(total_drafts)
+        len(drafts) == len(accepted_tokens)
+        and math.isfinite(total_drafts)
         and math.isfinite(total_accepted_tokens)
         and total_drafts > 0.0
         and total_accepted_tokens >= 0.0
@@ -589,21 +617,49 @@ def _speco_vllm_spec_decode_stats_from_batch(
     return {
         _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY: total_drafts,
         _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY: total_accepted_tokens,
+        _SPECO_VLLM_INVALID_FEEDBACK_KEY: float(
+            len(drafts) != len(accepted_tokens)
+            or not all(
+                math.isfinite(value) and value >= 0
+                for value in drafts + accepted_tokens
+            )
+        ),
     }
 
 
-def _speco_vllm_spec_decode_metrics_from_stats(
+def _speco_rollout_metrics_from_stats(
     stats: dict[str, float],
 ) -> dict[str, float]:
+    metrics: dict[str, float] = {}
     drafts = float(stats.get(_SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY, 0.0) or 0.0)
-    if drafts <= 0.0:
-        return {}
-    accepted_tokens = float(
-        stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY, 0.0) or 0.0
-    )
-    return {
-        SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC: 1.0 + accepted_tokens / drafts
-    }
+    if drafts > 0.0:
+        accepted_tokens = float(
+            stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY, 0.0) or 0.0
+        )
+        metrics[SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC] = (
+            1.0 + accepted_tokens / drafts
+        )
+    for phase, total_key, count_key, max_key in (
+        (
+            "student_decode",
+            _SPECO_STUDENT_DECODE_TOTAL_KEY,
+            _SPECO_STUDENT_DECODE_COUNT_KEY,
+            _SPECO_STUDENT_DECODE_MAX_KEY,
+        ),
+        (
+            "teacher_prefill",
+            _SPECO_TEACHER_PREFILL_TOTAL_KEY,
+            _SPECO_TEACHER_PREFILL_COUNT_KEY,
+            _SPECO_TEACHER_PREFILL_MAX_KEY,
+        ),
+    ):
+        count = float(stats.get(count_key, 0.0) or 0.0)
+        if count > 0.0:
+            metrics[f"timing_s/{phase}"] = float(stats.get(max_key, 0.0) or 0.0)
+            metrics[f"timing_s/{phase}_mean"] = (
+                float(stats.get(total_key, 0.0) or 0.0) / count
+            )
+    return metrics
 
 
 def _speco_truthy_meta_value(value: Any) -> bool:
@@ -656,6 +712,33 @@ def _speco_is_validation_generation(
     )
 
 
+def _speco_phase_timing_stats_from_batch(batch: Any) -> dict[str, float]:
+    non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+    if not isinstance(non_tensor_batch, dict):
+        return {}
+    stats: dict[str, float] = {}
+    for source_key, total_key, count_key, max_key in (
+        (
+            SPECO_STUDENT_DECODE_TIME_KEY,
+            _SPECO_STUDENT_DECODE_TOTAL_KEY,
+            _SPECO_STUDENT_DECODE_COUNT_KEY,
+            _SPECO_STUDENT_DECODE_MAX_KEY,
+        ),
+        (
+            SPECO_TEACHER_PREFILL_TIME_KEY,
+            _SPECO_TEACHER_PREFILL_TOTAL_KEY,
+            _SPECO_TEACHER_PREFILL_COUNT_KEY,
+            _SPECO_TEACHER_PREFILL_MAX_KEY,
+        ),
+    ):
+        values = _speco_float_values(non_tensor_batch.get(source_key))
+        if values:
+            stats[total_key] = float(sum(values))
+            stats[count_key] = float(len(values))
+            stats[max_key] = float(max(values))
+    return stats
+
+
 def _speco_set_generation_meta_flag(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
@@ -686,7 +769,7 @@ def _speco_set_generation_meta_flag(
     return lambda: None
 
 
-def _speco_merge_vllm_spec_decode_stats(
+def _speco_merge_rollout_stats(
     existing: dict[str, float] | None,
     current: dict[str, float],
 ) -> dict[str, float]:
@@ -695,10 +778,20 @@ def _speco_merge_vllm_spec_decode_stats(
     totals = {
         _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY: 0.0,
         _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY: 0.0,
+        _SPECO_STUDENT_DECODE_TOTAL_KEY: 0.0,
+        _SPECO_STUDENT_DECODE_COUNT_KEY: 0.0,
+        _SPECO_TEACHER_PREFILL_TOTAL_KEY: 0.0,
+        _SPECO_TEACHER_PREFILL_COUNT_KEY: 0.0,
+        _SPECO_VLLM_INVALID_FEEDBACK_KEY: 0.0,
     }
     for key in totals:
         totals[key] = float((existing or {}).get(key, 0.0) or 0.0) + float(
             current.get(key, 0.0) or 0.0
+        )
+    for key in (_SPECO_STUDENT_DECODE_MAX_KEY, _SPECO_TEACHER_PREFILL_MAX_KEY):
+        totals[key] = max(
+            float((existing or {}).get(key, 0.0) or 0.0),
+            float(current.get(key, 0.0) or 0.0),
         )
     return totals
 
@@ -1545,8 +1638,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         scheduler = getattr(self, "_drafter_scheduler", None)
         if scheduler is None:
             scheduler = DrafterScheduler()
+            self._speco_restore_adaptive_state(scheduler)
             self._drafter_scheduler = scheduler
         return scheduler
+
+    def _speco_restore_adaptive_state(self, scheduler: DrafterScheduler) -> None:
+        """Initialize adaptive scheduling and restore its selected checkpoint."""
+        controller = scheduler.configure_adaptive(self._speco_drafter_schedule_config())
+        if controller is not None:
+            _, resume_folder = self._speco_freeze_state_resume_path()
+            if resume_folder:
+                controller.restore(Path(resume_folder) / "adaptive_schedule.json")
 
     def _speco_get_drafter_runtime_state(self) -> DrafterRuntimeState:
         runtime_state = getattr(self, "_drafter_runtime_state", None)
@@ -4058,6 +4160,33 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 self._speco_get_drafter_runtime_state().status
                 in {DrafterRuntimeStatus.SUBMITTED, DrafterRuntimeStatus.RUNNING}
             ),
+            acceptance_feedback=self._speco_acceptance_feedback(),
+        )
+
+    def _speco_acceptance_feedback(self) -> AcceptanceFeedback | None:
+        """Use only this training rollout's weighted, non-validation counts.
+
+        Use the same weighted mean acceptance length as the rollout metric.
+        Verification rounds supply the feedback sample count, not a rate denominator.
+        Backends without these counts retain their budget and capped warmup.
+        """
+        if getattr(self, "_speco_last_rollout_metrics_step", None) != self.global_steps:
+            return None
+        stats = getattr(self, "_speco_last_rollout_metrics", None) or {}
+        if stats.get(_SPECO_VLLM_INVALID_FEEDBACK_KEY, 0):
+            return None
+        rounds = _speco_metric_float(stats.get(_SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY))
+        accepted = _speco_metric_float(
+            stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY)
+        )
+        metrics = _speco_rollout_metrics_from_stats(stats)
+        length = metrics.get(SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC)
+        if rounds is None or accepted is None or length is None:
+            return None
+        return AcceptanceFeedback(
+            step=int(self.global_steps),
+            sample_count=rounds,
+            mean_acceptance_length=length,
         )
 
     def _speco_on_before_actor_update(
@@ -4351,6 +4480,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 f"got {strategy!r}"
             )
         if strategy == "megatron":
+            if self._speco_oldlogprob_target_logz_temperature() is not None:
+                raise ValueError(
+                    "EAGLE3 LK with actor.strategy=megatron is not supported: "
+                    "the Megatron old-logprob path does not produce target_logz"
+                )
             tp_size = int(
                 _get_nested(
                     self.config,
@@ -4431,6 +4565,30 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             training_cfg.get("old_logprob_hidden_capture_impl", "forward_hook")
             or "forward_hook"
         )
+
+    def _speco_oldlogprob_target_logz_temperature(self) -> float | None:
+        drafter_cfg = self._speco_drafter_config()
+        algorithm = str(
+            _get_nested(drafter_cfg, ("speculative_algorithm",), "") or ""
+        ).upper()
+        if algorithm != "EAGLE3":
+            return None
+        training_cfg = self._speco_drafter_training_config()
+        capture_value = training_cfg.get("capture_target_logz", None)
+        capture_enabled = (
+            float(training_cfg.get("eagle3_lk_loss_alpha", 0.0) or 0.0) > 0
+            if capture_value is None
+            else self._speco_bool_config(capture_value)
+        )
+        if not capture_enabled:
+            return None
+        temperature = float(training_cfg.get("lk_temperature", 1.0) or 1.0)
+        if not (0.0 < temperature < float("inf")):
+            raise ValueError(
+                "actor_rollout_ref.rollout.drafter.training.lk_temperature must "
+                f"be finite and positive for target_logz capture, got {temperature!r}"
+            )
+        return temperature
 
     def _speco_oldlogprob_hidden_layout(self) -> str:
         drafter_cfg = self._speco_drafter_config()
@@ -5405,23 +5563,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not hidden_rows and not hidden_refs and not chunk_refs:
             raise RuntimeError("SPECO planned collection returned empty hidden payload")
         timing = self._speco_sum_timing_rows(tu.get(output, OLD_LOGPROB_TIMING_KEY))
-        if timing is not None and int(timing.numel()) >= 2:
-            self._speco_last_oldlogprob_select_elapsed_sec = (
-                float(timing[0].item()) / 1_000_000.0
+        from verl_speco.integration.oldlogprob_runtime import decode_oldlogprob_timing
+
+        for name, value in decode_oldlogprob_timing(timing).items():
+            suffix = (
+                ""
+                if name in {"control_bytes", "bulk_host_contexts"}
+                else "_elapsed_sec"
             )
-            self._speco_last_oldlogprob_sp_merge_elapsed_sec = (
-                float(timing[1].item()) / 1_000_000.0
-            )
-            if int(timing.numel()) >= 5:
-                self._speco_last_oldlogprob_concat_elapsed_sec = (
-                    float(timing[2].item()) / 1_000_000.0
-                )
-                self._speco_last_oldlogprob_cpu_copy_elapsed_sec = (
-                    float(timing[3].item()) / 1_000_000.0
-                )
-                self._speco_last_oldlogprob_ray_put_elapsed_sec = (
-                    float(timing[4].item()) / 1_000_000.0
-                )
+            setattr(self, f"_speco_last_oldlogprob_{name}{suffix}", value)
 
         prompts = batch.batch["prompts"]
         responses = batch.batch["responses"]
@@ -5552,7 +5702,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 if hidden is None:
                     skipped_missing_hidden += 1
                     continue
-                hidden = hidden[:valid_rows].contiguous()
+                hidden = detach_student_feature(hidden)[:valid_rows].contiguous()
                 if hidden.numel() == 0:
                     skipped_empty_hidden += 1
                     continue
@@ -5635,7 +5785,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 sample["hidden_states_ref_chunks"] = ref_chunks
             elif hidden_ref is None:
                 hidden = cast(torch.Tensor, hidden)
-                sample["hidden_states"] = hidden.detach().cpu().unsqueeze(0)
+                sample["hidden_states"] = hidden.cpu().unsqueeze(0)
             else:
                 sample["hidden_states_ref"] = hidden_ref
                 sample["hidden_states_ref_meta"] = ref_meta
@@ -5901,7 +6051,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             _get_nested(drafter_cfg, ("speculative_algorithm",), "") or ""
         ).upper()
         if (
-            algorithm == "DSPARK"
+            algorithm in {"DSPARK", "DFLASH"}
             and resolve_drafter_hidden_states_layout(algorithm, training_cfg)
             == "dflash_aux_plus_last"
         ):
@@ -6683,6 +6833,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if isinstance(payload, dict)
             else "unknown"
         )
+        if not self._speco_rollout_idle_worker_enabled():
+            logger.warning(
+                "[actor lm_head export diagnostics] step=%s strategy=%s details=%s",
+                self.global_steps,
+                export_strategy,
+                payload.get(
+                    "export_diagnostics", {"fallback_reason": "worker_metadata_missing"}
+                )
+                if isinstance(payload, dict)
+                else {"fallback_reason": "worker_metadata_missing"},
+            )
         referenced = isinstance(payload, dict) and "target_head_ref" in payload
         if referenced and not self._speco_rollout_idle_worker_enabled():
             raise RuntimeError("Reference head dispatch is restricted to Bubble")
@@ -6744,6 +6905,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
             "timing_s/drafter_sync_target_lm_head_dispatch": dispatch_elapsed,
         }
+        if not self._speco_rollout_idle_worker_enabled():
+            metrics.update(target_lm_head_export_metrics(payload))
         if self._speco_rollout_idle_worker_enabled():
             metrics.update(
                 {
@@ -7246,10 +7409,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_get_published_drafter_weights(self):
         prefetched = getattr(self, "_speco_publish_snapshot_prefetch", None)
-        if prefetched is not None and self._speco_rollout_idle_worker_enabled():
+        if prefetched is not None and (
+            self._speco_rollout_idle_worker_enabled()
+            or prefetched.get("sync_cpu_only", False)
+        ):
             if int(prefetched["source_step"]) != int(self.global_steps):
                 raise RuntimeError(
-                    "Bubble publish snapshot prefetch crossed its source version"
+                    "Publish snapshot prefetch crossed its source version"
                 )
             waited = time.perf_counter()
             published = self._ray_get_if_needed(prefetched["refs"]) or []
@@ -7261,15 +7427,32 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "bubble/publish_snapshot_prefetch_consumed": int(payload is not None),
                 "bubble/publish_snapshot_source_step": int(prefetched["source_step"]),
             }
-            logger.warning(
-                "[BubbleTime] publish_snapshot_prefetch_consumed: source_step=%s "
-                "cached=%s wait_s=%.4f",
-                prefetched["source_step"],
-                payload is not None,
-                self._speco_publish_snapshot_prefetch_metrics[
-                    "timing_s/drafter_publish_snapshot_prefetch_wait"
-                ],
-            )
+            if prefetched.get("sync_cpu_only", False):
+                self._speco_publish_snapshot_prefetch_metrics = {
+                    "drafter/sync_snapshot_prefetch_hit": int(payload is not None),
+                    "timing_s/drafter_sync_snapshot_prefetch_wait": time.perf_counter()
+                    - waited,
+                    "timing_s/drafter_sync_snapshot_prefetch_submit": prefetched[
+                        "submit_sec"
+                    ],
+                    "timing_s/drafter_sync_snapshot_prefetch_window": max(
+                        waited - prefetched["submitted_at"], 0.0
+                    ),
+                }
+                logger.warning(
+                    "[SPECO Sync snapshot prefetch] source_step=%s hit=%s metrics=%s",
+                    prefetched["source_step"],
+                    payload is not None,
+                    self._speco_publish_snapshot_prefetch_metrics,
+                )
+            if not prefetched.get("sync_cpu_only", False):
+                logger.warning(
+                    "[BubbleTime] publish_snapshot_prefetch_consumed: source_step=%s "
+                    "cached=%s wait_s=%.4f",
+                    prefetched["source_step"],
+                    payload is not None,
+                    time.perf_counter() - waited,
+                )
             if payload is not None:
                 return payload
             if getattr(self, "_speco_publish_cached_snapshot_only", False):
@@ -7630,7 +7813,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY, 0),
                 diagnostics.get("reason"),
             )
-        self._speco_last_rollout_metrics = _speco_merge_vllm_spec_decode_stats(
+        stats.update(_speco_phase_timing_stats_from_batch(output))
+        self._speco_last_rollout_metrics = _speco_merge_rollout_stats(
             getattr(self, "_speco_last_rollout_metrics", None),
             stats,
         )
@@ -7640,7 +7824,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self, "global_steps", None
         ):
             return {}
-        return _speco_vllm_spec_decode_metrics_from_stats(
+        return _speco_rollout_metrics_from_stats(
             getattr(self, "_speco_last_rollout_metrics", None) or {}
         )
 
@@ -8261,7 +8445,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     and not skip_collection_for_quota
                 )
                 if collection_allowed:
-                    collected = self._speco_collect_generation_samples(gen_batch_output)
+                    with _rl_insight_trace_state(
+                        "drafter/collect",
+                        state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                        global_step=self.global_steps,
+                    ):
+                        collected = self._speco_collect_generation_samples(
+                            gen_batch_output
+                        )
                     if collected:
                         meta_info = getattr(gen_batch_output, "meta_info", None)
                         if isinstance(meta_info, dict):
@@ -8410,6 +8601,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "speco_oldlogprob_sp_disabled",
                 not bool(_user_seq_parallel),
             )
+            target_logz_temperature = self._speco_oldlogprob_target_logz_temperature()
+            if target_logz_temperature is not None:
+                tu.assign_non_tensor_data(
+                    batch_td,
+                    OLD_LOGPROB_TARGET_LOGZ_TEMPERATURE_KEY,
+                    target_logz_temperature,
+                )
 
             self._speco_last_oldlogprob_prepare_elapsed_sec = (
                 time.perf_counter() - prepare_started
@@ -8553,10 +8751,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 and not self._pending_drafter_publish_refs
                 and self._pending_target_lm_head_sync is None
             )
-            before_actor_event = self._speco_on_before_actor_update(
-                allow_quota_topup=quota_topup_safe,
-                **({"force_quota_completion": True} if final_quota_step else {}),
-            )
+            with _rl_insight_trace_state(
+                "drafter/prepare",
+                state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                global_step=self.global_steps,
+            ):
+                before_actor_event = self._speco_on_before_actor_update(
+                    allow_quota_topup=quota_topup_safe,
+                    **({"force_quota_completion": True} if final_quota_step else {}),
+                )
             training_plan = before_actor_event.training_plan
             if training_plan is None:
                 raise RuntimeError(
@@ -8669,9 +8872,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     training_plan, launch=False, reason="drafter_convergence_frozen"
                 )
             if training_plan.launch:
-                drafter_trained, train_metrics = self._speco_train_drafter(
-                    training_plan
-                )
+                with _rl_insight_trace_state(
+                    "drafter/train",
+                    state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                    global_step=self.global_steps,
+                    strategy=str(
+                        getattr(
+                            training_plan.execution_strategy,
+                            "value",
+                            training_plan.execution_strategy,
+                        )
+                    ),
+                    max_batches=int(training_plan.max_batches),
+                ):
+                    drafter_trained, train_metrics = self._speco_train_drafter(
+                        training_plan
+                    )
             else:
                 drafter_trained, train_metrics = (
                     False,
@@ -8709,9 +8925,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     actor_output=actor_output,
                 )
             else:
-                metrics.update(
-                    self._speco_publish_drafter_weights(drafter_trained, training_plan)
-                )
+                with _rl_insight_trace_state(
+                    "drafter/publish",
+                    state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                    global_step=self.global_steps,
+                    trained=int(bool(drafter_trained)),
+                    deferred=False,
+                ):
+                    metrics.update(
+                        self._speco_publish_drafter_weights(
+                            drafter_trained, training_plan
+                        )
+                    )
             if final_quota_step:
                 metrics.update(
                     self._speco_finalize_quota_publication(
@@ -8923,11 +9148,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                             "[drafter freeze] probe before-arm failed; "
                             "publishing without paired probe (fail-open)"
                         )
-                publish_metrics = self._speco_publish_drafter_weights(
-                    pending_drafter_publish["drafter_trained"],
-                    pending_drafter_publish["training_plan"],
-                    after_weight_update=True,
-                )
+                with _rl_insight_trace_state(
+                    "drafter/publish",
+                    state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                    global_step=self.global_steps,
+                    trained=int(bool(pending_drafter_publish["drafter_trained"])),
+                    deferred=True,
+                ):
+                    publish_metrics = self._speco_publish_drafter_weights(
+                        pending_drafter_publish["drafter_trained"],
+                        pending_drafter_publish["training_plan"],
+                        after_weight_update=True,
+                    )
                 probe = None
                 if run_probe and before_arm is not None:
                     try:
@@ -9183,6 +9415,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ):
             self._save_checkpoint()
 
+    def _speco_save_adaptive_state(self) -> None:
+        """Persist the active controller alongside the completed checkpoint."""
+        scheduler = getattr(self, "_drafter_scheduler", None)
+        controller = getattr(scheduler, "adaptive_controller", None)
+        if controller is not None:
+            root = _get_nested(self.config, ("trainer", "default_local_dir"), None)
+            if root:
+                controller.save(
+                    Path(root)
+                    / f"global_step_{self.global_steps}"
+                    / "adaptive_schedule.json"
+                )
+
     def _save_checkpoint(self):
         if self._speco_checkpoint_pending_quota():
             # Do not serialize orphaned replay pins or silently discard debt on
@@ -9248,6 +9493,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     self._speco_freeze_save_state()
                 with boundary_stage(timings, "upstream_save"):
                     result = super()._save_checkpoint()
+            self._speco_save_adaptive_state()
             self._speco_last_checkpoint_saved_step = self.global_steps
             requested_step = getattr(self, "_speco_deferred_checkpoint_step", None)
             if requested_step is not None:

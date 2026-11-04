@@ -5,12 +5,15 @@
   "gpu-dspark-separate-async": "examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_separate_async_vllm.sh",
   "npu-dspark-colocate-async": "examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_colocate_async_vllm_npu.sh",
   "npu-dspark-separate-async": "examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_separate_async_vllm_npu.sh",
-  "npu-dsv4-flash-dspark-separate": "examples/run_dsv4-flash_drafter_dspark_separate_training.sh",
   "npu-v1-hard-freeze-smoke": "examples/run_qwen3-8b_v1_hard_freeze_smoke_drafter_dspark_vllm_npu.sh",
   "npu-v1-hard-freeze-longrun": "examples/run_qwen3-8b_v1_hard_freeze_longrun_drafter_dspark_vllm_npu.sh",
   "dspark-mrv2": "examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_vllm_npu.sh",
   "gpu-megatron-eagle3": "examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm.sh",
   "megatron-eagle3": "examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh",
+  "npu-adaptive-schedule-dflash": "examples/run_qwen3-4b_adaptive_schedule_drafter_dflash_vllm_npu.sh",
+  "gpu-adaptive-hybrid-lk-dspark": "examples/run_qwen3-8b-adaptive-hybrid-lk_drafter_dspark_vllm.sh",
+  "gpu-dpace-dflash": "examples/run_qwen3-8b-dpace_drafter_dflash_vllm.sh",
+  "gpu-lk-loss-eagle3": "examples/run_qwen3-8b-lk-loss_drafter_eagle3_vllm.sh",
   "gpu-veomni-dspark": "examples/run_qwen3-8b_actor_veomni_drafter_dspark_vllm.sh",
   "veomni-dspark": "examples/run_qwen3-8b_actor_veomni_drafter_dspark_vllm_npu.sh",
   "gpu-sglang-dflash2": "examples/run_qwen3-8b_drafter_dflash2_sglang.sh",
@@ -28,5 +31,6 @@
   "gpu-eagle3": "examples/run_qwen3-8b_drafter_eagle3_vllm.sh",
   "eagle3": "examples/run_qwen3-8b_drafter_eagle3_vllm_npu.sh",
   "gpu-eagle3-offline": "examples/run_qwen3-8b_drafter_separate_training.sh",
+  "gpu-opd-dspark": "examples/run_qwen3-8b_opd_actor_fsdp2_drafter_dspark_vllm.sh",
   "npu-dspark35b-separate": "examples/run_qwen3.6-35b-a3b_drafter_dspark_separate_training.sh"
 }
