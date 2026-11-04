@@ -274,6 +274,54 @@ class SpecoRaySFTRayTrainer(SFTTrainer):
             return type(value)(out) if isinstance(value, tuple) else out
         return value
 
+    @staticmethod
+    def _validate_lm_head_sync_result(sync_result):
+        """校验 lm_head 同步结果，要求所有参与训练的 rank 全部接受。
+
+        排除非训练 rank（disabled/not_in_training_group/not_target_worker），
+        这些 worker 不在训练组中，返回 accepted=False 是预期行为，不应导致
+        同步失败。只校验实际参与训练的 rank 是否全部接受当前 head 版本。
+
+        Args:
+            sync_result: worker 返回的同步结果（list 或 dict）
+
+        Returns:
+            tuple: (synced: bool, info: dict)
+                info 包含 accepted_count, total_count, rejected 列表
+        """
+        NON_TRAINING_REASONS = {
+            "disabled",
+            "not_in_training_group",
+            "not_target_worker",
+        }
+        if isinstance(sync_result, list):
+            training_responses = [
+                r
+                for r in sync_result
+                if r and r.get("reason", "") not in NON_TRAINING_REASONS
+            ]
+            if not training_responses:
+                return False, {
+                    "accepted_count": 0,
+                    "total_count": 0,
+                    "rejected": [],
+                }
+            accepted = [r for r in training_responses if r.get("accepted")]
+            rejected = [r for r in training_responses if not r.get("accepted")]
+            synced = len(accepted) == len(training_responses)
+            return synced, {
+                "accepted_count": len(accepted),
+                "total_count": len(training_responses),
+                "rejected": rejected,
+            }
+        # 单 worker 响应
+        synced = bool(sync_result and sync_result.get("accepted"))
+        return synced, {
+            "accepted_count": 1 if synced else 0,
+            "total_count": 1,
+            "rejected": [] if synced else [sync_result],
+        }
+
     def speco_sync_target_lm_head_weight(self, payload, global_step=None):
         """代理到 SpecoWorker group 的 sync_target_lm_head_weight。"""
         return self._require_speco_worker_group().sync_target_lm_head_weight(
@@ -482,6 +530,8 @@ class SpecoRaySFTRayTrainer(SFTTrainer):
         # 3. 构建 worker_snapshots（每个 rank 的 incarnation/buffer_version/data_version）
         worker_snapshots = {}
         data_versions = []
+        min_sample_steps = []
+        max_sample_steps = []
         for s in available_statuses:
             rank_str = str(s.get("rank", s.get("worker_id", "0")))
             worker_snapshots[rank_str] = {
@@ -493,9 +543,19 @@ class SpecoRaySFTRayTrainer(SFTTrainer):
             dv = s.get("data_version")
             if dv is not None:
                 data_versions.append(int(dv))
+            # 收集各 worker 的样本 step 范围，用于限制同版本采样
+            s_min = s.get("min_sample_step")
+            s_max = s.get("max_sample_step")
+            if s_min is not None:
+                min_sample_steps.append(int(s_min))
+            if s_max is not None:
+                max_sample_steps.append(int(s_max))
 
         # 取所有 worker 的最大 data_version 作为 plan 的 data_version
         plan_data_version = max(data_versions) if data_versions else None
+        # 取全局 min/max sample step，确保 DSpark 重建监督信号时 hidden 与 head 版本一致
+        plan_min_sample_step = min(min_sample_steps) if min_sample_steps else None
+        plan_max_sample_step = max(max_sample_steps) if max_sample_steps else None
 
         # 4. 构建 training plan
         plan_id = uuid4().hex
@@ -510,8 +570,8 @@ class SpecoRaySFTRayTrainer(SFTTrainer):
             "sample_last_n_steps": sample_last_n_steps,
             "data_version": plan_data_version,
             "required_target_version": None,
-            "min_sample_step": None,
-            "max_sample_step": None,
+            "min_sample_step": plan_min_sample_step,
+            "max_sample_step": plan_max_sample_step,
             "plan_id": plan_id,
             "worker_snapshots": worker_snapshots,
             "data_source": "local_buffer",
@@ -1724,35 +1784,25 @@ class SpecoRaySFTRayTrainer(SFTTrainer):
                                 # disabled/not_in_training_group/missing_payload 等场景
                                 # 返回 {"accepted": False, "applied": False} 而不抛异常，
                                 # 必须检查聚合结果避免用旧 head 训练 drafter。
-                                if isinstance(_sync_result, list):
-                                    accepted_ranks = [
-                                        r
-                                        for r in _sync_result
-                                        if r and r.get("accepted")
-                                    ]
-                                    _synced = bool(accepted_ranks)
-                                    if not _synced:
+                                _synced, _sync_info = (
+                                    self._validate_lm_head_sync_result(_sync_result)
+                                )
+                                if not _synced:
+                                    if _sync_info["total_count"] == 0:
                                         logger.error(
-                                            f"[LM-HEAD-SYNC] Step {global_step}: No worker accepted sync. "
+                                            f"[LM-HEAD-SYNC] Step {global_step}: No training ranks responded. "
                                             f"results={_sync_result}. Skipping drafter training."
                                         )
                                     else:
-                                        logger.info(
-                                            f"[LM-HEAD-SYNC] Sync OK: {len(accepted_ranks)}/{len(_sync_result)} workers accepted"
+                                        logger.error(
+                                            f"[LM-HEAD-SYNC] Step {global_step}: "
+                                            f"{_sync_info['accepted_count']}/{_sync_info['total_count']} training ranks accepted. "
+                                            f"rejected={_sync_info['rejected']}. Skipping drafter training."
                                         )
                                 else:
-                                    _synced = bool(
-                                        _sync_result and _sync_result.get("accepted")
+                                    logger.info(
+                                        f"[LM-HEAD-SYNC] Sync OK: all {_sync_info['accepted_count']} training ranks accepted"
                                     )
-                                    if _synced:
-                                        logger.info(
-                                            f"[LM-HEAD-SYNC] Sync OK: {_sync_result}"
-                                        )
-                                    else:
-                                        logger.error(
-                                            f"[LM-HEAD-SYNC] Step {global_step}: Sync rejected: {_sync_result}. "
-                                            f"Skipping drafter training."
-                                        )
                             else:
                                 logger.error(
                                     f"[LM-HEAD-SYNC] Step {global_step}: Export returned None even on rank0 — lm_head sync FAILED. "
@@ -1885,8 +1935,9 @@ class SpecoRaySFTRayTrainer(SFTTrainer):
                 # ==================================
 
                 is_last_step = global_step >= self.total_training_steps
-                is_valid_step = global_step % self.test_freq == 0
-                is_save_step = global_step % self.save_freq == 0
+                # 先检查 freq > 0 再取模，避免 save_freq/test_freq 为 0/-1 时 ZeroDivisionError
+                is_valid_step = self.test_freq > 0 and global_step % self.test_freq == 0
+                is_save_step = self.save_freq > 0 and global_step % self.save_freq == 0
 
                 if (
                     is_last_step

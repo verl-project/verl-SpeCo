@@ -132,8 +132,9 @@ def main(config):
     config.trainer.resume_mode = config.trainer.get("resume_mode") or "disable"
 
     # ========== 保存/测试配置 ==========
-    config.trainer.save_freq = config.trainer.get("save_freq") or 0
-    config.trainer.test_freq = config.trainer.get("test_freq") or 0
+    # 保留上游 -1 默认值：训练循环在 freq > 0 时才取模，-1 表示不启用周期性保存/验证。
+    config.trainer.save_freq = config.trainer.get("save_freq") or -1
+    config.trainer.test_freq = config.trainer.get("test_freq") or -1
     config.trainer.logger = config.trainer.get("logger") or ["console", "wandb"]
     config.trainer.project_name = config.trainer.get("project_name") or "sft_cotrain"
     config.trainer.experiment_name = (

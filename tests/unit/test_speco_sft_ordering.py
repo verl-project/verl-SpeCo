@@ -332,3 +332,80 @@ def test_micro_batch_execution_order_differs_from_original(monkeypatch) -> None:
 def test_sample_indices_key_name_stable() -> None:
     """确保 SAMPLE_INDICES 的 key 名称与 driver stamp 逻辑一致。"""
     assert OLD_LOGPROB_SAMPLE_INDICES_KEY == "speco_oldlogprob_sample_indices"
+
+
+def test_lm_head_sync_all_training_ranks_accepted():
+    """所有参与训练的 rank 都接受时，同步成功。"""
+    from verl_speco.trainer.speco_sft_trainer import SpecoRaySFTRayTrainer
+
+    result = [
+        {"accepted": True, "applied": True},
+        {"accepted": True, "applied": True},
+    ]
+    synced, info = SpecoRaySFTRayTrainer._validate_lm_head_sync_result(result)
+    assert synced is True
+    assert info["accepted_count"] == 2
+    assert info["total_count"] == 2
+
+
+def test_lm_head_sync_partial_acceptance_rejected():
+    """一个 rank 接受、另一个拒绝时，同步失败（不得用混合 head 版本训练）。"""
+    from verl_speco.trainer.speco_sft_trainer import SpecoRaySFTRayTrainer
+
+    result = [
+        {"accepted": True, "applied": True},
+        {"accepted": False, "applied": False, "reason": "missing_payload"},
+    ]
+    synced, info = SpecoRaySFTRayTrainer._validate_lm_head_sync_result(result)
+    assert synced is False
+    assert info["accepted_count"] == 1
+    assert info["total_count"] == 2
+    assert len(info["rejected"]) == 1
+
+
+def test_lm_head_sync_non_training_ranks_excluded():
+    """非训练 rank（disabled/not_in_training_group/not_target_worker）的拒绝
+    不影响同步结果，只校验实际参与训练的 rank。"""
+    from verl_speco.trainer.speco_sft_trainer import SpecoRaySFTRayTrainer
+
+    result = [
+        {"accepted": False, "applied": False, "reason": "disabled"},
+        {"accepted": False, "applied": False, "reason": "not_in_training_group"},
+        {"accepted": False, "applied": False, "reason": "not_target_worker"},
+        {"accepted": True, "applied": True},
+    ]
+    synced, info = SpecoRaySFTRayTrainer._validate_lm_head_sync_result(result)
+    assert synced is True
+    assert info["total_count"] == 1
+    assert info["accepted_count"] == 1
+
+
+def test_lm_head_sync_no_training_ranks_responded():
+    """所有响应都来自非训练 rank 时，同步失败。"""
+    from verl_speco.trainer.speco_sft_trainer import SpecoRaySFTRayTrainer
+
+    result = [
+        {"accepted": False, "applied": False, "reason": "disabled"},
+        {"accepted": False, "applied": False, "reason": "not_in_training_group"},
+    ]
+    synced, info = SpecoRaySFTRayTrainer._validate_lm_head_sync_result(result)
+    assert synced is False
+    assert info["total_count"] == 0
+
+
+def test_lm_head_sync_single_worker_accepted():
+    """单 worker 响应（非 list）且接受时，同步成功。"""
+    from verl_speco.trainer.speco_sft_trainer import SpecoRaySFTRayTrainer
+
+    result = {"accepted": True, "applied": True}
+    synced, info = SpecoRaySFTRayTrainer._validate_lm_head_sync_result(result)
+    assert synced is True
+
+
+def test_lm_head_sync_single_worker_rejected():
+    """单 worker 响应（非 list）且拒绝时，同步失败。"""
+    from verl_speco.trainer.speco_sft_trainer import SpecoRaySFTRayTrainer
+
+    result = {"accepted": False, "applied": False, "reason": "missing_payload"}
+    synced, info = SpecoRaySFTRayTrainer._validate_lm_head_sync_result(result)
+    assert synced is False

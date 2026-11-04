@@ -4909,12 +4909,14 @@ class DrafterBaseTrainer:
         allow_cross_step_hidden = bool(
             self.config.rollout.drafter.training.get("allow_cross_step_hidden", False)
         )
-        # eagle3 的 target_logprobs 在 rollout 时预计算，依赖当时的 actor 权重，
-        # 因此需要同 step 限制以避免 target_vN(hidden_vM) 错位。
-        # DSPARK 的 CE（target_argmax）和 L1 路径都用当前同步的 lm_head 重建监督信号，
-        # sync 模式下 head 始终最新，不存在错位，故不限制。
+        # eagle3 的 target_logprobs 在 rollout 时预计算，依赖当时的 actor 权重；
+        # DSpark 的 CE（target_argmax）和 L1 路径都用当前同步的 lm_head 从 hidden
+        # 重建监督信号。对于 buffer 中更早 step 的 hidden，head_current @ hidden_old
+        # ≠ head_old @ hidden_old，会产生版本不一致的监督信号。因此两者都需要
+        # 同 step 限制（allow_cross_step_hidden=true 时显式放宽）。
+        dspark_uses_last_hidden = self.backend.model_type == "dspark" and not use_logits
         same_step_target_head_required = (
-            self.backend.model_type == "eagle3"
+            (self.backend.model_type == "eagle3" or dspark_uses_last_hidden)
             and not use_logits
             and not getattr(self, "_bubble_time_enabled", False)
             and not allow_cross_step_hidden
@@ -6364,8 +6366,9 @@ class DrafterBaseTrainer:
         allow_cross_step_hidden = bool(
             self.config.rollout.drafter.training.get("allow_cross_step_hidden", False)
         )
+        dspark_uses_last_hidden = self.backend.model_type == "dspark" and not use_logits
         same_step_data_required = (
-            self.backend.model_type == "eagle3"
+            (self.backend.model_type == "eagle3" or dspark_uses_last_hidden)
             and not use_logits
             and not getattr(self, "_bubble_time_enabled", False)
             and not allow_cross_step_hidden
