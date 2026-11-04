@@ -16,10 +16,11 @@ import os
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from itertools import islice
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 from verl_speco.config import prefetch_depth
 from verl_speco.producer.metrics import current_ray_node_id
@@ -42,14 +43,14 @@ from verl_speco.trainer.scheduler import (
     QueueStatus,
     StandaloneQueueState,
 )
+from verl_speco.trainer.standalone_retry import retry_io
+from verl_speco.trainer.standalone_sample_cleanup import cleanup_standalone_samples
 from verl_speco.trainer.standalone_tracking import (
     _build_standalone_tracking,
     _finish_standalone_tracking,
     _log_producer_tracking_metrics,
     _log_standalone_tracking_metrics,
 )
-from verl_speco.trainer.tq_retry import retry_io
-from verl_speco.trainer.standalone_sample_cleanup import cleanup_standalone_samples
 
 logger = logging.getLogger(__name__)
 _SCHEDULER_INFO_INTERVAL_STEPS = 50
@@ -546,12 +547,8 @@ class StandaloneRayTrainer:
         consumer_wg = self.consumer_wg
         from queue import Empty
 
-        from verl_speco.trainer.tq_feature_store import (
-            ReferenceFeatureStore,
-            ReadyEntry,
-            TQFeatureStore,
-        )
-        from verl_speco.trainer.tq_sample_source import build_assignments
+        from verl_speco.trainer.reference_feature_store import ReferenceFeatureStore
+        from verl_speco.trainer.standalone_data import ReadyEntry, build_assignments
 
         assert self.commands_queue is not None and self.events_queue is not None
         config = self._queue_config()
@@ -563,17 +560,26 @@ class StandaloneRayTrainer:
         if hidden_references:
             source_cfg = {
                 **tq_cfg,
+                "reference_lifetime": (
+                    "persistent"
+                    if self.consumer_config.speco.draft_training.get(
+                        "data_source", "online"
+                    )
+                    == "saved_hidden"
+                    else "temporary"
+                ),
                 "hidden_states_store": (
                     training_cfg.get("target_feature_replay") or {}
                 ).get("hidden_states_store"),
             }
-        store = (
-            self.feature_store_factory(source_cfg)
-            if self.feature_store_factory is not None
-            else (
-                ReferenceFeatureStore if hidden_references else TQFeatureStore
-            ).from_config(source_cfg)
-        )
+        if self.feature_store_factory is not None:
+            store = self.feature_store_factory(source_cfg)
+        elif hidden_references:
+            store = ReferenceFeatureStore.from_config(source_cfg)
+        else:
+            from verl_speco.trainer.tq_feature_store import TQFeatureStore
+
+            store = TQFeatureStore.from_config(source_cfg)
         store.connect()
         scheduler = DrafterScheduler()
         depth = prefetch_depth(tq_cfg)
@@ -1119,6 +1125,9 @@ def run_ray_pipeline(
 ) -> int:
     """Keep service ownership local while Ray executes Producer and Consumer."""
 
+    if getattr(commands, "data_source", "online") == "saved_hidden":
+        # Persistent files need neither a vLLM service nor a hidden transfer store.
+        return run_ray_actors(commands, ray_module=ray_module)
     base_env = dict(os.environ if environ is None else environ)
     base_env["RAY_ADDRESS"] = ray_address
     # Mirror the subprocess path: fail fast when the selected TQ transport or

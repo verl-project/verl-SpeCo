@@ -26,20 +26,19 @@ import importlib
 import json
 import logging
 import os
+import socket
+import subprocess
+import sys
+import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-import socket
-import subprocess
-import sys
-import tempfile
-import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
-import uuid
 
 from omegaconf import OmegaConf
 
@@ -50,10 +49,13 @@ from verl_speco.draft_train_launcher import (
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
-from verl_speco.producer.hidden_states_store import _local_ip
+from verl_speco.producer.hidden_states_store import (
+    _local_ip,
+    bind_raw_hidden_contract,
+    load_raw_hidden_manifest,
+)
 from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.trainer.standalone_resume import load_standalone_resume
-
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +113,8 @@ _TQ_PREFIX = "actor_rollout_ref.rollout.drafter.training.transfer_queue"
 _FEATURE_STORE_PREFIX = "actor_rollout_ref.rollout.drafter.training.feature_store"
 _PRODUCER_PREFIX = "speco.standalone_tq_producer"
 _RUNTIME_BACKEND_KEY = "speco.draft_training.runtime_backend"
+_DATA_TRANSPORT_KEY = "speco.draft_training.data_transport"
+_DATA_SOURCE_KEY = "speco.draft_training.data_source"
 # Every user override under this prefix is forwarded to the Producer, except the
 # fields the unified launcher computes and sets itself (paths, identities,
 # endpoints, and the sample budget). Forwarding the whole prefix keeps newly
@@ -156,6 +160,7 @@ _INTERNAL_OVERRIDE_KEYS = frozenset(
         f"{_TQ_PREFIX}.expected_feature.hidden_states_layout",
         f"{_TQ_PREFIX}.expected_feature.hidden_dtype",
         _RUNTIME_BACKEND_KEY,
+        _DATA_TRANSPORT_KEY,
     }
 )
 
@@ -184,6 +189,8 @@ class PipelineConfig:
     vllm_aux_hidden_state_layer_ids: tuple[int, ...]
     vllm_endpoints: tuple[str, ...]
     run_id: str
+    data_source: str = "online"
+    saved_hidden_contract: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -191,10 +198,9 @@ class PipelineCommands:
     vllm: list[str] | None
     vllm_endpoints: tuple[str, ...]
     owner: list[str]
-    producer: list[str]
-    consumer: list[str]
     producer_overrides: tuple[str, ...]
     consumer_overrides: tuple[str, ...]
+    data_source: str = "online"
 
 
 @dataclass(frozen=True)
@@ -472,8 +478,40 @@ def resolve_pipeline_config(
     ).upper()
     if not algorithm:
         raise ValueError(f"{_ALGORITHM_KEY} must not be empty")
-    vllm_aux_layer_ids, target_layer_ids = _resolve_layer_ids(training_args, algorithm)
-    endpoints = _parse_vllm_endpoints(env)
+    data_source = _strip_quotes(
+        _find_override(training_args, _DATA_SOURCE_KEY, normalize_key=True) or "online"
+    )
+    if data_source not in {"online", "saved_hidden"}:
+        raise ValueError(f"{_DATA_SOURCE_KEY} must be online or saved_hidden")
+    layer_args = list(training_args)
+    saved_hidden_contract = None
+    if data_source == "saved_hidden":
+        if not Path(input_path).is_dir():
+            raise ValueError(
+                "saved_hidden requires data.train_files to be a dataset directory"
+            )
+        rows = load_raw_hidden_manifest(input_path)
+        if not rows:
+            raise ValueError("Saved hidden dataset contains no committed samples")
+        contract = rows[0]["feature_contract"]
+        saved_hidden_contract = dict(contract)
+        if any(row["feature_contract"] != contract for row in rows):
+            raise ValueError("Saved hidden dataset contains mixed feature contracts")
+        layer_keys = (
+            _PRODUCER_TARGET_LAYER_IDS_KEY,
+            _PRODUCER_VLLM_AUX_LAYER_IDS_KEY,
+            _ALGORITHM_TARGET_LAYER_IDS_KEYS.get(algorithm, ""),
+        )
+        if not any(
+            _find_override(training_args, key, normalize_key=True) is not None
+            for key in layer_keys
+        ):
+            layer_args.append(
+                f"{_PRODUCER_VLLM_AUX_LAYER_IDS_KEY}="
+                + _hydra_list(contract["vllm_aux_hidden_state_layer_ids"])
+            )
+    vllm_aux_layer_ids, target_layer_ids = _resolve_layer_ids(layer_args, algorithm)
+    endpoints = () if data_source == "saved_hidden" else _parse_vllm_endpoints(env)
     return PipelineConfig(
         input_path=input_path,
         model_path=model_path,
@@ -483,6 +521,8 @@ def resolve_pipeline_config(
         vllm_aux_hidden_state_layer_ids=vllm_aux_layer_ids,
         vllm_endpoints=endpoints,
         run_id=f"{algorithm.lower()}-{uuid.uuid4().hex}",
+        data_source=data_source,
+        saved_hidden_contract=saved_hidden_contract,
     )
 
 
@@ -528,7 +568,9 @@ def _validate_runtime_backend_topology(
     """Reject multi-node Ray jobs until external-cluster ownership is supported."""
 
     if runtime_backend != "ray":
-        return
+        raise ValueError(
+            "Standalone subprocess training was removed; runtime_backend must be ray"
+        )
     nnodes = _positive_int_override(training_args, _NNODES_KEYS, default=1)
     if nnodes != 1:
         raise ValueError(
@@ -820,10 +862,45 @@ def build_pipeline_commands(
     """Build the internal commands without exposing transport options.
 
     ``env`` selects the TQ storage backend (defaults to ``os.environ``); pass
-    the same mapping to :func:`run_pipeline` so backend selection and master
+    the same mapping to ``run_ray_pipeline`` so backend selection and master
     validation read one source.
     """
     backend_env = os.environ if env is None else env
+    if config.data_source == "saved_hidden":
+        if config.algorithm not in {"DSPARK", "DFLASH", "EAGLE3"}:
+            raise ValueError(
+                "saved_hidden supports DSPARK, DFLASH and EAGLE3 reference training"
+            )
+        use_logits = (
+            _find_override(
+                training_args,
+                "actor_rollout_ref.rollout.drafter.training.use_logits",
+                normalize_key=True,
+            )
+            or "false"
+        )
+        if _strip_quotes(use_logits).lower() not in {"false", "0"}:
+            raise ValueError(
+                "saved_hidden reference training does not support use_logits=true"
+            )
+        accumulation = (
+            _find_override(
+                training_args,
+                "actor_rollout_ref.rollout.drafter.training.gradient_accumulation_steps",
+                normalize_key=True,
+            )
+            or "1"
+        )
+        if int(_strip_quotes(accumulation)) != 1:
+            raise ValueError(
+                "saved_hidden reference training requires gradient_accumulation_steps=1"
+            )
+        # Ambient Mooncake/TQ settings must not initialize transports for disk input.
+        backend_env = {
+            **backend_env,
+            "SPECO_VLLM_HIDDEN_STATES_STORE": "file",
+            "SPECO_TQ_STORAGE_BACKEND": "SimpleStorage",
+        }
 
     drafter_path = _strip_quotes(_find_override(training_args, _DRAFTER_PATH_KEY) or "")
     _, resume_metadata = load_standalone_resume(
@@ -844,49 +921,51 @@ def build_pipeline_commands(
         f"{_TQ_PREFIX}.drop_last=true",
         *_tq_backend_overrides(backend_env),
     ]
-    parsed_endpoint = urlparse(config.vllm_endpoints[0])
-    vllm_port = parsed_endpoint.port or (
-        443 if parsed_endpoint.scheme == "https" else 80
-    )
-    # extract_hidden_states uses the model's layer-output convention. Qwen3-4B/8B
-    # have 36 transformer layers; the default DSpark auxiliary selection ends at
-    # 33 and requests the final layer output as 36.
-    final_layer_id = _target_final_layer_id(
-        config.model_path, config.vllm_aux_hidden_state_layer_ids
-    )
-    capture_layer_ids = _vllm_capture_layer_ids(
-        config.vllm_aux_hidden_state_layer_ids, final_layer_id
-    )
-    speculative_config = {
-        "method": "extract_hidden_states",
-        "num_speculative_tokens": 1,
-        "draft_model_config": {
-            "hf_config": {"eagle_aux_hidden_state_layer_ids": capture_layer_ids}
-        },
-    }
-    kv_transfer_config = _vllm_kv_transfer_config(backend_env)
     vllm = None
-    if len(config.vllm_endpoints) == 1 and parsed_endpoint.hostname in {
-        "127.0.0.1",
-        "localhost",
-        "0.0.0.0",
-    }:
-        vllm = [
-            "vllm",
-            "serve",
-            config.model_path,
-            "--host",
+    if config.data_source == "online":
+        parsed_endpoint = urlparse(config.vllm_endpoints[0])
+        vllm_port = parsed_endpoint.port or (
+            443 if parsed_endpoint.scheme == "https" else 80
+        )
+        # extract_hidden_states uses the model's layer-output convention. Qwen3-4B/8B
+        # have 36 transformer layers; the default DSpark auxiliary selection ends at
+        # 33 and requests the final layer output as 36.
+        final_layer_id = _target_final_layer_id(
+            config.model_path, config.vllm_aux_hidden_state_layer_ids
+        )
+        capture_layer_ids = _vllm_capture_layer_ids(
+            config.vllm_aux_hidden_state_layer_ids, final_layer_id
+        )
+        speculative_config = {
+            "method": "extract_hidden_states",
+            "num_speculative_tokens": 1,
+            "draft_model_config": {
+                "hf_config": {"eagle_aux_hidden_state_layer_ids": capture_layer_ids}
+            },
+        }
+        kv_transfer_config = _vllm_kv_transfer_config(backend_env)
+        vllm = None
+        if len(config.vllm_endpoints) == 1 and parsed_endpoint.hostname in {
             "127.0.0.1",
-            "--port",
-            str(vllm_port),
-            "--gpu-memory-utilization",
-            _DEFAULT_VLLM_GPU_MEMORY_UTILIZATION,
-            "--speculative-config",
-            json.dumps(speculative_config, separators=(",", ":")),
-            "--kv-transfer-config",
-            json.dumps(kv_transfer_config, separators=(",", ":")),
-            "--no-enable-chunked-prefill",
-        ]
+            "localhost",
+            "0.0.0.0",
+        }:
+            vllm = [
+                "vllm",
+                "serve",
+                config.model_path,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(vllm_port),
+                "--gpu-memory-utilization",
+                _DEFAULT_VLLM_GPU_MEMORY_UTILIZATION,
+                "--speculative-config",
+                json.dumps(speculative_config, separators=(",", ":")),
+                "--kv-transfer-config",
+                json.dumps(kv_transfer_config, separators=(",", ":")),
+                "--no-enable-chunked-prefill",
+            ]
     owner = [
         python_executable,
         "-m",
@@ -909,6 +988,7 @@ def build_pipeline_commands(
             )
         producer_tuning_overrides.append(item)
     producer_overrides = [
+        f"{_DATA_SOURCE_KEY}={config.data_source}",
         f"{_ALGORITHM_KEY}={config.algorithm}",
         "actor_rollout_ref.rollout.drafter.training.dflash_block_size="
         + (
@@ -962,10 +1042,24 @@ def build_pipeline_commands(
         f"{_FEATURE_STORE_PREFIX}.repeat=false",
         *tq_overrides,
     ]
-    hidden_references = (
-        _strip_quotes(_find_override(training_args, _RUNTIME_BACKEND_KEY) or "ray")
-        == "ray"
+    runtime_backend = _strip_quotes(
+        _find_override(training_args, _RUNTIME_BACKEND_KEY) or "ray"
     )
+    _validate_runtime_backend_topology(runtime_backend, training_args)
+    data_transport = _strip_quotes(
+        _find_override(training_args, _DATA_TRANSPORT_KEY) or "ray_reference"
+    )
+    if data_transport not in {"ray_reference", "tq"}:
+        raise ValueError(f"{_DATA_TRANSPORT_KEY} must be ray_reference or tq")
+    if config.data_source == "saved_hidden" and data_transport != "ray_reference":
+        raise ValueError("saved_hidden requires data_transport=ray_reference")
+    hidden_references = data_transport == "ray_reference"
+    consumer_internal.append(f"{_DATA_SOURCE_KEY}={config.data_source}")
+    consumer_internal.append(f"{_DATA_TRANSPORT_KEY}={data_transport}")
+    producer_overrides.append(f"{_DATA_TRANSPORT_KEY}={data_transport}")
+    if not hidden_references:
+        producer_overrides.append(f"{_FEATURE_STORE_PREFIX}.type=tq")
+        consumer_internal.append(f"{_TQ_PREFIX}.expected_feature.payload_kind=null")
     if hidden_references:
         consumer_internal.extend(
             item.replace(
@@ -1041,6 +1135,53 @@ def build_pipeline_commands(
             "ce_target_source": ce_target_source,
         },
     )
+    if config.data_source == "saved_hidden":
+        hidden_dtype = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}.get(
+            hidden_dtype.removeprefix("torch."), hidden_dtype.removeprefix("torch.")
+        )
+        producer_overrides.extend(
+            [
+                f"{_PRODUCER_PREFIX}.hidden_dtype={hidden_dtype}",
+                f"{_PRODUCER_PREFIX}.hidden_states_store.backend=file",
+            ]
+        )
+        consumer_internal.append(
+            "actor_rollout_ref.rollout.drafter.training.target_feature_replay.hidden_states_store.backend=file"
+        )
+        contract = config.saved_hidden_contract
+        if contract is None:
+            # Support callers constructing PipelineConfig directly.
+            rows = load_raw_hidden_manifest(config.input_path)
+            if not rows:
+                raise ValueError("Saved hidden dataset contains no committed samples")
+            contract = rows[0]["feature_contract"]
+            if any(row["feature_contract"] != contract for row in rows):
+                raise ValueError(
+                    "Saved hidden dataset contains mixed feature contracts"
+                )
+        expected = {
+            "algorithm": config.algorithm,
+            "target_model_id": config.model_path,
+            "target_model_revision": _stable_path_identity("target", config.model_path),
+            "tokenizer_fingerprint": _stable_path_identity(
+                "tokenizer", config.tokenizer_path
+            ),
+            "target_layer_ids": list(config.target_layer_ids),
+            "vllm_aux_hidden_state_layer_ids": list(
+                config.vllm_aux_hidden_state_layer_ids
+            ),
+            "hidden_states_layout": hidden_layout,
+            "dtype": "torch." + hidden_dtype.removeprefix("torch."),
+            "require_full_alignment": True,
+            "use_logits": False,
+        }
+        bind_raw_hidden_contract(contract, expected)
+        if Path(config.model_path, "config.json").is_file():
+            depth = _target_final_layer_id(
+                config.model_path, config.vllm_aux_hidden_state_layer_ids
+            )
+            if contract.get("target_num_hidden_layers") != depth:
+                raise ValueError("Saved hidden target model depth mismatch")
     consumer_internal.extend(
         [
             f"{_TQ_PREFIX}.expected_feature.algorithm={config.algorithm}",
@@ -1056,14 +1197,25 @@ def build_pipeline_commands(
             f"{_TQ_PREFIX}.expected_feature.hidden_dtype={hidden_dtype}",
         ]
     )
+    if config.data_source == "saved_hidden" and config.algorithm in {
+        "DSPARK",
+        "DFLASH",
+    }:
+        count_key = f"actor_rollout_ref.rollout.drafter.training.{config.algorithm.lower()}_num_target_layers"
+        explicit_count = _find_override(training_args, count_key, normalize_key=True)
+        if explicit_count is not None and int(_strip_quotes(explicit_count)) != len(
+            config.target_layer_ids
+        ):
+            raise ValueError(
+                "Saved hidden auxiliary count differs from training num_target_layers"
+            )
+        consumer_internal.append(f"{count_key}={len(config.target_layer_ids)}")
     algorithm_layer_ids_key = _ALGORITHM_TARGET_LAYER_IDS_KEYS.get(config.algorithm)
     if algorithm_layer_ids_key is not None:
         consumer_internal.append(
             f"{algorithm_layer_ids_key}={_hydra_list(config.target_layer_ids)}"
         )
-    # The subprocess path normally passes through draft_train_launcher, which
-    # removes user-facing aliases such as num_gpus_per_node before Hydra sees
-    # them. Ray composes Hydra directly, so apply the exact same normalization.
+    # Ray composes Hydra directly; normalize user-facing aliases before composition.
     launch_config = resolve_launch_config(list(training_args))
     normalized_training_args = normalize_training_args(
         list(training_args), launch_config
@@ -1071,26 +1223,13 @@ def build_pipeline_commands(
     consumer_overrides = _replace_internal_overrides(
         normalized_training_args, consumer_internal
     )
-    producer = [
-        python_executable,
-        "-m",
-        "verl_speco.standalone_tq_producer",
-        *producer_overrides,
-    ]
-    consumer = [
-        python_executable,
-        "-m",
-        "verl_speco.draft_train_launcher",
-        *consumer_overrides,
-    ]
     return PipelineCommands(
         vllm=vllm,
         vllm_endpoints=config.vllm_endpoints,
         owner=owner,
-        producer=producer,
-        consumer=consumer,
         producer_overrides=tuple(producer_overrides),
         consumer_overrides=tuple(consumer_overrides),
+        data_source=config.data_source,
     )
 
 
@@ -1154,117 +1293,6 @@ def _stop_process(process: subprocess.Popen[Any] | None) -> None:
         process.wait()
 
 
-def run_pipeline(
-    commands: PipelineCommands,
-    *,
-    ray_address: str,
-    environ: Mapping[str, str] | None = None,
-    popen: Callable[..., subprocess.Popen[Any]] = subprocess.Popen,
-    poll_interval_seconds: float = 0.2,
-    owner_ready_timeout_seconds: float = 120,
-    vllm_ready_timeout_seconds: float = 900,
-    endpoint_ready: Callable[[str], bool] = _vllm_is_ready,
-) -> int:
-    """Run the internal processes and return the training Consumer status."""
-
-    base_env = dict(os.environ if environ is None else environ)
-    # Ray itself also reads RAY_ADDRESS.  Pin every child (including the
-    # torchrun ranks created by the Consumer launcher) to the control plane
-    # created above instead of allowing a stale inherited value to win.
-    base_env["RAY_ADDRESS"] = ray_address
-    validate_tq_backend(base_env)
-    validate_hidden_states_store(base_env)
-    owner: subprocess.Popen[Any] | None = None
-    producer: subprocess.Popen[Any] | None = None
-    consumer: subprocess.Popen[Any] | None = None
-    vllm: subprocess.Popen[Any] | None = None
-    hidden_states_temp: tempfile.TemporaryDirectory[str] | None = None
-    try:
-        with tempfile.TemporaryDirectory(prefix="speco-tq-launch-") as temp_dir:
-            ready_file = Path(temp_dir) / "owner.ready"
-            hidden_states_temp = tempfile.TemporaryDirectory(
-                prefix="speco-vllm-hidden-states-"
-            )
-            hidden_states_dir = Path(hidden_states_temp.name)
-            unavailable_endpoints = [
-                endpoint
-                for endpoint in commands.vllm_endpoints
-                if not endpoint_ready(endpoint)
-            ]
-            if unavailable_endpoints:
-                if commands.vllm is None:
-                    raise RuntimeError(
-                        "The configured hidden-state vLLM endpoints are unavailable: "
-                        + ", ".join(unavailable_endpoints)
-                    )
-                config_endpoint = commands.vllm_endpoints[0]
-                vllm_command = [
-                    part.replace(_VLLM_HIDDEN_STATES_DIR, str(hidden_states_dir))
-                    for part in commands.vllm
-                ]
-                logger.info("Starting hidden-state vLLM at %s", config_endpoint)
-                vllm = popen(vllm_command, env=base_env)
-            owner_env = {**base_env, "SPECO_TQ_OWNER_READY_FILE": str(ready_file)}
-            logger.info("Starting TransferQueue owner")
-            owner = popen(commands.owner, env=owner_env)
-            _wait_for_owner_ready(
-                owner,
-                ready_file,
-                timeout_seconds=owner_ready_timeout_seconds,
-            )
-            if vllm is not None:
-                _wait_for_vllm_ready(
-                    vllm,
-                    config_endpoint,
-                    timeout_seconds=vllm_ready_timeout_seconds,
-                    endpoint_ready=endpoint_ready,
-                )
-            else:
-                unavailable_endpoints = [
-                    endpoint
-                    for endpoint in commands.vllm_endpoints
-                    if not endpoint_ready(endpoint)
-                ]
-                if unavailable_endpoints:
-                    raise RuntimeError(
-                        "hidden-state vLLM became unavailable at: "
-                        + ", ".join(unavailable_endpoints)
-                    )
-            logger.info("Starting standalone DSpark Consumer")
-            consumer = popen(commands.consumer, env=base_env)
-            logger.info("Starting standalone vLLM Producer")
-            producer = popen(commands.producer, env=base_env)
-
-            while True:
-                owner_status = owner.poll()
-                vllm_status = None if vllm is None else vllm.poll()
-                producer_status = producer.poll()
-                consumer_status = consumer.poll()
-                if owner_status is not None:
-                    raise RuntimeError(
-                        f"TransferQueue owner exited during training ({owner_status})"
-                    )
-                if producer_status is not None and producer_status != 0:
-                    return int(producer_status)
-                if vllm_status is not None:
-                    raise RuntimeError(
-                        f"hidden-state vLLM exited during training ({vllm_status})"
-                    )
-                if consumer_status is not None:
-                    return int(consumer_status)
-                time.sleep(poll_interval_seconds)
-    except KeyboardInterrupt:
-        logger.warning("Standalone DSpark training interrupted")
-        return 130
-    finally:
-        _stop_process(producer)
-        _stop_process(consumer)
-        _stop_process(owner)
-        _stop_process(vllm)
-        if hidden_states_temp is not None:
-            hidden_states_temp.cleanup()
-
-
 def _format_command(command: Sequence[str]) -> str:
     import shlex
 
@@ -1291,7 +1319,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--python-executable", default=sys.executable)
     parser.add_argument(
         "--runtime-backend",
-        choices=("subprocess", "ray"),
+        choices=("ray",),
         default=None,
         help="Override speco.draft_training.runtime_backend.",
     )
@@ -1303,8 +1331,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             _find_override(training_args, _RUNTIME_BACKEND_KEY) or "ray"
         ).lower()
     )
-    if runtime_backend not in {"subprocess", "ray"}:
-        parser.error(f"{_RUNTIME_BACKEND_KEY} must be either subprocess or ray")
+    if runtime_backend != "ray":
+        parser.error(
+            "Standalone subprocess training was removed; runtime_backend must be ray"
+        )
     # Keep command composition consistent with the explicit CLI backend too.
     training_args = [*training_args, f"{_RUNTIME_BACKEND_KEY}={runtime_backend}"]
 
@@ -1318,14 +1348,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ray_address="127.0.0.1:6379",
                 python_executable=args.python_executable,
             )
+            if config.data_source == "saved_hidden":
+                print(f"saved hidden directory: {config.input_path}")
             printable_commands = [
                 ("vllm", commands.vllm),
                 ("owner", commands.owner),
-                ("producer", commands.producer),
-                ("consumer", commands.consumer),
             ]
             for role, command in printable_commands:
                 if role == "owner" and not command:
+                    continue
+                if command is None and config.data_source == "saved_hidden":
                     continue
                 if command is None:
                     print(
@@ -1334,8 +1366,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     continue
                 print(f"{role}: {_format_command(command)}")
+            print("producer: Ray actor (StandaloneProducerActor)")
+            print("producer overrides: " + _format_command(commands.producer_overrides))
+            print("consumer: Ray WorkerGroup (StandaloneDrafterWorker)")
+            print("consumer overrides: " + _format_command(commands.consumer_overrides))
             return 0
-        _preflight_input_file(config.input_path)
+        if config.data_source == "online":
+            _preflight_input_file(config.input_path)
         ray_session = start_ray_session()
         try:
             commands = build_pipeline_commands(
@@ -1345,15 +1382,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 python_executable=args.python_executable,
             )
             logger.info("Using task-local Ray control plane at %s", ray_session.address)
-            if runtime_backend == "ray":
-                from verl_speco.standalone_ray_runtime import run_ray_pipeline
+            from verl_speco.standalone_ray_runtime import run_ray_pipeline
 
-                return run_ray_pipeline(
-                    commands,
-                    ray_module=ray_session.module,
-                    ray_address=ray_session.address,
-                )
-            return run_pipeline(commands, ray_address=ray_session.address)
+            return run_ray_pipeline(
+                commands,
+                ray_module=ray_session.module,
+                ray_address=ray_session.address,
+            )
         finally:
             ray_session.close()
     except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
@@ -1372,6 +1407,5 @@ __all__ = [
     "build_pipeline_commands",
     "main",
     "resolve_pipeline_config",
-    "run_pipeline",
     "start_ray_session",
 ]

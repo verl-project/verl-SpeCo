@@ -11,21 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Reconstruct standalone draft-training features from compact token samples."""
+"""Shared hidden-feature conversion and vLLM-only offline feature generation."""
 
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import logging
 import os
 import tempfile
 import threading
 import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, cast
+from typing import Any
 
 import torch
 from torch import nn
@@ -132,19 +132,6 @@ def _parse_dtype(value: Any) -> torch.dtype:
     return dtypes[normalized]
 
 
-def _tensor_from_module_output(value: Any) -> torch.Tensor:
-    if torch.is_tensor(value):
-        return cast(torch.Tensor, value)
-    if isinstance(value, (tuple, list)) and value and torch.is_tensor(value[0]):
-        return cast(torch.Tensor, value[0])
-    last_hidden_state = getattr(value, "last_hidden_state", None)
-    if torch.is_tensor(last_hidden_state):
-        return cast(torch.Tensor, last_hidden_state)
-    raise TypeError(
-        f"Target feature replay expected tensor-like module output, got {type(value)!r}"
-    )
-
-
 def _get_module_by_path(root: Any, path: str) -> Any:
     current = root
     for part in path.split("."):
@@ -195,20 +182,6 @@ def _find_layers_and_final_norm(model: nn.Module) -> tuple[list[nn.Module], nn.M
     raise RuntimeError(
         "Target feature replay could not find transformer layers and final norm"
     )
-
-
-def _hidden_capture_target(layer_id: int, num_layers: int) -> tuple[str, int | None]:
-    hidden_state_index = (
-        int(layer_id) + 1 if int(layer_id) >= 0 else num_layers + 1 + int(layer_id)
-    )
-    if hidden_state_index <= 0 or hidden_state_index > num_layers:
-        raise IndexError(
-            f"Target replay layer id {layer_id} resolved to hidden-state index "
-            f"{hidden_state_index}, but the model has {num_layers} layers"
-        )
-    if hidden_state_index == num_layers:
-        return "final", None
-    return "layer", hidden_state_index - 1
 
 
 def load_vllm_final_norm(
@@ -644,7 +617,7 @@ def feature_from_vllm_payload(
 
 
 class TargetFeatureReplayer:
-    """Materialize target hidden states only for standalone token replay."""
+    """Generate persistent offline features through vLLM; never used by training."""
 
     def __init__(
         self,
@@ -663,14 +636,14 @@ class TargetFeatureReplayer:
         self.training_cfg = self.drafter_cfg.training
         self.replay_cfg = self.training_cfg.get("target_feature_replay", {}) or {}
         self.backend = (
-            str(_config_value(self.replay_cfg, "backend", "torch") or "torch")
+            str(_config_value(self.replay_cfg, "backend", "vllm_file") or "vllm_file")
             .strip()
             .lower()
         )
-        if self.backend not in {"torch", "vllm_file"}:
+        if self.backend != "vllm_file":
             raise ValueError(
                 f"Unsupported target_feature_replay.backend={self.backend!r}; "
-                "expected 'torch' or 'vllm_file'"
+                "only vllm_file offline feature generation is supported"
             )
         configured_model_path = _config_value(self.replay_cfg, "model_path", None)
         model_path = configured_model_path or self.draft_config.model.path
@@ -697,9 +670,6 @@ class TargetFeatureReplayer:
             )
         self.use_logits = bool(self.training_cfg.get("use_logits", False))
         self.logits_topk = int(self.training_cfg.get("logits_topk", 128) or 128)
-        self.logits_chunk_rows = max(
-            int(_config_value(self.replay_cfg, "logits_chunk_rows", 32) or 32), 1
-        )
         self.vllm_endpoints = _normalize_vllm_endpoints(self.replay_cfg)
         self.vllm_endpoint = self.vllm_endpoints[0]
         self.vllm_hidden_states_store: HiddenStatesStore = build_hidden_states_store(
@@ -790,11 +760,6 @@ class TargetFeatureReplayer:
                 world_size=self.world_size,
             )
 
-        self.model: nn.Module | None = None
-        self.layers: list[nn.Module] = []
-        self.final_norm: nn.Module | None = None
-        self.backbone: nn.Module | None = None
-        self.output_embedding: nn.Module | None = None
         self.vllm_client: Any | None = None
         self.vllm_resolved_model: str | None = None
         self._vllm_endpoint_states = [
@@ -808,7 +773,6 @@ class TargetFeatureReplayer:
         self.cache_hits = 0
         self.cache_misses = 0
         self.materialized_samples = 0
-        self.target_forward_seconds = 0.0
         self.vllm_request_seconds = 0.0
         self.vllm_requests = 0
         self._warned_replay_algorithm_mismatch = False
@@ -962,179 +926,8 @@ class TargetFeatureReplayer:
             digest.update(contiguous.numpy().tobytes())
         return digest.hexdigest()
 
-    def _ensure_model(self) -> None:
-        if self.model is not None:
-            return
-        from transformers import AutoModelForCausalLM
-
-        logger.warning(
-            "Loading frozen target model for standalone token replay: path=%s dtype=%s device=%s",
-            self.model_path,
-            self.dtype,
-            self.device,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            self.model_path,
-            torch_dtype=self.dtype,
-            trust_remote_code=self.trust_remote_code,
-            low_cpu_mem_usage=True,
-        )
-        model.eval()
-        model.requires_grad_(False)
-        model.to(self.device)
-        self.layers, self.final_norm = _find_layers_and_final_norm(model)
-        base_model_prefix = str(getattr(model, "base_model_prefix", "") or "")
-        backbone = (
-            getattr(model, base_model_prefix, None) if base_model_prefix else None
-        )
-        self.backbone = backbone if isinstance(backbone, nn.Module) else model
-        output_embedding = model.get_output_embeddings()
-        self.output_embedding = (
-            output_embedding if isinstance(output_embedding, nn.Module) else None
-        )
-        self.model = model
-
     def _materialize_one(self, sample: DraftReplaySample) -> DraftFeatureSample:
-        if self.backend == "vllm_file":
-            return self._materialize_one_vllm_file(sample)
-        return self._materialize_one_torch(sample)
-
-    def _materialize_one_torch(self, sample: DraftReplaySample) -> DraftFeatureSample:
-        self._ensure_model()
-        assert self.backbone is not None
-        assert self.final_norm is not None
-
-        feature_positions = sample.feature_positions.detach().cpu().long()
-        feature_end = int(feature_positions[-1].item()) + 1
-        input_ids = sample.input_ids[:feature_end].to(
-            self.device, dtype=torch.long, non_blocking=True
-        )
-        attention_mask = sample.attention_mask[:feature_end].to(
-            self.device, dtype=torch.long, non_blocking=True
-        )
-        position_ids = sample.position_ids[:feature_end].to(
-            self.device, dtype=torch.long, non_blocking=True
-        )
-        captures: dict[str, torch.Tensor] = {}
-        handles = []
-
-        def capture(key: str):
-            def hook(_module, _inputs, output):
-                captures[key] = _tensor_from_module_output(output)
-
-            return hook
-
-        aux_keys: list[str] = []
-        modules: dict[str, nn.Module] = {}
-        for layer_id in self.target_layer_ids:
-            kind, layer_index = _hidden_capture_target(
-                layer_id, self.target_num_hidden_layers
-            )
-            if kind == "final":
-                key = "final"
-                module = self.final_norm
-            else:
-                assert layer_index is not None
-                key = f"layer:{layer_index}"
-                module = self.layers[layer_index]
-            aux_keys.append(key)
-            modules[key] = module
-        include_final = self.hidden_layout in {
-            "eagle3_aux_plus_last",
-            "dflash_aux_plus_last",
-        }
-        need_final = include_final or (self.algorithm == "EAGLE3" and self.use_logits)
-        if need_final:
-            modules["final"] = self.final_norm
-        for key, module in modules.items():
-            handles.append(module.register_forward_hook(capture(key)))
-
-        started = time.perf_counter()
-        try:
-            forward_kwargs = {
-                "input_ids": input_ids.unsqueeze(0),
-                "attention_mask": attention_mask.unsqueeze(0),
-                "position_ids": position_ids.unsqueeze(0),
-                "use_cache": False,
-                "return_dict": True,
-            }
-            forward_kwargs = _supported_forward_kwargs(
-                self.backbone.forward, forward_kwargs
-            )
-            with torch.inference_mode():
-                self.backbone(**forward_kwargs)
-        finally:
-            for handle in handles:
-                handle.remove()
-        self.target_forward_seconds += time.perf_counter() - started
-
-        required_keys = list(aux_keys)
-        if need_final:
-            required_keys.append("final")
-        missing = [key for key in required_keys if key not in captures]
-        if missing:
-            raise RuntimeError(
-                f"Target feature replay missed hidden-state captures: {missing}"
-            )
-
-        device_positions = feature_positions.to(self.device)
-        hidden_parts = [
-            captures[key].squeeze(0).index_select(0, device_positions)
-            for key in aux_keys
-        ]
-        selected_final = (
-            captures["final"].squeeze(0).index_select(0, device_positions)
-            if need_final
-            else None
-        )
-        if include_final:
-            assert selected_final is not None
-            hidden_parts.append(selected_final)
-        hidden_states = torch.cat(hidden_parts, dim=-1).to(
-            device="cpu", dtype=self.dtype
-        )
-
-        target_logprobs = None
-        if self.algorithm == "EAGLE3" and self.use_logits:
-            assert selected_final is not None
-            target_logprobs = self._build_sparse_target_logprobs(selected_final[:-1])
-
-        selected_input_ids = sample.input_ids.index_select(0, feature_positions).long()
-        selected_loss_mask = sample.loss_mask.index_select(0, feature_positions).float()
-        metadata = dict(sample.metadata)
-        feature_start = int(feature_positions[0].item())
-        feature_end = int(feature_positions[-1].item()) + 1
-        metadata.update(
-            {
-                "source": "token_replay",
-                "target_model_path": self.model_path,
-                "target_revision": self.target_revision,
-                "target_config_fingerprint": self.target_config_fingerprint,
-                "target_layer_ids": list(self.target_layer_ids),
-                "hidden_states_layout": self.hidden_layout,
-                "feature_start": feature_start,
-                "feature_end": feature_end,
-                "hidden_position_start": feature_start,
-                "hidden_position_end": feature_end,
-                "hidden_positions": feature_positions,
-                "sequence_length": int(selected_input_ids.numel()),
-                "full_sequence_length": int(sample.input_ids.numel()),
-                "use_logits": self.use_logits,
-            }
-        )
-        if target_logprobs is not None:
-            metadata["target_logprobs_position_start"] = feature_start + 1
-            metadata["target_logprobs_position_end"] = feature_end
-
-        return DraftFeatureSample(
-            algorithm=self.algorithm,
-            input_ids=selected_input_ids,
-            loss_mask=selected_loss_mask,
-            hidden_states=hidden_states,
-            target_logprobs=target_logprobs,
-            position_ids=sample.draft_position_ids.long(),
-            metadata=metadata,
-        )
+        return self._materialize_one_vllm_file(sample)
 
     def _materialize_one_vllm_file(
         self, sample: DraftReplaySample
@@ -1142,7 +935,7 @@ class TargetFeatureReplayer:
         if self.use_logits:
             raise NotImplementedError(
                 "target_feature_replay.backend=vllm_file does not yet support "
-                "training.use_logits=true; use backend=torch for EAGLE3 logits."
+                "training.use_logits=true; collect complete logits features before training."
             )
         self._validate_vllm_positions(sample)
         feature_positions = sample.feature_positions.detach().cpu().long()
@@ -1530,37 +1323,11 @@ class TargetFeatureReplayer:
             final_norm=self.vllm_final_norm,
         )
 
-    def _build_sparse_target_logprobs(
-        self, final_hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        if self.output_embedding is None:
-            raise RuntimeError(
-                "EAGLE3 token replay with use_logits=true requires target output embeddings"
-            )
-        rows: list[torch.Tensor] = []
-        topk = max(self.logits_topk, 1)
-        with torch.inference_mode():
-            for start in range(
-                0, int(final_hidden_states.size(0)), self.logits_chunk_rows
-            ):
-                hidden = final_hidden_states[start : start + self.logits_chunk_rows]
-                logits = self.output_embedding(hidden).float()
-                local_topk = min(topk, int(logits.size(-1)))
-                values, ids = logits.topk(local_topk, dim=-1)
-                values = values - torch.logsumexp(logits, dim=-1, keepdim=True)
-                rows.append(
-                    torch.stack((values, ids.to(dtype=values.dtype)), dim=-1).cpu()
-                )
-        if not rows:
-            return torch.empty(0, topk, 2, dtype=torch.float32)
-        return torch.cat(rows, dim=0).contiguous()
-
     def metrics(self) -> dict[str, float]:
         metrics = {
             "replay/cache_hits_total": float(self.cache_hits),
             "replay/cache_misses_total": float(self.cache_misses),
             "replay/materialized_samples_total": float(self.materialized_samples),
-            "replay/target_forward_time_total": float(self.target_forward_seconds),
         }
         if self.backend.startswith("vllm_"):
             metrics["replay/vllm_requests_total"] = float(self.vllm_requests)
@@ -1599,27 +1366,3 @@ class TargetFeatureReplayer:
                         exc_info=True,
                     )
             state.client = None
-        if self.model is None:
-            return
-        try:
-            self.model.to("cpu")
-        except Exception:  # noqa: BLE001
-            pass
-        self.model = None
-        self.layers = []
-        self.final_norm = None
-        self.backbone = None
-        self.output_embedding = None
-
-
-def _supported_forward_kwargs(forward: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
-    try:
-        signature = inspect.signature(forward)
-    except (TypeError, ValueError):
-        return kwargs
-    if any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in signature.parameters.values()
-    ):
-        return kwargs
-    return {key: value for key, value in kwargs.items() if key in signature.parameters}

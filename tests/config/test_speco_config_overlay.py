@@ -118,10 +118,8 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert standalone_training.target_feature_replay.cache.max_size_gb == 0
     assert standalone_training.target_feature_replay.vllm_endpoints is None
     assert standalone_training.target_feature_replay.endpoint_cooldown == 5
-    assert standalone_training.target_feature_pipeline.enabled is False
-    assert standalone_training.target_feature_pipeline.concurrency == 16
-    assert standalone_training.target_feature_pipeline.producer_prefetch_depth == 4
-    assert standalone_training.target_feature_pipeline.prefetch_depth == 2
+    assert "target_feature_pipeline" not in standalone_training
+    assert standalone_training.target_feature_replay.backend == "vllm_file"
     assert drafter.vllm.draft_sample_method == "greedy"
     assert drafter.training.lk_temperature == pytest.approx(1.0)
     assert drafter.training.dflash_lk_loss_alpha == 0.0

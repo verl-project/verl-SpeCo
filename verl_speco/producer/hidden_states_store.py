@@ -31,12 +31,15 @@ from __future__ import annotations
 import contextlib
 import errno
 import importlib
+import json
 import logging
 import os
+import shutil
 import socket
+import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -171,6 +174,7 @@ class HiddenStatesStore:
     """Loads and releases hidden-state payloads from one backend."""
 
     backend: str = FILE_BACKEND
+    wait_for_writer: bool = True
 
     def load(
         self, reference: str, *, timeout: float = 120.0
@@ -195,6 +199,9 @@ class FileHiddenStatesStore(HiddenStatesStore):
 
     backend = FILE_BACKEND
 
+    def __init__(self, *, wait_for_writer=True):
+        self.wait_for_writer = wait_for_writer
+
     def load(
         self, reference: str, *, timeout: float = 30.0
     ) -> tuple[dict[str, torch.Tensor], int]:
@@ -203,7 +210,8 @@ class FileHiddenStatesStore(HiddenStatesStore):
         except ImportError as exc:  # pragma: no cover - dependency issue
             raise RuntimeError("vLLM hidden-state replay requires safetensors") from exc
         path = Path(reference)
-        _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
+        if self.wait_for_writer:
+            _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
         if not path.is_file():
             raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
         payload = dict(load_file(str(path), device="cpu"))
@@ -325,14 +333,390 @@ def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
                 time.sleep(0.01)
 
 
+RAW_HIDDEN_FORMAT = "standalone_raw_hidden"
+RAW_HIDDEN_VERSION = 1
+
+
+@dataclass(frozen=True)
+class RawHiddenSample:
+    payload: dict[str, torch.Tensor]
+    sample_id: str
+    sequence_no: int
+    request: dict[str, Any]
+    feature_contract: dict[str, Any]
+
+
+def prepare_raw_hidden_sample(raw, request, contract, *, validate_outputs=True):
+    """Validate alignment without transforming, normalizing or cropping tensors."""
+    payload = raw.payload
+    tokens, hidden = payload.get("token_ids"), payload.get("hidden_states")
+    if not isinstance(tokens, torch.Tensor) or not isinstance(hidden, torch.Tensor):
+        raise TypeError(
+            "Raw hidden payload requires token_ids and hidden_states tensors"
+        )
+    if tokens.ndim != 1 or hidden.ndim != 3:
+        raise ValueError(
+            "Raw hidden payload requires [T] token_ids and [T,K,H] hidden_states"
+        )
+    if any(
+        not isinstance(t, torch.Tensor) or t.device.type != "cpu"
+        for t in payload.values()
+    ):
+        raise ValueError("Raw hidden payload must contain CPU tensors only")
+    if not hidden.is_floating_point() or (
+        validate_outputs and not torch.isfinite(hidden).all()
+    ):
+        raise ValueError("Raw hidden states must be finite floating-point tensors")
+    return _raw_hidden_metadata(
+        tokens, hidden.shape, str(hidden.dtype), request, contract, payload
+    )
+
+
+def _raw_hidden_metadata(tokens, shape, dtype, request, contract, payload):
+    if tokens.ndim != 1 or len(shape) != 3:
+        raise ValueError(
+            "Raw hidden payload requires [T] token_ids and [T,K,H] hidden_states"
+        )
+    if tokens.tolist() != list(request.prompt_token_ids):
+        raise ValueError("Raw hidden token_ids do not match the requested prefill")
+    rows, layers, width = shape
+    offset = tokens.numel() - rows
+    positions = request.feature_positions
+    if (
+        rows <= 0
+        or width <= 0
+        or offset < 0
+        or positions.numel() == 0
+        or int(positions.min()) < offset
+        or int(positions.max()) >= tokens.numel()
+    ):
+        raise ValueError("Raw hidden rows do not cover the requested feature window")
+    if isinstance(contract, Mapping):
+        values = dict(contract)
+        if values.get("contract_type") != "raw_capture":
+            raise ValueError("Unknown raw hidden capture descriptor")
+        aux_ids = values["vllm_aux_hidden_state_layer_ids"]
+        final_layer = values["target_num_hidden_layers"]
+        required = len(aux_ids) + int(
+            values["include_final_hidden"] and final_layer not in aux_ids
+        )
+        if layers != required:
+            raise ValueError(
+                f"Captured hidden layer count is {layers}, configured capture plan requires {required}"
+            )
+        values["raw_hidden_dtype"] = dtype
+    else:
+        # Previously generated raw datasets carried a bound training contract.
+        aux_ids = contract.vllm_aux_hidden_state_layer_ids or contract.target_layer_ids
+        include_final = contract.hidden_states_layout.endswith("_plus_last")
+        required = len(aux_ids) + int(
+            include_final and contract.target_num_hidden_layers not in aux_ids
+        )
+        if layers < required:
+            raise ValueError(
+                f"Raw hidden layer count is {layers}, expected at least {required}"
+            )
+        values = asdict(contract)
+        values["dtype"] = str(contract.dtype)
+    request_values = {
+        name: getattr(request, name).tolist()
+        for name in (
+            "input_ids",
+            "loss_mask",
+            "position_ids",
+            "feature_positions",
+            "draft_position_ids",
+        )
+    }
+    request_values.update(
+        vllm_prompt_token_ids=list(request.prompt_token_ids),
+        source_metadata=request.source_metadata,
+    )
+    return RawHiddenSample(
+        dict(payload), request.sample_id, request.sequence_no, request_values, values
+    )
+
+
+def bind_raw_hidden_contract(stored, expected):
+    """Bind capture metadata to the selected training algorithm at training time."""
+    if stored.get("contract_type") != "raw_capture":
+        for name, wanted in expected.items():
+            if stored.get(name) != wanted:
+                raise ValueError(
+                    f"Saved hidden feature contract mismatch for {name}: {stored.get(name)!r} != {wanted!r}"
+                )
+        return dict(stored)
+    for name in (
+        "target_model_id",
+        "target_model_revision",
+        "tokenizer_fingerprint",
+        "vllm_aux_hidden_state_layer_ids",
+    ):
+        if stored.get(name) != expected[name]:
+            raise ValueError(f"Saved hidden capture metadata mismatch for {name}")
+    depth = int(stored["target_num_hidden_layers"])
+    has_final = (
+        bool(stored.get("include_final_hidden"))
+        or depth in stored["vllm_aux_hidden_state_layer_ids"]
+    )
+    if expected["hidden_states_layout"].endswith("_plus_last") and not has_final:
+        raise ValueError(
+            "Training losses require final hidden states absent from the saved capture"
+        )
+    return {
+        **expected,
+        "target_num_hidden_layers": depth,
+        "target_config_fingerprint": stored.get("target_config_fingerprint"),
+        "source": stored.get("source", "standalone_data_generate"),
+    }
+
+
+def load_raw_hidden_manifest(path):
+    """Require an explicit format marker; never interpret normalized features as raw."""
+    path = Path(path)
+    metadata = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
+    if (
+        metadata.get("format") != RAW_HIDDEN_FORMAT
+        or metadata.get("schema_version") != RAW_HIDDEN_VERSION
+    ):
+        raise ValueError(
+            "Expected standalone_raw_hidden dataset; normalized feature stores are incompatible"
+        )
+    manifest = path / "manifest.jsonl"
+    if not manifest.exists():
+        return []
+    with manifest.open(encoding="utf-8") as stream:
+        entries = [json.loads(line) for line in stream if line.strip()]
+    for entry in entries:
+        if (
+            not isinstance(entry.get("sample_id"), str)
+            or not entry["sample_id"]
+            or not isinstance(entry.get("request"), dict)
+            or not isinstance(entry.get("feature_contract"), dict)
+            or not entry["feature_contract"]
+        ):
+            raise ValueError(
+                "Raw hidden manifest requires sample_id, request and feature_contract"
+            )
+        if (
+            entry.get("format") != RAW_HIDDEN_FORMAT
+            or entry.get("schema_version") != RAW_HIDDEN_VERSION
+        ):
+            raise ValueError("Raw hidden manifest format/version mismatch")
+        relative = Path(entry["path"])
+        if relative.name != entry["path"] or relative.suffix != ".safetensors":
+            raise ValueError(
+                "Raw hidden manifest must reference a local safetensors basename"
+            )
+        if not (path / relative).is_file():
+            raise FileNotFoundError(path / relative)
+    return entries
+
+
+def _replace_hidden_file(source, destination):
+    # Windows file scanners can briefly retain a just-closed connector file.
+    # Linux permission errors must propagate immediately, as do persistent errors.
+    for attempt in range(6):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == 5:
+                raise
+            time.sleep(0.01 * (attempt + 1))
+
+
+class RawHiddenDatasetWriter:
+    """One writer: atomic tensor file first, manifest commit second."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.mkdir(parents=True, exist_ok=True)
+        metadata_path = self.path / "metadata.json"
+        if metadata_path.exists():
+            load_raw_hidden_manifest(self.path)
+        else:
+            if any(self.path.iterdir()):
+                raise ValueError(
+                    "Refusing to append raw hidden data to an unmarked directory"
+                )
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "format": RAW_HIDDEN_FORMAT,
+                        "schema_version": RAW_HIDDEN_VERSION,
+                        "last_hidden_state_norm": "raw_target_residual",
+                        "created_by": "verl_speco.standalone_data_generate",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        # Include files left before an interrupted manifest commit; never overwrite.
+        self.next_index = (
+            max(
+                (
+                    int(p.stem[3:])
+                    for p in self.path.glob("hs_*.safetensors")
+                    if p.stem[3:].isdigit()
+                ),
+                default=-1,
+            )
+            + 1
+        )
+        self._index_lock = threading.Lock()
+        self._manifest = None
+        self._closed = False
+
+    def _entry(self, sample):
+        with self._index_lock:
+            name = f"hs_{self.next_index:06d}.safetensors"
+            self.next_index += 1
+        entry = {
+            "format": RAW_HIDDEN_FORMAT,
+            "schema_version": RAW_HIDDEN_VERSION,
+            "path": name,
+            "sample_id": sample.sample_id,
+            "sequence_no": sample.sequence_no,
+            "num_samples": 1,
+            "num_tokens": sum(sample.request["loss_mask"]),
+            "sequence_length": len(sample.request["feature_positions"]),
+            "request": sample.request,
+            "feature_contract": sample.feature_contract,
+        }
+        # Reject unsupported metadata before moving or saving a payload.
+        json.dumps(entry, ensure_ascii=False, allow_nan=False)
+        return entry
+
+    def stage_file(
+        self, reference, request, contract, *, validate_outputs=False, timings=None
+    ):
+        """Adopt a connector file without materializing its hidden tensor."""
+        from safetensors import safe_open
+
+        if timings is None:
+            timings = {}
+        source = Path(reference)
+        started = time.perf_counter()
+        _wait_for_lock(Path(f"{source}.lock"))
+        timings["file_lock"] = time.perf_counter() - started
+        started = time.perf_counter()
+        timings["file_bytes"] = source.stat().st_size
+        with safe_open(str(source), framework="pt", device="cpu") as saved:
+            tokens = saved.get_tensor("token_ids").clone()
+            hidden = saved.get_slice("hidden_states")
+            dtype = {
+                "F16": "torch.float16",
+                "BF16": "torch.bfloat16",
+                "F32": "torch.float32",
+                "F64": "torch.float64",
+            }.get(hidden.get_dtype())
+            if dtype is None:
+                raise ValueError("Raw hidden states require a supported floating dtype")
+            sample = _raw_hidden_metadata(
+                tokens, hidden.get_shape(), dtype, request, contract, {}
+            )
+        # Release safetensors mappings before renaming (also required on Windows).
+        del saved, tokens, hidden
+        timings["file_inspect"] = time.perf_counter() - started
+        started = time.perf_counter()
+        if validate_outputs:
+            with safe_open(str(source), framework="pt", device="cpu") as saved:
+                if not torch.isfinite(saved.get_tensor("hidden_states")).all():
+                    raise ValueError(
+                        "Raw hidden states must be finite floating-point tensors"
+                    )
+            del saved
+        timings["file_validate"] = time.perf_counter() - started
+        entry = self._entry(sample)
+        with tempfile.NamedTemporaryFile(
+            dir=self.path, suffix=".tmp", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+        try:
+            started = time.perf_counter()
+            timings["cross_fs"] = 0
+            try:
+                _replace_hidden_file(source, temporary)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                # Cross-filesystem copies remain invisible until the final rename.
+                timings["cross_fs"] = 1
+                copying = time.perf_counter()
+                shutil.copyfile(source, temporary)
+                timings["file_copy"] = time.perf_counter() - copying
+            _replace_hidden_file(temporary, self.path / entry["path"])
+            source.unlink(missing_ok=True)
+            timings["file_move"] = time.perf_counter() - started
+        finally:
+            temporary.unlink(missing_ok=True)
+        return entry
+
+    def stage_sample(self, sample):
+        """Persist an in-memory backend payload; leave its manifest uncommitted."""
+        from safetensors import SafetensorError
+        from safetensors.torch import save_file
+
+        if not isinstance(sample, RawHiddenSample):
+            raise TypeError("Raw hidden writer requires RawHiddenSample")
+        entry = self._entry(sample)
+        with tempfile.NamedTemporaryFile(
+            dir=self.path, suffix=".tmp", delete=False
+        ) as stream:
+            temporary = stream.name
+        try:
+            try:
+                save_file(
+                    {key: value.contiguous() for key, value in sample.payload.items()},
+                    temporary,
+                )
+            except SafetensorError as exc:
+                raise OSError(f"Failed to save raw hidden payload: {exc}") from exc
+            os.replace(temporary, self.path / entry["path"])
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        return entry
+
+    def commit(self, entry):
+        """Single-writer metadata commit, after the payload is in its final place."""
+        if self._closed:
+            raise ValueError("Raw hidden writer is closed")
+        line = json.dumps(entry, ensure_ascii=False, allow_nan=False) + "\n"
+        if not (self.path / entry["path"]).is_file():
+            raise FileNotFoundError(self.path / entry["path"])
+        if self._manifest is None:
+            self._manifest = (self.path / "manifest.jsonl").open("a", encoding="utf-8")
+        self._manifest.write(line)
+        self._manifest.flush()
+        return entry["path"]
+
+    def write_many(self, samples):
+        return [self.commit(self.stage_sample(sample)) for sample in samples]
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self._manifest is not None:
+            self._manifest.close()
+
+
 __all__ = [
     "FILE_BACKEND",
     "MOONCAKE_BACKEND",
+    "RAW_HIDDEN_FORMAT",
+    "RAW_HIDDEN_VERSION",
     "SUPPORTED_BACKENDS",
     "FileHiddenStatesStore",
     "HiddenStatesStore",
     "HiddenStatesStoreConfig",
     "MooncakeHiddenStatesStore",
     "MooncakeStoreSettings",
+    "RawHiddenDatasetWriter",
+    "RawHiddenSample",
     "build_hidden_states_store",
+    "load_raw_hidden_manifest",
+    "bind_raw_hidden_contract",
+    "prepare_raw_hidden_sample",
 ]

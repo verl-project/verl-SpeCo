@@ -10,7 +10,10 @@ from safetensors.torch import save_file
 
 from verl_speco.trainer.standalone_sample_cleanup import cleanup_standalone_samples
 from verl_speco.trainer.target_feature_replay import FeatureContract
-from verl_speco.trainer.tq_feature_store import ReferenceFeatureStore, ReadyEntry, TQFeatureStore
+from verl_speco.trainer.reference_feature_store import ReferenceFeatureStore
+from verl_speco.trainer.reference_sample_source import ReferenceFeatureDataLoader
+from verl_speco.trainer.standalone_data import ReadyEntry
+from verl_speco.trainer.tq_feature_store import TQFeatureStore
 from verl_speco.trainer.tq_sample_source import TQFeatureDataLoader, TQPrefetchIterator
 from verl_speco.transport.drafter_sample_protocol import (
     PROTOCOL_SCHEMA_VERSION, SampleMetadata, make_reference_tag, make_sample_key,
@@ -36,6 +39,36 @@ def _entry(tmp_path):
         "source_metadata": {},
     })
     return ReadyEntry(make_sample_key(meta), tag), path
+
+
+def test_reference_loader_preserves_legacy_batch_values(tmp_path):
+    entry, path = _entry(tmp_path)
+    batches = []
+    for loader_type in (TQFeatureDataLoader, ReferenceFeatureDataLoader):
+        store = ReferenceFeatureStore({"run_id": "run"})
+        commands = Queue()
+        commands.put({"kind": "batch", "plan_id": 7, "global_keys": [entry.key],
+                      "global_sequence_nos": [0],
+                      "assignments": [[{"key": entry.key, "tag": entry.tag}]]})
+        commands.put({"kind": "stop"})
+        loader = loader_type(
+            store, batch_size=1, rank=0, world_size=1, scheduled_commands=commands,
+            prepare_batch=partial(store.prepare_batch, pin_memory=False),
+        )
+        batches.append(list(loader)[0])
+        assert path.exists()  # Both reads must retain the source until cleanup.
+        store.close()
+    before, after = batches
+    assert before.local_keys == after.local_keys
+    assert before.global_keys == after.global_keys
+    assert before.global_sequence_nos == after.global_sequence_nos
+    assert before.plan_id == after.plan_id == 7
+    assert before.prepared_batch.keys() == after.prepared_batch.keys()
+    for name, value in before.prepared_batch.items():
+        if torch.is_tensor(value):
+            torch.testing.assert_close(value, after.prepared_batch[name], rtol=0, atol=0)
+        else:
+            assert value == after.prepared_batch[name]
 
 
 @pytest.mark.parametrize("delete_fails", [2, 99])
@@ -126,7 +159,7 @@ def _process_source(tmp_path, monkeypatch, *, missing=False, locked=False):
         "run_id": "run", "ray": {"address": "unused"},
         "expected_feature": {"algorithm": "DFLASH", "target_model_path": "target"},
     })
-    loader = TQFeatureDataLoader(
+    loader = ReferenceFeatureDataLoader(
         store, batch_size=1, rank=0, world_size=1, scheduled_commands=commands,
         prepare_batch=partial(store.prepare_batch, max_window=4), io_retry_max_attempts=1,
     )
@@ -225,7 +258,7 @@ def test_process_prefetch_rank_control_order_and_failure_agreement(tmp_path, mon
         barrier.wait()
         return result
 
-    class Loader(TQFeatureDataLoader):
+    class Loader(ReferenceFeatureDataLoader):
         def _broadcast_command(self, command):
             return exchange(self.rank, "broadcast", command)
 

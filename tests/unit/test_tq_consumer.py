@@ -95,7 +95,13 @@ def test_feature_store_factory_builds_tq_without_path(store_type) -> None:
         read_only=True,
         transfer_queue_cfg=_config(),
     )
-    assert isinstance(store, TQFeatureStore)
+    if store_type == "ray_reference":
+        from verl_speco.trainer.reference_feature_store import ReferenceFeatureStore
+
+        assert isinstance(store, ReferenceFeatureStore)
+        assert not isinstance(store, TQFeatureStore)
+    else:
+        assert isinstance(store, TQFeatureStore)
     assert store.run_id == "run-a"
     if store_type == "ray_reference":
         from verl_speco.trainer.tq_feature_store import ReferenceFeatureStore
@@ -214,31 +220,8 @@ class _FakeStore:
         self.entries = [entry for entry in self.entries if entry.key not in selected]
 
 
-def test_world_size_one_streams_trains_then_clears_and_stops() -> None:
-    entries = [_entry(0), _entry(1)]
-    store = _FakeStore(entries)
-    loader = TQFeatureDataLoader(
-        store, batch_size=2, rank=0, world_size=1, poll_interval_seconds=0.01
-    )
-    iterator = iter(loader)
-    batch = next(iterator)
-    assert batch.local_keys == [entry.key for entry in entries]
-    assert batch.global_keys == batch.local_keys
-    assert batch.global_sequence_nos == [0, 1]
-    assert store.get_calls == [batch.local_keys]
-
-    loader.clear_completed_batch(batch.global_keys)
-    with pytest.raises(StopIteration):
-        next(iterator)
-    assert store.clear_calls == [batch.local_keys]
 
 
-def test_eos_drops_incomplete_global_tail() -> None:
-    entry = _entry(0)
-    store = _FakeStore([entry])
-    loader = TQFeatureDataLoader(store, batch_size=2, rank=0, world_size=1)
-    assert list(loader) == []
-    assert store.clear_calls == [[entry.key]]
 
 
 def test_scheduled_loader_uses_driver_selected_keys_without_listing() -> None:
@@ -277,19 +260,10 @@ def test_scheduled_loader_uses_driver_selected_keys_without_listing() -> None:
     assert len(batches) == 1
     assert batches[0].global_keys == [entry.key for entry in entries]
     assert store.get_calls == [[entry.key for entry in entries]]
+    loader.clear_completed_batch(batches[0].global_keys)
+    assert store.clear_calls == [[entry.key for entry in entries]]
 
 
-def test_rank0_discovery_failure_is_raised_without_clearing() -> None:
-    store = _FakeStore([_entry(0)])
-
-    def _fail_list():
-        raise RuntimeError("list failed")
-
-    store.list_ready = _fail_list
-    loader = TQFeatureDataLoader(store, batch_size=1, rank=0, world_size=1)
-    with pytest.raises(RuntimeError, match="list failed"):
-        next(iter(loader))
-    assert store.clear_calls == []
 
 
 def test_nonzero_rank_uses_broadcast_assignment_without_listing(monkeypatch) -> None:
@@ -314,7 +288,7 @@ def test_nonzero_rank_uses_broadcast_assignment_without_listing(monkeypatch) -> 
     monkeypatch.setattr(module.dist, "broadcast_object_list", _broadcast)
     store.list_ready = lambda: pytest.fail("nonzero rank must not list TQ keys")
 
-    loader = TQFeatureDataLoader(store, batch_size=1, rank=1, world_size=2)
+    loader = TQFeatureDataLoader(store, batch_size=1, rank=1, world_size=2, scheduled_commands=object())
     batch = next(iter(loader))
     assert batch.local_keys == [entries[1].key]
     assert batch.global_keys is None

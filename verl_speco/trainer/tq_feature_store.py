@@ -15,8 +15,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from verl_speco.integration.transferqueue_bridge import (
     clear_samples,
@@ -28,20 +29,14 @@ from verl_speco.integration.transferqueue_bridge import (
     list_samples,
 )
 from verl_speco.trainer.feature_store import DraftFeatureSample
+from verl_speco.trainer.reference_feature_store import ReferenceFeatureStore
+from verl_speco.trainer.standalone_data import ReadyEntry
 from verl_speco.transport.drafter_sample_protocol import (
     PROTOCOL_SCHEMA_VERSION,
     ExpectedFeatureConfig,
     decode_sample,
     parse_ready_tag,
 )
-
-
-@dataclass(frozen=True)
-class ReadyEntry:
-    """One discoverable sample record; payload tensors are not loaded yet."""
-
-    key: str
-    tag: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -99,7 +94,7 @@ class TQFeatureStore:
         )
 
     @classmethod
-    def from_config(cls, config: Any) -> "TQFeatureStore":
+    def from_config(cls, config: Any) -> TQFeatureStore:
         return cls(_plain_dict(config))
 
     def connect(self) -> None:
@@ -172,6 +167,8 @@ class TQFeatureStore:
 
     def prepare_batch(self, entries: Sequence[ReadyEntry], **options) -> dict[str, Any]:
         """Materialize only scheduler-assigned file tags; never fetch TQ fields."""
+        import torch
+
         from verl_speco.trainer.standalone_batch_prepare import (
             prepare_standalone_cpu_batch,
         )
@@ -180,7 +177,6 @@ class TQFeatureStore:
             SampleMetadata,
             make_sample_key,
         )
-        import torch
 
         self._require_connected()
         if not entries:
@@ -256,47 +252,6 @@ class TQFeatureStore:
             )
 
 
-class ReferenceFeatureStore(TQFeatureStore):
-    """Prepare hidden references without connecting to TransferQueue.
-
-    Ready metadata is owned by the Driver's scheduler, not this rank-local adapter.
-    """
-
-    uses_transfer_queue = False
-
-    def __init__(self, config: Mapping[str, Any]):
-        super().__init__(config)
-        from verl_speco.producer.hidden_states_store import build_hidden_states_store
-
-        # Client setup is lazy; spawned workers construct their own store.
-        self.hidden_states_store = build_hidden_states_store(
-            self.config.get("hidden_states_store")
-        )
-
-    def connect(self) -> None:
-        self._connected = True
-
-    def owner_ready(self) -> bool:
-        self._require_connected()
-        return True
-
-    def clear_many(self, keys: Sequence[str]) -> None:
-        self._require_connected()
-        # Only scheduler completion releases metadata; cleanup releases hidden references.
-
-    def list_ready(self, run_id: str | None = None) -> list[ReadyEntry]:
-        raise RuntimeError(
-            "Hidden references must arrive through scheduler assignments"
-        )
-
-    def get_many(self, entries: Sequence[ReadyEntry]) -> list[DraftFeatureSample]:
-        raise RuntimeError("Hidden references require CPU batch preparation")
-
-    def close_local(self) -> None:
-        self.hidden_states_store.close()
-        self._connected = False
-
-
 def _plain_dict(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
@@ -330,4 +285,4 @@ def _optional_string(value: Any) -> str | None:
     return normalized or None
 
 
-__all__ = ["EosMetadata", "ReadyEntry", "TQFeatureStore"]
+__all__ = ["EosMetadata", "ReadyEntry", "ReferenceFeatureStore", "TQFeatureStore"]

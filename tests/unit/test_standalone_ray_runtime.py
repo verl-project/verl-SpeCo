@@ -27,8 +27,6 @@ def _commands() -> PipelineCommands:
         vllm=None,
         vllm_endpoints=("http://127.0.0.1:8000/v1",),
         owner=["python", "-m", "verl_speco.tq_owner"],
-        producer=["producer"],
-        consumer=["consumer"],
         producer_overrides=("producer=true",),
         consumer_overrides=("consumer=true",),
     )
@@ -215,9 +213,10 @@ def test_ray_backend_rejects_multi_node_local_runtime() -> None:
             "ray", ["speco.draft_training.nnodes=2"]
         )
 
-    _validate_runtime_backend_topology(
-        "subprocess", ["speco.draft_training.nnodes=2"]
-    )
+    with pytest.raises(ValueError, match="subprocess training was removed"):
+        _validate_runtime_backend_topology(
+            "subprocess", ["speco.draft_training.nnodes=2"]
+        )
 
 
 @dataclass(frozen=True)

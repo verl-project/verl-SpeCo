@@ -23,10 +23,12 @@ speco:
     master_port: null
     standalone: true
     mode: feature_store
-    # Ray is the default runtime (StandaloneRayTrainer + Ray WorkerGroup);
-    # set to subprocess only as a rollback path for debugging.
+    # Producer and Consumer run through Ray actors / WorkerGroup.
     runtime_backend: ray
-    use_ray_controller: false
+    # ray_reference sends hidden references; tq transfers complete feature tensors.
+    data_transport: ray_reference
+    # saved_hidden reads a standalone_raw_hidden directory through the same Consumer.
+    data_source: online # online | saved_hidden
     scheduler:
       # Zero derives low from half the Producer capacity (but never below one
       # global batch), and high from the full Producer capacity.
@@ -55,16 +57,15 @@ actor_rollout_ref:
         master_addr: ${speco.draft_training.master_addr}
         master_port: ${speco.draft_training.master_port}
         standalone: ${speco.draft_training.standalone}
-        # Standalone/offline-only reconstruction for compact token_replay stores.
-        # The frozen target model is loaded lazily after the draft trainer starts.
+        # Independent offline-feature generation tool settings. Training itself
+        # consumes complete features or scheduler-assigned streaming batches.
         target_feature_replay:
-          backend: torch
+          backend: vllm_file
           model_path: null
           target_revision: null
           dtype: bfloat16
           trust_remote_code: false
           strict_target_model_path: false
-          logits_chunk_rows: 32
           vllm_endpoint: http://localhost:8000/v1
           # Optional endpoint pool. When non-null, this takes precedence over
           # vllm_endpoint and requests use least-inflight routing with failover.
@@ -101,12 +102,3 @@ actor_rollout_ref:
             enabled: false
             path: null
             max_size_gb: 0
-        # Overlap vLLM file replay with FSDP training.
-        # This pipeline is standalone-only.
-        target_feature_pipeline:
-          enabled: false
-          # Global budgets. Standalone divides them across torchrun ranks.
-          concurrency: 16
-          producer_prefetch_depth: 4
-          prefetch_depth: 2
-          queue_timeout: 300
