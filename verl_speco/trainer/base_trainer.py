@@ -1480,7 +1480,7 @@ class DrafterBaseTrainer:
         """
 
         return bool(
-            self._bubble_time_enabled
+            getattr(self, "_bubble_time_enabled", False)
             and self.training_device_mesh is None
             and self.training_process_group is not None
             and self.training_group_world_size > 1
@@ -2035,7 +2035,7 @@ class DrafterBaseTrainer:
 
     def _use_replica_local_bubble_group(self) -> bool:
         return bool(
-            self._bubble_time_enabled
+            getattr(self, "_bubble_time_enabled", False)
             and self.training_device_mesh is None
             and self.training_process_group is not None
         )
@@ -4915,7 +4915,7 @@ class DrafterBaseTrainer:
         same_step_target_head_required = (
             (self.backend.model_type == "eagle3" or dspark_uses_last_hidden)
             and not use_logits
-            and not self._bubble_time_enabled
+            and not getattr(self, "_bubble_time_enabled", False)
             and not allow_cross_step_hidden
         )
 
@@ -4945,7 +4945,7 @@ class DrafterBaseTrainer:
         # head version that produced those hidden states, so older buffered Eagle3
         # samples are not valid for the actor head synced for this rollout step.
         elif self.use_data_buffer and len(self.data_buffer) > 0:
-            if not self._bubble_time_enabled and (
+            if not getattr(self, "_bubble_time_enabled", False) and (
                 min_sample_step is not None or max_sample_step is not None
             ):
                 available_data = self._filter_training_data_by_step(
@@ -6367,7 +6367,7 @@ class DrafterBaseTrainer:
         same_step_data_required = (
             (self.backend.model_type == "eagle3" or dspark_uses_last_hidden)
             and not use_logits
-            and not self._bubble_time_enabled
+            and not getattr(self, "_bubble_time_enabled", False)
             and not allow_cross_step_hidden
         )
         current_step_data = [
@@ -6440,7 +6440,7 @@ class DrafterBaseTrainer:
                 int(item.get("target_version", item.get("step", current_step)))
                 for item in recent_data
             ]
-            if self._bubble_time_enabled and not use_logits:
+            if getattr(self, "_bubble_time_enabled", False) and not use_logits:
                 cached_versions = set(self._target_lm_head_snapshots)
                 target_versions = [
                     version for version in target_versions if version in cached_versions
