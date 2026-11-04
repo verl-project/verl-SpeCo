@@ -256,26 +256,35 @@ def main(config):
             if not hasattr(config.rollout.drafter.training, "dspark_target_layer_ids"):
                 config.rollout.drafter.training.dspark_target_layer_ids = None
 
-        config.rollout.drafter.training.fsdp_config = OmegaConf.create(
-            {
-                "param_offload": True,
-                "optimizer_offload": True,
-                "use_orig_params": True,
-                "forward_prefetch": False,
-                "wrap_policy": OmegaConf.create({"min_num_params": 0}),
-            }
-        )
+        # fsdp_config：仅在未设置时创建默认配置，保留用户已配置的值
+        if getattr(config.rollout.drafter.training, "fsdp_config", None) is None:
+            config.rollout.drafter.training.fsdp_config = OmegaConf.create(
+                {
+                    "param_offload": True,
+                    "optimizer_offload": True,
+                    "use_orig_params": True,
+                    "forward_prefetch": False,
+                    "wrap_policy": OmegaConf.create({"min_num_params": 0}),
+                }
+            )
 
-        config.rollout.drafter.training.training_batch_size = 8
-        config.rollout.drafter.training.micro_batch_size = 8
-        config.rollout.drafter.training.batch_size_per_gpu = 8
-        config.rollout.drafter.training.max_grad_norm = 1.0
-        config.rollout.drafter.training.weight_decay = 0.0
-        config.rollout.drafter.training.use_kl_loss = False
-        config.rollout.drafter.training.use_adv_loss = False
-        config.rollout.drafter.training.hidden_state_clip_value = 1e8
-        config.rollout.drafter.training.is_offload_param = True
-        config.rollout.drafter.training.is_offload_optimizer = True
+        # 以下字段遵循"仅补缺失"原则，用户通过 CLI/YAML 传入的值不会被覆盖
+        _drafter_train = config.rollout.drafter.training
+        _defaults = {
+            "training_batch_size": 8,
+            "micro_batch_size": 8,
+            "batch_size_per_gpu": 8,
+            "max_grad_norm": 1.0,
+            "weight_decay": 0.0,
+            "use_kl_loss": False,
+            "use_adv_loss": False,
+            "hidden_state_clip_value": 1e8,
+            "is_offload_param": True,
+            "is_offload_optimizer": True,
+        }
+        for _key, _val in _defaults.items():
+            if getattr(_drafter_train, _key, None) is None:
+                setattr(_drafter_train, _key, _val)
 
     # ========== sft_drafter 配置（从 sft_specific 同步）==========
     if not hasattr(config, "sft_drafter"):

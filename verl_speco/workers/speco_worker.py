@@ -1409,7 +1409,7 @@ class SpecoWorker(Worker):
     )
     async def collect_rollout_features(self, samples: list[dict]):
         # [SFT-VERIFY] 验证数据收集
-        logger.warning(
+        logger.info(
             f"[SFT-VERIFY] Rank={self.rank}: received {len(samples)} samples, trainer_exists={self.trainer is not None}, in_drafter_train_group={self.in_drafter_train_group}"
         )
         if not samples:

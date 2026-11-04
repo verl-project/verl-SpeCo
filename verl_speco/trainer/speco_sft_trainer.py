@@ -247,7 +247,10 @@ class SpecoRaySFTRayTrainer(SFTTrainer):
         return int(self._speco_sft_config.get("drafter_train_interval", 5))
 
     def _ray_get_if_needed(self, value):
-        """如果 value 是 Ray ObjectRef，先 ray.get() 再返回。和 PPO trainer 保持一致。"""
+        """如果 value 是 Ray ObjectRef（或其集合），先 ray.get() 再返回。
+
+        支持单个 ObjectRef、list/tuple of ObjectRef（group dispatch 返回值）。
+        """
         if value is None:
             return None
         try:
@@ -257,6 +260,18 @@ class SpecoRaySFTRayTrainer(SFTTrainer):
         object_ref_type = getattr(ray, "ObjectRef", ())
         if object_ref_type and isinstance(value, object_ref_type):
             return ray.get(value)
+        if isinstance(value, (list, tuple)) and object_ref_type:
+            # 过滤出 ObjectRef 并批量 ray.get，非 ObjectRef 元素保留原值
+            ref_indices = [
+                i for i, v in enumerate(value) if isinstance(v, object_ref_type)
+            ]
+            if not ref_indices:
+                return value
+            resolved = ray.get([value[i] for i in ref_indices])
+            out = list(value)
+            for idx, r in zip(ref_indices, resolved):
+                out[idx] = r
+            return type(value)(out) if isinstance(value, tuple) else out
         return value
 
     def speco_sync_target_lm_head_weight(self, payload, global_step=None):
@@ -1705,8 +1720,39 @@ class SpecoRaySFTRayTrainer(SFTTrainer):
                                         payload, global_step=global_step
                                     )
                                 )
-                                _synced = True
-                                logger.info(f"[LM-HEAD-SYNC] Sync OK: {_sync_result}")
+                                # 校验 worker 侧同步结果：sync_target_lm_head_weight 在
+                                # disabled/not_in_training_group/missing_payload 等场景
+                                # 返回 {"accepted": False, "applied": False} 而不抛异常，
+                                # 必须检查聚合结果避免用旧 head 训练 drafter。
+                                if isinstance(_sync_result, list):
+                                    accepted_ranks = [
+                                        r
+                                        for r in _sync_result
+                                        if r and r.get("accepted")
+                                    ]
+                                    _synced = bool(accepted_ranks)
+                                    if not _synced:
+                                        logger.error(
+                                            f"[LM-HEAD-SYNC] Step {global_step}: No worker accepted sync. "
+                                            f"results={_sync_result}. Skipping drafter training."
+                                        )
+                                    else:
+                                        logger.info(
+                                            f"[LM-HEAD-SYNC] Sync OK: {len(accepted_ranks)}/{len(_sync_result)} workers accepted"
+                                        )
+                                else:
+                                    _synced = bool(
+                                        _sync_result and _sync_result.get("accepted")
+                                    )
+                                    if _synced:
+                                        logger.info(
+                                            f"[LM-HEAD-SYNC] Sync OK: {_sync_result}"
+                                        )
+                                    else:
+                                        logger.error(
+                                            f"[LM-HEAD-SYNC] Step {global_step}: Sync rejected: {_sync_result}. "
+                                            f"Skipping drafter training."
+                                        )
                             else:
                                 logger.error(
                                     f"[LM-HEAD-SYNC] Step {global_step}: Export returned None even on rank0 — lm_head sync FAILED. "

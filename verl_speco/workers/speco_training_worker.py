@@ -79,7 +79,7 @@ def _direct_patch_engine_instance(engine) -> bool:
 
         orig_inputs = engine.prepare_model_inputs
         orig_outputs = engine.prepare_model_outputs
-        logger.warning(
+        logger.info(
             "[SpecoTrainingWorker] Patching engine instance: %s", type(engine).__name__
         )
 
@@ -194,7 +194,7 @@ def _direct_patch_engine_instance(engine) -> bool:
         engine.prepare_model_inputs = types.MethodType(patched_prepare_inputs, engine)
         engine.prepare_model_outputs = types.MethodType(patched_prepare_outputs, engine)
         engine._speco_instance_patched = True
-        logger.warning("[SpecoTrainingWorker] Engine instance patched successfully")
+        logger.info("[SpecoTrainingWorker] Engine instance patched successfully")
         return True
 
     except Exception as exc:
@@ -213,7 +213,7 @@ class SpecoTrainingWorker(TrainingWorker):
         super().__init__(config)
         # 实例级 patch engine（必须在 super().__init__ 之后，因为需要 self.engine）
         success = _direct_patch_engine_instance(self.engine)
-        logger.warning("[SpecoTrainingWorker] Instance patch result: %s", success)
+        logger.info("[SpecoTrainingWorker] Instance patch result: %s", success)
 
     def _postprocess_output(self, output, **kwargs):
         """Override to inject hidden refs from engine._speco_pending_hidden."""
