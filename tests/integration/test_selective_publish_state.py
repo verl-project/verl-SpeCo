@@ -306,3 +306,12 @@ def test_selective_publish_matches_legacy_state_on_two_ranks(tmp_path, backend):
         nprocs=2,
         join=True,
     )
+
+
+def test_vat_training_head_is_excluded_from_publish():
+    trainer = object.__new__(_trainer_type())
+    trainer._frozen_param_names = set()
+    trainer.backend = SimpleNamespace(model_type="dflash", trains_draft_embeddings=False)
+    assert trainer._is_frozen_publish_param("vat_objective.accept_head.weight")
+    assert trainer._is_frozen_publish_param("module.vat_objective.accept_head.bias")
+    assert not trainer._is_frozen_publish_param("draft_model.layers.0.mlp.weight")

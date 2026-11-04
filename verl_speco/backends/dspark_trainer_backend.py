@@ -103,6 +103,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         distribution_loss_impl: str = "auto",
         ce_target_source: str = _CE_TARGET_SOURCE_LABELS,
         confidence_target_mode: str = "greedy",
+        vat_config: dict | None = None,
         debug_log: bool = False,
         debug_log_first_n: int = 2,
         debug_log_interval: int = 100,
@@ -120,6 +121,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
             sampled_ce_negatives=sampled_ce_negatives,
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
+            vat_config=vat_config,
+            vat_layout="dspark",
             lk_temperature=lk_temperature,
             lk_loss_type=lk_loss_type,
             lk_hybrid_eta=lk_hybrid_eta,
@@ -174,6 +177,13 @@ class DSparkTrainingModel(DFlashTrainingModel):
             logger.info(
                 "[dspark-trainer] confidence head is loaded but frozen because confidence loss is disabled"
             )
+        if self.vat_objective is not None:
+            if getattr(self.config, "dspark_bonus_anchor", False):
+                raise ValueError("VAT does not support DSpark bonus-anchor checkpoints")
+            if confidence_head is None:
+                raise ValueError("DSpark VAT requires a confidence head")
+            confidence_head.requires_grad_(True)
+            self.confidence_loss_enabled = False  # VAT supplies the conditional labels.
         self.debug_log = bool(debug_log)
         self.debug_log_first_n = max(int(debug_log_first_n), 0)
         self.debug_log_interval = max(int(debug_log_interval), 1)
@@ -845,7 +855,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         # DSpark's auxiliary distribution losses retain the fixed exponential
         # position weights even when CE uses dynamic D-PACE weights.
         weight_mask = base_loss_mask
-        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+        if self.vat_objective is None and self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             positions = self._cached_arange(
                 "dspark_decay_positions", self.block_size, device, view_shape=(1, 1, -1)
             )
@@ -893,8 +903,24 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_log_probs = None
         restricted_vocab = None
         use_fused_loss = self._use_fused_distribution_loss(device)
+        vat_loss = flat_hidden.sum() * 0.0
+        vat_metrics = {}
+        if self.vat_objective is not None:
+            vat_logits = F.linear(active_hidden, lm_head_weight)
+            markov_bias = self._markov_bias_for_active(
+                active_hidden=active_hidden, active_prev_tokens=active_prev_tokens,
+                restricted_vocab=None)
+            if markov_bias is not None:
+                vat_logits = vat_logits + markov_bias
+            confidence_logits = self.draft_model.predict_confidence(
+                active_hidden, prev_token_ids=active_prev_tokens)
+            weight_mask, vat_loss, vat_metrics = self.vat_objective(
+                vat_logits, active_hidden, active_target_hidden, lm_head_weight,
+                base_loss_mask, active_mask, active_targets, confidence_logits)
+            flat_weights = weight_mask.reshape(-1)
+            active_weights = flat_weights[active_mask]
         if active_targets.numel() == 0:
-            loss = flat_weights.sum() * 0.0
+            loss = flat_hidden.sum() * 0.0
         else:
             ce_targets = active_targets
             active_target_logits = None
@@ -940,14 +966,17 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     )
                 )
             else:
-                active_logits = F.linear(active_hidden, lm_head_weight)
-                markov_bias = self._markov_bias_for_active(
-                    active_hidden=active_hidden,
-                    active_prev_tokens=active_prev_tokens,
-                    restricted_vocab=None,
-                )
-                if markov_bias is not None:
-                    active_logits = active_logits + markov_bias
+                if self.vat_objective is not None:
+                    active_logits = vat_logits
+                else:
+                    active_logits = F.linear(active_hidden, lm_head_weight)
+                    markov_bias = self._markov_bias_for_active(
+                        active_hidden=active_hidden,
+                        active_prev_tokens=active_prev_tokens,
+                        restricted_vocab=None,
+                    )
+                    if markov_bias is not None:
+                        active_logits = active_logits + markov_bias
                 if use_fused_loss:
                     active_loss = fused_label_cross_entropy(active_logits, ce_targets)
                 else:
@@ -1078,6 +1107,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 + (confidence_loss * self.confidence_head_alpha)
             )
 
+        loss = loss + vat_loss
         with torch.no_grad():
             flat_eval_mask = eval_mask.reshape(-1)
             binary_eval_mask = flat_eval_mask & (flat_weights > 0)
@@ -1199,6 +1229,9 @@ class DSparkTrainingModel(DFlashTrainingModel):
             "scored_block_count": scored_block_count.detach(),
             "local_ploss_sum": local_ploss_sum.detach(),
         }
+        diagnostics.update(vat_metrics)
+        if self.vat_objective is not None:
+            diagnostics["vat/ce_loss"] = (local_ploss_sum / local_ce_den.clamp_min(1e-6)).detach()
         return (
             loss,
             accuracy,
@@ -1649,6 +1682,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             per_position_loss_weight=str(
                 training_cfg.get("dspark_per_position_loss_weight", "fixed_exp_decay")
             ),
+            vat_config=training_cfg.get("vat", {}),
             dpace_alpha=float(training_cfg.get("dspark_dpace_alpha", 0.5)),
             ce_loss_alpha=float(
                 training_cfg.get(

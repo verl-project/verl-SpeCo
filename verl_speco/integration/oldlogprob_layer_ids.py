@@ -95,6 +95,10 @@ def resolve_drafter_hidden_states_layout(algorithm: Any, training_cfg: Any) -> s
                 )
     if algorithm not in DFLASH_FAMILY_ALGORITHMS:
         return "eagle3_aux_plus_last"
+    if algorithm in {"DFLASH", "DSPARK"} and str(
+        _get_nested(training_cfg, (f"{algorithm.lower()}_per_position_loss_weight",), "fixed_exp_decay")
+    ).lower() == "vat":
+        return "dflash_aux_plus_last"
     if algorithm == "DSPARK" and (
         float(_get_nested(training_cfg, ("dspark_l1_loss_alpha",), 0.9) or 0.0) > 0
         or float(_get_nested(training_cfg, ("dspark_lk_loss_alpha",), 0.0) or 0.0) > 0

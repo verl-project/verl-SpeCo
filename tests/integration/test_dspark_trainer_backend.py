@@ -2248,3 +2248,57 @@ def test_block_drafter_packing_allows_equal_length_context():
     assert batch["input_ids"].size(1) >= 4
     assert "document_ids" in batch
     assert "label_ids" not in batch
+
+
+@pytest.mark.parametrize("model_type", ["dflash", "dspark"])
+@pytest.mark.parametrize("empty", [False, True])
+def test_vat_forward_backward_and_resume(model_type, empty):
+    config_cls = DFlashConfig if model_type == "dflash" else DSparkConfig
+    draft_cls = DFlashDraftModel if model_type == "dflash" else DSparkDraftModel
+    training_cls = DFlashTrainingModel if model_type == "dflash" else DSparkTrainingModel
+    config = config_cls(hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+                        num_attention_heads=2, num_key_value_heads=1, vocab_size=32,
+                        num_target_layers=4, num_context_layers=2, target_hidden_size=8,
+                        target_num_hidden_layers=4, target_layer_ids=[1, 3],
+                        mask_token_id=31, markov_rank=4, enable_confidence_head=True)
+    model = training_cls(draft_cls(config), block_size=2, num_anchors=2,
+                         per_position_loss_weight="vat", vat_config={"self_cov_weight": .6})
+    ids = torch.tensor([[1, 2, 3, 4, 5]])
+    loss, *_rest, diagnostics = model(
+        input_ids=ids, hidden_states_list=[torch.randn(1, 5, 8), torch.randn(1, 5, 8)],
+        loss_mask=torch.zeros_like(ids).float() if empty else torch.ones_like(ids).float(),
+        lm_head_weight=torch.randn(32, 8), target_last_hidden_states=torch.randn(1, 5, 8))
+    loss.backward()
+    assert torch.isfinite(loss)
+    head = model.vat_objective.accept_head if model_type == "dflash" else model.draft_model.confidence_head
+    for parameter in head.parameters():
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+    assert "vat/ce_loss" in diagnostics
+    clone = training_cls(draft_cls(config), block_size=2, num_anchors=2,
+                         per_position_loss_weight="vat", vat_config={"self_cov_weight": .6})
+    clone.load_state_dict(model.state_dict())
+    for name, parameter in clone.state_dict().items():
+        torch.testing.assert_close(parameter, model.state_dict()[name])
+    if model_type == "dflash":
+        assert not any("accept_head" in name for name in model.draft_model.state_dict())
+
+
+@pytest.mark.parametrize("draft_id,expected", [(0, 2.), (1, 0.)])
+def test_dspark_vat_acceptance_includes_markov_bias(draft_id, expected):
+    base = _tiny_dspark_training_model()
+    model = DSparkTrainingModel(base.draft_model, block_size=2, num_anchors=2,
+                                per_position_loss_weight="vat", l1_loss_alpha=0.)
+    def bias(*, active_hidden, active_prev_tokens, restricted_vocab):
+        result = active_hidden.new_zeros(active_hidden.shape[0], 32)
+        result[:, draft_id] = 1.
+        return result
+    model._markov_bias_for_active = bias
+    model._sample_anchor_positions = lambda *args, **kwargs: (
+        torch.tensor([[1, 1]]), torch.ones(1, 2, dtype=torch.bool))
+    _, *_rest, diagnostics = model(
+        input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
+        hidden_states_list=[torch.randn(1, 5, 8), torch.randn(1, 5, 8)],
+        loss_mask=torch.ones(1, 5), lm_head_weight=torch.zeros(32, 8),
+        target_last_hidden_states=torch.randn(1, 5, 8))
+    assert diagnostics["vat/mean_accepted"].item() == expected

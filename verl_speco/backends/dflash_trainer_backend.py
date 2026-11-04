@@ -344,6 +344,8 @@ class DFlashTrainingModel(nn.Module):
         lk_chunk_size: int = 1024,
         verifier_norm: torch.nn.Module | None = None,
         target_hidden_clip_value: float | None = None,
+        vat_config: dict | None = None,
+        vat_layout: str = "dflash",
     ):
         super().__init__()
         self.verifier_norm = (
@@ -366,9 +368,9 @@ class DFlashTrainingModel(nn.Module):
         self.per_position_loss_weight = (
             str(per_position_loss_weight or "fixed_exp_decay").strip().lower()
         )
-        if self.per_position_loss_weight not in {"fixed_exp_decay", "dpace"}:
+        if self.per_position_loss_weight not in {"fixed_exp_decay", "dpace", "vat"}:
             raise ValueError(
-                "per_position_loss_weight must be 'fixed_exp_decay' or 'dpace', "
+                "per_position_loss_weight must be 'fixed_exp_decay', 'dpace' or 'vat', "
                 f"got {per_position_loss_weight!r}"
             )
         self.dpace_alpha = float(dpace_alpha)
@@ -392,6 +394,13 @@ class DFlashTrainingModel(nn.Module):
                 f"lk_hybrid_eta must be finite and non-negative, got {lk_hybrid_eta!r}"
             )
         self._tensor_template_cache: dict[tuple, torch.Tensor] = {}
+        self.vat_objective = None
+        if self.per_position_loss_weight == "vat":
+            from verl_speco.backends.verification_aware import VATObjective
+            self.vat_objective = VATObjective(
+                self.config.hidden_size, layout=vat_layout, gamma=loss_decay_gamma,
+                config=vat_config or {}, loss_mode=self.loss_mode)
+
 
     def _auxiliary_loss(
         self,
@@ -751,7 +760,7 @@ class DFlashTrainingModel(nn.Module):
         binary_eval_mask = weight_mask.view(-1)
         base_loss_mask = weight_mask.clone()
 
-        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+        if self.vat_objective is None and self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             decay_weights = self._cached_decay_weights(device)
             weight_mask = weight_mask * decay_weights
         if self.front_position_count > 0 and self.front_position_weight != 1.0:
@@ -797,8 +806,19 @@ class DFlashTrainingModel(nn.Module):
         lk_tv_sum = torch.zeros((), dtype=torch.float32, device=device)
         finite_loss = torch.zeros(0, dtype=torch.bool, device=device)
         active_loss_weights = active_weights
+        vat_loss = flat_hidden.sum() * 0.0
+        vat_metrics = {}
+        if self.vat_objective is not None:
+            vat_logits = F.linear(active_hidden, lm_head_weight)
+            weight_mask, vat_loss, vat_metrics = self.vat_objective(
+                vat_logits, active_hidden, active_target_hidden, lm_head_weight,
+                base_loss_mask, active_mask, active_targets)
+            if self.front_position_count > 0 and self.front_position_weight != 1.0:
+                weight_mask = weight_mask * front_weights
+            flat_weights = weight_mask.reshape(-1)
+            active_weights = flat_weights[active_mask]
         if active_targets.numel() == 0:
-            loss = flat_weights.sum() * 0.0
+            loss = flat_hidden.sum() * 0.0
         else:
             if self.loss_mode in {"restricted_ce", "sampled_ce"}:
                 vocab_size = int(lm_head_weight.shape[0])
@@ -809,7 +829,7 @@ class DFlashTrainingModel(nn.Module):
                 active_logits = F.linear(active_hidden, restricted_weight)
                 ce_targets = torch.searchsorted(restricted_vocab, active_targets)
             else:
-                active_logits = F.linear(active_hidden, lm_head_weight)
+                active_logits = vat_logits if self.vat_objective is not None else F.linear(active_hidden, lm_head_weight)
                 ce_targets = active_targets
             active_loss = F.cross_entropy(active_logits, ce_targets, reduction="none")
             finite_loss = torch.isfinite(active_loss)
@@ -887,6 +907,7 @@ class DFlashTrainingModel(nn.Module):
                 lk_loss = local_lk_sum / local_lk_den.clamp(min=1e-6)
         loss = (ce_loss * self.ce_loss_alpha) + (lk_loss * self.lk_loss_alpha)
 
+        loss = loss + vat_loss
         auxiliary_metrics: dict[str, torch.Tensor] = {}
         if active_targets.numel() > 0:
             auxiliary_loss, auxiliary_metrics = self._auxiliary_loss(
@@ -1087,6 +1108,9 @@ class DFlashTrainingModel(nn.Module):
                 ),
             }
             diagnostics.update(auxiliary_metrics)
+            diagnostics.update(vat_metrics)
+            if self.vat_objective is not None:
+                diagnostics["vat/ce_loss"] = ce_loss.detach()
 
         return (
             loss,
@@ -1578,6 +1602,7 @@ class DFlashTrainerBackend:
             per_position_loss_weight=str(
                 training_cfg.get("dflash_per_position_loss_weight", "fixed_exp_decay")
             ),
+            vat_config=training_cfg.get("vat", {}),
             dpace_alpha=float(training_cfg.get("dflash_dpace_alpha", 0.5)),
             lk_temperature=float(training_cfg.get("lk_temperature", 1.0)),
             lk_loss_type=str(training_cfg.get("dflash_lk_loss_type", "alpha")),

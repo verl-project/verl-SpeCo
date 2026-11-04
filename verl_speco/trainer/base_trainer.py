@@ -1173,6 +1173,10 @@ class DrafterBaseTrainer:
         prefix = self._block_drafter_metric_prefix()
         if f"{prefix}/loss" in sums:
             metrics[f"{prefix}/loss"] = sums[f"{prefix}/loss"] / steps
+        vat_batches = sums.get(f"{prefix}/vat/batch_count", 0.0)
+        if vat_batches > 0:
+            for key in ("kd_loss", "accept_loss", "self_cov_loss", "ce_loss", "mean_accepted"):
+                metrics[f"{prefix}/vat/{key}"] = sums[f"{prefix}/vat/{key}"] / vat_batches
         selector_weight = sums.get(f"{prefix}/selector_weight_count", 0.0)
         if selector_weight > 0:
             metrics[f"{prefix}/selector_loss"] = (
@@ -1376,6 +1380,8 @@ class DrafterBaseTrainer:
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
             "loss_mode_id": f"{prefix}/loss_mode_id",
         }
+        for key in ("kd_loss", "accept_loss", "self_cov_loss", "ce_loss", "mean_accepted", "batch_count"):
+            scalar_keys[f"vat/{key}"] = f"{prefix}/vat/{key}"
         vector_keys = {
             "loss_sum_per_position": f"{prefix}/loss_sum_per_position",
             "correct_per_position": f"{prefix}/correct_per_position",
@@ -1889,6 +1895,8 @@ class DrafterBaseTrainer:
     def _is_frozen_publish_param(self, name: str) -> bool:
         """Return whether a drafter state entry should be excluded from hot publish."""
 
+        if "vat_objective.accept_head." in name:
+            return True
         if any(frozen_name in name for frozen_name in self._frozen_param_names):
             return True
         if (
