@@ -1254,3 +1254,72 @@ def test_v1_checkpoint_saves_and_resumes_adaptive_state(monkeypatch, tmp_path):
     restored = resumed._speco_get_drafter_scheduler().adaptive_controller
     assert asdict(restored.state) == expected
     assert restored.training_steps(11) == 0
+
+
+def test_v1_emits_trainer_phase_spans_for_prepare_train_and_publish(monkeypatch):
+    from contextlib import nullcontext
+
+    import verl_speco.trainer.v1.speco_mixin as mixin
+
+    spans = []
+
+    def fake_trace(state_name, *, state_lane_id=None, **labels):
+        spans.append((state_name, state_lane_id, labels))
+        return nullcontext()
+
+    monkeypatch.setattr(mixin, "_rl_insight_trace_state", fake_trace)
+
+    class Plan:
+        launch = True
+        reason = "training_ready"
+        execution_strategy = "sync"
+        max_batches = 4
+
+    class Event:
+        training_plan = Plan()
+        metrics = {}
+
+    class Upstream:
+        def _update_actor(self, batch, metrics):
+            return "updated"
+
+        def on_step_end(self):
+            return "upstream"
+
+    class Harness(SpecoV1Mixin, Upstream):
+        config = _config()
+        global_steps = 12
+        _speco_freeze_policy = None
+        _speco_v1_pending_training = False
+
+        def _speco_online_enabled_from_config(self, config):
+            return True
+
+        def _speco_on_before_actor_update(self):
+            return Event()
+
+        def _speco_train_drafter(self, plan):
+            self._speco_v1_pending_training = True
+            return True, {"drafter/trained": 1}
+
+        def _speco_publish_drafter_weights(self, *args, **kwargs):
+            return {"drafter/published": 1}
+
+        def _speco_wait_pending_drafter_publish(self):
+            return 0
+
+        def _speco_flush_request_accept_len_payloads(self):
+            pass
+
+    trainer = Harness()
+    assert trainer._update_actor(None, {}) == "updated"
+    assert [span[0] for span in spans] == ["drafter/prepare", "drafter/train"]
+    assert {span[1] for span in spans} == {"speco_trainer"}
+    assert spans[1][2]["strategy"] == "sync"
+    assert spans[1][2]["max_batches"] == 4
+
+    spans.clear()
+    assert trainer.on_step_end() == "upstream"
+    assert [span[0] for span in spans] == ["drafter/publish"]
+    assert spans[0][1] == "speco_trainer"
+    assert spans[0][2]["deferred"] is True
