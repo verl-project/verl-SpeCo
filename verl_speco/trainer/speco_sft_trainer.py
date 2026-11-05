@@ -503,7 +503,11 @@ class SpecoRaySFTRayTrainer(SFTTrainer):
         allow_cross_step_hidden = bool(
             drafter_training_cfg.get("allow_cross_step_hidden", False)
         )
-        model_type = str(getattr(self.backend, "model_type", "")).lower()
+        model_type = (
+            str(getattr(self.config.rollout.drafter, "speculative_algorithm", ""))
+            .strip()
+            .lower()
+        )
         enforce_same_step = (
             model_type == "dspark" and not use_logits and not allow_cross_step_hidden
         )
@@ -1271,81 +1275,63 @@ class SpecoRaySFTRayTrainer(SFTTrainer):
                             f"[TRACE] Step B: batch_idx={batch_idx}, error={e}"
                         )
 
-                # 构建样本（注意：collect_online_data 期望 2D tensor）
+                positions_flat = positions.reshape(-1)
+                segments = self._speco_find_continuous_segments(positions_flat)
+
                 sample_input_ids_2d = (
                     sample_input_ids.unsqueeze(0).detach().cpu()
                 )  # (1, seq_len)
-                hidden_tensor_2d = (
-                    hidden_tensor.unsqueeze(0).detach().cpu()
-                )  # (1, hidden_dim)
 
-                # 在构建 sample dict 之前添加调试日志
-                logger.debug(
-                    f"[DEBUG] Before sample dict: hidden_tensor.shape={hidden_tensor.shape}, positions.shape={positions.shape}"
-                )
+                for seg_start, seg_end in segments:
+                    seg_positions = positions_flat[seg_start:seg_end]
+                    seg_hidden = hidden_tensor[seg_start:seg_end]
+                    if seg_hidden.numel() == 0:
+                        continue
 
-                sample = {
-                    "input_ids": sample_input_ids_2d,
-                    "hidden_positions": positions.detach().cpu().unsqueeze(0),  # 2D
-                    "hidden_states": hidden_tensor_2d,
-                    "hidden_position_start": int(positions[0].item())
-                    if len(positions) > 0
-                    else 0,
-                    "hidden_position_end": int(positions[-1].item()) + 1
-                    if len(positions) > 0
-                    else 0,
-                    "global_step": self.global_steps
-                    if hasattr(self, "global_steps")
-                    else 0,
-                    "replica_rank": int(owner_rank[batch_idx].item()),
-                    "loss_mask": sample_loss_mask.unsqueeze(
-                        0
-                    ),  # (1, seq_len) 原始 loss_mask
-                    "hidden_states_layout": sft_hidden_layout,
-                    "target_layer_ids": sft_target_layer_ids,
-                }
+                    seg_hidden_2d = seg_hidden.unsqueeze(0).detach().cpu()
 
-                # [TRACE Step C] 检查 sample dict 中的 loss_mask
-                try:
-                    final_loss_mask = sample["loss_mask"]
                     logger.debug(
-                        f"[TRACE] Step C: batch_idx={batch_idx}, "
-                        f"final_loss_mask shape={final_loss_mask.shape}, "
-                        f"sum={final_loss_mask.sum().item()}, "
-                        f"first_40={final_loss_mask[0, :40].tolist()}"
+                        f"[DEBUG] Before sample dict: hidden_tensor.shape={seg_hidden.shape}, "
+                        f"positions.shape={seg_positions.shape}"
                     )
-                except Exception as e:
-                    logger.debug(f"[TRACE] Step C: batch_idx={batch_idx}, error={e}")
 
-                # 添加调试日志
-                logger.debug(
-                    f"[DEBUG] Sample dict created: hidden_states.shape={sample['hidden_states'].shape}, hidden_positions.shape={sample['hidden_positions'].shape}, loss_mask_sum={sample_loss_mask.sum().item()}"
-                )
+                    sample = {
+                        "input_ids": sample_input_ids_2d,
+                        "hidden_positions": seg_positions.detach().cpu().unsqueeze(0),
+                        "hidden_states": seg_hidden_2d,
+                        "hidden_position_start": int(seg_positions[0].item()),
+                        "hidden_position_end": int(seg_positions[-1].item()) + 1,
+                        "global_step": self.global_steps
+                        if hasattr(self, "global_steps")
+                        else 0,
+                        "replica_rank": int(owner_rank[batch_idx].item()),
+                        "loss_mask": sample_loss_mask.unsqueeze(0),
+                        "hidden_states_layout": sft_hidden_layout,
+                        "target_layer_ids": sft_target_layer_ids,
+                    }
 
-                if attention_mask is not None:
-                    if hasattr(attention_mask, "offsets") and is_nested:
-                        am_offsets = attention_mask.offsets()
-                        am_start = int(am_offsets[batch_idx])
-                        am_end = int(am_offsets[batch_idx + 1])
-                        # NestedTensor 不能直接切片
-                        attention_mask_flat = (
-                            attention_mask.values()
-                            if hasattr(attention_mask, "values")
-                            else attention_mask
-                        )
-                        sample["attention_mask"] = (
-                            attention_mask_flat[am_start:am_end].detach().cpu()
-                        )
-                    else:
-                        sample["attention_mask"] = (
-                            attention_mask[batch_idx].detach().cpu()
-                        )
+                    if attention_mask is not None:
+                        if hasattr(attention_mask, "offsets") and is_nested:
+                            am_offsets = attention_mask.offsets()
+                            am_start = int(am_offsets[batch_idx])
+                            am_end = int(am_offsets[batch_idx + 1])
+                            attention_mask_flat = (
+                                attention_mask.values()
+                                if hasattr(attention_mask, "values")
+                                else attention_mask
+                            )
+                            sample["attention_mask"] = (
+                                attention_mask_flat[am_start:am_end].detach().cpu()
+                            )
+                        else:
+                            sample["attention_mask"] = (
+                                attention_mask[batch_idx].detach().cpu()
+                            )
 
-                # 按 owner_rank 分发到对应 bucket（多卡支持）
-                owner = int(owner_rank[batch_idx].item())
-                owner = min(owner, owner_count - 1)  # 确保不越界
-                buckets[owner].append(sample)
-                collected_count += 1
+                    owner = int(owner_rank[batch_idx].item())
+                    owner = min(owner, owner_count - 1)
+                    buckets[owner].append(sample)
+                    collected_count += 1
 
             if collected_count > 0:
                 # 发送到 SpecoWorker
@@ -1384,6 +1370,39 @@ class SpecoRaySFTRayTrainer(SFTTrainer):
         if isinstance(sequence, (list, tuple)):
             return sequence[index] if index < len(sequence) else None
         return None
+
+    @staticmethod
+    def _speco_find_continuous_segments(
+        positions: torch.Tensor,
+    ) -> list[tuple[int, int]]:
+        """将位置序列拆分为连续区间，返回 (start_idx, end_idx) 列表。
+
+        多轮对话的 loss_mask 可能不连续，导致 shifted_mask 选出的 positions
+        也不连续（如 [1,2,5,6]）。下游 collect_online_data 要求
+        hidden_positions 连续，否则会在第一个断点处 truncate。
+        因此将不连续序列拆成多个连续段，每段生成独立 sample。
+
+        Args:
+            positions: 1D long tensor，如 tensor([1, 2, 5, 6])
+
+        Returns:
+            list of (start_idx, end_idx)，如 [(0, 2), (2, 4)]
+        """
+        if positions.numel() == 0:
+            return []
+        positions = positions.reshape(-1)
+        if positions.numel() == 1:
+            return [(0, 1)]
+        breaks = (
+            (positions[1:] != positions[:-1] + 1).nonzero(as_tuple=False).reshape(-1)
+        )
+        segments: list[tuple[int, int]] = []
+        seg_start = 0
+        for brk in breaks.tolist():
+            segments.append((seg_start, brk + 1))
+            seg_start = brk + 1
+        segments.append((seg_start, positions.numel()))
+        return segments
 
     def _build_engine(self):
         """Override _build_engine to use SpecoTrainingWorker with oldlogprob patch.

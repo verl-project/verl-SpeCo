@@ -113,6 +113,10 @@ def _make_mock_trainer(monkeypatch, hidden_by_ref: dict):
     trainer._speco_get_sequence_item.side_effect = lambda seq, idx: (
         seq[idx] if seq is not None and idx < len(seq) else None
     )
+    # P2: 让 _speco_find_continuous_segments 使用真实实现，而非返回 MagicMock
+    trainer._speco_find_continuous_segments = (
+        SpecoRaySFTRayTrainer._speco_find_continuous_segments
+    )
 
     # 捕获 speco_collect_rollout_features 收到的 buckets
     captured = {}
@@ -409,3 +413,107 @@ def test_lm_head_sync_single_worker_rejected():
     result = {"accepted": False, "applied": False, "reason": "missing_payload"}
     synced, info = SpecoRaySFTRayTrainer._validate_lm_head_sync_result(result)
     assert synced is False
+
+
+# ---------------------------------------------------------------------------
+# P2: 多轮 SFT 不连续 hidden positions 拆段测试
+# ---------------------------------------------------------------------------
+
+
+def test_find_continuous_segments_splits_discontinuous_positions():
+    """不连续 positions 被拆分为多个连续区间。"""
+    from verl_speco.trainer.speco_sft_trainer import SpecoRaySFTRayTrainer
+
+    find = SpecoRaySFTRayTrainer._speco_find_continuous_segments
+
+    # 两段不连续：[1,2,5,6] -> [(0,2),(2,4)]
+    segments = find(torch.tensor([1, 2, 5, 6]))
+    assert segments == [(0, 2), (2, 4)]
+
+    # 完全连续
+    assert find(torch.tensor([3, 4, 5, 6])) == [(0, 4)]
+
+    # 三段不连续
+    assert find(torch.tensor([0, 1, 3, 7, 8])) == [(0, 2), (2, 3), (3, 5)]
+
+    # 单元素
+    assert find(torch.tensor([5])) == [(0, 1)]
+
+    # 空
+    assert find(torch.tensor([], dtype=torch.long)) == []
+
+
+def test_multi_turn_collect_splits_into_continuous_segments(monkeypatch) -> None:
+    """多轮对话两段 assistant 回复：采集后拆成 2 个 sample，两段监督都保留。
+
+    场景：loss_mask=[0,0,1,1,0,0,1,1]，shifted_mask=[0,1,1,0,0,1,1,0]，
+    collect_positions=[1,2,5,6]。下游 collect_online_data 要求 hidden_positions
+    连续，因此必须拆成 [1,2] 和 [5,6] 两个 sample，否则第二段监督会被 truncate 丢弃。
+    """
+    batch_size = 1
+    seq_len = 8
+    hidden_dim = 3
+
+    # 构造多轮 loss_mask：两段 assistant 回复（位置 2-3 和 6-7）
+    loss_mask = torch.tensor([[0, 0, 1, 1, 0, 0, 1, 1]], dtype=torch.long)
+    input_ids = torch.arange(seq_len).unsqueeze(0).long()
+
+    batch = {
+        "input_ids": input_ids,
+        "loss_mask": loss_mask,
+        OLD_LOGPROB_SAMPLE_INDICES_KEY: torch.tensor([0]),
+    }
+
+    # collect_plan：positions=[1,2,5,6]（不连续），对应 4 个 valid rows
+    collect_positions = torch.tensor([1, 2, 5, 6], dtype=torch.long)
+    collect_plan = {
+        "collect_mask": torch.tensor([True]),
+        "hidden_positions": collect_positions.unsqueeze(0),
+        "hidden_position_mask": torch.ones(1, 4, dtype=torch.bool),
+        "owner_rank": torch.tensor([0]),
+        "owner_count": 1,
+    }
+
+    # hidden tensor 共 4 行，每行用行号填充便于验证
+    hidden_tensor = (
+        torch.arange(4, dtype=torch.float32).unsqueeze(1).expand(4, hidden_dim)
+    )
+    hidden_by_ref = {}
+    ref = MagicMock()
+    hidden_by_ref[id(ref)] = hidden_tensor
+
+    hidden_ref_meta = [
+        {"batch_idx": 0, "chunk_start": 0, "chunk_length": 4},
+    ]
+    output = {
+        OLD_LOGPROB_HIDDEN_REFS_KEY: [ref],
+        OLD_LOGPROB_HIDDEN_REF_META_KEY: hidden_ref_meta,
+    }
+
+    trainer, captured = _make_mock_trainer(monkeypatch, hidden_by_ref)
+
+    collected = SpecoRaySFTRayTrainer._speco_collect_sft_features(
+        trainer, batch, collect_plan, output
+    )
+
+    # 拆成 2 个 sample
+    assert collected == 2
+    samples = captured["buckets"][0]
+    assert len(samples) == 2
+
+    # 第一个 sample：positions=[1,2]，hidden 前 2 行（行号 0,1）
+    seg0 = samples[0]
+    assert seg0["hidden_positions"].reshape(-1).tolist() == [1, 2]
+    assert seg0["hidden_states"].shape == (1, 2, hidden_dim)
+    assert seg0["hidden_position_start"] == 1
+    assert seg0["hidden_position_end"] == 3
+    # 验证 hidden 行与 positions 一一对应
+    assert seg0["hidden_states"][0, :, 0].tolist() == [0.0, 1.0]
+
+    # 第二个 sample：positions=[5,6]，hidden 后 2 行（行号 2,3）
+    seg1 = samples[1]
+    assert seg1["hidden_positions"].reshape(-1).tolist() == [5, 6]
+    assert seg1["hidden_states"].shape == (1, 2, hidden_dim)
+    assert seg1["hidden_position_start"] == 5
+    assert seg1["hidden_position_end"] == 7
+    assert seg1["hidden_states"][0, :, 0].tolist() == [2.0, 3.0]
