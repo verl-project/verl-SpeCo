@@ -173,9 +173,13 @@ class HiddenStatesStore:
     backend: str = FILE_BACKEND
 
     def load(
-        self, reference: str, *, timeout: float = 120.0
+        self, reference: str | Mapping[str, Any], *, timeout: float = 120.0
     ) -> tuple[dict[str, torch.Tensor], int]:
-        """Return ``(payload, byte_size)`` for a response reference."""
+        """Return ``(payload, byte_size)`` for a response reference.
+
+        The Mooncake backend takes the full transfer manifest (a mapping);
+        the file backend takes a path string.
+        """
         raise NotImplementedError
 
     def release(self, reference: str) -> None:
@@ -196,8 +200,10 @@ class FileHiddenStatesStore(HiddenStatesStore):
     backend = FILE_BACKEND
 
     def load(
-        self, reference: str, *, timeout: float = 30.0
+        self, reference: str | Mapping[str, Any], *, timeout: float = 30.0
     ) -> tuple[dict[str, torch.Tensor], int]:
+        if not isinstance(reference, str):
+            raise TypeError("The file hidden-state store loads path strings")
         try:
             from safetensors.torch import load_file
         except ImportError as exc:  # pragma: no cover - dependency issue
@@ -251,7 +257,7 @@ class MooncakeHiddenStatesStore(HiddenStatesStore):
             return store
 
     def load(
-        self, reference: Mapping[str, Any] | str, *, timeout: float = 120.0
+        self, reference: str | Mapping[str, Any], *, timeout: float = 120.0
     ) -> tuple[dict[str, torch.Tensor], int]:
         if not isinstance(reference, Mapping):
             raise TypeError(

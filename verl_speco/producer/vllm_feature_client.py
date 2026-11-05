@@ -208,6 +208,8 @@ def load_hidden_state_result(
             f"vLLM returned a {expected_backend} reference but the consumer is "
             f"configured for the {resolved.backend} hidden-state store"
         )
+    reference: str | Mapping[str, Any]
+    cleanup_reference: str
     if response.is_handle:
         # The Mooncake store consumes the full transfer manifest; the bare
         # handle alone lacks the tensor layout get_sample decodes with.
@@ -215,7 +217,7 @@ def load_hidden_state_result(
         cleanup_reference = response.handle or ""
     else:
         reference = response.reference
-        cleanup_reference = reference
+        cleanup_reference = response.reference
     payload, byte_size = resolved.load(reference)
     return RawVllmFeature(
         payload=payload,
