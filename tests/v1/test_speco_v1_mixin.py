@@ -149,6 +149,24 @@ def test_online_drafter_trains_only_on_last_local_update_of_global_step():
     assert events == ["actor", "drafter_schedule", "actor"]
 
 
+def test_v1_acceptance_row_mismatch_uses_sidecar(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "transfer_queue",
+        types.SimpleNamespace(kv_batch_get=lambda **_: {"extra_fields": [{}]}),
+    )
+
+    class Harness(SpecoV1Mixin):
+        def _speco_v1_spec_decode_sidecar_metrics(self):
+            return {"drafter/spec_decode/mean_acceptance_length": 3.0}
+
+    batch = types.SimpleNamespace(keys=["a", "b"], partition_id="train")
+    assert Harness()._speco_v1_spec_decode_metrics(batch) == {
+        "drafter/spec_decode/mean_acceptance_length": 3.0,
+        "drafter/spec_decode/extra_fields_row_mismatch": 1,
+    }
+
+
 def test_v1_metrics_report_speco_mean_acceptance_length(monkeypatch):
     class ExtraFields(list):
         def tolist(self):
@@ -287,6 +305,30 @@ def test_online_training_rejects_rollout_correction_bypass():
 @pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
 def test_online_training_accepts_all_v1_modes(mode):
     SpecoV1Mixin._speco_validate_v1_training_config(_config(mode=mode))
+
+
+def test_v1_session_owns_shared_runtime_state():
+    trainer = SpecoV1Mixin()
+    trainer.config = _config(mode="sync")
+    trainer.config.actor_rollout_ref.rollout.drafter.training["scheduler"] = {
+        "execution": {"strategy": "rollout_idle_worker"},
+    }
+    trainer._speco_last_collected_step = 3
+    session = trainer._speco_bubble_session()
+    assert "_speco_last_collected_step" not in trainer.__dict__
+    assert trainer._speco_last_collected_step == 3
+    trainer._speco_last_collected_step = 4
+    assert session.runtime_state["_speco_last_collected_step"] == 4
+
+
+def test_v1_bubble_rejects_removed_head_preparation_override():
+    config = _config(mode="sync")
+    config.actor_rollout_ref.rollout.drafter.training["scheduler"] = {
+        "execution": {"strategy": "rollout_idle_worker"},
+        "idle_worker": {"v1_head_preparation_enable": True},
+    }
+    with pytest.raises(ValueError, match="no longer supported"):
+        SpecoV1Mixin._speco_validate_v1_training_config(config)
 
 
 @pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
@@ -1419,3 +1461,72 @@ def test_v1_checkpoint_saves_and_resumes_adaptive_state(monkeypatch, tmp_path):
     restored = resumed._speco_get_drafter_scheduler().adaptive_controller
     assert asdict(restored.state) == expected
     assert restored.training_steps(11) == 0
+
+
+def test_v1_emits_trainer_phase_spans_for_prepare_train_and_publish(monkeypatch):
+    from contextlib import nullcontext
+
+    import verl_speco.trainer.v1.speco_mixin as mixin
+
+    spans = []
+
+    def fake_trace(state_name, *, state_lane_id=None, **labels):
+        spans.append((state_name, state_lane_id, labels))
+        return nullcontext()
+
+    monkeypatch.setattr(mixin, "_rl_insight_trace_state", fake_trace)
+
+    class Plan:
+        launch = True
+        reason = "training_ready"
+        execution_strategy = "sync"
+        max_batches = 4
+
+    class Event:
+        training_plan = Plan()
+        metrics = {}
+
+    class Upstream:
+        def _update_actor(self, batch, metrics):
+            return "updated"
+
+        def on_step_end(self):
+            return "upstream"
+
+    class Harness(SpecoV1Mixin, Upstream):
+        config = _config()
+        global_steps = 12
+        _speco_freeze_policy = None
+        _speco_v1_pending_training = False
+
+        def _speco_online_enabled_from_config(self, config):
+            return True
+
+        def _speco_on_before_actor_update(self):
+            return Event()
+
+        def _speco_train_drafter(self, plan):
+            self._speco_v1_pending_training = True
+            return True, {"drafter/trained": 1}
+
+        def _speco_publish_drafter_weights(self, *args, **kwargs):
+            return {"drafter/published": 1}
+
+        def _speco_wait_pending_drafter_publish(self):
+            return 0
+
+        def _speco_flush_request_accept_len_payloads(self):
+            pass
+
+    trainer = Harness()
+    assert trainer._update_actor(None, {}) == "updated"
+    assert [span[0] for span in spans] == ["drafter/prepare", "drafter/train"]
+    assert {span[1] for span in spans} == {"speco_trainer"}
+    assert spans[1][2]["strategy"] == "sync"
+    assert spans[1][2]["max_batches"] == 4
+
+    spans.clear()
+    assert trainer.on_step_end() == "upstream"
+    assert [span[0] for span in spans] == ["drafter/publish"]
+    assert spans[0][1] == "speco_trainer"
+    assert spans[0][2]["deferred"] is True

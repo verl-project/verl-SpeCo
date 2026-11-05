@@ -1702,6 +1702,16 @@ class DrafterBaseTrainer:
                 forward_prefetch=fsdp_config.forward_prefetch,
                 cpu_offload=None,
             )
+            if self._use_replica_local_bubble_group():
+                logger.warning(
+                    "[BubbleTime] drafter_parallelism: rank=%s replica_rank=%s "
+                    "configured_strategy=%s effective_strategy=fsdp1 "
+                    "scope=replica_local group_size=%s",
+                    self.rank,
+                    self.rollout_dp_rank,
+                    self._drafter_strategy(),
+                    self.training_group_world_size,
+                )
         else:
             logger.debug(
                 "Building drafter model without FSDP (standalone/local trainer mode)"
@@ -1992,7 +2002,11 @@ class DrafterBaseTrainer:
         to discard them, and cast before transfer rather than on the host.
         Checkpoint and Sync export retain their original state-dict paths.
         """
+        from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
+
         config = self.config.rollout.drafter.training
+        batch_copy = gpu_transfer_enabled(config, "gpu_publish_cast_before_copy")
+        copy_budget_bytes = 256 * 1024 * 1024
         dtype = {
             "bf16": torch.bfloat16,
             "bfloat16": torch.bfloat16,
@@ -2008,9 +2022,25 @@ class DrafterBaseTrainer:
         copied_bytes = 0
         skipped_bytes = 0
         leader = self._is_checkpoint_leader()
+        pending_bytes = 0
+        pending_devices: set[torch.device] = set()
+        cast_seconds = 0.0
+        copy_seconds = 0.0
+        wait_seconds = 0.0
+
+        def finish_copies():
+            nonlocal pending_bytes, wait_seconds
+            if pending_devices:
+                started = time.perf_counter()
+                for device in pending_devices:
+                    torch.cuda.current_stream(device).synchronize()
+                wait_seconds += time.perf_counter() - started
+                pending_devices.clear()
+                pending_bytes = 0
 
         def copy_entry(name, tensor):
-            nonlocal copied_bytes, skipped_bytes
+            nonlocal copied_bytes, skipped_bytes, pending_bytes
+            nonlocal cast_seconds, copy_seconds
             name = name.replace("_fsdp_wrapped_module.", "")
             skip = (
                 not torch.is_floating_point(tensor)
@@ -2028,11 +2058,29 @@ class DrafterBaseTrainer:
                 skipped_bytes += tensor.numel() * tensor.element_size()
             elif leader:
                 value = tensor.detach()
+                started = time.perf_counter()
                 if dtype is not None:
                     value = value.to(dtype=dtype)
-                value = value.to(device="cpu", copy=True).contiguous()
+                cast_seconds += time.perf_counter() - started
+                size_bytes = value.numel() * value.element_size()
+                non_blocking = (
+                    batch_copy
+                    and value.device.type == "cuda"
+                    and value.is_contiguous()
+                    and size_bytes <= copy_budget_bytes
+                )
+                if not non_blocking or pending_bytes + size_bytes > copy_budget_bytes:
+                    finish_copies()
+                if non_blocking:
+                    pending_devices.add(value.device)
+                    pending_bytes += size_bytes
+                started = time.perf_counter()
+                value = value.to(
+                    device="cpu", copy=True, non_blocking=non_blocking
+                ).contiguous()
+                copy_seconds += time.perf_counter() - started
                 result[name] = value
-                copied_bytes += value.numel() * value.element_size()
+                copied_bytes += size_bytes
 
         started = time.perf_counter()
         with FSDP.summon_full_params(
@@ -2042,24 +2090,38 @@ class DrafterBaseTrainer:
             rank0_only=False,
             offload_to_cpu=False,
         ):
-            for name, tensor in self.model.named_parameters(remove_duplicate=False):
-                copy_entry(name, tensor)
-            for prefix, module in self.model.named_modules(remove_duplicate=False):
-                for name, tensor in module._buffers.items():
-                    if (
-                        tensor is not None
-                        and name not in module._non_persistent_buffers_set
-                    ):
-                        copy_entry(f"{prefix}.{name}" if prefix else name, tensor)
+            gather_seconds = time.perf_counter() - started
+            try:
+                for name, tensor in self.model.named_parameters(remove_duplicate=False):
+                    copy_entry(name, tensor)
+                for prefix, module in self.model.named_modules(remove_duplicate=False):
+                    for name, tensor in module._buffers.items():
+                        if (
+                            tensor is not None
+                            and name not in module._non_persistent_buffers_set
+                        ):
+                            copy_entry(f"{prefix}.{name}" if prefix else name, tensor)
+            finally:
+                # Full parameter storage must survive every outstanding device copy.
+                finish_copies()
+            release_started = time.perf_counter()
+        release_seconds = time.perf_counter() - release_started
         logger.warning(
             "[BubbleTime] publish_trainable_only_export: rank=%s leader=%s "
-            "copied_bytes=%s skipped_bytes=%s entries=%s elapsed_s=%.4f",
+            "copied_bytes=%s skipped_bytes=%s entries=%s elapsed_s=%.4f "
+            "gather_s=%.4f cast_submit_s=%.4f host_copy_s=%.4f "
+            "copy_wait_s=%.4f release_s=%.4f",
             self.rank,
             leader,
             copied_bytes,
             skipped_bytes,
             len(result),
             time.perf_counter() - started,
+            gather_seconds,
+            cast_seconds,
+            copy_seconds,
+            wait_seconds,
+            release_seconds,
         )
         return result
 

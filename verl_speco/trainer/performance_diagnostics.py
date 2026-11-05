@@ -133,11 +133,12 @@ def training_stage_clock(trainer):
 
 
 def gpu_first_step_diagnostics_enabled(worker, execution_strategy, coordinated_idle):
+    from verl_speco.utils.env import env_flag
+
     return (
         execution_strategy == "rollout_idle_worker"
         and not coordinated_idle
         and getattr(worker, "device_name", "") == "cuda"
         and getattr(worker.trainer, "optimizer_steps_total", 0) < 2
-        and os.getenv("VERL_SPECO_DIAGNOSTIC_GPU_FIRST_STEPS", "").lower()
-        in {"1", "true", "yes"}
+        and env_flag("VERL_SPECO_DIAGNOSTIC_GPU_FIRST_STEPS")
     )

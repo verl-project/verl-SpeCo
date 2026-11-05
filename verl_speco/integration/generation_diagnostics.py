@@ -69,9 +69,11 @@ def empty_idle_poll_ablation_allowed(owner, training_config):
     and the normal post-rollout event drain remain mandatory at the caller.
     Never apply this to SGLang collection or any existing training state.
     """
-    if not phase_timing_enabled() or os.getenv(
-        "VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL", ""
-    ).lower() not in {"1", "true", "yes"}:
+    from verl_speco.utils.env import env_flag
+
+    if not phase_timing_enabled() or not env_flag(
+        "VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL"
+    ):
         return False
     scheduler = getattr(owner, "_drafter_scheduler", None)
     runtime = getattr(owner, "_drafter_runtime_state", None)
@@ -560,6 +562,8 @@ def flush_requests(owner):
 
 def report_idle_rejection(owner, plan):
     """At most one cached-state snapshot per step/reason; no RPCs or lease changes."""
+    from verl_speco.utils.diagnostics import diagnostic_state
+
     if os.getenv("VERL_SPECO_DIAGNOSTIC_IDLE_REJECTIONS", "").lower() not in {
         "1",
         "true",
@@ -567,15 +571,18 @@ def report_idle_rejection(owner, plan):
     } or getattr(plan, "launch", False):
         return
     step = getattr(owner, "global_steps", None)
-    if getattr(owner, "_idle_rejection_diagnostic_step", None) != step:
-        owner._idle_rejection_diagnostic_step = step
-        owner._idle_rejection_diagnostic_reasons = set()
+    if (
+        getattr(diagnostic_state(owner), "_idle_rejection_diagnostic_step", None)
+        != step
+    ):
+        diagnostic_state(owner)._idle_rejection_diagnostic_step = step
+        diagnostic_state(owner)._idle_rejection_diagnostic_reasons = set()
     reason = str(getattr(plan, "reason", "unknown"))
-    seen = getattr(owner, "_idle_rejection_diagnostic_reasons", set())
+    seen = getattr(diagnostic_state(owner), "_idle_rejection_diagnostic_reasons", set())
     if reason in seen:
         return
     seen.add(reason)
-    owner._idle_rejection_diagnostic_reasons = seen
+    diagnostic_state(owner)._idle_rejection_diagnostic_reasons = seen
     snapshot = idle_snapshot(owner)
     now = time.time()
     scheduler = getattr(owner, "_drafter_scheduler", None)

@@ -429,6 +429,8 @@ def test_head_poll_counts_transfer_only_after_complete_validated_ack(
     time = SimpleNamespace(time=lambda: 1000 + clock[0], perf_counter=lambda: clock[0])
     monkeypatch.setattr(legacy, "time", time)
     monkeypatch.setattr(bubble_mixin, "time", time)
+    from verl_speco.trainer import bubble_lifecycle
+    monkeypatch.setattr(bubble_lifecycle, "time", time)
     ready = [True]
     trainer._speco_ray_refs_ready = lambda refs: ready[0]
     trainer._speco_start_target_lm_head_weight_sync = lambda plan: (

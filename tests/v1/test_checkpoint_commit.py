@@ -123,3 +123,18 @@ def test_retention_rejects_path_escape_before_deleting_any_checkpoint(tmp_path):
         commit.prune_checkpoint_roles(None, root, [3, 4], "actor")
     assert safe.is_dir()
     assert victim.is_dir()
+
+
+def test_retention_reports_failed_deletions(tmp_path, monkeypatch, caplog):
+    target = tmp_path / "global_step_3" / "actor"
+    target.mkdir(parents=True)
+
+    def fail(path):
+        raise PermissionError("checkpoint is busy")
+
+    monkeypatch.setattr(commit.shutil, "rmtree", fail)
+    assert commit.prune_checkpoint_roles(None, tmp_path, [3], "actor") == {
+        "pruned": 0, "failed": 1,
+    }
+    assert target.is_dir()
+    assert "Checkpoint retention failed" in caplog.text

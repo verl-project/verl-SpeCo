@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -140,7 +141,16 @@ def prune_checkpoint_roles(worker, root, steps, role):
                 "Checkpoint retention target escapes its recovery directory"
             )
         targets.append(target)
+    pruned = failed = 0
     for target in targets:
         if target.is_dir():
-            shutil.rmtree(target, ignore_errors=True)
-    return {"pruned": len(targets)}
+            try:
+                shutil.rmtree(target)
+            except OSError:
+                failed += 1
+                logging.getLogger(__name__).warning(
+                    "Checkpoint retention failed: %s", target, exc_info=True
+                )
+            else:
+                pruned += 1
+    return {"pruned": pruned, "failed": failed}

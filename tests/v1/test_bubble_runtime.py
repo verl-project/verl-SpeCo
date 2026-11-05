@@ -10,6 +10,20 @@ from verl_speco.integration.resource_identity import map_training_replicas
 from verl_speco.trainer.bubble_lifecycle import BubbleLifecycle, QuotaCostLedger
 
 
+def test_cost_clock_ignores_wall_clock_corrections(monkeypatch):
+    from verl_speco.trainer import bubble_lifecycle as runtime
+
+    wall, monotonic = [1000.0], [10.0]
+    monkeypatch.setattr(runtime, "time", SimpleNamespace(
+        time=lambda: wall[0], perf_counter=lambda: monotonic[0],
+    ))
+    clock = runtime.CostClock()
+    monotonic[0] = 12
+    wall[0] = -5000
+    assert clock.now() == 1002
+    assert clock.from_monotonic(11) == 1001
+
+
 def test_cost_ledger_deduplicates_completion_and_uses_maximum_rank_cost():
     ledger = QuotaCostLedger()
     plan = SimpleNamespace(plan_id="one")
@@ -144,6 +158,21 @@ def test_partial_quota_keeps_costs_without_publishing():
     )
     assert len(session.pending) == 1
     assert session.costs.total == 6
+
+
+def test_opening_generation_preserves_parked_training_memory():
+    owner = SimpleNamespace(
+        _speco_emit_rollout_generation_started=lambda: {},
+        _speco_record_rollout_idle_metrics=lambda metrics: None,
+        _speco_start_rollout_idle_event_loop=lambda: (object(), object()),
+    )
+    session = BubbleLifecycle(owner)
+    session.memory_parked = True
+
+    session.start()
+
+    assert owner._speco_rollout_idle_generation_open
+    assert session.memory_parked
 
 
 def test_failed_event_thread_join_prevents_reclaim_and_parking():

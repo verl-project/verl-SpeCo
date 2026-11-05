@@ -12,11 +12,9 @@ from pathlib import Path
 
 
 def enabled():
-    return os.getenv("VERL_SPECO_DIAGNOSTIC_ROLLOUT_PERF", "").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+    from verl_speco.utils.env import env_flag
+
+    return env_flag("VERL_SPECO_DIAGNOSTIC_ROLLOUT_PERF")
 
 
 @lru_cache(maxsize=1)
@@ -135,11 +133,16 @@ def safe_runtime_snapshot(owner, role, stage, *, requested=False):
 @contextmanager
 def generation_execution(owner):
     """Frontend execution concurrency, NOT engine scheduler running/waiting counts."""
-    if not enabled() or getattr(owner, "_speco_perf_execution_episode", 0) >= 3:
+    from verl_speco.utils.diagnostics import diagnostic_state
+
+    if (
+        not enabled()
+        or getattr(diagnostic_state(owner), "_speco_perf_execution_episode", 0) >= 3
+    ):
         yield
         return
     now = time.perf_counter()
-    state = getattr(owner, "_speco_perf_execution", None)
+    state = getattr(diagnostic_state(owner), "_speco_perf_execution", None)
     if state is None:
         state = {
             "active": 0,
@@ -153,7 +156,7 @@ def generation_execution(owner):
             "execution_sum_s": 0.0,
             "failed": 0,
         }
-        owner._speco_perf_execution = state
+        diagnostic_state(owner)._speco_perf_execution = state
     state["active_area_s"] += state["active"] * (now - state["last_event"])
     state["submit_gap_max_s"] = max(
         state["submit_gap_max_s"], now - state["last_submit"]
@@ -174,9 +177,11 @@ def generation_execution(owner):
         state["active"] -= 1
         state["last_event"] = end
         if state["active"] == 0:
-            owner._speco_perf_execution = None
-            episode = getattr(owner, "_speco_perf_execution_episode", 0) + 1
-            owner._speco_perf_execution_episode = episode
+            diagnostic_state(owner)._speco_perf_execution = None
+            episode = (
+                getattr(diagnostic_state(owner), "_speco_perf_execution_episode", 0) + 1
+            )
+            diagnostic_state(owner)._speco_perf_execution_episode = episode
             from verl_speco.integration.generation_diagnostics import emit_summary
 
             elapsed = end - state["start"]

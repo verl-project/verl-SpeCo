@@ -14,6 +14,7 @@
 """Measure residency boundaries without changing optimizer state or ordering."""
 
 import ast
+import builtins
 import asyncio
 import copy
 import json
@@ -85,6 +86,19 @@ def _trainer(events, *, fail_offload=False, skip=False, device="cuda"):
         "load_fsdp_model_to_gpu": lambda model: events.append("load_model"),
         "load_fsdp_optimizer": lambda **kwargs: events.append("load_optimizer"),
     }
+    allowed_imports = {
+        node.module for node in ast.walk(module) if isinstance(node, ast.ImportFrom)
+    } | {
+        alias.name for node in ast.walk(module) if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+
+    def declared_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name not in allowed_imports:
+            raise ImportError(f"Undeclared extracted-method dependency: {name}")
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    namespace["__builtins__"] = {**vars(builtins), "__import__": declared_import}
     exec(compile(module, str(path), "exec"), namespace)  # noqa: S102 - actual repository methods
     trainer = namespace["DrafterBaseTrainer"]()
     trainer._test_offload_cache_flags = offload_cache_flags

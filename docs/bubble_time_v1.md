@@ -1,6 +1,6 @@
 # Bubble Time 与 V1
 
-Last updated: 2026-11-03
+Last updated: 2026-11-04
 
 适配基线为上游 `release/v0.9.0`。PPO 主循环仍由上游 V1 trainer 执行；
 本仓库仅提供sync 生命周期 hook、数据采集和发布协议。
@@ -48,8 +48,8 @@ NPU 路径不变。设 `actor_rollout_ref.rollout.drafter.training.gpu_transfer_
 
 V1 已移除 step-end 的提前准备 head 路径。训练 preflight 仍选择并应用 quota
 绑定的 head；保留控制步同步、版本检查、quota、writer、资源租约及发布规则。
-`v1_head_preparation_enable` 仅为兼容旧启动命令而保留，默认 false；即使设置
-为 true，也不会启用提前准备。legacy trainer 的原有路径不受此调整影响。
+`v1_head_preparation_enable` 仅为兼容旧启动命令而保留，默认 false；设置
+为 true 将在 V1 Bubble 校验阶段报错；请移除旧 override 或设为 false。legacy trainer 的原有路径不受此调整影响。
 
 默认关闭边界诊断：
 
@@ -260,3 +260,37 @@ OOM、训练失败、发布 ACK/版本错误仍保留。`memory_park_breakdown` 
 Bubble 示例省略 `writer_migration_enable=false`、`full_collective_fallback=false`、
 `head_reference_transport=true` 和 `calibrated_budgets=true`，沿用配置默认值。
 `v1_head_preparation_enable` 虽然已无作用，仍作为旧命令的兼容键保留。
+
+
+## 边界与计费维护约定
+
+V1 session 持有共享 Bubble 运行状态，trainer 的历史属性名仅作兼容转发；
+legacy owner 不迁移存储。锁顺序为训练锁 → session 锁，停止并 join 事件线程时
+不持训练锁。已成功 park 的 driver receipt 可跳过重复 park RPC；新 generation、
+训练完成回调与激活会使 receipt 失效。失败的 park 不会生成成功 receipt。
+
+ROI 使用固定 epoch 加单调时钟的 CostClock。driver 和 worker 在初始化时各采样一次
+wall epoch，后续 NTP 跳变不影响本地成本区间。跨节点区间并集仍要求初始化时机器
+时钟同步，不能把它视为跨主机精确因果时钟。运行时 deadline 沿用原有调度时钟，
+不与成本时钟混用。head dispatch 的 perf_counter 起点用固定 epoch 转换，不能
+在结束时用当前 wall clock 反推起点。
+
+成本 identity 表示一次完成事件，同 identity 的重复回调采用 first-completion-wins；
+真正执行额外工作的重试需要不同 attempt identity。head 传输使用版本与 dispatch
+origin 区分不同传输；已完成事件的迟到重复回调不追加成本。不同 identity 的时间
+区间取并集，避免重叠工作重复计费。
+
+延迟 checkpoint 后直接调用 checkpoint manager 重新应用已确认 target，不再二次
+调用上游 on_step_end。sleep 会释放权重/KV，不能只解除 generation 的暂停。
+retention 删除失败记录 warning，并分别返回 pruned/failed，避免假报清理成功。
+
+V1 CPU CI 固定上游 commit 91c297dc8d9991b79c90cad5b50683a5d6d8c02b，
+缓存命中后仍检查 checkout SHA。AST 方法提取测试使用导入守卫；未声明的动态
+导入失败，新增依赖必须在被提取源码中显式声明。
+
+
+延迟 checkpoint 保存后的 rollout 权重/KV 恢复单独记录为
+`timing_s/checkpoint_rollout_restore`，从 `timing_s/drafter_v1_publish_blocking`
+及 `timing_s/drafter` 中排除。它仍包含在整步与 step-end 总耗时中；该指标表示
+保存后恢复 serving，不表示从磁盘恢复训练。此调整只修正计时归类，不改变同步
+调用次数、顺序或实际端到端耗时。

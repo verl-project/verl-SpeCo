@@ -25,8 +25,13 @@ import time
 from typing import Any, cast
 
 from verl_speco.trainer.v1.bubble_mixin import V1BubbleMixin
+from verl_speco.rl_insight_bridge import trace_state as _rl_insight_trace_state
 
 logger = logging.getLogger(__name__)
+
+# RL-Insight trace lane for the trainer-side phases owned by the V1 lifecycle.
+# Keep in sync with the legacy SpecoRayPPOTrainer lane.
+_SPECO_RL_INSIGHT_TRAINER_LANE = "speco_trainer"
 
 
 def _plain_config(value):
@@ -204,6 +209,10 @@ class SpecoV1Mixin(V1BubbleMixin):
         avoids importing the legacy Ray trainer during V1 module discovery and
         keeps one implementation of the runtime protocol.
         """
+        session = self.__dict__.get("_speco_bubble_lifecycle")
+        state = getattr(session, "runtime_state", None)
+        if state is not None and name in state:
+            return state[name]
         if (
             name.startswith("_speco")
             or name.startswith("speco_")
@@ -667,6 +676,12 @@ class SpecoV1Mixin(V1BubbleMixin):
             == "rollout_idle_worker"
         )
         mode = str(config.trainer.v1.get("trainer_mode", "sync"))
+        idle = (training.get("scheduler", {}) or {}).get("idle_worker", {}) or {}
+        if bubble and idle.get("v1_head_preparation_enable", False):
+            raise ValueError(
+                "v1_head_preparation_enable is no longer supported; remove the "
+                "override or set it to false. Quota heads are prepared by training preflight."
+            )
         if bubble and mode != "sync":
             raise ValueError(
                 "V1 Bubble Time supports only trainer_mode=sync; "
@@ -717,6 +732,7 @@ class SpecoV1Mixin(V1BubbleMixin):
 
     def _setup(self):
         self._speco_validate_v1_training_config(self.config)
+        self._speco_v1_bubble_enabled_cache = self._speco_rollout_idle_worker_enabled()
         if self._speco_rollout_idle_worker_enabled():
             self._speco_v1_log_runtime_provenance()
         from verl_speco.integration.vllm_runtime import (
@@ -904,9 +920,15 @@ class SpecoV1Mixin(V1BubbleMixin):
                 checkpoint_seconds = self._speco_v1_timings.get(
                     "drafter_v1_checkpoint", 0.0
                 )
+                checkpoint_restore_seconds = self._speco_v1_timings.get(
+                    "checkpoint_rollout_restore", 0.0
+                )
                 self._speco_v1_record_timing(
                     "drafter_v1_publish_blocking",
-                    elapsed - upstream_seconds - checkpoint_seconds,
+                    elapsed
+                    - upstream_seconds
+                    - checkpoint_seconds
+                    - checkpoint_restore_seconds,
                 )
         try:
             lifecycle_started = time.perf_counter()
@@ -922,7 +944,17 @@ class SpecoV1Mixin(V1BubbleMixin):
             # Native colocate_async resumes the engine during target sync.
             # Keep ordinary requests behind admission until both probe arms
             # and the drafter publication have settled at that fixed target.
-            publish_metrics = self._speco_finalize_v1_drafter_publish()
+            if getattr(self, "_speco_v1_pending_training", False):
+                with _rl_insight_trace_state(
+                    "drafter/publish",
+                    state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                    global_step=getattr(self, "global_steps", None),
+                    trained=1,
+                    deferred=True,
+                ):
+                    publish_metrics = self._speco_finalize_v1_drafter_publish()
+            else:
+                publish_metrics = self._speco_finalize_v1_drafter_publish()
             if self.__dict__.get("device_name") == "cuda":
                 # Inclusive lifecycle spans: do not sum with update_weights.
                 publish_metrics.update(
@@ -956,12 +988,9 @@ class SpecoV1Mixin(V1BubbleMixin):
                 return None
             if not getattr(self, "_speco_colocate_admission_closed", False):
                 with self._speco_v1_quiescent_boundary(charge_cost=False):
-                    managers = [self.checkpoint_manager]
-                    for manager in managers:
-                        manager.sleep_replicas()
+                    self.checkpoint_manager.sleep_replicas()
                     result = self._save_checkpoint()
-                    for manager in self._speco_v1_active_checkpoint_managers():
-                        manager.update_weights(self.global_steps)
+                    self.checkpoint_manager.update_weights(self.global_steps)
                     return result
         if (
             getattr(self, "_speco_last_checkpoint_saved_step", None)
@@ -1451,13 +1480,18 @@ class SpecoV1Mixin(V1BubbleMixin):
             temperature=self.config.actor_rollout_ref.rollout.temperature,
         )
         prepared_at = time.perf_counter()
-        output = self._speco_compute_collection_log_prob(control)
-        computed_at = time.perf_counter()
-        output_data = output
-        collected = self._speco_collect_oldlogprob_features(
-            data_proto, collect_plan, output_data
-        )
-        collected_at = time.perf_counter()
+        with _rl_insight_trace_state(
+            "drafter/collect",
+            state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+            global_step=getattr(self, "global_steps", None),
+        ):
+            output = self._speco_compute_collection_log_prob(control)
+            computed_at = time.perf_counter()
+            output_data = output
+            collected = self._speco_collect_oldlogprob_features(
+                data_proto, collect_plan, output_data
+            )
+            collected_at = time.perf_counter()
         self._speco_v1_state["features_collected"] = int(
             self._speco_v1_state.get("features_collected", 0) + collected
         )
@@ -1768,6 +1802,17 @@ class SpecoV1Mixin(V1BubbleMixin):
             request_acceptance_counters,
         )
 
+        if len(extra_fields) != len(batch.keys):
+            logger.warning(
+                "V1 acceptance metrics row mismatch: expected=%s actual=%s",
+                len(batch.keys),
+                len(extra_fields),
+            )
+            return {
+                **self._speco_v1_spec_decode_sidecar_metrics(),
+                "drafter/spec_decode/extra_fields_row_mismatch": 1,
+            }
+
         total_drafts = 0.0
         total_accepted = 0.0
         requests_with_stats = 0
@@ -1826,6 +1871,18 @@ class SpecoV1Mixin(V1BubbleMixin):
             # completion repaid quota (or this step registered a new quota).
             with self._speco_bubble_training_lock():
                 metrics.update(scheduler.training_quota_metrics(global_steps))
+                totals = scheduler.training_work_metrics()
+            # Derive step counts from the scheduler's single accounting point.
+            # A later top-up result can otherwise overwrite the idle count.
+            counted_step, baseline, last_totals = self.__dict__.get(
+                "_speco_v1_work_counts", (None, {}, {})
+            )
+            if counted_step != global_steps:
+                baseline = last_totals
+            for key, total in totals.items():
+                metrics[key.removesuffix("_total")] = total - baseline.get(key, 0)
+            metrics.update(totals)
+            self._speco_v1_work_counts = (global_steps, baseline, totals)
         if getattr(self, "_speco_freeze_policy", None) is not None:
             metrics.update(self._speco_freeze_metrics())
         if getattr(self, "_speco_ci_result", None) is not None:
@@ -1871,7 +1928,12 @@ class SpecoV1Mixin(V1BubbleMixin):
             return result
 
         before_started = time.perf_counter()
-        event = self._speco_on_before_actor_update()
+        with _rl_insight_trace_state(
+            "drafter/prepare",
+            state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+            global_step=getattr(self, "global_steps", None),
+        ):
+            event = self._speco_on_before_actor_update()
         plan = event.training_plan
         metrics.update(event.metrics or {})
         before_elapsed = max(0.0, time.perf_counter() - before_started)
@@ -1891,7 +1953,17 @@ class SpecoV1Mixin(V1BubbleMixin):
         if plan is not None:
             if plan.launch:
                 started = time.perf_counter()
-                trained, train_metrics = self._speco_train_drafter(plan)
+                execution_strategy = getattr(plan, "execution_strategy", "")
+                with _rl_insight_trace_state(
+                    "drafter/train",
+                    state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                    global_step=getattr(self, "global_steps", None),
+                    strategy=str(
+                        getattr(execution_strategy, "value", execution_strategy)
+                    ),
+                    max_batches=int(getattr(plan, "max_batches", 0)),
+                ):
+                    trained, train_metrics = self._speco_train_drafter(plan)
                 self._speco_v1_train_cost_seconds = time.perf_counter() - started
             else:
                 trained = False
@@ -1992,12 +2064,9 @@ class SpecoV1Mixin(V1BubbleMixin):
         if self._speco_online_enabled_from_config(self.config):
             if self._speco_rollout_idle_worker_enabled():
                 with self._speco_v1_quiescent_boundary():
-                    managers = [self.checkpoint_manager]
-                    for manager in managers:
-                        manager.sleep_replicas()
+                    self.checkpoint_manager.sleep_replicas()
                     self._speco_activate_drafter_training_model_before_fit()
-                    for manager in managers:
-                        manager.update_weights(self.global_steps)
+                    self.checkpoint_manager.update_weights(self.global_steps)
             else:
                 self._speco_activate_drafter_training_model_before_fit()
             self._speco_freeze_policy = self._speco_init_freeze_policy()
@@ -2023,8 +2092,7 @@ class SpecoV1Mixin(V1BubbleMixin):
                         server.speco_set_serving_drafter_revision.remote(
                             self._speco_freeze_policy.drafter_version
                         )
-                        for _, manager in self._speco_v1_serving_managers()
-                        for server in manager.server_handles
+                        for server in self.llm_server_manager.server_handles
                     ]
                 )
             if self._speco_colocate_probe_boundary_enabled():

@@ -290,6 +290,11 @@ def _load_methods(relative_path, class_name, names, namespace):
         for node in module.body
         if isinstance(node, ast.FunctionDef) and node.name in names
     ]
+    namespace.setdefault(
+        "_rl_insight_trace_state", lambda *args, **kwargs: nullcontext()
+    )
+    namespace.setdefault("_rl_insight_log_scalar_metrics", lambda *args, **kwargs: None)
+    namespace.setdefault("_SPECO_RL_INSIGHT_TRAINER_LANE", "speco_trainer")
     exec(
         compile(
             ast.fix_missing_locations(
@@ -317,6 +322,8 @@ def worker_class():
             "request_drafter_training_reclaim",
             "_receive_drafter_reclaim",
             "_reclaim_control_lock",
+            "_speco_rl_insight_labels",
+            "_speco_emit_rl_insight_worker_metrics",
             "train_drafter",
         },
         {
@@ -414,6 +421,7 @@ def _prepared_worker(worker_class, *, reclaim_after_first=False):
     worker = worker_class()
     for key, value in {
         "rank": 0,
+        "replica_rank": 0,
         "worker_incarnation": "rank-0",
         "enable_drafter": True,
         "in_drafter_train_group": True,
@@ -514,9 +522,10 @@ def test_reclaim_runs_between_atomic_optimizer_steps(worker_class):
     assert callbacks == [None]
 
 
-def test_standalone_training_offloads_before_returning_lease_completion(worker_class):
+def test_deadline_training_offloads_before_returning_lease_completion(worker_class):
     worker, plan, _ = _prepared_worker(worker_class)
-    worker._speco_require_lease_offload = True
+    plan["idle_park_after_training"] = True
+    plan["deadline_ts"] = float("inf")
     parked = []
 
     async def park(*, strict):

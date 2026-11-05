@@ -5,14 +5,40 @@
 from __future__ import annotations
 
 import threading
+import time
 import math
 from dataclasses import dataclass, field
+from contextlib import nullcontext
 from typing import Any
+
+
+class CostClock:
+    """Epoch-aligned monotonic clock, anchored once per process/session.
+
+    Wall time is sampled only at construction. NTP corrections after that
+    cannot reverse local intervals. Cross-node union still requires synchronized
+    initial epochs; duration measurements always use the monotonic clock.
+    """
+
+    def __init__(self):
+        self.monotonic_epoch = time.perf_counter()
+        self.wall_epoch = time.time()
+
+    def from_monotonic(self, instant):
+        return self.wall_epoch + instant - self.monotonic_epoch
+
+    def now(self):
+        return self.from_monotonic(time.perf_counter())
 
 
 @dataclass
 class QuotaCostLedger:
-    """Count completed work once; parallel rank durations use their maximum."""
+    """Count completed work once; parallel rank durations use their maximum.
+
+    Repeated completion observations use the first completed measurement for
+    each identity. Retries that execute additional work need distinct attempt
+    identities; polling the same completion must not inflate ROI costs.
+    """
 
     events: dict[str, float] = field(default_factory=dict)
     intervals: dict[str, tuple[float, float]] = field(default_factory=dict)
@@ -58,7 +84,13 @@ class QuotaCostLedger:
         ):
             critical: dict[str, Any] = max(
                 records,
-                key=lambda item: float(item.get(duration_key, 0) or 0),
+                key=lambda item: (
+                    float(item[f"cost_{phase}_finished_ts"])
+                    - float(item[f"cost_{phase}_started_ts"])
+                    if item.get(f"cost_{phase}_finished_ts") is not None
+                    and item.get(f"cost_{phase}_started_ts") is not None
+                    else float(item.get(duration_key, 0) or 0)
+                ),
                 default={},
             )
             duration = float(critical.get(duration_key, 0) or 0)
@@ -111,8 +143,18 @@ class BubbleLifecycle:
                 "_speco_deferred_publish_count": 0,
                 "_speco_freeze_state_sidecar": "speco_drafter_freeze_state.json",
             }
-            for name, value in defaults.items():
-                trainer.__dict__.setdefault(name, value)
+            if (
+                getattr(type(trainer), "_speco_session_state_owner", False)
+                and trainer._speco_rollout_idle_worker_enabled()
+            ):
+                self.runtime_state = {
+                    name: trainer.__dict__.pop(name, value)
+                    for name, value in defaults.items()
+                }
+            else:
+                # Legacy facade owners keep their existing storage contract.
+                for name, value in defaults.items():
+                    trainer.__dict__.setdefault(name, value)
         self.stop_event: Any = None
         self.thread: Any = None
         self.pending: list[tuple[Any, Any]] = []
@@ -120,43 +162,54 @@ class BubbleLifecycle:
         self.published_ids: set[str] = set()
         self.costs = QuotaCostLedger()
         self.receipts: list[dict[str, Any]] = []
+        # Lock order: owner Bubble training lock -> session lock. Never call
+        # acquire the owner lock from a session-locked callback.
         self.lock = threading.RLock()
+        self.memory_parked = False
+        self.clock = CostClock()
 
     def enqueue(self, plan: Any, outcome: Any) -> dict[str, int]:
-        with self.lock:
-            if plan.plan_id in self.published_ids:
-                return {"bubble/duplicate_completion_ignored": 1}
-            self.costs.observe_training(plan, outcome)
+        lock = getattr(self.trainer, "_speco_bubble_training_lock", None)
+        with lock() if lock is not None else nullcontext():
             quota_complete = (
                 self.trainer is None
                 or self.trainer._speco_get_drafter_scheduler()._training_quota_debt_steps
                 <= 0
             )
-            if (
-                outcome.trained
-                and plan.publish_after_success
-                and quota_complete
-                and plan.plan_id not in self.queued
-            ):
-                self.pending.append((plan, outcome))
-                self.queued.add(plan.plan_id)
-        return {"bubble/completion_queued": int(bool(self.pending))}
+            with self.lock:
+                self.memory_parked = False
+                if plan.plan_id in self.published_ids:
+                    return {"bubble/duplicate_completion_ignored": 1}
+                self.costs.observe_training(plan, outcome)
+                if (
+                    outcome.trained
+                    and plan.publish_after_success
+                    and quota_complete
+                    and plan.plan_id not in self.queued
+                ):
+                    self.pending.append((plan, outcome))
+                    self.queued.add(plan.plan_id)
+            return {"bubble/completion_queued": int(bool(self.pending))}
 
     def start(self) -> None:
-        owner = self.trainer
-        with self.lock:
-            if self.thread is not None or getattr(
-                owner, "_speco_validation_in_progress", False
-            ):
-                return
-            owner._speco_rollout_idle_generation_open = True
-            owner._speco_idle_continuation_plan = None
-            owner._speco_runtime_idle_events_this_generation = 0
-            owner._speco_runtime_sample_events_this_generation = 0
-            owner._speco_record_rollout_idle_metrics(
-                owner._speco_emit_rollout_generation_started()
-            )
-            self.stop_event, self.thread = owner._speco_start_rollout_idle_event_loop()
+        lock = getattr(self.trainer, "_speco_bubble_training_lock", None)
+        with lock() if lock is not None else nullcontext():
+            owner = self.trainer
+            with self.lock:
+                if self.thread is not None or getattr(
+                    owner, "_speco_validation_in_progress", False
+                ):
+                    return
+                owner._speco_rollout_idle_generation_open = True
+                owner._speco_idle_continuation_plan = None
+                owner._speco_runtime_idle_events_this_generation = 0
+                owner._speco_runtime_sample_events_this_generation = 0
+                owner._speco_record_rollout_idle_metrics(
+                    owner._speco_emit_rollout_generation_started()
+                )
+                self.stop_event, self.thread = (
+                    owner._speco_start_rollout_idle_event_loop()
+                )
 
     def close(self, boundary: str) -> dict[str, Any]:
         owner = self.trainer

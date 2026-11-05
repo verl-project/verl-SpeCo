@@ -62,7 +62,7 @@ def test_nested_requests_account_concurrency_without_summing_wall_times(monkeypa
     assert result["execution_sum_s"] == 6.0
     assert result["submit_span_s"] == 1.0
     assert result["engine_scheduler_counts"] == "unavailable_in_frontend"
-    assert owner._speco_perf_execution is None
+    assert owner._speco_diagnostics._speco_perf_execution is None
 
 
 def test_failed_requests_preserve_exception_and_logging_is_bounded(monkeypatch):

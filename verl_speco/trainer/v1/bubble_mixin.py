@@ -15,6 +15,16 @@ logger = logging.getLogger(__name__)
 
 
 class V1BubbleMixin:
+    _speco_session_state_owner = True
+
+    def __setattr__(self, name, value):
+        session = self.__dict__.get("_speco_bubble_lifecycle")
+        state = getattr(session, "runtime_state", None)
+        if state is not None and name in state:
+            state[name] = value
+        else:
+            super().__setattr__(name, value)
+
     if TYPE_CHECKING:
         # SpecoV1Mixin supplies the dynamically bound shared trainer facade.
         def __getattr__(self, name: str) -> Any: ...
@@ -22,6 +32,9 @@ class V1BubbleMixin:
     def _speco_rollout_idle_worker_enabled(self) -> bool:
         from verl_speco.trainer.scheduler import DrafterScheduleConfig
 
+        cached = self.__dict__.get("_speco_v1_bubble_enabled_cache")
+        if cached is not None:
+            return cached
         if getattr(self, "config", None) is None:
             return False
         actor = (
@@ -54,6 +67,14 @@ class V1BubbleMixin:
             self._speco_bubble_lifecycle = session
         return session
 
+    def _speco_bubble_clock(self):
+        from verl_speco.trainer.bubble_lifecycle import CostClock
+
+        session = self._speco_bubble_session()
+        if not hasattr(session, "clock"):
+            session.clock = CostClock()
+        return session.clock
+
     def _speco_bubble_roi_supported(self) -> bool:
         return self._speco_rollout_idle_worker_enabled()
 
@@ -84,15 +105,8 @@ class V1BubbleMixin:
             )
         return metrics
 
-    def _speco_v1_serving_managers(self):
-        managers = [("hybrid", self.llm_server_manager)]
-        return managers
-
     def _speco_v1_probe_servers(self):
         return list(self.llm_server_manager.server_handles)
-
-    def _speco_v1_active_checkpoint_managers(self):
-        return [self.checkpoint_manager]
 
     def _speco_park_drafter_training_memory(self, boundary):
         if not self._speco_rollout_idle_worker_enabled():
@@ -101,11 +115,15 @@ class V1BubbleMixin:
         # keep_hot_between_plans is only valid inside a resource-owned window;
         # it must not bypass parking across actor updates or rollout admission.
         # Preserve CPU optimizer/replay state and the fixed quota writer.
+        session = self._speco_bubble_session()
+        if getattr(session, "memory_parked", False):
+            return {}
         started = time.perf_counter()
         results = self._ray_get_if_needed(
             self._require_speco_worker_group().park_drafter_training_model()
         )
         items = self._speco_flatten_checkpoint_results(results)
+        session.memory_parked = True
         scheduler = self._speco_get_drafter_scheduler()
         scheduler.record_memory_park_elapsed(
             max(
@@ -140,43 +158,52 @@ class V1BubbleMixin:
 
         refs = [
             getattr(server, method).remote()
-            for _, manager in self._speco_v1_serving_managers()
-            for server in manager.server_handles
+            for server in self.llm_server_manager.server_handles
         ]
         if not refs:
             raise RuntimeError("Bubble boundary has no serving replicas")
         ray.get(refs)
 
     @contextmanager
-    def _speco_v1_quiescent_boundary(self, *, charge_cost=True):
-        """Pause ordinary requests, but allow dedicated probe RPCs."""
+    def _speco_v1_quiescent_boundary(self, *, charge_cost=True, timings=None):
+        """Close admission and drain sync serving RPCs without pausing vLLM.
+
+        abort_replicas() can leave vLLM >= 0.12 generation paused. The naive
+        sync weight update does not resume it, and probes inside this boundary
+        need a runnable engine. Sync has no concurrent rollout producer here;
+        admitted requests finish before weights or probe state are changed.
+        """
         already_closed = bool(getattr(self, "_speco_colocate_admission_closed", False))
         self._speco_bubble_session().close("v1_publish")
         pause_started = time.perf_counter()
-        pause_wall_started = time.time()
+        pause_wall_started = self._speco_bubble_clock().now()
         if not already_closed:
             self._speco_v1_admission("speco_close_rollout_admission")
             self._speco_colocate_admission_closed = True
         completed = False
         try:
-            managers = [self.checkpoint_manager]
-            for manager in managers:
-                # Abort partial requests so the idle wait cannot wait forever
-                # on a paused request; TQ retains the upstream retry ownership.
-                manager.abort_replicas()
             self._speco_v1_admission("speco_wait_rollout_idle")
+            if timings is not None:
+                timings["timing_s/drafter_v1_admission_close_and_drain"] = (
+                    time.perf_counter() - pause_started
+                )
             if charge_cost:
                 self._speco_bubble_session().costs.record_interval(
                     f"pause:{self.global_steps}",
                     pause_wall_started,
-                    time.time(),
+                    self._speco_bubble_clock().now(),
                 )
             yield
             completed = True
         finally:
             if completed and not already_closed:
-                resume_wall_started = time.time()
+                resume_wall_started = self._speco_bubble_clock().now()
+                resume_started = time.perf_counter()
                 self._speco_v1_admission("speco_resume_rollout_admission")
+                if timings is not None:
+                    timings["timing_s/drafter_v1_admission_resume"] = (
+                        time.perf_counter() - resume_started
+                    )
                 self._speco_colocate_admission_closed = False
                 receipts = self._speco_bubble_session().receipts
                 self._speco_v1_last_pause_seconds = time.perf_counter() - pause_started
@@ -184,14 +211,14 @@ class V1BubbleMixin:
                     receipts[-1]["costs"].record_interval(
                         f"resume:{self.global_steps}",
                         resume_wall_started,
-                        time.time(),
+                        self._speco_bubble_clock().now(),
                     )
 
     def _speco_v1_cache_old_policy_head(self) -> None:
         if not self._speco_rollout_idle_worker_enabled():
             return
         # Materialize the sync collection head before the next actor update.
-        wall_started = time.time()
+        wall_started = self._speco_bubble_clock().now()
         metrics, pending = self._speco_start_target_lm_head_weight_sync(None)
         if pending is not None:
             self._pending_target_lm_head_sync = pending
@@ -200,7 +227,7 @@ class V1BubbleMixin:
             self._speco_bubble_session().costs.record_interval(
                 f"head:{self.global_steps}",
                 wall_started,
-                time.time(),
+                self._speco_bubble_clock().now(),
             )
         self._speco_record_rollout_idle_metrics(metrics)
 
@@ -216,7 +243,7 @@ class V1BubbleMixin:
 
     def _speco_record_target_head_transfer_cost(self, pending):
         origin = pending.get("sync_started", time.perf_counter())
-        started = time.time() - max(0.0, time.perf_counter() - origin)
+        started = self._speco_bubble_clock().from_monotonic(origin)
         version = pending.get(
             "target_version", pending.get("global_step", self.global_steps)
         )
@@ -225,7 +252,7 @@ class V1BubbleMixin:
         self._speco_bubble_session().costs.record_interval(
             f"head_transfer:{version}:{origin}",
             started,
-            time.time(),
+            self._speco_bubble_clock().now(),
         )
 
     def _speco_dispatch_target_lm_head_payload(self, payload, **kwargs):
@@ -259,13 +286,18 @@ class V1BubbleMixin:
     def _speco_activate_drafter_training_model_before_fit(self):
         from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
 
-        started = time.time()
+        if not self._speco_rollout_idle_worker_enabled():
+            return SpecoRayPPOTrainer._speco_activate_drafter_training_model_before_fit(
+                self
+            )
+        self._speco_bubble_session().memory_parked = False
+        started = self._speco_bubble_clock().now()
         result = SpecoRayPPOTrainer._speco_activate_drafter_training_model_before_fit(
             self
         )
         if self._speco_rollout_idle_worker_enabled():
             self._speco_bubble_session().costs.record_interval(
-                "bootstrap", started, time.time()
+                "bootstrap", started, self._speco_bubble_clock().now()
             )
         return result
 
@@ -324,7 +356,7 @@ class V1BubbleMixin:
             try:
                 if run_probe:
                     started = time.perf_counter()
-                    probe_wall_started = time.time()
+                    probe_wall_started = self._speco_bubble_clock().now()
                     try:
                         self._speco_v1_probe_expected_revision = version_before
                         before = self._speco_run_freeze_probe_arm()
@@ -332,17 +364,26 @@ class V1BubbleMixin:
                         metrics["bubble/probe_before_failed"] = 1
                     probe_seconds += time.perf_counter() - started
                     session.costs.record_interval(
-                        f"probe_before:{plan.plan_id}", probe_wall_started, time.time()
+                        f"probe_before:{plan.plan_id}",
+                        probe_wall_started,
+                        self._speco_bubble_clock().now(),
                     )
-                publish_wall_started = time.time()
+                publish_wall_started = self._speco_bubble_clock().now()
                 publication = self._speco_publish_drafter_weights(
                     outcome.trained,
                     plan,
                     after_weight_update=True,
                 )
+                wait_started = time.perf_counter()
                 self._speco_wait_pending_drafter_publish()
+                wait_key = "timing_s/drafter_v1_publish_pending_wait"
+                metrics[wait_key] = (
+                    metrics.get(wait_key, 0.0) + time.perf_counter() - wait_started
+                )
                 session.costs.record_interval(
-                    f"publish:{plan.plan_id}", publish_wall_started, time.time()
+                    f"publish:{plan.plan_id}",
+                    publish_wall_started,
+                    self._speco_bubble_clock().now(),
                 )
                 if not self._speco_v1_publish_ack and not (
                     policy is None and publication.get("drafter/published")
@@ -353,18 +394,24 @@ class V1BubbleMixin:
                 if policy is not None:
                     import ray
 
+                    revision_started = time.perf_counter()
                     ray.get(
                         [
                             server.speco_set_serving_drafter_revision.remote(
                                 version_before + 1
                             )
-                            for _, manager in self._speco_v1_serving_managers()
-                            for server in manager.server_handles
+                            for server in self.llm_server_manager.server_handles
                         ]
+                    )
+                    revision_key = "timing_s/drafter_v1_publish_serving_revision"
+                    metrics[revision_key] = (
+                        metrics.get(revision_key, 0.0)
+                        + time.perf_counter()
+                        - revision_started
                     )
                 if run_probe and before is not None:
                     started = time.perf_counter()
-                    probe_wall_started = time.time()
+                    probe_wall_started = self._speco_bubble_clock().now()
                     try:
                         self._speco_v1_probe_expected_revision = version_before + 1
                         comparison = self._speco_build_freeze_probe_comparison(
@@ -376,7 +423,9 @@ class V1BubbleMixin:
                         metrics["bubble/probe_after_failed"] = 1
                     probe_seconds += time.perf_counter() - started
                     session.costs.record_interval(
-                        f"probe_after:{plan.plan_id}", probe_wall_started, time.time()
+                        f"probe_after:{plan.plan_id}",
+                        probe_wall_started,
+                        self._speco_bubble_clock().now(),
                     )
                 metrics.update(publication)
                 metrics["bubble/quota_update_cost_seconds"] = session.costs.total
@@ -487,9 +536,11 @@ class V1BubbleMixin:
             and scheduler._training_quota_debt_steps > 0
         )
         topup_plan = None
+        optimizer_bootstrap = False
         if not final_debt and scheduler._training_quota_debt_steps > 0:
             config = self._speco_drafter_schedule_config()
             if config.training_quota_allow_critical_path_fallback:
+                optimizer_bootstrap = scheduler.needs_idle_optimizer_bootstrap(config)
                 # Preserve the existing bounded assistance/freshness policy;
                 # only this explicit configuration may manufacture a pause.
                 topup_plan = scheduler._plan_training_quota_topup(
@@ -513,14 +564,28 @@ class V1BubbleMixin:
                 **metrics,
             }
             return result
-        with self._speco_v1_quiescent_boundary():
+        with self._speco_v1_quiescent_boundary(timings=metrics):
+            started = time.perf_counter()
             self._speco_wait_target_lm_head_prefetch()
+            metrics["timing_s/drafter_v1_target_head_prefetch_wait"] = (
+                time.perf_counter() - started
+            )
             if topup_plan is not None:
-                for manager in [self.checkpoint_manager]:
-                    manager.sleep_replicas()
+                started = time.perf_counter()
+                self.checkpoint_manager.sleep_replicas()
+                metrics["timing_s/drafter_v1_topup_replica_sleep"] = (
+                    time.perf_counter() - started
+                )
+                started = time.perf_counter()
                 metrics.update(scheduler.prepare_training_execution(topup_plan))
+                metrics["timing_s/drafter_v1_topup_prepare"] = (
+                    time.perf_counter() - started
+                )
                 started = time.perf_counter()
                 trained, train_metrics = self._speco_train_drafter(topup_plan)
+                elapsed = time.perf_counter() - started
+                if optimizer_bootstrap:
+                    metrics["timing_s/drafter_v1_optimizer_bootstrap"] = elapsed
                 from types import SimpleNamespace
 
                 session.enqueue(
@@ -528,7 +593,7 @@ class V1BubbleMixin:
                     SimpleNamespace(
                         trained=trained,
                         raw_results=[],
-                        elapsed_sec=time.perf_counter() - started,
+                        elapsed_sec=elapsed,
                     ),
                 )
                 metrics.update(train_metrics)
@@ -542,9 +607,7 @@ class V1BubbleMixin:
                     raise RuntimeError(
                         "Final V1 Bubble quota remains incomplete; critical-path fallback is disabled"
                     )
-                managers = [self.checkpoint_manager]
-                for manager in managers:
-                    manager.sleep_replicas()
+                self.checkpoint_manager.sleep_replicas()
                 event = self._speco_on_before_actor_update(force_quota_completion=True)
                 plan = event.training_plan
                 if plan is None or not plan.launch:
@@ -572,7 +635,9 @@ class V1BubbleMixin:
             # closed across both probe arms, even if native code resumes engines.
             metrics.update(self._speco_v1_prefetch_publish_snapshot())
             result = parent()
+            started = time.perf_counter()
             metrics.update(self._speco_v1_publish_bubble())
+            metrics["timing_s/drafter_v1_publish_total"] = time.perf_counter() - started
         metrics.update(self._speco_v1_finish_receipts())
         metrics["bubble/probe_pause_seconds"] = getattr(
             self, "_speco_v1_last_pause_seconds", 0.0
@@ -585,16 +650,23 @@ class V1BubbleMixin:
             # Persist the acknowledged version and its ROI observation together.
             # The first boundary includes resume costs before committing policy.
             with self._speco_v1_quiescent_boundary(charge_cost=False):
-                for manager in [self.checkpoint_manager]:
-                    manager.sleep_replicas()
+                self.checkpoint_manager.sleep_replicas()
                 checkpoint_started = time.perf_counter()
                 self._save_checkpoint()
                 self._speco_v1_record_timing(
                     "drafter_v1_checkpoint", time.perf_counter() - checkpoint_started
                 )
-                # Wake the serving engines with the same already-synchronized
-                # target before opening admission. No probe spans this update.
-                parent()
+                # sleep_replicas releases weight/KV storage. Reapply the same
+                # target through the checkpoint manager, not the native step
+                # hook (which may gain counters or other side effects).
+                restore_started = time.perf_counter()
+                try:
+                    self.checkpoint_manager.update_weights(self.global_steps)
+                finally:
+                    self._speco_v1_record_timing(
+                        "checkpoint_rollout_restore",
+                        time.perf_counter() - restore_started,
+                    )
         if getattr(self, "_speco_freeze_branch_save_pending", None) is not None:
             checkpoint_started = time.perf_counter()
             self._speco_maybe_save_freeze_branch_checkpoint()
@@ -621,7 +693,7 @@ class V1BubbleMixin:
             self.global_steps,
             event,
             boundary,
-            time.time(),
+            self._speco_bubble_clock().now(),
             session.thread is not None,
             getattr(self, "_speco_rollout_idle_generation_open", False),
         )

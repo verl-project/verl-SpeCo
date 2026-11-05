@@ -50,6 +50,7 @@ def bridge_request_acceptance_counters(fields):
 
     Run after SpeCo has attached the final per-request summary, so an aggregate
     engine-logger fallback cannot override that request's own counters.
+    Keep the provenance flag present with False for concat-compatible batches.
     """
     pair = _pair(
         fields,

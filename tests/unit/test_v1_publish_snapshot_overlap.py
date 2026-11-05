@@ -3,6 +3,7 @@
 """CPU contracts for V1 snapshot overlap without importing device runtimes."""
 
 import ast
+import builtins
 import logging
 import time
 from contextlib import contextmanager
@@ -36,6 +37,19 @@ def _methods(path, class_name, names):
         ],
         type_ignores=[],
     )
+    allowed_imports = {
+        node.module for node in ast.walk(module) if isinstance(node, ast.ImportFrom)
+    } | {
+        alias.name for node in ast.walk(module) if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+
+    def declared_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name not in allowed_imports:
+            raise ImportError(f"Undeclared extracted-method dependency: {name}")
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    namespace["__builtins__"] = {**vars(builtins), "__import__": declared_import}
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace["Subject"]
 
@@ -94,7 +108,7 @@ def _driver():
     driver.speco_maybe_publish = lambda **kw: pytest.fail("duplicate snapshot RPC")
 
     @contextmanager
-    def boundary():
+    def boundary(*, timings=None):
         yield
 
     driver._speco_v1_quiescent_boundary = boundary

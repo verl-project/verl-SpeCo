@@ -78,7 +78,8 @@ def test_bubble_global_timing_excludes_actor_target_sync_and_checkpoint(monkeypa
         parent()
         consume(5)
         trainer._speco_v1_record_timing("drafter_v1_checkpoint", 5)
-        parent()  # Deferred checkpoint recovery can repeat native target sync.
+        consume(10)  # Direct checkpoint-manager recovery bypasses the native hook.
+        trainer._speco_v1_record_timing("checkpoint_rollout_restore", 10)
         consume(4)
 
     trainer._speco_v1_bubble_step_end = boundary
@@ -90,7 +91,8 @@ def test_bubble_global_timing_excludes_actor_target_sync_and_checkpoint(monkeypa
     metrics = {}
     trainer._compute_metrics(None, metrics, {}, global_steps=1, epoch=0)
     assert metrics["timing_s/actor_update_without_drafter"] == 20
-    assert metrics["timing_s/drafter_v1_upstream_step_end"] == 20
+    assert metrics["timing_s/drafter_v1_upstream_step_end"] == 10
+    assert metrics["timing_s/checkpoint_rollout_restore"] == 10
     assert metrics["timing_s/drafter_v1_step_end_total"] == 32
     assert metrics["timing_s/drafter_v1_checkpoint"] == 5
     assert metrics["timing_s/drafter"] == 15
@@ -291,6 +293,9 @@ def test_real_mode_step_end_holds_target_across_probe_pair(mode, checkpoint):
     assert not session.pending
     if checkpoint:
         assert events.index("publish") < events.index("checkpoint")
+        assert "checkpoint_rollout_restore" in trainer._speco_v1_timings
+    else:
+        assert "checkpoint_rollout_restore" not in trainer._speco_v1_timings
 
 
 @pytest.mark.parametrize("mode", ["sync"])
@@ -323,8 +328,12 @@ def test_real_mode_final_quota_cannot_enable_critical_path_fallback(mode):
 
 
 @pytest.mark.parametrize("mode", ["sync"])
-@pytest.mark.parametrize("final", [False, True])
-def test_explicit_topup_preserves_bounded_and_final_completion_policy(mode, final):
+@pytest.mark.parametrize(
+    ("final", "bootstrap"), [(False, False), (False, True), (True, False)]
+)
+def test_explicit_topup_preserves_bounded_and_final_completion_policy(
+    mode, final, bootstrap
+):
     from verl_speco.trainer.bubble_lifecycle import BubbleLifecycle
     from verl_speco.trainer.scheduler import DrafterScheduleConfig
 
@@ -348,7 +357,9 @@ def test_explicit_topup_preserves_bounded_and_final_completion_policy(mode, fina
     )
     trainer.checkpoint_manager = trainer.standalone_checkpoint_manager = manager
     scheduler = SimpleNamespace(
-        _training_quota_debt_steps=3, training_work_metrics=lambda: {}
+        _training_quota_debt_steps=3,
+        training_work_metrics=lambda: {},
+        needs_idle_optimizer_bootstrap=lambda config: bootstrap,
     )
     trainer._speco_get_drafter_scheduler = lambda: scheduler
     trainer._speco_drafter_schedule_config = lambda: DrafterScheduleConfig(
@@ -379,7 +390,10 @@ def test_explicit_topup_preserves_bounded_and_final_completion_policy(mode, fina
 
     def train(plan):
         calls.append(plan.plan_id)
-        scheduler._training_quota_debt_steps -= 1
+        if bootstrap:
+            scheduler._training_quota_debt_steps = 0
+        else:
+            scheduler._training_quota_debt_steps -= 1
         return True, {}
 
     trainer._speco_on_before_actor_update = schedule
@@ -392,8 +406,15 @@ def test_explicit_topup_preserves_bounded_and_final_completion_policy(mode, fina
     trainer._speco_freeze_observe_publish = lambda *args, **kwargs: None
     trainer.on_step_end()
     assert calls == (["plan-3", "plan-2", "plan-1"] if final else ["regular-topup"])
-    assert publications == (["plan-1"] if final else [])
-    assert scheduler._training_quota_debt_steps == (0 if final else 2)
+    expected_publications = (
+        ["plan-1"] if final else ["regular-topup"] if bootstrap else []
+    )
+    assert publications == expected_publications
+    assert scheduler._training_quota_debt_steps == (0 if final or bootstrap else 2)
+    timing_key = "timing_s/drafter_v1_optimizer_bootstrap"
+    assert (timing_key in trainer._pending_sync_metrics) == bootstrap
+    if bootstrap:
+        assert trainer._pending_sync_metrics[timing_key] >= 0
 
 
 @pytest.mark.parametrize("mode", ["sync"])
@@ -423,6 +444,15 @@ def test_v1_parks_hot_writer_at_shared_resource_boundaries(mode, boundary):
     assert scheduler._idle_worker_writer_group == ("2", "3")
     assert scheduler._training_quota_debt_steps == 7
     assert f"timing_s/drafter_memory_park_{boundary}" in metrics
+    assert trainer._speco_park_drafter_training_memory("already_parked") == {}
+    assert calls == ["park", ("elapsed", 0.25)]
+    # A completed training attempt invalidates the driver's parking receipt.
+    trainer._speco_bubble_session().enqueue(
+        SimpleNamespace(plan_id="new-attempt", publish_after_success=False),
+        SimpleNamespace(trained=False, raw_results=[], elapsed_sec=0),
+    )
+    trainer._speco_park_drafter_training_memory("after_training")
+    assert calls.count("park") == 2
 
 
 @pytest.mark.parametrize("mode", ["sync"])

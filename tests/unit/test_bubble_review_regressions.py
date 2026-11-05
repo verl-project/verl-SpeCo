@@ -7,6 +7,7 @@ import asyncio
 import logging
 import random
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -54,6 +55,11 @@ def _methods(path, class_name, names, **namespace):
     )
     namespace.setdefault("logger", logging.getLogger(__name__))
     namespace.setdefault("__file__", str(path))
+    namespace.setdefault(
+        "_rl_insight_trace_state", lambda *args, **kwargs: nullcontext()
+    )
+    namespace.setdefault("_rl_insight_log_scalar_metrics", lambda *args, **kwargs: None)
+    namespace.setdefault("_SPECO_RL_INSIGHT_TRAINER_LANE", "speco_trainer")
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace["Subject"]
 
