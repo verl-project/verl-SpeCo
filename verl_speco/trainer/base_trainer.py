@@ -6523,10 +6523,10 @@ class DrafterBaseTrainer:
             "trainable_valid_tokens": trainable_valid_tokens,
             "min_sample_step": (min(sample_steps) if sample_steps else None)
             if bubble
-            else effective_min_sample_step,
+            else (min(sample_steps) if sample_steps else effective_min_sample_step),
             "max_sample_step": (max(sample_steps) if sample_steps else None)
             if bubble
-            else effective_max_sample_step,
+            else (max(sample_steps) if sample_steps else effective_max_sample_step),
         }
 
     def _mark_buffer_changed(self) -> None:
