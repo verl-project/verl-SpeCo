@@ -517,3 +517,138 @@ def test_multi_turn_collect_splits_into_continuous_segments(monkeypatch) -> None
     assert seg1["hidden_position_start"] == 5
     assert seg1["hidden_position_end"] == 7
     assert seg1["hidden_states"][0, :, 0].tolist() == [2.0, 3.0]
+
+
+# ---------------------------------------------------------------------------
+# P1: 直接调用 speco_train_drafter() 入口测试（无 backend 属性）
+# ---------------------------------------------------------------------------
+
+
+def test_speco_train_drafter_no_backend_dspark_enforces_same_step(monkeypatch):
+    """直接调用真实 speco_train_drafter()，验证无需 backend 属性，且 DSpark
+    场景下 plan 的 min_sample_step = max_sample_step = global_step。
+
+    PR review 要求：仅手动向 base trainer 传入范围的测试捕获不到 self.backend
+    AttributeError，必须直接调用 SFT driver 的 speco_train_drafter() 入口。
+    """
+    from verl_speco.trainer.speco_sft_trainer import SpecoRaySFTRayTrainer
+
+    captured_plan = {}
+
+    def _capture_preflight(plan):
+        captured_plan["plan"] = plan
+        return [{"ready": True, "reason": None}]
+
+    def _capture_train(plan):
+        return [{"trained": True, "successful_steps": 1}]
+
+    # 构造 mock trainer，不设置 backend 属性
+    trainer = MagicMock(spec=SpecoRaySFTRayTrainer)
+    # 显式删除 backend（spec= 会创建该属性，需删除以模拟真实 SFT trainer）
+    del trainer.backend
+    trainer.global_steps = 5
+
+    # 配置：DSpark，use_logits=False，allow_cross_step_hidden=False
+    drafter_cfg = MagicMock()
+    drafter_cfg.speculative_algorithm = "dspark"
+    training_cfg = {
+        "sample_last_n_steps": 10,
+        "require_full_batch": False,
+        "step": 10,
+        "min_trainable_batches": 1,
+        "use_logits": False,
+        "allow_cross_step_hidden": False,
+    }
+    drafter_cfg.training = training_cfg
+    trainer.config.rollout.drafter = drafter_cfg
+
+    # mock worker group
+    wg = MagicMock()
+    wg.get_drafter_training_data_status.return_value = [
+        {
+            "available": True,
+            "rank": 0,
+            "worker_incarnation": 1,
+            "buffer_version": 1,
+            "data_version": 1,
+            "trainable_samples": 16,
+            "min_sample_step": 0,
+            "max_sample_step": 5,
+        }
+    ]
+    wg.preflight_drafter_training.side_effect = _capture_preflight
+    wg.train_drafter.side_effect = _capture_train
+    trainer._require_speco_worker_group.return_value = wg
+
+    # mock _ray_get_if_needed 直接返回值
+    trainer._ray_get_if_needed.side_effect = lambda x: x
+
+    # mock _speco_publish_during_sft
+    trainer._speco_publish_during_sft.return_value = False
+
+    # 调用真实方法
+    result = SpecoRaySFTRayTrainer.speco_train_drafter(trainer)
+
+    # 验证训练成功执行
+    assert result[0]["trained"] is True
+
+    # 验证 plan 中 min/max_sample_step 被强制设为 global_step=5
+    plan = captured_plan["plan"]
+    assert plan["min_sample_step"] == 5
+    assert plan["max_sample_step"] == 5
+    assert plan["required_target_version"] is None  # plan 不传版本，靠 step 范围约束
+
+
+def test_speco_train_drafter_no_backend_eagle3_does_not_enforce_same_step(monkeypatch):
+    """eagle3 场景下不应强制同 step，min/max_sample_step 来自 worker 状态。"""
+    from verl_speco.trainer.speco_sft_trainer import SpecoRaySFTRayTrainer
+
+    captured_plan = {}
+
+    def _capture_preflight(plan):
+        captured_plan["plan"] = plan
+        return [{"ready": True, "reason": None}]
+
+    trainer = MagicMock(spec=SpecoRaySFTRayTrainer)
+    del trainer.backend
+    trainer.global_steps = 5
+
+    drafter_cfg = MagicMock()
+    drafter_cfg.speculative_algorithm = "eagle3"
+    training_cfg = {
+        "sample_last_n_steps": 10,
+        "require_full_batch": False,
+        "step": 10,
+        "min_trainable_batches": 1,
+        "use_logits": False,
+        "allow_cross_step_hidden": False,
+    }
+    drafter_cfg.training = training_cfg
+    trainer.config.rollout.drafter = drafter_cfg
+
+    wg = MagicMock()
+    wg.get_drafter_training_data_status.return_value = [
+        {
+            "available": True,
+            "rank": 0,
+            "worker_incarnation": 1,
+            "buffer_version": 1,
+            "data_version": 1,
+            "trainable_samples": 16,
+            "min_sample_step": 0,
+            "max_sample_step": 5,
+        }
+    ]
+    wg.preflight_drafter_training.side_effect = _capture_preflight
+    wg.train_drafter.return_value = [{"trained": True, "successful_steps": 1}]
+    trainer._require_speco_worker_group.return_value = wg
+    trainer._ray_get_if_needed.side_effect = lambda x: x
+    trainer._speco_publish_during_sft.return_value = False
+
+    result = SpecoRaySFTRayTrainer.speco_train_drafter(trainer)
+    assert result[0]["trained"] is True
+
+    # eagle3 不强制同 step，使用 worker 返回的实际范围 [0, 5]
+    plan = captured_plan["plan"]
+    assert plan["min_sample_step"] == 0
+    assert plan["max_sample_step"] == 5
