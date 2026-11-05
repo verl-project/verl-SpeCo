@@ -290,6 +290,11 @@ def _load_methods(relative_path, class_name, names, namespace):
         for node in module.body
         if isinstance(node, ast.FunctionDef) and node.name in names
     ]
+    namespace.setdefault(
+        "_rl_insight_trace_state", lambda *args, **kwargs: nullcontext()
+    )
+    namespace.setdefault("_rl_insight_log_scalar_metrics", lambda *args, **kwargs: None)
+    namespace.setdefault("_SPECO_RL_INSIGHT_TRAINER_LANE", "speco_trainer")
     exec(
         compile(
             ast.fix_missing_locations(
@@ -317,6 +322,8 @@ def worker_class():
             "request_drafter_training_reclaim",
             "_receive_drafter_reclaim",
             "_reclaim_control_lock",
+            "_speco_rl_insight_labels",
+            "_speco_emit_rl_insight_worker_metrics",
             "train_drafter",
         },
         {
@@ -414,6 +421,7 @@ def _prepared_worker(worker_class, *, reclaim_after_first=False):
     worker = worker_class()
     for key, value in {
         "rank": 0,
+        "replica_rank": 0,
         "worker_incarnation": "rank-0",
         "enable_drafter": True,
         "in_drafter_train_group": True,
