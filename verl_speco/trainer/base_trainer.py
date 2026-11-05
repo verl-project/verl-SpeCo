@@ -4909,14 +4909,12 @@ class DrafterBaseTrainer:
         allow_cross_step_hidden = bool(
             self.config.rollout.drafter.training.get("allow_cross_step_hidden", False)
         )
-        # eagle3 的 target_logprobs 在 rollout 时预计算，依赖当时的 actor 权重；
-        # DSpark 的 CE（target_argmax）和 L1 路径都用当前同步的 lm_head 从 hidden
-        # 重建监督信号。对于 buffer 中更早 step 的 hidden，head_current @ hidden_old
-        # ≠ head_old @ hidden_old，会产生版本不一致的监督信号。因此两者都需要
-        # 同 step 限制（allow_cross_step_hidden=true 时显式放宽）。
-        dspark_uses_last_hidden = self.backend.model_type == "dspark" and not use_logits
+        # eagle3 的 target_logprobs 在 rollout 时预计算，依赖当时的 actor 权重，
+        # 需要同 step 限制（allow_cross_step_hidden=true 时显式放宽）。
+        # DSpark 的版本一致限制仅在 SFT 路径显式传入样本范围，见 speco_train_drafter，
+        # 不影响共享 base_trainer 上原有 PPO / 非 SFT 路径的最近 N 步采样行为。
         same_step_target_head_required = (
-            (self.backend.model_type == "eagle3" or dspark_uses_last_hidden)
+            self.backend.model_type == "eagle3"
             and not use_logits
             and not getattr(self, "_bubble_time_enabled", False)
             and not allow_cross_step_hidden
@@ -6366,9 +6364,8 @@ class DrafterBaseTrainer:
         allow_cross_step_hidden = bool(
             self.config.rollout.drafter.training.get("allow_cross_step_hidden", False)
         )
-        dspark_uses_last_hidden = self.backend.model_type == "dspark" and not use_logits
         same_step_data_required = (
-            (self.backend.model_type == "eagle3" or dspark_uses_last_hidden)
+            self.backend.model_type == "eagle3"
             and not use_logits
             and not getattr(self, "_bubble_time_enabled", False)
             and not allow_cross_step_hidden
@@ -6523,10 +6520,10 @@ class DrafterBaseTrainer:
             "trainable_valid_tokens": trainable_valid_tokens,
             "min_sample_step": (min(sample_steps) if sample_steps else None)
             if bubble
-            else (min(sample_steps) if sample_steps else effective_min_sample_step),
+            else effective_min_sample_step,
             "max_sample_step": (max(sample_steps) if sample_steps else None)
             if bubble
-            else (max(sample_steps) if sample_steps else effective_max_sample_step),
+            else effective_max_sample_step,
         }
 
     def _mark_buffer_changed(self) -> None:

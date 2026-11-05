@@ -1859,6 +1859,8 @@ class SpecoWorker(Worker):
         sample_last_n_steps: int = 2,
         require_full_batch: bool = False,
         target_version: int | None = None,
+        min_sample_step: int | None = None,
+        max_sample_step: int | None = None,
     ):
         if not self.enable_drafter:
             return {"available": False, "reason": "disabled"}
@@ -1868,6 +1870,8 @@ class SpecoWorker(Worker):
             sample_last_n_steps=sample_last_n_steps,
             require_full_batch=require_full_batch,
             target_version=target_version,
+            min_sample_step=min_sample_step,
+            max_sample_step=max_sample_step,
         )
         status.update(
             {

@@ -495,12 +495,30 @@ class SpecoRaySFTRayTrainer(SFTTrainer):
 
         global_step = int(getattr(self, "global_steps", 0) or 0)
 
+        # DSpark 用当前同步后的 lm_head 从 hidden 重建监督信号（CE target +
+        # distribution-matching）。若复用旧 step 的 hidden，会产生 head_current @
+        # hidden_old 的版本错配。仅在此 SFT 路径显式限定同版本样本范围
+        # （min=max=global_step），不改变共享 base_trainer 的其他训练路径。
+        use_logits = bool(drafter_training_cfg.get("use_logits", False))
+        allow_cross_step_hidden = bool(
+            drafter_training_cfg.get("allow_cross_step_hidden", False)
+        )
+        model_type = str(getattr(self.backend, "model_type", "")).lower()
+        enforce_same_step = (
+            model_type == "dspark" and not use_logits and not allow_cross_step_hidden
+        )
+        status_min = global_step if enforce_same_step else None
+        status_max = global_step if enforce_same_step else None
+
         # 2. 获取各 worker 的数据状态（用于构建 worker_snapshots）
         logger.info(
             "[speco_train_drafter] Fetching training data status from workers..."
         )
         status_ref = wg.get_drafter_training_data_status(
-            sample_last_n_steps, require_full_batch
+            sample_last_n_steps,
+            require_full_batch,
+            min_sample_step=status_min,
+            max_sample_step=status_max,
         )
         status_list = self._ray_get_if_needed(status_ref)
         if isinstance(status_list, dict):
@@ -556,6 +574,11 @@ class SpecoRaySFTRayTrainer(SFTTrainer):
         # 取全局 min/max sample step，确保 DSpark 重建监督信号时 hidden 与 head 版本一致
         plan_min_sample_step = min(min_sample_steps) if min_sample_steps else None
         plan_max_sample_step = max(max_sample_steps) if max_sample_steps else None
+        # SFT DSpark 路径显式强制同版本采样：仅使用当前 step 样本，避免
+        # head_current @ hidden_old 的版本错配
+        if enforce_same_step:
+            plan_min_sample_step = global_step
+            plan_max_sample_step = global_step
 
         # 4. 构建 training plan
         plan_id = uuid4().hex

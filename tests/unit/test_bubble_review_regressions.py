@@ -900,17 +900,11 @@ def test_sync_status_preserves_full_cross_step_pool(use_logits):
     status = worker.get_training_data_status(
         sample_last_n_steps=2, require_full_batch=True
     )
-    # DSpark + use_logits=False 用当前同步 head 从 hidden 重建监督信号，
-    # 旧 hidden 与新 head 组合会产生版本不一致，故限制 same-step（仅 step=4 的 4 个样本）。
-    # use_logits=True 时使用预计算 logits，可跨 step 保留完整数据池。
-    if use_logits:
-        assert status["trainable_samples"] == 12
-        assert status["trainable_batches"] == 3
-        assert (status["min_sample_step"], status["max_sample_step"]) == (2, 4)
-    else:
-        assert status["trainable_samples"] == 4
-        assert status["trainable_batches"] == 1
-        assert (status["min_sample_step"], status["max_sample_step"]) == (4, 4)
+    # 共享 base 不在 DSpark 全局强制 same-step（保留 PPO 最近 N 步缓存行为），
+    # whatever use_logits，均保留完整跨步数据池；同版本限制由 SFT 路径显式传入。
+    assert status["trainable_samples"] == 12
+    assert status["trainable_batches"] == 3
+    assert (status["min_sample_step"], status["max_sample_step"]) == (2, 4)
     assert status["target_version"] == 9
 
 
@@ -969,24 +963,32 @@ def test_sync_eagle_without_logits_keeps_current_step_only():
     assert status["min_sample_step"] == 4
 
 
-def test_dspark_cross_step_samples_require_same_step_for_hidden_reconstruction():
-    """DSpark 用当前同步 lm_head 从 hidden 重建监督信号。buffer 中包含 step 2/3/4
-    三个版本的样本时，use_logits=False 必须只选当前 step(4) 的样本，避免
-    head_current @ hidden_old 产生版本不一致的监督信号。"""
+def test_dspark_sft_plan_enforces_same_step_via_explicit_range():
+    """共享 base_trainer 不对 DSpark 全局强制 same-step（保留 PPO 最近 N 步缓存行为）。
+    但 SFT 路径通过 speco_train_drafter 显式传入同版本范围 [min=4, max=4]，
+    get_training_data_status 据此收窄到当前 step 样本，保证 head_current @ hidden_old
+    不会产生版本不一致的监督信号。"""
     worker = _status_trainer(use_logits=False, model_type="dspark")
-    status = worker.get_training_data_status(sample_last_n_steps=10)
-    # same-step 限制生效：仅 step=4 的 4 个样本
-    assert status["same_step_data_required"] is True
+    # 未显式传范围时：base 层保留跨 step 可用（PPO 原有行为），min 为窗口下界
+    status_plain = worker.get_training_data_status(sample_last_n_steps=10)
+    assert status_plain["same_step_data_required"] is False
+    assert status_plain["trainable_samples"] == 12
+    assert status_plain["min_sample_step"] == 0
+    assert status_plain["max_sample_step"] == 4
+    # SFT 路径显式限定同版本范围 [4,4]：仅当前 step(4) 样本
+    status = worker.get_training_data_status(
+        sample_last_n_steps=10, min_sample_step=4, max_sample_step=4
+    )
     assert status["trainable_samples"] == 4
     assert status["trainable_batches"] == 1
     assert status["min_sample_step"] == 4
     assert status["max_sample_step"] == 4
-    # 反向验证：use_logits=True 时使用预计算 logits，可跨 step
+    # 反向：use_logits=True 时使用预计算 logits，SFT 不强制同版本，可跨 step
     worker_logits = _status_trainer(use_logits=True, model_type="dspark")
     status_logits = worker_logits.get_training_data_status(sample_last_n_steps=10)
     assert status_logits["same_step_data_required"] is False
     assert status_logits["trainable_samples"] == 12
-    assert status_logits["min_sample_step"] == 2
+    assert status_logits["min_sample_step"] == 0
     assert status_logits["max_sample_step"] == 4
 
 
