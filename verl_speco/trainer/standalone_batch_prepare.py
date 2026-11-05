@@ -134,7 +134,11 @@ def _prepare_chunk(
 ):
     """One scheduler-assigned sample; workers perform CPU work only."""
     reference = (
-        tag["handle"] if tag["backend"] == "mooncake" else tag["hidden_states_path"]
+        # The Mooncake store consumes the full transfer manifest the producer
+        # recorded; the bare handle lacks the tensor layout get_sample needs.
+        tag["transfer_params"]
+        if tag["backend"] == "mooncake"
+        else tag["hidden_states_path"]
     )
     if store.backend == "mooncake":
         remaining = read_deadline - time.monotonic()
