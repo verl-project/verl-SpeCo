@@ -46,6 +46,7 @@ def _trainer_type():
     methods = {
         "_is_frozen_publish_param",
         "_get_full_model_state_dict",
+        "_get_pretrained_export_model",
         "_get_trainable_state_dict",
         "get_model_state_dict",
         "prepare_model_state_dict_for_publish",
@@ -315,3 +316,39 @@ def test_vat_training_head_is_excluded_from_publish():
     assert trainer._is_frozen_publish_param("vat_objective.accept_head.weight")
     assert trainer._is_frozen_publish_param("module.vat_objective.accept_head.bias")
     assert not trainer._is_frozen_publish_param("draft_model.layers.0.mlp.weight")
+
+
+@pytest.mark.parametrize("vat_enabled", [False, True])
+@pytest.mark.parametrize("confidence_loss_alpha", [0.0, 1.0])
+@pytest.mark.parametrize("runner", ["0", "1"])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_dspark_publish_includes_head_trained_by_vat_or_confidence_loss(
+    monkeypatch, vat_enabled, confidence_loss_alpha, runner, wrapped
+):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", runner)
+    trainer = object.__new__(_trainer_type())
+    trainer._frozen_param_names = set()
+    trainer.training_device_mesh = None
+    trainer._is_ddp_wrapped = lambda: False
+    trainer.backend = SimpleNamespace(
+        model_type="dspark",
+    )
+    head = torch.nn.Linear(2, 1)
+    head.requires_grad_(vat_enabled or confidence_loss_alpha > 0)
+    state = {
+        "draft_model.confidence_head.proj.weight": torch.ones(1, 2),
+        "draft_model.confidence_head.proj.bias": torch.ones(1),
+        "draft_model.layers.0.mlp.weight": torch.ones(2, 2),
+    }
+    model = SimpleNamespace(
+        state_dict=lambda: state,
+        draft_model=SimpleNamespace(confidence_head=head),
+    )
+    trainer.model = SimpleNamespace(module=model) if wrapped else model
+    published = trainer._get_trainable_state_dict()
+    expected = set(state)
+    if not vat_enabled and confidence_loss_alpha == 0:
+        expected = {"draft_model.layers.0.mlp.weight"}
+    assert set(published) == expected
+    for name in expected:
+        torch.testing.assert_close(published[name], state[name])

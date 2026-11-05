@@ -1902,12 +1902,12 @@ class DrafterBaseTrainer:
         if (
             getattr(self.backend, "model_type", None) == "dspark"
             and "confidence_head." in name
-            and float(getattr(self.backend, "confidence_head_alpha", 0.0)) <= 0.0
         ):
-            # A checkpoint's untrained head stays frozen. Trained confidence
-            # heads must be published on both MRV1 and MRV2 now that the
-            # runtimes can register and consume them.
-            return True
+            # VAT can train this head with the ordinary confidence loss disabled.
+            draft_model, _ = self._get_pretrained_export_model()
+            return not any(
+                param.requires_grad for param in draft_model.confidence_head.parameters()
+            )
         if name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
             # Most backends seed the draft embedding from the target and freeze it,
             # so the engine already holds the same rows. Backends that fine-tune it
