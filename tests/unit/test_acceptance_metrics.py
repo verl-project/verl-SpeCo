@@ -111,14 +111,15 @@ def test_native_zero_counters_fall_back_to_request_counters():
     ) == (2, 0)
 
 
-def test_acceptance_rejects_truncated_extra_fields(monkeypatch):
+def test_acceptance_falls_back_on_truncated_extra_fields(monkeypatch):
     monkeypatch.setitem(sys.modules, "transfer_queue", SimpleNamespace(
         kv_batch_get=lambda **kwargs: {"extra_fields": [private(2, 0)]},
     ))
-    with pytest.raises(ValueError, match="length does not match"):
-        SpecoV1Mixin._speco_v1_spec_decode_metrics(
-            SimpleNamespace(), SimpleNamespace(keys=[1, 2], partition_id="p", tags=[]),
-        )
+    metrics = SpecoV1Mixin._speco_v1_spec_decode_metrics(
+        SimpleNamespace(_speco_v1_spec_decode_sidecar_metrics=lambda: {"sidecar": 1}),
+        SimpleNamespace(keys=[1, 2], partition_id="p", tags=[]),
+    )
+    assert metrics == {"sidecar": 1, "drafter/spec_decode/extra_fields_row_mismatch": 1}
 
 
 def test_no_valid_request_stats_preserves_existing_fallback(monkeypatch):

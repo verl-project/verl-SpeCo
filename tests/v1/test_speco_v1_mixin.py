@@ -321,6 +321,40 @@ def test_v1_session_owns_shared_runtime_state():
     assert session.runtime_state["_speco_last_collected_step"] == 4
 
 
+@pytest.mark.parametrize("bubble", [False, True])
+def test_v1_bubble_requires_full_drafter_checkpoint(bubble):
+    config = _config()
+    training = config.actor_rollout_ref.rollout.drafter.training
+    training["save_full_drafter_checkpoint"] = False
+    if bubble:
+        training["scheduler"] = {"execution": {"strategy": "rollout_idle_worker"}}
+        with pytest.raises(ValueError, match="save_full_drafter_checkpoint=true"):
+            SpecoV1Mixin._speco_validate_v1_training_config(config)
+    else:
+        SpecoV1Mixin._speco_validate_v1_training_config(config)
+
+
+@pytest.mark.parametrize(
+    "resume_option",
+    ["resume_trainer_state_from_checkpoint", "resume_lr_scheduler_from_checkpoint"],
+)
+def test_v1_bubble_rejects_disabling_drafter_restore_on_resume(resume_option):
+    class Harness(SpecoV1Mixin):
+        def _speco_resume_global_step_hint(self):
+            return 10
+
+    trainer = Harness()
+    trainer.config = _config()
+    training = trainer.config.actor_rollout_ref.rollout.drafter.training
+    training["scheduler"] = {"execution": {"strategy": "rollout_idle_worker"}}
+    training[resume_option] = False
+
+    with pytest.raises(
+        ValueError, match="requires resume_trainer_state_from_checkpoint"
+    ):
+        trainer._setup()
+
+
 def test_v1_bubble_rejects_removed_head_preparation_override():
     config = _config(mode="sync")
     config.actor_rollout_ref.rollout.drafter.training["scheduler"] = {
@@ -1000,7 +1034,8 @@ def test_bubble_manifest_restores_writer_and_versions_without_feature_store(tmp_
     trainer._speco_get_drafter_scheduler = lambda: scheduler
     trainer._speco_bubble_session().published_ids.add("published-once")
     trainer._speco_write_v1_joint_checkpoint_manifest(
-        drafter_results=[], feature_store=[]
+        drafter_results=[{"saved": True, "path": str(tmp_path / "draft_step_7")}],
+        feature_store=[],
     )
     trainer._speco_bubble_session().published_ids.clear()
     trainer._speco_last_published_drafter_step = 0
@@ -1013,9 +1048,71 @@ def test_bubble_manifest_restores_writer_and_versions_without_feature_store(tmp_
     assert trainer._speco_bubble_session().published_ids == {"published-once"}
 
 
+@pytest.mark.parametrize("relocated", [False, True])
+def test_v1_bubble_resume_rejects_same_step_drafter_from_another_run(tmp_path, relocated):
+    source = tmp_path / "source"
+    resume_directory = source / "global_step_10"
+    resume_directory.mkdir(parents=True)
+    expected = source / ("custom-drafts" if relocated else "drafter") / "draft_step_10"
+    other = tmp_path / "other" / "drafter" / "draft_step_10"
+    for path in (expected, other):
+        path.mkdir(parents=True)
+        (path / "config.json").write_text("{}", encoding="utf-8")
+        (path / "model.safetensors").touch()
+        (path / "metadata.json").write_text('{"step": 10}', encoding="utf-8")
+    record = {"saved": True, "path": str(expected)}
+    if relocated:
+        record.update(
+            path=str(tmp_path / "old-location" / "custom-drafts" / expected.name),
+            run_relative_path=f"custom-drafts/{expected.name}",
+        )
+    (resume_directory / "speco_v1_manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "speco_v1_joint_checkpoint",
+                "version": 1,
+                "global_step": 10,
+                "drafter_checkpoints": [record],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Harness(SpecoV1Mixin):
+        def _speco_resume_global_step_hint(self):
+            return 10
+
+        def _speco_set_config_value(self, config, key, value):
+            config[key] = value
+
+    trainer = Harness()
+    trainer.config = _config()
+    trainer.config.trainer.update(
+        resume_mode="resume_path",
+        resume_from_path=str(resume_directory),
+        default_local_dir=str(tmp_path / "new-run"),
+    )
+    drafter = trainer.config.actor_rollout_ref.rollout.drafter
+    drafter["model_path"] = str(other)
+    with pytest.raises(RuntimeError, match="does not match a saved drafter checkpoint"):
+        trainer._speco_validate_v1_drafter_resume_source()
+    drafter["model_path"] = str(expected)
+    trainer._speco_validate_v1_drafter_resume_source()
+    if relocated:
+        drafter["model_path"] = record["path"]
+        drafter["checkpoint_path"] = str(tmp_path / "old-location" / "custom-drafts")
+        trainer._speco_validate_v1_drafter_resume_source()
+        assert drafter["model_path"] == str(expected)
+        assert drafter["checkpoint_path"] == str(tmp_path / "new-run" / "custom-drafts")
+        drafter["checkpoint_path"] = str(tmp_path / "explicit-destination")
+        trainer._speco_validate_v1_drafter_resume_source()
+        assert drafter["checkpoint_path"] == str(tmp_path / "explicit-destination")
+
+
 @pytest.mark.parametrize("writer_index", [1, 3])
+@pytest.mark.parametrize("explicit_resume", [False, True])
 def test_feature_store_resume_deduplicates_shared_worker_cursors(
-    tmp_path, writer_index
+    tmp_path, writer_index, explicit_resume
 ):
     cursor = {
         "format": "torch_shard_feature_store_cursor",
@@ -1050,25 +1147,45 @@ def test_feature_store_resume_deduplicates_shared_worker_cursors(
 
     manifest_path = tmp_path / "global_step_1" / "speco_v1_manifest.json"
     manifest_path.parent.mkdir()
+    records = [
+        {"saved": True, "cursor": cursor},
+        {"saved": True, "cursor": {**cursor, "next_shard_index": writer_index}},
+    ]
+    if explicit_resume:
+        records = [
+            {
+                **record,
+                "run_relative_path": "feature-store",
+                "cursor": {
+                    **record["cursor"],
+                    "path": str(tmp_path / "old-location" / "feature-store"),
+                },
+            }
+            for record in records
+        ]
     manifest_path.write_text(
         json.dumps(
             {
                 "format": "speco_v1_joint_checkpoint",
                 "version": 1,
                 "global_step": 1,
-                "feature_store": [
-                    {"saved": True, "cursor": cursor},
-                    {
-                        "saved": True,
-                        "cursor": {**cursor, "next_shard_index": writer_index},
-                    },
-                ],
+                "feature_store": records,
             }
         ),
         encoding="utf-8",
     )
 
     harness = Harness()
+    if explicit_resume:
+        output = tmp_path / "new-run"
+        decoy = output / "global_step_1" / manifest_path.name
+        decoy.parent.mkdir(parents=True)
+        decoy.write_text("{}", encoding="utf-8")
+        harness.config.trainer.update(
+            default_local_dir=str(output),
+            resume_mode="resume_path",
+            resume_from_path=str(manifest_path.parent),
+        )
     harness._speco_restore_v1_feature_store_checkpoint()
     assert harness.restored_cursor == {**cursor, "next_shard_index": writer_index}
 

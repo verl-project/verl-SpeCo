@@ -1395,7 +1395,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         except ValueError:
             return None
 
-    def _speco_prepare_drafter_checkpoint_for_worker_init(self):
+    def _speco_prepare_drafter_checkpoint_for_worker_init(
+        self, *, resume_checkpoint_dir: str | None = None
+    ):
         drafter_cfg = self._speco_drafter_config()
         if drafter_cfg is None:
             return
@@ -1410,6 +1412,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return
 
         checkpoint_save_enabled = self._speco_drafter_checkpoint_save_config_enabled()
+        checkpoint_path = _get_nested(drafter_cfg, ("checkpoint_path",), None)
         if checkpoint_save_enabled:
             self._speco_ensure_drafter_checkpoint_path()
 
@@ -1432,7 +1435,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
 
         model_path = _get_nested(drafter_cfg, ("model_path",), None)
-        checkpoint_path = _get_nested(drafter_cfg, ("checkpoint_path",), None)
+        if (
+            resume_checkpoint_dir is not None
+            and checkpoint_path in _DRAFTER_CHECKPOINT_PATH_PLACEHOLDERS
+        ):
+            checkpoint_path = os.path.join(
+                os.path.dirname(os.path.abspath(resume_checkpoint_dir)), "drafter"
+            )
+        else:
+            checkpoint_path = _get_nested(drafter_cfg, ("checkpoint_path",), None)
         resolved_path = resolve_drafter_checkpoint_path(
             model_path, checkpoint_path, resume_step
         )

@@ -546,6 +546,9 @@ def test_native_joint_checkpoint_commits_last_and_preserves_previous_on_failure(
                 "format": "speco_v1_joint_checkpoint",
                 "version": 1,
                 "global_step": 3,
+                "drafter_checkpoints": [
+                    {"saved": True, "path": str(tmp_path / "drafter" / "draft_step_3")}
+                ],
                 "bubble": {
                     "quota_complete": True,
                     "writer_group": [],
@@ -581,7 +584,12 @@ def test_native_joint_checkpoint_commits_last_and_preserves_previous_on_failure(
     )
     trainer.critic_wg = SimpleNamespace(save_checkpoint=actor_save, workers=[worker])
     trainer._ray_get_if_needed = lambda refs: refs
-    trainer._speco_save_drafter_checkpoint = lambda **kwargs: check("drafter") or []
+
+    def save_drafter(**kwargs):
+        check("drafter")
+        return [{"saved": True, "path": str(tmp_path / "drafter" / "draft_step_7")}]
+
+    trainer._speco_save_drafter_checkpoint = save_drafter
     trainer._speco_snapshot_v1_feature_store_checkpoint = (
         lambda: check("features") or []
     )

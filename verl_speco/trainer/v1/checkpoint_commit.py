@@ -76,6 +76,33 @@ def _fsync_directory(path):
             os.close(descriptor)
 
 
+def saved_drafter_entries(entries):
+    if not isinstance(entries, list):
+        return []
+    return [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and entry.get("saved") is True
+        and isinstance(entry.get("path"), str)
+        and entry["path"].strip()
+    ]
+
+
+def _is_complete_bubble_manifest(manifest, step):
+    if not isinstance(manifest, dict):
+        return False
+    bubble = manifest.get("bubble")
+    return (
+        manifest.get("format") == "speco_v1_joint_checkpoint"
+        and manifest.get("version") == 1
+        and manifest.get("global_step") == int(step)
+        and isinstance(bubble, dict)
+        and bubble.get("quota_complete") is True
+        and bool(saved_drafter_entries(manifest.get("drafter_checkpoints")))
+    )
+
+
 def commit_latest(root, step):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -83,13 +110,7 @@ def commit_latest(root, step):
     manifest = json.loads(
         (folder / "speco_v1_manifest.json").read_text(encoding="utf-8")
     )
-    if (
-        not isinstance(manifest, dict)
-        or manifest.get("format") != "speco_v1_joint_checkpoint"
-        or manifest.get("version") != 1
-        or manifest.get("global_step") != int(step)
-        or manifest.get("bubble", {}).get("quota_complete") is not True
-    ):
+    if not _is_complete_bubble_manifest(manifest, step):
         raise RuntimeError("Cannot publish an incomplete V1 Bubble recovery point")
     _fsync_directory(folder)
     fd, temporary = tempfile.mkstemp(prefix=".speco_latest.", dir=root)
@@ -117,11 +138,7 @@ def committed_steps(root, through_step):
             )
         except (OSError, ValueError):
             continue
-        if not isinstance(manifest, dict):
-            continue
-        if manifest.get("format") == "speco_v1_joint_checkpoint" and manifest.get(
-            "global_step"
-        ) == int(suffix):
+        if _is_complete_bubble_manifest(manifest, int(suffix)):
             steps.append(int(suffix))
     return sorted(steps)
 
@@ -134,9 +151,10 @@ def prune_checkpoint_roles(worker, root, steps, role):
         raise ValueError("Invalid checkpoint role")
     targets = []
     for step in steps:
-        folder = (root / f"global_step_{int(step)}").resolve()
+        expected_folder = root / f"global_step_{int(step)}"
+        folder = expected_folder.resolve()
         target = (folder / role).resolve()
-        if folder.parent != root or target.parent != folder or target.name != role:
+        if folder != expected_folder or target != folder / role:
             raise ValueError(
                 "Checkpoint retention target escapes its recovery directory"
             )

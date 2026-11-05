@@ -20,6 +20,7 @@ import inspect
 import json
 import logging
 import os
+from pathlib import Path
 import tempfile
 import time
 from typing import Any, cast
@@ -261,6 +262,14 @@ class SpecoV1Mixin(V1BubbleMixin):
         return os.path.join(
             self._speco_v1_checkpoint_directory(global_step), "speco_v1_manifest.json"
         )
+
+    def _speco_v1_explicit_resume_directory(self) -> str | None:
+        trainer = self.config.trainer
+        if trainer.get("resume_mode") == "resume_path":
+            path = trainer.get("resume_from_path")
+            if path:
+                return os.path.abspath(os.fspath(path))
+        return None
 
     def _speco_finalize_v1_drafter_publish(self) -> dict[str, Any]:
         if not getattr(self, "_speco_v1_pending_training", False):
@@ -510,6 +519,36 @@ class SpecoV1Mixin(V1BubbleMixin):
         }
         async_evidence = getattr(self, "_speco_v1_async_checkpoint_evidence", None)
         if self._speco_rollout_idle_worker_enabled():
+            from verl_speco.trainer.v1.checkpoint_commit import saved_drafter_entries
+
+            saved = saved_drafter_entries(manifest["drafter_checkpoints"])
+            if not saved:
+                raise RuntimeError(
+                    "Cannot commit a Bubble checkpoint without saved drafter state"
+                )
+            run_root = Path(checkpoint_dir).resolve().parent
+            portable_entries = []
+            for entry in saved:
+                path = Path(entry["path"]).resolve()
+                portable_entry = {**entry, "path": str(path)}
+                if path.is_relative_to(run_root):
+                    portable_entry["run_relative_path"] = path.relative_to(
+                        run_root
+                    ).as_posix()
+                portable_entries.append(portable_entry)
+            manifest["drafter_checkpoints"] = portable_entries
+            portable_cursors = []
+            for record in feature_store:
+                cursor = record.get("cursor")
+                if isinstance(cursor, dict) and cursor.get("path"):
+                    path = Path(cursor["path"]).resolve()
+                    if path.is_relative_to(run_root):
+                        record = {
+                            **record,
+                            "run_relative_path": path.relative_to(run_root).as_posix(),
+                        }
+                portable_cursors.append(record)
+            manifest["feature_store"] = portable_cursors
             session = self._speco_bubble_session()
             if (
                 session.pending
@@ -546,19 +585,16 @@ class SpecoV1Mixin(V1BubbleMixin):
                 os.remove(temporary_path)
         return manifest_path
 
-    def _speco_restore_v1_feature_store_checkpoint(self) -> None:
-        feature_store_configured = self._speco_feature_store_checkpoint_configured()
-        bubble = self._speco_rollout_idle_worker_enabled()
-        if not feature_store_configured and not bubble:
-            return
-        resume_step = self._speco_resume_global_step_hint()
-        if resume_step is None:
-            return
-        manifest_path = self._speco_v1_joint_checkpoint_manifest_path(resume_step)
+    def _speco_read_v1_resume_manifest(self, resume_step: int) -> dict[str, Any]:
+        resume_directory = self._speco_v1_explicit_resume_directory()
+        manifest_path = (
+            os.path.join(resume_directory, "speco_v1_manifest.json")
+            if resume_directory is not None
+            else self._speco_v1_joint_checkpoint_manifest_path(resume_step)
+        )
         if not os.path.isfile(manifest_path):
             raise RuntimeError(
-                "V1 resume with Feature Store enabled requires a joint SPECO "
-                f"checkpoint manifest: {manifest_path}"
+                f"V1 resume requires a joint SPECO checkpoint manifest: {manifest_path}"
             )
         try:
             with open(manifest_path, encoding="utf-8") as stream:
@@ -568,13 +604,91 @@ class SpecoV1Mixin(V1BubbleMixin):
                 f"Invalid V1 SPECO checkpoint manifest: {manifest_path}"
             ) from exc
         if (
-            manifest.get("format") != "speco_v1_joint_checkpoint"
+            not isinstance(manifest, dict)
+            or manifest.get("format") != "speco_v1_joint_checkpoint"
             or int(manifest.get("version", 0)) != 1
             or int(manifest.get("global_step", -1)) != int(resume_step)
         ):
             raise RuntimeError(
                 f"V1 SPECO checkpoint manifest does not match resumed step {resume_step}"
             )
+        return manifest
+
+    def _speco_validate_v1_drafter_resume_source(self) -> None:
+        resume_step = self._speco_resume_global_step_hint()
+        if resume_step is None:
+            return
+        manifest = self._speco_read_v1_resume_manifest(resume_step)
+        from verl_speco.trainer.checkpoint import (
+            get_drafter_checkpoint_step,
+            is_pretrained_drafter_checkpoint,
+        )
+        from verl_speco.trainer.v1.checkpoint_commit import saved_drafter_entries
+
+        drafter = self.config.actor_rollout_ref.rollout.drafter
+        model_path = drafter.get("model_path")
+        resume_directory = (
+            self._speco_v1_explicit_resume_directory()
+            or self._speco_v1_checkpoint_directory(resume_step)
+        )
+        run_root = Path(resume_directory).resolve().parent
+        candidates: dict[Path, tuple[Path, Path | None]] = {}
+        for entry in saved_drafter_entries(manifest.get("drafter_checkpoints")):
+            original = Path(entry["path"]).resolve()
+            relative = entry.get("run_relative_path")
+            if relative is None:
+                candidates[original] = (original, None)
+            elif (
+                isinstance(relative, str)
+                and relative
+                and not Path(relative).is_absolute()
+            ):
+                path = (run_root / relative).resolve()
+                if path.is_relative_to(run_root):
+                    candidates[path] = (original, path.parent.relative_to(run_root))
+        candidates = {
+            path: provenance
+            for path, provenance in candidates.items()
+            if is_pretrained_drafter_checkpoint(path)
+            and get_drafter_checkpoint_step(path) == resume_step
+        }
+        selected = Path(model_path).resolve() if model_path else None
+        if selected is None or selected not in candidates:
+            if len(candidates) != 1 or (
+                model_path
+                and is_pretrained_drafter_checkpoint(model_path)
+                and get_drafter_checkpoint_step(model_path) == resume_step
+            ):
+                raise RuntimeError(
+                    f"V1 Bubble drafter model_path={model_path!r} does not match a saved "
+                    f"drafter checkpoint in the joint manifest for step {resume_step}"
+                )
+            selected = next(iter(candidates))
+            self._speco_set_config_value(drafter, "model_path", str(selected))
+
+        original, relative_parent = candidates[selected]
+        save_path = drafter.get("checkpoint_path")
+        output_root = self.config.trainer.get("default_local_dir")
+        if save_path and output_root and relative_parent is not None:
+            configured = Path(save_path).resolve()
+            # Only rebase a destination that still points at the source run.
+            # An explicitly configured independent destination stays in effect.
+            if configured in {original, original.parent, selected, selected.parent}:
+                destination = Path(output_root).resolve() / relative_parent
+                if configured != destination:
+                    self._speco_set_config_value(
+                        drafter, "checkpoint_path", str(destination)
+                    )
+
+    def _speco_restore_v1_feature_store_checkpoint(self) -> None:
+        feature_store_configured = self._speco_feature_store_checkpoint_configured()
+        bubble = self._speco_rollout_idle_worker_enabled()
+        if not feature_store_configured and not bubble:
+            return
+        resume_step = self._speco_resume_global_step_hint()
+        if resume_step is None:
+            return
+        manifest = self._speco_read_v1_resume_manifest(resume_step)
         if bubble:
             state = manifest.get("bubble", {})
             if state.get("quota_complete") is not True:
@@ -622,6 +736,26 @@ class SpecoV1Mixin(V1BubbleMixin):
                 "V1 SPECO checkpoint manifest must contain one unique Feature Store cursor"
             )
         state = next(iter(unique_states.values()))
+        relative = state.get("run_relative_path")
+        if relative is not None:
+            resume_directory = (
+                self._speco_v1_explicit_resume_directory()
+                or self._speco_v1_checkpoint_directory(resume_step)
+            )
+            run_root = Path(resume_directory).resolve().parent
+            if (
+                not isinstance(relative, str)
+                or not relative
+                or Path(relative).is_absolute()
+            ):
+                raise RuntimeError("Invalid run-relative Feature Store checkpoint path")
+            path = (run_root / relative).resolve()
+            if not path.is_relative_to(run_root):
+                raise RuntimeError(
+                    "Feature Store checkpoint path escapes the run directory"
+                )
+            # The worker still checks the configured path and manifest prefix.
+            state = {**state, "cursor": {**state["cursor"], "path": str(path)}}
         results = self._ray_get_if_needed(
             self.speco_restore_feature_store_checkpoint_state(state)
         )
@@ -687,6 +821,11 @@ class SpecoV1Mixin(V1BubbleMixin):
                 "V1 Bubble Time supports only trainer_mode=sync; "
                 "disable rollout_idle_worker for async training"
             )
+        if bubble and not bool(training.get("save_full_drafter_checkpoint", True)):
+            raise ValueError(
+                "V1 Bubble Time requires save_full_drafter_checkpoint=true "
+                "to restore drafter weights and state from a joint checkpoint"
+            )
         local_updates = int(
             (config.trainer.v1.get(mode, {}) or {}).get("parameter_sync_step", 1)
         )
@@ -734,6 +873,19 @@ class SpecoV1Mixin(V1BubbleMixin):
         self._speco_validate_v1_training_config(self.config)
         self._speco_v1_bubble_enabled_cache = self._speco_rollout_idle_worker_enabled()
         if self._speco_rollout_idle_worker_enabled():
+            drafter = self.config.actor_rollout_ref.rollout.drafter
+            training = drafter.get("training") or {}
+            resume_state = training.get("resume_trainer_state_from_checkpoint")
+            if resume_state is None:
+                resume_state = training.get("resume_lr_scheduler_from_checkpoint", True)
+            if (
+                not bool(resume_state)
+                and self._speco_resume_global_step_hint() is not None
+            ):
+                raise ValueError(
+                    "V1 Bubble Time requires resume_trainer_state_from_checkpoint=true "
+                    "when resuming a checkpoint to restore the matching drafter weights and state"
+                )
             self._speco_v1_log_runtime_provenance()
         from verl_speco.integration.vllm_runtime import (
             configure_vllm_runtime_from_config,
@@ -750,7 +902,15 @@ class SpecoV1Mixin(V1BubbleMixin):
         if self._speco_online_enabled_from_config(self.config):
             # Resolve a resumed draft checkpoint before V1 creates the rollout
             # server.  The server reads drafter.model_path during construction.
-            self._speco_prepare_drafter_checkpoint_for_worker_init()
+            if self._speco_rollout_idle_worker_enabled():
+                self._speco_validate_v1_drafter_resume_source()
+            resume_directory = self._speco_v1_explicit_resume_directory()
+            if resume_directory is None:
+                self._speco_prepare_drafter_checkpoint_for_worker_init()
+            else:
+                self._speco_prepare_drafter_checkpoint_for_worker_init(
+                    resume_checkpoint_dir=resume_directory
+                )
 
         configure_vllm_runtime_from_config(self.config)
         self._speco_drafter_config_for_worker_wrap = (

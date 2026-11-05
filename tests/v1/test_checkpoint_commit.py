@@ -62,6 +62,7 @@ def test_failed_atomic_pointer_replace_keeps_previous_pointer(tmp_path, monkeypa
                 "version": 1,
                 "global_step": 7,
                 "bubble": {"quota_complete": True},
+                "drafter_checkpoints": [{"saved": True, "path": "draft_step_7"}],
             }
         )
     )
@@ -76,7 +77,10 @@ def test_failed_atomic_pointer_replace_keeps_previous_pointer(tmp_path, monkeypa
     assert not list(tmp_path.glob(".speco_latest.*"))
 
 
-def test_pointer_cannot_commit_incomplete_manifest(tmp_path):
+@pytest.mark.parametrize("quota_complete", [False, True])
+def test_pointer_cannot_commit_incomplete_manifest(tmp_path, quota_complete):
+    tracker = tmp_path / "latest_checkpointed_iteration.txt"
+    tracker.write_text("3")
     folder = tmp_path / "global_step_7"
     folder.mkdir()
     (folder / "speco_v1_manifest.json").write_text(
@@ -85,33 +89,48 @@ def test_pointer_cannot_commit_incomplete_manifest(tmp_path):
                 "format": "speco_v1_joint_checkpoint",
                 "version": 1,
                 "global_step": 7,
-                "bubble": {"quota_complete": False},
+                "bubble": {"quota_complete": quota_complete},
             }
         )
     )
     with pytest.raises(RuntimeError, match="incomplete"):
         commit.commit_latest(tmp_path, 7)
-    assert not (tmp_path / "latest_checkpointed_iteration.txt").exists()
+    assert tracker.read_text() == "3"
 
 
 def test_retention_only_selects_completed_manifest_steps(tmp_path):
-    for step, payload in (
-        (3, {"format": "speco_v1_joint_checkpoint", "global_step": 3}),
-        (4, {"format": "other", "global_step": 4}),
-        (5, {"format": "speco_v1_joint_checkpoint", "global_step": 9}),
-        (8, {"format": "speco_v1_joint_checkpoint", "global_step": 8}),
+    for step, overrides in (
+        (3, {}),
+        (4, {"format": "other"}),
+        (5, {"global_step": 9}),
+        (6, {"drafter_checkpoints": []}),
+        (7, {"bubble": {"quota_complete": False}}),
+        (8, {}),
+        (9, {"bubble": None}),
+        (10, {}),
     ):
+        payload = {
+            "format": "speco_v1_joint_checkpoint",
+            "version": 1,
+            "global_step": step,
+            "bubble": {"quota_complete": True},
+            "drafter_checkpoints": [{"saved": True, "path": f"draft_step_{step}"}],
+            **overrides,
+        }
         folder = tmp_path / f"global_step_{step}"
         folder.mkdir()
         (folder / "speco_v1_manifest.json").write_text(json.dumps(payload))
-    assert commit.committed_steps(tmp_path, 7) == [3]
+    assert commit.committed_steps(tmp_path, 9) == [3, 8]
 
 
-def test_retention_rejects_path_escape_before_deleting_any_checkpoint(tmp_path):
+@pytest.mark.parametrize("same_root_alias", [False, True])
+def test_retention_rejects_path_escape_before_deleting_any_checkpoint(
+    tmp_path, same_root_alias
+):
     root = tmp_path / "checkpoints"
     safe = root / "global_step_3" / "actor"
     safe.mkdir(parents=True)
-    outside = tmp_path / "outside"
+    outside = root / "global_step_8" if same_root_alias else tmp_path / "outside"
     outside.mkdir()
     victim = outside / "actor"
     victim.mkdir()
@@ -134,7 +153,8 @@ def test_retention_reports_failed_deletions(tmp_path, monkeypatch, caplog):
 
     monkeypatch.setattr(commit.shutil, "rmtree", fail)
     assert commit.prune_checkpoint_roles(None, tmp_path, [3], "actor") == {
-        "pruned": 0, "failed": 1,
+        "pruned": 0,
+        "failed": 1,
     }
     assert target.is_dir()
     assert "Checkpoint retention failed" in caplog.text
