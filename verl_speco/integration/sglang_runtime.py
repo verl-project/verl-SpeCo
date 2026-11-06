@@ -594,6 +594,35 @@ def _nonnegative_int(value: Any, default: int = 0) -> int:
         return max(int(default), 0)
 
 
+def _block_drafter_hidden_alignment_failure(
+    hidden_positions: Any, hidden_rows: int
+) -> str | None:
+    """Return why a block-drafter (DFlash) hidden-state sample is malformed.
+
+    This is a structural check only. It rejects a sample that has no hidden
+    positions, a different number of positions than hidden rows, or a gap in
+    the positions. SGLang's native collection attaches no positions, so this
+    catches samples that bypassed the SGLang output patch.
+
+    It does not prove that each row belongs to this request or to the token at
+    its position: the positions are assigned by the same code that slices the
+    rows, so wrong rows with consistent positions pass. Row ownership is
+    covered by the per-request tests of the output patch on real SGLang
+    processor sources.
+    """
+
+    if not torch.is_tensor(hidden_positions):
+        return "hidden_positions_missing_or_mismatched"
+    positions = hidden_positions.reshape(-1)
+    if int(positions.numel()) != int(hidden_rows):
+        return "hidden_positions_missing_or_mismatched"
+    if int(positions.numel()) > 1 and not bool(
+        (positions[1:] == positions[:-1] + 1).all()
+    ):
+        return "hidden_positions_not_contiguous"
+    return None
+
+
 def _expected_full_hidden_rows(prompt_len: int, output_len: int) -> int:
     return max(int(prompt_len) + int(output_len) - 1, 0)
 
@@ -1094,6 +1123,28 @@ def _validate_sglang_dspark_config(drafter_cfg: dict[str, Any]) -> int:
     return gamma
 
 
+def _sglang_dflash_rejects_hidden_states_with_overlap() -> bool:
+    """Whether this SGLang aborts DFLASH ``return_hidden_states`` requests under overlap.
+
+    From v0.5.14 the scheduler validates DFLASH requests with
+    ``validate_dflash_request(req, enable_overlap)`` and aborts any request that sets
+    ``return_hidden_states`` while the overlap scheduler is on. The spec-v2
+    ``DFlashWorkerV2`` runs with and without overlap, so hidden-state collection needs
+    the overlap scheduler off. Through v0.5.13 the check takes only ``req`` and has no
+    such rule.
+    """
+
+    try:
+        from sglang.srt.speculative.dflash_utils import validate_dflash_request
+    except Exception:
+        return False
+    try:
+        parameters = inspect.signature(validate_dflash_request).parameters
+    except (TypeError, ValueError):
+        return False
+    return "enable_overlap" in parameters
+
+
 def _server_args_overrides_from_drafter(
     drafter_cfg: dict[str, Any], supported_fields: set[str]
 ) -> dict[str, Any]:
@@ -1181,6 +1232,19 @@ def _server_args_overrides_from_drafter(
         overrides["speculative_num_draft_tokens"] = (
             _validate_sglang_dspark_config(drafter_cfg) + 1
         )
+    if (
+        str(server_algorithm or "").strip().upper() == "DFLASH"
+        and overrides["enable_return_hidden_states"]
+        and _sglang_dflash_rejects_hidden_states_with_overlap()
+    ):
+        # Otherwise SGLang aborts every rollout request with "DFLASH speculative
+        # decoding does not support return_hidden_states yet."
+        logger.warning(
+            "SGLang rejects DFLASH return_hidden_states under the overlap scheduler; "
+            "starting SGLang with disable_overlap_schedule=True to collect drafter "
+            "hidden states."
+        )
+        overrides["disable_overlap_schedule"] = True
     cuda_graph_max_bs = rollout_cfg.get("cuda_graph_max_bs")
     if cuda_graph_max_bs is not None:
         overrides["cuda_graph_max_bs"] = cuda_graph_max_bs
@@ -2728,7 +2792,13 @@ class _SpecoSGLangHttpServerMixin:
                     )
                 hidden_kept_len = int(hidden_states.size(0))
                 fail_closed_alignment_reason = None
-                if not uses_dflash_aux_hidden:
+                if uses_dflash_aux_hidden:
+                    fail_closed_alignment_reason = (
+                        _block_drafter_hidden_alignment_failure(
+                            hidden_positions, hidden_kept_len
+                        )
+                    )
+                else:
                     if (
                         hidden_positions is None
                         or int(hidden_positions.numel()) != hidden_kept_len
