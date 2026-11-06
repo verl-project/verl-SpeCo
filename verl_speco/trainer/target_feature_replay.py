@@ -1407,9 +1407,14 @@ class TargetFeatureReplayer:
                     )
                 # The Mooncake store consumes the full transfer manifest; the
                 # bare handle alone lacks the tensor layout get_sample needs.
-                load_reference: str | Mapping[str, Any] = (
-                    getattr(response, "kv_transfer_params", None) if handle else path
-                )
+                load_reference: str | Mapping[str, Any]
+                if handle:
+                    params = getattr(response, "kv_transfer_params", None)
+                    if not isinstance(params, Mapping):
+                        raise ValueError("vLLM response missing kv_transfer_params")
+                    load_reference = params
+                else:
+                    load_reference = path
                 reference = handle or path
                 payload = self._load_vllm_hidden_states(load_reference)
                 with self._metrics_lock:
