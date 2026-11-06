@@ -649,7 +649,7 @@ or NPU runners with matching model paths and runtime packages.
 Scan the QR code below to join the verl-SpeCo Lark user group.
 
 <p align="center">
-  <img src="docs/assets/Lark_QR_code.jpg" alt="verl-SpeCo Lark user group QR code" width="220">
+  <img src="docs/assets/Lark_QR_Code.png" alt="verl-SpeCo Lark user group QR code" width="220">
 </p>
 
 ## Contributing
