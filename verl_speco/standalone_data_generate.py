@@ -296,6 +296,7 @@ async def _hidden_components(config, stack):
     from verl_speco.producer.hidden_states_store import (
         RawHiddenDatasetWriter,
         build_hidden_states_store,
+        load_raw_hidden_manifest,
         prepare_raw_hidden_sample,
     )
     from verl_speco.producer.input_reader import (
@@ -310,7 +311,7 @@ async def _hidden_components(config, stack):
         delete_temporary_result,
         load_hidden_state_result,
     )
-    from verl_speco.standalone_tq_training_launcher import _stable_path_identity
+    from verl_speco.standalone_tq_training_launcher import _saved_hidden_identity
 
     hidden, vllm = config["hidden"], config["vllm"]
     tokenizer = await asyncio.to_thread(
@@ -335,20 +336,32 @@ async def _hidden_components(config, stack):
         raise ValueError(
             "Configure distinct auxiliary output IDs within the target depth"
         )
+    store = RawHiddenDatasetWriter(config["output_path"])
+    stack.callback(store.close)
+    existing = load_raw_hidden_manifest(store.path)
+    previous_contract = existing[0]["feature_contract"] if existing else {}
     contract = {
         "contract_type": "raw_capture",
         "vllm_aux_hidden_state_layer_ids": aux_ids,
         "include_final_hidden": bool(hidden["include_final_hidden"]),
         "target_num_hidden_layers": target_depth,
         "target_model_id": hidden["target_model_path"],
-        "target_model_revision": hidden.get("target_model_revision")
-        or _stable_path_identity("target", hidden["target_model_path"]),
-        "tokenizer_fingerprint": hidden.get("tokenizer_fingerprint")
-        or _stable_path_identity(
-            "tokenizer", hidden["tokenizer_path"] or hidden["target_model_path"]
+        "target_model_revision": _saved_hidden_identity(
+            "target",
+            hidden["target_model_path"],
+            previous_contract.get("target_model_revision"),
+        ),
+        "tokenizer_fingerprint": _saved_hidden_identity(
+            "tokenizer",
+            hidden["tokenizer_path"] or hidden["target_model_path"],
+            previous_contract.get("tokenizer_fingerprint"),
         ),
         "source": "standalone_data_generate",
     }
+    if previous_contract:
+        for name in ("target_model_revision", "tokenizer_fingerprint"):
+            if previous_contract.get(name) != contract[name]:
+                raise ValueError(f"Saved hidden capture identity changed: {name}")
     pool = VllmFeatureClientPool(
         [
             VllmEndpoint(url.rstrip("/"), int(vllm["per_endpoint_concurrency"]))
@@ -361,8 +374,6 @@ async def _hidden_components(config, stack):
     )
     stack.push_async_callback(pool.close)
     await pool.start()
-    store = RawHiddenDatasetWriter(config["output_path"])
-    stack.callback(store.close)
     # Capture the full tokenized conversation. Training windows, block-size
     # filtering and conversion dtype belong to the training Producer.
     token_config = {
@@ -504,6 +515,9 @@ def _resume_state(config, output):
         for key, value in identity["hidden"].items()
         if key not in {"validate_outputs", "file_concurrency"}
     }
+    # Keep fingerprints compatible with configs that exposed unused null identities.
+    identity["hidden"].setdefault("target_model_revision", None)
+    identity["hidden"].setdefault("tokenizer_fingerprint", None)
     if config["task"] == "responses":
         identity["response_format_version"] = 1
     if config["task"] == "hidden":
@@ -524,6 +538,11 @@ def _resume_state(config, output):
         state_path.write_text(
             json.dumps({"fingerprint": fingerprint}), encoding="utf-8"
         )
+    from verl_speco.producer.hidden_states_store import repair_jsonl_tail
+
+    repair_jsonl_tail(
+        output / "manifest.jsonl" if config["task"] == "hidden" else output
+    )
     if config["task"] == "hidden":
         from verl_speco.producer.hidden_states_store import load_raw_hidden_manifest
 

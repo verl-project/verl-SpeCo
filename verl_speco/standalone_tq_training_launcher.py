@@ -428,6 +428,55 @@ def _stable_path_identity(kind: str, path: str) -> str:
     return f"{kind}-path-sha256-{digest}"
 
 
+def _saved_hidden_identity(kind: str, path: str, stored=None) -> str:
+    """Identify saved features by model/tokenizer files, retaining old datasets."""
+    legacy = _stable_path_identity(kind, path)
+    if stored == legacy:
+        return legacy
+    names = (
+        ("config.json",)
+        if kind == "target"
+        else (
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "vocab.json",
+            "merges.txt",
+            "tokenizer.model",
+            "spiece.model",
+            "chat_template.jinja",
+        )
+    )
+    digest = hashlib.sha256()
+    found = False
+    for name in names:
+        source = Path(path) / name
+        if not Path(path).is_dir():
+            from transformers.utils.hub import cached_file
+
+            resolved = cached_file(
+                path, name, _raise_exceptions_for_missing_entries=False
+            )
+            if resolved is None:
+                continue
+            source = Path(resolved)
+        if source.is_file():
+            found = True
+            digest.update(name.encode())
+            with source.open("rb") as stream:
+                file_digest = hashlib.sha256()
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    file_digest.update(chunk)
+                digest.update(file_digest.digest())
+    if not found:
+        # Some old local models bundle tokenizer settings in config.json only.
+        source = Path(path) / "config.json"
+        if not source.is_file():
+            raise ValueError(f"Cannot identify {kind} files at {path}")
+        digest.update(source.read_bytes())
+    return f"{kind}-files-sha256-{digest.hexdigest()}"
+
+
 def _target_final_layer_id(model_path: str, target_layer_ids: Sequence[int]) -> int:
     """Resolve the final transformer-layer output ID from a local HF config."""
 
@@ -866,7 +915,19 @@ def build_pipeline_commands(
     validation read one source.
     """
     backend_env = os.environ if env is None else env
+    target_identity = _stable_path_identity("target", config.model_path)
+    tokenizer_identity = _stable_path_identity("tokenizer", config.tokenizer_path)
     if config.data_source == "saved_hidden":
+        capture = config.saved_hidden_contract
+        if capture is None:
+            rows = load_raw_hidden_manifest(config.input_path)
+            capture = rows[0]["feature_contract"] if rows else {}
+        target_identity = _saved_hidden_identity(
+            "target", config.model_path, capture.get("target_model_revision")
+        )
+        tokenizer_identity = _saved_hidden_identity(
+            "tokenizer", config.tokenizer_path, capture.get("tokenizer_fingerprint")
+        )
         if config.algorithm not in {"DSPARK", "DFLASH", "EAGLE3"}:
             raise ValueError(
                 "saved_hidden supports DSPARK, DFLASH and EAGLE3 reference training"
@@ -1014,11 +1075,9 @@ def build_pipeline_commands(
         "speco.standalone_tq_producer.resume_checkpoint_path="
         + (drafter_path if resume_metadata is not None else "null"),
         f"speco.standalone_tq_producer.tokenizer_path={config.tokenizer_path}",
-        "speco.standalone_tq_producer.tokenizer_fingerprint="
-        + _stable_path_identity("tokenizer", config.tokenizer_path),
+        "speco.standalone_tq_producer.tokenizer_fingerprint=" + tokenizer_identity,
         f"speco.standalone_tq_producer.target_model_id={config.model_path}",
-        "speco.standalone_tq_producer.target_model_revision="
-        + _stable_path_identity("target", config.model_path),
+        "speco.standalone_tq_producer.target_model_revision=" + target_identity,
         "speco.standalone_tq_producer.target_layer_ids="
         + _hydra_list(config.target_layer_ids),
         "speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids="
@@ -1162,10 +1221,8 @@ def build_pipeline_commands(
         expected = {
             "algorithm": config.algorithm,
             "target_model_id": config.model_path,
-            "target_model_revision": _stable_path_identity("target", config.model_path),
-            "tokenizer_fingerprint": _stable_path_identity(
-                "tokenizer", config.tokenizer_path
-            ),
+            "target_model_revision": target_identity,
+            "tokenizer_fingerprint": tokenizer_identity,
             "target_layer_ids": list(config.target_layer_ids),
             "vllm_aux_hidden_state_layer_ids": list(
                 config.vllm_aux_hidden_state_layer_ids
@@ -1187,10 +1244,9 @@ def build_pipeline_commands(
             f"{_TQ_PREFIX}.expected_feature.algorithm={config.algorithm}",
             f"{_TQ_PREFIX}.expected_feature.target_model_path="
             + json.dumps(config.model_path),
-            f"{_TQ_PREFIX}.expected_feature.target_revision="
-            + _stable_path_identity("target", config.model_path),
+            f"{_TQ_PREFIX}.expected_feature.target_revision=" + target_identity,
             f"{_TQ_PREFIX}.expected_feature.tokenizer_fingerprint="
-            + _stable_path_identity("tokenizer", config.tokenizer_path),
+            + tokenizer_identity,
             f"{_TQ_PREFIX}.expected_feature.target_layer_ids="
             + _hydra_list(config.target_layer_ids),
             f"{_TQ_PREFIX}.expected_feature.hidden_states_layout={hidden_layout}",

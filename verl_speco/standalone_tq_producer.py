@@ -630,19 +630,24 @@ async def _publish_saved_hidden(
         "Saved hidden Producer indexed directory=%s samples=%s", root, len(rows)
     )
     first_contract = rows[0]["feature_contract"]
-    training_rows = []
-    for row in rows:
+    training_rows: dict[int, dict[str, Any]] = {}
+    for index, row in enumerate(rows):
         stored = row["feature_contract"]
         if stored != first_contract:
             raise ValueError("Saved hidden dataset contains mixed feature contracts")
         contract = bind_raw_hidden_contract(stored, expected)
         request = row["request"]
         if stored.get("contract_type") == "raw_capture":
-            request = _saved_hidden_training_request(
-                request, producer_cfg, training_cfg
-            )
+            try:
+                request = _saved_hidden_training_request(
+                    request, producer_cfg, training_cfg
+                )
+            except SampleFilteredError as exc:
+                logger.info(
+                    "Skipping saved hidden sample %s: %s", row["sample_id"], exc
+                )
+                continue
         row = {**row, "feature_contract": contract, "request": request}
-        training_rows.append(row)
         # Validate arrays and metadata before exposing any sample to the scheduler.
         tag = make_reference_tag(
             SampleMetadata(
@@ -668,10 +673,16 @@ async def _publish_saved_hidden(
             or len(positions) < (3 if algorithm == "EAGLE3" else 1)
             or (algorithm == "DFLASH" and len(positions) <= minimum)
         ):
-            raise ValueError(
-                "Saved hidden sample has insufficient rows for the training algorithm/block size"
+            logger.info(
+                "Skipping saved hidden sample %s: insufficient training rows",
+                row["sample_id"],
             )
-    rows = training_rows
+            continue
+        training_rows[index] = row
+    if not training_rows:
+        raise ValueError(
+            "Saved hidden dataset has no samples with sufficient training rows"
+        )
     consumed, resume_metadata = load_standalone_resume(
         producer_cfg.get("resume_checkpoint_path"),
         input_path=root,
@@ -702,22 +713,25 @@ async def _publish_saved_hidden(
             sequence_no = epoch * len(rows) + position
             if sequence_no in consumed:
                 continue
+            selected_row = training_rows.get(int(index))
+            if selected_row is None:
+                stats.filtered_count += 1
+                continue
             if budget > 0 and stats.published_count + len(pending) >= budget:
                 break
             if before_publish is not None:
                 await before_publish()
-            row = rows[int(index)]
             meta = SampleMetadata(
                 PROTOCOL_SCHEMA_VERSION,
                 str(tq_cfg["run_id"]),
-                row["sample_id"],
+                selected_row["sample_id"],
                 sequence_no,
             )
             tag = make_reference_tag(
                 meta,
-                path=str(root / row["path"]),
-                request=row["request"],
-                feature_contract=row["feature_contract"],
+                path=str(root / selected_row["path"]),
+                request=selected_row["request"],
+                feature_contract=selected_row["feature_contract"],
             )
             pending.append({"key": make_sample_key(meta), "tag": tag})
             stats.input_count += 1

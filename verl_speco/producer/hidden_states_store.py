@@ -471,6 +471,31 @@ def bind_raw_hidden_contract(stored, expected):
     }
 
 
+def repair_jsonl_tail(path):
+    """Recover an interrupted append; reject corruption in committed lines."""
+    path = Path(path)
+    if not path.exists():
+        return
+    with path.open("r+b") as stream:
+        while True:
+            offset = stream.tell()
+            line = stream.readline()
+            if not line:
+                return
+            try:
+                if line.strip():
+                    json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                if line.endswith(b"\n"):
+                    raise
+                stream.truncate(offset)
+                logger.warning("Removed interrupted JSONL tail from %s", path)
+                return
+            if not line.endswith(b"\n"):
+                stream.write(b"\n")
+                return
+
+
 def load_raw_hidden_manifest(path):
     """Require an explicit format marker; never interpret normalized features as raw."""
     path = Path(path)

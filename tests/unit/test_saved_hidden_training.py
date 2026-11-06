@@ -388,8 +388,47 @@ def test_training_block_size_cannot_silently_drop_saved_supervision(dataset):
     manifest.write_text(
         "".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8"
     )
-    with pytest.raises(ValueError, match="insufficient"):
+    with pytest.raises(ValueError, match="sufficient"):
         asyncio.run(collect(producer))
+
+
+@pytest.mark.parametrize("raw_capture", [False, True])
+def test_saved_filter_preserves_original_occurrence_numbers(dataset, raw_capture):
+    root, _ = dataset
+    manifest = root / "manifest.jsonl"
+    entries = [json.loads(line) for line in manifest.read_text().splitlines()]
+    if raw_capture:
+        for entry in entries:
+            stored = entry["feature_contract"]
+            entry["feature_contract"] = {
+                name: stored[name] for name in (
+                    "target_model_id", "target_model_revision", "tokenizer_fingerprint",
+                    "target_num_hidden_layers", "vllm_aux_hidden_state_layer_ids",
+                )
+            }
+            entry["feature_contract"].update(contract_type="raw_capture", include_final_hidden=True)
+    entries[1]["request"]["loss_mask"] = [0.0, 0.0, 0.0, 1.0]
+    manifest.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+    _, producer, _ = pipeline(dataset)
+    stats, references = asyncio.run(collect(producer))
+    assert stats.published_count == 4
+    assert [entry["tag"]["sequence_no"] for entry in references] == [0, 2, 3, 5]
+
+
+def test_saved_identity_uses_model_files_and_keeps_legacy_identity(tmp_path):
+    from verl_speco.standalone_tq_training_launcher import _saved_hidden_identity
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    for path in (first, second):
+        path.mkdir()
+        (path / "config.json").write_text('{"num_hidden_layers": 3}')
+        (path / "tokenizer.json").write_text('{"vocab": {"hello": 1}}')
+    for kind in ("target", "tokenizer"):
+        assert _saved_hidden_identity(kind, str(first)) == _saved_hidden_identity(kind, str(second))
+        legacy = _stable_path_identity(kind, str(first))
+        assert _saved_hidden_identity(kind, str(first), legacy) == legacy
+    (second / "tokenizer.json").write_text('{"vocab": {"hello": 2}}')
+    assert _saved_hidden_identity("tokenizer", str(first)) != _saved_hidden_identity("tokenizer", str(second))
 
 
 @pytest.mark.parametrize(

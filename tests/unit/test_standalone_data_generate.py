@@ -49,6 +49,34 @@ def config(tmp_path):
     return cfg
 
 
+@pytest.mark.parametrize("task", ["responses", "hidden"])
+def test_resume_repairs_only_an_uncommitted_tail(tmp_path, task):
+    from verl_speco.producer.hidden_states_store import RawHiddenDatasetWriter, repair_jsonl_tail
+
+    cfg = config(tmp_path)
+    cfg["task"] = task
+    output = Path(cfg["output_path"])
+    generation._resume_state(cfg, output)
+    if task == "hidden":
+        writer = RawHiddenDatasetWriter(output)
+        writer.close()
+        path = output / "manifest.jsonl"
+        committed = b""
+    else:
+        path = output
+        committed = b'{"sample_id":"row-0"}\n'
+    path.write_bytes(committed + b'{"sample_id":"interrupted')
+    assert generation._resume_state(cfg, output) == ({"row-0"} if committed else set())
+    assert path.read_bytes() == committed
+    path.write_bytes(b'{"sample_id":broken}\n')
+    with pytest.raises(ValueError):
+        repair_jsonl_tail(path)
+    assert path.read_bytes() == b'{"sample_id":broken}\n'
+    path.write_bytes(b'{"sample_id":"complete"}')
+    repair_jsonl_tail(path)
+    assert path.read_bytes().endswith(b"\n")
+
+
 def test_response_dispatch_resume_and_producer_roundtrip(tmp_path, monkeypatch):
     cfg = config(tmp_path)
     calls, inflight, peak = [], {"first": 0, "second": 0}, {"first": 0, "second": 0}
@@ -214,8 +242,11 @@ def test_hidden_preserves_raw_values_and_replays_through_existing_cpu_preparatio
     cfg.update(task="hidden", output_path=str(tmp_path / "features"), max_samples=1)
     cfg["hidden"].update(
         vllm_aux_hidden_state_layer_ids=[1],
-        target_model_path="fake-model",
+        target_model_path=str(tmp_path / "target"),
     )
+    target = Path(cfg["hidden"]["target_model_path"])
+    target.mkdir()
+    (target / "config.json").write_text('{"num_hidden_layers": 3}')
     Path(cfg["input_path"]).write_text(
         json.dumps({"sample_id": "known-answer", "prompt": "q", "response": response})
         + "\n"

@@ -29,8 +29,6 @@ standalone_data_generation:
   hidden:
     target_model_path: null
     tokenizer_path: null # defaults to target_model_path
-    target_model_revision: null
-    tokenizer_fingerprint: null # same path identity as standalone training
     trust_remote_code: false
     vllm_aux_hidden_state_layer_ids: [1, 9, 17, 25, 33]
     include_final_hidden: true # match whether the service also captures the final layer
