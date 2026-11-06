@@ -179,15 +179,19 @@ class SpecoMooncakeHiddenStatesConnector(_UpstreamMooncakeHiddenStatesConnector)
             # Wait for the DtoH copy to complete before handing data to the store.
             copy_stream.synchronize()
 
+            # The hs_connectors store API takes the transfer manifest, not the
+            # bare key: put_sample reads the packed layout (tensors,
+            # metadata.total_aligned_bytes) from it, matching the upstream
+            # connector this wrapper overrides.
             self._store.put_sample(
-                pending.mooncake_key,
+                pending.transfer_manifest,
                 {"hidden_states": pinned_hs, "token_ids": pending.token_ids},
             )
         except Exception as exc:
             try:
                 # Store error marker instead of the sample, so consumer can
                 # re-request.
-                self._store.put_error(pending.mooncake_key, str(exc))
+                self._store.put_error(pending.transfer_manifest, str(exc))
             except Exception:
                 logger.exception(
                     "Failed to publish Mooncake error marker for %s",
