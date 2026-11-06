@@ -50,6 +50,7 @@ def bridge_request_acceptance_counters(fields):
 
     Run after SpeCo has attached the final per-request summary, so an aggregate
     engine-logger fallback cannot override that request's own counters.
+    Keep the provenance flag present with False for concat-compatible batches.
     """
     pair = _pair(
         fields,
@@ -59,7 +60,7 @@ def bridge_request_acceptance_counters(fields):
     if pair is None:
         return False
     rounds, accepted = pair
-    fields.pop("_speco_acceptance_engine_fallback", None)
+    fields["_speco_acceptance_engine_fallback"] = False
     fields["spec_num_verify_steps"] = rounds
     fields["spec_num_accepted_tokens"] = accepted
     draft_tokens = fields.get("_speco_vllm_request_draft_tokens")

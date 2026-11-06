@@ -1459,6 +1459,16 @@ def export_actor_lm_head_weight(
 class DraftWeightPublishMixin:
     """Mixin for external actor-rollout workers that publish SPECO draft weights."""
 
+    @register(
+        dispatch_mode=getattr(
+            Dispatch, "DIRECT_ROLLOUT_METHOD", getattr(Dispatch, "ONE_TO_ALL", None)
+        )
+    )
+    def speco_resource_identity(self):
+        from verl_speco.integration.resource_identity import resource_identity
+
+        return resource_identity(self.rank)
+
     config: Any
     rollout: Any
 

@@ -1019,6 +1019,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._require_speco_worker_group().get_drafter_target_lm_head_row_indices()
         )
 
+    def _speco_invalidate_v1_drafter_park(self) -> None:
+        # Invalidate before a residency-changing RPC, even if it eventually
+        # completes zero optimizer steps or fails after allocating on device.
+        session = self.__dict__.get("_speco_bubble_lifecycle")
+        if session is not None:
+            session.memory_parked = False
+
     def speco_train_drafter(self, training_plan: dict[str, object]):
         if self._speco_rollout_idle_worker_enabled() and training_plan.get(
             "reason"
@@ -1030,6 +1037,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 training_plan,
                 reclaim_bus_name=self._speco_rollout_idle_event_bus_name(),
             )
+        self._speco_invalidate_v1_drafter_park()
         return self._require_speco_worker_group().train_drafter(training_plan)
 
     def _speco_poll_drafter_training(self, submission):
@@ -1068,6 +1076,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
 
     def speco_preflight_drafter_training(self, training_plan: dict[str, object]):
+        self._speco_invalidate_v1_drafter_park()
         return self._require_speco_worker_group().preflight_drafter_training(
             training_plan
         )
@@ -1091,11 +1100,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
 
     def speco_activate_drafter_training_model(self):
+        self._speco_invalidate_v1_drafter_park()
         return self._require_speco_worker_group().activate_drafter_training_model()
 
     def speco_prewarm_drafter_training_model(
         self, worker_ids: tuple[str, ...] | None = None
     ):
+        self._speco_invalidate_v1_drafter_park()
         return self._require_speco_worker_group().prewarm_drafter_training_model(
             list(worker_ids) if worker_ids is not None else None
         )
@@ -1384,7 +1395,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         except ValueError:
             return None
 
-    def _speco_prepare_drafter_checkpoint_for_worker_init(self):
+    def _speco_prepare_drafter_checkpoint_for_worker_init(
+        self, *, resume_checkpoint_dir: str | None = None
+    ):
         drafter_cfg = self._speco_drafter_config()
         if drafter_cfg is None:
             return
@@ -1399,6 +1412,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return
 
         checkpoint_save_enabled = self._speco_drafter_checkpoint_save_config_enabled()
+        checkpoint_path = _get_nested(drafter_cfg, ("checkpoint_path",), None)
         if checkpoint_save_enabled:
             self._speco_ensure_drafter_checkpoint_path()
 
@@ -1421,7 +1435,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
 
         model_path = _get_nested(drafter_cfg, ("model_path",), None)
-        checkpoint_path = _get_nested(drafter_cfg, ("checkpoint_path",), None)
+        if (
+            resume_checkpoint_dir is not None
+            and checkpoint_path in _DRAFTER_CHECKPOINT_PATH_PLACEHOLDERS
+        ):
+            checkpoint_path = os.path.join(
+                os.path.dirname(os.path.abspath(resume_checkpoint_dir)), "drafter"
+            )
+        else:
+            checkpoint_path = _get_nested(drafter_cfg, ("checkpoint_path",), None)
         resolved_path = resolve_drafter_checkpoint_path(
             model_path, checkpoint_path, resume_step
         )
@@ -1774,6 +1796,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             economics.get("enabled", False)
             and self._speco_drafter_schedule_config().execution_strategy
             is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            and not getattr(self, "_speco_bubble_roi_supported", lambda: False)()
         ):
             raise ValueError(
                 "Bubble Time (rollout_idle_worker) with "
@@ -1782,7 +1805,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "set economics.enabled=false or scheduler.execution.strategy=sync"
             )
         # shortcut: reject async ROI gating until completion waits are attributed correctly.
-        if training_cfg.get("publish_async", False) and economics.get("enabled", False):
+        if (
+            training_cfg.get("publish_async", False)
+            and economics.get("enabled", False)
+            and not getattr(self, "_speco_bubble_roi_supported", lambda: False)()
+        ):
             raise ValueError(
                 "publish_async=true with drafter_convergence_freeze.economics.enabled=true "
                 "is not supported while async publish completion-cost accounting is pending; "
@@ -3247,7 +3274,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 and required_target_version is not None
                 and not target_lm_head_ready_for_workers
             ):
-                print(
+                logger.debug(
                     "[BubbleTime] idle_launch_blocked: "
                     f"plan_id={plan.plan_id} reason=target_lm_head_not_ready "
                     f"required_target_version={required_target_version} "
@@ -3255,7 +3282,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     f"ready_workers={ready_target_workers} "
                     "ready_versions="
                     f"{tuple(sorted(self._speco_ready_target_lm_head_versions))}",
-                    flush=True,
                 )
                 plan = replace(
                     plan,
@@ -3287,7 +3313,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             from verl_speco.integration.generation_diagnostics import record_admission
 
             record_admission(plan)
-            print(
+            from verl_speco.integration.generation_diagnostics import (
+                report_idle_rejection,
+            )
+
+            report_idle_rejection(self, plan)
+            logger.debug(
                 "[BubbleTime] idle_launch_decision: "
                 f"launch={getattr(plan, 'launch', False)} "
                 f"reason={getattr(plan, 'reason', None)} "
@@ -3308,7 +3339,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 f"{max(float(getattr(plan, 'deadline_ts', 0.0) or 0.0) - time.time(), 0.0):.3f} "
                 f"idle_workers={metrics.get('bubble/idle_workers', 0)} "
                 f"idle_groups={metrics.get('bubble/idle_training_groups', 0)}",
-                flush=True,
             )
             if plan is None or not plan.launch:
                 if plan is not None:
@@ -4317,7 +4347,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         metrics: dict[str, Any] | None = None,
     ) -> None:
         metrics = metrics or {}
-        log = logger.warning if plan.launch else logger.info
+        log = logger.info if plan.launch else logger.debug
         log(
             "[DrafterScheduler] step=%s strategy=%s launch=%s reason=%s "
             "interval_matched=%s max_batches=%s publish_after_success=%s "

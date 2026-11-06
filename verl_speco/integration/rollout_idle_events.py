@@ -44,6 +44,7 @@ def _event_bus_actor_class(ray):
             self._training_owners: dict[str, tuple[str, float]] = {}
             self._pending_rollout_groups: set[tuple[str, ...]] = set()
             self._replica_groups: dict[int, tuple[str, ...]] = {}
+            self._strict_replica_groups = False
             self._training_reclaims: dict[str, float] = {}
             self._overlap_required_plans: set[str] = set()
             self._rollout_requests: dict[str, tuple[tuple[str, ...], bool]] = {}
@@ -86,10 +87,20 @@ def _event_bus_actor_class(ray):
             )
 
         def _append_event(self, event: dict[str, Any]) -> None:
+            if not self._managed_event(event):
+                return
             event = dict(event)
             event.setdefault("event_ts", time.time())
             event.setdefault("bus_received_ts", time.time())
             self._events.append(event)
+
+        def _managed_event(self, event):
+            if not self._strict_replica_groups:
+                return True
+            try:
+                return int(event["replica_rank"]) in self._replica_groups
+            except (KeyError, TypeError, ValueError):
+                return False
 
         def _worker_group_for_event(
             self,
@@ -100,6 +111,8 @@ def _event_bus_actor_class(ray):
                 replica_rank = int(cast(Any, event.get("replica_rank")))
             except (TypeError, ValueError):
                 replica_rank = -1
+            if self._strict_replica_groups:
+                return self._replica_groups.get(replica_rank, ())
             return self._replica_groups.get(
                 replica_rank,
                 self._worker_group(worker_ids),
@@ -126,12 +139,17 @@ def _event_bus_actor_class(ray):
         def configure_replica_groups(
             self,
             groups: dict[int, list[str] | tuple[str, ...]],
+            strict_groups: bool = False,
         ) -> dict[int, list[str]]:
             self._replica_groups = {
                 int(replica_rank): self._worker_group(worker_ids)
                 for replica_rank, worker_ids in dict(groups or {}).items()
                 if self._worker_group(worker_ids)
             }
+            self._strict_replica_groups = bool(strict_groups)
+            self._events = [
+                event for event in self._events if self._managed_event(event)
+            ]
             return {
                 replica_rank: list(worker_ids)
                 for replica_rank, worker_ids in self._replica_groups.items()
@@ -145,6 +163,10 @@ def _event_bus_actor_class(ray):
             """Atomically acquire one rollout replica's colocated resources."""
 
             group = self._worker_group_for_event(worker_ids, event)
+            if self._strict_replica_groups and not group:
+                # Hybrid serving owns a different physical pool. Its rank 0
+                # must never acquire/reclaim standalone drafter worker 0.
+                return {"acquired": True, "managed": False, "blocking_plan_ids": []}
             request_id = str(event.get("lease_request_id", ""))
             if request_id and self._rollout_requests.get(request_id) == (group, True):
                 return {"acquired": True, "blocking_plan_ids": []}
@@ -244,6 +266,8 @@ def _event_bus_actor_class(ray):
             event = dict(event)
             event.setdefault("bus_received_ts", time.time())
             group = self._worker_group_for_event(worker_ids, event)
+            if self._strict_replica_groups and not group:
+                return {"released": True, "idle": True, "managed": False}
             completed_request = next(
                 (
                     request
@@ -594,6 +618,8 @@ def reserve_rollout_training_resources(
 def configure_rollout_resource_groups(
     name: str | None,
     groups: dict[int, tuple[str, ...]],
+    *,
+    strict_groups: bool = False,
 ) -> bool:
     ray, actor = _event_bus(name)
     if actor is None:
@@ -608,7 +634,8 @@ def configure_rollout_resource_groups(
                 {
                     int(replica_rank): list(worker_ids)
                     for replica_rank, worker_ids in groups.items()
-                }
+                },
+                **({"strict_groups": True} if strict_groups else {}),
             )
         )
     except Exception as exc:  # noqa: BLE001
