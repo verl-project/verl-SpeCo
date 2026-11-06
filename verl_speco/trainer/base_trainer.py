@@ -1237,19 +1237,25 @@ class DrafterBaseTrainer:
         ``init_process_group`` (that would pin the result at False); every
         current call site runs after initialization.
         """
+        config = getattr(self, "config", None)
+        if config is None:
+            return False
         cached = getattr(self, "_is_ep_active_cache", None)
         if cached is None:
             from verl_speco.backends.dsv4_ep_utils import is_ep_active
 
-            cached = bool(is_ep_active(self.config))
+            cached = bool(is_ep_active(config))
             self._is_ep_active_cache = cached
         return cached
 
     def _is_ep_enabled(self) -> bool:
         """Config-only EP request (no process-group check); see _is_ep_active."""
+        config = getattr(self, "config", None)
+        if config is None:
+            return False
         from verl_speco.backends.dsv4_ep_utils import is_ep_enabled
 
-        return is_ep_enabled(self.config)
+        return is_ep_enabled(config)
 
     def _apply_ep_only(self, raw_model) -> None:
         from verl_speco.backends.dsv4_ep_utils import apply_ep_only
