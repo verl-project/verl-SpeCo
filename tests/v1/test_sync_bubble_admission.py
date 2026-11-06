@@ -106,3 +106,71 @@ def test_sync_boundary_drains_without_engine_pause(nested, fails):
                 return "generated"
 
         assert asyncio.run(rollout()) == "generated"
+
+
+@pytest.mark.parametrize("final", [False, True])
+def test_quota_topup_charges_each_replica_sleep_and_the_final_park(final):
+    driver = V1BubbleMixin()
+    session = driver._speco_bubble_session()
+    now = 0.0
+    session.clock = SimpleNamespace(now=lambda: now)
+    session.close = lambda boundary: {}
+    driver.global_steps = 1
+    driver.total_training_steps = 1 if final else 2
+    driver._speco_v1_admission = lambda method: None
+    driver._speco_wait_target_lm_head_prefetch = lambda: None
+    driver._speco_v1_prefetch_publish_snapshot = lambda: {}
+    driver._speco_v1_publish_bubble = lambda: {}
+
+    scheduler = SimpleNamespace(
+        _training_quota_debt_steps=2,
+        training_work_metrics=lambda: {},
+        needs_idle_optimizer_bootstrap=lambda config: False,
+        prepare_training_execution=lambda plan: {},
+    )
+
+    def plan():
+        return SimpleNamespace(
+            plan_id=f"plan-{scheduler._training_quota_debt_steps}",
+            launch=True,
+            publish_after_success=True,
+        )
+
+    scheduler._plan_training_quota_topup = lambda *args: plan()
+    driver._speco_get_drafter_scheduler = lambda: scheduler
+    driver._speco_drafter_schedule_context = lambda: None
+    driver._speco_drafter_schedule_config = lambda: SimpleNamespace(
+        training_quota_allow_critical_path_fallback=True,
+    )
+    driver._speco_on_before_actor_update = lambda **kwargs: SimpleNamespace(
+        training_plan=plan()
+    )
+
+    def sleep():
+        nonlocal now
+        now += 2.0
+
+    def park(boundary):
+        nonlocal now
+        now += 3.0
+        return {}
+
+    def train(plan):
+        scheduler._training_quota_debt_steps -= 1
+        return True, {}
+
+    driver.checkpoint_manager = SimpleNamespace(sleep_replicas=sleep)
+    driver._speco_park_drafter_training_memory = park
+    driver._speco_train_drafter = train
+    driver._speco_v1_bubble_step_end(lambda: None)
+
+    expected = (
+        {"final_sleep:2": (0.0, 2.0), "final_sleep:1": (2.0, 4.0), "park": (4.0, 7.0)}
+        if final
+        else {"sleep": (0.0, 2.0), "park": (2.0, 5.0)}
+    )
+    assert {
+        key.removeprefix("topup:1:"): interval
+        for key, interval in session.costs.intervals.items()
+        if key.startswith("topup:1:")
+    } == expected

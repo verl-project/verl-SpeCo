@@ -620,6 +620,7 @@ class SpecoV1Mixin(V1BubbleMixin):
             return
         manifest = self._speco_read_v1_resume_manifest(resume_step)
         from verl_speco.trainer.checkpoint import (
+            freeze_policy_sidecar_path,
             get_drafter_checkpoint_step,
             is_pretrained_drafter_checkpoint,
         )
@@ -631,6 +632,15 @@ class SpecoV1Mixin(V1BubbleMixin):
             self._speco_v1_explicit_resume_directory()
             or self._speco_v1_checkpoint_directory(resume_step)
         )
+        state = manifest.get("bubble")
+        if not isinstance(state, dict) or state.get("quota_complete") is not True:
+            raise RuntimeError("V1 Bubble checkpoint has no completed quota boundary")
+        if state.get("policy_drafter_version") is not None and not os.path.isfile(
+            freeze_policy_sidecar_path(resume_directory)
+        ):
+            raise RuntimeError(
+                "V1 Bubble checkpoint is missing its freeze-policy state"
+            )
         run_root = Path(resume_directory).resolve().parent
         candidates: dict[Path, tuple[Path, Path | None]] = {}
         for entry in saved_drafter_entries(manifest.get("drafter_checkpoints")):
@@ -821,6 +831,14 @@ class SpecoV1Mixin(V1BubbleMixin):
                 "V1 Bubble Time supports only trainer_mode=sync; "
                 "disable rollout_idle_worker for async training"
             )
+        if (
+            bubble
+            and str(training.get("mode", "online")).strip().lower() == "collect_only"
+        ):
+            raise ValueError(
+                "V1 Bubble Time does not support training.mode=collect_only; "
+                "use online training or disable rollout_idle_worker"
+            )
         if bubble and not bool(training.get("save_full_drafter_checkpoint", True)):
             raise ValueError(
                 "V1 Bubble Time requires save_full_drafter_checkpoint=true "
@@ -873,6 +891,13 @@ class SpecoV1Mixin(V1BubbleMixin):
         self._speco_validate_v1_training_config(self.config)
         self._speco_v1_bubble_enabled_cache = self._speco_rollout_idle_worker_enabled()
         if self._speco_rollout_idle_worker_enabled():
+            from verl_speco.trainer.v1.checkpoint_commit import (
+                validate_synchronous_checkpoint_config,
+            )
+
+            validate_synchronous_checkpoint_config(
+                self.config, use_critic=self.use_critic
+            )
             drafter = self.config.actor_rollout_ref.rollout.drafter
             training = drafter.get("training") or {}
             resume_state = training.get("resume_trainer_state_from_checkpoint")
@@ -1161,15 +1186,18 @@ class SpecoV1Mixin(V1BubbleMixin):
             from verl_speco.trainer.v1.checkpoint_commit import (
                 commit_latest,
                 defer_native_checkpoint_commit,
+                validate_checkpoint_step,
             )
 
+            root = self.config.trainer.default_local_dir
+            validate_checkpoint_step(root, self.global_steps)
             # Worker configs were serialized during setup. This scope defers
             # the native driver's pointer/retention only, not worker writes.
             with defer_native_checkpoint_commit(
                 self.config, use_critic=self.use_critic
             ):
                 result = self._speco_save_v1_checkpoint_components()
-            commit_latest(self.config.trainer.default_local_dir, self.global_steps)
+            commit_latest(root, self.global_steps)
         else:
             result = self._speco_save_v1_checkpoint_components()
         self._speco_last_checkpoint_saved_step = self.global_steps
@@ -1217,12 +1245,10 @@ class SpecoV1Mixin(V1BubbleMixin):
             drafter_results = self._speco_save_drafter_checkpoint(wait=True)
             self._speco_freeze_save_state()
         result = super()._save_checkpoint()
-        if getattr(self, "_speco_colocate_admission_closed", False) and (
-            self._speco_freeze_branch_config().get("enabled", False)
-            or (
-                self._speco_rollout_idle_worker_enabled()
-                and self._speco_v1_async_rollout_enabled()
-            )
+        if (
+            getattr(self, "_speco_colocate_admission_closed", False)
+            and self._speco_v1_async_rollout_enabled()
+            and self._speco_freeze_branch_config().get("enabled", False)
         ):
             queue_path = os.path.join(
                 self._speco_v1_checkpoint_directory(), "transfer_queue"

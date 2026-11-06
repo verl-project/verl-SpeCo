@@ -526,6 +526,16 @@ class V1BubbleMixin:
             - started,
         }
 
+    @contextmanager
+    def _speco_v1_record_topup_cost(self, phase):
+        session = self._speco_bubble_session()
+        clock = self._speco_bubble_clock()
+        started = clock.now()
+        yield
+        session.costs.record_interval(
+            f"topup:{self.global_steps}:{phase}", started, clock.now()
+        )
+
     def _speco_v1_bubble_step_end(self, parent):
         boundary_started = time.perf_counter()
         session = self._speco_bubble_session()
@@ -572,7 +582,8 @@ class V1BubbleMixin:
             )
             if topup_plan is not None:
                 started = time.perf_counter()
-                self.checkpoint_manager.sleep_replicas()
+                with self._speco_v1_record_topup_cost("sleep"):
+                    self.checkpoint_manager.sleep_replicas()
                 metrics["timing_s/drafter_v1_topup_replica_sleep"] = (
                     time.perf_counter() - started
                 )
@@ -607,7 +618,8 @@ class V1BubbleMixin:
                     raise RuntimeError(
                         "Final V1 Bubble quota remains incomplete; critical-path fallback is disabled"
                     )
-                self.checkpoint_manager.sleep_replicas()
+                with self._speco_v1_record_topup_cost(f"final_sleep:{debt_before}"):
+                    self.checkpoint_manager.sleep_replicas()
                 event = self._speco_on_before_actor_update(force_quota_completion=True)
                 plan = event.training_plan
                 if plan is None or not plan.launch:
@@ -630,7 +642,8 @@ class V1BubbleMixin:
                 if not trained or scheduler._training_quota_debt_steps >= debt_before:
                     raise RuntimeError("Final V1 Bubble quota remains incomplete")
             if topup_plan is not None or final_debt:
-                metrics.update(self._speco_park_drafter_training_memory("v1_topup"))
+                with self._speco_v1_record_topup_cost("park"):
+                    metrics.update(self._speco_park_drafter_training_memory("v1_topup"))
             # The native mode owns actor target synchronization. Admission is
             # closed across both probe arms, even if native code resumes engines.
             metrics.update(self._speco_v1_prefetch_publish_snapshot())

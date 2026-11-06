@@ -3,11 +3,55 @@
 """Failure and retention invariants for joint checkpoint commits."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from omegaconf import OmegaConf
 
 from verl_speco.trainer.v1 import checkpoint_commit as commit
+from verl_speco.trainer.v1.speco_mixin import SpecoV1Mixin
+
+
+@pytest.mark.parametrize("step", [80, 100])
+def test_rewind_cannot_write_components_in_published_checkpoint_root(tmp_path, step):
+    tracker = tmp_path / "latest_checkpointed_iteration.txt"
+    tracker.write_text("100", encoding="utf-8")
+    published = tmp_path / "global_step_100"
+    published.mkdir()
+    marker = published / "speco_v1_manifest.json"
+    marker.write_text("previous manifest", encoding="utf-8")
+
+    class Harness(SpecoV1Mixin):
+        config = SimpleNamespace(trainer=SimpleNamespace(default_local_dir=tmp_path))
+        global_steps = step
+        _speco_colocate_admission_closed = True
+        _speco_last_checkpoint_saved_step = None
+
+        def _speco_rollout_idle_worker_enabled(self):
+            return True
+
+        def _speco_bubble_session(self):
+            return SimpleNamespace(close=lambda boundary: None, pending=False)
+
+        def _speco_checkpoint_pending_quota(self):
+            return False
+
+        def _speco_save_v1_checkpoint_components(self):
+            pytest.fail("rewind must be rejected before any component writes")
+
+    with pytest.raises(RuntimeError, match="latest already points to step 100"):
+        Harness()._save_checkpoint()
+
+    assert tracker.read_text(encoding="utf-8") == "100"
+    assert marker.read_text(encoding="utf-8") == "previous manifest"
+    assert not (tmp_path / "global_step_80").exists()
+
+
+def test_checkpoint_step_allows_fresh_root_and_forward_progress(tmp_path):
+    commit.validate_checkpoint_step(tmp_path, 1)
+    tracker = tmp_path / "latest_checkpointed_iteration.txt"
+    tracker.write_text("100\n", encoding="utf-8")
+    commit.validate_checkpoint_step(tmp_path, 101)
 
 
 @pytest.mark.parametrize("has_checkpoint", [False, True])

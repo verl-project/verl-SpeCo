@@ -322,6 +322,19 @@ def test_v1_session_owns_shared_runtime_state():
 
 
 @pytest.mark.parametrize("bubble", [False, True])
+def test_v1_collect_only_is_rejected_only_with_bubble(bubble):
+    config = _config()
+    training = config.actor_rollout_ref.rollout.drafter.training
+    training["mode"] = " Collect_Only "
+    if bubble:
+        training["scheduler"] = {"execution": {"strategy": "rollout_idle_worker"}}
+        with pytest.raises(ValueError, match="training.mode=collect_only"):
+            SpecoV1Mixin._speco_validate_v1_training_config(config)
+    else:
+        SpecoV1Mixin._speco_validate_v1_training_config(config)
+
+
+@pytest.mark.parametrize("bubble", [False, True])
 def test_v1_bubble_requires_full_drafter_checkpoint(bubble):
     config = _config()
     training = config.actor_rollout_ref.rollout.drafter.training
@@ -340,6 +353,8 @@ def test_v1_bubble_requires_full_drafter_checkpoint(bubble):
 )
 def test_v1_bubble_rejects_disabling_drafter_restore_on_resume(resume_option):
     class Harness(SpecoV1Mixin):
+        use_critic = False
+
         def _speco_resume_global_step_hint(self):
             return 10
 
@@ -352,6 +367,39 @@ def test_v1_bubble_rejects_disabling_drafter_restore_on_resume(resume_option):
     with pytest.raises(
         ValueError, match="requires resume_trainer_state_from_checkpoint"
     ):
+        trainer._setup()
+
+
+@pytest.mark.parametrize(
+    ("role", "use_critic", "error"),
+    [
+        ("actor", False, "synchronous actor"),
+        ("critic", True, "synchronous critic"),
+        ("critic", False, "reached worker setup"),
+    ],
+)
+def test_v1_bubble_validates_checkpoint_synchrony_before_workers(
+    role, use_critic, error
+):
+    class Harness(SpecoV1Mixin):
+        def _speco_v1_log_runtime_provenance(self):
+            pass
+
+        def _speco_install_v1_standalone_publish_worker(self):
+            raise ValueError("reached worker setup")
+
+    trainer = Harness()
+    trainer.use_critic = use_critic
+    trainer.config = _config()
+    trainer.config.actor_rollout_ref.rollout.drafter.training["scheduler"] = {
+        "execution": {"strategy": "rollout_idle_worker"},
+    }
+    trainer.config.actor_rollout_ref.actor["checkpoint"] = {
+        "async_save": role == "actor"
+    }
+    trainer.config["critic"] = AttrDict(checkpoint={"async_save": role == "critic"})
+
+    with pytest.raises(ValueError, match=error):
         trainer._setup()
 
 
@@ -713,8 +761,11 @@ def test_colocate_probe_boundary_holds_admission_and_releases_on_failure(failure
     assert trainer._speco_colocate_admission_closed is False
 
 
-@pytest.mark.parametrize("saved", [False, True])
-def test_async_branch_checkpoint_requires_real_tq_snapshot(tmp_path, saved):
+@pytest.mark.parametrize(
+    ("mode", "saved"),
+    [("sync", False), ("colocate_async", False), ("colocate_async", True)],
+)
+def test_branch_checkpoint_requires_tq_snapshot_only_in_async(tmp_path, mode, saved):
     class Parent:
         def _save_checkpoint(self):
             if saved:
@@ -724,8 +775,9 @@ def test_async_branch_checkpoint_requires_real_tq_snapshot(tmp_path, saved):
 
     class Harness(SpecoV1Mixin, Parent):
         global_steps = 3
-        config = _config(mode="colocate_async")
+        config = _config(mode=mode)
         _speco_colocate_admission_closed = True
+        _speco_last_checkpoint_saved_step = None
 
         def _speco_online_enabled_from_config(self, config):
             return False
@@ -737,7 +789,10 @@ def test_async_branch_checkpoint_requires_real_tq_snapshot(tmp_path, saved):
             return str(tmp_path)
 
     trainer = Harness()
-    if not saved:
+    if mode == "sync":
+        trainer._save_checkpoint()
+        assert "_speco_v1_async_checkpoint_evidence" not in trainer.__dict__
+    elif not saved:
         with pytest.raises(RuntimeError, match="TransferQueue snapshot"):
             trainer._save_checkpoint()
     else:
@@ -1072,6 +1127,7 @@ def test_v1_bubble_resume_rejects_same_step_drafter_from_another_run(tmp_path, r
                 "format": "speco_v1_joint_checkpoint",
                 "version": 1,
                 "global_step": 10,
+                "bubble": {"quota_complete": True},
                 "drafter_checkpoints": [record],
             }
         ),
@@ -1107,6 +1163,33 @@ def test_v1_bubble_resume_rejects_same_step_drafter_from_another_run(tmp_path, r
         drafter["checkpoint_path"] = str(tmp_path / "explicit-destination")
         trainer._speco_validate_v1_drafter_resume_source()
         assert drafter["checkpoint_path"] == str(tmp_path / "explicit-destination")
+
+
+@pytest.mark.parametrize(
+    ("state", "error"),
+    [
+        ({"quota_complete": False}, "no completed quota boundary"),
+        (
+            {"quota_complete": True, "policy_drafter_version": 0},
+            "missing its freeze-policy state",
+        ),
+    ],
+)
+def test_v1_bubble_rejects_incomplete_resume_before_loading_weights(
+    tmp_path, state, error
+):
+    class Harness(SpecoV1Mixin):
+        def _speco_resume_global_step_hint(self):
+            return 10
+
+        def _speco_read_v1_resume_manifest(self, resume_step):
+            return {"bubble": state}
+
+    trainer = Harness()
+    trainer.config = _config()
+    trainer.config.trainer["default_local_dir"] = str(tmp_path)
+    with pytest.raises(RuntimeError, match=error):
+        trainer._speco_validate_v1_drafter_resume_source()
 
 
 @pytest.mark.parametrize("writer_index", [1, 3])
@@ -1325,6 +1408,10 @@ def test_setup_resolves_drafter_before_upstream_and_creates_worker_after(
 
     class Harness(SpecoV1Mixin, Upstream):
         config = _config()
+        use_critic = False
+
+        def _speco_resume_global_step_hint(self):
+            return None
 
         def _speco_install_v1_standalone_publish_worker(self):
             events.append("install_standalone_publish_worker")

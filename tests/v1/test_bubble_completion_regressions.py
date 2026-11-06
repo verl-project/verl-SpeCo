@@ -138,6 +138,7 @@ def test_runtime_provenance_survives_logger_filters(
 @pytest.mark.parametrize("mode", ["sync"])
 def test_runtime_provenance_precedes_worker_setup(mode):
     trainer = trainer_for(mode)
+    trainer.use_critic = False
     events = []
     trainer._speco_validate_v1_training_config = lambda config: None
     trainer._speco_v1_log_runtime_provenance = lambda: events.append("provenance")

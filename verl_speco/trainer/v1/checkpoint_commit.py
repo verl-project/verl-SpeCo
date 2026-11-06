@@ -15,6 +15,28 @@ from pathlib import Path
 from omegaconf import OmegaConf, open_dict
 
 
+_LATEST_TRACKER = "latest_checkpointed_iteration.txt"
+
+
+def validate_checkpoint_step(root, step):
+    """Keep a rewind from overwriting the recovery point published in this root."""
+    tracker = Path(root) / _LATEST_TRACKER
+    try:
+        contents = tracker.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    try:
+        latest = int(contents)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid V1 Bubble checkpoint tracker: {tracker}") from exc
+    if step <= latest:
+        raise RuntimeError(
+            f"Cannot save V1 Bubble checkpoint at step {step} in {root}: "
+            f"latest already points to step {latest}. "
+            "Resume into a new checkpoint output directory to save after a rewind."
+        )
+
+
 @contextmanager
 def temporary_values(mapping, values):
     missing = object()
@@ -32,15 +54,8 @@ def temporary_values(mapping, values):
                     mapping[key] = value
 
 
-@contextmanager
-def defer_native_checkpoint_commit(config, *, use_critic=False):
-    """Suppress only driver-side latest publication and premature retention.
-
-    V1's native save checks the driver's async_save setting only when writing
-    latest. Worker actors retain their already-serialized synchronous configs;
-    no async-save argument is sent by that RPC. Reject genuinely async workers
-    because their completion cannot be established by this transaction.
-    """
+def validate_synchronous_checkpoint_config(config, *, use_critic=False):
+    """Require worker saves to complete before publishing a joint checkpoint."""
     actor = config.actor_rollout_ref.actor
     if (actor.get("checkpoint") or {}).get("async_save", False):
         raise ValueError(
@@ -50,6 +65,18 @@ def defer_native_checkpoint_commit(config, *, use_critic=False):
         raise ValueError(
             "V1 Bubble joint checkpoint requires synchronous critic checkpoint saves"
         )
+
+
+@contextmanager
+def defer_native_checkpoint_commit(config, *, use_critic=False):
+    """Suppress only driver-side latest publication and premature retention.
+
+    V1's native save checks the driver's async_save setting only when writing
+    latest. Worker actors retain their already-serialized synchronous configs;
+    no async-save argument is sent by that RPC.
+    """
+    validate_synchronous_checkpoint_config(config, use_critic=use_critic)
+    actor = config.actor_rollout_ref.actor
     with ExitStack() as stack:
         if actor.get("checkpoint") is None:
             stack.enter_context(temporary_values(actor, {"checkpoint": {}}))
@@ -119,7 +146,7 @@ def commit_latest(root, step):
             stream.write(str(int(step)))
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, root / "latest_checkpointed_iteration.txt")
+        os.replace(temporary, root / _LATEST_TRACKER)
         _fsync_directory(root)
     finally:
         if os.path.exists(temporary):
