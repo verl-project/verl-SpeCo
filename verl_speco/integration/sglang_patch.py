@@ -30,6 +30,15 @@ import sglang.srt.entrypoints.engine
 from sglang.srt.utils import MultiprocessingSerializer
 
 from verl_speco.integration.drafter_config_env import get_drafter_config_env
+from verl_speco.integration.sglang_patch_controls import (
+    DISABLE_SGLANG_PATCH_ENV as _DISABLE_SGLANG_PATCH_ENV,
+)
+from verl_speco.integration.sglang_patch_controls import (
+    env_flag_enabled as _env_flag_enabled,
+)
+from verl_speco.integration.sglang_patch_controls import (
+    sglang_verl_patches_disabled as _sglang_verl_patches_disabled,
+)
 from verl_speco.integration.sglang_adapter import (
     _call_flashinfer_plan_with_abi_compat,
 )
@@ -67,7 +76,6 @@ _DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_TOPK_ENV = (
 _DRAFTER_RAW_TOP_LOGPROBS_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS"
 _DRAFTER_RAW_TOP_LOGPROBS_TOPK_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS_TOPK"
 _SGLANG_RETURN_ORIGINAL_LOGPROB_ENV = "SGLANG_RETURN_ORIGINAL_LOGPROB"
-_DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
 _SGLANG_BASE_COMPAT_PATCHES_ENV = "VERL_SGLANG_BASE_COMPAT_PATCHES"
 
@@ -914,18 +922,6 @@ def _is_sglang_npu_backend() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def _env_flag_enabled(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "on", "yes", "y"}:
-        return True
-    if normalized in {"0", "false", "off", "no", "n", ""}:
-        return False
-    return default
-
-
 def _sglang_npu_eagle_force_fp32_sampling_enabled() -> bool:
     return _env_flag_enabled(_EAGLE_FORCE_FP32_SAMPLING_ENV, default=False)
 
@@ -1146,10 +1142,6 @@ def _triton_ascend_available() -> bool:
 
 def _sglang_npu_eagle_top_k_renorm_fast_path_enabled() -> bool:
     return _env_flag_enabled(_EAGLE_TOP_K_RENORM_FAST_PATH_ENV, default=False)
-
-
-def _sglang_verl_patches_disabled() -> bool:
-    return _env_flag_enabled(_DISABLE_SGLANG_PATCH_ENV, default=False)
 
 
 def _normalize_sglang_patch_selection(raw_value: str | None) -> set[str] | None:

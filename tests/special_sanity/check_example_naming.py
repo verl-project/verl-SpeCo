@@ -18,7 +18,7 @@ SpeCo examples intentionally expose both the drafter backend and rollout
 backend in the filename because those combinations are the product surface:
 
     run_<model>_[actor_<actor-backend>_]drafter_<drafter-backend>_\
-      [colocate_async|separate_async_]<rollout-backend>[_npu].sh
+      [colocate_async|separate_async_]<rollout-backend>[_npu|_rocm].sh
 
 The standalone/offline draft-training entry point uses:
 
@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 
 ROLLOUT_BACKENDS = ("vllm", "sglang")
-OPTIONAL_SUFFIXES = ("npu",)
+OPTIONAL_SUFFIXES = ("npu", "rocm")
 STANDALONE_SUFFIX = ("separate", "training")
 ASYNC_TRAINER_MODES = (("colocate", "async"), ("separate", "async"))
 
@@ -67,7 +67,7 @@ def _format_expected() -> str:
     return (
         "expected run_<model>_[actor_<actor-backend>_]drafter_"
         "<drafter-backend>_[colocate_async|separate_async_]"
-        "<rollout-backend>[_npu].sh "
+        "<rollout-backend>[_npu|_rocm].sh "
         "with actor-backend set to any non-empty backend identifier, "
         "with drafter-backend set to any non-empty backend identifier and "
         f"rollout-backend in {list(ROLLOUT_BACKENDS)}, or "
