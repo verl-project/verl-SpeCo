@@ -82,8 +82,8 @@ matter for verl-SpeCo:
 | Variable | Value | Why |
 | --- | --- | --- |
 | `HSA_ENABLE_IPC_MODE_LEGACY` | `1` | Weight sync from the FSDP actor to the rollout engine goes through CUDA IPC. In the non-legacy IPC mode, device memory that was exported over IPC is not returned to the device after it is freed, so every weight sync loses about one model copy of GPU memory. Keep the image default. `verl_speco.main` sets it to `1` when it is unset (for example in images built on the SGLang ROCm base), and logs a warning if it is set to anything else. |
-| `SGLANG_ATTENTION_BACKEND` | `triton` | Read by the SGLang launch script as the attention backend (see [§6](#6-run-the-smoke-test)). |
-| `SGLANG_USE_AITER` | `0` | SGLang does not use aiter kernels. The aiter attention backend's JIT build also fails in this image, so keep `triton`. |
+| `SGLANG_ATTENTION_BACKEND` | `aiter` | Read by the SGLang launch script as the attention backend (see [§6](#6-run-the-smoke-test)). |
+| `SGLANG_USE_AITER` | `1` | SGLang uses aiter kernels. aiter's JIT build finds the GPU arch through the image's `/opt/rocm` link to `$ROCM_PATH`. On Qwen3-4B (MI355X, 80 requests, 512 in / 1024 out) the aiter backend decodes 10.4k tok/s against 6.7k tok/s for `triton`. |
 
 From the repo root:
 
@@ -257,7 +257,7 @@ GPU sets must not overlap, also when the runs are in separate containers.
 | `SPECO_RAY_NUM_CPUS` | `32` | Ray CPU pool. |
 | `SPECO_RAY_WORKER_SOFT_LIMIT` | `8` | Ray idle worker soft limit. |
 | `SPECO_NNODES` | `1` | Number of nodes. Above 1, the script joins the Ray cluster at `RAY_ADDRESS` (see [Multi-node](#multi-node)). |
-| `SGLANG_ATTENTION_BACKEND` | `triton` (image) | SGLang script only: the attention backend it passes to SGLang. |
+| `SGLANG_ATTENTION_BACKEND` | `aiter` (image; `triton` if unset) | SGLang script only: the attention backend it passes to SGLang. |
 
 Any extra Hydra overrides you append are forwarded to `python -m verl_speco.main`.
 
@@ -334,7 +334,7 @@ SGLang only:
 
 | Setting | Why |
 | --- | --- |
-| `++...engine_kwargs.sglang.attention_backend=$SGLANG_ATTENTION_BACKEND` (default `triton`) | verl picks `flashinfer` for SGLang ≥ 0.5.12, which does not exist on ROCm, so the script always sets the backend. `triton` is the image default, as in verl's ROCm image. Do not use `aiter`: its JIT build fails in this image (`GPU_ARCHS=native` and no `/opt/rocm` give an empty `--offload-arch`). |
+| `++...engine_kwargs.sglang.attention_backend=$SGLANG_ATTENTION_BACKEND` (default `triton` when the variable is unset) | verl picks `flashinfer` for SGLang ≥ 0.5.12, which does not exist on ROCm, so the script always sets the backend. `aiter` is the image default. `triton` also works. |
 
 vLLM only:
 
@@ -493,8 +493,8 @@ scripts above, you should hit none of them.
 | vLLM: `max_num_scheduled_tokens is set to -7168 based on the speculative decoding settings` | `max_num_batched_tokens` ≤ `max_num_seqs × 15` draft tokens | Set `rollout.max_num_seqs=256` and `rollout.max_num_batched_tokens=12288`. |
 | vLLM: run completes, but every step shows `drafter/collected_samples` `0.0`, `drafter/schedule_reason` `4.0`, `drafter/trained` `0.0` | No response is longer than the old-log-prob hidden window (default 512 rows + 1) | Set `drafter.training.hidden_state_window_tokens_per_sample` and `hidden_state_window_min_rows` below `max_response_length` (the script uses 256). |
 | Run completes, but `drafter/trained` and `drafter/published` are `0.0` every step, with `DFlash input/hidden/mask row mismatch: input_rows=301, hidden_rows=300, mask_rows=301` | Online samples carry one input row more than hidden rows (the trailing label token), which verl-SpeCo builds between #73 and #109 rejected | Fixed upstream in #109 (block drafters carry `label_ids`/`label_mask` separately). Update verl-SpeCo. |
-| SGLang fails on `flashinfer` | verl hardcodes `flashinfer` for SGLang ≥ 0.5.12 | Keep `engine_kwargs.sglang.attention_backend=triton` set, as the script does. |
-| SGLang with `attention_backend=aiter` fails in aiter's JIT build (empty `--offload-arch`) | The image's aiter JIT builds for `GPU_ARCHS=native`, and there is no `/opt/rocm` to detect the GPU from | Use `triton`, the image default. |
+| SGLang fails on `flashinfer` | verl hardcodes `flashinfer` for SGLang ≥ 0.5.12 | Keep `engine_kwargs.sglang.attention_backend` set to `aiter` or `triton`, as the script does. |
+| SGLang with `attention_backend=aiter` fails in aiter's JIT build (empty `--offload-arch`, then `constexpr variable 'warp_size' must be initialized`) | aiter reads the GPU arch from `/opt/rocm/llvm/bin/amdgpu-arch`, and images built from an older `Dockerfile.rocm` have no `/opt/rocm` (ROCm lives under `$ROCM_PATH`) | Rebuild the image, or run `ln -sfn "$ROCM_PATH" /opt/rocm` in the container. |
 | `Conflicting visibility of agent-N between HIP_VISIBLE_DEVICES and CUDA_VISIBLE_DEVICES`, then `Fatal Python error: Aborted` in every GPU worker | Ray sets `HIP_VISIBLE_DEVICES` per worker while the worker still inherits the full `CUDA_VISIBLE_DEVICES` mask | Use `CUDA_VISIBLE_DEVICES` only, and a verl-SpeCo version whose `rocm_env.py` has `align_visible_devices_with_ray` (the driver log shows `Ray keys AMD GPUs on HIP_VISIBLE_DEVICES; moved ...`). |
 | Ray `ValueError: Inconsistent values found. Please use either HIP_VISIBLE_DEVICES or CUDA_VISIBLE_DEVICES.` | Same as above, inside the SGLang TP subprocess | Same as above. |
 | `AssertionError: Please use the same HIP_VISIBLE_DEVICES or CUDA_VISIBLE_DEVICES, inconsistant values found: 0 and 4,5.` in verl's `_setup_env_cuda_visible_devices` | Ray 2.57 or newer: on AMD it ignores `CUDA_VISIBLE_DEVICES` and gives each worker a `HIP_VISIBLE_DEVICES` index, while the CUDA mask is still set | Same as above: verl-SpeCo moves the mask to `HIP_VISIBLE_DEVICES` before `ray.init`. |

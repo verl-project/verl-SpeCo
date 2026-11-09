@@ -171,6 +171,13 @@ RUN mkdir -p /workspace/.manifest \
 
 
 FROM install_sglang AS install_verl_speco
+# aiter's JIT build reads the GPU arch from /opt/rocm/llvm/bin/amdgpu-arch. The base ships ROCm
+# as a Python package under $ROCM_PATH, so without this link it builds with an empty
+# --offload-arch and fails. With the link, SGLang's aiter attention backend works and decodes
+# faster than triton, so SGLang uses it at runtime (the SGLang build above keeps aiter off).
+RUN ln -sfn "$ROCM_PATH" /opt/rocm
+ENV SGLANG_USE_AITER=1
+ENV SGLANG_ATTENTION_BACKEND=aiter
 COPY . /workspace/verl-SpeCo
 WORKDIR /workspace/verl-SpeCo
 # --no-deps keeps the ROCm torch, vLLM, SGLang and verl built above untouched.
