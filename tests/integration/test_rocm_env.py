@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GPU visibility mask normalization in ``neutralize_hip_visible_devices``."""
+"""ROCm driver env setup: GPU visibility masks and the legacy IPC mode default."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ import pytest
 from verl_speco.integration import rocm_env
 from verl_speco.integration.rocm_env import (
     align_visible_devices_with_ray,
+    default_legacy_ipc_mode,
     neutralize_hip_visible_devices,
 )
 
@@ -135,3 +136,28 @@ def test_align_without_cuda_mask_is_noop(rocm: pytest.MonkeyPatch) -> None:
 
     assert align_visible_devices_with_ray() is False
     assert _masks() == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, (True, "1")), ("", (True, "1")), ("1", (False, "1")), ("0", (False, "0"))],
+)
+def test_legacy_ipc_mode_defaults_on_and_keeps_explicit_value(
+    rocm: pytest.MonkeyPatch, value: str | None, expected: tuple
+) -> None:
+    if value is None:
+        rocm.delenv("HSA_ENABLE_IPC_MODE_LEGACY", raising=False)
+    else:
+        rocm.setenv("HSA_ENABLE_IPC_MODE_LEGACY", value)
+
+    applied, final = expected
+    assert default_legacy_ipc_mode() is applied
+    assert os.environ.get("HSA_ENABLE_IPC_MODE_LEGACY") == final
+
+
+def test_legacy_ipc_mode_non_rocm_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_rocm_build(monkeypatch, False)
+    monkeypatch.delenv("HSA_ENABLE_IPC_MODE_LEGACY", raising=False)
+
+    assert default_legacy_ipc_mode() is False
+    assert "HSA_ENABLE_IPC_MODE_LEGACY" not in os.environ
