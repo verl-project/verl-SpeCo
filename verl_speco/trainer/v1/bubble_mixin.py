@@ -254,7 +254,9 @@ class V1BubbleMixin:
                     )
 
     @contextmanager
-    def _speco_v1_quiescent_boundary(self, *, charge_cost=True, timings=None):
+    def _speco_v1_quiescent_boundary(
+        self, *, charge_cost=True, timings=None, publish_boundary=False
+    ):
         """Close admission and drain sync serving RPCs without pausing vLLM.
 
         abort_replicas() can leave vLLM >= 0.12 generation paused. The naive
@@ -269,6 +271,10 @@ class V1BubbleMixin:
         if not already_closed:
             self._speco_v1_admission("speco_close_rollout_admission")
             self._speco_colocate_admission_closed = True
+        retry_publish = publish_boundary and self.__dict__.pop(
+            "_speco_v1_resume_after_publish_retry", False
+        )
+        owns_admission = not already_closed or retry_publish
         completed = False
         try:
             self._speco_v1_admission("speco_wait_rollout_idle")
@@ -285,7 +291,14 @@ class V1BubbleMixin:
             yield
             completed = True
         finally:
-            if completed and not already_closed:
+            if (
+                publish_boundary
+                and owns_admission
+                and not completed
+                and self.__dict__.get("_speco_v1_applied_publish") is not None
+            ):
+                self._speco_v1_resume_after_publish_retry = True
+            if completed and owns_admission:
                 resume_wall_started = self._speco_bubble_clock().now()
                 resume_started = time.perf_counter()
                 self._speco_colocate_admission_closed = False
@@ -716,7 +729,7 @@ class V1BubbleMixin:
                 **metrics,
             }
             return result
-        with self._speco_v1_quiescent_boundary(timings=metrics):
+        with self._speco_v1_quiescent_boundary(timings=metrics, publish_boundary=True):
             started = time.perf_counter()
             self._speco_wait_target_lm_head_prefetch()
             metrics["timing_s/drafter_v1_target_head_prefetch_wait"] = (

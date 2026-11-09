@@ -158,12 +158,42 @@ def test_revision_timeout_reuses_applied_publish_and_before_probe(monkeypatch):
         after,
     )
 
+    driver._speco_v1_admission = events.append
+    session.close = lambda boundary: {}
     with pytest.raises(TimeoutError, match="revision sync"):
-        driver._speco_v1_publish_bubble()
+        with driver._speco_v1_quiescent_boundary(
+            charge_cost=False, publish_boundary=True
+        ):
+            driver._speco_v1_publish_bubble()
+    assert driver._speco_colocate_admission_closed
     assert session.pending and not session.receipts
     revision_ready = True
-    assert driver._speco_v1_publish_bubble()["drafter/published"] == 1
-    assert events == [4, "apply", 5, 5]
+
+    def fail_reclaim(boundary):
+        raise RuntimeError("reclaim failed")
+
+    session.close = fail_reclaim
+    with pytest.raises(RuntimeError, match="reclaim failed"):
+        with driver._speco_v1_quiescent_boundary(
+            charge_cost=False, publish_boundary=True
+        ):
+            pytest.fail("publish must wait for boundary preparation")
+    assert driver._speco_colocate_admission_closed
+
+    session.close = lambda boundary: {}
+    with driver._speco_v1_quiescent_boundary(charge_cost=False, publish_boundary=True):
+        assert driver._speco_v1_publish_bubble()["drafter/published"] == 1
+    assert events == [
+        "speco_close_rollout_admission",
+        "speco_wait_rollout_idle",
+        4,
+        "apply",
+        5,
+        "speco_wait_rollout_idle",
+        5,
+        "speco_resume_rollout_admission",
+    ]
+    assert not driver._speco_colocate_admission_closed
     assert not session.pending
     assert session.receipts[0]["probe"] == (4, 5)
 
