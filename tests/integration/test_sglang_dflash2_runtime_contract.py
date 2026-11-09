@@ -500,6 +500,23 @@ def test_dspark_maps_gamma_to_sglang_verify_window(tmp_path) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("algorithm", "rocm", "expected"),
+    [("DFLASH", True, True), ("DFLASH", False, False), ("EAGLE", True, False)],
+)
+def test_rocm_dflash_installs_target_sampling_patch(
+    monkeypatch, algorithm, rocm, expected
+) -> None:
+    monkeypatch.setattr(sglang_runtime, "_is_rocm_runtime", lambda: rocm)
+    monkeypatch.setattr(sglang_runtime, "_is_npu_runtime", lambda: False)
+
+    patches = sglang_runtime._default_sglang_verl_patches(
+        {"enable": True, "speculative_algorithm": algorithm}
+    )
+
+    assert ("rocm_dflash_target_sampling" in patches) is expected
+
+
 def test_flashinfer_plan_compat_drops_only_new_uniform_q_len_argument() -> None:
     calls = []
 
