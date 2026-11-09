@@ -103,6 +103,44 @@ def test_native_kernel_is_kept(monkeypatch, sglang_patch) -> None:
     assert dflash_utils.tree_speculative_sampling_target_only is native
 
 
+def test_rocm_launches_linear_triton_kernel_without_ascend_options(
+    monkeypatch, sglang_patch
+) -> None:
+    launches = []
+
+    class _Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launches.append((grid, kwargs))
+
+    monkeypatch.setattr(sglang_patch, "_linear_triton_on_rocm", lambda probs: True)
+    monkeypatch.setattr(
+        sglang_patch, "_tree_speculative_sampling_target_only_linear_triton_kernel", _Kernel()
+    )
+    monkeypatch.setattr(
+        sglang_patch,
+        "_triton_ascend_available",
+        lambda: pytest.fail("ROCm must not probe triton-ascend"),
+    )
+    bs, n, vocab = 3, 4, 8
+
+    assert sglang_patch._try_tree_speculative_sampling_target_only_linear_triton(
+        predicts=torch.empty(bs * n, dtype=torch.int32),
+        accept_index=torch.empty((bs, n), dtype=torch.int32),
+        accept_token_num=torch.empty(bs, dtype=torch.int32),
+        candidates=torch.zeros((bs, n), dtype=torch.int64),
+        retrive_index=torch.arange(bs * n).view(bs, n),
+        retrive_next_token=torch.zeros((bs, n), dtype=torch.int64),
+        uniform_samples=torch.rand(bs, n),
+        uniform_samples_for_final_sampling=torch.rand(bs),
+        target_probs=torch.full((bs, n, vocab), 1.0 / vocab),
+        threshold_single=1.0,
+        threshold_acc=1.0,
+    )
+    [(grid, kwargs)] = launches
+    assert grid == (bs,)
+    assert "multibuffer" not in kwargs
+
+
 def test_chain_verify_emits_target_distribution(sglang_patch) -> None:
     """The first two emitted tokens follow the target distribution, not its argmax."""
     torch.manual_seed(0)
