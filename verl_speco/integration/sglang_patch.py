@@ -1588,6 +1588,12 @@ def _triton_next_power_of_2(value: int) -> int:
     return 1 << (max(int(value), 1) - 1).bit_length()
 
 
+def _linear_triton_on_rocm(target_probs: torch.Tensor) -> bool:
+    # The kernel is plain Triton, so ROCm (DFlash chain verify) runs it too; the
+    # torch path launches hundreds of small kernels per verify step.
+    return bool(getattr(torch.version, "hip", None)) and target_probs.is_cuda
+
+
 def _try_tree_speculative_sampling_target_only_linear_triton(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -1606,8 +1612,8 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
         _debug_sglang_npu_eagle_linear_triton("linear_triton_disabled")
         return False
 
-    triton_ascend_available = _triton_ascend_available()
-    if not triton_ascend_available:
+    rocm = _linear_triton_on_rocm(target_probs)
+    if not rocm and not _triton_ascend_available():
         _debug_sglang_npu_eagle_linear_triton(
             "triton_ascend_unavailable",
         )
@@ -1615,7 +1621,7 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
     if _tree_speculative_sampling_target_only_linear_triton_kernel is None:
         _debug_sglang_npu_eagle_linear_triton("kernel_not_compiled")
         return False
-    if target_probs.device.type != "npu":
+    if not rocm and target_probs.device.type != "npu":
         _debug_sglang_npu_eagle_linear_triton(
             "target_probs_not_npu",
             target_probs=_tensor_debug_summary(target_probs),
@@ -1706,6 +1712,8 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
         "threshold_single": float(threshold_single),
         "threshold_acc": float(threshold_acc),
     }
+    # multibuffer is a triton-ascend launch option; other backends reject it.
+    launch_options = {} if rocm else {"multibuffer": kernel_meta["multibuffer"]}
     try:
         _tree_speculative_sampling_target_only_linear_triton_kernel[(batch_size,)](
             predicts,
@@ -1724,7 +1732,7 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
             NUM_SPECULATIVE_TOKENS=kernel_meta["num_speculative_tokens"],
             SUB_BLOCK=kernel_meta["sub_block"],
             SPEC_BLOCK=kernel_meta["spec_block"],
-            multibuffer=kernel_meta["multibuffer"],
+            **launch_options,
         )
         return True
     except Exception as exc:  # noqa: BLE001
