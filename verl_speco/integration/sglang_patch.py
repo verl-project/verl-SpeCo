@@ -2227,7 +2227,7 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
 
 
 def patch_sglang_rocm_dflash_target_sampling() -> None:
-    """Give SGLang DFlash non-greedy verification on ROCm via the torch target-only sampler.
+    """Give SGLang DFlash non-greedy verification on ROCm via the target-only sampler.
 
     SGLang enables DFlash sampling verification only when ``sgl_kernel`` provides
     ``tree_speculative_sampling_target_only`` (CUDA/MUSA builds); the HIP build does
@@ -2235,8 +2235,9 @@ def patch_sglang_rocm_dflash_target_sampling() -> None:
     verification" and every decoded token is the target argmax whatever the requested
     temperature. RL rollouts are then not samples of the policy (only the first token
     is sampled), which biases the policy gradient. The chain (topk=1) verify path takes
-    the same arguments as the kernel, so the torch implementation used for NPU EAGLE
-    is installed in ``dflash_utils`` together with torch top-k/top-p renorm.
+    the same arguments as the kernel, so the implementation used for NPU EAGLE (the
+    linear Triton kernel, with the torch path as fallback) is installed in
+    ``dflash_utils`` together with torch top-k/top-p renorm.
     """
     global _SGLANG_ROCM_DFLASH_SAMPLING_PATCHED
 
@@ -2266,8 +2267,9 @@ def patch_sglang_rocm_dflash_target_sampling() -> None:
     setattr(dflash_utils, "_DFLASH_SAMPLING_VERIFY_AVAILABLE", True)
     _SGLANG_ROCM_DFLASH_SAMPLING_PATCHED = True
     logger.warning(
-        "Patched SGLang DFlash verification on ROCm to sample with the torch "
-        "target-only sampler instead of falling back to greedy argmax."
+        "Patched SGLang DFlash verification on ROCm to sample with the target-only "
+        "sampler (linear Triton kernel, torch fallback) instead of falling back to "
+        "greedy argmax."
     )
 
 
