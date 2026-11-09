@@ -72,6 +72,10 @@ def test_worker_metadata_registration_scopes_rollout_leases(monkeypatch):
     trainer = trainer_for("sync")
     metadata = [
         {
+            "available": True,
+            "worker_id": str(rank),
+            "node_id": "node",
+            "device_ids": [str(rank)],
             "in_drafter_train_group": True,
             "replica_rank": replica,
             "training_group_ranks": ranks,
@@ -79,7 +83,30 @@ def test_worker_metadata_registration_scopes_rollout_leases(monkeypatch):
             "idle_collective_scope": "replica_local",
         }
         for replica, ranks in [(7, [0, 1]), (8, [2, 3])]
+        for rank in ranks
     ]
+    trainer.llm_server_manager = SimpleNamespace(
+        get_replicas=lambda: [
+            SimpleNamespace(
+                replica_rank=replica,
+                workers=[
+                    SimpleNamespace(
+                        speco_resource_identity=SimpleNamespace(
+                            remote=lambda rank=rank: {
+                                "node_id": "node",
+                                "device_ids": [str(rank)],
+                            }
+                        )
+                    )
+                    for rank in ranks
+                ],
+            )
+            for replica, ranks in [(7, [0, 1]), (8, [2, 3])]
+        ]
+    )
+    import ray
+
+    monkeypatch.setattr(ray, "get", LocalRay.get)
     trainer.drafter_wg = SimpleNamespace(
         get_drafter_training_resource_metadata=lambda: metadata
     )
@@ -457,8 +484,6 @@ def test_generation_start_uses_authoritative_replica_groups(mode):
     }
 
 
-
-
 @pytest.mark.parametrize("mode", ["sync"])
 @pytest.mark.parametrize("bad_ack", [False, True])
 def test_head_poll_counts_transfer_only_after_complete_validated_ack(
@@ -473,6 +498,7 @@ def test_head_poll_counts_transfer_only_after_complete_validated_ack(
     monkeypatch.setattr(legacy, "time", time)
     monkeypatch.setattr(bubble_mixin, "time", time)
     from verl_speco.trainer import bubble_lifecycle
+
     monkeypatch.setattr(bubble_lifecycle, "time", time)
     ready = [True]
     trainer._speco_ray_refs_ready = lambda refs: ready[0]

@@ -209,7 +209,11 @@ def test_real_native_step_obeys_bubble_resource_boundary(mode):
 
 @pytest.mark.parametrize("mode", ["sync"])
 @pytest.mark.parametrize("checkpoint", [False, True])
-def test_real_mode_step_end_holds_target_across_probe_pair(mode, checkpoint):
+def test_real_mode_step_end_holds_target_across_probe_pair(
+    mode, checkpoint, monkeypatch
+):
+    import ray
+
     from verl_speco.trainer.bubble_lifecycle import BubbleLifecycle
 
     trainer = TRAINERS[mode].__new__(TRAINERS[mode])
@@ -231,7 +235,21 @@ def test_real_mode_step_end_holds_target_across_probe_pair(mode, checkpoint):
         sleep_replicas=lambda: events.append("sleep"),
     )
     trainer.standalone_checkpoint_manager = trainer.checkpoint_manager
-    manager = SimpleNamespace(server_handles=[])
+
+    def set_revision(revision):
+        assert revision == 1
+        events.append("revision")
+        return revision
+
+    monkeypatch.setattr(ray, "wait", lambda refs, **kwargs: (refs, []))
+    monkeypatch.setattr(ray, "get", lambda refs: refs)
+    manager = SimpleNamespace(
+        server_handles=[
+            SimpleNamespace(
+                speco_set_serving_drafter_revision=SimpleNamespace(remote=set_revision)
+            )
+        ]
+    )
     trainer.llm_server_manager = trainer.standalone_server_manager = manager
     if mode == "separate_async":
         from verl.trainer.ppo.v1.trainer_separate_async import HybridEngineMode
@@ -287,6 +305,11 @@ def test_real_mode_step_end_holds_target_across_probe_pair(mode, checkpoint):
     assert probes == [1, 1]
     assert events.index("speco_close_rollout_admission") < events.index("target_sync")
     assert events.index("publish") < events.index("speco_resume_rollout_admission")
+    assert (
+        events.index("publish")
+        < events.index("revision")
+        < events.index("probe", events.index("publish"))
+    )
     assert len(observations) == 1
     assert observations[0]["probe"] == "paired"
     assert observations[0]["update_cost_seconds"] >= 4
