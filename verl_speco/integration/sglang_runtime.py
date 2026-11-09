@@ -56,6 +56,7 @@ from verl_speco.integration.sglang_adapter import (
     SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCH,
     SGLANG_NPU_EAGLE_TARGET_SAMPLING_PATCH,
     SGLANG_QWEN3_ROPE_COMPAT_PATCH,
+    SGLANG_ROCM_DFLASH_TARGET_SAMPLING_PATCH,
     sglang_needs_qwen3_rope_compat_patch,
 )
 from verl_speco.integration.sglang_patch_controls import (
@@ -513,6 +514,12 @@ def _is_npu_runtime() -> bool:
         return get_device_name() == "npu"
     except Exception:  # noqa: BLE001
         return False
+
+
+def _is_rocm_runtime() -> bool:
+    from verl_speco.integration.rocm_env import _is_rocm
+
+    return _is_rocm()
 
 
 def _load_env_drafter_config() -> dict[str, Any]:
@@ -1234,6 +1241,12 @@ def _default_sglang_verl_patches(drafter_cfg: dict[str, Any]) -> set[str]:
         patches.add(SGLANG_EAGLE_UPDATE_WEIGHTS_PATCH)
     if str(drafter_cfg.get("speculative_algorithm", "")).upper() == "DSPARK":
         patches.add(SGLANG_FLASHINFER_PLAN_ABI_PATCH)
+    if (
+        drafter_cfg.get("enable")
+        and str(drafter_cfg.get("speculative_algorithm", "")).upper() == "DFLASH"
+        and _is_rocm_runtime()
+    ):
+        patches.add(SGLANG_ROCM_DFLASH_TARGET_SAMPLING_PATCH)
     if drafter_cfg.get("enable") and drafter_cfg.get("enable_drafter_training"):
         training_cfg = drafter_cfg.get("training") or {}
         if training_cfg.get("collect_hidden_states_from_sgl"):
