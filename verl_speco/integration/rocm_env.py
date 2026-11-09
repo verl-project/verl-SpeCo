@@ -94,3 +94,43 @@ def neutralize_hip_visible_devices(*, context: str = "") -> bool:
             context,
         )
     return stripped
+
+
+def _ray_amd_visible_devices_env_var() -> str | None:
+    try:
+        from ray._private.accelerators.amd_gpu import AMDGPUAcceleratorManager
+
+        return AMDGPUAcceleratorManager.get_visible_accelerator_ids_env_var()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("cannot query Ray's AMD visible-devices keyword: %s", exc)
+        return None
+
+
+def align_visible_devices_with_ray() -> bool:
+    """Hand the driver's CUDA_VISIBLE_DEVICES mask to Ray as HIP_VISIBLE_DEVICES when Ray needs it.
+
+    Call in the driver after :func:`neutralize_hip_visible_devices` and before Ray starts.
+    Ray <= 2.56 keys AMD GPUs on CUDA_VISIBLE_DEVICES when HIP_VISIBLE_DEVICES is unset, so the
+    CUDA-only mask is kept. Newer Ray (2.60 in the ROCm 7.14 primus base) always keys AMD GPUs on
+    HIP_VISIBLE_DEVICES: it ignores a CUDA mask when sizing the GPU pool and sets only HIP per GPU
+    worker, so an inherited CUDA mask conflicts with it and the HIP runtime aborts every GPU worker
+    at ``import torch``. In that case the mask moves to HIP_VISIBLE_DEVICES (CUDA dropped) for Ray
+    and its workers; verl's Worker folds the per-worker HIP id back into CUDA_VISIBLE_DEVICES.
+    Returns whether the mask was moved. No-op on non-ROCm builds or without a CUDA mask.
+    """
+
+    if not _is_rocm():
+        return False
+    cuda_mask = _visible_devices("CUDA_VISIBLE_DEVICES")
+    if cuda_mask is None or _visible_devices("HIP_VISIBLE_DEVICES") is not None:
+        return False
+    if _ray_amd_visible_devices_env_var() != "HIP_VISIBLE_DEVICES":
+        return False
+    os.environ["HIP_VISIBLE_DEVICES"] = cuda_mask
+    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+    logger.warning(
+        "Ray keys AMD GPUs on HIP_VISIBLE_DEVICES; moved CUDA_VISIBLE_DEVICES=%r to "
+        "HIP_VISIBLE_DEVICES for the Ray cluster.",
+        cuda_mask,
+    )
+    return True

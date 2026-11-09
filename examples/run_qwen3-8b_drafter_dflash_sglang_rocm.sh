@@ -22,24 +22,25 @@ DRAFTER_PATH=${DRAFTER_PATH:-/path/to/Qwen3-8B-DFlash-b16}
 TRAIN_FILE=${TRAIN_FILE:-/path/to/gsm8k/train.parquet}
 TEST_FILE=${TEST_FILE:-/path/to/gsm8k/test.parquet}
 CKPTS_DIR=${CKPTS_DIR:-/dev/shm/verl_speco_ckpt}
-# SGLang attention backend. The ROCm image sets SGLANG_ATTENTION_BACKEND=triton, as verl's ROCm
-# image does; aiter also works (set SGLANG_ATTENTION_BACKEND=aiter). Set it explicitly because
-# verl otherwise picks flashinfer for SGLang >= 0.5.12, which does not exist on ROCm.
+# SGLang attention backend. The ROCm image sets SGLANG_ATTENTION_BACKEND=triton (and
+# SGLANG_USE_AITER=0), as verl's ROCm image does; SGLang's aiter backend fails its JIT build in
+# this image. Set it explicitly because verl otherwise picks flashinfer for SGLang >= 0.5.12,
+# which does not exist on ROCm.
 sglang_attention_backend=${SGLANG_ATTENTION_BACKEND:-triton}
 
 # ROCm + Ray GPU isolation. Set ONLY CUDA_VISIBLE_DEVICES (no HIP var, no NOSET flags):
-#  - Ray 2.56's AMD accelerator manager (amd_gpu.py) uses CUDA_VISIBLE_DEVICES as its
-#    keyword when HIP_VISIBLE_DEVICES is unset, so this mask restricts Ray's pool to
-#    exactly these GPUs and Ray becomes fully CUDA-native.
-#  - With NOSET off, Ray assigns each worker a single physical GPU and rewrites that
-#    worker's CUDA_VISIBLE_DEVICES to just that id (torch sees 1 device, ordinal 0).
-#    verl's Worker sees is_ray_noset_visible_devices=False and SKIPS set_device(local_rank),
-#    avoiding the "invalid device ordinal" that a non-contiguous HIP mask + NOSET causes
-#    (Ray returns physical ids like 4/5/6 but torch only has ordinals 0..3).
-#  - Crucially, HIP_VISIBLE_DEVICES is NEVER set by anyone. The SGLang http server
-#    (verl async_sglang_server.py) sets CUDA_VISIBLE_DEVICES to its aggregated TP devices;
-#    with no HIP var present there is no "Conflicting visibility between HIP and CUDA" abort
-#    that occurs when Ray injects HIP while the server sets CUDA.
+#  - Ray 2.60 (in the image) keys AMD GPUs on HIP_VISIBLE_DEVICES: it ignores a CUDA mask
+#    when sizing the GPU pool and sets only HIP_VISIBLE_DEVICES per GPU worker. An inherited
+#    CUDA mask next to it makes the HIP runtime abort every worker at `import torch`
+#    ("Conflicting visibility ... between HIP_VISIBLE_DEVICES and CUDA_VISIBLE_DEVICES").
+#  - verl_speco.main therefore moves this mask to HIP_VISIBLE_DEVICES (CUDA dropped) before
+#    ray.init (rocm_env.align_visible_devices_with_ray; a no-op on Ray <= 2.56, which keys on
+#    CUDA). verl's Worker folds each worker's HIP id back into CUDA_VISIBLE_DEVICES, and the
+#    SGLang server actor moves its HIP mask back to CUDA_VISIBLE_DEVICES before it spawns
+#    its TP processes, so they see CUDA_VISIBLE_DEVICES only.
+#  - With NOSET off, Ray gives each worker a single physical GPU (torch sees ordinal 0), so
+#    verl SKIPS set_device(local_rank) and avoids "invalid device ordinal".
+#  - Setting HIP_VISIBLE_DEVICES yourself as well is rejected if it differs from this mask.
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 
 if [ "${nnodes}" -gt 1 ]; then

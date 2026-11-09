@@ -11,42 +11,57 @@ For an end-to-end walkthrough (build, run, expected results), see
 ## Supported Hardware
 
 - `gfx950`: MI350 series (MI350X / MI355X), validated.
-- `gfx942`: MI300 series (MI300X / MI325X), a build target of the base image,
+- `gfx942`: MI300 series (MI300X / MI325X), a build target (`PYTORCH_ROCM_ARCH`),
   not run yet.
 
 ## Key Versions
 
 | Component | Version |
 | --------- | ------- |
-| Base image | `amdagi/verl-dev:rocm7.14_torch2.12_release_0724@sha256:919a8a9b462b3e637e3e50bd704b4d987846619ddb35e10b4f15643db179f0e6` |
+| Base image | `rocm/primus:v26.4@sha256:8c8ecc6fe14b5061423cc82517831e3515f6eb15647ee6d746fd6a0c1963da24` |
 | ROCm | 7.14 |
-| Python | 3.12 |
+| Python | 3.12 (`/opt/venv`) |
 | PyTorch | 2.12.0+rocm7.14 |
 | SGLang | 0.5.12 source @ `127b9e3` (tag `v0.5.12`) |
-| sglang-kernel | 0.4.2.post2 |
-| vLLM | 0.22.1rc1 source @ `18d87a87d` |
-| aiter | ROCm @ `b5e03ed19` |
+| sglang-kernel | 0.4.2.post2, built from SGLang's `sgl-kernel` source |
+| vLLM | 0.26.0 source @ `568afb3a1` (tag `v0.26.0`; reports `0.26.1.dev0+g568afb3a1`) |
+| xgrammar | 0.2.1 |
+| transformers | 5.6.2 |
+| aiter | 0.1.12.post2.dev214 @ `b5e03ed19` (from the base image) |
 | verl | 0.9.0.dev @ `7b19203c` |
-| ray | 2.56.1 |
+| megatron-core | 0.18.0 |
+| ray | 2.60.0 |
 
 ## What the Image Contains
 
-The base is verl's ROCm release image, from verl's
-[AMD quick start](https://github.com/verl-project/verl/blob/main/docs/amd_tutorial/amd_quick_start.rst)
-(built from verl's
-[`docker/rocm/Dockerfile.rocm`](https://github.com/verl-project/verl/blob/main/docker/rocm/Dockerfile.rocm)).
-On top of it, `Dockerfile.rocm`:
+`Dockerfile.rocm` is verl's
+[`docker/rocm/Dockerfile.rocm`](https://github.com/verl-project/verl/blob/5eb4826694f35d8453ad465b67e3e02cb6b34f07/docker/rocm/Dockerfile.rocm)
+(see verl's
+[AMD quick start](https://github.com/verl-project/verl/blob/main/docs/amd_tutorial/amd_quick_start.rst)),
+built from its own base, `rocm/primus` (torch, aiter and ray come from there).
+It does not depend on a published verl image. On top of verl's file it:
 
-- replaces the base image's SGLang source build with SGLang v0.5.12, the
-  release verl-SpeCo supports. It is installed from source the same way as in
-  verl's Dockerfile: the ROCm `layernorm.py` fix from sgl-project/sglang#32034,
-  the Rust gRPC extension disabled, `pip install --no-deps -e python`. The base
-  image's `sglang-kernel` 0.4.2.post2 is the version v0.5.12 pins, so it is
-  reused;
+- builds vLLM v0.26.0 instead of 0.22.1rc1, with verl's ROCm patches, and
+  installs xgrammar 0.2.1 (vLLM v0.26.0 requires >= 0.2.1). The patches leave
+  the source tree dirty, so vLLM reports `0.26.1.dev0+g568afb3a1`;
+- builds SGLang v0.5.12, the release verl-SpeCo supports, instead of verl's
+  newer source commit, the same way verl does: the ROCm `layernorm.py` fix from
+  sgl-project/sglang#32034, the Rust gRPC extension disabled,
+  `pip install --no-deps -e python`, and `sglang-kernel` 0.4.2.post2 built from
+  its `sgl-kernel` source for `gfx942` and `gfx950`;
+- installs transformers 5.6.2. SGLang v0.5.12 pins 5.6.0, whose
+  `flash_attention_forward` calls `s_aux.to()` on `None` and breaks every FSDP
+  actor forward;
+- installs `ipython` and `gguf`, which SGLang imports at engine start and the
+  `--no-deps` install skips;
+- puts `_rocm_sdk_core/lib` first on `LD_LIBRARY_PATH`. Otherwise SGLang's
+  `torch_memory_saver` `LD_PRELOAD` loads a second LLVM and the scheduler
+  aborts with `Option 'spirv-expand-step' registered more than once`;
 - installs verl-SpeCo in editable mode with `--no-deps`.
 
-The base image's torch, vLLM, aiter, verl and environment variables
-(`HSA_ENABLE_IPC_MODE_LEGACY=1`, `SGLANG_ATTENTION_BACKEND=triton`, ...) are kept.
+verl's environment variables are kept (`HSA_ENABLE_IPC_MODE_LEGACY=1`,
+`SGLANG_ATTENTION_BACKEND=triton`, `SGLANG_USE_AITER=0`, ...). SGLang's `aiter`
+attention backend fails its JIT build in this image, so use `triton`.
 
 ## Building Locally
 
@@ -54,7 +69,11 @@ The base image's torch, vLLM, aiter, verl and environment variables
 docker build -f docker/rocm/Dockerfile.rocm -t verl-speco:rocm .
 ```
 
+A full build takes about 36 minutes on a 256-core node.
+
 | Build arg | Default | Purpose |
 | --------- | ------- | ------- |
-| `BASE_IMAGE` | pinned digest above | verl ROCm base image. |
+| `BASE_IMAGE` | pinned `rocm/primus:v26.4` digest above | ROCm/torch base image. |
+| `VLLM_TAG` | `568afb3a13806beb53bb2e6bd518269357b237c0` (`v0.26.0`) | vLLM source commit. |
+| `VERL_TAG` | `7b19203c52503760f92e0368067c7eb744236274` | verl source commit. |
 | `SGLANG_TAG` | `127b9e3283f7c2a43234b852ff5c9f1796d53624` (`v0.5.12`) | SGLang source commit. |
