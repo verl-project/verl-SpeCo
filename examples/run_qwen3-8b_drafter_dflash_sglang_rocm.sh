@@ -22,10 +22,10 @@ DRAFTER_PATH=${DRAFTER_PATH:-/path/to/Qwen3-8B-DFlash-b16}
 TRAIN_FILE=${TRAIN_FILE:-/path/to/gsm8k/train.parquet}
 TEST_FILE=${TEST_FILE:-/path/to/gsm8k/test.parquet}
 CKPTS_DIR=${CKPTS_DIR:-/dev/shm/verl_speco_ckpt}
-# SGLang attention backend. The ROCm image sets SGLANG_ATTENTION_BACKEND=triton (and
-# SGLANG_USE_AITER=0), as verl's ROCm image does; SGLang's aiter backend fails its JIT build in
-# this image. Set it explicitly because verl otherwise picks flashinfer for SGLang >= 0.5.12,
-# which does not exist on ROCm.
+# SGLang attention backend. The ROCm image sets SGLANG_ATTENTION_BACKEND=aiter (and
+# SGLANG_USE_AITER=1); older images without it fall back to triton, since their aiter JIT build
+# fails. Set it explicitly because verl otherwise picks flashinfer for SGLang >= 0.5.12, which
+# does not exist on ROCm.
 sglang_attention_backend=${SGLANG_ATTENTION_BACKEND:-triton}
 
 # ROCm + Ray GPU isolation. Set ONLY CUDA_VISIBLE_DEVICES (no HIP var, no NOSET flags):
