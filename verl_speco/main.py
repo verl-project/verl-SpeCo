@@ -194,11 +194,13 @@ def run(config) -> None:
 
     from verl_speco.integration.rocm_env import (
         align_visible_devices_with_ray,
+        default_legacy_ipc_mode,
         neutralize_hip_visible_devices,
     )
 
     neutralize_hip_visible_devices()
     align_visible_devices_with_ray()
+    default_legacy_ipc_mode()
 
     from verl.trainer import main_ppo
     from verl.utils.device import auto_set_device

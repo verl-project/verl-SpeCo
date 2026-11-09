@@ -96,6 +96,46 @@ def neutralize_hip_visible_devices(*, context: str = "") -> bool:
     return stripped
 
 
+_LEGACY_IPC_ENV = "HSA_ENABLE_IPC_MODE_LEGACY"
+
+
+def default_legacy_ipc_mode() -> bool:
+    """Default HSA_ENABLE_IPC_MODE_LEGACY=1 on ROCm so IPC weight sync does not leak.
+
+    The actor -> rollout weight sync shares every bucket over CUDA IPC. In the HSA
+    runtime's default (non-legacy) IPC mode, device memory that was exported over IPC
+    is not returned to the device when the producer frees it, so each step loses about
+    one model copy per actor GPU until a later step fails with ``HIP error: invalid
+    argument`` in ``storage._share_cuda_()`` or a HIP OOM. verl's ROCm image and ours set
+    the variable, but images built on other bases (e.g. the SGLang ROCm images) do not.
+
+    Call in the driver before Ray starts so the local Ray cluster and all its workers
+    inherit it; the HSA runtime reads it once at init. An explicit value is kept (with a
+    warning if it is not ``1``). Returns whether the default was applied. No-op on
+    non-ROCm builds.
+    """
+
+    if not _is_rocm():
+        return False
+    value = os.environ.get(_LEGACY_IPC_ENV)
+    if value:
+        if value != "1":
+            logger.warning(
+                "%s=%s: the IPC weight sync leaks about one model copy of GPU memory per "
+                "step in this mode; set %s=1 unless this is intended.",
+                _LEGACY_IPC_ENV,
+                value,
+                _LEGACY_IPC_ENV,
+            )
+        return False
+    os.environ[_LEGACY_IPC_ENV] = "1"
+    logger.warning(
+        "%s was unset; set it to 1 so the IPC weight sync returns exported GPU memory.",
+        _LEGACY_IPC_ENV,
+    )
+    return True
+
+
 def _ray_amd_visible_devices_env_var() -> str | None:
     try:
         from ray._private.accelerators.amd_gpu import AMDGPUAcceleratorManager
