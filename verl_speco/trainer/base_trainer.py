@@ -1566,7 +1566,7 @@ class DrafterBaseTrainer:
         """
 
         return bool(
-            self._bubble_time_enabled
+            getattr(self, "_bubble_time_enabled", False)
             and self.training_device_mesh is None
             and self.training_process_group is not None
             and self.training_group_world_size > 1
@@ -2183,7 +2183,7 @@ class DrafterBaseTrainer:
 
     def _use_replica_local_bubble_group(self) -> bool:
         return bool(
-            self._bubble_time_enabled
+            getattr(self, "_bubble_time_enabled", False)
             and self.training_device_mesh is None
             and self.training_process_group is not None
         )
@@ -5243,10 +5243,18 @@ class DrafterBaseTrainer:
         min_items_for_batch = 1
 
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
+        allow_cross_step_hidden = bool(
+            self.config.rollout.drafter.training.get("allow_cross_step_hidden", False)
+        )
+        # eagle3 的 target_logprobs 在 rollout 时预计算，依赖当时的 actor 权重，
+        # 需要同 step 限制（allow_cross_step_hidden=true 时显式放宽）。
+        # DSpark 的版本一致限制仅在 SFT 路径显式传入样本范围，见 speco_train_drafter，
+        # 不影响共享 base_trainer 上原有 PPO / 非 SFT 路径的最近 N 步采样行为。
         same_step_target_head_required = (
             self.backend.model_type == "eagle3"
             and not use_logits
-            and not self._bubble_time_enabled
+            and not getattr(self, "_bubble_time_enabled", False)
+            and not allow_cross_step_hidden
         )
 
         self._last_prepared_training_items = []
@@ -5275,7 +5283,7 @@ class DrafterBaseTrainer:
         # head version that produced those hidden states, so older buffered Eagle3
         # samples are not valid for the actor head synced for this rollout step.
         elif self.use_data_buffer and len(self.data_buffer) > 0:
-            if not self._bubble_time_enabled and (
+            if not getattr(self, "_bubble_time_enabled", False) and (
                 min_sample_step is not None or max_sample_step is not None
             ):
                 available_data = self._filter_training_data_by_step(
@@ -5299,6 +5307,7 @@ class DrafterBaseTrainer:
                 available_data = self.data_buffer.get_data_from_last_n_steps(
                     buffer_steps
                 )
+            # Filter out items that are already in the active accumulation set, if any.
             if len(available_data) < effective_batch_size:
                 if len(available_data) >= min_items_for_batch:
                     items = available_data
@@ -6689,10 +6698,14 @@ class DrafterBaseTrainer:
 
         current_step = int(self.current_rl_step)
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
+        allow_cross_step_hidden = bool(
+            self.config.rollout.drafter.training.get("allow_cross_step_hidden", False)
+        )
         same_step_data_required = (
             self.backend.model_type == "eagle3"
             and not use_logits
-            and not self._bubble_time_enabled
+            and not getattr(self, "_bubble_time_enabled", False)
+            and not allow_cross_step_hidden
         )
         current_step_data = [
             item
@@ -6764,7 +6777,7 @@ class DrafterBaseTrainer:
                 int(item.get("target_version", item.get("step", current_step)))
                 for item in recent_data
             ]
-            if self._bubble_time_enabled and not use_logits:
+            if getattr(self, "_bubble_time_enabled", False) and not use_logits:
                 cached_versions = set(self._target_lm_head_snapshots)
                 target_versions = [
                     version for version in target_versions if version in cached_versions
