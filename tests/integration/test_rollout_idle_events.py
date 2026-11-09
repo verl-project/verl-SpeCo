@@ -43,6 +43,23 @@ def test_standalone_scope_does_not_alias_hybrid_rank_zero(strict):
         assert all(event["replica_rank"] == 7 for event in bus.drain())
 
 
+@pytest.mark.parametrize(
+    "reported", [{7: ["0", "1"]}, {7: ["2", "3"]}, {8: ["0", "1"]}]
+)
+def test_strict_group_configuration_requires_exact_ack(monkeypatch, reported):
+    def configure(groups, *, strict_groups):
+        assert strict_groups
+        assert groups == {7: ["0", "1"]}
+        return reported
+
+    actor = SimpleNamespace(configure_replica_groups=SimpleNamespace(remote=configure))
+    ray = SimpleNamespace(get=lambda value: value)
+    monkeypatch.setattr(rollout_idle_events, "_event_bus", lambda name: (ray, actor))
+    assert rollout_idle_events.configure_rollout_resource_groups(
+        "strict", {7: ("0", "1")}, strict_groups=True
+    ) == (reported == {7: ["0", "1"]})
+
+
 def test_event_poll_reuses_handle_but_always_drains_fresh_events(monkeypatch):
     lookups, drains = [], []
     actor = SimpleNamespace(

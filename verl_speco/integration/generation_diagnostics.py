@@ -563,12 +563,11 @@ def flush_requests(owner):
 def report_idle_rejection(owner, plan):
     """At most one cached-state snapshot per step/reason; no RPCs or lease changes."""
     from verl_speco.utils.diagnostics import diagnostic_state
+    from verl_speco.utils.env import env_flag
 
-    if os.getenv("VERL_SPECO_DIAGNOSTIC_IDLE_REJECTIONS", "").lower() not in {
-        "1",
-        "true",
-        "yes",
-    } or getattr(plan, "launch", False):
+    if not env_flag("VERL_SPECO_DIAGNOSTIC_IDLE_REJECTIONS") or getattr(
+        plan, "launch", False
+    ):
         return
     step = getattr(owner, "global_steps", None)
     if (

@@ -628,19 +628,22 @@ def configure_rollout_resource_groups(
     remote = getattr(configure, "remote", None)
     if not callable(remote):
         return False
+    expected = {
+        int(replica_rank): list(worker_ids)
+        for replica_rank, worker_ids in groups.items()
+    }
     try:
         result = ray.get(
             remote(
-                {
-                    int(replica_rank): list(worker_ids)
-                    for replica_rank, worker_ids in groups.items()
-                },
+                expected,
                 **({"strict_groups": True} if strict_groups else {}),
             )
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("Unable to configure rollout resource groups: %s", exc)
         return False
+    if strict_groups:
+        return result == expected
     return isinstance(result, dict) and len(result) == len(groups)
 
 

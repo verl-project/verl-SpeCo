@@ -315,10 +315,42 @@ def test_v1_session_owns_shared_runtime_state():
     }
     trainer._speco_last_collected_step = 3
     session = trainer._speco_bubble_session()
-    assert "_speco_last_collected_step" not in trainer.__dict__
     assert trainer._speco_last_collected_step == 3
-    trainer._speco_last_collected_step = 4
-    assert session.runtime_state["_speco_last_collected_step"] == 4
+    for name, original in tuple(session.runtime_state.items()):
+        assert name not in vars(trainer)
+        assert hasattr(trainer, name)
+        assert getattr(trainer, name) is original
+
+        # A raw dictionary write cannot override the live session value.
+        vars(trainer)[name] = object()
+        assert getattr(trainer, name) is original
+        replacement = object()
+        setattr(trainer, name, replacement)
+        assert session.runtime_state[name] is replacement
+        assert name not in vars(trainer)
+
+        vars(trainer)[name] = object()
+        delattr(trainer, name)
+        assert not hasattr(trainer, name)
+        assert name not in session.runtime_state
+        assert name not in vars(trainer)
+        with pytest.raises(AttributeError):
+            delattr(trainer, name)
+        setattr(trainer, name, original)
+        assert getattr(trainer, name) is original
+        assert name not in vars(trainer)
+
+
+def test_v1_without_bubble_keeps_runtime_attributes_in_instance_dictionary():
+    trainer = SpecoV1Mixin()
+    trainer.config = _config(mode="sync")
+    trainer._speco_last_collected_step = 3
+    session = trainer._speco_bubble_session()
+    assert not hasattr(session, "runtime_state")
+    assert vars(trainer)["_speco_last_collected_step"] == 3
+    assert trainer._speco_last_collected_step == 3
+    del trainer._speco_last_collected_step
+    assert "_speco_last_collected_step" not in vars(trainer)
 
 
 @pytest.mark.parametrize("bubble", [False, True])
@@ -1104,7 +1136,9 @@ def test_bubble_manifest_restores_writer_and_versions_without_feature_store(tmp_
 
 
 @pytest.mark.parametrize("relocated", [False, True])
-def test_v1_bubble_resume_rejects_same_step_drafter_from_another_run(tmp_path, relocated):
+def test_v1_bubble_resume_rejects_same_step_drafter_from_another_run(
+    tmp_path, relocated, caplog
+):
     source = tmp_path / "source"
     resume_directory = source / "global_step_10"
     resume_directory.mkdir(parents=True)
@@ -1160,6 +1194,8 @@ def test_v1_bubble_resume_rejects_same_step_drafter_from_another_run(tmp_path, r
         trainer._speco_validate_v1_drafter_resume_source()
         assert drafter["model_path"] == str(expected)
         assert drafter["checkpoint_path"] == str(tmp_path / "new-run" / "custom-drafts")
+        assert "setting drafter model_path" in caplog.text
+        assert "rebasing drafter checkpoint_path" in caplog.text
         drafter["checkpoint_path"] = str(tmp_path / "explicit-destination")
         trainer._speco_validate_v1_drafter_resume_source()
         assert drafter["checkpoint_path"] == str(tmp_path / "explicit-destination")

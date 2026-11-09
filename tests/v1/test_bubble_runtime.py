@@ -14,9 +14,14 @@ def test_cost_clock_ignores_wall_clock_corrections(monkeypatch):
     from verl_speco.trainer import bubble_lifecycle as runtime
 
     wall, monotonic = [1000.0], [10.0]
-    monkeypatch.setattr(runtime, "time", SimpleNamespace(
-        time=lambda: wall[0], perf_counter=lambda: monotonic[0],
-    ))
+    monkeypatch.setattr(
+        runtime,
+        "time",
+        SimpleNamespace(
+            time=lambda: wall[0],
+            perf_counter=lambda: monotonic[0],
+        ),
+    )
     clock = runtime.CostClock()
     monotonic[0] = 12
     wall[0] = -5000
@@ -122,8 +127,6 @@ def test_same_device_number_on_different_nodes_is_independent():
     assert len(map_training_replicas(records, {7: records})) == 2
 
 
-
-
 def test_completion_queue_is_idempotent_and_owns_its_cost_snapshot():
     session = BubbleLifecycle(None)
     plan = SimpleNamespace(plan_id="one", publish_after_success=True)
@@ -224,3 +227,25 @@ def test_overlapping_phases_and_parallel_preparation_are_not_double_charged():
     assert ledger.total == 8
     assert ledger.events["prepare:one"] == 2
     assert ledger.events["train:one"] == 3
+
+
+def test_v1_roi_cost_is_invariant_to_worker_clock_offsets():
+    def total(offset):
+        ledger = QuotaCostLedger(worker_durations_only=True)
+        ledger.record_interval("head", 0, 4)
+        ledger.record_interval("publish", 3, 5)
+        ledger.observe_training(
+            SimpleNamespace(plan_id="quota"),
+            SimpleNamespace(
+                raw_results=[
+                    {
+                        "cost_train_started_ts": offset,
+                        "cost_train_finished_ts": offset + 3,
+                    },
+                    {"cost_train_started_ts": 100, "cost_train_finished_ts": 101},
+                ]
+            ),
+        )
+        return ledger.total
+
+    assert total(0) == total(10_000) == 8

@@ -42,6 +42,7 @@ class QuotaCostLedger:
 
     events: dict[str, float] = field(default_factory=dict)
     intervals: dict[str, tuple[float, float]] = field(default_factory=dict)
+    worker_durations_only: bool = False
 
     def record(self, identity: str, seconds: float) -> None:
         if seconds < 0 or not math.isfinite(seconds):
@@ -99,11 +100,48 @@ class QuotaCostLedger:
             start = critical.get(f"cost_{phase}_started_ts")
             stop = critical.get(f"cost_{phase}_finished_ts")
             if start is not None and stop is not None:
-                self.record_interval(
-                    f"{phase}:{plan.plan_id}", float(start), float(stop)
-                )
+                if self.worker_durations_only:
+                    # A rank's elapsed time is valid across clock domains.
+                    # Its absolute timestamps cannot be aligned with the driver.
+                    self.record(f"{phase}:{plan.plan_id}", float(stop) - float(start))
+                else:
+                    self.record_interval(
+                        f"{phase}:{plan.plan_id}", float(start), float(stop)
+                    )
             else:
                 self.record(f"{phase}:{plan.plan_id}", duration)
+
+
+def bubble_runtime_defaults() -> dict[str, Any]:
+    return {
+        "_pending_drafter_publish_contexts": [],
+        "_speco_published_drafter_version": None,
+        "_speco_last_published_drafter_step": 0,
+        "_pending_drafter_publish_step": None,
+        "_speco_ready_target_lm_head_versions": set(),
+        "_speco_ready_target_lm_head_workers": {},
+        "_speco_last_known_trainable_batches": None,
+        "_speco_last_collected_step": None,
+        "_speco_bubble_lock": threading.RLock(),
+        "_speco_rollout_completed_training_metrics": {},
+        "_speco_idle_completed_publications": [],
+        "_speco_idle_continuation_plan": None,
+        "_speco_rollout_idle_generation_open": False,
+        "_speco_idle_completion_error": None,
+        "_speco_last_rollout_idle_metrics": {},
+        "_speco_direct_sample_ids": set(),
+        "_speco_direct_collected_samples": 0,
+        "_speco_runtime_reclaim_requested_plan_id": None,
+        "_speco_rollout_training_lease": None,
+        "_speco_runtime_idle_callback_verified": False,
+        "_speco_runtime_idle_events_this_generation": 0,
+        "_speco_runtime_sample_events_this_generation": 0,
+        "_speco_deferred_publish_count": 0,
+        "_speco_freeze_state_sidecar": "speco_drafter_freeze_state.json",
+    }
+
+
+BUBBLE_RUNTIME_FIELDS = tuple(bubble_runtime_defaults())
 
 
 class BubbleLifecycle:
@@ -117,32 +155,7 @@ class BubbleLifecycle:
     def __init__(self, trainer: Any):
         self.trainer = trainer
         if trainer is not None:
-            defaults: dict[str, Any] = {
-                "_pending_drafter_publish_contexts": [],
-                "_speco_published_drafter_version": None,
-                "_speco_last_published_drafter_step": 0,
-                "_pending_drafter_publish_step": None,
-                "_speco_ready_target_lm_head_versions": set(),
-                "_speco_ready_target_lm_head_workers": {},
-                "_speco_last_known_trainable_batches": None,
-                "_speco_last_collected_step": None,
-                "_speco_bubble_lock": threading.RLock(),
-                "_speco_rollout_completed_training_metrics": {},
-                "_speco_idle_completed_publications": [],
-                "_speco_idle_continuation_plan": None,
-                "_speco_rollout_idle_generation_open": False,
-                "_speco_idle_completion_error": None,
-                "_speco_last_rollout_idle_metrics": {},
-                "_speco_direct_sample_ids": set(),
-                "_speco_direct_collected_samples": 0,
-                "_speco_runtime_reclaim_requested_plan_id": None,
-                "_speco_rollout_training_lease": None,
-                "_speco_runtime_idle_callback_verified": False,
-                "_speco_runtime_idle_events_this_generation": 0,
-                "_speco_runtime_sample_events_this_generation": 0,
-                "_speco_deferred_publish_count": 0,
-                "_speco_freeze_state_sidecar": "speco_drafter_freeze_state.json",
-            }
+            defaults = bubble_runtime_defaults()
             if (
                 getattr(type(trainer), "_speco_session_state_owner", False)
                 and trainer._speco_rollout_idle_worker_enabled()
@@ -160,7 +173,11 @@ class BubbleLifecycle:
         self.pending: list[tuple[Any, Any]] = []
         self.queued: set[str] = set()
         self.published_ids: set[str] = set()
-        self.costs = QuotaCostLedger()
+        self.costs = QuotaCostLedger(
+            worker_durations_only=bool(
+                getattr(type(trainer), "_speco_session_state_owner", False)
+            )
+        )
         self.receipts: list[dict[str, Any]] = []
         # Lock order: owner Bubble training lock -> session lock. Never call
         # acquire the owner lock from a session-locked callback.
@@ -245,4 +262,6 @@ class BubbleLifecycle:
             self.pending.pop(0)
             self.published_ids.add(plan_id)
             self.queued.discard(plan_id)
-            self.costs = QuotaCostLedger()
+            self.costs = QuotaCostLedger(
+                worker_durations_only=self.costs.worker_durations_only
+            )

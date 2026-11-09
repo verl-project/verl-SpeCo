@@ -233,6 +233,11 @@ actor_rollout_ref:
         publish_trainable_only_export: true
         # One rollback switch for CUDA host reuse and lossless transport.
         gpu_transfer_optimizations: true
+        # FSDP2 casts before GPU-to-CPU copy; Bubble FSDP1 batches eligible copies.
+        gpu_publish_cast_before_copy: true
+        # Maximum queued Bubble FSDP1 snapshot copy bytes per leader, in MiB.
+        # Zero uses synchronous copies.
+        gpu_publish_fsdp1_copy_budget_mib: 256
         # Experimental CPU snapshot overlap; opt in only after end-to-end A/B.
         gpu_publish_snapshot_prefetch: false
         # Shared retained CPU model/optimizer buffer budget per rank; head cache is extra.
@@ -604,6 +609,8 @@ actor_rollout_ref:
             # Driver boundary timestamps; correlate with worker cleanup logs.
             # These report RPC/event lifecycle, not hardware utilization fences.
             boundary_diagnostics_enable: false
+            # Deadline for each V1 sync Bubble admission RPC fan-out.
+            admission_timeout_seconds: 300
             # Experimental: enable only after validating an equal-topology
             # subgroup state handoff and its end-to-end cost on the target host.
             writer_migration_enable: false

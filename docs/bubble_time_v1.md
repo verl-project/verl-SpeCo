@@ -105,7 +105,6 @@ step-end 边界落盘；冻结关闭特征采集后仍记录，供分布变化�
 路径通过 `VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH` 设置，默认
 `/tmp/speco_vllm_request_accept_len_hist.jsonl`。选样指标使用
 `drafter/selection/*`，冻结状态沿用 `drafter_convergence_freeze` 的指标。
-冻结状态、ROI 和漂移恢复仍需按下文完成 GPU 验收。
 
 ### 计时与 acceptance 指标
 
@@ -145,9 +144,9 @@ drafter 发布并等待完整 ACK → 更新 serving revision → after-arm → 
 两臂直接调用 serving RPC，不进入 PPO、reward 或 TransferQueue。
 探测缺少 revision、混合 revision、执行失败或覆盖不足时，不产生冻结证据。
 
-成本跨空闲窗口保留，按计划 ID 去重。组内准备和训练阶段取最大 rank 耗时，
-有时间区间的阶段计算区间并集，避免 head、训练及传输重叠重复计费。
-worker 时间区间使用集群 wall clock；验收机器应保持时钟同步。
+成本跨空闲窗口保留，按计划 ID 去重。组内准备和训练阶段取最大 rank 的本地耗时。
+driver 上的重叠区间取并集，再加上 worker 阶段耗时。跨进程重叠采用保守计费，
+因此重叠发生时该估算可能偏高。
 日志分别提供更新成本、probe 耗时、暂停时间和 step-end 关键路径耗时。
 
 未完成 quota 或未确认发布会延迟 checkpoint。发布和 ROI 状态提交后，
@@ -158,8 +157,14 @@ worker 时间区间使用集群 wall clock；验收机器应保持时钟同步�
 确保模型保存 RPC 返回时组件已完成。这与 V1 的异步 rollout 模式相互独立。
 上游 driver 的 latest 写入及提前清理在保存事务内暂缓；worker 仍按原配置同步保存。
 模型、冻结状态、TQ、Feature Store 和联合 manifest 均完成后，才原子提交 latest，
-随后在各 owning worker 上执行原有 actor/critic 保留数量策略。
-组件保存或 latest 提交失败时，旧指针和旧模型 checkpoint 均保留，允许重试。
+随后各 owning worker 结合 driver 确认的步号和本机完整 manifest 执行 actor/critic
+保留策略。共享目录中，同一个组件通过目录声明串行清理。
+组件保存或 latest 提交失败时，已发布的旧指针和旧模型 checkpoint 均保留。
+在同一输出目录续训时，下一次保存的 step 必须大于 latest 记录的 step。
+如果 latest 缺失，则以该目录中最高的已提交 Bubble 联合恢复点为保护边界。
+保存开始前会写入 pending 标记。latest 提交前失败的保存可以在同一步重试，
+其 manifest 不会被用于续训或占用保留名额。旧版没有标记的完整 manifest 仍兼容。
+从更早的 checkpoint 回退并重新保存时，请使用新的 `trainer.default_local_dir`。
 
 generation 启动事件使用注册的真实 replica 分组，不再根据 rollout DP 数量推断 rank。
 head 传输成本在同步返回或预取轮询收到完整版本 ACK 后统一记账；
@@ -184,19 +189,23 @@ PYTHONPATH="$PWD:$LEGACY_VERL" python -m pytest \
   tests/unit/test_idle_window_readmission.py -q -ra
 ```
 
-## GPU 验收记录
+## V1 sync 性能实测
 
-CPU 合约通过不代表 GPU 功能验收完成。当前开发环境无可用 CUDA GPU，以下项目仍须实测。
+对比 `train_sync_freeze.log` 和 `train_sync_freeze_bubble.log` 的共同区间
+step 1–95。两组均使用 V1 sync trainer，Bubble 组启用了 `rollout_idle_worker`。
+数据来源见 [PR #136 的性能对照](https://github.com/verl-project/verl-SpeCo/pull/136)。
 
-| 负载 | sync |
-| --- | --- |
-| DSpark：Bubble / 普通 drafter 等工作量对照 | 待测 |
-| DFlash：Bubble / 普通 drafter 等工作量对照 | 待测 |
-| ROI 探测、冻结、漂移恢复、checkpoint 恢复 | 待测 |
+| 指标 | Sync | Bubble | 变化 |
+| --- | ---: | ---: | ---: |
+| `timing_s/step` 累计 | 45,136.76 秒 | 43,599.30 秒 | −3.41% |
+| `timing_s/drafter` 累计 | 303.75 秒 | 194.36 秒 | −36.01% |
+| 完成的 drafter optimizer steps | 460 | 460 | 持平 |
+| 在 idle 窗口完成的 optimizer steps | 0 | 225 | 占 Bubble 组的 48.9% |
+| 平均 acceptance length | 3.451 | 3.733 | +8.17% |
 
-每组必须记录 optimizer 工作量、发布次数、未偿 quota、probe 暂停和端到端耗时，
-并核对共享 GPU 无越界重叠、完整 quota 只执行一次、发布和恢复版本一致。
-减少训练或遗留 quota 的结果不能作为等工作量加速证据。
+Bubble 组其余 235 步通过同步补训完成。`timing_s/drafter` 包含发布边界阻塞，
+`timing_s/step` 汇总 step 计时器内的耗时。两组为单次运行，生成轨迹存在差异，
+表中变化反映本次负载下的观测结果。两组均使用 `early_publish_staging=false`。
 
 
 ## 排查采样阶段性能差异
@@ -227,6 +236,15 @@ unavailable，不猜测数值。首次采样前每 replica 仅进行一次额外
 先跑三步比较第 2～3 步，统一 GPU、seed、参数和诊断开关，保存完整启动日志。
 
 ### V1 发布快照预取
+
+`training.gpu_publish_cast_before_copy` 默认开启，并受
+`training.gpu_transfer_optimizations` 控制。CUDA FSDP2 使用该开关在复制前转换
+dtype，Bubble FSDP1 使用它合并连续 CUDA 张量的非阻塞主机复制。
+`training.gpu_publish_fsdp1_copy_budget_mib` 默认 256 MiB，限制每个 leader
+的单批在途复制量。设为 0 使用逐张量同步复制，超过预算的单个张量也同步复制。
+
+一轮 Bubble FSDP1 运行中，step 10 的 leader 导出了约 2.25 GB 权重，快照生成
+约 0.078 秒，其中复制等待约 0.044 秒。该数字是单次热态观测。
 
 可通过以下配置启用发布准备与原生 target 权重同步的重叠：
 
@@ -269,16 +287,14 @@ legacy owner 不迁移存储。锁顺序为训练锁 → session 锁，停止并
 不持训练锁。已成功 park 的 driver receipt 可跳过重复 park RPC；新 generation、
 训练完成回调与激活会使 receipt 失效。失败的 park 不会生成成功 receipt。
 
-ROI 使用固定 epoch 加单调时钟的 CostClock。driver 和 worker 在初始化时各采样一次
-wall epoch，后续 NTP 跳变不影响本地成本区间。跨节点区间并集仍要求初始化时机器
-时钟同步，不能把它视为跨主机精确因果时钟。运行时 deadline 沿用原有调度时钟，
-不与成本时钟混用。head dispatch 的 perf_counter 起点用固定 epoch 转换，不能
-在结束时用当前 wall clock 反推起点。
+ROI 使用固定 epoch 加单调时钟的 CostClock。每个进程使用自己的时钟计算本地耗时，
+V1 driver 只合并本进程的区间。head dispatch 的 perf_counter 起点用 driver 的
+固定 epoch 转换。运行时 deadline 沿用原有调度时钟。
 
 成本 identity 表示一次完成事件，同 identity 的重复回调采用 first-completion-wins；
 真正执行额外工作的重试需要不同 attempt identity。head 传输使用版本与 dispatch
-origin 区分不同传输；已完成事件的迟到重复回调不追加成本。不同 identity 的时间
-区间取并集，避免重叠工作重复计费。
+origin 区分不同传输；已完成事件的迟到重复回调不追加成本。driver 内不同 identity
+的时间区间取并集，避免本地重叠重复计费。
 
 延迟 checkpoint 后直接调用 checkpoint manager 重新应用已确认 target，不再二次
 调用上游 on_step_end。sleep 会释放权重/KV，不能只解除 generation 的暂停。

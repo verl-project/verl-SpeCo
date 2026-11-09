@@ -25,6 +25,7 @@ import tempfile
 import time
 from typing import Any, cast
 
+from verl_speco.trainer.bubble_lifecycle import BUBBLE_RUNTIME_FIELDS
 from verl_speco.trainer.v1.bubble_mixin import V1BubbleMixin
 from verl_speco.rl_insight_bridge import trace_state as _rl_insight_trace_state
 
@@ -212,8 +213,10 @@ class SpecoV1Mixin(V1BubbleMixin):
         """
         session = self.__dict__.get("_speco_bubble_lifecycle")
         state = getattr(session, "runtime_state", None)
-        if state is not None and name in state:
-            return state[name]
+        if state is not None and name in BUBBLE_RUNTIME_FIELDS:
+            # The descriptor already checked the session. A deleted field
+            # stays absent rather than falling through to the legacy facade.
+            raise AttributeError(name)
         if (
             name.startswith("_speco")
             or name.startswith("speco_")
@@ -586,6 +589,8 @@ class SpecoV1Mixin(V1BubbleMixin):
         return manifest_path
 
     def _speco_read_v1_resume_manifest(self, resume_step: int) -> dict[str, Any]:
+        from verl_speco.trainer.v1.checkpoint_commit import is_unpublished_checkpoint
+
         resume_directory = self._speco_v1_explicit_resume_directory()
         manifest_path = (
             os.path.join(resume_directory, "speco_v1_manifest.json")
@@ -595,6 +600,10 @@ class SpecoV1Mixin(V1BubbleMixin):
         if not os.path.isfile(manifest_path):
             raise RuntimeError(
                 f"V1 resume requires a joint SPECO checkpoint manifest: {manifest_path}"
+            )
+        if is_unpublished_checkpoint(Path(manifest_path).parent):
+            raise RuntimeError(
+                f"V1 joint checkpoint was not committed: {manifest_path}"
             )
         try:
             with open(manifest_path, encoding="utf-8") as stream:
@@ -664,6 +673,11 @@ class SpecoV1Mixin(V1BubbleMixin):
         }
         selected = Path(model_path).resolve() if model_path else None
         if selected is None or selected not in candidates:
+            if model_path is None and len(candidates) != 1:
+                raise RuntimeError(
+                    "V1 Bubble drafter model_path is unset and the joint manifest "
+                    f"for step {resume_step} has {len(candidates)} usable drafter checkpoints"
+                )
             if len(candidates) != 1 or (
                 model_path
                 and is_pretrained_drafter_checkpoint(model_path)
@@ -674,6 +688,13 @@ class SpecoV1Mixin(V1BubbleMixin):
                     f"drafter checkpoint in the joint manifest for step {resume_step}"
                 )
             selected = next(iter(candidates))
+            logger.warning(
+                "V1 Bubble resume: setting drafter model_path from %r to %s "
+                "using the joint manifest for step %s",
+                model_path,
+                selected,
+                resume_step,
+            )
             self._speco_set_config_value(drafter, "model_path", str(selected))
 
         original, relative_parent = candidates[selected]
@@ -686,6 +707,11 @@ class SpecoV1Mixin(V1BubbleMixin):
             if configured in {original, original.parent, selected, selected.parent}:
                 destination = Path(output_root).resolve() / relative_parent
                 if configured != destination:
+                    logger.warning(
+                        "V1 Bubble resume: rebasing drafter checkpoint_path from %s to %s",
+                        configured,
+                        destination,
+                    )
                     self._speco_set_config_value(
                         drafter, "checkpoint_path", str(destination)
                     )
@@ -1173,10 +1199,8 @@ class SpecoV1Mixin(V1BubbleMixin):
                 return None
             if not getattr(self, "_speco_colocate_admission_closed", False):
                 with self._speco_v1_quiescent_boundary(charge_cost=False):
-                    self.checkpoint_manager.sleep_replicas()
-                    result = self._save_checkpoint()
-                    self.checkpoint_manager.update_weights(self.global_steps)
-                    return result
+                    with self._speco_v1_checkpoint_replicas_asleep():
+                        return self._save_checkpoint()
         if (
             getattr(self, "_speco_last_checkpoint_saved_step", None)
             == self.global_steps
@@ -1184,6 +1208,7 @@ class SpecoV1Mixin(V1BubbleMixin):
             return None
         if self._speco_rollout_idle_worker_enabled():
             from verl_speco.trainer.v1.checkpoint_commit import (
+                begin_checkpoint_commit,
                 commit_latest,
                 defer_native_checkpoint_commit,
                 validate_checkpoint_step,
@@ -1194,8 +1219,9 @@ class SpecoV1Mixin(V1BubbleMixin):
             # Worker configs were serialized during setup. This scope defers
             # the native driver's pointer/retention only, not worker writes.
             with defer_native_checkpoint_commit(
-                self.config, use_critic=self.use_critic
+                self.config, use_critic=self.use_critic, root=root
             ):
+                begin_checkpoint_commit(root, self.global_steps)
                 result = self._speco_save_v1_checkpoint_components()
             commit_latest(root, self.global_steps)
         else:
@@ -1225,14 +1251,16 @@ class SpecoV1Mixin(V1BubbleMixin):
                 if self.config.trainer.get("remove_previous_ckpt_in_save", False)
                 else self.config.trainer.get(setting)
             )
-            if not isinstance(keep, int) or keep <= 0 or len(steps) <= keep:
+            if not isinstance(keep, int) or keep <= 0:
                 continue
             refs.extend(
                 worker.execute_with_func_generator.remote(
                     prune_checkpoint_roles,
                     root,
-                    steps[:-keep],
+                    steps,
                     role,
+                    keep,
+                    int(self.global_steps),
                 )
                 for worker in group.workers
             )

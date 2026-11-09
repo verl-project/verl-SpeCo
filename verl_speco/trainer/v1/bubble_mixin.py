@@ -9,21 +9,49 @@ import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
-from verl_speco.trainer.bubble_lifecycle import BubbleLifecycle
+from verl_speco.trainer.bubble_lifecycle import BUBBLE_RUNTIME_FIELDS, BubbleLifecycle
 
 logger = logging.getLogger(__name__)
 
 
+class _BubbleRuntimeField:
+    """Keep legacy facade attribute access backed by one V1 session store."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+    @staticmethod
+    def _storage(owner):
+        instance = vars(owner)
+        session = instance.get("_speco_bubble_lifecycle")
+        return getattr(session, "runtime_state", instance)
+
+    def __get__(self, owner, owner_type=None):
+        if owner is None:
+            return self
+        try:
+            return self._storage(owner)[self.name]
+        except KeyError:
+            raise AttributeError(self.name) from None
+
+    def __set__(self, owner, value):
+        storage = self._storage(owner)
+        storage[self.name] = value
+        if storage is not vars(owner):
+            vars(owner).pop(self.name, None)
+
+    def __delete__(self, owner):
+        storage = self._storage(owner)
+        try:
+            del storage[self.name]
+        except KeyError:
+            raise AttributeError(self.name) from None
+        if storage is not vars(owner):
+            vars(owner).pop(self.name, None)
+
+
 class V1BubbleMixin:
     _speco_session_state_owner = True
-
-    def __setattr__(self, name, value):
-        session = self.__dict__.get("_speco_bubble_lifecycle")
-        state = getattr(session, "runtime_state", None)
-        if state is not None and name in state:
-            state[name] = value
-        else:
-            super().__setattr__(name, value)
 
     if TYPE_CHECKING:
         # SpecoV1Mixin supplies the dynamically bound shared trainer facade.
@@ -154,15 +182,76 @@ class V1BubbleMixin:
         return map_training_replicas(records, replicas)
 
     def _speco_v1_admission(self, method: str) -> None:
+        import math
+
         import ray
 
-        refs = [
-            getattr(server, method).remote()
-            for server in self.llm_server_manager.server_handles
-        ]
+        timeout = float(self._speco_v1_idle_option("admission_timeout_seconds", 300))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError(
+                "Bubble admission_timeout_seconds must be finite and positive"
+            )
+        changes_state = method in (
+            "speco_close_rollout_admission",
+            "speco_resume_rollout_admission",
+        )
+        if changes_state:
+            previous = self.__dict__.get("_speco_v1_admission_mutation")
+            if previous is not None:
+                previous_method, previous_refs = previous
+                if previous_refs:
+                    _, pending = ray.wait(
+                        previous_refs, num_returns=len(previous_refs), timeout=timeout
+                    )
+                    if pending:
+                        raise TimeoutError(
+                            f"Previous Bubble admission {previous_method} is still in flight"
+                        )
+        refs: list[Any] = []
+        if changes_state:
+            self._speco_v1_admission_mutation = (method, refs)
+        for server in self.llm_server_manager.server_handles:
+            refs.append(getattr(server, method).remote())
         if not refs:
             raise RuntimeError("Bubble boundary has no serving replicas")
-        ray.get(refs)
+        ready, pending = ray.wait(refs, num_returns=len(refs), timeout=timeout)
+        ready_set = set(ready)
+        for index, ref in enumerate(refs):
+            if ref in ready_set:
+                try:
+                    ray.get(ref)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Bubble admission {method} failed on serving replica index {index}"
+                    ) from exc
+        if pending:
+            missing = [index for index, ref in enumerate(refs) if ref not in ready_set]
+            raise TimeoutError(
+                f"Bubble admission {method} timed out after {timeout:g}s "
+                f"on serving replica indices {missing}"
+            )
+        if changes_state:
+            self.__dict__.pop("_speco_v1_admission_mutation", None)
+
+    @contextmanager
+    def _speco_v1_checkpoint_replicas_asleep(self, *, record_restore=False):
+        """Restore target weights before the enclosing admission boundary can open."""
+        try:
+            self.checkpoint_manager.sleep_replicas()
+            yield
+        finally:
+            started = time.perf_counter()
+            try:
+                self.checkpoint_manager.update_weights(self.global_steps)
+            except Exception as exc:
+                raise RuntimeError(
+                    "V1 Bubble checkpoint rollout weight restore failed; admission remains closed"
+                ) from exc
+            finally:
+                if record_restore:
+                    self._speco_v1_record_timing(
+                        "checkpoint_rollout_restore", time.perf_counter() - started
+                    )
 
     @contextmanager
     def _speco_v1_quiescent_boundary(self, *, charge_cost=True, timings=None):
@@ -199,12 +288,12 @@ class V1BubbleMixin:
             if completed and not already_closed:
                 resume_wall_started = self._speco_bubble_clock().now()
                 resume_started = time.perf_counter()
+                self._speco_colocate_admission_closed = False
                 self._speco_v1_admission("speco_resume_rollout_admission")
                 if timings is not None:
                     timings["timing_s/drafter_v1_admission_resume"] = (
                         time.perf_counter() - resume_started
                     )
-                self._speco_colocate_admission_closed = False
                 receipts = self._speco_bubble_session().receipts
                 self._speco_v1_last_pause_seconds = time.perf_counter() - pause_started
                 if receipts and charge_cost:
@@ -354,55 +443,102 @@ class V1BubbleMixin:
             self._speco_v1_publish_transaction = True
             self._speco_v1_publish_ack = False
             try:
-                if run_probe:
-                    started = time.perf_counter()
-                    probe_wall_started = self._speco_bubble_clock().now()
-                    try:
-                        self._speco_v1_probe_expected_revision = version_before
-                        before = self._speco_run_freeze_probe_arm()
-                    except Exception:
-                        metrics["bubble/probe_before_failed"] = 1
-                    probe_seconds += time.perf_counter() - started
+                applied = self.__dict__.get("_speco_v1_applied_publish")
+                if applied is None:
+                    if run_probe:
+                        started = time.perf_counter()
+                        probe_wall_started = self._speco_bubble_clock().now()
+                        try:
+                            self._speco_v1_probe_expected_revision = version_before
+                            before = self._speco_run_freeze_probe_arm()
+                        except Exception:
+                            metrics["bubble/probe_before_failed"] = 1
+                        probe_seconds += time.perf_counter() - started
+                        session.costs.record_interval(
+                            f"probe_before:{plan.plan_id}",
+                            probe_wall_started,
+                            self._speco_bubble_clock().now(),
+                        )
+                    publish_wall_started = self._speco_bubble_clock().now()
+                    publication = self._speco_publish_drafter_weights(
+                        outcome.trained,
+                        plan,
+                        after_weight_update=True,
+                    )
+                    wait_started = time.perf_counter()
+                    self._speco_wait_pending_drafter_publish()
+                    wait_key = "timing_s/drafter_v1_publish_pending_wait"
+                    metrics[wait_key] = (
+                        metrics.get(wait_key, 0.0) + time.perf_counter() - wait_started
+                    )
                     session.costs.record_interval(
-                        f"probe_before:{plan.plan_id}",
-                        probe_wall_started,
+                        f"publish:{plan.plan_id}",
+                        publish_wall_started,
                         self._speco_bubble_clock().now(),
                     )
-                publish_wall_started = self._speco_bubble_clock().now()
-                publication = self._speco_publish_drafter_weights(
-                    outcome.trained,
-                    plan,
-                    after_weight_update=True,
-                )
-                wait_started = time.perf_counter()
-                self._speco_wait_pending_drafter_publish()
-                wait_key = "timing_s/drafter_v1_publish_pending_wait"
-                metrics[wait_key] = (
-                    metrics.get(wait_key, 0.0) + time.perf_counter() - wait_started
-                )
-                session.costs.record_interval(
-                    f"publish:{plan.plan_id}",
-                    publish_wall_started,
-                    self._speco_bubble_clock().now(),
-                )
-                if not self._speco_v1_publish_ack and not (
-                    policy is None and publication.get("drafter/published")
-                ):
-                    raise RuntimeError(
-                        "Bubble publication did not complete its apply ACK"
+                    if not self._speco_v1_publish_ack and not (
+                        policy is None and publication.get("drafter/published")
+                    ):
+                        raise RuntimeError(
+                            "Bubble publication did not complete its apply ACK"
+                        )
+                    self._speco_v1_applied_publish = (
+                        plan.plan_id,
+                        version_before,
+                        before,
+                        publication,
+                        probe_seconds,
                     )
+                else:
+                    (
+                        applied_plan,
+                        applied_version,
+                        before,
+                        publication,
+                        probe_seconds,
+                    ) = applied
+                    if (applied_plan, applied_version) != (
+                        plan.plan_id,
+                        version_before,
+                    ):
+                        raise RuntimeError(
+                            "Bubble applied publication does not match the pending plan"
+                        )
                 if policy is not None:
                     import ray
 
                     revision_started = time.perf_counter()
-                    ray.get(
-                        [
-                            server.speco_set_serving_drafter_revision.remote(
-                                version_before + 1
-                            )
-                            for server in self.llm_server_manager.server_handles
-                        ]
+                    refs: list[Any] | None = self.__dict__.get(
+                        "_speco_v1_revision_refs"
                     )
+                    if refs is None:
+                        refs = []
+                        self._speco_v1_revision_refs = refs
+                        self._speco_v1_revision_submitted = False
+                        for server in self.llm_server_manager.server_handles:
+                            refs.append(
+                                server.speco_set_serving_drafter_revision.remote(
+                                    version_before + 1
+                                )
+                            )
+                        self._speco_v1_revision_submitted = True
+                    timeout = float(
+                        self._speco_v1_idle_option("admission_timeout_seconds", 300)
+                    )
+                    if not refs:
+                        self.__dict__.pop("_speco_v1_revision_refs", None)
+                        raise RuntimeError(
+                            "Bubble revision sync has no serving replicas"
+                        )
+                    _, pending = ray.wait(refs, num_returns=len(refs), timeout=timeout)
+                    if pending:
+                        raise TimeoutError("Bubble serving revision sync timed out")
+                    self.__dict__.pop("_speco_v1_revision_refs", None)
+                    ray.get(refs)
+                    if not self._speco_v1_revision_submitted:
+                        raise RuntimeError(
+                            "Bubble serving revision broadcast was incomplete"
+                        )
                     revision_key = "timing_s/drafter_v1_publish_serving_revision"
                     metrics[revision_key] = (
                         metrics.get(revision_key, 0.0)
@@ -435,6 +571,7 @@ class V1BubbleMixin:
                 self._speco_v1_probe_expected_revision = None
             session.receipts.append({"costs": session.costs, "probe": comparison})
             session.published(plan.plan_id)
+            self.__dict__.pop("_speco_v1_applied_publish", None)
         return metrics
 
     def _speco_v1_finish_receipts(self):
@@ -447,14 +584,15 @@ class V1BubbleMixin:
                 update_cost_seconds=receipt["costs"].total,
                 probe=receipt["probe"],
             )
+            # The policy has consumed this publish. Later hooks must not replay it.
+            session.receipts.pop(0)
             decision = getattr(self, "_speco_last_freeze_decision", None)
             if decision is not None:
                 if getattr(self, "_speco_freeze_policy_active", False):
                     self._speco_drafter_frozen = not bool(decision.should_train)
-                self._speco_freeze_emit_transition(decision)
                 self._speco_record_freeze_branch_request(decision)
+                self._speco_freeze_emit_transition(decision)
             metrics["bubble/quota_update_cost_seconds"] = receipt["costs"].total
-            session.receipts.pop(0)
         if getattr(self, "_speco_freeze_policy", None) is not None:
             metrics.update(self._speco_freeze_metrics())
         return metrics
@@ -540,6 +678,10 @@ class V1BubbleMixin:
         boundary_started = time.perf_counter()
         session = self._speco_bubble_session()
         metrics = session.close("v1_target_sync")
+        if session.receipts:
+            # Reconcile acknowledged publications before planning or taking
+            # the fast path. The current boundary's receipts are handled below.
+            metrics.update(self._speco_v1_finish_receipts())
         scheduler = self._speco_get_drafter_scheduler()
         final_debt = (
             self.global_steps >= self.total_training_steps
@@ -663,22 +805,12 @@ class V1BubbleMixin:
             # Persist the acknowledged version and its ROI observation together.
             # The first boundary includes resume costs before committing policy.
             with self._speco_v1_quiescent_boundary(charge_cost=False):
-                self.checkpoint_manager.sleep_replicas()
-                checkpoint_started = time.perf_counter()
-                self._save_checkpoint()
-                self._speco_v1_record_timing(
-                    "drafter_v1_checkpoint", time.perf_counter() - checkpoint_started
-                )
-                # sleep_replicas releases weight/KV storage. Reapply the same
-                # target through the checkpoint manager, not the native step
-                # hook (which may gain counters or other side effects).
-                restore_started = time.perf_counter()
-                try:
-                    self.checkpoint_manager.update_weights(self.global_steps)
-                finally:
+                with self._speco_v1_checkpoint_replicas_asleep(record_restore=True):
+                    checkpoint_started = time.perf_counter()
+                    self._save_checkpoint()
                     self._speco_v1_record_timing(
-                        "checkpoint_rollout_restore",
-                        time.perf_counter() - restore_started,
+                        "drafter_v1_checkpoint",
+                        time.perf_counter() - checkpoint_started,
                     )
         if getattr(self, "_speco_freeze_branch_save_pending", None) is not None:
             checkpoint_started = time.perf_counter()
@@ -842,3 +974,9 @@ class V1BubbleMixin:
 
                 drain_rollout_idle_events(self._speco_rollout_idle_event_bus_name())
                 self._speco_validation_in_progress = False
+
+
+# Only the shared facade's declared fields are intercepted. Data descriptors
+# keep raw instance-dictionary entries from shadowing a live Bubble session.
+for _field_name in BUBBLE_RUNTIME_FIELDS:
+    setattr(V1BubbleMixin, _field_name, _BubbleRuntimeField(_field_name))

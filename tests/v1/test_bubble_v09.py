@@ -304,7 +304,7 @@ def test_real_mode_final_quota_cannot_enable_critical_path_fallback(mode):
     trainer.config = config(mode)
     trainer.global_steps = trainer.total_training_steps = 1
     trainer._speco_bubble_lifecycle = SimpleNamespace(
-        close=lambda boundary: {}, pending=[]
+        close=lambda boundary: {}, pending=[], receipts=[]
     )
     trainer._speco_get_drafter_scheduler = lambda: SimpleNamespace(
         _training_quota_debt_steps=1

@@ -2006,7 +2006,13 @@ class DrafterBaseTrainer:
 
         config = self.config.rollout.drafter.training
         batch_copy = gpu_transfer_enabled(config, "gpu_publish_cast_before_copy")
-        copy_budget_bytes = 256 * 1024 * 1024
+        copy_budget_mib = config.get("gpu_publish_fsdp1_copy_budget_mib", 256)
+        if type(copy_budget_mib) is not int or copy_budget_mib < 0:
+            raise ValueError(
+                "gpu_publish_fsdp1_copy_budget_mib must be a nonnegative integer"
+            )
+        copy_budget_bytes = copy_budget_mib * 1024 * 1024
+        batch_copy = batch_copy and copy_budget_bytes > 0
         dtype = {
             "bf16": torch.bfloat16,
             "bfloat16": torch.bfloat16,

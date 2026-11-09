@@ -55,6 +55,48 @@ def trainer_for(mode):
     return trainer
 
 
+def test_worker_metadata_registration_scopes_rollout_leases(monkeypatch):
+    from verl_speco.integration import rollout_idle_events
+
+    class LocalRay:
+        remote = staticmethod(lambda actor_class: actor_class)
+        get = staticmethod(lambda result: result)
+
+    bus = rollout_idle_events._event_bus_actor_class(LocalRay)()
+    actor = SimpleNamespace(
+        configure_replica_groups=SimpleNamespace(remote=bus.configure_replica_groups)
+    )
+    monkeypatch.setattr(
+        rollout_idle_events, "_event_bus", lambda name: (LocalRay, actor)
+    )
+    trainer = trainer_for("sync")
+    metadata = [
+        {
+            "in_drafter_train_group": True,
+            "replica_rank": replica,
+            "training_group_ranks": ranks,
+            "full_collective_ranks": ranks,
+            "idle_collective_scope": "replica_local",
+        }
+        for replica, ranks in [(7, [0, 1]), (8, [2, 3])]
+    ]
+    trainer.drafter_wg = SimpleNamespace(
+        get_drafter_training_resource_metadata=lambda: metadata
+    )
+    trainer._ray_get_if_needed = lambda value: value
+    trainer._speco_rollout_idle_event_bus_name = lambda: "test-bus"
+
+    metrics = trainer._speco_register_drafter_training_resource_metadata()
+    assert metrics["bubble/resource_lease_groups_configured"] == 1
+    assert bus.reserve_training(["0", "1"], "writer", 0)["acquired"]
+    unknown = bus.acquire_rollout(["0"], {"replica_rank": 0, "worker_id": "0"})
+    assert unknown["acquired"] and not unknown["managed"]
+    assert not bus.training_reclaim_status("writer", "0")["requested"]
+    known = bus.acquire_rollout(["7"], {"replica_rank": 7, "worker_id": "7"})
+    assert not known["acquired"]
+    assert known["blocking_plan_ids"] == ["writer"]
+
+
 @pytest.mark.parametrize("mode", ["sync"])
 @pytest.mark.parametrize("requested", [None, False, True])
 def test_step_end_never_prepares_head_even_with_legacy_flag(
@@ -562,6 +604,18 @@ def test_native_joint_checkpoint_commits_last_and_preserves_previous_on_failure(
     tracker = tmp_path / "latest_checkpointed_iteration.txt"
     tracker.write_text("3")
     failing = [failure]
+    native = TRAINERS["sync"].__bases__[1]
+    native_save = native._save_checkpoint
+    native_returns = []
+
+    def observe_native_save(self):
+        assert self.config.actor_rollout_ref.actor.checkpoint.async_save is True
+        result = native_save(self)
+        assert tracker.read_text() == "3"
+        native_returns.append(self.global_steps)
+        return result
+
+    monkeypatch.setattr(native, "_save_checkpoint", observe_native_save)
 
     def check(stage):
         assert tracker.read_text() == "3"
@@ -618,6 +672,7 @@ def test_native_joint_checkpoint_commits_last_and_preserves_previous_on_failure(
         assert OmegaConf.to_container(trainer.config, resolve=True) == original
         failing[0] = None
     trainer._save_checkpoint()
+    assert native_returns and native_returns[-1] == 7
     assert tracker.read_text() == "7"
     assert (tmp_path / "global_step_7" / "actor" / "complete").is_file()
     assert not (previous / "actor").exists()

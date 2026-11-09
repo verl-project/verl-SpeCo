@@ -951,20 +951,20 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 metadata
             )
             scheduler = self._speco_get_drafter_scheduler()
-            if self._speco_rollout_idle_worker_enabled():
-                if not scheduler._metadata_idle_training_groups:
+            bubble_enabled = self._speco_rollout_idle_worker_enabled()
+            replica_groups = scheduler.rollout_idle_replica_groups()
+            if bubble_enabled:
+                if not scheduler._metadata_idle_training_groups or not replica_groups:
                     raise RuntimeError(
                         "No authoritative Bubble training collectives discovered"
                     )
                 scheduler._idle_training_groups(self._speco_drafter_schedule_config())
             lease_groups_configured = configure_rollout_resource_groups(
                 self._speco_rollout_idle_event_bus_name(),
-                scheduler.rollout_idle_replica_groups(),
+                replica_groups,
+                strict_groups=bubble_enabled,
             )
-            if (
-                self._speco_rollout_idle_worker_enabled()
-                and not lease_groups_configured
-            ):
+            if bubble_enabled and not lease_groups_configured:
                 raise RuntimeError(
                     "Bubble lease bus did not acknowledge replica groups; restart all actors"
                 )

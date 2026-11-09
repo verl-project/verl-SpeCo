@@ -86,7 +86,7 @@ def _driver():
         source_global_step=4, publish_after_success=True, launch=True, plan_id="quota-4"
     )
     session = SimpleNamespace(
-        pending=[(plan, SimpleNamespace(trained=True))], close=lambda _: {}
+        pending=[(plan, SimpleNamespace(trained=True))], receipts=[], close=lambda _: {}
     )
     driver._speco_drafter_schedule_config = lambda: config
     driver._speco_bubble_session = lambda: session
