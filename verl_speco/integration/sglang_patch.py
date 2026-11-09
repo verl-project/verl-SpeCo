@@ -87,6 +87,7 @@ _ORIGINAL_SGLANG_RUN_SCHEDULER_PROCESS = (
 _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = None
 _SGLANG_EAGLE_UPDATE_PATCHED = False
 _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
+_SGLANG_ROCM_DFLASH_SAMPLING_PATCHED = False
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = False
@@ -106,9 +107,11 @@ _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
 _SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME = "qwen3_rope_compat"
 _SGLANG_FLASHINFER_PLAN_ABI_PATCH_NAME = "flashinfer_plan_abi"
+_SGLANG_ROCM_DFLASH_TARGET_SAMPLING_PATCH_NAME = "rocm_dflash_target_sampling"
 _SGLANG_PATCH_NAMES = {
     "eagle_update_weights",
     "npu_eagle_target_sampling",
+    _SGLANG_ROCM_DFLASH_TARGET_SAMPLING_PATCH_NAME,
     "hidden_states_tensor_output",
     _SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME,
     _SGLANG_FLASHINFER_PLAN_ABI_PATCH_NAME,
@@ -2213,6 +2216,51 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
         logger.warning(
             "Patched SGLang NPU EAGLE sampling for %s", ", ".join(patched_targets)
         )
+
+
+def patch_sglang_rocm_dflash_target_sampling() -> None:
+    """Give SGLang DFlash non-greedy verification on ROCm via the torch target-only sampler.
+
+    SGLang enables DFlash sampling verification only when ``sgl_kernel`` provides
+    ``tree_speculative_sampling_target_only`` (CUDA/MUSA builds); the HIP build does
+    not compile that op. On ROCm DFlash therefore logs "falling back to greedy argmax
+    verification" and every decoded token is the target argmax whatever the requested
+    temperature. RL rollouts are then not samples of the policy (only the first token
+    is sampled), which biases the policy gradient. The chain (topk=1) verify path takes
+    the same arguments as the kernel, so the torch implementation used for NPU EAGLE
+    is installed in ``dflash_utils`` together with torch top-k/top-p renorm.
+    """
+    global _SGLANG_ROCM_DFLASH_SAMPLING_PATCHED
+
+    if _SGLANG_ROCM_DFLASH_SAMPLING_PATCHED or not getattr(torch.version, "hip", None):
+        return
+    try:
+        dflash_utils = importlib.import_module("sglang.srt.speculative.dflash_utils")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang ROCm DFlash target sampling patch: %s", exc)
+        return
+    if not hasattr(dflash_utils, "_DFLASH_SAMPLING_VERIFY_AVAILABLE"):
+        logger.warning(
+            "Skip SGLang ROCm DFlash target sampling patch: this SGLang has no "
+            "dflash_utils._DFLASH_SAMPLING_VERIFY_AVAILABLE switch."
+        )
+        return
+    if dflash_utils._DFLASH_SAMPLING_VERIFY_AVAILABLE:
+        _SGLANG_ROCM_DFLASH_SAMPLING_PATCHED = True
+        return
+    setattr(dflash_utils, "top_k_renorm_prob", _top_k_renorm_prob_torch)
+    setattr(dflash_utils, "top_p_renorm_prob", _top_p_renorm_prob_torch)
+    setattr(
+        dflash_utils,
+        "tree_speculative_sampling_target_only",
+        _tree_speculative_sampling_target_only_torch,
+    )
+    setattr(dflash_utils, "_DFLASH_SAMPLING_VERIFY_AVAILABLE", True)
+    _SGLANG_ROCM_DFLASH_SAMPLING_PATCHED = True
+    logger.warning(
+        "Patched SGLang DFlash verification on ROCm to sample with the torch "
+        "target-only sampler instead of falling back to greedy argmax."
+    )
 
 
 def _is_torch_tensor(value: Any) -> TypeGuard[torch.Tensor]:
@@ -6508,6 +6556,10 @@ def _apply_selected_sglang_patches(
         (_SGLANG_FLASHINFER_PLAN_ABI_PATCH_NAME, patch_sglang_flashinfer_plan_abi),
         ("eagle_update_weights", patch_sglang_eagle_update_weights_from_tensor),
         ("npu_eagle_target_sampling", patch_sglang_npu_eagle_target_sampling),
+        (
+            _SGLANG_ROCM_DFLASH_TARGET_SAMPLING_PATCH_NAME,
+            patch_sglang_rocm_dflash_target_sampling,
+        ),
         ("hidden_states_tensor_output", patch_sglang_hidden_states_tensor_output),
     )
 

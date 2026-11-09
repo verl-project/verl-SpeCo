@@ -31,6 +31,7 @@ SGLANG_QWEN3_ROPE_COMPAT_PATCH = "qwen3_rope_compat"
 SGLANG_EAGLE_UPDATE_WEIGHTS_PATCH = "eagle_update_weights"
 SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCH = "hidden_states_tensor_output"
 SGLANG_NPU_EAGLE_TARGET_SAMPLING_PATCH = "npu_eagle_target_sampling"
+SGLANG_ROCM_DFLASH_TARGET_SAMPLING_PATCH = "rocm_dflash_target_sampling"
 SGLANG_FLASHINFER_PLAN_ABI_PATCH = "flashinfer_plan_abi"
 
 
