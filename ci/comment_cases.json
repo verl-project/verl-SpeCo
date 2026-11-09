@@ -26,6 +26,7 @@
   "npu-dspark-separate": "examples/run_qwen3-8b_drafter_dspark_separate_training.sh",
   "gpu-dspark": "examples/run_qwen3-8b_drafter_dspark_vllm.sh",
   "dspark": "examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh",
+  "rocm-dspark": "examples/run_qwen3-8b_drafter_dspark_vllm_rocm.sh",
   "gpu-eagle3-separate": "examples/run_qwen3-8b_drafter_eagle3_separate_training.sh",
   "gpu-sglang-eagle3": "examples/run_qwen3-8b_drafter_eagle3_sglang.sh",
   "sglang-eagle3": "examples/run_qwen3-8b_drafter_eagle3_sglang_npu.sh",

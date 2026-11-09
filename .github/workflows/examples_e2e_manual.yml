@@ -41,6 +41,7 @@ on:
           - examples/run_qwen3-8b_drafter_dspark_separate_training.sh
           - examples/run_qwen3-8b_drafter_dspark_vllm.sh
           - examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh
+          - examples/run_qwen3-8b_drafter_dspark_vllm_rocm.sh
           - examples/run_qwen3-8b_drafter_eagle3_separate_training.sh
           - examples/run_qwen3-8b_drafter_eagle3_sglang.sh
           - examples/run_qwen3-8b_drafter_eagle3_sglang_npu.sh

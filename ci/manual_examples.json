@@ -24,6 +24,7 @@
   "examples/run_qwen3-8b_drafter_dspark_separate_training.sh": "npu",
   "examples/run_qwen3-8b_drafter_dspark_vllm.sh": "gpu",
   "examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh": "npu",
+  "examples/run_qwen3-8b_drafter_dspark_vllm_rocm.sh": "gpu",
   "examples/run_qwen3-8b_drafter_eagle3_separate_training.sh": "gpu",
   "examples/run_qwen3-8b_drafter_eagle3_sglang.sh": "gpu",
   "examples/run_qwen3-8b_drafter_eagle3_sglang_npu.sh": "npu",
