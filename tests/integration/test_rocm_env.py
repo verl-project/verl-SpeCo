@@ -20,7 +20,11 @@ import sys
 
 import pytest
 
-from verl_speco.integration.rocm_env import neutralize_hip_visible_devices
+from verl_speco.integration import rocm_env
+from verl_speco.integration.rocm_env import (
+    align_visible_devices_with_ray,
+    neutralize_hip_visible_devices,
+)
 
 
 def _set_rocm_build(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
@@ -108,3 +112,26 @@ def test_non_rocm_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert neutralize_hip_visible_devices() is False
     assert _masks() == ("0", "1")
+
+
+@pytest.mark.parametrize(
+    ("ray_keyword", "expected"),
+    [("HIP_VISIBLE_DEVICES", (True, ("2,3", None))), ("CUDA_VISIBLE_DEVICES", (False, (None, "2,3")))],
+)
+def test_cuda_mask_follows_ray_amd_keyword(
+    rocm: pytest.MonkeyPatch, ray_keyword: str, expected: tuple
+) -> None:
+    # Ray >= 2.60 keys AMD GPUs on HIP only; Ray <= 2.56 used CUDA when HIP was unset.
+    rocm.setattr(rocm_env, "_ray_amd_visible_devices_env_var", lambda: ray_keyword)
+    rocm.setenv("CUDA_VISIBLE_DEVICES", "2,3")
+
+    moved, masks = expected
+    assert align_visible_devices_with_ray() is moved
+    assert _masks() == masks
+
+
+def test_align_without_cuda_mask_is_noop(rocm: pytest.MonkeyPatch) -> None:
+    rocm.setattr(rocm_env, "_ray_amd_visible_devices_env_var", lambda: "HIP_VISIBLE_DEVICES")
+
+    assert align_visible_devices_with_ray() is False
+    assert _masks() == (None, None)

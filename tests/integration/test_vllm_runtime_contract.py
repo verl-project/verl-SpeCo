@@ -1642,6 +1642,34 @@ def test_vllm_dspark_restores_target_load_policy_when_draft_load_fails() -> None
     assert vllm_config.load_config is target_load_config
 
 
+@pytest.mark.parametrize("hip", ["7.14.0", None])
+def test_vllm_dspark_should_share_compares_on_cpu_under_rocm(monkeypatch, hip) -> None:
+    import torch
+
+    monkeypatch.setattr(torch.version, "hip", hip)
+
+    def upstream_should_share(*_args):
+        raise AssertionError("GPU torch.equal must not run under ROCm")
+
+    utils_module = SimpleNamespace(
+        load_dspark_model=lambda target_model, _vllm_config: target_model,
+        _should_share=upstream_should_share,
+    )
+    speculator_module = SimpleNamespace(load_dspark_model=None)
+    patch_vllm_dspark_draft_load_config(utils_module, speculator_module)
+
+    if hip is None:
+        assert utils_module._should_share is upstream_should_share
+        return
+    eagle = SimpleNamespace(has_own=True)
+    weight = SimpleNamespace(weight=torch.ones(3))
+    assert utils_module._should_share(eagle, "has_own", weight, weight) is True
+    other = SimpleNamespace(weight=torch.zeros(3))
+    assert utils_module._should_share(eagle, "has_own", weight, other) is False
+    assert utils_module._should_share(eagle, "missing", weight, other) is True
+    assert utils_module._should_share(eagle, "has_own", weight, None) is False
+
+
 def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(
     tmp_path, monkeypatch
 ) -> None:

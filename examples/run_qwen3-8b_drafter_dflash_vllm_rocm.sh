@@ -23,7 +23,8 @@ TRAIN_FILE=${TRAIN_FILE:-/path/to/gsm8k/train.parquet}
 TEST_FILE=${TEST_FILE:-/path/to/gsm8k/test.parquet}
 CKPTS_DIR=${CKPTS_DIR:-/dev/shm/verl_speco_ckpt}
 
-# ROCm + Ray GPU isolation: set ONLY CUDA_VISIBLE_DEVICES, never HIP_VISIBLE_DEVICES.
+# ROCm + Ray GPU isolation: set ONLY CUDA_VISIBLE_DEVICES, never HIP_VISIBLE_DEVICES as well.
+# verl_speco.main hands the mask to Ray as HIP_VISIBLE_DEVICES (Ray 2.60 keys AMD GPUs on it).
 # See run_qwen3-8b_drafter_dflash_sglang_rocm.sh for the full rationale.
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 
