@@ -312,9 +312,13 @@ def _forward_rl_insight_worker_env(config) -> None:
 def run(config) -> None:
     """Resolve SPECO/verl compatibility, device and the task-runner dispatch."""
 
-    from verl_speco.integration.rocm_env import neutralize_hip_visible_devices
+    from verl_speco.integration.rocm_env import (
+        align_visible_devices_with_ray,
+        neutralize_hip_visible_devices,
+    )
 
     neutralize_hip_visible_devices()
+    align_visible_devices_with_ray()
 
     from verl.trainer import main_ppo
     from verl.utils.device import auto_set_device

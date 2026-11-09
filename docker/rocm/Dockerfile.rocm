@@ -1,26 +1,104 @@
 # AMD ROCm (MI300X / MI355X) image for verl-SpeCo, one image for both SGLang and vLLM rollout.
 #
-# The base is verl's ROCm release image (verl docs/amd_tutorial/amd_quick_start.rst, built from
-# verl docker/rocm/Dockerfile.rocm): ROCm 7.14, Python 3.12, torch 2.12.0+rocm7.14,
-# vLLM 0.22.1rc1 (18d87a87d), aiter b5e03ed19, sglang-kernel 0.4.2.post2, verl 0.9.0.dev (7b19203c).
-#
-# The base image builds SGLang from a newer source commit than the release verl-SpeCo supports.
-# This file replaces it with SGLang v0.5.12, installed from source the same way as verl's
-# Dockerfile.rocm (same ROCm layernorm fix, Rust gRPC extension disabled). v0.5.12 pins
-# sglang-kernel==0.4.2.post2, the version already built in the base image, so the kernel package
-# is reused as is.
+# This is verl's ROCm Dockerfile
+# (https://github.com/verl-project/verl/blob/5eb4826694f35d8453ad465b67e3e02cb6b34f07/docker/rocm/Dockerfile.rocm)
+# built from its own base, with these verl-SpeCo changes:
+#   - vLLM v0.26.0 instead of 0.22.1rc1, and xgrammar 0.2.1 (vLLM v0.26.0 requires >= 0.2.1);
+#   - SGLang v0.5.12 (and its sglang-kernel 0.4.2.post2) instead of the 0.5.15 source commit,
+#     with transformers 5.6.2 (v0.5.12 pins 5.6.0, whose flash_attention_forward calls
+#     s_aux.to() on None and breaks every FSDP actor forward; 5.6.1 fixed it);
+#   - verl-SpeCo installed in editable mode with --no-deps on top.
+# It does not depend on a published verl image.
 #
 # Build from the repo root:
 #   docker build -f docker/rocm/Dockerfile.rocm -t verl-speco:rocm .
-ARG BASE_IMAGE=amdagi/verl-dev:rocm7.14_torch2.12_release_0724@sha256:919a8a9b462b3e637e3e50bd704b4d987846619ddb35e10b4f15643db179f0e6
-FROM ${BASE_IMAGE}
+ARG DEFAULT_BASE=rocm/primus:v26.4@sha256:8c8ecc6fe14b5061423cc82517831e3515f6eb15647ee6d746fd6a0c1963da24
+ARG BASE_IMAGE=${DEFAULT_BASE}
+FROM ${BASE_IMAGE:-$DEFAULT_BASE} AS pytorch_base
 
-# SGLang v0.5.12 (tag commit 127b9e3283f7c2a43234b852ff5c9f1796d53624).
+FROM pytorch_base AS install_vllm
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+# Set the working dir explicitly so later RUN steps don't rely on the base
+# image's inherited WORKDIR being /workspace.
+WORKDIR /workspace
+ENV PYTORCH_ROCM_ARCH="gfx942;gfx950"
+
+# Install Causal-Conv1d and its dependencies
+ARG CAUSAL_CONV1D_REPO=https://github.com/Dao-AILab/causal-conv1d
+ARG CAUSAL_CONV1D_BRANCH=e940ead2fd962c56854455017541384909ca669f
+
+ENV CAUSAL_CONV1D_FORCE_BUILD=TRUE
+ENV MAMBA_FORCE_BUILD=TRUE
+ENV HIP_ARCHITECTURES=gfx942,gfx950
+
+RUN cd /workspace \
+    && git clone ${CAUSAL_CONV1D_REPO} causal-conv1d \
+    && cd causal-conv1d \
+    && git checkout ${CAUSAL_CONV1D_BRANCH} \
+    && git show --oneline -s \
+    && pip install --no-cache-dir --no-build-isolation . \
+    && cd .. \
+    && rm -fr causal-conv1d
+
+# vLLM v0.26.0 (tag commit 568afb3a1).
+ARG VLLM_TAG="568afb3a13806beb53bb2e6bd518269357b237c0"
+RUN pip install --no-cache-dir setuptools_scm && \
+    cd /workspace && git clone https://github.com/vllm-project/vllm && \
+    cd vllm && git checkout ${VLLM_TAG} && \
+    # [V1] Add sleep/wake correctness regression test for hybrid GDN
+    # Ref: https://github.com/vllm-project/vllm/pull/44972
+    sed -i 's|\(  // std::cout << "create_and_map:\)|#ifdef USE_ROCM\n  // ROCm: zero freshly mapped VRAM to avoid stale data (PR #44972)\n  CUDA_CHECK((CUresult)hipMemset(reinterpret_cast<void*>(d_mem), 0, size));\n  if (error_code != 0) {\n    return;\n  }\n#endif\n\1|' csrc/cumem_allocator.cpp && \
+    # [Bugfix][MoE] Preserve unquantized weight storage on ROCm
+    # Ref: https://github.com/vllm-project/vllm/pull/46009
+    sed -i 's/layer\.w13_weight\.data = self\._maybe_pad_weight(layer\.w13_weight\.data)/layer.w13_weight.data.copy_(self._maybe_pad_weight(layer.w13_weight.data))/' \
+      /workspace/vllm/vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py && \
+    sed -i 's/layer\.w2_weight\.data = self\._maybe_pad_weight(layer\.w2_weight\.data)/layer.w2_weight.data.copy_(self._maybe_pad_weight(layer.w2_weight.data))/' \
+      /workspace/vllm/vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py && \
+    sed -i 's/return w13_weight\.contiguous(), w2_weight\.contiguous()/return w13_weight, w2_weight/' \
+      /workspace/vllm/vllm/model_executor/layers/fused_moe/oracle/unquantized.py && \
+    grep -q "hipMemset" csrc/cumem_allocator.cpp && \
+    grep -q "layer.w13_weight.data.copy_" vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py && \
+    grep -q "return w13_weight, w2_weight" vllm/model_executor/layers/fused_moe/oracle/unquantized.py && \
+    pip install --no-cache-dir -r requirements/rocm.txt && \
+    MAX_JOBS=64 python3 setup.py develop --no-deps
+RUN pip uninstall tilelang -y && pip install --no-cache-dir --no-deps xgrammar==0.2.1
+
+
+FROM install_vllm AS install_verl
+ARG VERL_TAG="7b19203c52503760f92e0368067c7eb744236274"
+RUN cd /workspace && git clone https://github.com/verl-project/verl.git && \
+    cd verl && git checkout ${VERL_TAG} && \
+    git submodule update --init --recursive && \
+    sed -i 's/^  vllm: {}/  vllm:\n    disable_custom_all_reduce: True/' /workspace/verl/verl/trainer/config/rollout/rollout.yaml && \
+    sed -i 's/^  sglang: {}/  sglang:\n    disable_custom_all_reduce: True\n    attention_backend: triton/' /workspace/verl/verl/trainer/config/rollout/rollout.yaml && \
+    pip install --no-cache-dir . 
+    
+# for qwen3.5 — versions pinned to what was validated on this image for reproducibility.
+RUN pip install --no-cache-dir \
+    "git+https://github.com/ISEEKYAN/mbridge.git@a61943d7fcb34a190471cfeb0a0eb8bbda621ddf" \
+    mcore_bridge==1.5.2 \
+    megatron-core==0.18.0 \
+    mathruler==0.1.0 \
+    qwen_vl_utils==0.0.14 \
+    datasets==5.0.0 \
+    accelerate==1.14.0 \
+    TransferQueue==0.1.11 \
+    flash-linear-attention==0.5.1
+
+RUN pip install --no-cache-dir cupy-rocm-7-0==14.1.1
+
+FROM install_verl AS install_sglang
+
+ENV SGLANG_USE_AITER=0
+ENV SGLANG_ATTENTION_BACKEND=triton
+# SGLang v0.5.12 (tag commit 127b9e328).
 ARG SGLANG_TAG="127b9e3283f7c2a43234b852ff5c9f1796d53624"
-RUN cd /workspace && rm -rf sglang && git clone https://github.com/sgl-project/sglang.git && \
+
+RUN cd /workspace && git clone https://github.com/sgl-project/sglang.git && \
     cd sglang && git checkout ${SGLANG_TAG} && \
     # [Bugfix][ROCm] Fix vllm fused_add_rms_norm 6-arg crash on non-AITER path
-    # Ref: https://github.com/sgl-project/sglang/pull/32034 (same patch as verl's Dockerfile.rocm)
+    # Ref: https://github.com/sgl-project/sglang/pull/32034
     sed -zi 's/            out = torch.empty_like(x)\n            residual_out = torch.empty_like(x)\n            if post_residual_addition is not None:\n                residual = residual + post_residual_addition\n            fused_add_rms_norm(\n                out, x, residual_out, residual, self.weight.data, self.variance_epsilon\n            )\n            return out, residual_out/            if post_residual_addition is not None:\n                residual = residual + post_residual_addition\n            residual = residual.contiguous()\n            fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)\n            return x, residual/' \
       python/sglang/srt/layers/layernorm.py && \
     sed -zi 's/                out = torch.empty_like(x)\n                residual_out = torch.empty_like(x)\n                if post_residual_addition is not None:\n                    residual = residual + post_residual_addition\n                fused_add_rms_norm(\n                    out, x, residual_out, residual, w, self.variance_epsilon\n                )\n                return out, residual_out/                if post_residual_addition is not None:\n                    residual = residual + post_residual_addition\n                residual = residual.contiguous()\n                fused_add_rms_norm(x, residual, w, self.variance_epsilon)\n                return x, residual/' \
@@ -28,20 +106,81 @@ RUN cd /workspace && rm -rf sglang && git clone https://github.com/sgl-project/s
     grep -q "fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)" python/sglang/srt/layers/layernorm.py && \
     grep -q "fused_add_rms_norm(x, residual, w, self.variance_epsilon)" python/sglang/srt/layers/layernorm.py && \
     sed -i 's|^\[\[tool.setuptools-rust.ext-modules\]\]|# [[tool.setuptools-rust.ext-modules]]|; s|^target = "sglang.srt.grpc._core"|# target = "sglang.srt.grpc._core"|; s|^path = "../rust/sglang-grpc/Cargo.toml"|# path = "../rust/sglang-grpc/Cargo.toml"|; s|^binding = "PyO3"|# binding = "PyO3"|' python/pyproject.toml && \
-    pip install --no-cache-dir --no-build-isolation --no-deps -e ./python && \
-    python -c "import importlib.metadata as md, sgl_kernel; \
-v = md.version('sglang'); k = md.version('sglang-kernel'); print('sglang', v, 'sglang-kernel', k); \
-assert v == '0.5.12', v; assert k == '0.4.2.post2', k"
+    pip install --no-cache-dir --no-build-isolation --no-deps \
+      -e ./python \
+      IPython \
+      soundfile==0.13.1 \
+      "git+https://github.com/fzyzcjy/torch_memory_saver.git" && \
+    cd sgl-kernel && cp pyproject_rocm.toml pyproject.toml && rm -rf build && \
+    sed -i 's|f"--amdgpu-target={amdgpu_target}"|"--offload-arch=gfx942", "--offload-arch=gfx950"|' setup_rocm.py && \
+    sed -i '/amdgpu_target not in \["gfx942", "gfx950"\]/,/sys.exit(1)/d' setup_rocm.py && \
+    sed -zi 's/#if HIP_FP8_TYPE_FNUZ\n#include <c10\/util\/Float8_e4m3fnuz.h>\nusing FP8_TYPE = c10::Float8_e4m3fnuz;\nconstexpr auto FP8_E4M3_MAX = 224.0f;\n#else\n#if HIP_FP8_TYPE_E4M3\n#include <c10\/util\/Float8_e4m3fn.h>\nusing FP8_TYPE = c10::Float8_e4m3fn;\nC10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();\n#else\n#error "fp8 is not supported in this processor (arch < gfx942)."\n#endif  \/\/ HIP_FP8_TYPE_E4M3\n#endif  \/\/ HIP_FP8_TYPE_FNUZ/#if defined(__gfx942__)\n#include <c10\/util\/Float8_e4m3fnuz.h>\nusing FP8_TYPE = c10::Float8_e4m3fnuz;\nconstexpr auto FP8_E4M3_MAX = 224.0f;\n#else\n#include <c10\/util\/Float8_e4m3fn.h>\nusing FP8_TYPE = c10::Float8_e4m3fn;\nC10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();\n#endif  \/\/ __gfx942__/' include/utils.h && \
+    grep -q "#if defined(__gfx942__)" include/utils.h && \
+    python setup_rocm.py install && \
+    pip install --no-cache-dir transformers==5.6.2
+# SGLang v0.5.12 imports IPython (sglang/utils.py) and gguf (the GGUF quantization module) at
+# engine import; the --no-deps install above leaves IPython's dependencies and gguf missing.
+RUN pip install --no-cache-dir ipython==9.18.1 gguf==0.19.0
+# torch preloads HIP and comgr from _rocm_sdk_core by path, while the base LD_LIBRARY_PATH resolves
+# them from _rocm_sdk_devel (separate copies). A library that loads first, such as the
+# torch_memory_saver LD_PRELOAD in SGLang's scheduler, then pulls in a second LLVM and the process
+# aborts on import torch ("Option 'spirv-expand-step' registered more than once"). Resolve to core.
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/_rocm_sdk_core/lib:${LD_LIBRARY_PATH}"
 
+# [Patch] megatron-core attention backend: assert → warn + override
+# Base image sets NVTE_FLASH_ATTN=0/NVTE_FUSED_ATTN=1 which conflicts with
+# megatron-core's attention_backend config (flash or auto).
+RUN sed -i \
+    's/            assert current_value is None or current_value == str(/            if current_value is not None and current_value != str(expected_value):/' \
+    /opt/venv/lib/python3.12/site-packages/megatron/core/models/common/language_module/language_module.py && \
+    sed -i \
+    's/                expected_value/                import warnings/' \
+    /opt/venv/lib/python3.12/site-packages/megatron/core/models/common/language_module/language_module.py && \
+    sed -i \
+    "s/            ), f'{env_variable_name} set to {current_value}, but expected {expected_value} for attention backend type {attn_type.name}. unset NVTE_FLASH_ATTN, NVTE_FUSED_ATTN and NVTE_UNFUSED_ATTN. Use the --attention-backend argument if you want to choose between (flash\/fused\/unfused\/auto\/local). Default is auto.'/                warnings.warn(f'{env_variable_name} was {current_value}, overriding to {expected_value} for attention backend {attn_type.name}')/" \
+    /opt/venv/lib/python3.12/site-packages/megatron/core/models/common/language_module/language_module.py
+
+ENV NVTE_USE_GROUPED_GEMM_TRITON=1
+ENV NCCL_DEBUG=ERROR
+ENV ROCPROFILER_LOG_LEVEL=fatal
+ENV HSA_ENABLE_IPC_MODE_LEGACY=1
+ENV PYTORCH_ALLOC_CONF=expandable_segments:True
+ENV MIOPEN_DEBUG_FORCE_IMMED_MODE_FALLBACK=1
+RUN SP="$(python -c 'import site; print(site.getsitepackages()[0])')"; \
+    ln -sfn "$SP/_rocm_sdk_core/share/amd_smi/amdsmi" "$SP/amdsmi"
+RUN apt-get update && apt-get install -y --no-install-recommends vim \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clean build artifacts and caches
+RUN rm -rf /*.whl \
+    && rm -rf /root/.cache \
+    && rm -rf /root/.triton \
+    && rm -rf /workspace/aiter/aiter/jit/build \
+    && rm -rf /workspace/TransformerEngine
+
+# Training docker manifest
+ARG GIT_COMMIT_TAG=DEV
+ARG DOCKERFILE_PATH=Dockerfile
+
+# Copy patch files for training docker versioning
+RUN mkdir -p /workspace/.manifest \
+    && env > /workspace/.manifest/env.txt \
+    && pip list > /workspace/.manifest/requirements.txt \
+    && dpkg -l > /workspace/.manifest/dpkg-list.txt \
+    && echo "${GIT_COMMIT_TAG}" > /workspace/.manifest/training_docker_version
+
+
+FROM install_sglang AS install_verl_speco
 COPY . /workspace/verl-SpeCo
 WORKDIR /workspace/verl-SpeCo
-# --no-deps keeps the base image's ROCm torch, vLLM, SGLang kernels and verl untouched.
+# --no-deps keeps the ROCm torch, vLLM, SGLang and verl built above untouched.
+# vLLM reports 0.26.1.dev0+g568afb3a1...: the ROCm patches above leave its tree dirty,
+# so setuptools_scm bumps past the v0.26.0 tag. Check the commit instead.
 RUN pip install --no-cache-dir --no-deps -e . \
     && python -c "import importlib.metadata as md, torch, verl, verl_speco; \
 assert torch.version.hip, 'expected a ROCm torch build'; \
-print('torch', torch.__version__, 'hip', torch.version.hip); \
-print('vllm', md.version('vllm'), 'sglang', md.version('sglang')); \
-print('verl', verl.__version__, verl.__file__); \
-print('verl_speco', verl_speco.__version__)"
+v = {p: md.version(p) for p in ('vllm', 'sglang', 'sglang-kernel', 'transformers', 'xgrammar')}; print(v); \
+assert 'g568afb3a1' in v['vllm'], v; assert v['sglang'] == '0.5.12', v; \
+print('torch', torch.__version__, 'hip', torch.version.hip, 'verl', verl.__version__, 'verl_speco', verl_speco.__version__)"
 
-CMD ["/bin/bash"]
+CMD ["/usr/bin/bash"]

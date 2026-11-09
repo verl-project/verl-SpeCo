@@ -2582,6 +2582,37 @@ def _vllm_ascend_has_dspark_pr11153_k_query_runtime() -> bool:
     return False
 
 
+def _patch_vllm_dspark_should_share_rocm(dspark_utils_module: Any) -> bool:
+    """Compare draft/target embed and lm_head weights on the CPU under ROCm.
+
+    MRV2 loads the draft inside the sleep-mode ``CuMemAllocator`` pool, and on
+    ROCm (torch 2.12 / ROCm 7.14) any GPU ``.item()`` there segfaults the
+    worker. ``_should_share`` calls ``torch.equal`` on GPU, which ends in
+    ``.item()``. Its CPU fallback branch avoids the GPU sync, so use it always.
+    """
+
+    current = getattr(dspark_utils_module, "_should_share", None)
+    if not callable(current) or getattr(current, "_speco_rocm_cpu_compare", False):
+        return False
+    try:
+        import torch
+    except Exception:  # noqa: BLE001
+        return False
+    if getattr(torch.version, "hip", None) is None:
+        return False
+
+    def should_share_cpu_compare(eagle, flag, draft, target) -> bool:
+        if not getattr(eagle, flag, False) or draft is None:
+            return True
+        if target is None:
+            return False
+        return torch.equal(draft.weight.cpu(), target.weight.cpu())
+
+    should_share_cpu_compare._speco_rocm_cpu_compare = True
+    dspark_utils_module._should_share = should_share_cpu_compare
+    return True
+
+
 def patch_vllm_dspark_draft_load_config(
     dspark_utils_module: Any = None,
     dspark_speculator_module: Any = None,
@@ -2612,6 +2643,7 @@ def patch_vllm_dspark_draft_load_config(
             logger.debug("Unable to install vLLM DSpark draft-load patch: %s", exc)
             return False
 
+    _patch_vllm_dspark_should_share_rocm(dspark_utils_module)
     current = getattr(dspark_utils_module, "load_dspark_model", None)
     if not callable(current):
         return False
