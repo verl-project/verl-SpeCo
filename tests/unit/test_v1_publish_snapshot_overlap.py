@@ -108,7 +108,8 @@ def _driver():
     driver.speco_maybe_publish = lambda **kw: pytest.fail("duplicate snapshot RPC")
 
     @contextmanager
-    def boundary(*, timings=None):
+    def boundary(*, timings=None, publish_boundary=False):
+        assert publish_boundary
         yield
 
     driver._speco_v1_quiescent_boundary = boundary
