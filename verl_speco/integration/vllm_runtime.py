@@ -2608,7 +2608,7 @@ def _patch_vllm_dspark_should_share_rocm(dspark_utils_module: Any) -> bool:
             return False
         return torch.equal(draft.weight.cpu(), target.weight.cpu())
 
-    should_share_cpu_compare._speco_rocm_cpu_compare = True
+    setattr(should_share_cpu_compare, "_speco_rocm_cpu_compare", True)
     dspark_utils_module._should_share = should_share_cpu_compare
     return True
 
