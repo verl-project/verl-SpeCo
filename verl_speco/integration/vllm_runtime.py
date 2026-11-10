@@ -1263,12 +1263,17 @@ def _ensure_vllm_server_drafter_env(
         # config may have lost private drafter fields during validation. Carry
         # this opt-out separately, without changing event-bus source selection.
         resolved = candidate
+        embedded_training = embedded_config.get("training", {})
+        if "drafter_opd" in embedded_training:
+            resolved = dict(resolved)
+            resolved["training"] = dict(resolved.get("training", {}))
+            resolved["training"]["drafter_opd"] = embedded_training["drafter_opd"]
         for control in (embedded_config, candidate, env_config):
             options = control.get("vllm") or {}
             if "acceptance_sidecar_enabled" not in options:
                 continue
-            resolved = dict(candidate)
-            resolved["vllm"] = dict(candidate.get("vllm") or {})
+            resolved = dict(resolved)
+            resolved["vllm"] = dict(resolved.get("vllm") or {})
             resolved["vllm"]["acceptance_sidecar_enabled"] = options[
                 "acceptance_sidecar_enabled"
             ]
@@ -1289,6 +1294,11 @@ def _ensure_vllm_server_drafter_env(
         )
         if candidate and configured_bus_name:
             return restore(candidate, source)
+
+    # Sync scheduling has no idle bus. Its embedded launcher snapshot still
+    # carries private training fields removed from the upstream server config.
+    if embedded_config and not server_config and not env_config:
+        return restore(embedded_config, "server_class")
 
     env_bus_name = _rollout_idle_event_bus_name(env_config)
     server_bus_name = _rollout_idle_event_bus_name(server_config)
@@ -3086,9 +3096,27 @@ def patch_vllm_request_acceptance_stats() -> bool:
     ):
 
         def patched_update_from_output(self, scheduler_output, model_runner_output):
+            opd_cfg = _load_env_drafter_config()
+            capture = opd_cfg.get("training", {}).get("drafter_opd", {}).get("capture_verify_trace", False)
+            if capture:
+                from verl_speco.integration.verify_trace import snapshot_verify_step
+                if self.num_sampled_tokens_per_step != 1:
+                    raise ValueError("Draft-OPD requires one target correction/bonus token per step")
+                snapshots = snapshot_verify_step(self, scheduler_output, model_runner_output)
             engine_core_outputs = original_update_from_output(
                 self, scheduler_output, model_runner_output
             )
+            if capture:
+                from verl_speco.integration.verify_trace import TRACE_KEY, finish_verify_step
+                traces = finish_verify_step(
+                    snapshots, layout=_drafter_algorithm(opd_cfg).lower(),
+                    capacity=int(self.num_spec_tokens))
+                store = _speco_vllm_request_stats_store(self)
+                for rid, trace in traces.items():
+                    item = store.setdefault(rid, {"verify_rounds": 0, "draft_tokens": 0,
+                                                  "accepted_tokens": 0, "invalid_spec_tokens": 0,
+                                                  "started_sec": time.perf_counter()})
+                    item[TRACE_KEY] = trace
             try:
                 finished_outputs = []
                 for client_outputs in engine_core_outputs.values():
@@ -3573,7 +3601,7 @@ def _vllm_request_accept_fields_from_summaries(
         completion_indices.append(_int_or_zero(item.get("completion_index", 0)))
         mean_accept_len.append(request_mean_accept_len)
         elapsed_sec.append(request_elapsed_sec)
-    return {
+    fields = {
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_id": ordered_ids,
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_verify_rounds": verify_rounds,
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_draft_tokens": draft_tokens,
@@ -3583,6 +3611,9 @@ def _vllm_request_accept_fields_from_summaries(
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_elapsed_sec": elapsed_sec,
         "_verl_request_mean_accept_len": mean_accept_len,
     }
+    if any("_speco_verify_trace" in summaries[rid] for rid in ordered_ids):
+        fields["_speco_verify_trace"] = [summaries[rid].get("_speco_verify_trace") for rid in ordered_ids]
+    return fields
 
 
 def _ordered_request_ids_from_summaries(
@@ -4273,6 +4304,15 @@ async def _speco_generate_with_request_stats_unblocked(
             )
 
             bridge_request_acceptance_counters(extra_fields)
+            if _load_env_drafter_config().get("training", {}).get("drafter_opd", {}).get("capture_verify_trace", False):
+                from verl_speco.integration.verify_trace import TRACE_KEY, token_digest
+                trace = extra_fields[TRACE_KEY]
+                prompt_ids = kwargs["prompt_ids"] if "prompt_ids" in kwargs else args[0]
+                if trace["response_length"] != len(output.token_ids):
+                    raise ValueError("Draft-OPD trace and returned response length differ")
+                trace["prefix_digest"] = token_digest([*prompt_ids, *output.token_ids])
+                trace["drafter_revision_min"] = min(revision_before, revision_after)
+                trace["drafter_revision_max"] = max(revision_before, revision_after)
             elapsed_key = f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_elapsed_sec"
             if (
                 extra_fields.get("_verl_request_mean_accept_len") is not None
@@ -4765,6 +4805,28 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
         return {}
     drafter_cfg = _drafter_config_from_config(config)
     enabled = bool(drafter_cfg.get("enable"))
+    opd_cfg = drafter_cfg.get("training", {}).get("drafter_opd", {})
+    if opd_cfg.get("enable", False):
+        if not enabled or not opd_cfg.get("capture_verify_trace", False):
+            raise ValueError("Draft-OPD requires drafter.enable and capture_verify_trace")
+        if _drafter_algorithm(drafter_cfg) not in {"DFLASH", "DSPARK"}:
+            raise ValueError("Draft-OPD supports DFLASH and DSPARK")
+        is_dflash = _drafter_algorithm(drafter_cfg) == "DFLASH"
+        block_key = "dflash_block_size" if is_dflash else "dspark_block_size"
+        block_size = int(drafter_cfg["training"].get(block_key, 16 if is_dflash else 7))
+        capacity = block_size - int(is_dflash)
+        verify_tokens = drafter_cfg.get("rollout", {}).get("spec_verify_tokens")
+        if verify_tokens != capacity:
+            raise ValueError(
+                "Draft-OPD requires rollout.spec_verify_tokens to match training draft capacity: "
+                f"spec_verify_tokens={verify_tokens}, {block_key}={block_size}, "
+                f"expected spec_verify_tokens={capacity}. "
+                "DFlash block_size includes the anchor; DSpark block_size counts draft positions."
+            )
+        if _get_nested(config, ("trainer", "device"), "cuda") != "cuda":
+            raise ValueError("Draft-OPD currently supports GPU only")
+        if drafter_cfg["training"].get("packing", {}).get("enable", False):
+            raise ValueError("Draft-OPD currently requires packing.enable=false")
     if not enabled:
         clear_drafter_config_env()
         # V1 creates standalone rollout replicas even without speculative

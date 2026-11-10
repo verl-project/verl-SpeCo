@@ -309,6 +309,14 @@ actor_rollout_ref:
         # Temperature used for both target and draft distributions in LK losses.
         # Set this to actor_rollout_ref.rollout.temperature for probabilistic drafts.
         # VAT KD defaults: DFlash=1, DSpark=0; acceptance is a greedy proxy.
+        drafter_opd:
+          enable: false
+          capture_verify_trace: false
+          anchor_planner: mixed
+          random_anchor_ratio: 0.25
+          loss: e2e_tv
+          first_reject_weight: 2.0
+          chunk_size: 1024
         vat:
           kd_weight: null
           kd_temperature: 2.0

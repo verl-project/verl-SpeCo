@@ -73,6 +73,7 @@ class VATObjective(nn.Module):
         active_mask,
         target_ids,
         confidence_logits=None,
+        observed_accepted=None,
     ):
         if target_hidden is None:
             raise ValueError("VAT requires dflash_aux_plus_last target hidden states")
@@ -90,6 +91,13 @@ class VATObjective(nn.Module):
         valid = base_mask[..., offset:] > 0
         match = matches[..., offset:]
         accepted = (match & valid).long().cumprod(-1).sum(-1, keepdim=True)
+        sim_accepted = accepted
+        if observed_accepted is not None:
+            accepted = torch.where(observed_accepted.unsqueeze(-1) >= 0,
+                                   observed_accepted.unsqueeze(-1), accepted)
+            match = torch.where(observed_accepted.unsqueeze(-1) >= 0,
+                                torch.arange(valid.shape[-1], device=logits.device) < accepted,
+                                match)
         j = torch.arange(valid.shape[-1], device=logits.device)
         decay = torch.exp(-(j - accepted).clamp_min(0).float() / self.gamma)
         weights = base_mask.clone()
@@ -147,4 +155,10 @@ class VATObjective(nn.Module):
             "vat/mean_accepted": (accepted.squeeze(-1) * blocks).sum()
             / blocks.sum().clamp_min(1),
         }
+        if observed_accepted is not None:
+            traced = (observed_accepted >= 0) * blocks
+            metrics["vat/sim_vs_obs_visible_accept_gap"] = (
+                (sim_accepted.squeeze(-1) - torch.minimum(
+                    observed_accepted, valid.long().cumprod(-1).sum(-1))).float().abs() * traced
+            ).sum() / traced.sum().clamp_min(1)
         return weights, loss, metrics

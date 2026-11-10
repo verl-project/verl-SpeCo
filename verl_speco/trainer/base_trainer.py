@@ -1175,8 +1175,13 @@ class DrafterBaseTrainer:
             metrics[f"{prefix}/loss"] = sums[f"{prefix}/loss"] / steps
         vat_batches = sums.get(f"{prefix}/vat/batch_count", 0.0)
         if vat_batches > 0:
-            for key in ("kd_loss", "accept_loss", "self_cov_loss", "ce_loss", "mean_accepted"):
-                metrics[f"{prefix}/vat/{key}"] = sums[f"{prefix}/vat/{key}"] / vat_batches
+            for key in ("kd_loss", "accept_loss", "self_cov_loss", "ce_loss", "mean_accepted", "sim_vs_obs_visible_accept_gap"):
+                if f"{prefix}/vat/{key}" in sums:
+                    metrics[f"{prefix}/vat/{key}"] = sums[f"{prefix}/vat/{key}"] / vat_batches
+        opd_batches = sums.get(f"{prefix}/opd/batch_count", 0.0)
+        if opd_batches > 0:
+            for key in ("loss", "trace_blocks", "random_blocks", "visible_tokens"):
+                metrics[f"{prefix}/opd/{key}"] = sums[f"{prefix}/opd/{key}"] / opd_batches
         selector_weight = sums.get(f"{prefix}/selector_weight_count", 0.0)
         if selector_weight > 0:
             metrics[f"{prefix}/selector_loss"] = (
@@ -1380,8 +1385,10 @@ class DrafterBaseTrainer:
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
             "loss_mode_id": f"{prefix}/loss_mode_id",
         }
-        for key in ("kd_loss", "accept_loss", "self_cov_loss", "ce_loss", "mean_accepted", "batch_count"):
+        for key in ("kd_loss", "accept_loss", "self_cov_loss", "ce_loss", "mean_accepted", "batch_count", "sim_vs_obs_visible_accept_gap"):
             scalar_keys[f"vat/{key}"] = f"{prefix}/vat/{key}"
+        for key in ("loss", "trace_blocks", "random_blocks", "visible_tokens", "batch_count"):
+            scalar_keys[f"opd/{key}"] = f"{prefix}/opd/{key}"
         vector_keys = {
             "loss_sum_per_position": f"{prefix}/loss_sum_per_position",
             "correct_per_position": f"{prefix}/correct_per_position",
@@ -4352,6 +4359,7 @@ class DrafterBaseTrainer:
                     batch.get("_verl_request_mean_accept_len"),
                     i,
                 ),
+                "_speco_verify_trace": _batch_item_value(batch.get("_speco_verify_trace"), i),
                 "_speco_vllm_request_id": _batch_item_value(
                     batch.get("_speco_vllm_request_id"), i
                 ),
@@ -4399,6 +4407,17 @@ class DrafterBaseTrainer:
                     else None
                 ),
             }
+            if data_item["_speco_verify_trace"] is not None:
+                from verl_speco.integration.verify_trace import align_trace_to_prompt
+                if cpu_prompts is None:
+                    raise ValueError("Draft-OPD collection requires prompt token coordinates")
+                data_item["_speco_verify_trace"] = align_trace_to_prompt(
+                    data_item["_speco_verify_trace"], cpu_prompts[i].numel())
+                if batch.get("response_mask") is None:
+                    raise ValueError("Draft-OPD collection requires the agent response_mask")
+                response_mask = batch["response_mask"][i].detach().cpu().float()[:response_len]
+                full_loss_mask[prompt_len:prompt_len+response_len] = response_mask
+                data_item["loss_mask"] = full_loss_mask[feature_start:feature_end]
             if shifted_block_labels:
                 if not 0 <= feature_start < feature_end < input_seq_length:
                     raise ValueError(
@@ -5320,6 +5339,8 @@ class DrafterBaseTrainer:
         packed_loss_tokens = 0
         trailing_label_rows = 0
         packing_enabled = self._packing_enabled()
+        if packing_enabled and "opd_trace" in preprocessed_lists:
+            raise ValueError("Draft-OPD currently requires packing=false")
 
         # Build training chunks inside each sample before packing. EAGLE3-style
         # models use next-token chunks, while DFlash keeps same-position blocks
@@ -5337,6 +5358,7 @@ class DrafterBaseTrainer:
         label_id_chunks = []
         label_mask_chunks = []
 
+        opd_trace_chunks = []
         ids_list = preprocessed_lists["ids"]
         hidden_list = preprocessed_lists["h_states"]
         mask_list = preprocessed_lists["masks"]
@@ -5790,6 +5812,8 @@ class DrafterBaseTrainer:
                             },
                         )
 
+            if "opd_trace" in preprocessed_lists:
+                opd_trace_chunks.append(preprocessed_lists["opd_trace"][item_idx][:train_seq_len])
             if uses_shifted_eagle_inputs or self.backend.model_type == "peagle":
                 input_id_chunks.append(ids[1 : 1 + train_seq_len])
                 hidden_state_chunks.append(h_states[:train_seq_len])
@@ -6216,6 +6240,10 @@ class DrafterBaseTrainer:
             and target_last_hidden_state_chunks
         ):
             batch["target_last_hidden_states"] = target_last_hidden_states
+        if opd_trace_chunks:
+            batch["opd_trace"] = torch.full((*input_ids.shape, 3), -1, dtype=torch.long, device=dev)
+            for row, trace in enumerate(opd_trace_chunks):
+                batch["opd_trace"][row, :trace.size(0)] = trace
         if document_ids is not None:
             batch["document_ids"] = document_ids
         batch["_speco_pad_size"] = pad_size_for_batch

@@ -157,6 +157,35 @@ def test_vllm_server_restores_idle_event_config_from_server_config(monkeypatch) 
     assert _rollout_idle_event_bus_name(resolved) == "bubble-bus"
 
 
+@pytest.mark.parametrize("has_server_config", [False, True])
+def test_vllm_server_restores_sync_opd_config_without_idle_bus(
+    monkeypatch, has_server_config
+):
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    monkeypatch.delenv("VERL_SPECO_SGLANG_DRAFTER_CONFIG", raising=False)
+    runtime_config = _drafter(
+        training={
+            "scheduler": {"execution": {"strategy": "sync"}},
+            "drafter_opd": {"enable": True, "capture_verify_trace": True},
+        }
+    )
+    server_config = (
+        _drafter(
+            training={
+                "scheduler": {"execution": {"strategy": "sync"}},
+            }
+        )
+        if has_server_config
+        else {}
+    )
+    resolved, source = _ensure_vllm_server_drafter_env(
+        {"rollout": {"drafter": server_config}}, json.dumps(runtime_config)
+    )
+    assert source == ("server_config" if has_server_config else "server_class")
+    assert resolved == runtime_config
+    assert vllm_runtime._load_env_drafter_config() == runtime_config
+
+
 def test_vllm_server_uses_embedded_runtime_config_when_server_config_is_stale(
     monkeypatch,
 ) -> None:
@@ -1243,6 +1272,44 @@ def test_vllm_speculative_config_maps_dflash_contract() -> None:
         "model": "/models/drafter",
         "num_speculative_tokens": 16,
     }
+
+
+@pytest.mark.parametrize(
+    "algorithm,block_size,verify_tokens,valid",
+    [
+        ("DFLASH", 16, 16, False),
+        ("DFLASH", 16, 15, True),
+        ("DSPARK", 7, 6, False),
+        ("DSPARK", 7, 7, True),
+    ],
+)
+def test_opd_capacity_is_checked_before_rollout_start(
+    monkeypatch, algorithm, block_size, verify_tokens, valid
+):
+    bridge_calls = []
+    monkeypatch.setattr(
+        vllm_runtime,
+        "install_upstream_vllm_runtime_bridge",
+        lambda: bridge_calls.append(True) or True,
+    )
+    monkeypatch.setattr(vllm_runtime, "_is_vllm_ascend_runtime_hint", lambda: False)
+    drafter = _drafter(
+        speculative_algorithm=algorithm,
+        rollout={"spec_verify_tokens": verify_tokens},
+        training={
+            "drafter_opd": {"enable": True, "capture_verify_trace": True},
+            f"{algorithm.lower()}_block_size": block_size,
+        },
+    )
+    config = {"actor_rollout_ref": {"rollout": {"name": "vllm", "drafter": drafter}}}
+    if valid:
+        result = configure_vllm_runtime_from_config(config)
+        assert result["num_speculative_tokens"] == verify_tokens
+        assert bridge_calls == [True]
+    else:
+        with pytest.raises(ValueError, match="Draft-OPD.*spec_verify_tokens"):
+            configure_vllm_runtime_from_config(config)
+        assert bridge_calls == []
 
 
 def test_vllm_speculative_config_maps_dspark_to_native_gpu_contract(

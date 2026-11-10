@@ -2302,3 +2302,109 @@ def test_dspark_vat_acceptance_includes_markov_bias(draft_id, expected):
         loss_mask=torch.ones(1, 5), lm_head_weight=torch.zeros(32, 8),
         target_last_hidden_states=torch.randn(1, 5, 8))
     assert diagnostics["vat/mean_accepted"].item() == expected
+
+
+@pytest.mark.parametrize("model_type", ["dflash", "dspark"])
+@pytest.mark.parametrize("loss_type", ["ce", "e2e_tv"])
+@pytest.mark.parametrize("vat,empty", [(False, False), (False, True), (True, False), (True, True)])
+def test_drafter_opd_backends_forward_backward(model_type, loss_type, vat, empty):
+    config_cls = DFlashConfig if model_type == "dflash" else DSparkConfig
+    draft_cls = DFlashDraftModel if model_type == "dflash" else DSparkDraftModel
+    training_cls = DFlashTrainingModel if model_type == "dflash" else DSparkTrainingModel
+    config = config_cls(hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+                        num_attention_heads=2, num_key_value_heads=1, vocab_size=32,
+                        num_target_layers=4, num_context_layers=2, target_hidden_size=8,
+                        target_num_hidden_layers=4, target_layer_ids=[1, 3],
+                        mask_token_id=31, markov_rank=4, enable_confidence_head=True)
+    model = training_cls(draft_cls(config), block_size=3, num_anchors=2,
+                         per_position_loss_weight="vat" if vat else "fixed_exp_decay",
+                         drafter_opd_config={"enable": True, "anchor_planner": "trace", "loss": loss_type})
+    ids = torch.tensor([[1, 2, 3, 4, 5]])
+    plan = torch.full((1, 5, 3), -1)
+    if not empty:
+        plan[0, 1] = torch.tensor([0, 1, 1])
+        plan[0, 3] = torch.tensor([2, 1, 1])  # EOS hides the later rejection.
+    loss, *_rest, diagnostics = model(
+        input_ids=ids, hidden_states_list=[torch.randn(1, 5, 8), torch.randn(1, 5, 8)],
+        loss_mask=torch.ones(1, 5), lm_head_weight=torch.randn(32, 8),
+        target_last_hidden_states=torch.randn(1, 5, 8), opd_trace=plan)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert diagnostics["opd/visible_tokens"].item() == (0 if empty else 2)
+    assert diagnostics["opd/trace_blocks"].item() == (0 if empty else 2)
+    if model_type == "dspark" and empty:
+        assert all(parameter.grad is not None for name, parameter in model.named_parameters()
+                   if parameter.requires_grad and "markov" in name)
+    if vat:
+        head = model.vat_objective.accept_head if model_type == "dflash" else model.draft_model.confidence_head
+        assert all(parameter.grad is not None for parameter in head.parameters())
+
+
+@pytest.mark.parametrize("model_type", ["dflash", "dspark"])
+@pytest.mark.parametrize("vat", [False, True])
+def test_drafter_opd_e2e_backends_apply_first_rejection_weight(model_type, vat):
+    torch.manual_seed(19)
+    config_cls = DFlashConfig if model_type == "dflash" else DSparkConfig
+    draft_cls = DFlashDraftModel if model_type == "dflash" else DSparkDraftModel
+    training_cls = DFlashTrainingModel if model_type == "dflash" else DSparkTrainingModel
+    config = config_cls(
+        hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1, vocab_size=32,
+        num_target_layers=4, num_context_layers=2, target_hidden_size=8,
+        target_num_hidden_layers=4, target_layer_ids=[1, 3],
+        mask_token_id=31, markov_rank=4, enable_confidence_head=True,
+    )
+    model = training_cls(
+        draft_cls(config), block_size=3, num_anchors=2,
+        per_position_loss_weight="vat" if vat else "fixed_exp_decay",
+        drafter_opd_config={"enable": True, "anchor_planner": "trace", "loss": "e2e_tv"},
+    )
+    plan = torch.full((1, 5, 3), -1)
+    plan[0, 1] = torch.tensor([0, 1, 1])
+    plan[0, 3] = torch.tensor([0, 1, 1])
+    inputs = dict(
+        input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
+        hidden_states_list=[torch.randn(1, 5, 8), torch.randn(1, 5, 8)],
+        loss_mask=torch.ones(1, 5), lm_head_weight=torch.randn(32, 8),
+        target_last_hidden_states=torch.randn(1, 5, 8), opd_trace=plan,
+    )
+    results = []
+    for multiplier in (1.0, 2.0):
+        model.opd_objective.reject_weight = multiplier
+        model.zero_grad(set_to_none=True)
+        torch.manual_seed(23)
+        loss, *_rest, diagnostics = model(**inputs)
+        loss.backward()
+        gradients = torch.cat([
+            parameter.grad.reshape(-1).clone() for parameter in model.parameters()
+            if parameter.grad is not None
+        ])
+        results.append((diagnostics["opd/loss"], gradients))
+    torch.testing.assert_close(results[1][0], 2 * results[0][0])
+    assert not torch.allclose(results[1][1], results[0][1])
+
+
+def test_drafter_opd_trace_survives_feature_store_preprocess_and_batch_padding():
+    trainer = _label_packing_trainer()
+    training = trainer.config.rollout.drafter.training
+    training["drafter_opd"] = {"enable": True, "capture_verify_trace": True}
+    trainer.model_config.block_size = 2
+    sample = _feature_sample(5, 5)
+    sample.hidden_states = torch.cat([sample.hidden_states, torch.randn(5, 8)], -1)
+    sample.metadata["hidden_states_layout"] = "dflash_aux_plus_last"
+    sample.metadata["_speco_verify_trace"] = {
+        "layout": "dspark", "num_spec_tokens": 2, "prompt_length": 2,
+        "response_length": 3, "steps": [
+            {"anchor": 1, "commit": 3, "drafts": 2, "accepted": 2,
+             "raw_generated": 3, "truncated": False}]}
+    batch = trainer.prepare_training_batch_from_samples([sample], step=0)
+    assert batch["opd_trace"][0, 1].tolist() == [2, 2, 0]
+    assert (batch["opd_trace"][0, 0] == -1).all()
+
+
+@pytest.mark.parametrize("model_type", ["dflash", "dspark"])
+def test_drafter_opd_requires_full_vocabulary(model_type):
+    from verl_speco.backends.drafter_opd import DraftOPDObjective
+    with pytest.raises(ValueError, match="requires full_vocab"):
+        DraftOPDObjective({}, layout=model_type, loss_mode="restricted_ce",
+                          per_position_loss_weight="fixed_exp_decay")

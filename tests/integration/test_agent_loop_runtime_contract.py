@@ -33,6 +33,92 @@ def test_agent_loop_preserves_spec_decode_metric_fields() -> None:
     assert output.extra_fields["_speco_vllm_spec_decode_accepted_tokens"] is None
 
 
+@pytest.mark.parametrize("layout", ["dflash", "dspark"])
+def test_vllm_remote_worker_installs_and_transports_verify_trace(monkeypatch, layout):
+    import sys
+
+    from verl_speco.backends.drafter_opd import preprocess_trace
+    from verl_speco.integration.verify_trace import TRACE_KEY, token_digest
+
+    evidence = {
+        "layout": layout,
+        "num_spec_tokens": 2,
+        "prompt_length": 2,
+        "response_length": 2,
+        "prefix_digest": token_digest([1, 2, 3, 4]),
+        "steps": [
+            {
+                "anchor": 1,
+                "drafts": 2,
+                "accepted": 1,
+                "raw_generated": 2,
+                "commit": 2,
+                "truncated": False,
+            }
+        ],
+    }
+
+    class Client:
+        async def generate(self, *, sampling_params):
+            return SimpleNamespace(token_ids=[3, 4], extra_fields={TRACE_KEY: evidence})
+
+    class Worker:
+        def __init__(self):
+            pass
+
+        async def generate_sequences(self, batch):
+            return batch
+
+        async def _run_agent_loop(self, sampling_params, trajectory):
+            await Client().generate(sampling_params=sampling_params)
+            output = SimpleNamespace(
+                prompt_ids=[1, 2], response_ids=[3, 4], extra_fields={}
+            )
+            return await self._agent_loop_postprocess(output, False)
+
+        async def _agent_loop_postprocess(self, output, validate):
+            return output
+
+        def _postprocess(self, inputs):
+            return inputs
+
+    class Manager:
+        def __init__(self):
+            pass
+
+        async def generate_sequences(self, batch):
+            return batch
+
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(remote=lambda cls: cls))
+    monkeypatch.setattr(agent_loop_runtime, "_PATCHED", False)
+    monkeypatch.setattr(
+        agent_loop_runtime,
+        "_load_agent_loop_module",
+        lambda: SimpleNamespace(
+            AgentLoopWorker=Worker, AgentLoopManager=Manager, LLMServerClient=Client
+        ),
+    )
+    replica = object()
+    manager = SimpleNamespace(
+        config=SimpleNamespace(
+            actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(name="vllm"))
+        ),
+        agent_loop_workers_class=Worker,
+        rollout_replica_class=replica,
+    )
+    agent_loop_runtime._configure_speco_agent_loop_manager_instance(manager, Worker)
+    assert manager.agent_loop_workers_class is not Worker
+    assert manager.rollout_replica_class is replica
+    # Start with unpatched upstream classes, as in a freshly imported Ray process.
+    worker = manager.agent_loop_workers_class()
+    output = asyncio.run(worker._run_agent_loop({}, {"step": 2}))
+    assert output.extra_fields[TRACE_KEY] == {"turns": [evidence]}
+    plan = preprocess_trace(
+        output.extra_fields, start=0, end=4, layout=layout, capacity=2, device="cpu"
+    )
+    assert plan[1].tolist() == [1, 2, 1]
+
+
 def test_agent_loop_patch_supports_release_v080_llm_server_client(monkeypatch) -> None:
     class AgentLoopWorker:
         distillation_enabled = True
@@ -178,6 +264,9 @@ def test_phase_timing_survives_postprocess_defaults(
     )
     monkeypatch.setattr(agent_loop_runtime, "_PATCHED", False)
     monkeypatch.setattr(agent_loop_runtime, "_load_agent_loop_module", lambda: module)
+    from verl_speco.integration import verify_trace
+    traced_calls = []
+    monkeypatch.setattr(verify_trace, "collect_turn_trace", traced_calls.append)
     # Each measured operation takes one unit, independently of wall-clock noise.
     ticks = iter(range(100))
     monkeypatch.setattr(agent_loop_runtime.time, "perf_counter", lambda: next(ticks))
@@ -188,6 +277,7 @@ def test_phase_timing_survives_postprocess_defaults(
         worker._run_agent_loop({}, {"step": 1, "validate": validate})
     )
     assert output.extra_fields[agent_loop_runtime.SPECO_STUDENT_DECODE_TIME_KEY] == 1.0
+    assert len(traced_calls) == 1  # Teacher scoring never enters the draft trace.
     teacher_time = output.extra_fields[agent_loop_runtime.SPECO_TEACHER_PREFILL_TIME_KEY]
     if distillation_enabled and not validate:
         assert calls == ["student", "postprocess", "teacher", "teacher"]

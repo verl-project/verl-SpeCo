@@ -346,6 +346,7 @@ class DFlashTrainingModel(nn.Module):
         target_hidden_clip_value: float | None = None,
         vat_config: dict | None = None,
         vat_layout: str = "dflash",
+        drafter_opd_config: dict | None = None,
     ):
         super().__init__()
         self.verifier_norm = (
@@ -394,6 +395,12 @@ class DFlashTrainingModel(nn.Module):
                 f"lk_hybrid_eta must be finite and non-negative, got {lk_hybrid_eta!r}"
             )
         self._tensor_template_cache: dict[tuple, torch.Tensor] = {}
+        self.opd_objective = None
+        if drafter_opd_config and drafter_opd_config.get("enable", False):
+            from verl_speco.backends.drafter_opd import DraftOPDObjective
+            self.opd_objective = DraftOPDObjective(
+                drafter_opd_config, layout=vat_layout, loss_mode=self.loss_mode,
+                per_position_loss_weight=self.per_position_loss_weight, temperature=lk_temperature)
         self.vat_objective = None
         if self.per_position_loss_weight == "vat":
             from verl_speco.backends.verification_aware import VATObjective
@@ -674,6 +681,7 @@ class DFlashTrainingModel(nn.Module):
         label_mask: torch.Tensor | None = None,
         target_hidden_is_raw: bool = False,
         hidden_source: str | None = None,
+        opd_trace: torch.Tensor | None = None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -686,6 +694,9 @@ class DFlashTrainingModel(nn.Module):
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
             label_len, label_mask, device, document_ids=document_ids
         )
+        if self.opd_objective is not None:
+            anchor_positions, block_keep_mask, observed, visible, rejected = self.opd_objective.plan(
+                anchor_positions, block_keep_mask, opd_trace)
         # Anchors must point at a real context row (the hidden states may be one
         # row shorter than the label sequence when a trailing label token exists).
         block_keep_mask = block_keep_mask & (anchor_positions < seq_len)
@@ -757,10 +768,12 @@ class DFlashTrainingModel(nn.Module):
                 clip=self.target_hidden_clip_value,
             )
             weight_mask = weight_mask * (~bad_target_rows).float()
+        if self.opd_objective is not None:
+            weight_mask = self.opd_objective.mask(weight_mask, visible)
         binary_eval_mask = weight_mask.view(-1)
         base_loss_mask = weight_mask.clone()
 
-        if self.vat_objective is None and self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+        if self.opd_objective is None and self.vat_objective is None and self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             decay_weights = self._cached_decay_weights(device)
             weight_mask = weight_mask * decay_weights
         if self.front_position_count > 0 and self.front_position_weight != 1.0:
@@ -778,6 +791,10 @@ class DFlashTrainingModel(nn.Module):
             )
             weight_mask = weight_mask * front_weights
 
+        if self.opd_objective is not None:
+            weight_mask = self.opd_objective.weights(
+                weight_mask, observed, rejected,
+                gamma=self.loss_decay_gamma if self.vat_objective is None else None)
         flat_targets = target_ids.view(-1)
         flat_weights = weight_mask.view(-1)
         active_mask = flat_weights > 0
@@ -812,9 +829,12 @@ class DFlashTrainingModel(nn.Module):
             vat_logits = F.linear(active_hidden, lm_head_weight)
             weight_mask, vat_loss, vat_metrics = self.vat_objective(
                 vat_logits, active_hidden, active_target_hidden, lm_head_weight,
-                base_loss_mask, active_mask, active_targets)
+                base_loss_mask, active_mask, active_targets,
+                observed_accepted=observed if self.opd_objective is not None else None)
             if self.front_position_count > 0 and self.front_position_weight != 1.0:
                 weight_mask = weight_mask * front_weights
+            if self.opd_objective is not None:
+                weight_mask = self.opd_objective.weights(weight_mask, observed, rejected)
             flat_weights = weight_mask.reshape(-1)
             active_weights = flat_weights[active_mask]
         if active_targets.numel() == 0:
@@ -857,7 +877,8 @@ class DFlashTrainingModel(nn.Module):
 
         ce_loss = loss
         lk_loss = local_ploss_sum.new_zeros(())
-        if self.lk_loss_alpha > 0 and active_targets.numel() > 0:
+        if (self.lk_loss_alpha > 0 and active_targets.numel() > 0
+                and not (self.opd_objective is not None and self.opd_objective.loss_type == "e2e_tv")):
             if active_target_hidden is None:
                 raise ValueError(
                     "DFlash LK loss requires target_last_hidden_states. "
@@ -907,6 +928,13 @@ class DFlashTrainingModel(nn.Module):
                 lk_loss = local_lk_sum / local_lk_den.clamp(min=1e-6)
         loss = (ce_loss * self.ce_loss_alpha) + (lk_loss * self.lk_loss_alpha)
 
+        if self.opd_objective is not None and self.opd_objective.loss_type == "e2e_tv":
+            opd_logits = active_logits if active_targets.numel() else F.linear(active_hidden, lm_head_weight)
+            loss = self.opd_objective(
+                opd_logits, active_target_hidden, lm_head_weight, base_loss_mask, active_mask,
+                position_weights=weight_mask)
+        opd_metrics = (self.opd_objective.metrics(loss, observed, base_loss_mask)
+                       if self.opd_objective is not None else {})
         loss = loss + vat_loss
         auxiliary_metrics: dict[str, torch.Tensor] = {}
         if active_targets.numel() > 0:
@@ -1109,6 +1137,7 @@ class DFlashTrainingModel(nn.Module):
             }
             diagnostics.update(auxiliary_metrics)
             diagnostics.update(vat_metrics)
+            diagnostics.update(opd_metrics)
             if self.vat_objective is not None:
                 diagnostics["vat/ce_loss"] = ce_loss.detach()
 
@@ -1603,6 +1632,7 @@ class DFlashTrainerBackend:
                 training_cfg.get("dflash_per_position_loss_weight", "fixed_exp_decay")
             ),
             vat_config=training_cfg.get("vat", {}),
+            drafter_opd_config=training_cfg.get("drafter_opd", {}),
             dpace_alpha=float(training_cfg.get("dflash_dpace_alpha", 0.5)),
             lk_temperature=float(training_cfg.get("lk_temperature", 1.0)),
             lk_loss_type=str(training_cfg.get("dflash_lk_loss_type", "alpha")),
@@ -1670,6 +1700,9 @@ class DFlashTrainerBackend:
         )
         expected_hidden_dim = h_dim * num_context_layers
 
+        opd_cfg = self.config.rollout.drafter.training.get("drafter_opd", {})
+        if opd_cfg.get("enable", False):
+            res["opd_trace"] = []
         for item in items:
             layout = item.get("hidden_states_layout")
             if layout not in (None, "dflash_aux", "dflash_aux_plus_last"):
@@ -1737,6 +1770,11 @@ class DFlashTrainerBackend:
             else:
                 start, end = max(0, ids.size(0) - max_window), ids.size(0)
 
+            if opd_cfg.get("enable", False):
+                from verl_speco.backends.drafter_opd import preprocess_trace
+                res["opd_trace"].append(preprocess_trace(
+                    item, start=start, end=end, layout="dflash",
+                    capacity=int(self.config.rollout.drafter.training.get("dflash_block_size", 16)) - 1, device=device))
             # ``ids`` / ``item_loss_mask`` carry the (optional) trailing label
             # token; the hidden context is one row shorter when it is present.
             hidden_end = max(start, min(end, int(full_h.size(0))))
@@ -1799,6 +1837,7 @@ class DFlashTrainerBackend:
             lm_head_weight=self.target_lm_head.fc.weight,
             target_last_hidden_states=batch.get("target_last_hidden_states"),
             document_ids=batch.get("document_ids"),
+            opd_trace=batch.get("opd_trace"),
             label_ids=batch.get("label_ids"),
             label_mask=batch.get("label_mask"),
             **target_norm_kwargs,
