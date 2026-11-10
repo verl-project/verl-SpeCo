@@ -100,6 +100,7 @@ def test_payload_always_cleared_and_exit_reclaim_registered(monkeypatch):
         ("cuda", "sync", False, True),
         ("cuda", "sync", True, False),
         ("cuda", "rollout_idle_worker", False, True),
+        ("cuda", "rollout_idle_worker", True, True),
         ("npu", "sync", False, False),
     ],
 )
@@ -119,6 +120,7 @@ def test_producer_drops_wire_before_clear_and_preserves_ray_snapshot(
     wire_ref, release_options, serialized = [], [], []
 
     def put(value):
+        assert ("_speco_cpu_tensor_wire_v1" in value) == (device == "cuda")
         if "_speco_cpu_tensor_wire_v1" in value:
             wire_ref.append(
                 weakref.ref(value["_speco_cpu_tensor_wire_v1"]["w"]["data"])

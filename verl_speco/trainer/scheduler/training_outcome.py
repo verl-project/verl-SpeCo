@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any, cast
 
 from verl_speco.trainer.scheduler.drafter_runtime_state import (
@@ -20,6 +21,8 @@ from verl_speco.trainer.scheduler.schedule_types import (
     _as_float,
     _as_int,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _metric_float(value: object) -> float | None:
@@ -220,6 +223,34 @@ class TrainingOutcome:
         )
         if not result_consistent:
             trained = False
+            logger.error(
+                "[BubbleTime] training_result_rejected: plan_id=%s execution_reason=%s "
+                "launched=%s expected_workers=%s workers=%s",
+                plan.plan_id,
+                execution.reason,
+                execution.launched,
+                sorted(expected_worker_ids),
+                [
+                    {
+                        key: result.get(key)
+                        for key in (
+                            "worker_id",
+                            "participating",
+                            "triggered",
+                            "ready",
+                            "reason",
+                            "plan_id",
+                            "source_global_step",
+                            "worker_global_step",
+                            "data_version",
+                            "target_version",
+                            "successful_steps",
+                            "optimizer_step",
+                        )
+                    }
+                    for result in normalized_results
+                ],
+            )
         quota_topup = plan.reason in {
             "quota_topup_training_ready",
             "quota_forced_completion_ready",
@@ -509,7 +540,9 @@ class TrainingOutcome:
                 }
             )
         outcome_reason = (
-            execution.reason if result_consistent else "worker_result_inconsistent"
+            execution.reason
+            if (result_consistent or not execution.launched)
+            else "worker_result_inconsistent"
         )
         if runtime_state.status is DrafterRuntimeStatus.RUNNING and result_consistent:
             runtime_state.mark_completed(
