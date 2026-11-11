@@ -333,8 +333,12 @@ def _head_trainer():
     return trainer
 
 
-def test_head_restore_reuses_host_storage_with_exact_values_and_parameter_identity():
+@pytest.mark.parametrize("bubble", [False, True])
+def test_head_restore_reuses_host_storage_with_exact_values_and_parameter_identity(
+    bubble,
+):
     trainer = _head_trainer()
+    trainer._bubble_time_enabled = bubble
     p = trainer.backend.target_lm_head.fc.weight
     original = p.detach().clone()
     cache = trainer._gpu_head_host_cache = FrozenHeadHostCache()
@@ -349,9 +353,11 @@ def test_head_restore_reuses_host_storage_with_exact_values_and_parameter_identi
     assert trainer._gpu_transfer_metrics["drafter/gpu_head_restore_cache_hit"] == 1
 
 
+@pytest.mark.parametrize("bubble", [False, True])
 @pytest.mark.parametrize("change", ["version", "mutation", "replacement", "trainable"])
-def test_head_cache_invalidates_when_supervision_is_no_longer_identical(change):
+def test_head_cache_invalidates_when_supervision_is_no_longer_identical(change, bubble):
     trainer = _head_trainer()
+    trainer._bubble_time_enabled = bubble
     p = trainer.backend.target_lm_head.fc.weight
     cache = trainer._gpu_head_host_cache = FrozenHeadHostCache()
     cache.capture(p, 4)

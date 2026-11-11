@@ -55,7 +55,16 @@ class _FakeRLInsight:
 
 
 @pytest.fixture(autouse=True)
-def _reset_bridge():
+def _reset_bridge(monkeypatch):
+    # Register both missing and present keys for restoration: the production
+    # initializer writes through os.environ.setdefault(), outside monkeypatch.
+    for name in (
+        "VERL_RL_INSIGHT_ENABLE", "VERL_RL_INSIGHT_PROJECT_NAME",
+        "VERL_RL_INSIGHT_EXPERIMENT_NAME", "VERL_RL_INSIGHT_CONFIG_JSON",
+        "RL_INSIGHT_SERVER_URL",
+    ):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
     bridge.reset_for_tests()
     yield
     bridge.reset_for_tests()

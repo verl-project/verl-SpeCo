@@ -4215,6 +4215,44 @@ async def _speco_generate_with_request_stats_unblocked(
         await self._speco_ensure_initial_draft_weights()
         if diagnostics is not None:
             diagnostics["initialize_s"] = time.perf_counter() - initialize_started
+        from verl_speco.integration.rollout_performance import enabled as perf_enabled
+
+        if perf_enabled() and not getattr(self, "_speco_perf_snapshot_done", False):
+            import asyncio
+
+            lock = getattr(self, "_speco_perf_snapshot_lock", None)
+            if lock is None:
+                lock = self._speco_perf_snapshot_lock = asyncio.Lock()
+            async with lock:
+                if not getattr(self, "_speco_perf_snapshot_done", False):
+                    self._speco_perf_snapshot_done = True
+                    from verl_speco.integration.generation_diagnostics import (
+                        emit_summary,
+                    )
+                    from verl_speco.integration.rollout_performance import (
+                        safe_runtime_snapshot,
+                    )
+
+                    snapshot_started = time.perf_counter()
+                    safe_runtime_snapshot(self, "vllm_server", "before_first_generate")
+                    try:
+                        snapshots = await self.collective_rpc(
+                            "speco_performance_snapshot"
+                        )
+                        emit_summary(
+                            "rollout_perf_worker_snapshots",
+                            replica_rank=getattr(self, "replica_rank", None),
+                            snapshots=snapshots,
+                        )
+                    except Exception as error:
+                        emit_summary(
+                            "rollout_perf_worker_snapshots_failed",
+                            error=type(error).__name__,
+                        )
+                    emit_summary(
+                        "rollout_perf_snapshot_rpc",
+                        elapsed_s=time.perf_counter() - snapshot_started,
+                    )
         request_started = time.perf_counter()
         if use_idle_lease and _rollout_idle_worker_config(_load_env_drafter_config()):
             output = await _speco_generate_with_idle_lease(
@@ -4222,7 +4260,12 @@ async def _speco_generate_with_request_stats_unblocked(
             )
         else:
             try:
-                output = await generate(*args, **kwargs)
+                from verl_speco.integration.rollout_performance import (
+                    generation_execution,
+                )
+
+                with generation_execution(self):
+                    output = await generate(*args, **kwargs)
             finally:
                 if diagnostics is not None:
                     diagnostics["generate_s"] = time.perf_counter() - request_started
@@ -4230,6 +4273,9 @@ async def _speco_generate_with_request_stats_unblocked(
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
             revision_after = int(getattr(self, "_speco_serving_drafter_revision", 0))
+            # Unscored requests must carry the same provenance key as requests
+            # with exact counters or an engine fallback before batch merging.
+            extra_fields.setdefault("_speco_acceptance_engine_fallback", False)
             extra_fields["_speco_drafter_revision_min"] = min(
                 revision_before, revision_after
             )
@@ -4401,7 +4447,10 @@ async def _speco_generate_with_idle_lease(
     request_completed_ts = None
     generate_started = time.perf_counter() if diagnostics is not None else None
     try:
-        output = await generate(*args, **kwargs)
+        from verl_speco.integration.rollout_performance import generation_execution
+
+        with generation_execution(self):
+            output = await generate(*args, **kwargs)
         request_completed = True
         request_completed_ts = time.time()
     finally:
@@ -4527,10 +4576,9 @@ class _SpecoVLLMHttpServerActorClass:
     def options(self, **options):
         runtime_env = dict(options.get("runtime_env", {}) or {})
         env_vars = dict(runtime_env.get("env_vars", {}) or {})
-        if "VERL_SPECO_PHASE_TIMING" in os.environ:
-            env_vars.setdefault(
-                "VERL_SPECO_PHASE_TIMING", os.environ["VERL_SPECO_PHASE_TIMING"]
-            )
+        for name in ("VERL_SPECO_PHASE_TIMING", "VERL_SPECO_DIAGNOSTIC_ROLLOUT_PERF"):
+            if name in os.environ:
+                env_vars.setdefault(name, os.environ[name])
         env_vars[self._SETUP_HOOK_ENV_VAR] = self._SETUP_HOOK_PATH
         runtime_env["env_vars"] = env_vars
         # Ray serializes per-actor runtime_env values as JSON before starting
@@ -5232,6 +5280,13 @@ except Exception:  # noqa: BLE001
 class SpecoVLLMWeightSyncCompatExtension(_VLLMWorkerExtensionBase):
     """Apply tied-weight and NPU transport compatibility during target sync."""
 
+    def speco_performance_snapshot(self):
+        from verl_speco.integration.rollout_performance import safe_runtime_snapshot
+
+        return safe_runtime_snapshot(
+            self, "vllm_worker", "before_first_generate", requested=True
+        )
+
     def update_weights_from_ipc(
         self,
         peft_config: dict | None = None,
@@ -5277,6 +5332,13 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     _speco_draft_level2_snapshot_revision: int | None = None
     _speco_draft_level2_restore_pending = False
     _speco_draft_runtime_revision = 0
+
+    def speco_performance_snapshot(self):
+        from verl_speco.integration.rollout_performance import safe_runtime_snapshot
+
+        return safe_runtime_snapshot(
+            self, "vllm_worker", "before_first_generate", requested=True
+        )
 
     def __new__(cls, **kwargs):
         # WorkerWrapperBase resolves and injects this extension before the

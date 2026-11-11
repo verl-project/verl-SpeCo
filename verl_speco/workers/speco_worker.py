@@ -511,6 +511,9 @@ class SpecoWorker(Worker):
     ):
         Worker.__init__(self)
         self.config = config
+        self._speco_require_physical_identity = bool(
+            kwargs.get("require_resource_identity", False)
+        )
         self.role = role
         if device_name is None:
             raise ValueError(
@@ -771,6 +774,8 @@ class SpecoWorker(Worker):
                 config=trainer_config,
                 world_size=self.training_group_world_size,
                 rollout_dp_rank=self.replica_rank,
+                # The local writer uses its own process group. The worker-wide
+                # mesh can include replicas that are still serving rollout.
                 training_device_mesh=None,
                 training_process_group=self.training_process_group,
                 data_parallel_process_group=None,
@@ -1433,6 +1438,7 @@ class SpecoWorker(Worker):
                 "hidden_last_hidden_filter",
                 "hidden_last_hidden_select",
                 "hidden_states_layout",
+                "target_layer_ids",
                 "_verl_request_mean_accept_len",
                 "_speco_vllm_request_id",
                 "_verl_is_hard",
@@ -1533,6 +1539,104 @@ class SpecoWorker(Worker):
             result["collected"] = False
             result["reason"] = "samples_rejected"
         return result
+
+    # [SFT-CoTrain] SFT 专用特征收集方法（PPO 使用 stage/commit 两阶段接口）
+    # 对照旧仓库 golden: verl-SpeCo-main/verl_speco/workers/speco_worker.py:883-971
+    @register(
+        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
+    )
+    async def collect_rollout_features(self, samples: list[dict]):
+        # [SFT-VERIFY] 验证数据收集
+        logger.info(
+            f"[SFT-VERIFY] Rank={self.rank}: received {len(samples)} samples, trainer_exists={self.trainer is not None}, in_drafter_train_group={self.in_drafter_train_group}"
+        )
+        if not samples:
+            return
+        valid_count = 0
+        for sample in samples:
+            if not sample:
+                continue
+            valid_count += 1
+            batch = {
+                "input_ids": sample["input_ids"],
+            }
+
+            # [SFT-VERIFY] 从 loss_mask 反推出 prompts/responses
+            # collect_online_data (base_trainer.py) 依赖 prompts/responses 来构建 full_loss_mask
+            # SFT 模式没有 prompts/responses 字段，需要从 loss_mask 推导
+            if "loss_mask" in sample and sample["loss_mask"] is not None:
+                lm = sample["loss_mask"].flatten()  # (seq_len,)
+                response_positions = torch.nonzero(lm > 0, as_tuple=False).flatten()
+                if response_positions.numel() > 0:
+                    prompt_len = int(response_positions[0].item())
+                    batch["prompts"] = sample["input_ids"][:, :prompt_len]
+                    batch["responses"] = sample["input_ids"][:, prompt_len:]
+                else:
+                    # 没有 response token，使用空 response
+                    batch["prompts"] = sample["input_ids"]
+                    batch["responses"] = torch.zeros(
+                        1, 0, dtype=sample["input_ids"].dtype
+                    )
+                batch["loss_mask"] = sample["loss_mask"]
+            # 只在值有效时才添加（SFT 模式下可能没有这些字段）
+            if "prompts" in sample and sample["prompts"] is not None:
+                batch["prompts"] = sample["prompts"]
+            if "responses" in sample and sample["responses"] is not None:
+                batch["responses"] = sample["responses"]
+            for key in (
+                "hidden_position_start",
+                "hidden_position_end",
+                "hidden_positions",
+                "hidden_prefix_cache_rows",
+                "hidden_window_start",
+                "hidden_window_end",
+                "hidden_lm_head_fingerprint",
+                "hidden_last_hidden_logprob_check",
+                "hidden_target_logprobs_source",
+                "hidden_raw_topk_logprob_check",
+                "hidden_raw_target_logprobs",
+                "hidden_raw_target_logprobs_positions",
+                "hidden_raw_target_logprobs_position_start",
+                "hidden_raw_target_logprobs_position_end",
+                "hidden_last_hidden_filter",
+                "hidden_last_hidden_select",
+                "hidden_states_layout",
+                "target_layer_ids",
+                "target_logprobs_position_start",
+                "target_logprobs_position_end",
+                "global_step",
+            ):
+                if key in sample:
+                    batch[key] = sample[key]
+            hidden = sample.get("hidden_states")
+            if hidden is None:
+                hidden_chunks = sample.get("hidden_states_ref_chunks")
+                if hidden_chunks:
+                    expected_rows = None
+                    hidden_positions = batch.get("hidden_positions")
+                    if torch.is_tensor(hidden_positions):
+                        hidden_positions = cast(torch.Tensor, hidden_positions)
+                        expected_rows = int(hidden_positions.numel())
+                    hidden = await _resolve_hidden_state_chunks(
+                        hidden_chunks, expected_rows=expected_rows
+                    )
+                else:
+                    hidden = await _resolve_ray_object_ref(
+                        sample.get("hidden_states_ref")
+                    )
+            target_logprobs = sample.get("target_logprobs")
+            if target_logprobs is None:
+                target_logprobs = await _resolve_ray_object_ref(
+                    sample.get("target_logprobs_ref")
+                )
+            if hidden is None:
+                continue
+            self._store_rollout_sample(
+                batch=batch,
+                hidden_states=hidden,
+                target_logprobs=target_logprobs,
+            )
+        self._flush_rollout_features_for_step()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_global_step(self, global_step: int):
@@ -1723,7 +1827,6 @@ class SpecoWorker(Worker):
                 tensor_payload_bytes(decoded),
                 time.perf_counter() - resolve_started,
             )
-
         weight = payload.get("weight")
         row_indices = payload.get("row_indices")
         source_vocab_size = payload.get("source_vocab_size")
@@ -1786,6 +1889,9 @@ class SpecoWorker(Worker):
 
         with _preserve_process_rng_state(self.device_name):
             start_ts = time.time()
+            from verl_speco.integration.rollout_performance import safe_runtime_snapshot
+
+            safe_runtime_snapshot(self, "drafter_worker", "before_prefit_activation")
             activation_ts = time.time()
             result["activated"] = bool(await self.trainer.activate_training_model())
             if not result["activated"]:
@@ -1798,6 +1904,7 @@ class SpecoWorker(Worker):
                     or {"type": "ActivationError", "message": "activation_failed"}
                 ]
             result["activation_elapsed_sec"] = time.time() - activation_ts
+            safe_runtime_snapshot(self, "drafter_worker", "after_prefit_activation")
             release_ts = time.time()
             await self.trainer.release_training_memory_after_activation()
             result["release_elapsed_sec"] = time.time() - release_ts
@@ -1822,6 +1929,7 @@ class SpecoWorker(Worker):
                 result["park_elapsed_sec"] = time.perf_counter() - park_ts
                 result["training_group_ranks"] = list(self.training_group_ranks)
                 result["activated"] = restored
+            safe_runtime_snapshot(self, "drafter_worker", "after_prefit_park")
             result["elapsed_sec"] = time.time() - start_ts
             result["reason"] = (
                 "activated" if result["activated"] else "activation_failed"
@@ -1912,6 +2020,8 @@ class SpecoWorker(Worker):
         sample_last_n_steps: int = 2,
         require_full_batch: bool = False,
         target_version: int | None = None,
+        min_sample_step: int | None = None,
+        max_sample_step: int | None = None,
     ):
         if not self.enable_drafter:
             return {"available": False, "reason": "disabled"}
@@ -1921,6 +2031,8 @@ class SpecoWorker(Worker):
             sample_last_n_steps=sample_last_n_steps,
             require_full_batch=require_full_batch,
             target_version=target_version,
+            min_sample_step=min_sample_step,
+            max_sample_step=max_sample_step,
         )
         status.update(
             {
@@ -1984,10 +2096,19 @@ class SpecoWorker(Worker):
                 "reason": "ok",
             }
         )
+        if getattr(self, "_speco_require_physical_identity", False):
+            from verl_speco.integration.resource_identity import resource_identity
+
+            result.update(resource_identity(self.rank))
         return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     async def preflight_drafter_training(self, training_plan=None):
+        from verl_speco.trainer.bubble_lifecycle import CostClock
+
+        if not hasattr(self, "_bubble_cost_clock"):
+            self._bubble_cost_clock = CostClock()
+        preflight_cost_started = self._bubble_cost_clock.now()
         preflight_started_ts = time.time()
         result = {
             "ready": False,
@@ -2030,6 +2151,8 @@ class SpecoWorker(Worker):
             return result
         if training_plan.get("source_global_step") != self.last_global_step:
             result["reason"] = "stale_training_plan"
+            result["source_global_step"] = training_plan.get("source_global_step")
+            result["worker_global_step"] = self.last_global_step
             return result
 
         if execution_strategy == "rollout_idle_worker":
@@ -2359,6 +2482,10 @@ class SpecoWorker(Worker):
         )
         self._prepared_training_preflight_elapsed_sec = preflight_elapsed_sec
         self._prepared_training_ready_ts = ready_ts
+        self._prepared_cost_interval = (
+            preflight_cost_started,
+            self._bubble_cost_clock.now(),
+        )
         result.update(
             {
                 "ready": True,
@@ -2704,6 +2831,11 @@ class SpecoWorker(Worker):
                 torch.set_rng_state(migrated_rng["cpu"])
                 if migrated_rng["device"] is not None:
                     get_torch_device().set_rng_state(migrated_rng["device"])
+            from verl_speco.trainer.bubble_lifecycle import CostClock
+
+            if not hasattr(self, "_bubble_cost_clock"):
+                self._bubble_cost_clock = CostClock()
+            cost_train_started = self._bubble_cost_clock.now()
             start_ts = time.time()
             if getattr(self, "_deferred_publish_snapshot_step", None) is not None:
                 raise RuntimeError(
@@ -2920,6 +3052,14 @@ class SpecoWorker(Worker):
                                 return False
                             return True
 
+                        from verl_speco.trainer.performance_diagnostics import (
+                            gpu_first_step_diagnostics_enabled,
+                        )
+
+                        diagnostic_step = gpu_first_step_diagnostics_enabled(
+                            self, execution_strategy, coordinated_idle
+                        )
+                        self.trainer._diagnostic_gpu_stage_sync = diagnostic_step
                         first_step_timings = (
                             dict(getattr(self.trainer, "_training_metric_sums", {}))
                             if (
@@ -2929,13 +3069,12 @@ class SpecoWorker(Worker):
                                     and getattr(self, "device_name", "") == "cuda"
                                 )
                             )
-                            and batch_index == 0
+                            and (batch_index == 0 or diagnostic_step)
                             else None
                         )
                         compile_before = None
-                        if (
-                            first_step_timings is not None
-                            and execution_strategy == "sync"
+                        if first_step_timings is not None and (
+                            execution_strategy == "sync" or diagnostic_step
                         ):
                             from verl_speco.trainer.performance_diagnostics import (
                                 compilation_metadata,
@@ -2968,6 +3107,8 @@ class SpecoWorker(Worker):
                         except Exception as error:  # noqa: BLE001
                             step_error = error
                             step_ok = False
+                        finally:
+                            self.trainer._diagnostic_gpu_stage_sync = False
                         first_step_elapsed = None
                         if first_step_timings is not None:
                             first_step_elapsed = (
@@ -2982,11 +3123,12 @@ class SpecoWorker(Worker):
                                 ).items()
                                 if key.startswith("timing_s/drafter_")
                             }
-                            result["first_optimizer_step_stage_sec"] = stage_times
+                            if batch_index == 0:
+                                result["first_optimizer_step_stage_sec"] = stage_times
                             logger.warning(
                                 "%s optimizer_first_step_breakdown: plan_id=%s "
                                 "rank=%s success=%s elapsed_s=%.4f stages_sec=%s "
-                                "timing_mode=host_wall_no_device_sync",
+                                "timing_mode=%s optimizer_steps_total=%s",
                                 "[drafter]"
                                 if execution_strategy == "sync"
                                 else "[BubbleTime]",
@@ -2995,6 +3137,10 @@ class SpecoWorker(Worker):
                                 step_ok,
                                 first_step_elapsed,
                                 stage_times,
+                                "device_synchronized"
+                                if diagnostic_step
+                                else "host_wall_no_device_sync",
+                                getattr(self.trainer, "optimizer_steps_total", None),
                             )
                         if compile_before is not None:
                             compile_after = compilation_metadata()
@@ -3006,7 +3152,7 @@ class SpecoWorker(Worker):
                             }
                             logger.warning(
                                 "[drafter first step compile] rank=%s plan=%s success=%s elapsed_s=%.6f "
-                                "cache_env=%s counter_delta=%s timing_mode=host_wall_no_device_sync",
+                                "cache_env=%s counter_delta=%s timing_mode=%s",
                                 self.rank,
                                 plan_id,
                                 step_ok,
@@ -3017,6 +3163,9 @@ class SpecoWorker(Worker):
                                     if key != "counters"
                                 },
                                 delta,
+                                "device_synchronized"
+                                if diagnostic_step
+                                else "host_wall_no_device_sync",
                             )
                         training_error = getattr(
                             self.trainer, "last_training_error", None
@@ -3354,6 +3503,14 @@ class SpecoWorker(Worker):
             result["buffer_size_after"] = int(data_status_after["trainable_samples"])
             result["optimizer_step"] = int(self.trainer.optimizer_steps_total)
             result["elapsed_sec"] = time.time() - start_ts
+            result["cost_train_started_ts"] = cost_train_started
+            result["cost_train_finished_ts"] = self._bubble_cost_clock.now()
+            prepared_cost = getattr(self, "_prepared_cost_interval", None)
+            if prepared_ready_ts is not None and prepared_cost is not None:
+                (
+                    result["cost_prepare_started_ts"],
+                    result["cost_prepare_finished_ts"],
+                ) = prepared_cost
             result["reclaim_received_via_bus"] = int(
                 getattr(self, "_drafter_reclaim_source", None) == "lease_bus"
             )
@@ -3496,7 +3653,7 @@ class SpecoWorker(Worker):
             return None
         started = time.perf_counter()
         result = self.maybe_publish(cached_snapshot_only=True)
-        logger.warning(
+        logger.debug(
             "[BubbleTime] publish_snapshot_prefetch_worker: rank=%s source_step=%s "
             "elapsed_s=%.4f cached=%s",
             self.rank,
@@ -3578,17 +3735,15 @@ class SpecoWorker(Worker):
             from verl_speco.integration.rollout_publish import _get_nested
             from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
 
-            numpy_transport = (
-                getattr(self, "device_name", "") == "cuda"
-                and self._last_trained_execution_strategy != "rollout_idle_worker"
-                and gpu_transfer_enabled(
-                    _get_nested(
-                        getattr(self, "config", None),
-                        ("rollout", "drafter", "training"),
-                        None,
-                    ),
-                    "gpu_publish_numpy_transport",
-                )
+            numpy_transport = getattr(
+                self, "device_name", ""
+            ) == "cuda" and gpu_transfer_enabled(
+                _get_nested(
+                    getattr(self, "config", None),
+                    ("rollout", "drafter", "training"),
+                    None,
+                ),
+                "gpu_publish_numpy_transport",
             )
             wire = None
             wire_bytes = None

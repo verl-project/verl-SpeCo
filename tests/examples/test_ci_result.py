@@ -203,6 +203,7 @@ def test_worker_retains_error_when_second_batch_succeeds():
 
         def get_training_data_stats(self):
             return {"buffer_total": 2, "eligible_samples": 2}
+
         def release_training_data_reservation(self, plan_id):
             return 0
 
