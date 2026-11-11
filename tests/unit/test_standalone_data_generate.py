@@ -554,7 +554,12 @@ def hidden_config(tmp_path, monkeypatch):
     )
     cfg = config(tmp_path)
     cfg.update(task="hidden", output_path=str(tmp_path / "hidden"), max_samples=2)
-    cfg["hidden"].update(target_model_path="fake", vllm_aux_hidden_state_layer_ids=[1])
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "config.json").write_text('{"num_hidden_layers": 3}', encoding="utf-8")
+    cfg["hidden"].update(
+        target_model_path=str(target), vllm_aux_hidden_state_layer_ids=[1]
+    )
     cfg["vllm"].update(
         endpoints=["http://first/v1"], concurrency=1, per_endpoint_concurrency=1
     )
@@ -860,7 +865,20 @@ def test_slow_error_log_does_not_block_event_loop(tmp_path, monkeypatch, caplog)
 
 
 @pytest.mark.parametrize("file_concurrency", [0, -1])
-def test_invalid_file_concurrency_is_rejected(hidden_config, file_concurrency):
+def test_invalid_file_concurrency_is_rejected(
+    hidden_config, file_concurrency, monkeypatch
+):
+    import sys
+
+    def unexpected_model_load(*args, **kwargs):
+        pytest.fail("Invalid file_concurrency must fail before loading model/tokenizer")
+
+    for name in ("AutoConfig", "AutoTokenizer"):
+        monkeypatch.setattr(
+            getattr(sys.modules["transformers"], name),
+            "from_pretrained",
+            unexpected_model_load,
+        )
     hidden_config["hidden"]["file_concurrency"] = file_concurrency
     with pytest.raises(ValueError, match="file_concurrency"):
         asyncio.run(generation.generate(hidden_config))

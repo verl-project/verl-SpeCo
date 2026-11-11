@@ -291,6 +291,11 @@ class ResponseClient:
 
 
 async def _hidden_components(config, stack):
+    hidden, vllm = config["hidden"], config["vllm"]
+    file_concurrency = int(hidden.get("file_concurrency", 4))
+    if file_concurrency <= 0:
+        raise ValueError("hidden.file_concurrency must be positive")
+
     from transformers import AutoConfig, AutoTokenizer
 
     from verl_speco.producer.hidden_states_store import (
@@ -313,7 +318,6 @@ async def _hidden_components(config, stack):
     )
     from verl_speco.standalone_tq_training_launcher import _saved_hidden_identity
 
-    hidden, vllm = config["hidden"], config["vllm"]
     tokenizer = await asyncio.to_thread(
         AutoTokenizer.from_pretrained,
         hidden["tokenizer_path"] or hidden["target_model_path"],
@@ -406,9 +410,6 @@ async def _hidden_components(config, stack):
                 )
         return tokenize_record(record, tokenizer, token_config)
 
-    file_concurrency = int(hidden.get("file_concurrency", 4))
-    if file_concurrency <= 0:
-        raise ValueError("hidden.file_concurrency must be positive")
     file_slots = asyncio.Semaphore(file_concurrency)
     file_executor = ThreadPoolExecutor(
         max_workers=file_concurrency, thread_name_prefix="hidden-file"

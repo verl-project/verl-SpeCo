@@ -428,6 +428,11 @@ default: the scheduler assigns hidden-state references to Consumers. Set
 `speco.draft_training.data_transport=tq` to transfer complete feature tensors
 through TransferQueue while keeping the same Ray Producer/Consumer runtime.
 
+The standalone `tq` path does not support Mooncake's Ascend transport for the
+vLLM hidden-state handoff. The CPU-only Ray Producer reads and deletes the
+temporary Mooncake samples, and Ascend transport requires a visible NPU in that
+process. Use the file handoff or Mooncake TCP with `tq`.
+
 Offline training from complete `torch_shard` or `vllm_safetensors` feature stores
 remains available through `verl_speco.draft_train_launcher`. Token-only stores
 must first be converted with `python -m verl_speco.vllm_hidden_states_generate`;
