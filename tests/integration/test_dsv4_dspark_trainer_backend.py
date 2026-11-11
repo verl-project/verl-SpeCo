@@ -548,24 +548,22 @@ def test_dsv4_ep_enabled_supports_namespace_configs():
     assert is_ep_enabled(config) is False
 
 
-def test_dsv4_init_router_bias_breaks_symmetry():
-    from verl_speco.backends.dsv4_ep_utils import _init_router_bias
+def test_dsv4_ep_setup_keeps_router_rank_independent():
+    from verl_speco.backends.dsv4_ep_utils import _finish_ep_setup
 
     model = DSV4DSparkDraftModel(_tiny_dsv4_config())
     router = model.layers[0].ffn.router
-    assert torch.count_nonzero(router.bias).item() == 0
+    bias_before = router.bias.detach().clone()
 
-    _init_router_bias(model, world_size=2, experts_per_rank=2, rank=1)
+    _finish_ep_setup(model, rank=1, log_prefix="test")
 
-    # The shared (exported) bias must stay untouched; the per-rank preference is
-    # a transient attribute applied at routing time only.
-    assert torch.count_nonzero(router.bias).item() == 0
-    assert router._bias_initialized is True
-    assert router._ep_rank_bias is not None
-    assert router._ep_rank_bias.shape == (router.bias.numel(),)
-    # Rank 1 owns global experts [2, 3] and prefers them (+boost), the rest -boost.
-    assert router._ep_rank_bias[2] > 0 and router._ep_rank_bias[3] > 0
-    assert router._ep_rank_bias[0] < 0 and router._ep_rank_bias[1] < 0
+    # EP setup must not install rank-local routing state: training then uses the
+    # same routing function as the exported checkpoint.
+    for module in model.modules():
+        candidate = getattr(module, "router", None)
+        if candidate is not None:
+            assert getattr(candidate, "_ep_rank_bias", None) is None
+    torch.testing.assert_close(router.bias, bias_before)
 
 
 def test_dsv4_load_embedding_handles_multiple_index_and_nested_key(tmp_path):

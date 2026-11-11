@@ -118,3 +118,55 @@ def test_dp_local_loss_scaling_recovers_global_token_mean_gradient(monkeypatch):
 
     fsdp_mean_grad = (per_rank_grads[0] + per_rank_grads[1]) / 2.0
     assert torch.allclose(fsdp_mean_grad, weight_ref.grad, atol=1e-6)
+
+
+def test_ep_disjoint_expert_grads_match_global_objective():
+    """Mirror the EP training scaling for shared vs rank-disjoint expert params.
+
+    Replicated params cancel the ``reduce_world_size`` loss factor through the
+    FSDP/DDP gradient mean. Expert params are never averaged, so the trainer must
+    divide them back by the same factor or they stay world-size too large.
+    """
+    torch.manual_seed(0)
+    rank_inputs = [torch.randn(2, 4), torch.randn(3, 4)]
+    world = len(rank_inputs)
+    total_tokens = sum(x.shape[0] for x in rank_inputs)
+
+    shared_ref = torch.randn(4, requires_grad=True)
+    expert_refs = [torch.randn(4, requires_grad=True) for _ in range(world)]
+
+    reference = (
+        sum(
+            ((x @ shared_ref) ** 2).sum() + ((x @ expert_refs[r]) ** 2).sum()
+            for r, x in enumerate(rank_inputs)
+        )
+        / float(total_tokens)
+    )
+    reference.backward()
+
+    shared = shared_ref.detach().clone().requires_grad_(True)
+    experts = [e.detach().clone().requires_grad_(True) for e in expert_refs]
+    shared_grads = []
+    expert_grads = []
+    for r, x in enumerate(rank_inputs):
+        local_loss = (
+            ((x @ shared) ** 2).sum() + ((x @ experts[r]) ** 2).sum()
+        ) * float(world)
+        local_loss.backward()
+        shared_grads.append(shared.grad.detach().clone())
+        # Fix under test: rank-disjoint expert grads are never averaged, so the
+        # extra world-size loss factor must be divided out explicitly.
+        expert_grads.append(experts[r].grad.detach().clone() / float(world))
+        shared.grad = None
+        for expert in experts:
+            expert.grad = None
+
+    shared_final = (shared_grads[0] + shared_grads[1]) / float(world * total_tokens)
+    torch.testing.assert_close(shared_final, shared_ref.grad, atol=1e-6, rtol=1e-6)
+    for r in range(world):
+        torch.testing.assert_close(
+            expert_grads[r] / float(total_tokens),
+            expert_refs[r].grad,
+            atol=1e-6,
+            rtol=1e-6,
+        )

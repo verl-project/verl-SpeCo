@@ -21,53 +21,6 @@ from torch.distributed.fsdp import fully_shard
 logger = logging.getLogger(__name__)
 
 
-def _init_router_bias(model, world_size, experts_per_rank, rank):
-    """Install a per-rank EP routing preference to break routing symmetry.
-
-    A (near-)zero router makes the selection logits constant, so every token
-    collapses onto the first ``topk`` experts and the other ranks receive no
-    real rows in the all-to-all. We therefore give each rank a small transient
-    preference (+boost for its own experts, -boost for the rest).
-
-    The preference is stored on the module as ``_ep_rank_bias`` (a plain
-    attribute, not a parameter/buffer) and applied at routing time only, so the
-    shared ``router.bias`` buffer keeps its real, rank-independent value and the
-    exported checkpoint is not polluted with rank-local routing state.
-    """
-    boost = 0.5
-    n_experts = world_size * experts_per_rank
-    for module in model.modules():
-        router = getattr(module, "router", None)
-        if router is None:
-            continue
-        # Bias is the global expert vector; shape[0] != n_experts rejects a
-        # partially-sharded buffer we must not write a mismatched slice into.
-        if not hasattr(router, "bias") or router.bias.shape[0] != n_experts:
-            continue
-        with torch.no_grad():
-            local_start = rank * experts_per_rank
-            local_end = min(local_start + experts_per_rank, n_experts)
-            preference = torch.full(
-                (n_experts,), -boost, dtype=torch.float32, device=router.bias.device
-            )
-            preference[local_start:local_end] = boost
-            # Break the within-rank symmetry so ties do not all go to one expert.
-            preference[local_start:local_end] += (
-                torch.randn(local_end - local_start, device=router.bias.device) * 0.01
-            )
-            router._ep_rank_bias = preference
-            # Mark the router's own symmetry-breaking as done: the per-rank
-            # preference below supersedes update_load_balance_bias's first-step
-            # random init, so the two mechanisms do not stack.
-            if hasattr(router, "_bias_initialized"):
-                router._bias_initialized = True
-    if rank == 0:
-        logger.info(
-            f"[EP] Router EP preference set: boost=±{boost} for "
-            f"{experts_per_rank} local experts/rank (shared bias preserved for export)"
-        )
-
-
 def _read_cfg(source, key, default=None):
     """Read a config value from either a mapping or an attribute object."""
     if source is None:
@@ -173,13 +126,11 @@ def _resolve_ep_layout(trainer) -> tuple[int, int, int]:
 
 def _finish_ep_setup(
     raw_model: torch.nn.Module,
-    world_size: int,
     rank: int,
-    experts_per_rank: int,
     *,
     log_prefix: str,
 ) -> None:
-    """Shared EP tail: rebuild the RoPE table, then break routing symmetry."""
+    """Shared EP tail: rebuild the RoPE table on the EP device."""
     draft_model = getattr(raw_model, "draft_model", None) or raw_model
     if hasattr(draft_model, "_rebuild_freqs"):
         seq_len = (
@@ -191,7 +142,6 @@ def _finish_ep_setup(
                 f"[{log_prefix}] Rebuilt freqs_cis "
                 f"({draft_model.freqs_cis.device}, {draft_model.freqs_cis.shape})"
             )
-    _init_router_bias(raw_model, world_size, experts_per_rank, rank)
 
 
 def apply_ep_only(trainer, raw_model: torch.nn.Module):
@@ -238,9 +188,7 @@ def apply_ep_only(trainer, raw_model: torch.nn.Module):
             f"{n_trainable - len(expert_param_ids)} non-expert params (DDP sync)"
         )
 
-    _finish_ep_setup(
-        raw_model, world_size, rank, experts_per_rank, log_prefix="EP-only"
-    )
+    _finish_ep_setup(raw_model, rank, log_prefix="EP-only")
 
 
 def apply_ep_fsdp2(
@@ -331,7 +279,7 @@ def apply_ep_fsdp2(
     # Mark FSDP2 mode (skip _sync_non_expert_grads)
     trainer._ep_ddp_world_size = 0  # 0 = FSDP2 mode (no manual gradient sync)
 
-    _finish_ep_setup(raw_model, world_size, rank, experts_per_rank, log_prefix="EP")
+    _finish_ep_setup(raw_model, rank, log_prefix="EP")
     logger.info(
         f"[Rank {rank}] EP+FSDP2 applied: EP={world_size}, "
         f"{experts_per_rank} experts/rank, "
@@ -401,6 +349,50 @@ def sync_non_expert_grads(trainer) -> None:
             if had_grad:
                 grad.copy_(flat_grad[offset : offset + numel].view_as(grad))
             offset += numel
+
+
+def scale_expert_grads(trainer, factor: float) -> None:
+    """Scale the rank-local routed-expert gradients by ``factor``.
+
+    The training loop multiplies each rank's local loss by
+    ``reduce_world_size`` so that FSDP/DDP's gradient mean (and the manual
+    non-expert all-reduce) recovers the global gradient sum for replicated
+    parameters. Routed experts are rank-disjoint and are never averaged: FSDP2
+    leaves them out of its reduce-scatter, EP+DDP excludes them from
+    :func:`sync_non_expert_grads`, and the all-to-all backward is a pure
+    transpose. They therefore keep that extra ``reduce_world_size`` factor.
+    Dividing them back before clipping puts expert and shared gradients on the
+    same global objective.
+    """
+    if factor == 1.0:
+        return
+
+    model = getattr(trainer, "model", None)
+    if model is None:
+        return
+    if hasattr(model, "module"):
+        model = model.module
+    draft_model = getattr(model, "draft_model", None) or model
+    layers = getattr(draft_model, "layers", None)
+    if layers is None:
+        return
+
+    from torch.distributed.tensor import DTensor
+
+    for layer in layers:
+        experts = getattr(getattr(layer, "ffn", None), "experts", None)
+        if experts is None:
+            continue
+        for param in experts.parameters():
+            grad = param.grad
+            if grad is None:
+                continue
+            if isinstance(grad, DTensor):
+                # Scale the local shard in place; a DTensor op would also work
+                # but touching the local tensor avoids placement checks.
+                grad.to_local().mul_(factor)
+            else:
+                grad.mul_(factor)
 
 
 def dump_local_expert_slices(trainer, checkpoint_path: str) -> str | None:

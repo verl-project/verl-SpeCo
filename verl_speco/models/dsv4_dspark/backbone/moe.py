@@ -46,10 +46,6 @@ class Router(nn.Module):
         self._balance_rate = float(os.environ.get("DSPARK_MOE_BALANCE_RATE", "1e-3"))
         self._step_load: torch.Tensor | None = None
         self._bias_initialized = False
-        # Per-rank EP routing preference. Kept OUT of the parameter/buffer state
-        # so the exported ``bias`` stays the real (rank-independent) load-balance
-        # bias; used only to break routing symmetry during EP training.
-        self._ep_rank_bias: torch.Tensor | None = None
 
     def _score(self, scores: torch.Tensor) -> torch.Tensor:
         if self.score_func == "softmax":
@@ -61,8 +57,6 @@ class Router(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         scores = self._score(F.linear(x.float(), self.weight.float()))
         selection = scores + self.bias.float()
-        if self._ep_rank_bias is not None:
-            selection = selection + self._ep_rank_bias
         indices = selection.topk(self.topk, dim=-1)[1]
         weights = scores.gather(1, indices)
         if self.score_func != "softmax":

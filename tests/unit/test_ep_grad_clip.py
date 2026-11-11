@@ -85,3 +85,67 @@ def test_ep_ddp_clip_treats_disjoint_plain_params_in_full():
         replicated_world_size=4,
     )
     torch.testing.assert_close(norm, expected, atol=1e-5, rtol=1e-5)
+
+
+class _Experts(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.w1 = torch.nn.Parameter(torch.randn(3, 2))
+        self.w2 = torch.nn.Parameter(torch.randn(2, 3))
+
+
+class _FFN(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.experts = _Experts()
+
+
+class _Layer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ffn = _FFN()
+
+
+class _Draft(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = torch.nn.ModuleList([_Layer(), _Layer()])
+
+
+class _Model(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.draft_model = _Draft()
+        self.shared = torch.nn.Parameter(torch.randn(2))
+
+
+def test_scale_expert_grads_scales_only_routed_experts():
+    from types import SimpleNamespace
+
+    from verl_speco.backends.dsv4_ep_utils import scale_expert_grads
+
+    model = _Model()
+    for param in model.parameters():
+        param.grad = torch.ones_like(param)
+
+    scale_expert_grads(SimpleNamespace(model=model), factor=0.25)
+
+    for layer in model.draft_model.layers:
+        for param in layer.ffn.experts.parameters():
+            torch.testing.assert_close(param.grad, torch.full_like(param.grad, 0.25))
+    torch.testing.assert_close(model.shared.grad, torch.ones_like(model.shared.grad))
+
+
+def test_scale_expert_grads_unit_factor_is_noop():
+    from types import SimpleNamespace
+
+    from verl_speco.backends.dsv4_ep_utils import scale_expert_grads
+
+    model = _Model()
+    for param in model.parameters():
+        param.grad = torch.ones_like(param)
+
+    scale_expert_grads(SimpleNamespace(model=model), factor=1.0)
+
+    for param in model.parameters():
+        torch.testing.assert_close(param.grad, torch.ones_like(param.grad))

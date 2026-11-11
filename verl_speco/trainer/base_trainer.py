@@ -1269,6 +1269,11 @@ class DrafterBaseTrainer:
 
         sync_non_expert_grads(self)
 
+    def _scale_ep_expert_grads(self, factor: float) -> None:
+        from verl_speco.backends.dsv4_ep_utils import scale_expert_grads
+
+        scale_expert_grads(self, factor)
+
     def _dump_local_expert_slices(self, checkpoint_path: str) -> str | None:
         if self.backend.model_type != "dsv4_dspark":
             return None
@@ -7584,7 +7589,7 @@ class DrafterBaseTrainer:
         # outside the autograd graph, so each rank's backward carries only its own
         # contribution, and FSDP then averages gradients across the same
         # `reduce_world_size` ranks. Scaling by `reduce_world_size` cancels that
-        # mean. Scaling by `reduce_world_size` cancels that mean. A single
+        # mean. A single
         # micro-batch divides here; accumulated loss-sum gradients divide once
         # by the combined valid-token count immediately before optimizer.step.
         local_loss_sum = loss_dict["v_weight"] * l_v + loss_dict["p_weight"] * l_p
@@ -7597,6 +7602,12 @@ class DrafterBaseTrainer:
             # EP keeps each rank's experts local; non-expert params are
             # replicated and need a manual gradient all-reduce.
             self._sync_non_expert_grads()
+            # Rank-local expert grads are never averaged, so they still carry
+            # the ``reduce_world_size`` loss-scaling factor that replicated
+            # params cancel through their gradient mean. Rescale them before
+            # clipping so expert and shared gradients follow the same global
+            # objective.
+            self._scale_ep_expert_grads(1.0 / float(reduce_world_size))
         self.record_training_timing(
             "timing_s/drafter_backward", training_stage_clock(self) - backward_ts
         )
