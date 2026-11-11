@@ -2384,6 +2384,55 @@ def test_drafter_opd_e2e_backends_apply_first_rejection_weight(model_type, vat):
     assert not torch.allclose(results[1][1], results[0][1])
 
 
+@pytest.mark.parametrize("vat", [False, True])
+@pytest.mark.parametrize("front_count", [1, 2, 3])
+def test_dflash_opd_zero_weight_prefix_matches_dense_loss_and_gradient(vat, front_count):
+    torch.manual_seed(29)
+    config = DFlashConfig(
+        hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1, vocab_size=32,
+        num_target_layers=4, num_context_layers=2, target_hidden_size=8,
+        target_num_hidden_layers=4, target_layer_ids=[1, 3], mask_token_id=31,
+    )
+    model = DFlashTrainingModel(
+        DFlashDraftModel(config), block_size=4, num_anchors=1,
+        front_position_weight=0, front_position_count=front_count,
+        per_position_loss_weight="vat" if vat else "fixed_exp_decay",
+        drafter_opd_config={"enable": True, "anchor_planner": "trace", "loss": "e2e_tv"},
+    )
+    outputs, tv_losses = [], []
+    model.draft_model.register_forward_hook(lambda module, args, output: outputs.append(output))
+    model.opd_objective.register_forward_hook(lambda module, args, output: tv_losses.append(output))
+    head = torch.randn(32, 8)
+    target_hidden = torch.randn(1, 6, 8)
+    plan = torch.full((1, 6, 3), -1)
+    plan[0, 1] = torch.tensor([3, 3, 0])
+    loss, *_rest, diagnostics = model(
+        input_ids=torch.tensor([[1, 2, 3, 4, 5, 6]]),
+        hidden_states_list=[torch.randn(1, 6, 8), torch.randn(1, 6, 8)],
+        loss_mask=torch.ones(1, 6), lm_head_weight=head,
+        target_last_hidden_states=target_hidden, opd_trace=plan,
+    )
+    # Anchor at token 1: draft positions 1..3 predict labels 2..4,
+    # whose teacher distributions come from hidden rows 1..3.
+    logits = outputs[0].reshape(4, 8)[1:] @ head.T
+    teacher_probs = (target_hidden[0, 1:4] @ head.T).softmax(-1)
+    tv = (logits.softmax(-1) - teacher_probs).abs().sum(-1) / 2
+    weights = torch.ones(3)
+    weights[:front_count] = 0
+    expected = ((1 - (1 - tv).cumprod(0)) * weights).sum() / 3
+    torch.testing.assert_close(diagnostics["opd/loss"], expected.detach())
+    actual_grad = torch.autograd.grad(tv_losses[0], outputs[0], retain_graph=True)[0]
+    expected_grad = torch.autograd.grad(expected, outputs[0], retain_graph=True)[0]
+    torch.testing.assert_close(actual_grad, expected_grad)
+    if front_count < 3:
+        assert expected_grad.reshape(4, 8)[1].abs().sum() > 0
+    else:
+        torch.testing.assert_close(actual_grad, torch.zeros_like(actual_grad))
+    loss.backward()
+    assert torch.isfinite(loss)
+
+
 def test_drafter_opd_trace_survives_feature_store_preprocess_and_batch_padding():
     trainer = _label_packing_trainer()
     training = trainer.config.rollout.drafter.training

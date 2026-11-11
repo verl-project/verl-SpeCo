@@ -930,8 +930,21 @@ class DFlashTrainingModel(nn.Module):
 
         if self.opd_objective is not None and self.opd_objective.loss_type == "e2e_tv":
             opd_logits = active_logits if active_targets.numel() else F.linear(active_hidden, lm_head_weight)
+            opd_active_mask = active_mask
+            opd_target_hidden = active_target_hidden
+            if self.front_position_count > 0 and self.front_position_weight == 0:
+                # Zero loss weight does not remove a probability from later prefixes.
+                # Keep CE/VAT selection intact; score the full visible prefix for TV.
+                opd_active_mask = base_loss_mask.reshape(-1) > 0
+                opd_logits = F.linear(flat_hidden[opd_active_mask], lm_head_weight)
+                opd_target_hidden = (
+                    aligned_target_hidden.reshape(-1, aligned_target_hidden.size(-1))[
+                        opd_active_mask
+                    ]
+                    if aligned_target_hidden is not None else None
+                )
             loss = self.opd_objective(
-                opd_logits, active_target_hidden, lm_head_weight, base_loss_mask, active_mask,
+                opd_logits, opd_target_hidden, lm_head_weight, base_loss_mask, opd_active_mask,
                 position_weights=weight_mask)
         opd_metrics = (self.opd_objective.metrics(loss, observed, base_loss_mask)
                        if self.opd_objective is not None else {})

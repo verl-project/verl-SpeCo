@@ -77,6 +77,8 @@ loss_block = sum_j w_j * (1 - survival_j) / num_valid_positions
 
 `w_j` 使用 backend 的最终位置权重：可见首拒位乘 `first_reject_weight`，random block 保留固定位置衰减；组合 VAT 时使用其返回的位置权重，DFlash front-position 权重也保留。权重作用在累计前缀失败损失上，不乘进 TV 或 survival 概率链。分母保留有效位置数，不按权重和归一化，因此只有一个可见首拒 token 时倍权仍有效；加权 loss 可以大于 1，不再解释为失败概率。所有有效位置权重为 1 时等价于旧公式。EOS/窗口截断隐藏的首拒位不加权，DFlash anchor 和不连续前缀后的无效位置不参与。
 
+DFlash 设置 `front_position_weight=0` 时，E2E-TV 仍计算完整可见前缀的 TV；零权重位置没有自身的加权损失项，但会通过后续 survival 影响 loss 和梯度。CE/VAT 的原有样本选择保留。额外投影仅用于该零权重配置，默认正权重路径继续复用已有 logits。
+
 2026-11-10 起，两个 backend 显式传入 `position_weights`，补齐上述 E2E-TV 权重支持；此前版本仅对 CE 应用这些权重。CE 仍用于原有诊断。训练器沿用原有 token 权重归约，不另改分布式归约协议。
 
 该修正的 CPU 验证：`test_drafter_opd.py`、`test_verify_trace_runtime.py` 和 `test_dspark_trainer_backend.py` 共 **163 passed、1 skipped**（缺少 CUDA/NPU）。新增测试核对带权 dense loss/梯度、单个首拒位置的倍权，以及两种 backend 组合 VAT 的实际前后向路径；将 Objective 临时恢复为忽略权重时，四个 backend 回归用例均失败。Ruff 和 `git diff --check` 通过。GPU 接受长度、吞吐及训练稳定性需要重新实验；旧日志不能用作修正后的性能证据。
