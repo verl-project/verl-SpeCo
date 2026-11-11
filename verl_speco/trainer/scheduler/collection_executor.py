@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
-from verl_speco.integration.phase_timing import phase_span
-
+from verl_speco.integration.phase_timing import phase_span, phase_timing_enabled
 from verl_speco.trainer.scheduler.schedule_types import (
     CollectionPayload,
     CollectionWorkerResult,
@@ -44,10 +45,27 @@ class CallbackDrafterCollectionExecutor:
     phase_timing: bool = False
 
     def _call(self, phase, submit, request, **labels):
-        if not self.phase_timing:
+        enabled = self.phase_timing or phase_timing_enabled()
+        if not enabled:
             return self.resolve(submit(request))
-        with phase_span(f"collection_{phase}", enabled=self.phase_timing, **labels):
-            return self.resolve(submit(request))
+        # One existing phase record includes both submission and awaited work.
+        # Mutate the nested labels while inside the span; phase_span serializes
+        # them on exit, including partial timing when an exception propagates.
+        stages = {}
+        started = time.perf_counter()
+        with phase_span(
+            f"collection_{phase}", enabled=enabled, stages=stages, **labels
+        ):
+            try:
+                refs = submit(request)
+            finally:
+                stages["submit_s"] = time.perf_counter() - started
+            submitted_at = time.perf_counter()
+            try:
+                result = self.resolve(refs)
+            finally:
+                stages["wait_s"] = time.perf_counter() - submitted_at
+        return result
 
     def set_global_step(self, global_step: object) -> None:
         self._call("set_step", self.set_step, global_step, source_step=str(global_step))

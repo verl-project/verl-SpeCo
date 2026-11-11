@@ -6,8 +6,10 @@
   "examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_colocate_async_vllm_npu.sh": "npu",
   "examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_separate_async_vllm_npu.sh": "npu",
   "examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_vllm_npu.sh": "npu",
+  "examples/run_qwen3-4b_actor_fsdp_drafter_dspark_sft.sh": "gpu",
   "examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm.sh": "gpu",
   "examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh": "npu",
+  "examples/run_qwen3-4b_adaptive_schedule_drafter_dflash_vllm_npu.sh": "npu",
   "examples/run_qwen3-8b-adaptive-hybrid-lk_drafter_dspark_vllm.sh": "gpu",
   "examples/run_qwen3-8b-dpace_drafter_dflash_vllm.sh": "gpu",
   "examples/run_qwen3-8b-lk-loss_drafter_eagle3_vllm.sh": "gpu",
@@ -28,6 +30,7 @@
   "examples/run_qwen3-8b_drafter_eagle3_vllm.sh": "gpu",
   "examples/run_qwen3-8b_drafter_eagle3_vllm_npu.sh": "npu",
   "examples/run_qwen3-8b_drafter_separate_training.sh": "gpu",
+  "examples/run_qwen3-8b_opd_actor_fsdp2_drafter_dspark_vllm.sh": "gpu",
   "examples/run_qwen3.6-35b-a3b_drafter_dspark_separate_training.sh": "npu",
   "examples/run_qwen3-8b_v1_hard_freeze_longrun_drafter_dspark_vllm_npu.sh": "npu",
   "examples/run_qwen3-8b_v1_hard_freeze_smoke_drafter_dspark_vllm_npu.sh": "npu"

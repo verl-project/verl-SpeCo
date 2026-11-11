@@ -21,9 +21,10 @@ distribution aligned with verl.
 """
 
 import inspect
+import json
+import os
 
 import hydra
-import os
 
 
 def drafter_diagnostic_env() -> dict[str, str]:
@@ -35,6 +36,9 @@ def drafter_diagnostic_env() -> dict[str, str]:
             "VERL_DRAFTER_KEEP_HOT_TRIM_CACHE",
             "VERL_SPECO_PHASE_TIMING",
             "VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL",
+            "VERL_SPECO_DIAGNOSTIC_GPU_FIRST_STEPS",
+            "VERL_SPECO_DIAGNOSTIC_IDLE_REJECTIONS",
+            "VERL_SPECO_DIAGNOSTIC_ROLLOUT_PERF",
         )
         if name in os.environ
     }
@@ -109,15 +113,30 @@ def _strip_speco_overlay_for_native_run(config) -> None:
 
 
 def configure_phase_diagnostic_runtime_env(config) -> None:
-    """Keep opt-in Bubble driver diagnostics visible in Ray's root env too.
+    """Keep opt-in Bubble/CUDA diagnostics visible in Ray's root env too.
 
     The actor-class override below is still needed for already running Ray
     clusters. Configuring both also survives upstream wrappers that replace
     class runtime options (for example a profiler runtime environment).
     """
-    value = os.environ.get("VERL_SPECO_PHASE_TIMING", "")
+    from omegaconf import OmegaConf
+
+    for name in (
+        "VERL_SPECO_DIAGNOSTIC_GPU_FIRST_STEPS",
+        "VERL_SPECO_DIAGNOSTIC_IDLE_REJECTIONS",
+        "VERL_SPECO_DIAGNOSTIC_ROLLOUT_PERF",
+    ):
+        if name in os.environ:
+            OmegaConf.update(
+                config,
+                f"ray_kwargs.ray_init.runtime_env.env_vars.{name}",
+                os.environ[name],
+                force_add=True,
+            )
+    from verl_speco.utils.env import env_flag
+
     if (
-        value.lower() not in {"1", "true", "yes"}
+        not env_flag("VERL_SPECO_PHASE_TIMING")
         or _config_get(
             config,
             "actor_rollout_ref",
@@ -130,24 +149,164 @@ def configure_phase_diagnostic_runtime_env(config) -> None:
             default="sync",
         )
         != "rollout_idle_worker"
+        and _config_get(config, "trainer", "device", default="") != "cuda"
     ):
         return
-    from omegaconf import OmegaConf
 
     OmegaConf.update(
         config,
         "ray_kwargs.ray_init.runtime_env.env_vars.VERL_SPECO_PHASE_TIMING",
-        value,
+        os.environ["VERL_SPECO_PHASE_TIMING"],
         force_add=True,
     )
     ablation = os.environ.get("VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL")
-    if ablation is not None:
+    if (
+        ablation is not None
+        and _config_get(
+            config,
+            "actor_rollout_ref",
+            "rollout",
+            "drafter",
+            "training",
+            "scheduler",
+            "execution",
+            "strategy",
+            default="sync",
+        )
+        == "rollout_idle_worker"
+    ):
         OmegaConf.update(
             config,
             "ray_kwargs.ray_init.runtime_env.env_vars.VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL",
             ablation,
             force_add=True,
         )
+
+
+def configure_compile_cache_runtime_env(config) -> dict[str, str]:
+    """Forward explicit compiler cache paths; never choose or create a directory."""
+    from omegaconf import OmegaConf
+
+    configured = (
+        _config_get(
+            config, "ray_kwargs", "ray_init", "runtime_env", "env_vars", default={}
+        )
+        or {}
+    )
+    cache_env = {}
+    for name in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+        value = configured.get(name) if name in configured else os.getenv(name)
+        if value is not None:
+            cache_env[name] = str(value)
+            OmegaConf.update(
+                config,
+                f"ray_kwargs.ray_init.runtime_env.env_vars.{name}",
+                str(value),
+                force_add=True,
+            )
+    return cache_env
+
+
+def _rl_insight_backend_supported() -> bool:
+    """Return whether the installed verl can build the RL-Insight logger."""
+
+    try:
+        from verl.utils.tracking import RLInsightLogger, Tracking
+    except Exception:  # noqa: BLE001 - any import failure means unsupported
+        return False
+    return RLInsightLogger is not None and "rl_insight" in getattr(
+        Tracking, "supported_backend", ()
+    )
+
+
+def _rl_insight_config_payload(config) -> dict | None:
+    """Return ``trainer.rl_insight`` as a JSON-safe mapping, if configured."""
+
+    value = _config_get(config, "trainer", "rl_insight")
+    if value is None:
+        return None
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(value):
+            value = OmegaConf.to_container(value, resolve=True)
+        else:
+            value = dict(value)
+    except Exception:  # noqa: BLE001 - malformed config is not fatal
+        return None
+    return value or None
+
+
+def _forward_rl_insight_worker_env(config) -> None:
+    """Forward RL-Insight metadata to Ray workers via the job runtime env.
+
+    Ray worker processes (``SpecoWorker``) never build
+    ``Tracking``/``RLInsightLogger``, and rl-insight keeps its
+    ``project``/``experiment_name`` labels per process, so workers would
+    otherwise emit worker metrics/traces without those labels (and, on
+    multi-node clusters, without ``RL_INSIGHT_SERVER_URL`` at all). The trainer
+    process learns the names from ``trainer.project_name`` /
+    ``trainer.experiment_name``, the resolved monitoring overrides from
+    ``trainer.rl_insight`` and the server URL from the environment; this pushes
+    all of them into the Ray runtime env that upstream ``run_ppo`` merges
+    before ``ray.init``. Existing environment values are never overridden.
+
+    RL-Insight support is a capability of the installed verl release. Validate
+    it here so a v0.8.x install fails with an actionable message instead of the
+    upstream ``Tracking`` assertion.
+    """
+
+    trainer_logger = _config_get(config, "trainer", "logger", default=[])
+    loggers = (
+        [trainer_logger] if isinstance(trainer_logger, str) else (trainer_logger or [])
+    )
+    if "rl_insight" not in loggers:
+        return
+    if not _rl_insight_backend_supported():
+        raise RuntimeError(
+            "trainer.logger includes 'rl_insight', but the installed verl does "
+            "not provide the RL-Insight backend. Install verl release/v0.9.0 "
+            "(see REQUIRED_VERL.txt and README 'Online Monitoring with "
+            "RL-Insight') before enabling this logger."
+        )
+
+    env_vars = {}
+    project = _config_get(config, "trainer", "project_name")
+    experiment = _config_get(config, "trainer", "experiment_name")
+    if project:
+        env_vars["VERL_RL_INSIGHT_PROJECT_NAME"] = str(project)
+    if experiment:
+        env_vars["VERL_RL_INSIGHT_EXPERIMENT_NAME"] = str(experiment)
+    server_url = os.environ.get("RL_INSIGHT_SERVER_URL")
+    if server_url:
+        env_vars["RL_INSIGHT_SERVER_URL"] = server_url
+    rl_insight_config = _rl_insight_config_payload(config)
+    if rl_insight_config:
+        from verl_speco.rl_insight_bridge import CONFIG_ENV
+
+        env_vars[CONFIG_ENV] = json.dumps(rl_insight_config, sort_keys=True)
+    if not env_vars:
+        return
+
+    for key, value in env_vars.items():
+        os.environ.setdefault(key, value)
+
+    try:
+        from omegaconf import open_dict
+
+        with open_dict(config):
+            node = config
+            for key in ("ray_kwargs", "ray_init", "runtime_env", "env_vars"):
+                if key not in node or node[key] is None:
+                    node[key] = {}
+                node = node[key]
+            for key, value in env_vars.items():
+                if key not in node:
+                    node[key] = value
+    except Exception:
+        # The config may be a read-only/plain namespace; the exported env vars
+        # still cover single-node runs where Ray workers inherit the driver env.
+        pass
 
 
 def run(config) -> None:
@@ -195,9 +354,13 @@ def run(config) -> None:
 
     from verl_speco.integration.task_runner import SpecoTaskRunner
 
+    _forward_rl_insight_worker_env(config)
     configure_phase_diagnostic_runtime_env(config)
     runner = ray.remote(num_cpus=1)(SpecoTaskRunner)
-    diagnostic_env = drafter_diagnostic_env()
+    diagnostic_env = {
+        **configure_compile_cache_runtime_env(config),
+        **drafter_diagnostic_env(),
+    }
     if diagnostic_env:
         runner = runner.options(runtime_env={"env_vars": diagnostic_env})
     main_ppo.run_ppo(config, task_runner_class=runner)

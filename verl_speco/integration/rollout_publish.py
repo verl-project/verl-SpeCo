@@ -15,10 +15,12 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 import json
 import os
 import time
+import threading
 from contextlib import contextmanager
 from typing import Any, Optional, cast
 
@@ -104,6 +106,43 @@ def rollout_backend_name(config: Any) -> Optional[str]:
     return _get_nested(config, ("rollout", "name"), None) or _get_nested(
         config, ("actor_rollout_ref", "rollout", "name"), None
     )
+
+
+def _gpu_transfer_training_config(worker):
+    """Resolve actor settings even when verl strips drafter training metadata."""
+    config = getattr(worker, "config", None)
+    fallback = None
+    for path in (
+        ("rollout", "drafter", "training"),
+        ("actor_rollout_ref", "rollout", "drafter", "training"),
+    ):
+        training = _get_nested(config, path, None)
+        if training is not None:
+            source = ".".join(path)
+            if any(
+                key in training
+                for key in (
+                    "gpu_transfer_optimizations",
+                    "gpu_head_numpy_transport",
+                    "gpu_publish_cast_before_copy",
+                )
+            ):
+                return training, source
+            if fallback is None:
+                fallback = (training, source)
+    serialized = getattr(type(worker), "_speco_drafter_config_env", None) or getattr(
+        type(worker), "_speco_sglang_drafter_config_env", None
+    )
+    if serialized:
+        import json
+
+        try:
+            drafter = json.loads(serialized)
+        except (TypeError, ValueError):
+            return None, "invalid_serialized_config"
+        if isinstance(drafter, dict) and isinstance(drafter.get("training"), dict):
+            return drafter["training"], "serialized_drafter_config"
+    return fallback if fallback is not None else (None, "missing_training_config")
 
 
 def actor_training_backend_name(config: Any) -> str:
@@ -253,14 +292,31 @@ def materialize_draft_weights_payload(weights: Any) -> tuple[Any, bool]:
         ray = None
         object_ref_type = ()
 
+    used_ref = False
     if isinstance(weights, dict) and "weights_ref" in weights:
         weights_ref = weights["weights_ref"]
         if object_ref_type and isinstance(weights_ref, object_ref_type):
-            return ray.get(weights_ref), True
-        return weights_ref, True
-    if object_ref_type and isinstance(weights, object_ref_type):
-        return ray.get(weights), True
-    return weights, False
+            weights = ray.get(weights_ref)
+        else:
+            weights = weights_ref
+        used_ref = True
+    elif object_ref_type and isinstance(weights, object_ref_type):
+        weights, used_ref = ray.get(weights), True
+    if isinstance(weights, dict) and "_speco_cpu_tensor_wire_v1" in weights:
+        from verl_speco.integration.tensor_wire import (
+            decode_cpu_tensors,
+            tensor_payload_bytes,
+        )
+
+        started = time.perf_counter()
+        weights = decode_cpu_tensors(weights)
+        logger.warning(
+            "[drafter publish wire] action=decode encoding=numpy_bytes_v1 entries=%s bytes=%s elapsed_s=%.4f",
+            len(weights),
+            tensor_payload_bytes(weights),
+            time.perf_counter() - started,
+        )
+    return weights, used_ref
 
 
 def _release_publish_host_memory() -> dict[str, Any]:
@@ -282,7 +338,54 @@ def _release_publish_host_memory() -> dict[str, Any]:
     }
 
 
-def release_draft_weights_payload(weights: Any) -> dict[str, Any]:
+_publish_reclaim_policy = None
+_publish_reclaim_lock = threading.Lock()
+
+
+def _release_publish_host_memory_on_demand(released_bytes):
+    from verl_speco.integration.publish_reclaim import (
+        PublishReclaimPolicy,
+        cgroup_memory_pressure,
+    )
+    from verl_speco.trainer.checkpoint import (
+        collect_checkpoint_memory_snapshot,
+        format_checkpoint_memory_snapshot,
+    )
+
+    global _publish_reclaim_policy
+    with _publish_reclaim_lock:
+        if _publish_reclaim_policy is None:
+            _publish_reclaim_policy = PublishReclaimPolicy()
+            atexit.register(_release_publish_host_memory)
+        started = time.perf_counter()
+        snapshot = collect_checkpoint_memory_snapshot()
+        reason = _publish_reclaim_policy.decide(
+            released_bytes, snapshot, cgroup_pressure=cgroup_memory_pressure()
+        )
+        details = {
+            "reclaim_reason": reason,
+            "released_bytes": released_bytes,
+            "since_reclaim_bytes": _publish_reclaim_policy.pending_bytes,
+            "release_count": _publish_reclaim_policy.releases,
+        }
+        if reason == "deferred":
+            memory = format_checkpoint_memory_snapshot(snapshot)
+            return {
+                **details,
+                "reclaim_action": "deferred",
+                "heap_trimmed": False,
+                "memory_before": memory,
+                "memory_after": memory,
+                "elapsed_sec": time.perf_counter() - started,
+            }
+        result = _release_publish_host_memory()
+        _publish_reclaim_policy.reset()
+        return {**result, **details}
+
+
+def release_draft_weights_payload(
+    weights: Any, *, defer_host_reclaim: bool = False, released_bytes: int = 0
+) -> dict[str, Any]:
     """Drop a consumed publish payload before reclaiming allocator pages."""
 
     try:
@@ -299,7 +402,11 @@ def release_draft_weights_payload(weights: Any) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to clear drafter publish payload: %s", exc)
 
-    reclaim = _release_publish_host_memory()
+    reclaim = (
+        _release_publish_host_memory_on_demand(released_bytes)
+        if defer_host_reclaim and payload_cleared
+        else _release_publish_host_memory()
+    )
     return {
         "num_weights": int(num_weights),
         "payload_cleared": int(payload_cleared),
@@ -900,6 +1007,206 @@ def _export_veomni_actor_lm_head_weight(
                 empty_cache()
 
 
+def _export_fsdp2_lm_head_full(
+    worker: Any, diagnostics: dict | None = None
+) -> tuple[bool, dict | None]:
+    """Export only an exposed FSDP2 head, without enumerating engine weights.
+
+    Selection must finish before the first collective. Unsupported layouts use
+    the engine path; collective/copy failures must propagate on every rank,
+    rather than retrying a different collective sequence after partial export.
+    """
+    diagnostics = diagnostics if diagnostics is not None else {}
+    config = getattr(worker, "config", None)
+    if actor_training_backend_name(config) != "fsdp2":
+        diagnostics["fallback_reason"] = "actor_not_fsdp2"
+        return False, None
+    # Engine export may merge adapters. A raw parameter is not equivalent then.
+    for prefix in ((), ("actor_rollout_ref",)):
+        if _get_nested(config, (*prefix, "model", "lora_rank"), 0) or _get_nested(
+            config, (*prefix, "model", "lora_adapter_path"), None
+        ):
+            diagnostics["fallback_reason"] = "lora_export"
+            return False, None
+
+    torch = _torch_module()
+    from torch.distributed.tensor import DTensor
+
+    selected_name, selected_weight = None, None
+    fallback_name, fallback_weight = None, None
+    for module in _actor_module_candidates(worker):
+        if not isinstance(module, torch.nn.Module):
+            continue
+        named_parameters = getattr(module, "named_parameters", None)
+        if not callable(named_parameters):
+            continue
+        # Retain aliases so a tied output head is not hidden by embed_tokens.
+        for name, tensor in named_parameters(remove_duplicate=False):
+            if name == "lm_head.weight" or name.endswith(".lm_head.weight"):
+                selected_name, selected_weight = name, tensor
+                break
+            if name == "model.embed_tokens.weight" or name.endswith(
+                ".embed_tokens.weight"
+            ):
+                fallback_name, fallback_weight = name, tensor
+        if selected_weight is not None:
+            break
+    if selected_weight is None:
+        selected_name, selected_weight = fallback_name, fallback_weight
+    # A plain parameter may be a local shard under an unsupported wrapper.
+    # Do not infer completeness from its 2D shape alone. NPU keeps its old path.
+    diagnostics.update(
+        head_name=selected_name,
+        parameter_type=f"{type(selected_weight).__module__}.{type(selected_weight).__qualname__}",
+    )
+    if selected_weight is None:
+        diagnostics["fallback_reason"] = "head_not_found"
+        return False, None
+    diagnostics.update(
+        shape=list(selected_weight.shape),
+        dtype=str(selected_weight.dtype),
+        device=str(selected_weight.device),
+    )
+    if not isinstance(selected_weight, DTensor):
+        diagnostics["fallback_reason"] = "head_not_dtensor"
+        return False, None
+    diagnostics.update(
+        mesh=str(selected_weight.device_mesh),
+        placements=[str(placement) for placement in selected_weight.placements],
+        local_shape=list(selected_weight.to_local().shape),
+    )
+    if selected_weight.dim() != 2:
+        diagnostics["fallback_reason"] = "head_not_2d"
+        return False, None
+    if selected_weight.device_mesh.device_type == "npu":
+        diagnostics["fallback_reason"] = "npu_original_path"
+        return False, None
+
+    started = time.perf_counter()
+    tensor = selected_weight.detach()
+    mesh_device = torch.device(tensor.device_mesh.device_type)
+    if tensor.to_local().device.type != mesh_device.type:
+        # Parameter offload preserves the mesh; restore only this local shard.
+        tensor = tensor.to(device=mesh_device)
+    gathered = tensor.full_tensor()
+    gather_elapsed = time.perf_counter() - started
+    # Every mesh rank must gather, even though only the global leader publishes.
+    if getattr(worker, "rank", None) != 0:
+        return True, None
+    from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
+
+    training, _ = _gpu_transfer_training_config(worker)
+    source_bytes = gathered.numel() * gathered.element_size()
+    cast_started = time.perf_counter()
+    cast_before_copy = (
+        gpu_transfer_enabled(training, "gpu_publish_cast_before_copy")
+        and gathered.device.type == "cuda"
+    )
+    if cast_before_copy:
+        gathered = gathered.to(dtype=torch.bfloat16)
+    cast_submit_s = time.perf_counter() - cast_started
+    copy_started = time.perf_counter()
+    # Own the snapshot even for a replicated CPU tensor: actor updates must not
+    # mutate an in-flight payload. Keep the original export's BF16 conversion.
+    weight = gathered.to(device="cpu", dtype=torch.bfloat16, copy=True).contiguous()
+    diagnostics.update(
+        fallback_reason="none",
+        gather_submit_s=gather_elapsed,
+        cast_submit_s=cast_submit_s,
+        cast_before_copy=int(cast_before_copy),
+        source_bytes=source_bytes,
+        payload_bytes=weight.numel() * weight.element_size(),
+        host_copy_s=time.perf_counter() - copy_started,
+    )
+    logger.warning(
+        "[actor lm_head export] direct_full name=%s shape=%s gather_submit_s=%.4f host_copy_s=%.4f "
+        "cast_before_copy=%s source_bytes=%s payload_bytes=%s",
+        selected_name,
+        tuple(weight.shape),
+        gather_elapsed,
+        time.perf_counter() - copy_started,
+        cast_before_copy,
+        source_bytes,
+        weight.numel() * weight.element_size(),
+    )
+    return True, {
+        "name": selected_name,
+        "weight": weight,
+        "row_indices": None,
+        "source_vocab_size": int(weight.shape[0]),
+        "selected_rows": None,
+        "export_strategy": "direct_full",
+    }
+
+
+_HEAD_EXPORT_FALLBACK_CODES = {
+    "none": 0,
+    "actor_not_fsdp2": 1,
+    "lora_export": 2,
+    "head_not_found": 3,
+    "head_not_dtensor": 4,
+    "head_not_2d": 5,
+    "npu_original_path": 6,
+    "row_selection_requested": 7,
+    "algorithm_not_dspark": 8,
+    "veomni_original_path": 9,
+}
+
+
+def target_lm_head_export_metrics(payload: Any) -> dict[str, float | int]:
+    """Expose worker export diagnostics as numeric driver metrics.
+
+    Missing metadata means an older worker, not a successful fast path. Gather
+    timing measures submission; host copy may also wait for queued device work.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    diagnostics = payload.get("export_diagnostics", {})
+    reason = diagnostics.get("fallback_reason", "unknown")
+    metrics: dict[str, float | int] = {
+        "drafter/target_lm_head_export_diagnostics_present": int(bool(diagnostics)),
+        "drafter/target_lm_head_numpy_transport": int(
+            diagnostics.get("numpy_transport", 0)
+        ),
+        "drafter/target_lm_head_cast_before_copy": int(
+            diagnostics.get("cast_before_copy", 0)
+        ),
+        "drafter/target_lm_head_direct_full_export": int(
+            payload.get("export_strategy") == "direct_full"
+        ),
+        "drafter/target_lm_head_engine_full_export": int(
+            payload.get("export_strategy") == "engine_full_param"
+        ),
+        "drafter/target_lm_head_export_fallback_reason": _HEAD_EXPORT_FALLBACK_CODES.get(
+            reason, -1
+        ),
+    }
+    for field in (
+        "elapsed_s",
+        "gather_submit_s",
+        "cast_submit_s",
+        "host_copy_s",
+        "engine_materialize_s",
+    ):
+        if field in diagnostics:
+            metrics[f"timing_s/drafter_head_export_{field.removesuffix('_s')}"] = float(
+                diagnostics[field]
+            )
+    return metrics
+
+
+def _finish_head_export(worker: Any, payload: Any, diagnostics: dict, started: float):
+    if payload is not None:
+        diagnostics.update(
+            worker_rank=getattr(worker, "rank", None),
+            source_file=os.path.abspath(__file__),
+            actor_backend=actor_training_backend_name(getattr(worker, "config", None)),
+            elapsed_s=time.perf_counter() - started,
+            exported_head_name=payload.get("name"),
+        )
+        payload["export_diagnostics"] = diagnostics
+    return payload
+
+
 def _worker_bubble_enabled(worker: Any) -> bool:
     strategy = _get_nested(
         getattr(worker, "config", None),
@@ -958,6 +1265,8 @@ def export_actor_lm_head_weight(
     """Export actor lm_head or tied embedding rows from an actor-rollout worker."""
 
     torch = _torch_module()
+    export_started = time.perf_counter()
+    diagnostics: dict[str, Any] = {}
 
     if (
         not getattr(worker, "_is_actor", False)
@@ -966,71 +1275,83 @@ def export_actor_lm_head_weight(
         return None
 
     if _is_veomni_actor_worker(worker):
-        return _export_veomni_actor_lm_head_weight(
+        diagnostics["fallback_reason"] = "veomni_original_path"
+        payload = _export_veomni_actor_lm_head_weight(
             worker,
             row_indices=row_indices,
             keep_model_on_device=keep_model_on_device,
         )
+        return _finish_head_export(worker, payload, diagnostics, export_started)
 
     normalized_row_indices = _normalize_lm_head_row_indices(row_indices)
     name, tensor, head_only_reason = _head_only_export_candidate(
         worker, normalized_row_indices
     )
-    if tensor is not None:
-        from verl_speco.integration.phase_timing import phase_span
-
-        trace_labels = {
-            "enabled": _worker_bubble_enabled(worker),
-            "rank": getattr(worker, "rank", None),
-        }
-        # FSDP2 exposes each parameter as a DTensor. Export only the projection
-        # instead of enumerating/materializing the entire actor checkpoint.
-        # All mesh ranks execute full_tensor; only rank zero retains the payload.
+    if tensor is None and not require_head_only and not _worker_bubble_enabled(worker):
+        if normalized_row_indices is None:
+            supported, payload = _export_fsdp2_lm_head_full(worker, diagnostics)
+            if supported:
+                return _finish_head_export(worker, payload, diagnostics, export_started)
+        else:
+            diagnostics["fallback_reason"] = "row_selection_requested"
+    else:
         if tensor is not None:
-            local = (
-                tensor.to_local()
-                if callable(getattr(tensor, "to_local", None))
-                else tensor
-            )
-            if callable(getattr(tensor, "full_tensor", None)):
-                if local.device.type == "cpu":
-                    from verl.utils.device import get_device_name
+            from verl_speco.integration.phase_timing import phase_span
 
-                    device = torch.device(get_device_name())
-                    with phase_span("lm_head_device_restore", **trace_labels):
-                        tensor = tensor.to(device=device)
-                with phase_span("lm_head_gather", **trace_labels):
-                    weight = tensor.detach().full_tensor()
-            else:
-                weight = tensor.detach()
-            if getattr(worker, "rank", None) != 0:
-                return None
-            with phase_span("lm_head_cpu_copy", **trace_labels):
-                if copy_cpu_snapshot:
-                    weight = weight.to(device="cpu", dtype=torch.bfloat16, copy=True)
+            trace_labels = {
+                "enabled": _worker_bubble_enabled(worker),
+                "rank": getattr(worker, "rank", None),
+            }
+            # FSDP2 exposes each parameter as a DTensor. Export only the projection
+            # instead of enumerating/materializing the entire actor checkpoint.
+            # All mesh ranks execute full_tensor; only rank zero retains the payload.
+            if tensor is not None:
+                local = (
+                    tensor.to_local()
+                    if callable(getattr(tensor, "to_local", None))
+                    else tensor
+                )
+                if callable(getattr(tensor, "full_tensor", None)):
+                    if local.device.type == "cpu":
+                        from verl.utils.device import get_device_name
+
+                        device = torch.device(get_device_name())
+                        with phase_span("lm_head_device_restore", **trace_labels):
+                            tensor = tensor.to(device=device)
+                    with phase_span("lm_head_gather", **trace_labels):
+                        weight = tensor.detach().full_tensor()
                 else:
-                    weight = weight.to(device="cpu", dtype=torch.bfloat16)
-            with phase_span("lm_head_cpu_contiguous", **trace_labels):
-                weight = weight.contiguous()
-            logger.info(
-                "[actor lm_head export] direct_full name=%s shape=%s",
-                name,
-                tuple(weight.shape),
+                    weight = tensor.detach()
+                if getattr(worker, "rank", None) != 0:
+                    return None
+                with phase_span("lm_head_cpu_copy", **trace_labels):
+                    if copy_cpu_snapshot:
+                        weight = weight.to(
+                            device="cpu", dtype=torch.bfloat16, copy=True
+                        )
+                    else:
+                        weight = weight.to(device="cpu", dtype=torch.bfloat16)
+                with phase_span("lm_head_cpu_contiguous", **trace_labels):
+                    weight = weight.contiguous()
+                logger.info(
+                    "[actor lm_head export] direct_full name=%s shape=%s",
+                    name,
+                    tuple(weight.shape),
+                )
+                with phase_span("lm_head_payload_build", **trace_labels):
+                    return {
+                        "name": name,
+                        "weight": weight,
+                        "row_indices": None,
+                        "source_vocab_size": int(weight.shape[0]),
+                        "selected_rows": 0,
+                        "export_strategy": "direct_full",
+                    }
+        if require_head_only:
+            raise RuntimeError(
+                "Async Bubble export requires the FSDP2 head-only path; refusing full actor reload: "
+                + head_only_reason
             )
-            with phase_span("lm_head_payload_build", **trace_labels):
-                return {
-                    "name": name,
-                    "weight": weight,
-                    "row_indices": None,
-                    "source_vocab_size": int(weight.shape[0]),
-                    "selected_rows": 0,
-                    "export_strategy": "direct_full",
-                }
-    if require_head_only:
-        raise RuntimeError(
-            "Async Bubble export requires the FSDP2 head-only path; refusing full actor reload: "
-            + head_only_reason
-        )
     # Block drafters that train against the target's own lm_head rows.
     is_dflash = drafter_speculative_algorithm(getattr(worker, "config", None)) in {
         "DFLASH",
@@ -1050,8 +1371,11 @@ def export_actor_lm_head_weight(
         ):
             return None
         if direct_payload is not None:
-            return direct_payload
+            return _finish_head_export(
+                worker, direct_payload, diagnostics, export_started
+            )
 
+    engine_started = time.perf_counter()
     per_tensor_param, _ = worker.actor.engine.get_per_tensor_param(
         layered_summon=getattr(worker, "layered_summon", False),
         base_sync_done=True,
@@ -1076,6 +1400,8 @@ def export_actor_lm_head_weight(
     if selected_weight is None:
         selected_name = fallback_name
         selected_weight = fallback_weight
+
+    diagnostics["engine_materialize_s"] = time.perf_counter() - engine_started
 
     if getattr(worker, "rank", None) != 0:
         return None
@@ -1102,9 +1428,11 @@ def export_actor_lm_head_weight(
                 "Received empty lm_head row_indices for SPECO sync; falling back to full lm_head export"
             )
 
+    copy_started = time.perf_counter()
     weight = (
         selected_weight.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
     )
+    diagnostics["host_copy_s"] = time.perf_counter() - copy_started
     logger.warning(
         "[actor lm_head export] name=%s shape=%s dtype=%s source_vocab=%s selected_rows=%s",
         selected_name,
@@ -1113,18 +1441,33 @@ def export_actor_lm_head_weight(
         source_vocab_size,
         selected_rows,
     )
-    return {
-        "name": selected_name,
-        "weight": weight,
-        "row_indices": exported_row_indices,
-        "source_vocab_size": source_vocab_size,
-        "selected_rows": selected_rows,
-        "export_strategy": "engine_full_param",
-    }
+    return _finish_head_export(
+        worker,
+        {
+            "name": selected_name,
+            "weight": weight,
+            "row_indices": exported_row_indices,
+            "source_vocab_size": source_vocab_size,
+            "selected_rows": selected_rows,
+            "export_strategy": "engine_full_param",
+        },
+        diagnostics,
+        export_started,
+    )
 
 
 class DraftWeightPublishMixin:
     """Mixin for external actor-rollout workers that publish SPECO draft weights."""
+
+    @register(
+        dispatch_mode=getattr(
+            Dispatch, "DIRECT_ROLLOUT_METHOD", getattr(Dispatch, "ONE_TO_ALL", None)
+        )
+    )
+    def speco_resource_identity(self):
+        from verl_speco.integration.resource_identity import resource_identity
+
+        return resource_identity(self.rank)
 
     config: Any
     rollout: Any
@@ -1142,9 +1485,16 @@ class DraftWeightPublishMixin:
         from verl_speco.integration.phase_timing import (
             install_engine_phase_timing,
             install_ref_worker_phase_timing,
+            phase_timing_enabled,
         )
 
-        if _worker_bubble_enabled(self):
+        sync_cuda_diagnostics = False
+        if phase_timing_enabled():
+            import torch
+
+            sync_cuda_diagnostics = torch.cuda.is_available()
+        if _worker_bubble_enabled(self) or sync_cuda_diagnostics:
+            # Helpers remain no-ops unless VERL_SPECO_PHASE_TIMING is enabled.
             install_ref_worker_phase_timing(self)
             for role in ("actor", "ref"):
                 engine = getattr(getattr(self, role, None), "engine", None)
@@ -1162,16 +1512,59 @@ class DraftWeightPublishMixin:
     ):
         from verl_speco.integration.phase_timing import phase_span
 
+        bubble = _worker_bubble_enabled(self)
         with phase_span(
-            "lm_head_export",
-            enabled=_worker_bubble_enabled(self),
-            rank=getattr(self, "rank", None),
+            "lm_head_export", enabled=bubble, rank=getattr(self, "rank", None)
         ):
-            return export_actor_lm_head_weight(
-                self,
-                row_indices=row_indices,
-                keep_model_on_device=keep_model_on_device,
+            payload = export_actor_lm_head_weight(
+                self, row_indices=row_indices, keep_model_on_device=keep_model_on_device
             )
+        if bubble:
+            return payload
+        from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
+
+        training, config_source = _gpu_transfer_training_config(self)
+        enabled = gpu_transfer_enabled(training, "gpu_head_numpy_transport")
+        if payload is not None and payload.get("row_indices") is None:
+            torch = _torch_module()
+            reason = "disabled" if training is not None else config_source
+            # Only CUDA FSDP2 full-head export; NPU/LoRA/sparse retain their path.
+            if (
+                enabled
+                and payload.get("export_strategy") == "direct_full"
+                and torch.cuda.is_available()
+            ):
+                from verl_speco.integration.tensor_wire import (
+                    encode_cpu_tensors,
+                    tensor_payload_bytes,
+                )
+
+                started = time.perf_counter()
+                wire = encode_cpu_tensors({"weight": payload["weight"]})
+                reason = "unsupported_tensor_layout"
+                if wire is not None:
+                    size = tensor_payload_bytes({"weight": payload["weight"]})
+                    payload = {**payload, "weight": None, "head_wire": wire}
+                    payload["export_diagnostics"]["numpy_transport"] = 1
+                    reason = "none"
+                    logger.warning(
+                        "[drafter head wire] action=encode bytes=%s elapsed_s=%.4f",
+                        size,
+                        time.perf_counter() - started,
+                    )
+            elif enabled:
+                reason = "unsupported_export_or_device"
+            payload.setdefault("export_diagnostics", {})["numpy_transport_reason"] = (
+                reason
+            )
+            logger.warning(
+                "[drafter head wire] action=select config_source=%s enabled=%s encoding=%s fallback_reason=%s",
+                config_source,
+                enabled,
+                "numpy_bytes_v1" if "head_wire" in payload else "torch",
+                reason,
+            )
+        return payload
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
     def get_actor_lm_head_export_capability(self):

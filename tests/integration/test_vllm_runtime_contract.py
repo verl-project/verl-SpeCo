@@ -712,9 +712,9 @@ def test_generation_diagnostics_separate_lease_from_raw_generate(monkeypatch):
     monkeypatch.setattr(
         diagnostics,
         "emit_summary",
-        lambda kind, **fields: records.append(fields)
-        if kind == "replica_episode"
-        else None,
+        lambda kind, **fields: (
+            records.append(fields) if kind == "replica_episode" else None
+        ),
     )
     config = _drafter(
         training={
@@ -775,9 +775,9 @@ def test_vllm_generate_cancellation_preserves_concurrent_request_stats(
     monkeypatch.setattr(
         diagnostics,
         "emit_summary",
-        lambda kind, **fields: records.append(fields)
-        if kind == "replica_episode"
-        else None,
+        lambda kind, **fields: (
+            records.append(fields) if kind == "replica_episode" else None
+        ),
     )
 
     async def run_requests():
@@ -889,6 +889,8 @@ def test_vllm_generate_preserves_unscored_request_ids_and_transport_keys(
     scored = outputs["scored-request"].extra_fields
     unscored = outputs["unscored-request"].extra_fields
     assert scored.keys() == unscored.keys()
+    assert scored["_speco_acceptance_engine_fallback"] is False
+    assert unscored["_speco_acceptance_engine_fallback"] is False
     assert scored["_speco_vllm_request_id"] == "scored-request"
     assert scored["_verl_request_mean_accept_len"] == 4.0
     assert unscored["_speco_vllm_request_id"] == "unscored-request"
@@ -2304,6 +2306,7 @@ def test_vllm_http_server_transports_final_request_acceptance_stats() -> None:
     elapsed = output.extra_fields.pop("_speco_vllm_request_elapsed_sec")
     assert elapsed >= 0
     assert output.extra_fields == {
+        "_speco_acceptance_engine_fallback": False,
         "global_steps": 1,
         "spec_num_draft_tokens": 28.0,
         "spec_num_accepted_tokens": 9.0,
@@ -2552,6 +2555,7 @@ def test_vllm_http_server_transports_stats_with_positional_request_id() -> None:
     elapsed = output.extra_fields.pop("_speco_vllm_request_elapsed_sec")
     assert elapsed >= 0
     assert output.extra_fields == {
+        "_speco_acceptance_engine_fallback": False,
         "global_steps": 1,
         "spec_num_draft_tokens": 21.0,
         "spec_num_accepted_tokens": 5.0,
@@ -2765,6 +2769,17 @@ def test_trainer_keeps_public_acceptance_metric_name() -> None:
     assert '"drafter/spec_decode/mean_acceptance_length"' in trainer_source
 
 
+def test_vllm_length_stats_accumulate_rounds_and_accepted_tokens():
+    stats = _new_vllm_spec_decode_stats()
+    for rounds, accepted in ((1, 1), (99, 199)):
+        _record_vllm_spec_decode_scheduler_stats(stats, SimpleNamespace(
+            spec_decoding_stats=SimpleNamespace(
+                num_drafts=rounds, num_accepted_tokens=accepted,
+            )
+        ))
+    assert stats == {"drafts": 100, "draft_tokens": 0, "accepted_tokens": 200}
+
+
 def test_trainer_drains_async_publish_before_checkpoint_and_validation() -> None:
     trainer_source = (
         Path(__file__).resolve().parents[2]
@@ -2941,6 +2956,12 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(
         def __init__(self, value):
             self.value = value
 
+        def numel(self):
+            return 1
+
+        def element_size(self):
+            return 4
+
         def detach(self):
             raise AssertionError(
                 "streamed draft updates must not detach bucket tensors"
@@ -3044,6 +3065,8 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(
     assert inner_model.loaded == [[("fc.weight", "first")], second_bucket]
     skip_logged = "does not register 1 inference-only drafter param" in caplog.text
     assert skip_logged is not registers_confidence_head
+    assert f"payload_bytes={(len(second_bucket) + 1) * 4}" in caplog.text
+    assert "receive_s=" in caplog.text and "callback_submit_s=" in caplog.text
     assert inner_model.rebuilds == 1
     assert extension._speco_draft_runtime_revision == 1
     assert cache_events == ["rebuild", "synchronize", "empty_cache"]
@@ -3265,3 +3288,98 @@ def test_vllm_draft_loader_rejects_partial_online_update() -> None:
             {"layers.0.self_attn.qkv_proj.weight"},
             draft_method="dspark",
         )
+
+
+@pytest.mark.parametrize("serialized", [False, True])
+def test_ipc_cpu_handle_does_not_remap_cuda_device_slot(serialized):
+    torch = pytest.importorskip("torch")
+    from torch.multiprocessing.reductions import reduce_tensor
+
+    source = torch.arange(12).reshape(3, 4)
+    func, args = reduce_tensor(source)
+    assert len(args) == 3
+    rebuilt = vllm_runtime._speco_rebuild_ipc_compat(
+        ("rebuild_tensor" if serialized else func, args), 2
+    )
+    assert rebuilt.device.type == "cpu"
+    torch.testing.assert_close(rebuilt, source, rtol=0, atol=0)
+
+
+def test_ipc_cuda_handle_only_remaps_storage_device(monkeypatch):
+    pytest.importorskip("torch")
+    from torch.multiprocessing import reductions
+
+    def rebuild(*args):
+        return args
+
+    monkeypatch.setattr(reductions, "rebuild_cuda_tensor", rebuild)
+    args = tuple(range(15))
+    result = vllm_runtime._speco_rebuild_ipc_compat(("rebuild_cuda_tensor", args), 2)
+    assert result == args[:6] + (2,) + args[7:]
+    assert args == tuple(range(15))
+    with pytest.raises(ValueError, match="CUDA IPC"):
+        vllm_runtime._speco_rebuild_ipc_compat((rebuild, (1, 2, 3)), 2)
+
+
+@pytest.mark.parametrize("serialized", [False, True])
+@pytest.mark.parametrize("device_id", [None, 0, 2])
+def test_ipc_npu_handle_remaps_only_receiver_device(monkeypatch, serialized, device_id):
+    import sys
+    from types import ModuleType
+
+    pytest.importorskip("torch")
+
+    def rebuild_npu_tensor(*args):
+        return args
+
+    rebuild_npu_tensor.__module__ = "torch_npu.multiprocessing.reductions"
+    module = ModuleType("torch_npu.multiprocessing.reductions")
+    module.rebuild_npu_tensor = rebuild_npu_tensor
+    package = ModuleType("torch_npu.multiprocessing")
+    package.reductions = module
+    monkeypatch.setitem(sys.modules, "torch_npu.multiprocessing", package)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    func = module.__name__ + ".rebuild_npu_tensor" if serialized else rebuild_npu_tensor
+    args = tuple(range(15))
+    result = vllm_runtime._speco_rebuild_ipc_compat((func, args), device_id)
+    expected = args if device_id is None else args[:6] + (device_id,) + args[7:]
+    assert result == expected
+    assert args == tuple(range(15))
+    if device_id is not None:
+        with pytest.raises(ValueError, match="NPU IPC"):
+            vllm_runtime._speco_rebuild_ipc_compat((func, (1, 2, 3)), device_id)
+
+
+@pytest.mark.parametrize("snapshot_fails", [False, True])
+def test_performance_snapshot_runs_once_and_cannot_fail_generation(
+    monkeypatch, snapshot_fails
+):
+    from verl_speco.integration import rollout_performance as perf
+    from verl_speco.integration import generation_diagnostics as diagnostics
+
+    monkeypatch.setenv("VERL_SPECO_DIAGNOSTIC_ROLLOUT_PERF", "true")
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: _drafter())
+    monkeypatch.setattr(perf, "safe_runtime_snapshot", lambda *args: {})
+    monkeypatch.setattr(diagnostics, "emit_summary", lambda *args, **kwargs: None)
+    calls = []
+
+    class Upstream:
+        async def generate(self, request_id):
+            return SimpleNamespace(extra_fields={}, request_id=request_id)
+
+    class Server(_SpecoVLLMHttpServerMixin, Upstream):
+        async def collective_rpc(self, method):
+            calls.append(method)
+            await asyncio.sleep(0)
+            if snapshot_fails:
+                raise RuntimeError("diagnostic unavailable")
+            return [{"kv_cache_config": {"num_blocks": 10}}]
+
+    async def run():
+        server = Server()
+        outputs = await asyncio.gather(server.generate("a"), server.generate("b"))
+        assert [result.request_id for result in outputs] == ["a", "b"]
+        await server.generate("c")
+
+    asyncio.run(run())
+    assert calls == ["speco_performance_snapshot"]

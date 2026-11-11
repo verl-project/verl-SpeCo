@@ -7,6 +7,7 @@ import asyncio
 import logging
 import random
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -54,6 +55,11 @@ def _methods(path, class_name, names, **namespace):
     )
     namespace.setdefault("logger", logging.getLogger(__name__))
     namespace.setdefault("__file__", str(path))
+    namespace.setdefault(
+        "_rl_insight_trace_state", lambda *args, **kwargs: nullcontext()
+    )
+    namespace.setdefault("_rl_insight_log_scalar_metrics", lambda *args, **kwargs: None)
+    namespace.setdefault("_SPECO_RL_INSIGHT_TRAINER_LANE", "speco_trainer")
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace["Subject"]
 
@@ -134,8 +140,8 @@ def _sampling_trainer():
     obj._sampling_micro_index = 0
     obj._is_block_drafter_backend = lambda: True
     obj._block_drafter_metric_prefix = lambda: "dspark"
-    obj._block_drafter_config_value = (
-        lambda key, default: 0.1 if key == "hard_sample_ratio" else default
+    obj._block_drafter_config_value = lambda key, default: (
+        0.1 if key == "hard_sample_ratio" else default
     )
     return obj
 
@@ -186,6 +192,7 @@ def test_schedule_context_does_not_reuse_previous_bubble_collection(
     driver = cls()
     driver.global_steps = 5
     driver._speco_last_collected_step = collected_step
+    driver._speco_acceptance_feedback = lambda: None
     driver._speco_last_collected_samples = 32
     driver._speco_rollout_idle_worker_enabled = lambda: bubble
     driver._speco_drafter_training_mode = lambda: "online"
@@ -296,8 +303,8 @@ def test_replay_sampling_continues_identically_after_short_plan_handoff():
 
 def test_hard_fractional_quota_does_not_restart_rounding_each_cycle():
     obj = _sampling_trainer()
-    obj._block_drafter_config_value = (
-        lambda key, default: 0.03 if key == "hard_sample_ratio" else default
+    obj._block_drafter_config_value = lambda key, default: (
+        0.03 if key == "hard_sample_ratio" else default
     )
     pool = [{"id": i, "_verl_is_hard": i < 10} for i in range(20)]
     hard = 0
@@ -386,10 +393,9 @@ def test_actor_timing_and_feedback_source_are_idempotent_across_publish_merges()
     obj.global_steps = 7
     feedback_steps = []
     obj._speco_get_drafter_scheduler = lambda: SimpleNamespace(
-        record_step_metrics=lambda metrics,
-        config,
-        *,
-        global_step: feedback_steps.append(global_step) or {}
+        record_step_metrics=lambda metrics, config, *, global_step: (
+            feedback_steps.append(global_step) or {}
+        )
     )
     obj._speco_drafter_schedule_config = lambda: DrafterScheduleConfig()
     output = SimpleNamespace(
@@ -810,8 +816,8 @@ def test_sync_step_preserves_preparation_timing_and_sample_bounds(ready):
     worker.record_training_timing = lambda name, elapsed: events.append(
         ("timing", name)
     )
-    worker._sync_batch_readiness = (
-        lambda flag: events.append(("readiness", flag)) or ready
+    worker._sync_batch_readiness = lambda flag: (
+        events.append(("readiness", flag)) or ready
     )
 
     async def train(batch, step):
@@ -901,6 +907,8 @@ def test_sync_status_preserves_full_cross_step_pool(use_logits):
     status = worker.get_training_data_status(
         sample_last_n_steps=2, require_full_batch=True
     )
+    # 共享 base 不在 DSpark 全局强制 same-step（保留 PPO 最近 N 步缓存行为），
+    # whatever use_logits，均保留完整跨步数据池；同版本限制由 SFT 路径显式传入。
     assert status["trainable_samples"] == 12
     assert status["trainable_batches"] == 3
     assert (status["min_sample_step"], status["max_sample_step"]) == (2, 4)
@@ -960,6 +968,35 @@ def test_sync_eagle_without_logits_keeps_current_step_only():
     status = worker.get_training_data_status(sample_last_n_steps=2)
     assert status["trainable_samples"] == 4
     assert status["min_sample_step"] == 4
+
+
+def test_dspark_sft_plan_enforces_same_step_via_explicit_range():
+    """共享 base_trainer 不对 DSpark 全局强制 same-step（保留 PPO 最近 N 步缓存行为）。
+    但 SFT 路径通过 speco_train_drafter 显式传入同版本范围 [min=4, max=4]，
+    get_training_data_status 据此收窄到当前 step 样本，保证 head_current @ hidden_old
+    不会产生版本不一致的监督信号。"""
+    worker = _status_trainer(use_logits=False, model_type="dspark")
+    # 未显式传范围时：base 层保留跨 step 可用（PPO 原有行为），min 为窗口下界
+    status_plain = worker.get_training_data_status(sample_last_n_steps=10)
+    assert status_plain["same_step_data_required"] is False
+    assert status_plain["trainable_samples"] == 12
+    assert status_plain["min_sample_step"] == 0
+    assert status_plain["max_sample_step"] == 4
+    # SFT 路径显式限定同版本范围 [4,4]：仅当前 step(4) 样本
+    status = worker.get_training_data_status(
+        sample_last_n_steps=10, min_sample_step=4, max_sample_step=4
+    )
+    assert status["trainable_samples"] == 4
+    assert status["trainable_batches"] == 1
+    assert status["min_sample_step"] == 4
+    assert status["max_sample_step"] == 4
+    # 反向：use_logits=True 时使用预计算 logits，SFT 不强制同版本，可跨 step
+    worker_logits = _status_trainer(use_logits=True, model_type="dspark")
+    status_logits = worker_logits.get_training_data_status(sample_last_n_steps=10)
+    assert status_logits["same_step_data_required"] is False
+    assert status_logits["trainable_samples"] == 12
+    assert status_logits["min_sample_step"] == 0
+    assert status_logits["max_sample_step"] == 4
 
 
 @pytest.mark.parametrize("target_version, expected", [(None, 4), (3, 3)])
@@ -1074,8 +1111,8 @@ def test_streamed_accumulation_discards_partial_gradients_on_peer_failure():
     worker._last_prepared_training_items = [{"id": 1}]
     worker.prepare_training_batch = lambda: object()
     ready_calls = []
-    worker._sync_batch_readiness = (
-        lambda flag: ready_calls.append(flag) or len(ready_calls) == 1
+    worker._sync_batch_readiness = lambda flag: (
+        ready_calls.append(flag) or len(ready_calls) == 1
     )
     gradients = []
     worker.optimizer = SimpleNamespace(zero_grad=lambda **kwargs: gradients.clear())
@@ -1222,8 +1259,9 @@ def _freeze_publish_driver(*, bubble=True, asynchronous=True, failure=None):
     scheduler = SimpleNamespace(
         _publish_executor=object(),
         _flatten_publish_acknowledgements=DrafterScheduler._flatten_publish_acknowledgements,
-        record_rollout_drafter_publish_completed=lambda version,
-        **kwargs: completed.append(version),
+        record_rollout_drafter_publish_completed=lambda version, **kwargs: (
+            completed.append(version)
+        ),
         record_training_quota_publish_completed=lambda step: None,
     )
 
@@ -1449,8 +1487,9 @@ def test_worker_rpc_forwards_head_protection_only_for_bubble(bubble):
     calls = []
     worker.trainer = SimpleNamespace(
         _bubble_time_enabled=bubble,
-        sync_target_lm_head_weight=lambda weight, **kwargs: calls.append(kwargs)
-        or {"accepted": True},
+        sync_target_lm_head_weight=lambda weight, **kwargs: (
+            calls.append(kwargs) or {"accepted": True}
+        ),
     )
     result = worker.sync_target_lm_head_weight(
         {
@@ -2228,8 +2267,8 @@ def _collection_alignment_driver(
     driver._speco_oldlogprob_window_mode = lambda cfg: "random"
     driver._speco_oldlogprob_window_train_rows = lambda cfg: 512
     driver._speco_owner_bucket_count = lambda: owners
-    driver._speco_bubble_collection_owner_ranks = (
-        lambda **kwargs: routed if bubble else ()
+    driver._speco_bubble_collection_owner_ranks = lambda **kwargs: (
+        routed if bubble else ()
     )
     driver._speco_rollout_idle_worker_enabled = lambda: bubble
     driver._speco_drafter_schedule_config = lambda: DrafterScheduleConfig(

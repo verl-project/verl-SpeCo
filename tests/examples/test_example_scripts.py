@@ -26,6 +26,7 @@ PPO_EXAMPLES = [
     script
     for script in (ROOT / "examples").glob("*.sh")
     if not script.name.endswith("_separate_training.sh")
+    and not script.name.endswith("_sft.sh")
     and "_eval" not in script.name
 ]
 
@@ -64,7 +65,12 @@ def test_example_shell_syntax_is_valid(script: Path) -> None:
     path = str(script)
     if os.name == "nt":
         if "system32" in bash.lower():
-            path = "/mnt/" + script.drive.rstrip(":").lower() + "/" + script.relative_to(script.anchor).as_posix()
+            path = (
+                "/mnt/"
+                + script.drive.rstrip(":").lower()
+                + "/"
+                + script.relative_to(script.anchor).as_posix()
+            )
         else:
             path = script.as_posix()
     subprocess.run([bash, "-n", path], check=True)
@@ -151,18 +157,16 @@ def test_standalone_tq_training_example_uses_unified_launcher() -> None:
     assert "DSPARK_MAX_WINDOW=${DSPARK_MAX_WINDOW:-0}" in source
     assert "DSPARK_MAX_WINDOW=${DSPARK_MAX_WINDOW:-512}" not in source
     assert "training.dspark_max_window=${DSPARK_MAX_WINDOW}" in source
-    assert (
-        "speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids=" in source
-    )
+    assert "speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids=" in source
     assert "training.dspark_target_layer_ids=" not in source
 
 
 def test_standalone_tq_hidden_state_vllm_uses_separate_devices() -> None:
-    source = (
-        ROOT / "tools" / "run_qwen3-8b_drafter_hidden_state_vllm.sh"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / "tools" / "run_qwen3-8b_drafter_hidden_state_vllm.sh").read_text(
+        encoding="utf-8"
+    )
 
-    assert 'VLLM_DEVICES=${VLLM_DEVICES:-0,1,2,3,4,5}' in source
+    assert "VLLM_DEVICES=${VLLM_DEVICES:-0,1,2,3,4,5}" in source
     assert "service_count=$((device_count / VLLM_TP))" in source
     assert 'env "${DEVICE_ENV}=${devices}" vllm serve "${MODEL_PATH}"' in source
     assert '--tensor-parallel-size "${VLLM_TP}"' in source
@@ -315,4 +319,7 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     assert "CKPTS_DIR=${CKPTS_DIR:-/path/to/checkpoint}" in mrv2_source
     assert "TRAIN_FILE=${TRAIN_FILE:-/path/to/train_file}" in mrv2_source
     assert "TEST_FILE=${TEST_FILE:-/path/to/test_file}" in mrv2_source
-    assert "DRAFTER_PATH=${DRAFTER_PATH:-/path/to/vllm-compatible-dspark-drafter}" in mrv2_source
+    assert (
+        "DRAFTER_PATH=${DRAFTER_PATH:-/path/to/vllm-compatible-dspark-drafter}"
+        in mrv2_source
+    )

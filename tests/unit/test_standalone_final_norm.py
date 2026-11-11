@@ -285,7 +285,7 @@ def test_dspark_forward_selects_target_positions_before_norm(apply_norm):
     forward.body = forward.body[:end] + [ast.parse("return aligned_target_hidden, eval_mask").body[0]]
     namespace = {
         "torch": torch, "Optional": Optional,
-        "gather_aligned_target_hidden": gather_aligned_target_hidden, 
+        "gather_aligned_target_hidden": gather_aligned_target_hidden,
         "_resolve_sliding_windows": lambda config: None,
         "build_dflash_attention_masks": lambda **kwargs: (None, None),
     }

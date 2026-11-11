@@ -7,6 +7,7 @@ import ast
 import asyncio
 import logging
 import math
+import time
 from types import MethodType, SimpleNamespace
 from pathlib import Path
 from typing import Any, Optional, cast
@@ -22,7 +23,8 @@ def load_function(path, name, **bindings):
     node = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
     node.decorator_list = []
     namespace = dict(torch=torch, F=torch.nn.functional, logging=logging, Any=Any, Optional=Optional, cast=cast,
-                     logger=logging.getLogger(__name__), **bindings)
+                     logger=logging.getLogger(__name__), time=time,
+                     _is_ray_object_ref=lambda value: False, **bindings)
     exec(compile(ast.Module(body=[node], type_ignores=[]), path, "exec"), namespace)
     return namespace[name]
 

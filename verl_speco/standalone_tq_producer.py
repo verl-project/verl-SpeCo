@@ -50,7 +50,7 @@ from verl_speco.producer.input_reader import (
     tokenize_record,
     tokenize_record_with_render_boundary,
 )
-from verl_speco.producer.metrics import producer_window_metrics
+from verl_speco.producer.metrics import ProducerDiagnostics, producer_window_metrics
 from verl_speco.producer.vllm_feature_client import (
     RawVllmFeature,
     VllmResponse,
@@ -497,10 +497,12 @@ def _format_perf_sample(row: Mapping[str, Any]) -> str:
 
 
 async def _collect_reference_batch(
-    queue, first, batch_size: int, *, timeout: float = 0.2
+    queue, first, batch_size: int, *, timeout: float = 0.2, on_dequeue=None
 ):
     """Collect one training batch, flushing partial data on timeout or EOS."""
     batch = [first]
+    if on_dequeue is not None:
+        on_dequeue(first)
     deadline = time.monotonic() + timeout
     while len(batch) < batch_size:
         remaining = deadline - time.monotonic()
@@ -512,6 +514,8 @@ async def _collect_reference_batch(
             break
         if item is _PUBLISH_DONE:
             return batch, True
+        if on_dequeue is not None:
+            on_dequeue(item)
         batch.append(item)
     return batch, False
 
@@ -722,6 +726,8 @@ async def run_producer(
         sample_timings: dict[int, dict[str, float]] = {}
         unsubmitted_references: dict[str, VllmResponse] = {}
         perf_rows: list[dict[str, Any]] = []
+        diagnostics = getattr(pool, "diagnostics", None) or ProducerDiagnostics()
+        diagnostics.snapshot()  # Exclude model/client initialization from occupancy.
         perf_window_started = time.monotonic()
         peak_publish_queue = 0
         publish_inflight = 0
@@ -747,6 +753,12 @@ async def run_producer(
         def mark_stage(worker: str, stage: str, sample_id: str = "") -> None:
             stages[worker] = (stage, time.monotonic(), sample_id)
 
+        async def monitor_event_loop():
+            while True:
+                expected = time.monotonic() + 0.1
+                await asyncio.sleep(0.1)
+                diagnostics.loop_lag(max(0.0, time.monotonic() - expected))
+
         async def log_heartbeat() -> None:
             last_inputs = 0
             last_published = 0
@@ -767,7 +779,8 @@ async def run_producer(
                     "published=%s filtered=%s dropped=%s request_failed=%s "
                     "input_rate=%.2f/s "
                     "publish_rate=%.2f/s input_queue=%s/%s publish_queue=%s/%s "
-                    "pending_tensor_bytes=%s seconds_since_publish=%.0f stages=%s oldest=%s",
+                    "pending_tensor_bytes=%s seconds_since_publish=%.0f stages=%s oldest=%s "
+                    "http_inflight=%s loop_lag_max=%.3fs",
                     get_runtime_state() if get_runtime_state is not None else "running",
                     stats.input_count,
                     stats.published_count,
@@ -787,6 +800,8 @@ async def run_producer(
                         (worker, stage, sample_id, round(age))
                         for age, worker, stage, sample_id in oldest
                     ],
+                    diagnostics.http_inflight,
+                    diagnostics.snapshot(reset=False)["loop_lag_max"],
                 )
                 last_inputs = stats.input_count
                 last_published = stats.published_count
@@ -971,8 +986,15 @@ async def run_producer(
             return request
 
         async def next_request_async() -> Any:
+            started = time.monotonic()
             async with request_generation_lock:
-                return await asyncio.to_thread(next_request)
+                request = await asyncio.to_thread(next_request)
+            if request is not _INPUT_DONE:
+                timing = sample_timings[int(request.sequence_no)]
+                timing["input_dispatch"] = max(
+                    0.0, time.monotonic() - started - timing["input_prepare"]
+                )
+            return request
 
         async def read_inputs() -> None:
             initial_count = 0
@@ -1066,14 +1088,18 @@ async def run_producer(
             while True:
                 if replacement_request is None:
                     mark_stage(worker, "input_queue_get")
+                    input_wait_started = time.monotonic()
                     request = await input_queue.get()
+                    input_get_wait = time.monotonic() - input_wait_started
                 else:
                     request = replacement_request
                     replacement_request = None
+                    input_get_wait = 0.0
                 if request is _INPUT_DONE:
                     stages.pop(worker, None)
                     return
                 timing = sample_timings[int(request.sequence_no)]
+                timing["input_get_wait"] = input_get_wait
                 now = time.monotonic()
                 input_queue_started = timing.pop("input_queue_started", now)
                 timing["input_queue"] = now - input_queue_started
@@ -1163,7 +1189,12 @@ async def run_producer(
                     account_request_failure(request, exc, stage="prefill")
                     replacement_request = await next_replacement(cause=exc)
                     continue
-                timing["prefill"] = time.monotonic() - prefill_started
+                reference_ready_at = time.monotonic()
+                timing["prefill"] = reference_ready_at - prefill_started
+                timing.update(
+                    (f"prefill_{key}", value) for key, value in raw.timings.items()
+                )
+                timing["reference_ready_at"] = reference_ready_at
                 if hidden_references:
                     reference = _as_vllm_reference(raw)
                     unsubmitted_references[reference.reference] = reference
@@ -1212,23 +1243,27 @@ async def run_producer(
                 mark_stage(worker, "publish_queue_put", request.sample_id)
                 timing["publish_queue_started"] = time.monotonic()
                 enqueue_started = time.monotonic()
-                await publish_queue.put(
-                    PreparedFeature(
-                        request=request,
-                        raw=raw,
-                        sample=sample,
-                        metadata=_sample_metadata(
-                            request, sample, feature_contract, run_id, tq_cfg
-                        ),
-                        timing=timing,
-                        reference_tag=(
-                            _reference_tag(
-                                request, raw, feature_contract, run_id, tq_cfg
-                            )
-                            if hidden_references
-                            else None
-                        ),
-                    )
+                metadata_started = time.monotonic()
+                prepared = PreparedFeature(
+                    request=request,
+                    raw=raw,
+                    sample=sample,
+                    metadata=_sample_metadata(
+                        request, sample, feature_contract, run_id, tq_cfg
+                    ),
+                    timing=timing,
+                    reference_tag=(
+                        _reference_tag(request, raw, feature_contract, run_id, tq_cfg)
+                        if hidden_references
+                        else None
+                    ),
+                )
+                timing["metadata_build"] = time.monotonic() - metadata_started
+                put_started = time.monotonic()
+                await publish_queue.put(prepared)
+                timing["reference_enqueued_at"] = time.monotonic()
+                timing["publish_enqueue"] = (
+                    timing["reference_enqueued_at"] - put_started
                 )
                 timing["publish_queue_wait"] = time.monotonic() - enqueue_started
                 peak_publish_queue = max(peak_publish_queue, publish_queue.qsize())
@@ -1244,11 +1279,25 @@ async def run_producer(
             if on_references is not None:
                 logger.info(
                     "Standalone Producer metadata samples=%s batch_size_avg=%.2f "
-                    "submit_avg=%.3fs enqueue_wait_avg=%.3fs",
+                    "submit_avg=%.3fs enqueue_wait_avg=%.3fs "
+                    "build_avg=%.3fs enqueue_block_avg=%.3fs residence_avg=%.3fs "
+                    "batch_wait_avg=%.3fs latest_ready_delay_avg=%.3fs full_sample_frac=%.3f",
                     len(perf_rows),
                     tracking_metrics["producer/metadata_batch_size"],
                     tracking_metrics["producer/metadata_submit_time"],
                     tracking_metrics["producer/publish_queue_wait_time"],
+                    *[
+                        sum(_timing_value(row["timing"], key) for row in perf_rows)
+                        / len(perf_rows)
+                        for key in (
+                            "metadata_build",
+                            "publish_enqueue",
+                            "publish_residence",
+                            "publish_batch_wait",
+                            "metadata_ready_delay",
+                            "metadata_full_batch",
+                        )
+                    ],
                 )
             timing_names = (
                 "e2e",
@@ -1278,6 +1327,25 @@ async def run_producer(
                 _timing_value(row["timing"], "publish_transport") for row in perf_rows
             ]
             total_mb = sum(float(row["mb"]) for row in perf_rows)
+            diagnostic_window = diagnostics.snapshot()
+            diagnostic_text = " ".join(
+                f"{key}={value:.4f}" for key, value in diagnostic_window.items()
+            )
+            diagnostic_text += " " + " ".join(
+                f"{key}_avg={sum(_timing_value(row['timing'], key) for row in perf_rows) / len(perf_rows):.4f}s"
+                for key in (
+                    "input_dispatch",
+                    "input_get_wait",
+                    "prefill_global_wait",
+                    "prefill_endpoint_wait",
+                    "prefill_http",
+                    "prefill_retry_backoff",
+                )
+            )
+            tracking_metrics.update(
+                (f"producer/{key}", float(value))
+                for key, value in diagnostic_window.items()
+            )
             logger.info(
                 "Standalone Producer perf samples=%s window=%.3fs rate=%.2f/s "
                 "e2e_avg=%.3fs e2e_p95=%.3fs e2e_max=%.3fs "
@@ -1293,7 +1361,7 @@ async def run_producer(
                 "tensor_payload_mb_per_second=%.2f tensor_payload_mb_per_transport_second=%.2f "
                 "prefill_tokens=%s prefill_tokens_per_second=%.2f "
                 "publish_queue_peak=%s "
-                "publish_inflight_peak=%s pending_tensor_mb_peak=%.2f",
+                "publish_inflight_peak=%s pending_tensor_mb_peak=%.2f %s",
                 len(perf_rows),
                 window,
                 len(perf_rows) / window,
@@ -1330,6 +1398,7 @@ async def run_producer(
                 peak_publish_queue,
                 peak_publish_inflight,
                 peak_pending_bytes / (1024 * 1024),
+                diagnostic_text,
             )
             ordered_by_sequence = sorted(
                 perf_rows, key=lambda row: int(row["sequence_no"])
@@ -1385,6 +1454,9 @@ async def run_producer(
                         publish_queue,
                         first,
                         reference_batch_size,
+                        on_dequeue=lambda item: item.timing.update(
+                            publisher_dequeued_at=time.monotonic()
+                        ),
                     )
                     buffered.extend(batch)
                     entries = []
@@ -1400,7 +1472,23 @@ async def run_producer(
                             }
                         )
                     submitted_at = time.monotonic()
+                    latest_ready_at = max(
+                        item.timing["reference_ready_at"] for item in buffered
+                    )
                     for item in buffered:
+                        item.timing["publish_residence"] = (
+                            item.timing["publisher_dequeued_at"]
+                            - item.timing["reference_enqueued_at"]
+                        )
+                        item.timing["publish_batch_wait"] = (
+                            submitted_at - item.timing["publisher_dequeued_at"]
+                        )
+                        item.timing["metadata_ready_delay"] = (
+                            submitted_at - latest_ready_at
+                        )
+                        item.timing["metadata_full_batch"] = float(
+                            len(entries) == reference_batch_size
+                        )
                         # Queue residence includes batching, but ends before the RPC.
                         item.timing["publish_queue"] = submitted_at - item.timing.pop(
                             "publish_queue_started"
@@ -1586,6 +1674,9 @@ async def run_producer(
             for index in range(publish_workers)
         )
         heartbeat = asyncio.create_task(log_heartbeat(), name="producer-heartbeat")
+        loop_monitor = asyncio.create_task(
+            monitor_event_loop(), name="producer-loop-monitor"
+        )
         try:
             done, pending = await asyncio.wait(
                 tasks, return_when=asyncio.FIRST_EXCEPTION
@@ -1641,7 +1732,8 @@ async def run_producer(
             if window_metrics is not None and on_metrics is not None:
                 await on_metrics(stats.published_count, window_metrics)
             heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
+            loop_monitor.cancel()
+            await asyncio.gather(heartbeat, loop_monitor, return_exceptions=True)
 
         if stats.published_count == 0:
             logger.error(

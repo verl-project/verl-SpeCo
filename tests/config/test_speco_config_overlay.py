@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from verl_speco.integration.opd_cotrain import validate_sync_opd_cotrain_config
+
 hydra = pytest.importorskip("hydra", reason="config overlay tests need hydra-core")
 omegaconf = pytest.importorskip(
     "omegaconf", reason="config overlay tests need omegaconf"
@@ -104,6 +106,12 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.training.mode == "online"
     assert drafter.training.preserve_prompt_hidden_states is False
     assert standalone_training.preserve_prompt_hidden_states is True
+    from verl_speco.trainer.scheduler import (
+        AdaptiveScheduleConfig,
+        DrafterScheduleConfig,
+    )
+    schedule = DrafterScheduleConfig.from_mapping(drafter.training)
+    assert schedule.adaptive_schedule == AdaptiveScheduleConfig()
     assert drafter.training.feature_store.type == "torch_shard"
     assert "target_feature_replay" not in drafter.training
     assert standalone_training.target_feature_replay.cache.enabled is False
@@ -183,6 +191,56 @@ def test_draft_trainer_composes_as_primary_config(tmp_path: Path) -> None:
     assert config.speco.draft_training.enable is True
     assert "trainer" in config
     assert "algorithm" in config
+
+
+@pytest.mark.parametrize(
+    ("opd", "drafter", "train_drafter"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (True, True, True),
+    ],
+)
+def test_opd_drafter_modes_compose_with_fsdp2(
+    tmp_path: Path,
+    opd: bool,
+    drafter: bool,
+    train_drafter: bool,
+) -> None:
+    upstream_root = os.getenv("VERL_SPECO_UPSTREAM_ROOT")
+    if not upstream_root:
+        pytest.skip(
+            "set VERL_SPECO_UPSTREAM_ROOT to check OPD composition against verl"
+        )
+    upstream_config = _upstream_repo_root(upstream_root) / "verl" / "trainer" / "config"
+    composed_config_dir = tmp_path / "config"
+    _copy_overlay_configs(
+        upstream_config, composed_config_dir, ("speco_base.yaml", "speco_trainer.yaml")
+    )
+
+    overrides = [
+        "actor_rollout_ref.actor.strategy=fsdp2",
+        f"distillation.enabled={str(opd).lower()}",
+        f"actor_rollout_ref.rollout.drafter.enable={str(drafter).lower()}",
+        "actor_rollout_ref.rollout.drafter.enable_drafter_training="
+        f"{str(train_drafter).lower()}",
+    ]
+    if train_drafter:
+        overrides.append(
+            "actor_rollout_ref.rollout.drafter.training."
+            "collect_hidden_states_from_old_logprob=true"
+        )
+
+    with initialize_config_dir(config_dir=str(composed_config_dir), version_base=None):
+        config = compose(config_name="speco_trainer", overrides=overrides)
+
+    validate_sync_opd_cotrain_config(config)
+    assert config.actor_rollout_ref.actor.strategy == "fsdp2"
+    teacher_inference = config.distillation.teacher_models.teacher_model.get(
+        "inference"
+    )
+    assert teacher_inference is None or "drafter" not in teacher_inference
 
 
 def test_veomni_trainer_composes_with_release_upstream_verl(tmp_path: Path) -> None:

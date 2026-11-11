@@ -286,9 +286,15 @@ def _load_methods(relative_path, class_name, names, namespace):
         name="Subject", bases=[], keywords=[], body=methods, decorator_list=[]
     )
     helpers = [
-        node for node in module.body
+        node
+        for node in module.body
         if isinstance(node, ast.FunctionDef) and node.name in names
     ]
+    namespace.setdefault(
+        "_rl_insight_trace_state", lambda *args, **kwargs: nullcontext()
+    )
+    namespace.setdefault("_rl_insight_log_scalar_metrics", lambda *args, **kwargs: None)
+    namespace.setdefault("_SPECO_RL_INSIGHT_TRAINER_LANE", "speco_trainer")
     exec(
         compile(
             ast.fix_missing_locations(
@@ -316,6 +322,8 @@ def worker_class():
             "request_drafter_training_reclaim",
             "_receive_drafter_reclaim",
             "_reclaim_control_lock",
+            "_speco_rl_insight_labels",
+            "_speco_emit_rl_insight_worker_metrics",
             "train_drafter",
         },
         {
@@ -413,6 +421,7 @@ def _prepared_worker(worker_class, *, reclaim_after_first=False):
     worker = worker_class()
     for key, value in {
         "rank": 0,
+        "replica_rank": 0,
         "worker_incarnation": "rank-0",
         "enable_drafter": True,
         "in_drafter_train_group": True,
@@ -511,6 +520,23 @@ def test_reclaim_runs_between_atomic_optimizer_steps(worker_class):
     assert result["stop_reason"] == "reclaim_requested"
     assert result["replay_session_retained"] == 1
     assert callbacks == [None]
+
+
+def test_deadline_training_offloads_before_returning_lease_completion(worker_class):
+    worker, plan, _ = _prepared_worker(worker_class)
+    plan["idle_park_after_training"] = True
+    plan["deadline_ts"] = float("inf")
+    parked = []
+
+    async def park(*, strict):
+        assert strict
+        parked.append(True)
+
+    worker.trainer.release_training_memory_after_activation = park
+    result = asyncio.run(worker.train_drafter(plan))
+    assert result["trained"]
+    assert parked == [True]
+    assert result["training_residency_retained"] == 0
 
 
 @pytest.mark.parametrize("reclaim", [False, True])
@@ -663,8 +689,9 @@ def test_driver_control_bus_bypasses_busy_worker_rpc():
         {
             "time": __import__("time"),
             "logger": logging.getLogger(__name__),
-            "request_rollout_training_reclaim": lambda *args: calls.append("bus")
-            or True,
+            "request_rollout_training_reclaim": lambda *args: (
+                calls.append("bus") or True
+            ),
         },
     )
     driver = cls()
@@ -756,8 +783,9 @@ def test_hot_head_prepare_never_reloads_training_state(
     trainer = SimpleNamespace(
         _training_device_resident=resident,
         optimizer_steps_total=optimizer_steps,
-        select_target_lm_head_version=lambda version: calls.append(("select", version))
-        or True,
+        select_target_lm_head_version=lambda version: (
+            calls.append(("select", version)) or True
+        ),
         _target_lm_head_module=lambda: SimpleNamespace(
             weight=SimpleNamespace(device=SimpleNamespace(type="cuda"))
         ),
@@ -1061,3 +1089,70 @@ def test_event_thread_timeout_cannot_continue_into_ppo(continuation_driver_class
     with pytest.raises(RuntimeError, match="did not drain before PPO"):
         continuation_driver_class._speco_stop_rollout_idle_event_loop(stop, thread)
     assert calls == ["stop", 60.0]
+
+
+def test_sync_cuda_first_step_diagnostics_preserve_training_and_rng(
+    worker_class, caplog
+):
+    worker, plan, callbacks = _prepared_worker(worker_class)
+    worker.device_name = "cuda"
+    plan["execution_strategy"] = "sync"
+    worker.trainer._training_metric_sums = {"timing_s/drafter_forward_loss": 100.0}
+
+    async def sync_step(step, **kwargs):
+        callbacks.append(kwargs)
+        worker.trainer.optimizer_steps_total += 1
+        worker.trainer._training_metric_sums["timing_s/drafter_forward_loss"] += 0.25
+        return True
+
+    worker.trainer.training_step = sync_step
+    result = asyncio.run(worker.train_drafter(plan))
+    assert result["successful_steps"] == 3
+    assert len(callbacks) == 3
+    assert result["first_optimizer_step_stage_sec"] == {
+        "timing_s/drafter_forward_loss": 0.25
+    }
+    assert caplog.text.count("optimizer_first_step_breakdown:") == 1
+    assert caplog.text.count("[drafter first step compile]") == 1
+    assert "host_wall_no_device_sync" in caplog.text
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+def test_cleanup_allocator_observation_preserves_sync_and_reclaim(device):
+    subject = _load_methods(
+        "verl_speco/trainer/base_trainer.py",
+        "DrafterBaseTrainer",
+        {"cleanup_training"},
+        {
+            "device_name": device,
+            "asyncio": asyncio,
+            "logger": logging.getLogger(__name__),
+        },
+    )
+    events = []
+    trainer = subject()
+    trainer._pending_checkpoint_future = None
+    trainer._pending_full_checkpoint_future = None
+    trainer._full_checkpoint_executor = None
+    trainer.optimizer = None
+    trainer.model = None
+    trainer._residency_stage = lambda *args: nullcontext()
+    trainer._move_target_lm_head = lambda device: events.append("head")
+    trainer._park_idle_drafter_hccl = lambda: events.append("park")
+    trainer._record_gpu_transfer = lambda scope, stats: events.append((scope, stats))
+    trainer.device_module = SimpleNamespace(
+        synchronize=lambda: events.append("sync"),
+        empty_cache=lambda: events.append("reclaim"),
+        memory_stats=lambda: events.append("stats")
+        or {"reserved_bytes.all.current": 42},
+    )
+    asyncio.run(trainer.cleanup_training(clear_data=False))
+    assert events.count("sync") == events.count("reclaim") == 1
+    assert events.index("sync") < events.index("reclaim") < events.index("park")
+    assert events.count("stats") == (3 if device == "cuda" else 0)
+    records = [event for event in events if isinstance(event, tuple)]
+    assert len(records) == (1 if device == "cuda" else 0)
+    if records:
+        assert records[0][1]["after_reclaim_reserved_bytes"] == 42
+    assert trainer._training_active is False
+    assert trainer._training_initialized is False
