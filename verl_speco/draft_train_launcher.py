@@ -26,6 +26,7 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 
@@ -96,12 +97,12 @@ def _split_override(item: str) -> tuple[str, str] | None:
 
 def _find_override(overrides: Iterable[str], keys: Iterable[str]) -> str | None:
     wanted = set(keys)
-    for item in overrides:
+    for item in reversed(list(overrides)):
         parsed = _split_override(item)
         if parsed is None:
             continue
         key, value = parsed
-        if key in wanted:
+        if key.lstrip("+") in wanted:
             return value
     return None
 
@@ -156,7 +157,7 @@ def normalize_training_args(
     normalized = []
     for item in overrides:
         parsed = _split_override(item)
-        if parsed is None or parsed[0] not in _LAUNCH_OVERRIDE_KEYS:
+        if parsed is None or parsed[0].lstrip("+") not in _LAUNCH_OVERRIDE_KEYS:
             normalized.append(item)
     normalized.extend(
         [
@@ -250,6 +251,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Python executable used to invoke torch.distributed.run.",
     )
     args, training_args = parser.parse_known_args(argv)
+
+    # Resolve before torchrun so all workers receive the same selected path.
+    rollback_key = "actor_rollout_ref.rollout.drafter.training.checkpoint_auto_rollback"
+    from omegaconf import OmegaConf
+    base = OmegaConf.load(Path(__file__).with_name("config") / "draft_trainer.yaml")
+    default_rollback = OmegaConf.select(base, rollback_key, default=False)
+    if type(default_rollback) is not bool:
+        raise ValueError(f"{rollback_key} must be a boolean")
+    rollback_value = next((item.split("=", 1)[1] for item in reversed(training_args)
+                           if "=" in item and item.split("=", 1)[0].lstrip("+") == rollback_key), None)
+    if _parse_bool(rollback_value, default=default_rollback):
+        from verl_speco.standalone_tq_training_launcher import _resolve_checkpoint_rollback
+
+        store_type = str(_find_override(training_args, (_FEATURE_STORE_TYPE_KEY,)) or "torch_shard").strip().lower()
+        training_args = _resolve_checkpoint_rollback(
+            training_args, require_input=store_type in {"tq", "ray_reference"},
+        )
 
     validate_tq_launch_config(training_args)
     launch_config = resolve_launch_config(training_args, module=args.module)
