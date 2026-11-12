@@ -29,6 +29,7 @@ from verl_speco.producer.metrics import ProducerDiagnostics
 from verl_speco.producer.hidden_states_store import (
     FILE_BACKEND,
     MOONCAKE_BACKEND,
+    NATIVE_BACKEND,
     FileHiddenStatesStore,
     HiddenStatesStore,
     build_hidden_states_store,
@@ -91,6 +92,7 @@ class _EndpointState:
     semaphore: asyncio.Semaphore
     inflight: int = 0
     requests: int = 0
+    inflight_tokens: int = 0
 
 
 def _parse_transfer_reference(
@@ -202,7 +204,7 @@ def load_hidden_state_result(
         if response.hidden_states_path is None:
             raise ValueError("vLLM response missing hidden_states_path/handle")
         resolved = store or FileHiddenStatesStore()
-    expected_backend = MOONCAKE_BACKEND if response.is_handle else FILE_BACKEND
+    expected_backend = _response_backend(response, resolved)
     if resolved.backend != expected_backend:
         raise ValueError(
             f"vLLM returned a {expected_backend} reference but the consumer is "
@@ -210,7 +212,7 @@ def load_hidden_state_result(
         )
     reference: str | Mapping[str, Any]
     cleanup_reference: str
-    if response.is_handle:
+    if response.is_handle and expected_backend == MOONCAKE_BACKEND:
         # The Mooncake store consumes the full transfer manifest; the bare
         # handle alone lacks the tensor layout get_sample decodes with.
         reference = response.transfer_params
@@ -228,6 +230,12 @@ def load_hidden_state_result(
         store=resolved,
         is_handle=response.is_handle,
     )
+
+
+def _response_backend(response: VllmResponse, store: HiddenStatesStore) -> str:
+    if not response.is_handle:
+        return FILE_BACKEND
+    return NATIVE_BACKEND if store.backend == NATIVE_BACKEND else MOONCAKE_BACKEND
 
 
 def delete_temporary_result(raw: RawVllmFeature | VllmResponse) -> None:
@@ -249,9 +257,11 @@ def delete_temporary_result(raw: RawVllmFeature | VllmResponse) -> None:
     Path(f"{path}.lock").unlink(missing_ok=True)
 
 
-def choose_endpoint(states: Sequence[_EndpointState]) -> _EndpointState:
+def choose_endpoint(states: Sequence[_EndpointState], *, token_balanced: bool = False) -> _EndpointState:
     if not states:
         raise RuntimeError("No vLLM endpoints are configured")
+    if token_balanced:
+        return min(states, key=lambda state: (state.inflight_tokens, state.inflight, state.requests))
     return min(states, key=lambda state: (state.inflight, state.requests))
 
 
@@ -265,6 +275,9 @@ class VllmFeatureClientPool:
         request_timeout: float,
         success_log_interval: int = 100,
         hidden_states_store: HiddenStatesStore | None = None,
+        token_balanced: bool = False,
+        max_inflight_tokens: int = 0,
+        max_inflight_tokens_per_endpoint: int = 0,
     ) -> None:
         if not endpoints:
             raise ValueError("At least one vLLM endpoint is required")
@@ -274,6 +287,22 @@ class VllmFeatureClientPool:
             raise ValueError("vllm_model must not be empty")
         self.endpoints = list(endpoints)
         self.model = model
+        if type(token_balanced) is not bool:
+            raise ValueError("token_balanced must be a boolean")
+        self.token_balanced = token_balanced
+        if type(max_inflight_tokens) is not int or max_inflight_tokens < 0:
+            raise ValueError("max_inflight_tokens must be a non-negative integer")
+        self.max_inflight_tokens = max_inflight_tokens
+        if type(max_inflight_tokens_per_endpoint) is not int or max_inflight_tokens_per_endpoint < 0:
+            raise ValueError("max_inflight_tokens_per_endpoint must be a non-negative integer")
+        if max_inflight_tokens_per_endpoint:
+            urls = [endpoint.base_url.rstrip("/") for endpoint in endpoints]
+            if len(set(urls)) != len(urls):
+                raise ValueError("Per-endpoint token limits require unique endpoint URLs")
+        self.max_inflight_tokens_per_endpoint = max_inflight_tokens_per_endpoint
+        self._endpoint_token_condition = asyncio.Condition()
+        self._inflight_tokens = 0
+        self._token_condition = asyncio.Condition()
         self.request_timeout = float(request_timeout)
         self.success_log_interval = int(success_log_interval)
         if self.success_log_interval < 0:
@@ -341,14 +370,42 @@ class VllmFeatureClientPool:
     ) -> RawVllmFeature | VllmResponse:
         if not self._states:
             raise RuntimeError("VllmFeatureClientPool.start() must be called first")
+        route = getattr(request, "source_route", None)
+        plan = getattr(request, "source_plan_sha256", None)
+        if route is not None:
+            if (type(route) is not int or not 0 <= route < len(self._states)
+                    or not isinstance(plan, str) or len(plan) != 64
+                    or any(char not in "0123456789abcdef" for char in plan)):
+                raise ValueError("Invalid source route or plan fingerprint")
+        elif plan is not None:
+            raise ValueError("Source plan fingerprint requires a source route")
+        cost = max(1, len(request.prompt_token_ids))
+        if generate:
+            cost += max(0, int(request.max_tokens))
+        if self.max_inflight_tokens and cost > self.max_inflight_tokens:
+            raise ValueError(f"Request token budget {cost} exceeds max_inflight_tokens={self.max_inflight_tokens}")
+        if self.max_inflight_tokens_per_endpoint and cost > self.max_inflight_tokens_per_endpoint:
+            raise ValueError(f"Request token budget {cost} exceeds max_inflight_tokens_per_endpoint={self.max_inflight_tokens_per_endpoint}")
         waiting = time.monotonic()
         async with self._global_semaphore:
-            global_wait = time.monotonic() - waiting
-            raw = await self._request_with_retries(
-                request, generate=generate, reference_only=reference_only
-            )
-            raw.timings["global_wait"] = global_wait
-            return raw
+            if self.max_inflight_tokens:
+                async with self._token_condition:
+                    await self._token_condition.wait_for(
+                        lambda: self._inflight_tokens + cost <= self.max_inflight_tokens
+                    )
+                    self._inflight_tokens += cost
+            try:
+                global_wait = time.monotonic() - waiting
+                raw = await self._request_with_retries(
+                    request, generate=generate, reference_only=reference_only
+                )
+                raw.timings["global_wait"] = global_wait
+                return raw
+            finally:
+                if self.max_inflight_tokens:
+                    async with self._token_condition:
+                        self._inflight_tokens -= cost
+                        self._token_condition.notify_all()
 
     async def _request_with_retries(
         self,
@@ -360,18 +417,32 @@ class VllmFeatureClientPool:
         total_attempts = _DEFAULT_MAX_RETRIES + 1
         failed_in_round: set[str] = set()
         timings = {"endpoint_wait": 0.0, "http": 0.0, "retry_backoff": 0.0}
+        route = getattr(request, "source_route", None)
+        routed_states = self._states if route is None else [self._states[route]]
         for attempt in range(1, total_attempts + 1):
             candidates = [
                 state
-                for state in self._states
+                for state in routed_states
                 if state.endpoint.base_url not in failed_in_round
             ]
             if not candidates:
                 failed_in_round.clear()
-                candidates = self._states
-            state = choose_endpoint(candidates)
-            state.inflight += 1
+                candidates = routed_states
+            token_cost = max(1, len(request.prompt_token_ids))
+            if generate:
+                token_cost += max(0, int(request.max_tokens))
             request_started = time.monotonic()
+            async with self._endpoint_token_condition:
+                await self._endpoint_token_condition.wait_for(
+                    lambda: any(not self.max_inflight_tokens_per_endpoint
+                                or state.inflight_tokens + token_cost <= self.max_inflight_tokens_per_endpoint
+                                for state in candidates)
+                )
+                eligible = [state for state in candidates if not self.max_inflight_tokens_per_endpoint
+                            or state.inflight_tokens + token_cost <= self.max_inflight_tokens_per_endpoint]
+                state = choose_endpoint(eligible, token_balanced=self.token_balanced)
+                state.inflight += 1
+                state.inflight_tokens += token_cost
             response: VllmResponse | None = None
             accepted = False
             try:
@@ -401,13 +472,18 @@ class VllmFeatureClientPool:
                         timings["http"] += time.monotonic() - http_started
                         self.diagnostics.http_finish()
                     if reference_only:
-                        expected = (
-                            MOONCAKE_BACKEND if response.is_handle else FILE_BACKEND
-                        )
+                        expected = _response_backend(response, self.hidden_states_store)
                         if self.hidden_states_store.backend != expected:
                             raise ValueError(
                                 "vLLM reference backend does not match configured store"
                             )
+                        if expected == FILE_BACKEND and callable(getattr(self.hidden_states_store, "validate_reference", None)):
+                            self.hidden_states_store.validate_reference(response.reference)
+                        resolver = getattr(self.hidden_states_store, "resolve_reference", None)
+                        if expected == NATIVE_BACKEND and callable(resolver):
+                            handle = await asyncio.to_thread(resolver, response.reference)
+                            response = replace(response, handle=handle,
+                                               transfer_params={**response.transfer_params, "handle": handle})
                         raw: RawVllmFeature | VllmResponse = replace(
                             response, store=self.hidden_states_store
                         )
@@ -478,9 +554,14 @@ class VllmFeatureClientPool:
                 # reference not handed to the caller must be released; otherwise
                 # retries (and cancellation) leak a file or leave an object in
                 # the bounded Mooncake store.
-                if response is not None and not accepted:
-                    await self._release_unconsumed(response)
-                state.inflight = max(state.inflight - 1, 0)
+                try:
+                    if response is not None and not accepted:
+                        await self._release_unconsumed(response)
+                finally:
+                    async with self._endpoint_token_condition:
+                        state.inflight -= 1
+                        state.inflight_tokens -= token_cost
+                        self._endpoint_token_condition.notify_all()
         raise RuntimeError(
             "unreachable: vLLM request retry loop exhausted without returning"
         )
@@ -492,7 +573,7 @@ class VllmFeatureClientPool:
         mismatch is a deterministic protocol error that must not trigger a
         delete against the wrong store.
         """
-        expected = MOONCAKE_BACKEND if response.is_handle else FILE_BACKEND
+        expected = _response_backend(response, self.hidden_states_store)
         reference = response.reference
         if self.hidden_states_store.backend != expected or not reference:
             return
