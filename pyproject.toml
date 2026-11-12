@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68", "wheel", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -30,8 +30,9 @@ verl-speco-tq-owner = "verl_speco.tq_owner:main"
 verl-speco-tq-producer = "verl_speco.standalone_tq_producer:main"
 verl-speco-convert-speculators-dflash2 = "verl_speco.convert_speculators_dflash2:main"
 
-[tool.setuptools.dynamic]
-version = { attr = "verl_speco.__version__" }
+[tool.setuptools_scm]
+version_file = "verl_speco/_version.py"
+parentdir_prefix_version = "verl-SpeCo-"
 
 [tool.setuptools.packages.find]
 include = ["verl_speco*"]
