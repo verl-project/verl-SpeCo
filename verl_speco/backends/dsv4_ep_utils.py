@@ -144,6 +144,44 @@ def _finish_ep_setup(
             )
 
 
+def broadcast_replicated_state(raw_model: torch.nn.Module, *, src: int = 0) -> None:
+    """Make replicated parameters/buffers identical across EP ranks.
+
+    Routed experts are rank-disjoint and keep each rank's own slice. Every other
+    parameter and buffer is replicated, but a randomly initialized model builds
+    them with the process-local RNG, whose default seed differs across ranks.
+    Broadcasting from ``src`` (the checkpoint-leading rank) mirrors the non-EP
+    FSDP2 flow and keeps the FSDP2 shards consistent.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    if dist.get_world_size() <= 1:
+        return
+
+    # Match ``apply_ep_only``'s signature for routed experts: the MoE block
+    # exposes a stacked ``experts.w1`` with a leading local-expert dimension.
+    expert_param_ids: set[int] = set()
+    expert_buffer_ids: set[int] = set()
+    for module in raw_model.modules():
+        experts = getattr(module, "experts", None)
+        if experts is None or not hasattr(experts, "w1"):
+            continue
+        if experts.w1.dim() < 3:
+            continue
+        expert_param_ids.update(id(p) for p in experts.parameters())
+        expert_buffer_ids.update(id(b) for b in experts.buffers())
+
+    with torch.no_grad():
+        for param in raw_model.parameters():
+            if id(param) in expert_param_ids:
+                continue
+            dist.broadcast(param.data, src=src)
+        for buffer in raw_model.buffers():
+            if id(buffer) in expert_buffer_ids:
+                continue
+            dist.broadcast(buffer.data, src=src)
+
+
 def apply_ep_only(trainer, raw_model: torch.nn.Module):
     """Apply expert parallelism without FSDP2 (EP+DDP).
 
@@ -156,6 +194,9 @@ def apply_ep_only(trainer, raw_model: torch.nn.Module):
     so the model already carries its per-rank expert slice.
     """
     world_size, rank, experts_per_rank = _resolve_ep_layout(trainer)
+    random_init = bool(
+        trainer.config.rollout.drafter.training.get("dsv4_dspark_random_init", False)
+    )
     logger.info(
         f"[Rank {rank}] EP+DDP: {experts_per_rank} experts/rank, "
         f"non-expert grads synced via all-reduce"
@@ -187,6 +228,9 @@ def apply_ep_only(trainer, raw_model: torch.nn.Module):
             f"{len(expert_param_ids)} expert params (local), "
             f"{n_trainable - len(expert_param_ids)} non-expert params (DDP sync)"
         )
+
+    if random_init:
+        broadcast_replicated_state(raw_model)
 
     _finish_ep_setup(raw_model, rank, log_prefix="EP-only")
 
@@ -227,6 +271,9 @@ def apply_ep_fsdp2(
     # Move to device (cast to bf16 first to halve memory, matching speculators)
     raw_model.to(torch.bfloat16)
     raw_model.to(trainer.runtime_device)
+
+    if random_init:
+        broadcast_replicated_state(raw_model)
 
     # shard_experts_as_dtensor — wrap the routed experts (one local EP slice
     # per rank) as Shard(0) DTensors. This keeps every parameter a DTensor so
