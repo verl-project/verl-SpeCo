@@ -61,6 +61,42 @@ class _FakeTrainer:
         return self.future
 
 
+def test_persistent_lease_checkpoint_provider_is_bound_after_trainer_construction(monkeypatch):
+    import asyncio
+    import sys
+    from verl_speco.trainer import draft_training_loop as loop
+
+    config = OmegaConf.create({
+        "speco": {"draft_training": {"scheduler": {"per_rank_reference_ack": True}},
+                  "standalone_tq_producer": {"reference_lease_journal_path": "leases.sqlite"}},
+        "actor_rollout_ref": {"rollout": {"drafter": {
+            "speculative_algorithm": "DSPARK", "training": {
+                "feature_store": {"type": "ray_reference"}, "mode": "offline"}}}}})
+    snapshot = {"snapshot": "producer-owned"}
+    producer = SimpleNamespace(reference_lease_snapshot=SimpleNamespace(remote=lambda: snapshot))
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda ref, timeout: ref))
+    monkeypatch.setattr(loop, "_init_distributed", lambda: (0, 0, 1))
+    for name in ("_verify_live_trainer_topology", "_verify_rollback_checkpoint_across_ranks",
+                 "_disable_standalone_sequence_parallel", "_apply_standalone_fsdp_shard_default",
+                 "_configure_device", "_build_training_device_mesh"):
+        monkeypatch.setattr(loop, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(loop, "_build_backend", lambda _: SimpleNamespace())
+    class ProviderBound(Exception):
+        pass
+    class Trainer:
+        def __init__(self, **kwargs):
+            self.constructed = True
+        def __setattr__(self, name, value):
+            if name == "_standalone_lease_snapshot_provider":
+                assert self.constructed and value() is snapshot
+                raise ProviderBound()
+            object.__setattr__(self, name, value)
+    monkeypatch.setattr(loop, "DrafterBaseTrainer", Trainer)
+    with pytest.raises(ProviderBound):
+        asyncio.run(loop._run_standalone_draft_training_async(
+            config, scheduled_commands=object(), training_events=object(), producer_handle=producer))
+
+
 class _FakeTQLoader:
     def __init__(self, error: BaseException | None = None):
         self.error = error
@@ -490,6 +526,478 @@ def test_standalone_checkpoint_waits_when_requested():
     assert result["saved"] is True
     assert result["reason"] == "saved"
     assert trainer._pending_full_checkpoint_future is None
+
+
+def test_standalone_checkpoint_wait_timeout_keeps_running_future():
+    trainer = _FakeTrainer()
+    trainer._standalone_checkpoint_timeout = 0.02
+    with pytest.raises(TimeoutError):
+        _save_standalone_checkpoint(trainer, 5, wait=True)
+    assert trainer._pending_full_checkpoint_future is trainer.future
+    assert not trainer.future.cancelled() and not trainer.future.done()
+
+
+def test_base_checkpoint_wait_timeout_keeps_running_future(monkeypatch, tmp_path):
+    import verl_speco.trainer.base_trainer as base
+    future = Future()
+    trainer = SimpleNamespace(
+        checkpoint_dir=str(tmp_path), rollout_dp_rank=0, rank=0,
+        _pending_full_checkpoint_future=None, _standalone_checkpoint_timeout=0.02,
+        _is_checkpoint_leader=lambda: True,
+        _sync_checkpoint_phase_error=lambda error, phase: None,
+        model=torch.nn.Linear(1, 1), training_device_mesh=None,
+        _save_optimizer_checkpoint=lambda path: {"format": "test"},
+    )
+    def save_async(step, manifest, *, defer_completion):
+        trainer._pending_full_checkpoint_future = future
+        return future
+    trainer._save_checkpoint_async = save_async
+    monkeypatch.setattr(base, "device_name", "cpu")
+    with pytest.raises(TimeoutError):
+        DrafterBaseTrainer.save_checkpoint(trainer, 5, wait=True, defer_completion=True)
+    assert trainer._pending_full_checkpoint_future is future
+    assert not future.cancelled() and not future.done()
+
+
+def test_base_previous_checkpoint_wait_timeout_keeps_running_future(tmp_path):
+    future = Future()
+    def sync(error, phase):
+        assert phase == "previous save wait"
+        raise error
+    trainer = SimpleNamespace(checkpoint_dir=str(tmp_path), rollout_dp_rank=0, rank=0,
+                              _pending_full_checkpoint_future=future, _standalone_checkpoint_timeout=0.02,
+                              _is_checkpoint_leader=lambda: True, _sync_checkpoint_phase_error=sync)
+    with pytest.raises(TimeoutError):
+        DrafterBaseTrainer.save_checkpoint(trainer, 6, wait=True, defer_completion=True)
+    assert trainer._pending_full_checkpoint_future is future
+    assert not future.cancelled() and not future.done()
+
+
+def test_checkpoint_error_sync_waits_for_finalization_callback(monkeypatch):
+    import threading
+    from verl_speco.trainer import draft_training_loop as loop
+
+    started, release, checked = threading.Event(), threading.Event(), threading.Event()
+    trainer, future = SimpleNamespace(), Future()
+    def finalize(trainer, path, completed, **kwargs):
+        started.set()
+        assert release.wait(5)
+        trainer._standalone_export_error = RuntimeError("finalization failed")
+    monkeypatch.setattr(loop, "_finalize_standalone_checkpoint", finalize)
+    monkeypatch.setattr(loop.dist, "is_initialized", lambda: False)
+    loop._attach_standalone_finalizer(trainer, future, "/unused")
+    writer = threading.Thread(target=lambda: future.set_result(None))
+    result = []
+    checker = threading.Thread(target=lambda: (
+        result.append(loop._sync_standalone_export_error(trainer, torch.device("cpu"), raise_on_error=False)),
+        checked.set(),
+    ))
+    writer.start()
+    try:
+        assert started.wait(5)
+        checker.start()
+        assert not checked.wait(0.2)
+        release.set()
+        checker.join(timeout=5)
+        assert checked.is_set() and result == [True]
+    finally:
+        release.set()
+        writer.join(timeout=5)
+        if checker.ident is not None:
+            checker.join(timeout=5)
+
+
+@pytest.mark.parametrize("keep,delete,exclusive,valid", [
+    (0, False, False, True), (2, False, False, True), (2, True, True, True),
+    (2, True, False, False), (0, True, True, False), (1, False, True, False),
+    (2, True, 1, False), (True, False, True, False),
+])
+def test_checkpoint_retention_requires_exclusive_ownership_for_deletion(keep, delete, exclusive, valid):
+    from verl_speco.trainer.draft_training_loop import _valid_checkpoint_retention
+    assert _valid_checkpoint_retention(keep, delete, exclusive) is valid
+
+
+def test_checkpoint_retention_inheritance_requires_exclusive_ownership():
+    from verl_speco.trainer.draft_training_loop import _valid_checkpoint_retention
+    assert _valid_checkpoint_retention(2, False, True, True)
+    assert not _valid_checkpoint_retention(2, False, False, True)
+    assert not _valid_checkpoint_retention(0, False, True, True)
+    assert not _valid_checkpoint_retention(2, False, True, 1)
+
+
+@pytest.mark.parametrize("host,frame,valid", [(300, 100, True), (299, 100, False),
+                                             (0, 0, False), (True, 1, False), (300, -1, False)])
+def test_node_window_host_reservation(host, frame, valid):
+    from verl_speco.trainer.draft_training_loop import _validate_node_window_host_budget
+    if valid:
+        _validate_node_window_host_budget(host, frame)
+    else:
+        with pytest.raises(ValueError, match="three-frame"):
+            _validate_node_window_host_budget(host, frame)
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_owned_node_dispatch_preserves_reference_until_training_finishes(monkeypatch, failed):
+    import asyncio
+    from verl_speco.trainer import draft_training_loop as loop
+    entries = [SimpleNamespace(tag={"sample": 1})]
+    groups = {0: entries, 1: entries}
+    batch = SimpleNamespace(file_entries=entries, node_file_entries=groups, plan_id=3,
+                            receipt_token="receipt", is_padding_rank=False)
+    store = SimpleNamespace(run_id="run", reference_contract=lambda values: "contract")
+    trainer = SimpleNamespace(_get_hidden_state_clip_value=lambda: 1000.0)
+    observed = []
+    async def execute(*args, **kwargs):
+        observed.append(kwargs["node_context"])
+        if failed:
+            raise RuntimeError("injected node failure")
+        return True
+    monkeypatch.setattr(loop, "_owned_reference_training_step", execute)
+    monkeypatch.setattr(loop, "_ack_reference_materialization_across_ranks", lambda *args, **kwargs: observed.append("ack"))
+    call = loop._execute_owned_reference_batch(trainer, store, batch, 0, rank=0, device=torch.device("cpu"),
+                                               events=object(), transport_config={}, node_ranks_per_host=2)
+    if failed:
+        with pytest.raises(RuntimeError, match="injected node failure"):
+            asyncio.run(call)
+        assert len(observed) == 1
+    else:
+        assert asyncio.run(call) and observed[-1] == "ack"
+    assert observed[0] == {"rank": 0, "ranks_per_host": 2, "entries": groups, "run_id": "run",
+                           "plan_id": 3, "receipt_token": "receipt"}
+
+
+def _retention_settings_gloo_worker(rank, port, mode, results):
+    from datetime import timedelta
+    import torch.distributed as dist
+    from verl_speco.trainer.draft_training_loop import _validate_checkpoint_retention_across_ranks
+    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2,
+                            timeout=timedelta(seconds=20))
+    try:
+        settings = (2, bool(rank) if mode == "mismatch" else True,
+                    False if mode == "invalid" and rank == 1 else True)
+        try:
+            _validate_checkpoint_retention_across_ranks(settings, rank=rank, device=torch.device("cpu"))
+            results.put((rank, "ok"))
+        except ValueError as exc:
+            results.put((rank, str(exc)))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
+@pytest.mark.parametrize("mode", ["same", "mismatch", "invalid"])
+def test_retention_settings_agree_on_all_ranks(mode):
+    import multiprocessing
+    import socket
+    ctx = multiprocessing.get_context("spawn")
+    results = ctx.Queue()
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    processes = [ctx.Process(target=_retention_settings_gloo_worker, args=(rank, port, mode, results))
+                 for rank in range(2)]
+    for process in processes:
+        process.start()
+    try:
+        rows = [results.get(timeout=30) for _ in processes]
+        assert {rank for rank, _ in rows} == {0, 1}
+        assert all((result == "ok") if mode == "same" else ("must agree" in result) for _, result in rows)
+        for process in processes:
+            process.join(timeout=10)
+        assert all(process.exitcode == 0 for process in processes)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+        results.close()
+
+
+def test_token_metrics_window_aggregates_steps_and_preserves_selected_metrics(monkeypatch):
+    from verl_speco.trainer import standalone_tracking as tracking
+
+    monkeypatch.setattr(tracking.time, "perf_counter", lambda: 20.0)
+    window = tracking.StandaloneTokenWindow(2)
+    counts = {"source_tokens": 10, "window_tokens": 8, "supervised_tokens": 5,
+              "padding_tokens": 2, "samples": 1}
+    kwargs = dict(max_steps=10, start_time=10.0, device=torch.device("cpu"), world_size=1)
+    assert window.update(counts, successful_steps=1, optimizer_step=1, **kwargs) == {}
+    window.record_checkpoint(2.0)
+    metrics = window.update(counts, successful_steps=2, optimizer_step=2, **kwargs)
+    assert metrics["tokens/source"] == 20 and metrics["tokens/source_per_second"] == 2
+    assert metrics["tokens/source_per_second_excluding_checkpoints"] == 2.5
+    assert metrics["perf/checkpoint_blocking_time"] == 2.0
+    assert metrics["tokens/supervised"] == 10 and metrics["tokens/padding"] == 4
+    selected = _select_standalone_tracking_metrics({"dspark/loss": 0.2, **metrics})
+    assert selected["tokens/source"] == 20 and selected["tokens/padding"] == 4
+    assert selected["tokens/source_per_second_excluding_checkpoints"] == 2.5
+    assert selected["perf/checkpoint_blocking_time"] == 2.0
+    assert window.update(None, successful_steps=3, optimizer_step=3, **kwargs) == {}
+    assert window.update(counts, successful_steps=4, optimizer_step=4, **kwargs) == {}
+
+
+def test_reference_parts_stage_once_without_mutating_the_input():
+    import asyncio
+    from verl_speco.trainer.draft_training_loop import _reference_training_parts_across_ranks
+    calls = []
+    batch = {"hidden_source": "standalone_vllm_reference", "input_ids": torch.ones(1)}
+    async def train(value, step, **kwargs):
+        calls.append((value.get("_speco_reference_staged"), kwargs["accumulation_index"]))
+        return True
+    trainer = SimpleNamespace(_stage_standalone_cpu_batch=lambda value: value, training_step_from_batch=train,
+                              backend=SimpleNamespace(reference_parts_additive=True))
+    assert asyncio.run(_reference_training_parts_across_ranks(trainer, [batch], 1, device=torch.device("cpu")))
+    assert calls == [(True, 0)] and "_speco_reference_staged" not in batch
+
+
+def test_token_metrics_track_window_work_only_when_complete(monkeypatch):
+    from verl_speco.trainer import standalone_tracking as tracking
+    monkeypatch.setattr(tracking.time, "perf_counter", lambda: 20.0)
+    window = tracking.StandaloneTokenWindow(2)
+    counts = {"source_tokens": 10, "window_tokens": 8, "supervised_tokens": 5,
+              "padding_tokens": 2, "samples": 1, "window_train_input_positions": 17,
+              "window_statistics_input_positions": 17}
+    kwargs = dict(max_steps=4, start_time=10.0, device=torch.device("cpu"), world_size=1)
+    assert window.update(counts, successful_steps=1, optimizer_step=1, **kwargs) == {}
+    metrics = window.update(counts, successful_steps=2, optimizer_step=2, **kwargs)
+    assert metrics["tokens/window_train_input_positions"] == 34
+    assert metrics["tokens/window_statistics_input_positions"] == 34
+    assert tracking._select_standalone_tracking_metrics({"dspark/loss": 1, **metrics})[
+        "tokens/window_train_input_positions"] == 34
+    run = window.finish(device=torch.device("cpu"), world_size=1)
+    assert run["tokens/run_window_statistics_input_positions"] == 34
+    missing = dict(counts)
+    del missing["window_train_input_positions"], missing["window_statistics_input_positions"]
+    window.update(counts, successful_steps=3, optimizer_step=3, **kwargs)
+    metrics = window.update(missing, successful_steps=4, optimizer_step=4, **kwargs)
+    assert "tokens/window_train_input_positions" not in metrics
+    assert "tokens/run_window_train_input_positions" not in window.finish(device=torch.device("cpu"), world_size=1)
+
+
+@pytest.mark.parametrize("key,value", [("loss_mode", "invalid_ce"), ("loss_mode", "unsupported"),
+                                      ("per_position_loss_weight", "unsupported"), ("ce_target_source", "unsupported")])
+def test_reference_part_loss_recipe_rejects_unverified_modes(key, value):
+    from verl_speco.trainer.draft_training_loop import _validate_reference_part_loss_recipe
+    values = dict(loss_mode="full_vocab", per_position_loss_weight="fixed_exp_decay", ce_target_source="labels",
+                  l1_loss_alpha=0.0, lk_loss_alpha=0.0, confidence_head_alpha=0.0,
+                  loss_decay_gamma=7.0, block_size=2)
+    trainer = SimpleNamespace(backend=SimpleNamespace(model_type="dspark"),
+                              model=SimpleNamespace(module=SimpleNamespace(**values)))
+    _validate_reference_part_loss_recipe(trainer)
+    setattr(trainer.model.module, key, value)
+    with pytest.raises(ValueError, match="full-vocabulary fixed-weight CE"):
+        _validate_reference_part_loss_recipe(trainer)
+
+
+@pytest.mark.parametrize("alpha,l1", [(-0.01, 0.0), (1.01, 0.0), (True, 0.0), (float("nan"), 0.0)])
+def test_reference_dpace_rejects_unsupported_normalization(alpha, l1):
+    from verl_speco.trainer.draft_training_loop import _validate_reference_part_loss_recipe
+    model = SimpleNamespace(loss_mode="full_vocab", per_position_loss_weight="dpace", ce_target_source="labels",
+                            l1_loss_alpha=l1, lk_loss_alpha=0.0, confidence_head_alpha=0.0,
+                            loss_decay_gamma=7.0, block_size=2, dpace_alpha=alpha)
+    trainer = SimpleNamespace(backend=SimpleNamespace(model_type="dspark"), model=model)
+    with pytest.raises(ValueError, match="Reference D-PACE"):
+        _validate_reference_part_loss_recipe(trainer)
+
+
+def test_reference_restricted_ce_rejects_target_argmax():
+    from verl_speco.trainer.draft_training_loop import _validate_reference_part_loss_recipe
+    model = SimpleNamespace(loss_mode="restricted_ce", per_position_loss_weight="fixed_exp_decay",
+                            ce_target_source="target_argmax", l1_chunk_size=0, l1_loss_alpha=0.0,
+                            lk_loss_alpha=0.0, confidence_head_alpha=0.0, loss_decay_gamma=7.0, block_size=2)
+    trainer = SimpleNamespace(backend=SimpleNamespace(model_type="dspark"), model=model)
+    with pytest.raises(ValueError, match="restricted CE with labels"):
+        _validate_reference_part_loss_recipe(trainer)
+
+
+def test_reference_part_loss_rejects_tiny_position_weights():
+    from verl_speco.trainer.draft_training_loop import _validate_reference_part_loss_recipe
+    model = SimpleNamespace(loss_mode="full_vocab", per_position_loss_weight="fixed_exp_decay",
+                            ce_target_source="labels", l1_loss_alpha=0.0, lk_loss_alpha=0.0,
+                            confidence_head_alpha=0.0, loss_decay_gamma=0.01, block_size=2)
+    with pytest.raises(ValueError, match="normalization floor"):
+        _validate_reference_part_loss_recipe(SimpleNamespace(backend=SimpleNamespace(model_type="dspark"), model=model))
+
+
+def test_reference_part_loss_accepts_unchunked_target_argmax():
+    from verl_speco.trainer.draft_training_loop import _validate_reference_part_loss_recipe
+    model = SimpleNamespace(loss_mode="full_vocab", per_position_loss_weight="fixed_exp_decay",
+                            ce_target_source="target_argmax", l1_chunk_size=0,
+                            l1_loss_alpha=0.0, lk_loss_alpha=0.0, confidence_head_alpha=0.0,
+                            loss_decay_gamma=7.0, block_size=2)
+    trainer = SimpleNamespace(backend=SimpleNamespace(model_type="dspark"), model=model)
+    assert _validate_reference_part_loss_recipe(trainer) is model
+    model.l1_chunk_size = 1
+    with pytest.raises(ValueError, match="full-vocabulary fixed-weight CE"):
+        _validate_reference_part_loss_recipe(trainer)
+
+
+def test_reference_part_loss_requires_deterministic_adaptive_lk():
+    from verl_speco.trainer.draft_training_loop import _validate_reference_part_loss_recipe
+    model = SimpleNamespace(loss_mode="full_vocab", per_position_loss_weight="fixed_exp_decay",
+                            ce_target_source="labels", l1_loss_alpha=0.9, lk_loss_alpha=0.1,
+                            confidence_head_alpha=0.0, lk_loss_type="adaptive_hybrid",
+                            lk_hybrid_eta=3.0, loss_decay_gamma=7.0, block_size=2, modules=lambda: [])
+    trainer = SimpleNamespace(backend=SimpleNamespace(model_type="dspark"), model=model)
+    assert _validate_reference_part_loss_recipe(trainer) is model
+    model.modules = lambda: [torch.nn.Dropout(p=0.1)]
+    with pytest.raises(ValueError, match="deterministic model dropout"):
+        _validate_reference_part_loss_recipe(trainer)
+    model.modules = lambda: [torch.nn.BatchNorm1d(2)]
+    with pytest.raises(ValueError, match="deterministic model dropout and state"):
+        _validate_reference_part_loss_recipe(trainer)
+    model.modules = lambda: [SimpleNamespace(attention_dropout=0.1)]
+    with pytest.raises(ValueError, match="deterministic model dropout and state"):
+        _validate_reference_part_loss_recipe(trainer)
+    model.modules = lambda: []
+    model.lk_hybrid_eta = float("nan")
+    with pytest.raises(ValueError, match="coefficient"):
+        _validate_reference_part_loss_recipe(trainer)
+
+
+def test_reference_confidence_requires_enabled_head():
+    from verl_speco.trainer.draft_training_loop import _validate_reference_part_loss_recipe
+    model = SimpleNamespace(loss_mode="full_vocab", per_position_loss_weight="fixed_exp_decay",
+                            ce_target_source="labels", l1_loss_alpha=0.0, lk_loss_alpha=0.0,
+                            confidence_head_alpha=0.1, loss_decay_gamma=7.0, block_size=2)
+    with pytest.raises(ValueError, match="enabled confidence head"):
+        _validate_reference_part_loss_recipe(SimpleNamespace(backend=SimpleNamespace(model_type="dspark"), model=model))
+
+
+def test_reference_part_loss_rejects_unverified_backend():
+    from verl_speco.trainer.draft_training_loop import _validate_reference_part_loss_recipe
+    with pytest.raises(ValueError, match="not validated"):
+        _validate_reference_part_loss_recipe(SimpleNamespace(backend=SimpleNamespace(model_type="eagle3")))
+
+
+def test_token_metrics_do_not_divide_by_zero_checkpoint_window(monkeypatch):
+    from verl_speco.trainer import standalone_tracking as tracking
+    monkeypatch.setattr(tracking.time, "perf_counter", lambda: 10.0)
+    window = tracking.StandaloneTokenWindow(1)
+    window.record_checkpoint(1.0)
+    counts = {"source_tokens": 5, "window_tokens": 5, "supervised_tokens": 3,
+              "padding_tokens": 0, "samples": 1}
+    metrics = window.update(counts, successful_steps=1, optimizer_step=1, max_steps=1,
+                            start_time=10.0, device=torch.device("cpu"), world_size=1)
+    assert "tokens/source_per_second" not in metrics
+    assert "tokens/source_per_second_excluding_checkpoints" not in metrics
+    assert metrics["perf/checkpoint_blocking_time"] == 1.0
+
+
+def test_run_token_metrics_include_final_checkpoint_and_incomplete_counts(monkeypatch):
+    from verl_speco.trainer import standalone_tracking as tracking
+    clock = [20.0]
+    monkeypatch.setattr(tracking.time, "perf_counter", lambda: clock[0])
+    window = tracking.StandaloneTokenWindow(1)
+    counts = {"source_tokens": 10, "window_tokens": 8, "supervised_tokens": 5,
+              "padding_tokens": 2, "samples": 1}
+    kwargs = dict(max_steps=2, start_time=10.0, device=torch.device("cpu"), world_size=1)
+    window.update(counts, successful_steps=1, optimizer_step=1, **kwargs)
+    clock[0] = 25.0
+    window.update(counts, successful_steps=2, optimizer_step=2, **kwargs)
+    window.record_checkpoint(5.0)
+    clock[0] = 30.0
+    metrics = window.finish(device=torch.device("cpu"), world_size=1)
+    assert metrics["tokens/run_source"] == 20
+    assert metrics["perf/run_training_time"] == 20
+    assert metrics["perf/run_checkpoint_blocking_time"] == 5
+    assert metrics["tokens/run_source_per_second"] == 1
+    assert metrics["tokens/run_source_per_second_excluding_checkpoints"] == pytest.approx(20 / 15)
+    incomplete = tracking.StandaloneTokenWindow(1)
+    incomplete.update(None, successful_steps=1, optimizer_step=1, **kwargs)
+    assert "tokens/run_source" not in incomplete.finish(device=torch.device("cpu"), world_size=1)
+
+
+
+def test_checkpoint_remains_incomplete_if_input_changes_during_training(tmp_path, monkeypatch):
+    from verl_speco.trainer import draft_training_loop as loop
+    from verl_speco.trainer.standalone_resume import build_input_fingerprint, input_content_identity
+    source = tmp_path / "input.jsonl"
+    source.write_bytes(b"first\n")
+    identity = input_content_identity(build_input_fingerprint(source, include_content_hash=True))
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "metadata.json").write_text('{"complete": true}', encoding="utf-8")
+    monkeypatch.setattr(loop, "_rewrite_standalone_block_runtime_config", lambda *args: None)
+    source.write_bytes(b"other\n")
+    trainer = SimpleNamespace(_standalone_input_identity=identity)
+    with pytest.raises(ValueError, match="changed since training began"):
+        loop._finalize_standalone_checkpoint_files(trainer, str(checkpoint),
+            consumed_snapshot=torch.tensor([0]), step=1, input_path=str(source))
+    assert json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))["complete"] is False
+    assert not (checkpoint / "standalone_resume.json").exists()
+    with pytest.raises(ValueError, match="without input path and progress"):
+        loop._finalize_standalone_checkpoint_files(trainer, str(checkpoint),
+            consumed_snapshot=torch.tensor([0]), step=1, input_path=None)
+    assert json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))["complete"] is False
+
+
+
+@pytest.mark.parametrize("storage_format", ["tensor", "gzip"])
+def test_standalone_finalization_seals_checkpoint_before_retention(tmp_path, storage_format):
+    import torch.distributed.checkpoint as dcp
+    from verl_speco.trainer.checkpoint import verify_standalone_checkpoint_integrity, write_standalone_optimizer_layout
+    from verl_speco.trainer.draft_training_loop import _finalize_standalone_checkpoint_files
+
+    checkpoint = tmp_path / "draft_step_1"
+    optimizer = checkpoint / "optimizer"
+    optimizer.mkdir(parents=True)
+    (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    (checkpoint / "pytorch_model.bin").write_bytes(b"weights")
+    dcp_metadata = dcp.save({"state": torch.tensor([1])}, checkpoint_id=optimizer, no_dist=True)
+    write_standalone_optimizer_layout(optimizer, dcp_metadata)
+    (optimizer / "trainer_state.pt").write_bytes(b"state")
+    (checkpoint / "metadata.json").write_text(json.dumps({
+        "step": 1, "complete": False,
+        "optimizer": {"format": "torch_distributed_checkpoint", "path": "optimizer",
+                      "trainer_state_file": "trainer_state.pt"},
+    }), encoding="utf-8")
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="eagle3"),
+        _standalone_retention_keep_last=2, _standalone_retention_delete=False,
+        _standalone_retention_run_id="a" * 32, _standalone_retention_protected=(),
+        _standalone_resume_format=storage_format,
+    )
+    source = tmp_path / "input.jsonl"
+    source.write_text("{}\n", encoding="utf-8")
+    import hashlib
+    lease_snapshot = {"version": 1, "incarnation": "producer", "drained": True}
+    lease_snapshot["sha256"] = hashlib.sha256(json.dumps(lease_snapshot, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    trainer._standalone_lease_snapshot_provider = lambda: lease_snapshot
+    _finalize_standalone_checkpoint_files(
+        trainer, str(checkpoint), consumed_snapshot=torch.tensor([1]), step=1, input_path=str(source),
+    )
+    from verl_speco.trainer.standalone_resume import load_standalone_resume
+    consumed, resume = load_standalone_resume(checkpoint, input_path=source)
+    assert consumed == {1} and resume["schema_version"] == 3 and resume["storage_format"] == storage_format
+    assert verify_standalone_checkpoint_integrity(checkpoint)
+    assert resume["reference_lease_snapshot_sha256"] == lease_snapshot["sha256"]
+    assert (checkpoint / "reference_leases.json").is_file()
+    assert json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))["complete"] is True
+
+
+def test_checkpoint_retention_deletion_rechecks_directory_lease(tmp_path, monkeypatch):
+    from verl_speco.trainer import checkpoint, draft_training_loop as loop
+    calls = []
+    monkeypatch.setattr(loop, "_set_standalone_checkpoint_complete", lambda *args, **kwargs: None)
+    monkeypatch.setattr(loop, "_rewrite_standalone_block_runtime_config", lambda *args: None)
+    monkeypatch.setattr(loop, "_save_resume_sidecar", lambda *args, **kwargs: None)
+    monkeypatch.setattr(checkpoint, "write_standalone_integrity_manifest", lambda *args, **kwargs: None)
+    monkeypatch.setattr(checkpoint, "retire_standalone_checkpoints", lambda *args, **kwargs: calls.append(kwargs) or [])
+    trainer = SimpleNamespace(_standalone_retention_keep_last=2, _standalone_retention_delete=True,
+                              _standalone_retention_run_id="a" * 32, _standalone_retention_protected=())
+    path = str(tmp_path / "draft_step_3")
+    def finalize():
+        loop._finalize_standalone_checkpoint_files(trainer, path, consumed_snapshot=None, step=3, input_path=None)
+    finalize()
+    assert not calls
+    trainer._standalone_checkpoint_directory_lease = SimpleNamespace(
+        directory=tmp_path, verify=lambda: (_ for _ in ()).throw(RuntimeError("marker missing")))
+    finalize()
+    assert not calls
+    trainer._standalone_checkpoint_directory_lease.verify = lambda: None
+    finalize()
+    assert len(calls) == 1 and calls[0]["delete"] is True
 
 
 def test_standalone_checkpoint_skips_when_previous_save_is_running():
@@ -1219,3 +1727,414 @@ def test_standalone_checkpoint_export_error_can_be_deferred_until_teardown(
     assert _sync_standalone_export_error(
         trainer, torch.device("cpu"), raise_on_error=False
     )
+
+
+def test_rollback_checkpoint_agreement_rejects_divergent_or_failed_rank(monkeypatch, tmp_path):
+    import verl_speco.trainer.checkpoint as checkpoint
+    import verl_speco.trainer.draft_training_loop as loop
+
+    (tmp_path / "standalone_integrity.json").write_text("manifest", encoding="utf-8")
+    monkeypatch.setattr(checkpoint, "verify_standalone_checkpoint_integrity", lambda path: True)
+    monkeypatch.setattr(loop.dist, "is_initialized", lambda: True)
+    def gather_matching(out, local):
+        out[:] = [local, local]
+    monkeypatch.setattr(loop.dist, "all_gather_object", gather_matching)
+    loop._verify_rollback_checkpoint_across_ranks({"checkpoint_auto_rollback": True}, tmp_path, 2)
+
+    def gather_other(out, local):
+        out[:] = [local, ("different", None)]
+    monkeypatch.setattr(loop.dist, "all_gather_object", gather_other)
+    with pytest.raises(ValueError, match="differs or is invalid"):
+        loop._verify_rollback_checkpoint_across_ranks({"checkpoint_auto_rollback": True}, tmp_path, 2)
+
+    monkeypatch.setattr(checkpoint, "verify_standalone_checkpoint_integrity", lambda path: False)
+    monkeypatch.setattr(loop.dist, "all_gather_object", gather_matching)
+    with pytest.raises(ValueError, match="integrity verification failed"):
+        loop._verify_rollback_checkpoint_across_ranks({"checkpoint_auto_rollback": True}, tmp_path, 2)
+
+
+def test_step_rng_is_repeatable_across_restart_and_distinct_between_ranks():
+    import random
+    import numpy as np
+    from verl_speco.trainer.draft_training_loop import _seed_standalone_step
+    def draw(rank, step):
+        _seed_standalone_step(17, step, rank)
+        return random.random(), np.random.random(), torch.rand(4).tolist()
+    first = draw(0, 9)
+    draw(1, 10)
+    assert draw(0, 9) == first
+    assert draw(1, 9) != first
+    assert draw(0, 10) != first
+
+
+def test_deterministic_rng_resume_binds_device_type(caplog):
+    from verl_speco.trainer.draft_training_loop import _standalone_rng_identity, _validate_resume_training_plan
+    assert _standalone_rng_identity(False, torch.device("cpu")) == {}
+    for kind in ("cpu", "cuda", "npu"):
+        assert _standalone_rng_identity(True, SimpleNamespace(type=kind)) == {"rng_device_type": kind}
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _standalone_rng_identity(1, torch.device("cpu"))
+    with pytest.raises(ValueError, match="supported"):
+        _standalone_rng_identity(True, SimpleNamespace(type="meta"))
+    saved = {"world_size": 2, "deterministic_step_rng": True, "rng_device_type": "cpu"}
+    metadata = {"optimizer_step": 4, "training_plan": saved}
+    _validate_resume_training_plan(metadata, 4, dict(saved))
+    with pytest.raises(ValueError, match="training plan changed"):
+        _validate_resume_training_plan(metadata, 4, {**saved, "rng_device_type": "cuda"})
+    legacy = {key: value for key, value in saved.items() if key != "rng_device_type"}
+    _validate_resume_training_plan({"optimizer_step": 4, "training_plan": legacy}, 4, saved)
+    assert "cannot be verified" in caplog.text
+
+
+def test_step_rng_seeds_npu_with_the_same_rank_step_seed(monkeypatch):
+    from verl_speco.trainer.draft_training_loop import _seed_standalone_step
+    seeds = []
+    monkeypatch.setattr(torch, "manual_seed", lambda seed: seeds.append(("torch", seed)))
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(is_available=lambda: True,
+                        manual_seed_all=lambda seed: seeds.append(("npu", seed))), raising=False)
+    _seed_standalone_step(17, 3, 1)
+    assert len(seeds) == 2 and seeds[0][0] == "torch" and seeds[1] == ("npu", seeds[0][1])
+
+
+def test_resume_rank_consensus_reports_failed_or_different_progress(monkeypatch):
+    import verl_speco.trainer.draft_training_loop as loop
+    monkeypatch.setattr(loop.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(loop, "load_standalone_resume", lambda *a, **kw: ({1, 2}, {"optimizer_step": 3}))
+    def agree(out, local):
+        out[:] = [local, local]
+    monkeypatch.setattr(loop.dist, "all_gather_object", agree)
+    assert loop._load_resume_across_ranks("path", None, 3, {"world_size": 2}, 2)[0] == {1, 2}
+    def mismatch(out, local):
+        out[:] = [local, {**local, "progress": "different"}]
+    monkeypatch.setattr(loop.dist, "all_gather_object", mismatch)
+    with pytest.raises(ValueError, match="differs or failed across ranks"):
+        loop._load_resume_across_ranks("path", None, 3, {"world_size": 2}, 2)
+    def fail(*args, **kwargs):
+        raise OSError("missing checkpoint")
+    monkeypatch.setattr(loop, "load_standalone_resume", fail)
+    monkeypatch.setattr(loop.dist, "all_gather_object", agree)
+    with pytest.raises(ValueError, match="missing checkpoint"):
+        loop._load_resume_across_ranks("path", None, 3, {"world_size": 2}, 2)
+
+
+def test_new_save_waits_for_previous_finalizer_and_surfaces_error():
+    import threading
+    import time
+    trainer = _FakeTrainer()
+    trainer._standalone_finalization_event = threading.Event()
+    result = []
+    def save():
+        try:
+            _save_standalone_checkpoint(trainer, 2)
+        except Exception as exc:
+            result.append(exc)
+    thread = threading.Thread(target=save)
+    thread.start()
+    time.sleep(0.05)
+    assert thread.is_alive() and trainer.calls == 0
+    trainer._standalone_export_error = RuntimeError("sidecar failed")
+    trainer._standalone_finalization_event.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive() and trainer.calls == 0
+    assert len(result) == 1 and "checkpoint" in str(result[0]).lower()
+
+
+def test_checkpoint_finalization_timeout_stops_new_save_and_retains_state(monkeypatch):
+    import threading
+    import verl_speco.trainer.draft_training_loop as loop
+    trainer = _FakeTrainer()
+    trainer._standalone_finalization_event = threading.Event()
+    trainer._standalone_checkpoint_timeout = 0.02
+    monkeypatch.setattr(loop.dist, "is_initialized", lambda: False)
+    with pytest.raises(RuntimeError, match="checkpoint export failed or timed out") as error:
+        loop._sync_standalone_export_error(trainer, torch.device("cpu"))
+    assert isinstance(error.value.__cause__, TimeoutError)
+    assert not trainer._standalone_finalization_event.is_set() and trainer.calls == 0
+    with pytest.raises(TimeoutError, match="remains unresolved"):
+        _save_standalone_checkpoint(trainer, 2)
+    assert trainer.calls == 0
+
+
+@pytest.mark.parametrize("mapped", [False, True])
+def test_detached_reference_batch_survives_source_reuse_and_checks_budget(tmp_path, mapped):
+    from dataclasses import replace
+    from verl_speco.trainer.draft_training_loop import _detach_reference_batch
+    from verl_speco.trainer.tq_sample_source import TQLocalBatch
+    source = torch.arange(8, dtype=torch.float32)
+    if mapped:
+        path = tmp_path / "source.pt"
+        torch.save(source, path)
+        source = torch.load(path, weights_only=True, mmap=True)
+    batch = TQLocalBatch(["sample"], [], ["sample"], prepared_batch={"input_ids": source})
+    detached = _detach_reference_batch(batch, {"consumer_prefetch_batch_bytes": 64})
+    source.zero_()
+    assert torch.equal(detached.prepared_batch["input_ids"], torch.arange(8, dtype=torch.float32))
+    assert detached.global_keys == batch.global_keys
+    with pytest.raises(ValueError, match="batch byte budget"):
+        _detach_reference_batch(batch, {"consumer_prefetch_batch_bytes": 63})
+    nested = replace(batch, prepared_batch={"nested": [torch.ones(16)]})
+    with pytest.raises(ValueError, match="batch byte budget"):
+        _detach_reference_batch(nested, {"consumer_prefetch_batch_bytes": 64})
+
+
+@pytest.mark.parametrize("local_exhausted", [False, True])
+def test_reference_source_rejects_inconsistent_rank_exhaustion(monkeypatch, local_exhausted):
+    from verl_speco.trainer.tq_sample_source import TQLocalBatch
+
+    monkeypatch.setattr("verl_speco.trainer.draft_training_loop.dist.is_initialized", lambda: True)
+    monkeypatch.setattr("verl_speco.trainer.draft_training_loop.dist.get_world_size", lambda: 2)
+    def reduce(state, op):
+        state[1] = 1
+        state[2] = 1
+    monkeypatch.setattr("verl_speco.trainer.draft_training_loop.dist.all_reduce", reduce)
+    batch = TQLocalBatch([], [], [], prepared_batch={"input_ids": torch.ones(1)})
+    with pytest.raises(RuntimeError, match="exhausted inconsistently"):
+        _next_batch_across_ranks(iter([] if local_exhausted else [batch]), rank=0,
+                                 device=torch.device("cpu"), require_prepared=True)
+
+
+def test_reference_source_rejects_mismatched_dispatch_identity(monkeypatch):
+    from verl_speco.trainer.tq_sample_source import TQLocalBatch
+
+    monkeypatch.setattr("verl_speco.trainer.draft_training_loop.dist.is_initialized", lambda: True)
+    monkeypatch.setattr("verl_speco.trainer.draft_training_loop.dist.get_world_size", lambda: 2)
+    def reduce(state, op):
+        state[3] += 1
+    monkeypatch.setattr("verl_speco.trainer.draft_training_loop.dist.all_reduce", reduce)
+    batch = TQLocalBatch([], [], [], prepared_batch={"input_ids": torch.ones(1)},
+                         plan_id=2, receipt_token="dispatch")
+    with pytest.raises(RuntimeError, match="dispatch identity differs"):
+        _next_batch_across_ranks(iter([batch]), rank=0, device=torch.device("cpu"), require_prepared=True)
+
+
+def test_reference_source_accepts_only_matching_deferred_assignments(monkeypatch):
+    from dataclasses import replace
+    from verl_speco.trainer.tq_feature_store import ReadyEntry
+    from verl_speco.trainer.tq_sample_source import TQLocalBatch
+    monkeypatch.setattr("verl_speco.trainer.draft_training_loop.dist.is_initialized", lambda: False)
+    entry = ReadyEntry("key", {"key": "metadata"})
+    batch = TQLocalBatch(["key"], [], ["key"], file_entries=[entry], plan_id=2,
+                         receipt_token="dispatch", assignment_digest="a" * 64)
+    kwargs = dict(rank=0, device=torch.device("cpu"), require_reference_metadata=True)
+    assert _next_batch_across_ranks(iter([batch]), **kwargs) is batch
+    padding = replace(batch, local_keys=[], is_padding_rank=True)
+    assert _next_batch_across_ranks(iter([padding]), **kwargs) is padding
+    for invalid in (replace(batch, file_entries=[]), replace(batch, local_keys=["other"]),
+                    replace(batch, cleanup_after_load=True), replace(batch, assignment_digest=None),
+                    replace(batch, prepared_batch={"input_ids": torch.ones(1)})):
+        with pytest.raises(RuntimeError, match="target-feature producer failed"):
+            _next_batch_across_ranks(iter([invalid]), **kwargs)
+
+
+def test_reference_batch_rejects_conflicting_source_identity(monkeypatch):
+    import verl_speco.trainer.draft_training_loop as loop
+    from verl_speco.trainer.tq_sample_source import TQLocalBatch
+    monkeypatch.setattr(loop.dist, "is_initialized", lambda: False)
+    expected = {"kind": "file", "sha256": "a" * 64, "size_bytes": 4}
+    other = {"kind": "file", "sha256": "b" * 64, "size_bytes": 4}
+    batch = TQLocalBatch([], [], [], prepared_batch={"input_ids": torch.ones(1)},
+                         plan_id=1, receipt_token="token", input_identity=other)
+    with pytest.raises(RuntimeError, match="target-feature producer failed") as error:
+        loop._next_batch_across_ranks(iter([batch]), rank=0, device=torch.device("cpu"),
+            require_prepared=True, expected_input_identity=expected)
+    assert "input content differs" in str(error.value.__cause__)
+
+
+def test_checkpoint_agreement_blocks_publication_when_another_rank_fails(monkeypatch):
+    import verl_speco.trainer.draft_training_loop as loop
+
+    trainer = _FakeTrainer()
+    trainer.future.set_result(None)
+    finalized = []
+    monkeypatch.setattr(loop, "_finalize_standalone_checkpoint_files", lambda *a, **kw: finalized.append(True))
+    monkeypatch.setattr(loop.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(loop.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(loop.dist, "get_rank", lambda: 0)
+    def fail_remote(state, op):
+        state[0] += 1
+    monkeypatch.setattr(loop.dist, "all_reduce", fail_remote)
+    with pytest.raises(RuntimeError, match="save failed on at least one rank"):
+        loop._save_standalone_checkpoint_across_ranks(trainer, 5, device=torch.device("cpu"), wait=True)
+    assert not finalized
+
+
+def test_checkpoint_agreement_rejects_missing_export_writer(monkeypatch):
+    import verl_speco.trainer.draft_training_loop as loop
+
+    trainer = SimpleNamespace(save_checkpoint=lambda *a, **kw: {
+        "saved": True, "path": "unused", "reason": "optimizer_shard_saved"})
+    monkeypatch.setattr(loop.dist, "is_initialized", lambda: False)
+    with pytest.raises(RuntimeError, match="exactly one export writer"):
+        loop._save_standalone_checkpoint_across_ranks(trainer, 5, device=torch.device("cpu"))
+
+
+def test_native_reader_requires_safe_scheduled_lifecycle():
+    from verl_speco.trainer.draft_training_loop import _validate_native_reader
+    valid = {"per_rank_ack": True, "node_reference_owner": False, "owned_windows": False,
+             "tq_cfg": {"consumer_batch_workers": 0, "expected_feature": {"payload_kind": "vllm_reference"}},
+             "producer_cfg": {"max_published_references": 1}}
+    _validate_native_reader(**valid)
+    _validate_native_reader(**{**valid, "producer_cfg": {"publication_after_parent_commit": True}})
+    for change in ({"per_rank_ack": False}, {"node_reference_owner": True}, {"owned_windows": True},
+                   {"tq_cfg": {"consumer_batch_workers": 1, "expected_feature": {"payload_kind": "vllm_reference"}}},
+                   {"tq_cfg": {"consumer_batch_workers": 0}}, {"producer_cfg": {}}):
+        with pytest.raises(ValueError, match="Native reader requires"):
+            _validate_native_reader(**{**valid, **change})
+
+
+def test_live_topology_rejects_native_reader_configuration_mismatch(monkeypatch):
+    from copy import deepcopy
+    from omegaconf import OmegaConf
+    import verl_speco.trainer.draft_training_loop as loop
+    config = OmegaConf.create({"speco": {"draft_training": {"nnodes": 1, "nproc_per_node": 2,
+                                "trainer_node_ips": None, "scheduler": {"per_rank_reference_ack": True}},
+                                "standalone_tq_producer": {"max_published_references": 2}},
+                               "actor_rollout_ref": {"rollout": {"drafter": {"training": {
+                                   "feature_store": {"type": "ray_reference"},
+                                   "transfer_queue": {"run_id": "run"},
+                                   "target_feature_replay": {"hidden_states_store": {
+                                       "backend": "native", "native": {"generation": 1}}}}}}}})
+    def gather(output, local):
+        output[0] = deepcopy(local)
+        output[1] = deepcopy(local)
+        output[1]["rank"] = 1
+        output[1]["plan"]["native_reader"]["settings"]["generation"] = 2
+    monkeypatch.setattr(loop.dist, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="disagree"):
+        loop._verify_live_trainer_topology(config, rank=0, world_size=2, scheduled=True,
+                                           events_available=True, producer_available=True)
+
+
+def test_reference_device_budget_checks_before_staging_and_training():
+    import asyncio
+    from verl_speco.trainer.draft_training_loop import _reference_training_step_across_ranks
+    calls = []
+    async def train(batch, step, **kwargs):
+        calls.append("train")
+        return True
+    trainer = SimpleNamespace(
+        _stage_standalone_cpu_batch=lambda batch: (calls.append("stage") or dict(batch)),
+        training_step_from_batch=train,
+    )
+    batch = {"hidden_source": "standalone_vllm_reference", "hidden_states": torch.zeros(8)}
+    with pytest.raises(RuntimeError, match="device byte budget") as error:
+        asyncio.run(_reference_training_step_across_ranks(
+            trainer, batch, 0, device=torch.device("cpu"), max_device_bytes=31))
+    assert isinstance(error.value.__cause__, ValueError) and not calls
+    assert asyncio.run(_reference_training_step_across_ranks(
+        trainer, batch, 0, device=torch.device("cpu"), max_device_bytes=32))
+    assert calls == ["stage", "train"]
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5, "1024"])
+def test_reference_device_budget_rejects_invalid_values(value):
+    from verl_speco.trainer.draft_training_loop import _reference_device_budget
+    with pytest.raises(ValueError, match="non-negative integer"):
+        _reference_device_budget({"consumer_device_batch_bytes": value}, "ray_reference")
+    with pytest.raises(ValueError, match="requires ray_reference"):
+        _reference_device_budget({"consumer_device_batch_bytes": 1024}, "tq")
+
+
+def test_device_prefetch_requires_two_batch_budgets_and_supported_backend():
+    from verl_speco.trainer.draft_training_loop import _reference_device_prefetch_budget
+    assert _reference_device_prefetch_budget({}, "ray_reference", "cpu", 0) == 0
+    assert _reference_device_prefetch_budget({"consumer_device_prefetch_bytes": 2048, "consumer_prefetch_batches": 1}, "ray_reference", "cuda", 1024) == 2048
+    for config, store, device, limit in [
+        ({"consumer_device_prefetch_bytes": -1}, "ray_reference", "cuda", 1024),
+        ({"consumer_device_prefetch_bytes": 2048}, "ray_reference", "cpu", 1024),
+        ({"consumer_device_prefetch_bytes": 2048}, "tq", "cuda", 1024),
+        ({"consumer_device_prefetch_bytes": 1024}, "ray_reference", "npu", 1024),
+        ({"consumer_device_prefetch_bytes": 2048}, "ray_reference", "npu", 0),
+        ({"consumer_device_prefetch_bytes": 2048}, "ray_reference", "npu", 1024),
+        ({"consumer_device_prefetch_bytes": 2048, "consumer_prefetch_batches": 1,
+          "consumer_prefetch_host_bytes": 100, "consumer_prefetch_batch_bytes": 60}, "ray_reference", "npu", 1024),
+    ]:
+        with pytest.raises(ValueError):
+            _reference_device_prefetch_budget(config, store, device, limit)
+
+
+def test_reference_device_budget_counts_each_aliased_tensor_copy():
+    from verl_speco.trainer.draft_training_loop import _reference_device_transfer_bytes
+    value = torch.arange(8, dtype=torch.float32)
+    assert _reference_device_transfer_bytes({"a": value[:4], "b": value[4:]}) == 64
+
+
+def test_reference_step_stages_once_and_preserves_backend_hidden_source():
+    import asyncio
+    from verl_speco.trainer.draft_training_loop import _reference_training_step_across_ranks
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    stages = []
+    def stage(batch):
+        stages.append(True)
+        return dict(batch)
+    async def train(batch, step):
+        assert batch["hidden_source"] == "standalone_vllm_reference"
+        assert "_speco_reference_staged" not in batch
+        return True
+    trainer._stage_standalone_cpu_batch = stage
+    trainer._training_step_on_batch = train
+    assert asyncio.run(_reference_training_step_across_ranks(
+        trainer, {"hidden_source": "standalone_vllm_reference"}, 0, device=torch.device("cpu")))
+    assert stages == [True]
+
+
+def _device_budget_gloo_worker(rank, port, oversized, results):
+    import asyncio
+    import datetime
+    import torch
+    import torch.distributed as dist
+    from types import SimpleNamespace
+    from verl_speco.trainer.draft_training_loop import _reference_training_step_across_ranks
+    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2,
+                            timeout=datetime.timedelta(seconds=25))
+    calls = []
+    async def train(batch, step, **kwargs):
+        calls.append("train")
+        return True
+    trainer = SimpleNamespace(_stage_standalone_cpu_batch=lambda batch: (calls.append("stage") or dict(batch)),
+                              training_step_from_batch=train)
+    batch = {"hidden_source": "standalone_vllm_reference",
+             "hidden_states": torch.zeros(64 if oversized and rank == 1 else 4)}
+    try:
+        try:
+            asyncio.run(_reference_training_step_across_ranks(
+                trainer, batch, 0, device=torch.device("cpu"), max_device_bytes=128))
+            results.put((rank, "ok", calls))
+        except RuntimeError as exc:
+            results.put((rank, str(exc), calls))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("oversized", [False, True])
+def test_reference_device_budget_two_gloo_ranks(oversized):
+    import multiprocessing
+    import socket
+    import torch.distributed as dist
+    if not dist.is_gloo_available():
+        pytest.skip("Gloo is unavailable")
+    ctx = multiprocessing.get_context("spawn")
+    results = ctx.Queue()
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    processes = [ctx.Process(target=_device_budget_gloo_worker, args=(rank, port, oversized, results))
+                 for rank in range(2)]
+    for process in processes:
+        process.start()
+    try:
+        rows = [results.get(timeout=60) for _ in processes]
+        for process in processes:
+            process.join(timeout=20)
+        assert all(process.exitcode == 0 for process in processes)
+        assert {row[0] for row in rows} == {0, 1}
+        if oversized:
+            assert all("device byte budget" in row[1] and not row[2] for row in rows)
+        else:
+            assert all(row[1] == "ok" and row[2] == ["stage", "train"] for row in rows)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
