@@ -18,6 +18,11 @@ speco:
     launcher: python
     nproc_per_node: 1
     nnodes: 1
+    # Explicit Ray node manager IPs for distributed trainer placement.
+    trainer_node_ips: null
+    placement_timeout_seconds: 120
+    # Optional verified local replica for a launcher-owned target vLLM.
+    local_target_cache_path: null
     node_rank: null
     master_addr: null
     master_port: null
@@ -32,6 +37,32 @@ speco:
       # global batch), and high from the full Producer capacity.
       low_watermark_samples: 0
       high_watermark_samples: 0
+      # Balance assigned feature tokens across ranks while preserving the global batch.
+      balance_by_tokens: false
+      # partial trains real tail samples with explicit zero-loss ranks when needed.
+      tail_policy: drop  # drop | partial
+      # Optional direct Producer receipts; requires ray_reference and a Producer credit limit.
+      per_rank_reference_ack: false
+      # Return source credits after detached materialization, before optimizer commit.
+      release_payload_on_materialization: false
+      # Includes input fingerprinting before Producer startup acknowledgement.
+      producer_start_timeout_seconds: 1800
+      # Preserve unresolved references if Producer stop does not finish in time.
+      producer_stop_timeout_seconds: 180
+      # Optional Ray State API confirmation; zero disables dashboard queries.
+      reader_exit_timeout_seconds: 0
+      # Includes final trainer save and cleanup after the stop command.
+      consumer_shutdown_timeout_seconds: 1800
+      # Bound waiting for asynchronous checkpoint publication callbacks.
+      checkpoint_finalization_timeout_seconds: 1800
+      # Maximum wait for reference finalization, its queue, and commit gates.
+      commit_gate_timeout_seconds: 180
+      # Zero leaves the temporary identity index without an entry cap.
+      identity_ledger_max_entries: 0
+      # Canonical JSON metadata bytes per reference training command.
+      reference_command_max_bytes: 268435456
+      # Maximum serialized payload bytes in one command frame.
+      reference_command_frame_bytes: 4194304
 
 actor_rollout_ref:
   rollout:
@@ -45,10 +76,40 @@ actor_rollout_ref:
         preserve_prompt_hidden_states: true
         max_steps: 1000
         save_interval_steps: 100
+        # Separate trainable-parameter export; zero disables, never a resume checkpoint.
+        trainable_snapshot_interval_steps: 0
+        # Logical trainable tensor bytes per snapshot; zero disables this limit.
+        trainable_snapshot_max_bytes: 0
+        # Optional trainable-only initialization; requires a fresh optimizer.
+        trainable_snapshot_initialization_path: null
+        # Zero disables integrity scans and retention. Set >= 2 to audit and plan;
+        # deletion also requires checkpoint_retention_delete=true and exclusive ownership below.
+        checkpoint_retention_keep_last: 0
+        checkpoint_retention_delete: false
+        # Optional cooperative exclusive ownership of the checkpoint directory.
+        # A crash leaves a marker that requires operator inspection and removal.
+        checkpoint_directory_exclusive: false
+        # Reuse a verified resume checkpoint's retention identity under exclusive ownership.
+        checkpoint_retention_inherit_run: false
+        # Plan reference batches from metadata and materialize one sample at a time.
+        reference_streaming_prepare: false
+        # Experimental file-backed owned-window execution; optional node owner uses
+        # synchronous local frame transfers and explicit host/frame byte budgets.
+        reference_owned_windows: false
+        checkpoint_auto_rollback: false
+        # Optional full model-cache hash for path-independent resume identity.
+        target_model_cache_content_identity: false
+        target_model_logical_id: null
+        # gzip reduces progress sidecar size; older runtimes only read tensor.
+        checkpoint_resume_format: tensor
+        # Aggregate processed token counts across ranks once per N steps; 0 disables.
+        token_metrics_interval_steps: 50
         save_final_checkpoint: true
         eval_interval_steps: 0
         gradient_accumulation_steps: 1
         seed: 0
+        # Re-seed training randomness from seed, optimizer step and rank.
+        deterministic_step_rng: false
         nproc_per_node: ${speco.draft_training.nproc_per_node}
         nnodes: ${speco.draft_training.nnodes}
         node_rank: ${speco.draft_training.node_rank}
@@ -78,9 +139,18 @@ actor_rollout_ref:
           # Consumer side of the vLLM hidden-state transfer. ``file`` reads the
           # legacy safetensors path; ``mooncake`` reads the handle-based store
           # written by hs_connectors.MooncakeHiddenStatesConnector.
-          # Keep in sync with the producer copy in speco_base.yaml.
+          # Keep shared file/Mooncake settings in sync with speco_base.yaml.
           hidden_states_store:
             backend: file
+            file_root: null
+            # Experimental rank-local native reader; launcher settings are
+            # derived from SPECO_NATIVE_* when the native backend is selected.
+            native:
+              endpoints: []
+              metadata_server: P2PHANDSHAKE
+              generation: 0
+              max_bytes: 0
+              chunk_bytes: 2097152
             mooncake:
               local_hostname: ""
               metadata_server: P2PHANDSHAKE

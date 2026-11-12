@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from copy import deepcopy
@@ -165,12 +166,31 @@ def validate_reference_envelope(tag: Mapping[str, Any]) -> None:
     if tag.get("reference_version") != REFERENCE_VERSION:
         raise ValueError("Unsupported hidden reference version")
     backend = tag.get("backend")
-    if backend not in {"file", "mooncake"}:
-        raise ValueError("Hidden references require backend=file or mooncake")
+    if backend not in {"file", "mooncake", "native"}:
+        raise ValueError("Hidden references require backend=file, mooncake or native")
     field = "hidden_states_path" if backend == "file" else "handle"
     reference = tag.get(field)
     if not isinstance(reference, str) or not reference.strip():
         raise ValueError(f"Hidden reference requires {field}")
+    if backend == "native":
+        try:
+            if len(reference.encode("utf-8")) > 64 * 1024:
+                raise ValueError("Native hidden reference exceeds its byte limit")
+            descriptor = json.loads(reference)
+        except (ValueError, UnicodeError, RecursionError) as exc:
+            raise ValueError("Malformed native hidden reference") from exc
+        if (not isinstance(descriptor, dict) or type(descriptor.get("version")) is not int
+                or descriptor["version"] != 2 or descriptor.get("run_id") != tag.get("run_id")):
+            raise ValueError("Native hidden reference scope differs")
+        try:
+            canonical = json.dumps(descriptor, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            unsigned = {key: value for key, value in descriptor.items() if key != "sha256"}
+            digest = hashlib.sha256(json.dumps(unsigned, sort_keys=True, separators=(",", ":"),
+                                               allow_nan=False).encode()).hexdigest()
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("Malformed native hidden reference") from exc
+        if canonical != reference or descriptor.get("sha256") != digest:
+            raise ValueError("Native hidden reference is not canonical or its fingerprint differs")
     other = "handle" if backend == "file" else "hidden_states_path"
     if tag.get(other) is not None:
         raise ValueError("Hidden reference must select exactly one backend")

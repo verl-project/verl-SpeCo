@@ -15,12 +15,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import logging
 import os
 from array import array
-from dataclasses import dataclass
+from collections import Counter, deque
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
@@ -29,6 +31,15 @@ import torch
 from verl_speco.data.parse import clean_conversation_roles
 
 logger = logging.getLogger(__name__)
+DEFAULT_MAX_JSONL_LINE_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_INDEXED_RECORDS = 10_000_000
+
+
+def _bounded_jsonl_line(stream, limit: int) -> bytes:
+    line = stream.readline(limit + 1) if limit else stream.readline()
+    if limit and len(line) > limit:
+        raise ValueError(f"JSONL input line exceeds max_jsonl_line_bytes={limit}")
+    return line
 
 
 class SampleFilteredError(ValueError):
@@ -60,6 +71,8 @@ class TokenizedRequest:
     draft_position_ids: torch.Tensor
     source_metadata: dict[str, Any]
     vllm_prompt_token_ids: tuple[int, ...]
+    source_route: int | None = None
+    source_plan_sha256: str | None = None
 
     @property
     def prompt_token_ids(self) -> list[int]:
@@ -75,6 +88,8 @@ class GenerationRequest:
     prompt_token_ids: tuple[int, ...]
     max_tokens: int
     source_metadata: dict[str, Any]
+    source_route: int | None = None
+    source_plan_sha256: str | None = None
 
 
 def iter_input_records(
@@ -83,6 +98,7 @@ def iter_input_records(
     on_error: str = "skip",
     max_consecutive_errors: int = 20,
     parser_strict_roles: bool = False,
+    max_jsonl_line_bytes: int = DEFAULT_MAX_JSONL_LINE_BYTES,
 ) -> Iterator[InputRecord]:
     """Yield prompt/response records from one JSONL or Parquet file.
 
@@ -98,6 +114,8 @@ def iter_input_records(
         raise ValueError(f"on_error must be 'skip' or 'raise', got {on_error!r}")
     if max_consecutive_errors < 0:
         raise ValueError("max_consecutive_errors must be >= 0")
+    if type(max_jsonl_line_bytes) is not int or max_jsonl_line_bytes < 0:
+        raise ValueError("max_jsonl_line_bytes must be a non-negative integer")
 
     input_path = Path(path)
     if not input_path.is_file():
@@ -126,7 +144,7 @@ def iter_input_records(
             ) from error
 
     sequence_no = 0
-    for location, payload in _iter_payloads(input_path, handle_error):
+    for location, payload in _iter_payloads(input_path, handle_error, max_jsonl_line_bytes):
         try:
             record = _record_from_payload(
                 payload, location, sequence_no, parser_strict_roles
@@ -163,11 +181,23 @@ class ShuffledJsonlReader:
         on_error: str = "skip",
         max_consecutive_errors: int = 20,
         parser_strict_roles: bool = False,
+        source_field: str | None = None,
+        stable_source_ids: bool = False,
+        max_jsonl_line_bytes: int = DEFAULT_MAX_JSONL_LINE_BYTES,
+        max_indexed_records: int = DEFAULT_MAX_INDEXED_RECORDS,
+        verify_indexed_input: bool = False,
     ) -> None:
         if on_error not in {"skip", "raise"}:
             raise ValueError(f"on_error must be 'skip' or 'raise', got {on_error!r}")
         if max_consecutive_errors < 0:
             raise ValueError("max_consecutive_errors must be >= 0")
+        if type(stable_source_ids) is not bool:
+            raise ValueError("stable_source_ids must be a boolean")
+        if (type(max_jsonl_line_bytes) is not int or max_jsonl_line_bytes < 0
+                or type(max_indexed_records) is not int or max_indexed_records < 0):
+            raise ValueError("JSONL line and index limits must be non-negative integers")
+        if type(verify_indexed_input) is not bool:
+            raise ValueError("verify_indexed_input must be a boolean")
         input_path = Path(path)
         if not input_path.is_file():
             raise FileNotFoundError(f"Producer input file not found: {input_path}")
@@ -181,15 +211,79 @@ class ShuffledJsonlReader:
         self._parser_strict_roles = parser_strict_roles
         self._offsets = array("q")
         self._line_numbers = array("q")
+        self._source_field = source_field
+        self._stable_source_ids = stable_source_ids
+        self._line_limit = (min(max_jsonl_line_bytes, 4 * 1024 * 1024) if max_jsonl_line_bytes
+                            else 4 * 1024 * 1024) if source_field else max_jsonl_line_bytes
+        self._verify_lines = bool(source_field or verify_indexed_input)
+        self._source_labels: list[str] = []
+        self._line_digests = bytearray()
+        unique_sources: dict[str, str] = {}
         with input_path.open("rb") as input_file:
+            initial_stat = os.fstat(input_file.fileno())
             offset = 0
             line_number = 0
-            for raw_line in input_file:
+            while True:
+                raw_line = _bounded_jsonl_line(input_file, self._line_limit)
+                if not raw_line:
+                    break
                 line_number += 1
                 if raw_line.strip():
+                    if max_indexed_records and len(self._offsets) >= max_indexed_records:
+                        raise ValueError(f"JSONL input exceeds max_indexed_records={max_indexed_records}")
+                    if source_field:
+                        if len(self._offsets) >= 1_000_000:
+                            raise ValueError("Source-proportional input exceeds 1000000 records")
+                        try:
+                            payload = json.loads(raw_line)
+                            label = payload[source_field]
+                        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+                            raise ValueError(f"Invalid source label at {input_path}:{line_number}") from exc
+                        if not isinstance(label, str) or not label or len(label) > 1024:
+                            raise ValueError(f"Invalid source label at {input_path}:{line_number}")
+                        if label not in unique_sources and len(unique_sources) >= 256:
+                            raise ValueError("Source-proportional input exceeds 256 sources")
+                        label = unique_sources.setdefault(label, label)
+                        self._source_labels.append(label)
+                    if self._verify_lines:
+                        self._line_digests.extend(hashlib.sha256(raw_line).digest())
                     self._offsets.append(offset)
                     self._line_numbers.append(line_number)
                 offset += len(raw_line)
+            final_stat = os.fstat(input_file.fileno())
+        self._source_signature = self._signature(final_stat)
+        if self._signature(initial_stat) != self._source_signature or self._signature(input_path.stat()) != self._source_signature:
+            raise ValueError("JSONL input changed during indexing")
+
+    @staticmethod
+    def _signature(stat: os.stat_result) -> tuple[int, int, int, int]:
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+    def _check_input(self, input_file) -> None:
+        if (self._signature(os.fstat(input_file.fileno())) != self._source_signature
+                or self._signature(self._input_path.stat()) != self._source_signature):
+            raise ValueError("JSONL input changed after indexing")
+
+    def source_proportional_order(self, *, seed: int | None = None) -> Iterator[int]:
+        """Visit every original row once, distributing source counts over the epoch."""
+        if not self._source_field:
+            raise ValueError("Source-proportional order requires a source field")
+        groups: dict[str, deque[int]] = {label: deque() for label in sorted(set(self._source_labels))}
+        if seed is None:
+            indices: Iterable[int] = range(self.record_count)
+        else:
+            import numpy as np
+            indices = np.random.default_rng(seed).permutation(self.record_count)
+        for index in indices:
+            groups[self._source_labels[int(index)]].append(int(index))
+        counts = Counter(self._source_labels)
+        used: Counter[str] = Counter()
+        total = self.record_count
+        for position in range(total):
+            eligible = (label for label, group in groups.items() if group)
+            label = max(eligible, key=lambda name: counts[name] * (position + 1) - used[name] * total)
+            used[label] += 1
+            yield groups[label].popleft()
 
     @property
     def record_count(self) -> int:
@@ -222,9 +316,14 @@ class ShuffledJsonlReader:
 
         sequence_no = 0
         with self._input_path.open("rb") as input_file:
+            self._check_input(input_file)
             for index in order:
+                self._check_input(input_file)
                 input_file.seek(self._offsets[index])
-                raw_line = input_file.readline()
+                raw_line = _bounded_jsonl_line(input_file, self._line_limit)
+                self._check_input(input_file)
+                if self._verify_lines and hashlib.sha256(raw_line).digest() != self._line_digests[32 * index:32 * (index + 1)]:
+                    raise ValueError("JSONL input changed after indexing")
                 line_number = self._line_numbers[index]
                 location = f"{self._input_path}:{line_number}"
                 try:
@@ -237,14 +336,18 @@ class ShuffledJsonlReader:
                     continue
                 try:
                     record = _record_from_payload(
-                        payload, location, sequence_no, self._parser_strict_roles
+                        payload, location, int(index) if self._source_field or self._stable_source_ids else sequence_no,
+                        self._parser_strict_roles
                     )
+                    if self._stable_source_ids or self._source_field:
+                        record = replace(record, sequence_no=sequence_no)
                 except Exception as error:  # noqa: BLE001 - policy decides skip vs raise
                     handle_error(location, error)
                     continue
                 state["consecutive"] = 0
                 yield record
                 sequence_no += 1
+            self._check_input(input_file)
 
 
 def _record_from_payload(
@@ -402,11 +505,12 @@ def _extra_info_index(payload: Mapping[str, Any]) -> str | None:
 def _iter_payloads(
     input_path: Path,
     on_error: Any = None,
+    max_jsonl_line_bytes: int = DEFAULT_MAX_JSONL_LINE_BYTES,
 ) -> Iterator[tuple[str, Any]]:
     if _is_parquet(input_path):
         yield from _iter_parquet_payloads(input_path)
         return
-    yield from _iter_jsonl_payloads(input_path, on_error)
+    yield from _iter_jsonl_payloads(input_path, on_error, max_jsonl_line_bytes)
 
 
 def _is_parquet(input_path: Path) -> bool:
@@ -419,10 +523,14 @@ def _is_parquet(input_path: Path) -> bool:
 def _iter_jsonl_payloads(
     input_path: Path,
     on_error: Any = None,
+    max_jsonl_line_bytes: int = DEFAULT_MAX_JSONL_LINE_BYTES,
 ) -> Iterator[tuple[str, Any]]:
     try:
-        with input_path.open("r", encoding="utf-8") as input_file:
-            for line_number, line in enumerate(input_file, start=1):
+        with input_path.open("rb") as input_file:
+            line_number = 0
+            while raw_line := _bounded_jsonl_line(input_file, max_jsonl_line_bytes):
+                line_number += 1
+                line = raw_line.decode("utf-8")
                 if not line.strip():
                     continue
                 location = f"{input_path}:{line_number}"

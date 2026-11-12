@@ -65,6 +65,38 @@ speco:
     vllm_model: null
     request_timeout: 120
     max_inflight_requests: 16
+    # Route requests by outstanding prompt/generation token budget.
+    token_balanced: false
+    # Fixed logical occurrence windows; zero keeps dynamic endpoint selection.
+    # ray_reference mode also requires deterministic_publication=true.
+    source_route_wave_samples: 0
+    source_route_max_samples: 64
+    source_route_max_tokens: 1048576
+    source_route_max_sequence_tokens: 65536
+    # Optional absolute local SQLite path; unresolved ownership blocks reuse.
+    # Requires scheduler.per_rank_reference_ack=true; not an automatic recovery permit.
+    reference_lease_journal_path: null
+    # Optional aggregate prompt + generation token budget; zero disables it.
+    max_inflight_tokens: 0
+    # Optional per-vLLM-endpoint token admission; 0 disables the limit.
+    max_inflight_tokens_per_endpoint: 0
+    # Preserve source order for ray_reference publications; zero derives the window.
+    deterministic_publication: false
+    max_ordered_inflight: 0
+    # Canonical JSON metadata bytes per reference publication event.
+    reference_event_max_bytes: 16777216
+    # Cap published, unconfirmed references; 0 leaves existing behavior.
+    max_published_references: 0
+    # Publish at most one global batch until its previous plan is completed.
+    publication_after_parent_commit: false
+    # Bound accepted reference requests through completed cleanup; 0 disables.
+    max_reference_execution_slots: 0
+    # Optional file-reference tensor payload quota and per-reference bound.
+    # Both must be enabled; total must cover a global batch at the per-item bound.
+    max_published_file_tensor_bytes: 0
+    max_single_file_tensor_bytes: 0
+    # Optional conservative reservation for in-flight plus published file tensors.
+    max_reserved_file_tensor_bytes: 0
     per_endpoint_concurrency: 4
     input_queue_size: 32
     publish_queue_size: 16
@@ -88,6 +120,16 @@ speco:
     # available yet.
     shuffle: false
     shuffle_seed: 42
+    # Use the original nonempty JSONL row index for implicit IDs under shuffle.
+    # Disabled by default to preserve IDs in existing runs and checkpoints.
+    stable_source_ids: false
+    # Zero disables each limit; source-proportional ordering has separate bounds.
+    max_jsonl_line_bytes: 67108864
+    max_indexed_records: 10000000
+    # Hash indexed rows to detect edits that preserve file metadata.
+    verify_indexed_input: false
+    # Optional top-level JSONL field; distributes each source by its row count.
+    source_proportional_field: null
     pending_poll_interval_seconds: 0.5
     # After publishing EOS the producer waits until the consumer clears every
     # published sample before closing the remote client. Bound that wait with
@@ -117,6 +159,7 @@ speco:
     # Keep in sync with the target-replay copy in draft_trainer.yaml.
     hidden_states_store:
       backend: file
+      file_root: null
       mooncake:
         local_hostname: ""
         metadata_server: P2PHANDSHAKE
@@ -206,6 +249,7 @@ actor_rollout_ref:
         max_seq_len: 8192
         step: 10
         batch_size_per_gpu: 4
+        reference_owned_windows: false
         training_interval_steps: 5
         min_trainable_batches: 1
         require_full_batch: false
@@ -537,6 +581,17 @@ actor_rollout_ref:
           consumer_prefetch_batches: 0
           # ray_reference: whole-batch CPU processes per rank; 0 restores sample threads.
           consumer_batch_workers: 2
+          # Experimental Linux-only per-node reference owner; requires a host budget
+          # of at least three batch limits. Whole-batch mode also requires depth=1
+          # and one worker; owned-window mode uses synchronous window transfers.
+          consumer_node_reference_owner: false
+          # Optional per-rank queued original + pinned tensor byte reservations.
+          consumer_prefetch_host_bytes: 0
+          consumer_prefetch_batch_bytes: 0
+          # Optional limit on one reference batch's tensor transfers to the device.
+          consumer_device_batch_bytes: 0
+          # Optional one-batch device lookahead; requires at least two batch budgets.
+          consumer_device_prefetch_bytes: 0
           # Sample threads used only by the fallback or retained-TQ file path.
           consumer_prepare_workers: 4
           io_retry_max_attempts: 3
