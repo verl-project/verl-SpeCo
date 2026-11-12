@@ -1,6 +1,6 @@
 # Getting Started on AMD GPUs (ROCm)
 
-Last updated: 11/09/2026
+Last updated: 11/11/2026
 
 This guide takes you from a bare AMD GPU node to a verified verl-SpeCo run:
 GRPO on Qwen3-8B with a DFlash or DSpark drafter co-trained during rollout. The
@@ -257,6 +257,8 @@ GPU sets must not overlap, also when the runs are in separate containers.
 | `SPECO_RAY_NUM_CPUS` | `32` | Ray CPU pool. |
 | `SPECO_RAY_WORKER_SOFT_LIMIT` | `8` | Ray idle worker soft limit. |
 | `SPECO_NNODES` | `1` | Number of nodes. Above 1, the script joins the Ray cluster at `RAY_ADDRESS` (see [Multi-node](#multi-node)). |
+| `VERL_SGLANG_LINEAR_TRITON_VERIFY` | `1` | SGLang only: `0` disables the Triton DFlash verify kernel and uses the slower torch sampler. A warning is logged if the kernel cannot be compiled or launched. The old name `VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON` still works but is deprecated. |
+| `VERL_SGLANG_LINEAR_TRITON_VERIFY_DEBUG` | `0` | `1` logs why the Triton verify kernel was skipped (deprecated alias `VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON_DEBUG`). |
 | `SGLANG_ATTENTION_BACKEND` | `aiter` (image; `triton` if unset) | SGLang script only: the attention backend it passes to SGLang. |
 
 Any extra Hydra overrides you append are forwarded to `python -m verl_speco.main`.
@@ -313,10 +315,14 @@ the existing cluster's CPUs instead of starting a local one. The reference
 samples and trained and published the drafter once.
 
 These 2-node runs were made with the previous image (vLLM 0.22.1rc1, Ray
-2.56.1) and have not been repeated on the current one. Ray 2.60 keys AMD GPUs
-on `HIP_VISIBLE_DEVICES`, and verl-SpeCo moves only the driver's mask (see
+2.56.1). Multi-node has not been re-run on the current image (Ray 2.60) yet.
+A known risk to check in that re-run: Ray 2.60 keys AMD GPUs on
+`HIP_VISIBLE_DEVICES`, and verl-SpeCo moves only the driver's mask (see
 [GPU selection](#gpu-selection-read-this-once)), not the masks of the
-`ray start` processes on each node.
+`ray start` processes on each node. If the GPU workers abort with a
+`HIP_VISIBLE_DEVICES` / `CUDA_VISIBLE_DEVICES` conflict, export
+`HIP_VISIBLE_DEVICES` and unset `CUDA_VISIBLE_DEVICES` on every node before
+`ray start`.
 
 ### ROCm-specific settings in the scripts
 
@@ -506,7 +512,7 @@ scripts above, you should hit none of them.
 | SGLang scheduler aborts at `import torch` with `Option 'spirv-expand-step' registered more than once` | `torch_memory_saver`'s `LD_PRELOAD` loads a second LLVM from `_rocm_sdk_devel` | Keep the image's `LD_LIBRARY_PATH`, which puts `_rocm_sdk_core/lib` first. |
 | vLLM DSpark worker segfaults while loading the draft | GPU `.item()` inside vLLM's sleep-mode memory pool on ROCm 7.14 / torch 2.12 | Fixed in verl-SpeCo, which compares the shared draft/target weights on the CPU on ROCm. Update verl-SpeCo. |
 | Free GPU memory drops by about one model copy per step, and the run fails after about 10 steps with `HIP error: invalid argument` in `_share_cuda_` (weight sync) or `HSA_STATUS_ERROR_OUT_OF_RESOURCES` | `HSA_ENABLE_IPC_MODE_LEGACY` is `0` or unset: in the non-legacy IPC mode, memory exported over CUDA IPC is not returned to the device after it is freed | Keep `HSA_ENABLE_IPC_MODE_LEGACY=1`, the image default. Do not override it with `docker run -e`. `verl_speco.main` fills it in when it is unset, but not when it is set to `0`, and not on a Ray cluster started outside the driver (export it before `ray start`). |
-| SGLang logs `DFLASH non-greedy verification is unavailable on this build/device; falling back to greedy argmax verification` | The ROCm build of `sgl_kernel` has no `tree_speculative_sampling_target_only`, so SGLang decodes with target argmax at any temperature and the rollouts are not samples of the policy | Fixed in verl-SpeCo, which installs a target-only sampler (linear Triton kernel, torch fallback) in SGLang's DFlash verify on ROCm (the log then shows `Patched SGLang DFlash verification on ROCm`). Update verl-SpeCo. |
+| SGLang logs `DFLASH non-greedy verification is unavailable on this build/device; falling back to greedy argmax verification` | The ROCm build of `sgl_kernel` has no `tree_speculative_sampling_target_only`, so SGLang decodes with target argmax at any temperature and the rollouts are not samples of the policy | Fixed in verl-SpeCo, which installs a target-only sampler (linear Triton kernel, torch fallback) in SGLang's DFlash verify on ROCm (the log then shows `Patched SGLang DFlash verification on ROCm`). Update verl-SpeCo. If the log also warns that the Triton verify kernel is unavailable, sampling is still correct but slower. |
 | Drafter fails to load with a missing `config.json` / safetensors, or a broken-link error | Only `snapshots/<rev>` of an HF cache was mounted; its symlinks point into `../../blobs` | Mount the whole `models--<org>--<name>` directory (see [§3](#3-start-the-container)). |
 | OOM, `invalid device ordinal`, or a hang at startup | GPUs busy or mask wrong | Check `rocm-smi --showmemuse`, pick 2 idle GPUs, and remove any `NOSET_*` or `HIP_VISIBLE_DEVICES` from the environment. On hosts where the HIP device order differs from `rocm-smi`'s, map the mask first (see [GPU selection](#gpu-selection-read-this-once)). |
 
@@ -529,5 +535,6 @@ scripts above, you should hit none of them.
   on, and custom all-reduce is off. It is a functional smoke, not a performance
   baseline.
 - Rollout TP=2 only, on 1 node, or 2 nodes (2 GPUs each, TCP between nodes)
-  with the previous image. MI300X (gfx942) is a build target but has not been
-  run.
+  with the previous image (Ray 2.56.1). Multi-node has not been re-run on the
+  current image (Ray 2.60) yet. MI300X (gfx942) is a build target but has not
+  been run.
