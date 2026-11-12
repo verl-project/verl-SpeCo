@@ -175,6 +175,16 @@ class TQFeatureStore:
         from verl_speco.trainer.standalone_batch_prepare import (
             prepare_standalone_cpu_batch,
         )
+        return prepare_standalone_cpu_batch(
+            [entry.tag for entry in entries],
+            self.reference_contract(entries),
+            hidden_states_store=getattr(self, "hidden_states_store", None),
+            read_timeout=float(self.config.get("io_timeout_seconds", 30)),
+            **options,
+        )
+
+    def reference_contract(self, entries: Sequence[ReadyEntry]):
+        """Validate assigned identities before either full or windowed reads."""
         from verl_speco.trainer.target_feature_replay import FeatureContract
         from verl_speco.transport.drafter_sample_protocol import (
             SampleMetadata,
@@ -207,13 +217,12 @@ class TQFeatureStore:
                     )
         values = dict(entries[0].tag["feature_contract"])
         values["dtype"] = getattr(torch, values["dtype"].removeprefix("torch."))
-        return prepare_standalone_cpu_batch(
-            [entry.tag for entry in entries],
-            FeatureContract(**values),
-            hidden_states_store=getattr(self, "hidden_states_store", None),
-            read_timeout=float(self.config.get("io_timeout_seconds", 30)),
-            **options,
-        )
+        contract = FeatureContract(**values)
+        from verl_speco.producer.hidden_states_store import FileHiddenStatesStore
+        from verl_speco.trainer.standalone_batch_prepare import _validate_reference_contracts
+        _validate_reference_contracts([entry.tag for entry in entries], contract,
+                                      getattr(self, "hidden_states_store", None) or FileHiddenStatesStore())
+        return contract
 
     def clear_many(self, keys: Sequence[str]) -> None:
         self._require_connected()
@@ -260,18 +269,18 @@ class ReferenceFeatureStore(TQFeatureStore):
     """Prepare hidden references without connecting to TransferQueue.
 
     Ready metadata is owned by the Driver's scheduler, not this rank-local adapter.
+    An explicitly injected hidden-state store is owned and closed by this adapter.
     """
 
     uses_transfer_queue = False
 
-    def __init__(self, config: Mapping[str, Any]):
+    def __init__(self, config: Mapping[str, Any], *, hidden_states_store: Any | None = None):
         super().__init__(config)
         from verl_speco.producer.hidden_states_store import build_hidden_states_store
 
         # Client setup is lazy; spawned workers construct their own store.
-        self.hidden_states_store = build_hidden_states_store(
-            self.config.get("hidden_states_store")
-        )
+        self.hidden_states_store = (hidden_states_store if hidden_states_store is not None
+                                    else build_hidden_states_store(self.config.get("hidden_states_store")))
 
     def connect(self) -> None:
         self._connected = True

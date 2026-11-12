@@ -15,12 +15,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import math
 import threading
 import time
 from collections import deque
 from collections.abc import Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from functools import partial
 from queue import Empty
@@ -39,6 +42,86 @@ from verl_speco.trainer.standalone_sample_cleanup import cleanup_standalone_samp
 logger = logging.getLogger(__name__)
 
 
+def _command_fingerprint(command: dict[str, Any]) -> bytes:
+    payload = json.dumps(command, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(payload).digest()
+
+
+class _ReferenceCommandAssembler:
+    """Validate and reassemble bounded, duplicate-safe command fragments."""
+
+    def __init__(self, max_bytes: int, frame_bytes: int):
+        if type(max_bytes) is not int or not 1024 <= max_bytes <= 1024**3:
+            raise ValueError("Invalid reference command byte limit")
+        if type(frame_bytes) is not int or not 1024 <= frame_bytes <= 32 * 1024 * 1024:
+            raise ValueError("Invalid reference command frame limit")
+        self.max_bytes, self.frame_bytes = max_bytes, frame_bytes
+        self.active = None
+        self.recent = {}
+        self.recent_hashes = 0
+
+    def add(self, frame):
+        fields = {"kind", "plan_id", "receipt_token", "index", "count", "nbytes", "sha256", "data"}
+        if not isinstance(frame, dict) or set(frame) != fields or frame["kind"] != "batch_fragment":
+            raise ValueError("Malformed reference command frame")
+        plan, token = frame["plan_id"], frame["receipt_token"]
+        index, count, size, digest, data = (frame[key] for key in ("index", "count", "nbytes", "sha256", "data"))
+        if (type(plan) is not int or plan < 0 or not isinstance(token, str) or not 1 <= len(token) <= 128
+                or type(size) is not int or not self.frame_bytes < size <= self.max_bytes
+                or type(count) is not int or count != (size + self.frame_bytes - 1) // self.frame_bytes
+                or type(index) is not int or not 0 <= index < count
+                or not isinstance(digest, str) or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)
+                or type(data) is not bytes
+                or len(data) != min(self.frame_bytes, size - index * self.frame_bytes)):
+            raise ValueError("Invalid reference command frame bounds or identity")
+        identity = (plan, token, count, size, digest)
+        chunk_hash = hashlib.sha256(data).digest()
+        prior = self.recent.get(plan)
+        if prior is not None:
+            if prior[0] != identity or prior[1][index] != chunk_hash:
+                raise ValueError("Conflicting completed reference command frame")
+            return None
+        if self.active is None:
+            if index != 0:
+                raise ValueError("Reference command starts with an out-of-order frame")
+            self.active = {"identity": identity, "data": bytearray(), "hashes": []}
+        active = self.active
+        if active["identity"] != identity:
+            raise ValueError("Reference command frames have conflicting identities")
+        next_index = len(active["hashes"])
+        if index < next_index:
+            if active["hashes"][index] != chunk_hash:
+                raise ValueError("Conflicting duplicate reference command frame")
+            return None
+        if index != next_index:
+            raise ValueError("Reference command frame is out of order")
+        active["data"].extend(data)
+        active["hashes"].append(chunk_hash)
+        if len(active["hashes"]) < count:
+            return None
+        payload = active["data"]
+        if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+            raise ValueError("Reference command frame checksum mismatch")
+        try:
+            command = json.loads(payload)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError("Reference command frame payload is not valid JSON") from exc
+        if (not isinstance(command, dict) or command.get("kind") != "batch"
+                or command.get("plan_id") != plan or command.get("receipt_token") != token):
+            raise ValueError("Reference command frame payload identity differs")
+        hashes = tuple(active["hashes"])
+        self.active = None
+        if len(hashes) <= 8192:
+            self.recent[plan] = (identity, hashes)
+            self.recent_hashes += len(hashes)
+            while len(self.recent) > 64 or self.recent_hashes > 8192:
+                oldest = next(iter(self.recent))
+                _, old_hashes = self.recent.pop(oldest)
+                self.recent_hashes -= len(old_hashes)
+        return command
+
+
 @dataclass(frozen=True)
 class TQLocalBatch:
     """The payload owned by one rank plus rank-0's global cleanup keys."""
@@ -55,27 +138,66 @@ class TQLocalBatch:
     batch_prepare_seconds: float = 0.0
     file_entries: list[ReadyEntry] | None = None
     cleanup_after_load: bool = False
+    is_padding_rank: bool = False
+    has_padding_ranks: bool = False
     delivery_times: dict[str, float] = field(default_factory=dict)
+    receipt_token: str | None = None
+    input_identity: dict[str, Any] | None = None
+    producer_incarnation: str | None = None
+    assignment_digest: str | None = None
+    node_file_entries: dict[int, list[ReadyEntry]] | None = None
 
 
 def build_assignments(
-    entries: Sequence[ReadyEntry], *, batch_size: int, world_size: int
+    entries: Sequence[ReadyEntry], *, batch_size: int, world_size: int,
+    balance_by_tokens: bool = False, allow_uneven: bool = False,
+    allow_empty: bool = False,
 ) -> list[list[ReadyEntry]]:
-    """Split one complete global batch into disjoint contiguous rank batches."""
+    """Split a complete batch; optionally balance feature tokens across ranks."""
 
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     if world_size <= 0:
         raise ValueError(f"world_size must be positive, got {world_size}")
     expected = batch_size * world_size
-    if len(entries) != expected:
+    if type(allow_uneven) is not bool or type(allow_empty) is not bool:
+        raise ValueError("allow_uneven and allow_empty must be booleans")
+    if allow_empty and not allow_uneven:
+        raise ValueError("Empty ranks require uneven assignment")
+    minimum = 1 if allow_empty else world_size
+    if len(entries) != expected and not (
+        allow_uneven and minimum <= len(entries) < expected
+    ):
         raise ValueError(
             f"Expected exactly {expected} ready entries for one global batch, got {len(entries)}"
         )
-    return [
-        list(entries[rank * batch_size : (rank + 1) * batch_size])
-        for rank in range(world_size)
-    ]
+    if type(balance_by_tokens) is not bool:
+        raise ValueError("balance_by_tokens must be a boolean")
+    base, extra = divmod(len(entries), world_size)
+    capacities = [base + int(rank < extra) for rank in range(world_size)]
+    if balance_by_tokens:
+        lengths = []
+        for entry in entries:
+            request = entry.tag.get("request")
+            positions = request.get("feature_positions") if isinstance(request, dict) else None
+            if not isinstance(positions, list) or not positions:
+                raise ValueError("Token-balanced assignment requires feature position metadata")
+            lengths.append(len(positions))
+        assignments: list[list[tuple[int, ReadyEntry]]] = [[] for _ in range(world_size)]
+        totals = [0] * world_size
+        # LPT is deterministic; restore input order within each rank afterwards.
+        for index in sorted(range(len(entries)), key=lambda i: (-lengths[i], i)):
+            rank = min((r for r in range(world_size) if len(assignments[r]) < capacities[r]),
+                       key=lambda r: (totals[r], r))
+            assignments[rank].append((index, entries[index]))
+            totals[rank] += lengths[index]
+        return [[entry for _, entry in sorted(group)] for group in assignments]
+    result = []
+    offset = 0
+    for count in capacities:
+        result.append(list(entries[offset : offset + count]))
+        offset += count
+    return result
 
 
 class TQFeatureDataLoader:
@@ -97,6 +219,9 @@ class TQFeatureDataLoader:
         io_timeout_seconds: float = 30.0,
         prepare_batch: Any | None = None,
         cleanup_after_load: bool = False,
+        reference_command_max_bytes: int = 256 * 1024 * 1024,
+        reference_command_frame_bytes: int = 4 * 1024 * 1024,
+        node_ranks_per_host: int = 0,
     ):
         self.store = store
         self.batch_size = int(batch_size)
@@ -112,11 +237,19 @@ class TQFeatureDataLoader:
         self.io_timeout_seconds = io_timeout_seconds
         self.prepare_batch = prepare_batch
         self.cleanup_after_load = cleanup_after_load
+        self._reference_command_max_bytes = reference_command_max_bytes
+        self._reference_command_frame_bytes = reference_command_frame_bytes
+        if type(node_ranks_per_host) is not int or node_ranks_per_host < 0 or (node_ranks_per_host and
+                (node_ranks_per_host > self.world_size or self.world_size % node_ranks_per_host)):
+            raise ValueError("Invalid local reference owner topology")
+        self.node_ranks_per_host = node_ranks_per_host
+        _ReferenceCommandAssembler(reference_command_max_bytes, reference_command_frame_bytes)
         if cleanup_after_load and (prepare_batch is None or store.uses_transfer_queue):
             raise ValueError(
                 "Cleanup after load requires ray_reference batch preparation"
             )
         self._cleanup_entries: dict[str, ReadyEntry] = {}
+        self._released_cleanup_keys: set[str] = set()
         if prepare_batch is not None and scheduled_commands is None:
             raise ValueError(
                 "File preparation requires scheduler-assigned batch commands"
@@ -153,6 +286,8 @@ class TQFeatureDataLoader:
         global_batch_size = self.batch_size * self.world_size
         owner_ready = False
         last_plan_id = -1
+        command_history: dict[int, bytes] = {}
+        assembler = _ReferenceCommandAssembler(self._reference_command_max_bytes, self._reference_command_frame_bytes)
         cycle_started_at = time.perf_counter()
         command_wait_seconds = 0.0
         while True:
@@ -194,13 +329,9 @@ class TQFeatureDataLoader:
                         command_wait_seconds += (
                             time.perf_counter() - command_wait_started
                         )
-                        plan_id = command.get("plan_id")
-                        if plan_id is not None and int(plan_id) <= last_plan_id:
-                            # Queue put may have succeeded before a response timeout.
-                            continue
                         if command.get("kind") == "stop":
                             pass
-                        elif command.get("kind") not in {"batch", "wait"}:
+                        elif command.get("kind") not in {"batch", "batch_fragment", "wait"}:
                             raise RuntimeError(
                                 f"Unsupported scheduled TQ command: {command!r}"
                             )
@@ -234,6 +365,12 @@ class TQFeatureDataLoader:
                     }
 
             command = self._broadcast_command(command)
+            if command.get("kind") == "batch_fragment":
+                command = assembler.add(command)
+                if command is None:
+                    continue
+            elif assembler.active is not None and command.get("kind") not in {"wait", "error"}:
+                raise RuntimeError("Reference command was interrupted before all frames arrived")
             if command.get("kind") == "wait":
                 stop_event = self.stop_event
                 stopped = torch.tensor(
@@ -245,6 +382,8 @@ class TQFeatureDataLoader:
                         stopped, op=dist.ReduceOp.MAX, group=self.process_group
                     )
                 if stopped.item():
+                    if assembler.active is not None:
+                        raise RuntimeError("Reference command was interrupted before all frames arrived")
                     return
                 continue
             if command.get("kind") == "error":
@@ -253,14 +392,51 @@ class TQFeatureDataLoader:
                 return
             if command.get("kind") != "batch":
                 raise RuntimeError(f"Unsupported TQ loader command: {command!r}")
-            if command.get("plan_id") is not None:
-                last_plan_id = int(command["plan_id"])
+            plan_id = command.get("plan_id")
+            if plan_id is not None:
+                if type(plan_id) is not int or plan_id < 0:
+                    raise RuntimeError("Invalid scheduled TQ plan ID")
+                if plan_id <= last_plan_id:
+                    saved = command_history.get(plan_id)
+                    if saved is None:
+                        raise RuntimeError("Expired scheduled TQ command cannot be verified")
+                    if saved != _command_fingerprint(command):
+                        raise RuntimeError("Conflicting duplicate scheduled TQ command")
+                    continue
+                last_plan_id = plan_id
+                command_history[last_plan_id] = _command_fingerprint(command)
+                if len(command_history) > 4096:
+                    del command_history[next(iter(command_history))]
             wire_assignments = command.get("assignments")
             if (
                 not isinstance(wire_assignments, list)
                 or len(wire_assignments) != self.world_size
             ):
                 raise RuntimeError("TQ loader received malformed rank assignments")
+            assignment_digest = None
+            if not getattr(self.store, "uses_transfer_queue", True):
+                keys, sequences = command.get("global_keys"), command.get("global_sequence_nos")
+                if (not isinstance(keys, list) or not keys
+                        or any(not isinstance(key, str) or not key for key in keys)
+                        or len(set(keys)) != len(keys)
+                        or not isinstance(sequences, list) or len(sequences) != len(keys)
+                        or any(type(seq) is not int or seq < 0 for seq in sequences)
+                        or len(set(sequences)) != len(sequences)
+                        or any(not isinstance(group, list) for group in wire_assignments)):
+                    raise RuntimeError("Invalid reference batch assignment manifest")
+                expected = dict(zip(keys, sequences))
+                assigned = {}
+                for item in (item for group in wire_assignments for item in group):
+                    if (not isinstance(item, dict) or not isinstance(item.get("key"), str)
+                            or not isinstance(item.get("tag"), dict)):
+                        raise RuntimeError("Invalid reference batch assignment entry")
+                    key, sequence = item["key"], item["tag"].get("sequence_no")
+                    if key in assigned or key not in expected or type(sequence) is not int or sequence != expected[key]:
+                        raise RuntimeError("Reference batch assignments do not match manifest")
+                    assigned[key] = sequence
+                if assigned != expected:
+                    raise RuntimeError("Reference batch assignments do not match manifest")
+                assignment_digest = _command_fingerprint(command).hex()
             delivery_times = dict(command.get("delivery_times", {}))
             if (
                 self._clock_node_id is not None
@@ -273,6 +449,36 @@ class TQFeatureDataLoader:
             local_entries = [
                 _entry_from_wire(item) for item in wire_assignments[self.rank]
             ]
+            padding_ranks = command.get("padding_ranks", [])
+            if (not isinstance(padding_ranks, list)
+                    or any(type(item) is not int or not 0 <= item < self.world_size for item in padding_ranks)
+                    or len(set(padding_ranks)) != len(padding_ranks)):
+                raise RuntimeError("TQ loader received malformed padding ranks")
+            is_padding_rank = self.rank in padding_ranks
+            if padding_ranks:
+                template = command.get("padding_reference")
+                real_items = [item for group in wire_assignments for item in group]
+                if (self.prepare_batch is None or self.store.uses_transfer_queue
+                        or self.cleanup_after_load or template not in real_items
+                        or not isinstance(template, dict)
+                        or template.get("key") not in command.get("global_keys", [])
+                        or str(template.get("tag", {}).get("feature_contract", {}).get("algorithm", "")).upper()
+                           not in {"DSPARK", "DFLASH", "EAGLE3"}
+                        or any(bool(group) == (rank in padding_ranks)
+                               for rank, group in enumerate(wire_assignments))):
+                    raise RuntimeError("Invalid padding reference or early cleanup configuration")
+                if is_padding_rank:
+                    local_entries = [_entry_from_wire(template)]
+            node_entries = None
+            if self.node_ranks_per_host and self.rank % self.node_ranks_per_host == 0:
+                template = command.get("padding_reference")
+                if any(not wire_assignments[rank] and rank not in padding_ranks
+                       for rank in range(self.rank, self.rank + self.node_ranks_per_host)):
+                    raise RuntimeError("Empty local reference assignment lacks a padding rank")
+                node_entries = {
+                    rank: [_entry_from_wire(item) for item in (wire_assignments[rank] or [template])]
+                    for rank in range(self.rank, self.rank + self.node_ranks_per_host)
+                }
             tq_get_started = time.perf_counter()
             prepared_batch = None
             fetched: Any = (
@@ -294,7 +500,9 @@ class TQFeatureDataLoader:
             if self.prepare_batch is not None:
                 prepared_batch, samples = fetched, []
                 if materialize and self.cleanup_after_load:
-                    cleanup_standalone_samples(self.store, local_entries)
+                    remaining = cleanup_standalone_samples(self.store, local_entries)
+                    if remaining:
+                        raise RuntimeError(f"Failed to release {len(remaining)} prepared references")
                     cleanup_after_load = True
                 batch_prepare_seconds = (
                     time.perf_counter() - tq_get_started if materialize else 0.0
@@ -321,7 +529,7 @@ class TQFeatureDataLoader:
                 else None
             )
             yield TQLocalBatch(
-                local_keys=[entry.key for entry in local_entries],
+                local_keys=[] if is_padding_rank else [entry.key for entry in local_entries],
                 local_samples=samples,
                 global_keys=global_keys,
                 global_sequence_nos=global_sequence_nos,
@@ -329,10 +537,17 @@ class TQFeatureDataLoader:
                 tq_get_seconds=tq_get_seconds,
                 cycle_started_at=cycle_started_at,
                 plan_id=command.get("plan_id"),
+                receipt_token=command.get("receipt_token"),
+                input_identity=command.get("input_identity"),
+                producer_incarnation=command.get("producer_incarnation"),
+                assignment_digest=assignment_digest,
+                node_file_entries=node_entries if not materialize else None,
                 prepared_batch=prepared_batch,
                 batch_prepare_seconds=batch_prepare_seconds,
                 file_entries=local_entries if not materialize else None,
                 cleanup_after_load=cleanup_after_load,
+                is_padding_rank=is_padding_rank,
+                has_padding_ranks=bool(padding_ranks),
                 delivery_times=delivery_times,
             )
             cycle_started_at = time.perf_counter()
@@ -368,12 +583,27 @@ class TQFeatureDataLoader:
         if self.prepare_batch is None:
             self.store.clear_many(global_keys)
         else:
-            # The training completion boundary already retries TQ clear.
+            # Retain failed references for the outer retry, but do not delete a
+            # successfully released handle twice if another release failed.
             if not cleanup_after_load:
-                entries = [self._cleanup_entries[key] for key in global_keys]
-                cleanup_standalone_samples(self.store, entries, attempts=1)
+                unknown = [key for key in global_keys if key not in self._cleanup_entries
+                           and key not in self._released_cleanup_keys]
+                if unknown:
+                    raise ValueError("Completed batch includes an unknown cleanup key")
+                entries = [self._cleanup_entries[key] for key in global_keys if key in self._cleanup_entries]
+                remaining = set(cleanup_standalone_samples(self.store, entries, attempts=1))
+                for entry in entries:
+                    tag = entry.tag
+                    reference = (tag.get("hidden_states_path") if tag.get("backend") == "file"
+                                 else tag.get("handle"))
+                    if reference not in remaining:
+                        self._cleanup_entries.pop(entry.key, None)
+                        self._released_cleanup_keys.add(entry.key)
+                if remaining:
+                    raise RuntimeError(f"Failed to release {len(remaining)} completed references")
             for key in global_keys:
                 self._cleanup_entries.pop(key, None)
+                self._released_cleanup_keys.discard(key)
 
     def _broadcast_command(self, command: dict[str, Any] | None) -> dict[str, Any]:
         if not dist.is_initialized() or self.world_size == 1:
@@ -403,6 +633,58 @@ def _entry_from_wire(value: Any) -> ReadyEntry:
     return ReadyEntry(key=str(value["key"]), tag=dict(value["tag"]))
 
 
+def _prepared_host_bytes(batch):
+    """Bound original tensor storages plus the copies made by the pin thread."""
+    storages, pin_bytes = {}, 0
+    for value in batch.values():
+        if torch.is_tensor(value):
+            storage = value.untyped_storage()
+            storages[storage._cdata] = storage.nbytes()
+            pin_bytes += max(storage.nbytes(), value.numel() * value.element_size())
+    return sum(storages.values()) + pin_bytes
+
+
+def _reference_device_transfer_bytes(batch):
+    """Conservatively account every tensor copied by the device staging path."""
+    return sum(max(value.untyped_storage().nbytes(), value.numel() * value.element_size())
+               for value in batch.values() if torch.is_tensor(value))
+
+
+def _host_budget_depth(depth, max_host_bytes, max_batch_host_bytes):
+    if (type(max_host_bytes) is not int or max_host_bytes < 0
+            or type(max_batch_host_bytes) is not int or max_batch_host_bytes < 0
+            or bool(max_host_bytes) != bool(max_batch_host_bytes)):
+        raise ValueError("Prefetch host byte limits must both be non-negative integers and enabled together")
+    if max_host_bytes:
+        if max_host_bytes < max_batch_host_bytes:
+            raise ValueError("Prefetch host bytes must cover one maximum-sized batch")
+        depth = min(depth, max_host_bytes // max_batch_host_bytes)
+    return depth
+
+
+class _TrackedPrefetchExecutor(ThreadPoolExecutor):
+    """Keep in-flight reads visible after the coordinator has stopped."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tracked, self._tracked_lock = set(), threading.Lock()
+
+    def submit(self, *args, **kwargs):
+        future = super().submit(*args, **kwargs)
+        with self._tracked_lock:
+            self._tracked.add(future)
+        future.add_done_callback(self._forget)
+        return future
+
+    def _forget(self, future):
+        with self._tracked_lock:
+            self._tracked.discard(future)
+
+    def pending(self):
+        with self._tracked_lock:
+            return {future for future in self._tracked if not future.done()}
+
+
 class TQPrefetchIterator:
     """One ordered coordinator per rank, bounded payloads, separate CPU collectives.
 
@@ -420,15 +702,24 @@ class TQPrefetchIterator:
         pin_memory: bool = False,
         prepare_workers: int = 4,
         pin_device: torch.device | None = None,
+        max_host_bytes: int = 0,
+        max_batch_host_bytes: int = 0,
     ):
+        depth = _host_budget_depth(depth, max_host_bytes, max_batch_host_bytes)
+        if max_host_bytes and (not pin_memory or getattr(loader, "cleanup_after_load", False)):
+            raise ValueError("Prefetch host limits require deferred-cleanup reference batches")
         if depth < 1:
             raise ValueError("prefetch depth must be positive")
         if prepare_workers < 0:
             raise ValueError("prepare_workers must be non-negative")
+        if (isinstance(close_timeout, bool) or not isinstance(close_timeout, (int, float))
+                or not math.isfinite(close_timeout) or close_timeout <= 0):
+            raise ValueError("Prefetch close timeout must be a positive finite number")
         if pin_memory and getattr(loader, "prepare_batch", None) is None:
             raise ValueError("Independent pinning requires file batch preparation")
         self.loader = loader
         self.depth = depth
+        self._max_batch_host_bytes = max_batch_host_bytes
         self.close_timeout = close_timeout
         self.stop = loader.stop_event = threading.Event()
         self._condition = threading.Condition()
@@ -444,7 +735,7 @@ class TQPrefetchIterator:
             assert loader.prepare_batch is not None
             self._original_prepare = loader.prepare_batch
             if prepare_workers:
-                self._executor = ThreadPoolExecutor(
+                self._executor = _TrackedPrefetchExecutor(
                     max_workers=prepare_workers,
                     thread_name_prefix=f"file-prepare-{loader.rank}",
                 )
@@ -482,9 +773,20 @@ class TQPrefetchIterator:
             return state.tolist()
         return values
 
-    def _run(self) -> None:
-        source = iter(self.loader)
+    def _open_source(self, factory):
+        source, error = None, None
         try:
+            source = factory()
+        except BaseException as exc:
+            error = exc
+        if self._sync([int(error is not None)])[0]:
+            raise RuntimeError("Consumer prefetch source initialization failed on at least one rank") from error
+        return source
+
+    def _run(self) -> None:
+        source = None
+        try:
+            source = self._open_source(lambda: iter(self.loader))
             while True:
                 with self._condition:
                     self._condition.wait_for(
@@ -499,6 +801,11 @@ class TQPrefetchIterator:
                 exhausted = False
                 try:
                     batch = next(source)
+                    if self._max_batch_host_bytes:
+                        if batch.prepared_batch is None:
+                            raise RuntimeError("Reference prefetch returned no prepared batch")
+                        if _prepared_host_bytes(batch.prepared_batch) > self._max_batch_host_bytes:
+                            raise ValueError("Prepared reference batch exceeds consumer_prefetch_batch_bytes")
                 except StopIteration:
                     exhausted = True
                 except BaseException as exc:  # noqa: BLE001 - deliver thread failures to every rank
@@ -615,23 +922,31 @@ class TQPrefetchIterator:
                 raise self._error
             raise StopIteration
 
-    def close(self) -> None:
+    def _thread_work_running(self) -> bool:
+        return (self._thread.is_alive() or (self._pin_thread is not None and self._pin_thread.is_alive())
+                or (self._executor is not None and bool(self._executor.pending())))
+
+    @property
+    def has_running_work(self) -> bool:
+        return self._thread_work_running()
+
+    def close(self, *, timeout: float | None = None) -> None:
+        timeout = self.close_timeout if timeout is None else timeout
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout) or timeout <= 0):
+            raise ValueError("Prefetch close timeout must be a positive finite number")
+        deadline = time.monotonic() + timeout
         self.stop.set()
         with self._condition:
             self._condition.notify_all()
-        self._thread.join(timeout=self.close_timeout)
-        if self._thread.is_alive():
-            raise RuntimeError(
-                "TQ prefetch thread did not stop before its shutdown deadline"
-            )
+        self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if self._pin_thread is not None:
-            self._pin_thread.join(timeout=self.close_timeout)
-            if self._pin_thread.is_alive():
-                raise RuntimeError(
-                    "Consumer pin thread did not stop before its shutdown deadline"
-                )
+            self._pin_thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if self._executor is not None:
-            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            wait(self._executor.pending(), timeout=max(0.0, deadline - time.monotonic()))
+        if self._thread_work_running():
+            raise RuntimeError("TQ prefetch work did not stop before its shutdown deadline")
         if self._original_prepare is not None:
             self.loader.prepare_batch = self._original_prepare
         self._batches.clear()
