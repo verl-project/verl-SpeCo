@@ -62,6 +62,11 @@ _EAGLE_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_VERIFY_MODE"
 _EAGLE_V1_TARGET_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TARGET_SAMPLING"
 _EAGLE_V1_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_VERIFY_MODE"
 _EAGLE_FORCE_FP32_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_FORCE_FP32_SAMPLING"
+# The linear target-only Triton verify kernel runs on NPU (EAGLE) and ROCm (DFlash), so its
+# switches are backend-neutral. The NPU_EAGLE names are deprecated aliases, read only when
+# the new name is unset.
+_LINEAR_TRITON_VERIFY_ENV = "VERL_SGLANG_LINEAR_TRITON_VERIFY"
+_LINEAR_TRITON_VERIFY_DEBUG_ENV = "VERL_SGLANG_LINEAR_TRITON_VERIFY_DEBUG"
 _EAGLE_LINEAR_TRITON_ENV = "VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON"
 _EAGLE_LINEAR_TRITON_DEBUG_ENV = "VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON_DEBUG"
 _EAGLE_TOP_K_RENORM_FAST_PATH_ENV = "VERL_SGLANG_NPU_EAGLE_TOP_K_RENORM_FAST_PATH"
@@ -88,6 +93,8 @@ _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = None
 _SGLANG_EAGLE_UPDATE_PATCHED = False
 _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
 _SGLANG_ROCM_DFLASH_SAMPLING_PATCHED = False
+_LINEAR_TRITON_FALLBACK_WARNED: set[str] = set()
+_DEPRECATED_ENV_WARNED: set[str] = set()
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = False
@@ -929,12 +936,40 @@ def _sglang_npu_eagle_force_fp32_sampling_enabled() -> bool:
     return _env_flag_enabled(_EAGLE_FORCE_FP32_SAMPLING_ENV, default=False)
 
 
+def _env_flag_with_deprecated_alias(name: str, deprecated: str, default: bool) -> bool:
+    if os.getenv(name) is not None or os.getenv(deprecated) is None:
+        return _env_flag_enabled(name, default=default)
+    if deprecated not in _DEPRECATED_ENV_WARNED:
+        _DEPRECATED_ENV_WARNED.add(deprecated)
+        logger.warning("%s is deprecated; set %s instead.", deprecated, name)
+    return _env_flag_enabled(deprecated, default=default)
+
+
 def _sglang_npu_eagle_linear_triton_enabled() -> bool:
-    return _env_flag_enabled(_EAGLE_LINEAR_TRITON_ENV, default=True)
+    return _env_flag_with_deprecated_alias(
+        _LINEAR_TRITON_VERIFY_ENV, _EAGLE_LINEAR_TRITON_ENV, default=True
+    )
 
 
 def _sglang_npu_eagle_linear_triton_debug_enabled() -> bool:
-    return _env_flag_enabled(_EAGLE_LINEAR_TRITON_DEBUG_ENV, default=False)
+    return _env_flag_with_deprecated_alias(
+        _LINEAR_TRITON_VERIFY_DEBUG_ENV, _EAGLE_LINEAR_TRITON_DEBUG_ENV, default=False
+    )
+
+
+def _warn_linear_triton_fallback(reason: str, exc: Exception | None = None) -> None:
+    # Falling back to the torch sampler keeps sampling correct but is several times slower
+    # (hundreds of small kernels per verify step), so say so once per process and reason.
+    if reason in _LINEAR_TRITON_FALLBACK_WARNED:
+        return
+    _LINEAR_TRITON_FALLBACK_WARNED.add(reason)
+    logger.warning(
+        "SGLang linear target-only Triton verify kernel unavailable (%s%s); falling back "
+        "to the torch sampler, which is slower. Set %s=1 for details.",
+        reason,
+        f": {type(exc).__name__}: {exc}" if exc is not None else "",
+        _LINEAR_TRITON_VERIFY_DEBUG_ENV,
+    )
 
 
 def _sglang_drafter_return_last_hidden_enabled() -> bool:
@@ -1620,6 +1655,8 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
         return False
     if _tree_speculative_sampling_target_only_linear_triton_kernel is None:
         _debug_sglang_npu_eagle_linear_triton("kernel_not_compiled")
+        if rocm:
+            _warn_linear_triton_fallback("kernel_not_compiled")
         return False
     if not rocm and target_probs.device.type != "npu":
         _debug_sglang_npu_eagle_linear_triton(
@@ -1755,9 +1792,7 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
             ),
             target_probs_for_sampling=_tensor_debug_summary(target_probs_for_sampling),
         )
-        logger.debug(
-            "SGLang NPU EAGLE linear target-only Triton kernel failed: %s", exc
-        )
+        _warn_linear_triton_fallback("kernel_launch_failed", exc)
         return False
 
 
