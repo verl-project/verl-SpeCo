@@ -566,6 +566,43 @@ def test_dsv4_ep_setup_keeps_router_rank_independent():
     torch.testing.assert_close(router.bias, bias_before)
 
 
+def test_dsv4_router_balance_skips_loaded_bias(monkeypatch):
+    monkeypatch.setenv("DSPARK_MOE_BALANCE", "1")
+    model = DSV4DSparkDraftModel(_tiny_dsv4_config())
+    router = model.layers[0].ffn.router
+    with torch.no_grad():
+        router.bias.fill_(3.0)
+
+    router.update_load_balance_bias()
+
+    # A loaded (or resumed) bias already encodes load balance; it must not be
+    # perturbed again.
+    torch.testing.assert_close(router.bias, torch.full_like(router.bias, 3.0))
+    assert router._bias_initialized is True
+
+
+def test_dsv4_router_balance_init_is_rank_independent(monkeypatch):
+    monkeypatch.setenv("DSPARK_MOE_BALANCE", "1")
+    first = DSV4DSparkDraftModel(_tiny_dsv4_config())
+    second = DSV4DSparkDraftModel(_tiny_dsv4_config())
+    router_a = first.layers[0].ffn.router
+    router_b = second.layers[0].ffn.router
+    with torch.no_grad():
+        router_a.bias.zero_()
+        router_b.bias.zero_()
+
+    # Different ambient RNG states must still produce the same initial bias:
+    # every EP rank has to train (and export) the same routing state.
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(1)
+        router_a.update_load_balance_bias()
+        torch.manual_seed(9999)
+        router_b.update_load_balance_bias()
+
+    torch.testing.assert_close(router_a.bias, router_b.bias)
+    assert torch.count_nonzero(router_a.bias).item() > 0
+
+
 def test_dsv4_load_embedding_handles_multiple_index_and_nested_key(tmp_path):
     safetensors_torch = pytest.importorskip("safetensors.torch")
     model = DSV4DSparkDraftModel(_tiny_dsv4_config())

@@ -70,18 +70,39 @@ class Router(nn.Module):
             )
         return weights, indices
 
+    def _init_balance_bias(self) -> None:
+        """Seed an all-zero bias with a rank-independent perturbation.
+
+        Called only for a fresh (or random-initialized) model: a loaded or
+        resumed checkpoint already carries a meaningful load-balance bias. The
+        noise uses a local CPU generator with a fixed seed instead of the
+        process-global RNG, so every EP rank applies identical values without a
+        collective. Otherwise each rank would perturb ``router.bias``
+        differently, the all-reduced load updates would preserve that initial
+        divergence, and the exported checkpoint (leader rank only) would not
+        represent the routing used on the other ranks.
+        """
+        init_scale = self._balance_rate * 10
+        generator = torch.Generator().manual_seed(0)
+        noise = torch.randn(
+            self.bias.shape,
+            generator=generator,
+            dtype=self.bias.dtype,
+            device="cpu",
+        ).to(self.bias.device)
+        self.bias.add_(noise * init_scale - init_scale * 0.5)
+
     @torch.no_grad()
     def update_load_balance_bias(self) -> None:
         if not self._balance:
             return
-        # First-step initialization: inject uniform bias to prevent expert collapse
-        # on the very first forward (before any load is recorded)
+        # First-step initialization: inject a bias to prevent expert collapse on
+        # the very first forward (before any load is recorded). Skip it when the
+        # bias is already populated (pretrained weights or resumed checkpoint).
         if not self._bias_initialized:
             self._bias_initialized = True
-            # Small random perturbation around zero to break symmetry
-            # but large enough to distribute tokens across all experts
-            init_scale = self._balance_rate * 10
-            self.bias.add_(torch.randn_like(self.bias) * init_scale - init_scale * 0.5)
+            if not bool(torch.count_nonzero(self.bias).item()):
+                self._init_balance_bias()
             return
         if self._step_load is None:
             return
