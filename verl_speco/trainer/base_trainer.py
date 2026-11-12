@@ -2542,6 +2542,43 @@ class DrafterBaseTrainer:
                 ) from error
             raise RuntimeError(f"Drafter checkpoint {phase} failed on another SP rank")
 
+    def _dump_ep_expert_slices_or_fail(self, checkpoint_path: str) -> None:
+        """Dump this rank's EP expert slice, failing all ranks on any error.
+
+        The leader's main checkpoint only contains its own expert slice, so
+        every EP rank's ``ep_experts/rank_<r>.pt`` file is required to
+        reconstruct the drafter. Capturing a local write failure and then
+        all-reducing a failure flag over the checkpoint group guarantees that:
+
+        * one rank's disk/permission/I/O error fails the whole checkpoint
+          instead of silently producing an incomplete one; and
+        * the failing rank does not raise before the other ranks enter the
+          subsequent save collectives (which would hang them).
+
+        Only a checkpoint that reaches the later save phases can be reported as
+        successfully saved.
+        """
+        if not self._is_ep_active():
+            return
+
+        error: BaseException | None = None
+        try:
+            slice_path = self._dump_local_expert_slices(checkpoint_path)
+            if not slice_path:
+                error = RuntimeError(
+                    "EP expert slice dump produced no file; the checkpoint "
+                    "would not be reconstructable"
+                )
+            elif not os.path.exists(slice_path):
+                error = RuntimeError(
+                    f"EP expert slice disappeared after write: {slice_path}"
+                )
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+        # Collective failure: every participating rank raises together, and the
+        # original exception is preserved on the rank that observed it.
+        self._sync_checkpoint_phase_error(error, "EP expert slice dump")
+
     def _save_optimizer_checkpoint(self, checkpoint_path: str) -> dict[str, Any]:
         if self.optimizer is None:
             raise RuntimeError("Cannot save drafter optimizer before it is initialized")
@@ -2881,11 +2918,9 @@ class DrafterBaseTrainer:
         checkpoint_path = os.path.join(self.checkpoint_dir, f"draft_step_{int(step)}")
         # Expert-parallel ranks each hold a disjoint expert slice; dump every
         # rank's slice before the leader-only export so the drafter can be
-        # reconstructed completely offline.
-        try:
-            self._dump_local_expert_slices(checkpoint_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to dump local EP expert slices: %s", exc)
+        # reconstructed completely offline. A slice failure fails the checkpoint
+        # collectively instead of silently saving an incomplete one.
+        self._dump_ep_expert_slices_or_fail(checkpoint_path)
         if (
             self.rollout_dp_rank != 0
             and not self._use_flattened_drafter_fsdp_mesh()
