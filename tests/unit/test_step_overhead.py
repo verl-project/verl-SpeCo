@@ -211,3 +211,19 @@ def test_pin_thread_limits_its_threads_without_changing_main_thread(monkeypatch)
         source.close()
     assert ("file-pin-0", 1) in calls
     assert torch.get_num_threads() == before
+
+
+@pytest.mark.parametrize("dtype,expected_calls", [(torch.float32, 2), (torch.float64, 4)])
+@pytest.mark.parametrize("has_graph", [False, True])
+def test_combined_statistics_include_missing_gradient_graph_without_extra_reduction(dtype, expected_calls, has_graph):
+    trainer, calls = _trainer()
+    local_loss = torch.tensor(3.0, dtype=dtype, requires_grad=has_graph)
+    data = {"total_local_vloss": torch.tensor(0.0, dtype=dtype),
+            "total_local_ploss": local_loss, "local_num_tokens": torch.tensor(5.0, dtype=dtype),
+            "v_weight": 0.0, "p_weight": 1.0,
+            "diagnostics": {"correct_count": torch.tensor(2.0)}}
+    result = trainer._reduce_standalone_step_statistics(data, check_grad_graph=True)
+    assert len(calls) == expected_calls
+    assert result[2].item() == 20.0
+    assert trainer._standalone_missing_grad_graph is not has_graph
+    assert trainer._training_metric_sums["dspark/correct_count"] == 8.0
