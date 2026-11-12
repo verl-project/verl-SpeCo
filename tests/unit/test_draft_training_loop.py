@@ -780,18 +780,19 @@ def test_standalone_dflash_checkpoint_preserves_source_runtime_config(tmp_path):
     assert saved_training_config == training_config
 
 
-def test_standalone_block_checkpoint_uses_target_model_type_without_source_config(
-    tmp_path,
+@pytest.mark.parametrize("source_model_type", [None, "dspark", "qwen3"])
+def test_standalone_dspark_checkpoint_normalizes_identity_only_without_source(
+    tmp_path, source_model_type
 ):
     checkpoint_dir = tmp_path / "draft_step_5"
     checkpoint_dir.mkdir()
-    target_dir = tmp_path / "target_qwen3"
+    target_dir = tmp_path / "target_glm"
     target_dir.mkdir()
-    missing_source_dir = tmp_path / "missing_source_dspark"
+    source_dir = tmp_path / "source_dspark"
     (target_dir / "config.json").write_text(
         json.dumps(
             {
-                "model_type": "qwen3",
+                "model_type": "glm_moe_dsa",
                 "head_dim": 128,
                 "rope_theta": 1000000.0,
                 "max_position_embeddings": 40960,
@@ -810,12 +811,24 @@ def test_standalone_block_checkpoint_uses_target_model_type_without_source_confi
     (checkpoint_dir / "config.json").write_text(
         json.dumps(training_config), encoding="utf-8"
     )
+    if source_model_type is not None:
+        source_dir.mkdir()
+        source_config = dict(
+            training_config,
+            model_type=source_model_type,
+            architectures=[
+                "Qwen3DSparkModel" if source_model_type == "qwen3" else "DSparkDraftModel"
+            ],
+        )
+        (source_dir / "config.json").write_text(
+            json.dumps(source_config), encoding="utf-8"
+        )
     trainer = SimpleNamespace(
         backend=SimpleNamespace(model_type="dspark"),
         config=SimpleNamespace(
             model=SimpleNamespace(path=str(target_dir)),
             rollout=SimpleNamespace(
-                drafter=SimpleNamespace(model_path=str(missing_source_dir))
+                drafter=SimpleNamespace(model_path=str(source_dir))
             ),
         ),
     )
@@ -828,13 +841,20 @@ def test_standalone_block_checkpoint_uses_target_model_type_without_source_confi
     saved_training_config = json.loads(
         (checkpoint_dir / "speco_training_config.json").read_text(encoding="utf-8")
     )
-    assert runtime_config["model_type"] == "dspark"
-    assert runtime_config["architectures"] == ["DSparkDraftModel"]
+    assert runtime_config["model_type"] == (source_model_type or "qwen3")
+    assert runtime_config["architectures"] == [
+        "DSparkDraftModel" if source_model_type == "dspark" else "Qwen3DSparkModel"
+    ]
     assert runtime_config["speco_training_model_type"] == "dspark"
     assert runtime_config["dspark_config"]["markov_head_type"] == "vanilla"
     assert runtime_config["head_dim"] == 80
     assert runtime_config["rope_theta"] == 10000.0
     assert saved_training_config == training_config
+    if source_model_type is not None:
+        saved_source_config = json.loads(
+            (source_dir / "config.json").read_text(encoding="utf-8")
+        )
+        assert saved_source_config == source_config
 
 
 def test_standalone_eagle3_checkpoint_exports_vllm_llama_runtime_config(tmp_path):
