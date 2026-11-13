@@ -15,13 +15,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 from typing import Any, Iterable
 
 import torch
-
 
 RESUME_METADATA_NAME = "standalone_resume.json"
 CONSUMED_SEQUENCE_NAME = "consumed_sequence_nos.pt"
@@ -30,6 +30,20 @@ RESUME_SCHEMA_VERSION = 1
 
 def build_input_fingerprint(path: str | os.PathLike[str]) -> dict[str, Any]:
     input_path = Path(path).resolve()
+    if input_path.is_dir():
+        fingerprints = {}
+        for name in ("metadata.json", "manifest.jsonl"):
+            digest = hashlib.sha256()
+            with (input_path / name).open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            fingerprints[name] = digest.hexdigest()
+        return {
+            "path": str(input_path),
+            "format": "standalone_raw_hidden",
+            "sampler_version": 1,
+            "files": fingerprints,
+        }
     stat = input_path.stat()
     return {
         "path": str(input_path),

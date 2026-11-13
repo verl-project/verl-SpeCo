@@ -31,7 +31,6 @@ from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _build_standalone_tracking,
     _clear_tq_batch_across_ranks,
     _connect_tq_store_across_ranks,
-    _contains_replay_samples,
     _finalize_standalone_checkpoint,
     _finish_standalone_tracking,
     _is_out_of_memory_error,
@@ -44,7 +43,6 @@ from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _should_log_batch_progress,
     _sync_standalone_export_error,
 )
-from verl_speco.trainer.feature_store import DraftReplaySample  # noqa: E402
 
 
 class _FakeTrainer:
@@ -223,18 +221,6 @@ def test_prefetch_tracking_subtracts_foreground_wait_not_background_wait():
     assert selected["perf/other_time"] == pytest.approx(0.22)
 
 
-def test_contains_replay_samples_detects_draft_replay_sample():
-    sample = DraftReplaySample(
-        input_ids=torch.arange(4),
-        loss_mask=torch.ones(4),
-        attention_mask=torch.ones(4, dtype=torch.bool),
-        position_ids=torch.arange(4),
-        feature_positions=torch.arange(1, 3),
-        draft_position_ids=torch.arange(2, 4),
-    )
-
-    assert _contains_replay_samples([sample])
-    assert not _contains_replay_samples([{"input_ids": [1, 2]}])
 
 
 def test_standalone_dspark_tracking_keeps_only_core_metrics():

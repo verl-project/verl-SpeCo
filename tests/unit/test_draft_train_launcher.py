@@ -19,7 +19,7 @@ from verl_speco.draft_train_launcher import (
     build_torch_distributed_command,
     normalize_training_args,
     resolve_launch_config,
-    validate_tq_launch_config,
+    validate_feature_store_launch_config,
 )
 
 
@@ -113,44 +113,20 @@ def test_launcher_rejects_standalone_multinode() -> None:
         )
 
 
-def test_launcher_accepts_complete_tq_consumer_config() -> None:
-    validate_tq_launch_config(
-        [
-            "actor_rollout_ref.rollout.drafter.training.feature_store.type=tq",
-            "actor_rollout_ref.rollout.drafter.training.transfer_queue.enable=true",
-            "actor_rollout_ref.rollout.drafter.training.transfer_queue.ray.address=ray:6379",
-            "actor_rollout_ref.rollout.drafter.training.transfer_queue.run_id=run-a",
-        ]
-    )
 
 
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ([], "enable=true"),
-        (
-            [
-                "actor_rollout_ref.rollout.drafter.training.transfer_queue.enable=true",
-                "actor_rollout_ref.rollout.drafter.training.transfer_queue.run_id=run-a",
-            ],
-            "ray.address",
-        ),
-        (
-            [
-                "actor_rollout_ref.rollout.drafter.training.transfer_queue.enable=true",
-                "actor_rollout_ref.rollout.drafter.training.transfer_queue.ray.address=ray:6379",
-            ],
-            "run_id",
-        ),
-    ],
-)
-def test_launcher_tq_validation_requires_canonical_connection_overrides(
-    overrides, message
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        validate_tq_launch_config(
-            [
-                "actor_rollout_ref.rollout.drafter.training.feature_store.type=tq",
-                *overrides,
-            ]
-        )
+
+
+@pytest.mark.parametrize("store_type", ["tq", "ray_reference", "token_replay", "jsonl_token_replay", "jsonl"])
+def test_direct_launcher_rejects_streaming_and_token_replay(store_type):
+    with pytest.raises(ValueError, match="standalone_tq_training_launcher|vllm_hidden_states_generate"):
+        validate_feature_store_launch_config([
+            f"actor_rollout_ref.rollout.drafter.training.feature_store.type={store_type}",
+        ])
+
+
+@pytest.mark.parametrize("store_type", ["torch_shard", "vllm_safetensors", "safetensors"])
+def test_direct_launcher_keeps_complete_offline_features(store_type):
+    validate_feature_store_launch_config([
+        f"actor_rollout_ref.rollout.drafter.training.feature_store.type={store_type}",
+    ])

@@ -15,18 +15,18 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import random
 import tempfile
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Protocol, cast
+from typing import Any, Protocol, cast
 
 import torch
-
 
 SCHEMA_VERSION = 1
 MANIFEST_NAME = "manifest.jsonl"
@@ -59,7 +59,7 @@ class DraftFeatureSample:
     @classmethod
     def from_dict(
         cls, payload: dict[str, Any], *, strict: bool = True
-    ) -> "DraftFeatureSample":
+    ) -> DraftFeatureSample:
         sample = cls(
             schema_version=int(payload.get("schema_version", SCHEMA_VERSION)),
             algorithm=str(
@@ -297,7 +297,7 @@ class DraftReplaySample:
     @classmethod
     def from_dict(
         cls, payload: dict[str, Any], *, strict: bool = True
-    ) -> "DraftReplaySample":
+    ) -> DraftReplaySample:
         sample = cls(
             schema_version=int(payload.get("schema_version", SCHEMA_VERSION)),
             algorithm=str(
@@ -1219,6 +1219,7 @@ def build_feature_store_from_config(
     shard_prefix: str = "shard",
     transfer_queue_cfg: Any | None = None,
     hidden_states_store_cfg: Any | None = None,
+    reference_lifetime: str = "temporary",
 ) -> Any:
     store_type = (
         str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
@@ -1230,11 +1231,6 @@ def build_feature_store_from_config(
             raise ValueError(
                 f"feature_store.type={store_type} is a read-only Consumer data source"
             )
-        from verl_speco.trainer.tq_feature_store import (
-            ReferenceFeatureStore,
-            TQFeatureStore,
-        )
-
         tq_cfg = transfer_queue_cfg
         if tq_cfg is None:
             tq_cfg = feature_store_cfg.get("tq")
@@ -1243,13 +1239,19 @@ def build_feature_store_from_config(
                 f"feature_store.type={store_type} requires the sibling training.transfer_queue configuration"
             )
         if store_type == "ray_reference":
-            from verl_speco.trainer.tq_feature_store import _plain_dict
+            from verl_speco.trainer.reference_feature_store import (
+                ReferenceFeatureStore,
+                _plain_dict,
+            )
 
             tq_cfg = {
                 **_plain_dict(tq_cfg),
+                "reference_lifetime": reference_lifetime,
                 "hidden_states_store": _plain_dict(hidden_states_store_cfg),
             }
             return ReferenceFeatureStore.from_config(tq_cfg)
+        from verl_speco.trainer.tq_feature_store import TQFeatureStore
+
         return TQFeatureStore.from_config(tq_cfg)
     if store_type == "torch_shard":
         store_cls: type[TorchShardFeatureStore] = TorchShardFeatureStore

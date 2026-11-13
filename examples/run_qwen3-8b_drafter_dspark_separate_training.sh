@@ -31,8 +31,9 @@ TRAIN_LOGGERS=${TRAIN_LOGGERS:-'["console","swanlab"]'}
 
 draft_train_gpus_per_node=${TRAIN_GPUS:-2}
 
+DATA_SOURCE=${DATA_SOURCE:-online} # online | saved_hidden
 MODEL_PATH=${MODEL_PATH:-/path/to/Qwen3-8B}
-# Ordinary verl prompt Parquet is supported; target vLLM generates responses.
+# online: JSONL/Parquet input; saved_hidden: directory containing metadata.json and manifest.jsonl.
 TRAIN_FILE=${TRAIN_FILE:-/path/to/train_file.parquet}
 # Optional. Leave empty to initialize DSpark from the target-model/config
 # fallback; set it only when loading or resuming an existing drafter.
@@ -130,11 +131,13 @@ export SPECO_VLLM_ENDPOINTS
 # Fail before entering the unified launcher when the separately managed vLLM
 # is absent. Otherwise a localhost endpoint would make the launcher start its
 # fallback vLLM inside the training process and on the training devices.
-if ! "${PYTHON_BIN}" tools/wait_for_vllm_endpoints.py \
-    --endpoints "${SPECO_VLLM_ENDPOINTS}" \
-    --timeout-seconds "${VLLM_READY_TIMEOUT_SECONDS}"; then
-    echo "Start tools/run_qwen3-8b_drafter_hidden_state_vllm.sh first" >&2
-    exit 1
+if [[ "${DATA_SOURCE}" == "online" ]]; then
+    if ! "${PYTHON_BIN}" tools/wait_for_vllm_endpoints.py \
+        --endpoints "${SPECO_VLLM_ENDPOINTS}" \
+        --timeout-seconds "${VLLM_READY_TIMEOUT_SECONDS}"; then
+        echo "Start tools/run_qwen3-8b_drafter_hidden_state_vllm.sh first" >&2
+        exit 1
+    fi
 fi
 
 PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher \
@@ -142,6 +145,7 @@ PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher
     speco.draft_training.num_gpus_per_node=${draft_train_gpus_per_node} \
     speco.draft_training.nnodes=1 \
     speco.draft_training.standalone=True \
+    speco.draft_training.data_source=${DATA_SOURCE} \
     speco.draft_training.scheduler.low_watermark_samples=${SCHEDULER_LOW_WATERMARK_SAMPLES} \
     speco.draft_training.scheduler.high_watermark_samples=${SCHEDULER_HIGH_WATERMARK_SAMPLES} \
     data.train_files=${TRAIN_FILE} \

@@ -26,7 +26,6 @@ from verl_speco.trainer.target_feature_replay import (  # noqa: E402
     FeatureContract,
     TargetFeatureReplayer,
     _VllmEndpointState,
-    _hidden_capture_target,
     _normalize_vllm_endpoints,
     feature_from_vllm_payload,
     load_vllm_final_norm,
@@ -42,10 +41,6 @@ def _feature_sample() -> DraftFeatureSample:
     )
 
 
-def test_hidden_capture_target_matches_transformers_hidden_state_indices():
-    assert _hidden_capture_target(0, 36) == ("layer", 0)
-    assert _hidden_capture_target(34, 36) == ("layer", 34)
-    assert _hidden_capture_target(35, 36) == ("final", None)
 
 
 def test_normalize_vllm_endpoints_prefers_pool_and_deduplicates():
@@ -465,7 +460,7 @@ def test_vllm_replay_initializes_norm_and_invalidates_old_cache(tmp_path, monkey
         config, rank=0, world_size=1, device=torch.device("cpu")
     )
     assert calls == [(str(tmp_path),)]
-    assert replayer.model is None  # No full target model was loaded for replay.
+    assert not hasattr(replayer, "model")  # Generation never loads a full target model.
     assert replayer.vllm_final_norm is norm
     sample = DraftReplaySample(
         input_ids=torch.arange(4),
@@ -482,11 +477,9 @@ def test_vllm_replay_initializes_norm_and_invalidates_old_cache(tmp_path, monkey
         "torch"
     )
     calls.clear()
-    torch_replayer = TargetFeatureReplayer(
-        config, rank=0, world_size=1, device=torch.device("cpu")
-    )
+    with pytest.raises(ValueError, match="only vllm_file"):
+        TargetFeatureReplayer(config, rank=0, world_size=1, device=torch.device("cpu"))
     assert calls == []
-    assert torch_replayer.vllm_final_norm is None
 
 
 def test_vllm_file_replay_routes_handles_through_the_store() -> None:

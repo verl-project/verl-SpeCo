@@ -24,10 +24,10 @@ Repository = "https://github.com/verl-project/verl-SpeCo"
 
 [project.scripts]
 verl-speco = "verl_speco.main:main"
+verl-speco-standalone-data-generate = "verl_speco.standalone_data_generate:main"
 verl-speco-draft-train = "verl_speco.draft_train_launcher:main"
 verl-speco-inspect-features = "verl_speco.inspect_feature_store:main"
 verl-speco-tq-owner = "verl_speco.tq_owner:main"
-verl-speco-tq-producer = "verl_speco.standalone_tq_producer:main"
 verl-speco-convert-speculators-dflash2 = "verl_speco.convert_speculators_dflash2:main"
 
 [tool.setuptools_scm]

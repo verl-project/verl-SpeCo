@@ -422,6 +422,23 @@ Quickstart:
 bash examples/run_qwen3-8b_drafter_dspark_separate_training.sh
 ```
 
+Streaming standalone training runs the Producer as a Ray actor and the Consumer
+as a Ray WorkerGroup. `speco.draft_training.data_transport=ray_reference` is the
+default: the scheduler assigns hidden-state references to Consumers. Set
+`speco.draft_training.data_transport=tq` to transfer complete feature tensors
+through TransferQueue while keeping the same Ray Producer/Consumer runtime.
+
+The standalone `tq` path does not support Mooncake's Ascend transport for the
+vLLM hidden-state handoff. The CPU-only Ray Producer reads and deletes the
+temporary Mooncake samples, and Ascend transport requires a visible NPU in that
+process. Use the file handoff or Mooncake TCP with `tq`.
+
+Offline training from complete `torch_shard` or `vllm_safetensors` feature stores
+remains available through `verl_speco.draft_train_launcher`. Token-only stores
+must first be converted with `python -m verl_speco.vllm_hidden_states_generate`;
+target-model replay and the in-process vLLM request pipeline are no longer
+training modes. The subprocess Producer/Consumer runtime has been removed.
+
 Set the same model, dataset, drafter, checkpoint, GPU, and optimization values
 used by ordinary standalone training near the top of the script. Transport
 identity, Ray/TQ connection settings, and the Producer/Consumer lifecycle are
@@ -669,3 +686,181 @@ This project builds on [verl](https://github.com/verl-project/verl),
 [vLLM](https://github.com/vllm-project/vllm),
 [SGLang](https://github.com/sgl-project/sglang), and
 [vLLM-Ascend](https://github.com/vllm-project/vllm-ascend).
+
+
+### Standalone response and hidden generation
+
+`python -m verl_speco.standalone_data_generate` (or
+`verl-speco-standalone-data-generate`) uses the independent
+`standalone_data_generation.yaml` configuration. Start vLLM yourself and configure
+one or more compatible served-model endpoints. This command never launches Ray,
+TransferQueue, training workers, or vLLM servers.
+
+Generate plain-text ShareGPT JSONL (no token IDs or hidden states):
+
+```bash
+python -m verl_speco.standalone_data_generate \
+  standalone_data_generation.task=responses \
+  standalone_data_generation.input_path=/data/source.jsonl \
+  standalone_data_generation.output_path=/data/responses.jsonl \
+  'standalone_data_generation.vllm.endpoints=[http://host1:8000/v1,http://host2:8000/v1]' \
+  standalone_data_generation.vllm.model=Qwen3-8B \
+  standalone_data_generation.vllm.concurrency=32 \
+  standalone_data_generation.vllm.per_endpoint_concurrency=16 \
+  standalone_data_generation.responses.max_tokens=4096
+```
+
+The last assistant answer is replaced; a prompt without an answer gets a new
+assistant turn. Earlier history is retained. Rows contain `sample_id` and
+`conversations` with `from`/`value` entries. Rows are written in completion order.
+Temperature, top-p, seed, request timeout and response retry settings are configurable.
+All endpoints must serve the same model and chat template.
+
+Extract hidden features from existing answers, including the JSONL above:
+
+```bash
+python -m verl_speco.standalone_data_generate \
+  standalone_data_generation.task=hidden \
+  standalone_data_generation.input_path=/data/responses.jsonl \
+  standalone_data_generation.output_path=/data/hidden \
+  'standalone_data_generation.vllm.endpoints=[http://host1:8000/v1,http://host2:8000/v1]' \
+  standalone_data_generation.vllm.model=Qwen3-8B \
+  standalone_data_generation.hidden.target_model_path=/models/Qwen3-8B \
+  'standalone_data_generation.hidden.vllm_aux_hidden_state_layer_ids=[1,9,17,25,33]'
+```
+
+Hidden extraction reuses Producer input parsing, tokenization, bounded asynchronous
+vLLM prefill clients and retry policy. It never regenerates an
+answer. Configure the connector's matching layer layout (including the final layer
+when needed); its files must be visible locally, or configure the existing
+`hidden.hidden_states_store` backend. The output is a versioned
+`standalone_raw_hidden` dataset: each `.safetensors` preserves the connector's
+`token_ids [T]` and unnormalized `hidden_states [T,K,H]` tensors, including their
+original dtype. No auxiliary flattening, final norm, or tensor-window cropping
+is applied during saving. `manifest.jsonl` retains the serialized Producer request
+(token IDs, masks, feature positions) and feature contract needed to rebuild a
+reference. Only tokenizer and model configuration are loaded locally, not final
+norm weights. Capture settings describe the auxiliary output IDs and whether the
+service also captures final hidden states (`hidden.include_final_hidden=true`).
+There are no training algorithms, loss weights, block sizes, conversion dtypes or
+training feature windows in the generation config. Full tokenized conversations
+are saved up to `hidden.max_sequence_length`; over-limit samples follow `on_error`
+rather than being silently cropped for a training recipe. The raw format is **not** a `vllm_safetensors`
+normalized feature store. The Ray standalone launcher can consume this directory with
+`speco.draft_training.data_source=saved_hidden` (see below).
+Use a new output directory instead of appending to older normalized datasets.
+The old `vllm_hidden_states_generate` entry remains available for token-replay inputs.
+
+A bounded worker pool overlaps requests and file handling. Hidden extraction releases
+HTTP request slots before file handling and uses twice as many workers as request
+slots. The file backend moves the connector's original safetensors into the dataset;
+large file work uses a dedicated executor capped by `hidden.file_concurrency`
+(wrapper: `HIDDEN_FILE_CONCURRENCY=4`), independently of HTTP concurrency. Metadata
+and error-log writes use a separate single-thread executor so large cross-filesystem
+copies cannot starve commits or block the event loop. Cleanup/commit timing separates
+thread queue wait from actual I/O; file concurrency can change when resuming.
+same-filesystem moves avoid hidden-tensor loading and rewriting. Cross-filesystem
+copies stage to a temporary output file before an atomic rename. Tokens, shapes and
+capture layer counts are always checked; `hidden.validate_outputs=true` (wrapper:
+`VALIDATE_HIDDEN_OUTPUTS=true`) additionally scans the full hidden tensor for NaN/Inf.
+The Mooncake backend fetches and saves its payload in these same concurrent workers.
+A single lightweight writer commits manifest records after files are in place.
+It reuses one manifest handle, flushes each committed record, and closes the handle
+on exit.
+Timing logs report the first completed record, every `log_interval` records
+(wrapper: `LOG_INTERVAL=20`, use `1` for each record), and the final tail.
+Every `log_interval_seconds` seconds (wrapper: `LOG_INTERVAL_SECONDS=10`), a
+heartbeat also reports active workers, live HTTP requests, queues and any completed
+timing window, so a stalled first sample is visible.
+They include per-stage average/maximum milliseconds, HTTP occupancy, queue lengths,
+logical input tokens/s, payload MiB/s, and cross-filesystem copy counts. The logical
+input rate includes cached prompt tokens and is not vLLM's scheduled-token rate.
+`request` includes slot waits and retries; `http` is its HTTP portion. `file_total`
+contains lock/header/validation/move times; `file_copy` is part of `file_move`.
+`input_wait` and `result_wait` include queue backpressure plus residence. Overlapping
+stage durations must not be added to estimate wall time. Timing configuration does
+not change the dataset fingerprint or the on-disk format.
+`resume=true` skips committed output records and verifies the input/config fingerprint;
+`max_samples` caps newly processed records. Use a separate output for a new config.
+`on_error=skip` records request/validation failures in a sibling `.errors.jsonl` and
+retries those records on the next run; disk write failures always abort. Keep a single
+writer process per output path. Duplicate sample IDs are rejected.
+
+The editable wrapper `bash tools/run_standalone_data_generation.sh` defaults to the
+Qwen3-8B standalone DSpark recipe: `MODEL_PATH=/path/to/Qwen3-8B`,
+`SPECO_VLLM_ENDPOINTS`, `VLLM_MAX_INFLIGHT_REQUESTS=16`,
+`VLLM_PER_ENDPOINT_CONCURRENCY=4`, `VLLM_REQUEST_TIMEOUT=120`,
+`PRODUCER_MAX_SEQUENCE_LENGTH=8192`, and
+`PRODUCER_GENERATION_MAX_TOKENS=512`. `VLLM_MODEL` defaults to `MODEL_PATH`,
+matching services launched without `--served-model-name`.
+Auxiliary vLLM output IDs are `[1,9,17,25,33]` (canonical decoder IDs
+`[0,8,16,24,32]`); the existing 8B service additionally captures final layer `36`.
+Match these capture IDs and `INCLUDE_FINAL_HIDDEN` to the service's output layer
+plan. Optional server-rendered response boundaries use the same local-tokenizer
+fallback. The dataset records capture metadata; training binds algorithm, conversion
+dtype and loss-driven layout later, and applies the existing Producer feature-window
+and minimum-supervision rules. Capturing a final layer permits both final-hidden
+supervision and auxiliary-only training without regenerating the data.
+
+Response regeneration accepts inline `<think>reasoning</think>answer`, the
+missing-opening-tag form `reasoning</think>answer`, and separate string
+`reasoning_content` / `reasoning` fields. It writes one complete
+`<think>\nreasoning\n</think>\n\nanswer` into the assistant `value`; ordinary
+answers remain unchanged. Duplicate reasoning is merged, conflicting fields are
+rejected, and truncated results (`finish_reason=length`), unfinished think blocks,
+reasoning without a final answer, tool calls, refusals and unsupported content
+structures follow `on_error` instead of being committed as successful samples.
+Official Qwen3-8B and GLM-5.3 templates both parse this complete think format;
+local/custom templates must retain equivalent behavior. Existing response outputs
+from before this normalization cannot be resumed into the new format: use a new
+output path. Hidden extraction and training checkpoints are unaffected.
+
+
+### Standalone training from saved raw hidden
+
+Use the **directory**, not the manifest file, as `data.train_files`:
+
+```bash
+python -m verl_speco.standalone_tq_training_launcher \
+  speco.draft_training.data_source=saved_hidden \
+  speco.draft_training.data_transport=ray_reference \
+  speco.draft_training.num_gpus_per_node=2 \
+  data.train_files=/data/hidden \
+  actor_rollout_ref.model.path=/path/to/Qwen3-8B \
+  actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK \
+  actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu=2 \
+  actor_rollout_ref.rollout.drafter.training.max_steps=1000
+```
+
+The Qwen3-8B DSpark wrapper also supports the same source:
+
+```bash
+DATA_SOURCE=saved_hidden TRAIN_FILE=/data/hidden MODEL_PATH=/path/to/Qwen3-8B \
+  bash examples/run_qwen3-8b_drafter_dspark_separate_training.sh
+```
+
+The launcher validates the raw format and feature contract, derives auxiliary IDs
+from the manifest unless explicitly supplied, and skips vLLM/TQ/Mooncake service
+startup and probes. Model/tokenizer identity and auxiliary layer selection must
+match the capture. The selected training algorithm, dtype, losses and window are
+resolved at training startup; required final hidden states must have been captured.
+Older raw datasets carrying bound training contracts retain their strict checks. Target configuration and
+training-side target weights are still needed by the trainer. All Consumer nodes
+must see the saved files at the same paths. The current Ray launcher remains
+single-node and reference training requires gradient accumulation of one.
+
+The existing Producer actor reads the manifest once and publishes ordinary file
+references, obeying the existing scheduler pause/resume gate. For a finite
+`max_steps`, it repeats the dataset until the remaining global-batch sample budget
+is filled. It reuses the online per-epoch NumPy shuffle rule (`shuffle_seed + epoch`)
+when Producer shuffle is enabled; `max_steps<=0` reads one pass. The same Consumer
+process prefetch, CPU preparation, FIFO pinning, packing, H2D and forward-time final
+norm are reused. No separate offline Consumer or training loop is introduced.
+
+Saved references are persistent: completion, dropped tails and shutdown only
+release control metadata, never the dataset files. A checkpoint records consumed
+training-occurrence numbers and Producer shuffle settings; directory fingerprints
+hash `metadata.json` and `manifest.jsonl`. Resume skips consumed occurrences and
+rejects changed indexes or shuffle settings. Treat the dataset as immutable during
+training; tensor files themselves are not content-hashed by this cursor. Supply an
+existing drafter checkpoint through the usual drafter `model_path` to resume.

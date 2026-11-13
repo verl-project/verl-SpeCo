@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import os
 import sys
 import time
@@ -35,8 +34,8 @@ from verl.utils.device import get_device_name, get_torch_device
 
 from verl_speco.backends.factory import build_trainer_backend
 from verl_speco.config import config_int, prefetch_depth
-from verl_speco.standalone_ray_runtime import put_queue
 from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
+from verl_speco.standalone_ray_runtime import put_queue
 from verl_speco.trainer.base_trainer import (
     DrafterBaseTrainer,
     resolve_drafter_strategy,
@@ -46,26 +45,26 @@ from verl_speco.trainer.draft_dataset import (
     DraftFeatureDataLoaderConfig,
 )
 from verl_speco.trainer.feature_store import (
-    DraftReplaySample,
     build_feature_store_from_config,
 )
+from verl_speco.trainer.reference_batch_prefetch import ReferenceBatchPrefetchIterator
+from verl_speco.trainer.reference_sample_source import ReferenceFeatureDataLoader
+from verl_speco.trainer.standalone_batch_finalize import AsyncBatchFinalizer
+from verl_speco.trainer.standalone_data import (
+    StandaloneLocalBatch,
+    validate_standalone_training_source,
+)
+from verl_speco.trainer.standalone_prefetch import StandalonePrefetchIterator
 from verl_speco.trainer.standalone_resume import (
     load_standalone_resume,
     save_standalone_resume,
 )
+from verl_speco.trainer.standalone_retry import retry_io
 from verl_speco.trainer.standalone_tracking import (
     _build_standalone_tracking,
     _finish_standalone_tracking,
     _log_standalone_tracking_metrics,
     _select_standalone_tracking_metrics,
-)
-from verl_speco.trainer.tq_retry import retry_io
-from verl_speco.trainer.standalone_batch_finalize import AsyncBatchFinalizer
-from verl_speco.trainer.reference_batch_prefetch import ReferenceBatchPrefetchIterator
-from verl_speco.trainer.tq_sample_source import (
-    TQFeatureDataLoader,
-    TQLocalBatch,
-    TQPrefetchIterator,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,10 +83,6 @@ def _is_out_of_memory_error(error: BaseException) -> bool:
     if "out of memory" in message or "oom" in message:
         return True
     return error.__class__.__name__ in {"OutOfMemoryError", "CudaOutOfMemoryError"}
-
-
-def _contains_replay_samples(samples: list[Any]) -> bool:
-    return any(isinstance(sample, DraftReplaySample) for sample in samples)
 
 
 def run_standalone_draft_training(config) -> dict[str, Any]:
@@ -121,7 +116,9 @@ async def _run_standalone_draft_training_async(
     training_mode = (
         str(training_cfg.get("mode", "offline") or "offline").strip().lower()
     )
-    replay_feature_store_types = {"token_replay", "jsonl_token_replay", "jsonl"}
+    validate_standalone_training_source(
+        training_cfg, scheduled_commands=scheduled_commands
+    )
     if feature_store_type not in {"tq", "ray_reference"} and not feature_store_cfg.get(
         "path"
     ):
@@ -131,11 +128,6 @@ async def _run_standalone_draft_training_async(
     if feature_store_type in {"tq", "ray_reference"} and training_mode != "offline":
         raise ValueError(
             f"feature_store.type={feature_store_type} requires standalone training.mode=offline"
-        )
-    if feature_store_type in replay_feature_store_types and training_mode != "offline":
-        raise ValueError(
-            f"feature_store.type={feature_store_type} is supported only by "
-            "standalone training.mode=offline"
         )
     _disable_standalone_sequence_parallel(draft_config)
     _apply_standalone_fsdp_shard_default(draft_config)
@@ -179,9 +171,9 @@ async def _run_standalone_draft_training_async(
     standalone_producer_shuffle = _standalone_producer_shuffle(config)
     trainer.combine_standalone_metrics = feature_store_type == "ray_reference"
     store = None
-    feature_replayer = None
-    feature_producer = None
-    tq_prefetch: TQPrefetchIterator | ReferenceBatchPrefetchIterator | None = None
+    tq_prefetch: StandalonePrefetchIterator | ReferenceBatchPrefetchIterator | None = (
+        None
+    )
     tq_prefetch_group = None
     batch_finalizer = None
     current_stage = "activate_training_model"
@@ -234,14 +226,6 @@ async def _run_standalone_draft_training_async(
             feature_store_type,
             feature_store_cfg.get("path"),
         )
-        if feature_store_type in {"jsonl_token_replay", "jsonl"} and not (
-            feature_store_cfg.get("tokenizer_path")
-        ):
-            tokenizer_path = draft_config.model.path
-            try:
-                feature_store_cfg.tokenizer_path = tokenizer_path
-            except AttributeError:
-                feature_store_cfg["tokenizer_path"] = tokenizer_path
         store = build_feature_store_from_config(
             feature_store_cfg,
             read_only=True,
@@ -249,6 +233,12 @@ async def _run_standalone_draft_training_async(
             hidden_states_store_cfg=(
                 training_cfg.get("target_feature_replay") or {}
             ).get("hidden_states_store"),
+            reference_lifetime=(
+                "persistent"
+                if config.speco.draft_training.get("data_source", "online")
+                == "saved_hidden"
+                else "temporary"
+            ),
         )
         if feature_store_type in {"tq", "ray_reference"}:
             current_stage = "connect_feature_store"
@@ -262,33 +252,6 @@ async def _run_standalone_draft_training_async(
             rank,
             time.perf_counter() - stage_started,
         )
-        if feature_store_type in replay_feature_store_types:
-            # Keep the large target model entirely outside online training imports
-            # and lifetime. The standalone loop materializes ordinary feature
-            # samples before handing them to the shared trainer.
-            from verl_speco.trainer.target_feature_replay import (
-                TargetFeatureReplayer,
-            )
-
-            current_stage = "initialize_target_feature_replayer"
-            stage_started = time.perf_counter()
-            logger.info(
-                "[standalone rank=%s] initializing target feature replayer",
-                rank,
-            )
-            feature_replayer = TargetFeatureReplayer(
-                config,
-                rank=rank,
-                world_size=world_size,
-                device=trainer.runtime_device,
-            )
-            logger.info(
-                "[standalone rank=%s] target feature replayer initialized "
-                "backend=%s elapsed=%.3fs",
-                rank,
-                feature_replayer.backend,
-                time.perf_counter() - stage_started,
-            )
         current_stage = "create_dataloader"
         loader: Any
         if feature_store_type in {"tq", "ray_reference"}:
@@ -362,7 +325,14 @@ async def _run_standalone_draft_training_async(
                         )
                     ),
                 )
-            loader = TQFeatureDataLoader(
+            loader_cls: Any
+            if feature_store_type == "ray_reference":
+                loader_cls = ReferenceFeatureDataLoader
+            else:
+                from verl_speco.trainer.tq_sample_source import TQFeatureDataLoader
+
+                loader_cls = TQFeatureDataLoader
+            loader = loader_cls(
                 store,
                 batch_size=int(training_cfg.get("batch_size_per_gpu", 4)),
                 rank=rank,
@@ -463,7 +433,7 @@ async def _run_standalone_draft_training_async(
                     **prefetch_options,
                 )
             else:
-                tq_prefetch = TQPrefetchIterator(
+                tq_prefetch = StandalonePrefetchIterator(
                     loader,
                     depth,
                     pin_memory=hidden_references,
@@ -471,42 +441,6 @@ async def _run_standalone_draft_training_async(
                     **prefetch_options,
                 )
             sample_source = tq_prefetch
-        pipeline_cfg = training_cfg.get("target_feature_pipeline", {}) or {}
-        pipeline_enabled = bool(pipeline_cfg.get("enabled", False))
-        if feature_store_type in {"tq", "ray_reference"} and pipeline_enabled:
-            raise ValueError(
-                "feature_store.type=tq already contains target hidden states and cannot be "
-                "combined with target_feature_pipeline.enabled=true"
-            )
-        if pipeline_enabled:
-            if feature_replayer is None or not feature_replayer.backend.startswith(
-                "vllm_"
-            ):
-                raise ValueError(
-                    "target_feature_pipeline.enabled=true requires a vLLM replay "
-                    "backend (vllm_file)"
-                )
-            from verl_speco.trainer.target_feature_pipeline import (
-                TargetFeatureProducer,
-            )
-
-            feature_producer = TargetFeatureProducer(
-                loader,
-                feature_replayer,
-                rank=rank,
-                concurrency=max(
-                    math.ceil(
-                        int(pipeline_cfg.get("concurrency", 16) or 16) / world_size
-                    ),
-                    1,
-                ),
-                producer_prefetch_depth=int(
-                    pipeline_cfg.get("producer_prefetch_depth", 4) or 4
-                ),
-                prefetch_depth=int(pipeline_cfg.get("prefetch_depth", 2) or 2),
-                queue_timeout=float(pipeline_cfg.get("queue_timeout", 300.0) or 300.0),
-            )
-            sample_source = feature_producer
         sample_iterator = iter(sample_source)
         while max_steps <= 0 or optimizer_step < max_steps:
             current_stage = "load_next_batch"
@@ -523,7 +457,7 @@ async def _run_standalone_draft_training_async(
             if loaded_batch is None:
                 break
             tq_local_batch = (
-                loaded_batch if isinstance(loaded_batch, TQLocalBatch) else None
+                loaded_batch if isinstance(loaded_batch, StandaloneLocalBatch) else None
             )
             samples = (
                 tq_local_batch.local_samples
@@ -567,47 +501,6 @@ async def _run_standalone_draft_training_async(
                     else len(samples),
                     successful_steps,
                 )
-            current_stage = "materialize_target_features"
-            if feature_replayer is None and _contains_replay_samples(samples):
-                logger.warning(
-                    "[standalone rank=%s] feature store type=%s yielded replay "
-                    "samples without an initialized target feature replayer; "
-                    "initializing replayer lazily",
-                    rank,
-                    feature_store_type,
-                )
-                from verl_speco.trainer.target_feature_replay import (
-                    TargetFeatureReplayer,
-                )
-
-                feature_replayer = TargetFeatureReplayer(
-                    config,
-                    rank=rank,
-                    world_size=world_size,
-                    device=trainer.runtime_device,
-                )
-            if feature_replayer is not None and feature_producer is None:
-                materialize_started = time.perf_counter()
-                if log_batch_progress:
-                    logger.info(
-                        "[standalone rank=%s] batch=%s materializing target features "
-                        "backend=%s",
-                        rank,
-                        attempted_batches,
-                        feature_replayer.backend,
-                    )
-                materialized_samples = feature_replayer.materialize(samples)
-                if log_batch_progress:
-                    logger.info(
-                        "[standalone rank=%s] batch=%s target features materialized "
-                        "samples=%s elapsed=%.3fs",
-                        rank,
-                        attempted_batches,
-                        len(materialized_samples),
-                        time.perf_counter() - materialize_started,
-                    )
-            else:
-                materialized_samples = samples
             current_stage = "prepare_training_batch"
             batch: dict[str, Any] | None
             batch_prepare_started = time.perf_counter()
@@ -617,7 +510,7 @@ async def _run_standalone_draft_training_async(
                 batch_prepare_seconds = 0.0
             else:
                 batch = trainer.prepare_training_batch_from_samples(
-                    cast(list[Any], materialized_samples),
+                    cast(list[Any], samples),
                     step=optimizer_step,
                 )
                 batch_prepare_seconds = time.perf_counter() - batch_prepare_started
@@ -682,7 +575,7 @@ async def _run_standalone_draft_training_async(
                 current_stage = "finalize_completed_batch"
                 tq_clear_started = time.perf_counter()
                 _clear_tq_batch_across_ranks(
-                    cast(TQFeatureDataLoader, loader),
+                    loader,
                     tq_local_batch.global_keys,
                     rank=rank,
                     device=trainer.runtime_device,
@@ -737,10 +630,6 @@ async def _run_standalone_draft_training_async(
                     step_metrics["perf/loader_batch_prepare_time"] = float(
                         tq_local_batch.batch_prepare_seconds
                     )
-            if feature_replayer is not None:
-                step_metrics.update(feature_replayer.metrics())
-            if feature_producer is not None:
-                step_metrics.update(feature_producer.metrics())
             _log_standalone_step_metrics(step_metrics, rank=rank)
             tracking_metrics = _select_standalone_tracking_metrics(step_metrics)
             if training_events is not None and rank == 0:
@@ -882,8 +771,6 @@ async def _run_standalone_draft_training_async(
             attempted_batches,
             successful_steps,
         )
-        if feature_producer is not None:
-            feature_producer.close()
         if tq_prefetch is not None:
             try:
                 tq_prefetch.close()
@@ -897,8 +784,6 @@ async def _run_standalone_draft_training_async(
                 if prefetch_cleanup_error is None:
                     prefetch_cleanup_error = error
                 logger.exception("Failed to destroy TQ prefetch process group")
-        if feature_replayer is not None:
-            feature_replayer.close()
         if store is not None:
             store.close()
         logger.info("[standalone rank=%s] cleaning trainer resources", rank)
@@ -1149,7 +1034,7 @@ def _set_standalone_checkpoint_complete(
     if not os.path.exists(metadata_path):
         return
     try:
-        with open(metadata_path, "r", encoding="utf-8") as f:
+        with open(metadata_path, encoding="utf-8") as f:
             metadata = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(
@@ -1239,7 +1124,7 @@ def _load_source_drafter_config(trainer: DrafterBaseTrainer) -> dict[str, Any] |
     if not os.path.exists(config_path):
         return None
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             loaded = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("Failed to load source drafter config %s: %s", config_path, exc)
@@ -1487,7 +1372,7 @@ def _rewrite_standalone_block_runtime_config(
         )
 
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             training_config = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(
@@ -1808,11 +1693,6 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         ("perf/batch_prepare_time", "batch_prepare_time"),
         ("perf/train_time", "train_time"),
         ("perf/batch_finalize_time", "batch_finalize_time"),
-        ("replay/cache_hit_ratio", "cache_hit"),
-        ("replay/target_forward_time_total", "target_forward_total"),
-        ("replay/vllm_request_time_total", "vllm_request_total"),
-        ("producer/consumer_wait_time_total", "producer_wait_total"),
-        ("producer/ready_queue_size", "ready_batches"),
     ):
         if key not in metrics:
             continue
@@ -1822,11 +1702,7 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         elif (
             key.endswith("_time_total")
             or key.startswith("perf/")
-            or key
-            in {
-                "perf/step_time",
-                "replay/target_forward_time_total",
-            }
+            or key == "perf/step_time"
         ):
             fields.append(f"{label}={value:.3f}s")
         else:
@@ -1924,7 +1800,7 @@ def _submit_standalone_metrics(finalizer, events, event, config) -> None:
 
 
 def _clear_tq_batch_across_ranks(
-    loader: TQFeatureDataLoader,
+    loader: Any,
     global_keys: list[str] | None,
     *,
     rank: int,
@@ -2057,7 +1933,7 @@ def _next_batch_across_ranks(
 ) -> Any | None:
     """Fetch one batch and make producer failures visible to every rank.
 
-    Producer and replay errors happen before the FSDP training step. Every
+    Producer and feature-loading errors happen before the FSDP training step. Every
     rank therefore reports its fetch result through the same collective before
     any rank is allowed to enter model collectives.  This prevents healthy
     ranks from waiting in FSDP after another rank has already started cleanup.
@@ -2071,7 +1947,7 @@ def _next_batch_across_ranks(
         if samples is None:
             raise RuntimeError("Successful batch fetch returned no samples")
         if require_prepared and (
-            not isinstance(samples, TQLocalBatch) or not samples.prepared_batch
+            not isinstance(samples, StandaloneLocalBatch) or not samples.prepared_batch
         ):
             raise RuntimeError("Reference input returned no prepared training batch")
     except StopIteration:
