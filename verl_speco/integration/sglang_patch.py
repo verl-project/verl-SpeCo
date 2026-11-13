@@ -30,6 +30,15 @@ import sglang.srt.entrypoints.engine
 from sglang.srt.utils import MultiprocessingSerializer
 
 from verl_speco.integration.drafter_config_env import get_drafter_config_env
+from verl_speco.integration.sglang_patch_controls import (
+    DISABLE_SGLANG_PATCH_ENV as _DISABLE_SGLANG_PATCH_ENV,
+)
+from verl_speco.integration.sglang_patch_controls import (
+    env_flag_enabled as _env_flag_enabled,
+)
+from verl_speco.integration.sglang_patch_controls import (
+    sglang_verl_patches_disabled as _sglang_verl_patches_disabled,
+)
 from verl_speco.integration.sglang_adapter import (
     _call_flashinfer_plan_with_abi_compat,
 )
@@ -53,6 +62,11 @@ _EAGLE_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_VERIFY_MODE"
 _EAGLE_V1_TARGET_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_V1_TARGET_SAMPLING"
 _EAGLE_V1_VERIFY_MODE_ENV = "VERL_SGLANG_NPU_EAGLE_V1_VERIFY_MODE"
 _EAGLE_FORCE_FP32_SAMPLING_ENV = "VERL_SGLANG_NPU_EAGLE_FORCE_FP32_SAMPLING"
+# The linear target-only Triton verify kernel runs on NPU (EAGLE) and ROCm (DFlash), so its
+# switches are backend-neutral. The NPU_EAGLE names are deprecated aliases, read only when
+# the new name is unset.
+_LINEAR_TRITON_VERIFY_ENV = "VERL_SGLANG_LINEAR_TRITON_VERIFY"
+_LINEAR_TRITON_VERIFY_DEBUG_ENV = "VERL_SGLANG_LINEAR_TRITON_VERIFY_DEBUG"
 _EAGLE_LINEAR_TRITON_ENV = "VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON"
 _EAGLE_LINEAR_TRITON_DEBUG_ENV = "VERL_SGLANG_NPU_EAGLE_LINEAR_TRITON_DEBUG"
 _EAGLE_TOP_K_RENORM_FAST_PATH_ENV = "VERL_SGLANG_NPU_EAGLE_TOP_K_RENORM_FAST_PATH"
@@ -67,7 +81,6 @@ _DRAFTER_LAST_HIDDEN_LOGPROB_CHECK_TOPK_ENV = (
 _DRAFTER_RAW_TOP_LOGPROBS_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS"
 _DRAFTER_RAW_TOP_LOGPROBS_TOPK_ENV = "VERL_DRAFTER_RAW_TOP_LOGPROBS_TOPK"
 _SGLANG_RETURN_ORIGINAL_LOGPROB_ENV = "SGLANG_RETURN_ORIGINAL_LOGPROB"
-_DISABLE_SGLANG_PATCH_ENV = "VERL_DISABLE_SGLANG_PATCH"
 _SGLANG_PATCHES_ENV = "VERL_SGLANG_PATCHES"
 _SGLANG_BASE_COMPAT_PATCHES_ENV = "VERL_SGLANG_BASE_COMPAT_PATCHES"
 
@@ -79,6 +92,9 @@ _ORIGINAL_SGLANG_RUN_SCHEDULER_PROCESS = (
 _ORIGINAL_SGLANG_DIRECT_RUN_SCHEDULER_PROCESS = None
 _SGLANG_EAGLE_UPDATE_PATCHED = False
 _SGLANG_NPU_EAGLE_SAMPLING_PATCHED = False
+_SGLANG_ROCM_DFLASH_SAMPLING_PATCHED = False
+_LINEAR_TRITON_FALLBACK_WARNED: set[str] = set()
+_DEPRECATED_ENV_WARNED: set[str] = set()
 _SGLANG_HIDDEN_STATES_TENSOR_OUTPUT_PATCHED = False
 _SGLANG_EAGLE_VERIFY_HIDDEN_STATES_PATCHED = False
 _SGLANG_DFLASH_VERIFY_HIDDEN_STATES_PATCHED = False
@@ -98,9 +114,11 @@ _SCHEDULER_PROCESS_PATCH_ATTR = "_verl_patched_scheduler_process"
 _SGLANG_TOP_K_ALL = 1 << 30
 _SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME = "qwen3_rope_compat"
 _SGLANG_FLASHINFER_PLAN_ABI_PATCH_NAME = "flashinfer_plan_abi"
+_SGLANG_ROCM_DFLASH_TARGET_SAMPLING_PATCH_NAME = "rocm_dflash_target_sampling"
 _SGLANG_PATCH_NAMES = {
     "eagle_update_weights",
     "npu_eagle_target_sampling",
+    _SGLANG_ROCM_DFLASH_TARGET_SAMPLING_PATCH_NAME,
     "hidden_states_tensor_output",
     _SGLANG_QWEN3_ROPE_COMPAT_PATCH_NAME,
     _SGLANG_FLASHINFER_PLAN_ABI_PATCH_NAME,
@@ -914,28 +932,44 @@ def _is_sglang_npu_backend() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def _env_flag_enabled(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "on", "yes", "y"}:
-        return True
-    if normalized in {"0", "false", "off", "no", "n", ""}:
-        return False
-    return default
-
-
 def _sglang_npu_eagle_force_fp32_sampling_enabled() -> bool:
     return _env_flag_enabled(_EAGLE_FORCE_FP32_SAMPLING_ENV, default=False)
 
 
+def _env_flag_with_deprecated_alias(name: str, deprecated: str, default: bool) -> bool:
+    if os.getenv(name) is not None or os.getenv(deprecated) is None:
+        return _env_flag_enabled(name, default=default)
+    if deprecated not in _DEPRECATED_ENV_WARNED:
+        _DEPRECATED_ENV_WARNED.add(deprecated)
+        logger.warning("%s is deprecated; set %s instead.", deprecated, name)
+    return _env_flag_enabled(deprecated, default=default)
+
+
 def _sglang_npu_eagle_linear_triton_enabled() -> bool:
-    return _env_flag_enabled(_EAGLE_LINEAR_TRITON_ENV, default=True)
+    return _env_flag_with_deprecated_alias(
+        _LINEAR_TRITON_VERIFY_ENV, _EAGLE_LINEAR_TRITON_ENV, default=True
+    )
 
 
 def _sglang_npu_eagle_linear_triton_debug_enabled() -> bool:
-    return _env_flag_enabled(_EAGLE_LINEAR_TRITON_DEBUG_ENV, default=False)
+    return _env_flag_with_deprecated_alias(
+        _LINEAR_TRITON_VERIFY_DEBUG_ENV, _EAGLE_LINEAR_TRITON_DEBUG_ENV, default=False
+    )
+
+
+def _warn_linear_triton_fallback(reason: str, exc: Exception | None = None) -> None:
+    # Falling back to the torch sampler keeps sampling correct but is several times slower
+    # (hundreds of small kernels per verify step), so say so once per process and reason.
+    if reason in _LINEAR_TRITON_FALLBACK_WARNED:
+        return
+    _LINEAR_TRITON_FALLBACK_WARNED.add(reason)
+    logger.warning(
+        "SGLang linear target-only Triton verify kernel unavailable (%s%s); falling back "
+        "to the torch sampler, which is slower. Set %s=1 for details.",
+        reason,
+        f": {type(exc).__name__}: {exc}" if exc is not None else "",
+        _LINEAR_TRITON_VERIFY_DEBUG_ENV,
+    )
 
 
 def _sglang_drafter_return_last_hidden_enabled() -> bool:
@@ -1146,10 +1180,6 @@ def _triton_ascend_available() -> bool:
 
 def _sglang_npu_eagle_top_k_renorm_fast_path_enabled() -> bool:
     return _env_flag_enabled(_EAGLE_TOP_K_RENORM_FAST_PATH_ENV, default=False)
-
-
-def _sglang_verl_patches_disabled() -> bool:
-    return _env_flag_enabled(_DISABLE_SGLANG_PATCH_ENV, default=False)
 
 
 def _normalize_sglang_patch_selection(raw_value: str | None) -> set[str] | None:
@@ -1593,6 +1623,12 @@ def _triton_next_power_of_2(value: int) -> int:
     return 1 << (max(int(value), 1) - 1).bit_length()
 
 
+def _linear_triton_on_rocm(target_probs: torch.Tensor) -> bool:
+    # The kernel is plain Triton, so ROCm (DFlash chain verify) runs it too; the
+    # torch path launches hundreds of small kernels per verify step.
+    return bool(getattr(torch.version, "hip", None)) and target_probs.is_cuda
+
+
 def _try_tree_speculative_sampling_target_only_linear_triton(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -1611,16 +1647,18 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
         _debug_sglang_npu_eagle_linear_triton("linear_triton_disabled")
         return False
 
-    triton_ascend_available = _triton_ascend_available()
-    if not triton_ascend_available:
+    rocm = _linear_triton_on_rocm(target_probs)
+    if not rocm and not _triton_ascend_available():
         _debug_sglang_npu_eagle_linear_triton(
             "triton_ascend_unavailable",
         )
         return False
     if _tree_speculative_sampling_target_only_linear_triton_kernel is None:
         _debug_sglang_npu_eagle_linear_triton("kernel_not_compiled")
+        if rocm:
+            _warn_linear_triton_fallback("kernel_not_compiled")
         return False
-    if target_probs.device.type != "npu":
+    if not rocm and target_probs.device.type != "npu":
         _debug_sglang_npu_eagle_linear_triton(
             "target_probs_not_npu",
             target_probs=_tensor_debug_summary(target_probs),
@@ -1711,6 +1749,8 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
         "threshold_single": float(threshold_single),
         "threshold_acc": float(threshold_acc),
     }
+    # multibuffer is a triton-ascend launch option; other backends reject it.
+    launch_options = {} if rocm else {"multibuffer": kernel_meta["multibuffer"]}
     try:
         _tree_speculative_sampling_target_only_linear_triton_kernel[(batch_size,)](
             predicts,
@@ -1729,7 +1769,7 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
             NUM_SPECULATIVE_TOKENS=kernel_meta["num_speculative_tokens"],
             SUB_BLOCK=kernel_meta["sub_block"],
             SPEC_BLOCK=kernel_meta["spec_block"],
-            multibuffer=kernel_meta["multibuffer"],
+            **launch_options,
         )
         return True
     except Exception as exc:  # noqa: BLE001
@@ -1752,9 +1792,7 @@ def _try_tree_speculative_sampling_target_only_linear_triton(
             ),
             target_probs_for_sampling=_tensor_debug_summary(target_probs_for_sampling),
         )
-        logger.debug(
-            "SGLang NPU EAGLE linear target-only Triton kernel failed: %s", exc
-        )
+        _warn_linear_triton_fallback("kernel_launch_failed", exc)
         return False
 
 
@@ -2221,6 +2259,53 @@ def patch_sglang_npu_eagle_target_sampling() -> None:
         logger.warning(
             "Patched SGLang NPU EAGLE sampling for %s", ", ".join(patched_targets)
         )
+
+
+def patch_sglang_rocm_dflash_target_sampling() -> None:
+    """Give SGLang DFlash non-greedy verification on ROCm via the target-only sampler.
+
+    SGLang enables DFlash sampling verification only when ``sgl_kernel`` provides
+    ``tree_speculative_sampling_target_only`` (CUDA/MUSA builds); the HIP build does
+    not compile that op. On ROCm DFlash therefore logs "falling back to greedy argmax
+    verification" and every decoded token is the target argmax whatever the requested
+    temperature. RL rollouts are then not samples of the policy (only the first token
+    is sampled), which biases the policy gradient. The chain (topk=1) verify path takes
+    the same arguments as the kernel, so the implementation used for NPU EAGLE (the
+    linear Triton kernel, with the torch path as fallback) is installed in
+    ``dflash_utils`` together with torch top-k/top-p renorm.
+    """
+    global _SGLANG_ROCM_DFLASH_SAMPLING_PATCHED
+
+    if _SGLANG_ROCM_DFLASH_SAMPLING_PATCHED or not getattr(torch.version, "hip", None):
+        return
+    try:
+        dflash_utils = importlib.import_module("sglang.srt.speculative.dflash_utils")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Skip SGLang ROCm DFlash target sampling patch: %s", exc)
+        return
+    if not hasattr(dflash_utils, "_DFLASH_SAMPLING_VERIFY_AVAILABLE"):
+        logger.warning(
+            "Skip SGLang ROCm DFlash target sampling patch: this SGLang has no "
+            "dflash_utils._DFLASH_SAMPLING_VERIFY_AVAILABLE switch."
+        )
+        return
+    if dflash_utils._DFLASH_SAMPLING_VERIFY_AVAILABLE:
+        _SGLANG_ROCM_DFLASH_SAMPLING_PATCHED = True
+        return
+    setattr(dflash_utils, "top_k_renorm_prob", _top_k_renorm_prob_torch)
+    setattr(dflash_utils, "top_p_renorm_prob", _top_p_renorm_prob_torch)
+    setattr(
+        dflash_utils,
+        "tree_speculative_sampling_target_only",
+        _tree_speculative_sampling_target_only_torch,
+    )
+    setattr(dflash_utils, "_DFLASH_SAMPLING_VERIFY_AVAILABLE", True)
+    _SGLANG_ROCM_DFLASH_SAMPLING_PATCHED = True
+    logger.warning(
+        "Patched SGLang DFlash verification on ROCm to sample with the target-only "
+        "sampler (linear Triton kernel, torch fallback) instead of falling back to "
+        "greedy argmax."
+    )
 
 
 def _is_torch_tensor(value: Any) -> TypeGuard[torch.Tensor]:
@@ -6516,6 +6601,10 @@ def _apply_selected_sglang_patches(
         (_SGLANG_FLASHINFER_PLAN_ABI_PATCH_NAME, patch_sglang_flashinfer_plan_abi),
         ("eagle_update_weights", patch_sglang_eagle_update_weights_from_tensor),
         ("npu_eagle_target_sampling", patch_sglang_npu_eagle_target_sampling),
+        (
+            _SGLANG_ROCM_DFLASH_TARGET_SAMPLING_PATCH_NAME,
+            patch_sglang_rocm_dflash_target_sampling,
+        ),
         ("hidden_states_tensor_output", patch_sglang_hidden_states_tensor_output),
     )
 
