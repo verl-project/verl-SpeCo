@@ -46,6 +46,161 @@ def _mask_inputs():
     return anchor_positions, block_keep_mask
 
 
+@pytest.mark.parametrize("windows", [[2, 5], [2, None], [None]])
+def test_owned_anchor_windows_preserve_attention_and_labels(windows):
+    from verl_speco.trainer.standalone_batch_prepare import plan_owned_anchor_windows
+    docs = [0] * 9 + [-1] * 2 + [1] * 10 + [-1]
+    anchors = [3, 6, 13, 18, 0]
+    keep = [True, True, True, True, False]
+    state = torch.random.get_rng_state().clone()
+    groups = plan_owned_anchor_windows(docs, anchors, keep, block_size=2, label_shift=1,
+                                       windows=windows, world_size=3)
+    assert [[p["anchor_slot"] for p in group] for group in groups] == [[0, 3], [1], [2]]
+    assert torch.equal(state, torch.random.get_rng_state())
+    for window in windows:
+        full = _create_dflash_dense_attention_mask(
+            torch.tensor([anchors]), torch.tensor([keep]), len(docs), 2,
+            sliding_window=window, document_ids=torch.tensor([docs]))
+        for part in (part for group in groups for part in group):
+            slot, start, end = part["anchor_slot"], part["start"], part["end"]
+            cropped = _create_dflash_dense_attention_mask(
+                torch.tensor([[part["local_anchor"]]]), torch.tensor([[True]]), end - start, 2,
+                sliding_window=window, document_ids=torch.tensor([docs[start:end]]))
+            original = full[0, 0, slot * 2, :len(docs)]
+            assert not original[:start].any() and not original[end:].any()
+            assert torch.equal(original[start:end], cropped[0, 0, 0, :end - start])
+            assert torch.equal(full[0, 0, slot * 2, len(docs) + slot * 2:len(docs) + (slot + 1) * 2],
+                               cropped[0, 0, 0, end - start:])
+            assert docs[start:end] == [part["document_id"]] * (end - start)
+            assert list(range(part["anchor"] + 1, part["anchor"] + 3)) == list(range(end - 2, end))
+
+
+@pytest.mark.parametrize("docs,anchors,keep", [
+    ([0, 0, 1, 1], [1], [True]), ([0, -1, 0], [0], [True]),
+    ([0, 0], [0, 0], [True, True]), ([0, -1], [1], [True]),
+])
+def test_owned_anchor_windows_reject_invalid_document_or_anchor(docs, anchors, keep):
+    from verl_speco.trainer.standalone_batch_prepare import plan_owned_anchor_windows
+    with pytest.raises(ValueError):
+        plan_owned_anchor_windows(docs, anchors, keep, block_size=2, label_shift=1,
+                                  windows=[2], world_size=2)
+
+
+@pytest.mark.parametrize("windows", [[3, 3], [3, None]])
+def test_owned_anchor_window_matches_model_output_and_gradient(windows):
+    from copy import deepcopy
+    from verl_speco.trainer.standalone_batch_prepare import plan_owned_anchor_windows
+
+    torch.manual_seed(73)
+    config = DFlashConfig(hidden_size=8, intermediate_size=16, num_hidden_layers=2,
+                          num_attention_heads=2, num_key_value_heads=1, head_dim=4,
+                          vocab_size=16, num_target_layers=4, num_context_layers=1,
+                          target_hidden_size=8, target_num_hidden_layers=4, target_layer_ids=[1],
+                          sliding_window=3, use_sliding_window=True,
+                          layer_types=["sliding_attention" if w else "full_attention" for w in windows])
+    model = DFlashDraftModel(config).eval()
+    cropped_model = deepcopy(model)
+    docs = [0] * 6 + [-1] + [1] * 9
+    anchor = 12
+    part = plan_owned_anchor_windows(docs, [anchor], [True], block_size=2, label_shift=1,
+                                      windows=windows, world_size=1)[0][0]
+    start, end = part["start"], part["end"]
+    context = torch.randn(1, len(docs), 8, requires_grad=True)
+    local_context = context.detach()[:, start:end].clone().requires_grad_()
+    noise = torch.randn(1, 2, 8)
+    def forward(module, features, docs_slice, anchor_pos):
+        length = len(docs_slice)
+        masks = [_create_dflash_dense_attention_mask(
+            torch.tensor([[anchor_pos]]), torch.tensor([[True]]), length, 2,
+            sliding_window=window, document_ids=torch.tensor([docs_slice])) for window in windows]
+        return module(draft_input_ids=None, context_feature=features,
+                      draft_position_ids=torch.tensor([[anchor_pos, anchor_pos + 1]]),
+                      context_position_ids=torch.arange(length).unsqueeze(0),
+                      dense_attention_mask=masks, noise_embedding=noise)
+    full = forward(model, context, docs, anchor)
+    local = forward(cropped_model, local_context, docs[start:end], part["local_anchor"])
+    torch.testing.assert_close(full, local, rtol=2e-5, atol=2e-6)
+    weights = torch.randn_like(full)
+    (full * weights).sum().backward()
+    (local * weights).sum().backward()
+    torch.testing.assert_close(context.grad[:, start:end], local_context.grad, rtol=2e-5, atol=2e-6)
+    assert torch.count_nonzero(context.grad[:, :start]) == 0 and torch.count_nonzero(context.grad[:, end:]) == 0
+    for original, cropped in zip(model.parameters(), cropped_model.parameters(), strict=True):
+        assert (original.grad is None) == (cropped.grad is None)
+        if original.grad is not None:
+            torch.testing.assert_close(original.grad, cropped.grad, rtol=2e-5, atol=2e-6)
+
+
+def _anchor_test_model():
+    config = DSparkConfig(hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+                          num_attention_heads=2, num_key_value_heads=1, head_dim=4,
+                          vocab_size=16, num_target_layers=4, num_context_layers=1,
+                          target_hidden_size=8, target_num_hidden_layers=4, target_layer_ids=[1],
+                          mask_token_id=15, markov_rank=4, markov_head_type="vanilla")
+    return DSparkTrainingModel(draft_model=DSparkDraftModel(config), block_size=2,
+                               num_anchors=3, l1_loss_alpha=0.0).eval()
+
+
+def test_preselected_anchors_match_original_sampling_and_gradient():
+    from copy import deepcopy
+    torch.manual_seed(31)
+    model = _anchor_test_model()
+    replay = deepcopy(model)
+    docs = torch.tensor([[0] * 6 + [-1] + [1] * 6])
+    mask = (docs >= 0).float()
+    args = dict(input_ids=torch.arange(13).reshape(1, 13), hidden_states_list=[torch.randn(1, 13, 8)],
+                loss_mask=mask, lm_head_weight=torch.randn(16, 8), document_ids=docs)
+    torch.manual_seed(41)
+    anchors, keep = replay._sample_anchor_positions(13, mask, torch.device("cpu"), document_ids=docs)
+    after_sample = torch.random.get_rng_state().clone()
+    replay_out = replay(**args, preselected_anchor_positions=anchors, preselected_anchor_keep_mask=keep)
+    assert torch.equal(after_sample, torch.random.get_rng_state())
+    torch.manual_seed(41)
+    original_out = model(**args)
+    for original, selected in zip(original_out[:5], replay_out[:5], strict=True):
+        torch.testing.assert_close(original, selected)
+    original_out[0].backward()
+    replay_out[0].backward()
+    for original, selected in zip(model.parameters(), replay.parameters(), strict=True):
+        assert (original.grad is None) == (selected.grad is None)
+        if original.grad is not None:
+            torch.testing.assert_close(original.grad, selected.grad)
+
+
+@pytest.mark.parametrize("fault", ["boundary", "mask", "duplicate", "outside", "dtype", "missing"])
+def test_preselected_anchors_reject_invalid_inputs(fault):
+    model = _anchor_test_model()
+    docs = torch.tensor([[0, 0, 0, -1, 1, 1, 1]])
+    mask = torch.tensor([[1., 1., 1., 0., 1., 1., 1.]])
+    anchors, keep = torch.tensor([[0]]), torch.tensor([[True]])
+    if fault == "boundary": anchors = torch.tensor([[1]])
+    elif fault == "mask": mask[0, 1] = 0
+    elif fault == "duplicate": anchors, keep = torch.tensor([[0, 0]]), torch.tensor([[True, True]])
+    elif fault == "outside": anchors = torch.tensor([[7]])
+    elif fault == "dtype": anchors = anchors.float()
+    else: keep = None
+    with pytest.raises(ValueError, match="[Aa]nchor"):
+        model._validate_preselected_anchors(anchors, keep, seq_len=7, label_mask=mask,
+                                            document_ids=docs, next_token_loss_mask=None)
+
+
+def test_preselected_anchors_follow_aligned_next_token_mask():
+    model = _anchor_test_model()
+    docs = torch.tensor([[0, 0, 0, -1, 1, 1, 1]])
+    mask = (docs >= 0).float()
+    next_mask = mask.clone()
+    anchors, keep = model._sample_anchor_positions(7, mask, torch.device("cpu"),
+                                                    document_ids=docs, next_token_loss_mask=next_mask)
+    positions, active = model._validate_preselected_anchors(
+        anchors, keep, seq_len=7, label_mask=mask, document_ids=docs, next_token_loss_mask=next_mask)
+    assert torch.equal(positions, anchors) and torch.equal(active, keep)
+    if keep.any():
+        next_mask[0, int(anchors[keep][0])] = 0
+        with pytest.raises(ValueError, match="boundaries"):
+            model._validate_preselected_anchors(anchors, keep, seq_len=7, label_mask=mask,
+                                                document_ids=docs, next_token_loss_mask=next_mask)
+
+
 def test_dense_mask_caps_context_to_sliding_window() -> None:
     anchor_positions, block_keep_mask = _mask_inputs()
     windowed = _create_dflash_dense_attention_mask(
@@ -1097,3 +1252,159 @@ def test_prepare_training_batch_packing_keeps_trailing_label_row() -> None:
     assert batch["input_ids"][0].tolist() == list(range(seq_len + 1)) + [0, 0, 0]
     assert batch["document_ids"][0].tolist() == [0] * (seq_len + 1) + [-1] * 3
     assert batch["hidden_states"][0, seq_len:].abs().sum().item() == 0
+
+
+@pytest.mark.parametrize("sliding_window", [None, 3])
+def test_flex_and_dense_masks_match_for_unused_anchor_rows(sliding_window):
+    anchors = torch.tensor([[3, 5, 0]])
+    keep = torch.tensor([[True, True, False]])
+    documents = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]])
+    kwargs = dict(anchor_positions=anchors, block_keep_mask=keep, ctx_len=8,
+                  block_size=2, sliding_window=sliding_window, document_ids=documents)
+    dense = _create_dflash_dense_attention_mask(**kwargs)
+    flex = _create_dflash_mask_mod(**kwargs)
+    for query in range(6):
+        for key in range(14):
+            assert bool(flex(0, 0, query, key)) == bool(dense[0, 0, query, key])
+    assert dense[0, 0, 4].sum() == 1 and dense[0, 0, 4, 12]
+    assert dense[0, 0, 5].sum() == 1 and dense[0, 0, 5, 13]
+
+
+@pytest.mark.parametrize("algorithm,markov,confidence", [
+    ("dflash", None, False), ("dspark", "vanilla", False),
+    ("dspark", "gated", True),
+])
+def test_zero_supervision_row_has_finite_zero_gradient(algorithm, markov, confidence):
+    common = dict(hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+                  num_attention_heads=2, num_key_value_heads=1, head_dim=4,
+                  vocab_size=16, num_target_layers=4, num_context_layers=1,
+                  target_hidden_size=8, target_num_hidden_layers=4,
+                  target_layer_ids=[1], mask_token_id=15)
+    if algorithm == "dspark":
+        config = DSparkConfig(**common, markov_rank=4, markov_head_type=markov,
+                              enable_confidence_head=confidence, confidence_head_with_markov=confidence)
+        model = DSparkTrainingModel(draft_model=DSparkDraftModel(config), block_size=2,
+                                    num_anchors=2, l1_loss_alpha=0.0,
+                                    confidence_head_alpha=float(confidence))
+    else:
+        config = DFlashConfig(**common)
+        model = DFlashTrainingModel(draft_model=DFlashDraftModel(config), block_size=2, num_anchors=2)
+    result = model(input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
+                   hidden_states_list=[torch.randn(1, 5, 8)], loss_mask=torch.zeros(1, 5),
+                   lm_head_weight=torch.randn(16, 8))
+    loss = result[0]
+    assert torch.isfinite(loss) and loss.item() == pytest.approx(0)
+    loss.backward()
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.requires_grad]
+    assert gradients and all(gradient is not None and torch.isfinite(gradient).all()
+                             and torch.count_nonzero(gradient) == 0 for gradient in gradients)
+
+
+def _zero_supervision_ddp_worker(rank, port, algorithm, confidence, strategy, results):
+    from copy import deepcopy
+    from datetime import timedelta
+    import torch.distributed as dist
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
+                            rank=rank, world_size=2, timeout=timedelta(seconds=45))
+    try:
+        torch.manual_seed(17)
+        common = dict(hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+                      num_attention_heads=2, num_key_value_heads=1, head_dim=4,
+                      vocab_size=16, num_target_layers=4, num_context_layers=1,
+                      target_hidden_size=8, target_num_hidden_layers=4,
+                      target_layer_ids=[1], mask_token_id=15)
+        if algorithm == "dspark":
+            cfg = DSparkConfig(**common, markov_rank=4, markov_head_type="gated",
+                               enable_confidence_head=confidence, confidence_head_with_markov=confidence)
+            raw = DSparkTrainingModel(draft_model=DSparkDraftModel(cfg), block_size=2,
+                                      num_anchors=2, l1_loss_alpha=0.0,
+                                      confidence_head_alpha=float(confidence))
+        else:
+            cfg = DFlashConfig(**common)
+            raw = DFlashTrainingModel(draft_model=DFlashDraftModel(cfg), block_size=2, num_anchors=2)
+        reference = deepcopy(raw)
+        if strategy == "ddp":
+            model = torch.nn.parallel.DistributedDataParallel(raw, broadcast_buffers=False)
+            model_to_compare = model.module
+        else:
+            from torch.distributed.device_mesh import init_device_mesh
+            from torch.distributed.fsdp import fully_shard
+            mesh = init_device_mesh("cpu", (2,))
+            for layer in raw.draft_model.layers:
+                fully_shard(layer, mesh=mesh)
+            fully_shard(raw, mesh=mesh)
+            model = model_to_compare = raw
+        inputs = dict(input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
+                      hidden_states_list=[torch.randn(1, 5, 8)],
+                      lm_head_weight=torch.randn(16, 8))
+        if confidence:
+            inputs["target_last_hidden_states"] = torch.randn(1, 5, 8)
+        rng = torch.get_rng_state()
+        if rank == 0:
+            ref_result = reference(**inputs, loss_mask=torch.ones(1, 5))
+            ref_result[0].backward()
+            torch.set_rng_state(rng)
+        result = model(**inputs, loss_mask=torch.ones(1, 5) if rank == 0 else torch.zeros(1, 5))
+        tokens = (result[5]["ce_weighted_token_count"] if algorithm == "dspark"
+                  else result[4].sum()).detach().clone()
+        global_tokens = tokens.clone()
+        dist.all_reduce(global_tokens)
+        assert global_tokens.item() > 0
+        (result[0] * tokens * 2.0 / global_tokens).backward()
+        assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all()
+                   for parameter in model.parameters() if parameter.requires_grad)
+        diffs = []
+        for parameter, ref_parameter in zip(model_to_compare.parameters(), reference.parameters(), strict=True):
+            if not parameter.requires_grad:
+                continue
+            gradient = parameter.grad.full_tensor() if strategy == "fsdp2" else parameter.grad
+            if rank == 0:
+                diffs.append((gradient - ref_parameter.grad).abs().max().item())
+        if rank == 0:
+            results.put(max(diffs, default=0.0))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
+@pytest.mark.parametrize("algorithm,confidence", [("dspark", False), ("dspark", True), ("dflash", False)])
+@pytest.mark.parametrize("strategy", ["ddp", "fsdp2"])
+def test_zero_supervision_rank_matches_real_model_reference(algorithm, confidence, strategy):
+    import multiprocessing
+    import socket
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    processes = [context.Process(target=_zero_supervision_ddp_worker,
+                                 args=(rank, port, algorithm, confidence, strategy, results)) for rank in range(2)]
+    for process in processes:
+        process.start()
+    try:
+        for process in processes:
+            process.join(timeout=60)
+        assert all(process.exitcode == 0 for process in processes)
+        assert results.get(timeout=5) < 1e-5
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+        results.close()
+
+
+def test_dspark_rnn_empty_supervision_preserves_zero_loss():
+    config = DSparkConfig(hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+                          num_attention_heads=2, num_key_value_heads=1, head_dim=4,
+                          vocab_size=16, num_target_layers=4, num_context_layers=1,
+                          target_hidden_size=8, target_num_hidden_layers=4,
+                          target_layer_ids=[1], mask_token_id=15,
+                          markov_rank=4, markov_head_type="rnn")
+    model = DSparkTrainingModel(draft_model=DSparkDraftModel(config), block_size=2,
+                                num_anchors=2, l1_loss_alpha=0.0)
+    result = model(input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
+                   hidden_states_list=[torch.randn(1, 5, 8)], loss_mask=torch.zeros(1, 5),
+                   lm_head_weight=torch.randn(16, 8))
+    assert torch.isfinite(result[0]) and result[0].item() == 0

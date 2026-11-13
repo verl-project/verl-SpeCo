@@ -1219,12 +1219,15 @@ def build_feature_store_from_config(
     shard_prefix: str = "shard",
     transfer_queue_cfg: Any | None = None,
     hidden_states_store_cfg: Any | None = None,
+    hidden_states_store: Any | None = None,
 ) -> Any:
     store_type = (
         str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
         .strip()
         .lower()
     )
+    if hidden_states_store is not None and store_type != "ray_reference":
+        raise ValueError("An injected hidden-state reader requires ray_reference input")
     if store_type in {"tq", "ray_reference"}:
         if not read_only:
             raise ValueError(
@@ -1249,7 +1252,7 @@ def build_feature_store_from_config(
                 **_plain_dict(tq_cfg),
                 "hidden_states_store": _plain_dict(hidden_states_store_cfg),
             }
-            return ReferenceFeatureStore.from_config(tq_cfg)
+            return ReferenceFeatureStore(tq_cfg, hidden_states_store=hidden_states_store)
         return TQFeatureStore.from_config(tq_cfg)
     if store_type == "torch_shard":
         store_cls: type[TorchShardFeatureStore] = TorchShardFeatureStore

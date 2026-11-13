@@ -23,14 +23,17 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
+import ipaddress
 import json
 import logging
+import math
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -50,9 +53,19 @@ from verl_speco.draft_train_launcher import (
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
-from verl_speco.producer.hidden_states_store import _local_ip
 from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
-from verl_speco.trainer.standalone_resume import load_standalone_resume
+
+
+def _local_ip() -> str:
+    from verl_speco.producer.hidden_states_store import _local_ip as resolve
+
+    return resolve()
+
+
+def load_standalone_resume(*args, **kwargs):
+    from verl_speco.trainer.standalone_resume import load_standalone_resume as load
+
+    return load(*args, **kwargs)
 
 
 logger = logging.getLogger(__name__)
@@ -132,6 +145,7 @@ _PRODUCER_LAUNCHER_OWNED_KEYS = frozenset(
     }
 )
 _PRODUCER_CONFIG_PATH = Path(__file__).with_name("config") / "speco_base.yaml"
+_DRAFT_TRAINER_CONFIG_PATH = Path(__file__).with_name("config") / "draft_trainer.yaml"
 _INTERNAL_OVERRIDE_KEYS = frozenset(
     {
         f"{_FEATURE_STORE_PREFIX}.type",
@@ -168,7 +182,7 @@ _VLLM_HIDDEN_STATES_DIR = "__SPECO_HIDDEN_STATES_DIR__"
 _TQ_NAMESPACE = "speco-drafter"
 _TQ_PARTITION = "speco_drafter_features"
 _TQ_STORAGE_BACKENDS = ("SimpleStorage", "MooncakeStore")
-_HS_STORES = ("file", "mooncake")
+_HS_STORES = ("file", "mooncake", "native")
 _HS_STORE_ENV = "SPECO_VLLM_HIDDEN_STATES_STORE"
 _MOONCAKE_MASTER_DEFAULT = "127.0.0.1:50051"
 _MOONCAKE_AUTO_INIT_DEFAULT = False
@@ -195,15 +209,20 @@ class PipelineCommands:
     consumer: list[str]
     producer_overrides: tuple[str, ...]
     consumer_overrides: tuple[str, ...]
+    local_model_cache: tuple[str, str] | None = None
+    native_settings: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class RaySession:
     module: Any
     address: str
+    owns_connection: bool = True
 
     def close(self) -> None:
-        self.module.shutdown()
+        if self.owns_connection:
+            # Disconnect this driver, never stop an external Ray cluster.
+            self.module.shutdown()
 
 
 def _split_override(item: str) -> tuple[str, str] | None:
@@ -245,7 +264,7 @@ def _producer_config_keys() -> frozenset[str]:
 
 
 def _find_override(
-    overrides: Sequence[str], key: str, *, normalize_key: bool = False
+    overrides: Sequence[str], key: str, *, normalize_key: bool = True
 ) -> str | None:
     for item in reversed(overrides):
         parsed = _split_override(item)
@@ -256,11 +275,12 @@ def _find_override(
     return None
 
 
-def _find_first_override(overrides: Sequence[str], keys: Sequence[str]) -> str | None:
-    for key in keys:
-        value = _find_override(overrides, key)
-        if value is not None:
-            return value
+def _find_last_override(overrides: Sequence[str], keys: Sequence[str]) -> str | None:
+    wanted = set(keys)
+    for item in reversed(overrides):
+        parsed = _split_override(item)
+        if parsed and parsed[0].lstrip("+") in wanted:
+            return parsed[1]
     return None
 
 
@@ -390,7 +410,7 @@ def _required_override(overrides: Sequence[str], key: str) -> str:
 def _positive_int_override(
     overrides: Sequence[str], keys: Sequence[str], *, default: int
 ) -> int:
-    raw = _find_first_override(overrides, keys)
+    raw = _find_last_override(overrides, keys)
     value = int(_strip_quotes(raw)) if raw is not None else int(default)
     if value <= 0:
         raise ValueError(f"{keys[0]} must be positive, got {value}")
@@ -402,7 +422,7 @@ def _producer_max_samples(
 ) -> int:
     """Return samples needed for exactly max_steps complete global batches."""
 
-    raw_max_steps = _find_override(training_args, _MAX_STEPS_KEY)
+    raw_max_steps = _find_override(training_args, _MAX_STEPS_KEY, normalize_key=True)
     max_steps = int(_strip_quotes(raw_max_steps)) if raw_max_steps is not None else 1000
     if max_steps <= 0:
         # An unbounded training run cannot have a finite Producer target. Keep
@@ -420,6 +440,63 @@ def _producer_max_samples(
 def _stable_path_identity(kind: str, path: str) -> str:
     digest = hashlib.sha256(path.encode("utf-8")).hexdigest()
     return f"{kind}-path-sha256-{digest}"
+
+
+def _verify_local_model_cache(source: str, cache: str) -> None:
+    """Compare every local model file before launching a cache-backed service."""
+    def inventory(root_name: str) -> dict[str, Path]:
+        root = Path(root_name)
+        if root.is_symlink() or getattr(os.path, "isjunction", lambda _: False)(root) or not root.is_dir():
+            raise ValueError(f"Model cache comparison requires a real directory: {root}")
+        files: dict[str, Path] = {}
+        def fail(error: OSError) -> None:
+            raise error
+        for directory, dirs, names in os.walk(root, followlinks=False, onerror=fail):
+            for name in dirs:
+                candidate = Path(directory) / name
+                if candidate.is_symlink() or getattr(os.path, "isjunction", lambda _: False)(candidate):
+                    raise ValueError(f"Model cache directory contains a link: {candidate}")
+            for name in names:
+                candidate = Path(directory) / name
+                if not stat.S_ISREG(candidate.lstat().st_mode):
+                    raise ValueError(f"Model cache contains a non-regular file: {candidate}")
+                files[candidate.relative_to(root).as_posix()] = candidate
+                if len(files) > 100_000:
+                    raise ValueError("Model cache has too many files")
+        if not files:
+            raise ValueError(f"Model cache directory contains no files: {root}")
+        return files
+
+    def signature(path: Path) -> tuple[int, int, int, int, int]:
+        value = path.lstat()
+        if not stat.S_ISREG(value.st_mode):
+            raise ValueError(f"Model cache file changed type: {path}")
+        return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+
+    def digest(path: Path) -> bytes:
+        result = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                result.update(chunk)
+        return result.digest()
+
+    source_files, cache_files = inventory(source), inventory(cache)
+    if source_files.keys() != cache_files.keys():
+        raise ValueError("Local model cache file inventory differs from the source model")
+    signatures = {}
+    for name in sorted(source_files):
+        original, replica = source_files[name], cache_files[name]
+        before = signature(original), signature(replica)
+        if before[0][2] != before[1][2] or digest(original) != digest(replica):
+            raise ValueError(f"Local model cache content differs for {name}")
+        if (signature(original), signature(replica)) != before:
+            raise ValueError(f"Model file changed during cache verification: {name}")
+        signatures[name] = before
+    if inventory(source).keys() != source_files.keys() or inventory(cache).keys() != cache_files.keys():
+        raise ValueError("Model file inventory changed during cache verification")
+    for name, before in signatures.items():
+        if (signature(source_files[name]), signature(cache_files[name])) != before:
+            raise ValueError(f"Model file changed during cache verification: {name}")
 
 
 def _target_final_layer_id(model_path: str, target_layer_ids: Sequence[int]) -> int:
@@ -482,7 +559,9 @@ def resolve_pipeline_config(
         target_layer_ids=target_layer_ids,
         vllm_aux_hidden_state_layer_ids=vllm_aux_layer_ids,
         vllm_endpoints=endpoints,
-        run_id=f"{algorithm.lower()}-{uuid.uuid4().hex}",
+        run_id=(str(env.get("SPECO_NATIVE_RUN_ID", "")).strip()
+                if _resolve_hidden_states_store(env) == "native" and env.get("SPECO_NATIVE_RUN_ID")
+                else f"{algorithm.lower()}-{uuid.uuid4().hex}"),
     )
 
 
@@ -491,9 +570,10 @@ def start_ray_session(
     environ: Mapping[str, str] | None = None,
     ray_module: Any | None = None,
 ) -> RaySession:
-    """Create a task-local Ray control plane for the hidden TQ pipeline."""
+    """Own a local runtime or explicitly connect to an external control plane."""
 
     env = os.environ if environ is None else environ
+    external_address = _external_ray_address(env)
     ray_runtime = ray_module
     if ray_runtime is None:
         try:
@@ -502,40 +582,140 @@ def start_ray_session(
             raise RuntimeError(
                 "Standalone TQ training requires Ray and TransferQueue==0.1.10"
             ) from exc
-    # ``ray.init()`` consults RAY_ADDRESS when no explicit address is supplied.
-    # This launcher owns the complete Producer/TQ/Consumer lifetime, so an
-    # inherited address (often left by another job) must never select its
-    # control plane.  ``local`` explicitly starts this task's Ray runtime.
+    if getattr(ray_runtime, "is_initialized", lambda: False)():
+        context = ray_runtime.get_runtime_context()
+        if (
+            not external_address
+            or str(context.gcs_address).strip() != external_address
+            or context.namespace != _TQ_NAMESPACE
+        ):
+            raise ValueError(
+                "Ray is already initialized with a different address or namespace; "
+                "use a fresh driver or explicitly select its address"
+            )
+        return RaySession(ray_runtime, external_address, owns_connection=False)
+    # Ignore stale inherited RAY_ADDRESS unless this task explicitly opts in.
     init_kwargs: dict[str, Any] = {
-        "address": "local",
+        "address": external_address or "local",
         "namespace": _TQ_NAMESPACE,
-        "include_dashboard": False,
     }
+    if not external_address:
+        init_kwargs["include_dashboard"] = False
     num_cpus = str(env.get("SPECO_RAY_NUM_CPUS", "")).strip()
-    if num_cpus:
+    if num_cpus and not external_address:
+        if int(num_cpus) <= 0:
+            raise ValueError("SPECO_RAY_NUM_CPUS must be positive")
         init_kwargs["num_cpus"] = int(num_cpus)
     ray_runtime.init(**init_kwargs)
-    address = str(ray_runtime.get_runtime_context().gcs_address).strip()
-    if not address:
+    try:
+        address = str(ray_runtime.get_runtime_context().gcs_address).strip()
+        if not address:
+            raise RuntimeError("Ray did not report a GCS address for TQ clients")
+    except Exception:
         ray_runtime.shutdown()
-        raise RuntimeError("Ray did not report a GCS address for TQ clients")
+        raise
     return RaySession(module=ray_runtime, address=address)
 
 
+def _external_ray_address(env: Mapping[str, str]) -> str:
+    """Only explicit GCS host:port addresses are valid for TQ subprocess clients."""
+    address = str(env.get("SPECO_EXTERNAL_RAY_ADDRESS", "")).strip()
+    if not address:
+        return ""
+    try:
+        parsed = urlparse("//" + address)
+        if (
+            not parsed.hostname or parsed.port is None or not 0 < parsed.port < 65536
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path or parsed.query or parsed.fragment
+            or any(char.isspace() for char in address)
+        ):
+            raise ValueError
+    except ValueError:
+        raise ValueError(
+            "SPECO_EXTERNAL_RAY_ADDRESS requires an explicit GCS host:port "
+            "(not auto, local or a ray:// client URL)"
+        ) from None
+    return address
+
+
 def _validate_runtime_backend_topology(
-    runtime_backend: str, training_args: Sequence[str]
+    runtime_backend: str, training_args: Sequence[str],
+    *, environ: Mapping[str, str] | None = None,
 ) -> None:
-    """Reject multi-node Ray jobs until external-cluster ownership is supported."""
+    """Keep unsupported multi-node data paths from failing after model startup."""
 
     if runtime_backend != "ray":
         return
+    env = os.environ if environ is None else environ
+    external_address = _external_ray_address(env)
     nnodes = _positive_int_override(training_args, _NNODES_KEYS, default=1)
-    if nnodes != 1:
+    _positive_int_override(training_args, _NPROC_KEYS, default=1)
+    if nnodes != 1 and not external_address:
         raise ValueError(
-            "Standalone Ray backend currently requires "
-            "speco.draft_training.nnodes=1 because the launcher starts a "
-            "task-local single-node Ray runtime"
+            "Standalone local Ray requires speco.draft_training.nnodes=1; "
+            "multi-node training needs SPECO_EXTERNAL_RAY_ADDRESS"
         )
+    if nnodes != 1:
+        _trainer_node_ips(training_args, nnodes)
+    shared_root = _shared_hidden_states_root(env)
+    if external_address:
+        backend = _resolve_hidden_states_store(env)
+        if backend not in {"mooncake", "native"} and shared_root is None:
+            raise ValueError(
+                "External Ray requires the mooncake hidden-state store or an explicit shared file root; "
+                "local temporary file references are not shared across nodes"
+            )
+        endpoints = _parse_vllm_endpoints(env)
+        if any(urlparse(endpoint).hostname in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+               for endpoint in endpoints):
+            raise ValueError("Multi-node Ray requires remotely reachable vLLM endpoints")
+        if backend == "mooncake":
+            settings = _hidden_states_mooncake_settings(env)
+            host = urlparse("//" + settings["master_server_address"]).hostname
+            if host in {None, "localhost", "127.0.0.1", "0.0.0.0", "::1"}:
+                raise ValueError("Multi-node Ray requires a remotely reachable Mooncake master")
+            if settings["local_hostname"]:
+                raise ValueError(
+                    "Multi-node Ray must resolve Mooncake local_hostname on each worker; "
+                    "unset the shared local-hostname override"
+                )
+
+
+def _trainer_node_ips(training_args: Sequence[str], nnodes: int) -> list[str]:
+    raw = _find_override(training_args, "speco.draft_training.trainer_node_ips", normalize_key=True)
+    try:
+        value = _strip_quotes(raw or "")
+        if not value.startswith("[") or not value.endswith("]"):
+            raise ValueError
+        parts = value[1:-1].split(",")
+        if len(parts) != nnodes:
+            raise ValueError
+        nodes = [str(ipaddress.ip_address(_strip_quotes(part))) for part in parts]
+        if len(set(nodes)) != nnodes:
+            raise ValueError
+        # verl's WorkerGroup orders placement groups by node IP for rank assignment.
+        return sorted(nodes)
+    except (ValueError, TypeError):
+        raise ValueError("trainer_node_ips must contain one distinct IP per trainer node") from None
+
+
+def _trainer_topology_plan(runtime_backend: str, training_args: Sequence[str]) -> dict[str, Any]:
+    """Describe logical trainer ranks without allocating Ray or devices."""
+    nnodes = _positive_int_override(training_args, _NNODES_KEYS, default=1)
+    nproc = _positive_int_override(training_args, _NPROC_KEYS, default=1)
+    addresses = _trainer_node_ips(training_args, nnodes) if nnodes > 1 and runtime_backend == "ray" else None
+    nodes = [
+        {"node_rank": rank, "address": addresses[rank] if addresses else None,
+         "ranks": [{"local_rank": local, "global_rank": rank * nproc + local}
+                   for local in range(nproc)]}
+        for rank in range(nnodes)
+    ]
+    plan = {"schema_version": 1, "backend": runtime_backend, "nodes": nodes,
+            "processes_per_node": nproc, "world_size": nnodes * nproc}
+    payload = json.dumps(plan, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    plan["topology_sha256"] = hashlib.sha256(payload).hexdigest()
+    return plan
 
 
 def _hydra_list(values: Sequence[Any]) -> str:
@@ -548,7 +728,7 @@ def _replace_internal_overrides(
     cleaned: list[str] = []
     for item in training_args:
         parsed = _split_override(item)
-        if parsed is not None and parsed[0] in _INTERNAL_OVERRIDE_KEYS:
+        if parsed is not None and parsed[0].lstrip("+") in _INTERNAL_OVERRIDE_KEYS:
             continue
         cleaned.append(item)
     return [*cleaned, *internal]
@@ -677,6 +857,15 @@ def _resolve_hidden_states_store(env: Mapping[str, str]) -> str:
     return backend
 
 
+def _shared_hidden_states_root(env: Mapping[str, str]) -> str | None:
+    raw = str(env.get("SPECO_VLLM_SHARED_HIDDEN_STATES_ROOT", "")).strip()
+    if not raw:
+        return None
+    if not Path(raw).is_absolute() or _resolve_hidden_states_store(env) != "file":
+        raise ValueError("SPECO_VLLM_SHARED_HIDDEN_STATES_ROOT requires an absolute path and file store")
+    return raw
+
+
 def _hidden_states_mooncake_settings(env: Mapping[str, str]) -> dict[str, Any]:
     """Resolve Mooncake settings, falling back to the TQ Mooncake variables."""
 
@@ -698,7 +887,7 @@ def _hidden_states_mooncake_settings(env: Mapping[str, str]) -> dict[str, Any]:
             "SPECO_TQ_MOONCAKE_LOCAL_HOSTNAME",
             "",
         )
-        or _local_ip()
+        or ("" if _external_ray_address(env) else _local_ip())
     )
     return {
         "local_hostname": local_hostname,
@@ -741,10 +930,13 @@ def _hidden_states_mooncake_settings(env: Mapping[str, str]) -> dict[str, Any]:
 
 
 def _vllm_kv_transfer_config(env: Mapping[str, str]) -> dict[str, Any]:
+    shared_root = _shared_hidden_states_root(env)
     """Build the vLLM ``--kv-transfer-config`` for the selected backend."""
-    if _resolve_hidden_states_store(env) == "mooncake":
+    backend = _resolve_hidden_states_store(env)
+    if backend in {"mooncake", "native"}:
         return {
-            "kv_connector": "SpecoMooncakeHiddenStatesConnector",
+            "kv_connector": ("SpecoNativeHiddenStatesConnector" if backend == "native"
+                             else "SpecoMooncakeHiddenStatesConnector"),
             "kv_connector_module_path": "verl_speco.mooncake_hidden_states_connector",
             "kv_role": "kv_producer",
             "kv_connector_extra_config": {
@@ -755,7 +947,7 @@ def _vllm_kv_transfer_config(env: Mapping[str, str]) -> dict[str, Any]:
         "kv_connector": "ExampleHiddenStatesConnector",
         "kv_role": "kv_producer",
         "kv_connector_extra_config": {
-            "shared_storage_path": _VLLM_HIDDEN_STATES_DIR,
+            "shared_storage_path": shared_root or _VLLM_HIDDEN_STATES_DIR,
             "use_synchronization_lock": True,
         },
     }
@@ -763,8 +955,12 @@ def _vllm_kv_transfer_config(env: Mapping[str, str]) -> dict[str, Any]:
 
 def _hidden_states_store_overrides(env: Mapping[str, str]) -> list[str]:
     """Producer-side overrides that select the consumer store backend."""
-    if _resolve_hidden_states_store(env) != "mooncake":
-        return []
+    root = _shared_hidden_states_root(env)
+    backend = _resolve_hidden_states_store(env)
+    if backend == "native":
+        return [f"{_PRODUCER_PREFIX}.hidden_states_store.backend=native"]
+    if backend != "mooncake":
+        return [] if root is None else [f"{_PRODUCER_PREFIX}.hidden_states_store.file_root={json.dumps(root, ensure_ascii=False)}"]
     settings = _hidden_states_mooncake_settings(env)
     prefix = f"{_PRODUCER_PREFIX}.hidden_states_store"
     return [
@@ -778,6 +974,103 @@ def _hidden_states_store_overrides(env: Mapping[str, str]) -> list[str]:
         f"{prefix}.mooncake.device_name={settings['device_name']}",
         f"{prefix}.mooncake.num_writer_threads={settings['num_writer_threads']}",
     ]
+
+
+def _native_launch_settings(config: PipelineConfig, training_args: Sequence[str], env: Mapping[str, str],
+                            *, launcher_owned: bool) -> tuple[dict[str, Any], list[str], list[str]]:
+    """Resolve bounded source/reader resources and scheduler preconditions."""
+    if _strip_quotes(_find_override(training_args, _RUNTIME_BACKEND_KEY, normalize_key=True) or "ray") != "ray":
+        raise ValueError("Native hidden states require the Ray runtime")
+    world_size = (_positive_int_override(training_args, _NNODES_KEYS, default=1)
+                  * _positive_int_override(training_args, _NPROC_KEYS, default=1))
+    batch = world_size * _positive_int_override(training_args, (_BATCH_SIZE_PER_GPU_KEY,), default=4)
+
+    def integer(name, default, minimum, maximum):
+        try:
+            value = int(_env(env, name, str(default)))
+        except ValueError:
+            raise ValueError(f"{name} must be an integer") from None
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{name} must be between {minimum} and {maximum}")
+        return value
+
+    try:
+        endpoints = json.loads(_env(env, "SPECO_NATIVE_READER_ENDPOINTS", "[]"))
+    except (TypeError, ValueError):
+        raise ValueError("SPECO_NATIVE_READER_ENDPOINTS must be a JSON array") from None
+    if (not isinstance(endpoints, list) or len(endpoints) != world_size
+            or any(not isinstance(item, str) or not item.strip() or item != item.strip() or len(item) > 256
+                   for item in endpoints) or len(set(endpoints)) != world_size):
+        raise ValueError("SPECO_NATIVE_READER_ENDPOINTS must contain one distinct endpoint per rank")
+    source_endpoint = _env(env, "SPECO_NATIVE_SOURCE_ENDPOINT")
+    if launcher_owned and (not source_endpoint or len(source_endpoint) > 256 or source_endpoint in endpoints):
+        raise ValueError("Launcher-owned native vLLM needs a source endpoint distinct from reader endpoints")
+    directory = _env(env, "SPECO_NATIVE_DIRECTORY")
+    reuse_existing = bool(directory and _env(env, "SPECO_NATIVE_RUN_ID"))
+    if not directory:
+        if not launcher_owned:
+            raise ValueError("External native vLLM requires SPECO_NATIVE_DIRECTORY and SPECO_NATIVE_RUN_ID")
+        directory = f"speco_native_{uuid.uuid4().hex}"
+    if not launcher_owned and not _env(env, "SPECO_NATIVE_RUN_ID"):
+        raise ValueError("External native vLLM requires SPECO_NATIVE_DIRECTORY and SPECO_NATIVE_RUN_ID")
+    if reuse_existing and _env(env, "SPECO_NATIVE_RUN_ID") != config.run_id:
+        raise ValueError("Native vLLM and launcher must use the same run identity")
+    if len(directory) > 256 or not config.run_id or len(config.run_id) > 256:
+        raise ValueError("Invalid native directory name or run identity")
+    align = 2 * 1024**2
+    source_slots = integer("SPECO_NATIVE_SOURCE_MAX_SLOTS", max(batch, 16), batch, 4096)
+    source_bytes = integer("SPECO_NATIVE_SOURCE_MAX_BYTES", source_slots * (2 * align - 1),
+                           batch * (2 * align - 1), 2**63 - 1)
+    reader_bytes = integer("SPECO_NATIVE_READER_MAX_BYTES", 2 * 1024**3, 2 * align - 1, 2**63 - 1)
+    chunk = integer("SPECO_NATIVE_CHUNK_BYTES", align, align, 2**63 - 1)
+    if chunk % align:
+        raise ValueError("SPECO_NATIVE_CHUNK_BYTES must be a multiple of 2 MiB")
+    try:
+        timeout = float(_env(env, "SPECO_NATIVE_CONTROL_TIMEOUT", "30"))
+    except ValueError:
+        raise ValueError("SPECO_NATIVE_CONTROL_TIMEOUT must be a positive finite number") from None
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("SPECO_NATIVE_CONTROL_TIMEOUT must be a positive finite number")
+    settings = {"directory": directory, "run_id": config.run_id, "reuse_existing": reuse_existing,
+                "namespace": _env(env, "SPECO_NATIVE_RAY_NAMESPACE", "transfer_queue"),
+                "generation": integer("SPECO_NATIVE_GENERATION", 0, 0, 2**63 - 1),
+                "max_sources": integer("SPECO_NATIVE_MAX_SOURCES", len(config.vllm_endpoints), 1, 4096),
+                "max_records": integer("SPECO_NATIVE_MAX_RECORDS", 1_000_000, 1, 10_000_000),
+                "max_descriptor_bytes": integer("SPECO_NATIVE_MAX_DESCRIPTOR_BYTES", 256 * 1024**2, 1, 16 * 1024**3),
+                "metadata_server": _env(env, "SPECO_NATIVE_METADATA_SERVER", "P2PHANDSHAKE"),
+                "source_endpoint": source_endpoint, "reader_endpoints": endpoints, "source_max_bytes": source_bytes,
+                "source_max_slots": source_slots, "chunk_bytes": chunk, "timeout": timeout}
+    if not settings["namespace"] or not settings["metadata_server"]:
+        raise ValueError("Native Ray namespace and metadata server must not be empty")
+    source_overrides, consumer_overrides = [], []
+    for key in ("max_published_references", "max_reference_execution_slots"):
+        full = f"{_PRODUCER_PREFIX}.{key}"
+        raw = _find_override(training_args, full, normalize_key=True)
+        value = int(_strip_quotes(raw)) if raw is not None else batch
+        if value < batch or (key == "max_reference_execution_slots" and value > source_slots):
+            raise ValueError(f"{full} must cover one batch and execution slots must fit the source")
+        if key == "max_reference_execution_slots" and source_bytes < value * (2 * align - 1):
+            raise ValueError("SPECO_NATIVE_SOURCE_MAX_BYTES must cover the minimum allocation for each execution slot")
+        if raw is None:
+            source_overrides.append(f"{full}={value}")
+            consumer_overrides.append(f"{full}={value}")
+    for key, required in (("speco.draft_training.scheduler.per_rank_reference_ack", "true"),
+                          (f"{_TQ_PREFIX}.consumer_batch_workers", "0")):
+        raw = _find_override(training_args, key, normalize_key=True)
+        if raw is None:
+            consumer_overrides.append(f"{key}={required}")
+        elif _strip_quotes(raw).lower() != required:
+            raise ValueError(f"Native hidden states require {key}={required}")
+    for key in (f"{_TQ_PREFIX}.consumer_node_reference_owner",
+                "actor_rollout_ref.rollout.drafter.training.reference_owned_windows"):
+        raw = _find_override(training_args, key, normalize_key=True)
+        if raw is not None and _strip_quotes(raw).lower() != "false":
+            raise ValueError(f"Native hidden states require {key}=false")
+    prefix = "actor_rollout_ref.rollout.drafter.training.target_feature_replay.hidden_states_store.native"
+    consumer_overrides.extend([f"{prefix}.endpoints={json.dumps(endpoints, separators=(',', ':'))}",
+        f"{prefix}.metadata_server={json.dumps(settings['metadata_server'])}", f"{prefix}.generation={settings['generation']}",
+        f"{prefix}.max_bytes={reader_bytes}", f"{prefix}.chunk_bytes={chunk}"])
+    return settings, source_overrides, consumer_overrides
 
 
 def validate_hidden_states_store(
@@ -865,6 +1158,10 @@ def build_pipeline_commands(
         },
     }
     kv_transfer_config = _vllm_kv_transfer_config(backend_env)
+    cache_override = _find_override(training_args, "speco.draft_training.local_target_cache_path", normalize_key=True)
+    cache_path = _strip_quotes(cache_override) if cache_override else ""
+    if cache_path.lower() in {"null", "none"}:
+        cache_path = ""
     vllm = None
     if len(config.vllm_endpoints) == 1 and parsed_endpoint.hostname in {
         "127.0.0.1",
@@ -874,7 +1171,8 @@ def build_pipeline_commands(
         vllm = [
             "vllm",
             "serve",
-            config.model_path,
+            cache_path or config.model_path,
+            *(["--served-model-name", config.model_path] if cache_path else []),
             "--host",
             "127.0.0.1",
             "--port",
@@ -887,6 +1185,8 @@ def build_pipeline_commands(
             json.dumps(kv_transfer_config, separators=(",", ":")),
             "--no-enable-chunked-prefill",
         ]
+    if cache_path and vllm is None:
+        raise ValueError("Local target cache requires a launcher-owned local vLLM endpoint")
     owner = [
         python_executable,
         "-m",
@@ -896,9 +1196,9 @@ def build_pipeline_commands(
     producer_tuning_overrides = []
     for item in training_args:
         parsed = _split_override(item)
-        if parsed is None or not _is_forwarded_producer_override(parsed[0]):
+        if parsed is None or not _is_forwarded_producer_override(parsed[0].lstrip("+")):
             continue
-        key = parsed[0]
+        key = parsed[0].lstrip("+")
         if key in _PRODUCER_LAUNCHER_OWNED_KEYS:
             # The launcher computes these and sets them on the Producer command.
             continue
@@ -966,6 +1266,23 @@ def build_pipeline_commands(
         _strip_quotes(_find_override(training_args, _RUNTIME_BACKEND_KEY) or "ray")
         == "ray"
     )
+    native_settings = None
+    if _resolve_hidden_states_store(backend_env) == "native":
+        controlled = (f"{_PRODUCER_PREFIX}.hidden_states_store",
+                      "actor_rollout_ref.rollout.drafter.training.target_feature_replay.hidden_states_store")
+        for item in training_args:
+            parsed = _split_override(item)
+            if parsed and any(parsed[0].lstrip("+") == prefix or parsed[0].lstrip("+").startswith(prefix + ".")
+                              for prefix in controlled):
+                raise ValueError("Native hidden-state store settings are configured by SPECO_NATIVE_* environment variables")
+        native_settings, source_native, consumer_native = _native_launch_settings(
+            config, training_args, backend_env, launcher_owned=vllm is not None)
+        sample_budget = _producer_max_samples(training_args, resumed_optimizer_step=resumed_optimizer_step)
+        if sample_budget > native_settings["max_records"]:
+            raise ValueError("SPECO_NATIVE_MAX_RECORDS must cover the requested sample budget; "
+                             "allow extra records for filtered samples")
+        producer_overrides.extend(source_native)
+        consumer_internal.extend(consumer_native)
     if hidden_references:
         consumer_internal.extend(
             item.replace(
@@ -1091,6 +1408,8 @@ def build_pipeline_commands(
         consumer=consumer,
         producer_overrides=tuple(producer_overrides),
         consumer_overrides=tuple(consumer_overrides),
+        local_model_cache=(config.model_path, cache_path) if cache_path else None,
+        native_settings=native_settings,
     )
 
 
@@ -1143,15 +1462,63 @@ def _wait_for_vllm_ready(
         sleep(1.0)
 
 
+def _cleanup_hidden_states_directory(path):
+    import shutil
+    path = Path(path)
+    resolved = path.resolve()
+    if (path.is_symlink() or resolved.parent != Path(tempfile.gettempdir()).resolve()
+            or not resolved.name.startswith("speco-vllm-hidden-states-")):
+        raise RuntimeError("Refusing to remove an unowned hidden-state directory")
+    shutil.rmtree(resolved)
+
+
+def _start_process(popen, command, *, env):
+    # Only real, task-owned Linux children get a dedicated process session.
+    grouped = os.name == "posix" and popen is subprocess.Popen
+    process = popen(command, env=env, **({"start_new_session": True} if grouped else {}))
+    if grouped:
+        process._speco_process_group = process.pid
+    return process
+
+
 def _stop_process(process: subprocess.Popen[Any] | None) -> None:
-    if process is None or process.poll() is not None:
+    if process is None:
         return
-    process.terminate()
+    import signal
+
+    group = getattr(process, "_speco_process_group", None)
+
+    def confirm_group_exit():
+        if os.name == "posix" and group is not None and group == process.pid:
+            try:
+                os.killpg(group, 0)
+            except ProcessLookupError:
+                return
+            # The leader may already have been reaped and its PID reused. Do
+            # not signal an unproven group; keep resources for explicit recovery.
+            raise RuntimeError(f"Process group {group} exit is unconfirmed; retaining resources")
+
+    if process.poll() is not None:
+        confirm_group_exit()
+        return
+
+    def stop(kill=False):
+        group = getattr(process, "_speco_process_group", None)
+        if os.name == "posix" and group is not None and group == process.pid:
+            try:
+                if os.getpgid(process.pid) == group:
+                    os.killpg(group, signal.SIGKILL if kill else signal.SIGTERM)
+                    return
+            except ProcessLookupError:
+                return
+        process.kill() if kill else process.terminate()
+    stop()
     try:
         process.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
+        stop(kill=True)
+        process.wait(timeout=10)
+    confirm_group_exit()
 
 
 def run_pipeline(
@@ -1178,20 +1545,24 @@ def run_pipeline(
     producer: subprocess.Popen[Any] | None = None
     consumer: subprocess.Popen[Any] | None = None
     vllm: subprocess.Popen[Any] | None = None
-    hidden_states_temp: tempfile.TemporaryDirectory[str] | None = None
+    hidden_states_temp: Path | None = None
     try:
         with tempfile.TemporaryDirectory(prefix="speco-tq-launch-") as temp_dir:
             ready_file = Path(temp_dir) / "owner.ready"
-            hidden_states_temp = tempfile.TemporaryDirectory(
+            hidden_states_temp = Path(tempfile.mkdtemp(
                 prefix="speco-vllm-hidden-states-"
-            )
-            hidden_states_dir = Path(hidden_states_temp.name)
+            ))
+            hidden_states_dir = hidden_states_temp
             unavailable_endpoints = [
                 endpoint
                 for endpoint in commands.vllm_endpoints
                 if not endpoint_ready(endpoint)
             ]
+            if commands.local_model_cache and not unavailable_endpoints:
+                raise RuntimeError("Local model cache requires a new launcher-owned vLLM service")
             if unavailable_endpoints:
+                if commands.local_model_cache:
+                    _verify_local_model_cache(*commands.local_model_cache)
                 if commands.vllm is None:
                     raise RuntimeError(
                         "The configured hidden-state vLLM endpoints are unavailable: "
@@ -1203,10 +1574,10 @@ def run_pipeline(
                     for part in commands.vllm
                 ]
                 logger.info("Starting hidden-state vLLM at %s", config_endpoint)
-                vllm = popen(vllm_command, env=base_env)
+                vllm = _start_process(popen, vllm_command, env=base_env)
             owner_env = {**base_env, "SPECO_TQ_OWNER_READY_FILE": str(ready_file)}
             logger.info("Starting TransferQueue owner")
-            owner = popen(commands.owner, env=owner_env)
+            owner = _start_process(popen, commands.owner, env=owner_env)
             _wait_for_owner_ready(
                 owner,
                 ready_file,
@@ -1231,9 +1602,9 @@ def run_pipeline(
                         + ", ".join(unavailable_endpoints)
                     )
             logger.info("Starting standalone DSpark Consumer")
-            consumer = popen(commands.consumer, env=base_env)
+            consumer = _start_process(popen, commands.consumer, env=base_env)
             logger.info("Starting standalone vLLM Producer")
-            producer = popen(commands.producer, env=base_env)
+            producer = _start_process(popen, commands.producer, env=base_env)
 
             while True:
                 owner_status = owner.poll()
@@ -1257,12 +1628,19 @@ def run_pipeline(
         logger.warning("Standalone DSpark training interrupted")
         return 130
     finally:
-        _stop_process(producer)
-        _stop_process(consumer)
-        _stop_process(owner)
-        _stop_process(vllm)
-        if hidden_states_temp is not None:
-            hidden_states_temp.cleanup()
+        failures = []
+        for process in (producer, consumer, owner, vllm):
+            try:
+                _stop_process(process)
+            except Exception as exc:
+                failures.append(exc)
+                logger.exception("Task-owned process shutdown was not confirmed")
+        if failures and hidden_states_temp is not None:
+            logger.error("Preserving hidden-state directory after incomplete process shutdown: %s", hidden_states_temp)
+        elif hidden_states_temp is not None:
+            _cleanup_hidden_states_directory(hidden_states_temp)
+        if failures:
+            raise RuntimeError("Standalone subprocess shutdown was not confirmed") from failures[0]
 
 
 def _format_command(command: Sequence[str]) -> str:
@@ -1271,16 +1649,57 @@ def _format_command(command: Sequence[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
 
-def _preflight_input_file(input_path: str) -> None:
+def _preflight_input_file(input_path: str, *, max_jsonl_line_bytes: int | None = None) -> None:
     path = Path(input_path)
+    if path.is_dir():
+        from verl_speco.producer.sequence_replay import SequenceReplayReader
+
+        if not len(SequenceReplayReader(path)):
+            raise ValueError(f"Sequence replay contains no samples: {input_path}")
+        return
     if not path.is_file():
         raise ValueError(f"Training file does not exist: {input_path}")
     from verl_speco.producer.input_reader import iter_input_records
 
     try:
-        next(iter_input_records(path))
+        kwargs = {} if max_jsonl_line_bytes is None else {"max_jsonl_line_bytes": max_jsonl_line_bytes}
+        next(iter_input_records(path, **kwargs))
     except StopIteration as exc:
         raise ValueError(f"Training file contains no samples: {input_path}") from exc
+
+
+def _resolve_checkpoint_rollback(
+    training_args: Sequence[str], *, require_input: bool = True,
+) -> list[str]:
+    """Resolve an explicitly enabled rollback before Producer and Consumer diverge."""
+    key = "actor_rollout_ref.rollout.drafter.training.checkpoint_auto_rollback"
+    raw = _find_override(training_args, key, normalize_key=True)
+    if raw is None:
+        base = OmegaConf.load(_DRAFT_TRAINER_CONFIG_PATH)
+        default = OmegaConf.select(base, key, default=False)
+        if type(default) is not bool:
+            raise ValueError(f"{key} must be true or false")
+        value = str(default).lower()
+    else:
+        value = _strip_quotes(raw).lower()
+    if value not in {"true", "false"}:
+        raise ValueError(f"{key} must be true or false")
+    if value == "false":
+        return list(training_args)
+    requested = _strip_quotes(_find_override(training_args, _DRAFTER_PATH_KEY, normalize_key=True) or "")
+    if not requested:
+        raise ValueError("Automatic rollback requires a requested drafter checkpoint")
+    input_path = _single_train_file(_find_override(training_args, _TRAIN_FILES_KEY)) if require_input else None
+    from verl_speco.trainer.checkpoint import resolve_verified_standalone_checkpoint
+
+    selected = resolve_verified_standalone_checkpoint(requested, input_path=input_path)
+    if os.path.normcase(os.path.abspath(selected)) == os.path.normcase(os.path.abspath(requested)):
+        return list(training_args)
+    logger.warning("Rolling back standalone checkpoint from %s to %s", requested, selected)
+    filtered = [item for item in training_args if not (
+        _split_override(item) and _split_override(item)[0].lstrip("+") == _DRAFTER_PATH_KEY
+    )]
+    return [*filtered, f"{_DRAFTER_PATH_KEY}={json.dumps(selected.replace(chr(92), '/'), ensure_ascii=False)}"]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1288,6 +1707,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Launch standalone DSpark training through Producer/TQ/Consumer."
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--dry-run-topology", action="store_true",
+        help="Print the logical topology without loading models or connecting to services.",
+    )
     parser.add_argument("--python-executable", default=sys.executable)
     parser.add_argument(
         "--runtime-backend",
@@ -1309,13 +1732,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     training_args = [*training_args, f"{_RUNTIME_BACKEND_KEY}={runtime_backend}"]
 
     try:
+        if args.dry_run_topology:
+            _validate_runtime_backend_topology(runtime_backend, training_args)
+            plan = _trainer_topology_plan(runtime_backend, training_args)
+            plan["ray_address"] = _external_ray_address(os.environ) or "local"
+            plan["hidden_states_store"] = _resolve_hidden_states_store(os.environ)
+            plan["vllm_endpoints"] = _parse_vllm_endpoints(os.environ)
+            canonical = {key: value for key, value in plan.items() if key != "topology_sha256"}
+            plan["topology_sha256"] = hashlib.sha256(
+                json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            print(json.dumps(plan, sort_keys=True))
+            return 0
+        training_args = _resolve_checkpoint_rollback(training_args)
         config = resolve_pipeline_config(training_args)
         _validate_runtime_backend_topology(runtime_backend, training_args)
         if args.dry_run:
+            nnodes = _positive_int_override(training_args, _NNODES_KEYS, default=1)
+            nproc = _positive_int_override(training_args, _NPROC_KEYS, default=1)
+            print("runtime: " + json.dumps({
+                "backend": runtime_backend,
+                "ray_address": _external_ray_address(os.environ) or "local",
+                "trainer_nodes": nnodes,
+                "trainer_node_ips": _trainer_node_ips(training_args, nnodes) if nnodes > 1 and runtime_backend == "ray" else None,
+                "processes_per_node": nproc,
+                "world_size": nnodes * nproc,
+                "trainer_topology": _trainer_topology_plan(runtime_backend, training_args),
+                "hidden_states_store": _resolve_hidden_states_store(os.environ),
+                "vllm_endpoints": config.vllm_endpoints,
+            }, sort_keys=True))
             commands = build_pipeline_commands(
                 config,
                 training_args,
-                ray_address="127.0.0.1:6379",
+                ray_address=_external_ray_address(os.environ) or "127.0.0.1:6379",
                 python_executable=args.python_executable,
             )
             printable_commands = [
@@ -1335,7 +1784,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     continue
                 print(f"{role}: {_format_command(command)}")
             return 0
-        _preflight_input_file(config.input_path)
+        line_limit = _find_override(training_args, "speco.standalone_tq_producer.max_jsonl_line_bytes", normalize_key=True)
+        if line_limit is None:
+            _preflight_input_file(config.input_path)
+        else:
+            _preflight_input_file(config.input_path, max_jsonl_line_bytes=int(_strip_quotes(line_limit)))
         ray_session = start_ray_session()
         try:
             commands = build_pipeline_commands(
@@ -1344,7 +1797,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ray_address=ray_session.address,
                 python_executable=args.python_executable,
             )
-            logger.info("Using task-local Ray control plane at %s", ray_session.address)
+            logger.info("Using Ray control plane at %s", ray_session.address)
             if runtime_backend == "ray":
                 from verl_speco.standalone_ray_runtime import run_ray_pipeline
 

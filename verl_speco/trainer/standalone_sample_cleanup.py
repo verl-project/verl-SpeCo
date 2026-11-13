@@ -33,10 +33,12 @@ def cleanup_standalone_samples(
             validate_reference_envelope(entry.tag)
             if entry.tag["backend"] != hidden_store.backend:
                 raise ValueError("Cleanup reference backend does not match store")
+            if entry.tag["backend"] == "file" and callable(getattr(hidden_store, "validate_reference", None)):
+                hidden_store.validate_reference(entry.tag["hidden_states_path"])
             references.append(
-                entry.tag["handle"]
-                if entry.tag["backend"] == "mooncake"
-                else entry.tag["hidden_states_path"]
+                entry.tag["hidden_states_path"]
+                if entry.tag["backend"] == "file"
+                else entry.tag["handle"]
             )
     if not entries:
         return []

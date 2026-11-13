@@ -69,6 +69,24 @@ def test_prefill_reference_does_not_load_or_release_file(monkeypatch):
     assert pool._states[0].inflight == 0
 
 
+def test_prefill_reference_rejects_outside_shared_root_without_deleting(tmp_path, monkeypatch):
+    from verl_speco.producer.hidden_states_store import FileHiddenStatesStore
+    root = tmp_path / "shared"
+    root.mkdir()
+    outside = tmp_path / "outside.safetensors"
+    outside.write_bytes(b"must remain")
+    endpoint = VllmEndpoint("http://vllm:8000/v1", 1)
+    async def fake_prefill(*args, **kwargs):
+        return VllmResponse(str(outside), endpoint.base_url)
+    monkeypatch.setattr(client_module, "request_prefill", fake_prefill)
+    pool = VllmFeatureClientPool([endpoint], model="target", max_inflight_requests=1,
+                                 request_timeout=10, hidden_states_store=FileHiddenStatesStore(str(root)))
+    pool._states = [client_module._EndpointState(endpoint, object(), asyncio.Semaphore(1))]
+    with pytest.raises(ValueError, match="outside the configured shared file root"):
+        asyncio.run(pool.prefill_reference(SimpleNamespace(prompt_token_ids=[1, 2])))
+    assert outside.read_bytes() == b"must remain"
+
+
 def test_prefill_reference_transfers_handle_without_reading(monkeypatch):
     endpoint = VllmEndpoint("http://vllm:8000/v1", 1)
     store = _RecordingStore()
@@ -88,6 +106,42 @@ def test_prefill_reference_transfers_handle_without_reading(monkeypatch):
     assert store.loaded == store.released == []
     delete_temporary_result(response)
     assert store.released == ["hs-123"]
+
+
+def test_prefill_accepts_explicit_native_store_and_preserves_handle(monkeypatch):
+    endpoint = VllmEndpoint("http://vllm:8000/v1", 1)
+    store = _RecordingStore()
+    store.backend = "native"
+    async def prefill(*args, **kwargs):
+        return VllmResponse(None, endpoint.base_url, handle="native-reference")
+    monkeypatch.setattr(client_module, "request_prefill", prefill)
+    pool = VllmFeatureClientPool([endpoint], model="target", max_inflight_requests=1,
+                                 request_timeout=10, hidden_states_store=store)
+    pool._states = [client_module._EndpointState(endpoint, object(), asyncio.Semaphore(1))]
+    response = asyncio.run(pool.prefill_reference(SimpleNamespace(prompt_token_ids=[1, 2])))
+    assert response.store is store and response.reference == "native-reference"
+    assert store.loaded == store.released == []
+    raw = load_hidden_state_result(response, store)
+    assert store.loaded == ["native-reference"]
+    delete_temporary_result(raw)
+    assert store.released == ["native-reference"]
+
+
+def test_prefill_resolves_native_handle_before_transferring_ownership(monkeypatch):
+    endpoint = VllmEndpoint("http://vllm:8000/v1", 1)
+    store = _RecordingStore()
+    store.backend = "native"
+    store.resolve_reference = lambda key: {"opaque": "canonical-descriptor"}[key]
+    async def prefill(*args, **kwargs):
+        return VllmResponse(None, endpoint.base_url, handle="opaque", transfer_params={"handle": "opaque", "version": 1})
+    monkeypatch.setattr(client_module, "request_prefill", prefill)
+    pool = VllmFeatureClientPool([endpoint], model="target", max_inflight_requests=1,
+                                 request_timeout=10, hidden_states_store=store)
+    pool._states = [client_module._EndpointState(endpoint, object(), asyncio.Semaphore(1))]
+    response = asyncio.run(pool.prefill_reference(SimpleNamespace(prompt_token_ids=[1, 2])))
+    assert response.reference == response.transfer_params["handle"] == "canonical-descriptor"
+    assert response.transfer_params["version"] == 1 and response.store is store
+    assert not store.loaded and not store.released
 
 
 def test_request_generate_returns_store_handle() -> None:
@@ -212,7 +266,9 @@ def test_direct_http_errors_keep_status_and_response_body():
     asyncio.run(run())
 
 
-def test_pool_retry_fails_over_to_another_endpoint(monkeypatch) -> None:
+@pytest.mark.parametrize("endpoint_limit", [0, 4])
+@pytest.mark.parametrize("fixed_route", [False, True])
+def test_pool_retry_fails_over_to_another_endpoint(monkeypatch, endpoint_limit, fixed_route) -> None:
     calls: list[str] = []
     first = VllmEndpoint("http://vllm-a:8000/v1", 1)
     second = VllmEndpoint("http://vllm-b:8000/v1", 1)
@@ -220,7 +276,7 @@ def test_pool_retry_fails_over_to_another_endpoint(monkeypatch) -> None:
     async def fake_prefill(endpoint, client, prompt_token_ids, **kwargs):
         del client, prompt_token_ids, kwargs
         calls.append(endpoint.base_url)
-        if endpoint == first:
+        if endpoint == first and (not fixed_route or len(calls) == 1):
             raise ConnectionError("endpoint unavailable")
         return VllmResponse("/tmp/result.safetensors", endpoint.base_url)
 
@@ -243,6 +299,7 @@ def test_pool_retry_fails_over_to_another_endpoint(monkeypatch) -> None:
         [first, second],
         model="target",
         max_inflight_requests=1,
+        max_inflight_tokens_per_endpoint=endpoint_limit,
         request_timeout=10,
     )
     pool._states = [
@@ -251,14 +308,17 @@ def test_pool_retry_fails_over_to_another_endpoint(monkeypatch) -> None:
     ]
 
     raw = asyncio.run(
-        pool.prefill(SimpleNamespace(prompt_token_ids=[1, 2], sample_id="sample-a"))
+        pool.prefill(SimpleNamespace(prompt_token_ids=[1, 2], sample_id="sample-a",
+                                    source_route=0 if fixed_route else None,
+                                    source_plan_sha256="a" * 64 if fixed_route else None))
     )
 
-    assert calls == [first.base_url, second.base_url]
-    assert raw.endpoint_url == second.base_url
+    successful = first if fixed_route else second
+    assert calls == [first.base_url, successful.base_url]
+    assert raw.endpoint_url == successful.base_url
     assert pool._states[0].inflight == pool._states[1].inflight == 0
-    assert pool._states[0].requests == 0
-    assert pool._states[1].requests == 1
+    assert pool._states[0].requests == int(fixed_route)
+    assert pool._states[1].requests == int(not fixed_route)
 
 
 def test_pool_releases_reference_when_load_fails_before_retry(monkeypatch) -> None:
@@ -378,3 +438,117 @@ def test_http_diagnostics_exclude_endpoint_wait_and_release_on_cancel(monkeypatc
         assert pool.diagnostics.snapshot()["http_calls"] == 1
 
     asyncio.run(exercise())
+def test_token_balanced_routing_prefers_less_outstanding_work():
+    first = client_module._EndpointState(
+        client_module.VllmEndpoint("http://first", 2), object(), asyncio.Semaphore(2),
+        inflight=1, inflight_tokens=8192,
+    )
+    second = client_module._EndpointState(
+        client_module.VllmEndpoint("http://second", 2), object(), asyncio.Semaphore(2),
+        inflight=2, inflight_tokens=512,
+    )
+    assert client_module.choose_endpoint([first, second]) is first
+    assert client_module.choose_endpoint([first, second], token_balanced=True) is second
+
+
+def test_inflight_token_budget_blocks_and_releases_on_cancellation(monkeypatch):
+    endpoint = VllmEndpoint("http://vllm:8000/v1", 2)
+    pool = VllmFeatureClientPool(
+        [endpoint], model="target", max_inflight_requests=2,
+        max_inflight_tokens=5, request_timeout=10,
+    )
+    pool._states = [object()]
+
+    async def exercise():
+        entered = asyncio.Event()
+        unblock = asyncio.Event()
+        calls = []
+        async def fake_request(request, **kwargs):
+            calls.append(request)
+            entered.set()
+            await unblock.wait()
+            return SimpleNamespace(timings={})
+        monkeypatch.setattr(pool, "_request_with_retries", fake_request)
+        first = asyncio.create_task(pool.prefill(SimpleNamespace(prompt_token_ids=[1, 2, 3])))
+        await entered.wait()
+        second = asyncio.create_task(pool.prefill(SimpleNamespace(prompt_token_ids=[4, 5, 6])))
+        await asyncio.sleep(0)
+        assert len(calls) == 1 and pool._inflight_tokens == 3
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await asyncio.sleep(0)
+        assert len(calls) == 2 and pool._inflight_tokens == 3
+        unblock.set()
+        await second
+        assert pool._inflight_tokens == 0
+        with pytest.raises(ValueError, match="exceeds max_inflight_tokens"):
+            await pool.generate(SimpleNamespace(prompt_token_ids=[1, 2, 3], max_tokens=3))
+    asyncio.run(exercise())
+
+
+def test_per_endpoint_token_admission_routes_and_releases_on_cancel(monkeypatch):
+    endpoints = [VllmEndpoint(f"http://vllm-{i}/v1", 2) for i in range(2)]
+    pool = VllmFeatureClientPool(endpoints, model="target", max_inflight_requests=3,
+        max_inflight_tokens_per_endpoint=5, request_timeout=10)
+    pool._states = [client_module._EndpointState(endpoint, object(), asyncio.Semaphore(2))
+                    for endpoint in endpoints]
+    async def exercise():
+        entered = asyncio.Queue()
+        blocker = asyncio.Event()
+        async def prefill(endpoint, client, prompt_token_ids, **kwargs):
+            await entered.put(endpoint.base_url)
+            await blocker.wait()
+            return VllmResponse("/tmp/hidden", endpoint.base_url)
+        monkeypatch.setattr(client_module, "request_prefill", prefill)
+        request = SimpleNamespace(prompt_token_ids=[1, 2, 3])
+        first = asyncio.create_task(pool.prefill_reference(request))
+        second = asyncio.create_task(pool.prefill_reference(request))
+        assert {await asyncio.wait_for(entered.get(), 2), await asyncio.wait_for(entered.get(), 2)} == {
+            endpoint.base_url for endpoint in endpoints}
+        third = asyncio.create_task(pool.prefill_reference(request))
+        await asyncio.sleep(0)
+        assert entered.empty() and [state.inflight_tokens for state in pool._states] == [3, 3]
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert await asyncio.wait_for(entered.get(), 2) in {endpoint.base_url for endpoint in endpoints}
+        blocker.set()
+        await asyncio.gather(second, third)
+        assert all(state.inflight == state.inflight_tokens == 0 for state in pool._states)
+        with pytest.raises(ValueError, match="exceeds max_inflight_tokens_per_endpoint"):
+            await pool.generate(SimpleNamespace(prompt_token_ids=[1, 2, 3], max_tokens=3))
+    asyncio.run(exercise())
+
+
+def test_explicit_source_route_overrides_dynamic_endpoint_choice(monkeypatch):
+    endpoints = [VllmEndpoint(f"http://vllm-{i}/v1", 2) for i in range(2)]
+    pool = VllmFeatureClientPool(endpoints, model="target", max_inflight_requests=2, request_timeout=10)
+    pool._states = [client_module._EndpointState(endpoint, object(), asyncio.Semaphore(2)) for endpoint in endpoints]
+    visited = []
+    async def prefill(endpoint, client, prompt_token_ids, **kwargs):
+        visited.append(endpoint.base_url)
+        return VllmResponse("/tmp/hidden", endpoint.base_url)
+    monkeypatch.setattr(client_module, "request_prefill", prefill)
+    async def exercise():
+        request = SimpleNamespace(prompt_token_ids=[1], source_route=1, source_plan_sha256="a" * 64)
+        await pool.prefill_reference(request)
+        await pool.prefill_reference(request)
+        assert visited == [endpoints[1].base_url] * 2
+        request.source_route = 2
+        with pytest.raises(ValueError, match="source route"):
+            await pool.prefill_reference(request)
+        assert all(state.inflight == state.inflight_tokens == 0 for state in pool._states)
+    asyncio.run(exercise())
+
+
+def test_per_endpoint_token_budget_rejects_invalid_configuration():
+    with pytest.raises(ValueError, match="max_inflight_tokens_per_endpoint"):
+        VllmFeatureClientPool([VllmEndpoint("http://vllm", 1)], model="target",
+            max_inflight_requests=1, request_timeout=1, max_inflight_tokens_per_endpoint=True)
+
+
+def test_per_endpoint_token_budget_rejects_duplicate_urls():
+    with pytest.raises(ValueError, match="unique endpoint URLs"):
+        VllmFeatureClientPool([VllmEndpoint("http://vllm/v1", 1), VllmEndpoint("http://vllm/v1/", 1)],
+            model="target", max_inflight_requests=2, request_timeout=1, max_inflight_tokens_per_endpoint=10)

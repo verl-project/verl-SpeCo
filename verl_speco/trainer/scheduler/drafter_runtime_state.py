@@ -17,8 +17,9 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
+import hashlib
 from typing import Any
 
 from verl_speco.trainer.scheduler.schedule_types import TrainingPlan
@@ -135,6 +136,11 @@ class PendingStandalonePlan:
     keys: tuple[str, ...]
     runtime: DrafterRuntimeState
     entries: tuple[Any, ...] = ()
+    receipt_token: str | None = None
+    materialized: bool = False
+    optimizer_applied: bool = False
+    acknowledged_ranks: set[int] = field(default_factory=set)
+    payload_released: bool = False
 
 
 class StandaloneQueueState:
@@ -151,6 +157,8 @@ class StandaloneQueueState:
         self.next_id = 0
         self.completed_id = -1
         self.last_completed_keys: tuple[str, ...] = ()
+        self._completion_history: dict[int, tuple[bytes, str | None]] = {}
+        self._completion_history_limit = 4096
 
     @property
     def has_capacity(self) -> bool:
@@ -169,12 +177,15 @@ class StandaloneQueueState:
             )
         )
 
-    def reserve(self) -> tuple[PendingStandalonePlan, list[Any]]:
-        if not self.has_capacity or len(self.ready) < self.batch_size:
+    def reserve(self, *, size: int | None = None) -> tuple[PendingStandalonePlan, list[Any]]:
+        count = self.batch_size if size is None else size
+        if type(count) is not int or count < 1 or count > self.batch_size:
+            raise ValueError("Standalone reservation size must fit one global batch")
+        if not self.has_capacity or len(self.ready) < count:
             raise RuntimeError(
                 "Cannot reserve an incomplete batch or exceed plan capacity"
             )
-        entries = [self.ready.popleft() for _ in range(self.batch_size)]
+        entries = [self.ready.popleft() for _ in range(count)]
         keys = tuple(entry.key for entry in entries)
         pending = PendingStandalonePlan(
             self.next_id, keys, DrafterRuntimeState(), tuple(entries)
@@ -184,20 +195,90 @@ class StandaloneQueueState:
         self.reserved.update(keys)
         return pending, entries
 
+    def mark_rank_materialized(self, plan_id: int, receipt_token: str, rank: int, world_size: int) -> bool:
+        if (type(plan_id) is not int or plan_id < 0 or not isinstance(receipt_token, str)
+                or not receipt_token or type(rank) is not int or type(world_size) is not int
+                or not 0 <= rank < world_size):
+            raise RuntimeError("Invalid rank materialization acknowledgement")
+        if plan_id <= self.completed_id:
+            previous = self._completion_history.get(plan_id)
+            if previous is None or previous[1] != receipt_token:
+                raise RuntimeError("Expired or conflicting rank materialization acknowledgement")
+            return False
+        pending = next((item for item in self.pending if item.plan_id == plan_id), None)
+        if pending is None or pending.receipt_token != receipt_token:
+            raise RuntimeError("Rank materialization acknowledgement does not match a pending plan")
+        if rank in pending.acknowledged_ranks:
+            return False
+        if pending.materialized:
+            raise RuntimeError("Rank materialization acknowledgement arrived after aggregate acknowledgement")
+        pending.acknowledged_ranks.add(rank)
+        return True
+
+    def mark_materialized(self, plan_id: int, receipt_token: str, *, required_ranks: int = 0) -> bool:
+        """Accept an aggregate all-rank materialization acknowledgement once."""
+        if type(plan_id) is not int or plan_id < 0 or not isinstance(receipt_token, str) or not receipt_token:
+            raise RuntimeError("Invalid reference materialization acknowledgement")
+        if plan_id <= self.completed_id:
+            previous = self._completion_history.get(plan_id)
+            if previous is None or previous[1] != receipt_token:
+                raise RuntimeError("Expired or conflicting reference materialization acknowledgement")
+            return False
+        if not self.pending:
+            raise RuntimeError("Reference materialization acknowledgement without a pending plan")
+        pending = next((item for item in self.pending if item.plan_id == plan_id), None)
+        if pending is None or pending.receipt_token != receipt_token:
+            raise RuntimeError("Reference materialization acknowledgement does not match a pending plan")
+        if pending.materialized:
+            return False
+        if required_ranks and pending.acknowledged_ranks != set(range(required_ranks)):
+            raise RuntimeError("Reference materialization requires every rank acknowledgement")
+        pending.materialized = True
+        return True
+
+    def mark_payload_released(self, pending: PendingStandalonePlan) -> None:
+        if not any(item is pending for item in self.pending) or not pending.materialized:
+            raise RuntimeError("Payload release requires a pending materialized plan")
+        pending.payload_released = True
+
+    def mark_applied(self, plan_id: int, receipt_token: str) -> bool:
+        """Record an all-rank optimizer step before releasing references."""
+        if type(plan_id) is not int or plan_id < 0 or not isinstance(receipt_token, str) or not receipt_token:
+            raise RuntimeError("Invalid reference optimizer acknowledgement")
+        if plan_id <= self.completed_id:
+            previous = self._completion_history.get(plan_id)
+            if previous is None or previous[1] != receipt_token:
+                raise RuntimeError("Expired or conflicting reference optimizer acknowledgement")
+            return False
+        pending = next((item for item in self.pending if item.plan_id == plan_id), None)
+        if pending is None or pending.receipt_token != receipt_token:
+            raise RuntimeError("Reference optimizer acknowledgement does not match a pending plan")
+        if not pending.materialized:
+            raise RuntimeError("Reference optimizer acknowledgement before materialization acknowledgement")
+        if pending.optimizer_applied:
+            return False
+        pending.optimizer_applied = True
+        return True
+
     def completion(
-        self, plan_id: int | None, keys: Sequence[str]
+        self, plan_id: int | None, keys: Sequence[str], *, receipt_token: str | None = None
     ) -> PendingStandalonePlan | None:
         actual = tuple(keys)
+        if plan_id is not None and (type(plan_id) is not int or plan_id < 0):
+            raise RuntimeError("Invalid TQ completion plan ID")
         if plan_id is not None and plan_id <= self.completed_id:
-            if plan_id == self.completed_id and actual != self.last_completed_keys:
-                raise RuntimeError("Conflicting duplicate TQ completion keys")
+            previous = self._completion_history.get(plan_id)
+            if previous is None:
+                raise RuntimeError("Expired TQ completion cannot be verified")
+            if previous != (self._completion_fingerprint(actual), receipt_token):
+                raise RuntimeError("Conflicting duplicate TQ completion keys or receipt token")
             return None
         if not self.pending:
             raise RuntimeError("TQ completion without an outstanding plan")
         pending = self.pending[0]
         if (
             plan_id is not None and plan_id != pending.plan_id
-        ) or actual != pending.keys:
+        ) or actual != pending.keys or receipt_token != pending.receipt_token:
             raise RuntimeError("TQ completion does not match the FIFO plan")
         return pending
 
@@ -208,3 +289,17 @@ class StandaloneQueueState:
         self.reserved.difference_update(pending.keys)
         self.completed_id = pending.plan_id
         self.last_completed_keys = pending.keys
+        self._completion_history[pending.plan_id] = (self._completion_fingerprint(pending.keys), pending.receipt_token)
+        if len(self._completion_history) > self._completion_history_limit:
+            del self._completion_history[next(iter(self._completion_history))]
+
+    @staticmethod
+    def _completion_fingerprint(keys: Sequence[str]) -> bytes:
+        digest = hashlib.sha256()
+        for key in keys:
+            if not isinstance(key, str):
+                raise RuntimeError("Invalid TQ completion key")
+            encoded = key.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        return digest.digest()

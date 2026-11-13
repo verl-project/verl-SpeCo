@@ -1,6 +1,8 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 # Licensed under the Apache License, Version 2.0
 import ast
+import hashlib
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,7 +28,7 @@ def test_file_prepared_validation_shares_fetch_collective(valid, remote_error):
 
     ticks = iter([0.0, 0.2, 0.5])
     namespace = {
-        "time": SimpleNamespace(perf_counter=lambda: next(ticks)),
+        "time": SimpleNamespace(perf_counter=lambda: next(ticks)), "hashlib": hashlib, "json": json,
         "torch": torch, "TQLocalBatch": TQLocalBatch, "logger": logging.getLogger(__name__),
         "dist": SimpleNamespace(is_initialized=lambda: True, get_world_size=lambda: 2,
                                 all_reduce=reduce, ReduceOp=SimpleNamespace(MAX="max")),
@@ -44,4 +46,4 @@ def test_file_prepared_validation_shares_fetch_collective(valid, remote_error):
             operation(iter([batch]), rank=0, device="cpu", require_prepared=True, timings=timings)
     assert timings == {"local_batch_wait_time": 0.2, "rank_ready_sync_time": 0.3}
     assert len(calls) == 1
-    assert calls[0].tolist() == [int(not valid), 0]
+    assert calls[0].tolist()[:3] == [int(not valid), 0, int(valid)]

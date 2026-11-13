@@ -50,6 +50,17 @@ def test_launcher_resolves_python_friendly_gpu_count_override() -> None:
     assert command[-3:] == ["-m", "verl_speco.draft_train", "foo=bar"]
 
 
+def test_launcher_normalizes_prefixed_aliases_with_last_override_winning():
+    overrides = ["speco.draft_training.nproc_per_node=1", "++speco.draft_training.num_gpus_per_node=2",
+                 "+speco.draft_training.nnodes=2"]
+    config = resolve_launch_config(overrides)
+    normalized = normalize_training_args(overrides, config)
+    assert config.nproc_per_node == "2" and config.nnodes == "2"
+    assert normalized.count("speco.draft_training.nproc_per_node=2") == 1
+    assert normalized.count("speco.draft_training.nnodes=2") == 1
+    assert not any(item.startswith(("+speco.draft_training", "++speco.draft_training")) for item in normalized)
+
+
 def test_launcher_normalizes_gpu_count_alias_for_hydra() -> None:
     overrides = [
         "speco.draft_training.num_gpus_per_node=8",
@@ -154,3 +165,18 @@ def test_launcher_tq_validation_requires_canonical_connection_overrides(
                 *overrides,
             ]
         )
+
+
+def test_direct_launcher_resolves_requested_rollback_before_torchrun(monkeypatch, capsys):
+    from verl_speco import draft_train_launcher, standalone_tq_training_launcher
+
+    observed = []
+    def resolve(args, *, require_input):
+        observed.append(require_input)
+        return [*args, "actor_rollout_ref.rollout.drafter.model_path=/checkpoint/draft_step_2"]
+    monkeypatch.setattr(standalone_tq_training_launcher, "_resolve_checkpoint_rollback", resolve)
+    result = draft_train_launcher.main([
+        "--dry-run", "actor_rollout_ref.rollout.drafter.training.checkpoint_auto_rollback=true",
+    ])
+    assert result == 0 and observed == [False]
+    assert "draft_step_2" in capsys.readouterr().out

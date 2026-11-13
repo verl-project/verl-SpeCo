@@ -133,7 +133,10 @@ def _create_dflash_mask_mod(
         is_draft = kv_idx >= ctx_len
         kv_block_id = (kv_idx - ctx_len) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
-        return (mask_context | mask_draft) & block_keep_mask[b, q_block_id]
+        keep = block_keep_mask[b, q_block_id]
+        # Match the dense path: an unused query sees only its own draft key.
+        # Some attention kernels produce NaN for completely masked rows.
+        return ((mask_context | mask_draft) & keep) | (~keep & (kv_idx == ctx_len + q_idx))
 
     dflash_mask_mod.__name__ = (
         f"dflash_mask_A{anchor_positions.shape[1]}_B{block_size}_C{ctx_len}"
@@ -798,7 +801,9 @@ class DFlashTrainingModel(nn.Module):
         finite_loss = torch.zeros(0, dtype=torch.bool, device=device)
         active_loss_weights = active_weights
         if active_targets.numel() == 0:
-            loss = flat_weights.sum() * 0.0
+            # Keep an autograd path for ranks with no supervised anchors. Other
+            # ranks may still have work and require this rank in gradient sync.
+            loss = (torch.nan_to_num(flat_hidden[:1], nan=0.0, posinf=0.0, neginf=0.0) * 0.0).sum()
         else:
             if self.loss_mode in {"restricted_ce", "sampled_ce"}:
                 vocab_size = int(lm_head_weight.shape[0])

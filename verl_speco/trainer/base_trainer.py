@@ -717,7 +717,7 @@ class DrafterBaseTrainer:
         self._training_timing_steps = 0
         self._training_metric_sums: dict[str, float] = {}
         self._training_metric_steps = 0
-        self._current_accumulation_valid_tokens = 0
+        self._current_accumulation_valid_tokens = 0.0
         self._current_accumulation_vloss_sum = 0.0
         self._current_accumulation_ploss_sum = 0.0
         self._last_optimizer_valid_tokens = 0
@@ -1462,17 +1462,15 @@ class DrafterBaseTrainer:
         self._last_step_metrics = self._summarize_step_metrics(keys, reduced)
         return self._last_step_metrics
 
-    def _reduce_standalone_step_statistics(self, loss_dict: dict[str, Any]):
-        loss_values = torch.stack(
-            [
-                loss_dict[name].detach()
-                for name in (
-                    "total_local_vloss",
-                    "total_local_ploss",
-                    "local_num_tokens",
-                )
-            ]
-        )
+    def _reduce_standalone_step_statistics(self, loss_dict: dict[str, Any], *, check_grad_graph: bool = False):
+        loss_values = [loss_dict[name].detach() for name in (
+            "total_local_vloss", "total_local_ploss", "local_num_tokens",
+        )]
+        if check_grad_graph:
+            local_graph = (loss_dict["v_weight"] * loss_dict["total_local_vloss"]
+                           + loss_dict["p_weight"] * loss_dict["total_local_ploss"])
+            loss_values.append(loss_values[2].new_tensor(float(not local_graph.requires_grad)))
+        loss_values = torch.stack(loss_values)
         keys, diagnostics = self._pack_training_diagnostics(loss_dict)
         if (
             diagnostics is None
@@ -1481,14 +1479,17 @@ class DrafterBaseTrainer:
         ):
             # Preserve the previous precision and behavior for uncommon dtypes.
             self._record_dflash_training_metrics(loss_dict)
-            return self._reduce_loss_metrics(*loss_values.unbind())
-        reduced, world_size = self._reduce_loss_statistics(
-            torch.cat([loss_values, diagnostics])
-        )
-        self._training_metric_steps += 1
-        diagnostic_values = reduced[3:].cpu().tolist()
-        self._accumulate_training_diagnostics(keys, diagnostic_values)
-        self._last_step_metrics = self._summarize_step_metrics(keys, diagnostic_values)
+            if not check_grad_graph:
+                return self._reduce_loss_metrics(*loss_values.unbind())
+            reduced, world_size = self._reduce_loss_statistics(loss_values)
+        else:
+            reduced, world_size = self._reduce_loss_statistics(torch.cat([loss_values, diagnostics]))
+            self._training_metric_steps += 1
+            diagnostic_values = reduced[len(loss_values):].cpu().tolist()
+            self._accumulate_training_diagnostics(keys, diagnostic_values)
+            self._last_step_metrics = self._summarize_step_metrics(keys, diagnostic_values)
+        if check_grad_graph:
+            self._standalone_missing_grad_graph = bool(reduced[3].item())
         return reduced[0], reduced[1], reduced[2], world_size
 
     def _get_sp_group(self):
@@ -2349,7 +2350,7 @@ class DrafterBaseTrainer:
         try:
             import torch.distributed.checkpoint as dcp
 
-            dcp.save(
+            saved_optimizer_metadata = dcp.save(
                 {
                     "optimizer": _DrafterOptimizerState(
                         self.model,
@@ -2369,6 +2370,9 @@ class DrafterBaseTrainer:
         finalize_error = None
         if is_leader:
             try:
+                if getattr(self, "_standalone_retention_keep_last", 0):
+                    from verl_speco.trainer.checkpoint import write_standalone_optimizer_layout
+                    write_standalone_optimizer_layout(temporary_path, saved_optimizer_metadata)
                 self._atomic_torch_save(
                     {
                         "version": 1,
@@ -2683,11 +2687,12 @@ class DrafterBaseTrainer:
         previous_error = None
         if self._is_checkpoint_leader() and pending_full_checkpoint is not None:
             try:
-                pending_full_checkpoint.result()
+                pending_full_checkpoint.result(timeout=getattr(self, "_standalone_checkpoint_timeout", None))
             except Exception as exc:  # noqa: BLE001
                 previous_error = exc
             finally:
-                self._pending_full_checkpoint_future = None
+                if pending_full_checkpoint.done():
+                    self._pending_full_checkpoint_future = None
         self._sync_checkpoint_phase_error(previous_error, "previous save wait")
 
         if self.model is None:
@@ -2735,9 +2740,10 @@ class DrafterBaseTrainer:
             )
             if wait and future is not None:
                 try:
-                    write_result = future.result()
+                    write_result = future.result(timeout=getattr(self, "_standalone_checkpoint_timeout", None))
                 finally:
-                    self._pending_full_checkpoint_future = None
+                    if future.done():
+                        self._pending_full_checkpoint_future = None
                 if isinstance(write_result, dict):
                     export_elapsed = float(
                         write_result.get("export_elapsed", 0.0) or 0.0
@@ -5008,6 +5014,32 @@ class DrafterBaseTrainer:
             )
             return None
 
+        if getattr(self, "_standalone_preserve_packed_samples", False):
+            from verl_speco.trainer.standalone_batch_prepare import _pack
+
+            if not (len(input_id_chunks) == len(loss_mask_chunks)
+                    == len(hidden_state_chunks) == len(position_id_chunks)):
+                raise ValueError("Standalone packing requires aligned per-sample fields")
+            chunks = []
+            for index, (ids, mask, hidden, position) in enumerate(zip(
+                input_id_chunks, loss_mask_chunks, hidden_state_chunks, position_id_chunks,
+                strict=True,
+            )):
+                chunk = {"input_ids": ids, "loss_mask": mask,
+                         "hidden_states": hidden, "position_ids": position}
+                if target_last_hidden_state_chunks:
+                    chunk["target_last_hidden_states"] = target_last_hidden_state_chunks[index]
+                if has_next_token_labels:
+                    chunk["next_token_ids"] = cast(list[torch.Tensor], next_token_id_chunks)[index]
+                    chunk["next_token_loss_mask"] = cast(list[torch.Tensor], next_token_loss_mask_chunks)[index]
+                chunks.append(chunk)
+            batch = _pack(chunks, block_size, max_packed_len,
+                          cast_hidden_bfloat=False, flatten_hidden=False)
+            return (batch["input_ids"], batch["loss_mask"], batch["hidden_states"],
+                    batch["position_ids"], batch["attention_mask"], batch["document_ids"],
+                    batch.get("target_last_hidden_states"), batch.get("next_token_ids"),
+                    batch.get("next_token_loss_mask"), len(chunks))
+
         ids_out: list[torch.Tensor] = []
         mask_out: list[torch.Tensor] = []
         hidden_out: list[torch.Tensor] = []
@@ -6970,15 +7002,26 @@ class DrafterBaseTrainer:
             self._last_prepared_training_items = previous_prepared_items
 
     async def training_step_from_batch(
-        self, batch: dict[str, torch.Tensor], step: int, *, raise_on_error: bool = False
+        self, batch: dict[str, torch.Tensor], step: int, *, raise_on_error: bool = False,
+        accumulation_steps: int = 1, accumulation_index: int = 0,
     ) -> bool:
-        """Execute one optimizer step from a pre-built standalone batch."""
+        """Execute a standalone batch, optionally as part of one optimizer step."""
         self.last_standalone_training_error = None
         try:
+            if (type(accumulation_steps) is not int or accumulation_steps < 1
+                    or type(accumulation_index) is not int or not 0 <= accumulation_index < accumulation_steps):
+                raise ValueError("Invalid standalone accumulation index or count")
             if batch.get("hidden_source") == "standalone_vllm_reference":
-                batch = self._stage_standalone_cpu_batch(batch)
+                if batch.get("_speco_reference_staged") is True:
+                    batch = dict(batch)
+                    del batch["_speco_reference_staged"]
+                else:
+                    batch = self._stage_standalone_cpu_batch(batch)
             with torch.enable_grad():
-                return await self._training_step_on_batch(batch, step)
+                if accumulation_steps == 1:
+                    return await self._training_step_on_batch(batch, step)
+                return await self._training_step_on_batch(batch, step, accumulation_steps=accumulation_steps,
+                                                          accumulation_index=accumulation_index)
         except Exception as e:  # noqa: BLE001
             self.last_standalone_training_error = e
             logger.exception(f"Standalone training step {step} failed with error: {e}")
@@ -7198,7 +7241,8 @@ class DrafterBaseTrainer:
         return step_ok
 
     def _reduce_loss_metrics(
-        self, l_v: torch.Tensor, l_p: torch.Tensor, l_n: torch.Tensor
+        self, l_v: torch.Tensor, l_p: torch.Tensor, l_n: torch.Tensor, *,
+        check_grad_graph: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """All-reduce detached loss/token sums across the SP/DP groups.
 
@@ -7207,8 +7251,12 @@ class DrafterBaseTrainer:
         local loss by that world size to cancel FSDP's gradient averaging over
         the same ranks.
         """
-        metrics = torch.stack([l_v.detach(), l_p.detach(), l_n.detach()])
-        metrics, world_size = self._reduce_loss_statistics(metrics)
+        values = [l_v.detach(), l_p.detach(), l_n.detach()]
+        if check_grad_graph:
+            values.append(l_n.detach().new_tensor(float(not (l_v.requires_grad or l_p.requires_grad))))
+        metrics, world_size = self._reduce_loss_statistics(torch.stack(values))
+        if check_grad_graph:
+            self._standalone_missing_grad_graph = bool(metrics[3].item())
         return metrics[0], metrics[1], metrics[2], world_size
 
     def _reduce_loss_statistics(
@@ -7236,9 +7284,8 @@ class DrafterBaseTrainer:
         return metrics, reduce_world_size
 
     def _clip_training_grad_norm(self):
-        if getattr(self, "_bubble_time_enabled", False) and isinstance(
-            self.model, FSDP
-        ):
+        if (getattr(self, "_bubble_time_enabled", False)
+                or getattr(self, "_standalone_validate_grad_graph", False)) and isinstance(self.model, FSDP):
             # Original-parameter FSDP1 gradients are local shards. All writer
             # ranks must clip against the same full-model norm, not each shard.
             return self.model.clip_grad_norm_(max_norm=1.0)
@@ -7255,9 +7302,10 @@ class DrafterBaseTrainer:
         self.model.train()
         accumulation_steps = max(int(accumulation_steps), 1)
         accumulation_index = max(int(accumulation_index), 0)
+        allow_zero_accumulation = batch.get("_speco_allow_zero_accumulation") is True
         if accumulation_index == 0:
             self.optimizer.zero_grad(set_to_none=True)
-            self._current_accumulation_valid_tokens = 0
+            self._current_accumulation_valid_tokens = 0.0
             self._current_accumulation_vloss_sum = 0.0
             self._current_accumulation_ploss_sum = 0.0
         sample_count = int(batch.get("_speco_sample_count", 0) or 0)
@@ -7293,22 +7341,33 @@ class DrafterBaseTrainer:
 
         # Reduce scalar loss statistics once across SP/DP groups.
         reduce_ts = training_stage_clock(self)
+        graph_options = ({"check_grad_graph": True}
+                         if getattr(self, "_standalone_validate_grad_graph", False) else {})
         if getattr(self, "combine_standalone_metrics", False):
-            statistics = self._reduce_standalone_step_statistics(loss_dict)
+            statistics = self._reduce_standalone_step_statistics(loss_dict, **graph_options)
             step_accuracy = getattr(self, "_last_step_metrics", None) or {}
         else:
-            statistics = self._reduce_loss_metrics(l_v, l_p, l_n)
+            statistics = self._reduce_loss_metrics(l_v, l_p, l_n, **graph_options)
         global_vloss, global_ploss, global_tokens, reduce_world_size = statistics
         self.record_training_timing(
             "timing_s/drafter_reduce_loss", training_stage_clock(self) - reduce_ts
         )
 
-        if float(global_tokens.detach().float().item()) <= 0:
+        if (getattr(self, "_standalone_validate_grad_graph", False)
+                and getattr(self, "_standalone_missing_grad_graph", False)
+                and (float(global_tokens.detach().float().item()) > 0
+                     or (accumulation_steps > 1 and allow_zero_accumulation))):
+            raise RuntimeError(
+                "A standalone rank has no loss gradient graph while the distributed "
+                "batch requires backward; refusing distributed backward"
+            )
+        if (float(global_tokens.detach().float().item()) <= 0
+                and (accumulation_steps == 1 or not allow_zero_accumulation)):
             logger.debug(
                 f"Step {self.training_steps + 1}: no finite drafter target tokens, skipping optimizer step"
             )
             return False
-        self._current_accumulation_valid_tokens += int(
+        self._current_accumulation_valid_tokens += float(
             global_tokens.detach().float().item()
         )
         self._current_accumulation_vloss_sum += float(
@@ -7351,7 +7410,7 @@ class DrafterBaseTrainer:
         # outside the autograd graph, so each rank's backward carries only its own
         # contribution, and FSDP then averages gradients across the same
         # `reduce_world_size` ranks. Scaling by `reduce_world_size` cancels that
-        # mean. Scaling by `reduce_world_size` cancels that mean. A single
+        # mean. A single
         # micro-batch divides here; accumulated loss-sum gradients divide once
         # by the combined valid-token count immediately before optimizer.step.
         local_loss_sum = loss_dict["v_weight"] * l_v + loss_dict["p_weight"] * l_p
@@ -7369,6 +7428,10 @@ class DrafterBaseTrainer:
             return True
 
         optimizer_ts = training_stage_clock(self)
+        if self._current_accumulation_valid_tokens <= 0:
+            self.optimizer.zero_grad(set_to_none=True)
+            logger.debug("No finite drafter target tokens in the accumulated batch; skipping optimizer step")
+            return False
         if accumulation_steps > 1:
             accumulation_denom = float(max(self._current_accumulation_valid_tokens, 1))
             for parameter in self.model.parameters():

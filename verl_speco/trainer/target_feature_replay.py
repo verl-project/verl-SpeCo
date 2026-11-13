@@ -404,6 +404,8 @@ def feature_from_vllm_payload(
     normalize_final_hidden: bool = True,
     split_hidden_states: bool = False,
     validate_finite: bool = True,
+    hidden_row_offset: int | None = None,
+    hidden_row_positions: list[int] | None = None,
 ) -> DraftFeatureSample:
     """Convert vLLM output; standalone CPU prefetch can retain raw final residuals.
 
@@ -476,7 +478,20 @@ def feature_from_vllm_payload(
     }:
         raise ValueError(f"Unsupported vLLM hidden_states_layout {hidden_layout!r}")
 
-    hidden_position_offset = max(len(expected_prompt_ids) - int(hidden.size(0)), 0)
+    if hidden_row_positions is not None and hidden_row_offset is not None:
+        raise ValueError("Specify either hidden row offset or explicit row positions")
+    if hidden_row_offset is not None and (type(hidden_row_offset) is not int or hidden_row_offset < 0):
+        raise ValueError("hidden_row_offset must be a non-negative integer")
+    if hidden_row_positions is not None:
+        if (not isinstance(hidden_row_positions, list)
+                or any(type(position) is not int or position < 0 for position in hidden_row_positions)
+                or hidden_row_positions != feature_positions.tolist()
+                or len(hidden_row_positions) != int(hidden.size(0))):
+            raise HiddenStateAlignmentError("Explicit hidden rows differ from the requested feature positions")
+        hidden_position_offset = min(hidden_row_positions)
+    else:
+        hidden_position_offset = (max(len(expected_prompt_ids) - int(hidden.size(0)), 0)
+                                  if hidden_row_offset is None else hidden_row_offset)
     include_final = hidden_layout in {
         "eagle3_aux_plus_last",
         "dflash_aux_plus_last",
@@ -506,7 +521,8 @@ def feature_from_vllm_payload(
             "Start vLLM with target layer ids plus the final layer when the "
             "training layout needs last hidden states."
         )
-    relative_positions = feature_positions - hidden_position_offset
+    relative_positions = (torch.arange(feature_positions.numel(), dtype=torch.long)
+                          if hidden_row_positions is not None else feature_positions - hidden_position_offset)
     keep_mask = (relative_positions >= 0) & (relative_positions < int(hidden.size(0)))
     filtered = not bool(keep_mask.all().item())
     if filtered:
@@ -805,6 +821,7 @@ class TargetFeatureReplayer:
         self._client_lock = threading.Lock()
         self._endpoint_lock = threading.Lock()
         self._metrics_lock = threading.Lock()
+        self._reference_metrics = {}
         self.cache_hits = 0
         self.cache_misses = 0
         self.materialized_samples = 0
@@ -1499,8 +1516,30 @@ class TargetFeatureReplayer:
     def _load_vllm_hidden_states(
         self, reference: str | Mapping[str, Any]
     ) -> dict[str, Any]:
-        payload, _ = self.vllm_hidden_states_store.load(reference)
+        started = time.monotonic()
+        backend = getattr(self.vllm_hidden_states_store, "backend", "unknown")
+        try:
+            payload, _ = self.vllm_hidden_states_store.load(reference)
+        except BaseException:
+            self._record_reference_metrics(backend, {"load_failures_total": 1,
+                                                   "failed_load_seconds_total": time.monotonic() - started})
+            raise
+        self._record_reference_metrics(backend, {
+            "loads_total": 1, "load_seconds_total": time.monotonic() - started,
+            "tensor_bytes_total": sum(value.numel() * value.element_size() for value in payload.values()
+                                      if isinstance(value, torch.Tensor)),
+        })
         return payload
+
+    def _record_reference_metrics(self, backend, values):
+        if not hasattr(self, "_metrics_lock"):
+            self._metrics_lock = threading.Lock()
+        with self._metrics_lock:
+            if not hasattr(self, "_reference_metrics"):
+                self._reference_metrics = {}
+            for key, value in values.items():
+                name = f"replay/reference_{backend}_{key}"
+                self._reference_metrics[name] = self._reference_metrics.get(name, 0.0) + value
 
     def _feature_from_vllm_payload(
         self,
@@ -1574,6 +1613,12 @@ class TargetFeatureReplayer:
             "replay/materialized_samples_total": float(self.materialized_samples),
             "replay/target_forward_time_total": float(self.target_forward_seconds),
         }
+        if hasattr(self, "_metrics_lock"):
+            with self._metrics_lock:
+                metrics.update(getattr(self, "_reference_metrics", {}))
+        store_metrics = getattr(getattr(self, "vllm_hidden_states_store", None), "metrics", None)
+        if callable(store_metrics):
+            metrics.update(store_metrics())
         if self.backend.startswith("vllm_"):
             metrics["replay/vllm_requests_total"] = float(self.vllm_requests)
             metrics["replay/vllm_request_time_total"] = float(self.vllm_request_seconds)
