@@ -1578,8 +1578,21 @@ def _rewrite_standalone_block_runtime_config(
     if runtime_config is None:
         runtime_config = deepcopy(training_config)
         logger.warning(
-            "Source drafter config is unavailable; standalone checkpoint keeps SpeCo training config as runtime config"
+            "Source drafter config is unavailable; deriving runtime config from SpeCo training config"
         )
+
+    if (
+        source_runtime_config is None
+        and backend_type == "dspark"
+        and runtime_config.get("model_type") == "dspark"
+        and runtime_config.get("architectures")
+        in (["DSparkDraftModel"], ["Qwen3DSparkModel"])
+        and runtime_config.get("speculators_config") is None
+    ):
+        # save_pretrained records SpeCo's training class name. vLLM uses that
+        # name for DeepSeek-V4, so export the identity of this draft backbone.
+        runtime_config["model_type"] = "qwen3"
+        runtime_config["architectures"] = ["Qwen3DSparkModel"]
 
     runtime_config["speco_training_model_type"] = backend_type
     common_alias_keys = ("target_layer_ids", "mask_token_id", "num_context_layers")
