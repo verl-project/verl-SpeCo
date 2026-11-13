@@ -36,6 +36,7 @@ def test_factory_lists_every_supported_algorithm() -> None:
         "DFLASH",
         "DFLASH2",
         "DSPARK",
+        "DSV4_DSPARK",
         "DOMINO",
         "PEAGLE",
     }
@@ -68,6 +69,11 @@ def test_factory_rejects_unknown_algorithm_before_importing_a_backend() -> None:
         ("DSPARK", {}, "dflash_aux_plus_last"),
         ("DSPARK", {"dspark_l1_loss_alpha": 0.0}, "dflash_aux"),
         ("DSPARK", {"dspark_l1_loss_alpha": None}, "dflash_aux"),
+        # DSV4 DSpark mirrors the DSpark layout but reads its own dsv4_dspark_*
+        # loss coefficients.
+        ("DSV4_DSPARK", {}, "dflash_aux"),
+        ("DSV4_DSPARK", {"dsv4_dspark_tv_loss_alpha": 1.8}, "dflash_aux_plus_last"),
+        ("DSV4_DSPARK", {"dsv4_dspark_l1_loss_alpha": 0.0}, "dflash_aux"),
     ],
 )
 def test_hidden_states_layout_per_algorithm(algorithm, training_cfg, expected) -> None:

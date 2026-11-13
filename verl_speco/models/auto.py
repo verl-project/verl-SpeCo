@@ -36,6 +36,10 @@ _DSPARK_ARCHITECTURE_ALIASES = {
     "Qwen3DSparkModel",
 }
 
+_DSV4_DSPARK_ARCHITECTURE_ALIASES = {
+    "DSV4DSparkDraftModel",
+}
+
 _DOMINO_ARCHITECTURE_ALIASES = {
     "DominoDraftModel",
     "Qwen3DominoModel",
@@ -236,6 +240,7 @@ class AutoDraftModelConfig:
         if (
             architecture not in cls._config_mapping
             and architecture not in _DSPARK_ARCHITECTURE_ALIASES
+            and architecture not in _DSV4_DSPARK_ARCHITECTURE_ALIASES
             and architecture not in _DOMINO_ARCHITECTURE_ALIASES
             and architecture not in _DFLASH2_ARCHITECTURE_ALIASES
         ):
@@ -249,6 +254,10 @@ class AutoDraftModelConfig:
             from .dspark import DSparkConfig
 
             return DSparkConfig.from_dspark_dict(config)
+        elif architecture in _DSV4_DSPARK_ARCHITECTURE_ALIASES:
+            from .dsv4_dspark import DSV4DSparkConfig
+
+            return DSV4DSparkConfig.from_dsv4_dspark_dict(config)
         elif architecture in _DOMINO_ARCHITECTURE_ALIASES:
             from .domino import DominoConfig
 
