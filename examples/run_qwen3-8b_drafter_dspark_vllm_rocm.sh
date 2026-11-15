@@ -16,6 +16,8 @@ ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
 # Multi-node: start Ray on every node first (`ray start --head` / `ray start --address`),
 # then run this script on the head node with RAY_ADDRESS=<head-ip>:<port> and
 # SPECO_NNODES=<number of nodes>. Each node contributes ngpus GPUs.
+# On Ray 2.60, run `ray start` on each node with HIP_VISIBLE_DEVICES set to its GPUs and
+# CUDA_VISIBLE_DEVICES unset; see Multi-node in docs/amd/get_started.md.
 nnodes=${SPECO_NNODES:-1}
 
 MODEL_PATH=${MODEL_PATH:-/path/to/Qwen3-8B}

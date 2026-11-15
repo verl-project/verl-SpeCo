@@ -1,6 +1,6 @@
 # Getting Started on AMD GPUs (ROCm)
 
-Last updated: 11/11/2026
+Last updated: 11/15/2026
 
 This guide takes you from a bare AMD GPU node to a verified verl-SpeCo run:
 GRPO on Qwen3-8B with a DFlash or DSpark drafter co-trained during rollout. The
@@ -11,7 +11,7 @@ What is validated today:
 
 | Item | Validated |
 | --- | --- |
-| GPU | 2 × AMD Instinct MI355X (gfx950, 288 GB) per node; 1 node, and 2 nodes over TCP (previous image, see [Multi-node](#multi-node)) |
+| GPU | 2 × AMD Instinct MI355X (gfx950, 288 GB) per node; 1 node, and 2 nodes over TCP (see [Multi-node](#multi-node)) |
 | Image | `verl-speco:rocm`, built from [`docker/rocm/Dockerfile.rocm`](../../docker/rocm/Dockerfile.rocm) (verl's ROCm 7.14 Dockerfile on `rocm/primus`): SGLang 0.5.12 and vLLM 0.26.0 in one image |
 | Drafter | DFlash (`z-lab/Qwen3-8B-DFlash-b16`) on SGLang and vLLM; DSpark (`deepseek-ai/dspark_qwen3_8b_block7`) on vLLM |
 | Actor | FSDP2 with param/optimizer offload, rollout TP=2 |
@@ -150,7 +150,9 @@ Notes:
   `-v ~/.cache/huggingface/hub/models--z-lab--Qwen3-8B-DFlash-b16:/models/hf-dflash:ro`,
   then `DRAFTER_PATH=/models/hf-dflash/snapshots/<rev>`.
 - Do **not** pass `-e HIP_VISIBLE_DEVICES=...`. See
-  [GPU selection](#gpu-selection-read-this-once).
+  [GPU selection](#gpu-selection-read-this-once). Multi-node is the one
+  exception: there the mask is set in the shell that runs `ray start` (see
+  [Multi-node](#multi-node)).
 
 ## 4. Check the environment
 
@@ -286,21 +288,27 @@ bash examples/run_qwen3-8b_drafter_dflash_vllm_rocm.sh \
 
 ### Multi-node
 
-Each node contributes the 2 GPUs in its `CUDA_VISIBLE_DEVICES`; rollout stays
-TP=2, so 2 nodes give 2 rollout replicas and a 4-GPU FSDP actor. Start one
-container per node with the same image, models and data at the same paths, and
-`--network host` (Ray and RCCL need the node addresses). Then:
+Each node contributes 2 GPUs; rollout stays TP=2, so 2 nodes give 2 rollout
+replicas and a 4-GPU FSDP actor. Start one container per node with the same
+image, models and data at the same paths, and `--network host` (Ray and RCCL
+need the node addresses). Then:
 
 ```bash
 # Every node: pin RCCL/Gloo to the interface that connects the nodes.
 export NCCL_SOCKET_IFNAME=<iface> GLOO_SOCKET_IFNAME=<iface>
+# Every node, before `ray start`: give Ray the node's GPUs as a HIP mask and
+# no CUDA mask (see below). Use the node's own 2 GPUs, e.g. 0,1.
+export HIP_VISIBLE_DEVICES=0,1
+unset CUDA_VISIBLE_DEVICES
 
 # Head node
 ray start --head --port=6379 --num-gpus=2
 # Each other node
 ray start --address=<head-ip>:6379 --num-gpus=2
 
-# Head node, after `ray status` lists every node
+# Head node, after `ray status` lists every node. The driver uses no GPU; give
+# it the same mask as CUDA_VISIBLE_DEVICES (a different one is rejected).
+CUDA_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES \
 RAY_ADDRESS=<head-ip>:6379 SPECO_NNODES=2 \
 MODEL_PATH=... DRAFTER_PATH=... TRAIN_FILE=... TEST_FILE=... \
 SPECO_TOTAL_TRAINING_STEPS=8 \
@@ -308,21 +316,29 @@ SPECO_TOTAL_TRAINING_STEPS=8 \
 ```
 
 With `SPECO_NNODES` above 1, the script sets `trainer.nnodes` and lets Ray use
-the existing cluster's CPUs instead of starting a local one. The reference
-2-node runs (8 steps, both engines) used TCP between the nodes
-(`NCCL_IB_DISABLE=1`), so a step took about 130–140 s instead of about
-26–29 s on one node; with RDMA it is much faster. Each step collected 32
-samples and trained and published the drafter once.
+the existing cluster's CPUs instead of starting a local one.
 
-These 2-node runs were made with the previous image (vLLM 0.22.1rc1, Ray
-2.56.1). Multi-node has not been re-run on the current image (Ray 2.60) yet.
-A known risk to check in that re-run: Ray 2.60 keys AMD GPUs on
-`HIP_VISIBLE_DEVICES`, and verl-SpeCo moves only the driver's mask (see
-[GPU selection](#gpu-selection-read-this-once)), not the masks of the
-`ray start` processes on each node. If the GPU workers abort with a
-`HIP_VISIBLE_DEVICES` / `CUDA_VISIBLE_DEVICES` conflict, export
-`HIP_VISIBLE_DEVICES` and unset `CUDA_VISIBLE_DEVICES` on every node before
-`ray start`.
+**Why the HIP mask before `ray start`.** Ray 2.60 (in the image) keys AMD GPUs
+on `HIP_VISIBLE_DEVICES` and sets only that variable for each GPU worker. The
+workers inherit the rest of their environment from the `ray start` process on
+their node, not from the driver, so the driver-side fix described in
+[GPU selection](#gpu-selection-read-this-once) does not reach them. If
+`CUDA_VISIBLE_DEVICES` is set when `ray start` runs (for example `0,1` via
+`docker run -e`), a worker gets `HIP_VISIBLE_DEVICES=1` next to
+`CUDA_VISIBLE_DEVICES=0,1`, and the HIP runtime aborts it at `import torch`
+with `Conflicting visibility of agent-N between HIP_VISIBLE_DEVICES and
+CUDA_VISIBLE_DEVICES`, on every node including the head. A container that maps
+only its node's 2 GPUs can also leave both variables unset. With Ray 2.56 or
+older (previous image) the CUDA mask worked, and these two lines are harmless.
+
+Reference runs on the current image (Ray 2.60, 8 steps, the scripts' default
+settings): two Ray nodes × 2 MI355X as two containers on one host, RCCL over
+TCP on the Docker bridge (`NCCL_IB_DISABLE=1`), with the HIP mask set as above.
+SGLang and vLLM each finished 8/8 at about 51 s and 47 s per step (steps 2–8);
+each step collected 32 samples and trained and published the drafter once to
+both replicas. Without the two mask lines, both engines' GPU workers abort as
+described. Earlier runs on two separate hosts with the previous image took about
+130–140 s per step over TCP; with RDMA it is much faster.
 
 ### ROCm-specific settings in the scripts
 
@@ -378,6 +394,11 @@ verl-SpeCo normalizes the masks for you in the driver, before `ray.init`
 Inside the workers, verl folds each worker's HIP id back into
 `CUDA_VISIBLE_DEVICES`, and the SGLang server actor moves its HIP mask back to
 `CUDA_VISIBLE_DEVICES` before it starts its TP processes.
+
+This covers the single-node case, where the driver starts Ray. On a
+multi-node cluster started with `ray start`, the workers inherit each node's
+`ray start` environment instead, so set the mask there as shown in
+[Multi-node](#multi-node).
 
 On some hosts, the CUDA/HIP device order differs from the order `amd-smi` and
 `rocm-smi` print. Before you pick GPUs by their `rocm-smi` index, check which
@@ -501,7 +522,7 @@ scripts above, you should hit none of them.
 | Run completes, but `drafter/trained` and `drafter/published` are `0.0` every step, with `DFlash input/hidden/mask row mismatch: input_rows=301, hidden_rows=300, mask_rows=301` | Online samples carry one input row more than hidden rows (the trailing label token), which verl-SpeCo builds between #73 and #109 rejected | Fixed upstream in #109 (block drafters carry `label_ids`/`label_mask` separately). Update verl-SpeCo. |
 | SGLang fails on `flashinfer` | verl hardcodes `flashinfer` for SGLang ≥ 0.5.12 | Keep `engine_kwargs.sglang.attention_backend` set to `aiter` or `triton`, as the script does. |
 | SGLang with `attention_backend=aiter` fails in aiter's JIT build (empty `--offload-arch`, then `constexpr variable 'warp_size' must be initialized`) | aiter reads the GPU arch from `/opt/rocm/llvm/bin/amdgpu-arch`, and images built from an older `Dockerfile.rocm` have no `/opt/rocm` (ROCm lives under `$ROCM_PATH`) | Rebuild the image, or run `ln -sfn "$ROCM_PATH" /opt/rocm` in the container. |
-| `Conflicting visibility of agent-N between HIP_VISIBLE_DEVICES and CUDA_VISIBLE_DEVICES`, then `Fatal Python error: Aborted` in every GPU worker | Ray sets `HIP_VISIBLE_DEVICES` per worker while the worker still inherits the full `CUDA_VISIBLE_DEVICES` mask | Use `CUDA_VISIBLE_DEVICES` only, and a verl-SpeCo version whose `rocm_env.py` has `align_visible_devices_with_ray` (the driver log shows `Ray keys AMD GPUs on HIP_VISIBLE_DEVICES; moved ...`). |
+| `Conflicting visibility of agent-N between HIP_VISIBLE_DEVICES and CUDA_VISIBLE_DEVICES`, then `Fatal Python error: Aborted` in every GPU worker | Ray sets `HIP_VISIBLE_DEVICES` per worker while the worker still inherits the full `CUDA_VISIBLE_DEVICES` mask | Use `CUDA_VISIBLE_DEVICES` only, and a verl-SpeCo version whose `rocm_env.py` has `align_visible_devices_with_ray` (the driver log shows `Ray keys AMD GPUs on HIP_VISIBLE_DEVICES; moved ...`). On a multi-node cluster, the workers take their environment from `ray start`, not from the driver: export `HIP_VISIBLE_DEVICES` and unset `CUDA_VISIBLE_DEVICES` on every node before `ray start` (see [Multi-node](#multi-node)). |
 | Ray `ValueError: Inconsistent values found. Please use either HIP_VISIBLE_DEVICES or CUDA_VISIBLE_DEVICES.` | Same as above, inside the SGLang TP subprocess | Same as above. |
 | `AssertionError: Please use the same HIP_VISIBLE_DEVICES or CUDA_VISIBLE_DEVICES, inconsistant values found: 0 and 4,5.` in verl's `_setup_env_cuda_visible_devices` | Ray 2.57 or newer: on AMD it ignores `CUDA_VISIBLE_DEVICES` and gives each worker a `HIP_VISIBLE_DEVICES` index, while the CUDA mask is still set | Same as above: verl-SpeCo moves the mask to `HIP_VISIBLE_DEVICES` before `ray.init`. |
 | `ValueError: could not convert string to float: ''` in `ServerArgs.__post_init__` | SGLang's `rocminfo` memory probe returned empty output | Handled by verl-SpeCo's torch fallback. If it still appears, check that `rocminfo` works in the container. |
@@ -534,7 +555,8 @@ scripts above, you should hit none of them.
 - The configuration is sized for 2 GPUs: FSDP param and optimizer offload are
   on, and custom all-reduce is off. It is a functional smoke, not a performance
   baseline.
-- Rollout TP=2 only, on 1 node, or 2 nodes (2 GPUs each, TCP between nodes)
-  with the previous image (Ray 2.56.1). Multi-node has not been re-run on the
-  current image (Ray 2.60) yet. MI300X (gfx942) is a build target but has not
-  been run.
+- Rollout TP=2 only, on 1 node or 2 nodes (2 GPUs each, TCP between nodes).
+  On the current image (Ray 2.60), the 2-node runs were two containers on one
+  host; on two separate hosts, 2 nodes were run with the previous image (Ray
+  2.56.1). More than 2 nodes and RDMA have not been run. MI300X (gfx942) is a
+  build target but has not been run.
