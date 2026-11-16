@@ -597,3 +597,8 @@ actor_rollout_ref:
 DP 按 SP 组分配完整轨迹；组内协同计算，只由 leader 输出。空 DP 组运行 dummy，防止 FSDP collective 失配。仅归并所需 response 概率、分支 readout 和辅助 hidden，不 all-gather 整个序列×词表 logits。
 
 普通 actor/ref 的 PPO 前向仍使用 upstream unpadding + FlashAttention/Ulysses；联合评分结束后恢复实例方法。SP=1 保留原 dense eager/SDPA 路径、remove_padding=false。SP>1 使用 remove_padding=true；本次 SP=4。动态/adaptive RoPE、LoRA、滑窗/混合模型仍拒绝。当前真实模型长序列/16 die、性能和 checkpoint 恢复不由短测覆盖。
+
+
+### 固定组的执行效率（2026-11-16）
+
+联合old-logprob把完整微批计划一次提交给actor，保持一次engine驻留；各轨迹仍按既定微批依次forward，不增加单个树mask峰值。草稿按实际DP组分配整条轨迹，SP组内共享；组内每个optimizer step都覆盖完整组数据的全局token均值，20步后统一发布。非均匀分配使用零loss dummy保持collective次数，dummy不参与有效token归一化。固定输入仅在本组内有界缓存（64MiB设备上限），训练context和q始终重新前向。耗时指标、原始数据与验收边界见 [性能记录](specopd_performance_optimization.md)。
