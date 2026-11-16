@@ -65,3 +65,6 @@ bash /efs_rl/z00886395/shell/speco-runping/run_qwen3-8b_drafter_dspark_spec_opd_
 如果平台使用“代码目录＋启动文件”模式，代码目录使用 `/efs_rl/z00886395/shell/speco-runping`，启动文件使用对应的 `.sh` 文件名（不加 `bash` 前缀），例如 `run_qwen3-8b_drafter_dspark_draft_opd_v1_with_train.sh`。不要在启动文件中填写 `bash run_….sh`，也不要把目录拼成 `/speco-runping/bash`。
 
 以上修正的是入口填写方式，不能据此确认已提交ModelArts任务配置被修改。尚未重新提交或启动ModelArts训练。自动诊断引用的11月12日AIV事件不是本次20:38入口失败的直接根因证据。
+
+
+2026-11-17 bootstrap OOM修复：SpecOPD NPU/FSDP2启用既有选择性发布，先过滤冻结embedding/共享LM head，再逐项汇总到CPU，避免原先全量state汇总的2.32GiB临时分配。每项汇总后显式释放设备临时tensor；bootstrap恢复/版本校验、完整checkpoint及DraftOPD NPU路由保留。保持脚本gpu_memory_utilization=0.7，不靠降低该参数修复。针对性回归及1GiB余量/2.32GiB冻结embedding的真实HCCL检查已通过；额外完整五步大模型测试按用户加快交付要求提前结束，正式ModelArts配置待重试。

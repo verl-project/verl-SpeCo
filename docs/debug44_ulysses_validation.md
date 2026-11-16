@@ -115,3 +115,17 @@ PERF-06B通过：`perf06-spec-b4-01` 完整10轮退出0，采集轮仅5/10，每
 
 
 PERF-06C完成：核心 `6b0143a`（22,162字节）与性能文档 `8ae25f1`（11,042字节）已推送 `crp0128/specopd` 并快进部署到 `.242` 真实仓库；487个源码/测试/文档文件形成SHA回执，两个V1脚本路径/语法/原SHA、实际import路径均通过。原参考脚本未改，生产训练未启动。最后台账提交随后同步并更新receipt commit。
+
+
+## FIX-07：ModelArts SpecOPD bootstrap OOM
+
+2026-11-17，用户提供053d0686任务日志：启动入口已正确，首次prepare_specopd_bootstrap在FSDP2全量state汇总的NPU all-gather申请2.32GiB、仅剩约2.06GiB时OOM；尚未进入草稿训练。正式rollout显存比例0.7，先前短测0.35。CUDA已有逐参数选择性发布，但NPU未启用。本阶段为NPU SpecOPD启用现有选择性导出，保留DraftOPD路径与完整checkpoint内容，显式释放逐项临时full tensor。先检查数值/路由/冻结参数，再做HCCL及0.7配置短测。
+
+- [x] FIX-07A：选择性导出与原路径数值/发布生命周期等价；冻结参数不汇总；DraftOPD路由保留。
+- [x] FIX-07B：HCCL导出与大冻结embedding受限显存检查；0.7完整大模型短测因用户要求加快交付提前结束，不作为已通过项目。
+- [ ] FIX-07C：推送小提交，同步 .242 代码及说明。
+
+
+FIX-07验收：本地选择性发布3 passed/1 CUDA跳过；远端发布/生命周期等回归86 passed，加上选择性发布独立重跑3 passed/1 CUDA跳过。首轮Gloo环境未设lo导致“File name too long”，设置GLOO_SOCKET_IFNAME=lo后通过，无需修改运行代码。真实HCCL检查覆盖原/新发布值、dtype、参数patterns、checkpoint不丢冻结参数、消费端SGD等价、快照版本与独立性；随后构造151936×4096 FP32冻结embedding（2,489,319,424字节），进程allocator只留1GiB额外余量，确认embedding从不full_tensor，唯一汇总为4×4待发布参数，导出峰值增量512字节，两rank退出0。该小探针验证具体汇总峰值原因，不代表完整生产负载容量保证。
+
+用户要求尽快同步后，停止额外fix07-spec-mem07-01五步测试，不再等待大模型初始化/训练。保留原日志和退出状态，不标记该测试成功。正式0.7/16die/8192负载需要用户重试确认。DraftOPD的NPU发布路由保持原路径；SpecOPD NPU使用已存在的选择性FSDP2发布，未删除bootstrap版本校验。原full checkpoint路径未改；未改显存比例或两份启动脚本参数。
