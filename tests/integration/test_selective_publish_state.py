@@ -34,7 +34,7 @@ from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 from verl_speco.trainer.publish_state import export_fsdp2_publish_state
 
 
-def _trainer_type():
+def _trainer_type(device_type="cuda"):
     # Import actual method bodies without requiring the full verl/Ray stack.
     path = Path(__file__).parents[2] / "verl_speco" / "trainer" / "base_trainer.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -73,7 +73,7 @@ def _trainer_type():
         "FSDP": FSDP,
         "fnmatch": fnmatch,
         "logger": logging.getLogger(__name__),
-        "device_name": "cuda",
+        "device_name": device_type,
         "get_fsdp_full_state_dict": legacy_full_state,
         "load_fsdp_model_to_gpu": lambda model: None,
         "offload_fsdp_model_to_cpu": lambda model: None,
@@ -108,9 +108,12 @@ def _model(mesh):
 
 
 def _distributed_check(rank, rendezvous, backend):
-    device_type = "cuda" if backend == "nccl" else "cpu"
+    device_type = {"nccl": "cuda", "hccl": "npu"}.get(backend, "cpu")
     if device_type == "cuda":
         torch.cuda.set_device(rank)
+    if device_type == "npu":
+        import torch_npu  # noqa: F401
+        torch.npu.set_device(rank)
     dist.init_process_group(
         backend,
         rank=rank,
@@ -121,7 +124,7 @@ def _distributed_check(rank, rendezvous, backend):
     try:
         mesh = dist.device_mesh.init_device_mesh(device_type, (2,))
         model = _model(mesh)
-        trainer = _trainer_type()()
+        trainer = _trainer_type("npu" if backend == "hccl" else "cuda")()
         trainer._record_gpu_transfer = lambda scope, stats: None
         trainer.rank = rank
         trainer.clear_pending_publish_state_dict()
@@ -129,7 +132,8 @@ def _distributed_check(rank, rendezvous, backend):
         trainer.training_device_mesh = mesh
         trainer._frozen_param_names = ["frozen."]
         trainer._is_ddp_wrapped = lambda: False
-        config = {"publish_dtype": "bf16", "gpu_publish_cast_before_copy": True}
+        config = {"publish_dtype": "bf16", "gpu_publish_cast_before_copy": True,
+                  "drafter_opd": {"enable": True, "method": "spec_opd"}}
         trainer.config = SimpleNamespace(
             rollout=SimpleNamespace(drafter=SimpleNamespace(training=config))
         )
@@ -306,3 +310,30 @@ def test_selective_publish_matches_legacy_state_on_two_ranks(tmp_path, backend):
         nprocs=2,
         join=True,
     )
+
+
+@pytest.mark.parametrize("method,selective", [("spec_opd", True), ("draft_opd", False)])
+def test_npu_selective_route_preserves_draft_baseline(monkeypatch, method, selective):
+    from verl_speco.trainer import publish_state
+
+    trainer = _trainer_type("npu")()
+    trainer.model = torch.nn.Linear(4, 2)
+    trainer.training_device_mesh = object()
+    trainer._is_ddp_wrapped = lambda: False
+    trainer.backend = SimpleNamespace(trains_draft_lm_head=False)
+    trainer.config = SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(training={
+        "drafter_opd": {"enable": True, "method": method},
+    })))
+    trainer._record_gpu_transfer = lambda *args: None
+    calls = []
+    def export(*args, **kwargs):
+        calls.append("selective")
+        return {"weight": torch.ones(2, 4)}
+    def legacy():
+        calls.append("legacy")
+        return {"weight": torch.ones(2, 4)}
+    monkeypatch.setattr(publish_state, "export_fsdp2_publish_state", export)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    trainer._get_trainable_state_dict = legacy
+    assert trainer.get_model_state_dict()["weight"].device.type == "cpu"
+    assert calls == ["selective" if selective else "legacy"]

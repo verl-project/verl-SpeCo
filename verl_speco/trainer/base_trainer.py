@@ -7847,8 +7847,10 @@ class DrafterBaseTrainer:
 
         try:
             training_cfg = self.config.rollout.drafter.training
+            from verl_speco.opd_method import spec_opd_enabled
+
             if (
-                device_name == "cuda"
+                (device_name == "cuda" or (device_name == "npu" and spec_opd_enabled(training_cfg)))
                 and not getattr(self, "_bubble_time_enabled", False)
                 and self.training_device_mesh is not None
                 and not isinstance(self.model, FSDP)
