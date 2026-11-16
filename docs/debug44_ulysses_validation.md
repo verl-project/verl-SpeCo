@@ -82,7 +82,7 @@ SpecOPD 两个采集轮 logical/independent 行数分别 2526/5388、2426/5092�
 
 - [x] PERF-05A：小模型数值与输入缓存/单次engine上下文回归。
 - [x] PERF-05B：.44 HCCL oracle及真实10轮优化后短测，记录可比范围。
-- [ ] PERF-05C：推送小于100KB的提交，同步 .242 代码及文档。
+- [x] PERF-05C：推送小于100KB的提交，同步 .242 代码及文档。
 
 
 PERF-05A 通过：本地34 passed/2缺Ray跳过；`.44` 最终相关回归201 passed、真实草稿前后向补充12 passed；HCCL FP32/BF16 oracle退出0。新增20步DP2/SP1与DP2/SP2梯度/参数等价检查覆盖非均匀token和dummy。6个运行模块哈希已与baseline b09287c/本地优化源码分别核对，证据 `perf05-source-provenance.json`。
@@ -94,3 +94,6 @@ PERF-05B 中间结果：优化版第5轮联合评分6.3649秒（同设备新base
 
 
 PERF-05B 最终通过：优化版10步退出0，第二采集轮联合评分6.3450秒、草稿训练RPC18.4836秒、训练loop16.1261秒、整轮79.5878秒。累计optimizer20→40，发布revision1→2，仅5/10轮训练且每次20步；8次联合forward/112个proposal位置、actor SP4、草稿DP2与缓存上限已逐条检查，10轮ACK顺序通过。总step552.07秒，201+12项测试通过。新独立基线只有前7轮完整数据，比较前5轮319.13→280.32秒（减少12.2%）、前7轮415.12→376.36秒（减少9.3%），不计算独立10轮加速率。第5轮联合评分减少79.9%、整轮减少30.6%。不再重复昂贵基线，保留未知SIGKILL及范围说明；详见 [性能记录](specopd_performance_optimization.md)。本次driver为零，NPU仅留其他任务PID1799413。
+
+
+PERF-05C 完成：性能代码 `0caec0b`（31,721字节）及方案/结果 `161464a`（12,241字节）已推送 `crp0128/specopd` 并快进同步 `.242:/efs_rl/z00886395/codes/test_speco/verl-SpeCo-specopd`。部署时工作区干净，486个源码/测试/文档文件形成SHA回执；两份现有V1启动脚本SHA保持不变、bash语法和真实import路径通过，原参考脚本SHA也未改变。最后台账提交同步后receipt commit随之推进。`.242` 正式训练未启动。
