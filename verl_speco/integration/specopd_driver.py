@@ -357,7 +357,7 @@ class SpecOPDDriver:
                 values = [s.get(f"timing_s/specopd_{key}") for s in statuses]
                 if values and all(v is not None for v in values):
                     self.metrics[f"timing_s/specopd_{key}"] = max(values)
-            for key in ("prepared_batches", "input_cache_bytes", "train_dp_size"):
+            for key in ("prepared_batches", "input_cache_bytes", "train_dp_size", "train_microbatch_trajectories"):
                 values = [s.get(f"specopd/{key}") for s in statuses]
                 if values and all(v is not None for v in values):
                     self.metrics[f"specopd/{key}"] = max(values)

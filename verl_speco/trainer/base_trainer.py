@@ -7259,7 +7259,7 @@ class DrafterBaseTrainer:
 
     async def training_specopd_group(self, samples, step, spec, feature_indices):
         """Train one collected group for its configured updates, then publish once."""
-        from verl_speco.backends.specopd_forward import prepare_specopd_training_batches, partition_specopd_samples
+        from verl_speco.backends.specopd_forward import prepare_specopd_training_batches, partition_specopd_samples, plan_specopd_training_groups
 
         selected = [(request, scores) for request, scores in samples if request.branches]
         positions = sum(len(branch.token_ids) for request, _ in selected for branch in request.branches)
@@ -7279,18 +7279,17 @@ class DrafterBaseTrainer:
         prepare_started = time.perf_counter()
         dp_size = self._get_dp_world_size()
         dp_rank = self._get_dp_local_rank()
+        group_sizes = plan_specopd_training_groups(
+            selected, dp_size, spec.training_microbatch_trajectories, spec.training_microbatch_token_budget,
+        )
         selected, real_slots = partition_specopd_samples(selected, dp_rank, dp_size)
         batches, cache_bytes = prepare_specopd_training_batches(
             selected, self.runtime_device, spec, feature_indices,
+            group_sizes=group_sizes, real_slots=real_slots,
         )
-        for batch, real in zip(batches, real_slots, strict=True):
-            if not real:
-                batch["proposal_mask"].zero_()
-                batch["_speco_sample_count"] = 0
-                batch["_speco_sample_ids"] = ()
         self._specopd_group_metrics.update({
             "timing_s/specopd_prepare": time.perf_counter() - prepare_started,
-            "specopd/prepared_batches": len(batches), "specopd/train_dp_size": dp_size, "specopd/input_cache_bytes": cache_bytes,
+            "specopd/prepared_batches": len(batches), "specopd/train_microbatch_trajectories": max(group_sizes), "specopd/train_dp_size": dp_size, "specopd/input_cache_bytes": cache_bytes,
         })
         optimizer_before = self.optimizer_steps_total
         train_started = time.perf_counter()
@@ -7302,7 +7301,7 @@ class DrafterBaseTrainer:
                 }
                 with torch.enable_grad():
                     ok = await self._training_step_on_batch(
-                        batch, step, accumulation_steps=len(selected), accumulation_index=index,
+                        batch, step, accumulation_steps=len(batches), accumulation_index=index,
                     )
                 if not ok:
                     self.optimizer.zero_grad(set_to_none=True)

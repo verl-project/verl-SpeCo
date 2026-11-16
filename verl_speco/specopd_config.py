@@ -33,6 +33,8 @@ class SpecOPDConfig:
     max_wire_bytes: int = 1048576
     min_scored_positions_per_update: int = 1
     microbatch_trajectories: int = 1
+    training_microbatch_trajectories: int = 4
+    training_microbatch_token_budget: int = 16384
     actor_temperature: float = 1.0
     proposal_temperature: float = 1.0
     target_temperature: float = 1.0
@@ -83,6 +85,8 @@ class SpecOPDConfig:
             "max_wire_bytes",
             "min_scored_positions_per_update",
             "microbatch_trajectories",
+            "training_microbatch_trajectories",
+            "training_microbatch_token_budget",
             "optimizer_updates_per_collection",
         ):
             value = getattr(self, name)

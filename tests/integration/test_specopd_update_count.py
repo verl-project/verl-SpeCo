@@ -6,8 +6,9 @@ import pytest
 from verl_speco.specopd_config import SpecOPDConfig
 
 
+@pytest.mark.parametrize("microbatch_size", [1, 4])
 @pytest.mark.parametrize("updates,dp_rank,dp_size", [(1, 0, 1), (20, 0, 1), (20, 0, 2), (20, 1, 2), (20, 2, 3)])
-def test_collected_group_executes_all_optimizer_updates_before_publication(monkeypatch, updates, dp_rank, dp_size):
+def test_collected_group_executes_all_optimizer_updates_before_publication(monkeypatch, updates, dp_rank, dp_size, microbatch_size):
     pytest.importorskip("ray")
     from verl_speco.trainer.base_trainer import DrafterBaseTrainer
     from verl_speco.backends import specopd_forward
@@ -34,18 +35,22 @@ def test_collected_group_executes_all_optimizer_updates_before_publication(monke
     builds = []
     def build(*args):
         builds.append(args[0])
-        return {"proposal_mask": torch.ones(1, 2, dtype=torch.bool)}
+        return dict(proposal_mask=torch.ones(1, 2, dtype=torch.bool),
+                    input_ids=torch.ones(1, 3, dtype=torch.long), hidden_states=torch.ones(1, 3, 1),
+                    anchor_positions=torch.ones(1, 1, dtype=torch.long), proposal_ids=torch.ones(1, 2, dtype=torch.long),
+                    target_last_hidden_states=torch.ones(1, 2, 1), proposal_temperature=1.0, target_temperature=1.0,
+                    proposal_block_width=7, _speco_sample_count=1, _speco_sample_ids=("b",), _specopd_trunk_digest="fixed")
     monkeypatch.setattr(specopd_forward, "build_specopd_training_batch", build)
-    request = SimpleNamespace(branches=[SimpleNamespace(token_ids=(1, 2))])
+    request = SimpleNamespace(trunk_ids=(1, 2, 3), branches=[SimpleNamespace(token_ids=(1, 2))])
     result = asyncio.run(DrafterBaseTrainer.training_specopd_group(
         trainer, [(request, None), (request, None)], 5,
-        SpecOPDConfig(optimizer_updates_per_collection=updates), (1,),
+        SpecOPDConfig(optimizer_updates_per_collection=updates, training_microbatch_trajectories=microbatch_size), (1,),
     ))
     local_count = (2 + dp_size - 1) // dp_size
     assert len(builds) == local_count  # fixed local inputs built once
     assert result and trainer.optimizer_steps_total == updates
     assert events.count(("snapshot", 5)) == 1
-    assert [e[1] for e in events if e[0] == "microbatch"] == list(range(local_count)) * updates
+    assert [e[1] for e in events if e[0] == "microbatch"] == list(range((local_count + microbatch_size - 1) // microbatch_size)) * updates
     assert events[-1] == ("snapshot", 5)
 
 
@@ -64,3 +69,11 @@ def test_fixed_input_cache_respects_budget(monkeypatch, budget):
     assert used == min(budget // 16, 2) * 16
     assert [batch["input_ids"].tolist() for batch in batches] == [[1, 1], [2, 2]]
     assert all(batch["temperature"] == 1.0 for batch in batches)
+
+
+@pytest.mark.parametrize("maximum,expected", [(1, [1, 1, 1, 1]), (2, [2, 2]), (4, [4])])
+def test_global_training_groups_have_identical_dp_boundaries(maximum, expected):
+    from verl_speco.backends.specopd_forward import plan_specopd_training_groups
+    selected = [(SimpleNamespace(trunk_ids=tuple(range(n))), None) for n in [7, 20, 9, 8, 15, 6, 5]]
+    assert plan_specopd_training_groups(selected, 2, maximum, 1000) == expected
+    assert plan_specopd_training_groups(selected, 2, 4, 30) == [1, 2, 1]

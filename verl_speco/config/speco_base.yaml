@@ -196,6 +196,8 @@ actor_rollout_ref:
           max_wire_bytes: 1048576
           min_scored_positions_per_update: 1
           microbatch_trajectories: 1
+          training_microbatch_trajectories: 4
+          training_microbatch_token_budget: 16384
           actor_temperature: 1.0
           proposal_temperature: 1.0
           target_temperature: 1.0

@@ -29,15 +29,14 @@ def proposal_loss(wrapper, batch, lm_head_weight):
     anchors = batch["anchor_positions"]
     valid = batch["proposal_mask"]
     proposal = batch["proposal_ids"]
-    n = anchors.shape[1]
+    bsz, n = anchors.shape
     if (
-        ids.shape[0] != 1
-        or anchors.shape[0] != 1
+        ids.shape[0] != bsz
         or proposal.shape != valid.shape
-        or proposal.shape[0] != n
+        or proposal.shape[0] != bsz * n
     ):
         raise ValueError(
-            "SpecOPD microbatches contain one shared trunk and all its branches"
+            "SpecOPD proposal rows must match the padded trajectory/branch layout"
         )
     spark = hasattr(wrapper.draft_model, "markov_head")
     start = 0 if spark else 1
@@ -48,7 +47,7 @@ def proposal_loss(wrapper, batch, lm_head_weight):
     width = proposal.shape[1]
     if width + start > wrapper.block_size:
         raise ValueError("SpecOPD proposal width exceeds the drafter block capacity")
-    keep = torch.ones_like(anchors, dtype=torch.bool)
+    keep = valid.any(-1).reshape(bsz, n)
     base = batch["hidden_states"]
     layers = wrapper.draft_model.num_context_layers
     if base.shape[-1] % layers:
@@ -75,12 +74,12 @@ def proposal_loss(wrapper, batch, lm_head_weight):
         block_mask=mask,
         dense_attention_mask=dense,
         noise_embedding=wrapper._create_noise_embed(ids, anchors, keep),
-    ).reshape(n, wrapper.block_size, -1)[:, start : start + width]
+    ).reshape(bsz * n, wrapper.block_size, -1)[:, start : start + width]
     head = lm_head_weight
     if head.shape[0] != wrapper.draft_model.config.vocab_size:
         raise ValueError("SpecOPD currently requires the complete target LM head")
     unary = F.linear(hidden, head.to(hidden.dtype)).float()
-    anchor_tokens = ids[0, anchors[0]]
+    anchor_tokens = ids.gather(1, anchors).reshape(-1)
     predecessors = torch.cat((anchor_tokens[:, None], proposal[:, :-1]), dim=-1)
     candidate_ids = None
     if hasattr(wrapper.draft_model, "candidate_selector"):
@@ -197,15 +196,67 @@ def build_specopd_training_batch(request, scores, device, config, feature_indice
     }
 
 
-def prepare_specopd_training_batches(selected, device, config, feature_indices, *, cache_bytes=64 * 1024**2):
-    """Build fixed inputs once; keep at most 64 MiB resident across updates.
+def plan_specopd_training_groups(selected, dp_size, max_trajectories, token_budget):
+    """Use global slot maxima so every DP/SP rank chooses identical groups."""
+    lengths = [max(len(r.trunk_ids) for r, _ in selected[i:i + dp_size])
+               for i in range(0, len(selected), dp_size)]
+    sizes, current, longest = [], 0, 0
+    for length in lengths:
+        if current and (current == max_trajectories or (current + 1) * max(longest, length) > token_budget):
+            sizes.append(current)
+            current, longest = 0, 0
+        current += 1
+        longest = max(longest, length)
+    if current:
+        sizes.append(current)
+    return sizes
 
-    Larger groups retain prepared CPU batches and stage one trajectory at a
-    time. Learned context projections and draft probabilities are never cached.
-    """
-    batches, used = [], 0
-    for request, scores in selected:
+
+def merge_specopd_training_batches(batches):
+    """Pad independent trajectory batch rows; branches never share context."""
+    if len(batches) == 1:
+        return batches[0]
+    first = batches[0]
+    for batch in batches:
+        for key in ("proposal_temperature", "target_temperature", "proposal_block_width"):
+            if batch[key] != first[key]:
+                raise ValueError("cannot merge incompatible SpecOPD sampling contracts")
+    length = max(b["input_ids"].shape[1] for b in batches)
+    anchors = max(b["anchor_positions"].shape[1] for b in batches)
+    width = max(b["proposal_ids"].shape[1] for b in batches)
+    result = dict(first)
+    result["input_ids"] = torch.cat([F.pad(b["input_ids"], (0, length-b["input_ids"].shape[1])) for b in batches])
+    result["hidden_states"] = torch.cat([F.pad(b["hidden_states"], (0, 0, 0, length-b["hidden_states"].shape[1])) for b in batches])
+    result["anchor_positions"] = torch.cat([F.pad(b["anchor_positions"], (0, anchors-b["anchor_positions"].shape[1])) for b in batches])
+    for key in ("proposal_ids", "proposal_mask"):
+        result[key] = torch.cat([F.pad(b[key], (0, width-b[key].shape[1], 0, anchors-b[key].shape[0])) for b in batches])
+    result["target_last_hidden_states"] = torch.cat([
+        F.pad(b["target_last_hidden_states"], (0, 0, 0, width-b["proposal_ids"].shape[1], 0, anchors-b["proposal_ids"].shape[0]))
+        for b in batches
+    ])
+    result["_speco_sample_count"] = sum(b["_speco_sample_count"] for b in batches)
+    result["_speco_sample_ids"] = tuple(x for b in batches for x in b["_speco_sample_ids"])
+    result["_specopd_trunk_digest"] = tuple(b["_specopd_trunk_digest"] for b in batches)
+    return result
+
+
+def prepare_specopd_training_batches(selected, device, config, feature_indices, *, cache_bytes=64 * 1024**2, group_sizes=None, real_slots=None):
+    """Prepare once, merge independent rows, cache at most 64MiB on device."""
+    prepared = []
+    for index, (request, scores) in enumerate(selected):
         batch = build_specopd_training_batch(request, scores, "cpu", config, feature_indices)
+        if real_slots is not None and not real_slots[index]:
+            batch["proposal_mask"].zero_()
+            batch["_speco_sample_count"] = 0
+            batch["_speco_sample_ids"] = ()
+        prepared.append(batch)
+    sizes = group_sizes if group_sizes is not None else [1] * len(prepared)
+    if any(n <= 0 for n in sizes) or sum(sizes) != len(prepared):
+        raise ValueError("invalid SpecOPD training microbatch partition")
+    batches, used, offset = [], 0, 0
+    for length in sizes:
+        batch = merge_specopd_training_batches(prepared[offset:offset + length])
+        offset += length
         size = sum(v.numel() * v.element_size() for v in batch.values() if torch.is_tensor(v))
         if used + size <= cache_bytes:
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
@@ -223,5 +274,5 @@ def partition_specopd_samples(selected, dp_rank, dp_size):
     if not selected or not 0 <= dp_rank < dp_size:
         raise ValueError("invalid SpecOPD data-parallel schedule")
     indices = range(dp_rank, ((len(selected) + dp_size - 1) // dp_size) * dp_size, dp_size)
-    slots = [(selected[i] if i < len(selected) else selected[0], i < len(selected)) for i in indices]
+    slots = [(selected[i] if i < len(selected) else selected[(i // dp_size) * dp_size], i < len(selected)) for i in indices]
     return [sample for sample, _ in slots], [real for _, real in slots]

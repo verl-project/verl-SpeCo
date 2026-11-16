@@ -187,6 +187,35 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
             assert a is b
         else:
             torch.testing.assert_close(a, b)
+    from dataclasses import replace
+    from verl_speco.backends.specopd_forward import merge_specopd_training_batches
+
+    ragged = []
+    for index in range(4):
+        branches = tuple(replace(b, branch_id=f"{index}-{b.branch_id}",
+                                 token_ids=b.token_ids[:2] if index == 1 else b.token_ids)
+                         for b in request.branches[:1 if index == 1 else 2])
+        req = replace(request, sample_id=f"sample-{index}", branches=branches,
+                      trunk_ids=request.trunk_ids[:-1] if index == 2 else request.trunk_ids)
+        scores, _ = score_joint_batch(target, [req], hidden_state_indices=(1, 2), return_target_logits=False)
+        item = build_specopd_training_batch(req, scores[0], 'cpu', SpecOPDConfig(proposal_width=3), (1, 2))
+        if index == 3:
+            item['proposal_mask'].zero_()  # DP dummy row
+        ragged.append(item)
+    merged = merge_specopd_training_batches(ragged)
+    combined = compute_specopd_backend_loss(backend, wrapper, merged)
+    separate = [compute_specopd_backend_loss(backend, wrapper, item) for item in ragged]
+    expected_sum = sum(item['total_local_ploss'] for item in separate)
+    expected_count = sum(item['local_num_tokens'] for item in separate)
+    assert combined['local_num_tokens'] == expected_count
+    torch.testing.assert_close(combined['total_local_ploss'], expected_sum, atol=2e-5, rtol=2e-5)
+    merged_grads = torch.autograd.grad(combined['total_local_ploss'] / expected_count, params, allow_unused=True)
+    individual_grads = torch.autograd.grad(expected_sum / expected_count, params, allow_unused=True)
+    for a, b in zip(merged_grads, individual_grads, strict=True):
+        if a is None or b is None:
+            assert a is b
+        else:
+            torch.testing.assert_close(a, b, atol=2e-5, rtol=2e-5)
     dummy = dict(batch, proposal_mask=torch.zeros_like(batch["proposal_mask"]))
     dummy_loss = compute_specopd_backend_loss(backend, wrapper, dummy)
     assert dummy_loss["local_num_tokens"] == 0
