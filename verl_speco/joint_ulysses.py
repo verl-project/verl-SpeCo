@@ -159,15 +159,30 @@ def score_ulysses_joint_batch(
             if len(rows):
                 dist.all_reduce(entropy, group=group)
         branches = []
-        local_logz = (output.logits[i].float() / target_temperature).logsumexp(-1) if request.branches else None
-        for branch, readout in zip(request.branches, packed.branch_rows[i], strict=True):
-            # Reduce scalar logZ rather than gathering all sequence x vocab logits.
-            branches.append(BranchScores(
-                branch.branch_id,
-                _gather_rows(output.logits[i], readout, start, group) if return_target_logits else None,
-                _gather_rows(local_logz, readout, start, group),
-                _gather_rows(output.hidden_states[-1][i], readout, start, group),
-            ))
+        readouts = packed.branch_rows[i]
+        flat_rows = [row for readout in readouts for row in readout]
+        if flat_rows:
+            # Compute vocabulary normalization only at branch readout rows owned
+            # by this rank; never normalize the entire trunk a second time.
+            row_ids = torch.tensor(flat_rows, device=parameter.device)
+            owned_readouts = (row_ids >= start) & (row_ids < start + width)
+            flat_logz = output.logits.new_zeros(len(flat_rows), dtype=torch.float32)
+            flat_logz[owned_readouts] = (
+                output.logits[i].index_select(0, row_ids[owned_readouts] - start).float()
+                / target_temperature
+            ).logsumexp(-1)
+            dist.all_reduce(flat_logz, group=group)
+            flat_hidden = _gather_rows(output.hidden_states[-1][i], flat_rows, start, group)
+            flat_logits = _gather_rows(output.logits[i], flat_rows, start, group) if return_target_logits else None
+            offset = 0
+            for branch, readout in zip(request.branches, readouts, strict=True):
+                end = offset + len(readout)
+                branches.append(BranchScores(
+                    branch.branch_id,
+                    flat_logits[offset:end] if flat_logits is not None else None,
+                    flat_logz[offset:end], flat_hidden[offset:end],
+                ))
+                offset = end
         features = {
             index: _gather_rows(output.hidden_states[index][i], range(n), start, group)
             for index in hidden_state_indices

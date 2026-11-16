@@ -39,7 +39,46 @@ def partition_joint_requests(requests, rank, world_size):
     return (dummy,), True
 
 
-def score_actor_joint(worker, requests, **options):
+def score_actor_joint(worker, requests, *, microbatch_sizes=None, **options):
+    """Keep one actor residency context across a bounded microbatch schedule."""
+    if microbatch_sizes is None:
+        return _score_actor_joint(worker, requests, **options)
+    sizes = tuple(microbatch_sizes)
+    if not sizes or any(type(n) is not int or n <= 0 for n in sizes) or sum(sizes) != len(requests):
+        raise ValueError("joint microbatch sizes must partition the complete request schedule")
+    if torch.distributed.is_initialized():
+        import hashlib
+
+        digest = hashlib.sha256(repr((requests, sizes, sorted(options.items()))).encode()).hexdigest()
+        schedules = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(schedules, digest)
+        if len(set(schedules)) != 1:
+            raise RuntimeError("joint actor ranks received different microbatch schedules")
+    engine = worker.actor.engine
+    states = [(m, m.training) for m in engine.module.modules()]
+    results, totals, offset = [], {}, 0
+    try:
+        with engine.eval_mode():
+            for length in sizes:
+                scored, measured = _score_actor_joint(
+                    worker, requests[offset:offset + length], manage_engine=False, **options,
+                )
+                results.extend(scored)
+                for key, value in measured.items():
+                    if key == "sp_size":
+                        if key in totals and totals[key] != value:
+                            raise RuntimeError("joint microbatch SP size changed")
+                        totals[key] = value
+                    else:
+                        totals[key] = totals.get(key, 0) + value
+                offset += length
+    finally:
+        for module, training in states:
+            module.training = training
+    return tuple(results), totals
+
+
+def _score_actor_joint(worker, requests, *, manage_engine=True, **options):
     """Run inside the RL actor's own eval/offload context, never the SFT worker.
 
     ONE_TO_ALL receives the same global schedule; each FSDP rank owns complete
@@ -152,7 +191,7 @@ def score_actor_joint(worker, requests, **options):
     dtype = getattr(engine, "_autocast_dtype", torch.float32)
     states = [(module, module.training) for module in model.modules()]
     try:
-        with engine.eval_mode():
+        with engine.eval_mode() if manage_engine else nullcontext():
             device_type = next(model.parameters()).device.type
             autocast = (
                 nullcontext()

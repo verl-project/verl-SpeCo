@@ -7259,24 +7259,47 @@ class DrafterBaseTrainer:
 
     async def training_specopd_group(self, samples, step, spec, feature_indices):
         """Train one collected group for its configured updates, then publish once."""
-        from verl_speco.backends.specopd_forward import build_specopd_training_batch
+        from verl_speco.backends.specopd_forward import prepare_specopd_training_batches, partition_specopd_samples
 
         selected = [(request, scores) for request, scores in samples if request.branches]
         positions = sum(len(branch.token_ids) for request, _ in selected for branch in request.branches)
         if positions < spec.min_scored_positions_per_update:
             return False
+        self._specopd_group_metrics = {}
+        activation_started = time.perf_counter()
         if not await self.activate_training_model():
             raise RuntimeError("SpecOPD drafter activation failed")
+        self._specopd_group_metrics["timing_s/specopd_activation"] = time.perf_counter() - activation_started
         wrapper = self.model.module if hasattr(self.model, "module") else self.model
         layers = wrapper.draft_model.num_context_layers
         if len(feature_indices) != layers:
             raise ValueError("SpecOPD auxiliary layer count differs from drafter checkpoint")
         if float(getattr(wrapper.draft_model.config, "attention_dropout", 0.0)) != 0:
             raise ValueError("SpecOPD fixed-history probability reconstruction requires zero draft dropout")
+        prepare_started = time.perf_counter()
+        dp_size = self._get_dp_world_size()
+        dp_rank = self._get_dp_local_rank()
+        selected, real_slots = partition_specopd_samples(selected, dp_rank, dp_size)
+        batches, cache_bytes = prepare_specopd_training_batches(
+            selected, self.runtime_device, spec, feature_indices,
+        )
+        for batch, real in zip(batches, real_slots, strict=True):
+            if not real:
+                batch["proposal_mask"].zero_()
+                batch["_speco_sample_count"] = 0
+                batch["_speco_sample_ids"] = ()
+        self._specopd_group_metrics.update({
+            "timing_s/specopd_prepare": time.perf_counter() - prepare_started,
+            "specopd/prepared_batches": len(batches), "specopd/train_dp_size": dp_size, "specopd/input_cache_bytes": cache_bytes,
+        })
         optimizer_before = self.optimizer_steps_total
+        train_started = time.perf_counter()
         for _ in range(spec.optimizer_updates_per_collection):
-            for index, (request, scores) in enumerate(selected):
-                batch = build_specopd_training_batch(request, scores, self.runtime_device, spec, feature_indices)
+            for index, prepared in enumerate(batches):
+                batch = {
+                    key: value.to(self.runtime_device) if torch.is_tensor(value) else value
+                    for key, value in prepared.items()
+                }
                 with torch.enable_grad():
                     ok = await self._training_step_on_batch(
                         batch, step, accumulation_steps=len(selected), accumulation_index=index,
@@ -7284,9 +7307,14 @@ class DrafterBaseTrainer:
                 if not ok:
                     self.optimizer.zero_grad(set_to_none=True)
                     raise RuntimeError("SpecOPD update failed; this group must not be replayed")
+        self._specopd_group_metrics["timing_s/specopd_train_loop"] = time.perf_counter() - train_started
         if self.optimizer_steps_total != optimizer_before + spec.optimizer_updates_per_collection:
             raise RuntimeError("SpecOPD group optimizer update count differs from its configuration")
+        snapshot_started = time.perf_counter()
         self.prepare_model_state_dict_for_publish(step)
+        self._specopd_group_metrics["timing_s/specopd_snapshot"] = time.perf_counter() - snapshot_started
+        # Drop fixed input device tensors before the worker offloads its model.
+        del batches, batch, prepared
         return True
 
     async def training_step_from_batch(

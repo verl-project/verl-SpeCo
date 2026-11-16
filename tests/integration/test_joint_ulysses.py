@@ -67,6 +67,17 @@ def _run(rank, size, init_file, kv_heads, kind):
         isolated, _ = score_ulysses_joint_batch(model, (changed,), dist.group.WORLD, **options)
         torch.testing.assert_close(isolated[0].branches[0].target_logits, actual[0].branches[0].target_logits, atol=2e-5, rtol=2e-5)
         if size == 4:
+            engine_schedule = SimpleNamespace(module=model, eval_mode=nullcontext,
+                use_remove_padding=True, use_ulysses_sp=True, ulysses_sequence_parallel_size=size,
+                ulysses_parallel_group=dist.group.WORLD, model_config=SimpleNamespace(use_fused_kernels=False),
+                _autocast_dtype=torch.float32)
+            schedule_worker = SimpleNamespace(_is_actor=True, actor=SimpleNamespace(engine=engine_schedule))
+            exported, measured = score_actor_joint(schedule_worker, _requests(), microbatch_sizes=(1, 1), **options)
+            if rank == 0:
+                _assert_scores(exported, expected)
+                assert measured["sp_size"] == size and measured["model_forward_calls"] == 2
+            else:
+                assert not exported and measured["model_forward_calls"] == 0
             groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
             group = groups[rank // 2]
             engine = SimpleNamespace(module=model, eval_mode=nullcontext,

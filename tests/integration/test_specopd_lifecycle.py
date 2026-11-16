@@ -222,6 +222,7 @@ def test_fit_hooks_replace_normal_forward_and_train_before_actor_update(monkeypa
     class ActorGroup:
         def compute_joint_old_log_prob(self, requests, **options):
             events.append("joint")
+            options.pop("microbatch_sizes", None)
             return [score_joint_batch(model, requests, **options)]
 
     class DrafterGroup:

@@ -291,37 +291,37 @@ class SpecOPDDriver:
             },
         )
         started = time.perf_counter()
-        for chunk in plan_microbatches(requests, self.spec):
-            output = self.trainer.actor_rollout_wg.compute_joint_old_log_prob(
-                chunk,
-                actor_temperature=self.spec.actor_temperature,
-                target_temperature=self.spec.target_temperature,
-                hidden_state_indices=self.feature_indices,
-                calculate_entropy=(
-                    self.trainer._speco_oldlogprob_calculate_entropy()
-                    if hasattr(self.trainer, "_speco_oldlogprob_calculate_entropy")
-                    else True
-                ),
-                return_target_logits=False,
-                capture_empty_trunk_features=False,
-                max_packed_tokens=self.spec.scoring_token_budget,
-                max_mask_elements=self.spec.max_dense_mask_elements,
+        output = self.trainer.actor_rollout_wg.compute_joint_old_log_prob(
+            requests,
+            microbatch_sizes=tuple(len(part) for part in plan_microbatches(requests, self.spec)),
+            actor_temperature=self.spec.actor_temperature,
+            target_temperature=self.spec.target_temperature,
+            hidden_state_indices=self.feature_indices,
+            calculate_entropy=(
+                self.trainer._speco_oldlogprob_calculate_entropy()
+                if hasattr(self.trainer, "_speco_oldlogprob_calculate_entropy")
+                else True
+            ),
+            return_target_logits=False,
+            capture_empty_trunk_features=False,
+            max_packed_tokens=self.spec.scoring_token_budget,
+            max_mask_elements=self.spec.max_dense_mask_elements,
+        )
+        scored, measured = unwrap_rank_result(
+            self.trainer._ray_get_if_needed(output)
+        )
+        indexed = {r.sample_id: r for r in scored}
+        if len(indexed) != len(scored) or set(indexed) != {
+            r.sample_id for r in requests
+        }:
+            raise RuntimeError(
+                "joint actor RPC lost or duplicated trajectory results"
             )
-            scored, measured = unwrap_rank_result(
-                self.trainer._ray_get_if_needed(output)
-            )
-            indexed = {r.sample_id: r for r in scored}
-            if len(indexed) != len(scored) or set(indexed) != {
-                r.sample_id for r in chunk
-            }:
-                raise RuntimeError(
-                    "joint actor RPC lost or duplicated trajectory results"
-                )
-            scored = tuple(indexed[r.sample_id] for r in chunk)
-            results.extend(scored)
-            metrics["specopd/actor_sp_size"] = measured.get("sp_size", 1)
-            for key in ("model_forward_calls", "logical_rows", "independent_rows"):
-                metrics[f"specopd/{key}"] += measured[key]
+        scored = tuple(indexed[r.sample_id] for r in requests)
+        results.extend(scored)
+        metrics["specopd/actor_sp_size"] = measured.get("sp_size", 1)
+        for key in ("model_forward_calls", "logical_rows", "independent_rows"):
+            metrics[f"specopd/{key}"] += measured[key]
         metrics["timing_s/specopd_joint_oldlogprob"] = time.perf_counter() - started
         self.metrics.update(metrics)
         self.cycle.scored(
@@ -342,6 +342,7 @@ class SpecOPDDriver:
         if positions >= self.spec.min_scored_positions_per_update:
             self.trainer._speco_set_drafter_global_step()
             self.metrics.update(self.trainer._speco_sync_target_lm_head_weight())
+            training_started = time.perf_counter()
             output = self.trainer._require_speco_worker_group().train_specopd_group(
                 samples,
                 int(self.cycle.step),
@@ -351,6 +352,15 @@ class SpecOPDDriver:
             statuses = [
                 s for s in self.trainer._ray_get_if_needed(output) if s is not None
             ]
+            self.metrics["timing_s/specopd_train_rpc"] = time.perf_counter() - training_started
+            for key in ("prepare", "train_loop", "snapshot", "release", "activation"):
+                values = [s.get(f"timing_s/specopd_{key}") for s in statuses]
+                if values and all(v is not None for v in values):
+                    self.metrics[f"timing_s/specopd_{key}"] = max(values)
+            for key in ("prepared_batches", "input_cache_bytes", "train_dp_size"):
+                values = [s.get(f"specopd/{key}") for s in statuses]
+                if values and all(v is not None for v in values):
+                    self.metrics[f"specopd/{key}"] = max(values)
             if (
                 not statuses
                 or len({(s["trained"], s["revision"]) for s in statuses}) != 1

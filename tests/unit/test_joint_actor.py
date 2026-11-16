@@ -125,3 +125,42 @@ def test_ulysses_rejects_adaptive_rotary_frequencies():
     model.model.rotary_emb.rope_type = "dynamic"
     with pytest.raises(ValueError, match="global-frequency"):
         validate_ulysses_model(model, 2)
+
+
+def test_microbatch_schedule_uses_one_engine_residency_context():
+    actor, events = worker()
+    requests = request() + request()
+    expected = [score_actor_joint(actor, [r])[0][0] for r in requests]
+    events.clear()
+    actual, measured = score_actor_joint(actor, requests, microbatch_sizes=(1, 1))
+    assert events == ["enter", "exit"]
+    assert actor.actor.engine.module.training
+    assert measured["model_forward_calls"] == 2
+    for a, b in zip(actual, expected, strict=True):
+        torch.testing.assert_close(a.response_log_probs, b.response_log_probs)
+        torch.testing.assert_close(a.branches[0].target_logits, b.branches[0].target_logits)
+
+
+def test_microbatch_schedule_error_restores_engine(monkeypatch):
+    actor, events = worker()
+    original = actor.actor.engine.module.forward
+    calls = 0
+    def fail_second(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("second chunk failed")
+        return original(**kwargs)
+    monkeypatch.setattr(actor.actor.engine.module, "forward", fail_second)
+    with pytest.raises(RuntimeError, match="second chunk failed"):
+        score_actor_joint(actor, request() + request(), microbatch_sizes=(1, 1))
+    assert events == ["enter", "exit"]
+    assert actor.actor.engine.module.training
+
+
+@pytest.mark.parametrize("sizes", [(), (0, 2), (1,), (True, 1)])
+def test_invalid_microbatch_schedule_does_not_enter_engine(sizes):
+    actor, events = worker()
+    with pytest.raises(ValueError, match="partition"):
+        score_actor_joint(actor, request() + request(), microbatch_sizes=sizes)
+    assert not events

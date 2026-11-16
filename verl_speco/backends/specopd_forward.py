@@ -142,7 +142,7 @@ def compute_specopd_backend_loss(backend, model, batch):
         "local_num_tokens": count.to(numerator.dtype),
         "v_weight": 0.0,
         "p_weight": 1.0,
-        "accuracy": diagnostics["overlap"][batch["proposal_mask"]].mean(),
+        "accuracy": diagnostics["overlap"].masked_fill(~batch["proposal_mask"], 0).sum() / count.clamp_min(1),
         "diagnostics": {},
     }
 
@@ -195,3 +195,33 @@ def build_specopd_training_batch(request, scores, device, config, feature_indice
         "_speco_sample_ids": tuple(b.branch_id for b in request.branches),
         "_specopd_trunk_digest": token_digest(request.trunk_ids),
     }
+
+
+def prepare_specopd_training_batches(selected, device, config, feature_indices, *, cache_bytes=64 * 1024**2):
+    """Build fixed inputs once; keep at most 64 MiB resident across updates.
+
+    Larger groups retain prepared CPU batches and stage one trajectory at a
+    time. Learned context projections and draft probabilities are never cached.
+    """
+    batches, used = [], 0
+    for request, scores in selected:
+        batch = build_specopd_training_batch(request, scores, "cpu", config, feature_indices)
+        size = sum(v.numel() * v.element_size() for v in batch.values() if torch.is_tensor(v))
+        if used + size <= cache_bytes:
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            used += size
+        batches.append(batch)
+    return batches, used
+
+
+def partition_specopd_samples(selected, dp_rank, dp_size):
+    """Each DP replica trains distinct trees; SP peers share a tree.
+
+    Zero-loss dummy slots keep the FSDP collective count equal for uneven
+    groups. Global token-sum normalization preserves the complete group loss.
+    """
+    if not selected or not 0 <= dp_rank < dp_size:
+        raise ValueError("invalid SpecOPD data-parallel schedule")
+    indices = range(dp_rank, ((len(selected) + dp_size - 1) // dp_size) * dp_size, dp_size)
+    slots = [(selected[i] if i < len(selected) else selected[0], i < len(selected)) for i in indices]
+    return [sample for sample, _ in slots], [real for _, real in slots]

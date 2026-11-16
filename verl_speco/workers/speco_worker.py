@@ -1689,9 +1689,12 @@ class SpecoWorker(Worker):
             self._specopd_revision = local_revision + 1
             self.last_trained_step = step
             self._last_trained_execution_strategy = "sync"
+        release_started = time.perf_counter()
         if self.trainer.model is not None:
             await self.trainer.release_training_memory_after_activation(strict=True)
         return {
+            **getattr(self.trainer, "_specopd_group_metrics", {}),
+            "timing_s/specopd_release": time.perf_counter() - release_started,
             "trained": trained, "revision": getattr(self, "_specopd_revision", 0),
             "optimizer_updates": self.trainer.optimizer_steps_total - optimizer_before,
         }

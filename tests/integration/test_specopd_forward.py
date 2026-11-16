@@ -131,6 +131,7 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
     batch = build_specopd_training_batch(
         request, scored[0], next(wrapper.parameters()).device, SpecOPDConfig(proposal_width=3), (1, 2)
     )
+    fixed_inputs = {k: v.clone() for k, v in batch.items() if torch.is_tensor(v)}
     backend = SimpleNamespace(target_lm_head=SimpleNamespace(fc=target.lm_head))
     # Teacher projection weights are inputs to draft logits, but the target is
     # frozen; backward must update only the actual draft network.
@@ -167,6 +168,30 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
         )
     optimizer.step()
     assert not torch.equal(before, draft.fc.weight)
+
+    # A retained input batch must remain immutable and agree with fresh input
+    # reconstruction after the model weights have changed.
+    for key, value in fixed_inputs.items():
+        torch.testing.assert_close(batch[key], value)
+    fresh = build_specopd_training_batch(
+        request, scored[0], next(wrapper.parameters()).device, SpecOPDConfig(proposal_width=3), (1, 2)
+    )
+    reused_loss = compute_specopd_backend_loss(backend, wrapper, batch)
+    fresh_loss = compute_specopd_backend_loss(backend, wrapper, fresh)
+    torch.testing.assert_close(reused_loss["total_local_ploss"], fresh_loss["total_local_ploss"])
+    params = tuple(p for p in wrapper.parameters() if p.requires_grad)
+    reused_grads = torch.autograd.grad(reused_loss["total_local_ploss"], params, allow_unused=True)
+    fresh_grads = torch.autograd.grad(fresh_loss["total_local_ploss"], params, allow_unused=True)
+    for a, b in zip(reused_grads, fresh_grads, strict=True):
+        if a is None or b is None:
+            assert a is b
+        else:
+            torch.testing.assert_close(a, b)
+    dummy = dict(batch, proposal_mask=torch.zeros_like(batch["proposal_mask"]))
+    dummy_loss = compute_specopd_backend_loss(backend, wrapper, dummy)
+    assert dummy_loss["local_num_tokens"] == 0
+    assert dummy_loss["total_local_ploss"] == 0
+    assert torch.isfinite(dummy_loss["accuracy"])
 
 
 def test_accumulated_prefix_loss_matches_concatenated_gradient():
