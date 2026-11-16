@@ -42,3 +42,26 @@ SpecOPD 联合评分 token budget=9216、dense mask budget=9216²，覆盖原脚
 
 
 PERF-06 草稿训练批配置：SpecOPD新增 `training.specopd.training_microbatch_trajectories=4` 和 `training_microbatch_token_budget=16384`，从代码基础配置读取，两个现有启动脚本无需修改。实际会按主干padding预算拆小，长序列生产负载不能据短测断言始终四条一批；设1可恢复逐条累积。DraftOPD沿用原训练微批路径。
+
+
+## ModelArts 启动入口填写
+
+2026-11-16日志 `modelarts-job-9e0449e3-2d3f-4d67-ac5e-491137feef04-worker-0.log` 第120行实际命令为 `bash /efs_rl/z00886395/shell/speco-runping/bash run_qwen3-8b_drafter_dspark_draft_opd_v1_with_train.sh`，第196行报目录下的 `bash` 不存在，随后退出127，尚未进入Python训练。
+
+同目录原 `run_qwen3-8b_drafter_dspark_drafter_with_train.sh`、base和两份OPD脚本都是 `#!/usr/bin/env bash`，内部使用 `PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_v1_trainer`。两份OPD脚本语法检查通过，训练脚本内容不需要为此次127错误修改。
+
+如果填写的是完整自定义启动命令，两个方法分别复制以下一条：
+
+DraftOPD：
+```bash
+bash /efs_rl/z00886395/shell/speco-runping/run_qwen3-8b_drafter_dspark_draft_opd_v1_with_train.sh
+```
+
+SpecOPD：
+```bash
+bash /efs_rl/z00886395/shell/speco-runping/run_qwen3-8b_drafter_dspark_spec_opd_v1_with_train.sh
+```
+
+如果平台使用“代码目录＋启动文件”模式，代码目录使用 `/efs_rl/z00886395/shell/speco-runping`，启动文件使用对应的 `.sh` 文件名（不加 `bash` 前缀），例如 `run_qwen3-8b_drafter_dspark_draft_opd_v1_with_train.sh`。不要在启动文件中填写 `bash run_….sh`，也不要把目录拼成 `/speco-runping/bash`。
+
+以上修正的是入口填写方式，不能据此确认已提交ModelArts任务配置被修改。尚未重新提交或启动ModelArts训练。自动诊断引用的11月12日AIV事件不是本次20:38入口失败的直接根因证据。
