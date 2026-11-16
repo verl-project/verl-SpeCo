@@ -344,6 +344,8 @@ class DFlashTrainingModel(nn.Module):
         lk_chunk_size: int = 1024,
         verifier_norm: torch.nn.Module | None = None,
         target_hidden_clip_value: float | None = None,
+        opd_layout: str = "dflash",
+        drafter_opd_config: dict | None = None,
     ):
         super().__init__()
         self.verifier_norm = (
@@ -392,6 +394,15 @@ class DFlashTrainingModel(nn.Module):
                 f"lk_hybrid_eta must be finite and non-negative, got {lk_hybrid_eta!r}"
             )
         self._tensor_template_cache: dict[tuple, torch.Tensor] = {}
+        self.opd_objective = None
+        from verl_speco.opd_method import draft_opd_enabled
+
+        if draft_opd_enabled({"drafter_opd": drafter_opd_config}):
+            from verl_speco.backends.drafter_opd import DraftOPDObjective
+            self.opd_objective = DraftOPDObjective(
+                drafter_opd_config, layout=opd_layout, loss_mode=self.loss_mode,
+                per_position_loss_weight=self.per_position_loss_weight, temperature=lk_temperature)
+
 
     def _auxiliary_loss(
         self,
@@ -665,7 +676,13 @@ class DFlashTrainingModel(nn.Module):
         label_mask: torch.Tensor | None = None,
         target_hidden_is_raw: bool = False,
         hidden_source: str | None = None,
+        specopd_batch: dict | None = None,
+        opd_trace: torch.Tensor | None = None,
     ):
+        if specopd_batch is not None:
+            from verl_speco.backends.specopd_forward import proposal_loss
+
+            return proposal_loss(self, specopd_batch, lm_head_weight)
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         if label_ids is None:
@@ -677,6 +694,9 @@ class DFlashTrainingModel(nn.Module):
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
             label_len, label_mask, device, document_ids=document_ids
         )
+        if self.opd_objective is not None:
+            anchor_positions, block_keep_mask, observed, visible, rejected = self.opd_objective.plan(
+                anchor_positions, block_keep_mask, opd_trace)
         # Anchors must point at a real context row (the hidden states may be one
         # row shorter than the label sequence when a trailing label token exists).
         block_keep_mask = block_keep_mask & (anchor_positions < seq_len)
@@ -748,10 +768,12 @@ class DFlashTrainingModel(nn.Module):
                 clip=self.target_hidden_clip_value,
             )
             weight_mask = weight_mask * (~bad_target_rows).float()
+        if self.opd_objective is not None:
+            weight_mask = self.opd_objective.mask(weight_mask, visible)
         binary_eval_mask = weight_mask.view(-1)
         base_loss_mask = weight_mask.clone()
 
-        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+        if self.opd_objective is None and self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             decay_weights = self._cached_decay_weights(device)
             weight_mask = weight_mask * decay_weights
         if self.front_position_count > 0 and self.front_position_weight != 1.0:
@@ -769,6 +791,10 @@ class DFlashTrainingModel(nn.Module):
             )
             weight_mask = weight_mask * front_weights
 
+        if self.opd_objective is not None:
+            weight_mask = self.opd_objective.weights(
+                weight_mask, observed, rejected,
+                gamma=self.loss_decay_gamma)
         flat_targets = target_ids.view(-1)
         flat_weights = weight_mask.view(-1)
         active_mask = flat_weights > 0
@@ -798,7 +824,7 @@ class DFlashTrainingModel(nn.Module):
         finite_loss = torch.zeros(0, dtype=torch.bool, device=device)
         active_loss_weights = active_weights
         if active_targets.numel() == 0:
-            loss = flat_weights.sum() * 0.0
+            loss = (flat_hidden if self.opd_objective is not None else flat_weights).sum() * 0.0
         else:
             if self.loss_mode in {"restricted_ce", "sampled_ce"}:
                 vocab_size = int(lm_head_weight.shape[0])
@@ -837,7 +863,8 @@ class DFlashTrainingModel(nn.Module):
 
         ce_loss = loss
         lk_loss = local_ploss_sum.new_zeros(())
-        if self.lk_loss_alpha > 0 and active_targets.numel() > 0:
+        if (self.lk_loss_alpha > 0 and active_targets.numel() > 0
+                and not (self.opd_objective is not None and self.opd_objective.loss_type == "e2e_tv")):
             if active_target_hidden is None:
                 raise ValueError(
                     "DFlash LK loss requires target_last_hidden_states. "
@@ -887,6 +914,26 @@ class DFlashTrainingModel(nn.Module):
                 lk_loss = local_lk_sum / local_lk_den.clamp(min=1e-6)
         loss = (ce_loss * self.ce_loss_alpha) + (lk_loss * self.lk_loss_alpha)
 
+        if self.opd_objective is not None and self.opd_objective.loss_type == "e2e_tv":
+            opd_logits = active_logits if active_targets.numel() else F.linear(active_hidden, lm_head_weight)
+            opd_active_mask = active_mask
+            opd_target_hidden = active_target_hidden
+            if self.front_position_count > 0 and self.front_position_weight == 0:
+                # Zero loss weight does not remove a probability from later prefixes.
+                # Keep CE selection intact; score the full visible prefix for TV.
+                opd_active_mask = base_loss_mask.reshape(-1) > 0
+                opd_logits = F.linear(flat_hidden[opd_active_mask], lm_head_weight)
+                opd_target_hidden = (
+                    aligned_target_hidden.reshape(-1, aligned_target_hidden.size(-1))[
+                        opd_active_mask
+                    ]
+                    if aligned_target_hidden is not None else None
+                )
+            loss = self.opd_objective(
+                opd_logits, opd_target_hidden, lm_head_weight, base_loss_mask, opd_active_mask,
+                position_weights=weight_mask)
+        opd_metrics = (self.opd_objective.metrics(loss, observed, base_loss_mask)
+                       if self.opd_objective is not None else {})
         auxiliary_metrics: dict[str, torch.Tensor] = {}
         if active_targets.numel() > 0:
             auxiliary_loss, auxiliary_metrics = self._auxiliary_loss(
@@ -1087,6 +1134,7 @@ class DFlashTrainingModel(nn.Module):
                 ),
             }
             diagnostics.update(auxiliary_metrics)
+            diagnostics.update(opd_metrics)
 
         return (
             loss,
@@ -1578,6 +1626,7 @@ class DFlashTrainerBackend:
             per_position_loss_weight=str(
                 training_cfg.get("dflash_per_position_loss_weight", "fixed_exp_decay")
             ),
+            drafter_opd_config=training_cfg.get("drafter_opd", {}),
             dpace_alpha=float(training_cfg.get("dflash_dpace_alpha", 0.5)),
             lk_temperature=float(training_cfg.get("lk_temperature", 1.0)),
             lk_loss_type=str(training_cfg.get("dflash_lk_loss_type", "alpha")),
@@ -1645,6 +1694,9 @@ class DFlashTrainerBackend:
         )
         expected_hidden_dim = h_dim * num_context_layers
 
+        opd_cfg = self.config.rollout.drafter.training.get("drafter_opd", {})
+        if opd_cfg.get("enable", False) and opd_cfg.get("method", "draft_opd") == "draft_opd":
+            res["opd_trace"] = []
         for item in items:
             layout = item.get("hidden_states_layout")
             if layout not in (None, "dflash_aux", "dflash_aux_plus_last"):
@@ -1712,6 +1764,11 @@ class DFlashTrainerBackend:
             else:
                 start, end = max(0, ids.size(0) - max_window), ids.size(0)
 
+            if opd_cfg.get("enable", False) and opd_cfg.get("method", "draft_opd") == "draft_opd":
+                from verl_speco.backends.drafter_opd import preprocess_trace
+                res["opd_trace"].append(preprocess_trace(
+                    item, start=start, end=end, layout="dflash",
+                    capacity=int(self.config.rollout.drafter.training.get("dflash_block_size", 16)) - 1, device=device))
             # ``ids`` / ``item_loss_mask`` carry the (optional) trailing label
             # token; the hidden context is one row shorter when it is present.
             hidden_end = max(start, min(end, int(full_h.size(0))))
@@ -1725,6 +1782,10 @@ class DFlashTrainerBackend:
         return res
 
     def compute_loss(self, model, batch, _current_pad_size):
+        if batch.get("specopd", False):
+            from verl_speco.backends.specopd_forward import compute_specopd_backend_loss
+
+            return compute_specopd_backend_loss(self, model, batch)
         if getattr(self, "use_ulysses_sp", False):
             raise NotImplementedError(
                 "DFlash drafter training does not support Ulysses sequence parallel yet"
@@ -1774,6 +1835,7 @@ class DFlashTrainerBackend:
             lm_head_weight=self.target_lm_head.fc.weight,
             target_last_hidden_states=batch.get("target_last_hidden_states"),
             document_ids=batch.get("document_ids"),
+            opd_trace=batch.get("opd_trace"),
             label_ids=batch.get("label_ids"),
             label_mask=batch.get("label_mask"),
             **target_norm_kwargs,

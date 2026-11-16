@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from verl_speco.opd_method import draft_opd_enabled
+
 # Drafters that consume the DFlash aux context layers instead of the EAGLE
 # aux-plus-final layout. Domino and DFlash2 are DFlash variants, so they share
 # the layout.
@@ -97,6 +99,8 @@ def resolve_drafter_hidden_states_layout(algorithm: Any, training_cfg: Any) -> s
                 )
     if algorithm not in DFLASH_FAMILY_ALGORITHMS:
         return "eagle3_aux_plus_last"
+    if algorithm in {"DFLASH", "DSPARK"} and draft_opd_enabled(training_cfg):
+        return "dflash_aux_plus_last"
     if algorithm in ("DSPARK", "DSV4_DSPARK"):
         loss_prefix = "dsv4_dspark" if algorithm == "DSV4_DSPARK" else "dspark"
         default_l1 = 0.0 if algorithm == "DSV4_DSPARK" else 0.9

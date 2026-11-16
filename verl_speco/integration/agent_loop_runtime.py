@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import inspect
+import os
 import logging
 import time
 import types
@@ -30,6 +31,8 @@ _PATCHED = False
 SPECO_STUDENT_DECODE_TIME_KEY = "speco_student_decode_time_s"
 SPECO_TEACHER_PREFILL_TIME_KEY = "speco_teacher_prefill_time_s"
 _DEFAULT_EXTRA_KEYS = {
+    "_specopd_proposals": "",
+    "_speco_verify_trace": None,
     "_speco_vllm_spec_decode_accepted_tokens": None,
     "_speco_vllm_spec_decode_drafts": None,
     "turn_scores": None,
@@ -45,6 +48,7 @@ _DEFAULT_EXTRA_KEYS = {
 _CURRENT_GLOBAL_STEPS = contextvars.ContextVar(
     "speco_current_global_steps", default=None
 )
+_CURRENT_SPECOPD_REVISION = contextvars.ContextVar("specopd_revision", default=None)
 _CURRENT_VALIDATE = contextvars.ContextVar("speco_current_validate", default=False)
 _CURRENT_SKIP_DRAFTER_COLLECTION = contextvars.ContextVar(
     "speco_current_skip_drafter_collection", default=False
@@ -140,6 +144,9 @@ def _sampling_params_with_speco_context(sampling_params: Any) -> Any:
     if not isinstance(sampling_params, dict):
         return sampling_params
     patched = dict(sampling_params)
+    revision = _CURRENT_SPECOPD_REVISION.get()
+    if revision is not None:
+        patched["_specopd_drafter_revision"] = revision
     global_steps = _CURRENT_GLOBAL_STEPS.get()
     if global_steps is not None:
         patched.setdefault("_verl_global_steps", global_steps)
@@ -215,10 +222,13 @@ def _speco_context_from_batch(batch: Any) -> tuple[Any, ...]:
         probe_greedy_token,
         probe_max_tokens_token,
         skip_collection_token,
+        _CURRENT_SPECOPD_REVISION.set(meta_info.get("specopd_drafter_revision")),
     )
 
 
 def _speco_reset_context(*tokens: Any) -> None:
+    if len(tokens) >= 6:
+        _CURRENT_SPECOPD_REVISION.reset(tokens[5])
     if len(tokens) >= 5:
         _CURRENT_SKIP_DRAFTER_COLLECTION.reset(tokens[4])
     if len(tokens) >= 4:
@@ -288,6 +298,10 @@ async def _run_agent_loop_with_student_timing(call: Any, *args, **kwargs) -> Any
         return result
 
     student_decode_times: list[float] = []
+    from verl_speco.integration.verify_trace import TURN_TRACES
+    from verl_speco.integration.specopd_agent import PROPOSAL_TURNS
+    trace_token = TURN_TRACES.set([])
+    proposal_token = PROPOSAL_TURNS.set([])
     token = _CURRENT_STUDENT_DECODE_TIMES.set(student_decode_times)
     try:
         result = call(*args, **kwargs)
@@ -295,6 +309,8 @@ async def _run_agent_loop_with_student_timing(call: Any, *args, **kwargs) -> Any
             result = await result
     finally:
         _CURRENT_STUDENT_DECODE_TIMES.reset(token)
+        TURN_TRACES.reset(trace_token)
+        PROPOSAL_TURNS.reset(proposal_token)
     _record_phase_time(
         result,
         SPECO_STUDENT_DECODE_TIME_KEY,
@@ -315,6 +331,8 @@ async def _speco_worker_generate_sequences(self, batch):
     context_tokens = None
     try:
         context_tokens = _speco_context_from_batch(batch)
+        if os.getenv("VERL_SPECO_DIAGNOSTIC_TRANSPORT") == "1":
+            print(f"[specopd transport] worker={type(self).__name__} revision={_CURRENT_SPECOPD_REVISION.get()} meta={list(batch.meta_info)}", flush=True)
         generate_sequences = _speco_parent_method(self, "generate_sequences")
         if not callable(generate_sequences):
             raise AttributeError(
@@ -358,6 +376,10 @@ async def _speco_worker_run_agent_loop(
 
 
 async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs):
+    from verl_speco.integration.verify_trace import merge_turn_traces
+    from verl_speco.integration.specopd_agent import merge_proposal_output
+    merge_turn_traces(output)
+    merge_proposal_output(output)
     _speco_default_agent_loop_extra_fields(output)
     agent_loop_postprocess = _speco_parent_method(self, "_agent_loop_postprocess")
     if not callable(agent_loop_postprocess):
@@ -540,7 +562,11 @@ def _build_speco_agent_loop_worker_class(worker_cls):
 
 
 def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) -> None:
-    if not _is_sglang_rollout_config(getattr(manager, "config", None)):
+    is_sglang = _is_sglang_rollout_config(getattr(manager, "config", None))
+    rollout = getattr(
+        getattr(manager.config, "actor_rollout_ref", None), "rollout", None
+    )
+    if not is_sglang and getattr(rollout, "name", None) != "vllm":
         return
     if getattr(manager, "_speco_agent_loop_manager_configured", False):
         return
@@ -550,6 +576,12 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
     manager.agent_loop_workers_class = ray.remote(
         _build_speco_agent_loop_worker_class(worker_cls)
     )
+
+    if not is_sglang:
+        # Install patches again in the Ray process, where upstream classes are
+        # imported afresh. Driver-side monkey patches do not survive that import.
+        manager._speco_agent_loop_manager_configured = True
+        return
 
     try:
         from verl.workers.rollout.sglang_rollout import async_sglang_server
@@ -663,6 +695,19 @@ def install_agent_loop_runtime_patch() -> bool:
             )
 
             record_serving_segment(result)
+            if os.getenv("VERL_SPECO_DIAGNOSTIC_TRANSPORT") == "1":
+                fields = getattr(result, "extra_fields", {}) or {}
+                print(f"[specopd transport] client={type(self).__name__} revision={_CURRENT_SPECOPD_REVISION.get()} collecting={student_decode_times is not None} fields={list(fields)}", flush=True)
+            if _CURRENT_SPECOPD_REVISION.get() is not None:
+                fields = getattr(result, "extra_fields", {}) or {}
+                logger.warning("[specopd transport] client=%s revision=%s validate=%s skip=%s wire_present=%s",
+                    type(self).__name__, _CURRENT_SPECOPD_REVISION.get(), _CURRENT_VALIDATE.get(),
+                    _CURRENT_SKIP_DRAFTER_COLLECTION.get(), bool(fields.get("_specopd_proposals")))
+            if student_decode_times is not None:
+                from verl_speco.integration.verify_trace import collect_turn_trace
+                collect_turn_trace(result)
+                from verl_speco.integration.specopd_agent import collect_proposal_output
+                collect_proposal_output(result)
             return result
 
         llm_server_client_cls.generate = speco_llm_server_generate
@@ -733,6 +778,10 @@ def install_agent_loop_runtime_patch() -> bool:
 
         @wraps(agent_loop_postprocess)
         async def speco_agent_loop_postprocess(self, output, validate, **kwargs):
+            from verl_speco.integration.verify_trace import merge_turn_traces
+            from verl_speco.integration.specopd_agent import merge_proposal_output
+            merge_turn_traces(output)
+            merge_proposal_output(output)
             extra_fields = getattr(output, "extra_fields", None)
             if isinstance(extra_fields, dict):
                 for key in _DEFAULT_EXTRA_KEYS:
