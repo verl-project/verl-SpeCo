@@ -2,6 +2,8 @@
 
 Last updated: 11/16/2026
 
+本页记录旧版同步 trainer 的验收。后续 **V1 sync + TransferQueue** 的 Draft-OPD / SpecOPD 也均完成两步并退出 0，详细证据和范围见 [V1 验收台账](debug44_v1_validation.md)，`.242` 启动说明见 [部署文档](deploy242_opd_v1.md)。
+
 已完成用户要求的短步调试：保留 Draft-OPD 基线，同时可通过内部方法开关运行 SpecOPD。两条路径均执行真实采集、草稿更新、权重发布及 AIME 小验证，退出码为 0。未进行长跑，未据此宣称质量或速度提升。
 
 ## 环境与数据

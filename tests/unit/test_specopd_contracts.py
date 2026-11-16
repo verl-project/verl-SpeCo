@@ -87,6 +87,22 @@ def test_config_unknown_and_non_joint_modes_rejected():
         )
 
 
+def test_v1_sync_config_requires_one_publication_per_group():
+    cfg = config()
+    cfg["trainer"] = {"use_v1": True, "v1": {"trainer_mode": "sync"}}
+    assert validate_specopd_config(cfg).enable
+    cfg["trainer"]["v1"]["trainer_mode"] = "colocate_async"
+    with pytest.raises(ValueError, match="trainer_mode=sync"):
+        validate_specopd_config(cfg)
+    cfg["trainer"]["v1"] = {"trainer_mode": "sync", "separate_async": {"parameter_sync_step": 2}}
+    with pytest.raises(ValueError, match="parameter_sync_step=1"):
+        validate_specopd_config(cfg)
+    cfg["trainer"]["v1"]["separate_async"]["parameter_sync_step"] = 1
+    cfg["algorithm"] = {"filter_groups": {"enable": True}}
+    with pytest.raises(ValueError, match="group-filter"):
+        validate_specopd_config(cfg)
+
+
 def test_window_is_preplanned_deterministic_and_uses_response_offsets():
     spec = SpecOPDConfig(window_mode="random", window_response_tokens=32)
     a = make_window(spec, "r", 2, 3, 100, 1000)
@@ -215,6 +231,27 @@ def test_batch_restores_real_unpadded_trunk_and_keeps_rejected_tokens():
     data.batch["input_ids"][0, 2] = 20
     with pytest.raises(ValueError, match="prefix"):
         build_requests(data, SpecOPDConfig(), 3)
+
+
+def test_v1_synthetic_padding_has_normal_scores_without_duplicate_branches():
+    row = torch.tensor([[1, 2, 3, 4]])
+    data = SimpleNamespace(
+        batch={
+            "prompts": row[:, :3].repeat(2, 1),
+            "input_ids": row.repeat(2, 1),
+            "attention_mask": torch.ones(2, 4, dtype=torch.long),
+        },
+        non_tensor_batch={
+            "_specopd_proposals": [encode_bundle(bundle(), 10000), None],
+            "_specopd_padding": [False, True],
+        },
+    )
+    requests, version = build_requests(data, SpecOPDConfig(), 3)
+    assert version == 2 and len(requests) == 2
+    assert len(requests[0].branches) == 1
+    assert requests[1].branches == ()
+    assert requests[1].trunk_ids == (1, 2, 3, 4)
+    assert requests[1].sample_id != requests[0].sample_id
 
 
 def test_cycle_consumes_only_once_and_waits_for_publication():

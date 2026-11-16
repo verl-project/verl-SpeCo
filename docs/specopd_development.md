@@ -12,6 +12,12 @@ validation, not a quality, throughput or other-backend certification.
 See [results and reproduction](debug44_results.md) and
 [per-attempt ledger](debug44_validation.md).
 
+The subsequent **V1 sync + TransferQueue** integration also passed both methods'
+two-step runs (attempt 06), including normal actor updates, drafter updates,
+acknowledged publication and the AIME smoke check. See the
+[V1 ledger](debug44_v1_validation.md). V1 async and long-run validation remain
+outside this result.
+
 ## Integration source
 
 Reuse source: [vx120/verl-SpeCo PR #1](https://github.com/vx120/verl-SpeCo/pull/1),

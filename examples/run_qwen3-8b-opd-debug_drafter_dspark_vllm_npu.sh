@@ -18,7 +18,7 @@ export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-lo}
 unset RAY_ADDRESS
 out=${DEBUG_OUTPUT:-/home/c00954340/specopd-debug-logs/${method}-01}
 mkdir -p "$out"
-python -m verl_speco.main \
+python -m verl_speco.main --config-name="${SPECO_CONFIG_NAME:-speco_trainer}" \
     algorithm.adv_estimator=grpo \
     data.train_files=/data/c00954340/specopd-debug/train16.parquet \
     data.val_files=/data/c00954340/specopd-debug/aime4.parquet \

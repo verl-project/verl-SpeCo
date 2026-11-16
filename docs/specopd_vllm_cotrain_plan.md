@@ -4,7 +4,7 @@
 
 Last updated: 11/16/2026
 
-状态：已在 `.44` 的 `verl-speco-090` 容器完成 **Qwen3-8B + DSpark、Ascend NPU、vLLM MRV2、legacy 同步训练**的 Draft-OPD / SpecOPD 两步短测、更新/发布、AIME 小验证和数值探针。验收仅覆盖该组合与调试预算，不代表质量或性能提升，也不代表所有 backend 已通过硬件验收。结果见 [本次验收结果](debug44_results.md)，详细历史见 [测试记录](debug44_validation.md)，评分核心见 [联合评分说明](specopd_joint_scoring.md)。
+状态：已在 `.44` 的 `verl-speco-090` 容器完成 **Qwen3-8B + DSpark、Ascend NPU、vLLM MRV2、legacy 同步训练**的 Draft-OPD / SpecOPD 两步短测、更新/发布、AIME 小验证和数值探针。随后两种方法均完成 **V1 sync + TransferQueue** 两步短测、更新/发布与 AIME 小验证，退出码均为 0。验收仅覆盖这些组合与调试预算，不代表质量或性能提升。旧版结果见 [原验收结果](debug44_results.md)，V1 结果及修复见 [V1 台账](debug44_v1_validation.md)，评分核心见 [联合评分说明](specopd_joint_scoring.md)，`.242` 脚本见 [部署说明](deploy242_opd_v1.md)。
 
 本地代码基线：`054683f15550af4bf28e6e6a024df15bf455b64e`。复用来源：[vx120/verl-SpeCo PR #1](https://github.com/vx120/verl-SpeCo/pull/1)，固定提交 `7611fd559f3c5a8d89034683eacb436bf0a377b7`；只合入该 PR 的改动，不引入其父分支的无关改动。
 
@@ -377,12 +377,12 @@ checkpoint 不保存 pending proposal/scored group；恢复后从已提交权重
 | `backends/drafter_opd.py`、`opd_math.py` | PR 基线目标保留；TV 和前缀 survival 公共计算 |
 | `backends/specopd_forward.py`、`specopd_loss.py` | 固定草稿历史的 forward、纯分支 E2E-TV、按有效位置归一化及 DFlash2 候选外质量 |
 | `backends/dflash_trainer_backend.py`、`dspark_trainer_backend.py` | 保留原模式/PR 基线，增加 SpecOPD wrapped forward 分派；DFlash2 继承对应入口 |
-| `integration/oldlogprob_layer_ids.py`、`trainer/v1/speco_mixin.py` | 保留 PR 基线最后层采集和 trace 传递；不据此宣称 SpecOPD 已支持 V1 |
+| `integration/oldlogprob_layer_ids.py`、`trainer/v1/speco_mixin.py`、`trainer/v1/specopd_adapter.py` | PR 基线最后层采集和 trace 传递；V1 sync 中绑定请求 revision、读取 TQ 完整 wire、联合 old-logprob 写回 TQ、一次更新及 actor 同步后的草稿发布/ACK；跳过旧 replay hooks |
 | `examples/run_qwen3-8b-draftopd_drafter_{dflash,dspark}_vllm.sh` | 保留 PR 基线参数，按仓库规则调整脚本名 |
 | `examples/run_qwen3-8b-specopd_drafter_dflash_vllm.sh` | 小预算同步双方法模板，`OPD_METHOD` 选择方法，默认 SpecOPD |
 | `examples/run_qwen3-8b-opd-debug_drafter_dspark_vllm_npu.sh` | 本次 NPU 两方法短测入口，固定 16/4 数据子集、2 步；按方法设置 padding/attention |
 
-本轮不修改 upstream verl 源码。独立 SFT worker、TQ/offline 扩展、V1 SpecOPD、VeOmni/Megatron、异步/Bubble 和高性能树 attention kernel 均不属于已验收范围。
+本轮不修改 upstream verl 源码。V1 sync 已接入并短测；保留原生 TQ worker，避免通用 manager 初始化覆盖它。独立 SFT worker、离线 TQ 数据管道、V1 异步 SpecOPD、VeOmni/Megatron、异步/Bubble 和高性能树 attention kernel 均不属于已验收范围。V1 SpecOPD 强制 sync、parameter_sync_step=1，并拒绝 group-filter refill。
 
 ## 10. 实际配置与启动入口
 
@@ -521,7 +521,7 @@ actor_rollout_ref:
 
 ### D. DSpark / DFlash2 与更多部署组合
 
-已完成三个 backend 的 CPU 模型反向；实机逐个对齐真实 proposal 分布。V1、NPU/MRV2、异步和 Bubble 扩展需要独立适配与验收。默认严格单版本策略在各组合验证前不放开。
+已完成三个 backend 的 CPU 模型反向；DSpark 的真实 proposal 分布、NPU/MRV2 及 V1 sync 已按各自台账验收。其他 backend 的 V1、异步和 Bubble 扩展仍需独立适配与验收。默认严格单版本策略在各组合验证前不放开。
 
 ### E. 联合前向的 kernel 与内存优化
 

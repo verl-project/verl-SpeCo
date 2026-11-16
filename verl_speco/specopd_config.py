@@ -178,8 +178,15 @@ def validate_specopd_config(config):
         raise ValueError("SpecOPD supports vLLM DFlash/DSpark/DFlash2 only")
     if drafter.get("vllm", {}).get("draft_sample_method", "greedy") != "probabilistic":
         raise ValueError("SpecOPD requires vllm.draft_sample_method=probabilistic")
-    if config.get("trainer", {}).get("use_v1", False):
-        raise ValueError("SpecOPD currently requires trainer.use_v1=false")
+    trainer = config.get("trainer", {})
+    if trainer.get("use_v1", False):
+        v1 = trainer.get("v1", {})
+        if v1.get("trainer_mode", "sync") != "sync":
+            raise ValueError("SpecOPD V1 requires trainer_mode=sync")
+        if v1.get("separate_async", {}).get("parameter_sync_step", 1) != 1:
+            raise ValueError("SpecOPD V1 requires parameter_sync_step=1")
+        if config.get("algorithm", {}).get("filter_groups", {}).get("enable", False):
+            raise ValueError("SpecOPD V1 does not support group-filter refill")
     if actor.get("actor", {}).get("strategy", "fsdp2") not in {"fsdp", "fsdp2"}:
         raise ValueError("SpecOPD requires the FSDP actor engine")
     model = actor.get("model", {})

@@ -332,7 +332,7 @@ async def _speco_worker_generate_sequences(self, batch):
     try:
         context_tokens = _speco_context_from_batch(batch)
         if os.getenv("VERL_SPECO_DIAGNOSTIC_TRANSPORT") == "1":
-            print(f"[specopd transport] worker={type(self).__name__} revision={_CURRENT_SPECOPD_REVISION.get()} meta={list(batch.meta_info)}", flush=True)
+            print(f"[specopd transport] worker={type(self).__name__} revision={_CURRENT_SPECOPD_REVISION.get()} meta={list(getattr(batch, 'meta_info', {}))}", flush=True)
         generate_sequences = _speco_parent_method(self, "generate_sequences")
         if not callable(generate_sequences):
             raise AttributeError(
@@ -365,14 +365,19 @@ async def _speco_worker_run_agent_loop(
         raise AttributeError(
             "SPECO AgentLoop worker parent has no _run_agent_loop method"
         )
-    return await _run_agent_loop_with_student_timing(
-        run_agent_loop,
-        self,
-        sampling_params,
-        trajectory,
-        *args,
-        **kwargs,
-    )
+    revision = kwargs.pop("_specopd_drafter_revision", _CURRENT_SPECOPD_REVISION.get())
+    token = _CURRENT_SPECOPD_REVISION.set(revision)
+    try:
+        return await _run_agent_loop_with_student_timing(
+            run_agent_loop,
+            self,
+            sampling_params,
+            trajectory,
+            *args,
+            **kwargs,
+        )
+    finally:
+        _CURRENT_SPECOPD_REVISION.reset(token)
 
 
 async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs):
@@ -571,6 +576,13 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
     if getattr(manager, "_speco_agent_loop_manager_configured", False):
         return
 
+    # AgentLoopManagerTQ selects the serializable TQ worker installed by
+    # install_v1_agent_loop_worker_bridge before calling this patched parent
+    # constructor. Replacing it with the generic worker loses TQ semantics.
+    if type(manager).__module__ == "verl.trainer.ppo.v1.agent_loop_tq":
+        manager._speco_agent_loop_manager_configured = True
+        return
+
     import ray
 
     manager.agent_loop_workers_class = ray.remote(
@@ -760,14 +772,19 @@ def install_agent_loop_runtime_patch() -> bool:
                 ),
             )
             sampling_params = _apply_probe_sampling_overrides(sampling_params)
-            return await _run_agent_loop_with_student_timing(
-                run_agent_loop,
-                self,
-                sampling_params,
-                trajectory,
-                *args,
-                **kwargs,
-            )
+            revision = kwargs.pop("_specopd_drafter_revision", _CURRENT_SPECOPD_REVISION.get())
+            token = _CURRENT_SPECOPD_REVISION.set(revision)
+            try:
+                return await _run_agent_loop_with_student_timing(
+                    run_agent_loop,
+                    self,
+                    sampling_params,
+                    trajectory,
+                    *args,
+                    **kwargs,
+                )
+            finally:
+                _CURRENT_SPECOPD_REVISION.reset(token)
 
         worker_cls._run_agent_loop = speco_run_agent_loop
         worker_cls._speco_patched_run_agent_loop = True

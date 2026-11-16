@@ -24,6 +24,67 @@ from verl_speco.integration.partial_rollout_stats import (
 from verl_speco.integration.rollout_admission import RolloutAdmission
 
 
+def test_v1_manager_keeps_native_transfer_queue_worker():
+    from types import SimpleNamespace
+
+    manager_cls = type("AgentLoopManagerTQ", (), {"__module__": "verl.trainer.ppo.v1.agent_loop_tq"})
+    manager = manager_cls()
+    worker = object()
+    manager.agent_loop_workers_class = worker
+    manager.config = SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(name="vllm")))
+    agent_loop_runtime._configure_speco_agent_loop_manager_instance(manager, object)
+    assert manager.agent_loop_workers_class is worker
+    assert manager._speco_agent_loop_manager_configured
+
+
+def test_v1_tensor_dict_diagnostic_accepts_no_meta_info(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    import torch
+    from tensordict import TensorDict
+    from verl_speco.integration import agent_loop_runtime as runtime
+
+    async def generate(self, batch):
+        return None
+
+    monkeypatch.setenv("VERL_SPECO_DIAGNOSTIC_TRANSPORT", "1")
+    monkeypatch.setattr(runtime, "_speco_worker_request_started", lambda self: None)
+    monkeypatch.setattr(runtime, "_speco_worker_request_finished", lambda self: None)
+    monkeypatch.setattr(runtime, "_speco_parent_method", lambda self, name: generate)
+    batch = TensorDict({"input_ids": torch.tensor([[1, 2]])}, batch_size=[1])
+    assert asyncio.run(runtime._speco_worker_generate_sequences(SimpleNamespace(), batch)) is None
+
+
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("inherited", [False, True])
+def test_v1_explicit_worker_binds_and_resets_proposal_revision(monkeypatch, fail, inherited):
+    import asyncio
+    from types import SimpleNamespace
+    from verl_speco.integration import agent_loop_runtime as runtime
+
+    async def run(self, sampling_params, trajectory, **kwargs):
+        assert runtime._sampling_params_with_speco_context(sampling_params)["_specopd_drafter_revision"] == (3 if inherited else 7)
+        assert "_specopd_drafter_revision" not in kwargs
+        if fail:
+            raise ValueError("test failure")
+        return SimpleNamespace(extra_fields={})
+
+    monkeypatch.setattr(runtime, "_speco_parent_method", lambda self, name: run)
+    async def check():
+        token = runtime._CURRENT_SPECOPD_REVISION.set(3)
+        try:
+            kwargs = {} if inherited else {"_specopd_drafter_revision": 7}
+            call = runtime._speco_worker_run_agent_loop(SimpleNamespace(), {}, {"step": 1}, **kwargs)
+            if fail:
+                with pytest.raises(ValueError, match="test failure"):
+                    await call
+            else:
+                await call
+            assert runtime._CURRENT_SPECOPD_REVISION.get() == 3
+        finally:
+            runtime._CURRENT_SPECOPD_REVISION.reset(token)
+    asyncio.run(check())
+
 def test_agent_loop_preserves_spec_decode_metric_fields() -> None:
     output = SimpleNamespace(extra_fields={})
 

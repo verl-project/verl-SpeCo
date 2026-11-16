@@ -38,6 +38,12 @@ def build_requests(batch, spec, revision):
     requests, actor_versions = [], set()
     seen = set()
     for index, wire in enumerate(wires):
+        if batch.non_tensor_batch.get("_specopd_padding", [False] * len(wires))[index]:
+            mask = tensors["attention_mask"][index].bool()
+            ids = tuple(tensors["input_ids"][index][mask].cpu().tolist())
+            prompt_len = int(mask[:prompt_width].sum())
+            requests.append(JointScoringRequest(f"__specopd_padding_{index}", ids, prompt_len))
+            continue
         bundle = decode_bundle(wire, spec.max_wire_bytes)
         if (
             bundle["drafter_revision"] != revision
@@ -166,9 +172,11 @@ class SpecOPDDriver:
         self._acknowledged_actor_revision = None
 
     def acknowledge_serving_revision(self, revision):
-        target = self.trainer._speco_rollout_generation_target()
         server_manager = getattr(self.trainer, "llm_server_manager", None)
-        servers = getattr(server_manager, "server_handles", None) or getattr(target, "server_handles", None)
+        servers = getattr(server_manager, "server_handles", None)
+        if not servers:
+            target = self.trainer._speco_rollout_generation_target()
+            servers = getattr(target, "server_handles", None)
         if not servers:
             raise RuntimeError("SpecOPD requires rollout server handles for serving revision ACKs")
         replies = self.trainer._ray_get_if_needed([
