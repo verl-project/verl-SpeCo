@@ -1,5 +1,7 @@
 # Draft-OPD GPU L1 实现说明
 
+Last updated: 11/16/2026
+
 日期：2026-11-04。代码范围：仅 verl-SpeCo。支持 DFlash 和标准 anchor-as-first DSpark。
 
 本次交付设计中的 P1 L1：记录真实验证计数，在真实验证起点训练 CE 或 E2E TV，并可组合已实现的 VAT。没有修改 Draft-OPD 参考仓库或 vLLM fork。L2 的被拒 token/logprob、suffix-k3、bonus-anchor、SPARK 和 NPU 不在本次交付中。
@@ -250,3 +252,45 @@ python -m pytest tests/unit/test_training_outcome_metrics.py tests/unit/test_dra
 ```
 
 结果 **36 passed**；两个 Python 文件通过 Ruff，`git diff --check` 通过。未验证 GPU 实际日志；同步修改并重新启动作业后观察上述字段。
+
+
+## Ray transport fixes and Ascend validation (2026-11-16)
+
+The HTTP bridge now owns forwarding methods on its serialized subclass, so a
+fresh Ray worker importing the unpatched upstream base retains collection and
+configuration restoration. Reinstalling an early bridge refreshes its resolved
+configuration instead of retaining an empty snapshot. The launcher passes the
+resolved drafter configuration through the Ray job, TaskRunner and HTTP actor
+runtime environments, including when upstream supplies actor-specific options.
+
+Draft-OPD now accepts `trainer.device=npu` as well as CUDA. In the development
+environment, actual small-model DFlash/DSpark CE and E2E-TV NPU backward checks
+passed; a DSpark two-step RL debug run collected eight samples per step, advanced
+the drafter optimizer to steps 1 and 2 and published both updates. This bounded
+run does not establish model quality, performance or support for every runtime.
+The baseline old-logprob feature collector still requires remove-padding;
+short-run response/window lengths must leave enough rows for collection.
+
+The transfer preserves this branch's VAT and weighted E2E-TV behavior. It does
+not add SpecOPD collection or tree scoring. Local transport/objective regression:
+267 passed, 7 skipped (upstream verl unavailable). Seven new regression cases
+failed before the fix, including fresh-interpreter cloudpickle, late config,
+actor runtime environment propagation and NPU launch checks.
+
+
+Validation command:
+
+```bash
+python -m pytest -q -rs tests/integration/test_vllm_runtime_contract.py \
+  tests/integration/test_native_bypass_contract.py \
+  tests/integration/test_verify_trace_runtime.py \
+  tests/integration/test_drafter_config_env.py \
+  tests/integration/test_agent_loop_runtime_contract.py \
+  tests/unit/test_drafter_opd.py tests/unit/test_vat_loss.py \
+  tests/unit/test_training_outcome_metrics.py
+```
+
+Ruff checks, license, device-boundary and diff-whitespace checks pass. The
+repository-wide documentation-date check still reports three unchanged files:
+`draft_opd_vat_spark_design.md`, `draft_opd_vat_spark_design_review.md` and
+`dspark_vat_publish_fix.md`. They already lack `Last updated` on the source branch.

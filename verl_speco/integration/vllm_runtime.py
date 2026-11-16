@@ -4534,13 +4534,33 @@ def _build_speco_vllm_http_server_class(upstream_module: Any):
             upstream_cls._speco_drafter_config_env = drafter_config_env
         return upstream_cls
     if bool(getattr(upstream_cls, "_speco_vllm_http_methods_patched", False)):
+        # Ray imports the base by reference in a fresh process. Keep the
+        # patched methods on the by-value subclass as well; inheriting them
+        # loses launch config restoration and proposal capture after import.
+        namespace = {
+            "__module__": __name__,
+            "_speco_drafter_config_env": drafter_config_env,
+        }
+        from functools import wraps
+
+        def own_bridge(method):
+            @wraps(method)
+            async def routed(self, *args, **kwargs):
+                return await method(self, *args, **kwargs)
+
+            return routed
+
+        for name in ("launch_server", "run_server", "generate", "speco_generate_probe"):
+            method = getattr(upstream_cls, name, None)
+            if method is not None:
+                # Cloudpickle removes class entries identical to inherited
+                # entries. A distinct forwarding closure must retain this
+                # bridge even when the imported base is pristine remotely.
+                namespace[name] = own_bridge(method)
         return type(
             "SpecoVLLMHttpServer",
-            (upstream_cls,),
-            {
-                "__module__": __name__,
-                "_speco_drafter_config_env": drafter_config_env,
-            },
+            (_SpecoVLLMHttpServerMixin, upstream_cls),
+            namespace,
         )
     return type(
         "SpecoVLLMHttpServer",
@@ -4561,12 +4581,15 @@ class _SpecoVLLMHttpServerActorClass:
     )
     _SETUP_HOOK_ENV_VAR = "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR"
 
-    def __init__(self, actor_class: Any):
+    def __init__(self, actor_class: Any, drafter_config_env: str | None = None):
         self._actor_class = actor_class
+        self._drafter_config_env = drafter_config_env
 
     def options(self, **options):
         runtime_env = dict(options.get("runtime_env", {}) or {})
         env_vars = dict(runtime_env.get("env_vars", {}) or {})
+        if self._drafter_config_env:
+            env_vars[SPECO_DRAFTER_CONFIG_ENV] = self._drafter_config_env
         if "VERL_SPECO_PHASE_TIMING" in os.environ:
             env_vars.setdefault(
                 "VERL_SPECO_PHASE_TIMING", os.environ["VERL_SPECO_PHASE_TIMING"]
@@ -4591,7 +4614,11 @@ class _SpecoVLLMHttpServerActorClass:
 def _remote_speco_vllm_http_server(ray_module: Any, server_cls: type[Any]) -> Any:
     """Create the HTTP actor with import compatibility active at process start."""
 
-    return _SpecoVLLMHttpServerActorClass(ray_module.remote(server_cls))
+    return _SpecoVLLMHttpServerActorClass(
+        ray_module.remote(server_cls),
+        getattr(server_cls, "_speco_drafter_config_env", None)
+        or get_drafter_config_env(),
+    )
 
 
 def _patch_upstream_vllm_http_server_methods(upstream_cls: type[Any]) -> bool:
@@ -4741,13 +4768,14 @@ def install_upstream_vllm_runtime_bridge() -> bool:
         return False
 
     _patch_upstream_vllm_http_server_methods(vllm_async_server.vLLMHttpServer)
+    # Early worker bootstrap can precede configuration; refresh on reinstall.
+    speco_http_server_cls = _build_speco_vllm_http_server_class(vllm_async_server)
     if bool(getattr(upstream_replica, "_speco_vllm_replica_bridge", False)):
         registry = getattr(replica_module, "RolloutReplicaRegistry", None)
         if registry is not None and hasattr(registry, "_registry"):
             registry._registry["vllm"] = lambda: upstream_replica
         _VLLM_REPLICA_PATCHED = True
         return True
-    speco_http_server_cls = _build_speco_vllm_http_server_class(vllm_async_server)
 
     upstream_replica_base = cast(type[Any], upstream_replica)
 
@@ -4823,8 +4851,8 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
                 f"expected spec_verify_tokens={capacity}. "
                 "DFlash block_size includes the anchor; DSpark block_size counts draft positions."
             )
-        if _get_nested(config, ("trainer", "device"), "cuda") != "cuda":
-            raise ValueError("Draft-OPD currently supports GPU only")
+        if _get_nested(config, ("trainer", "device"), "cuda") not in {"cuda", "npu"}:
+            raise ValueError("Draft-OPD requires CUDA or Ascend NPU")
         if drafter_cfg["training"].get("packing", {}).get("enable", False):
             raise ValueError("Draft-OPD currently requires packing.enable=false")
     if not enabled:

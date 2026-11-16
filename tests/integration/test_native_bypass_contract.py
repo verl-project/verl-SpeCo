@@ -288,3 +288,21 @@ def test_run_bypass_strips_speco_overlay_before_native_run(monkeypatch) -> None:
     # The strip must be surgical: native rollout keys stay intact.
     assert native_config.actor_rollout_ref.rollout.name == "vllm"
     assert native_config.actor_rollout_ref.rollout.n == 1
+
+
+def test_drafter_runtime_config_is_resolved_before_ray_start():
+    import json
+    from verl_speco.main import configure_drafter_runtime_env
+    from verl_speco.integration.drafter_config_env import SPECO_DRAFTER_CONFIG_ENV
+
+    config = _config(enable=True, training=True)
+    config.actor_rollout_ref.rollout.drafter.training = {
+        "drafter_opd": {"enable": True, "method": "draft_opd"},
+        "window": "${actor_rollout_ref.rollout.drafter.enable}",
+    }
+    env = configure_drafter_runtime_env(config)
+    assert config.ray_kwargs.ray_init.runtime_env.env_vars[SPECO_DRAFTER_CONFIG_ENV] == env[SPECO_DRAFTER_CONFIG_ENV]
+    assert json.loads(env[SPECO_DRAFTER_CONFIG_ENV])["training"] == {
+        "drafter_opd": {"enable": True, "method": "draft_opd"}, "window": True,
+    }
+    assert configure_drafter_runtime_env(_config()) == {}
