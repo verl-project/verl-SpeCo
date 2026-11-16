@@ -87,12 +87,21 @@ The real RL actor's existing `DraftWeightPublishMixin` now exposes an explicit
 context, respects its autocast dtype, and returns CPU scoring snapshots. It is
 not attached to the SFT-only `SpecoTrainingWorker`.
 
-The adapter assigns complete trajectories to FSDP ranks using one shared
-schedule. Empty ranks execute a one-token dummy, and rank outputs are restored
-to request order. Preflight and schedule consensus occur before the forward.
-Real multi-rank collectives and NPU kernels still require environment validation.
-Remove-padding, sequence parallelism, fused forward and LoRA are rejected;
-the core also rejects FlashAttention, sliding-window and hybrid attention.
+The adapter assigns complete trajectories to DP groups using one shared
+schedule. SP=1 uses the dense eager/SDPA executor without remove-padding.
+SP>1 uses `joint_ulysses.py`: local token shards exchange QKV sequence/head
+axes, apply the tree mask with logical RoPE, then reverse the exchange.
+Only the SP leader exports results; empty DP groups execute a padded dummy.
+Response logprobs and selected hidden/readout rows are gathered, rather than
+all-gathering sequence-by-vocabulary logits.
+
+Normal PPO/ref forwards retain upstream remove-padding and FlashAttention
+when SP is enabled; instance attention methods are restored after joint
+scoring. Fused model forwards, LoRA, adaptive RoPE, sliding-window and hybrid
+models remain unsupported. CPU multi-process and actual HCCL SP=4/DP=2-SP=2
+checks, plus Qwen3-8B V1 actor/ref SP=4 ten-step runs are recorded in the
+[Ulysses ledger](debug44_ulysses_validation.md). These are correctness and short
+lifecycle checks, not long-sequence performance certification.
 
 The automatic production entry now exists behind the unified selector:
 

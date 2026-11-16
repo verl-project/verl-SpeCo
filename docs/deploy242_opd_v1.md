@@ -25,9 +25,9 @@ title、日志和 checkpoint 输出名按方法区分。用户额外 Hydra 参�
 | 草稿损失 | PR 基线 E2E-TV | 完整 rollout 分支的 E2E-TV |
 | draft sampling | probabilistic，T=1 | probabilistic，T=1 |
 | DSpark loss mode | full_vocab / fixed_exp_decay | full_vocab / fixed_exp_decay |
-| actor/ref SP | 保留 4 | 均为 1，适配 dense actor/ref 路径 |
-| actor attention | 保留原路径 | eager，remove_padding=false，fused/compile=false |
-| 草稿更新调度 | 保留 step=20、间隔=5 | 每轮单次更新，采集/训练间隔=1、同步发布 |
+| actor/ref SP | 4 | 4（Ulysses 联合评分） |
+| actor attention | 保留原路径，remove_padding=true | 普通 PPO/ref 用 FlashAttention；联合评分用 SP 树 attention，remove_padding=true，fused/compile=false |
+| 草稿更新调度 | step=20、采集/训练间隔=5 | step=20、采集/训练间隔=5；20 步后同步发布一次 |
 | SpecOPD 采集 | 不使用该通道 | front 512-token 窗口，每请求最多 8 个完整 K=7 分支（56 proposal tokens） |
 
 SpecOPD 联合评分 token budget=9216、dense mask budget=9216²，覆盖原脚本 512+8192 主干加 8 个分支的物理行数；没有因默认 4096² mask 上限而静默截断主干或分支。
@@ -35,7 +35,7 @@ SpecOPD 联合评分 token budget=9216、dense mask budget=9216²，覆盖原脚
 
 `.242` 宿主机当前没有 torch 和完整 verl 配置，未安装或改变公共依赖；它用于接收代码和脚本。
 两脚本已做 bash 语法检查；捕获实际 argv 后，在 `.44` 的完整训练环境完成 Hydra compose 和方法校验。
-V1 的短步硬件验收及失败历史见 [V1 调试台账](debug44_v1_validation.md)。
+早期 V1 SP=1 的验收见 [V1 台账](debug44_v1_validation.md)；最新 actor/ref SP=4、每 5 轮训练 20 步的 10-step 结果及数值/DP-SP 检查见 [Ulysses 台账](debug44_ulysses_validation.md)。
 
 源码部署 receipt：`/efs_rl/z00886395/codes/test_speco/specopd-v1-source-manifest.json`。
-脚本与代码最终哈希已核对；原参考脚本哈希未改变。两个方法的 V1 两步硬件测试均退出 0，最终 focused 回归 159 passed。`.242` 的完整生产训练未启动。
+脚本与代码最终哈希已核对；原参考脚本哈希未改变。两个方法最新的 V1 sync/SP=4 十步硬件测试均退出 0，optimizer 累计均为 20→40；完整回归结果见 Ulysses 台账。`.242` 的完整生产训练未启动。

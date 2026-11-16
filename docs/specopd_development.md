@@ -96,8 +96,9 @@ not claimed to have the same chunked implementation.
    channel. Even an unselected/no-proposal request returns an explicit empty
    bundle. No rollout target hidden/logits are saved in this mode.
 4. `SpecOPDDriver` compiles each exact trunk and all its collected branches.
-   Whole trees are assigned to microbatches and FSDP ranks. Empty ranks have a
-   dummy forward; real trajectories are not split or repeated.
+   Whole trees are assigned to microbatches and DP groups. Under Ulysses,
+   token activations are sharded inside each SP group, with QKV head/sequence
+   exchanges and one leader export. Empty groups have a dummy forward.
 5. `compute_joint_old_log_prob` enters the actual actor engine eval/autocast
    context and calls its model once per local microbatch. A tree mask and
    logical positions prevent future-trunk/sibling leakage. Normal response
@@ -106,8 +107,11 @@ not claimed to have the same chunked implementation.
    to the drafter. The original normal old-logprob path is not called again.
 6. Drafter training reuses all captured anchors without resampling. DFlash,
    DSpark and DFlash2 reconstruct their probabilities using the actual sampled
-   histories. Microbatches accumulate to exactly one optimizer update, before
-   actor update, using the same target head as scoring.
+   histories. Each optimizer update accumulates the group microbatches, before actor
+   update, using the same target head as scoring. The deployment recipe now
+   reuses each collected group for 20 optimizer updates every five RL steps;
+   this is multi-step reuse of sampled histories, not fresh current-q samples
+   at every optimizer step. The group is published/consumed once.
 7. After actor weight publication, publish the updated drafter synchronously;
    do not start another rollout with an unacknowledged revision. Scored groups
    are consumed once. Failed/partial groups stop the run rather than replay.
@@ -138,8 +142,10 @@ short template. A quality/performance experiment must additionally match
 data, parameter snapshots, sampling, update budget and run duration, and
 report the different valid training-position counts.
 
-SpecOPD requires full-attention Qwen2/Qwen3/Llama eager or SDPA actor, FSDP/
-FSDP2, no actor sequence parallelism, no remove-padding/fused forward/LoRA,
+SpecOPD supports full-attention Qwen2/Qwen3/Llama and FSDP/FSDP2. SP=1
+uses dense eager/SDPA without remove-padding; SP>1 uses the scoped tree
+Ulysses adapter with upstream remove-padding enabled for normal PPO/ref.
+Fused model forwards, LoRA and adaptive RoPE remain unsupported,
 single-turn exact token histories, probabilistic drafter sampling, and equal
 rollout/actor/proposal/target temperature. Only unmodified sampling distributions
 are supported: no top-k/top-p filtering, custom processors or penalties.

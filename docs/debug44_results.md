@@ -1,5 +1,7 @@
 # .44 Draft-OPD / SpecOPD 短测结果
 
+后续已实现 Ulysses 与更新调度对齐：两种方法 actor/ref SP=4、每 5 轮训练 20 步、十步短测完成。当前部署参数和验收以 [Ulysses 台账](debug44_ulysses_validation.md) 为准；下文保留早期结果。
+
 Last updated: 11/16/2026
 
 本页记录旧版同步 trainer 的验收。后续 **V1 sync + TransferQueue** 的 Draft-OPD / SpecOPD 也均完成两步并退出 0，详细证据和范围见 [V1 验收台账](debug44_v1_validation.md)，`.242` 启动说明见 [部署文档](deploy242_opd_v1.md)。

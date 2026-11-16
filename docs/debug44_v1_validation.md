@@ -1,5 +1,7 @@
 # .44 V1 Draft-OPD / SpecOPD 调试台账
 
+后续已实现 Ulysses 与更新调度对齐：两种方法 actor/ref SP=4、每 5 轮训练 20 步、十步短测完成。当前部署参数和验收以 [Ulysses 台账](debug44_ulysses_validation.md) 为准；下文保留早期结果。
+
 2026-11-16：用户要求两种方法使用 `trainer.use_v1=true`，先在
 `7.208.150.44` / `verl-speco-090` 短步调试，再完成 `.242` 部署。
 既有旧版 trainer 的成功结果不能作为 V1 验收结果。

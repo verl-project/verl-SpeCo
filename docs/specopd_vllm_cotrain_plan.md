@@ -6,6 +6,8 @@ Last updated: 11/16/2026
 
 状态：已在 `.44` 的 `verl-speco-090` 容器完成 **Qwen3-8B + DSpark、Ascend NPU、vLLM MRV2、legacy 同步训练**的 Draft-OPD / SpecOPD 两步短测、更新/发布、AIME 小验证和数值探针。随后两种方法均完成 **V1 sync + TransferQueue** 两步短测、更新/发布与 AIME 小验证，退出码均为 0。验收仅覆盖这些组合与调试预算，不代表质量或性能提升。旧版结果见 [原验收结果](debug44_results.md)，V1 结果及修复见 [V1 台账](debug44_v1_validation.md)，评分核心见 [联合评分说明](specopd_joint_scoring.md)，`.242` 脚本见 [部署说明](deploy242_opd_v1.md)。
 
+最新扩展：Ulysses 已支持当前静态 RoPE 的全注意力模型；Qwen3-8B V1 sync actor/ref SP=4、每 5 轮训练 20 步的 10-step 短测均退出 0。非采集轮使用正常 old-logprob，不采集分支也不训练草稿。数值、DP/SP 分组、发布计数及范围见 [Ulysses 台账](debug44_ulysses_validation.md)。
+
 本地代码基线：`054683f15550af4bf28e6e6a024df15bf455b64e`。复用来源：[vx120/verl-SpeCo PR #1](https://github.com/vx120/verl-SpeCo/pull/1)，固定提交 `7611fd559f3c5a8d89034683eacb436bf0a377b7`；只合入该 PR 的改动，不引入其父分支的无关改动。
 
 ## 0. 方法选择及与基线的边界
@@ -16,13 +18,13 @@ Last updated: 11/16/2026
 |---|---|---|
 | `enable=false` | 原有 SpeCo | 原训练行为，旧 `specopd.enable` 也必须为 false |
 | `enable=true, method=draft_opd` | PR 原有验证 trace，正常最终 response 前向和特征采集 | 接受前缀及首拒绝位置；CE 或加权 E2E-TV；random/trace/mixed 锚点 |
-| `enable=true, method=spec_opd` | 预设窗口、完整原始 proposal，正常主干与全部有效分支一次联合 actor 前向 | 固定采集锚点、纯分支 E2E-TV、同版本一次 optimizer 更新 |
+| `enable=true, method=spec_opd` | 预设窗口、完整原始 proposal，正常主干与全部有效分支一次联合 actor 前向 | 固定采集锚点、纯分支 E2E-TV、固定采样组内按 training.step 训练；当前部署每 5 轮采集、20 步后发布一次 |
 
 `opd_method.py` 在入口、server、backend 和训练钩子中统一分派。默认方法为 `draft_opd`，因此 PR 原配置仍有效；原 `specopd.enable=true` 作为兼容入口保留，与已启用的 Draft-OPD 同时配置则报错。SpecOPD 模式忽略基线 trace 采集、随机锚点比例和首拒绝加权，不能同时跑两套采集/训练钩子。
 
 已复用：PR 的 Draft-OPD 目标和 planner、验证 trace、远端 agent worker 补丁绑定、私有配置恢复、特征元数据传递、回归测试；两种方法共用 prefix-survival 数学函数和原有模型/LM-head/optimizer/权重发布设施。SpecOPD 自行实现完整 proposal 协议、预采集窗口、树形联合评分和一次消费调度。PR 的 trace 仅含位置和计数，不能替代完整 proposal。
 
-以下 §1–§13 中关于“只保存 token、完整拒绝尾部、联合前向、一次更新”的要求专指 **SpecOPD 路径**，不强加给 Draft-OPD 基线。两种方法已通过 .44 上真实小模型 NPU 反向验证，因此 Draft-OPD 入口已放开 NPU；两者完整 serving/RL 短跑验收仍进行中，见 [实机记录](debug44_validation.md)。
+以下 §1–§13 中关于“只保存 token、完整拒绝尾部、联合前向、一次消费事务”的要求专指 **SpecOPD 路径**，不强加给 Draft-OPD 基线。两种方法已通过 .44 上真实小模型 NPU 反向验证，因此 Draft-OPD 入口已放开 NPU；两者完整 serving/RL 短跑验收仍进行中，见 [实机记录](debug44_validation.md)。
 
 ## 1. 目标与已确定的边界
 
@@ -35,7 +37,7 @@ Last updated: 11/16/2026
 - actor 仍使用正常 rollout response 计算奖励、优势及 PPO/GRPO loss；分支不进入 RL loss。
 - drafter 使用分支 E2E-TV，不混入正常主干 CE/L1/LK/D-PACE loss。第一阶段也关闭 confidence 辅助 loss。
 - 主干用于提供 drafter 上下文及 target 评分前缀，主干 token 本身不单独产生 drafter loss。
-- 第一阶段同步执行、明确版本边界、一次采集对应一次 optimizer 更新，直接以全注意力树形联合评分为目标；暂不启用异步多版本 replay、Bubble Time 或混合/线性注意力状态重放。
+- 第一阶段同步执行、明确版本边界、一次采集形成固定组，在 actor 更新前完成配置数量的 optimizer 更新，最后发布一次（当前配置为每 5 轮采集、20 步训练），直接以全注意力树形联合评分为目标；暂不启用异步多版本 replay、Bubble Time 或混合/线性注意力状态重放。
 - 不修改已安装的 upstream verl 源码；继续使用 `verl_speco` overlay 和运行时适配。
 
 ## 2. 原始基线检查与实际扩展
@@ -108,7 +110,7 @@ actor_t 的 old-logprob 阶段
         ↓
 drafter_k：重建对应 proposal 概率，计算分支 E2E-TV
         ↓
-所有 microbatch 累积结束，仅一次 optimizer.step → drafter_k+1
+每个 optimizer step 累积整组 microbatch；完成 20 步 → 发布一次 drafter_k+1
         ↓
 正常 actor 更新 → actor_t+1
         ↓
@@ -328,11 +330,11 @@ DP/梯度累积按全局有效位置数归一化，适配框架已有梯度平�
 
 ### 7.3 一次采集、一次更新
 
-采集时冻结 drafter_k；汇总若干 rollout 请求的 branches，按预算累积梯度；所有 microbatch 完成后只执行一次 optimizer.step。更新后这些 branches 标记消费，不进入下一次 optimizer update。
+采集时记录 actor/drafter 来源版本；汇总本轮 rollout branches 成一个固定组。每个 optimizer step 对该组微批次累积梯度，当前配置连续执行 20 步，期间 actor/teacher 不更新；随后一次发布并消费/释放整组，不跨采集周期 replay。
 
 默认现有 training.step/epoch、last_n_steps、replay、自动补 quota 等逻辑可能重复消费数据，必须给 SpecOPD 独立约束，不能仅设置一个 loss flag。
 
-相同 drafter_k 下分批梯度累积是允许的；更新后继续使用未消费 branches 也存在版本滞后，首阶段丢弃剩余记录并统计。若以后允许有界 lag，需另立实验配置，不能默认为论文严格 on-policy。
+同组 20 步中使用固定采样历史、重算当前 q；这是用户要求与 Draft-OPD 对齐的多步复用采样数据近似。采样来源 q 随训练逐步偏离当前 q，不能宣称每个 optimizer step 都重新从当前 q 采样。原单步设置仍可用 training.step=1 选择。
 
 同样不能“本轮采集不够，等 actor 下一次更新后再补”：即使 drafter 权重没变，其共享 target head/embedding 和上下文特征分布可能已变。第一阶段在当前 actor/drafter revision 内形成一个 update group；不足时本轮不训练并丢弃/释放该组，不跨 revision 合并。
 
@@ -346,7 +348,9 @@ DP/梯度累积按全局有效位置数归一化，适配框架已有梯度平�
 ready → collecting → scored → updating → awaiting_publish → ready
 ```
 
-rollout 携带已确认 drafter revision，server 记录自身实际 actor revision；整组必须一致。同步执行期间 actor 不会在 rollout 与联合评分之间更新。评分后、actor 更新前同步当前完整 target head 并训练 drafter，微批次累积后严格检查 optimizer step 只增加 1。worker 拒绝错 revision、重复 step 或 target-head step 不符的数据。
+非采集轮走正常 RL 前向，actor 同步后仅刷新 actor/drafter ACK；不增加 drafter revision。仅第 5、10 等采集轮进入上面的 cycle。
+
+rollout 携带已确认 drafter revision，server 记录自身实际 actor revision；整组必须一致。同步执行期间 actor 不会在 rollout 与联合评分之间更新。评分后、actor 更新前同步当前完整 target head 并训练 drafter，每一步均完成组内微批次累积，严格检查 optimizer 累计增加 training.step（当前 20），草稿逻辑服务 revision 只在本周期发布后增加 1。worker 拒绝错 revision、重复 step 或 target-head step 不符的数据。
 
 actor 更新并发布后，driver 发布新 drafter 并等待确认；下一轮训练前再次同步那一轮的 actor head。DSpark 等依赖 target head/embedding 的架构，必须实测 serving 与训练重建是否一致；不能把版本号相同当作数值一致的证明。target 更新导致的接受率漂移需要单独观察。
 
@@ -373,11 +377,11 @@ checkpoint 不保存 pending proposal/scored group；恢复后从已提交权重
 | `integration/specopd_driver.py`、`trainer/speco_ray_trainer.py` | 自动替换 old-logprob；按方法选择整套训练钩子，恢复正常 RL 输出 |
 | `integration/specopd_driver.py`、`integration/vllm_runtime.py` | actor/drafter 版本分离、逐 frontend 发布 ACK、请求版本检查和同一步发布指标 |
 | `trainer/scheduler/specopd_cycle.py`、`workers/speco_worker.py` | bootstrap、同版本 scored group、一次消费和同步发布 |
-| `trainer/base_trainer.py` | 复用 optimizer/梯度累积/发布机制；新增固定分支组的一次更新入口 |
+| `trainer/base_trainer.py` | 复用 optimizer/梯度累积/发布机制；新增固定分支组的配置步数更新入口 |
 | `backends/drafter_opd.py`、`opd_math.py` | PR 基线目标保留；TV 和前缀 survival 公共计算 |
 | `backends/specopd_forward.py`、`specopd_loss.py` | 固定草稿历史的 forward、纯分支 E2E-TV、按有效位置归一化及 DFlash2 候选外质量 |
 | `backends/dflash_trainer_backend.py`、`dspark_trainer_backend.py` | 保留原模式/PR 基线，增加 SpecOPD wrapped forward 分派；DFlash2 继承对应入口 |
-| `integration/oldlogprob_layer_ids.py`、`trainer/v1/speco_mixin.py`、`trainer/v1/specopd_adapter.py` | PR 基线最后层采集和 trace 传递；V1 sync 中绑定请求 revision、读取 TQ 完整 wire、联合 old-logprob 写回 TQ、一次更新及 actor 同步后的草稿发布/ACK；跳过旧 replay hooks |
+| `integration/oldlogprob_layer_ids.py`、`trainer/v1/speco_mixin.py`、`trainer/v1/specopd_adapter.py` | PR 基线最后层采集和 trace 传递；V1 sync 中绑定请求 revision、读取 TQ 完整 wire、联合 old-logprob 写回 TQ、周期内多步更新及 actor 同步后的单次草稿发布/ACK；跳过旧 replay hooks |
 | `examples/run_qwen3-8b-draftopd_drafter_{dflash,dspark}_vllm.sh` | 保留 PR 基线参数，按仓库规则调整脚本名 |
 | `examples/run_qwen3-8b-specopd_drafter_dflash_vllm.sh` | 小预算同步双方法模板，`OPD_METHOD` 选择方法，默认 SpecOPD |
 | `examples/run_qwen3-8b-opd-debug_drafter_dspark_vllm_npu.sh` | 本次 NPU 两方法短测入口，固定 16/4 数据子集、2 步；按方法设置 padding/attention |
@@ -390,16 +394,22 @@ checkpoint 不保存 pending proposal/scored group；恢复后从已提交权重
 
 ```yaml
 trainer:
-  use_v1: false
+  use_v1: true
+  v1:
+    trainer_mode: sync
+transfer_queue:
+  enable: true
 actor_rollout_ref:
   model:
-    use_remove_padding: false
+    use_remove_padding: true
     use_fused_kernels: false
     override_config:
-      attn_implementation: eager
+      attn_implementation: flash_attention_2
   actor:
     strategy: fsdp2
-    ulysses_sequence_parallel_size: 1
+    ulysses_sequence_parallel_size: 4
+  ref:
+    ulysses_sequence_parallel_size: 4
   rollout:
     name: vllm
     temperature: 1.0
@@ -408,7 +418,7 @@ actor_rollout_ref:
     drafter:
       enable: true
       enable_drafter_training: true
-      speculative_algorithm: DFLASH
+      speculative_algorithm: DSPARK
       vllm:
         draft_sample_method: probabilistic
         allow_lossy_speculative_sampling: false
@@ -418,12 +428,12 @@ actor_rollout_ref:
         mode: online
         collect_hidden_states_from_sgl: false
         collect_hidden_states_from_old_logprob: true
-        collect_interval_steps: 1
-        training_interval_steps: 1
-        step: 1
+        collect_interval_steps: 5
+        training_interval_steps: 5
+        step: 20
         publish_async: false
         target_lm_head_row_restricted_sync: false
-        dflash_block_size: 8
+        dspark_block_size: 7
         drafter_opd:
           enable: true
           method: spec_opd
@@ -442,15 +452,15 @@ actor_rollout_ref:
           replace_normal_old_logprob_forward: true
           one_forward_per_trajectory: true
           independent_branches_for_validation_only: true
-          scoring_token_budget: 8192
-          max_dense_mask_elements: 16777216
+          scoring_token_budget: 9216
+          max_dense_mask_elements: 84934656
           objective: e2e_tv
           objective_weight: 1.0
           mix_trunk_loss: false
           confidence_loss_weight: 0.0
           strict_versions: true
           max_drafter_revision_lag: 0
-          optimizer_updates_per_collection: 1
+          optimizer_updates_per_collection: 20 # 默认由 training.step 推导；显式配置需一致
           replay: false
           allow_bubble_training: false
 ```
@@ -459,7 +469,7 @@ actor_rollout_ref:
 
 原 `hidden_state_window_min_rows=512` 是旧轨迹样本门槛，不能套到仅有几十个 proposal 位置的 branch 批次；SpecOPD 使用独立的 `min_scored_positions_per_update`，并在新数据状态策略中分派。旧 sample/window/token quota 的单位也必须区分 request、branch、proposal position 和重算 prefix token，禁止混算。
 
-已实现的 SpecOPD 消费语义中，`step: 1`：它表示当前 update group 只做一次 optimizer.step，允许多个 microbatch 累积，而不是每个 microbatch 都 step。需关闭/拒绝 adaptive schedule、replay、旧 hard-selection/冻结调度或 quota top-up 对该组的重复执行；collection interval 未命中时应同时跳过新采集和对应训练。
+已实现的 SpecOPD 消费语义中，`step: 20` 表示当前固定 update group 完成 20 次 optimizer.step；每次均可包含多个 microbatch 累积，而不是每个 microbatch 都 step。整个周期只消费一次并在结束后发布一次。需关闭/拒绝 adaptive schedule、replay、旧 hard-selection/冻结调度或 quota top-up 对该组的重复执行；collection interval 未命中时应同时跳过新采集和对应训练。
 
 联合评分预算按每条轨迹的 `L + sum_b(valid_width_b - 1)` 及 microbatch 合计控制；稠密 mask 另按 `batch_size * max_tree_length^2` 控制。完整轨迹单元无法容纳时，按 §6.1 预检失败处理，不能偷偷左截断、丢弃已采有效分支或复制主干分批重复评分。当前未实现单独的特征字节配置上限，主要由整树 token/mask 预算约束；环境验收要实测 host/Ray 对象峰值，再决定是否增加字节门槛。BF16 主干辅助层拼接特征近似为 `2 * context_rows * hidden_dim * num_aux_layers` 字节/轨迹，按 trunk 保存一次，另加各分支 predecessor hidden 和 head 缓存。token 预算不能替代显存/host/Ray 对象预算。
 
@@ -517,7 +527,7 @@ actor_rollout_ref:
 
 ### C. DFlash 同步 E2E-TV
 
-支持单次 optimizer update、无主干混合 loss、消费校验与版本约束。先冻结 target 验证接受率，再接入更新 actor 的短 RL run。
+支持配置数量的 optimizer updates（当前 20）、无主干混合 loss、单次消费事务校验与版本约束。先冻结 target 验证接受率，再接入更新 actor 的短 RL run。
 
 ### D. DSpark / DFlash2 与更多部署组合
 
@@ -579,3 +589,11 @@ actor_rollout_ref:
 草稿专用发布不能调用主模型的 `set_global_steps` 来标记草稿训练步数；SpecOPD 分支已取消这一混用，普通 Draft-OPD 路径保持既有行为。`SpecOPDDriver` 在初始/恢复发布及每轮提交后，向各 rollout frontend 设置并收集草稿 revision ACK，ACK 同时返回该服务的原生 actor revision。所有副本需要一致，old-logprob 的 bundle 也需要与 ACK 匹配。服务在生成前检查请求草稿 revision 与实际已安装版本，不能把请求自己声明的版本直接当成发布证据。
 
 发布完成的指标会补入上游即将记录的同一个 actor_output，避免日志滞后一轮。该严格边界正在最终短测前验证，详细进展以 `debug44_validation.md` 为准。
+
+## Ulysses 联合评分执行方式
+
+`joint_ulysses.py` 在一次评分调用内覆盖 attention 实例方法：输入沿物理 token 行切分，QKV all-to-all 汇总序列并切分 heads，按完整树 mask 计算注意力，再逆向 all-to-all 恢复本地 token shard。GQA 在需要时仅复制足够的 KV heads。逻辑 RoPE 位置随 token 一起切分，不用物理行号替代分支位置。
+
+DP 按 SP 组分配完整轨迹；组内协同计算，只由 leader 输出。空 DP 组运行 dummy，防止 FSDP collective 失配。仅归并所需 response 概率、分支 readout 和辅助 hidden，不 all-gather 整个序列×词表 logits。
+
+普通 actor/ref 的 PPO 前向仍使用 upstream unpadding + FlashAttention/Ulysses；联合评分结束后恢复实例方法。SP=1 保留原 dense eager/SDPA 路径、remove_padding=false。SP>1 使用 remove_padding=true；本次 SP=4。动态/adaptive RoPE、LoRA、滑窗/混合模型仍拒绝。当前真实模型长序列/16 die、性能和 checkpoint 恢复不由短测覆盖。
