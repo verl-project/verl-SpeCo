@@ -33,6 +33,41 @@ def test_agent_loop_preserves_spec_decode_metric_fields() -> None:
     assert output.extra_fields["_speco_vllm_spec_decode_accepted_tokens"] is None
 
 
+@pytest.mark.parametrize("fallback_first", [False, True])
+def test_mixed_acceptance_sources_have_concat_compatible_fields(fallback_first):
+    np = pytest.importorskip("numpy")
+
+    from verl_speco.integration.acceptance_metrics import (
+        bridge_request_acceptance_counters,
+        request_acceptance_counters,
+    )
+
+    key = "_speco_acceptance_engine_fallback"
+    outputs = [SimpleNamespace(extra_fields={}), SimpleNamespace(extra_fields={key: True})]
+    if fallback_first:
+        outputs.reverse()
+    agent_loop_runtime._speco_default_agent_loop_inputs(outputs)
+    assert outputs[0].extra_fields.keys() == outputs[1].extra_fields.keys()
+    assert [output.extra_fields[key] for output in outputs] == (
+        [True, False] if fallback_first else [False, True]
+    )
+    DataProto = pytest.importorskip("verl.protocol").DataProto
+    batches = [
+        DataProto(non_tensor_batch={k: np.array([v], dtype=object) for k, v in output.extra_fields.items()})
+        for output in outputs
+    ]
+    combined = DataProto.concat(batches)
+    assert combined.non_tensor_batch[key].tolist() == ([True, False] if fallback_first else [False, True])
+
+    fields = next(output.extra_fields for output in outputs if output.extra_fields[key])
+    fields.update(spec_num_verify_steps=100, spec_num_accepted_tokens=300)
+    assert request_acceptance_counters(fields) is None
+    fields.update(_speco_vllm_request_verify_rounds=2, _speco_vllm_request_accepted_tokens=3)
+    assert bridge_request_acceptance_counters(fields)
+    assert fields[key] is False
+    assert request_acceptance_counters(fields) == (2, 3)
+
+
 def test_agent_loop_patch_supports_release_v080_llm_server_client(monkeypatch) -> None:
     class AgentLoopWorker:
         distillation_enabled = True

@@ -36,6 +36,9 @@ def drafter_diagnostic_env() -> dict[str, str]:
             "VERL_DRAFTER_KEEP_HOT_TRIM_CACHE",
             "VERL_SPECO_PHASE_TIMING",
             "VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL",
+            "VERL_SPECO_DIAGNOSTIC_GPU_FIRST_STEPS",
+            "VERL_SPECO_DIAGNOSTIC_IDLE_REJECTIONS",
+            "VERL_SPECO_DIAGNOSTIC_ROLLOUT_PERF",
         )
         if name in os.environ
     }
@@ -116,9 +119,24 @@ def configure_phase_diagnostic_runtime_env(config) -> None:
     clusters. Configuring both also survives upstream wrappers that replace
     class runtime options (for example a profiler runtime environment).
     """
-    value = os.environ.get("VERL_SPECO_PHASE_TIMING", "")
+    from omegaconf import OmegaConf
+
+    for name in (
+        "VERL_SPECO_DIAGNOSTIC_GPU_FIRST_STEPS",
+        "VERL_SPECO_DIAGNOSTIC_IDLE_REJECTIONS",
+        "VERL_SPECO_DIAGNOSTIC_ROLLOUT_PERF",
+    ):
+        if name in os.environ:
+            OmegaConf.update(
+                config,
+                f"ray_kwargs.ray_init.runtime_env.env_vars.{name}",
+                os.environ[name],
+                force_add=True,
+            )
+    from verl_speco.utils.env import env_flag
+
     if (
-        value.lower() not in {"1", "true", "yes"}
+        not env_flag("VERL_SPECO_PHASE_TIMING")
         or _config_get(
             config,
             "actor_rollout_ref",
@@ -134,12 +152,11 @@ def configure_phase_diagnostic_runtime_env(config) -> None:
         and _config_get(config, "trainer", "device", default="") != "cuda"
     ):
         return
-    from omegaconf import OmegaConf
 
     OmegaConf.update(
         config,
         "ray_kwargs.ray_init.runtime_env.env_vars.VERL_SPECO_PHASE_TIMING",
-        value,
+        os.environ["VERL_SPECO_PHASE_TIMING"],
         force_add=True,
     )
     ablation = os.environ.get("VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL")

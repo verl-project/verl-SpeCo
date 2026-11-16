@@ -325,7 +325,7 @@ def _read_on_missing_response(producer_cfg: Any) -> str:
 
 def _minimum_response_feature_rows(training_cfg: Mapping[str, Any]) -> int:
     algorithm = str(training_cfg.get("speculative_algorithm", "")).strip().upper()
-    if algorithm == "DSPARK":
+    if algorithm in ("DSPARK", "DSV4_DSPARK"):
         return 2
     if algorithm == "DFLASH":
         block_size = int(training_cfg.get("dflash_block_size", 16))
@@ -339,7 +339,7 @@ def standalone_token_config(producer_cfg, training_cfg):
     """Keep saved features under the same supervision constraints as live features."""
     algorithm = str(training_cfg["speculative_algorithm"]).strip().upper()
     config = dict(producer_cfg)
-    config["response_feature_budget"] = algorithm in {"DFLASH", "DSPARK"}
+    config["response_feature_budget"] = algorithm in {"DFLASH", "DSPARK", "DSV4_DSPARK"}
     config["min_feature_rows"] = 3 if algorithm == "EAGLE3" else 1
     config["min_response_feature_rows"] = _minimum_response_feature_rows(training_cfg)
     config["response_block_size"] = (

@@ -50,7 +50,14 @@ def _preprocess_backend(max_window):
     backend = object.__new__(DSparkTrainerBackend)
     backend.config = SimpleNamespace(
         rollout=SimpleNamespace(
-            drafter=SimpleNamespace(training={"dspark_max_window": max_window})
+            drafter=SimpleNamespace(
+                training={
+                    "dspark_max_window": max_window,
+                    # aux-only items: disable the losses that need the final
+                    # target hidden state (the DSpark default is 0.9).
+                    "dspark_l1_loss_alpha": 0.0,
+                }
+            )
         )
     )
     return backend

@@ -431,7 +431,7 @@ def feature_from_vllm_payload(
         )
 
     algorithm = str(feature_config.algorithm).strip().upper()
-    if algorithm not in {"EAGLE3", "DFLASH", "DSPARK"}:
+    if algorithm not in {"EAGLE3", "DFLASH", "DSPARK", "DSV4_DSPARK"}:
         raise ValueError(f"Unsupported vLLM feature algorithm {algorithm!r}")
     configured_vllm_ids = (
         feature_config.vllm_aux_hidden_state_layer_ids
@@ -664,7 +664,7 @@ class TargetFeatureReplayer:
             _config_value(self.replay_cfg, "strict_target_model_path", False)
         )
         self.algorithm = str(self.drafter_cfg.speculative_algorithm).upper()
-        if self.algorithm not in {"EAGLE3", "DFLASH", "DSPARK"}:
+        if self.algorithm not in {"EAGLE3", "DFLASH", "DSPARK", "DSV4_DSPARK"}:
             raise ValueError(
                 f"Token replay does not support drafter algorithm {self.algorithm!r}"
             )
@@ -1198,8 +1198,18 @@ class TargetFeatureReplayer:
                         f"replay uses the {self.vllm_hidden_states_store.backend} "
                         "hidden-state store"
                     )
+                # The Mooncake store consumes the full transfer manifest; the
+                # bare handle alone lacks the tensor layout get_sample needs.
+                load_reference: str | Mapping[str, Any]
+                if handle:
+                    params = getattr(response, "kv_transfer_params", None)
+                    if not isinstance(params, Mapping):
+                        raise ValueError("vLLM response missing kv_transfer_params")
+                    load_reference = params
+                else:
+                    load_reference = path
                 reference = handle or path
-                payload = self._load_vllm_hidden_states(reference)
+                payload = self._load_vllm_hidden_states(load_reference)
                 with self._metrics_lock:
                     self.vllm_requests += 1
                     self.vllm_request_seconds += time.perf_counter() - started
@@ -1279,7 +1289,9 @@ class TargetFeatureReplayer:
             raise ValueError("vLLM response has both hidden_states_path and handle")
         return (os.fspath(path) if path else "", str(handle) if handle else None)
 
-    def _load_vllm_hidden_states(self, reference: str) -> dict[str, Any]:
+    def _load_vllm_hidden_states(
+        self, reference: str | Mapping[str, Any]
+    ) -> dict[str, Any]:
         payload, _ = self.vllm_hidden_states_store.load(reference)
         return payload
 

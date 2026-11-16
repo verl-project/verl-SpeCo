@@ -889,6 +889,8 @@ def test_vllm_generate_preserves_unscored_request_ids_and_transport_keys(
     scored = outputs["scored-request"].extra_fields
     unscored = outputs["unscored-request"].extra_fields
     assert scored.keys() == unscored.keys()
+    assert scored["_speco_acceptance_engine_fallback"] is False
+    assert unscored["_speco_acceptance_engine_fallback"] is False
     assert scored["_speco_vllm_request_id"] == "scored-request"
     assert scored["_verl_request_mean_accept_len"] == 4.0
     assert unscored["_speco_vllm_request_id"] == "unscored-request"
@@ -2304,6 +2306,7 @@ def test_vllm_http_server_transports_final_request_acceptance_stats() -> None:
     elapsed = output.extra_fields.pop("_speco_vllm_request_elapsed_sec")
     assert elapsed >= 0
     assert output.extra_fields == {
+        "_speco_acceptance_engine_fallback": False,
         "global_steps": 1,
         "spec_num_draft_tokens": 28.0,
         "spec_num_accepted_tokens": 9.0,
@@ -2552,6 +2555,7 @@ def test_vllm_http_server_transports_stats_with_positional_request_id() -> None:
     elapsed = output.extra_fields.pop("_speco_vllm_request_elapsed_sec")
     assert elapsed >= 0
     assert output.extra_fields == {
+        "_speco_acceptance_engine_fallback": False,
         "global_steps": 1,
         "spec_num_draft_tokens": 21.0,
         "spec_num_accepted_tokens": 5.0,
@@ -3344,3 +3348,38 @@ def test_ipc_npu_handle_remaps_only_receiver_device(monkeypatch, serialized, dev
     if device_id is not None:
         with pytest.raises(ValueError, match="NPU IPC"):
             vllm_runtime._speco_rebuild_ipc_compat((func, (1, 2, 3)), device_id)
+
+
+@pytest.mark.parametrize("snapshot_fails", [False, True])
+def test_performance_snapshot_runs_once_and_cannot_fail_generation(
+    monkeypatch, snapshot_fails
+):
+    from verl_speco.integration import rollout_performance as perf
+    from verl_speco.integration import generation_diagnostics as diagnostics
+
+    monkeypatch.setenv("VERL_SPECO_DIAGNOSTIC_ROLLOUT_PERF", "true")
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: _drafter())
+    monkeypatch.setattr(perf, "safe_runtime_snapshot", lambda *args: {})
+    monkeypatch.setattr(diagnostics, "emit_summary", lambda *args, **kwargs: None)
+    calls = []
+
+    class Upstream:
+        async def generate(self, request_id):
+            return SimpleNamespace(extra_fields={}, request_id=request_id)
+
+    class Server(_SpecoVLLMHttpServerMixin, Upstream):
+        async def collective_rpc(self, method):
+            calls.append(method)
+            await asyncio.sleep(0)
+            if snapshot_fails:
+                raise RuntimeError("diagnostic unavailable")
+            return [{"kv_cache_config": {"num_blocks": 10}}]
+
+    async def run():
+        server = Server()
+        outputs = await asyncio.gather(server.generate("a"), server.generate("b"))
+        assert [result.request_id for result in outputs] == ["a", "b"]
+        await server.generate("c")
+
+    asyncio.run(run())
+    assert calls == ["speco_performance_snapshot"]

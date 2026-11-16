@@ -40,6 +40,18 @@ WORKER_SPANS = ["drafter/worker_train_loop", "drafter/worker_publish_snapshot", 
 TRAINER_SPANS = ["drafter/collect", "drafter/prepare", "drafter/train", "drafter/publish"]
 
 
+@pytest.fixture(autouse=True)
+def _isolate_rl_insight_environment(monkeypatch):
+    # Register both missing and present keys for restoration: the production
+    # initializer writes through os.environ.setdefault(), outside monkeypatch.
+    for name in (
+        "VERL_RL_INSIGHT_ENABLE", "VERL_RL_INSIGHT_PROJECT_NAME",
+        "VERL_RL_INSIGHT_EXPERIMENT_NAME", "VERL_RL_INSIGHT_CONFIG_JSON",
+        "RL_INSIGHT_SERVER_URL",
+    ):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
 def _load_method(path, class_name, name, globals_=None):
     source = Path(path)
     tree = ast.parse(source.read_text(encoding="utf-8"))
