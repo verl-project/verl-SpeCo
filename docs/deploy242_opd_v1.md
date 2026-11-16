@@ -39,3 +39,6 @@ SpecOPD 联合评分 token budget=9216、dense mask budget=9216²，覆盖原脚
 
 源码部署 receipt：`/efs_rl/z00886395/codes/test_speco/specopd-v1-source-manifest.json`。
 脚本与代码最终哈希已核对；原参考脚本哈希未改变。两个方法最新的 V1 sync/SP=4 十步硬件测试均退出 0，optimizer 累计均为 20→40；完整回归结果见 Ulysses 台账。`.242` 的完整生产训练未启动。
+
+
+PERF-06 草稿训练批配置：SpecOPD新增 `training.specopd.training_microbatch_trajectories=4` 和 `training_microbatch_token_budget=16384`，从代码基础配置读取，两个现有启动脚本无需修改。实际会按主干padding预算拆小，长序列生产负载不能据短测断言始终四条一批；设1可恢复逐条累积。DraftOPD沿用原训练微批路径。

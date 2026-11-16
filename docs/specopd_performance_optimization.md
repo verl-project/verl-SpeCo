@@ -67,3 +67,48 @@
 两轮均为实际actor SP=4、8次联合forward、112个proposal位置；草稿实际DP=2、每副本4个轨迹微批，缓存分别53,471,912/49,948,664字节，均低于64MiB。optimizer累计20→40，revision1→2，actor ACK每轮推进；第5轮来源4/0、第10轮9/1。branch位置数及logical rows（2526/2426）与旧短测一致。actor grad_norm仍均为0，小AIME验证acc@1=0；此处只证明控制流、数值和短测耗时，不证明RL学习质量。
 
 原始日志在 `.44:/home/c00954340/specopd-debug-logs/perf05-*`，本地副本在 `tmp/debug44-artifacts/perf05-*`，解析结果 `tmp/perf05-timing-results.json`。源码哈希证据 `perf05-source-provenance.json`。最终部署与提交见 [Ulysses台账](debug44_ulysses_validation.md) PERF-05。
+
+
+## PERF-06：轨迹微批合并
+
+2026-11-16，用户要求优先测试4条一批。独立于actor评分微批，新增：
+
+```yaml
+actor_rollout_ref:
+  rollout:
+    drafter:
+      training:
+        specopd:
+          training_microbatch_trajectories: 4
+          training_microbatch_token_budget: 16384
+```
+
+设为1复现PERF-05的逐条累积；设2/4控制每个DP副本的训练批大小。token预算限制合并后的 `批大小×最大主干长度`；长序列拆成更小批，单条仍按原路径处理，不把超出合并预算的单条直接丢弃。默认16384不保证8192-response生产配置始终能四条合并，实际值需要看长度分布与记录的微批数。
+
+实现使用独立batch行保存不同轨迹，分别pad主干、anchor与proposal；padding/dummy的proposal mask为false，query有安全self-attention行，不能访问其他轨迹。E2E-TV前将batch/anchor轴摊平，按全部真实proposal token之和归一化；20个optimizer step与每5轮一次发布均不变。CUDA/Flex与其他设备SDPA沿用已有mask构造，不把不同轨迹拼到同一因果主干中。
+
+DP间分组边界从全局槽位的最大主干长度计算，保证不齐/长短数据下每个rank都有相同的前后向及collective次数。缺少轨迹的dummy使用同槽位真实轨迹的形状，避免从全组第一条长轨迹引入意外padding。输入缓存仍有64MiB设备上限。
+
+验证：221项相关回归通过。真实DFlash/DSpark/DFlash2的4条ragged（主干长短、分支数、proposal长度）+dummy合并loss/梯度，与逐条累积一致；更新计数检查覆盖批大小1/4及DP不齐。真实NPU DSpark小模型oracle：FP32 loss差0、最大梯度差1.8626e-9；BF16 loss差0、最大梯度差1.2207e-4。预设容差FP32 atol1e-4/rtol1e-3，BF16 atol0.01/rtol0.05，限于该小模型检查，不能视作任意模型/长度的误差保证。日志 `perf06-contracts-01`、`perf06-npu-grad-01`。
+
+实际Qwen3-8B检查 `perf06-spec-b4-01` 在 .44 die4–7，保留V1 sync/actor-ref SP4、5×20、16条训练/4条验证prompt及response cap128，另用Ray目录 `/tmp/speco44-perf06-b4`。以已通过的PERF-05独立batch1十步结果为参照；HBM采样文件 `perf06-memory-01.jsonl` 只观察专用die4–7，每2秒采样，不能当作精确allocator瞬时峰值。完整10步已退出0，结果如下。
+
+
+### PERF-06 实测验收
+
+对照PERF-05的独立逐条累积运行 `perf05-spec-optimized-01`，新运行 `perf06-spec-b4-01` 仍为同一die4–7和同一短测配置；运行之间存在系统负载/数据采样波动，以下为单次实测。
+
+| 秒 | 原逐条，第5轮 | 4条合并，第5轮 | 原逐条，第10轮 | 4条合并，第10轮 |
+|---|---:|---:|---:|---:|
+| 草稿训练循环，20步 | 16.1734 | 9.3327 | 16.1261 | 5.0967 |
+| 草稿训练RPC | 18.7893 | 12.8622 | 18.4836 | 7.8949 |
+| actor+草稿更新阶段 | 38.8420 | 34.4033 | 42.0785 | 29.3069 |
+| 整个RL step | 79.3867 | 76.1441 | 79.5878 | 69.7278 |
+
+第10轮草稿训练loop耗时减少68.4%（约3.16倍速度），actor+草稿阶段减少30.4%，整轮减少12.4%。第5轮仍有较高的首次阶段开销，不将连续optimizer日志间隔误当整个训练循环计时。十轮step累计552.07→541.04秒，减少约2.0%；草稿每5轮更新一次，加上其他阶段波动，不能把采集轮加速率直接当作整体训练加速率。没有另外跑batch2，不能声称4是所有硬件/长度下的最优批大小。
+
+两次采集轮均实际为每个DP副本1个训练微批、批内4条轨迹，20次前后向对应20个optimizer step；原来每副本4个微批累积对应80次前后向。每轮仍为112个真实proposal位置，actor联合评分8次、SP4，草稿DP2，20→40累计更新和revision1→2，10轮ACK校验通过。输入缓存56,339,672/53,553,848字节，小于64MiB。独立轨迹batch行隔离、ragged padding、dummy及全组token归一化通过221项回归与NPU数值oracle。
+
+HBM采样196次，die4/5/6/7最大工具读数分别49,974/50,616/50,891/50,582 MB，总容量各65,536 MB；这是包含初始化/actor/rollout/草稿的设备整体观测值，不是精确allocator或草稿独占瞬时峰值。无本次NPU溢出，所有训练driver已退出，其他原有PID1799413保留。采样程序在该短测退出后自动结束。actor梯度仍为0，验证准确率仍为0，未作学习质量结论；16-die长序列生产负载未测。
+
+验收源码候选 `6b0143a`，核心补丁22,162字节。两个生产脚本保持原参数/路径，新默认配置从代码仓读取；最终部署回执见Ulysses台账PERF-06。

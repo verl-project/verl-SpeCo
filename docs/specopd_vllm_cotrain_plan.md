@@ -602,3 +602,8 @@ DP 按 SP 组分配完整轨迹；组内协同计算，只由 leader 输出。�
 ### 固定组的执行效率（2026-11-16）
 
 联合old-logprob把完整微批计划一次提交给actor，保持一次engine驻留；各轨迹仍按既定微批依次forward，不增加单个树mask峰值。草稿按实际DP组分配整条轨迹，SP组内共享；组内每个optimizer step都覆盖完整组数据的全局token均值，20步后统一发布。非均匀分配使用零loss dummy保持collective次数，dummy不参与有效token归一化。固定输入仅在本组内有界缓存（64MiB设备上限），训练context和q始终重新前向。耗时指标、原始数据与验收边界见 [性能记录](specopd_performance_optimization.md)。
+
+
+### 草稿训练的轨迹批合并（PERF-06）
+
+`training.specopd.training_microbatch_trajectories=4`控制每个草稿DP副本每次forward最多合并4条轨迹，`training_microbatch_token_budget=16384`限制批大小乘padding后最大主干长度；actor评分仍由原`microbatch_trajectories=1`控制。轨迹放在独立batch行，主干/anchor/proposal分别补齐，padding及dummy不计loss；梯度按全组真实token总数归一化，20次更新和发布边界不变。长序列会拆成2/1等较小组，各DP副本通过全局槽位最大长度统一规划，避免collective次数不一致。参数设1可复现PERF-05；完整8192-response配置不保证每批都能放4条。实际耗时与数值证据见性能记录。

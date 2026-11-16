@@ -97,3 +97,18 @@ PERF-05B 最终通过：优化版10步退出0，第二采集轮联合评分6.345
 
 
 PERF-05C 完成：性能代码 `0caec0b`（31,721字节）及方案/结果 `161464a`（12,241字节）已推送 `crp0128/specopd` 并快进同步 `.242:/efs_rl/z00886395/codes/test_speco/verl-SpeCo-specopd`。部署时工作区干净，486个源码/测试/文档文件形成SHA回执；两份现有V1启动脚本SHA保持不变、bash语法和真实import路径通过，原参考脚本SHA也未改变。最后台账提交同步后receipt commit随之推进。`.242` 正式训练未启动。
+
+
+## PERF-06：草稿轨迹微批合并进行中
+
+用户要求合并微批，并优先测试4条一批。增加独立的training_microbatch_trajectories=4（可设1/2/4）、training_microbatch_token_budget=16384。按全局DP槽位最大长度选择一致分组，长序列超预算拆小；单条原样保留。先检查ragged/padded/dummy数值及梯度，再在.44短测第5/10轮的20步训练与显存。PERF-05的联合评分配置不变。
+
+- [x] PERF-06A：批内轨迹隔离、ragged与dummy、loss/梯度等价及配置回归。
+- [x] PERF-06B：.44实际4条合并短测，20→40更新、一次发布与阶段耗时/显存。
+- [ ] PERF-06C：推送并同步 .242，记录实际选择及范围。
+
+
+PERF-06A通过：221 passed，真实NPU DSpark FP32/BF16四条合并oracle均退出0；loss差0，最大梯度差分别1.86e-9/1.22e-4。最后dummy形状选取修正后，CPU DP20步梯度与分组检查8 passed（本地缺Ray的10个真实trainer控制用例跳过，这些用例已在远端221项中通过）。PERF-06B使用`perf06-spec-b4-01`，独立die4–7，HBM只读采样有上限并随测试退出停止；仍待实际5/10轮计时与退出。
+
+
+PERF-06B通过：`perf06-spec-b4-01` 完整10轮退出0，采集轮仅5/10，每轮20步、一次发布；实际训练批大小4、每DP副本1个微批，actor SP4、草稿DP2、112个proposal位置/8个联合forward、全部ACK顺序和64MiB输入缓存上限均已核对。第10轮train_loop16.1261→5.0967秒，actor+草稿42.0785→29.3069秒，step79.5878→69.7278秒；10轮累计552.07→541.04秒，不能将采集轮收益外推为总收益。221项回归及NPU FP32/BF16梯度oracle通过，HBM采样最大50,891/65,536 MB。训练driver为零，其他PID1799413未操作。原始文件 `tmp/debug44-artifacts/perf06-*`，详细边界和计时见性能记录。
