@@ -5,6 +5,8 @@
 import asyncio
 import copy
 import json
+import shutil
+from pathlib import Path
 from queue import Queue
 
 import numpy as np
@@ -12,6 +14,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from verl_speco.checkpoint_tensor import checkpoint_fingerprint
 from verl_speco.producer.hidden_states_store import (
     RawHiddenDatasetWriter,
     RawHiddenSample,
@@ -19,6 +22,7 @@ from verl_speco.producer.hidden_states_store import (
 )
 from verl_speco.standalone_tq_producer import run_producer
 from verl_speco.standalone_tq_training_launcher import (
+    _saved_hidden_tokenizer_fingerprint,
     _stable_path_identity,
     build_pipeline_commands,
     resolve_pipeline_config,
@@ -37,6 +41,7 @@ def dataset(tmp_path):
     target = tmp_path / "target"
     target.mkdir()
     (target / "config.json").write_text(json.dumps({"num_hidden_layers": 3}))
+    (target / "model.safetensors").write_bytes(b"checkpoint-a")
     root = tmp_path / "hidden"
     writer = RawHiddenDatasetWriter(root)
     contract = {
@@ -46,8 +51,8 @@ def dataset(tmp_path):
         "hidden_states_layout": "dflash_aux_plus_last",
         "dtype": "torch.bfloat16",
         "target_model_id": str(target),
-        "target_model_revision": _stable_path_identity("target", str(target)),
-        "tokenizer_fingerprint": _stable_path_identity("tokenizer", str(target)),
+        "target_model_revision": checkpoint_fingerprint(target),
+        "tokenizer_fingerprint": _saved_hidden_tokenizer_fingerprint(str(target)),
         "use_logits": False,
         "target_config_fingerprint": None,
         "source": "standalone_tq_producer",
@@ -415,20 +420,104 @@ def test_saved_filter_preserves_original_occurrence_numbers(dataset, raw_capture
     assert [entry["tag"]["sequence_no"] for entry in references] == [0, 2, 3, 5]
 
 
-def test_saved_identity_uses_model_files_and_keeps_legacy_identity(tmp_path):
-    from verl_speco.standalone_tq_training_launcher import _saved_hidden_identity
-
+def test_tokenizer_fingerprint_follows_file_content(tmp_path):
     first, second = tmp_path / "first", tmp_path / "second"
     for path in (first, second):
         path.mkdir()
         (path / "config.json").write_text('{"num_hidden_layers": 3}')
         (path / "tokenizer.json").write_text('{"vocab": {"hello": 1}}')
-    for kind in ("target", "tokenizer"):
-        assert _saved_hidden_identity(kind, str(first)) == _saved_hidden_identity(kind, str(second))
-        legacy = _stable_path_identity(kind, str(first))
-        assert _saved_hidden_identity(kind, str(first), legacy) == legacy
+    fingerprint = _saved_hidden_tokenizer_fingerprint(str(first))
+    assert _saved_hidden_tokenizer_fingerprint(str(second)) == fingerprint
     (second / "tokenizer.json").write_text('{"vocab": {"hello": 2}}')
-    assert _saved_hidden_identity("tokenizer", str(first)) != _saved_hidden_identity("tokenizer", str(second))
+    assert _saved_hidden_tokenizer_fingerprint(str(second)) != fingerprint
+
+
+@pytest.mark.parametrize("raw_capture", [False, True])
+def test_saved_checkpoint_relocation_and_weight_replacement(dataset, raw_capture):
+    root, target = dataset
+    manifest = root / "manifest.jsonl"
+    entries = load_raw_hidden_manifest(root)
+    if raw_capture:
+        for entry in entries:
+            entry["feature_contract"].update(contract_type="raw_capture", include_final_hidden=True)
+        manifest.write_text(
+            "".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8"
+        )
+    relocated = target.with_name("relocated")
+    shutil.copytree(target, relocated)
+
+    _, producer, consumer = pipeline((root, relocated))
+    _, references = asyncio.run(collect(producer))
+    assert Path(references[0]["tag"]["feature_contract"]["target_model_id"]) == relocated
+    assert Path(consumer.actor_rollout_ref.model.path) == relocated
+    assert load_raw_hidden_manifest(root)[0]["feature_contract"]["target_model_id"] == str(target)
+
+    for checkpoint in (target, relocated):
+        (checkpoint / "model.safetensors").write_bytes(b"checkpoint-b")
+        with pytest.raises(ValueError, match="mismatch for target_model_revision"):
+            pipeline((root, checkpoint))
+
+
+@pytest.mark.parametrize("config_only", [False, True])
+def test_saved_checkpoint_rejects_unverified_identity(dataset, config_only):
+    root, target = dataset
+    entries = load_raw_hidden_manifest(root)
+    for entry in entries:
+        entry["feature_contract"]["target_model_revision"] = (
+            "target-files-sha256-" + "0" * 64
+            if config_only
+            else _stable_path_identity("target", str(target))
+        )
+    (root / "manifest.jsonl").write_text(
+        "".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8"
+    )
+    (target / "model.safetensors").unlink()
+
+    with pytest.raises(ValueError, match="no target checkpoint fingerprint"):
+        pipeline(dataset)
+
+
+def test_saved_checkpoint_pins_hub_snapshot_in_runtime_configs(dataset, monkeypatch):
+    from hydra.core.override_parser.overrides_parser import OverridesParser
+
+    from verl_speco import checkpoint_tensor
+
+    root, target = dataset
+    repo_id = "owner/model"
+
+    def download(*, repo_id):
+        assert repo_id == "owner/model"
+        return str(target)
+
+    monkeypatch.setattr(checkpoint_tensor, "snapshot_download", download)
+    commands, _, _ = pipeline((root, repo_id))
+    parser = OverridesParser.create()
+    for overrides, key in (
+        (commands.consumer_overrides, "actor_rollout_ref.model.path"),
+        (commands.producer_overrides, "speco.standalone_tq_producer.target_model_id"),
+    ):
+        matching = [item for item in overrides if item.startswith(f"{key}=")]
+        assert parser.parse_overrides(matching)[-1].value() == target.as_posix()
+
+
+def test_checkpoint_fingerprint_includes_every_indexed_shard(tmp_path):
+    (tmp_path / "config.json").write_text("{}")
+    shards = ["model-00001.safetensors", "model-00002.safetensors"]
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict(zip(["a", "b"], shards, strict=True))})
+    )
+    for name in shards:
+        (tmp_path / name).write_bytes(b"original")
+    fingerprint = checkpoint_fingerprint(tmp_path)
+
+    for name in shards:
+        shard = tmp_path / name
+        shard.write_bytes(b"replaced")
+        assert checkpoint_fingerprint(tmp_path) != fingerprint
+        shard.write_bytes(b"original")
+    (tmp_path / shards[-1]).unlink()
+    with pytest.raises(FileNotFoundError):
+        checkpoint_fingerprint(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -538,13 +627,13 @@ def test_capture_window_is_selected_by_training_and_leaves_full_file_untouched(d
     ]
 
 
-def test_capture_without_final_layer_fails_when_training_needs_it():
+def test_capture_without_final_layer_fails_when_training_needs_it(dataset):
     from verl_speco.producer.hidden_states_store import bind_raw_hidden_contract
 
     captured = {
         "contract_type": "raw_capture",
         "target_model_id": "m",
-        "target_model_revision": "r",
+        "target_model_revision": checkpoint_fingerprint(dataset[1]),
         "tokenizer_fingerprint": "t",
         "vllm_aux_hidden_state_layer_ids": [1],
         "target_num_hidden_layers": 3,

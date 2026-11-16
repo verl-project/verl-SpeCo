@@ -247,6 +247,7 @@ def test_hidden_preserves_raw_values_and_replays_through_existing_cpu_preparatio
     target = Path(cfg["hidden"]["target_model_path"])
     target.mkdir()
     (target / "config.json").write_text('{"num_hidden_layers": 3}')
+    (target / "model.safetensors").write_bytes(b"checkpoint-a")
     Path(cfg["input_path"]).write_text(
         json.dumps({"sample_id": "known-answer", "prompt": "q", "response": response})
         + "\n"
@@ -336,6 +337,7 @@ def test_hidden_preserves_raw_values_and_replays_through_existing_cpu_preparatio
 
     captured = entry["feature_contract"]
     assert captured["contract_type"] == "raw_capture"
+    assert captured["target_model_revision"].startswith("target-checkpoint-v1-sha256-")
     assert (
         not {"algorithm", "dtype", "hidden_states_layout", "target_layer_ids"}
         & captured.keys()
@@ -372,6 +374,14 @@ def test_hidden_preserves_raw_values_and_replays_through_existing_cpu_preparatio
         saved["hidden_states"][:, -1].bfloat16().float(),
     )
     assert path.exists()
+
+    if backend == "file" and response == "a":
+        cfg["resume"] = True
+        (target / "model.safetensors").write_bytes(b"checkpoint-b")
+        with pytest.raises(ValueError, match="capture identity changed: target_model_revision"):
+            asyncio.run(generation.generate(cfg))
+        assert len(requests) == 1
+        assert load_raw_hidden_manifest(cfg["output_path"]) == [entry]
 
 
 @pytest.mark.parametrize("algorithm,response", [("DSPARK", "a"), ("DFLASH", "short")])
@@ -557,6 +567,7 @@ def hidden_config(tmp_path, monkeypatch):
     target = tmp_path / "target"
     target.mkdir()
     (target / "config.json").write_text('{"num_hidden_layers": 3}', encoding="utf-8")
+    (target / "model.safetensors").write_bytes(b"checkpoint-a")
     cfg["hidden"].update(
         target_model_path=str(target), vllm_aux_hidden_state_layer_ids=[1]
     )

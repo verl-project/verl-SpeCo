@@ -298,11 +298,16 @@ async def _hidden_components(config, stack):
 
     from transformers import AutoConfig, AutoTokenizer
 
+    from verl_speco.checkpoint_tensor import (
+        checkpoint_fingerprint,
+        resolve_checkpoint_path,
+    )
     from verl_speco.producer.hidden_states_store import (
         RawHiddenDatasetWriter,
         build_hidden_states_store,
         load_raw_hidden_manifest,
         prepare_raw_hidden_sample,
+        require_saved_hidden_checkpoint_fingerprint,
     )
     from verl_speco.producer.input_reader import (
         SampleFilteredError,
@@ -316,16 +321,23 @@ async def _hidden_components(config, stack):
         delete_temporary_result,
         load_hidden_state_result,
     )
-    from verl_speco.standalone_tq_training_launcher import _saved_hidden_identity
+    from verl_speco.standalone_tq_training_launcher import (
+        _saved_hidden_tokenizer_fingerprint,
+    )
 
+    target_path = hidden["target_model_path"]
+    checkpoint_path = await asyncio.to_thread(resolve_checkpoint_path, target_path)
+    tokenizer_path = hidden["tokenizer_path"]
+    if not tokenizer_path or tokenizer_path == target_path:
+        tokenizer_path = str(checkpoint_path)
     tokenizer = await asyncio.to_thread(
         AutoTokenizer.from_pretrained,
-        hidden["tokenizer_path"] or hidden["target_model_path"],
+        tokenizer_path,
         trust_remote_code=hidden["trust_remote_code"],
     )
     model_config = await asyncio.to_thread(
         AutoConfig.from_pretrained,
-        hidden["target_model_path"],
+        str(checkpoint_path),
         trust_remote_code=bool(hidden["trust_remote_code"]),
     )
     target_depth = int(
@@ -344,21 +356,19 @@ async def _hidden_components(config, stack):
     stack.callback(store.close)
     existing = load_raw_hidden_manifest(store.path)
     previous_contract = existing[0]["feature_contract"] if existing else {}
+    if previous_contract:
+        require_saved_hidden_checkpoint_fingerprint(previous_contract)
     contract = {
         "contract_type": "raw_capture",
         "vllm_aux_hidden_state_layer_ids": aux_ids,
         "include_final_hidden": bool(hidden["include_final_hidden"]),
         "target_num_hidden_layers": target_depth,
-        "target_model_id": hidden["target_model_path"],
-        "target_model_revision": _saved_hidden_identity(
-            "target",
-            hidden["target_model_path"],
-            previous_contract.get("target_model_revision"),
+        "target_model_id": target_path,
+        "target_model_revision": await asyncio.to_thread(
+            checkpoint_fingerprint, checkpoint_path
         ),
-        "tokenizer_fingerprint": _saved_hidden_identity(
-            "tokenizer",
-            hidden["tokenizer_path"] or hidden["target_model_path"],
-            previous_contract.get("tokenizer_fingerprint"),
+        "tokenizer_fingerprint": await asyncio.to_thread(
+            _saved_hidden_tokenizer_fingerprint, tokenizer_path
         ),
         "source": "standalone_data_generate",
     }

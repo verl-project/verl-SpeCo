@@ -32,7 +32,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -53,6 +53,7 @@ from verl_speco.producer.hidden_states_store import (
     _local_ip,
     bind_raw_hidden_contract,
     load_raw_hidden_manifest,
+    require_saved_hidden_checkpoint_fingerprint,
 )
 from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.trainer.standalone_resume import load_standalone_resume
@@ -429,24 +430,17 @@ def _stable_path_identity(kind: str, path: str) -> str:
     return f"{kind}-path-sha256-{digest}"
 
 
-def _saved_hidden_identity(kind: str, path: str, stored=None) -> str:
-    """Identify saved features by model/tokenizer files, retaining old datasets."""
-    legacy = _stable_path_identity(kind, path)
-    if stored == legacy:
-        return legacy
+def _saved_hidden_tokenizer_fingerprint(path: str) -> str:
+    """Identify the tokenizer used to capture or train on saved hidden states."""
     names = (
-        ("config.json",)
-        if kind == "target"
-        else (
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "special_tokens_map.json",
-            "vocab.json",
-            "merges.txt",
-            "tokenizer.model",
-            "spiece.model",
-            "chat_template.jinja",
-        )
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "vocab.json",
+        "merges.txt",
+        "tokenizer.model",
+        "spiece.model",
+        "chat_template.jinja",
     )
     digest = hashlib.sha256()
     found = False
@@ -473,9 +467,9 @@ def _saved_hidden_identity(kind: str, path: str, stored=None) -> str:
         # Some old local models bundle tokenizer settings in config.json only.
         source = Path(path) / "config.json"
         if not source.is_file():
-            raise ValueError(f"Cannot identify {kind} files at {path}")
+            raise ValueError(f"Cannot identify tokenizer files at {path}")
         digest.update(source.read_bytes())
-    return f"{kind}-files-sha256-{digest.hexdigest()}"
+    return f"tokenizer-files-sha256-{digest.hexdigest()}"
 
 
 def _target_final_layer_id(model_path: str, target_layer_ids: Sequence[int]) -> int:
@@ -918,17 +912,14 @@ def build_pipeline_commands(
     backend_env = os.environ if env is None else env
     target_identity = _stable_path_identity("target", config.model_path)
     tokenizer_identity = _stable_path_identity("tokenizer", config.tokenizer_path)
+    pinned_model_override = []
+    capture: Mapping[str, Any] | None = None
     if config.data_source == "saved_hidden":
-        capture = config.saved_hidden_contract
-        if capture is None:
-            rows = load_raw_hidden_manifest(config.input_path)
-            capture = rows[0]["feature_contract"] if rows else {}
-        target_identity = _saved_hidden_identity(
-            "target", config.model_path, capture.get("target_model_revision")
+        from verl_speco.checkpoint_tensor import (
+            checkpoint_fingerprint,
+            resolve_checkpoint_path,
         )
-        tokenizer_identity = _saved_hidden_identity(
-            "tokenizer", config.tokenizer_path, capture.get("tokenizer_fingerprint")
-        )
+
         if config.algorithm not in {"DSPARK", "DFLASH", "EAGLE3"}:
             raise ValueError(
                 "saved_hidden supports DSPARK, DFLASH and EAGLE3 reference training"
@@ -957,6 +948,34 @@ def build_pipeline_commands(
             raise ValueError(
                 "saved_hidden reference training requires gradient_accumulation_steps=1"
             )
+        capture = config.saved_hidden_contract
+        if capture is None:
+            rows = load_raw_hidden_manifest(config.input_path)
+            if not rows:
+                raise ValueError("Saved hidden dataset contains no committed samples")
+            capture = rows[0]["feature_contract"]
+            if any(row["feature_contract"] != capture for row in rows):
+                raise ValueError(
+                    "Saved hidden dataset contains mixed feature contracts"
+                )
+        require_saved_hidden_checkpoint_fingerprint(capture)
+        checkpoint_path = resolve_checkpoint_path(config.model_path)
+        target_identity = checkpoint_fingerprint(checkpoint_path)
+        # Point training at the same snapshot that supplied the fingerprint.
+        runtime_model_path = checkpoint_path.as_posix()
+        if runtime_model_path != config.model_path:
+            encoded_path = json.dumps(runtime_model_path, ensure_ascii=False)
+            pinned_model_override.append(f"{_MODEL_PATH_KEY}={encoded_path}")
+            config = replace(
+                config,
+                model_path=runtime_model_path,
+                tokenizer_path=(
+                    runtime_model_path
+                    if config.tokenizer_path == config.model_path
+                    else config.tokenizer_path
+                ),
+            )
+        tokenizer_identity = _saved_hidden_tokenizer_fingerprint(config.tokenizer_path)
         # Ambient Mooncake/TQ settings must not initialize transports for disk input.
         backend_env = {
             **backend_env,
@@ -1077,7 +1096,8 @@ def build_pipeline_commands(
         + (drafter_path if resume_metadata is not None else "null"),
         f"speco.standalone_tq_producer.tokenizer_path={config.tokenizer_path}",
         "speco.standalone_tq_producer.tokenizer_fingerprint=" + tokenizer_identity,
-        f"speco.standalone_tq_producer.target_model_id={config.model_path}",
+        "speco.standalone_tq_producer.target_model_id="
+        + json.dumps(config.model_path, ensure_ascii=False),
         "speco.standalone_tq_producer.target_model_revision=" + target_identity,
         "speco.standalone_tq_producer.target_layer_ids="
         + _hydra_list(config.target_layer_ids),
@@ -1195,7 +1215,7 @@ def build_pipeline_commands(
             "ce_target_source": ce_target_source,
         },
     )
-    if config.data_source == "saved_hidden":
+    if capture is not None:
         hidden_dtype = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}.get(
             hidden_dtype.removeprefix("torch."), hidden_dtype.removeprefix("torch.")
         )
@@ -1208,17 +1228,6 @@ def build_pipeline_commands(
         consumer_internal.append(
             "actor_rollout_ref.rollout.drafter.training.target_feature_replay.hidden_states_store.backend=file"
         )
-        contract = config.saved_hidden_contract
-        if contract is None:
-            # Support callers constructing PipelineConfig directly.
-            rows = load_raw_hidden_manifest(config.input_path)
-            if not rows:
-                raise ValueError("Saved hidden dataset contains no committed samples")
-            contract = rows[0]["feature_contract"]
-            if any(row["feature_contract"] != contract for row in rows):
-                raise ValueError(
-                    "Saved hidden dataset contains mixed feature contracts"
-                )
         expected = {
             "algorithm": config.algorithm,
             "target_model_id": config.model_path,
@@ -1233,18 +1242,18 @@ def build_pipeline_commands(
             "require_full_alignment": True,
             "use_logits": False,
         }
-        bind_raw_hidden_contract(contract, expected)
+        bind_raw_hidden_contract(capture, expected)
         if Path(config.model_path, "config.json").is_file():
             depth = _target_final_layer_id(
                 config.model_path, config.vllm_aux_hidden_state_layer_ids
             )
-            if contract.get("target_num_hidden_layers") != depth:
+            if capture.get("target_num_hidden_layers") != depth:
                 raise ValueError("Saved hidden target model depth mismatch")
     consumer_internal.extend(
         [
             f"{_TQ_PREFIX}.expected_feature.algorithm={config.algorithm}",
             f"{_TQ_PREFIX}.expected_feature.target_model_path="
-            + json.dumps(config.model_path),
+            + json.dumps(config.model_path, ensure_ascii=False),
             f"{_TQ_PREFIX}.expected_feature.target_revision=" + target_identity,
             f"{_TQ_PREFIX}.expected_feature.tokenizer_fingerprint="
             + tokenizer_identity,
@@ -1278,7 +1287,7 @@ def build_pipeline_commands(
         list(training_args), launch_config
     )
     consumer_overrides = _replace_internal_overrides(
-        normalized_training_args, consumer_internal
+        normalized_training_args, [*consumer_internal, *pinned_model_override]
     )
     return PipelineCommands(
         vllm=vllm,

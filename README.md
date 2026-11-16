@@ -739,8 +739,9 @@ when needed); its files must be visible locally, or configure the existing
 original dtype. No auxiliary flattening, final norm, or tensor-window cropping
 is applied during saving. `manifest.jsonl` retains the serialized Producer request
 (token IDs, masks, feature positions) and feature contract needed to rebuild a
-reference. Only tokenizer and model configuration are loaded locally, not final
-norm weights. Capture settings describe the auxiliary output IDs and whether the
+reference. Capture streams the checkpoint files once to record a content
+fingerprint without deserializing the weights. The vLLM service must use that
+same checkpoint. Capture settings describe the auxiliary output IDs and whether the
 service also captures final hidden states (`hidden.include_final_hidden=true`).
 There are no training algorithms, loss weights, block sizes, conversion dtypes or
 training feature windows in the generation config. Full tokenized conversations
@@ -844,8 +845,11 @@ from the manifest unless explicitly supplied, and skips vLLM/TQ/Mooncake service
 startup and probes. Model/tokenizer identity and auxiliary layer selection must
 match the capture. The selected training algorithm, dtype, losses and window are
 resolved at training startup; required final hidden states must have been captured.
-Older raw datasets carrying bound training contracts retain their strict checks. Target configuration and
-training-side target weights are still needed by the trainer. All Consumer nodes
+The model can be moved to another directory if its checkpoint files are
+unchanged. Training and capture resume reject mismatched weights. Saved-hidden
+datasets created before checkpoint fingerprinting need to be captured again
+from the original checkpoint. Target configuration and training-side target
+weights are still needed by the trainer. All Consumer nodes
 must see the saved files at the same paths. The current Ray launcher remains
 single-node and reference training requires gradient accumulation of one.
 

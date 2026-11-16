@@ -454,17 +454,30 @@ def _raw_hidden_metadata(tokens, shape, dtype, request, contract, payload):
     )
 
 
+def require_saved_hidden_checkpoint_fingerprint(stored):
+    from verl_speco.checkpoint_tensor import CHECKPOINT_FINGERPRINT_PREFIX
+
+    revision = stored.get("target_model_revision")
+    if not isinstance(revision, str) or not revision.startswith(
+        CHECKPOINT_FINGERPRINT_PREFIX
+    ):
+        raise ValueError(
+            "Saved hidden dataset has no target checkpoint fingerprint. "
+            "Capture it again from the original checkpoint in a new directory."
+        )
+
+
 def bind_raw_hidden_contract(stored, expected):
     """Bind capture metadata to the selected training algorithm at training time."""
+    require_saved_hidden_checkpoint_fingerprint(stored)
     if stored.get("contract_type") != "raw_capture":
         for name, wanted in expected.items():
-            if stored.get(name) != wanted:
+            if name != "target_model_id" and stored.get(name) != wanted:
                 raise ValueError(
                     f"Saved hidden feature contract mismatch for {name}: {stored.get(name)!r} != {wanted!r}"
                 )
-        return dict(stored)
+        return {**stored, "target_model_id": expected["target_model_id"]}
     for name in (
-        "target_model_id",
         "target_model_revision",
         "tokenizer_fingerprint",
         "vllm_aux_hidden_state_layer_ids",
