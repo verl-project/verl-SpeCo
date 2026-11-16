@@ -1305,6 +1305,10 @@ class DrafterBaseTrainer:
         prefix = self._block_drafter_metric_prefix()
         if f"{prefix}/loss" in sums:
             metrics[f"{prefix}/loss"] = sums[f"{prefix}/loss"] / steps
+        opd_batches = sums.get(f"{prefix}/opd/batch_count", 0.0)
+        if opd_batches > 0:
+            for key in ("loss", "trace_blocks", "random_blocks", "visible_tokens"):
+                metrics[f"{prefix}/opd/{key}"] = sums[f"{prefix}/opd/{key}"] / opd_batches
         selector_weight = sums.get(f"{prefix}/selector_weight_count", 0.0)
         if selector_weight > 0:
             metrics[f"{prefix}/selector_loss"] = (
@@ -1508,6 +1512,8 @@ class DrafterBaseTrainer:
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
             "loss_mode_id": f"{prefix}/loss_mode_id",
         }
+        for key in ("loss", "trace_blocks", "random_blocks", "visible_tokens", "batch_count"):
+            scalar_keys[f"opd/{key}"] = f"{prefix}/opd/{key}"
         vector_keys = {
             "loss_sum_per_position": f"{prefix}/loss_sum_per_position",
             "correct_per_position": f"{prefix}/correct_per_position",
@@ -4669,6 +4675,7 @@ class DrafterBaseTrainer:
                     batch.get("_verl_request_mean_accept_len"),
                     i,
                 ),
+                "_speco_verify_trace": _batch_item_value(batch.get("_speco_verify_trace"), i),
                 "_speco_vllm_request_id": _batch_item_value(
                     batch.get("_speco_vllm_request_id"), i
                 ),
@@ -4716,6 +4723,17 @@ class DrafterBaseTrainer:
                     else None
                 ),
             }
+            if data_item["_speco_verify_trace"] is not None:
+                from verl_speco.integration.verify_trace import align_trace_to_prompt
+                if cpu_prompts is None:
+                    raise ValueError("Draft-OPD collection requires prompt token coordinates")
+                data_item["_speco_verify_trace"] = align_trace_to_prompt(
+                    data_item["_speco_verify_trace"], cpu_prompts[i].numel())
+                if batch.get("response_mask") is None:
+                    raise ValueError("Draft-OPD collection requires the agent response_mask")
+                response_mask = batch["response_mask"][i].detach().cpu().float()[:response_len]
+                full_loss_mask[prompt_len:prompt_len+response_len] = response_mask
+                data_item["loss_mask"] = full_loss_mask[feature_start:feature_end]
             if shifted_block_labels:
                 if not 0 <= feature_start < feature_end < input_seq_length:
                     raise ValueError(
@@ -5646,6 +5664,8 @@ class DrafterBaseTrainer:
         packed_loss_tokens = 0
         trailing_label_rows = 0
         packing_enabled = self._packing_enabled()
+        if packing_enabled and "opd_trace" in preprocessed_lists:
+            raise ValueError("Draft-OPD currently requires packing=false")
 
         # Build training chunks inside each sample before packing. EAGLE3-style
         # models use next-token chunks, while DFlash keeps same-position blocks
@@ -5663,6 +5683,7 @@ class DrafterBaseTrainer:
         label_id_chunks = []
         label_mask_chunks = []
 
+        opd_trace_chunks = []
         ids_list = preprocessed_lists["ids"]
         hidden_list = preprocessed_lists["h_states"]
         mask_list = preprocessed_lists["masks"]
@@ -6116,6 +6137,8 @@ class DrafterBaseTrainer:
                             },
                         )
 
+            if "opd_trace" in preprocessed_lists:
+                opd_trace_chunks.append(preprocessed_lists["opd_trace"][item_idx][:train_seq_len])
             if uses_shifted_eagle_inputs or self.backend.model_type == "peagle":
                 input_id_chunks.append(ids[1 : 1 + train_seq_len])
                 hidden_state_chunks.append(h_states[:train_seq_len])
@@ -6542,6 +6565,10 @@ class DrafterBaseTrainer:
             and target_last_hidden_state_chunks
         ):
             batch["target_last_hidden_states"] = target_last_hidden_states
+        if opd_trace_chunks:
+            batch["opd_trace"] = torch.full((*input_ids.shape, 3), -1, dtype=torch.long, device=dev)
+            for row, trace in enumerate(opd_trace_chunks):
+                batch["opd_trace"][row, :trace.size(0)] = trace
         if document_ids is not None:
             batch["document_ids"] = document_ids
         batch["_speco_pad_size"] = pad_size_for_batch
@@ -7229,6 +7256,37 @@ class DrafterBaseTrainer:
             self._active_training_reservation_id = previous_reservation_id
             self._active_training_target_version = previous_target_version
             self._last_prepared_training_items = previous_prepared_items
+
+    async def training_specopd_group(self, samples, step, spec, feature_indices):
+        """Consume fixed proposals with exactly one optimizer update across microbatches."""
+        from verl_speco.backends.specopd_forward import build_specopd_training_batch
+
+        selected = [(request, scores) for request, scores in samples if request.branches]
+        positions = sum(len(branch.token_ids) for request, _ in selected for branch in request.branches)
+        if positions < spec.min_scored_positions_per_update:
+            return False
+        if not await self.activate_training_model():
+            raise RuntimeError("SpecOPD drafter activation failed")
+        wrapper = self.model.module if hasattr(self.model, "module") else self.model
+        layers = wrapper.draft_model.num_context_layers
+        if len(feature_indices) != layers:
+            raise ValueError("SpecOPD auxiliary layer count differs from drafter checkpoint")
+        if float(getattr(wrapper.draft_model.config, "attention_dropout", 0.0)) != 0:
+            raise ValueError("SpecOPD fixed-history probability reconstruction requires zero draft dropout")
+        optimizer_before = self.optimizer_steps_total
+        for index, (request, scores) in enumerate(selected):
+            batch = build_specopd_training_batch(request, scores, self.runtime_device, spec, feature_indices)
+            with torch.enable_grad():
+                ok = await self._training_step_on_batch(
+                    batch, step, accumulation_steps=len(selected), accumulation_index=index,
+                )
+            if not ok:
+                self.optimizer.zero_grad(set_to_none=True)
+                raise RuntimeError("SpecOPD update failed; this group must not be replayed")
+        if self.optimizer_steps_total != optimizer_before + 1:
+            raise RuntimeError("SpecOPD group did not produce exactly one optimizer update")
+        self.prepare_model_state_dict_for_publish(step)
+        return True
 
     async def training_step_from_batch(
         self, batch: dict[str, torch.Tensor], step: int, *, raise_on_error: bool = False

@@ -1514,6 +1514,7 @@ class SpecoV1Mixin(V1BubbleMixin):
         result.meta_info["speco_v1_padding_rows"] = sum(padding)
         for key in (
             "_verl_request_mean_accept_len",
+            "_speco_verify_trace",
             "_speco_vllm_request_id",
             "_speco_vllm_request_verify_rounds",
             "_speco_vllm_request_accepted_tokens",

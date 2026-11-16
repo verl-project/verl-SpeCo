@@ -27,6 +27,8 @@ import hashlib
 import inspect
 import json
 import logging
+
+from verl_speco.opd_method import draft_opd_enabled, spec_opd_enabled, capture_verify_trace_enabled
 import os
 import sys
 import threading
@@ -1252,6 +1254,8 @@ def _ensure_vllm_server_drafter_env(
         if isinstance(loaded, dict):
             embedded_config = loaded
     env_config = _load_env_drafter_config()
+    if os.getenv("VERL_SPECO_DIAGNOSTIC_TRANSPORT") == "1":
+        print(f"[specopd transport] restore server_config={bool(server_config)} embedded_config={bool(embedded_config)} environment_config={bool(env_config)}", flush=True)
     candidates = (
         (server_config, "server_config"),
         (embedded_config, "server_class"),
@@ -1263,12 +1267,18 @@ def _ensure_vllm_server_drafter_env(
         # config may have lost private drafter fields during validation. Carry
         # this opt-out separately, without changing event-bus source selection.
         resolved = candidate
+        embedded_training = embedded_config.get("training", {})
+        for key in ("drafter_opd", "specopd"):
+            if key in embedded_training:
+                resolved = dict(resolved)
+                resolved["training"] = dict(resolved.get("training", {}))
+                resolved["training"][key] = embedded_training[key]
         for control in (embedded_config, candidate, env_config):
             options = control.get("vllm") or {}
             if "acceptance_sidecar_enabled" not in options:
                 continue
-            resolved = dict(candidate)
-            resolved["vllm"] = dict(candidate.get("vllm") or {})
+            resolved = dict(resolved)
+            resolved["vllm"] = dict(resolved.get("vllm") or {})
             resolved["vllm"]["acceptance_sidecar_enabled"] = options[
                 "acceptance_sidecar_enabled"
             ]
@@ -1289,6 +1299,11 @@ def _ensure_vllm_server_drafter_env(
         )
         if candidate and configured_bus_name:
             return restore(candidate, source)
+
+    # Sync scheduling has no idle bus. Its embedded launcher snapshot still
+    # carries private training fields removed from the upstream server config.
+    if embedded_config and not server_config and not env_config:
+        return restore(embedded_config, "server_class")
 
     env_bus_name = _rollout_idle_event_bus_name(env_config)
     server_bus_name = _rollout_idle_event_bus_name(server_config)
@@ -3086,9 +3101,27 @@ def patch_vllm_request_acceptance_stats() -> bool:
     ):
 
         def patched_update_from_output(self, scheduler_output, model_runner_output):
+            opd_cfg = _load_env_drafter_config()
+            capture = capture_verify_trace_enabled(opd_cfg.get("training", {}))
+            if capture:
+                from verl_speco.integration.verify_trace import snapshot_verify_step
+                if self.num_sampled_tokens_per_step != 1:
+                    raise ValueError("Draft-OPD requires one target correction/bonus token per step")
+                snapshots = snapshot_verify_step(self, scheduler_output, model_runner_output)
             engine_core_outputs = original_update_from_output(
                 self, scheduler_output, model_runner_output
             )
+            if capture:
+                from verl_speco.integration.verify_trace import TRACE_KEY, finish_verify_step
+                traces = finish_verify_step(
+                    snapshots, layout=_drafter_algorithm(opd_cfg).lower(),
+                    capacity=int(self.num_spec_tokens))
+                store = _speco_vllm_request_stats_store(self)
+                for rid, trace in traces.items():
+                    item = store.setdefault(rid, {"verify_rounds": 0, "draft_tokens": 0,
+                                                  "accepted_tokens": 0, "invalid_spec_tokens": 0,
+                                                  "started_sec": time.perf_counter()})
+                    item[TRACE_KEY] = trace
             try:
                 finished_outputs = []
                 for client_outputs in engine_core_outputs.values():
@@ -3433,6 +3466,14 @@ def install_vllm_spec_decode_acceptance_logging() -> bool:
     global _ACCEPTANCE_HOOK_STATUS
     scheduler_patched = patch_vllm_spec_decode_acceptance_logging()
     request_acceptance_patched = patch_vllm_request_acceptance_stats()
+    if spec_opd_enabled(_load_env_drafter_config().get("training", {})):
+        from verl_speco.integration.specopd_vllm import (
+            install_specopd_vllm_patch,
+            install_specopd_draft_token_transport_patch,
+        )
+
+        install_specopd_vllm_patch()
+        install_specopd_draft_token_transport_patch()
     engine_core_patched = patch_vllm_engine_core_entrypoint()
     status = (scheduler_patched, request_acceptance_patched, engine_core_patched)
     if status != _ACCEPTANCE_HOOK_STATUS:
@@ -3573,7 +3614,7 @@ def _vllm_request_accept_fields_from_summaries(
         completion_indices.append(_int_or_zero(item.get("completion_index", 0)))
         mean_accept_len.append(request_mean_accept_len)
         elapsed_sec.append(request_elapsed_sec)
-    return {
+    fields = {
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_id": ordered_ids,
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_verify_rounds": verify_rounds,
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_draft_tokens": draft_tokens,
@@ -3583,6 +3624,9 @@ def _vllm_request_accept_fields_from_summaries(
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_elapsed_sec": elapsed_sec,
         "_verl_request_mean_accept_len": mean_accept_len,
     }
+    if any("_speco_verify_trace" in summaries[rid] for rid in ordered_ids):
+        fields["_speco_verify_trace"] = [summaries[rid].get("_speco_verify_trace") for rid in ordered_ids]
+    return fields
 
 
 def _ordered_request_ids_from_summaries(
@@ -4102,6 +4146,8 @@ class _SpecoVLLMHttpServerMixin:
         # The trainer calls this only after all weight commit RPCs have settled,
         # while ordinary serving is quiescent behind the admission boundary.
         self._speco_serving_drafter_revision = int(revision)
+        return {"drafter_revision": self._speco_serving_drafter_revision,
+                "actor_revision": self.global_steps}
 
     async def speco_generate_probe(self, *args, **kwargs):
         # Dedicated RPC: public generation cannot opt out of admission by
@@ -4174,6 +4220,61 @@ async def _speco_generate_with_request_stats_unblocked(
         sampling_params = args[1]
     if isinstance(sampling_params, dict):
         clean_params = dict(sampling_params)
+        specopd_revision = clean_params.pop("_specopd_drafter_revision", None)
+        from verl_speco.specopd_config import SpecOPDConfig
+        from verl_speco.integration.specopd_window import make_window
+        from verl_speco.transport.specopd_protocol import PLAN_KEY
+
+        specopd_config = SpecOPDConfig.from_training(_load_env_drafter_config().get("training", {}))
+        if not getattr(self, "_specopd_context_logged", False):
+            if os.getenv("VERL_SPECO_DIAGNOSTIC_TRANSPORT") == "1":
+                print(f"[specopd transport] server={type(self).__name__} enabled={specopd_config.enable} revision={specopd_revision} config_present={bool(_load_env_drafter_config())} logger_disabled={logger.disabled}", flush=True)
+            logger.warning("[specopd transport] server=%s enabled=%s revision_hint=%s skip=%s",
+                type(self).__name__, specopd_config.enable, specopd_revision,
+                clean_params.get("_verl_skip_drafter_collection", False))
+            self._specopd_context_logged = True
+        specopd_collect = specopd_config.enable and not clean_params.get("_verl_skip_drafter_collection", False)
+        if specopd_collect:
+            if specopd_revision is None:
+                raise RuntimeError("SpecOPD request is missing its acknowledged drafter revision")
+            if specopd_revision != getattr(self, "_speco_serving_drafter_revision", None):
+                raise RuntimeError("SpecOPD request differs from the acknowledged serving drafter revision")
+            for key, default in (("top_p", 1.0), ("top_k", -1), ("min_p", 0.0), ("repetition_penalty", 1.0)):
+                if clean_params.get(key, default) != default:
+                    raise ValueError(f"SpecOPD does not support modified proposal processing: {key}")
+            for key, default in (("min_tokens", 0), ("frequency_penalty", 0.0), ("presence_penalty", 0.0),
+                                 ("logit_bias", None), ("allowed_token_ids", None), ("bad_words", None),
+                                 ("structured_outputs", None), ("guided_decoding", None), ("stop", None), ("n", 1)):
+                if clean_params.get(key, default) != default:
+                    raise ValueError(f"SpecOPD cannot reconstruct this sampling modifier: {key}")
+            if float(clean_params.get("temperature", 1.0)) != specopd_config.proposal_temperature:
+                raise ValueError("rollout and SpecOPD proposal temperatures differ")
+            prompt = kwargs.get("prompt_ids", args[0] if args else None)
+            rid = self._speco_request_id_from_generate_call(args, kwargs)
+            budget = int(clean_params.get("max_tokens", clean_params.get("max_new_tokens", self.config.response_length)))
+            native_extra = dict(clean_params.get("extra_args") or {})
+            native_extra[PLAN_KEY] = make_window(specopd_config, rid, self.global_steps,
+                                                 specopd_revision, len(prompt), budget)
+            eos = _get_nested(self.model_config, ("hf_config", "eos_token_id"), None)
+            stop_ids = clean_params.get("stop_token_ids", []) or []
+            native_extra[PLAN_KEY]["eos_token_ids"] = list(stop_ids) + (
+                [] if clean_params.get("ignore_eos", False) or eos is None else (eos if isinstance(eos, list) else [eos])
+            )
+            # Reuse the existing request-count budget, with an explicit empty
+            # bundle for unselected requests so normal old-logprob still runs.
+            training_cfg = _load_env_drafter_config().get("training", {})
+            epoch = int(self.global_steps)
+            if getattr(self, "_specopd_collection_epoch", None) != epoch:
+                self._specopd_collection_epoch = epoch
+                self._specopd_collection_requests = 0
+            rate = float(training_cfg.get("collection_sample_rate", 1.0))
+            sample_hash = int.from_bytes(hashlib.sha256(f"{rid}:{epoch}".encode()).digest()[:8], "little") / 2**64
+            limit = int(training_cfg.get("max_collect_samples_per_step_per_replica", 16))
+            if sample_hash >= rate or (limit > 0 and self._specopd_collection_requests >= limit):
+                native_extra[PLAN_KEY]["max_branches"] = 0
+            else:
+                self._specopd_collection_requests += 1
+            clean_params["extra_args"] = native_extra
         clean_params.pop("_verl_global_steps", None)
         clean_params.pop("_verl_skip_drafter_collection", None)
         if positional_params:
@@ -4272,6 +4373,20 @@ async def _speco_generate_with_request_stats_unblocked(
         request_elapsed = time.perf_counter() - request_started
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
+            if isinstance(sampling_params, dict) and specopd_collect:
+                from verl_speco.integration.specopd_vllm import pop_completed
+                from verl_speco.transport.specopd_protocol import PROPOSAL_KEY
+
+                wire = pop_completed(request_id)
+                if wire is None:
+                    raise RuntimeError("SpecOPD proposal channel missing from vLLM final output")
+                extra_fields[PROPOSAL_KEY] = wire
+                if os.getenv("VERL_SPECO_DIAGNOSTIC_TRANSPORT") == "1":
+                    from verl_speco.transport.specopd_protocol import decode_bundle
+                    records = decode_bundle(wire)["records"]
+                    tokens = sum(len(r["proposal_ids"]) for r in records)
+                    tails = sum(max(0, len(r["proposal_ids"]) - r["accepted_count"] - 1) for r in records)
+                    print(f"[specopd transport] proposals branches={len(records)} tokens={tokens} rejected_tail_tokens={tails}", flush=True)
             revision_after = int(getattr(self, "_speco_serving_drafter_revision", 0))
             # Unscored requests must carry the same provenance key as requests
             # with exact counters or an engine fallback before batch merging.
@@ -4319,6 +4434,15 @@ async def _speco_generate_with_request_stats_unblocked(
             )
 
             bridge_request_acceptance_counters(extra_fields)
+            if capture_verify_trace_enabled(_load_env_drafter_config().get("training", {})):
+                from verl_speco.integration.verify_trace import TRACE_KEY, token_digest
+                trace = extra_fields[TRACE_KEY]
+                prompt_ids = kwargs["prompt_ids"] if "prompt_ids" in kwargs else args[0]
+                if trace["response_length"] != len(output.token_ids):
+                    raise ValueError("Draft-OPD trace and returned response length differ")
+                trace["prefix_digest"] = token_digest([*prompt_ids, *output.token_ids])
+                trace["drafter_revision_min"] = min(revision_before, revision_after)
+                trace["drafter_revision_max"] = max(revision_before, revision_after)
             elapsed_key = f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_elapsed_sec"
             if (
                 extra_fields.get("_verl_request_mean_accept_len") is not None
@@ -4367,6 +4491,10 @@ async def _speco_generate_with_request_stats_unblocked(
         if isinstance(pending, dict):
             pending.pop(str(request_id), None)
         _pop_vllm_request_stats_for_rollout_output(request_id)
+        if isinstance(sampling_params, dict) and specopd_config.enable:
+            from verl_speco.integration.specopd_vllm import pop_completed
+
+            pop_completed(request_id)
 
 
 async def _speco_generate_with_idle_lease(
@@ -4543,13 +4671,33 @@ def _build_speco_vllm_http_server_class(upstream_module: Any):
             upstream_cls._speco_drafter_config_env = drafter_config_env
         return upstream_cls
     if bool(getattr(upstream_cls, "_speco_vllm_http_methods_patched", False)):
+        # Ray imports the base by reference in a fresh process. Keep the
+        # patched methods on the by-value subclass as well; inheriting them
+        # loses launch config restoration and proposal capture after import.
+        namespace = {
+            "__module__": __name__,
+            "_speco_drafter_config_env": drafter_config_env,
+        }
+        from functools import wraps
+
+        def own_bridge(method):
+            @wraps(method)
+            async def routed(self, *args, **kwargs):
+                return await method(self, *args, **kwargs)
+
+            return routed
+
+        for name in ("launch_server", "run_server", "generate", "speco_generate_probe"):
+            method = getattr(upstream_cls, name, None)
+            if method is not None:
+                # Cloudpickle removes class entries identical to inherited
+                # entries. A distinct forwarding closure must retain this
+                # bridge even when the imported base is pristine remotely.
+                namespace[name] = own_bridge(method)
         return type(
             "SpecoVLLMHttpServer",
-            (upstream_cls,),
-            {
-                "__module__": __name__,
-                "_speco_drafter_config_env": drafter_config_env,
-            },
+            (_SpecoVLLMHttpServerMixin, upstream_cls),
+            namespace,
         )
     return type(
         "SpecoVLLMHttpServer",
@@ -4570,12 +4718,15 @@ class _SpecoVLLMHttpServerActorClass:
     )
     _SETUP_HOOK_ENV_VAR = "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR"
 
-    def __init__(self, actor_class: Any):
+    def __init__(self, actor_class: Any, drafter_config_env: str | None = None):
         self._actor_class = actor_class
+        self._drafter_config_env = drafter_config_env
 
     def options(self, **options):
         runtime_env = dict(options.get("runtime_env", {}) or {})
         env_vars = dict(runtime_env.get("env_vars", {}) or {})
+        if self._drafter_config_env:
+            env_vars[SPECO_DRAFTER_CONFIG_ENV] = self._drafter_config_env
         for name in ("VERL_SPECO_PHASE_TIMING", "VERL_SPECO_DIAGNOSTIC_ROLLOUT_PERF"):
             if name in os.environ:
                 env_vars.setdefault(name, os.environ[name])
@@ -4599,7 +4750,11 @@ class _SpecoVLLMHttpServerActorClass:
 def _remote_speco_vllm_http_server(ray_module: Any, server_cls: type[Any]) -> Any:
     """Create the HTTP actor with import compatibility active at process start."""
 
-    return _SpecoVLLMHttpServerActorClass(ray_module.remote(server_cls))
+    return _SpecoVLLMHttpServerActorClass(
+        ray_module.remote(server_cls),
+        getattr(server_cls, "_speco_drafter_config_env", None)
+        or get_drafter_config_env(),
+    )
 
 
 def _patch_upstream_vllm_http_server_methods(upstream_cls: type[Any]) -> bool:
@@ -4749,14 +4904,15 @@ def install_upstream_vllm_runtime_bridge() -> bool:
         return False
 
     _patch_upstream_vllm_http_server_methods(vllm_async_server.vLLMHttpServer)
+    # Worker bootstrap may install the bridge before the trainer has resolved
+    # its drafter config. Refresh the existing class snapshot on reinstall too.
+    speco_http_server_cls = _build_speco_vllm_http_server_class(vllm_async_server)
     if bool(getattr(upstream_replica, "_speco_vllm_replica_bridge", False)):
         registry = getattr(replica_module, "RolloutReplicaRegistry", None)
         if registry is not None and hasattr(registry, "_registry"):
             registry._registry["vllm"] = lambda: upstream_replica
         _VLLM_REPLICA_PATCHED = True
         return True
-    speco_http_server_cls = _build_speco_vllm_http_server_class(vllm_async_server)
-
     upstream_replica_base = cast(type[Any], upstream_replica)
 
     def _speco_vllm_replica_init(self, *args, **kwargs):
@@ -4813,6 +4969,28 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
         return {}
     drafter_cfg = _drafter_config_from_config(config)
     enabled = bool(drafter_cfg.get("enable"))
+    opd_cfg = drafter_cfg.get("training", {}).get("drafter_opd", {})
+    if draft_opd_enabled(drafter_cfg.get("training", {})):
+        if not enabled or not opd_cfg.get("capture_verify_trace", False):
+            raise ValueError("Draft-OPD requires drafter.enable and capture_verify_trace")
+        if _drafter_algorithm(drafter_cfg) not in {"DFLASH", "DSPARK"}:
+            raise ValueError("Draft-OPD supports DFLASH and DSPARK")
+        is_dflash = _drafter_algorithm(drafter_cfg) == "DFLASH"
+        block_key = "dflash_block_size" if is_dflash else "dspark_block_size"
+        block_size = int(drafter_cfg["training"].get(block_key, 16 if is_dflash else 7))
+        capacity = block_size - int(is_dflash)
+        verify_tokens = drafter_cfg.get("rollout", {}).get("spec_verify_tokens")
+        if verify_tokens != capacity:
+            raise ValueError(
+                "Draft-OPD requires rollout.spec_verify_tokens to match training draft capacity: "
+                f"spec_verify_tokens={verify_tokens}, {block_key}={block_size}, "
+                f"expected spec_verify_tokens={capacity}. "
+                "DFlash block_size includes the anchor; DSpark block_size counts draft positions."
+            )
+        if _get_nested(config, ("trainer", "device"), "cuda") not in {"cuda", "npu"}:
+            raise ValueError("Draft-OPD requires CUDA or Ascend NPU")
+        if drafter_cfg["training"].get("packing", {}).get("enable", False):
+            raise ValueError("Draft-OPD currently requires packing.enable=false")
     if not enabled:
         clear_drafter_config_env()
         # V1 creates standalone rollout replicas even without speculative
@@ -4826,6 +5004,8 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     engine_kwargs = _ensure_nested_mapping(
         config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm")
     )
+    if spec_opd_enabled(drafter_cfg.get("training", {})):
+        _set_child(engine_kwargs, "async_scheduling", False)
     additional_config = _get_nested(engine_kwargs, ("additional_config",), {}) or {}
     additional_config = dict(additional_config)
     # Keep private transport metadata out of platform additional_config: some
@@ -5193,7 +5373,10 @@ async def speco_vllm_update_draft_weights(
         if self.rollout_rank == 0:
             if flush_after:
                 await _maybe_call_vllm_server_method(self, "clear_kv_cache")
-            if global_steps is not None:
+            # Native global_steps identifies the target/actor snapshot. SpecOPD
+            # acknowledges its drafter revision separately; a draft-only publish
+            # must not relabel target weights (including the initial bootstrap).
+            if global_steps is not None and not spec_opd_enabled(training_cfg):
                 await _maybe_call_vllm_server_method(
                     self, "set_global_steps", global_steps
                 )
