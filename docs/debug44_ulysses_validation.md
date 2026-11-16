@@ -10,7 +10,7 @@
 - [x] SP-01：CPU 多进程 SP=2/4 与完整树前向对照，覆盖非整除长度、GQA、逻辑 RoPE、不同分支位置、hidden/logprob 与隔离；该完整树参考实现已有独立因果 oracle。
 - [x] SP-02：真实 NPU 小模型/通信检查，SP=4、DP=2/SP=2、leader 和 dummy 组无重复/遗漏。
 - [x] SP-03：`.44` V1 sync + actor/ref SP=4、10 个 RL step 短测，覆盖第 5/10 轮，完成正常 actor/ref 与草稿更新、评分/发布 ACK。
-- [ ] SP-04：参数、方案和 `.242` 代码/脚本同步；短测范围和生产长序列范围分别说明。
+- [x] SP-04：参数、方案和 `.242` 代码/脚本同步；短测范围和生产长序列范围分别说明。
 
 ## SP-00 进行中
 
@@ -60,3 +60,17 @@ SpecOPD 两个采集轮 logical/independent 行数分别 2526/5388、2426/5092�
 结束清理中出现一条 `EngineDeadError`。完整日志显示：最终 validation 与 100% 进度已经完成；对应 Ray core-worker 日志在 11:49:53 记录 owner `INTENDED_SYSTEM_EXIT`，随后主动杀死子进程，11:49:54 vLLM 才打印 shutdown/output-handler 错误。该条为退出时的 worker 回收日志，不是训练过程中的 EngineCore 失败；原始日志保留，不屏蔽。
 
 本地日志在 `tmp/debug44-artifacts/ulysses-*`，远端在 `/home/c00954340/specopd-debug-logs/ulysses-*`。多 optimizer 测试 1/20 两种配置均在真实容器依赖下通过；每组只在全部更新完成后生成一次发布快照。
+
+
+## SP-04：最终回归与部署完成
+
+2026-11-16：最终源码回归 `ulysses-final-contracts-04.log` 为 **187 passed**、退出 0；`ulysses-npu-final-04.log` HCCL oracle 退出 0，SP=4 FP32/BF16 三类 readout 最大差异均为 0，DP=2/SP=2 FP32 LP 最大差异 4.77e-7、BF16 为 0，仅真实组 leader 导出。原日志已取回 `tmp/debug44-artifacts/`。
+
+- 代码 `0f7645a` 已推送 `crp0128/specopd`，补丁 52,160 字节；方案更新 `ed0cac9` 补丁 33,019 字节，均小于 100 KB。
+- `.242` 代码仓 `/efs_rl/z00886395/codes/test_speco/verl-SpeCo-specopd` 使用干净的 specopd 分支，通过 bundle 快进同步。
+- 两个 `*_draft_opd_v1_with_train.sh` / `*_spec_opd_v1_with_train.sh` 已发布至 `/efs_rl/z00886395/shell/speco-runping/`。覆盖前核对旧 release SHA，备份为 `.before-ulysses-89f2915`。原参考脚本 SHA256 保持 `ed9bf6fef29ada5676503eb958f76bd440bb8dcc63ad264ae1463373d19c78bf`。
+- 使用 shell function 替代启动入口捕获真实 argv；在 `.44` 完整依赖环境通过 Hydra compose、SpecOPD 校验及 vLLM runtime 配置。实际为 V1 sync、16 die、TP=2、actor/ref SP=4、remove-padding=true、step=20、采集/训练间隔均为 5；SpecOPD async_scheduling=false、联合评分 budget=9216。只替换模型路径读取本地元数据，没有加载模型或启动 `.242` 训练。可选 MSC 配置源缺失打印依赖日志，未影响校验，退出 0。
+- import 定位到上述真实代码仓，发布 SHA 记录在 `specopd-v1-source-manifest.json`；最终文档提交同步后 receipt commit 相应更新。
+- `.44` 本次 Ulysses 测试训练 driver 为零，NPU 仅保留其他任务原有的 PID 1799413，未操作该进程。
+
+生产配置仍保留 16 die、8192 response token、200 RL step；该完整负载未运行。本次验收证明短测控制流和数值一致性，不证明完整负载容量、吞吐或训练收益。
