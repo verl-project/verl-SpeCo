@@ -912,6 +912,10 @@ class SpecoWorker(Worker):
                 ).float()
         else:
             loss_mask[:] = 1.0
+        if batch.get("_speco_verify_trace") is not None:
+            prompt_len = batch["prompts"].numel()
+            response_mask = batch["response_mask"].detach().cpu().float().reshape(-1)
+            loss_mask[prompt_len:prompt_len+response_mask.numel()] = response_mask
         return loss_mask
 
     def _write_rollout_feature_sample(
@@ -1027,6 +1031,7 @@ class SpecoWorker(Worker):
             "target_logprobs_position_start",
             "target_logprobs_position_end",
             "_verl_request_mean_accept_len",
+            "_speco_verify_trace",
             "_speco_vllm_request_id",
             "_verl_is_hard",
             "_verl_hard_score",
@@ -1035,6 +1040,10 @@ class SpecoWorker(Worker):
         ):
             if key in batch:
                 metadata[key] = batch[key]
+        if metadata.get("_speco_verify_trace") is not None:
+            from verl_speco.integration.verify_trace import align_trace_to_prompt
+            metadata["_speco_verify_trace"] = align_trace_to_prompt(
+                metadata["_speco_verify_trace"], batch["prompts"].numel())
         feature_sample = DraftFeatureSample(
             algorithm=algorithm,
             input_ids=input_ids,
@@ -1440,6 +1449,8 @@ class SpecoWorker(Worker):
                 "hidden_states_layout",
                 "target_layer_ids",
                 "_verl_request_mean_accept_len",
+                "_speco_verify_trace",
+                "response_mask",
                 "_speco_vllm_request_id",
                 "_verl_is_hard",
                 "_verl_hard_score",
@@ -1637,6 +1648,49 @@ class SpecoWorker(Worker):
                 target_logprobs=target_logprobs,
             )
         self._flush_rollout_features_for_step()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def prepare_specopd_bootstrap(self, step):
+        """Publish the actual restored trainer state before collecting fresh proposals."""
+        if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
+            return None
+        if self.last_global_step != step:
+            raise RuntimeError("SpecOPD bootstrap must follow target-head synchronization")
+        if not await self.trainer.activate_training_model():
+            raise RuntimeError("SpecOPD bootstrap activation failed")
+        self._specopd_revision = int(self.trainer.optimizer_steps_total)
+        self._specopd_consumed_step = -1
+        self.trainer.prepare_model_state_dict_for_publish(step)
+        self.last_trained_step = step  # Snapshot availability, not an optimizer update.
+        self._last_trained_execution_strategy = "sync"
+        await self.trainer.release_training_memory_after_activation(strict=True)
+        return {"revision": self._specopd_revision}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def train_specopd_group(self, samples, step, revision, feature_indices):
+        """Synchronous, one-use proposal update; no legacy replay/quota execution."""
+        if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
+            return None
+        from verl_speco.specopd_config import SpecOPDConfig
+
+        spec = SpecOPDConfig.from_training(self.config.rollout.drafter.training)
+        if not spec.enable:
+            raise RuntimeError("SpecOPD RPC invoked while disabled")
+        local_revision = getattr(self, "_specopd_revision", 0)
+        if revision != local_revision or step <= getattr(self, "_specopd_consumed_step", -1):
+            raise RuntimeError("SpecOPD revision mismatch or already consumed group")
+        if self.last_global_step != step:
+            raise RuntimeError("SpecOPD group does not match synchronized target-head step")
+        self._specopd_consumed_step = step
+        with _preserve_process_rng_state(self.device_name):
+            trained = await self.trainer.training_specopd_group(samples, step, spec, feature_indices)
+        if trained:
+            self._specopd_revision = local_revision + 1
+            self.last_trained_step = step
+            self._last_trained_execution_strategy = "sync"
+        if self.trainer.model is not None:
+            await self.trainer.release_training_memory_after_activation(strict=True)
+        return {"trained": trained, "revision": getattr(self, "_specopd_revision", 0)}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_global_step(self, global_step: int):
