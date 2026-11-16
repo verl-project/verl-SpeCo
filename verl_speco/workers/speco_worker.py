@@ -1682,6 +1682,7 @@ class SpecoWorker(Worker):
         if self.last_global_step != step:
             raise RuntimeError("SpecOPD group does not match synchronized target-head step")
         self._specopd_consumed_step = step
+        optimizer_before = self.trainer.optimizer_steps_total
         with _preserve_process_rng_state(self.device_name):
             trained = await self.trainer.training_specopd_group(samples, step, spec, feature_indices)
         if trained:
@@ -1690,7 +1691,10 @@ class SpecoWorker(Worker):
             self._last_trained_execution_strategy = "sync"
         if self.trainer.model is not None:
             await self.trainer.release_training_memory_after_activation(strict=True)
-        return {"trained": trained, "revision": getattr(self, "_specopd_revision", 0)}
+        return {
+            "trained": trained, "revision": getattr(self, "_specopd_revision", 0),
+            "optimizer_updates": self.trainer.optimizer_steps_total - optimizer_before,
+        }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_global_step(self, global_step: int):

@@ -60,7 +60,10 @@ class SpecOPDConfig:
         unknown = set(raw) - allowed
         if unknown:
             raise ValueError(f"unknown SpecOPD options: {sorted(unknown)}")
-        result = cls(**{**dict(raw), "enable": spec_opd_enabled(training)})
+        result = cls(**{
+            "optimizer_updates_per_collection": training.get("step", 1),
+            **dict(raw), "enable": spec_opd_enabled(training),
+        })
         if result.enable:
             result.validate()
         return result
@@ -80,6 +83,7 @@ class SpecOPDConfig:
             "max_wire_bytes",
             "min_scored_positions_per_update",
             "microbatch_trajectories",
+            "optimizer_updates_per_collection",
         ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
@@ -91,13 +95,12 @@ class SpecOPDConfig:
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"SpecOPD {name} must be finite and positive")
         if (
-            self.optimizer_updates_per_collection != 1
-            or self.replay
+            self.replay
             or self.mix_trunk_loss
             or self.allow_bubble_training
         ):
             raise ValueError(
-                "SpecOPD requires one update, no replay, no trunk loss and no Bubble"
+                "SpecOPD requires no cross-collection replay, no trunk loss and no Bubble"
             )
         if (
             self.collection_source != "rollout_proposals"
@@ -150,8 +153,9 @@ def validate_specopd_config(config):
     limit = training.get("max_collect_samples_per_step_per_replica", 16)
     if type(limit) is not int or limit < 0:
         raise ValueError("SpecOPD request collection limit must be nonnegative")
-    if actor.get("actor", {}).get("ulysses_sequence_parallel_size", 1) != 1:
-        raise ValueError("SpecOPD actor sequence parallelism is unsupported")
+    sp_size = actor.get("actor", {}).get("ulysses_sequence_parallel_size", 1)
+    if type(sp_size) is not int or sp_size < 1:
+        raise ValueError("SpecOPD Ulysses size must be a positive integer")
     temperature = float(rollout.get("temperature", 1.0))
     if any(
         t != temperature
@@ -190,18 +194,17 @@ def validate_specopd_config(config):
     if actor.get("actor", {}).get("strategy", "fsdp2") not in {"fsdp", "fsdp2"}:
         raise ValueError("SpecOPD requires the FSDP actor engine")
     model = actor.get("model", {})
-    if model.get("use_remove_padding", True) or model.get("use_fused_kernels", False):
+    if model.get("use_remove_padding", True) != (sp_size > 1) or model.get("use_fused_kernels", False):
         raise ValueError(
-            "SpecOPD requires model.use_remove_padding=false and use_fused_kernels=false"
+            "SpecOPD requires use_remove_padding=(SP>1) and use_fused_kernels=false"
         )
     if model.get("lora_rank", 0) or model.get("lora_adapter_path"):
         raise ValueError("SpecOPD LoRA actor scoring is not supported")
-    if (
-        training.get("step", 1) != 1
-        or training.get("collect_interval_steps", 1) != 1
-        or training.get("training_interval_steps", 1) != 1
-    ):
-        raise ValueError("SpecOPD requires step=1 and collection/training intervals=1")
+    interval = training.get("collect_interval_steps", 1)
+    if (type(interval) is not int or interval < 1
+            or training.get("training_interval_steps", 1) != interval
+            or training.get("step", 1) != spec.optimizer_updates_per_collection):
+        raise ValueError("SpecOPD requires equal positive collection/training intervals and step=optimizer_updates_per_collection")
     if training.get("collect_hidden_states_from_sgl", False) or training.get(
         "use_data_buffer", False
     ):

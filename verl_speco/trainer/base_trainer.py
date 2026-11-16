@@ -7258,7 +7258,7 @@ class DrafterBaseTrainer:
             self._last_prepared_training_items = previous_prepared_items
 
     async def training_specopd_group(self, samples, step, spec, feature_indices):
-        """Consume fixed proposals with exactly one optimizer update across microbatches."""
+        """Train one collected group for its configured updates, then publish once."""
         from verl_speco.backends.specopd_forward import build_specopd_training_batch
 
         selected = [(request, scores) for request, scores in samples if request.branches]
@@ -7274,17 +7274,18 @@ class DrafterBaseTrainer:
         if float(getattr(wrapper.draft_model.config, "attention_dropout", 0.0)) != 0:
             raise ValueError("SpecOPD fixed-history probability reconstruction requires zero draft dropout")
         optimizer_before = self.optimizer_steps_total
-        for index, (request, scores) in enumerate(selected):
-            batch = build_specopd_training_batch(request, scores, self.runtime_device, spec, feature_indices)
-            with torch.enable_grad():
-                ok = await self._training_step_on_batch(
-                    batch, step, accumulation_steps=len(selected), accumulation_index=index,
-                )
-            if not ok:
-                self.optimizer.zero_grad(set_to_none=True)
-                raise RuntimeError("SpecOPD update failed; this group must not be replayed")
-        if self.optimizer_steps_total != optimizer_before + 1:
-            raise RuntimeError("SpecOPD group did not produce exactly one optimizer update")
+        for _ in range(spec.optimizer_updates_per_collection):
+            for index, (request, scores) in enumerate(selected):
+                batch = build_specopd_training_batch(request, scores, self.runtime_device, spec, feature_indices)
+                with torch.enable_grad():
+                    ok = await self._training_step_on_batch(
+                        batch, step, accumulation_steps=len(selected), accumulation_index=index,
+                    )
+                if not ok:
+                    self.optimizer.zero_grad(set_to_none=True)
+                    raise RuntimeError("SpecOPD update failed; this group must not be replayed")
+        if self.optimizer_steps_total != optimizer_before + spec.optimizer_updates_per_collection:
+            raise RuntimeError("SpecOPD group optimizer update count differs from its configuration")
         self.prepare_model_state_dict_for_publish(step)
         return True
 

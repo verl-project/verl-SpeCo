@@ -110,6 +110,10 @@ def unwrap_rank_result(result):
     metrics["model_forward_calls"] = max(
         values["model_forward_calls"] for _, values in active
     )
+    sp_sizes = {values.get("sp_size", 1) for _, values in active}
+    if len(sp_sizes) != 1:
+        raise RuntimeError("joint actor ranks disagree about the active SP size")
+    metrics["sp_size"] = sp_sizes.pop()
     return results, metrics
 
 
@@ -170,6 +174,31 @@ class SpecOPDDriver:
         self._bound_actor_revision = False
         self.bootstrapped = False
         self._acknowledged_actor_revision = None
+        training = trainer.config["actor_rollout_ref"]["rollout"]["drafter"]["training"]
+        self.collection_interval = int(training.get("collect_interval_steps", 1))
+        self.update_due = True
+
+    def begin_step(self, step):
+        if self.cycle.state != "ready":
+            raise RuntimeError("previous SpecOPD collection has not completed publication")
+        self.update_due = int(step) % self.collection_interval == 0
+        self.metrics = {
+            "specopd/update_due": int(self.update_due),
+            "specopd/trained": 0, "specopd/published": 0,
+            "specopd/optimizer_updates": 0,
+            "specopd/bootstrap_published": int(self.bootstrapped),
+        }
+        if self.update_due:
+            self.cycle.begin(step)
+        return self.update_due
+
+    def finish_step(self):
+        if self.cycle.state == "awaiting_publish":
+            self.publish()
+        elif self.cycle.state == "ready":
+            self.acknowledge_serving_revision(self.cycle.drafter_revision)
+        else:
+            raise RuntimeError("SpecOPD step ended with an unfinished collection")
 
     def acknowledge_serving_revision(self, revision):
         server_manager = getattr(self.trainer, "llm_server_manager", None)
@@ -290,6 +319,7 @@ class SpecOPDDriver:
                 )
             scored = tuple(indexed[r.sample_id] for r in chunk)
             results.extend(scored)
+            metrics["specopd/actor_sp_size"] = measured.get("sp_size", 1)
             for key in ("model_forward_calls", "logical_rows", "independent_rows"):
                 metrics[f"specopd/{key}"] += measured[key]
         metrics["timing_s/specopd_joint_oldlogprob"] = time.perf_counter() - started
@@ -302,6 +332,8 @@ class SpecOPDDriver:
         return make_oldlogprob(batch, results), 0.0  # No fabricated MFU estimate.
 
     def before_actor_update(self):
+        if not self.update_due:
+            return
         samples = self.cycle.begin_update()
         positions = sum(
             len(b.token_ids) for request, _ in samples for b in request.branches
@@ -327,6 +359,10 @@ class SpecOPDDriver:
                     "SpecOPD drafter ranks disagree about the optimizer update"
                 )
             self.trained = bool(statuses[0]["trained"])
+            updates = self.spec.optimizer_updates_per_collection if self.trained else 0
+            if any(s.get("optimizer_updates", updates) != updates for s in statuses):
+                raise RuntimeError("SpecOPD drafter ranks did not complete the configured optimizer updates")
+            self.metrics["specopd/optimizer_updates"] = updates
             expected = self.cycle.drafter_revision + int(self.trained)
             if statuses[0]["revision"] != expected:
                 raise RuntimeError(
@@ -377,7 +413,7 @@ def specopd_fit_hooks(trainer):
 
     def generated(_manager, *args, **kwargs):
         driver.bootstrap()
-        driver.publish()  # Previous actor weight update has completed before new rollout.
+        driver.publish()  # Fallback publication after the previous actor weight update.
         batch = args[0] if args else kwargs.get("batch", kwargs.get("prompts"))
         if batch is None:
             raise ValueError("SpecOPD rollout requires a DataProto input")
@@ -389,7 +425,8 @@ def specopd_fit_hooks(trainer):
             if validation:
                 batch.meta_info["skip_drafter_collection"] = True
             else:
-                driver.cycle.begin(trainer.global_steps)
+                due = driver.begin_step(trainer.global_steps)
+                batch.meta_info["skip_drafter_collection"] = not due
                 batch.meta_info["specopd_drafter_revision"] = (
                     driver.cycle.drafter_revision
                 )
@@ -401,6 +438,8 @@ def specopd_fit_hooks(trainer):
             batch.meta_info.update(previous)
 
     def old_log_prob(_trainer, batch):
+        if not driver.update_due:
+            return oldlog(batch)
         return driver.old_log_prob(batch)
 
     def updated(_trainer, *args, **kwargs):
@@ -413,7 +452,7 @@ def specopd_fit_hooks(trainer):
 
     def weights_updated(_manager, *args, **kwargs):
         result = weight_update(*args, **kwargs)
-        driver.publish()
+        driver.finish_step()
         if last_actor_output is not None:
             # Upstream logs actor_output only after weight publication. Include
             # the completed ACK instead of leaving its metrics one step behind.

@@ -69,20 +69,30 @@ def score_actor_joint(worker, requests, **options):
                 "joint actor ranks must receive the same complete trajectory schedule"
             )
     engine = getattr(getattr(worker, "actor", None), "engine", None)
+    sp_size = int(getattr(engine, "ulysses_sequence_parallel_size", 1) or 1)
+    sp_group = getattr(engine, "ulysses_parallel_group", None)
     error = None
     try:
         if not getattr(worker, "_is_actor", False):
             raise ValueError("joint scoring must run on the RL actor worker")
         if engine is None or not callable(getattr(engine, "eval_mode", None)):
             raise ValueError("actor engine must expose module and eval_mode")
-        if getattr(engine, "use_remove_padding", True):
+        if getattr(engine, "use_remove_padding", True) and sp_size == 1:
             raise NotImplementedError(
                 "joint scoring requires model.use_remove_padding=false"
             )
-        if getattr(engine, "use_ulysses_sp", False):
-            raise NotImplementedError(
-                "joint scoring does not support sequence parallelism"
-            )
+        if getattr(engine, "use_ulysses_sp", False) and sp_size == 1:
+            raise NotImplementedError("joint Ulysses requires an explicit SP size")
+        if sp_size > 1:
+            if not distributed or sp_group is None or torch.distributed.get_world_size(sp_group) != sp_size:
+                raise ValueError("joint Ulysses requires the actor engine's initialized SP group")
+            if not getattr(engine, "use_remove_padding", False):
+                raise ValueError("upstream Ulysses requires use_remove_padding=true")
+            members = torch.distributed.get_process_group_ranks(sp_group)
+            global_rank = torch.distributed.get_rank()
+            expected_members = list(range(global_rank // sp_size * sp_size, (global_rank // sp_size + 1) * sp_size))
+            if members != expected_members:
+                raise ValueError("joint Ulysses requires the upstream contiguous [dp, sp] mesh")
         model_config = getattr(engine, "model_config", None)
         if getattr(model_config, "use_fused_kernels", False):
             raise NotImplementedError("joint scoring requires use_fused_kernels=false")
@@ -98,7 +108,7 @@ def score_actor_joint(worker, requests, **options):
         config = engine.module.config
         if config.model_type not in {"qwen2", "qwen3", "llama"} or getattr(
             config, "_attn_implementation", None
-        ) not in {"eager", "sdpa"}:
+        ) not in ({"eager", "sdpa", "flash_attention_2"} if sp_size > 1 else {"eager", "sdpa"}):
             raise ValueError(
                 "joint actor requires a supported full-attention eager/SDPA model"
             )
@@ -114,7 +124,12 @@ def score_actor_joint(worker, requests, **options):
             vocab_size=config.vocab_size,
             max_packed_tokens=options.get("max_packed_tokens", 8192),
             max_mask_elements=options.get("max_mask_elements", 16777216),
+            sequence_multiple=sp_size,
         )
+        if sp_size > 1:
+            from verl_speco.joint_ulysses import validate_ulysses_model
+
+            validate_ulysses_model(engine.module, sp_size)
         if int(packed.position_ids.max()) >= config.max_position_embeddings:
             raise ValueError("joint actor exceeds max_position_embeddings")
         del packed
@@ -132,7 +147,7 @@ def score_actor_joint(worker, requests, **options):
         raise error
     rank = torch.distributed.get_rank() if distributed else 0
     world = torch.distributed.get_world_size() if distributed else 1
-    requests, dummy = partition_joint_requests(requests, rank, world)
+    requests, dummy = partition_joint_requests(requests, rank // sp_size, world // sp_size)
     model = engine.module
     dtype = getattr(engine, "_autocast_dtype", torch.float32)
     states = [(module, module.training) for module in model.modules()]
@@ -145,7 +160,19 @@ def score_actor_joint(worker, requests, **options):
                 else torch.autocast(device_type, dtype=dtype)
             )
             with autocast:
-                result, metrics = score_joint_batch(model, requests, **options)
+                if sp_size > 1:
+                    from verl_speco.joint_ulysses import score_ulysses_joint_batch
+
+                    result, metrics = score_ulysses_joint_batch(model, requests, sp_group, **options)
+                else:
+                    result, metrics = score_joint_batch(model, requests, **options)
+            # Only one SP rank exports a tree. Other members finish the same
+            # forward/collectives but avoid duplicate host feature transfers.
+            nonleader = sp_size > 1 and torch.distributed.get_rank(sp_group) != 0
+            if dummy or nonleader:
+                result = ()
+                metrics["logical_rows"] = metrics["independent_rows"] = 0
+                metrics["model_forward_calls"] = 0
             # Materialize independent CPU snapshots before the engine offloads.
             for sample in result:
                 sample.response_log_probs = sample.response_log_probs.cpu()
@@ -160,9 +187,6 @@ def score_actor_joint(worker, requests, **options):
                     branch.target_logz = branch.target_logz.cpu()
                     branch.target_hidden = branch.target_hidden.cpu()
             metrics["dummy_rows"] = metrics["padded_rows"] if dummy else 0
-            if dummy:
-                result = ()
-                metrics["logical_rows"] = metrics["independent_rows"] = 0
             return result, metrics
     finally:
         for module, training in states:

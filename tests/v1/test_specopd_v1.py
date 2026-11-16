@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from verl_speco.trainer.v1 import specopd_adapter
 from verl_speco.trainer.v1.speco_mixin import SpecoV1Mixin
 
@@ -9,9 +11,10 @@ from verl_speco.trainer.v1.speco_mixin import SpecoV1Mixin
 def test_v1_sync_bypasses_legacy_replay_and_publishes_after_actor(monkeypatch):
     events = []
     value = SimpleNamespace(
+        update_due=True,
         metrics={"specopd/trained": 1},
         before_actor_update=lambda: events.append("draft-update"),
-        publish=lambda: events.append("draft-publish-ack"),
+        finish_step=lambda: events.append("draft-publish-ack"),
     )
     monkeypatch.setattr(specopd_adapter, "enabled", lambda trainer: True)
     monkeypatch.setattr(specopd_adapter, "driver", lambda trainer: value)
@@ -49,6 +52,21 @@ def test_v1_sync_bypasses_legacy_replay_and_publishes_after_actor(monkeypatch):
 def test_v1_empty_config_keeps_baseline_path():
     assert not specopd_adapter.enabled(SimpleNamespace())
     assert not specopd_adapter.enabled(SimpleNamespace(config={}))
+
+
+def test_noncollection_v1_step_uses_normal_oldlogprob(monkeypatch):
+    monkeypatch.setattr(specopd_adapter, "enabled", lambda trainer: True)
+    monkeypatch.setattr(specopd_adapter, "driver", lambda trainer: SimpleNamespace(update_due=False))
+    monkeypatch.setattr(specopd_adapter, "old_log_prob", lambda *args: pytest.fail("unexpected joint scoring"))
+    class Base:
+        def _compute_old_log_prob(self, batch, metrics):
+            metrics["normal_oldlogprob"] = 1
+            return batch
+    class Trainer(SpecoV1Mixin, Base):
+        pass
+    batch, metrics = object(), {}
+    assert Trainer()._compute_old_log_prob(batch, metrics) is batch
+    assert metrics == {"normal_oldlogprob": 1}
 
 
 def test_joint_oldlogprob_writes_response_aligned_tq_fields(monkeypatch):

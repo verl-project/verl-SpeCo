@@ -27,8 +27,9 @@ def prepare_rollout(trainer, batch):
 
     value = driver(trainer)
     value.bootstrap()
-    value.cycle.begin(trainer.global_steps)
+    due = value.begin_step(trainer.global_steps)
     batch["_specopd_drafter_revision"] = NonTensorData(value.cycle.drafter_revision)
+    batch["_specopd_skip_collection"] = NonTensorData(not due)
     return batch
 
 

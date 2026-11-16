@@ -360,6 +360,8 @@ async def _speco_worker_run_agent_loop(
         skip_drafter_collection=bool(trajectory.get("skip_drafter_collection", False)),
     )
     sampling_params = _apply_probe_sampling_overrides(sampling_params)
+    if kwargs.pop("_specopd_skip_collection", False):
+        sampling_params = dict(sampling_params, _verl_skip_drafter_collection=True)
     run_agent_loop = _speco_parent_method(self, "_run_agent_loop")
     if not callable(run_agent_loop):
         raise AttributeError(
@@ -772,6 +774,8 @@ def install_agent_loop_runtime_patch() -> bool:
                 ),
             )
             sampling_params = _apply_probe_sampling_overrides(sampling_params)
+            if kwargs.pop("_specopd_skip_collection", False):
+                sampling_params = dict(sampling_params, _verl_skip_drafter_collection=True)
             revision = kwargs.pop("_specopd_drafter_revision", _CURRENT_SPECOPD_REVISION.get())
             token = _CURRENT_SPECOPD_REVISION.set(revision)
             try:

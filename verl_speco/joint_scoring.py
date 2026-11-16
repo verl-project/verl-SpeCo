@@ -84,6 +84,7 @@ def pack_joint_batch(
     vocab_size: int,
     max_packed_tokens: int = 8192,
     max_mask_elements: int = 16_777_216,
+    sequence_multiple: int = 1,
 ) -> PackedJointBatch:
     """Compile ancestry, semantic RoPE positions and predecessor readouts.
 
@@ -135,7 +136,9 @@ def pack_joint_batch(
         if any(not _integer(token) or not 0 <= token < vocab_size for token in ids):
             raise ValueError("token IDs must be integers inside the model vocabulary")
         lengths.append(length)
-    width = max(lengths)
+    if not _integer(sequence_multiple) or sequence_multiple < 1:
+        raise ValueError("sequence_multiple must be a positive integer")
+    width = math.ceil(max(lengths) / sequence_multiple) * sequence_multiple
     if sum(lengths) > max_packed_tokens:
         raise ValueError(
             "joint batch exceeds max_packed_tokens; split into microbatches"
@@ -204,6 +207,7 @@ def score_joint_batch(
     capture_empty_trunk_features: bool = True,
     max_packed_tokens: int = 8192,
     max_mask_elements: int = 16_777_216,
+    sequence_multiple: int = 1,
 ) -> tuple[tuple[JointScores, ...], dict[str, int]]:
     """Evaluate all trunks and branches in ONE model call, without gradients.
 
@@ -242,6 +246,7 @@ def score_joint_batch(
         vocab_size=config.vocab_size,
         max_packed_tokens=max_packed_tokens,
         max_mask_elements=max_mask_elements,
+        sequence_multiple=sequence_multiple,
     )
     if int(packed.position_ids.max()) >= config.max_position_embeddings:
         raise ValueError(

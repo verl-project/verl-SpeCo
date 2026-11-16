@@ -1109,7 +1109,7 @@ class SpecoV1Mixin(V1BubbleMixin):
         if specopd_adapter.enabled(self):
             result = super().on_step_end()
             value = specopd_adapter.driver(self)
-            value.publish()
+            value.finish_step()
             self._pending_sync_metrics = {
                 **(getattr(self, "_pending_sync_metrics", None) or {}),
                 **value.metrics,
@@ -1594,7 +1594,9 @@ class SpecoV1Mixin(V1BubbleMixin):
 
     def _compute_old_log_prob(self, batch, metrics):
         if specopd_adapter.enabled(self):
-            return specopd_adapter.old_log_prob(self, batch, metrics)
+            if specopd_adapter.driver(self).update_due:
+                return specopd_adapter.old_log_prob(self, batch, metrics)
+            return super()._compute_old_log_prob(batch, metrics)
         evidence = None
         if self._speco_rollout_idle_worker_enabled():
             _, evidence = self._speco_v1_batch_data(batch)

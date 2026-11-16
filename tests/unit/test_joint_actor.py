@@ -115,3 +115,13 @@ def test_actor_publish_mixin_exposes_joint_scoring():
     assert result[0].sample_id == "x"
     assert metrics["model_forward_calls"] == 1
     assert events == ["enter", "exit"]
+
+
+def test_ulysses_rejects_adaptive_rotary_frequencies():
+    from verl_speco.joint_ulysses import validate_ulysses_model
+
+    actor, _ = worker()
+    model = actor.actor.engine.module
+    model.model.rotary_emb.rope_type = "dynamic"
+    with pytest.raises(ValueError, match="global-frequency"):
+        validate_ulysses_model(model, 2)
