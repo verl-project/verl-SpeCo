@@ -28,27 +28,59 @@ CONSUMED_SEQUENCE_NAME = "consumed_sequence_nos.pt"
 RESUME_SCHEMA_VERSION = 1
 
 
+def _file_stat_fingerprint(file_path: Path) -> dict[str, int]:
+    stat = file_path.stat()
+    return {"size_bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+
+
 def build_input_fingerprint(path: str | os.PathLike[str]) -> dict[str, Any]:
     input_path = Path(path).resolve()
     if input_path.is_dir():
-        fingerprints = {}
-        for name in ("metadata.json", "manifest.jsonl"):
-            digest = hashlib.sha256()
-            with (input_path / name).open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            fingerprints[name] = digest.hexdigest()
+        metadata_path = input_path / "metadata.json"
+        manifest_path = input_path / "manifest.jsonl"
+        if metadata_path.is_file() and manifest_path.is_file():
+            fingerprints = {}
+            for name, file_path in (
+                ("metadata.json", metadata_path),
+                ("manifest.jsonl", manifest_path),
+            ):
+                digest = hashlib.sha256()
+                with file_path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                fingerprints[name] = digest.hexdigest()
+            return {
+                "path": str(input_path),
+                "format": "standalone_raw_hidden",
+                "sampler_version": 1,
+                "files": fingerprints,
+            }
+        jsonl_files = sorted(input_path.glob("*.jsonl"))
+        if jsonl_files:
+            return {
+                "path": str(input_path),
+                "format": "jsonl_token_replay",
+                "files": {
+                    file_path.name: _file_stat_fingerprint(file_path)
+                    for file_path in jsonl_files
+                },
+            }
+        directory_files = sorted(
+            file_path for file_path in input_path.rglob("*") if file_path.is_file()
+        )
         return {
             "path": str(input_path),
-            "format": "standalone_raw_hidden",
-            "sampler_version": 1,
-            "files": fingerprints,
+            "format": "directory",
+            "files": {
+                file_path.relative_to(input_path).as_posix(): _file_stat_fingerprint(
+                    file_path
+                )
+                for file_path in directory_files
+            },
         }
-    stat = input_path.stat()
     return {
         "path": str(input_path),
-        "size_bytes": int(stat.st_size),
-        "mtime_ns": int(stat.st_mtime_ns),
+        **_file_stat_fingerprint(input_path),
     }
 
 
@@ -59,6 +91,8 @@ def save_standalone_resume(
     optimizer_step: int,
     input_path: str | os.PathLike[str],
     producer_shuffle: dict[str, Any] | None = None,
+    data_progress: dict[str, Any] | None = None,
+    loader_config: dict[str, Any] | None = None,
 ) -> None:
     checkpoint_dir = Path(checkpoint_path)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -93,6 +127,33 @@ def save_standalone_resume(
         metadata["producer_shuffle"] = {
             "shuffle": bool(producer_shuffle.get("shuffle", False)),
             "shuffle_seed": int(producer_shuffle.get("shuffle_seed", 42)),
+        }
+    if data_progress is not None:
+        # Deterministic file stores do not need (or maintain) a per-sample
+        # consumed set; their loader order is a pure function of
+        # ``(seed, epoch, store)``. Persist the batch cursor instead so a
+        # resumed run continues at the exact epoch/batch position.
+        epoch = int(data_progress.get("epoch", 0) or 0)
+        batch_index = int(data_progress.get("batch_index", 0) or 0)
+        if epoch < 0 or batch_index < 0:
+            raise ValueError(f"data_progress must be non-negative: {data_progress!r}")
+        progress_metadata: dict[str, Any] = {
+            "epoch": epoch,
+            "batch_index": batch_index,
+        }
+        read_errors = data_progress.get("read_errors")
+        if read_errors is not None:
+            progress_metadata["read_errors"] = int(read_errors)
+        read_errors_exact = data_progress.get("read_errors_exact")
+        if read_errors_exact is not None:
+            progress_metadata["read_errors_exact"] = bool(read_errors_exact)
+        metadata["data_progress"] = progress_metadata
+    if loader_config is not None:
+        # The cursor is a batch ordinal over the filtered key order, so every
+        # setting that changes that order (batch size, sharding, shuffle/seed,
+        # filters, ...) must match on resume.
+        metadata["data_loader"] = {
+            str(key): value for key, value in loader_config.items()
         }
     metadata_path = checkpoint_dir / RESUME_METADATA_NAME
     metadata_temporary = metadata_path.with_suffix(metadata_path.suffix + ".incomplete")
@@ -144,10 +205,36 @@ def load_standalone_resume(
     return consumed, metadata
 
 
+def validate_standalone_loader_config(
+    saved: dict[str, Any] | None, current: dict[str, Any]
+) -> None:
+    """Fail closed when the saved cursor no longer describes this loader.
+
+    ``data_progress`` is a batch ordinal over the filtered key order. Batch
+    size, sharding, shuffle/seed, step windows and read-side filters all change
+    that order, so resuming with different settings would silently repeat or
+    skip samples instead of continuing at the saved position.
+    """
+
+    if saved is None:
+        return
+    mismatched = {
+        key: {"saved": saved.get(key), "current": current.get(key)}
+        for key in sorted(set(saved) | set(current))
+        if saved.get(key) != current.get(key)
+    }
+    if mismatched:
+        raise ValueError(
+            "Standalone resume loader configuration changed since the checkpoint "
+            f"was saved: {mismatched}"
+        )
+
+
 __all__ = [
     "CONSUMED_SEQUENCE_NAME",
     "RESUME_METADATA_NAME",
     "build_input_fingerprint",
     "load_standalone_resume",
     "save_standalone_resume",
+    "validate_standalone_loader_config",
 ]

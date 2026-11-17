@@ -40,6 +40,7 @@ from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _rewrite_standalone_block_runtime_config,
     _save_standalone_checkpoint,
     _select_standalone_tracking_metrics,
+    _standalone_loader_config,
     _should_log_batch_progress,
     _sync_standalone_export_error,
 )
@@ -1154,6 +1155,45 @@ def test_standalone_checkpoint_finalize_failure_stays_incomplete(
     assert isinstance(trainer._standalone_export_error, OSError)
 
 
+def test_standalone_checkpoint_sidecar_failure_keeps_checkpoint_incomplete(
+    monkeypatch, tmp_path
+) -> None:
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    metadata_path = checkpoint_dir / "metadata.json"
+    metadata_path.write_text(
+        json.dumps({"step": 5, "complete": True}), encoding="utf-8"
+    )
+    trainer = SimpleNamespace()
+    completed = Future()
+    completed.set_result(None)
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop._rewrite_standalone_block_runtime_config",
+        lambda *args, **kwargs: None,
+    )
+
+    def fail_sidecar(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop._save_resume_sidecar",
+        fail_sidecar,
+    )
+
+    _finalize_standalone_checkpoint(
+        trainer,
+        str(checkpoint_dir),
+        completed,
+        consumed_snapshot=torch.tensor([], dtype=torch.int64),
+        step=5,
+        input_path=str(tmp_path / "manifest.jsonl"),
+    )
+
+    assert json.loads(metadata_path.read_text(encoding="utf-8"))["complete"] is False
+    assert isinstance(trainer._standalone_export_error, OSError)
+
+
 def test_standalone_runtime_config_write_error_propagates(monkeypatch, tmp_path) -> None:
     checkpoint_dir = tmp_path / "draft_step_5"
     checkpoint_dir.mkdir()
@@ -1225,3 +1265,38 @@ def test_standalone_checkpoint_export_error_can_be_deferred_until_teardown(
     assert _sync_standalone_export_error(
         trainer, torch.device("cpu"), raise_on_error=False
     )
+
+
+def test_standalone_loader_config_includes_jsonl_store_settings() -> None:
+    config = _standalone_loader_config(
+        {},
+        {
+            "type": "jsonl_token_replay",
+            "max_seq_len": 4096,
+            "window_mode": "front",
+            "tokenizer_path": "/tmp/tokenizer",
+            "train_on": "last_assistant",
+            "trust_remote_code": True,
+            "strict_schema": True,
+        },
+        world_size=2,
+        feature_store_type="jsonl_token_replay",
+    )
+    assert config["max_seq_len"] == 4096
+    assert config["window_mode"] == "front"
+    assert config["tokenizer_path"] == "/tmp/tokenizer"
+    assert config["train_on"] == "last_assistant"
+    assert config["trust_remote_code"] is True
+    assert config["strict_schema"] is True
+
+
+def test_standalone_loader_config_omits_jsonl_only_settings_for_other_stores() -> None:
+    config = _standalone_loader_config(
+        {},
+        {"type": "torch_shard"},
+        world_size=1,
+        feature_store_type="torch_shard",
+    )
+    assert "max_seq_len" not in config
+    assert "window_mode" not in config
+    assert "tokenizer_path" not in config
