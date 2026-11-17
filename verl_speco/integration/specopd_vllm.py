@@ -60,7 +60,9 @@ def patch_draft_token_handler(handler):
         from verl_speco.opd_method import spec_opd_enabled
 
         self._specopd_real_draft_ids = None
-        if spec_opd_enabled(_load_env_drafter_config().get("training", {})):
+        collecting = getattr(self, "_specopd_collecting_requests", set())
+        if (spec_opd_enabled(_load_env_drafter_config().get("training", {}))
+                and any(rid in collecting for rid in input_batch.req_ids)):
             if getattr(getattr(draft_tokens, "device", None), "type", None) == "npu":
                 # Ascend MRV2 constructs this CUDA helper under a native shim,
                 # but its transport setter runs outside that shim. Copy these
@@ -88,12 +90,48 @@ def patch_draft_token_handler(handler):
     return True
 
 
+def patch_draft_token_request_tracking(runner):
+    """Track opt-in requests on each runner's own handler, including eviction."""
+    if getattr(runner, "_specopd_request_tracking_installed", False):
+        return True
+    add = runner.add_requests
+    remove = runner._remove_request
+
+    @wraps(add)
+    def added(self, scheduler_output, *args, **kwargs):
+        result = add(self, scheduler_output, *args, **kwargs)
+        handler = self.draft_tokens_handler
+        collecting = getattr(handler, "_specopd_collecting_requests", None)
+        if collecting is None:
+            collecting = handler._specopd_collecting_requests = set()
+        for request in scheduler_output.scheduled_new_reqs:
+            params = getattr(request, "sampling_params", None)
+            plan = (getattr(params, "extra_args", None) or {}).get(PLAN_KEY)
+            collecting.discard(request.req_id)
+            if plan and plan.get("max_branches", 0) > 0:
+                collecting.add(request.req_id)
+        return result
+
+    @wraps(remove)
+    def removed(self, request_id, *args, **kwargs):
+        result = remove(self, request_id, *args, **kwargs)
+        getattr(self.draft_tokens_handler, "_specopd_collecting_requests", set()).discard(request_id)
+        return result
+
+    runner.add_requests, runner._remove_request = added, removed
+    runner._specopd_request_tracking_installed = True
+    return True
+
+
 def install_specopd_draft_token_transport_patch():
     try:
         from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
     except ImportError:
         # MRV1 already returns real draft IDs through take_draft_token_ids.
         return False
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    patch_draft_token_request_tracking(GPUModelRunner)
     return patch_draft_token_handler(DraftTokensHandler)
 
 

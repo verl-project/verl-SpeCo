@@ -2103,3 +2103,24 @@ def test_dspark_hard_sample_ratio_matrix(candidate, sample, expected_hard):
         assert torch.equal(batch.batch[key], value)
     if candidate:
         assert int(plan["collect_mask"][80:].sum()) > 0
+
+
+@pytest.mark.parametrize("step,buffer,validation,frozen,expected", [
+    (4, True, False, False, False),
+    (5, True, False, False, True),
+    (5, False, False, False, False),
+    (10, False, False, False, True),
+    (10, True, True, False, False),
+    (10, True, False, True, False),
+])
+def test_rollout_trace_uses_feature_collection_policy(step, buffer, validation, frozen, expected):
+    trainer = _trainer({
+        "collect_hidden_states_from_old_logprob": True,
+        "collect_hidden_states_from_sgl": False,
+        "use_data_buffer": buffer,
+        "collect_interval_steps": 5,
+        "training_interval_steps": 10,
+    }, step=step)
+    trainer._speco_online_enabled = lambda: True
+    trainer._speco_drafter_frozen = frozen
+    assert trainer._speco_opd_trace_collection_due(validation=validation) is expected

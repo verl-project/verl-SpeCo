@@ -3107,7 +3107,7 @@ def patch_vllm_request_acceptance_stats() -> bool:
                 from verl_speco.integration.verify_trace import snapshot_verify_step
                 if self.num_sampled_tokens_per_step != 1:
                     raise ValueError("Draft-OPD requires one target correction/bonus token per step")
-                snapshots = snapshot_verify_step(self, scheduler_output, model_runner_output)
+                snapshots = snapshot_verify_step(self, scheduler_output, model_runner_output, require_opt_in=True)
             engine_core_outputs = original_update_from_output(
                 self, scheduler_output, model_runner_output
             )
@@ -4218,6 +4218,7 @@ async def _speco_generate_with_request_stats_unblocked(
     positional_params = "sampling_params" not in kwargs and len(args) >= 2
     if positional_params:
         sampling_params = args[1]
+    trace_collect = False
     if isinstance(sampling_params, dict):
         clean_params = dict(sampling_params)
         specopd_revision = clean_params.pop("_specopd_drafter_revision", None)
@@ -4274,6 +4275,13 @@ async def _speco_generate_with_request_stats_unblocked(
                 native_extra[PLAN_KEY]["max_branches"] = 0
             else:
                 self._specopd_collection_requests += 1
+            clean_params["extra_args"] = native_extra
+        from verl_speco.integration.verify_trace import CAPTURE_KEY
+
+        if capture_verify_trace_enabled(_load_env_drafter_config().get("training", {})):
+            trace_collect = not clean_params.get("_verl_skip_drafter_collection", False)
+            native_extra = dict(clean_params.get("extra_args") or {})
+            native_extra[CAPTURE_KEY] = trace_collect
             clean_params["extra_args"] = native_extra
         clean_params.pop("_verl_global_steps", None)
         clean_params.pop("_verl_skip_drafter_collection", None)
@@ -4434,7 +4442,7 @@ async def _speco_generate_with_request_stats_unblocked(
             )
 
             bridge_request_acceptance_counters(extra_fields)
-            if capture_verify_trace_enabled(_load_env_drafter_config().get("training", {})):
+            if trace_collect:
                 from verl_speco.integration.verify_trace import TRACE_KEY, token_digest
                 trace = extra_fields[TRACE_KEY]
                 prompt_ids = kwargs["prompt_ids"] if "prompt_ids" in kwargs else args[0]

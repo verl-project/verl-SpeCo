@@ -1564,6 +1564,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             raise RuntimeError(f"Drafter checkpoint wait failed: {incomplete}")
         return len(pending_refs)
 
+    def _speco_opd_trace_collection_due(self, *, validation: bool = False) -> bool:
+        """Use feature-collection policy before requesting rollout trace capture."""
+        return any(
+            self._speco_plan_drafter_collection(source, validation=validation).collect
+            for source in (DrafterCollectionSource.OLD_LOGPROB, DrafterCollectionSource.SGLANG)
+        )
+
     def _speco_plan_drafter_collection(
         self,
         source: DrafterCollectionSource,
@@ -8287,6 +8294,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     )
                 )
             )
+            # Resolve collection before rollout, including interval and buffer policy.
+            if draft_opd_enabled(self._speco_drafter_training_config()):
+                skip_collection_for_quota = (
+                    skip_collection_for_quota
+                    or not self._speco_opd_trace_collection_due(validation=input_is_validation)
+                )
             restore_collection_flag = _speco_set_generation_meta_flag(
                 args,
                 kwargs,

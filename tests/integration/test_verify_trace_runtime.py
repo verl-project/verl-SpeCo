@@ -8,18 +8,20 @@ from types import SimpleNamespace
 import pytest
 
 import verl_speco.integration.vllm_runtime as runtime
-from verl_speco.integration.verify_trace import TRACE_KEY, validate_verify_trace
+from verl_speco.integration.verify_trace import CAPTURE_KEY, TRACE_KEY, validate_verify_trace
 
 
+@pytest.mark.parametrize("request_collect", [False, True])
 @pytest.mark.parametrize("capture", [False, True])
 @pytest.mark.parametrize("config_source", ["environment", "server_class"])
 @pytest.mark.parametrize("invalid_tokens", [None, {}, {"r": 1}])
 @pytest.mark.parametrize("layout", ["dflash", "dspark"])
 def test_scheduler_patch_transports_trace_on_finished_request(
-    monkeypatch, capture, config_source, invalid_tokens, layout
+    monkeypatch, capture, config_source, invalid_tokens, layout, request_collect
 ):
     request = SimpleNamespace(
-        prompt_token_ids=[1, 2], _output_token_ids=[], is_finished=lambda: False
+        prompt_token_ids=[1, 2], _output_token_ids=[], is_finished=lambda: False,
+        sampling_params=SimpleNamespace(extra_args={CAPTURE_KEY: request_collect})
     )
 
     class Scheduler:
@@ -77,7 +79,9 @@ def test_scheduler_patch_transports_trace_on_finished_request(
     summary = json.loads(
         result.trace_headers[runtime.SPECO_VLLM_REQUEST_STATS_TRACE_HEADER]
     )
-    if capture:
+    assert summary["verify_rounds"] == 1
+    assert summary["accepted_tokens"] == 2
+    if capture and request_collect:
         trace = summary[TRACE_KEY]
         validate_verify_trace(trace, layout=layout, capacity=2)
         assert trace["steps"][0]["drafts"] == 2

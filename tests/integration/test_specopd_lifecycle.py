@@ -31,9 +31,10 @@ from verl_speco.transport.specopd_protocol import (
 )
 
 
+@pytest.mark.parametrize("collect", [False, True])
 @pytest.mark.parametrize("method", ["draft_opd", "spec_opd"])
 @pytest.mark.parametrize("npu", [False, True])
-def test_mrv2_copies_real_draft_ids_only_for_specopd(monkeypatch, method, npu):
+def test_mrv2_copies_real_draft_ids_only_for_specopd(monkeypatch, method, npu, collect):
     from verl_speco.integration import vllm_runtime
 
     class Handler:
@@ -64,10 +65,11 @@ def test_mrv2_copies_real_draft_ids_only_for_specopd(monkeypatch, method, npu):
     if npu:
         tokens = NPUTokens(tokens)
     handler = Handler()
+    handler._specopd_collecting_requests = {"r"} if collect else set()
     assert specopd_vllm.patch_draft_token_handler(Handler)
     assert specopd_vllm.patch_draft_token_handler(Handler)
     handler.set_draft_tokens(batch, tokens)
-    assert handler.get_draft_tokens().draft_token_ids == (tokens if method == "spec_opd" else [[-1, -1, -1]])
+    assert handler.get_draft_tokens().draft_token_ids == (tokens if method == "spec_opd" and collect else [[-1, -1, -1]])
     assert not batch.has_structured_output_reqs
     assert handler.req_ids == ["r"]
 
@@ -414,3 +416,24 @@ def test_serving_ack_rejects_wrong_draft_or_inconsistent_actor_revisions(replies
     driver = specopd_driver.SpecOPDDriver(trainer)
     with pytest.raises(RuntimeError, match="acknowledge"):
         driver.acknowledge_serving_revision(0)
+
+
+def test_mrv2_request_tracking_is_runner_local_and_cleans_evictions():
+    class Runner:
+        def __init__(self):
+            self.draft_tokens_handler = SimpleNamespace()
+        def add_requests(self, output):
+            return "added"
+        def _remove_request(self, request_id):
+            return "removed"
+    assert specopd_vllm.patch_draft_token_request_tracking(Runner)
+    left, right = Runner(), Runner()
+    def request(rid, branches):
+        return SimpleNamespace(req_id=rid, sampling_params=SimpleNamespace(
+            extra_args={"specopd_plan": {"max_branches": branches}}))
+    assert left.add_requests(SimpleNamespace(scheduled_new_reqs=[request("yes", 8), request("no", 0)])) == "added"
+    right.add_requests(SimpleNamespace(scheduled_new_reqs=[]))
+    assert left.draft_tokens_handler._specopd_collecting_requests == {"yes"}
+    assert right.draft_tokens_handler._specopd_collecting_requests == set()
+    assert left._remove_request("yes") == "removed"
+    assert left.draft_tokens_handler._specopd_collecting_requests == set()
