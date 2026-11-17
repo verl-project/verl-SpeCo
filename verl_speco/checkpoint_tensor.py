@@ -14,12 +14,61 @@
 """Read a target checkpoint tensor without importing drafter model implementations."""
 
 import glob
+import hashlib
 import json
 import os
+from pathlib import Path
 
 import torch
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
+
+CHECKPOINT_FINGERPRINT_PREFIX = "target-checkpoint-v1-sha256-"
+
+
+def resolve_checkpoint_path(model_path: str) -> Path:
+    """Use an existing directory or resolve a Hub model to a single snapshot."""
+    path = Path(model_path)
+    return path if path.is_dir() else Path(snapshot_download(repo_id=model_path))
+
+
+def checkpoint_fingerprint(path: Path) -> str:
+    """Hash the config and all checkpoint weight files without loading tensors."""
+    files = {"config.json"}
+    indexes = sorted(path.glob("*.index.json"))
+    if indexes:
+        for index in indexes:
+            with index.open(encoding="utf-8") as stream:
+                weight_map = json.load(stream).get("weight_map", {})
+            if weight_map:
+                files.add(index.name)
+                for name in set(weight_map.values()):
+                    relative = Path(name)
+                    if (
+                        relative.is_absolute()
+                        or relative.drive
+                        or ".." in relative.parts
+                    ):
+                        raise ValueError(f"Invalid checkpoint shard path: {name!r}")
+                    files.add(name)
+    else:
+        for name in ("model.safetensors", "pytorch_model.bin"):
+            if (path / name).is_file():
+                files.add(name)
+                break
+    if len(files) == 1:
+        raise FileNotFoundError(f"No checkpoint weights found in {path}")
+
+    digest = hashlib.sha256()
+    for name in sorted(files):
+        file_digest = hashlib.sha256()
+        with (path / name).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                file_digest.update(chunk)
+        digest.update(name.encode("utf-8") + b"\0")
+        digest.update(file_digest.digest())
+    return CHECKPOINT_FINGERPRINT_PREFIX + digest.hexdigest()
+
 
 # Multimodal / conditional-generation targets (e.g. Qwen3.5/3.6 MoE) nest the
 # text backbone under ``model.language_model`` (or similar) while the module

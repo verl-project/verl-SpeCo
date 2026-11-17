@@ -10,8 +10,8 @@ Results use torch multiprocessing reducers, then the existing pin thread.
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -23,8 +23,8 @@ from typing import Any
 import torch
 import torch.multiprocessing as mp
 
-from verl_speco.trainer.tq_retry import retry_io
-from verl_speco.trainer.tq_sample_source import TQPrefetchIterator
+from verl_speco.trainer.standalone_prefetch import StandalonePrefetchIterator
+from verl_speco.trainer.standalone_retry import retry_io
 
 _STORE: Any = None
 _OPTIONS: dict[str, Any] = {}
@@ -38,7 +38,7 @@ def _initialize_worker(config, options, attempts):
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ.setdefault(name, "1")
     torch.set_num_threads(1)
-    from verl_speco.trainer.tq_feature_store import ReferenceFeatureStore
+    from verl_speco.trainer.reference_feature_store import ReferenceFeatureStore
 
     _STORE = ReferenceFeatureStore(config)
     _STORE.connect()
@@ -62,7 +62,7 @@ def _prepare_batch(entries):
     return batch, time.perf_counter() - started
 
 
-class ReferenceBatchPrefetchIterator(TQPrefetchIterator):
+class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
     """Dispatch up to depth batches without waiting for previous preparation.
 
     The collector drains results FIFO, independently of command reception.
@@ -186,9 +186,11 @@ class ReferenceBatchPrefetchIterator(TQPrefetchIterator):
             while True:
                 with self._condition:
                     self._condition.wait_for(
-                        lambda: self.stop.is_set()
-                        or self._pending
-                        or self._assignments_done
+                        lambda: (
+                            self.stop.is_set()
+                            or self._pending
+                            or self._assignments_done
+                        )
                     )
                     if self.stop.is_set() or not self._pending:
                         return

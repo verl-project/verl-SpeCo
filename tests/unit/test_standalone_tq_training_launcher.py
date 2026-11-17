@@ -34,7 +34,6 @@ from verl_speco.standalone_tq_training_launcher import (
     _vllm_kv_transfer_config,
     build_pipeline_commands,
     resolve_pipeline_config,
-    run_pipeline,
     start_ray_session,
     validate_hidden_states_store,
     validate_tq_backend,
@@ -42,12 +41,12 @@ from verl_speco.standalone_tq_training_launcher import (
 import verl_speco.tq_owner as tq_owner
 
 
-@pytest.mark.parametrize("hidden_store,runtime,is_reference", [
-    ("file", "ray", True), ("mooncake", "ray", True), ("file", "subprocess", False),
+@pytest.mark.parametrize("hidden_store,data_transport,is_reference", [
+    ("file", "ray_reference", True), ("mooncake", "ray_reference", True), ("file", "tq", False),
 ])
-def test_reference_mode_uses_existing_ray_prefetch(hidden_store, runtime, is_reference):
+def test_reference_mode_uses_existing_ray_prefetch(hidden_store, data_transport, is_reference):
     env = {"SPECO_VLLM_HIDDEN_STATES_STORE": hidden_store}
-    args = [*_training_args(), f"speco.draft_training.runtime_backend={runtime}"]
+    args = [*_training_args(), f"speco.draft_training.data_transport={data_transport}"]
     commands = build_pipeline_commands(
         resolve_pipeline_config(args, environ=env), args, ray_address="10.0.0.1:6379", env=env,
     )
@@ -490,25 +489,15 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
     assert commands.vllm[:3] == ["vllm", "serve", "/models/Qwen3-8B"]
     assert "ExampleHiddenStatesConnector" in " ".join(commands.vllm)
     assert commands.vllm_endpoints == ("http://127.0.0.1:8000/v1",)
-    assert commands.producer[:3] == [
-        "python",
-        "-m",
-        "verl_speco.standalone_tq_producer",
-    ]
-    assert commands.consumer[:3] == [
-        "python",
-        "-m",
-        "verl_speco.draft_train_launcher",
-    ]
-    assert any(item.endswith("feature_store.type=ray_reference") for item in commands.consumer)
-    assert not any("run_id=user-value" in item for item in commands.consumer)
+    assert any(item.endswith("feature_store.type=ray_reference") for item in commands.consumer_overrides)
+    assert not any("run_id=user-value" in item for item in commands.consumer_overrides)
     assert not any("runtime_backend" in item for item in commands.consumer_overrides)
     assert not any("num_gpus_per_node" in item for item in commands.consumer_overrides)
     assert not any("num_nodes" in item for item in commands.consumer_overrides)
     assert "speco.draft_training.nproc_per_node=8" in commands.consumer_overrides
     assert "speco.draft_training.nnodes=1" in commands.consumer_overrides
-    assert any(f"run_id={config.run_id}" in item for item in commands.consumer)
-    expected_contract = " ".join(commands.consumer)
+    assert any(f"run_id={config.run_id}" in item for item in commands.consumer_overrides)
+    expected_contract = " ".join(commands.consumer_overrides)
     assert "expected_feature.algorithm=DSPARK" in expected_contract
     assert 'expected_feature.target_model_path="/models/Qwen3-8B"' in expected_contract
     assert "expected_feature.target_revision=target-path-sha256-" in expected_contract
@@ -524,10 +513,10 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
     assert "expected_feature.hidden_dtype=bfloat16" in expected_contract
     assert any(
         "vllm_endpoints=[http://127.0.0.1:8000/v1]" in item
-        for item in commands.producer
+        for item in commands.producer_overrides
     )
     # 10 steps * default batch_size_per_gpu=4 * 8 GPUs * 1 node.
-    assert any("max_samples=320" in item for item in commands.producer)
+    assert any("max_samples=320" in item for item in commands.producer_overrides)
 
 
 def test_pipeline_commands_pass_all_external_vllm_endpoints_to_producer() -> None:
@@ -546,7 +535,7 @@ def test_pipeline_commands_pass_all_external_vllm_endpoints_to_producer() -> Non
     # Multiple services are started by the dedicated shell script. The unified
     # launcher only verifies them and passes both URLs into the Producer pool.
     assert commands.vllm is None
-    assert any(f"vllm_endpoints={endpoints}" in item for item in commands.producer)
+    assert any(f"vllm_endpoints={endpoints}" in item for item in commands.producer_overrides)
 
 
 def test_pipeline_commands_forward_producer_tuning_overrides() -> None:
@@ -588,7 +577,7 @@ def test_pipeline_commands_forward_producer_tuning_overrides() -> None:
         "speco.standalone_tq_producer.render_boundary.enabled=true",
         "speco.standalone_tq_producer.render_boundary.timeout=45",
     ):
-        assert override in commands.producer
+        assert override in commands.producer_overrides
 
 
 def test_pipeline_commands_ignore_launcher_owned_producer_overrides() -> None:
@@ -606,9 +595,9 @@ def test_pipeline_commands_ignore_launcher_owned_producer_overrides() -> None:
         python_executable="python",
     )
 
-    assert "speco.standalone_tq_producer.input_path=/data/train.jsonl" in commands.producer
-    assert "speco.standalone_tq_producer.input_path=/evil.jsonl" not in commands.producer
-    assert "speco.standalone_tq_producer.max_samples=999" not in commands.producer
+    assert "speco.standalone_tq_producer.input_path=/data/train.jsonl" in commands.producer_overrides
+    assert "speco.standalone_tq_producer.input_path=/evil.jsonl" not in commands.producer_overrides
+    assert "speco.standalone_tq_producer.max_samples=999" not in commands.producer_overrides
 
 
 def test_pipeline_commands_reject_unknown_producer_override() -> None:
@@ -663,73 +652,8 @@ def test_ray_session_starts_local_control_plane_without_exposed_address() -> Non
     assert ray.shutdown_called
 
 
-class _FakeProcess:
-    def __init__(self, role: str) -> None:
-        self.role = role
-        self.returncode = 0 if role == "consumer" else None
-        self.terminated = False
-
-    def poll(self):
-        return self.returncode
-
-    def terminate(self) -> None:
-        self.terminated = True
-        self.returncode = -15
-
-    def wait(self, timeout=None):
-        return self.returncode
-
-    def kill(self) -> None:
-        self.returncode = -9
 
 
-def test_pipeline_starts_owner_then_consumer_then_producer() -> None:
-    started: list[str] = []
-    processes: list[_FakeProcess] = []
-    child_environments: list[dict[str, str]] = []
-    vllm_started = False
-
-    def fake_popen(command, *, env):
-        nonlocal vllm_started
-        if command[0] == "vllm":
-            role = "vllm"
-            vllm_started = True
-        else:
-            module = command[2]
-            role = {
-                "verl_speco.tq_owner": "owner",
-                "verl_speco.draft_train_launcher": "consumer",
-                "verl_speco.standalone_tq_producer": "producer",
-            }[module]
-        process = _FakeProcess(role)
-        started.append(role)
-        processes.append(process)
-        child_environments.append(dict(env))
-        if role == "owner":
-            Path(env["SPECO_TQ_OWNER_READY_FILE"]).touch()
-        return process
-
-    args = [*_training_args(), "speco.draft_training.runtime_backend=subprocess"]
-    config = resolve_pipeline_config(args, environ={})
-    commands = build_pipeline_commands(
-        config,
-        args,
-        ray_address="127.0.0.1:61234",
-    )
-
-    assert (
-        run_pipeline(
-            commands,
-            ray_address="127.0.0.1:61234",
-            environ={"RAY_ADDRESS": "172.51.9.253:35195"},
-            popen=fake_popen,
-            endpoint_ready=lambda _: vllm_started,
-        )
-        == 0
-    )
-    assert started == ["vllm", "owner", "consumer", "producer"]
-    assert all(env["RAY_ADDRESS"] == "127.0.0.1:61234" for env in child_environments)
-    assert all(process.poll() is not None for process in processes)
 
 
 def test_owner_writes_internal_ready_file(monkeypatch, tmp_path) -> None:
@@ -885,8 +809,8 @@ def test_pipeline_commands_use_provided_env_for_backend() -> None:
         env={"SPECO_TQ_STORAGE_BACKEND": "MooncakeStore"},
     )
 
-    assert any("storage_backend=MooncakeStore" in item for item in commands.consumer)
-    assert not any("storage_backend=SimpleStorage" in item for item in commands.consumer)
+    assert any("storage_backend=MooncakeStore" in item for item in commands.consumer_overrides)
+    assert not any("storage_backend=SimpleStorage" in item for item in commands.consumer_overrides)
 
 
 def test_resolve_hidden_states_store_defaults_to_file() -> None:
@@ -1047,11 +971,11 @@ def test_pipeline_commands_select_mooncake_hidden_states_store() -> None:
     assert "SpecoMooncakeHiddenStatesConnector" in joined_vllm
     assert "verl_speco.mooncake_hidden_states_connector" in joined_vllm
     assert any(
-        "hidden_states_store.backend=mooncake" in item for item in commands.producer
+        "hidden_states_store.backend=mooncake" in item for item in commands.producer_overrides
     )
     assert any(
         "mooncake.master_server_address=10.0.0.7:50051" in item
-        for item in commands.producer
+        for item in commands.producer_overrides
     )
 
 

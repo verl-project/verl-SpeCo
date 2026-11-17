@@ -18,10 +18,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import deque
 from collections.abc import Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
 from functools import partial
 from queue import Empty
 from typing import Any
@@ -29,57 +26,28 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from verl_speco.standalone_ray_runtime import get_queue
 from verl_speco.producer.metrics import current_ray_node_id
+from verl_speco.standalone_ray_runtime import get_queue
 from verl_speco.trainer.feature_store import DraftFeatureSample
+from verl_speco.trainer.standalone_data import (
+    StandaloneLocalBatch as TQLocalBatch,
+)
+from verl_speco.trainer.standalone_data import (
+    _entry_from_wire,
+    build_assignments,
+)
+from verl_speco.trainer.standalone_prefetch import (
+    StandalonePrefetchIterator as TQPrefetchIterator,
+)
+from verl_speco.trainer.standalone_sample_cleanup import cleanup_standalone_samples
 from verl_speco.trainer.tq_feature_store import ReadyEntry, TQFeatureStore
 from verl_speco.trainer.tq_retry import retry_io
-from verl_speco.trainer.standalone_sample_cleanup import cleanup_standalone_samples
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class TQLocalBatch:
-    """The payload owned by one rank plus rank-0's global cleanup keys."""
-
-    local_keys: list[str]
-    local_samples: list[DraftFeatureSample]
-    global_keys: list[str] | None
-    global_sequence_nos: list[int] | None = None
-    command_wait_seconds: float = 0.0
-    tq_get_seconds: float = 0.0
-    cycle_started_at: float = 0.0
-    plan_id: int | None = None
-    prepared_batch: dict[str, Any] | None = None
-    batch_prepare_seconds: float = 0.0
-    file_entries: list[ReadyEntry] | None = None
-    cleanup_after_load: bool = False
-    delivery_times: dict[str, float] = field(default_factory=dict)
-
-
-def build_assignments(
-    entries: Sequence[ReadyEntry], *, batch_size: int, world_size: int
-) -> list[list[ReadyEntry]]:
-    """Split one complete global batch into disjoint contiguous rank batches."""
-
-    if batch_size <= 0:
-        raise ValueError(f"batch_size must be positive, got {batch_size}")
-    if world_size <= 0:
-        raise ValueError(f"world_size must be positive, got {world_size}")
-    expected = batch_size * world_size
-    if len(entries) != expected:
-        raise ValueError(
-            f"Expected exactly {expected} ready entries for one global batch, got {len(entries)}"
-        )
-    return [
-        list(entries[rank * batch_size : (rank + 1) * batch_size])
-        for rank in range(world_size)
-    ]
-
-
 class TQFeatureDataLoader:
-    """Poll TQ on rank 0, distribute keys, and fetch payloads on owner ranks."""
+    """Receive Ray scheduler assignments and fetch TQ payloads on owner ranks."""
 
     def __init__(
         self,
@@ -117,9 +85,9 @@ class TQFeatureDataLoader:
                 "Cleanup after load requires ray_reference batch preparation"
             )
         self._cleanup_entries: dict[str, ReadyEntry] = {}
-        if prepare_batch is not None and scheduled_commands is None:
+        if scheduled_commands is None:
             raise ValueError(
-                "File preparation requires scheduler-assigned batch commands"
+                "TQ consumption requires scheduler-assigned batch commands"
             )
         if io_retry_max_attempts < 1 or io_timeout_seconds <= 0:
             raise ValueError("TQ retry attempts and I/O timeout must be positive")
@@ -150,7 +118,6 @@ class TQFeatureDataLoader:
 
     def _iterate(self, *, materialize: bool) -> Iterator[TQLocalBatch]:
         self.store.connect()
-        global_batch_size = self.batch_size * self.world_size
         owner_ready = False
         last_plan_id = -1
         cycle_started_at = time.perf_counter()
@@ -204,29 +171,6 @@ class TQFeatureDataLoader:
                             raise RuntimeError(
                                 f"Unsupported scheduled TQ command: {command!r}"
                             )
-                    elif command is None:
-                        ready = self.store.list_ready()
-                        if len(ready) >= global_batch_size:
-                            selected = ready[:global_batch_size]
-                            command = self._batch_command(selected)
-                        else:
-                            eos = self.store.read_eos()
-                            if eos is not None:
-                                tail_keys = [entry.key for entry in ready]
-                                if tail_keys:
-                                    logger.info(
-                                        "Dropping %s TQ tail samples after EOS because one "
-                                        "global batch requires %s",
-                                        len(tail_keys),
-                                        global_batch_size,
-                                    )
-                                    cleanup_standalone_samples(
-                                        self.store, ready, reason="tail_dropped"
-                                    )
-                                command = {"kind": "stop"}
-                            else:
-                                time.sleep(self.poll_interval_seconds)
-                                continue
                 except BaseException as exc:  # noqa: BLE001
                     command = {
                         "kind": "error",
@@ -338,24 +282,6 @@ class TQFeatureDataLoader:
             cycle_started_at = time.perf_counter()
             command_wait_seconds = 0.0
 
-    def _batch_command(self, selected: Sequence[ReadyEntry]) -> dict[str, Any]:
-        assignments = build_assignments(
-            selected,
-            batch_size=self.batch_size,
-            world_size=self.world_size,
-        )
-        return {
-            "kind": "batch",
-            "global_keys": [entry.key for entry in selected],
-            "global_sequence_nos": [
-                int(entry.tag["sequence_no"]) for entry in selected
-            ],
-            "assignments": [
-                [_entry_to_wire(entry) for entry in rank_entries]
-                for rank_entries in assignments
-            ],
-        }
-
     def clear_completed_batch(
         self, global_keys: Sequence[str] | None, *, cleanup_after_load=False
     ) -> None:
@@ -389,254 +315,6 @@ class TQFeatureDataLoader:
         if not isinstance(received, dict):
             raise RuntimeError("TQ loader broadcast did not contain a command mapping")
         return received
-
-
-def _entry_to_wire(entry: ReadyEntry) -> dict[str, Any]:
-    return {"key": entry.key, "tag": dict(entry.tag)}
-
-
-def _entry_from_wire(value: Any) -> ReadyEntry:
-    if not isinstance(value, dict) or "key" not in value or "tag" not in value:
-        raise TypeError(f"Invalid serialized ReadyEntry: {value!r}")
-    if not isinstance(value["tag"], dict):
-        raise TypeError("Serialized ReadyEntry.tag must be a mapping")
-    return ReadyEntry(key=str(value["key"]), tag=dict(value["tag"]))
-
-
-class TQPrefetchIterator:
-    """One ordered coordinator per rank, bounded payloads, separate CPU collectives.
-
-    Each fetch occupies a slot before next(source). The main thread taking a
-    batch frees a slot. EOS/errors live outside the payload buffer so shutdown
-    does not depend on a consumer draining a full queue.
-    """
-
-    def __init__(
-        self,
-        loader: TQFeatureDataLoader,
-        depth: int,
-        *,
-        close_timeout: float = 180.0,
-        pin_memory: bool = False,
-        prepare_workers: int = 4,
-        pin_device: torch.device | None = None,
-    ):
-        if depth < 1:
-            raise ValueError("prefetch depth must be positive")
-        if prepare_workers < 0:
-            raise ValueError("prepare_workers must be non-negative")
-        if pin_memory and getattr(loader, "prepare_batch", None) is None:
-            raise ValueError("Independent pinning requires file batch preparation")
-        self.loader = loader
-        self.depth = depth
-        self.close_timeout = close_timeout
-        self.stop = loader.stop_event = threading.Event()
-        self._condition = threading.Condition()
-        self._batches: deque[TQLocalBatch] = deque()
-        self._pin_batches: deque[TQLocalBatch] = deque()
-        self._reserved = 0
-        self._source_done = False
-        self._pin_device = pin_device
-        self._original_prepare: Any | None = None
-        self._executor: ThreadPoolExecutor | None = None
-        self._pin_thread: threading.Thread | None = None
-        if pin_memory:
-            assert loader.prepare_batch is not None
-            self._original_prepare = loader.prepare_batch
-            if prepare_workers:
-                self._executor = ThreadPoolExecutor(
-                    max_workers=prepare_workers,
-                    thread_name_prefix=f"file-prepare-{loader.rank}",
-                )
-            loader.prepare_batch = partial(
-                loader.prepare_batch,
-                pin_memory=False,
-                executor=self._executor,
-            )
-            self._pin_thread = threading.Thread(
-                target=self._pin_loop,
-                name=f"file-pin-{loader.rank}",
-                daemon=True,
-            )
-        self._done = False
-        self._error: BaseException | None = None
-        self._thread = threading.Thread(
-            target=self._run,
-            name=f"{'file' if getattr(loader, 'prepare_batch', None) is not None else 'tq'}-prefetch-{loader.rank}",
-            daemon=True,
-        )
-        if self._pin_thread is not None:
-            self._pin_thread.start()
-        self._thread.start()
-
-    def _sync(self, values: list[int]) -> list[int]:
-        if self.loader.world_size > 1:
-            if self.loader.process_group is None:
-                raise RuntimeError(
-                    "Distributed prefetch requires its own Gloo process group"
-                )
-            state = torch.tensor(values, dtype=torch.int32)
-            dist.all_reduce(
-                state, op=dist.ReduceOp.MAX, group=self.loader.process_group
-            )
-            return state.tolist()
-        return values
-
-    def _run(self) -> None:
-        source = iter(self.loader)
-        try:
-            while True:
-                with self._condition:
-                    self._condition.wait_for(
-                        lambda: self.stop.is_set() or self._reserved < self.depth
-                    )
-                    if not self.stop.is_set():
-                        self._reserved += 1
-                if self._sync([int(self.stop.is_set())])[0]:
-                    return
-                batch = None
-                error = None
-                exhausted = False
-                try:
-                    batch = next(source)
-                except StopIteration:
-                    exhausted = True
-                except BaseException as exc:  # noqa: BLE001 - deliver thread failures to every rank
-                    error = exc
-                failed, ended = self._sync([int(error is not None), int(exhausted)])
-                if failed:
-                    raise RuntimeError(
-                        f"Consumer prefetch failed on rank={self.loader.rank}"
-                    ) from error
-                if ended:
-                    return
-                if batch is None:
-                    raise RuntimeError(
-                        "Consumer prefetch returned no batch without EOS"
-                    )
-                with self._condition:
-                    if self._pin_thread is None:
-                        self._batches.append(batch)
-                    else:
-                        batch.delivery_times["_pin_queued_at"] = time.monotonic()
-                        self._pin_batches.append(batch)
-                    self._condition.notify_all()
-        except BaseException as exc:  # noqa: BLE001 - surface worker failures in the main thread
-            with self._condition:
-                self._error = exc
-        finally:
-            try:
-                close = getattr(source, "close", None)
-                if close is not None:
-                    close()
-            finally:
-                with self._condition:
-                    self._source_done = True
-                    if self._pin_thread is None:
-                        self._done = True
-                    self._condition.notify_all()
-
-    def _pin_loop(self) -> None:
-        """Pin FIFO batches while the coordinator prepares the next assignment.
-
-        This thread never performs distributed collectives. Its errors surface
-        through next(), then the existing main-thread rank agreement aborts all
-        ranks before a mismatched training step can start.
-        """
-        try:
-            # Match torch DataLoader's pin thread, avoiding parallel CPU copies.
-            torch.set_num_threads(1)
-            if self._pin_device is not None and self._pin_device.type != "cpu":
-                getattr(torch, self._pin_device.type).set_device(self._pin_device)
-            while True:
-                with self._condition:
-                    self._condition.wait_for(
-                        lambda: self.stop.is_set()
-                        or self._pin_batches
-                        or self._source_done
-                    )
-                    if self.stop.is_set() or not self._pin_batches:
-                        return
-                    batch = self._pin_batches.popleft()
-                started = time.perf_counter()
-                delivery_times = dict(batch.delivery_times)
-                queued_at = delivery_times.pop("_pin_queued_at", None)
-                if queued_at is not None:
-                    delivery_times["loader_pin_queue_time"] = (
-                        time.monotonic() - queued_at
-                    )
-                if batch.prepared_batch is None:
-                    raise RuntimeError("File pinning received no prepared batch")
-                pinned = {
-                    key: value.pin_memory() if torch.is_tensor(value) else value
-                    for key, value in batch.prepared_batch.items()
-                }
-                delivery_times["loader_pin_time"] = time.perf_counter() - started
-                delivery_times["_ready_at"] = time.monotonic()
-                batch = replace(
-                    batch,
-                    delivery_times=delivery_times,
-                    prepared_batch=pinned,
-                    batch_prepare_seconds=batch.batch_prepare_seconds
-                    + time.perf_counter()
-                    - started,
-                )
-                with self._condition:
-                    self._batches.append(batch)
-                    self._condition.notify_all()
-        except BaseException as exc:  # noqa: BLE001 - surface pin failures in the main thread
-            with self._condition:
-                self._error = exc
-                self.stop.set()
-                self._condition.notify_all()
-        finally:
-            with self._condition:
-                self._done = True
-                self._condition.notify_all()
-
-    def __iter__(self):
-        return self
-
-    def __next__(self) -> TQLocalBatch:
-        with self._condition:
-            self._condition.wait_for(lambda: bool(self._batches) or self._done)
-            if self._batches:
-                batch = self._batches.popleft()
-                if self._pin_thread is not None:
-                    ready_at = batch.delivery_times.pop("_ready_at", None)
-                    if ready_at is not None:
-                        batch.delivery_times["loader_ready_queue_time"] = (
-                            time.monotonic() - ready_at
-                        )
-                self._reserved -= 1
-                self._condition.notify_all()
-                return batch
-            if self._error is not None:
-                raise self._error
-            raise StopIteration
-
-    def close(self) -> None:
-        self.stop.set()
-        with self._condition:
-            self._condition.notify_all()
-        self._thread.join(timeout=self.close_timeout)
-        if self._thread.is_alive():
-            raise RuntimeError(
-                "TQ prefetch thread did not stop before its shutdown deadline"
-            )
-        if self._pin_thread is not None:
-            self._pin_thread.join(timeout=self.close_timeout)
-            if self._pin_thread.is_alive():
-                raise RuntimeError(
-                    "Consumer pin thread did not stop before its shutdown deadline"
-                )
-        if self._executor is not None:
-            self._executor.shutdown(wait=True, cancel_futures=True)
-        if self._original_prepare is not None:
-            self.loader.prepare_batch = self._original_prepare
-        self._batches.clear()
-        self._pin_batches.clear()
-        self._reserved = 0
 
 
 __all__ = [
