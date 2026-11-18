@@ -510,6 +510,8 @@ def test_vllm_file_replay_routes_handles_through_the_store() -> None:
 
     assert path == ""
     assert handle == "hs-key"
-    payload = replayer._load_vllm_hidden_states(handle)
+    # The Mooncake store consumes the full transfer manifest, not the bare
+    # handle, when loading.
+    payload = replayer._load_vllm_hidden_states(response.kv_transfer_params)
     assert "hidden_states" in payload
-    assert store.loaded == ["hs-key"]
+    assert store.loaded == [response.kv_transfer_params]

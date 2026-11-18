@@ -103,6 +103,7 @@ from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
     configure_vllm_runtime_from_config,
 )
+from verl_speco.rl_insight_bridge import trace_state as _rl_insight_trace_state
 from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
 from verl_speco.trainer.hard_sample_selection import partition_hard_candidates
 from verl_speco.trainer.scheduler import (
@@ -177,6 +178,9 @@ _DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
 # tensor cache; it prevents stale readiness markers from authorizing a version
 # that the worker has already evicted.
 _SPECO_TARGET_LM_HEAD_READY_VERSION_LIMIT = 2
+# RL-Insight trace lane for the drafter co-training phases owned by the trainer
+# process. Worker-side phases use per-rank lanes inside SpecoWorker.
+_SPECO_RL_INSIGHT_TRAINER_LANE = "speco_trainer"
 
 _DRAFTER_CHECKPOINT_PATH_PLACEHOLDERS = {
     None,
@@ -948,20 +952,20 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 metadata
             )
             scheduler = self._speco_get_drafter_scheduler()
-            if self._speco_rollout_idle_worker_enabled():
-                if not scheduler._metadata_idle_training_groups:
+            bubble_enabled = self._speco_rollout_idle_worker_enabled()
+            replica_groups = scheduler.rollout_idle_replica_groups()
+            if bubble_enabled:
+                if not scheduler._metadata_idle_training_groups or not replica_groups:
                     raise RuntimeError(
                         "No authoritative Bubble training collectives discovered"
                     )
                 scheduler._idle_training_groups(self._speco_drafter_schedule_config())
             lease_groups_configured = configure_rollout_resource_groups(
                 self._speco_rollout_idle_event_bus_name(),
-                scheduler.rollout_idle_replica_groups(),
+                replica_groups,
+                strict_groups=bubble_enabled,
             )
-            if (
-                self._speco_rollout_idle_worker_enabled()
-                and not lease_groups_configured
-            ):
+            if bubble_enabled and not lease_groups_configured:
                 raise RuntimeError(
                     "Bubble lease bus did not acknowledge replica groups; restart all actors"
                 )
@@ -1016,6 +1020,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._require_speco_worker_group().get_drafter_target_lm_head_row_indices()
         )
 
+    def _speco_invalidate_v1_drafter_park(self) -> None:
+        # Invalidate before a residency-changing RPC, even if it eventually
+        # completes zero optimizer steps or fails after allocating on device.
+        session = self.__dict__.get("_speco_bubble_lifecycle")
+        if session is not None:
+            session.memory_parked = False
+
     def speco_train_drafter(self, training_plan: dict[str, object]):
         if self._speco_rollout_idle_worker_enabled() and training_plan.get(
             "reason"
@@ -1027,6 +1038,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 training_plan,
                 reclaim_bus_name=self._speco_rollout_idle_event_bus_name(),
             )
+        self._speco_invalidate_v1_drafter_park()
         return self._require_speco_worker_group().train_drafter(training_plan)
 
     def _speco_poll_drafter_training(self, submission):
@@ -1065,6 +1077,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
 
     def speco_preflight_drafter_training(self, training_plan: dict[str, object]):
+        self._speco_invalidate_v1_drafter_park()
         return self._require_speco_worker_group().preflight_drafter_training(
             training_plan
         )
@@ -1088,11 +1101,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
 
     def speco_activate_drafter_training_model(self):
+        self._speco_invalidate_v1_drafter_park()
         return self._require_speco_worker_group().activate_drafter_training_model()
 
     def speco_prewarm_drafter_training_model(
         self, worker_ids: tuple[str, ...] | None = None
     ):
+        self._speco_invalidate_v1_drafter_park()
         return self._require_speco_worker_group().prewarm_drafter_training_model(
             list(worker_ids) if worker_ids is not None else None
         )
@@ -1381,7 +1396,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         except ValueError:
             return None
 
-    def _speco_prepare_drafter_checkpoint_for_worker_init(self):
+    def _speco_prepare_drafter_checkpoint_for_worker_init(
+        self, *, resume_checkpoint_dir: str | None = None
+    ):
         drafter_cfg = self._speco_drafter_config()
         if drafter_cfg is None:
             return
@@ -1396,6 +1413,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return
 
         checkpoint_save_enabled = self._speco_drafter_checkpoint_save_config_enabled()
+        checkpoint_path = _get_nested(drafter_cfg, ("checkpoint_path",), None)
         if checkpoint_save_enabled:
             self._speco_ensure_drafter_checkpoint_path()
 
@@ -1418,7 +1436,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
 
         model_path = _get_nested(drafter_cfg, ("model_path",), None)
-        checkpoint_path = _get_nested(drafter_cfg, ("checkpoint_path",), None)
+        if (
+            resume_checkpoint_dir is not None
+            and checkpoint_path in _DRAFTER_CHECKPOINT_PATH_PLACEHOLDERS
+        ):
+            checkpoint_path = os.path.join(
+                os.path.dirname(os.path.abspath(resume_checkpoint_dir)), "drafter"
+            )
+        else:
+            checkpoint_path = _get_nested(drafter_cfg, ("checkpoint_path",), None)
         resolved_path = resolve_drafter_checkpoint_path(
             model_path, checkpoint_path, resume_step
         )
@@ -1771,6 +1797,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             economics.get("enabled", False)
             and self._speco_drafter_schedule_config().execution_strategy
             is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            and not getattr(self, "_speco_bubble_roi_supported", lambda: False)()
         ):
             raise ValueError(
                 "Bubble Time (rollout_idle_worker) with "
@@ -1779,7 +1806,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "set economics.enabled=false or scheduler.execution.strategy=sync"
             )
         # shortcut: reject async ROI gating until completion waits are attributed correctly.
-        if training_cfg.get("publish_async", False) and economics.get("enabled", False):
+        if (
+            training_cfg.get("publish_async", False)
+            and economics.get("enabled", False)
+            and not getattr(self, "_speco_bubble_roi_supported", lambda: False)()
+        ):
             raise ValueError(
                 "publish_async=true with drafter_convergence_freeze.economics.enabled=true "
                 "is not supported while async publish completion-cost accounting is pending; "
@@ -3244,7 +3275,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 and required_target_version is not None
                 and not target_lm_head_ready_for_workers
             ):
-                print(
+                logger.debug(
                     "[BubbleTime] idle_launch_blocked: "
                     f"plan_id={plan.plan_id} reason=target_lm_head_not_ready "
                     f"required_target_version={required_target_version} "
@@ -3252,7 +3283,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     f"ready_workers={ready_target_workers} "
                     "ready_versions="
                     f"{tuple(sorted(self._speco_ready_target_lm_head_versions))}",
-                    flush=True,
                 )
                 plan = replace(
                     plan,
@@ -3284,7 +3314,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             from verl_speco.integration.generation_diagnostics import record_admission
 
             record_admission(plan)
-            print(
+            from verl_speco.integration.generation_diagnostics import (
+                report_idle_rejection,
+            )
+
+            report_idle_rejection(self, plan)
+            logger.debug(
                 "[BubbleTime] idle_launch_decision: "
                 f"launch={getattr(plan, 'launch', False)} "
                 f"reason={getattr(plan, 'reason', None)} "
@@ -3305,7 +3340,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 f"{max(float(getattr(plan, 'deadline_ts', 0.0) or 0.0) - time.time(), 0.0):.3f} "
                 f"idle_workers={metrics.get('bubble/idle_workers', 0)} "
                 f"idle_groups={metrics.get('bubble/idle_training_groups', 0)}",
-                flush=True,
             )
             if plan is None or not plan.launch:
                 if plan is not None:
@@ -4314,7 +4348,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         metrics: dict[str, Any] | None = None,
     ) -> None:
         metrics = metrics or {}
-        log = logger.warning if plan.launch else logger.info
+        log = logger.info if plan.launch else logger.debug
         log(
             "[DrafterScheduler] step=%s strategy=%s launch=%s reason=%s "
             "interval_matched=%s max_batches=%s publish_after_success=%s "
@@ -8463,7 +8497,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     and not skip_collection_for_quota
                 )
                 if collection_allowed:
-                    collected = self._speco_collect_generation_samples(gen_batch_output)
+                    with _rl_insight_trace_state(
+                        "drafter/collect",
+                        state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                        global_step=self.global_steps,
+                    ):
+                        collected = self._speco_collect_generation_samples(
+                            gen_batch_output
+                        )
                     if collected:
                         meta_info = getattr(gen_batch_output, "meta_info", None)
                         if isinstance(meta_info, dict):
@@ -8762,10 +8803,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 and not self._pending_drafter_publish_refs
                 and self._pending_target_lm_head_sync is None
             )
-            before_actor_event = self._speco_on_before_actor_update(
-                allow_quota_topup=quota_topup_safe,
-                **({"force_quota_completion": True} if final_quota_step else {}),
-            )
+            with _rl_insight_trace_state(
+                "drafter/prepare",
+                state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                global_step=self.global_steps,
+            ):
+                before_actor_event = self._speco_on_before_actor_update(
+                    allow_quota_topup=quota_topup_safe,
+                    **({"force_quota_completion": True} if final_quota_step else {}),
+                )
             training_plan = before_actor_event.training_plan
             if training_plan is None:
                 raise RuntimeError(
@@ -8878,9 +8924,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     training_plan, launch=False, reason="drafter_convergence_frozen"
                 )
             if training_plan.launch:
-                drafter_trained, train_metrics = self._speco_train_drafter(
-                    training_plan
-                )
+                with _rl_insight_trace_state(
+                    "drafter/train",
+                    state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                    global_step=self.global_steps,
+                    strategy=str(
+                        getattr(
+                            training_plan.execution_strategy,
+                            "value",
+                            training_plan.execution_strategy,
+                        )
+                    ),
+                    max_batches=int(training_plan.max_batches),
+                ):
+                    drafter_trained, train_metrics = self._speco_train_drafter(
+                        training_plan
+                    )
             else:
                 drafter_trained, train_metrics = (
                     False,
@@ -8918,9 +8977,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     actor_output=actor_output,
                 )
             else:
-                metrics.update(
-                    self._speco_publish_drafter_weights(drafter_trained, training_plan)
-                )
+                with _rl_insight_trace_state(
+                    "drafter/publish",
+                    state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                    global_step=self.global_steps,
+                    trained=int(bool(drafter_trained)),
+                    deferred=False,
+                ):
+                    metrics.update(
+                        self._speco_publish_drafter_weights(
+                            drafter_trained, training_plan
+                        )
+                    )
             if final_quota_step:
                 metrics.update(
                     self._speco_finalize_quota_publication(
@@ -9132,11 +9200,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                             "[drafter freeze] probe before-arm failed; "
                             "publishing without paired probe (fail-open)"
                         )
-                publish_metrics = self._speco_publish_drafter_weights(
-                    pending_drafter_publish["drafter_trained"],
-                    pending_drafter_publish["training_plan"],
-                    after_weight_update=True,
-                )
+                with _rl_insight_trace_state(
+                    "drafter/publish",
+                    state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
+                    global_step=self.global_steps,
+                    trained=int(bool(pending_drafter_publish["drafter_trained"])),
+                    deferred=True,
+                ):
+                    publish_metrics = self._speco_publish_drafter_weights(
+                        pending_drafter_publish["drafter_trained"],
+                        pending_drafter_publish["training_plan"],
+                        after_weight_update=True,
+                    )
                 probe = None
                 if run_probe and before_arm is not None:
                     try:

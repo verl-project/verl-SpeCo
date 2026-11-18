@@ -43,29 +43,31 @@ def _load_checkpoint_tensor(model_path: str, key: str) -> torch.Tensor:
     if not os.path.exists(model_path):
         model_path = snapshot_download(repo_id=model_path)
 
-    index_paths = glob.glob(os.path.join(model_path, "*.index.json"))
-    if len(index_paths) > 1:
-        raise FileNotFoundError(f"Multiple index.json files found in {model_path}")
-
+    index_paths = sorted(glob.glob(os.path.join(model_path, "*.index.json")))
     if index_paths:
-        with open(index_paths[0], encoding="utf-8") as f:
-            index_json = json.load(f)
-        weight_map = index_json.get("weight_map", {})
-        for candidate in _candidate_keys(key):
-            if candidate in weight_map:
-                resolved_key = candidate
-                break
-        else:
-            raise KeyError(
-                f"Tensor {key!r} is not present in checkpoint index for {model_path}"
-            )
-        ckpt_file = os.path.join(model_path, weight_map[resolved_key])
-        if ckpt_file.endswith(".safetensors"):
-            with safe_open(ckpt_file, framework="pt", device="cpu") as f:
-                return f.get_tensor(resolved_key)
-        return torch.load(ckpt_file, map_location="cpu", weights_only=True)[
-            resolved_key
-        ]
+        # Quantized DeepSeek-V4 packages ship multiple indices (a drafter/model
+        # index plus a quantized-weights index); search each for the key instead
+        # of rejecting the checkpoint.
+        for index_path in index_paths:
+            with open(index_path, encoding="utf-8") as f:
+                index_json = json.load(f)
+            weight_map = index_json.get("weight_map", {})
+            for candidate in _candidate_keys(key):
+                if candidate in weight_map:
+                    resolved_key = candidate
+                    break
+            else:
+                continue
+            ckpt_file = os.path.join(model_path, weight_map[resolved_key])
+            if ckpt_file.endswith(".safetensors"):
+                with safe_open(ckpt_file, framework="pt", device="cpu") as f:
+                    return f.get_tensor(resolved_key)
+            return torch.load(ckpt_file, map_location="cpu", weights_only=True)[
+                resolved_key
+            ]
+        raise KeyError(
+            f"Tensor {key!r} is not present in any checkpoint index for {model_path}"
+        )
 
     safetensors_path = os.path.join(model_path, "model.safetensors")
     if os.path.exists(safetensors_path):

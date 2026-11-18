@@ -176,3 +176,102 @@ def test_transfer_log_cleanup_preserves_metrics_and_fallback_warnings(caplog):
     )
     assert "shared_pool_budget" in caplog.text
     assert trainer._gpu_transfer_metrics["drafter/gpu_optimizer_offload_used_pool"] == 0
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_stage_clock_only_synchronizes_when_explicitly_armed(enabled):
+    from verl_speco.trainer.performance_diagnostics import training_stage_clock
+
+    calls = []
+    trainer = SimpleNamespace(
+        _diagnostic_gpu_stage_sync=enabled,
+        device_module=SimpleNamespace(synchronize=lambda: calls.append("wait")),
+    )
+    assert isinstance(training_stage_clock(trainer), float)
+    assert calls == (["wait"] if enabled else [])
+
+
+def test_idle_rejection_is_opt_in_bounded_and_uses_cached_state(monkeypatch):
+    from verl_speco.integration import generation_diagnostics as diagnostics
+
+    emitted = []
+    monkeypatch.setattr(diagnostics, "emit_summary", lambda *a, **k: emitted.append(k))
+    worker = SimpleNamespace(
+        status="ready", memory_released=False, must_be_ready_at=None
+    )
+    owner = SimpleNamespace(
+        global_steps=4,
+        _drafter_scheduler=SimpleNamespace(
+            _replica_idle_worker_groups={0: ("0", "1")},
+            _idle_workers={"0": worker},
+            _training_quota_data_version=4,
+        ),
+        _speco_ready_target_lm_head_workers={4: ("0",)},
+    )
+    plan = SimpleNamespace(launch=False, reason="incomplete_training_group")
+    monkeypatch.delenv("VERL_SPECO_DIAGNOSTIC_IDLE_REJECTIONS", raising=False)
+    diagnostics.report_idle_rejection(owner, plan)
+    assert emitted == []
+    monkeypatch.setenv("VERL_SPECO_DIAGNOSTIC_IDLE_REJECTIONS", "true")
+    diagnostics.report_idle_rejection(owner, plan)
+    diagnostics.report_idle_rejection(owner, plan)
+    assert len(emitted) == 1
+    group = emitted[0]["snapshot"]["replicas"][0]
+    assert group["worker_status"] == ["ready", "unknown"]
+    assert group["head_ready_workers"] == ["0"]
+    owner.global_steps = 5
+    diagnostics.report_idle_rejection(owner, plan)
+    assert len(emitted) == 2
+    diagnostics.report_idle_rejection(owner, SimpleNamespace(launch=True))
+    assert len(emitted) == 2
+
+
+@pytest.mark.parametrize(
+    "strategy,idle,device,steps,expected",
+    [
+        ("rollout_idle_worker", False, "cuda", 0, True),
+        ("rollout_idle_worker", False, "cuda", 1, True),
+        ("rollout_idle_worker", False, "cuda", 2, False),
+        ("rollout_idle_worker", True, "cuda", 0, False),
+        ("rollout_idle_worker", False, "npu", 0, False),
+        ("sync", False, "cuda", 0, False),
+    ],
+)
+def test_cold_step_diagnostic_scope(
+    monkeypatch, strategy, idle, device, steps, expected
+):
+    from verl_speco.trainer.performance_diagnostics import (
+        gpu_first_step_diagnostics_enabled,
+    )
+
+    worker = SimpleNamespace(
+        device_name=device, trainer=SimpleNamespace(optimizer_steps_total=steps)
+    )
+    monkeypatch.delenv("VERL_SPECO_DIAGNOSTIC_GPU_FIRST_STEPS", raising=False)
+    assert not gpu_first_step_diagnostics_enabled(worker, strategy, idle)
+    monkeypatch.setenv("VERL_SPECO_DIAGNOSTIC_GPU_FIRST_STEPS", "true")
+    assert gpu_first_step_diagnostics_enabled(worker, strategy, idle) == expected
+
+
+def test_new_diagnostics_propagate_without_phase_timing(monkeypatch):
+    from omegaconf import OmegaConf
+    from verl_speco.main import (
+        configure_phase_diagnostic_runtime_env,
+        drafter_diagnostic_env,
+    )
+
+    monkeypatch.delenv("VERL_SPECO_PHASE_TIMING", raising=False)
+    names = (
+        "VERL_SPECO_DIAGNOSTIC_GPU_FIRST_STEPS",
+        "VERL_SPECO_DIAGNOSTIC_IDLE_REJECTIONS",
+    )
+    for name in names:
+        monkeypatch.setenv(name, "true")
+    config = OmegaConf.create({})
+    configure_phase_diagnostic_runtime_env(config)
+    for name in names:
+        assert (
+            OmegaConf.select(config, f"ray_kwargs.ray_init.runtime_env.env_vars.{name}")
+            == "true"
+        )
+        assert drafter_diagnostic_env()[name] == "true"

@@ -157,3 +157,7 @@ def test_scheduler_overrides_match_structured_configuration():
     assert scheduler.execution.strategy == "rollout_idle_worker"
     assert scheduler.training_quota.target_steps == 20
     assert scheduler.training_quota.allow_critical_path_fallback
+    assert not scheduler.idle_worker.writer_migration_enable
+    assert not scheduler.idle_worker.full_collective_fallback
+    assert scheduler.idle_worker.head_reference_transport
+    assert scheduler.idle_worker.calibrated_budgets

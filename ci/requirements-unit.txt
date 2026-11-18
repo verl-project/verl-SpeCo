@@ -20,3 +20,5 @@ cachetools
 fastapi
 uvicorn
 httpx
+# Upstream verl's reward loop imports this when loading main_ppo.
+aiohttp

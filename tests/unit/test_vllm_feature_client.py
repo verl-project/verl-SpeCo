@@ -116,15 +116,21 @@ def test_request_generate_returns_store_handle() -> None:
 
 def test_load_and_delete_route_handles_through_the_store() -> None:
     store = _RecordingStore()
-    response = VllmResponse(None, "http://vllm:8000/v1", handle="hs-9")
+    params = {"handle": "hs-9", "version": 1, "tensors": {}, "metadata": {}}
+    response = VllmResponse(
+        None, "http://vllm:8000/v1", handle="hs-9", transfer_params=params
+    )
 
     raw = load_hidden_state_result(response, store)
 
     assert raw.temporary_path == "hs-9"
     assert raw.is_handle is True
     assert raw.byte_size == 2
-    assert store.loaded == ["hs-9"]
+    # The Mooncake store receives the full transfer manifest on load ...
+    assert store.loaded == [params]
+    assert store.released == []
 
+    # ... and the bare handle on release.
     delete_temporary_result(raw)
     assert store.released == ["hs-9"]
 

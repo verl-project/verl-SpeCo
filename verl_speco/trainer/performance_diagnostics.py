@@ -11,15 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Metadata-only diagnostics: never read accelerator values or synchronize."""
+"""Metadata diagnostics plus explicitly enabled cold-step completion timing."""
 
 import os
 import sys
-
-import torch
+import time
 
 
 def optimizer_state_metadata(optimizer):
+    import torch
+
     stats = {
         "optimizer_id": id(optimizer),
         "state_entries": len(optimizer.state),
@@ -66,6 +67,7 @@ def optimizer_state_metadata(optimizer):
 
 def compilation_metadata():
     # Do not import Dynamo/Inductor just to measure their initialization.
+    torch = sys.modules.get("torch")
     utils = sys.modules.get("torch._dynamo.utils")
     counters = getattr(utils, "counters", {})
     values = {}
@@ -75,8 +77,8 @@ def compilation_metadata():
                 values[f"{group}/{name}"] = value
     return {
         "counters": values,
-        "torch_version": str(torch.__version__),
-        "cuda_build": torch.version.cuda,
+        "torch_version": str(getattr(torch, "__version__", "unavailable")),
+        "cuda_build": getattr(getattr(torch, "version", None), "cuda", None),
         "TORCHINDUCTOR_CACHE_DIR": os.getenv(
             "TORCHINDUCTOR_CACHE_DIR", "torch_default"
         ),
@@ -100,3 +102,43 @@ def allocator_metadata(device_module):
         "allocation_retries": int(stats.get("num_alloc_retries", 0)),
         "ooms": int(stats.get("num_ooms", 0)),
     }
+
+
+def accelerator_runtime_metadata():
+    """Read CUDA metadata only after initialization; never initialize or fence it."""
+    import torch
+
+    result = {"cuda_initialized": torch.cuda.is_initialized()}
+    if result["cuda_initialized"]:
+        device = torch.cuda.current_device()
+        free, total = torch.cuda.mem_get_info(device)
+        props = torch.cuda.get_device_properties(device)
+        result["cuda"] = {
+            "device": device,
+            "name": props.name,
+            "uuid": str(getattr(props, "uuid", "unavailable")),
+            "allocated_bytes": torch.cuda.memory_allocated(device),
+            "reserved_bytes": torch.cuda.memory_reserved(device),
+            "device_free_bytes": free,
+            "device_total_bytes": total,
+        }
+    return result
+
+
+def training_stage_clock(trainer):
+    """Opt-in CUDA completion fences for cold-step diagnosis, not benchmarking."""
+    if getattr(trainer, "_diagnostic_gpu_stage_sync", False):
+        trainer.device_module.synchronize()
+    return time.perf_counter()
+
+
+def gpu_first_step_diagnostics_enabled(worker, execution_strategy, coordinated_idle):
+    from verl_speco.utils.env import env_flag
+
+    return (
+        execution_strategy == "rollout_idle_worker"
+        and not coordinated_idle
+        and getattr(worker, "device_name", "") == "cuda"
+        and getattr(worker.trainer, "optimizer_steps_total", 0) < 2
+        and env_flag("VERL_SPECO_DIAGNOSTIC_GPU_FIRST_STEPS")
+    )

@@ -166,12 +166,16 @@ def load_base_method():
     return namespace[method.name]
 
 
-def test_first_success_marker_is_set_only_after_wait_and_budget_is_shared(transfer):
+@pytest.mark.parametrize("bubble", [False, True])
+def test_first_success_marker_is_set_only_after_wait_and_budget_is_shared(
+    transfer, bubble
+):
     opt, source = optimizer(transfer)
     trainer = SimpleNamespace(
         optimizer=opt,
         rank=0,
         current_rl_step=2,
+        _bubble_time_enabled=bubble,
         _gpu_optimizer_host_reuse=True,
         _gpu_offload_pool_max_bytes=64,
         _gpu_model_host_pool=SimpleNamespace(entries={"model": (None, None, 32)}),
@@ -368,13 +372,13 @@ def test_two_rank_cuda_optimizer_dtensor_roundtrip(tmp_path):
 @pytest.mark.parametrize(
     "device,bubble,strategy,enabled",
     [
-        ("cuda", True, "fsdp2", True),
+        ("cuda", True, "fsdp2", False),
         ("npu", False, "fsdp2", True),
         ("cuda", False, "ddp", True),
         ("cuda", False, "fsdp2", False),
     ],
 )
-def test_pool_guards_keep_bubble_npu_other_strategies_and_rollback_original(
+def test_pool_guards_keep_npu_other_strategies_and_rollback_original(
     device,
     bubble,
     strategy,
