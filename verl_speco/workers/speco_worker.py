@@ -458,6 +458,25 @@ class SpecoWorker(Worker):
         if not self.in_drafter_train_group:
             return
 
+        from verl_speco.backends.training_backend import resolve_training_backend
+
+        if resolve_training_backend(self.config) == "vllm_ascend":
+            from verl_speco.integration.deepseek_v4_online import online_enabled
+
+            if not online_enabled(self.config):
+                raise ValueError("SpecoWorker vllm_ascend requires training.mode=online")
+            from verl_speco.trainer.vllm_ascend_online import build_online_trainer
+
+            if self.device_name != "npu":
+                raise ValueError("Online vllm_ascend training requires device_name=npu")
+            self.trainer = build_online_trainer(
+                self.config,
+                world_size=self.training_group_world_size,
+                rollout_dp_rank=self.replica_rank,
+                training_device_mesh=self.training_device_mesh,
+            )
+            return
+
         from verl_speco.backends.factory import build_trainer_backend
         from verl_speco.trainer.base_trainer import DrafterBaseTrainer
 
@@ -1038,6 +1057,13 @@ class SpecoWorker(Worker):
         )
         if not samples:
             return result
+        from verl_speco.backends.training_backend import resolve_training_backend
+
+        feature_keys = (
+            ("target_head_hidden_states",)
+            if resolve_training_backend(self.config) == "vllm_ascend"
+            else ()
+        )
         for sample in samples:
             if not sample:
                 result["rejected_samples"] += 1
@@ -1047,7 +1073,7 @@ class SpecoWorker(Worker):
                 "prompts": sample["prompts"],
                 "responses": sample["responses"],
             }
-            for key in (
+            for key in feature_keys + (
                 "hidden_position_start",
                 "hidden_position_end",
                 "hidden_positions",
@@ -1244,6 +1270,13 @@ class SpecoWorker(Worker):
         if not payload:
             return {"accepted": False, "applied": False, "reason": "missing_payload"}
 
+        from verl_speco.backends.training_backend import resolve_training_backend
+
+        if resolve_training_backend(self.config) == "vllm_ascend" and callable(
+            getattr(self.trainer, "sync_target_output", None)
+        ):
+            return self.trainer.sync_target_output(payload, global_step)
+
         weight = payload.get("weight")
         row_indices = payload.get("row_indices")
         source_vocab_size = payload.get("source_vocab_size")
@@ -1302,6 +1335,17 @@ class SpecoWorker(Worker):
             start_ts = time.time()
             activation_ts = time.time()
             result["activated"] = bool(await self.trainer.activate_training_model())
+            from verl_speco.backends.training_backend import resolve_training_backend
+
+            if (
+                result["activated"]
+                and resolve_training_backend(self.config) == "vllm_ascend"
+                and callable(getattr(self.trainer, "sync_target_output", None))
+                and self.last_trained_step is None
+            ):
+                self.last_global_step = 0
+                self.last_trained_step = 0
+                self.trainer.prepare_model_state_dict_for_publish(0)
             if not result["activated"]:
                 result["errors"] = [
                     getattr(

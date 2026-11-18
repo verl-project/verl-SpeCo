@@ -24,11 +24,10 @@ import logging
 
 import hydra
 
-from verl_speco.trainer.draft_training_loop import (
-    log_resolved_config,
-    run_standalone_draft_training,
+from verl_speco.backends.training_backend import (
+    resolve_training_backend,
+    run_standalone_training,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +37,8 @@ def main(config):
     """Run standalone draft model training."""
 
     logging.basicConfig(level=logging.INFO)
-    log_resolved_config(config)
-    result = run_standalone_draft_training(config)
+    logger.info("Drafter training backend: %s", resolve_training_backend(config))
+    result = run_standalone_training(config)
     if result.get("rank", 0) == 0:
         logger.info("Standalone SPECO draft training finished: %s", result)
 

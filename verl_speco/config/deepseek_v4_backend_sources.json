@@ -1,0 +1,205 @@
+{
+  "origin": "User-provided AIRDrafter DSpark implementation",
+  "files": {
+    "verl_speco.ops.deepseek_v4_cache": [
+      {
+        "source": "training_common/utils/cache.py",
+        "sha256": "9fb9a211e90ceed4a2e6e70441ab9988a7d0f5c13cd5433ff390af55c2e27b3e",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.ops.deepseek_v4_moe": [
+      {
+        "source": "training_common/utils/moe_chunking.py",
+        "sha256": "ea6a565bf25408e4af60b52aa839b351df1eebbe6712b878fe546ddf0a7038d4",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.ops.deepseek_v4_hc": [
+      {
+        "source": "training_common/utils/hc_backward.py",
+        "sha256": "6086ff5ab3845c090cd36af0b780ed00875840e50a5681792a53fe00ce73d6b3",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.ops.deepseek_v4_router": [
+      {
+        "source": "training_common/utils/internal_router.py",
+        "sha256": "1eae3b5f307c2a44f0bd24f4dcd353a270f5cca8d95052b5f52943481c1c2746",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.ops.deepseek_v4_dsa": [
+      {
+        "source": "training_common/utils/dsa_backward.py",
+        "sha256": "791a36728a0fd40ba79ee850fbcd305f7e6de434c1a843269459ed6d06fc9ede",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.ops.deepseek_v4_dsa_diagnostics": [
+      {
+        "source": "training_common/utils/dsa_backward_diagnostic.py",
+        "sha256": "b70e5c1124f289b334bab2646c884edd410153c26fadf5683bc7118f119df725",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.ops.deepseek_v4_ranges": [
+      {
+        "source": "training_common/utils/dsa_source_ranges.py",
+        "sha256": "1b8cfce0eecb76ba3a82b371d5b690c13e2714c3f16811f2bec40dafd6c00436",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.backends.vllm_ascend_parallel": [
+      {
+        "source": "training_common/utils/parallel.py",
+        "sha256": "854c56f62615d83899abcffa12b60b12c08005833c0502c42efe0078628db1a9",
+        "symbols": "runtime dependency closure"
+      },
+      {
+        "source": "training_common/utils/distributed.py",
+        "sha256": "9d69a48b2c29b95b7f7e8931903f2ea2559bc87dc757155d17b74475fa63f8d9",
+        "symbols": [
+          "is_main_process"
+        ]
+      }
+    ],
+    "verl_speco.trainer.vllm_ascend_state": [
+      {
+        "source": "training_common/utils/ds_utils.py",
+        "sha256": "cb29cb3b58b7ac05ffafb0b77780588d0c5158f827fb02a00c77755d1ae56054",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.trainer.deepseek_v4_metrics": [
+      {
+        "source": "training_common/utils/debug.py",
+        "sha256": "7b788b400bb7366c2f212a0f7f38c365526949c8feffd5c099cec686d8b781d8",
+        "symbols": "runtime dependency closure"
+      },
+      {
+        "source": "training_common/utils/metrics.py",
+        "sha256": "72815fb03442cdaade0401842cb3e66623b39ffca612b67b3a535a9a6118ef28",
+        "symbols": "runtime dependency closure"
+      },
+      {
+        "source": "training_common/utils/runtime_metrics.py",
+        "sha256": "f75d2c46b5f84a1b23abb4b18105247aabeb974c523a4fb2bc9f680e0decdbc0",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.backends.vllm_ascend_options": [
+      {
+        "source": "training_common/utils/memory_chunking.py",
+        "sha256": "589bfef59366b5b8118fbecfdc8d2ab88dde26429419d14f7d25caaa1d406bca",
+        "symbols": "runtime dependency closure"
+      },
+      {
+        "source": "training_common/utils/optimization_config.py",
+        "sha256": "a4ce35f12807774dbbb84820515573df0e6c8457b1a12138caa623b99f310769",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.backends.vllm_ascend_scheduler": [
+      {
+        "source": "training_common/utils/scheduler.py",
+        "sha256": "f77355e4a97edc851b86b2a7891f7901c90841bd586a235b44329c1eb3035d1b",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.trainer.deepseek_v4_diagnostics": [
+      {
+        "source": "training_common/utils/gradient_audit.py",
+        "sha256": "9e51e11fcce532aadbe9a1547ef736d7ab7e81e7312e8f1ffd9bfd8b589f5cd9",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.data.deepseek_v4_sampler": [
+      {
+        "source": "training_common/utils/samplers.py",
+        "sha256": "346dbdd22b60dbddb3689f41f8e1f3e04f223df622b9ca29652fe22dbe280cf6",
+        "symbols": "runtime dependency closure"
+      },
+      {
+        "source": "training_common/utils/data.py",
+        "sha256": "eb6d75729b90e8b206c8907ac68a2d13f04246466aee51035d021b4b652e5de0",
+        "symbols": [
+          "MTPSegment"
+        ]
+      }
+    ],
+    "verl_speco.models.deepseek_v4.checkpoint": [
+      {
+        "source": "training_common/utils/ds4_checkpoint_format.py",
+        "sha256": "5d73b69f8d128ce49427e2cc07da342d1329e2f88aea8846f4ba19a852000e09",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.ops.deepseek_v4_loss": [
+      {
+        "source": "training_common/utils/losses.py",
+        "sha256": "a0dd74acc462b6780e918a0eaf1f1a9107b65f4f8d91224c6a690b642aea2054",
+        "symbols": [
+          "all_reduce_gradient",
+          "differentiable_all_reduce_sum",
+          "differentiable_vocab_parallel_log_probs",
+          "scale_gradient",
+          "vocab_parallel_log_probs"
+        ]
+      }
+    ],
+    "verl_speco.ops.deepseek_v4_runtime": [
+      {
+        "source": "training_common/modeling/ds4_runtime.py",
+        "sha256": "8849e34080997fa5c607e8fac5c4837f3be7c31db754c7b7866ccd942f7761a4",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.models.deepseek_v4.runtime": [
+      {
+        "source": "training_common/modeling/ds4_runtime.py",
+        "sha256": "8849e34080997fa5c607e8fac5c4837f3be7c31db754c7b7866ccd942f7761a4",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.models.deepseek_v4.modeling_dspark": [
+      {
+        "source": "training_common/modeling/ds4_dspark.py",
+        "sha256": "9d883ed10d2b3892b42fe6f01e47459247111df91b7aa1ebcaccf089817b79ed",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.models.target.deepseek_v4_head": [
+      {
+        "source": "training_common/modeling/lm_head.py",
+        "sha256": "ea7e28c81d72e13eef8ac8d73acae3d29068a40e4f3841c2f1fc7fa478215856",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.trainer.deepseek_v4_training": [
+      {
+        "source": "offline_training/train_mtp.py",
+        "sha256": "f46263ca190a008727d034e6dc57c7e25994e44f0e5053ed0fff4c6e659d863c",
+        "symbols": [
+          "run_dspark_training"
+        ]
+      }
+    ],
+    "verl_speco.models.deepseek_v4.export": [
+      {
+        "source": "loading_trained_mtp/loading_ds4.py",
+        "sha256": "cc381ca290db7ef6714f8a1a23d0b70cbe7bccf54d10cc70c8878758c73f72fd",
+        "symbols": "runtime dependency closure"
+      }
+    ],
+    "verl_speco.backends.vllm_ascend_model": [
+      {
+        "source": "training_common/utils/mtp_trainer.py",
+        "sha256": "f9c98ed7966f313031cc4e28d8b81cf21b1764b34450c623a554d28f8becd574",
+        "symbols": [
+          "load_mtp_draft_model (DSpark branch only)"
+        ]
+      }
+    ]
+  }
+}

@@ -13,6 +13,9 @@
 # limitations under the License.
 from __future__ import annotations
 
+import json
+import sys
+
 import pytest
 
 from verl_speco.draft_train_launcher import (
@@ -21,6 +24,63 @@ from verl_speco.draft_train_launcher import (
     resolve_launch_config,
     validate_tq_launch_config,
 )
+
+
+@pytest.mark.parametrize("backend", [None, "pytorch", "vllm_ascend"])
+def test_real_child_gets_policy_before_python_imports(tmp_path, monkeypatch, backend):
+    from verl_speco.draft_train_launcher import main
+
+    output = tmp_path / "environment.json"
+    child = tmp_path / "inspect_child"
+    child.write_text(
+        f"#!{sys.executable}\n"
+        "import os,json\nfrom pathlib import Path\n"
+        f"Path({str(output)!r}).write_text(json.dumps({{k:os.environ.get(k) for k in "
+        "['HCCL_DETERMINISTIC','LCCL_DETERMINISTIC','SPECO_TEST_KEEP']}))\n"
+    )
+    child.chmod(0o755)
+    monkeypatch.setenv("HCCL_DETERMINISTIC", "false")
+    monkeypatch.setenv("LCCL_DETERMINISTIC", "0")
+    monkeypatch.setenv("SPECO_TEST_KEEP", "retained")
+    arguments = ["--python-executable", str(child)]
+    if backend:
+        arguments.append(
+            f"actor_rollout_ref.rollout.drafter.training.backend={backend}"
+        )
+    assert main(arguments) == 0
+    actual = json.loads(output.read_text())
+    assert actual == {
+        "HCCL_DETERMINISTIC": "strict" if backend == "vllm_ascend" else "false",
+        "LCCL_DETERMINISTIC": "1" if backend == "vllm_ascend" else "0",
+        "SPECO_TEST_KEEP": "retained",
+    }
+    # Configuring the child must not mutate the launching process.
+    import os
+
+    assert os.environ["LCCL_DETERMINISTIC"] == "0"
+
+
+def test_ascend_profile_selection_and_explicit_pytorch_override():
+    from verl_speco.integration.ascend_state_config import standalone_launch_environment
+
+    profile = ["--config-name", "deepseek_v4_0731_draft_trainer"]
+    assert standalone_launch_environment(profile, {})["LCCL_DETERMINISTIC"] == "1"
+    assert (
+        standalone_launch_environment(
+            profile + ["actor_rollout_ref.rollout.drafter.training.backend=pytorch"], {}
+        )
+        is None
+    )
+    assert (
+        standalone_launch_environment(
+            profile + ["~actor_rollout_ref.rollout.drafter.training.backend"], {}
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="LCCL_DETERMINISTIC=1"):
+        standalone_launch_environment(
+            profile + ["++draft_engine.environment.LCCL_DETERMINISTIC=0"], {}
+        )
 
 
 def test_launcher_resolves_python_friendly_gpu_count_override() -> None:

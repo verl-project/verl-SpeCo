@@ -38,6 +38,10 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any, Iterable, cast
 
+from verl_speco.backends.training_backend import (
+    actor_capture_enabled,
+    is_vllm_ascend_drafter,
+)
 from verl_speco.integration.verl_npu_vllm_compat import (
     install_verl_npu_vllm_import_compat,
 )
@@ -1203,6 +1207,15 @@ def _load_env_drafter_config() -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def _embedded_rollout_draft_enabled() -> bool:
+    drafter = _load_env_drafter_config()
+    return bool(
+        is_vllm_ascend_drafter(drafter)
+        and drafter.get("training", {}).get("rollout_capture", {}).get("model_family")
+        == "deepseek_v4"
+    )
+
+
 def _vllm_drafter_env_payload(drafter_cfg: dict[str, Any]) -> dict[str, Any]:
     return dict(drafter_cfg)
 
@@ -1649,6 +1662,15 @@ def build_vllm_speculative_config_from_drafter(
 
     if not bool(drafter_cfg.get("enable")):
         return {}
+
+    if actor_capture_enabled(drafter_cfg):
+        from verl_speco.integration.vllm_rollout_capture import (
+            embedded_speculative_config,
+        )
+
+        embedded_config = embedded_speculative_config(drafter_cfg)
+        if embedded_config is not None:
+            return embedded_config
 
     algorithm = _drafter_algorithm(drafter_cfg)
     dynamic_spec_config = _dspark_dynamic_spec_config_from_rollout(rollout_cfg)
@@ -3757,7 +3779,14 @@ class _SpecoVLLMHttpServerMixin:
 
         gate = getattr(self, "_speco_rollout_admission_gate", None)
         if gate is None:
-            gate = RolloutAdmission()
+            if is_vllm_ascend_drafter(_load_env_drafter_config()):
+                from verl_speco.integration.serving_drafter_commit import (
+                    AscendRolloutAdmission,
+                )
+
+                gate = AscendRolloutAdmission()
+            else:
+                gate = RolloutAdmission()
             self._speco_rollout_admission_gate = gate
         return gate
 
@@ -3769,6 +3798,22 @@ class _SpecoVLLMHttpServerMixin:
 
     async def speco_resume_rollout_admission(self):
         self._speco_rollout_admission().resume()
+
+    async def speco_get_serving_versions(self):
+        if not is_vllm_ascend_drafter(_load_env_drafter_config()):
+            raise RuntimeError("Serving commit API requires backend=vllm_ascend")
+        from verl_speco.integration.serving_drafter_commit import serving_versions
+
+        return serving_versions(self)
+
+    async def speco_commit_serving_drafter_revision(self, expected_revision, revision, target_version):
+        if not is_vllm_ascend_drafter(_load_env_drafter_config()):
+            raise RuntimeError("Serving commit API requires backend=vllm_ascend")
+        from verl_speco.integration.serving_drafter_commit import (
+            commit_drafter_revision,
+        )
+
+        return commit_drafter_revision(self, expected_revision, revision, target_version)
 
     async def speco_set_serving_drafter_revision(self, revision):
         # The trainer calls this only after all weight commit RPCs have settled,
@@ -3917,6 +3962,17 @@ class _SpecoVLLMHttpServerActorClass:
     def options(self, **options):
         runtime_env = dict(options.get("runtime_env", {}) or {})
         env_vars = dict(runtime_env.get("env_vars", {}) or {})
+        from verl_speco.integration.ascend_state_config import (
+            parking_worker_environments,
+        )
+
+        _, serving_environment = parking_worker_environments(
+            {"rollout": {"drafter": _load_env_drafter_config()}}
+        )
+        for name, value in serving_environment.items():
+            if name in env_vars and env_vars[name] != value:
+                raise ValueError(f"Conflicting Ascend serving environment {name}: {env_vars[name]!r} != {value!r}")
+            env_vars[name] = value
         env_vars[self._SETUP_HOOK_ENV_VAR] = self._SETUP_HOOK_PATH
         runtime_env["env_vars"] = env_vars
         # Ray serializes per-actor runtime_env values as JSON before starting
@@ -3962,6 +4018,8 @@ def _patch_upstream_vllm_http_server_methods(upstream_cls: type[Any]) -> bool:
         "speco_wait_rollout_idle",
         "speco_resume_rollout_admission",
         "speco_set_serving_drafter_revision",
+        "speco_get_serving_versions",
+        "speco_commit_serving_drafter_revision",
         "_speco_request_id_from_generate_call",
         "_speco_pop_vllm_spec_decode_stats",
         "_speco_capture_request_spec_decode_stats",
@@ -4152,6 +4210,10 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
         sidecar_dir = os.path.abspath(sidecar_dir)
 
     drafter_env_payload = _vllm_drafter_env_payload(drafter_cfg)
+    if is_vllm_ascend_drafter(drafter_cfg):
+        from verl_speco.integration.vllm_rollout_capture import configure_capture
+
+        configure_capture(config, drafter_cfg, drafter_env_payload, engine_kwargs)
     if run_dir:
         runtime_drafter = _ensure_nested_mapping(
             config, ("actor_rollout_ref", "rollout", "drafter")
@@ -4387,6 +4449,12 @@ async def speco_vllm_update_draft_weights(
     flush_after = bool(training_cfg.get("draft_update_flush_after", True))
     generation_paused = False
     use_shm = _resolve_vllm_draft_update_use_shm(self, training_cfg)
+    if use_shm and is_vllm_ascend_drafter(drafter_cfg):
+        from verl_speco.transport.bucketed_weight_transfer import (
+            required_bucket_megabytes,
+        )
+
+        bucket_mb = required_bucket_megabytes(weights, int(bucket_mb))
     if (
         getattr(self, "replica_rank", -1) == 0
         and getattr(self, "rollout_rank", -1) == 0
@@ -4568,6 +4636,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     _speco_draft_level2_restore_pending = False
     _speco_draft_runtime_revision = 0
 
+
     def __new__(cls, **kwargs):
         # WorkerWrapperBase resolves and injects this extension before the
         # concrete vLLM worker is constructed. Install the native DSpark loader
@@ -4575,6 +4644,17 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         # WorkerDict-side installer runs in a different process and is too
         # early only for the frontend, not for this model-worker process.
         patch_vllm_dspark_draft_load_config()
+        from verl_speco.integration.ascend_state_config import state_parking_mode
+
+        if (
+            state_parking_mode({"rollout": {"drafter": _load_env_drafter_config()}})
+            == "camem"
+        ):
+            from vllm_ascend.device_allocator.camem import CaMemAllocator
+
+            from verl_speco.trainer.ascend_state_parking import retain_camem_callbacks
+
+            retain_camem_callbacks(CaMemAllocator.get_instance())
         try:
             instance = super().__new__(cls, **kwargs)
         except TypeError:
@@ -4802,6 +4882,10 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
 
         if int(level) != 2:
             return 0
+        if _embedded_rollout_draft_enabled():
+            raise RuntimeError(
+                "DeepSeek V4 rollout capture has not validated embedded draft restore after level-2 sleep; use level 1 or disable sleep"
+            )
         self._speco_draft_level2_restore_pending = True
         return self._speco_snapshot_draft_for_level2()
 
@@ -5258,7 +5342,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             )
         return len(requested)
 
-    def update_draft_weights_from_ipc(self, use_shm: bool = False):
+    def update_draft_weights_from_ipc(
+        self, use_shm: bool = False, timeout: float | None = None
+    ):
         """Receive and load draft-model weights through the verl bucketed IPC path.
 
         Streams each transfer bucket through the model loader (the same path as
@@ -5300,6 +5386,20 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         is_dflash = draft_method == "dflash"
         is_dspark = draft_method == "dspark"
         is_eagle3 = draft_method == "eagle3"
+        embedded_loader = None
+        if _embedded_rollout_draft_enabled():
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+
+            from verl_speco.integration.deepseek_v4_online import EmbeddedDraftLoader
+
+            embedded_loader = EmbeddedDraftLoader(
+                draft_model,
+                tp_rank=get_tensor_model_parallel_rank(),
+                tp_size=get_tensor_model_parallel_world_size(),
+            )
 
         # Translate training-side names.  DFlash/DSpark publish into the inner
         # DFlashQwen3Model/Qwen3DSparkModel, while EAGLE3 publishes into the
@@ -5315,6 +5415,8 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             _strip_prefixes = (*_strip_prefixes, "model.")
 
         def translate_name(name: str) -> str:
+            if embedded_loader is not None:
+                return name
             n = name
             changed = True
             while changed:
@@ -5374,7 +5476,10 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             translated_bucket = [
                 (translate_name(str(name)), tensor) for name, tensor in bucket_weights
             ]
-            if is_dspark and target_param_names:
+            # Embedded Ascend names include a transport TP prefix. Its loader
+            # validates the decoded runtime parameter set, so inner-model name
+            # filtering here would incorrectly drop registered confidence heads.
+            if embedded_loader is None and is_dspark and target_param_names:
                 skipped = {
                     name
                     for name, _ in translated_bucket
@@ -5409,6 +5514,10 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 loaded_params += self._speco_update_draft_weights(translated_bucket)
                 return
 
+            if embedded_loader is not None:
+                embedded_loader.receive(translated_bucket)
+                return
+
             bucket_loaded_names = inner_model.load_weights(iter(translated_bucket))
             loaded_names.update(
                 self._speco_normalize_loaded_draft_weight_names(
@@ -5421,6 +5530,12 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             device=self.device,
             use_shm=use_shm,
         )
+        if timeout is not None and is_vllm_ascend_drafter(_load_env_drafter_config()):
+            from verl_speco.transport.bucketed_weight_transfer import (
+                configure_socket_timeout,
+            )
+
+            configure_socket_timeout(receiver, timeout)
         receiver.receive_weights(on_bucket_received=on_bucket_received)
 
         if not requested_names:
@@ -5439,11 +5554,14 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 draft_method,
                 first_keys,
             )
-            loaded_params = self._speco_validate_loaded_draft_weights(
-                requested_names,
-                loaded_names,
-                draft_method=draft_method,
-            )
+            if embedded_loader is not None:
+                loaded_params = embedded_loader.finish()
+            else:
+                loaded_params = self._speco_validate_loaded_draft_weights(
+                    requested_names,
+                    loaded_names,
+                    draft_method=draft_method,
+                )
 
             # Rebuild fused KV buffers (torch.cat snapshot, not a view).
             try:
@@ -5592,6 +5710,13 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
 
     def speco_ensure_draft_initialized(self) -> dict[str, Any]:
         """Load the base drafter once, before its first serving request."""
+
+        if _embedded_rollout_draft_enabled():
+            return {
+                "initialized": True,
+                "source": "embedded_target_checkpoint",
+                "loaded_params": 0,
+            }
         source = getattr(self, "_speco_draft_weight_source", None)
         if source in {"checkpoint", "online"}:
             return {"initialized": True, "source": source, "loaded_params": 0}
@@ -5643,6 +5768,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
 
     def _speco_sync_dspark_lm_head_from_target(self) -> int:
         """Update only the Actor-owned LM head and preserve trained draft weights."""
+
+        if _embedded_rollout_draft_enabled():
+            return 0  # The native DeepSeek V4 teacher head is part of the target.
 
         if not self._speco_is_dspark_algorithm():
             return 0

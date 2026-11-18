@@ -37,7 +37,7 @@ version = { attr = "verl_speco.__version__" }
 include = ["verl_speco*"]
 
 [tool.setuptools.package-data]
-verl_speco = ["config/*.yaml"]
+verl_speco = ["config/*.yaml", "config/*.json"]
 
 [tool.mypy]
 python_version = "3.10"

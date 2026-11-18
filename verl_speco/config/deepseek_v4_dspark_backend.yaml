@@ -1,0 +1,163 @@
+# DeepSeek V4 DSpark numerical defaults. Paths and orchestration are owned by SpeCo.
+model:
+  path: ???
+  type: ds4_dspark
+  ds4_layout: vllm_ascend
+  use_ascend_hc_ops: false
+  vllm_tensor_parallel_size: 8
+  vllm_data_parallel_size: auto
+  vllm_training_dp_replicate_moe: true
+  vllm_max_model_len: 4096
+  vllm_max_num_seqs: 4
+  vllm_max_num_batched_tokens: 8192
+  vllm_enable_chunked_prefill: true
+  vllm_enable_prefix_caching: true
+  vllm_async_scheduling: true
+  vllm_gpu_memory_utilization: 0.3
+  vllm_safetensors_load_strategy: lazy
+  vllm_block_size: 128
+  vllm_cache_dtype: auto
+  dspark_share_context_kv: true
+  vllm_compact_training_kv_cache: false
+  checkpoint_format: auto
+  vllm_quantization: auto
+  dequantize_mtp_for_training: auto
+  vllm_dtype: auto
+  vllm_distributed_init_method: null
+  vllm_set_ascend_env_defaults: true
+  vllm_enable_expert_parallel: false
+  vllm_additional_config:
+    enable_cpu_binding: true
+    enable_flashcomm1: false
+    multistream_overlap_shared_expert: false
+  vllm_compilation_config:
+    mode: NONE
+    cudagraph_mode: NONE
+    cudagraph_capture_sizes: []
+  vllm_model_loader_extra_config:
+    enable_multithread_load: true
+    num_threads: 16
+  resume_ckpt: null
+paths:
+  experiment_path: outputs/deepseek_v4_0731
+  save_dir: checkpoints
+train:
+  hidden_states_dir: null
+  prompts: null
+  epochs: 10
+  max_optimizer_steps: null
+  omp_num_threads: 2
+  max_len: null
+  segment_length: 4096
+  segment_overlap: 512
+  segment_min_loss_tokens: 1
+  pad_segment_tails: true
+  mmap_tensors: true
+  ttt_length: 1
+  dspark_anchor_min_spacing: 8
+  dspark_num_anchors: 128
+  dspark_ce_weight: 0.1
+  dspark_l1_weight: 0.9
+  dspark_kl_weight: 0
+  dspark_enable_confidence_head: false
+  dspark_confidence_weight: 0.0
+  dspark_hidden_state_noise_std: 0
+  dspark_loss_decay_gamma: 4
+  num_workers: 0
+  prefetch_factor: 4
+  persistent_workers: true
+  length_bucket_multiplier: 50
+  train_embeds: false
+  load_weights: full
+  loss_type: eagle
+  detach_hs_graph: false
+  scheduler: linear
+  warmup_ratio: 0
+  dspark_freeze_mlp: false
+  params_to_freeze: []
+validation:
+  hidden_states_dir: null
+  prompts: null
+  interval: 500
+optimizations:
+  common:
+    empty_cache_every: null
+    parallel_lm_head: true
+    lazy_segment_mmap_cache_size: 8
+    lazy_segment_source_locality: true
+    grouped_routed_moe_replay: true
+    fused_routed_moe_swiglu: true
+    fused_routed_moe_token_unpermute: true
+    fused_hc_forward: true
+    fp32_route_argsort: true
+    cache_dsa_metadata_structures: true
+    reuse_dsa_backward_host_metadata: true
+    reuse_dsa_backward_structures: true
+    fused_qnorm_unquantized_backward: true
+    dsa_backward_group_by_kv_length: true
+    explicit_dsa_backward: true
+    dsa_backward_selected_kv_row_budget: 4096
+    dsa_backward_max_queries_per_batch: 32
+    memory_chunking:
+      enabled: false
+      dsa_backward_query_chunk_size: 0
+      hc_token_chunk_size: 0
+      grouped_routed_moe_expert_streaming: false
+      grouped_routed_moe_route_budget: auto
+      grouped_routed_moe_max_experts_per_group: 16
+    buffered_deterministic_reduce: true
+    profile_optimizer_step: false
+    strict_runtime_diagnostics: false
+  mtp:
+    prune_grad_tree: false
+    valid_token_logits_only: true
+    vocab_parallel_kl: true
+    vocab_parallel_loss_token_chunk_size: 0
+    tp_shard_eh_projections: true
+    tp_shard_attention_projections: true
+    fused_eh_projection_collective: true
+  dspark:
+    dp_align_length_buckets: true
+    anchor_micro_batch_size: 32
+    reuse_combined_target_hidden_states: true
+    vocab_parallel_loss: true
+    coalesce_gradient_communication: true
+logging:
+  mlflow_tracking_uri: null
+  mlflow_experiment_name: speco_deepseek_v4
+  mlflow_run_name: null
+  interval: 1
+  extended_step_metrics: false
+  parameter_audit_details: false
+  prefix_accuracy_interval: 1
+  distribution_metrics_interval: 10
+  profile_step_phases: false
+  phase_profile_interval: 1
+debug:
+  profile_memory: false
+  seed: 4444
+deepspeed:
+  zero_allow_untested_optimizer: true
+  train_micro_batch_size_per_gpu: 2
+  gradient_accumulation_steps: 16
+  gradient_clipping: 1.0
+  bf16:
+    enabled: true
+  optimizer:
+    type: AdamW
+    params:
+      lr: 0.0001
+      betas:
+      - 0.9
+      - 0.95
+      eps: 1.0e-08
+      weight_decay: 0.0
+  zero_optimization:
+    stage: 1
+    allgather_partitions: true
+    allgather_bucket_size: 200000000.0
+    overlap_comm: false
+    reduce_scatter: true
+    reduce_bucket_size: 200000000.0
+    contiguous_gradients: true
+  steps_per_print: 10000000000.0

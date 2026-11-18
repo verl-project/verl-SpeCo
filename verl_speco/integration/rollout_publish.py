@@ -822,6 +822,20 @@ def export_actor_lm_head_weight(
     ):
         return None
 
+    from verl_speco.backends.training_backend import resolve_training_backend
+
+    if resolve_training_backend(getattr(worker, "config", None)) == "vllm_ascend":
+        from verl_speco.integration.deepseek_v4_online import (
+            export_target_output,
+            online_enabled,
+        )
+
+        if online_enabled(worker.config):
+            output = export_target_output(worker, keep_model_on_device=keep_model_on_device)
+            if getattr(worker, "rank", None) != 0:
+                return None
+            return {"ds4_target_output": output, "export_strategy": "ds4_full_output"}
+
     if _is_veomni_actor_worker(worker):
         return _export_veomni_actor_lm_head_weight(
             worker,

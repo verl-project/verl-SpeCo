@@ -1,0 +1,18 @@
+defaults:
+  - deepseek_v4_0731_draft_trainer
+  - _self_
+
+actor_rollout_ref:
+  rollout:
+    drafter:
+      speculative_algorithm: MTP
+draft_engine:
+  variant: ds4_mtp
+  # MTP is a different checkpoint family; do not assert the DSpark 0731 identity.
+  target_revision: null
+  output_dir: outputs/deepseek_v4_mtp
+  environment:
+    MTP_DS4_FUSED_ROUTED_MOE_SWIGLU: '1'
+trainer:
+  project_name: speco_deepseek_v4_mtp
+  experiment_name: native_mtp_offline

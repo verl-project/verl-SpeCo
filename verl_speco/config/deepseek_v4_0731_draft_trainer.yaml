@@ -1,0 +1,73 @@
+# Opt-in vLLM-Ascend training through the common standalone entrypoint.
+defaults:
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+
+speco:
+  draft_training:
+    nproc_per_node: 1
+    nnodes: 1
+    node_rank: null
+    master_addr: null
+    master_port: null
+    standalone: true
+
+actor_rollout_ref:
+  model:
+    path: ???
+  rollout:
+    drafter:
+      speculative_algorithm: DSPARK
+      training:
+        backend: vllm_ascend
+        mode: offline
+        feature_store:
+          type: torch_shard
+          path: ???
+        # Absolute optimizer-step limit, including restored progress.
+        max_steps: 1
+        save_interval_steps: 1
+        save_final_checkpoint: true
+
+draft_engine:
+  variant: ds4_dspark
+  target_revision: '0731'
+  # Required assertion when consuming a versioned store captured during RL.
+  target_runtime_version: null
+  # Deprecated compatibility fields; native code is packaged in verl_speco.
+  source_root: null
+  source_fingerprint: null
+  implementation_fingerprint: null
+  config_path: null
+  # preflight validates source, feature store and TP/DP batches without NPU.
+  action: preflight
+  require_runtime: false
+  output_dir: outputs/ds4_draft_0731
+  resume_from: null
+  overrides:
+    train:
+      # Keep store access and recovery cursors in the training process.
+      num_workers: 0
+      dspark_hidden_state_noise_std: 0.0
+  environment:
+    # TP replicas must receive identical gradient sums before Adam updates.
+    HCCL_DETERMINISTIC: 'strict'
+    LCCL_DETERMINISTIC: '1'
+    VLLM_USE_V2_MODEL_RUNNER: '0'
+    VLLM_ASCEND_ENABLE_FLASHCOMM1: '0'
+    TORCHDYNAMO_DISABLE: '1'
+    VLLM_ASCEND_APPLY_DSV4_PATCH: '1'
+    MTP_DS4_FUSED_ATTN_INNER_PRECISE: '1'
+    MTP_DS4_FUSED_SPARSE_ATTN_REPLAY: '1'
+    MTP_DS4_STREAMING_SPARSE_ATTN_VJP: '0'
+    MTP_DS4_CHECKPOINT_SPARSE_ATTN_REPLAY: '0'
+    MTP_DS4_SPARSE_ATTN_REPLAY_QUERY_CHUNK_SIZE: '256'
+    DS4_NPU_PROCESS_MEMORY_FRACTION: '0.90'
+
+trainer:
+  logger: [console]
+  project_name: speco_ds4
+  experiment_name: deepseek_v4_0731_dspark

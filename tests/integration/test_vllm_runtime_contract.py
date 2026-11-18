@@ -2629,3 +2629,68 @@ def test_vllm_draft_loader_rejects_partial_online_update() -> None:
             {"layers.0.self_attn.qkv_proj.weight"},
             draft_method="dspark",
         )
+
+
+def test_embedded_ascend_ipc_preserves_encoded_confidence_parameter(monkeypatch):
+    import torch
+
+    import verl_speco.integration.vllm_runtime as runtime
+    from verl_speco.integration.deepseek_v4_online import runtime_weight_name
+
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.proj = torch.nn.Linear(2, 2, bias=False)
+    model.model.confidence_head = torch.nn.Module()
+    model.model.confidence_head.proj = torch.nn.Linear(2, 1, bias=False)
+    expected = {
+        name: torch.full_like(value, 0.25) for name, value in model.named_parameters()
+    }
+    pointers = {name: value.data_ptr() for name, value in model.named_parameters()}
+
+    class Receiver:
+        def __init__(self, **kwargs):
+            assert kwargs["use_shm"] is True
+
+        def receive_weights(self, on_bucket_received):
+            for name, value in expected.items():
+                on_bucket_received([(runtime_weight_name(0, 1, name), value)], False)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer",
+        SimpleNamespace(BucketedWeightReceiver=Receiver),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.platforms",
+        SimpleNamespace(current_platform=SimpleNamespace(device_type="cpu")),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed",
+        SimpleNamespace(
+            get_tensor_model_parallel_rank=lambda: 0,
+            get_tensor_model_parallel_world_size=lambda: 1,
+        ),
+    )
+    monkeypatch.setattr(runtime, "_embedded_rollout_draft_enabled", lambda: True)
+    monkeypatch.setattr(
+        runtime, "patch_verl_bucketed_weight_transfer_rebuild_ipc", lambda: False
+    )
+    monkeypatch.setattr(
+        runtime, "patch_verl_bucketed_weight_transfer_shm_reuse", lambda: False
+    )
+    monkeypatch.setattr(runtime, "trim_process_host_memory", lambda: None)
+    extension = SpecoVLLMColocateWorkerExtension()
+    extension.device = "cpu"
+    extension._get_speco_draft_zmq_handle = lambda: "ipc://test"
+    extension._speco_resolve_draft_model = lambda: (model, None)
+    extension._speco_draft_method = lambda: "dspark"
+    extension._speco_diag_draft_state = lambda *args, **kwargs: None
+    extension._speco_resolve_draft_proposer = lambda: None
+    result = extension.update_draft_weights_from_ipc(use_shm=True)
+    assert result == {"loaded_params": len(expected), "has_draft_model": True}
+    assert extension._speco_draft_runtime_revision == 1
+    for name, value in model.named_parameters():
+        torch.testing.assert_close(value, expected[name])
+        assert value.data_ptr() == pointers[name]

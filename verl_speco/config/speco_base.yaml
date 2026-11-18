@@ -162,12 +162,41 @@ actor_rollout_ref:
         allow_lossy_speculative_sampling: false
 
       training:
+        # Forward/backward implementation; independent of rollout engine and algorithm.
+        backend: pytorch
+        vllm_ascend:
+          # Deprecated: the backend implementation now ships with SpeCo.
+          source_root: null
+          source_fingerprint: null
+          implementation_fingerprint: null
+          config_path: null
+          # Shared worker path for temporary TP export shards.
+          work_dir: null
+          total_optimizer_steps: 10000
+          # Opt-in address-preserving release at the existing cleanup hooks.
+          state_parking: none
+          # File scratch bounds host RAM during persistent rollout/trainer swaps.
+          state_parking_storage: memory
+          state_parking_chunk_mib: 128
+          training_hccl_port_base: 61000
+          serving_hccl_port_base: 62000
+          resume_from: null
+          overrides: {}
         mode: online
         # Consumed by the standalone DFlash/DSpark producer only.
         # Cotrain collection keeps its existing behavior.
         preserve_prompt_hidden_states: false
         collect_hidden_states_from_sgl: false
+        # Also available with vllm_ascend: capture raw pre-HC in actor old-logprob.
+        # Select exactly one source; DeepSeek V4 actor capture requires PP=1.
         collect_hidden_states_from_old_logprob: false
+        # Removed: true is rejected for Ascend; use actor old-logprob or replay.
+        collect_hidden_states_from_rollout: false
+        rollout_capture:
+          max_pending_requests: 64
+          max_pending_bytes: 1073741824
+          max_rows_per_request: 8192
+          timeout: 120
         # SGLang does not apply the target final norm to captured aux states.
         # Keep this false unless training and serving consistently use pre-norm.
         allow_sglang_prenorm_last_layer: false

@@ -1,0 +1,33 @@
+# Merge over the shared Ascend defaults; do not change the DSpark default file.
+model:
+  type: ds4
+  ds4_layout: vllm_ascend
+  ds4_mtp_impl: vllm_import_train
+  checkpoint_format: bf16
+  vllm_quantization: null
+  dequantize_mtp_for_training: false
+  dspark_share_context_kv: false
+train:
+  epochs: 2
+  segment_length: 512
+  segment_overlap: 64
+  ttt_length: 2
+  loss_type: eagle
+  detach_hs_graph: false
+  num_workers: 0
+optimizations:
+  mtp:
+    prune_grad_tree: false
+    valid_token_logits_only: true
+    vocab_parallel_kl: true
+    tp_shard_eh_projections: false
+    tp_shard_attention_projections: false
+    fused_eh_projection_collective: false
+  dspark:
+    dp_align_length_buckets: false
+deepspeed:
+  train_micro_batch_size_per_gpu: 1
+  gradient_accumulation_steps: 1
+  optimizer:
+    params:
+      lr: 0.00001

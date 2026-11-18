@@ -68,6 +68,21 @@ def resolve_weight_update_mode(config: Any) -> str:
             "speco.runtime.weight_update_mode must be one of "
             f"{_WEIGHT_UPDATE_MODES}, got {raw!r}"
         )
+    from verl_speco.backends.training_backend import resolve_training_backend
+
+    training_mode = _get_nested(
+        config, ("actor_rollout_ref", "rollout", "drafter", "training", "mode"), None
+    )
+    if training_mode is None:
+        training_mode = _get_nested(
+            config, ("rollout", "drafter", "training", "mode"), "online"
+        )
+    if resolve_training_backend(config) == "vllm_ascend" and training_mode == "online":
+        if mode == "native":
+            raise ValueError(
+                "Online DeepSeek V4 runtime shards require weight_update_mode=compat"
+            )
+        return "compat"
     return mode
 
 

@@ -46,11 +46,11 @@ class StandaloneDrafterWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def run_standalone_training(self):
-        from verl_speco.trainer.draft_training_loop import (
-            _run_standalone_draft_training_async,
+        from verl_speco.backends.training_backend import (
+            run_standalone_training_async,
         )
 
-        return await _run_standalone_draft_training_async(
+        return await run_standalone_training_async(
             self.config,
             scheduled_commands=self.scheduled_commands,
             training_events=self.training_events,

@@ -25,9 +25,8 @@ import argparse
 import shlex
 import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
-
 
 _NPROC_KEYS = (
     "speco.draft_training.nproc_per_node",
@@ -259,10 +258,22 @@ def main(argv: list[str] | None = None) -> int:
         normalized_training_args,
         python_executable=args.python_executable,
     )
+    from verl_speco.integration.ascend_state_config import (
+        DETERMINISTIC_TRAINING_ENV,
+        standalone_launch_environment,
+    )
+
+    environment = standalone_launch_environment(normalized_training_args)
     if args.dry_run:
-        print(_format_command(command))
+        prefix = ""
+        if environment is not None:
+            prefix = " ".join(
+                f"{key}={value}" for key, value in DETERMINISTIC_TRAINING_ENV.items()
+            ) + " "
+        print(prefix + _format_command(command))
         return 0
-    return subprocess.run(command, check=False).returncode
+    options = {"env": environment} if environment is not None else {}
+    return subprocess.run(command, check=False, **options).returncode
 
 
 if __name__ == "__main__":

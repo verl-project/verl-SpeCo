@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from verl_speco.backends.training_backend import require_pytorch_training
+
 SUPPORTED_DRAFTER_ALGORITHMS = (
     "EAGLE1",
     "EAGLE2",
@@ -47,6 +49,7 @@ def build_trainer_backend(config, model_config) -> Any:
         model_config: The target model config passed to every backend.
     """
 
+    require_pytorch_training(config)
     raw_algorithm = config.rollout.drafter.speculative_algorithm
     algorithm = str(raw_algorithm).strip().upper()
 

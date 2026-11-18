@@ -1,0 +1,11 @@
+{
+  "source": "user-provided AIRDrafter-master",
+  "files": {
+    "training_common/modeling/ds4_mtp.py": "3788bf985043aee5bccbb22b7faea69eaf5e3455b394a76f3eda8e0643494d4a",
+    "training_common/utils/losses.py": "a0dd74acc462b6780e918a0eaf1f1a9107b65f4f8d91224c6a690b642aea2054",
+    "training_common/utils/data.py": "eb6d75729b90e8b206c8907ac68a2d13f04246466aee51035d021b4b652e5de0",
+    "offline_training/train_mtp.py": "f46263ca190a008727d034e6dc57c7e25994e44f0e5053ed0fff4c6e659d863c",
+    "tuner/trackers.py": "8c864a1fcccf2c17e17432c221a63a645d2f392fcc223ae1cb0293fe74439735"
+  },
+  "scope": "MTP native model shell; Eagle vocabulary loss; recursive teacher-forced shifts and global valid-token accumulation. SpeCo positive masks replace AIR prompt-mask semantics."
+}

@@ -874,11 +874,24 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             device_name=self.device_name,
         )
 
+        from verl_speco.integration.ascend_state_config import (
+            training_worker_environment,
+        )
+
+        worker_environment = training_worker_environment(self.config)
+        worker_options = {}
+        if worker_environment:
+            existing_options = getattr(self.ray_worker_group_cls, "keywords", {}) or {}
+            worker_options["worker_env"] = {
+                **dict(existing_options.get("worker_env", {}) or {}),
+                **worker_environment,
+            }
         worker_group = self.ray_worker_group_cls(
             resource_pool=resource_pool,
             ray_cls_with_init=drafter_cls,
             name_prefix="speco_drafter",
             device_name=self.device_name,
+            **worker_options,
         )
         worker_group.init_model()
         self.attach_speco_worker_group(worker_group)
@@ -1019,6 +1032,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_ensure_drafter_checkpoint_path()
 
         training_cfg = self._speco_drafter_training_config()
+        if (
+            training_cfg.get("backend", "pytorch") == "vllm_ascend"
+            and self._speco_drafter_training_mode() == "online"
+        ):
+            from verl_speco.integration.deepseek_v4_online import prepare_online_resume
+
+            prepare_online_resume(
+                training_cfg,
+                drafter_cfg.get("checkpoint_path"),
+                self._speco_resume_global_step_hint(),
+            )
+            return
         resume_setting = training_cfg.get("resume_trainer_state_from_checkpoint", None)
         if resume_setting is None:
             resume_setting = training_cfg.get(
@@ -1179,6 +1204,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_collection_plan = plan
         return plan
 
+
     @staticmethod
     def _speco_log_drafter_collection_plan(plan: CollectionPlan) -> None:
         logger.info(
@@ -1206,6 +1232,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             scheduler = DrafterScheduler()
             self._drafter_scheduler = scheduler
         return scheduler
+
 
     def _speco_get_drafter_runtime_state(self) -> DrafterRuntimeState:
         runtime_state = getattr(self, "_drafter_runtime_state", None)
@@ -2294,6 +2321,27 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ):
             return False
         training_cfg = self._speco_drafter_training_config()
+        if training_cfg.get("backend", "pytorch") == "vllm_ascend":
+            from verl_speco.integration.deepseek_v4_actor_capture import feature_source
+
+            feature_source(training_cfg)
+            pp_size = int(
+                _get_nested(
+                    self.config,
+                    (
+                        "actor_rollout_ref",
+                        "actor",
+                        "megatron",
+                        "pipeline_model_parallel_size",
+                    ),
+                    1,
+                )
+                or 1
+            )
+            if pp_size != 1:
+                raise ValueError(
+                    "DeepSeek V4 actor pre-HC capture currently requires actor PP=1"
+                )
         if bool(training_cfg.get("collect_hidden_states_from_sgl", False)):
             raise ValueError(
                 "SPECO old-logprob hidden collection requires "
@@ -2396,6 +2444,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
 
     def _speco_oldlogprob_hidden_layout(self) -> str:
+        if (
+            self._speco_drafter_training_config().get("backend", "pytorch")
+            == "vllm_ascend"
+        ):
+            from verl_speco.trainer.deepseek_v4_contract import LAYOUT
+
+            return LAYOUT
         drafter_cfg = self._speco_drafter_config()
         algorithm = _get_nested(drafter_cfg, ("speculative_algorithm",), "")
         return resolve_drafter_hidden_states_layout(
@@ -2513,6 +2568,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
 
     def _speco_oldlogprob_aux_layer_ids(self) -> list[int]:
+        if (
+            self._speco_drafter_training_config().get("backend", "pytorch")
+            == "vllm_ascend"
+        ):
+            from verl_speco.trainer.deepseek_v4_contract import DeepSeekV4Contract
+
+            return list(
+                DeepSeekV4Contract.from_model(
+                    self.config.actor_rollout_ref.model.path
+                ).target_layer_ids
+            )
         drafter_cfg = self._speco_drafter_config()
         model_configs = []
         for path_key in ("model_path", "checkpoint_path"):
@@ -3591,6 +3657,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_collected_samples = outcome.collected_samples
         return outcome.collected_samples
 
+
     def _speco_owner_route_mapping(self):
         worker_group = self.drafter_wg
         if worker_group is None:
@@ -3946,6 +4013,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if payload:
             self._speco_last_published_drafter_payload = payload
             self._speco_last_published_drafter_step = 0
+            if (
+                self._speco_drafter_training_config().get("backend", "pytorch")
+                == "vllm_ascend"
+            ):
+                self._speco_update_rollout_drafter_weights(
+                    payload, self.global_steps, asynchronous=False
+                )
+                self._speco_last_published_drafter_step = self.global_steps
 
     def _speco_wait_pending_drafter_publish_rpc(self) -> int:
         if not self._pending_drafter_publish_refs:
@@ -4414,6 +4489,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 batch_td[_SPECO_VLLM_REQUEST_MEAN_ACCEPT_LEN_KEY] = collect_plan[
                     "request_mean_accept_len"
                 ]
+            if (
+                self._speco_drafter_training_config().get("backend", "pytorch")
+                == "vllm_ascend"
+            ):
+                from verl_speco.integration.deepseek_v4_actor_capture import (
+                    CONTRACT_KEY,
+                )
+                from verl_speco.trainer.deepseek_v4_contract import DeepSeekV4Contract
+
+                tu.assign_non_tensor_data(
+                    batch_td,
+                    CONTRACT_KEY,
+                    DeepSeekV4Contract.from_model(
+                        self.config.actor_rollout_ref.model.path
+                    ).identity(),
+                )
             tu.assign_non_tensor_data(
                 batch_td,
                 OLD_LOGPROB_AUX_LAYER_IDS_KEY,

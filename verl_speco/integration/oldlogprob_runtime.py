@@ -197,7 +197,12 @@ def _oldlogprob_hidden_layout(micro_batch: Any) -> str:
             value = micro_batch[OLD_LOGPROB_HIDDEN_LAYOUT_KEY]
     value = getattr(value, "data", value)
     layout = str(value or "eagle3_aux_plus_last")
-    if layout not in {"eagle3_aux_plus_last", "dflash_aux", "dflash_aux_plus_last"}:
+    if layout not in {
+        "eagle3_aux_plus_last",
+        "dflash_aux",
+        "dflash_aux_plus_last",
+        "deepseek_v4_0731_dspark_pre_hc_v1",
+    }:
         raise ValueError(f"Unsupported SPECO old-logprob hidden layout: {layout!r}")
     return layout
 
@@ -1083,6 +1088,17 @@ def _build_selection_context(
     pad_mode = tu.get_non_tensor_data(
         data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING
     )
+    if (
+        not use_remove_padding
+        and pad_mode == DatasetPadMode.NO_PADDING
+        and _oldlogprob_hidden_layout(micro_batch)
+        == "deepseek_v4_0731_dspark_pre_hc_v1"
+    ):
+        from verl_speco.integration.deepseek_v4_actor_capture import (
+            padded_selection_context,
+        )
+
+        return padded_selection_context(engine, micro_batch)
     if not use_remove_padding or pad_mode != DatasetPadMode.NO_PADDING:
         raise NotImplementedError(
             "SPECO old-logprob hidden collection currently requires use_remove_padding=True "
@@ -1877,6 +1893,11 @@ def _install_oldlogprob_hidden_hooks(
         )
 
     selection_context = _build_selection_context(engine, output_args, micro_batch)
+    if _oldlogprob_hidden_layout(micro_batch) == "deepseek_v4_0731_dspark_pre_hc_v1":
+        from verl_speco.integration.deepseek_v4_actor_capture import install_hooks
+
+        install_hooks(engine, layers, selection_context, micro_batch)
+        return
     aux_layer_ids = _oldlogprob_aux_layer_ids_from_batch(micro_batch)
     layer_id_space = _oldlogprob_aux_layer_id_space(micro_batch)
     hidden_layout = _oldlogprob_hidden_layout(micro_batch)
@@ -2008,6 +2029,8 @@ def _select_oldlogprob_hidden_states(
 
     import torch
 
+    if _oldlogprob_hidden_layout(micro_batch) == "deepseek_v4_0731_dspark_pre_hc_v1":
+        raise ValueError("DeepSeek V4 pre-HC actor capture requires forward_hook")
     hidden_states = getattr(output, "hidden_states", None)
     if hidden_states is None and isinstance(output, dict):
         hidden_states = output.get("hidden_states")
@@ -2543,6 +2566,11 @@ def _install_megatron_hidden_hooks(engine: Any, model: Any, micro_batch: Any) ->
         )
 
     selection_context = _build_megatron_selection_context(engine, model, micro_batch)
+    if _oldlogprob_hidden_layout(micro_batch) == "deepseek_v4_0731_dspark_pre_hc_v1":
+        from verl_speco.integration.deepseek_v4_actor_capture import install_hooks
+
+        install_hooks(engine, layers, selection_context, micro_batch)
+        return
     pp_rank = selection_context["pp_rank"]
     pp_size = selection_context["pp_size"]
     is_last_stage = selection_context["is_last_stage"]
