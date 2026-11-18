@@ -50,3 +50,5 @@ DSpark 原有 l1/confidence 用原始 softmax，只有 LK 分支使用 lk_temper
 2. GPU、标准 DSpark layout 实现公共组件与 VAT；参考 VAT 数值对齐和发布/resume 验证。
 3. L1 先验证同步单轮，再补 async/preemption/多轮/窗口测试，最后接入 Draft-OPD loss。
 4. NPU 动态验证、bonus checkpoint、L2 和 SPARK 各自独立验收，避免影响基础路径交付。
+
+Last updated: 11/19/2026

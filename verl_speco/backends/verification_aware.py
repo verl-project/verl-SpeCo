@@ -56,6 +56,10 @@ class VATObjective(nn.Module):
     def _teacher_terms(self, logits, target_hidden, weight):
         with torch.no_grad():
             teacher = F.linear(target_hidden, weight).float()
+        if self.kd_weight == 0:
+            return teacher.argmax(-1), logits.new_zeros(
+                logits.shape[0], dtype=torch.float32
+            )
         kd = F.kl_div(
             F.log_softmax(logits.float() / self.temperature, -1),
             F.softmax(teacher / self.temperature, -1),
@@ -74,6 +78,7 @@ class VATObjective(nn.Module):
         target_ids,
         confidence_logits=None,
         observed_accepted=None,
+        position_weights=None,
     ):
         if target_hidden is None:
             raise ValueError("VAT requires dflash_aux_plus_last target hidden states")
@@ -93,16 +98,24 @@ class VATObjective(nn.Module):
         accepted = (match & valid).long().cumprod(-1).sum(-1, keepdim=True)
         sim_accepted = accepted
         if observed_accepted is not None:
-            accepted = torch.where(observed_accepted.unsqueeze(-1) >= 0,
-                                   observed_accepted.unsqueeze(-1), accepted)
-            match = torch.where(observed_accepted.unsqueeze(-1) >= 0,
-                                torch.arange(valid.shape[-1], device=logits.device) < accepted,
-                                match)
+            accepted = torch.where(
+                observed_accepted.unsqueeze(-1) >= 0,
+                observed_accepted.unsqueeze(-1),
+                accepted,
+            )
+            match = torch.where(
+                observed_accepted.unsqueeze(-1) >= 0,
+                torch.arange(valid.shape[-1], device=logits.device) < accepted,
+                match,
+            )
         j = torch.arange(valid.shape[-1], device=logits.device)
         decay = torch.exp(-(j - accepted).clamp_min(0).float() / self.gamma)
         weights = base_mask.clone()
         weights[..., offset:] *= decay
-        active_weights = weights.reshape(-1)[active_mask]
+        loss_weights = (
+            weights if position_weights is None else weights * position_weights
+        )
+        active_weights = loss_weights.reshape(-1)[active_mask]
         kd_loss = (kd * active_weights).sum() / active_weights.sum().clamp_min(1e-6)
         targets = torch.zeros_like(base_mask)
         head_mask = base_mask.clone()
@@ -113,6 +126,8 @@ class VATObjective(nn.Module):
             targets[..., offset:] = match.float()
             head_mask[..., offset:] *= j <= accepted
             accept_logits = confidence_logits
+        if position_weights is not None:
+            head_mask = head_mask * position_weights
         hw = head_mask.reshape(-1)[active_mask]
         accept_loss = (
             F.binary_cross_entropy_with_logits(
@@ -123,7 +138,7 @@ class VATObjective(nn.Module):
             * hw
         ).sum()
         accept_loss = accept_loss / hw.sum().clamp_min(1e-6)
-        cov_loss = logits.sum() * 0.0
+        cov_loss = logits[:0].sum()
         if self.cov_weight > 0:
             neg_log_q = torch.zeros_like(base_mask)
             neg_log_q.reshape(-1)[active_mask] = (
@@ -158,7 +173,12 @@ class VATObjective(nn.Module):
         if observed_accepted is not None:
             traced = (observed_accepted >= 0) * blocks
             metrics["vat/sim_vs_obs_visible_accept_gap"] = (
-                (sim_accepted.squeeze(-1) - torch.minimum(
-                    observed_accepted, valid.long().cumprod(-1).sum(-1))).float().abs() * traced
+                (
+                    sim_accepted.squeeze(-1)
+                    - torch.minimum(observed_accepted, valid.long().cumprod(-1).sum(-1))
+                )
+                .float()
+                .abs()
+                * traced
             ).sum() / traced.sum().clamp_min(1)
         return weights, loss, metrics

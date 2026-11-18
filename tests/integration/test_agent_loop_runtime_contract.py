@@ -37,6 +37,7 @@ def test_agent_loop_preserves_spec_decode_metric_fields() -> None:
 def test_vllm_remote_worker_installs_and_transports_verify_trace(monkeypatch, layout):
     import sys
 
+    pytest.importorskip("torch")
     from verl_speco.backends.drafter_opd import preprocess_trace
     from verl_speco.integration.verify_trace import TRACE_KEY, token_digest
 
@@ -575,3 +576,26 @@ def test_failed_or_cancelled_request_releases_idle_barrier(cancel):
             pass
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("already_wrapped", [False, True])
+def test_vllm_manager_preserves_native_transfer_queue_worker(monkeypatch, already_wrapped):
+    import sys
+    class BaseWorker:
+        pass
+    class QueueWorker(BaseWorker):
+        def write_to_queue(self):
+            return "queued"
+    if already_wrapped:
+        QueueWorker._speco_explicit_worker_runtime = True
+    actor = SimpleNamespace(__ray_actor_class__=QueueWorker)
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(remote=lambda cls: cls))
+    manager = SimpleNamespace(
+        config=SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(name="vllm"))),
+        agent_loop_workers_class=actor)
+    agent_loop_runtime._configure_speco_agent_loop_manager_instance(manager, BaseWorker)
+    if already_wrapped:
+        assert manager.agent_loop_workers_class is actor
+    else:
+        assert issubclass(manager.agent_loop_workers_class, QueueWorker)
+        assert manager.agent_loop_workers_class.write_to_queue(None) == "queued"

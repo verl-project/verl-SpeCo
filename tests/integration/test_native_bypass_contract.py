@@ -223,10 +223,13 @@ def test_run_uses_speco_task_runner_when_drafter_enabled(
     task_runner_class = calls[0]
     assert task_runner_class is not None
     assert actors == [SpecoTaskRunner]
-    assert task_runner_class is (sentinel if diagnostic_enabled else actor)
-    assert options == (
-        [{"runtime_env": {"env_vars": env}}] if diagnostic_enabled else []
-    )
+    assert task_runner_class is sentinel
+    assert len(options) == 1
+    forwarded = options[0]["runtime_env"]["env_vars"]
+    from verl_speco.integration.drafter_config_env import SPECO_DRAFTER_CONFIG_ENV
+    import json
+    assert json.loads(forwarded[SPECO_DRAFTER_CONFIG_ENV])["enable"] is True
+    assert {key: value for key, value in forwarded.items() if key != SPECO_DRAFTER_CONFIG_ENV} == env
 
 
 def test_run_bypass_propagates_training_without_rollout_error(monkeypatch) -> None:

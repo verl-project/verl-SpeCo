@@ -35,6 +35,7 @@ import types
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import Any, Iterable, cast
 
@@ -1216,7 +1217,11 @@ def _validate_vllm_dflash_drafter_config(
 
 
 def _load_env_drafter_config() -> dict[str, Any]:
-    raw = get_drafter_config_env()
+    return _parse_env_drafter_config(get_drafter_config_env())
+
+
+@lru_cache(maxsize=1)
+def _parse_env_drafter_config(raw: str | None) -> dict[str, Any]:
     if not raw:
         return {}
     try:
@@ -3097,25 +3102,47 @@ def patch_vllm_request_acceptance_stats() -> bool:
 
         def patched_update_from_output(self, scheduler_output, model_runner_output):
             opd_cfg = _load_env_drafter_config()
-            capture = opd_cfg.get("training", {}).get("drafter_opd", {}).get("capture_verify_trace", False)
+            capture = (
+                opd_cfg.get("training", {})
+                .get("drafter_opd", {})
+                .get("capture_verify_trace", False)
+            )
             if capture:
                 from verl_speco.integration.verify_trace import snapshot_verify_step
+
                 if self.num_sampled_tokens_per_step != 1:
-                    raise ValueError("Draft-OPD requires one target correction/bonus token per step")
-                snapshots = snapshot_verify_step(self, scheduler_output, model_runner_output)
+                    raise ValueError(
+                        "Draft-OPD requires one target correction/bonus token per step"
+                    )
+                snapshots = snapshot_verify_step(
+                    self, scheduler_output, model_runner_output
+                )
             engine_core_outputs = original_update_from_output(
                 self, scheduler_output, model_runner_output
             )
             if capture:
-                from verl_speco.integration.verify_trace import TRACE_KEY, finish_verify_step
+                from verl_speco.integration.verify_trace import (
+                    TRACE_KEY,
+                    finish_verify_step,
+                )
+
                 traces = finish_verify_step(
-                    snapshots, layout=_drafter_algorithm(opd_cfg).lower(),
-                    capacity=int(self.num_spec_tokens))
+                    snapshots,
+                    layout=_drafter_algorithm(opd_cfg).lower(),
+                    capacity=int(self.num_spec_tokens),
+                )
                 store = _speco_vllm_request_stats_store(self)
                 for rid, trace in traces.items():
-                    item = store.setdefault(rid, {"verify_rounds": 0, "draft_tokens": 0,
-                                                  "accepted_tokens": 0, "invalid_spec_tokens": 0,
-                                                  "started_sec": time.perf_counter()})
+                    item = store.setdefault(
+                        rid,
+                        {
+                            "verify_rounds": 0,
+                            "draft_tokens": 0,
+                            "accepted_tokens": 0,
+                            "invalid_spec_tokens": 0,
+                            "started_sec": time.perf_counter(),
+                        },
+                    )
                     item[TRACE_KEY] = trace
             try:
                 finished_outputs = []
@@ -3612,7 +3639,9 @@ def _vllm_request_accept_fields_from_summaries(
         "_verl_request_mean_accept_len": mean_accept_len,
     }
     if any("_speco_verify_trace" in summaries[rid] for rid in ordered_ids):
-        fields["_speco_verify_trace"] = [summaries[rid].get("_speco_verify_trace") for rid in ordered_ids]
+        fields["_speco_verify_trace"] = [
+            summaries[rid].get("_speco_verify_trace") for rid in ordered_ids
+        ]
     return fields
 
 
@@ -4350,12 +4379,20 @@ async def _speco_generate_with_request_stats_unblocked(
             )
 
             bridge_request_acceptance_counters(extra_fields)
-            if _load_env_drafter_config().get("training", {}).get("drafter_opd", {}).get("capture_verify_trace", False):
+            if (
+                _load_env_drafter_config()
+                .get("training", {})
+                .get("drafter_opd", {})
+                .get("capture_verify_trace", False)
+            ):
                 from verl_speco.integration.verify_trace import TRACE_KEY, token_digest
+
                 trace = extra_fields[TRACE_KEY]
                 prompt_ids = kwargs["prompt_ids"] if "prompt_ids" in kwargs else args[0]
                 if trace["response_length"] != len(output.token_ids):
-                    raise ValueError("Draft-OPD trace and returned response length differ")
+                    raise ValueError(
+                        "Draft-OPD trace and returned response length differ"
+                    )
                 trace["prefix_digest"] = token_digest([*prompt_ids, *output.token_ids])
                 trace["drafter_revision_min"] = min(revision_before, revision_after)
                 trace["drafter_revision_max"] = max(revision_before, revision_after)
@@ -4884,7 +4921,9 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     opd_cfg = drafter_cfg.get("training", {}).get("drafter_opd", {})
     if opd_cfg.get("enable", False):
         if not enabled or not opd_cfg.get("capture_verify_trace", False):
-            raise ValueError("Draft-OPD requires drafter.enable and capture_verify_trace")
+            raise ValueError(
+                "Draft-OPD requires drafter.enable and capture_verify_trace"
+            )
         if _drafter_algorithm(drafter_cfg) not in {"DFLASH", "DSPARK"}:
             raise ValueError("Draft-OPD supports DFLASH and DSPARK")
         is_dflash = _drafter_algorithm(drafter_cfg) == "DFLASH"

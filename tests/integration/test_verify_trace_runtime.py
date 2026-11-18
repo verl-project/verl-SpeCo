@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("torch")
+
 import verl_speco.integration.vllm_runtime as runtime
 from verl_speco.integration.verify_trace import TRACE_KEY, validate_verify_trace
 
@@ -92,3 +94,24 @@ def test_scheduler_patch_transports_trace_on_finished_request(
         assert fields[TRACE_KEY] == trace
     else:
         assert TRACE_KEY not in summary
+
+
+
+def test_env_config_parsing_cached_until_raw_value_changes(monkeypatch):
+    runtime._parse_env_drafter_config.cache_clear()
+    calls = []
+    original = json.loads
+    def parse(raw):
+        calls.append(raw)
+        return original(raw)
+    monkeypatch.setattr(runtime.json, "loads", parse)
+    monkeypatch.setenv(runtime.SPECO_DRAFTER_CONFIG_ENV, '{"training": {}}')
+    for _ in range(5):
+        assert runtime._load_env_drafter_config() == {"training": {}}
+    assert len(calls) == 1
+    monkeypatch.setenv(runtime.SPECO_DRAFTER_CONFIG_ENV, '{"enable": true}')
+    assert runtime._load_env_drafter_config() == {"enable": True}
+    assert len(calls) == 2
+    monkeypatch.setenv(runtime.SPECO_DRAFTER_CONFIG_ENV, '{invalid')
+    with pytest.raises(RuntimeError, match="Invalid"):
+        runtime._load_env_drafter_config()

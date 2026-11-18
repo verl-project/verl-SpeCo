@@ -290,6 +290,7 @@ async def _run_agent_loop_with_student_timing(call: Any, *args, **kwargs) -> Any
 
     student_decode_times: list[float] = []
     from verl_speco.integration.verify_trace import TURN_TRACES
+
     trace_token = TURN_TRACES.set([])
     token = _CURRENT_STUDENT_DECODE_TIMES.set(student_decode_times)
     try:
@@ -363,6 +364,7 @@ async def _speco_worker_run_agent_loop(
 
 async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs):
     from verl_speco.integration.verify_trace import merge_turn_traces
+
     merge_turn_traces(output)
     _speco_default_agent_loop_extra_fields(output)
     agent_loop_postprocess = _speco_parent_method(self, "_agent_loop_postprocess")
@@ -557,9 +559,14 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
 
     import ray
 
-    manager.agent_loop_workers_class = ray.remote(
-        _build_speco_agent_loop_worker_class(worker_cls)
-    )
+    existing_worker = getattr(manager, "agent_loop_workers_class", None)
+    existing_raw = getattr(existing_worker, "__ray_actor_class__", None)
+    if existing_raw is not None:
+        worker_cls = existing_raw
+    if not worker_cls.__dict__.get("_speco_explicit_worker_runtime", False):
+        manager.agent_loop_workers_class = ray.remote(
+            _build_speco_agent_loop_worker_class(worker_cls)
+        )
 
     if not is_sglang:
         # Install patches again in the Ray process, where upstream classes are
@@ -681,6 +688,7 @@ def install_agent_loop_runtime_patch() -> bool:
             record_serving_segment(result)
             if student_decode_times is not None:
                 from verl_speco.integration.verify_trace import collect_turn_trace
+
                 collect_turn_trace(result)
             return result
 
@@ -753,6 +761,7 @@ def install_agent_loop_runtime_patch() -> bool:
         @wraps(agent_loop_postprocess)
         async def speco_agent_loop_postprocess(self, output, validate, **kwargs):
             from verl_speco.integration.verify_trace import merge_turn_traces
+
             merge_turn_traces(output)
             extra_fields = getattr(output, "extra_fields", None)
             if isinstance(extra_fields, dict):

@@ -306,6 +306,7 @@ def test_dspark_forward_selects_target_positions_before_norm(apply_norm):
 
     trainer = SimpleNamespace(
         _debug_forward_count=0, draft_model=Draft(), block_size=2,
+        opd_objective=None,
         _sample_anchor_positions=lambda *a, **kw: (torch.tensor([[0]]), torch.tensor([[True]])),
         _create_noise_embed=lambda *a: torch.zeros(1, 1, 2, 2),
         _create_position_ids=lambda *a: (torch.arange(3), torch.arange(2)),

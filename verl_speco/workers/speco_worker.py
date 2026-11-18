@@ -915,7 +915,7 @@ class SpecoWorker(Worker):
         if batch.get("_speco_verify_trace") is not None:
             prompt_len = batch["prompts"].numel()
             response_mask = batch["response_mask"].detach().cpu().float().reshape(-1)
-            loss_mask[prompt_len:prompt_len+response_mask.numel()] = response_mask
+            loss_mask[prompt_len : prompt_len + response_mask.numel()] = response_mask
         return loss_mask
 
     def _write_rollout_feature_sample(
@@ -1042,8 +1042,10 @@ class SpecoWorker(Worker):
                 metadata[key] = batch[key]
         if metadata.get("_speco_verify_trace") is not None:
             from verl_speco.integration.verify_trace import align_trace_to_prompt
+
             metadata["_speco_verify_trace"] = align_trace_to_prompt(
-                metadata["_speco_verify_trace"], batch["prompts"].numel())
+                metadata["_speco_verify_trace"], batch["prompts"].numel()
+            )
         feature_sample = DraftFeatureSample(
             algorithm=algorithm,
             input_ids=input_ids,

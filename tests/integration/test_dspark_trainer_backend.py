@@ -2444,7 +2444,8 @@ def test_drafter_opd_trace_survives_feature_store_preprocess_and_batch_padding()
     trainer = _label_packing_trainer()
     training = trainer.config.rollout.drafter.training
     training["drafter_opd"] = {"enable": True, "capture_verify_trace": True}
-    trainer.model_config.block_size = 2
+    trainer.model_config.block_size = 7
+    training["dspark_block_size"] = 2
     sample = _feature_sample(5, 5)
     sample.hidden_states = torch.cat([sample.hidden_states, torch.randn(5, 8)], -1)
     sample.metadata["hidden_states_layout"] = "dflash_aux_plus_last"
@@ -2464,3 +2465,52 @@ def test_drafter_opd_requires_full_vocabulary(model_type):
     with pytest.raises(ValueError, match="requires full_vocab"):
         DraftOPDObjective({}, layout=model_type, loss_mode="restricted_ce",
                           per_position_loss_weight="fixed_exp_decay")
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("front_count", [1, 3])
+def test_dflash_vat_zero_weight_prefix_still_accepts_matches(mixed, front_count):
+    config = DFlashConfig(hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+                         num_attention_heads=2, num_key_value_heads=1, vocab_size=32,
+                         num_target_layers=4, num_context_layers=2, target_hidden_size=8,
+                         target_num_hidden_layers=4, target_layer_ids=[1, 3], mask_token_id=31)
+    model = DFlashTrainingModel(
+        DFlashDraftModel(config), block_size=4, num_anchors=1,
+        front_position_weight=0., front_position_count=front_count,
+        per_position_loss_weight="vat",
+        drafter_opd_config={"enable": mixed, "anchor_planner": "mixed", "loss": "ce"})
+    model._sample_anchor_positions = lambda *args, **kwargs: (
+        torch.tensor([[1]]), torch.ones(1, 1, dtype=torch.bool))
+    loss, *_rest, metrics = model(
+        input_ids=torch.tensor([[1, 2, 3, 4, 5, 6]]),
+        hidden_states_list=[torch.randn(1, 6, 8), torch.randn(1, 6, 8)],
+        loss_mask=torch.ones(1, 6), lm_head_weight=torch.zeros(32, 8),
+        target_last_hidden_states=torch.randn(1, 6, 8),
+        opd_trace=torch.full((1, 6, 3), -1) if mixed else None)
+    assert metrics["vat/mean_accepted"].item() == 3
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all()
+               for p in model.vat_objective.accept_head.parameters())
+
+
+@pytest.mark.parametrize("model_type", ["dflash", "dspark"])
+def test_disabled_vat_does_not_overflow_fp16_hidden_sum(model_type):
+    config_cls = DFlashConfig if model_type == "dflash" else DSparkConfig
+    draft_cls = DFlashDraftModel if model_type == "dflash" else DSparkDraftModel
+    training_cls = DFlashTrainingModel if model_type == "dflash" else DSparkTrainingModel
+    config = config_cls(hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+                        num_attention_heads=2, num_key_value_heads=1, vocab_size=32,
+                        num_target_layers=4, num_context_layers=2, target_hidden_size=8,
+                        target_num_hidden_layers=4, target_layer_ids=[1, 3], mask_token_id=31)
+    model = training_cls(draft_cls(config), block_size=4, num_anchors=2).half()
+    model.draft_model.register_forward_hook(
+        lambda module, args, output: output * 0 + 2000)
+    with torch.autocast("cpu", dtype=torch.float16):
+        loss, *_ = model(
+            input_ids=torch.tensor([[1, 2, 3, 4, 5, 6]]),
+            hidden_states_list=[torch.randn(1, 6, 8).half(), torch.randn(1, 6, 8).half()],
+            loss_mask=torch.ones(1, 6), lm_head_weight=torch.zeros(32, 8).half(),
+            target_last_hidden_states=torch.zeros(1, 6, 8).half())
+    assert torch.isfinite(loss)
+    loss.backward()

@@ -165,6 +165,9 @@ def test_merged_dspark_publish_filters_only_untrained_confidence_head(
         model_type="dspark", confidence_head_alpha=confidence_alpha
     )
     worker._frozen_param_names = []
+    parameter = SimpleNamespace(requires_grad=confidence_alpha > 0)
+    draft = SimpleNamespace(confidence_head=SimpleNamespace(parameters=lambda: [parameter]))
+    worker._get_pretrained_export_model = lambda: (draft, ())
     for name in (
         "draft_model.confidence_head.proj.weight",
         "draft_model.confidence_head.proj.bias",

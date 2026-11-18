@@ -185,3 +185,40 @@ def test_self_coverage_uses_data_labels_not_teacher_argmax():
     )
     expected = -F.log_softmax(logits, -1)[:, 1].cumsum(-1).mean()
     torch.testing.assert_close(loss, expected)
+
+
+@pytest.mark.parametrize("layout", ["dflash", "dspark"])
+def test_fp16_vat_without_coverage_is_finite(layout):
+    obj = VATObjective(2, layout=layout, gamma=7., config={}, loss_mode="full_vocab")
+    logits = torch.full((1, 1024), -100., dtype=torch.float16, requires_grad=True)
+    hidden = torch.zeros(1, 2, requires_grad=True)
+    mask = torch.ones(1, 1, 1 + int(layout == "dflash"))
+    if layout == "dflash":
+        mask[..., 0] = 0
+    _, loss, _ = obj(logits, hidden, torch.zeros(1, 2), torch.zeros(1024, 2),
+                     mask, mask.flatten().bool(), torch.zeros(1, dtype=torch.long),
+                     hidden[:, 0])
+    assert torch.isfinite(loss)
+    loss.backward()
+    if logits.grad is not None:
+        assert torch.isfinite(logits.grad).all()
+
+
+def test_zero_kd_skips_kl_and_preserves_acceptance(monkeypatch):
+    logits = torch.tensor([[2., 0.], [0., 2.], [2., 0.]], requires_grad=True)
+    mask = torch.ones(1, 1, 3)
+    inputs = (logits, logits, logits.detach(), torch.eye(2), mask,
+              mask.flatten().bool(), torch.zeros(3, dtype=torch.long), torch.zeros(3))
+    enabled = VATObjective(2, layout="dspark", gamma=1., config={"kd_weight": 1.}, loss_mode="full_vocab")
+    disabled = VATObjective(2, layout="dspark", gamma=1., config={}, loss_mode="full_vocab")
+    expected_weights, _, expected_metrics = enabled(*inputs)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("KL evaluated with zero KD weight")
+    monkeypatch.setattr(F, "kl_div", forbidden)
+    monkeypatch.setattr(F, "softmax", forbidden)
+    monkeypatch.setattr(F, "log_softmax", forbidden)
+    weights, loss, metrics = disabled(*inputs)
+    torch.testing.assert_close(weights, expected_weights)
+    torch.testing.assert_close(metrics["vat/mean_accepted"], expected_metrics["vat/mean_accepted"])
+    assert metrics["vat/kd_loss"] == 0
+    loss.backward()

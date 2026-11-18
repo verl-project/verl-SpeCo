@@ -96,8 +96,8 @@ DSpark 的 draft logits 包含 Markov bias，prev token 取真实 response 前�
 从仓库根目录运行，先设置基础示例使用的 `MODEL_PATH`、`DRAFTER_PATH`、`TRAIN_FILE`、`TEST_FILE`、`CKPTS_DIR`：
 
 ```bash
-bash examples/run_qwen3-8b-drafter_opd_dflash_vllm.sh
-bash examples/run_qwen3-8b-drafter_opd_dspark_vllm.sh
+bash examples/run_qwen3-8b-opd_drafter_dflash_vllm.sh
+bash examples/run_qwen3-8b-opd_drafter_dspark_vllm.sh
 ```
 
 脚本设置 GPU MRv2、full_vocab、mixed + E2E TV、同步发布、单步样本保留和禁用 data buffer。TV 温度 0.6 与基础 rollout 温度一致。GPU 数和 TP 沿用基础示例，需按实际资源覆盖。
@@ -106,12 +106,12 @@ bash examples/run_qwen3-8b-drafter_opd_dspark_vllm.sh
 
 ```bash
 # Trace-only CE + 首拒倍权
-bash examples/run_qwen3-8b-drafter_opd_dflash_vllm.sh \
+bash examples/run_qwen3-8b-opd_drafter_dflash_vllm.sh \
   actor_rollout_ref.rollout.drafter.training.drafter_opd.anchor_planner=trace \
   actor_rollout_ref.rollout.drafter.training.drafter_opd.loss=ce
 
 # DSpark Draft-OPD + VAT
-bash examples/run_qwen3-8b-drafter_opd_dspark_vllm.sh \
+bash examples/run_qwen3-8b-opd_drafter_dspark_vllm.sh \
   actor_rollout_ref.rollout.drafter.training.dspark_per_position_loss_weight=vat \
   actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha=1.0
 ```
@@ -220,7 +220,7 @@ python -m pytest tests/integration/test_verify_trace_runtime.py \
 
 ### 同日：统一 DFlash 的训练和验证容量
 
-后续日志显示轨迹已到达训练预处理，但布局或容量校验失败。原错误消息没有给出实际值；核对用户指定的 `scripts/examples_20261106/run_qwen3-8b-drafter_opd_dflash_vllm.sh`，其中 `spec_verify_tokens=16`，训练 `dflash_block_size` 则默认 16，存在确定的容量差一位问题。
+后续日志显示轨迹已到达训练预处理，但布局或容量校验失败。原错误消息没有给出实际值；核对用户指定的 `scripts/examples_20261106/run_qwen3-8b-opd_drafter_dflash_vllm.sh`，其中 `spec_verify_tokens=16`，训练 `dflash_block_size` 则默认 16，存在确定的容量差一位问题。
 
 vLLM 将 `spec_verify_tokens` 直接映射为 `num_speculative_tokens`，scheduler 将该容量写入轨迹。DFlash 训练 block 的位置 0 是 anchor，实际 draft 容量为 `dflash_block_size - 1`；DSpark 的容量则等于 `dspark_block_size`。因此原 DFlash 示例会记录容量 16，而预处理要求 15。该配置问题与日志吻合；新错误消息也增加实际和期望的布局、容量，以便识别额外的服务器配置差异。
 
@@ -294,3 +294,16 @@ Ruff checks, license, device-boundary and diff-whitespace checks pass. The
 repository-wide documentation-date check still reports three unchanged files:
 `draft_opd_vat_spark_design.md`, `draft_opd_vat_spark_design_review.md` and
 `dspark_vat_publish_fix.md`. They already lack `Last updated` on the source branch.
+
+
+## Validation and experiment interpretation
+
+The mixed planner samples its random quota uniformly without replacement from
+valid sampled anchors before filling the remaining slots from the trace. Earlier
+runs retained the smallest sorted random anchors; rerun mixed experiments after
+this correction before comparing anchor policies.
+
+For VAT, speedups against a frozen drafter measure the combined benefit of online
+training and VAT. Isolating the VAT objective requires an ordinary online-training
+baseline with the same update frequency and rollout settings. CPU regression tests
+do not replace a distributed GPU/NPU training run.

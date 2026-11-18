@@ -464,3 +464,5 @@ drafter_opd:
 - DSpark 推理时是 greedy drafting 还是 probabilistic drafting？这决定了 VAT 和 confidence 标签默认用 `greedy` 还是 `probabilistic`。目前 vLLM 中 `draft_logits` 非空时走 probabilistic。
 - 是否需要 bonus-anchor（speculators 格式）的 DSpark checkpoint？如果不需要，`SlotLayout` 只实现两种即可。
 - P1 是否需要覆盖 NPU？只用 L1 的话可以复用；L2 需要额外排期。
+
+Last updated: 11/19/2026

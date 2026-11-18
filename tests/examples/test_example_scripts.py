@@ -88,6 +88,13 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
         assert f'exec bash "${{script_dir}}/{launch}"' in source
         source = (script.parent / launch).read_text(encoding="utf-8")
 
+    if "-vat_drafter_" in script.name or "-opd_drafter_" in script.name:
+        backend = "dflash" if "dflash" in script.name else "dspark"
+        base = f"run_qwen3-8b_drafter_{backend}_vllm.sh"
+        assert f"bash examples/{base}" in source
+        assert f"training.{backend}_loss_mode=full_vocab" in source
+        source += (script.parent / base).read_text(encoding="utf-8")
+
     assert (
         "python3 -m verl_speco.main" in source or "python -m verl_speco.main" in source
     )

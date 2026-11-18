@@ -95,6 +95,18 @@ class DraftOPDObjective(nn.Module):
         result = anchors.clone()
         result_keep = keep.clone()
         for row in range(bsz):
+            if self.planner == "mixed":
+                # Upstream samplers sort coordinates; choose the random quota
+                # uniformly from valid slots before packing the trace slots.
+                valid_slots = torch.nonzero(keep[row], as_tuple=True)[0]
+                random_slots = valid_slots[
+                    torch.randperm(valid_slots.numel(), device=anchors.device)[
+                        :random_count
+                    ]
+                ]
+                result_keep[row, :random_count] = False
+                result[row, : random_slots.numel()] = anchors[row, random_slots]
+                result_keep[row, : random_slots.numel()] = True
             candidates = torch.nonzero(trace[row, :, 1] > 0, as_tuple=True)[0]
             selected = candidates[
                 torch.randperm(candidates.numel(), device=anchors.device)[
@@ -135,8 +147,14 @@ class DraftOPDObjective(nn.Module):
         return (target_probs - draft_probs).abs().sum(-1) * 0.5
 
     def forward(
-        self, logits, target_hidden, weight, base_mask, active_mask,
-        *, position_weights,
+        self,
+        logits,
+        target_hidden,
+        weight,
+        base_mask,
+        active_mask,
+        *,
+        position_weights,
     ):
         if target_hidden is None:
             raise ValueError("Draft-OPD E2E TV requires final target hidden states")
@@ -163,7 +181,7 @@ class DraftOPDObjective(nn.Module):
         # Keep the count denominator so a single first rejection is amplified too.
         failures = (valid - survival) * position_weights[..., offset:]
         losses = failures.sum(-1) / counts.clamp_min(1)
-        return (losses * blocks).sum() / blocks.sum().clamp_min(1) + logits.sum() * 0.0
+        return (losses * blocks).sum() / blocks.sum().clamp_min(1) + logits[:0].sum()
 
     def metrics(self, loss, accepted, base_mask):
         valid = base_mask.bool().any(-1)

@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 from torch.nn import functional as F
 
 from verl_speco.backends.drafter_opd import DraftOPDObjective, preprocess_trace
@@ -398,3 +398,36 @@ def test_vat_uses_observed_acceptance_only_on_the_visible_prefix(
     assert metrics["vat/sim_vs_obs_visible_accept_gap"].item() == (
         1 if visible == 2 else 0
     )
+
+
+@pytest.mark.parametrize("layout", ["dflash", "dspark"])
+def test_uniform_fp16_tv_is_finite_zero(layout):
+    objective = DraftOPDObjective({}, layout=layout, loss_mode="full_vocab",
+                                  per_position_loss_weight="fixed_exp_decay")
+    logits = torch.full((1, 1024), -100., dtype=torch.float16, requires_grad=True)
+    base = torch.ones(1, 1, 1 + int(layout == "dflash"))
+    if layout == "dflash":
+        base[..., 0] = 0
+    loss = objective(logits, torch.zeros(1, 2, dtype=torch.float16),
+                     torch.zeros(1024, 2, dtype=torch.float16), base,
+                     base.flatten().bool(), position_weights=base)
+    assert loss.item() == 0
+    loss.backward()
+    assert torch.isfinite(logits.grad).all()
+
+
+def test_mixed_random_quota_samples_all_valid_sorted_slots():
+    objective = DraftOPDObjective({"anchor_planner": "mixed"}, layout="dspark",
+                                 loss_mode="full_vocab", per_position_loss_weight="fixed_exp_decay")
+    anchors = torch.arange(8).expand(1024, -1)
+    keep = torch.ones_like(anchors, dtype=torch.bool)
+    keep[:, 0] = False
+    coords = torch.full((1024, 8, 3), -1)
+    torch.manual_seed(42)
+    result, valid, accepted, *_ = objective.plan(anchors, keep, coords)
+    random = result[valid & (accepted < 0)]
+    assert random.numel() == 2048
+    counts = torch.bincount(random, minlength=8)
+    assert counts[0] == 0
+    assert (counts[1:] > 200).all() and (counts[1:] < 400).all()
+    assert (result[:, 0] != result[:, 1]).all()

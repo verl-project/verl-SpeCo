@@ -19,3 +19,5 @@ python -m pytest tests/integration/test_selective_publish_state.py tests/integra
 ```
 
 Ruff 检查通过；`test_selective_publish_state.py` 保留提交前已有的 5 项 E402 导入顺序诊断，本次对此文件忽略 E402 后检查通过。
+
+Last updated: 11/19/2026
