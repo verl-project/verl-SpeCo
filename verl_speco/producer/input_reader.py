@@ -19,9 +19,10 @@ import importlib
 import json
 import logging
 import os
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 import torch
 
@@ -136,6 +137,114 @@ def iter_input_records(
         state["consecutive"] = 0
         yield record
         sequence_no += 1
+
+
+class ShuffledInputUnsupportedError(ValueError):
+    """The input format cannot be indexed for shuffled replay (e.g. Parquet)."""
+
+
+class ShuffledJsonlReader:
+    """Byte-offset index over a JSONL input for shuffled replay.
+
+    Replacement for buffering the parsed dataset in memory: the index pass
+    stores one (byte offset, line number) pair per non-empty line and records
+    are re-read lazily in the caller's order, so memory stays at a few bytes
+    per line instead of one parsed record per line.
+
+    Parsing and the ``on_error`` policy match :func:`iter_input_records`. The
+    ``max_consecutive_errors`` breaker counts consecutive failures in the
+    shuffled order, which is a different grouping than the sequential order.
+    """
+
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        on_error: str = "skip",
+        max_consecutive_errors: int = 20,
+        parser_strict_roles: bool = False,
+    ) -> None:
+        if on_error not in {"skip", "raise"}:
+            raise ValueError(f"on_error must be 'skip' or 'raise', got {on_error!r}")
+        if max_consecutive_errors < 0:
+            raise ValueError("max_consecutive_errors must be >= 0")
+        input_path = Path(path)
+        if not input_path.is_file():
+            raise FileNotFoundError(f"Producer input file not found: {input_path}")
+        if _is_parquet(input_path):
+            raise ShuffledInputUnsupportedError(
+                f"Shuffled replay needs line-seekable JSONL input, got {input_path}"
+            )
+        self._input_path = input_path
+        self._on_error = on_error
+        self._max_consecutive_errors = max_consecutive_errors
+        self._parser_strict_roles = parser_strict_roles
+        self._offsets = array("q")
+        self._line_numbers = array("q")
+        with input_path.open("rb") as input_file:
+            offset = 0
+            line_number = 0
+            for raw_line in input_file:
+                line_number += 1
+                if raw_line.strip():
+                    self._offsets.append(offset)
+                    self._line_numbers.append(line_number)
+                offset += len(raw_line)
+
+    @property
+    def record_count(self) -> int:
+        return len(self._offsets)
+
+    def iter_records(self, order: Iterable[int]) -> Iterator[InputRecord]:
+        """Yield the record at ``self._offsets[i]`` for each ``i`` in ``order``."""
+        state = {"consecutive": 0, "skipped": 0}
+
+        def handle_error(location: str, error: Exception) -> None:
+            if self._on_error == "raise":
+                raise ValueError(
+                    f"Producer input at {location} is invalid: {error}"
+                ) from error
+            state["consecutive"] += 1
+            state["skipped"] += 1
+            logger.warning(
+                "Skipping invalid Producer input at %s (consecutive: %d/%d): %s",
+                location,
+                state["consecutive"],
+                self._max_consecutive_errors,
+                error,
+            )
+            if state["consecutive"] > self._max_consecutive_errors:
+                raise RuntimeError(
+                    f"Exceeded max_consecutive_errors="
+                    f"{self._max_consecutive_errors} while reading "
+                    f"{self._input_path} (last: {location}): {error}"
+                ) from error
+
+        sequence_no = 0
+        with self._input_path.open("rb") as input_file:
+            for index in order:
+                input_file.seek(self._offsets[index])
+                raw_line = input_file.readline()
+                line_number = self._line_numbers[index]
+                location = f"{self._input_path}:{line_number}"
+                try:
+                    payload = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    handle_error(
+                        location,
+                        ValueError(f"Invalid JSON object at {location}: {error}"),
+                    )
+                    continue
+                try:
+                    record = _record_from_payload(
+                        payload, location, sequence_no, self._parser_strict_roles
+                    )
+                except Exception as error:  # noqa: BLE001 - policy decides skip vs raise
+                    handle_error(location, error)
+                    continue
+                state["consecutive"] = 0
+                yield record
+                sequence_no += 1
 
 
 def _record_from_payload(
@@ -777,6 +886,7 @@ def _build_tokenized_request(
 
 
 def _token_ids(encoding: Any) -> list[int]:
+    value: Any
     if isinstance(encoding, (list, tuple)) or torch.is_tensor(encoding):
         value = encoding
     else:

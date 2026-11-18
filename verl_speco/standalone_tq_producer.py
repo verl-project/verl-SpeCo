@@ -19,6 +19,7 @@ import asyncio
 import logging
 import math
 import os
+import numpy as np
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -40,6 +41,7 @@ from verl_speco.producer.hidden_states_store import (
 from verl_speco.producer.input_reader import (
     GenerationRequest,
     SampleFilteredError,
+    ShuffledJsonlReader,
     TokenizedRequest,
     build_render_fn,
     iter_input_records,
@@ -243,6 +245,48 @@ async def publish_one(
     )
 
 
+def _assert_resume_shuffle_alignment(
+    resume_metadata: dict[str, Any] | None,
+    *,
+    shuffle: bool,
+    shuffle_seed: int,
+    consumed_sequence_nos: set[int],
+) -> None:
+    """Refuse a resume whose checkpoint was written under another shuffle config.
+
+    Consumed sequence numbers are positions in the per-epoch permutations, so
+    changing shuffle settings between runs silently duplicates or skips
+    samples instead of failing loudly. A legacy checkpoint that predates the
+    saved shuffle metadata cannot be verified either: with existing consumed
+    progress the original (sequential) ordering is the only safe replay, so a
+    shuffled resume is rejected. An empty progress set is a fresh run and may
+    start shuffled freely.
+    """
+    saved = (resume_metadata or {}).get("producer_shuffle")
+    if saved is None:
+        if shuffle and consumed_sequence_nos:
+            raise ValueError(
+                "Standalone resume checkpoint has consumed progress "
+                f"({len(consumed_sequence_nos)} sequence numbers) but predates "
+                "shuffle metadata, so its ordering cannot be verified: with "
+                "shuffle=true the replayed permutation would silently skip "
+                "unconsumed samples and repeat consumed ones. Keep "
+                "shuffle=false to continue this run, or clear the resume "
+                "checkpoint to start a fresh data-progress run."
+            )
+        return
+    saved_shuffle = bool(saved.get("shuffle", False))
+    saved_seed = int(saved.get("shuffle_seed", 42))
+    if saved_shuffle != shuffle or (shuffle and saved_seed != shuffle_seed):
+        raise ValueError(
+            "Standalone resume shuffle config changed since the checkpoint was "
+            f"saved: saved shuffle={saved_shuffle} shuffle_seed={saved_seed}, "
+            f"current shuffle={shuffle} shuffle_seed={shuffle_seed}; consumed "
+            "sequence numbers are permutation positions and would silently "
+            "misalign"
+        )
+
+
 def _read_on_missing_response(producer_cfg: Any) -> str:
     """Return the validated ``on_missing_response`` policy ('skip'|'generate')."""
     value = str(producer_cfg.get("on_missing_response", "skip") or "skip").lower()
@@ -279,6 +323,18 @@ def validate_producer_config(config: Any) -> str:
     missing = [name for name in required if not producer_cfg.get(name)]
     if missing:
         raise ValueError(f"standalone_tq_producer missing required fields: {missing}")
+    if bool(producer_cfg.get("shuffle", False)):
+        input_path = str(producer_cfg.get("input_path") or "")
+        if input_path.lower().endswith((".parquet", ".pq")):
+            # No bounded shuffled Parquet reader exists: rows have no cheap
+            # byte offsets to index, so shuffling would materialize the whole
+            # dataset before the first request. Fail at startup instead of
+            # taking that path silently.
+            raise ValueError(
+                "standalone_tq_producer.shuffle=true requires a line-seekable "
+                f"JSONL input, got Parquet {input_path!r}; convert the input "
+                "to JSONL or set shuffle=false"
+            )
     endpoints = producer_cfg.get("vllm_endpoints")
     if not isinstance(endpoints, list) or not endpoints or not all(endpoints):
         raise ValueError(
@@ -474,6 +530,12 @@ async def run_producer(
             producer_cfg.get("resume_checkpoint_path"),
             input_path=str(producer_cfg["input_path"]),
         )
+        _assert_resume_shuffle_alignment(
+            resume_metadata,
+            shuffle=bool(producer_cfg.get("shuffle", False)),
+            shuffle_seed=int(producer_cfg.get("shuffle_seed", 42)),
+            consumed_sequence_nos=consumed_sequence_nos,
+        )
         logger.info(
             "Standalone TQ Producer resume progress checkpoint=%s consumed=%s step=%s",
             producer_cfg.get("resume_checkpoint_path"),
@@ -655,6 +717,28 @@ async def run_producer(
                 last_heartbeat_at = now
 
         def iter_requests():
+            shuffle = bool(producer_cfg.get("shuffle", False))
+            shuffle_seed = int(producer_cfg.get("shuffle_seed", 42))
+            shuffled_reader: ShuffledJsonlReader | None = None
+            if shuffle:
+                # Parquet+shuffle is rejected up front in
+                # validate_producer_config; ShuffledInputUnsupportedError here
+                # only fires for Parquet content behind a non-Parquet name.
+                shuffled_reader = ShuffledJsonlReader(
+                    str(producer_cfg["input_path"]),
+                    on_error=str(producer_cfg.get("on_error", "skip") or "skip"),
+                    max_consecutive_errors=config_int(
+                        producer_cfg, "max_consecutive_errors", 20
+                    ),
+                    parser_strict_roles=bool(
+                        producer_cfg.get("parser_strict_roles", False)
+                    ),
+                )
+                logger.info(
+                    "Standalone TQ Producer indexed %s JSONL lines for shuffle_seed=%s",
+                    shuffled_reader.record_count,
+                    shuffle_seed,
+                )
             epoch = 0
             source_sequence_no = 0
             render_boundary_cfg = producer_cfg.get("render_boundary", {}) or {}
@@ -678,16 +762,29 @@ async def run_producer(
                 scanned_count = 0
                 considered_count = 0
                 produced_count = 0
-                for source_record in iter_input_records(
-                    str(producer_cfg["input_path"]),
-                    on_error=str(producer_cfg.get("on_error", "skip") or "skip"),
-                    max_consecutive_errors=config_int(
-                        producer_cfg, "max_consecutive_errors", 20
-                    ),
-                    parser_strict_roles=bool(
-                        producer_cfg.get("parser_strict_roles", False)
-                    ),
-                ):
+                if shuffled_reader is not None:
+                    # Deterministic per-epoch permutation (seed + epoch), so a
+                    # resumed run replays the same order and the consumed
+                    # sequence set stays aligned across restarts. Uses the
+                    # speculators RNG recipe (NumPy default_rng(seed + epoch)
+                    # .permutation, cf. distributed_batch_sampler) so the same
+                    # seed produces the same order there and here.
+                    record_order = np.random.default_rng(
+                        shuffle_seed + epoch
+                    ).permutation(shuffled_reader.record_count)
+                    record_iter = shuffled_reader.iter_records(record_order)
+                else:
+                    record_iter = iter_input_records(
+                        str(producer_cfg["input_path"]),
+                        on_error=str(producer_cfg.get("on_error", "skip") or "skip"),
+                        max_consecutive_errors=config_int(
+                            producer_cfg, "max_consecutive_errors", 20
+                        ),
+                        parser_strict_roles=bool(
+                            producer_cfg.get("parser_strict_roles", False)
+                        ),
+                    )
+                for source_record in record_iter:
                     sequence_no = source_sequence_no
                     source_sequence_no += 1
                     scanned_count += 1

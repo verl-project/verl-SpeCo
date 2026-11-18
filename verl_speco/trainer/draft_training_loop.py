@@ -171,6 +171,7 @@ async def _run_standalone_draft_training_async(
     last_saved_step = 0
     consumed_sequence_nos: set[int] = set()
     standalone_input_path = _standalone_input_path(config)
+    standalone_producer_shuffle = _standalone_producer_shuffle(config)
     store = None
     feature_replayer = None
     feature_producer = None
@@ -662,6 +663,11 @@ async def _run_standalone_draft_training_async(
                     input_path=(
                         standalone_input_path if feature_store_type == "tq" else None
                     ),
+                    producer_shuffle=(
+                        standalone_producer_shuffle
+                        if feature_store_type == "tq"
+                        else None
+                    ),
                 )
                 if rank == 0:
                     logger.info(
@@ -694,6 +700,9 @@ async def _run_standalone_draft_training_async(
                 consumed_sequence_nos=consumed_sequence_nos,
                 input_path=(
                     standalone_input_path if feature_store_type == "tq" else None
+                ),
+                producer_shuffle=(
+                    standalone_producer_shuffle if feature_store_type == "tq" else None
                 ),
             )
             if rank == 0:
@@ -792,6 +801,7 @@ def _save_standalone_checkpoint(
     wait: bool = False,
     consumed_sequence_nos: set[int] | None = None,
     input_path: str | None = None,
+    producer_shuffle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     consumed_snapshot = torch.tensor(
         sorted(consumed_sequence_nos or ()), dtype=torch.int64
@@ -809,6 +819,7 @@ def _save_standalone_checkpoint(
                     consumed_snapshot=consumed_snapshot,
                     step=step,
                     input_path=input_path,
+                    producer_shuffle=producer_shuffle,
                 )
             else:
                 future = getattr(trainer, "_pending_full_checkpoint_future", None)
@@ -821,6 +832,7 @@ def _save_standalone_checkpoint(
                             consumed_snapshot=consumed_snapshot,
                             step=step,
                             input_path=input_path,
+                            producer_shuffle=producer_shuffle,
                         )
                     )
         return result
@@ -856,6 +868,7 @@ def _save_standalone_checkpoint(
             consumed_snapshot=consumed_snapshot,
             step=step,
             input_path=input_path,
+            producer_shuffle=producer_shuffle,
         )
     elif future is not None:
         future.add_done_callback(
@@ -866,6 +879,7 @@ def _save_standalone_checkpoint(
                 consumed_snapshot=consumed_snapshot,
                 step=step,
                 input_path=input_path,
+                producer_shuffle=producer_shuffle,
             )
         )
     return {
@@ -905,6 +919,7 @@ def _finalize_standalone_checkpoint(
     consumed_snapshot: torch.Tensor | None = None,
     step: int | None = None,
     input_path: str | None = None,
+    producer_shuffle: dict[str, Any] | None = None,
 ) -> None:
     try:
         completed_future.result()
@@ -936,6 +951,7 @@ def _finalize_standalone_checkpoint(
             consumed_snapshot=consumed_snapshot,
             step=step,
             input_path=input_path,
+            producer_shuffle=producer_shuffle,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception(
@@ -954,6 +970,7 @@ def _finalize_standalone_checkpoint_files(
     consumed_snapshot: torch.Tensor | None,
     step: int | None,
     input_path: str | None,
+    producer_shuffle: dict[str, Any] | None = None,
 ) -> None:
     """Commit standalone-only files before publishing a managed checkpoint."""
 
@@ -964,6 +981,7 @@ def _finalize_standalone_checkpoint_files(
         consumed_snapshot,
         step=step,
         input_path=input_path,
+        producer_shuffle=producer_shuffle,
     )
     _set_standalone_checkpoint_complete(checkpoint_path, complete=True)
 
@@ -998,6 +1016,7 @@ def _save_resume_sidecar(
     *,
     step: int | None,
     input_path: str | None,
+    producer_shuffle: dict[str, Any] | None = None,
 ) -> None:
     if consumed_snapshot is None or step is None or input_path is None:
         return
@@ -1006,6 +1025,7 @@ def _save_resume_sidecar(
         consumed_snapshot,
         optimizer_step=step,
         input_path=input_path,
+        producer_shuffle=producer_shuffle,
     )
 
 
@@ -1019,6 +1039,30 @@ def _standalone_input_path(config: Any) -> str | None:
     if train_files is not None and len(train_files) == 1:
         return str(train_files[0])
     return None
+
+
+def _standalone_producer_shuffle(config: Any) -> dict[str, Any] | None:
+    """Producer shuffle settings to persist beside standalone checkpoints.
+
+    Consumed sequence numbers are permutation positions, so a resumed Producer
+    must see the settings that produced them (see ``_assert_resume_shuffle_
+    alignment`` in the producer).
+    """
+    speco_cfg = getattr(config, "speco", None)
+    if speco_cfg is None and isinstance(config, dict):
+        speco_cfg = config.get("speco")
+    producer_cfg = getattr(speco_cfg, "standalone_tq_producer", None)
+    if producer_cfg is None and isinstance(speco_cfg, dict):
+        producer_cfg = speco_cfg.get("standalone_tq_producer")
+    if producer_cfg is None:
+        return None
+    try:
+        return {
+            "shuffle": bool(producer_cfg.get("shuffle", False)),
+            "shuffle_seed": int(producer_cfg.get("shuffle_seed", 42)),
+        }
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def _ensure_dict_child(config: dict[str, Any], key: str) -> dict[str, Any]:
