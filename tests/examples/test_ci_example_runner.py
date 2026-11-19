@@ -221,7 +221,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             assert "Verify model paths" in source
             assert "Missing target model directory" in source
             assert (
-                "SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '4' }}"
+                "SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '8' }}"
                 in source
             )
             assert (
@@ -407,13 +407,13 @@ def test_npu_workflow_default_topology_and_configured_device_count(drafter) -> N
     count = workflow["on"]["workflow_dispatch"]["inputs"]["accelerator_count"][
         "default"
     ]
-    assert count == "4"
+    assert count == "8"
     stdout = _dry_run(drafter, platform="npu", accelerator_count=count)
-    assert "trainer.n_gpus_per_node=4" in stdout
-    assert "ASCEND_RT_VISIBLE_DEVICES=0,1,2,3" in stdout
-    configured = _dry_run(drafter, platform="npu", accelerator_count="8")
-    assert "trainer.n_gpus_per_node=8" in configured
-    assert "ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7" in configured
+    assert "trainer.n_gpus_per_node=8" in stdout
+    assert "ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7" in stdout
+    configured = _dry_run(drafter, platform="npu", accelerator_count="4")
+    assert "trainer.n_gpus_per_node=4" in configured
+    assert "ASCEND_RT_VISIBLE_DEVICES=0,1,2,3" in configured
 
 
 def test_npu_smoke_bounds_dataset_filter_workers_and_preserves_overrides():

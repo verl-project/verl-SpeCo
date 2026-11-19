@@ -61,7 +61,7 @@ on:
       accelerator_count:
         description: Number of NPU devices
         required: false
-        default: "4"
+        default: "8"
         type: string
       tensor_parallel_size:
         description: Rollout tensor parallel size
@@ -92,9 +92,7 @@ env:
   SPECO_DEFAULT_DSPARK_DRAFT_MODEL: ${{ vars.SPECO_DSPARK_DRAFT_MODEL || '/root/.cache/huggingface/hub/models--deepseek-ai--dspark_qwen3_8b_block7/snapshots/03326e5043815da1f81b109078b2889737c26017' }}
   SPECO_DEFAULT_TRAIN_FILE: ${{ vars.SPECO_TRAIN_FILE || '/root/.cache/huggingface/hub/datasets--BytedTsinghua-SIA--DAPO-Math-17k/snapshots/65877096c24ffa7abc4e4fa5edb95cf3413a5674/data/dapo-math-17k.parquet' }}
   SPECO_DEFAULT_TEST_FILE: ${{ vars.SPECO_TEST_FILE || '/root/.cache/huggingface/hub/datasets--BytedTsinghua-SIA--AIME-2024/snapshots/aa49075e24ad594b79fdf0bdcefa735c2181be67/data/aime-2024.parquet' }}
-  # Bound the number of actor/ref/rollout/drafter processes on the 512 GiB runner.
-  # Four devices retain distributed coverage without eight resident model copies.
-  SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '4' }}
+  SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '8' }}
   SPECO_DEFAULT_TENSOR_PARALLEL_SIZE: ${{ vars.SPECO_TENSOR_PARALLEL_SIZE || '1' }}
   SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE: ${{ vars.SPECO_SEQUENCE_PARALLEL_SIZE || '1' }}
 
