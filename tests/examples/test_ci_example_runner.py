@@ -385,6 +385,16 @@ def test_example_runner_dry_run_covers_npu_dspark() -> None:
     assert "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=7" in stdout
 
 
+def test_npu_smoke_bounds_dataset_filter_workers_and_preserves_overrides():
+    stdout = _dry_run("dspark", platform="npu")
+    assert "data.filter_overlong_prompts_workers=1" in stdout
+    configured = _dry_run(
+        "dspark", platform="npu",
+        ci_variables='{"SPECO_FILTER_OVERLONG_PROMPTS_WORKERS":"3"}',
+    )
+    assert "data.filter_overlong_prompts_workers=3" in configured
+
+
 def test_example_runner_dry_run_omits_ulysses_overrides_for_npu_megatron() -> None:
     stdout = _dry_run("megatron-eagle3", platform="npu", accelerator_count="8")
 

@@ -244,6 +244,7 @@ overrides=(
   "data.train_max_samples=${SPECO_TRAIN_MAX_SAMPLES:-1}"
   "data.val_max_samples=${SPECO_VAL_MAX_SAMPLES:-1}"
   "data.dataloader_num_workers=${SPECO_DATALOADER_NUM_WORKERS:-0}"
+  "data.filter_overlong_prompts_workers=${SPECO_FILTER_OVERLONG_PROMPTS_WORKERS:-1}"
   "actor_rollout_ref.rollout.drafter.training.hidden_state_window_min_rows=${hidden_state_window_min_rows}"
   "actor_rollout_ref.rollout.drafter.training.hidden_state_window_tokens_per_sample=${hidden_state_window_tokens_per_sample}"
 )
