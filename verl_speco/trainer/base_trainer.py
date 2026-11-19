@@ -850,6 +850,12 @@ class DrafterBaseTrainer:
             self.training_group_world_size > 1
             and self.ulysses_sequence_parallel_size > 1
         )
+        if self.use_ulysses_sp and training_cfg.get("drafter_opd", {}).get(
+            "enable", False
+        ):
+            raise ValueError(
+                "Draft-OPD does not support Ulysses sequence parallelism > 1"
+            )
         setattr(self.backend, "use_ulysses_sp", self.use_ulysses_sp)
         self.use_native_dp_sp = (
             self.training_group_world_size > 1 and self.dp_group_world_size > 1
@@ -2636,16 +2642,21 @@ class DrafterBaseTrainer:
         save_error = None
         try:
             import torch.distributed.checkpoint as dcp
+            from verl_speco.trainer.auxiliary_state import DrafterAuxiliaryState
+
+            auxiliary = DrafterAuxiliaryState(self.model)
+            has_auxiliary = bool(auxiliary.state_dict())
 
             dcp.save(
                 {
+                    **({"auxiliary_model": auxiliary} if has_auxiliary else {}),
                     "optimizer": _DrafterOptimizerState(
                         self.model,
                         self.optimizer,
                         self._checkpoint_process_group()
                         if self._use_replica_local_bubble_group()
                         else None,
-                    )
+                    ),
                 },
                 checkpoint_id=temporary_path,
                 process_group=self._checkpoint_process_group(),
@@ -2683,6 +2694,8 @@ class DrafterBaseTrainer:
                 self.fsdp_device_mesh.size() if self.fsdp_device_mesh is not None else 1
             ),
         }
+        if has_auxiliary:
+            manifest["auxiliary_model"] = True
         if is_leader:
             try:
                 total_bytes = sum(
@@ -2718,6 +2731,21 @@ class DrafterBaseTrainer:
 
         try:
             import torch.distributed.checkpoint as dcp
+            from verl_speco.trainer.auxiliary_state import DrafterAuxiliaryState
+
+            auxiliary = DrafterAuxiliaryState(self.model)
+            if auxiliary.state_dict():
+                if not metadata["optimizer"].get("auxiliary_model", False):
+                    raise ValueError(
+                        "Checkpoint is missing VAT acceptance-head weights; "
+                        "disable resume_trainer_state_from_checkpoint to start fresh"
+                    )
+                # Restore auxiliary parameters before applying their optimizer moments.
+                dcp.load(
+                    {"auxiliary_model": auxiliary},
+                    checkpoint_id=optimizer_path,
+                    process_group=self._checkpoint_process_group(),
+                )
 
             dcp.load(
                 {
