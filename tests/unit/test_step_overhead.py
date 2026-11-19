@@ -44,7 +44,9 @@ def _trainer():
     namespace = dict(torch=torch, logging=logging, logger=logging.getLogger("overhead-test"),
                      Any=Any, Optional=Optional, cast=cast, time=time, device_name="cpu",
                      dist=SimpleNamespace(all_reduce=reduce))
-    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(path), "exec"), namespace)
+    constants = [n for n in tree.body if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id in {"_VAT_METRIC_KEYS", "_OPD_METRIC_KEYS"} for t in n.targets)]
+    exec(compile(ast.Module(body=[*constants, cls], type_ignores=[]), str(path), "exec"), namespace)
     trainer = namespace[cls.name]()
     trainer._training_metric_sums, trainer._training_metric_steps = {}, 0
     trainer.training_device_mesh = None

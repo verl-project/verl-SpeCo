@@ -24,13 +24,15 @@ import types
 from functools import wraps
 from typing import Any, cast
 
+from verl_speco.integration.verify_trace import TRACE_KEY
+
 logger = logging.getLogger(__file__)
 
 _PATCHED = False
 SPECO_STUDENT_DECODE_TIME_KEY = "speco_student_decode_time_s"
 SPECO_TEACHER_PREFILL_TIME_KEY = "speco_teacher_prefill_time_s"
 _DEFAULT_EXTRA_KEYS = {
-    "_speco_verify_trace": None,
+    TRACE_KEY: None,
     "_speco_vllm_spec_decode_accepted_tokens": None,
     "_speco_vllm_spec_decode_drafts": None,
     "turn_scores": None,

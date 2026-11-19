@@ -56,6 +56,8 @@ from verl_speco.integration.drafter_config_env import (
 )
 from verl_speco.trainer.checkpoint import trim_process_host_memory
 
+from verl_speco.integration.verify_trace import TRACE_KEY
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 _ACCEPTANCE_HOOK_STATUS: tuple[bool, bool, bool] | None = None
@@ -3122,7 +3124,6 @@ def patch_vllm_request_acceptance_stats() -> bool:
             )
             if capture:
                 from verl_speco.integration.verify_trace import (
-                    TRACE_KEY,
                     finish_verify_step,
                 )
 
@@ -3638,10 +3639,8 @@ def _vllm_request_accept_fields_from_summaries(
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_elapsed_sec": elapsed_sec,
         "_verl_request_mean_accept_len": mean_accept_len,
     }
-    if any("_speco_verify_trace" in summaries[rid] for rid in ordered_ids):
-        fields["_speco_verify_trace"] = [
-            summaries[rid].get("_speco_verify_trace") for rid in ordered_ids
-        ]
+    if any(TRACE_KEY in summaries[rid] for rid in ordered_ids):
+        fields[TRACE_KEY] = [summaries[rid].get(TRACE_KEY) for rid in ordered_ids]
     return fields
 
 
@@ -4385,7 +4384,7 @@ async def _speco_generate_with_request_stats_unblocked(
                 .get("drafter_opd", {})
                 .get("capture_verify_trace", False)
             ):
-                from verl_speco.integration.verify_trace import TRACE_KEY, token_digest
+                from verl_speco.integration.verify_trace import token_digest
 
                 trace = extra_fields[TRACE_KEY]
                 prompt_ids = kwargs["prompt_ids"] if "prompt_ids" in kwargs else args[0]
@@ -4394,8 +4393,6 @@ async def _speco_generate_with_request_stats_unblocked(
                         "Draft-OPD trace and returned response length differ"
                     )
                 trace["prefix_digest"] = token_digest([*prompt_ids, *output.token_ids])
-                trace["drafter_revision_min"] = min(revision_before, revision_after)
-                trace["drafter_revision_max"] = max(revision_before, revision_after)
             elapsed_key = f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_elapsed_sec"
             if (
                 extra_fields.get("_verl_request_mean_accept_len") is not None

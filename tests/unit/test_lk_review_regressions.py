@@ -25,7 +25,9 @@ def load_function(path, name, **bindings):
     namespace = dict(torch=torch, F=torch.nn.functional, logging=logging, Any=Any, Optional=Optional, cast=cast,
                      logger=logging.getLogger(__name__), time=time,
                      _is_ray_object_ref=lambda value: False, **bindings)
-    exec(compile(ast.Module(body=[node], type_ignores=[]), path, "exec"), namespace)
+    constants = [n for n in tree.body if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id in {"_VAT_METRIC_KEYS", "_OPD_METRIC_KEYS"} for t in n.targets)]
+    exec(compile(ast.Module(body=[*constants, node], type_ignores=[]), path, "exec"), namespace)
     return namespace[name]
 
 

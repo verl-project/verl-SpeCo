@@ -135,6 +135,8 @@ from verl_speco.trainer.scheduler import (
 from verl_speco.workers import SpecoWorker
 
 
+from verl_speco.integration.verify_trace import TRACE_KEY
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -200,7 +202,7 @@ _POLICY_MODEL_NON_TENSOR_KEYS = {
     "_speco_vllm_request_completion_index",
     "_speco_vllm_request_elapsed_sec",
     "_verl_request_mean_accept_len",
-    "_speco_verify_trace",
+    TRACE_KEY,
 }
 
 
@@ -5785,7 +5787,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 ),
             }
             if opd_enabled:
-                traces = batch.non_tensor_batch.get("_speco_verify_trace")
+                traces = batch.non_tensor_batch.get(TRACE_KEY)
                 if traces is None or traces[batch_idx] is None:
                     request_id = (
                         request_ids[batch_idx] if request_ids is not None else None
@@ -5797,7 +5799,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         f"trace_column_present={traces is not None}. "
                         "Check vLLM scheduler capture and agent-loop trace transport."
                     )
-                sample["_speco_verify_trace"] = traces[batch_idx]
+                sample[TRACE_KEY] = traces[batch_idx]
                 sample["response_mask"] = (
                     response_mask_tensor[batch_idx][response_mask][:response_len]
                     .detach()

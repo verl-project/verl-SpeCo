@@ -161,31 +161,38 @@ class DSparkTrainingModel(DFlashTrainingModel):
         self._logged_distribution_loss_backend: Optional[str] = None
         self._distribution_loss_by_device: dict[str, bool] = {}
         confidence_head = getattr(self.draft_model, "confidence_head", None)
-        self.confidence_loss_enabled = self.confidence_head_alpha > 0
-        if self.confidence_loss_enabled:
-            if confidence_head is None:
-                raise ValueError(
-                    "DSpark confidence loss is enabled but the draft model has no "
-                    "confidence head; set dspark_confidence_head_alpha>0 or load a "
-                    "checkpoint that carries one."
-                )
-            confidence_head.requires_grad_(True)
-            logger.info(
-                "[dspark-trainer] confidence head is trainable (alpha=%.4f)",
-                self.confidence_head_alpha,
-            )
-        elif confidence_head is not None:
-            confidence_head.requires_grad_(False)
-            logger.info(
-                "[dspark-trainer] confidence head is loaded but frozen because confidence loss is disabled"
-            )
+        self.confidence_loss_enabled = (
+            self.confidence_head_alpha > 0 and self.vat_objective is None
+        )
         if self.vat_objective is not None:
             if getattr(self.config, "dspark_bonus_anchor", False):
                 raise ValueError("VAT does not support DSpark bonus-anchor checkpoints")
             if confidence_head is None:
                 raise ValueError("DSpark VAT requires a confidence head")
-            confidence_head.requires_grad_(True)
-            self.confidence_loss_enabled = False  # VAT supplies the conditional labels.
+        elif self.confidence_loss_enabled and confidence_head is None:
+            raise ValueError(
+                "DSpark confidence loss is enabled but the draft model has no "
+                "confidence head; set dspark_confidence_head_alpha=0 or load a "
+                "checkpoint that carries one."
+            )
+        if confidence_head is not None:
+            train_confidence_head = (
+                self.vat_objective is not None or self.confidence_loss_enabled
+            )
+            confidence_head.requires_grad_(train_confidence_head)
+            if self.vat_objective is not None:
+                logger.info(
+                    "[dspark-trainer] confidence head is trainable (VAT supervision)"
+                )
+            elif self.confidence_loss_enabled:
+                logger.info(
+                    "[dspark-trainer] confidence head is trainable (alpha=%.4f)",
+                    self.confidence_head_alpha,
+                )
+            else:
+                logger.info(
+                    "[dspark-trainer] confidence head is loaded but frozen because confidence loss is disabled"
+                )
         if self.opd_objective is not None:
             if getattr(self.config, "dspark_bonus_anchor", False):
                 raise ValueError(

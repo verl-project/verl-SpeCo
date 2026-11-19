@@ -59,6 +59,8 @@ from verl_speco.rl_insight_bridge import (
 )
 from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
 
+from verl_speco.integration.verify_trace import TRACE_KEY
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -912,7 +914,7 @@ class SpecoWorker(Worker):
                 ).float()
         else:
             loss_mask[:] = 1.0
-        if batch.get("_speco_verify_trace") is not None:
+        if batch.get(TRACE_KEY) is not None:
             prompt_len = batch["prompts"].numel()
             response_mask = batch["response_mask"].detach().cpu().float().reshape(-1)
             loss_mask[prompt_len : prompt_len + response_mask.numel()] = response_mask
@@ -1031,7 +1033,7 @@ class SpecoWorker(Worker):
             "target_logprobs_position_start",
             "target_logprobs_position_end",
             "_verl_request_mean_accept_len",
-            "_speco_verify_trace",
+            TRACE_KEY,
             "_speco_vllm_request_id",
             "_verl_is_hard",
             "_verl_hard_score",
@@ -1040,11 +1042,11 @@ class SpecoWorker(Worker):
         ):
             if key in batch:
                 metadata[key] = batch[key]
-        if metadata.get("_speco_verify_trace") is not None:
+        if metadata.get(TRACE_KEY) is not None:
             from verl_speco.integration.verify_trace import align_trace_to_prompt
 
-            metadata["_speco_verify_trace"] = align_trace_to_prompt(
-                metadata["_speco_verify_trace"], batch["prompts"].numel()
+            metadata[TRACE_KEY] = align_trace_to_prompt(
+                metadata[TRACE_KEY], batch["prompts"].numel()
             )
         feature_sample = DraftFeatureSample(
             algorithm=algorithm,
@@ -1451,7 +1453,7 @@ class SpecoWorker(Worker):
                 "hidden_states_layout",
                 "target_layer_ids",
                 "_verl_request_mean_accept_len",
-                "_speco_verify_trace",
+                TRACE_KEY,
                 "response_mask",
                 "_speco_vllm_request_id",
                 "_verl_is_hard",

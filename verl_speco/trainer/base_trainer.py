@@ -59,10 +59,22 @@ from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
 
+from verl_speco.integration.verify_trace import TRACE_KEY
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 device_name = get_device_name()
+
+_VAT_METRIC_KEYS = (
+    "kd_loss",
+    "accept_loss",
+    "self_cov_loss",
+    "ce_loss",
+    "mean_accepted",
+    "sim_vs_obs_visible_accept_gap",
+)
+_OPD_METRIC_KEYS = ("loss", "trace_blocks", "random_blocks", "visible_tokens")
 
 _ALIGNMENT_DEBUG_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG"
 _ALIGNMENT_DEBUG_EVERY_N_STEPS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_EVERY_N_STEPS"
@@ -1307,21 +1319,14 @@ class DrafterBaseTrainer:
             metrics[f"{prefix}/loss"] = sums[f"{prefix}/loss"] / steps
         vat_batches = sums.get(f"{prefix}/vat/batch_count", 0.0)
         if vat_batches > 0:
-            for key in (
-                "kd_loss",
-                "accept_loss",
-                "self_cov_loss",
-                "ce_loss",
-                "mean_accepted",
-                "sim_vs_obs_visible_accept_gap",
-            ):
+            for key in _VAT_METRIC_KEYS:
                 if f"{prefix}/vat/{key}" in sums:
                     metrics[f"{prefix}/vat/{key}"] = (
                         sums[f"{prefix}/vat/{key}"] / vat_batches
                     )
         opd_batches = sums.get(f"{prefix}/opd/batch_count", 0.0)
         if opd_batches > 0:
-            for key in ("loss", "trace_blocks", "random_blocks", "visible_tokens"):
+            for key in _OPD_METRIC_KEYS:
                 metrics[f"{prefix}/opd/{key}"] = (
                     sums[f"{prefix}/opd/{key}"] / opd_batches
                 )
@@ -1528,23 +1533,9 @@ class DrafterBaseTrainer:
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
             "loss_mode_id": f"{prefix}/loss_mode_id",
         }
-        for key in (
-            "kd_loss",
-            "accept_loss",
-            "self_cov_loss",
-            "ce_loss",
-            "mean_accepted",
-            "batch_count",
-            "sim_vs_obs_visible_accept_gap",
-        ):
+        for key in (*_VAT_METRIC_KEYS, "batch_count"):
             scalar_keys[f"vat/{key}"] = f"{prefix}/vat/{key}"
-        for key in (
-            "loss",
-            "trace_blocks",
-            "random_blocks",
-            "visible_tokens",
-            "batch_count",
-        ):
+        for key in (*_OPD_METRIC_KEYS, "batch_count"):
             scalar_keys[f"opd/{key}"] = f"{prefix}/opd/{key}"
         vector_keys = {
             "loss_sum_per_position": f"{prefix}/loss_sum_per_position",
@@ -4710,9 +4701,7 @@ class DrafterBaseTrainer:
                     batch.get("_verl_request_mean_accept_len"),
                     i,
                 ),
-                "_speco_verify_trace": _batch_item_value(
-                    batch.get("_speco_verify_trace"), i
-                ),
+                TRACE_KEY: _batch_item_value(batch.get(TRACE_KEY), i),
                 "_speco_vllm_request_id": _batch_item_value(
                     batch.get("_speco_vllm_request_id"), i
                 ),
@@ -4760,15 +4749,15 @@ class DrafterBaseTrainer:
                     else None
                 ),
             }
-            if data_item["_speco_verify_trace"] is not None:
+            if data_item[TRACE_KEY] is not None:
                 from verl_speco.integration.verify_trace import align_trace_to_prompt
 
                 if cpu_prompts is None:
                     raise ValueError(
                         "Draft-OPD collection requires prompt token coordinates"
                     )
-                data_item["_speco_verify_trace"] = align_trace_to_prompt(
-                    data_item["_speco_verify_trace"], cpu_prompts[i].numel()
+                data_item[TRACE_KEY] = align_trace_to_prompt(
+                    data_item[TRACE_KEY], cpu_prompts[i].numel()
                 )
                 if batch.get("response_mask") is None:
                     raise ValueError(

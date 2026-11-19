@@ -524,6 +524,28 @@ def test_dspark_untrained_confidence_head_is_kept_but_excluded_from_optimizer():
     )
 
 
+@pytest.mark.parametrize("vat", [False, True])
+@pytest.mark.parametrize("alpha", [0.0, 0.5])
+def test_dspark_confidence_head_log_matches_resolved_supervision(caplog, vat, alpha):
+    with caplog.at_level("INFO", logger=dspark_backend.__name__):
+        model = _small_dspark_training_model(
+            enable_confidence_head=True,
+            confidence_head_alpha=alpha,
+            per_position_loss_weight="vat" if vat else "fixed_exp_decay",
+        )
+    trainable = vat or alpha > 0
+    assert all(
+        parameter.requires_grad == trainable
+        for parameter in model.draft_model.confidence_head.parameters()
+    )
+    assert model.confidence_loss_enabled == (alpha > 0 and not vat)
+    messages = [record.message for record in caplog.records if "confidence head" in record.message]
+    assert len(messages) == 1
+    assert ("trainable" in messages[0]) == trainable
+    assert ("frozen" in messages[0]) == (not trainable)
+    assert ("VAT supervision" in messages[0]) == vat
+
+
 def test_dspark_confidence_loss_without_a_head_is_rejected():
     config = DSparkConfig(
         hidden_size=8,
