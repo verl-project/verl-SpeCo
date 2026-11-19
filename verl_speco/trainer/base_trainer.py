@@ -7838,8 +7838,7 @@ class DrafterBaseTrainer:
         try:
             training_cfg = self.config.rollout.drafter.training
             if (
-                device_name == "cuda"
-                and not getattr(self, "_bubble_time_enabled", False)
+                not getattr(self, "_bubble_time_enabled", False)
                 and self.training_device_mesh is not None
                 and not isinstance(self.model, FSDP)
                 and not self._is_ddp_wrapped()

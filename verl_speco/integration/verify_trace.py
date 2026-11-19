@@ -6,7 +6,9 @@ import contextvars
 import hashlib
 
 TRACE_KEY = "_speco_verify_trace"
-TURN_TRACES = contextvars.ContextVar("speco_verify_turns", default=None)
+TURN_TRACES: contextvars.ContextVar[list[dict] | None] = contextvars.ContextVar(
+    "speco_verify_turns", default=None
+)
 
 
 def snapshot_verify_step(scheduler, scheduled, output):

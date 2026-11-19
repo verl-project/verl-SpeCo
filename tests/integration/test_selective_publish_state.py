@@ -34,7 +34,7 @@ from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 from verl_speco.trainer.publish_state import export_fsdp2_publish_state
 
 
-def _trainer_type():
+def _trainer_type(device_name="cuda"):
     # Import actual method bodies without requiring the full verl/Ray stack.
     path = Path(__file__).parents[2] / "verl_speco" / "trainer" / "base_trainer.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -74,7 +74,7 @@ def _trainer_type():
         "FSDP": FSDP,
         "fnmatch": fnmatch,
         "logger": logging.getLogger(__name__),
-        "device_name": "cuda",
+        "device_name": device_name,
         "get_fsdp_full_state_dict": legacy_full_state,
         "load_fsdp_model_to_gpu": lambda model: None,
         "offload_fsdp_model_to_cpu": lambda model: None,
@@ -352,3 +352,29 @@ def test_dspark_publish_includes_head_trained_by_vat_or_confidence_loss(
     assert set(published) == expected
     for name in expected:
         torch.testing.assert_close(published[name], state[name])
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda", "npu"])
+def test_selective_publish_route_is_not_limited_to_cuda(monkeypatch, device_name):
+    import verl_speco.trainer.publish_state as publish
+
+    trainer = _trainer_type(device_name)()
+    trainer.model = torch.nn.Linear(2, 2)
+    trainer.training_device_mesh = object()
+    trainer.backend = SimpleNamespace(trains_draft_lm_head=False)
+    trainer._is_ddp_wrapped = lambda: False
+    trainer._record_gpu_transfer = lambda *args: None
+    trainer.config = SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(
+        training={"publish_dtype": "bf16"})))
+    expected = {"weight": torch.ones(2, 2)}
+    calls = []
+    def selective(model, **kwargs):
+        calls.append(model)
+        return expected
+    def forbidden():
+        raise AssertionError("Full state export would gather frozen target weights")
+    trainer._get_trainable_state_dict = forbidden
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(publish, "export_fsdp2_publish_state", selective)
+    assert trainer.get_model_state_dict() is expected
+    assert calls == [trainer.model]
