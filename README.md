@@ -6,7 +6,9 @@
 
 <h3 align="center">verl-SpeCo: A Unified Training System for Speculative Drafters</h3>
 
-[Quickstart](#getting-started) · [Hardware Support](#hardware-support) · [Benchmarks](#co-training-results) · [Documentation](docs/usage.md) · [Blog](https://verl-project.github.io/posts/2026-11-16-verl-speco-v0-2-0/) · [Releases](https://github.com/verl-project/verl-SpeCo/releases)
+<p align="center">
+  <a href="#getting-started">Quickstart</a> · <a href="#hardware-support">Hardware Support</a> · <a href="#co-training-results">Benchmarks</a> · <a href="docs/usage.md">Documentation</a> · <a href="https://verl-project.github.io/posts/2026-11-16-verl-speco-v0-2-0/">Blog</a> · <a href="https://github.com/verl-project/verl-SpeCo/releases">Releases</a> · <a href="#community--contributing">Developer Slack</a>
+</p>
 
 SpeCo keeps speculative drafters aligned with evolving RL policies. It reuses
 training features, adapts the drafter online, and hot-updates rollout engines
@@ -121,10 +123,10 @@ trainer. Check compatibility and measure E2E gains for new configurations.
 
 ## Community & Contributing
 
-Join the verl-SpeCo Lark user group:
+Join the verl-SpeCo Feishu group to discuss setup and training.
 
 <p align="center">
-  <img src="docs/assets/Lark_QR_Code.png" alt="verl-SpeCo Lark user group" width="220">
+  <img src="docs/assets/Lark_QR_Code.png" alt="verl-SpeCo Feishu group QR code" width="220">
 </p>
 
 Before contributing, follow [AGENTS.md](AGENTS.md), including duplicate-work
