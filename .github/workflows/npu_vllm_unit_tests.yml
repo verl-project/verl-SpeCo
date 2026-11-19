@@ -61,7 +61,7 @@ on:
       accelerator_count:
         description: Number of NPU devices
         required: false
-        default: "8"
+        default: "4"
         type: string
       tensor_parallel_size:
         description: Rollout tensor parallel size
@@ -92,7 +92,9 @@ env:
   SPECO_DEFAULT_DSPARK_DRAFT_MODEL: ${{ vars.SPECO_DSPARK_DRAFT_MODEL || '/root/.cache/huggingface/hub/models--deepseek-ai--dspark_qwen3_8b_block7/snapshots/03326e5043815da1f81b109078b2889737c26017' }}
   SPECO_DEFAULT_TRAIN_FILE: ${{ vars.SPECO_TRAIN_FILE || '/root/.cache/huggingface/hub/datasets--BytedTsinghua-SIA--DAPO-Math-17k/snapshots/65877096c24ffa7abc4e4fa5edb95cf3413a5674/data/dapo-math-17k.parquet' }}
   SPECO_DEFAULT_TEST_FILE: ${{ vars.SPECO_TEST_FILE || '/root/.cache/huggingface/hub/datasets--BytedTsinghua-SIA--AIME-2024/snapshots/aa49075e24ad594b79fdf0bdcefa735c2181be67/data/aime-2024.parquet' }}
-  SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '8' }}
+  # Bound the number of actor/ref/rollout/drafter processes on the 512 GiB runner.
+  # Four devices retain distributed coverage without eight resident model copies.
+  SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '4' }}
   SPECO_DEFAULT_TENSOR_PARALLEL_SIZE: ${{ vars.SPECO_TENSOR_PARALLEL_SIZE || '1' }}
   SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE: ${{ vars.SPECO_SEQUENCE_PARALLEL_SIZE || '1' }}
 
@@ -220,8 +222,8 @@ jobs:
           SPECO_DSPARK_DRAFT_MODEL: ${{ inputs.dspark_draft_model || env.SPECO_DEFAULT_DSPARK_DRAFT_MODEL }}
           SPECO_TRAIN_FILE: ${{ inputs.train_file || env.SPECO_DEFAULT_TRAIN_FILE }}
           SPECO_TEST_FILE: ${{ inputs.test_file || env.SPECO_DEFAULT_TEST_FILE }}
-          SPECO_CI_RESULT_PATH: ${{ github.workspace }}/outputs/npu-ci/${{ matrix.drafter }}/result.json
-          SPECO_CKPT_DIR: ${{ vars.SPECO_CKPT_DIR || format('{0}/outputs/npu-ci/{1}/checkpoints', github.workspace, matrix.drafter) }}
+          SPECO_CI_RESULT_PATH: outputs/npu-ci/${{ matrix.drafter }}/result.json
+          SPECO_CKPT_DIR: ${{ vars.SPECO_CKPT_DIR || format('outputs/npu-ci/{0}/checkpoints', matrix.drafter) }}
           SPECO_ACCELERATOR_COUNT: ${{ inputs.accelerator_count || env.SPECO_DEFAULT_ACCELERATOR_COUNT }}
           SPECO_TENSOR_PARALLEL_SIZE: ${{ inputs.tensor_parallel_size || env.SPECO_DEFAULT_TENSOR_PARALLEL_SIZE }}
           SPECO_SEQUENCE_PARALLEL_SIZE: ${{ inputs.sequence_parallel_size || env.SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE }}
@@ -250,10 +252,11 @@ jobs:
         if: always()
         shell: bash
         run: |
-          output="${GITHUB_WORKSPACE}/outputs/npu-ci/${{ matrix.drafter }}/diagnostics"
+          output="outputs/npu-ci/${{ matrix.drafter }}/diagnostics"
           mkdir -p "${output}"
           {
             df -h /dev/shm
+            ps -eo pid,ppid,rss,comm --sort=-rss | head -n 40 || true
             for file in /sys/fs/cgroup/memory.events /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.failcnt; do
               if test -r "${file}"; then
                 echo "${file}"
@@ -274,8 +277,8 @@ jobs:
         with:
           name: npu_vllm_unit_tests-${{ matrix.drafter }}-result
           path: |
-            ${{ github.workspace }}/outputs/npu-ci/${{ matrix.drafter }}/result.json
-            ${{ github.workspace }}/outputs/npu-ci/${{ matrix.drafter }}/result.json.log
-            ${{ github.workspace }}/outputs/npu-ci/${{ matrix.drafter }}/result.json.timing.json
-            ${{ github.workspace }}/outputs/npu-ci/${{ matrix.drafter }}/diagnostics/
+            outputs/npu-ci/${{ matrix.drafter }}/result.json
+            outputs/npu-ci/${{ matrix.drafter }}/result.json.log
+            outputs/npu-ci/${{ matrix.drafter }}/result.json.timing.json
+            outputs/npu-ci/${{ matrix.drafter }}/diagnostics/
           if-no-files-found: warn
