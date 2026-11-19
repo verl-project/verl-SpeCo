@@ -6,7 +6,7 @@
 
 <h3 align="center">verl-SpeCo: A Unified Training System for Speculative Drafters</h3>
 
-[Documentation](docs/usage.md) · [Releases](https://github.com/verl-project/verl-SpeCo/releases)
+[Quickstart](#getting-started) · [Hardware Support](#hardware-support) · [Benchmarks](#co-training-results) · [Documentation](docs/usage.md) · [Blog](https://verl-project.github.io/posts/2026-11-16-verl-speco-v0-2-0/) · [Releases](https://github.com/verl-project/verl-SpeCo/releases)
 
 SpeCo keeps speculative drafters aligned with evolving RL policies. It reuses
 training features, adapts the drafter online, and hot-updates rollout engines
@@ -14,20 +14,18 @@ without restarting the RL job. Built as an import-only extension of
 [verl](https://github.com/verl-project/verl), it leaves upstream verl unmodified.
 Standalone training can also produce a deployable drafter or initialize co-training.
 
-SpeCo brings drafter training into practical RL and deployment workflows:
+In the Qwen3-8B + DSpark evaluation, async Train+Freeze achieved **1.50× GPU**
+and **1.58× Ascend NPU** end-to-end step speedup against each platform's
+synchronous baseline without speculative decoding. [See the comparison](#co-training-results).
 
-- **Keep the drafter aligned with the actor.** Adapt from responses and target features produced by the evolving policy, then hot-publish weights at safe points without restarting RL. The actor retains its original RL optimization objective.
-- **Reuse existing target computation.** Capture hidden states during old-policy log-probability computation instead of adding a full-batch target forward pass. A shared scheduler coordinates collection, optimization, and publication.
-- **Control updates using adaptation feedback.** Mix low-acceptance hard samples with uniform samples, pause collection and updates when gains plateau, and resume on sustained degradation while continuing to serve the adapted drafter.
-- **Use idle capacity and support async pipelines.** Bubble Time fits optimizer work into rollout-idle windows and completes remaining quotas through fallback. Async co-training coordinates publication and acceptance statistics for requests spanning drafter versions.
-- **Connect standalone training to online adaptation.** Build a drafter for a fixed target, deploy its checkpoint, or use it to initialize co-training. Both workflows share backends and checkpointing and can also run independently.
-- **Reuse hardware and algorithm infrastructure.** CUDA GPU and Huawei Ascend NPU paths integrate multiple drafter training backends and serving engines. Consult [runtime compatibility](docs/usage.md#runtime-compatibility) for supported combinations.
+## Key Features
 
-Current Qwen3-8B + DSpark evaluation reaches **1.50× GPU and 1.58× NPU
-end-to-end step speedup**. These single-run async Train+Freeze results use each
-platform's synchronous non-speculative baseline, include adaptation, exclude
-checkpoint I/O and validation, and combine async scheduling and speculation
-with adaptation. [Full evaluation](docs/evaluation.md).
+- **Online adaptation:** reuse rollout responses and old-policy features; train from current data or replay, then safely publish drafter weights.
+- **Acceptance-guided control:** mix hard and uniform samples, and pause/resume updates as adaptation gains change.
+- **Flexible execution:** synchronous and asynchronous co-training; optional Bubble Time moves optimizer work into rollout-idle windows. Bubble Time currently requires the legacy trainer.
+- **Extensible infrastructure:** EAGLE-1/2/3, DFlash/DFlash2, DSpark, Domino, and P-EAGLE training backends, with backend-specific rollout support on GPU/NPU.
+- **Standalone training:** independently generate features and train deployable drafters using shared training infrastructure.
+- **Hardware portability:** CUDA GPU and Ascend NPU paths for co-training and standalone training; availability depends on the drafter and serving runtime.
 
 ## Architecture
 
@@ -40,20 +38,65 @@ share training backends and checkpointing.
 
 [Scheduler guide](docs/drafter_scheduler.md) · [Bubble Time guide](docs/bubble_time_drafter_training.md)
 
-## News
+## Co-Training Results
 
-- [2026/11] [v0.2.0](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.2.0) released: V1 synchronous/asynchronous DSpark co-training, Bubble Time, acceptance-guided freezing and hard sampling, standalone training, and expanded runtime integration.
-- [2026/08] [v0.1.0](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.1.0) released: end-to-end DSpark support, decoupled feature collection/training, and more drafter backends.
-- [2026/06] [v0.1.0-pre](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.1.0-pre) pre-released: speculative drafter collection, training, and hot-updates on verl.
+Paper Table 1 compares Qwen3-8B + DSpark on DAPO-Math-17k using GRPO and vLLM. All speedups use the synchronous baseline without speculative decoding on the same platform. End-to-end (E2E) step time includes adaptation costs and excludes checkpoint I/O and validation. Asynchronous rollout time measures exposed generation wait.
 
-## Key Features
+![Paper Table 1. Qwen3-8B co-training results grouped by execution mode and hardware](docs/assets/paper/cotrain-table.png)
 
-- **Online adaptation:** reuse rollout responses and old-policy features; train from current data or replay, then safely publish drafter weights.
-- **Acceptance-guided control:** mix hard and uniform samples, and pause/resume updates as adaptation gains change.
-- **Flexible execution:** synchronous and asynchronous co-training; optional Bubble Time moves optimizer work into rollout-idle windows. Bubble Time currently requires the legacy trainer.
-- **Extensible infrastructure:** EAGLE-1/2/3, DFlash/DFlash2, DSpark, Domino, and P-EAGLE training backends, with backend-specific rollout support on GPU/NPU.
-- **Standalone training:** independently generate features and train deployable drafters using shared training infrastructure.
-- **Hardware portability:** CUDA GPU and Ascend NPU paths for co-training and standalone training; availability depends on the drafter and serving runtime.
+Async Train+Freeze reaches **1.50× GPU** and **1.58× NPU** E2E step speedup in these single runs, combining asynchronous execution, speculative decoding, and online adaptation.
+
+### Standalone Drafter Training Results
+
+Paper Table 2 compares average acceptance length (tokens per verification round)
+after three epochs of standalone drafter training under matched conditions.
+
+![Paper Table 2. SpeCo and Speculators average acceptance lengths across five benchmarks on GPU and NPU](docs/assets/paper/standalone-table.png)
+
+Across the five benchmarks, the absolute difference is at most 0.08 tokens per
+verification round on GPU and 0.05 on NPU.
+
+See the [evaluation guide](docs/evaluation.md) for the experiment curves and Bubble Time comparison.
+
+## Hardware Support
+
+| Platform | Rollout runtime and examples | Support status |
+| --- | --- | --- |
+| NVIDIA GPU (CUDA) | [vLLM DSpark example](examples/run_qwen3-8b_drafter_dspark_vllm.sh); SGLang for supported drafters | Available in this repository |
+| Huawei Ascend NPU | [vLLM-Ascend DSpark example](examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh) | Available in this repository |
+| AMD Instinct MI355X (ROCm) | DFlash with SGLang or vLLM, and DSpark with vLLM | End-to-end runs reported in [PR #83](https://github.com/verl-project/verl-SpeCo/pull/83) |
+
+See [runtime compatibility](docs/usage.md#runtime-compatibility) for supported drafter and engine combinations.
+
+## Getting Started
+
+[Full documentation](docs/usage.md)
+
+### Online Co-Training
+
+1. [Install SpeCo and upstream verl](docs/usage.md#installation), then check [runtime compatibility](docs/usage.md#runtime-compatibility).
+2. Prepare the target model, a compatible drafter checkpoint, and the training and validation datasets. Set their paths in the launch script. [Co-training setup](docs/usage.md#quickstart)
+3. For a first run on NVIDIA GPUs, use [`examples/run_qwen3-8b_drafter_dspark_vllm.sh`](examples/run_qwen3-8b_drafter_dspark_vllm.sh).
+4. For other modes or update policies, see [V1 examples](docs/usage.md#dspark-mrv2-launch-examples), [Hard Sampling and Freeze](docs/usage.md#dspark-hard-sampling-and-drafter-freeze), and [Bubble Time](docs/usage.md#bubble-time).
+
+For Ascend, use [`examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh`](examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh). See [hardware smoke tests](docs/usage.md#hardware-smoke-tests) for the CI cases.
+
+### Standalone Drafter Training
+
+Train a DSpark drafter against a fixed target model for deployment or to
+initialize online co-training. Start with [`examples/run_qwen3-8b_drafter_dspark_separate_training.sh`](examples/run_qwen3-8b_drafter_dspark_separate_training.sh).
+The [standalone training guide](docs/usage.md#separate-draft-model-training)
+covers target model setup, streaming features, and reusing saved hidden states.
+
+Advanced usage:
+
+- [Configuration](docs/usage.md#configuration) and [RL-Insight monitoring](docs/usage.md#online-monitoring-with-rl-insight)
+- [Evaluation results](docs/evaluation.md)
+- [Testing](docs/usage.md#testing)
+
+Support varies by drafter, engine, and hardware; P-EAGLE currently supports
+training only. For V1 and native MRV2 deployments, follow the verl 0.9 and
+runtime requirements in the detailed guide.
 
 ## What Can You Do with SpeCo?
 
@@ -70,31 +113,11 @@ The paper evaluates DSpark, Qwen3-8B, GRPO, and vLLM; implemented backends do
 not imply equivalent speedups. Bubble Time currently requires the legacy
 trainer. Check compatibility and measure E2E gains for new configurations.
 
-## Getting Started
+## News
 
-[Full documentation](docs/usage.md)
-
-Quickstart:
-
-1. [Install SpeCo and upstream verl](docs/usage.md#installation), then check [runtime compatibility](docs/usage.md#runtime-compatibility).
-2. Set model, drafter checkpoint, and dataset paths, then follow the [co-training quickstart](docs/usage.md#quickstart).
-3. Select a [scheduling strategy](docs/drafter_scheduler.md) or optional [Bubble Time execution](docs/bubble_time_drafter_training.md).
-
-Launch examples:
-
-- [GPU DSpark co-training](examples/run_qwen3-8b_drafter_dspark_vllm.sh)
-- [NPU DSpark co-training](examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh)
-- [Standalone drafter training](examples/run_qwen3-8b_drafter_dspark_separate_training.sh)
-
-Advanced usage:
-
-- [Configuration](docs/usage.md#configuration) and [RL-Insight monitoring](docs/usage.md#online-monitoring-with-rl-insight)
-- [Paper evaluation results](docs/evaluation.md) and [standalone results](docs/evaluation.md#standalone-training)
-- [Testing](docs/usage.md#testing)
-
-Support varies by drafter, engine, and hardware; P-EAGLE currently supports
-training only. For V1 and native MRV2 deployments, follow the verl 0.9 and
-runtime requirements in the detailed guide.
+- [2026/11] [v0.2.0](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.2.0) released: V1 synchronous/asynchronous DSpark co-training, Bubble Time, acceptance-guided freezing and hard sampling, standalone training, and expanded runtime integration.
+- [2026/08] [v0.1.0](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.1.0) released: end-to-end DSpark support, decoupled feature collection/training, and more drafter backends.
+- [2026/06] [v0.1.0-pre](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.1.0-pre) pre-released: speculative drafter collection, training, and hot-updates on verl.
 
 ## Community & Contributing
 
