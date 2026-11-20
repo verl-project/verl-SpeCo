@@ -24,6 +24,7 @@ import types
 from functools import wraps
 from typing import Any, cast
 
+from verl_speco.integration.specopd_protocol import PROPOSAL_KEY
 from verl_speco.integration.verify_trace import TRACE_KEY
 
 logger = logging.getLogger(__file__)
@@ -33,6 +34,7 @@ SPECO_STUDENT_DECODE_TIME_KEY = "speco_student_decode_time_s"
 SPECO_TEACHER_PREFILL_TIME_KEY = "speco_teacher_prefill_time_s"
 _DEFAULT_EXTRA_KEYS = {
     TRACE_KEY: None,
+    PROPOSAL_KEY: "",
     "_speco_vllm_spec_decode_accepted_tokens": None,
     "_speco_vllm_spec_decode_drafts": None,
     "turn_scores": None,
@@ -48,6 +50,7 @@ _DEFAULT_EXTRA_KEYS = {
 _CURRENT_GLOBAL_STEPS = contextvars.ContextVar(
     "speco_current_global_steps", default=None
 )
+_CURRENT_SPECOPD_REVISION = contextvars.ContextVar("specopd_revision", default=None)
 _CURRENT_VALIDATE = contextvars.ContextVar("speco_current_validate", default=False)
 _CURRENT_SKIP_DRAFTER_COLLECTION = contextvars.ContextVar(
     "speco_current_skip_drafter_collection", default=False
@@ -143,6 +146,9 @@ def _sampling_params_with_speco_context(sampling_params: Any) -> Any:
     if not isinstance(sampling_params, dict):
         return sampling_params
     patched = dict(sampling_params)
+    revision = _CURRENT_SPECOPD_REVISION.get()
+    if revision is not None:
+        patched["_specopd_drafter_revision"] = revision
     global_steps = _CURRENT_GLOBAL_STEPS.get()
     if global_steps is not None:
         patched.setdefault("_verl_global_steps", global_steps)
@@ -218,10 +224,13 @@ def _speco_context_from_batch(batch: Any) -> tuple[Any, ...]:
         probe_greedy_token,
         probe_max_tokens_token,
         skip_collection_token,
+        _CURRENT_SPECOPD_REVISION.set(meta_info.get("specopd_drafter_revision")),
     )
 
 
 def _speco_reset_context(*tokens: Any) -> None:
+    if len(tokens) >= 6:
+        _CURRENT_SPECOPD_REVISION.reset(tokens[5])
     if len(tokens) >= 5:
         _CURRENT_SKIP_DRAFTER_COLLECTION.reset(tokens[4])
     if len(tokens) >= 4:
@@ -291,9 +300,11 @@ async def _run_agent_loop_with_student_timing(call: Any, *args, **kwargs) -> Any
         return result
 
     student_decode_times: list[float] = []
+    from verl_speco.integration.specopd_agent import PROPOSAL_TURNS
     from verl_speco.integration.verify_trace import TURN_TRACES
 
     trace_token = TURN_TRACES.set([])
+    proposal_token = PROPOSAL_TURNS.set([])
     token = _CURRENT_STUDENT_DECODE_TIMES.set(student_decode_times)
     try:
         result = call(*args, **kwargs)
@@ -302,6 +313,7 @@ async def _run_agent_loop_with_student_timing(call: Any, *args, **kwargs) -> Any
     finally:
         _CURRENT_STUDENT_DECODE_TIMES.reset(token)
         TURN_TRACES.reset(trace_token)
+        PROPOSAL_TURNS.reset(proposal_token)
     _record_phase_time(
         result,
         SPECO_STUDENT_DECODE_TIME_KEY,
@@ -349,25 +361,34 @@ async def _speco_worker_run_agent_loop(
         skip_drafter_collection=bool(trajectory.get("skip_drafter_collection", False)),
     )
     sampling_params = _apply_probe_sampling_overrides(sampling_params)
+    if kwargs.pop("_specopd_skip_collection", False):
+        sampling_params = dict(sampling_params, _verl_skip_drafter_collection=True)
     run_agent_loop = _speco_parent_method(self, "_run_agent_loop")
     if not callable(run_agent_loop):
         raise AttributeError(
             "SPECO AgentLoop worker parent has no _run_agent_loop method"
         )
-    return await _run_agent_loop_with_student_timing(
-        run_agent_loop,
-        self,
-        sampling_params,
-        trajectory,
-        *args,
-        **kwargs,
-    )
+    revision = kwargs.pop("_specopd_drafter_revision", _CURRENT_SPECOPD_REVISION.get())
+    token = _CURRENT_SPECOPD_REVISION.set(revision)
+    try:
+        return await _run_agent_loop_with_student_timing(
+            run_agent_loop,
+            self,
+            sampling_params,
+            trajectory,
+            *args,
+            **kwargs,
+        )
+    finally:
+        _CURRENT_SPECOPD_REVISION.reset(token)
 
 
 async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs):
+    from verl_speco.integration.specopd_agent import merge_proposal_output
     from verl_speco.integration.verify_trace import merge_turn_traces
 
     merge_turn_traces(output)
+    merge_proposal_output(output)
     _speco_default_agent_loop_extra_fields(output)
     agent_loop_postprocess = _speco_parent_method(self, "_agent_loop_postprocess")
     if not callable(agent_loop_postprocess):
@@ -559,6 +580,13 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
     if getattr(manager, "_speco_agent_loop_manager_configured", False):
         return
 
+    # AgentLoopManagerTQ selects the serializable TQ worker installed by
+    # install_v1_agent_loop_worker_bridge before calling this patched parent
+    # constructor. Replacing it with the generic worker loses TQ semantics.
+    if type(manager).__module__ == "verl.trainer.ppo.v1.agent_loop_tq":
+        manager._speco_agent_loop_manager_configured = True
+        return
+
     import ray
 
     existing_worker = getattr(manager, "agent_loop_workers_class", None)
@@ -689,9 +717,11 @@ def install_agent_loop_runtime_patch() -> bool:
 
             record_serving_segment(result)
             if student_decode_times is not None:
+                from verl_speco.integration.specopd_agent import collect_proposal_output
                 from verl_speco.integration.verify_trace import collect_turn_trace
 
                 collect_turn_trace(result)
+                collect_proposal_output(result)
             return result
 
         llm_server_client_cls.generate = speco_llm_server_generate
@@ -744,14 +774,25 @@ def install_agent_loop_runtime_patch() -> bool:
                 ),
             )
             sampling_params = _apply_probe_sampling_overrides(sampling_params)
-            return await _run_agent_loop_with_student_timing(
-                run_agent_loop,
-                self,
-                sampling_params,
-                trajectory,
-                *args,
-                **kwargs,
+            if kwargs.pop("_specopd_skip_collection", False):
+                sampling_params = dict(
+                    sampling_params, _verl_skip_drafter_collection=True
+                )
+            revision = kwargs.pop(
+                "_specopd_drafter_revision", _CURRENT_SPECOPD_REVISION.get()
             )
+            token = _CURRENT_SPECOPD_REVISION.set(revision)
+            try:
+                return await _run_agent_loop_with_student_timing(
+                    run_agent_loop,
+                    self,
+                    sampling_params,
+                    trajectory,
+                    *args,
+                    **kwargs,
+                )
+            finally:
+                _CURRENT_SPECOPD_REVISION.reset(token)
 
         worker_cls._run_agent_loop = speco_run_agent_loop
         worker_cls._speco_patched_run_agent_loop = True
@@ -762,9 +803,11 @@ def install_agent_loop_runtime_patch() -> bool:
 
         @wraps(agent_loop_postprocess)
         async def speco_agent_loop_postprocess(self, output, validate, **kwargs):
+            from verl_speco.integration.specopd_agent import merge_proposal_output
             from verl_speco.integration.verify_trace import merge_turn_traces
 
             merge_turn_traces(output)
+            merge_proposal_output(output)
             extra_fields = getattr(output, "extra_fields", None)
             if isinstance(extra_fields, dict):
                 for key in _DEFAULT_EXTRA_KEYS:

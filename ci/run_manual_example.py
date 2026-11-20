@@ -125,6 +125,8 @@ def prepare(example, settings, hydra_args, output):
             args = defaults + args
         if manifest[example] == "npu" and "eagle3" in example:
             env.setdefault("SPECO_EAGLE3_DISABLE_TORCH_COMPILE", "true")
+        if example == "examples/run_qwen3-8b-specopd_drafter_dspark_vllm_npu.sh":
+            env.setdefault("SPECO_ACCELERATOR_COUNT", "8")
     online = "separate_training" not in example
     if online:
         env["SPECO_CI_RESULT_PATH"] = str(output / "result.json")

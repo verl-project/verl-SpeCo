@@ -416,3 +416,15 @@ def test_bubble_pool_copy_failure_cannot_release_residency(monkeypatch, strict):
     assert trainer._training_device_resident
     assert "offload_model" not in events
     assert "synchronize" in events and "offload_optimizer" in events
+
+
+def test_specopd_npu_parking_reclaims_once_after_offload_and_sync():
+    events = []
+    trainer = _trainer(events, device="npu")
+    assert asyncio.run(
+        trainer.release_training_memory_after_activation(strict=True, single_cache_reclaim=True)
+    )
+    assert trainer._test_offload_cache_flags == [False]
+    assert events.count("empty_cache") == 1
+    assert events.index("offload_model") < events.index("offload_optimizer")
+    assert events.index("head_cpu") < events.index("synchronize") < events.index("empty_cache")

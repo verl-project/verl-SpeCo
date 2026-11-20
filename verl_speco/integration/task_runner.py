@@ -172,6 +172,9 @@ class SpecoTaskRunner(_TaskRunnerBase):
         return _remotify_like_worker_mapping_value(worker_cls, wrapped_cls)
 
     def run(self, config):
+        from verl_speco.specopd_config import validate_specopd_config
+
+        validate_specopd_config(config)
         validate_sync_opd_cotrain_config(config)
         from verl_speco.integration.compat import check_compatible_verl
 

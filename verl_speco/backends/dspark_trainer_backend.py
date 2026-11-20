@@ -776,7 +776,12 @@ class DSparkTrainingModel(DFlashTrainingModel):
         opd_trace: Optional[torch.Tensor] = None,
         next_token_ids: Optional[torch.Tensor] = None,
         next_token_loss_mask: Optional[torch.Tensor] = None,
+        specopd_batch: Optional[dict] = None,
     ):
+        if specopd_batch is not None:
+            from verl_speco.backends.specopd_forward import proposal_loss
+
+            return proposal_loss(self, specopd_batch, lm_head_weight)
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         self._debug_forward_count += 1
@@ -2017,6 +2022,10 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         return res
 
     def compute_loss(self, model, batch, _current_pad_size):
+        if batch.get("specopd", False):
+            from verl_speco.backends.specopd_forward import compute_specopd_backend_loss
+
+            return compute_specopd_backend_loss(self, model, batch)
         if getattr(self, "use_ulysses_sp", False):
             raise NotImplementedError(
                 "DSpark drafter training does not support Ulysses sequence parallel yet"

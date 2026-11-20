@@ -17,6 +17,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+
 import math
 import os
 import time
@@ -7788,7 +7789,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             metrics.update(snapshot_metrics)
             self._speco_publish_snapshot_prefetch_metrics = {}
         if getattr(self, "_speco_ci_result", None) is not None:
-            self._speco_ci_result.record_metrics(metrics)
+            from verl_speco.specopd_config import (
+                spec_opd_enabled,
+                specopd_training_config,
+            )
+
+            # SpecOPD records its update and acknowledged publication together.
+            if not spec_opd_enabled(specopd_training_config(self.config)):
+                self._speco_ci_result.record_metrics(metrics)
         return metrics
 
     def _speco_update_output_metrics(self, output: Any, metrics: dict[str, Any]):
@@ -8037,6 +8045,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     @contextmanager
     def _speco_online_fit_hooks(self):
+        from verl_speco.specopd_config import spec_opd_enabled, specopd_training_config
+
+        training = specopd_training_config(getattr(self, "config", None))
+        if spec_opd_enabled(training):
+            from verl_speco.integration.specopd_driver import specopd_fit_hooks
+
+            with specopd_fit_hooks(self):
+                yield
+            return
         from verl_speco.integration.phase_timing import (
             phase_span,
             phase_timing_enabled,
