@@ -1,0 +1,42 @@
+# External services are managed by the user; this command never starts vLLM.
+standalone_data_generation:
+  task: responses # responses | hidden (unnormalized standalone_raw_hidden dataset)
+  input_path: ???
+  output_path: ???
+  resume: true
+  on_error: raise # skip records whose requests/conversion fail
+  max_samples: 0 # newly processed records; zero means all remaining records
+  log_interval: 20 # completed records per timing report; first record and final tail also log
+  log_interval_seconds: 10 # periodic timing/status report, even while no sample completes
+  input_queue_size: 32
+  publish_queue_size: 16
+  parser_strict_roles: false
+  max_consecutive_errors: 20
+  vllm:
+    endpoints: [http://localhost:8000/v1]
+    model: ??? # served model name, identical on every endpoint
+    api_key: EMPTY # responses only; hidden uses existing Producer authentication
+    concurrency: 16
+    per_endpoint_concurrency: 4
+    request_timeout: 120
+    max_retries: 3 # responses; hidden reuses Producer's existing retry policy
+    endpoint_cooldown: 2 # responses only
+  responses:
+    max_tokens: 512
+    temperature: 0.7
+    top_p: 0.95
+    seed: null
+  hidden:
+    target_model_path: null
+    tokenizer_path: null # defaults to target_model_path
+    trust_remote_code: false
+    vllm_aux_hidden_state_layer_ids: [1, 9, 17, 25, 33]
+    include_final_hidden: true # match whether the service also captures the final layer
+    validate_outputs: false # optional full hidden NaN/Inf scan; shapes/tokens are always checked
+    file_concurrency: 4 # dedicated file workers, independent of HTTP request concurrency
+    render_boundary:
+      enabled: false
+      timeout: 10
+    max_sequence_length: 8192
+    hidden_states_store:
+      backend: file # connector files must be accessible from this process

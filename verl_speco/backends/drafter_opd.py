@@ -3,9 +3,6 @@
 """Trace anchors and first-rejection objectives shared by DFlash and DSpark."""
 
 import math
-import hashlib
-import json
-from collections import OrderedDict
 
 import torch
 from torch import nn
@@ -13,12 +10,6 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from verl_speco.integration.verify_trace import TRACE_KEY, validate_verify_trace
-from verl_speco.backends.opd_math import prefix_survival
-from verl_speco.backends.opd_distribution import token_total_variation
-
-
-# At most 64 windows of <=8192 rows: <=12 MiB of CPU integer coordinates.
-_TRACE_PLAN_CACHE = OrderedDict()
 
 
 def preprocess_trace(
@@ -27,17 +18,12 @@ def preprocess_trace(
     trace = item.get(TRACE_KEY)
     if trace is None:
         raise ValueError("Draft-OPD requires a captured verification trace")
+    plan = torch.full((end - start, 3), -1, dtype=torch.long, device=device)
     origin = (
         int(item.get("_verl_feature_start", item.get("feature_start", 0)))
-        + start - trace.get("token_offset", 0)
+        + start
+        - trace.get("token_offset", 0)
     )
-    fingerprint = hashlib.sha256(json.dumps(trace, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).digest()
-    key = (fingerprint, start, end, origin, layout, capacity, bool(aligned_next_tokens))
-    cached = _TRACE_PLAN_CACHE.get(key)
-    if cached is not None:
-        _TRACE_PLAN_CACHE.move_to_end(key)
-        return cached.to(device=device, copy=True)
-    rows = [[-1, -1, -1] for _ in range(end - start)]
     turns = trace["turns"] if "turns" in trace else [trace]
     last_end = -1
     for turn in turns:
@@ -48,16 +34,16 @@ def preprocess_trace(
         for step in turn["steps"]:
             anchor = step["anchor"] - origin
             if step["drafts"] and step["commit"] and 0 <= anchor < end - start:
-                visible = min(step["commit"], step["drafts"],
-                              end - start - anchor - 1 + int(aligned_next_tokens))
-                rows[anchor] = [step["accepted"], visible, int(step["accepted"] < step["drafts"])]
-    plan = torch.tensor(rows, dtype=torch.long, device="cpu").reshape(end - start, 3)
-    if 0 <= end - start <= 8192:
-        _TRACE_PLAN_CACHE[key] = plan
-        if len(_TRACE_PLAN_CACHE) > 64:
-            _TRACE_PLAN_CACHE.popitem(last=False)
-    # One bulk H2D transfer; clone on CPU too, so callers cannot poison the cache.
-    return plan.to(device=device, copy=True)
+                visible = min(
+                    step["commit"],
+                    step["drafts"],
+                    end - start - anchor - 1 + int(aligned_next_tokens),
+                )
+                plan[anchor] = torch.tensor(
+                    [step["accepted"], visible, int(step["accepted"] < step["drafts"])],
+                    device=device,
+                )
+    return plan
 
 
 class DraftOPDObjective(nn.Module):
@@ -66,7 +52,6 @@ class DraftOPDObjective(nn.Module):
     ):
         super().__init__()
         self.layout = layout
-        self.distribution_loss_impl = config.get("distribution_loss_impl", "auto")
         self.temperature = float(temperature)
         self.planner = config.get("anchor_planner", "mixed")
         self.random_ratio = float(config.get("random_anchor_ratio", 0.25))
@@ -89,8 +74,9 @@ class DraftOPDObjective(nn.Module):
             raise ValueError("Invalid Draft-OPD ratio, rejection weight or chunk size")
         if loss_mode != "full_vocab" or per_position_loss_weight not in {
             "fixed_exp_decay",
+            "vat",
         }:
-            raise ValueError("Draft-OPD requires full_vocab and fixed_exp_decay")
+            raise ValueError("Draft-OPD requires full_vocab and fixed_exp_decay or vat")
 
     def plan(self, anchors, keep, trace):
         if trace is None:
@@ -109,6 +95,18 @@ class DraftOPDObjective(nn.Module):
         result = anchors.clone()
         result_keep = keep.clone()
         for row in range(bsz):
+            if self.planner == "mixed":
+                # Upstream samplers sort coordinates; choose the random quota
+                # uniformly from valid slots before packing the trace slots.
+                valid_slots = torch.nonzero(keep[row], as_tuple=True)[0]
+                random_slots = valid_slots[
+                    torch.randperm(valid_slots.numel(), device=anchors.device)[
+                        :random_count
+                    ]
+                ]
+                result_keep[row, :random_count] = False
+                result[row, : random_slots.numel()] = anchors[row, random_slots]
+                result_keep[row, : random_slots.numel()] = True
             candidates = torch.nonzero(trace[row, :, 1] > 0, as_tuple=True)[0]
             selected = candidates[
                 torch.randperm(candidates.numel(), device=anchors.device)[
@@ -142,10 +140,11 @@ class DraftOPDObjective(nn.Module):
 
     def _tv(self, logits, target_hidden, weight):
         with torch.no_grad():
-            target_logits = F.linear(target_hidden, weight)
-        return token_total_variation(logits, target_logits,
-            proposal_temperature=self.temperature, target_temperature=self.temperature,
-            implementation=self.distribution_loss_impl)
+            target_probs = F.softmax(
+                F.linear(target_hidden, weight).float() / self.temperature, -1
+            )
+        draft_probs = F.softmax(logits.float() / self.temperature, -1)
+        return (target_probs - draft_probs).abs().sum(-1) * 0.5
 
     def forward(
         self,
@@ -175,14 +174,14 @@ class DraftOPDObjective(nn.Module):
             tv.reshape(-1)[active_mask] = torch.cat(terms)
         offset = int(self.layout == "dflash")
         valid = base_mask[..., offset:].bool().long().cumprod(-1)
-        survival = prefix_survival(1.0 - tv[..., offset:]) * valid
+        survival = (1.0 - tv[..., offset:]).clamp(0, 1).cumprod(-1) * valid
         counts = valid.sum(-1)
         blocks = counts > 0
         # Weight prefix failures, not the TV probabilities inside the product.
         # Keep the count denominator so a single first rejection is amplified too.
         failures = (valid - survival) * position_weights[..., offset:]
         losses = failures.sum(-1) / counts.clamp_min(1)
-        return (losses * blocks).sum() / blocks.sum().clamp_min(1) + logits.sum() * 0.0
+        return (losses * blocks).sum() / blocks.sum().clamp_min(1) + logits[:0].sum()
 
     def metrics(self, loss, accepted, base_mask):
         valid = base_mask.bool().any(-1)

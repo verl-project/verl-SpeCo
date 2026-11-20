@@ -268,7 +268,7 @@ def test_merged_server_launch_restores_bubble_config_before_initial_draft(
 @pytest.mark.parametrize("serving_revision", [None, 0])
 def test_specopd_request_rejects_unacknowledged_revision_before_generation(monkeypatch, serving_revision):
     monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: {
-        "training": {"drafter_opd": {"enable": True, "method": "spec_opd"}},
+        "training": {"specopd": {"enable": True}},
     })
     server = SimpleNamespace(_speco_serving_drafter_revision=serving_revision)
     async def generate(**kwargs):
@@ -287,8 +287,7 @@ def test_specopd_vllm_uses_the_server_temperature_and_existing_verify_width(monk
         "rollout": {"spec_verify_tokens": 5},
         "training": {
             "dspark_num_anchors": 32,
-            "drafter_opd": {"enable": True, "method": "spec_opd"},
-            "specopd": {"anchor_count": None},
+            "specopd": {"enable": True, "anchor_count": None},
         },
     })
     server = SimpleNamespace(
@@ -1406,6 +1405,7 @@ def test_vllm_speculative_config_maps_dflash_contract() -> None:
     }
 
 
+@pytest.mark.parametrize("device", ["cuda", "npu"])
 @pytest.mark.parametrize(
     "algorithm,block_size,verify_tokens,valid",
     [
@@ -1415,7 +1415,6 @@ def test_vllm_speculative_config_maps_dflash_contract() -> None:
         ("DSPARK", 7, 7, True),
     ],
 )
-@pytest.mark.parametrize("device", ["cuda", "npu"])
 def test_opd_capacity_is_checked_before_rollout_start(
     monkeypatch, algorithm, block_size, verify_tokens, valid, device
 ):
@@ -3113,7 +3112,8 @@ def test_vllm_draft_update_pauses_flushes_and_resumes_after_commit(monkeypatch, 
         "_load_env_drafter_config",
         lambda: {
             "training": {
-                "drafter_opd": {"enable": method is not None, "method": method or "draft_opd"},
+                "drafter_opd": {"enable": method == "draft_opd"},
+                "specopd": {"enable": method == "spec_opd"},
                 "draft_update_pause_generation": True,
                 "draft_update_flush_before": True,
                 "draft_update_flush_after": True,
@@ -3561,6 +3561,77 @@ def test_ipc_npu_handle_remaps_only_receiver_device(monkeypatch, serialized, dev
     if device_id is not None:
         with pytest.raises(ValueError, match="NPU IPC"):
             vllm_runtime._speco_rebuild_ipc_compat((func, (1, 2, 3)), device_id)
+
+
+def test_reinstall_bridge_refreshes_config_after_early_install(monkeypatch):
+    class Server:
+        async def launch_server(self):
+            pass
+
+        async def run_server(self, args):
+            pass
+
+        async def generate(self):
+            pass
+
+    upstream = types.ModuleType("verl.workers.rollout.vllm_rollout.vllm_async_server")
+    upstream.vLLMHttpServer = Server
+    upstream.vLLMReplica = type("Replica", (), {})
+    modules = {
+        "ray": types.ModuleType("ray"),
+        "verl": types.ModuleType("verl"),
+        "verl.workers": types.ModuleType("verl.workers"),
+        "verl.workers.rollout": types.ModuleType("verl.workers.rollout"),
+        "verl.workers.rollout.replica": types.ModuleType("verl.workers.rollout.replica"),
+        "verl.workers.rollout.vllm_rollout": types.ModuleType("verl.workers.rollout.vllm_rollout"),
+        upstream.__name__: upstream,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+        if "." in name and name.rsplit(".", 1)[0] in modules:
+            setattr(modules[name.rsplit(".", 1)[0]], name.rsplit(".", 1)[1], module)
+    monkeypatch.setattr(vllm_runtime, "install_vllm_runtime_observability", lambda: None)
+    monkeypatch.setattr(vllm_runtime, "patch_vllm_server_adapter_update", lambda: None)
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    assert vllm_runtime.install_upstream_vllm_runtime_bridge()
+    server = upstream.vLLMHttpServer
+    assert server._speco_drafter_config_env is None
+    payload = json.dumps(_drafter(training={"drafter_opd": {"enable": True, "method": "draft_opd"}}))
+    monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, payload)
+    assert vllm_runtime.install_upstream_vllm_runtime_bridge()
+    assert upstream.vLLMHttpServer is server
+    assert server._speco_drafter_config_env == payload
+
+
+
+def test_http_bridge_survives_cloudpickle_fresh_import(tmp_path, monkeypatch):
+    import importlib.util
+    import os
+    import subprocess
+    cloudpickle = pytest.importorskip("cloudpickle")
+    module_name = "speco_fresh_http_probe"
+    source = tmp_path / (module_name + ".py")
+    source.write_text('class Upstream:\n    async def generate(self): return "native"\n    async def launch_server(self): return "native-launch"\n    async def run_server(self, args): return None\n', encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(module_name, source)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    spec.loader.exec_module(module)
+    native = module.Upstream.generate
+
+    async def patched(self):
+        return "bridge:" + await native(self)
+
+    module.Upstream.generate = patched
+    module.Upstream._speco_vllm_http_methods_patched = True
+    cls = vllm_runtime._build_speco_vllm_http_server_class(SimpleNamespace(vLLMHttpServer=module.Upstream))
+    payload = tmp_path / "server.pickle"
+    payload.write_bytes(cloudpickle.dumps(cls))
+    code = ('import asyncio,cloudpickle,sys; import speco_fresh_http_probe as m; '
+            'c=cloudpickle.loads(open(sys.argv[1],"rb").read()); '
+            'print(asyncio.run(m.Upstream().generate())); print(asyncio.run(c().generate()))')
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), str(Path(__file__).resolve().parents[2]), os.environ.get("PYTHONPATH", "")])}
+    result = subprocess.run([sys.executable, "-c", code, str(payload)], env=env, capture_output=True, text=True, check=True)
+    assert result.stdout.strip().splitlines()[-2:] == ["native", "bridge:native"]
 
 
 @pytest.mark.parametrize("snapshot_fails", [False, True])

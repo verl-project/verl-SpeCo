@@ -22,14 +22,13 @@ keeps draft-only weight publishing as a runtime method on the rollout adapter.
 from __future__ import annotations
 
 import atexit
-from functools import lru_cache
 import gc
 import hashlib
 import inspect
 import json
 import logging
 
-from verl_speco.opd_method import draft_opd_enabled, spec_opd_enabled, capture_verify_trace_enabled
+from verl_speco.specopd_config import spec_opd_enabled
 import os
 import sys
 import threading
@@ -38,6 +37,7 @@ import types
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import Any, Iterable, cast
 
@@ -57,6 +57,8 @@ from verl_speco.integration.drafter_config_env import (
     set_drafter_config_env,
 )
 from verl_speco.trainer.checkpoint import trim_process_host_memory
+
+from verl_speco.integration.verify_trace import TRACE_KEY
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -1219,7 +1221,11 @@ def _validate_vllm_dflash_drafter_config(
 
 
 def _load_env_drafter_config() -> dict[str, Any]:
-    raw = get_drafter_config_env()
+    return _parse_env_drafter_config(get_drafter_config_env())
+
+
+@lru_cache(maxsize=1)
+def _parse_env_drafter_config(raw: str | None) -> dict[str, Any]:
     if not raw:
         return {}
     try:
@@ -1227,17 +1233,6 @@ def _load_env_drafter_config() -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Invalid {SPECO_DRAFTER_CONFIG_ENV}: {exc}") from exc
     return loaded if isinstance(loaded, dict) else {}
-
-
-@lru_cache(maxsize=8)
-def _verify_trace_runtime_settings(raw: str):
-    """Cache immutable capture settings; never share a mutable config dict."""
-    try:
-        loaded = json.loads(raw) if raw else {}
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid {SPECO_DRAFTER_CONFIG_ENV}: {exc}") from exc
-    config = loaded if isinstance(loaded, dict) else {}
-    return capture_verify_trace_enabled(config.get("training", {})), _drafter_algorithm(config).lower()
 
 
 def _vllm_drafter_env_payload(drafter_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -1266,8 +1261,6 @@ def _ensure_vllm_server_drafter_env(
         if isinstance(loaded, dict):
             embedded_config = loaded
     env_config = _load_env_drafter_config()
-    if os.getenv("VERL_SPECO_DIAGNOSTIC_TRANSPORT") == "1":
-        print(f"[specopd transport] restore server_config={bool(server_config)} embedded_config={bool(embedded_config)} environment_config={bool(env_config)}", flush=True)
     candidates = (
         (server_config, "server_config"),
         (embedded_config, "server_class"),
@@ -1280,11 +1273,10 @@ def _ensure_vllm_server_drafter_env(
         # this opt-out separately, without changing event-bus source selection.
         resolved = candidate
         embedded_training = embedded_config.get("training", {})
-        for key in ("drafter_opd", "specopd"):
-            if key in embedded_training:
-                resolved = dict(resolved)
-                resolved["training"] = dict(resolved.get("training", {}))
-                resolved["training"][key] = embedded_training[key]
+        if "drafter_opd" in embedded_training:
+            resolved = dict(resolved)
+            resolved["training"] = dict(resolved.get("training", {}))
+            resolved["training"]["drafter_opd"] = embedded_training["drafter_opd"]
         for control in (embedded_config, candidate, env_config):
             options = control.get("vllm") or {}
             if "acceptance_sidecar_enabled" not in options:
@@ -3113,25 +3105,47 @@ def patch_vllm_request_acceptance_stats() -> bool:
     ):
 
         def patched_update_from_output(self, scheduler_output, model_runner_output):
-            capture, trace_layout = _verify_trace_runtime_settings(get_drafter_config_env())
+            opd_cfg = _load_env_drafter_config()
+            capture = (
+                opd_cfg.get("training", {})
+                .get("drafter_opd", {})
+                .get("capture_verify_trace", False)
+            )
             if capture:
                 from verl_speco.integration.verify_trace import snapshot_verify_step
+
                 if self.num_sampled_tokens_per_step != 1:
-                    raise ValueError("Draft-OPD requires one target correction/bonus token per step")
-                snapshots = snapshot_verify_step(self, scheduler_output, model_runner_output, require_opt_in=True)
+                    raise ValueError(
+                        "Draft-OPD requires one target correction/bonus token per step"
+                    )
+                snapshots = snapshot_verify_step(
+                    self, scheduler_output, model_runner_output
+                )
             engine_core_outputs = original_update_from_output(
                 self, scheduler_output, model_runner_output
             )
             if capture:
-                from verl_speco.integration.verify_trace import TRACE_KEY, finish_verify_step
+                from verl_speco.integration.verify_trace import (
+                    finish_verify_step,
+                )
+
                 traces = finish_verify_step(
-                    snapshots, layout=trace_layout,
-                    capacity=int(self.num_spec_tokens))
+                    snapshots,
+                    layout=_drafter_algorithm(opd_cfg).lower(),
+                    capacity=int(self.num_spec_tokens),
+                )
                 store = _speco_vllm_request_stats_store(self)
                 for rid, trace in traces.items():
-                    item = store.setdefault(rid, {"verify_rounds": 0, "draft_tokens": 0,
-                                                  "accepted_tokens": 0, "invalid_spec_tokens": 0,
-                                                  "started_sec": time.perf_counter()})
+                    item = store.setdefault(
+                        rid,
+                        {
+                            "verify_rounds": 0,
+                            "draft_tokens": 0,
+                            "accepted_tokens": 0,
+                            "invalid_spec_tokens": 0,
+                            "started_sec": time.perf_counter(),
+                        },
+                    )
                     item[TRACE_KEY] = trace
             try:
                 finished_outputs = []
@@ -3635,8 +3649,8 @@ def _vllm_request_accept_fields_from_summaries(
         f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_elapsed_sec": elapsed_sec,
         "_verl_request_mean_accept_len": mean_accept_len,
     }
-    if any("_speco_verify_trace" in summaries[rid] for rid in ordered_ids):
-        fields["_speco_verify_trace"] = [summaries[rid].get("_speco_verify_trace") for rid in ordered_ids]
+    if any(TRACE_KEY in summaries[rid] for rid in ordered_ids):
+        fields[TRACE_KEY] = [summaries[rid].get(TRACE_KEY) for rid in ordered_ids]
     return fields
 
 
@@ -4236,7 +4250,6 @@ async def _speco_generate_with_request_stats_unblocked(
     positional_params = "sampling_params" not in kwargs and len(args) >= 2
     if positional_params:
         sampling_params = args[1]
-    trace_collect = False
     if isinstance(sampling_params, dict):
         clean_params = dict(sampling_params)
         specopd_revision = clean_params.pop("_specopd_drafter_revision", None)
@@ -4249,13 +4262,6 @@ async def _speco_generate_with_request_stats_unblocked(
             drafter_cfg,
             rollout_temperature=_get_nested(self, ("config", "temperature"), 1.0),
         )
-        if not getattr(self, "_specopd_context_logged", False):
-            if os.getenv("VERL_SPECO_DIAGNOSTIC_TRANSPORT") == "1":
-                print(f"[specopd transport] server={type(self).__name__} enabled={specopd_config.enable} revision={specopd_revision} config_present={bool(_load_env_drafter_config())} logger_disabled={logger.disabled}", flush=True)
-            logger.warning("[specopd transport] server=%s enabled=%s revision_hint=%s skip=%s",
-                type(self).__name__, specopd_config.enable, specopd_revision,
-                clean_params.get("_verl_skip_drafter_collection", False))
-            self._specopd_context_logged = True
         specopd_collect = specopd_config.enable and not clean_params.get("_verl_skip_drafter_collection", False)
         if specopd_collect:
             if specopd_revision is None:
@@ -4304,13 +4310,6 @@ async def _speco_generate_with_request_stats_unblocked(
                 native_extra[PLAN_KEY]["max_branches"] = 0
             else:
                 self._specopd_collection_requests += 1
-            clean_params["extra_args"] = native_extra
-        from verl_speco.integration.verify_trace import CAPTURE_KEY
-
-        if capture_verify_trace_enabled(_load_env_drafter_config().get("training", {})):
-            trace_collect = not clean_params.get("_verl_skip_drafter_collection", False)
-            native_extra = dict(clean_params.get("extra_args") or {})
-            native_extra[CAPTURE_KEY] = trace_collect
             clean_params["extra_args"] = native_extra
         clean_params.pop("_verl_global_steps", None)
         clean_params.pop("_verl_skip_drafter_collection", None)
@@ -4418,12 +4417,6 @@ async def _speco_generate_with_request_stats_unblocked(
                 if wire is None:
                     raise RuntimeError("SpecOPD proposal channel missing from vLLM final output")
                 extra_fields[PROPOSAL_KEY] = wire
-                if os.getenv("VERL_SPECO_DIAGNOSTIC_TRANSPORT") == "1":
-                    from verl_speco.transport.specopd_protocol import decode_bundle
-                    records = decode_bundle(wire)["records"]
-                    tokens = sum(len(r["proposal_ids"]) for r in records)
-                    tails = sum(max(0, len(r["proposal_ids"]) - r["accepted_count"] - 1) for r in records)
-                    print(f"[specopd transport] proposals branches={len(records)} tokens={tokens} rejected_tail_tokens={tails}", flush=True)
             revision_after = int(getattr(self, "_speco_serving_drafter_revision", 0))
             # Unscored requests must carry the same provenance key as requests
             # with exact counters or an engine fallback before batch merging.
@@ -4471,15 +4464,21 @@ async def _speco_generate_with_request_stats_unblocked(
             )
 
             bridge_request_acceptance_counters(extra_fields)
-            if trace_collect:
-                from verl_speco.integration.verify_trace import TRACE_KEY, token_digest
+            if (
+                _load_env_drafter_config()
+                .get("training", {})
+                .get("drafter_opd", {})
+                .get("capture_verify_trace", False)
+            ):
+                from verl_speco.integration.verify_trace import token_digest
+
                 trace = extra_fields[TRACE_KEY]
                 prompt_ids = kwargs["prompt_ids"] if "prompt_ids" in kwargs else args[0]
                 if trace["response_length"] != len(output.token_ids):
-                    raise ValueError("Draft-OPD trace and returned response length differ")
+                    raise ValueError(
+                        "Draft-OPD trace and returned response length differ"
+                    )
                 trace["prefix_digest"] = token_digest([*prompt_ids, *output.token_ids])
-                trace["drafter_revision_min"] = min(revision_before, revision_after)
-                trace["drafter_revision_max"] = max(revision_before, revision_after)
             elapsed_key = f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_elapsed_sec"
             if (
                 extra_fields.get("_verl_request_mean_accept_len") is not None
@@ -4699,9 +4698,7 @@ async def _speco_generate_with_idle_lease(
 
 def _build_speco_vllm_http_server_class(upstream_module: Any):
     upstream_cls = upstream_module.vLLMHttpServer
-    from verl_speco.integration.lifecycle_timing import (
-        install_server_lifecycle_timing, server_lifecycle_namespace,
-    )
+    from verl_speco.integration.lifecycle_timing import install_server_lifecycle_timing
 
     install_server_lifecycle_timing(upstream_cls)
     drafter_config_env = os.getenv(SPECO_DRAFTER_CONFIG_ENV)
@@ -4716,7 +4713,6 @@ def _build_speco_vllm_http_server_class(upstream_module: Any):
         namespace = {
             "__module__": __name__,
             "_speco_drafter_config_env": drafter_config_env,
-            **server_lifecycle_namespace(upstream_cls),
         }
         from functools import wraps
 
@@ -4745,7 +4741,6 @@ def _build_speco_vllm_http_server_class(upstream_module: Any):
         {
             "__module__": __name__,
             "_speco_drafter_config_env": drafter_config_env,
-            **server_lifecycle_namespace(upstream_cls),
         },
     )
 
@@ -4945,8 +4940,7 @@ def install_upstream_vllm_runtime_bridge() -> bool:
         return False
 
     _patch_upstream_vllm_http_server_methods(vllm_async_server.vLLMHttpServer)
-    # Worker bootstrap may install the bridge before the trainer has resolved
-    # its drafter config. Refresh the existing class snapshot on reinstall too.
+    # Early worker bootstrap can precede configuration; refresh on reinstall.
     speco_http_server_cls = _build_speco_vllm_http_server_class(vllm_async_server)
     if bool(getattr(upstream_replica, "_speco_vllm_replica_bridge", False)):
         registry = getattr(replica_module, "RolloutReplicaRegistry", None)
@@ -4954,6 +4948,7 @@ def install_upstream_vllm_runtime_bridge() -> bool:
             registry._registry["vllm"] = lambda: upstream_replica
         _VLLM_REPLICA_PATCHED = True
         return True
+
     upstream_replica_base = cast(type[Any], upstream_replica)
 
     def _speco_vllm_replica_init(self, *args, **kwargs):
@@ -5011,9 +5006,11 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     drafter_cfg = _drafter_config_from_config(config)
     enabled = bool(drafter_cfg.get("enable"))
     opd_cfg = drafter_cfg.get("training", {}).get("drafter_opd", {})
-    if draft_opd_enabled(drafter_cfg.get("training", {})):
+    if opd_cfg.get("enable", False):
         if not enabled or not opd_cfg.get("capture_verify_trace", False):
-            raise ValueError("Draft-OPD requires drafter.enable and capture_verify_trace")
+            raise ValueError(
+                "Draft-OPD requires drafter.enable and capture_verify_trace"
+            )
         if _drafter_algorithm(drafter_cfg) not in {"DFLASH", "DSPARK"}:
             raise ValueError("Draft-OPD supports DFLASH and DSPARK")
         is_dflash = _drafter_algorithm(drafter_cfg) == "DFLASH"

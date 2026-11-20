@@ -147,10 +147,6 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_v1_trainer \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.top_k=-1 \
     actor_rollout_ref.rollout.drafter.vllm.draft_sample_method=greedy \
-    actor_rollout_ref.rollout.drafter.training.drafter_opd.enable=true \
-    actor_rollout_ref.rollout.drafter.training.drafter_opd.method=spec_opd \
-    actor_rollout_ref.rollout.drafter.training.drafter_opd.capture_verify_trace=true \
-    actor_rollout_ref.rollout.drafter.training.drafter_opd.loss=e2e_tv \
     actor_rollout_ref.rollout.drafter.training.dspark_per_position_loss_weight=fixed_exp_decay \
     actor_rollout_ref.rollout.drafter.training.lk_temperature=1.0 \
     actor_rollout_ref.model.use_fused_kernels=false \
@@ -158,6 +154,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_v1_trainer \
     actor_rollout_ref.actor.use_torch_compile=true \
     actor_rollout_ref.rollout.drafter.training.packing.enable=false \
     actor_rollout_ref.rollout.drafter.training.scheduler.execution.strategy=sync \
+    actor_rollout_ref.rollout.drafter.training.specopd.enable=true \
     actor_rollout_ref.rollout.drafter.training.specopd.objective=tv \
     actor_rollout_ref.rollout.drafter.training.specopd.anchor_count=null \
     actor_rollout_ref.rollout.drafter.training.specopd.max_collect_samples_per_step=80 \

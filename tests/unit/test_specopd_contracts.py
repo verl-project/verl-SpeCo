@@ -49,10 +49,10 @@ def config():
                 "drafter": {
                     "enable": True,
                     "enable_drafter_training": True,
-                    "speculative_algorithm": "DFLASH",
+                    "speculative_algorithm": "DSPARK",
                     "vllm": {"draft_sample_method": "greedy"},
                     "training": {
-                        "dflash_block_size": 8,
+                        "dspark_block_size": 7,
                         "step": 1,
                         "collect_interval_steps": 1,
                         "training_interval_steps": 1,
@@ -67,7 +67,7 @@ def config():
 def test_configuration_requires_exact_block_and_sampling():
     assert validate_specopd_config(config()).enable
     cfg = config()
-    cfg["actor_rollout_ref"]["rollout"]["drafter"]["training"]["dflash_block_size"] = 16
+    cfg["actor_rollout_ref"]["rollout"]["drafter"]["training"]["dspark_block_size"] = 16
     with pytest.raises(ValueError, match="block size"):
         validate_specopd_config(cfg)
     cfg = config()
@@ -104,8 +104,8 @@ def test_specopd_inherits_shared_collection_settings_and_keeps_explicit_override
         "hidden_state_window_mode": "random",
         "hidden_state_window_tokens_per_sample": 256,
         "hidden_state_random_max_offset": 0,
-        "drafter_opd": {"enable": True, "method": "spec_opd", "first_reject_weight": 3.0},
-        "specopd": {"anchor_count": 64, "window_response_tokens": 512},
+        "drafter_opd": {"first_reject_weight": 3.0},
+        "specopd": {"enable": True, "anchor_count": 64, "window_response_tokens": 512},
     }
     spec = SpecOPDConfig.from_training(training)
     assert (spec.window_mode, spec.window_response_tokens, spec.random_max_offset) == (

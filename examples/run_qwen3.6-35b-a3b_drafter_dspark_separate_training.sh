@@ -331,19 +331,15 @@ if ! "${PYTHON_BIN}" tools/wait_for_vllm_endpoints.py \
     exit 1
 fi
 
-# TransferQueue runtime backend. "subprocess" runs the producer/owner/consumer
-# as plain processes that inherit the driver's ASCEND_RT_VISIBLE_DEVICES, so the
-# CPU-only producer keeps a valid NPU context for Mooncake's Ascend transport.
-# With the default "ray" backend, Ray clears that variable for the CPU-only
-# producer actor and Mooncake setup fails (error code -1). Override with
-# RUNTIME_BACKEND=ray only once the producer actor device env is handled.
-RUNTIME_BACKEND=${RUNTIME_BACKEND:-subprocess}
+# Both streaming transports use the Ray Producer and Consumer.
+DATA_TRANSPORT=${DATA_TRANSPORT:-ray_reference}
 
 PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher \
     speco.draft_training.num_gpus_per_node=${draft_train_gpus_per_node} \
     speco.draft_training.nnodes=1 \
     speco.draft_training.standalone=True \
-    speco.draft_training.runtime_backend=${RUNTIME_BACKEND} \
+    speco.draft_training.runtime_backend=ray \
+    speco.draft_training.data_transport=${DATA_TRANSPORT} \
     data.train_files=${TRAIN_FILE} \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.actor.strategy=${DRAFTER_STRATEGY} \

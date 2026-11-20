@@ -26,8 +26,8 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl_speco/main.py",
     # Actor-side collection selects CUDA communication/transport implementations.
     "verl_speco/integration/oldlogprob_runtime.py",
-    # Native vLLM launch/weight-transfer dispatch and PR #1's CUDA-only
-    # Draft-OPD capability guard belong to this runtime adapter boundary.
+    # Native vLLM launch, weight transfer and CUDA/NPU capability checks
+    # belong to this runtime adapter boundary.
     "verl_speco/integration/vllm_runtime.py",
     # Read-only build/allocator metadata; never moves tensors or synchronizes.
     "verl_speco/trainer/performance_diagnostics.py",

@@ -69,6 +69,10 @@ def test_factory_rejects_unknown_algorithm_before_importing_a_backend() -> None:
         ("DSPARK", {}, "dflash_aux_plus_last"),
         ("DSPARK", {"dspark_l1_loss_alpha": 0.0}, "dflash_aux"),
         ("DSPARK", {"dspark_l1_loss_alpha": None}, "dflash_aux"),
+        ("DFLASH", {"dflash_per_position_loss_weight": "vat"}, "dflash_aux_plus_last"),
+        ("DFLASH", {"drafter_opd": {"enable": True}}, "dflash_aux_plus_last"),
+        ("DSPARK", {"dspark_l1_loss_alpha": 0.0, "dspark_per_position_loss_weight": "vat"}, "dflash_aux_plus_last"),
+        ("DSPARK", {"dspark_l1_loss_alpha": 0.0, "drafter_opd": {"enable": True}}, "dflash_aux_plus_last"),
         # DSV4 DSpark mirrors the DSpark layout but reads its own dsv4_dspark_*
         # loss coefficients.
         ("DSV4_DSPARK", {}, "dflash_aux"),

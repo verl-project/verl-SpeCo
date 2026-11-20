@@ -16,13 +16,6 @@ from verl_speco.integration.phase_timing import (
 )
 
 
-_LIFECYCLE_METHODS = (
-    "abort_all_requests", "pause_generation", "resume_generation",
-    "sleep", "wake_up", "clear_kv_cache",
-    "wait_for_requests_to_drain", "resume_engine_generation",
-)
-
-
 @contextmanager
 def lifecycle_span(server, method):
     if not phase_timing_enabled():
@@ -99,27 +92,18 @@ def _wrap(method, name):
     return measured
 
 
-def server_lifecycle_namespace(server_cls):
-    """Carry fresh wrappers by value instead of inheriting a patched base.
-
-    Ray imports upstream bases in a fresh process, where parent-only patches
-    are absent. Distinct child methods keep lifecycle traces after cloudpickle.
-    """
-    if not phase_timing_enabled():
-        return {}
-    result = {}
-    for name in _LIFECYCLE_METHODS:
-        method = getattr(server_cls, name, None)
-        if getattr(method, "_speco_lifecycle_timed", False):
-            result[name] = _wrap(getattr(method, "__wrapped__", method), name)
-    return result
-
-
 def install_server_lifecycle_timing(server_cls):
     """Install before Ray captures the actor method table; preserve signatures."""
     if not phase_timing_enabled():
         return
-    for name in _LIFECYCLE_METHODS:
+    for name in (
+        "abort_all_requests",
+        "pause_generation",
+        "resume_generation",
+        "sleep",
+        "wake_up",
+        "clear_kv_cache",
+    ):
         method = getattr(server_cls, name, None)
         descriptor = inspect.getattr_static(server_cls, name, None)
         if (

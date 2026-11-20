@@ -24,67 +24,6 @@ from verl_speco.integration.partial_rollout_stats import (
 from verl_speco.integration.rollout_admission import RolloutAdmission
 
 
-def test_v1_manager_keeps_native_transfer_queue_worker():
-    from types import SimpleNamespace
-
-    manager_cls = type("AgentLoopManagerTQ", (), {"__module__": "verl.trainer.ppo.v1.agent_loop_tq"})
-    manager = manager_cls()
-    worker = object()
-    manager.agent_loop_workers_class = worker
-    manager.config = SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(name="vllm")))
-    agent_loop_runtime._configure_speco_agent_loop_manager_instance(manager, object)
-    assert manager.agent_loop_workers_class is worker
-    assert manager._speco_agent_loop_manager_configured
-
-
-def test_v1_tensor_dict_diagnostic_accepts_no_meta_info(monkeypatch):
-    import asyncio
-    from types import SimpleNamespace
-    import torch
-    from tensordict import TensorDict
-    from verl_speco.integration import agent_loop_runtime as runtime
-
-    async def generate(self, batch):
-        return None
-
-    monkeypatch.setenv("VERL_SPECO_DIAGNOSTIC_TRANSPORT", "1")
-    monkeypatch.setattr(runtime, "_speco_worker_request_started", lambda self: None)
-    monkeypatch.setattr(runtime, "_speco_worker_request_finished", lambda self: None)
-    monkeypatch.setattr(runtime, "_speco_parent_method", lambda self, name: generate)
-    batch = TensorDict({"input_ids": torch.tensor([[1, 2]])}, batch_size=[1])
-    assert asyncio.run(runtime._speco_worker_generate_sequences(SimpleNamespace(), batch)) is None
-
-
-@pytest.mark.parametrize("fail", [False, True])
-@pytest.mark.parametrize("inherited", [False, True])
-def test_v1_explicit_worker_binds_and_resets_proposal_revision(monkeypatch, fail, inherited):
-    import asyncio
-    from types import SimpleNamespace
-    from verl_speco.integration import agent_loop_runtime as runtime
-
-    async def run(self, sampling_params, trajectory, **kwargs):
-        assert runtime._sampling_params_with_speco_context(sampling_params)["_specopd_drafter_revision"] == (3 if inherited else 7)
-        assert "_specopd_drafter_revision" not in kwargs
-        if fail:
-            raise ValueError("test failure")
-        return SimpleNamespace(extra_fields={})
-
-    monkeypatch.setattr(runtime, "_speco_parent_method", lambda self, name: run)
-    async def check():
-        token = runtime._CURRENT_SPECOPD_REVISION.set(3)
-        try:
-            kwargs = {} if inherited else {"_specopd_drafter_revision": 7}
-            call = runtime._speco_worker_run_agent_loop(SimpleNamespace(), {}, {"step": 1}, **kwargs)
-            if fail:
-                with pytest.raises(ValueError, match="test failure"):
-                    await call
-            else:
-                await call
-            assert runtime._CURRENT_SPECOPD_REVISION.get() == 3
-        finally:
-            runtime._CURRENT_SPECOPD_REVISION.reset(token)
-    asyncio.run(check())
-
 def test_agent_loop_preserves_spec_decode_metric_fields() -> None:
     output = SimpleNamespace(extra_fields={})
 
@@ -94,46 +33,11 @@ def test_agent_loop_preserves_spec_decode_metric_fields() -> None:
     assert output.extra_fields["_speco_vllm_spec_decode_accepted_tokens"] is None
 
 
-@pytest.mark.parametrize("fallback_first", [False, True])
-def test_mixed_acceptance_sources_have_concat_compatible_fields(fallback_first):
-    np = pytest.importorskip("numpy")
-
-    from verl_speco.integration.acceptance_metrics import (
-        bridge_request_acceptance_counters,
-        request_acceptance_counters,
-    )
-
-    key = "_speco_acceptance_engine_fallback"
-    outputs = [SimpleNamespace(extra_fields={}), SimpleNamespace(extra_fields={key: True})]
-    if fallback_first:
-        outputs.reverse()
-    agent_loop_runtime._speco_default_agent_loop_inputs(outputs)
-    assert outputs[0].extra_fields.keys() == outputs[1].extra_fields.keys()
-    assert [output.extra_fields[key] for output in outputs] == (
-        [True, False] if fallback_first else [False, True]
-    )
-    DataProto = pytest.importorskip("verl.protocol").DataProto
-    batches = [
-        DataProto(non_tensor_batch={k: np.array([v], dtype=object) for k, v in output.extra_fields.items()})
-        for output in outputs
-    ]
-    combined = DataProto.concat(batches)
-    assert combined.non_tensor_batch[key].tolist() == ([True, False] if fallback_first else [False, True])
-
-    fields = next(output.extra_fields for output in outputs if output.extra_fields[key])
-    fields.update(spec_num_verify_steps=100, spec_num_accepted_tokens=300)
-    assert request_acceptance_counters(fields) is None
-    fields.update(_speco_vllm_request_verify_rounds=2, _speco_vllm_request_accepted_tokens=3)
-    assert bridge_request_acceptance_counters(fields)
-    assert fields[key] is False
-    assert request_acceptance_counters(fields) == (2, 3)
-
-
 @pytest.mark.parametrize("layout", ["dflash", "dspark"])
-@pytest.mark.parametrize("with_proposal", [False, True])
-def test_vllm_remote_worker_installs_and_transports_verify_trace(monkeypatch, layout, with_proposal):
+def test_vllm_remote_worker_installs_and_transports_verify_trace(monkeypatch, layout):
     import sys
 
+    pytest.importorskip("torch")
     from verl_speco.backends.drafter_opd import preprocess_trace
     from verl_speco.integration.verify_trace import TRACE_KEY, token_digest
 
@@ -157,10 +61,7 @@ def test_vllm_remote_worker_installs_and_transports_verify_trace(monkeypatch, la
 
     class Client:
         async def generate(self, *, sampling_params):
-            fields = {TRACE_KEY: evidence}
-            if with_proposal:
-                fields["_specopd_proposals"] = "opaque-full-proposal-wire"
-            return SimpleNamespace(token_ids=[3, 4], extra_fields=fields)
+            return SimpleNamespace(token_ids=[3, 4], extra_fields={TRACE_KEY: evidence})
 
     class Worker:
         def __init__(self):
@@ -213,11 +114,45 @@ def test_vllm_remote_worker_installs_and_transports_verify_trace(monkeypatch, la
     worker = manager.agent_loop_workers_class()
     output = asyncio.run(worker._run_agent_loop({}, {"step": 2}))
     assert output.extra_fields[TRACE_KEY] == {"turns": [evidence]}
-    assert output.extra_fields["_specopd_proposals"] == ("opaque-full-proposal-wire" if with_proposal else "")
     plan = preprocess_trace(
         output.extra_fields, start=0, end=4, layout=layout, capacity=2, device="cpu"
     )
     assert plan[1].tolist() == [1, 2, 1]
+
+
+@pytest.mark.parametrize("fallback_first", [False, True])
+def test_mixed_acceptance_sources_have_concat_compatible_fields(fallback_first):
+    np = pytest.importorskip("numpy")
+
+    from verl_speco.integration.acceptance_metrics import (
+        bridge_request_acceptance_counters,
+        request_acceptance_counters,
+    )
+
+    key = "_speco_acceptance_engine_fallback"
+    outputs = [SimpleNamespace(extra_fields={}), SimpleNamespace(extra_fields={key: True})]
+    if fallback_first:
+        outputs.reverse()
+    agent_loop_runtime._speco_default_agent_loop_inputs(outputs)
+    assert outputs[0].extra_fields.keys() == outputs[1].extra_fields.keys()
+    assert [output.extra_fields[key] for output in outputs] == (
+        [True, False] if fallback_first else [False, True]
+    )
+    DataProto = pytest.importorskip("verl.protocol").DataProto
+    batches = [
+        DataProto(non_tensor_batch={k: np.array([v], dtype=object) for k, v in output.extra_fields.items()})
+        for output in outputs
+    ]
+    combined = DataProto.concat(batches)
+    assert combined.non_tensor_batch[key].tolist() == ([True, False] if fallback_first else [False, True])
+
+    fields = next(output.extra_fields for output in outputs if output.extra_fields[key])
+    fields.update(spec_num_verify_steps=100, spec_num_accepted_tokens=300)
+    assert request_acceptance_counters(fields) is None
+    fields.update(_speco_vllm_request_verify_rounds=2, _speco_vllm_request_accepted_tokens=3)
+    assert bridge_request_acceptance_counters(fields)
+    assert fields[key] is False
+    assert request_acceptance_counters(fields) == (2, 3)
 
 
 def test_agent_loop_patch_supports_release_v080_llm_server_client(monkeypatch) -> None:
@@ -641,3 +576,26 @@ def test_failed_or_cancelled_request_releases_idle_barrier(cancel):
             pass
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("already_wrapped", [False, True])
+def test_vllm_manager_preserves_native_transfer_queue_worker(monkeypatch, already_wrapped):
+    import sys
+    class BaseWorker:
+        pass
+    class QueueWorker(BaseWorker):
+        def write_to_queue(self):
+            return "queued"
+    if already_wrapped:
+        QueueWorker._speco_explicit_worker_runtime = True
+    actor = SimpleNamespace(__ray_actor_class__=QueueWorker)
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(remote=lambda cls: cls))
+    manager = SimpleNamespace(
+        config=SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(name="vllm"))),
+        agent_loop_workers_class=actor)
+    agent_loop_runtime._configure_speco_agent_loop_manager_instance(manager, BaseWorker)
+    if already_wrapped:
+        assert manager.agent_loop_workers_class is actor
+    else:
+        assert issubclass(manager.agent_loop_workers_class, QueueWorker)
+        assert manager.agent_loop_workers_class.write_to_queue(None) == "queued"

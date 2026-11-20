@@ -39,14 +39,12 @@ def proposal_loss(wrapper, batch, lm_head_weight):
         raise ValueError(
             "SpecOPD proposal rows must match the padded trajectory/branch layout"
         )
-    spark = hasattr(wrapper.draft_model, "markov_head")
-    start = 0 if spark else 1
-    if wrapper.block_size != batch["proposal_block_width"] + start:
+    if wrapper.block_size != batch["proposal_block_width"]:
         raise ValueError(
             "drafter mask-block width differs from rollout; probabilities cannot be replayed"
         )
     width = proposal.shape[1]
-    if width + start > wrapper.block_size:
+    if width > wrapper.block_size:
         raise ValueError("SpecOPD proposal width exceeds the drafter block capacity")
     keep = valid.any(-1).reshape(bsz, n)
     base = batch["hidden_states"]
@@ -75,53 +73,27 @@ def proposal_loss(wrapper, batch, lm_head_weight):
         block_mask=mask,
         dense_attention_mask=dense,
         noise_embedding=wrapper._create_noise_embed(ids, anchors, keep),
-    ).reshape(bsz * n, wrapper.block_size, -1)[:, start : start + width]
+    ).reshape(bsz * n, wrapper.block_size, -1)[:, :width]
     head = lm_head_weight
     if head.shape[0] != wrapper.draft_model.config.vocab_size:
         raise ValueError("SpecOPD currently requires the complete target LM head")
     unary = F.linear(hidden, head.to(hidden.dtype)).float()
     anchor_tokens = ids.gather(1, anchors).reshape(-1)
     predecessors = torch.cat((anchor_tokens[:, None], proposal[:, :-1]), dim=-1)
-    candidate_ids = None
-    if hasattr(wrapper.draft_model, "candidate_selector"):
-        selector = wrapper.draft_model.candidate_selector
-        _, candidate_ids = unary.detach().topk(
-            min(selector.top_k, unary.shape[-1]), dim=-1, sorted=False
-        )
-        supported = (candidate_ids == proposal.unsqueeze(-1)).any(-1)
-        support_mask = batch.get("sampling_support_mask", valid)
-        if not supported[support_mask].all():
-            raise ValueError(
-                "sampled proposal is outside reconstructed DFlash2 candidate support"
-            )
-        selected_unary = unary.gather(-1, candidate_ids)
-        logits = selector.pair_scores(
-            hidden.reshape(-1, hidden.shape[-1]),
-            selected_unary.reshape(-1, candidate_ids.shape[-1]),
-            candidate_ids.reshape(-1, candidate_ids.shape[-1]),
-            predecessors.reshape(-1),
-        ).reshape_as(selected_unary)
-    elif spark:
-        if wrapper.draft_model.markov_head is None:
-            raise ValueError("SpecOPD DSpark requires a conditional Markov head")
-        logits = wrapper.draft_model.apply_markov_logits(
-            unary,
-            prev_token_ids=predecessors,
-            draft_hidden=hidden,
-        )
-    else:
-        logits = unary
+    if wrapper.draft_model.markov_head is None:
+        raise ValueError("SpecOPD DSpark requires a conditional Markov head")
+    logits = wrapper.draft_model.apply_markov_logits(
+        unary, prev_token_ids=predecessors, draft_hidden=hidden,
+    )
     with torch.no_grad():
         teacher = F.linear(
             batch["target_last_hidden_states"].to(head.dtype), head
         ).float()
     distribution_weight, ce_weight = batch.get("loss_weights", (1.0, 0.0))
-    # DFlash2 uses full-vocabulary unary scores for labels outside its shortlist.
     return specopd_distribution_loss(
         logits,
         teacher,
         valid,
-        candidate_ids=candidate_ids,
         position_weights=batch.get("position_weights"),
         distribution_loss_impl=getattr(wrapper, "distribution_loss_impl", "auto"),
         proposal_temperature=batch["proposal_temperature"],
@@ -129,7 +101,6 @@ def proposal_loss(wrapper, batch, lm_head_weight):
         use_l1=batch.get("objective") == "l1",
         distribution_weight=distribution_weight,
         ce_weight=ce_weight,
-        ce_logits=unary if candidate_ids is not None else None,
     )
 
 

@@ -182,7 +182,6 @@ actor_rollout_ref:
         mode: online
         # Opt-in joint trajectory/branch old-logprob and one-use distillation.
         specopd:
-          # Deprecated compatibility flag. Prefer drafter_opd.method=spec_opd.
           enable: false
           # e2e_tv retains the original pure objective. tv/l1 use shared CE and distribution weights.
           objective: e2e_tv
@@ -356,15 +355,22 @@ actor_rollout_ref:
         group_by_length_megabatch: 8
         # Temperature used for both target and draft distributions in LK losses.
         # Set this to actor_rollout_ref.rollout.temperature for probabilistic drafts.
+        # VAT KD defaults: DFlash=1, DSpark=0; acceptance is a greedy proxy.
         drafter_opd:
           enable: false
-          # draft_opd preserves PR #1; spec_opd uses complete proposal branches.
-          method: draft_opd
           capture_verify_trace: false
           anchor_planner: mixed
           random_anchor_ratio: 0.25
           loss: e2e_tv
           first_reject_weight: 2.0
+          chunk_size: 1024
+        vat:
+          kd_weight: null
+          kd_temperature: 2.0
+          accept_head_weight: 1.0
+          self_cov_weight: 0.0
+          self_cov_floor: 1.0e-6
+          accept_mode: greedy
           chunk_size: 1024
         lk_temperature: 1.0
         # null enables actor-side full-vocabulary logZ capture automatically when

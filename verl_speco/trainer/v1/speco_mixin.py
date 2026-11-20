@@ -30,6 +30,8 @@ from verl_speco.trainer.v1.bubble_mixin import V1BubbleMixin
 from verl_speco.trainer.v1 import specopd_adapter
 from verl_speco.rl_insight_bridge import trace_state as _rl_insight_trace_state
 
+from verl_speco.integration.verify_trace import TRACE_KEY
+
 logger = logging.getLogger(__name__)
 
 # RL-Insight trace lane for the trainer-side phases owned by the V1 lifecycle.
@@ -1310,34 +1312,29 @@ class SpecoV1Mixin(V1BubbleMixin):
         return result
 
     def on_sample_end(self):
-        from verl_speco.integration.phase_timing import phase_span
-
-        with phase_span(
-            "v1_sample_end", role="trainer", source_step=getattr(self, "global_steps", -1),
-        ):
-            if self._speco_rollout_idle_worker_enabled():
-                started = time.perf_counter()
-                self._speco_record_rollout_idle_metrics(
-                    self._speco_bubble_session().close("v1_sample_end")
-                )
-                self._speco_v1_record_timing(
-                    "drafter_v1_sample_end", time.perf_counter() - started
-                )
-                return super().on_sample_end()
-            if not self._speco_colocate_probe_boundary_enabled():
-                return super().on_sample_end()
-            self._speco_rollout_admission_rpc("speco_close_rollout_admission")
-            self._speco_colocate_admission_closed = True
-            try:
-                # Wait only for serving RPCs after abort, not for TQ agent loops:
-                # those loops can be waiting to retry when cards are returned.
-                self.checkpoint_manager.abort_replicas()
-                self._speco_rollout_admission_rpc("speco_wait_rollout_idle")
-                self.checkpoint_manager.sleep_replicas()
-            except BaseException:
-                self._speco_rollout_admission_rpc("speco_resume_rollout_admission")
-                self._speco_colocate_admission_closed = False
-                raise
+        if self._speco_rollout_idle_worker_enabled():
+            started = time.perf_counter()
+            self._speco_record_rollout_idle_metrics(
+                self._speco_bubble_session().close("v1_sample_end")
+            )
+            self._speco_v1_record_timing(
+                "drafter_v1_sample_end", time.perf_counter() - started
+            )
+            return super().on_sample_end()
+        if not self._speco_colocate_probe_boundary_enabled():
+            return super().on_sample_end()
+        self._speco_rollout_admission_rpc("speco_close_rollout_admission")
+        self._speco_colocate_admission_closed = True
+        try:
+            # Wait only for serving RPCs after abort, not for TQ agent loops:
+            # those loops can be waiting to retry when cards are returned.
+            self.checkpoint_manager.abort_replicas()
+            self._speco_rollout_admission_rpc("speco_wait_rollout_idle")
+            self.checkpoint_manager.sleep_replicas()
+        except BaseException:
+            self._speco_rollout_admission_rpc("speco_resume_rollout_admission")
+            self._speco_colocate_admission_closed = False
+            raise
 
     def _speco_colocate_probe_boundary_enabled(self):
         training = self._speco_drafter_training_config() or {}
@@ -1531,7 +1528,7 @@ class SpecoV1Mixin(V1BubbleMixin):
         for key in (
             "_specopd_proposals",
             "_verl_request_mean_accept_len",
-            "_speco_verify_trace",
+            TRACE_KEY,
             "_speco_vllm_request_id",
             "_speco_vllm_request_verify_rounds",
             "_speco_vllm_request_accepted_tokens",
@@ -2305,8 +2302,6 @@ class SpecoV1Mixin(V1BubbleMixin):
     def _submit_batch_to_rollout(self, batch):
         if specopd_adapter.enabled(self):
             batch = specopd_adapter.prepare_rollout(self, batch)
-        else:
-            batch = specopd_adapter.prepare_draft_rollout(self, batch)
         return super()._submit_batch_to_rollout(batch)
 
     def prepare_for_fit(self, agent_loop_manager) -> None:
@@ -2421,8 +2416,6 @@ class SpecoV1Mixin(V1BubbleMixin):
             if not bool(getattr(self, "_speco_prepared_for_fit", False)):
                 # Compatibility fallback for callers other than SpecoTaskRunner.
                 self.prepare_for_fit(agent_loop_manager)
-            from verl_speco.integration.request_stage_diagnostics import install_replay_sample_timing
-            install_replay_sample_timing(getattr(self, "replay_buffer", None))
             result = super().fit(agent_loop_manager)
             completed = True
             return result

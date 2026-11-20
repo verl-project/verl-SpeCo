@@ -19,7 +19,6 @@ import torch
 import torch.nn.functional as F
 
 from verl_speco.backends.opd_distribution import token_total_variation, use_fused_opd_loss
-from verl_speco.backends.opd_math import prefix_survival
 from verl_speco.ops.dspark_fused_loss import (
     fused_label_cross_entropy,
     fused_total_variation_and_teacher_ce,
@@ -97,7 +96,7 @@ def specopd_distribution_loss(
         alpha = torch.minimum(q, p).sum(-1).clamp(max=1.0)
         tv = 1.0 - alpha
     alpha = torch.where(valid_mask, alpha, torch.ones_like(alpha))
-    survival = prefix_survival(alpha)
+    survival = alpha.cumprod(dim=-1)
     distance = 2.0 * tv if use_l1 else 1.0 - survival
     numerator, count = reduce_specopd_loss(distance, valid_mask, position_weights)
     if ce_weight:

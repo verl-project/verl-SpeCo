@@ -110,19 +110,14 @@ def configuration():
                 "drafter": {
                     "enable": True,
                     "enable_drafter_training": True,
-                    "speculative_algorithm": "DFLASH",
+                    "speculative_algorithm": "DSPARK",
                     "vllm": {"draft_sample_method": "probabilistic"},
                     "training": {
-                        "dflash_block_size": 4,
+                        "dspark_block_size": 3,
                         "step": 1,
                         "collect_interval_steps": 1,
                         "training_interval_steps": 1,
-                        "drafter_opd": {
-                            "enable": True,
-                            "method": "spec_opd",
-                            "capture_verify_trace": True,
-                        },
-                        "specopd": {"proposal_width": 3},
+                        "specopd": {"enable": True, "proposal_width": 3},
                     },
                 },
             },

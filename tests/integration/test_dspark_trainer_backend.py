@@ -524,6 +524,28 @@ def test_dspark_untrained_confidence_head_is_kept_but_excluded_from_optimizer():
     )
 
 
+@pytest.mark.parametrize("vat", [False, True])
+@pytest.mark.parametrize("alpha", [0.0, 0.5])
+def test_dspark_confidence_head_log_matches_resolved_supervision(caplog, vat, alpha):
+    with caplog.at_level("INFO", logger=dspark_backend.__name__):
+        model = _small_dspark_training_model(
+            enable_confidence_head=True,
+            confidence_head_alpha=alpha,
+            per_position_loss_weight="vat" if vat else "fixed_exp_decay",
+        )
+    trainable = vat or alpha > 0
+    assert all(
+        parameter.requires_grad == trainable
+        for parameter in model.draft_model.confidence_head.parameters()
+    )
+    assert model.confidence_loss_enabled == (alpha > 0 and not vat)
+    messages = [record.message for record in caplog.records if "confidence head" in record.message]
+    assert len(messages) == 1
+    assert ("trainable" in messages[0]) == trainable
+    assert ("frozen" in messages[0]) == (not trainable)
+    assert ("VAT supervision" in messages[0]) == vat
+
+
 def test_dspark_confidence_loss_without_a_head_is_rejected():
     config = DSparkConfig(
         hidden_size=8,
@@ -2258,9 +2280,63 @@ def test_block_drafter_packing_allows_equal_length_context():
 
 
 @pytest.mark.parametrize("model_type", ["dflash", "dspark"])
-@pytest.mark.parametrize("loss_type", ["ce", "e2e_tv"])
 @pytest.mark.parametrize("empty", [False, True])
-def test_drafter_opd_backends_forward_backward(model_type, loss_type, empty):
+def test_vat_forward_backward_and_resume(model_type, empty):
+    config_cls = DFlashConfig if model_type == "dflash" else DSparkConfig
+    draft_cls = DFlashDraftModel if model_type == "dflash" else DSparkDraftModel
+    training_cls = DFlashTrainingModel if model_type == "dflash" else DSparkTrainingModel
+    config = config_cls(hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+                        num_attention_heads=2, num_key_value_heads=1, vocab_size=32,
+                        num_target_layers=4, num_context_layers=2, target_hidden_size=8,
+                        target_num_hidden_layers=4, target_layer_ids=[1, 3],
+                        mask_token_id=31, markov_rank=4, enable_confidence_head=True)
+    model = training_cls(draft_cls(config), block_size=2, num_anchors=2,
+                         per_position_loss_weight="vat", vat_config={"self_cov_weight": .6})
+    ids = torch.tensor([[1, 2, 3, 4, 5]])
+    loss, *_rest, diagnostics = model(
+        input_ids=ids, hidden_states_list=[torch.randn(1, 5, 8), torch.randn(1, 5, 8)],
+        loss_mask=torch.zeros_like(ids).float() if empty else torch.ones_like(ids).float(),
+        lm_head_weight=torch.randn(32, 8), target_last_hidden_states=torch.randn(1, 5, 8))
+    loss.backward()
+    assert torch.isfinite(loss)
+    head = model.vat_objective.accept_head if model_type == "dflash" else model.draft_model.confidence_head
+    for parameter in head.parameters():
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+    assert "vat/ce_loss" in diagnostics
+    clone = training_cls(draft_cls(config), block_size=2, num_anchors=2,
+                         per_position_loss_weight="vat", vat_config={"self_cov_weight": .6})
+    clone.load_state_dict(model.state_dict())
+    for name, parameter in clone.state_dict().items():
+        torch.testing.assert_close(parameter, model.state_dict()[name])
+    if model_type == "dflash":
+        assert not any("accept_head" in name for name in model.draft_model.state_dict())
+
+
+@pytest.mark.parametrize("draft_id,expected", [(0, 2.), (1, 0.)])
+def test_dspark_vat_acceptance_includes_markov_bias(draft_id, expected):
+    base = _tiny_dspark_training_model()
+    model = DSparkTrainingModel(base.draft_model, block_size=2, num_anchors=2,
+                                per_position_loss_weight="vat", l1_loss_alpha=0.)
+    def bias(*, active_hidden, active_prev_tokens, restricted_vocab):
+        result = active_hidden.new_zeros(active_hidden.shape[0], 32)
+        result[:, draft_id] = 1.
+        return result
+    model._markov_bias_for_active = bias
+    model._sample_anchor_positions = lambda *args, **kwargs: (
+        torch.tensor([[1, 1]]), torch.ones(1, 2, dtype=torch.bool))
+    _, *_rest, diagnostics = model(
+        input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
+        hidden_states_list=[torch.randn(1, 5, 8), torch.randn(1, 5, 8)],
+        loss_mask=torch.ones(1, 5), lm_head_weight=torch.zeros(32, 8),
+        target_last_hidden_states=torch.randn(1, 5, 8))
+    assert diagnostics["vat/mean_accepted"].item() == expected
+
+
+@pytest.mark.parametrize("model_type", ["dflash", "dspark"])
+@pytest.mark.parametrize("loss_type", ["ce", "e2e_tv"])
+@pytest.mark.parametrize("vat,empty", [(False, False), (False, True), (True, False), (True, True)])
+def test_drafter_opd_backends_forward_backward(model_type, loss_type, vat, empty):
     config_cls = DFlashConfig if model_type == "dflash" else DSparkConfig
     draft_cls = DFlashDraftModel if model_type == "dflash" else DSparkDraftModel
     training_cls = DFlashTrainingModel if model_type == "dflash" else DSparkTrainingModel
@@ -2270,7 +2346,7 @@ def test_drafter_opd_backends_forward_backward(model_type, loss_type, empty):
                         target_num_hidden_layers=4, target_layer_ids=[1, 3],
                         mask_token_id=31, markov_rank=4, enable_confidence_head=True)
     model = training_cls(draft_cls(config), block_size=3, num_anchors=2,
-                         per_position_loss_weight="fixed_exp_decay",
+                         per_position_loss_weight="vat" if vat else "fixed_exp_decay",
                          drafter_opd_config={"enable": True, "anchor_planner": "trace", "loss": loss_type})
     ids = torch.tensor([[1, 2, 3, 4, 5]])
     plan = torch.full((1, 5, 3), -1)
@@ -2288,11 +2364,14 @@ def test_drafter_opd_backends_forward_backward(model_type, loss_type, empty):
     if model_type == "dspark" and empty:
         assert all(parameter.grad is not None for name, parameter in model.named_parameters()
                    if parameter.requires_grad and "markov" in name)
-
+    if vat:
+        head = model.vat_objective.accept_head if model_type == "dflash" else model.draft_model.confidence_head
+        assert all(parameter.grad is not None for parameter in head.parameters())
 
 
 @pytest.mark.parametrize("model_type", ["dflash", "dspark"])
-def test_drafter_opd_e2e_backends_apply_first_rejection_weight(model_type):
+@pytest.mark.parametrize("vat", [False, True])
+def test_drafter_opd_e2e_backends_apply_first_rejection_weight(model_type, vat):
     torch.manual_seed(19)
     config_cls = DFlashConfig if model_type == "dflash" else DSparkConfig
     draft_cls = DFlashDraftModel if model_type == "dflash" else DSparkDraftModel
@@ -2306,7 +2385,7 @@ def test_drafter_opd_e2e_backends_apply_first_rejection_weight(model_type):
     )
     model = training_cls(
         draft_cls(config), block_size=3, num_anchors=2,
-        per_position_loss_weight="fixed_exp_decay",
+        per_position_loss_weight="vat" if vat else "fixed_exp_decay",
         drafter_opd_config={"enable": True, "anchor_planner": "trace", "loss": "e2e_tv"},
     )
     plan = torch.full((1, 5, 3), -1)
@@ -2334,8 +2413,9 @@ def test_drafter_opd_e2e_backends_apply_first_rejection_weight(model_type):
     assert not torch.allclose(results[1][1], results[0][1])
 
 
+@pytest.mark.parametrize("vat", [False, True])
 @pytest.mark.parametrize("front_count", [1, 2, 3])
-def test_dflash_opd_zero_weight_prefix_matches_dense_loss_and_gradient(front_count):
+def test_dflash_opd_zero_weight_prefix_matches_dense_loss_and_gradient(vat, front_count):
     torch.manual_seed(29)
     config = DFlashConfig(
         hidden_size=8, intermediate_size=16, num_hidden_layers=1,
@@ -2346,7 +2426,7 @@ def test_dflash_opd_zero_weight_prefix_matches_dense_loss_and_gradient(front_cou
     model = DFlashTrainingModel(
         DFlashDraftModel(config), block_size=4, num_anchors=1,
         front_position_weight=0, front_position_count=front_count,
-        per_position_loss_weight="fixed_exp_decay",
+        per_position_loss_weight="vat" if vat else "fixed_exp_decay",
         drafter_opd_config={"enable": True, "anchor_planner": "trace", "loss": "e2e_tv"},
     )
     outputs, tv_losses = [], []
@@ -2386,7 +2466,8 @@ def test_drafter_opd_trace_survives_feature_store_preprocess_and_batch_padding()
     trainer = _label_packing_trainer()
     training = trainer.config.rollout.drafter.training
     training["drafter_opd"] = {"enable": True, "capture_verify_trace": True}
-    trainer.model_config.block_size = 2
+    trainer.model_config.block_size = 7
+    training["dspark_block_size"] = 2
     sample = _feature_sample(5, 5)
     sample.hidden_states = torch.cat([sample.hidden_states, torch.randn(5, 8)], -1)
     sample.metadata["hidden_states_layout"] = "dflash_aux_plus_last"
@@ -2406,3 +2487,52 @@ def test_drafter_opd_requires_full_vocabulary(model_type):
     with pytest.raises(ValueError, match="requires full_vocab"):
         DraftOPDObjective({}, layout=model_type, loss_mode="restricted_ce",
                           per_position_loss_weight="fixed_exp_decay")
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("front_count", [1, 3])
+def test_dflash_vat_zero_weight_prefix_still_accepts_matches(mixed, front_count):
+    config = DFlashConfig(hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+                         num_attention_heads=2, num_key_value_heads=1, vocab_size=32,
+                         num_target_layers=4, num_context_layers=2, target_hidden_size=8,
+                         target_num_hidden_layers=4, target_layer_ids=[1, 3], mask_token_id=31)
+    model = DFlashTrainingModel(
+        DFlashDraftModel(config), block_size=4, num_anchors=1,
+        front_position_weight=0., front_position_count=front_count,
+        per_position_loss_weight="vat",
+        drafter_opd_config={"enable": mixed, "anchor_planner": "mixed", "loss": "ce"})
+    model._sample_anchor_positions = lambda *args, **kwargs: (
+        torch.tensor([[1]]), torch.ones(1, 1, dtype=torch.bool))
+    loss, *_rest, metrics = model(
+        input_ids=torch.tensor([[1, 2, 3, 4, 5, 6]]),
+        hidden_states_list=[torch.randn(1, 6, 8), torch.randn(1, 6, 8)],
+        loss_mask=torch.ones(1, 6), lm_head_weight=torch.zeros(32, 8),
+        target_last_hidden_states=torch.randn(1, 6, 8),
+        opd_trace=torch.full((1, 6, 3), -1) if mixed else None)
+    assert metrics["vat/mean_accepted"].item() == 3
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all()
+               for p in model.vat_objective.accept_head.parameters())
+
+
+@pytest.mark.parametrize("model_type", ["dflash", "dspark"])
+def test_disabled_vat_does_not_overflow_fp16_hidden_sum(model_type):
+    config_cls = DFlashConfig if model_type == "dflash" else DSparkConfig
+    draft_cls = DFlashDraftModel if model_type == "dflash" else DSparkDraftModel
+    training_cls = DFlashTrainingModel if model_type == "dflash" else DSparkTrainingModel
+    config = config_cls(hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+                        num_attention_heads=2, num_key_value_heads=1, vocab_size=32,
+                        num_target_layers=4, num_context_layers=2, target_hidden_size=8,
+                        target_num_hidden_layers=4, target_layer_ids=[1, 3], mask_token_id=31)
+    model = training_cls(draft_cls(config), block_size=4, num_anchors=2).half()
+    model.draft_model.register_forward_hook(
+        lambda module, args, output: output * 0 + 2000)
+    with torch.autocast("cpu", dtype=torch.float16):
+        loss, *_ = model(
+            input_ids=torch.tensor([[1, 2, 3, 4, 5, 6]]),
+            hidden_states_list=[torch.randn(1, 6, 8).half(), torch.randn(1, 6, 8).half()],
+            loss_mask=torch.ones(1, 6), lm_head_weight=torch.zeros(32, 8).half(),
+            target_last_hidden_states=torch.zeros(1, 6, 8).half())
+    assert torch.isfinite(loss)
+    loss.backward()

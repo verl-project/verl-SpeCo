@@ -69,21 +69,3 @@ def test_prefix_masks_and_weighted_anchor_loss_remain_exact(monkeypatch, empty, 
     torch.testing.assert_close(actual_grad, expected_grad, atol=0, rtol=0)
     assert not actual_grad[~mask].any()
     assert torch.autograd.grad(actual, target, allow_unused=True)[0] is None
-
-
-def test_shared_draftopd_teacher_projection_remains_exact(monkeypatch):
-    from verl_speco.backends import drafter_opd
-
-    torch.manual_seed(37)
-    draft = torch.randn(9, 19, requires_grad=True)
-    hidden = torch.randn(9, 5, requires_grad=True)
-    weight = torch.randn(19, 5, requires_grad=True)
-    objective = drafter_opd.DraftOPDObjective(dict(distribution_loss_impl="eager"), layout="dspark",
-        loss_mode="full_vocab", per_position_loss_weight="fixed_exp_decay")
-    actual = objective._tv(draft, hidden, weight)
-    monkeypatch.setattr(drafter_opd, "token_total_variation", legacy_tv)
-    expected = objective._tv(draft, hidden, weight)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    torch.testing.assert_close(torch.autograd.grad(actual.sum(), draft, retain_graph=True)[0],
-                               torch.autograd.grad(expected.sum(), draft)[0], atol=0, rtol=0)
-    assert torch.autograd.grad(actual.sum(), (hidden, weight), allow_unused=True) == (None, None)

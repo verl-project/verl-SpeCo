@@ -11,7 +11,7 @@ def test_five_step_twenty_update_schedule_with_one_publication(monkeypatch):
         trainer._require_speco_worker_group().train_specopd_group(samples, step, revision, indices))
     events = []
     training = dict(step=20, collect_interval_steps=5, training_interval_steps=5,
-                    dspark_block_size=7, drafter_opd=dict(enable=True, method="spec_opd"))
+                    dspark_block_size=7, specopd=dict(enable=True))
     cfg = dict(trainer=dict(use_v1=True, v1=dict(trainer_mode="sync")), actor_rollout_ref=dict(
         actor=dict(strategy="fsdp2", ulysses_sequence_parallel_size=4),
         model=dict(use_remove_padding=True), rollout=dict(name="vllm", temperature=1.0,

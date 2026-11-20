@@ -18,7 +18,6 @@ import hashlib
 import json
 import logging
 
-from verl_speco.opd_method import draft_opd_enabled
 import math
 import os
 import time
@@ -137,6 +136,8 @@ from verl_speco.trainer.scheduler import (
 from verl_speco.workers import SpecoWorker
 
 
+from verl_speco.integration.verify_trace import TRACE_KEY
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -202,7 +203,7 @@ _POLICY_MODEL_NON_TENSOR_KEYS = {
     "_speco_vllm_request_completion_index",
     "_speco_vllm_request_elapsed_sec",
     "_verl_request_mean_accept_len",
-    "_speco_verify_trace",
+    TRACE_KEY,
 }
 
 
@@ -1563,13 +1564,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if incomplete:
             raise RuntimeError(f"Drafter checkpoint wait failed: {incomplete}")
         return len(pending_refs)
-
-    def _speco_opd_trace_collection_due(self, *, validation: bool = False) -> bool:
-        """Use feature-collection policy before requesting rollout trace capture."""
-        return any(
-            self._speco_plan_drafter_collection(source, validation=validation).collect
-            for source in (DrafterCollectionSource.OLD_LOGPROB, DrafterCollectionSource.SGLANG)
-        )
 
     def _speco_plan_drafter_collection(
         self,
@@ -5202,8 +5196,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             prompt_len = int(
                 attention_mask[batch_idx, :prompt_width].detach().sum().item()
             )
-            if draft_opd_enabled(training_cfg):
-                response_len = int(attention_mask[batch_idx, prompt_width:].detach().sum().item())
+            if training_cfg.get("drafter_opd", {}).get("enable", False):
+                response_len = int(
+                    attention_mask[batch_idx, prompt_width:].detach().sum().item()
+                )
             elif response_mask is not None:
                 response_len = int(response_mask[batch_idx].detach().sum().item())
             else:
@@ -5755,10 +5751,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 payload_bytes += _speco_ref_meta_nbytes(ref_meta)
             owner = int(owner_rank[batch_idx].item())
             prompt_mask = attention_mask[batch_idx, : prompts.size(1)].bool()
-            opd_enabled = draft_opd_enabled(self._speco_drafter_training_config())
+            opd_enabled = (
+                self._speco_drafter_training_config()
+                .get("drafter_opd", {})
+                .get("enable", False)
+            )
             if opd_enabled:
                 response_mask = attention_mask[
-                    batch_idx, prompts.size(1):prompts.size(1)+responses.size(1)].bool()
+                    batch_idx, prompts.size(1) : prompts.size(1) + responses.size(1)
+                ].bool()
             elif response_mask_tensor is not None:
                 response_mask = response_mask_tensor[batch_idx].bool()
             else:
@@ -5787,7 +5788,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 ),
             }
             if opd_enabled:
-                traces = batch.non_tensor_batch.get("_speco_verify_trace")
+                traces = batch.non_tensor_batch.get(TRACE_KEY)
                 if traces is None or traces[batch_idx] is None:
                     request_id = (
                         request_ids[batch_idx] if request_ids is not None else None
@@ -5799,8 +5800,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         f"trace_column_present={traces is not None}. "
                         "Check vLLM scheduler capture and agent-loop trace transport."
                     )
-                sample["_speco_verify_trace"] = traces[batch_idx]
-                sample["response_mask"] = response_mask_tensor[batch_idx][response_mask][:response_len].detach().cpu().unsqueeze(0)
+                sample[TRACE_KEY] = traces[batch_idx]
+                sample["response_mask"] = (
+                    response_mask_tensor[batch_idx][response_mask][:response_len]
+                    .detach()
+                    .cpu()
+                    .unsqueeze(0)
+                )
             if hard_sampling_enabled:
                 if isinstance(request_ids, (list, tuple)) and batch_idx < len(
                     request_ids
@@ -8032,7 +8038,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     @contextmanager
     def _speco_online_fit_hooks(self):
-        from verl_speco.opd_method import spec_opd_enabled
+        from verl_speco.specopd_config import spec_opd_enabled
 
         training = self.config.actor_rollout_ref.rollout.drafter.training
         if spec_opd_enabled(training):
@@ -8294,12 +8300,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     )
                 )
             )
-            # Resolve collection before rollout, including interval and buffer policy.
-            if draft_opd_enabled(self._speco_drafter_training_config()):
-                skip_collection_for_quota = (
-                    skip_collection_for_quota
-                    or not self._speco_opd_trace_collection_due(validation=input_is_validation)
-                )
             restore_collection_flag = _speco_set_generation_meta_flag(
                 args,
                 kwargs,

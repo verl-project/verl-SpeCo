@@ -50,24 +50,17 @@ def classes(monkeypatch):
         functional.get_constant_schedule_with_warmup = unused_scheduler
         functional.get_cosine_schedule_with_warmup = unused_scheduler
         monkeypatch.setitem(sys.modules, "verl.utils.torch_functional", functional)
-    from verl_speco.backends.dflash_trainer_backend import DFlashTrainingModel
     from verl_speco.backends.dspark_trainer_backend import DSparkTrainingModel
-    from verl_speco.backends.dflash2_trainer_backend import DFlash2TrainingModel
-    from verl_speco.models.dflash import DFlashConfig, DFlashDraftModel
     from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
-    from verl_speco.models.dflash2 import DFlash2Config, DFlash2DraftModel
 
     return {
-        "dflash": (DFlashConfig, DFlashDraftModel, DFlashTrainingModel),
         "dspark": (DSparkConfig, DSparkDraftModel, DSparkTrainingModel),
-        "dflash2": (DFlash2Config, DFlash2DraftModel, DFlash2TrainingModel),
     }
 
 
-@pytest.mark.parametrize("algorithm", ["dflash", "dspark", "dflash2"])
 @pytest.mark.parametrize("objective", ["e2e_tv", "tv", "l1"])
 def test_joint_actor_to_real_drafter_backward_without_resampling(
-    classes, algorithm, objective, monkeypatch
+    classes, objective, monkeypatch
 ):
     torch.manual_seed(21)
     target_config = Qwen3Config(
@@ -91,8 +84,8 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
     scored, metrics = score_joint_batch(
         target, [request], hidden_state_indices=(1, 2), return_target_logits=False
     )
-    config_class, draft_class, wrapper_class = classes[algorithm]
-    block_size = 3 if algorithm == "dspark" else 4
+    config_class, draft_class, wrapper_class = classes["dspark"]
+    block_size = 3
     cfg = config_class(
         vocab_size=32,
         hidden_size=16,
@@ -117,11 +110,6 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
         draft_model=draft,
         block_size=block_size,
         num_anchors=2,
-        drafter_opd_config={
-            "enable": True,
-            "method": "spec_opd",
-            "capture_verify_trace": True,
-        },
     )
     assert wrapper.opd_objective is None
     monkeypatch.setattr(
@@ -134,13 +122,9 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
         request, scored[0], next(wrapper.parameters()).device, spec, (1, 2)
     )
     fixed_inputs = {k: v.clone() for k, v in batch.items() if torch.is_tensor(v)}
-    dist_key, ce_key = (
-        ("dspark_l1_loss_alpha", "dspark_ce_loss_alpha")
-        if algorithm == "dspark"
-        else ("dflash_lk_loss_alpha", "dflash_ce_loss_alpha")
-    )
+    dist_key, ce_key = "dspark_l1_loss_alpha", "dspark_ce_loss_alpha"
     training = {dist_key: 0.9, ce_key: 0.1}
-    drafter = SimpleNamespace(speculative_algorithm=algorithm.upper(), training=training)
+    drafter = SimpleNamespace(speculative_algorithm="DSPARK", training=training)
     backend = SimpleNamespace(
         target_lm_head=SimpleNamespace(fc=target.lm_head),
         config=SimpleNamespace(rollout=SimpleNamespace(drafter=drafter)),
@@ -175,21 +159,20 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
     )
     parameters = tuple(wrapper.parameters())
     cropped_grad = torch.autograd.grad(loss["total_local_ploss"], parameters, retain_graph=True, allow_unused=True)
-    if algorithm == "dspark":
-        lean_scores, _ = score_joint_batch(
-            target, [request], hidden_state_indices=(1, 2),
-            return_target_logits=False, return_target_logz=False,
-        )
-        assert all(branch.target_logz is None for branch in lean_scores[0].branches)
-        lean_batch = build_specopd_training_batch(
-            request, lean_scores[0], next(wrapper.parameters()).device,
-            spec, (1, 2),
-        )
-        lean_loss = compute_specopd_backend_loss(backend, wrapper, lean_batch)
-        torch.testing.assert_close(lean_loss["total_local_ploss"], loss["total_local_ploss"], atol=0, rtol=0)
-        lean_grad = torch.autograd.grad(lean_loss["total_local_ploss"], parameters, allow_unused=True)
-        for actual, expected in zip(lean_grad, cropped_grad, strict=True):
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    lean_scores, _ = score_joint_batch(
+        target, [request], hidden_state_indices=(1, 2),
+        return_target_logits=False, return_target_logz=False,
+    )
+    assert all(branch.target_logz is None for branch in lean_scores[0].branches)
+    lean_batch = build_specopd_training_batch(
+        request, lean_scores[0], next(wrapper.parameters()).device,
+        spec, (1, 2),
+    )
+    lean_loss = compute_specopd_backend_loss(backend, wrapper, lean_batch)
+    torch.testing.assert_close(lean_loss["total_local_ploss"], loss["total_local_ploss"], atol=0, rtol=0)
+    lean_grad = torch.autograd.grad(lean_loss["total_local_ploss"], parameters, allow_unused=True)
+    for actual, expected in zip(lean_grad, cropped_grad, strict=True):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     full_grad = torch.autograd.grad(unchanged["total_local_ploss"], parameters, retain_graph=True, allow_unused=True)
     for a, b in zip(cropped_grad, full_grad, strict=True):
         if a is None or b is None:
@@ -204,16 +187,10 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
     )
     assert draft.fc.weight.grad.abs().sum() > 0
     assert all(parameter.grad is None for parameter in target.parameters())
-    if algorithm == "dspark":
-        assert any(
-            p.grad is not None and p.grad.abs().sum() > 0
-            for p in draft.markov_head.parameters()
-        )
-    if algorithm == "dflash2":
-        assert any(
-            p.grad is not None and p.grad.abs().sum() > 0
-            for p in draft.candidate_selector.parameters()
-        )
+    assert any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in draft.markov_head.parameters()
+    )
     optimizer.step()
     assert not torch.equal(before, draft.fc.weight)
 
@@ -285,69 +262,6 @@ def test_accumulated_prefix_loss_matches_concatenated_gradient():
         local, _, _ = e2e_tv_loss(copied[start:end], target[start:end], mask[start:end])
         (local / count).backward()
     torch.testing.assert_close(copied.grad, expected)
-
-
-@pytest.mark.parametrize("algorithm", ["dflash", "dspark"])
-@pytest.mark.parametrize("loss_type", ["ce", "e2e_tv"])
-@pytest.mark.parametrize("empty", [False, True])
-def test_preserved_draftopd_baseline_real_backward(
-    classes, algorithm, loss_type, empty, monkeypatch
-):
-    from verl_speco.backends import specopd_forward
-
-    monkeypatch.setattr(
-        specopd_forward,
-        "proposal_loss",
-        lambda *a, **k: pytest.fail("SpecOPD entered baseline"),
-    )
-    config_class, draft_class, wrapper_class = classes[algorithm]
-    cfg = config_class(
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        vocab_size=32,
-        num_context_layers=2,
-        target_hidden_size=8,
-        target_num_hidden_layers=4,
-        target_layer_ids=[1, 3],
-        mask_token_id=31,
-        markov_rank=4,
-    )
-    wrapper = wrapper_class(
-        draft_class(cfg),
-        block_size=3,
-        num_anchors=2,
-        per_position_loss_weight="fixed_exp_decay",
-        drafter_opd_config={
-            "enable": True,
-            "method": "draft_opd",
-            "anchor_planner": "trace",
-            "loss": loss_type,
-        },
-    )
-    assert wrapper.opd_objective is not None
-    trace = torch.full((1, 5, 3), -1)
-    if not empty:
-        trace[0, 1] = torch.tensor([0, 1, 1])
-        trace[0, 3] = torch.tensor([2, 1, 1])
-    head = torch.randn(32, 8)
-    loss, *_rest, diagnostics = wrapper(
-        input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
-        hidden_states_list=[torch.randn(1, 5, 8), torch.randn(1, 5, 8)],
-        loss_mask=torch.ones(1, 5),
-        lm_head_weight=head,
-        target_last_hidden_states=torch.randn(1, 5, 8),
-        opd_trace=trace,
-    )
-    loss.backward()
-    assert torch.isfinite(loss)
-    assert diagnostics["opd/visible_tokens"] == (0 if empty else 2)
-    assert wrapper.draft_model.fc.weight.grad is not None
-    assert torch.isfinite(wrapper.draft_model.fc.weight.grad).all()
-    if not empty:
-        assert wrapper.draft_model.fc.weight.grad.abs().sum() > 0
 
 
 @pytest.mark.parametrize("objective", ["e2e_tv", "tv", "l1"])

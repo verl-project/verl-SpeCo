@@ -8,38 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from verl_speco.integration import vllm_runtime
-from verl_speco.integration.verify_trace import CAPTURE_KEY
 from verl_speco.transport.specopd_protocol import PLAN_KEY
-
-
-@pytest.mark.parametrize("method", ["draft_opd", "spec_opd"])
-@pytest.mark.parametrize("skip", [False, True])
-def test_server_sends_capture_decision_in_native_sampling_params(monkeypatch, method, skip):
-    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: {
-        "training": {"drafter_opd": {"enable": True, "method": method, "capture_verify_trace": True}},
-    })
-    class StopGeneration(Exception):
-        pass
-    class Server(vllm_runtime._SpecoVLLMHttpServerMixin):
-        config = SimpleNamespace(response_length=32)
-        model_config = SimpleNamespace(hf_config=SimpleNamespace(eos_token_id=99))
-        global_steps = 5
-        _speco_serving_drafter_revision = 0
-    async def generate(**kwargs):
-        extra = kwargs["sampling_params"].get("extra_args", {})
-        if method == "draft_opd":
-            assert extra[CAPTURE_KEY] is not skip
-            assert PLAN_KEY not in extra
-        else:
-            assert (PLAN_KEY in extra) is not skip
-            assert CAPTURE_KEY not in extra
-        assert "_verl_skip_drafter_collection" not in kwargs["sampling_params"]
-        raise StopGeneration
-    with pytest.raises(StopGeneration):
-        asyncio.run(vllm_runtime._speco_generate_with_request_stats_unblocked(
-            Server(), generate, (), {"prompt_ids": [1, 2], "request_id": "gate-test",
-            "sampling_params": {"_verl_skip_drafter_collection": skip, "_specopd_drafter_revision": 0}},
-        ))
 
 
 @pytest.mark.parametrize("quota,local_cap,expected", [(10, 16, 10), (2, 1, 1), (0, 0, 0)])

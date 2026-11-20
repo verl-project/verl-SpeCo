@@ -157,7 +157,7 @@ def test_spawned_worker_extension_installs_capture_without_parent_entrypoint(mon
 
     monkeypatch.setattr(vllm_runtime, "patch_vllm_dspark_draft_load_config", lambda: None)
     monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: {
-        "training": {"drafter_opd": {"enable": True, "method": "spec_opd"}},
+        "training": {"specopd": {"enable": True}},
     })
     calls = []
     monkeypatch.setattr(specopd_vllm, "install_specopd_draft_token_transport_patch",
@@ -171,7 +171,7 @@ def test_worker_extension_rejects_missing_capture_hooks_before_generation(monkey
 
     monkeypatch.setattr(vllm_runtime, "patch_vllm_dspark_draft_load_config", lambda: None)
     monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: {
-        "training": {"drafter_opd": {"enable": True, "method": "spec_opd"}},
+        "training": {"specopd": {"enable": True}},
     })
     monkeypatch.setattr(specopd_vllm, "install_specopd_draft_token_transport_patch", lambda: False)
     with pytest.raises(RuntimeError, match="worker requires the MRV2"):

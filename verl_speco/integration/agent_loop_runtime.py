@@ -18,12 +18,13 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import inspect
-import os
 import logging
 import time
 import types
 from functools import wraps
 from typing import Any, cast
+
+from verl_speco.integration.verify_trace import TRACE_KEY
 
 logger = logging.getLogger(__file__)
 
@@ -31,8 +32,8 @@ _PATCHED = False
 SPECO_STUDENT_DECODE_TIME_KEY = "speco_student_decode_time_s"
 SPECO_TEACHER_PREFILL_TIME_KEY = "speco_teacher_prefill_time_s"
 _DEFAULT_EXTRA_KEYS = {
+    TRACE_KEY: None,
     "_specopd_proposals": "",
-    "_speco_verify_trace": None,
     "_speco_vllm_spec_decode_accepted_tokens": None,
     "_speco_vllm_spec_decode_drafts": None,
     "turn_scores": None,
@@ -298,8 +299,9 @@ async def _run_agent_loop_with_student_timing(call: Any, *args, **kwargs) -> Any
         return result
 
     student_decode_times: list[float] = []
-    from verl_speco.integration.verify_trace import TURN_TRACES
     from verl_speco.integration.specopd_agent import PROPOSAL_TURNS
+    from verl_speco.integration.verify_trace import TURN_TRACES
+
     trace_token = TURN_TRACES.set([])
     proposal_token = PROPOSAL_TURNS.set([])
     token = _CURRENT_STUDENT_DECODE_TIMES.set(student_decode_times)
@@ -331,8 +333,6 @@ async def _speco_worker_generate_sequences(self, batch):
     context_tokens = None
     try:
         context_tokens = _speco_context_from_batch(batch)
-        if os.getenv("VERL_SPECO_DIAGNOSTIC_TRANSPORT") == "1":
-            print(f"[specopd transport] worker={type(self).__name__} revision={_CURRENT_SPECOPD_REVISION.get()} meta={list(getattr(batch, 'meta_info', {}))}", flush=True)
         generate_sequences = _speco_parent_method(self, "generate_sequences")
         if not callable(generate_sequences):
             raise AttributeError(
@@ -383,8 +383,9 @@ async def _speco_worker_run_agent_loop(
 
 
 async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs):
-    from verl_speco.integration.verify_trace import merge_turn_traces
     from verl_speco.integration.specopd_agent import merge_proposal_output
+    from verl_speco.integration.verify_trace import merge_turn_traces
+
     merge_turn_traces(output)
     merge_proposal_output(output)
     _speco_default_agent_loop_extra_fields(output)
@@ -563,8 +564,6 @@ def _build_speco_agent_loop_worker_class(worker_cls):
         attrs["_postprocess"] = _speco_worker_postprocess
 
     speco_worker_cls = type("SpecoAgentLoopWorker", (worker_cls,), attrs)
-    from verl_speco.integration.request_stage_diagnostics import install_request_stage_diagnostics
-    install_request_stage_diagnostics(speco_worker_cls)
     speco_worker_cls.__qualname__ = "SpecoAgentLoopWorker"
     worker_cls._speco_remote_worker_cls = speco_worker_cls
     return speco_worker_cls
@@ -589,9 +588,20 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
 
     import ray
 
-    manager.agent_loop_workers_class = ray.remote(
-        _build_speco_agent_loop_worker_class(worker_cls)
-    )
+    existing_worker = getattr(manager, "agent_loop_workers_class", None)
+    existing_raw = getattr(existing_worker, "__ray_actor_class__", None)
+    if existing_raw is not None:
+        worker_cls = existing_raw
+    if not worker_cls.__dict__.get("_speco_explicit_worker_runtime", False):
+        manager.agent_loop_workers_class = ray.remote(
+            _build_speco_agent_loop_worker_class(worker_cls)
+        )
+
+    if not is_sglang:
+        # Install patches again in the Ray process, where upstream classes are
+        # imported afresh. Driver-side monkey patches do not survive that import.
+        manager._speco_agent_loop_manager_configured = True
+        return
 
     if not is_sglang:
         # Install patches again in the Ray process, where upstream classes are
@@ -711,18 +721,11 @@ def install_agent_loop_runtime_patch() -> bool:
             )
 
             record_serving_segment(result)
-            if os.getenv("VERL_SPECO_DIAGNOSTIC_TRANSPORT") == "1":
-                fields = getattr(result, "extra_fields", {}) or {}
-                print(f"[specopd transport] client={type(self).__name__} revision={_CURRENT_SPECOPD_REVISION.get()} collecting={student_decode_times is not None} fields={list(fields)}", flush=True)
-            if _CURRENT_SPECOPD_REVISION.get() is not None:
-                fields = getattr(result, "extra_fields", {}) or {}
-                logger.warning("[specopd transport] client=%s revision=%s validate=%s skip=%s wire_present=%s",
-                    type(self).__name__, _CURRENT_SPECOPD_REVISION.get(), _CURRENT_VALIDATE.get(),
-                    _CURRENT_SKIP_DRAFTER_COLLECTION.get(), bool(fields.get("_specopd_proposals")))
             if student_decode_times is not None:
-                from verl_speco.integration.verify_trace import collect_turn_trace
-                collect_turn_trace(result)
                 from verl_speco.integration.specopd_agent import collect_proposal_output
+                from verl_speco.integration.verify_trace import collect_turn_trace
+
+                collect_turn_trace(result)
                 collect_proposal_output(result)
             return result
 
@@ -801,8 +804,9 @@ def install_agent_loop_runtime_patch() -> bool:
 
         @wraps(agent_loop_postprocess)
         async def speco_agent_loop_postprocess(self, output, validate, **kwargs):
-            from verl_speco.integration.verify_trace import merge_turn_traces
             from verl_speco.integration.specopd_agent import merge_proposal_output
+            from verl_speco.integration.verify_trace import merge_turn_traces
+
             merge_turn_traces(output)
             merge_proposal_output(output)
             extra_fields = getattr(output, "extra_fields", None)
@@ -924,8 +928,6 @@ def install_agent_loop_runtime_patch() -> bool:
         )
         manager_cls._speco_patched_generate_sequences = True
 
-    from verl_speco.integration.request_stage_diagnostics import install_request_stage_diagnostics
-    install_request_stage_diagnostics(worker_cls, llm_server_client_cls)
     _PATCHED = True
     logger.warning("Installed SPECO agent-loop runtime patch.")
     return True

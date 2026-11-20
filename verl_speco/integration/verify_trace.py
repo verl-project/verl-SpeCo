@@ -6,19 +6,17 @@ import contextvars
 import hashlib
 
 TRACE_KEY = "_speco_verify_trace"
-CAPTURE_KEY = "speco_capture_verify_trace"
-TURN_TRACES = contextvars.ContextVar("speco_verify_turns", default=None)
+TURN_TRACES: contextvars.ContextVar[list[dict] | None] = contextvars.ContextVar(
+    "speco_verify_turns", default=None
+)
 
 
-def snapshot_verify_step(scheduler, scheduled, output, *, require_opt_in=False):
+def snapshot_verify_step(scheduler, scheduled, output):
     """Read CPU counts before Scheduler mutates generated tokens or frees requests."""
     snapshots = []
     for rid in scheduled.num_scheduled_tokens:
         request = scheduler.requests.get(rid)
         if request is None or request.is_finished():
-            continue
-        params = getattr(request, "sampling_params", None)
-        if require_opt_in and not (getattr(params, "extra_args", None) or {}).get(CAPTURE_KEY, False):
             continue
         if rid not in output.req_id_to_index:
             continue  # A failed KV load has no worker row and commits no tokens.

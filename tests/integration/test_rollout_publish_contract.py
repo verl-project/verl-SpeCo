@@ -728,6 +728,7 @@ def test_mrv2_dspark_publish_includes_confidence_head(monkeypatch) -> None:
     trainer.training_device_mesh = None
     trainer._frozen_param_names = []
     trainer.model = SimpleNamespace(
+        draft_model=SimpleNamespace(confidence_head=torch.nn.Linear(2, 1)),
         state_dict=lambda: {
             "draft_model.confidence_head.proj.weight": torch.ones(1, 2),
             "draft_model.confidence_head.proj.bias": torch.ones(1),
@@ -772,6 +773,9 @@ def test_dspark_publish_excludes_untrained_confidence_head(
     trainer.training_device_mesh = None
     trainer._frozen_param_names = []
     trainer.model = SimpleNamespace(
+        draft_model=SimpleNamespace(
+            confidence_head=torch.nn.Linear(2, 1).requires_grad_(False)
+        ),
         state_dict=lambda: {
             "draft_model.confidence_head.proj.weight": torch.ones(1, 2),
             "draft_model.confidence_head.proj.bias": torch.ones(1),
@@ -1015,6 +1019,7 @@ def test_mrv1_dspark_publish_keeps_trainable_confidence_head(monkeypatch) -> Non
     trainer.training_device_mesh = None
     trainer._frozen_param_names = []
     trainer.model = SimpleNamespace(
+        draft_model=SimpleNamespace(confidence_head=torch.nn.Linear(2, 1)),
         state_dict=lambda: {
             "draft_model.confidence_head.proj.weight": torch.ones(1, 2),
             "draft_model.confidence_head.proj.bias": torch.ones(1),

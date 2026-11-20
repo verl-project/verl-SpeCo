@@ -5,7 +5,7 @@
 import os
 from functools import partial
 
-from verl_speco.opd_method import spec_opd_enabled
+from verl_speco.specopd_config import spec_opd_enabled
 
 
 def training_config(trainer):
@@ -17,26 +17,6 @@ def training_config(trainer):
 
 def enabled(trainer):
     return spec_opd_enabled(training_config(trainer))
-
-
-def prepare_draft_rollout(trainer, batch):
-    """Carry Draft-OPD's collection decision through native V1 TQ prompts."""
-    from verl_speco.opd_method import draft_opd_enabled
-    if not draft_opd_enabled(training_config(trainer)):
-        return batch
-    from tensordict import NonTensorData
-    validate = batch.get("validate", False)
-    validate = bool(getattr(validate, "data", validate))
-    due = trainer._speco_opd_trace_collection_due(validation=validate)
-    config = trainer._speco_drafter_schedule_config()
-    blocked = trainer._speco_get_drafter_scheduler().training_quota_blocks_collection(
-        trainer.global_steps, config,
-    )
-    previous = batch.get("_specopd_skip_collection", False)
-    skip = bool(getattr(previous, "data", previous)) or not due or blocked
-    # Reuse the proven SpecOPD scalar channel, consumed before upstream generation.
-    batch["_specopd_skip_collection"] = NonTensorData(skip)
-    return batch
 
 
 def driver(trainer):

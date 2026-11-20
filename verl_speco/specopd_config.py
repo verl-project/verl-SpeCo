@@ -16,7 +16,6 @@
 import math
 from dataclasses import dataclass, fields
 
-from verl_speco.opd_method import spec_opd_enabled
 
 
 @dataclass(frozen=True)
@@ -222,14 +221,16 @@ class SpecOPDConfig:
             raise ValueError("SpecOPD wire must fit the 1 MiB frontend transport limit")
 
 
+def spec_opd_enabled(training):
+    return (training.get("specopd") or {}).get("enable", False)
+
+
 def specopd_loss_weights(training, algorithm):
     """Read the existing drafter CE and distribution-loss coefficients."""
-    if algorithm.lower() == "dspark":
-        distribution = float(training.get("dspark_l1_loss_alpha", 0.9))
-        ce = float(training.get("dspark_ce_loss_alpha", 0.1))
-    else:
-        distribution = float(training.get("dflash_lk_loss_alpha", 0.0))
-        ce = float(training.get("dflash_ce_loss_alpha", 1.0))
+    if algorithm.lower() != "dspark":
+        raise ValueError("SpecOPD requires DSpark")
+    distribution = float(training.get("dspark_l1_loss_alpha", 0.9))
+    ce = float(training.get("dspark_ce_loss_alpha", 0.1))
     if (
         not all(math.isfinite(weight) and weight >= 0 for weight in (distribution, ce))
         or not (distribution or ce)
@@ -249,6 +250,8 @@ def validate_specopd_config(config):
     spec = SpecOPDConfig.from_drafter(drafter, rollout_temperature=temperature)
     if not spec.enable:
         return spec
+    if (training.get("drafter_opd") or {}).get("enable", False):
+        raise ValueError("Enable only one of SpecOPD and Draft-OPD")
     if training.get("mode", "online") != "online" or training.get("use_logits", False):
         raise ValueError(
             "SpecOPD requires online hidden-state supervision and a synchronized target head"
@@ -291,8 +294,8 @@ def validate_specopd_config(config):
         )
     if rollout.get("name") != "vllm" or drafter.get(
         "speculative_algorithm", ""
-    ).upper() not in {"DFLASH", "DSPARK", "DFLASH2"}:
-        raise ValueError("SpecOPD supports vLLM DFlash/DSpark/DFlash2 only")
+    ).upper() != "DSPARK":
+        raise ValueError("SpecOPD requires DSpark on vLLM")
     if drafter.get("vllm", {}).get("draft_sample_method", "greedy") not in {"greedy", "probabilistic"}:
         raise ValueError("SpecOPD draft_sample_method must be greedy or probabilistic")
     trainer = config.get("trainer", {})
@@ -365,10 +368,8 @@ def validate_specopd_config(config):
     name = drafter.get("speculative_algorithm", "").lower()
     if spec.objective in {"tv", "l1"}:
         specopd_loss_weights(training, name)
-    capacity = training.get(
-        f"{name}_block_size", {"dspark": 7, "dflash2": 8}.get(name, 16)
-    )
-    if int(capacity) != spec.proposal_width + (0 if name == "dspark" else 1):
+    capacity = training.get("dspark_block_size", 7)
+    if int(capacity) != spec.proposal_width:
         raise ValueError(
             "SpecOPD training block size must equal the actual rollout proposal block"
         )

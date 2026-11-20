@@ -103,6 +103,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         distribution_loss_impl: str = "auto",
         ce_target_source: str = _CE_TARGET_SOURCE_LABELS,
         confidence_target_mode: str = "greedy",
+        vat_config: dict | None = None,
         drafter_opd_config: dict | None = None,
         debug_log: bool = False,
         debug_log_first_n: int = 2,
@@ -121,7 +122,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
             sampled_ce_negatives=sampled_ce_negatives,
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
-            opd_layout="dspark",
+            vat_config=vat_config,
+            vat_layout="dspark",
             drafter_opd_config=drafter_opd_config,
             lk_temperature=lk_temperature,
             lk_loss_type=lk_loss_type,
@@ -159,32 +161,49 @@ class DSparkTrainingModel(DFlashTrainingModel):
         self._logged_distribution_loss_backend: Optional[str] = None
         self._distribution_loss_by_device: dict[str, bool] = {}
         confidence_head = getattr(self.draft_model, "confidence_head", None)
-        self.confidence_loss_enabled = self.confidence_head_alpha > 0
-        if self.confidence_loss_enabled:
-            if confidence_head is None:
-                raise ValueError(
-                    "DSpark confidence loss is enabled but the draft model has no "
-                    "confidence head; set dspark_confidence_head_alpha>0 or load a "
-                    "checkpoint that carries one."
-                )
-            confidence_head.requires_grad_(True)
-            logger.info(
-                "[dspark-trainer] confidence head is trainable (alpha=%.4f)",
-                self.confidence_head_alpha,
-            )
-        elif confidence_head is not None:
-            confidence_head.requires_grad_(False)
-            logger.info(
-                "[dspark-trainer] confidence head is loaded but frozen because confidence loss is disabled"
-            )
-        if self.opd_objective is not None:
-            self.opd_objective.distribution_loss_impl = self.distribution_loss_impl
+        self.confidence_loss_enabled = (
+            self.confidence_head_alpha > 0 and self.vat_objective is None
+        )
+        if self.vat_objective is not None:
             if getattr(self.config, "dspark_bonus_anchor", False):
-                raise ValueError("Draft-OPD does not support DSpark bonus-anchor checkpoints")
+                raise ValueError("VAT does not support DSpark bonus-anchor checkpoints")
+            if confidence_head is None:
+                raise ValueError("DSpark VAT requires a confidence head")
+        elif self.confidence_loss_enabled and confidence_head is None:
+            raise ValueError(
+                "DSpark confidence loss is enabled but the draft model has no "
+                "confidence head; set dspark_confidence_head_alpha=0 or load a "
+                "checkpoint that carries one."
+            )
+        if confidence_head is not None:
+            train_confidence_head = (
+                self.vat_objective is not None or self.confidence_loss_enabled
+            )
+            confidence_head.requires_grad_(train_confidence_head)
+            if self.vat_objective is not None:
+                logger.info(
+                    "[dspark-trainer] confidence head is trainable (VAT supervision)"
+                )
+            elif self.confidence_loss_enabled:
+                logger.info(
+                    "[dspark-trainer] confidence head is trainable (alpha=%.4f)",
+                    self.confidence_head_alpha,
+                )
+            else:
+                logger.info(
+                    "[dspark-trainer] confidence head is loaded but frozen because confidence loss is disabled"
+                )
+        if self.opd_objective is not None:
+            if getattr(self.config, "dspark_bonus_anchor", False):
+                raise ValueError(
+                    "Draft-OPD does not support DSpark bonus-anchor checkpoints"
+                )
             if self.ce_target_source != "labels":
                 raise ValueError("Draft-OPD requires ce_target_source=labels")
             if self.confidence_loss_enabled:
-                raise ValueError("Draft-OPD requires the original confidence loss to be disabled")
+                raise ValueError(
+                    "Draft-OPD observed confidence supervision requires VAT; disable the original confidence loss"
+                )
         self.debug_log = bool(debug_log)
         self.debug_log_first_n = max(int(debug_log_first_n), 0)
         self.debug_log_interval = max(int(debug_log_interval), 1)
@@ -754,10 +773,10 @@ class DSparkTrainingModel(DFlashTrainingModel):
         label_mask: Optional[torch.Tensor] = None,
         target_hidden_is_raw: bool = False,
         hidden_source: Optional[str] = None,
+        opd_trace: Optional[torch.Tensor] = None,
         next_token_ids: Optional[torch.Tensor] = None,
         next_token_loss_mask: Optional[torch.Tensor] = None,
         specopd_batch: Optional[dict] = None,
-        opd_trace: Optional[torch.Tensor] = None,
     ):
         if specopd_batch is not None:
             from verl_speco.backends.specopd_forward import proposal_loss
@@ -783,8 +802,9 @@ class DSparkTrainingModel(DFlashTrainingModel):
         # Anchors must point at a real context row (the hidden states may be one
         # row shorter than the label sequence when a trailing label token exists).
         if self.opd_objective is not None:
-            anchor_positions, block_keep_mask, observed, visible, rejected = self.opd_objective.plan(
-                anchor_positions, block_keep_mask, opd_trace)
+            anchor_positions, block_keep_mask, observed, visible, rejected = (
+                self.opd_objective.plan(anchor_positions, block_keep_mask, opd_trace)
+            )
         block_keep_mask = block_keep_mask & (anchor_positions < seq_len)
         n_blocks = anchor_positions.shape[1]
         noise_embedding = self._create_noise_embed(
@@ -867,7 +887,12 @@ class DSparkTrainingModel(DFlashTrainingModel):
         # DSpark's auxiliary distribution losses retain the fixed exponential
         # position weights even when CE uses dynamic D-PACE weights.
         weight_mask = base_loss_mask
-        if self.opd_objective is None and self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+        if (
+            self.opd_objective is None
+            and self.vat_objective is None
+            and self.loss_decay_gamma is not None
+            and self.loss_decay_gamma > 0
+        ):
             positions = self._cached_arange(
                 "dspark_decay_positions", self.block_size, device, view_shape=(1, 1, -1)
             )
@@ -877,8 +902,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
 
         if self.opd_objective is not None:
             weight_mask = self.opd_objective.weights(
-                weight_mask, observed, rejected,
-                gamma=self.loss_decay_gamma)
+                weight_mask,
+                observed,
+                rejected,
+                gamma=self.loss_decay_gamma if self.vat_objective is None else None,
+            )
         flat_targets = target_ids.reshape(-1)
         flat_prev_tokens = prev_token_ids.reshape(-1)
         flat_weights = weight_mask.reshape(-1)
@@ -919,12 +947,45 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_log_probs = None
         restricted_vocab = None
         use_fused_loss = self._use_fused_distribution_loss(device)
-        if active_targets.numel() == 0:
-            loss = flat_hidden.sum() * 0.0
+        vat_loss = flat_hidden[:0].sum()
+        vat_metrics = {}
+        if self.vat_objective is not None:
+            vat_logits = F.linear(active_hidden, lm_head_weight)
+            markov_bias = self._markov_bias_for_active(
+                active_hidden=active_hidden,
+                active_prev_tokens=active_prev_tokens,
+                restricted_vocab=None,
+            )
+            if markov_bias is not None:
+                vat_logits = vat_logits + markov_bias
+            confidence_logits = self.draft_model.predict_confidence(
+                active_hidden, prev_token_ids=active_prev_tokens
+            )
+            weight_mask, vat_loss, vat_metrics = self.vat_objective(
+                vat_logits,
+                active_hidden,
+                active_target_hidden,
+                lm_head_weight,
+                base_loss_mask,
+                active_mask,
+                active_targets,
+                confidence_logits,
+                observed_accepted=observed if self.opd_objective is not None else None,
+            )
             if self.opd_objective is not None:
+                weight_mask = self.opd_objective.weights(
+                    weight_mask, observed, rejected
+                )
+            flat_weights = weight_mask.reshape(-1)
+            active_weights = flat_weights[active_mask]
+        if active_targets.numel() == 0:
+            loss = flat_hidden[:0].sum()
+            if self.opd_objective is not None and self.vat_objective is None:
                 bias = self._markov_bias_for_active(
-                    active_hidden=active_hidden, active_prev_tokens=active_prev_tokens,
-                    restricted_vocab=None)
+                    active_hidden=active_hidden,
+                    active_prev_tokens=active_prev_tokens,
+                    restricted_vocab=None,
+                )
                 if bias is not None:
                     loss = loss + bias.sum() * 0.0
         else:
@@ -956,7 +1017,6 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     # than the dataset label. This makes `sim_acc_len` the same
                     # quantity that serving measures.
                     active_targets = ce_targets
-            opd_tv = self.opd_objective is not None and self.opd_objective.loss_type == "e2e_tv"
             if self.loss_mode in {"restricted_ce", "sampled_ce"}:
                 restricted_vocab = self._build_restricted_vocab(
                     input_ids, ce_targets, int(lm_head_weight.shape[0])
@@ -979,18 +1039,21 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     )
                 )
             else:
-                active_logits = F.linear(active_hidden, lm_head_weight)
-                markov_bias = self._markov_bias_for_active(
-                    active_hidden=active_hidden,
-                    active_prev_tokens=active_prev_tokens,
-                    restricted_vocab=None,
-                )
-                if markov_bias is not None:
-                    active_logits = active_logits + markov_bias
-                if use_fused_loss:
-                    active_loss = fused_label_cross_entropy(active_logits.detach() if opd_tv else active_logits, ce_targets)
+                if self.vat_objective is not None:
+                    active_logits = vat_logits
                 else:
-                    active_log_probs = F.log_softmax((active_logits.detach() if opd_tv else active_logits).float(), dim=-1)
+                    active_logits = F.linear(active_hidden, lm_head_weight)
+                    markov_bias = self._markov_bias_for_active(
+                        active_hidden=active_hidden,
+                        active_prev_tokens=active_prev_tokens,
+                        restricted_vocab=None,
+                    )
+                    if markov_bias is not None:
+                        active_logits = active_logits + markov_bias
+                if use_fused_loss:
+                    active_loss = fused_label_cross_entropy(active_logits, ce_targets)
+                else:
+                    active_log_probs = F.log_softmax(active_logits.float(), dim=-1)
                     active_loss = F.nll_loss(
                         active_log_probs, ce_targets, reduction="none"
                     )
@@ -1024,7 +1087,10 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 self.l1_loss_alpha > 0
                 or self.lk_loss_alpha > 0
                 or self.confidence_loss_enabled
-            ) and not (self.opd_objective is not None and self.opd_objective.loss_type == "e2e_tv")
+            ) and not (
+                self.opd_objective is not None
+                and self.opd_objective.loss_type == "e2e_tv"
+            )
             if needs_target_distribution:
                 if active_target_hidden is None:
                     raise ValueError(
@@ -1122,15 +1188,26 @@ class DSparkTrainingModel(DFlashTrainingModel):
             if opd_logits is None:
                 opd_logits = F.linear(active_hidden, lm_head_weight)
                 bias = self._markov_bias_for_active(
-                    active_hidden=active_hidden, active_prev_tokens=active_prev_tokens,
-                    restricted_vocab=None)
+                    active_hidden=active_hidden,
+                    active_prev_tokens=active_prev_tokens,
+                    restricted_vocab=None,
+                )
                 if bias is not None:
                     opd_logits = opd_logits + bias
             loss = self.opd_objective(
-                opd_logits, active_target_hidden, lm_head_weight, base_loss_mask, active_mask,
-                position_weights=weight_mask)
-        opd_metrics = (self.opd_objective.metrics(loss, observed, base_loss_mask)
-                       if self.opd_objective is not None else {})
+                opd_logits,
+                active_target_hidden,
+                lm_head_weight,
+                base_loss_mask,
+                active_mask,
+                position_weights=weight_mask,
+            )
+        opd_metrics = (
+            self.opd_objective.metrics(loss, observed, base_loss_mask)
+            if self.opd_objective is not None
+            else {}
+        )
+        loss = loss + vat_loss
         with torch.no_grad():
             flat_eval_mask = eval_mask.reshape(-1)
             binary_eval_mask = flat_eval_mask & (flat_weights > 0)
@@ -1252,7 +1329,12 @@ class DSparkTrainingModel(DFlashTrainingModel):
             "scored_block_count": scored_block_count.detach(),
             "local_ploss_sum": local_ploss_sum.detach(),
         }
+        diagnostics.update(vat_metrics)
         diagnostics.update(opd_metrics)
+        if self.vat_objective is not None:
+            diagnostics["vat/ce_loss"] = (
+                local_ploss_sum / local_ce_den.clamp_min(1e-6)
+            ).detach()
         return (
             loss,
             accuracy,
@@ -1703,6 +1785,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             per_position_loss_weight=str(
                 training_cfg.get("dspark_per_position_loss_weight", "fixed_exp_decay")
             ),
+            vat_config=training_cfg.get("vat", {}),
             drafter_opd_config=training_cfg.get("drafter_opd", {}),
             dpace_alpha=float(training_cfg.get("dspark_dpace_alpha", 0.5)),
             ce_loss_alpha=float(
@@ -1802,7 +1885,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         )
 
         opd_cfg = self.config.rollout.drafter.training.get("drafter_opd", {})
-        if opd_cfg.get("enable", False) and opd_cfg.get("method", "draft_opd") == "draft_opd":
+        if opd_cfg.get("enable", False):
             res["opd_trace"] = []
         for item in items:
             layout = item.get("hidden_states_layout")
@@ -1902,12 +1985,24 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 else:
                     start, end = max(0, ids.size(0) - max_window), ids.size(0)
 
-            if opd_cfg.get("enable", False) and opd_cfg.get("method", "draft_opd") == "draft_opd":
+            if opd_cfg.get("enable", False):
                 from verl_speco.backends.drafter_opd import preprocess_trace
-                res["opd_trace"].append(preprocess_trace(
-                    item, start=start, end=end, layout="dspark",
-                    capacity=int(model_config.block_size), device=device,
-                    aligned_next_tokens=next_token_ids is not None))
+
+                res["opd_trace"].append(
+                    preprocess_trace(
+                        item,
+                        start=start,
+                        end=end,
+                        layout="dspark",
+                        capacity=int(
+                            self.config.rollout.drafter.training.get(
+                                "dspark_block_size", model_config.block_size
+                            )
+                        ),
+                        device=device,
+                        aligned_next_tokens=next_token_ids is not None,
+                    )
+                )
             # ``ids`` / ``item_loss_mask`` carry the (optional) trailing label
             # token; the hidden context is one row shorter when it is present.
             hidden_end = max(start, min(end, int(full_h.size(0))))

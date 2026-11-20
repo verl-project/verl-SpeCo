@@ -16,6 +16,7 @@ import pytest
 torch = pytest.importorskip("torch")
 from verl_speco.integration.opd_cotrain import ensure_student_only_feature_payload
 from verl_speco.integration.tensor_wire import encode_cpu_tensors
+from verl_speco.integration.verify_trace import TRACE_KEY
 
 
 class Ref:
@@ -53,6 +54,7 @@ def production():
     ]
     namespace = {
         "torch": torch,
+        "TRACE_KEY": TRACE_KEY,
         "asyncio": asyncio,
         "time": time,
         "Any": Any,

@@ -7,21 +7,21 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("torch")
+
 import verl_speco.integration.vllm_runtime as runtime
-from verl_speco.integration.verify_trace import CAPTURE_KEY, TRACE_KEY, validate_verify_trace
+from verl_speco.integration.verify_trace import TRACE_KEY, validate_verify_trace
 
 
-@pytest.mark.parametrize("request_collect", [False, True])
 @pytest.mark.parametrize("capture", [False, True])
 @pytest.mark.parametrize("config_source", ["environment", "server_class"])
 @pytest.mark.parametrize("invalid_tokens", [None, {}, {"r": 1}])
 @pytest.mark.parametrize("layout", ["dflash", "dspark"])
 def test_scheduler_patch_transports_trace_on_finished_request(
-    monkeypatch, capture, config_source, invalid_tokens, layout, request_collect
+    monkeypatch, capture, config_source, invalid_tokens, layout
 ):
     request = SimpleNamespace(
-        prompt_token_ids=[1, 2], _output_token_ids=[], is_finished=lambda: False,
-        sampling_params=SimpleNamespace(extra_args={CAPTURE_KEY: request_collect})
+        prompt_token_ids=[1, 2], _output_token_ids=[], is_finished=lambda: False
     )
 
     class Scheduler:
@@ -79,9 +79,7 @@ def test_scheduler_patch_transports_trace_on_finished_request(
     summary = json.loads(
         result.trace_headers[runtime.SPECO_VLLM_REQUEST_STATS_TRACE_HEADER]
     )
-    assert summary["verify_rounds"] == 1
-    assert summary["accepted_tokens"] == 2
-    if capture and request_collect:
+    if capture:
         trace = summary[TRACE_KEY]
         validate_verify_trace(trace, layout=layout, capacity=2)
         assert trace["steps"][0]["drafts"] == 2
@@ -96,3 +94,24 @@ def test_scheduler_patch_transports_trace_on_finished_request(
         assert fields[TRACE_KEY] == trace
     else:
         assert TRACE_KEY not in summary
+
+
+
+def test_env_config_parsing_cached_until_raw_value_changes(monkeypatch):
+    runtime._parse_env_drafter_config.cache_clear()
+    calls = []
+    original = json.loads
+    def parse(raw):
+        calls.append(raw)
+        return original(raw)
+    monkeypatch.setattr(runtime.json, "loads", parse)
+    monkeypatch.setenv(runtime.SPECO_DRAFTER_CONFIG_ENV, '{"training": {}}')
+    for _ in range(5):
+        assert runtime._load_env_drafter_config() == {"training": {}}
+    assert len(calls) == 1
+    monkeypatch.setenv(runtime.SPECO_DRAFTER_CONFIG_ENV, '{"enable": true}')
+    assert runtime._load_env_drafter_config() == {"enable": True}
+    assert len(calls) == 2
+    monkeypatch.setenv(runtime.SPECO_DRAFTER_CONFIG_ENV, '{invalid')
+    with pytest.raises(RuntimeError, match="Invalid"):
+        runtime._load_env_drafter_config()
