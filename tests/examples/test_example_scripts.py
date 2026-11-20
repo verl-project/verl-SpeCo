@@ -88,6 +88,11 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
         assert f'exec bash "${{script_dir}}/{launch}"' in source
         source = (script.parent / launch).read_text(encoding="utf-8")
 
+    if "-vat_drafter_" in script.name or "-opd_drafter_" in script.name:
+        backend = "dflash" if "dflash" in script.name else "dspark"
+        assert "bash examples/" not in source
+        assert f"training.{backend}_loss_mode=full_vocab" in source
+
     assert (
         "python3 -m verl_speco.main" in source or "python -m verl_speco.main" in source
     )
@@ -102,6 +107,45 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
         "actor_rollout_ref.rollout.drafter.training.training_interval_steps=" in source
     )
     assert "actor_rollout_ref.rollout.drafter.training.publish_async=" in source
+
+
+@pytest.mark.parametrize("backend", ["dflash", "dspark"])
+@pytest.mark.parametrize("method", ["opd", "vat"])
+def test_standalone_objective_examples_launch_experiment_settings(
+    backend: str, method: str, tmp_path: Path,
+) -> None:
+    bash = _require_working_bash()
+    script = ROOT / "examples" / f"run_qwen3-8b-{method}_drafter_{backend}_vllm.sh"
+    path = script.as_posix()
+    if os.name == "nt" and "system32" in bash.lower():
+        path = "/mnt/" + script.drive.rstrip(":").lower() + "/" + script.relative_to(script.anchor).as_posix()
+    # Intercept the Python launch: exercise Bash expansion from another cwd,
+    # including paths with spaces and the user's trailing Hydra overrides.
+    result = subprocess.run(
+        [bash, "-c", 'python3() { printf "%s\\n" "$@"; }; source "$1" "${@:2}"',
+         "standalone-example", path, "trainer.total_training_steps=3"],
+        cwd=tmp_path, env={**os.environ, "MODEL_PATH": "/models/Qwen 3",
+                           "DRAFTER_PATH": "/models/drafter with spaces", "RUN_TIMESTAMP": "test"},
+        capture_output=True, text=True, check=True,
+    )
+    args = result.stdout.splitlines()
+    assert args[:2] == ["-m", "verl_speco.main"]
+    assert args[-1] == "trainer.total_training_steps=3"
+    assignments = dict(arg.split("=", 1) for arg in args[2:])
+    assert assignments["actor_rollout_ref.model.path"] == "/models/Qwen 3"
+    assert assignments["actor_rollout_ref.rollout.drafter.model_path"] == "/models/drafter with spaces"
+    assert assignments["data.train_batch_size"] == "32"
+    assert assignments["data.max_response_length"] == ("2048" if method == "opd" else "8192")
+    assert assignments["trainer.n_gpus_per_node"] == "2"
+    assert assignments["trainer.save_freq"] == "-1"
+    prefix = "actor_rollout_ref.rollout.drafter.training."
+    assert assignments[prefix + "collect_interval_steps"] == "2"
+    assert assignments[prefix + "training_interval_steps"] == "2"
+    assert assignments[prefix + "step"] == "10"
+    assert assignments[prefix + "drafter_opd.enable"] == ("true" if method == "opd" else "false")
+    if method == "vat":
+        assert assignments[prefix + f"{backend}_per_position_loss_weight"] == "vat"
+        assert assignments[prefix + "vat.accept_mode"] == "greedy"
 
 
 def test_v1_hard_freeze_longrun_uses_full_dimensions_and_normal_policy() -> None:

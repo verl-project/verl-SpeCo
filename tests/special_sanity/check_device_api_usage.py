@@ -26,6 +26,9 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl_speco/main.py",
     # Actor-side collection selects CUDA communication/transport implementations.
     "verl_speco/integration/oldlogprob_runtime.py",
+    # Native vLLM launch, weight transfer and CUDA/NPU capability checks
+    # belong to this runtime adapter boundary.
+    "verl_speco/integration/vllm_runtime.py",
     # Read-only build/allocator metadata; never moves tensors or synchronizes.
     "verl_speco/trainer/performance_diagnostics.py",
     "verl_speco/backends/dflash_trainer_backend.py",
@@ -43,6 +46,9 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # Dispatches on ``device.type`` and only names the backends in literals;
     # no device API is called from this module.
     "verl_speco/ops/dspark_fused_loss.py",
+    # Synchronizes the active accelerator behind a device-name guard for the
+    # optional forward profiler; it selects CUDA vs NPU by device name only.
+    "verl_speco/models/dsv4_dspark/backbone/block.py",
     # FlexAttention kernel dispatch distinguishes CUDA training from inference
     # and non-CUDA backends; no tensor placement/device allocation occurs here.
     "verl_speco/models/dflash/flex_attention.py",

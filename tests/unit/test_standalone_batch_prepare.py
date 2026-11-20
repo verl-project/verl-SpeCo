@@ -420,6 +420,22 @@ def test_mooncake_batch_reads_share_one_timeout_budget(tmp_path, monkeypatch):
     assert timeouts == [3]
 
 
+def test_dsv4_dspark_shares_dspark_layouts(tmp_path):
+    # DSV4-Flash DSpark is accepted by the reference pipeline and shares the
+    # DSpark block-drafter context layouts (dflash_aux / dflash_aux_plus_last).
+    contract = _contract("DSV4_DSPARK")
+    assert contract.hidden_states_layout == "dflash_aux_plus_last"
+    a, ah = _sample(tmp_path, contract)
+    b, _ = _sample(tmp_path, contract, length=3, index=1)
+
+    batch = prepare_standalone_cpu_batch([a, b], contract, pin_memory=False)
+
+    assert batch["input_ids"].shape == (2, 5)
+    torch.testing.assert_close(batch["hidden_states"][0], ah[:, :2].flatten(1).bfloat16())
+    torch.testing.assert_close(batch["target_last_hidden_states"][0], ah[:, 2].bfloat16())
+    assert batch["last_hidden_state_norm"] == "raw_target_residual"
+
+
 @pytest.mark.parametrize("field,value", [
     ("input_ids", [False, 1, 2, 3, 4]),
     ("position_ids", [0.5, 1, 2, 3, 4]),

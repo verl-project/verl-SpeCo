@@ -1358,6 +1358,7 @@ def export_actor_lm_head_weight(
         "DFLASH",
         "DFLASH2",
         "DSPARK",
+        "DSV4_DSPARK",
     }
     if (
         is_dflash

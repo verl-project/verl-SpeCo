@@ -2011,6 +2011,51 @@ def test_oldlogprob_collection_omits_masked_response_token_from_payload() -> Non
     assert sample["input_ids"].tolist() == [[11, 12, 21, 22, 23]]
 
 
+@pytest.mark.parametrize("fields", [{}, {"_speco_verify_trace": [None]}])
+def test_drafter_opd_missing_trace_fails_before_worker_dispatch(fields):
+    trainer = _oldlogprob_collect_plan_trainer()
+    trainer._speco_drafter_training_config()["drafter_opd"] = {"enable": True}
+    batch = SimpleNamespace(
+        batch={
+            "prompts": torch.tensor([[11, 12]]),
+            "responses": torch.tensor([[21, 22, 23, 24]]),
+            "attention_mask": torch.ones((1, 6), dtype=torch.long),
+            "response_mask": torch.ones((1, 4), dtype=torch.long),
+        },
+        non_tensor_batch=fields,
+    )
+    plan = trainer._speco_build_oldlogprob_collect_plan(batch)
+    dispatched = []
+    trainer._speco_execute_collection = lambda *args: dispatched.append(args)
+    output = {_speco_ray_trainer.OLD_LOGPROB_HIDDEN_STATES_KEY: torch.randn(1, 3, 2)}
+    with pytest.raises(ValueError, match="before worker dispatch: step=.*batch_idx=0"):
+        trainer._speco_collect_oldlogprob_features(batch, plan, output)
+    assert dispatched == []
+
+
+def test_drafter_opd_collection_preserves_tool_tokens_mask_and_trace():
+    trainer = _oldlogprob_collect_plan_trainer()
+    trainer._speco_drafter_training_config()["drafter_opd"] = {"enable": True}
+    evidence = {"turns": [{"prompt_length": 2, "response_length": 1}]}
+    batch = SimpleNamespace(
+        batch={"prompts": torch.tensor([[0, 11, 12]]),
+               "responses": torch.tensor([[21, 22, 23, 24, 0]]),
+               "attention_mask": torch.tensor([[0, 1, 1, 1, 1, 1, 1, 0]]),
+               "response_mask": torch.tensor([[1, 0, 0, 1, 0]])},
+        non_tensor_batch={"_speco_verify_trace": [evidence]})
+    plan = trainer._speco_build_oldlogprob_collect_plan(batch)
+    assert plan["response_lens"] == [4]
+    captured = {}
+    trainer._speco_execute_collection = lambda plan, payload: (
+        captured.setdefault("payload", payload) or SimpleNamespace(collected_samples=1))
+    output = {_speco_ray_trainer.OLD_LOGPROB_HIDDEN_STATES_KEY: torch.randn(1, 3, 2)}
+    assert trainer._speco_collect_oldlogprob_features(batch, plan, output) == 1
+    sample = captured["payload"].buckets[0][0]
+    assert sample["input_ids"].tolist() == [[11, 12, 21, 22, 23, 24]]
+    assert sample["response_mask"].tolist() == [[1, 0, 0, 1]]
+    assert sample["_speco_verify_trace"] == evidence
+
+
 @pytest.mark.parametrize(
     "candidate,sample,expected_hard",
     [(0, 0, 0), (0.1, 0.4, 32), (0.4, 0.1, 8), (0.2, 0.3, 24), (0.3, 0.2, 16)],

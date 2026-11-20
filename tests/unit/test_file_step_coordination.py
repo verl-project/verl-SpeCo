@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl_speco.trainer.tq_sample_source import TQLocalBatch
+from verl_speco.trainer.standalone_data import StandaloneLocalBatch
 
 
 @pytest.mark.parametrize("valid,remote_error", [(True, False), (False, False), (True, True)])
@@ -27,14 +27,14 @@ def test_file_prepared_validation_shares_fetch_collective(valid, remote_error):
     ticks = iter([0.0, 0.2, 0.5])
     namespace = {
         "time": SimpleNamespace(perf_counter=lambda: next(ticks)),
-        "torch": torch, "TQLocalBatch": TQLocalBatch, "logger": logging.getLogger(__name__),
+        "torch": torch, "StandaloneLocalBatch": StandaloneLocalBatch, "logger": logging.getLogger(__name__),
         "dist": SimpleNamespace(is_initialized=lambda: True, get_world_size=lambda: 2,
                                 all_reduce=reduce, ReduceOp=SimpleNamespace(MAX="max")),
     }
     module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[
         ast.alias(name="annotations")], level=0), function], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
-    batch = TQLocalBatch([], [], [], prepared_batch={"input_ids": torch.ones(1)} if valid else None)
+    batch = StandaloneLocalBatch([], [], [], prepared_batch={"input_ids": torch.ones(1)} if valid else None)
     operation = namespace[function.name]
     timings = {}
     if valid and not remote_error:
