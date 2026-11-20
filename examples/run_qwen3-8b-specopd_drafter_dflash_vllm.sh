@@ -32,7 +32,7 @@ bash examples/run_qwen3-8b_drafter_dflash_vllm.sh \
     actor_rollout_ref.rollout.top_k=-1 \
     actor_rollout_ref.rollout.n=2 \
     actor_rollout_ref.rollout.drafter.world_size=${num_devices} \
-    actor_rollout_ref.rollout.drafter.vllm.draft_sample_method=probabilistic \
+    actor_rollout_ref.rollout.drafter.vllm.draft_sample_method=greedy \
     actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=7 \
     actor_rollout_ref.rollout.drafter.training.dflash_block_size=8 \
     actor_rollout_ref.rollout.drafter.training.dflash_loss_mode=full_vocab \
@@ -47,12 +47,6 @@ bash examples/run_qwen3-8b_drafter_dflash_vllm.sh \
     actor_rollout_ref.rollout.drafter.training.training_interval_steps=1 \
     actor_rollout_ref.rollout.drafter.training.publish_async=false \
     actor_rollout_ref.rollout.drafter.training.scheduler.execution.strategy=sync \
-    actor_rollout_ref.rollout.drafter.training.specopd.actor_temperature=0.6 \
-    actor_rollout_ref.rollout.drafter.training.specopd.proposal_temperature=0.6 \
-    actor_rollout_ref.rollout.drafter.training.specopd.target_temperature=0.6 \
-    actor_rollout_ref.rollout.drafter.training.specopd.proposal_width=7 \
-    actor_rollout_ref.rollout.drafter.training.specopd.max_branches_per_request=8 \
-    actor_rollout_ref.rollout.drafter.training.specopd.max_proposal_tokens_per_request=56 \
     actor_rollout_ref.rollout.drafter.training.specopd.microbatch_trajectories=1 \
     data.train_batch_size=4 \
     data.max_prompt_length=512 \
