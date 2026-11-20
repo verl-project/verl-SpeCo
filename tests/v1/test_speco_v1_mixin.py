@@ -591,6 +591,11 @@ def test_final_colocate_async_step_does_not_prefetch_an_unconsumed_rollout():
 
     class Harness(SpecoV1Mixin, Upstream):
         config = _config(mode="colocate_async")
+        config.data = AttrDict(train_batch_size=1)
+        replay_buffer = types.SimpleNamespace(
+            get_sampleable_count=lambda *args: 1,
+            prompt_global_steps={"train": {"ready": 2}},
+        )
         global_steps = 3
         total_training_steps = 3
 

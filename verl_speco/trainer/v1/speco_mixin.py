@@ -729,7 +729,7 @@ class SpecoV1Mixin:
         )
 
         for role, worker_cls in list(self.role_worker_mapping.items()):
-            if role not in {Role.ActorRollout, Role.ActorRolloutRef}:
+            if role not in {Role.Actor, Role.ActorRollout, Role.ActorRolloutRef}:
                 continue
             raw = _unwrap_remote(worker_cls)
             bases = []
@@ -858,32 +858,37 @@ class SpecoV1Mixin:
         return ray.get([getattr(server, method).remote(*args) for server in servers])
 
     def prepare_step(self):
-        """Avoid creating an unconsumed rollout at the async loop boundary.
+        """Avoid a new final batch when unconsumed prompt inventory suffices.
 
-        V1 calls ``prepare_step`` before sampling the current batch.  In
-        ``colocate_async`` that method submits a batch which becomes
-        unconsumed at the final loop boundary, because upstream ``fit``
-        returns immediately after the step.  Its agent-loop request then
-        races Ray's rollout-server teardown and surfaces as an
-        ``ActorDiedError`` or vLLM ``EngineDeadError``.
-
-        Sync mode must retain the parent behavior because it creates the batch
-        consumed by the current step rather than maintaining an async prefetch
-        buffer.  ``separate_async`` must also retain its parent behavior: its
-        final ``prepare_step`` submits the batch that is consumed by the final
-        update, then waits for it and switches hybrid workers back to trainer
-        mode.  The V1 agent-loop drain in ``fit`` makes any post-final queued
-        work safe before teardown.
+        Pending/running groups already cover the final update. Terminal groups
+        that need replacement also count: the existing replay-buffer wait path
+        evicts and refills failures, stale groups, and filtered groups itself.
+        Count the whole update, including all parameter-sync mini-batches.
+        Keep upstream admission when inventory is short (including warmup=0),
+        and preserve Sync/separate-async behavior.
         """
         mode = str(self.config.trainer.v1.get("trainer_mode", "sync")).lower()
         is_last_step = int(self.global_steps) >= int(self.total_training_steps)
         if mode == "colocate_async" and is_last_step:
-            logger.info(
-                "SPECO V1 skipping final async rollout prefetch at step=%s; "
-                "the batch cannot be consumed before trainer teardown",
-                self.global_steps,
+            required = int(self.config.data.train_batch_size)
+            sampleable = self.replay_buffer.get_sampleable_count(self.global_steps, "train")
+            # get_sampleable_count refreshes this TQ snapshot. Consumed prompt
+            # UIDs have already been cleared by ReplayBuffer._materialize_batch.
+            prompt_steps = getattr(self.replay_buffer, "prompt_global_steps", None)
+            registered = (
+                len(prompt_steps.get("train", {}))
+                if isinstance(prompt_steps, dict)
+                else sampleable  # Preserve custom samplers without inventory metadata.
             )
-            return {}
+            inventory = max(int(sampleable), registered)
+            print(
+                "[SPECO V1 final async rollout admission] "
+                f"step={self.global_steps} sampleable={sampleable} "
+                f"inventory={inventory} required={required} prefetch={inventory < required}",
+                flush=True,
+            )
+            if inventory >= required:
+                return {}
         return super().prepare_step()
 
     @staticmethod
@@ -955,10 +960,10 @@ class SpecoV1Mixin:
         from verl.trainer.ppo.utils import Role
         from verl_speco.workers import SpecoWorker
 
-        actor_role = (
-            Role.ActorRolloutRef
-            if Role.ActorRolloutRef in self.role_worker_mapping
-            else Role.ActorRollout
+        actor_role = next(
+            role
+            for role in (Role.Actor, Role.ActorRolloutRef, Role.ActorRollout)
+            if role in self.role_worker_mapping
         )
         resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
         worker_cls = self.speco_worker_cls or SpecoWorker
@@ -1143,6 +1148,7 @@ class SpecoV1Mixin:
             response_to_nested,
         )
         from verl_speco.integration.oldlogprob_runtime import (
+            OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY,
             OLD_LOGPROB_AUX_LAYER_IDS_KEY,
             OLD_LOGPROB_COLLECT_MASK_KEY,
             OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
@@ -1179,6 +1185,11 @@ class SpecoV1Mixin:
             control,
             OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
             self._speco_oldlogprob_hidden_capture_impl(),
+        )
+        tu.assign_non_tensor_data(
+            control,
+            OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY,
+            self._speco_oldlogprob_aux_layer_id_space(),
         )
         tu.assign_non_tensor_data(
             control,

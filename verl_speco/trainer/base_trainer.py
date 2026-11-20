@@ -1660,7 +1660,7 @@ class DrafterBaseTrainer:
             }
             logger.debug("Building drafter model with its configured FSDP2 mesh")
 
-            full_state = raw_model.state_dict()
+            full_state = raw_model.state_dict() if dist.get_rank() == 0 else {}
             apply_fsdp2(raw_model, fsdp_kwargs, fsdp_config)
 
             # Load full state dict using the same mesh as used by drafter FSDP wrapping

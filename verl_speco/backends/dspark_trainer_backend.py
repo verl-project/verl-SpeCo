@@ -343,6 +343,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_hidden: torch.Tensor,
         active_prev_tokens: torch.Tensor,
         restricted_vocab: Optional[torch.Tensor],
+        prev_embeddings: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         markov_head = getattr(self.draft_model, "markov_head", None)
         if markov_head is None:
@@ -353,9 +354,12 @@ class DSparkTrainingModel(DFlashTrainingModel):
             )
 
         if restricted_vocab is None:
-            return markov_head.compute_step_bias(active_prev_tokens, active_hidden)
+            return markov_head.compute_step_bias(
+                active_prev_tokens, active_hidden, prev_embeddings=prev_embeddings
+            )
 
-        prev_embeddings = markov_head.get_prev_embeddings(active_prev_tokens)
+        if prev_embeddings is None:
+            prev_embeddings = markov_head.get_prev_embeddings(active_prev_tokens)
         if hasattr(markov_head, "gate_proj"):
             gate = torch.sigmoid(
                 markov_head.gate_proj(
@@ -391,6 +395,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_draft_logits: Optional[torch.Tensor] = None,
         active_draft_log_probs: Optional[torch.Tensor] = None,
         active_target_logits: Optional[torch.Tensor] = None,
+        active_prev_embeddings: Optional[torch.Tensor] = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -476,11 +481,21 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     f"{expected_shape}, got {tuple(tensor.shape)}"
                 )
 
+        # Full forwards pass their single Markov lookup here. Standalone users
+        # of this helper also keep the lookup outside the token chunk loop.
+        markov_head = getattr(self.draft_model, "markov_head", None)
+        if active_prev_embeddings is None and markov_head is not None:
+            active_prev_embeddings = markov_head.get_prev_embeddings(active_prev_tokens)
         chunk_size = self.l1_chunk_size if self.l1_chunk_size > 0 else active_count
         for start in range(0, active_count, chunk_size):
             end = min(start + chunk_size, active_count)
             hidden_chunk = active_hidden[start:end]
             prev_chunk = active_prev_tokens[start:end]
+            prev_embeddings = (
+                active_prev_embeddings[start:end]
+                if active_prev_embeddings is not None
+                else None
+            )
             target_hidden_chunk = active_target_hidden[start:end]
             weights_chunk = active_weights[start:end].float()
 
@@ -498,6 +513,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     active_hidden=hidden_chunk,
                     active_prev_tokens=prev_chunk,
                     restricted_vocab=None,
+                    prev_embeddings=prev_embeddings,
                 )
                 if markov_bias is not None:
                     draft_logits = draft_logits + markov_bias
@@ -609,7 +625,9 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 else:
                     acceptance_target = probabilistic_target.detach()
                 confidence_logits = self.draft_model.predict_confidence(
-                    hidden_chunk, prev_token_ids=prev_chunk
+                    hidden_chunk,
+                    prev_token_ids=prev_chunk,
+                    prev_embeddings=prev_embeddings,
                 )
                 if confidence_logits is None:
                     raise ValueError(
@@ -869,6 +887,21 @@ class DSparkTrainingModel(DFlashTrainingModel):
             if aligned_target_hidden is not None
             else None
         )
+
+        markov_head = getattr(self.draft_model, "markov_head", None)
+        active_prev_embeddings = None
+        if markov_head is not None:
+            # FSDP2 wraps the embedding separately. Always run its forward once
+            # on each rank before any token-dependent branches or chunk loops.
+            lookup_ids = (
+                active_prev_tokens
+                if active_prev_tokens.numel()
+                else active_prev_tokens.new_zeros((1,))
+            )
+            active_prev_embeddings = markov_head.get_prev_embeddings(lookup_ids)[
+                : active_prev_tokens.numel()
+            ]
+
         loss_per_token = torch.zeros_like(flat_weights)
 
         sanitized_rows = torch.zeros((), dtype=torch.float32, device=device)
@@ -893,8 +926,17 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_log_probs = None
         restricted_vocab = None
         use_fused_loss = self._use_fused_distribution_loss(device)
+        unused_projections = []
+        confidence_evaluated = False
         if active_targets.numel() == 0:
-            loss = flat_weights.sum() * 0.0
+            # Even a rank without active labels must enter the model's
+            # backward collectives when its peers have valid tokens.
+            loss = flat_hidden[:0].sum()
+            if active_prev_embeddings is not None:
+                loss = loss + active_prev_embeddings.sum()
+                unused_projections.extend(
+                    (markov_head.markov_w2, getattr(markov_head, "gate_proj", None))
+                )
         else:
             ce_targets = active_targets
             active_target_logits = None
@@ -928,6 +970,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     active_hidden=active_hidden,
                     active_prev_tokens=active_prev_tokens,
                     restricted_vocab=restricted_vocab,
+                    prev_embeddings=active_prev_embeddings,
                 )
                 if markov_bias is not None:
                     active_logits = active_logits + markov_bias
@@ -945,6 +988,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     active_hidden=active_hidden,
                     active_prev_tokens=active_prev_tokens,
                     restricted_vocab=None,
+                    prev_embeddings=active_prev_embeddings,
                 )
                 if markov_bias is not None:
                     active_logits = active_logits + markov_bias
@@ -997,6 +1041,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 distribution_mask = finite_loss & finite_target_hidden
                 if distribution_mask.any():
                     all_rows = bool(distribution_mask.all())
+                    confidence_evaluated = self.confidence_loss_enabled
                     reusable_draft_logits = None
                     reusable_draft_log_probs = None
                     # Full-vocab CE already normalizes the complete LM head and Markov
@@ -1040,6 +1085,13 @@ class DSparkTrainingModel(DFlashTrainingModel):
                             if all_rows
                             else active_prev_tokens[distribution_mask]
                         ),
+                        active_prev_embeddings=(
+                            None
+                            if active_prev_embeddings is None
+                            else active_prev_embeddings
+                            if all_rows
+                            else active_prev_embeddings[distribution_mask]
+                        ),
                         active_target_hidden=(
                             active_target_hidden
                             if all_rows
@@ -1077,6 +1129,16 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 + (lk_loss * self.lk_loss_alpha)
                 + (confidence_loss * self.confidence_head_alpha)
             )
+
+        # A rank with no usable labels still needs to contribute zero gradients
+        # for the same projection parameters as ranks with usable labels.
+        if self.confidence_loss_enabled and not confidence_evaluated:
+            unused_projections.append(self.draft_model.confidence_head)
+        for projection in unused_projections:
+            if projection is not None:
+                for parameter in projection.parameters():
+                    if parameter.requires_grad:
+                        loss = loss + parameter.reshape(-1)[:0].sum()
 
         with torch.no_grad():
             flat_eval_mask = eval_mask.reshape(-1)

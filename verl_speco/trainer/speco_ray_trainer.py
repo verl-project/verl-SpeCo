@@ -45,6 +45,7 @@ from verl_speco.integration.oldlogprob_layer_ids import (
     assert_sglang_aux_last_layer_norm_safe,
     resolve_drafter_hidden_states_layout,
     resolve_oldlogprob_aux_layer_ids,
+    resolve_oldlogprob_aux_layer_id_space,
 )
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY,
@@ -4469,21 +4470,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
 
     def _speco_oldlogprob_aux_layer_id_space(self) -> str:
-        algorithm = (
-            str(
-                _get_nested(
-                    self._speco_drafter_config(),
-                    ("speculative_algorithm",),
-                    "EAGLE3",
-                )
-                or "EAGLE3"
-            )
-            .strip()
-            .upper()
+        drafter_cfg = self._speco_drafter_config()
+        model_configs = [
+            self._speco_load_model_config(_get_nested(drafter_cfg, (key,), None))
+            for key in ("model_path", "checkpoint_path")
+        ]
+        return resolve_oldlogprob_aux_layer_id_space(
+            drafter_cfg, model_configs=model_configs
         )
-        # EAGLE3 config IDs are the same output IDs passed to vLLM serve.
-        # DFlash-family and EAGLE1/2 IDs remain decoder-layer indices.
-        return "output" if algorithm == "EAGLE3" else "decoder"
 
     @staticmethod
     def _speco_oldlogprob_window_train_rows(training_cfg) -> int:
@@ -5622,7 +5616,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 if hidden is None:
                     skipped_missing_hidden += 1
                     continue
-                hidden = hidden[:valid_rows].contiguous()
+                hidden = hidden[:valid_rows].detach().clone(memory_format=torch.contiguous_format)
                 if hidden.numel() == 0:
                     skipped_empty_hidden += 1
                     continue

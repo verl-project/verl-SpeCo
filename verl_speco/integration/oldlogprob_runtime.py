@@ -2204,26 +2204,17 @@ def _consume_oldlogprob_hidden_capture(
             required_keys.append(context["final_key"])
         missing = [key for key in required_keys if key not in captures]
         if missing:
-            # For Megatron PP>1, cross-stage communication may have failed
-            # (e.g., HCCL port conflicts on NPU).  Skip missing keys instead
-            # of crashing; the drafter will train with fewer hidden states.
-            pp_size = context.get("pp_size", 1)
-            if pp_size > 1:
-                logger.warning(
-                    "SPECO old-logprob Megatron PP>1: skipping missing hidden "
-                    "tensors %s (cross-stage communication may have failed)",
-                    missing,
-                )
-            else:
-                raise RuntimeError(
-                    f"SPECO old-logprob forward-hook capture missed hidden tensors: {missing}"
-                )
+            raise RuntimeError(
+                "SPECO old-logprob forward-hook capture missed hidden tensors: "
+                f"missing={missing}, expected={required_keys}, captured={list(captures)}, "
+                f"pp_rank={context.get('pp_rank')}, pp_size={context.get('pp_size')}, "
+                f"num_global_layers={context.get('num_global_layers')}. "
+                "Refusing to train on a partial hidden layout."
+            )
 
-        # Only include keys that were actually captured (skip missing).
-        aux_keys_present = [k for k in context["aux_keys"] if k in captures]
-        hidden_parts = [captures[key] for key in aux_keys_present]
+        hidden_parts = [captures[key] for key in context["aux_keys"]]
         final_key = context.get("final_key")
-        if final_key is not None and final_key in captures:
+        if final_key is not None:
             hidden_parts.append(captures[final_key])
         if not hidden_parts:
             logger.warning(
@@ -2237,6 +2228,17 @@ def _consume_oldlogprob_hidden_capture(
             hidden_parts,
             already_selected=True,
         )
+        if selected is not None and not getattr(
+            engine, "_speco_oldlogprob_layout_verified_logged", False
+        ):
+            selected_rows = selected["rows"] if _is_sparse_selected(selected) else selected
+            print(
+                "[SPECO oldlogprob layout INFO] "
+                f"pp_rank={context.get('pp_rank')} pp_size={context.get('pp_size')} "
+                f"keys={required_keys} hidden_shape={tuple(selected_rows.shape)}",
+                flush=True,
+            )
+            engine._speco_oldlogprob_layout_verified_logged = True
         target_logz = (
             _select_oldlogprob_target_logz(
                 context,
@@ -2564,12 +2566,15 @@ def _find_megatron_layers_and_final_norm(engine: Any, model: Any):
         if eu is not None and all(eu is not existing for existing in roots):
             roots.append(eu)
 
-    # mcore GPTModel layout: decoder.layers + decoder.final_layernorm
+    # VL wrappers register the vision decoder before the language decoder.
+    # Select the text stack explicitly; intermediate PP stages correctly have
+    # no final norm, which must not send them into the generic fallback.
     for root in roots:
-        layers = _get_module_by_path(root, "decoder.layers")
-        if isinstance(layers, (nn.ModuleList, list, tuple)) and len(layers) > 0:
-            final_norm = _get_module_by_path(root, "decoder.final_layernorm")
-            if final_norm is not None:
+        for decoder_path in ("language_model.decoder", "decoder"):
+            layers = _get_module_by_path(root, f"{decoder_path}.layers")
+            if isinstance(layers, (nn.ModuleList, list, tuple)) and len(layers) > 0:
+                final_norm = _get_module_by_path(root, f"{decoder_path}.final_layernorm")
+                engine._speco_oldlogprob_decoder_path = f"{decoder_path}.layers"
                 return list(layers), final_norm
 
     # Fallback: search named_modules for a ModuleList ending in "layers" or "h"
@@ -2577,6 +2582,8 @@ def _find_megatron_layers_and_final_norm(engine: Any, model: Any):
     # attribute names.
     for root in roots:
         for name, child in root.named_modules():
+            if set(name.split(".")) & {"vision_model", "visual", "vision_encoder", "image_encoder", "vision_tower"}:
+                continue
             if not isinstance(child, (nn.ModuleList, list, tuple)) or len(child) <= 0:
                 continue
             if not (name.endswith("layers") or name.endswith("h")):
@@ -2587,7 +2594,9 @@ def _find_megatron_layers_and_final_norm(engine: Any, model: Any):
                 norm_path = f"{parent_path}.{norm_name}" if parent_path else norm_name
                 final_norm = _get_module_by_path(root, norm_path)
                 if final_norm is not None:
+                    engine._speco_oldlogprob_decoder_path = name
                     return list(child), final_norm
+            engine._speco_oldlogprob_decoder_path = name
             return list(child), None
 
     return None, None
@@ -2934,6 +2943,20 @@ def _install_megatron_hidden_hooks(engine: Any, model: Any, micro_batch: Any) ->
         "stage_capture_keys": stage_capture_keys,
         "num_global_layers": num_global_layers,
     }
+    if not getattr(engine, "_speco_oldlogprob_capture_provenance_logged", False):
+        # Use one stdout record: backend logging reconfiguration may disable
+        # this already-created module logger during worker initialization.
+        print(
+            "[SPECO oldlogprob capture INFO] "
+            f"engine={type(engine).__module__}.{type(engine).__qualname__} "
+            f"pp_rank={pp_rank} pp_size={pp_size} num_global_layers={num_global_layers} "
+            f"num_local_layers={len(layers)} aux_ids={aux_layer_ids} "
+            f"decoder_path={getattr(engine, '_speco_oldlogprob_decoder_path', None)} "
+            f"id_space={layer_id_space} layout={hidden_layout} "
+            f"local_keys={stage_capture_keys}",
+            flush=True,
+        )
+        engine._speco_oldlogprob_capture_provenance_logged = True
     for key, module in required_modules.items():
         context["handles"].append(
             module.register_forward_hook(_make_capture_hook(context, key))

@@ -1890,7 +1890,11 @@ def build_vllm_speculative_config_from_drafter(
         # The dynamic pipeline added by vllm-ascend#13216 is registered under the
         # native dspark method and consumes confidence-head outputs.
         method = "dspark"
+    # Native inference may need release-format metadata while the learner
+    # resumes its full training checkpoint (including optimizer state).
+    # This optional locator affects only vLLM, never drafter.model_path.
     spec_model_path = _first_present(
+        _get_nested(drafter_cfg, ("vllm", "model_path"), None),
         drafter_cfg.get("model_path"),
         drafter_cfg.get("checkpoint_path"),
         _get_nested(drafter_cfg, ("spec_model", "path"), None),
@@ -5624,7 +5628,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         return ("checkpoint", reloaded) if reloaded > 0 else (None, 0)
 
     @staticmethod
-    def _speco_rebuild_draft_metadata_buffers(draft_model) -> None:
+    def _speco_rebuild_draft_metadata_buffers(
+        draft_model, captured_buffers: dict[str, Any] | None = None
+    ) -> None:
         """Refresh derived draft tensors without replacing graph-captured storage.
 
         Qwen3 DFlash/DSpark builds fused KV and K-norm tensors with
@@ -5719,9 +5725,14 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             "_fused_kv_bias",
             "_k_norm_weights",
         )
-        previous = {
-            name: getattr(inner_model, name, missing) for name in graph_buffer_names
-        }
+        previous = (
+            {
+                name: getattr(inner_model, name, missing)
+                for name in graph_buffer_names
+            }
+            if captured_buffers is None
+            else captured_buffers
+        )
         rebuild()
 
         for name, old_buffer in previous.items():
@@ -6321,12 +6332,22 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             logger.warning("[speco draft reload] checkpoint empty, skip")
             return 0
 
+        # Native loaders can rebuild these derived tensors inside load_weights.
+        # Hold the captured objects before that call can replace their storage.
+        inner_model = getattr(draft_model, "model", None)
+        captured_buffers = {
+            name: getattr(inner_model, name)
+            for name in ("_fused_kv_weight", "_fused_kv_bias", "_k_norm_weights")
+            if hasattr(inner_model, name)
+        }
         try:
             draft_model.load_weights(iter(weights_iter))
-            self._speco_rebuild_draft_metadata_buffers(draft_model)
+            self._speco_rebuild_draft_metadata_buffers(
+                draft_model, captured_buffers=captured_buffers
+            )
             loaded_count = len(weights_iter)
         except Exception as exc:
-            logger.warning("[speco draft reload] load_weights failed: %s", exc)
+            logger.warning("[speco draft reload] load_weights failed: %s", exc, exc_info=True)
             return 0
 
         self._speco_draft_weight_source = "checkpoint"
