@@ -425,7 +425,7 @@ def test_collection_calls_unchanged_and_sync_emits_no_trace(
     assert executor.commit(payload) == []
     assert executor.finalize(payload) == []
     assert len(calls) == 4
-    assert len(caplog.records) == (4 if bubble else 0)
+    assert len(caplog.records) == 4
 
 
 def test_explicit_off_overrides_enabled_environment(monkeypatch, caplog):
@@ -506,11 +506,25 @@ def test_driver_observes_ref_without_polling_and_restores_hooks(monkeypatch, bub
         assert not recorded
 
 
-@pytest.mark.parametrize("bubble", [False, True])
-def test_worker_init_instruments_only_bubble(monkeypatch, bubble):
+@pytest.mark.parametrize(
+    "bubble,cuda,enabled",
+    [
+        (False, False, True),
+        (True, False, True),
+        (False, True, True),
+        (False, True, False),
+        (True, True, False),
+    ],
+)
+def test_worker_init_instruments_bubble_and_opt_in_cuda(
+    monkeypatch, bubble, cuda, enabled
+):
     from verl_speco.integration import rollout_publish as publish
 
-    monkeypatch.setenv("VERL_SPECO_PHASE_TIMING", "true")
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+    monkeypatch.setenv("VERL_SPECO_PHASE_TIMING", "true" if enabled else "false")
     for name in (
         "install_rollout_runtime_for_worker",
         "install_oldlogprob_hidden_runtime_for_worker",
@@ -543,5 +557,26 @@ def test_worker_init_instruments_only_bubble(monkeypatch, bubble):
     worker.actor = SimpleNamespace(engine=engine)
     original = engine.train_batch
     assert worker.init_model() == "original-result"
-    assert (engine.train_batch is original) is (not bubble)
+    assert (engine.train_batch is original) is (not (enabled and (bubble or cuda)))
     assert engine.train_batch() == "unchanged"
+
+
+@pytest.mark.parametrize(
+    "device,enabled", [("cuda", True), ("cuda", False), ("npu", True)]
+)
+def test_sync_diagnostics_forward_only_cuda_without_bubble_ablation(
+    monkeypatch, device, enabled
+):
+    from omegaconf import OmegaConf
+    from verl_speco.main import configure_phase_diagnostic_runtime_env
+
+    monkeypatch.setenv("VERL_SPECO_PHASE_TIMING", "true" if enabled else "false")
+    monkeypatch.setenv("VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL", "true")
+    config = OmegaConf.create({"trainer": {"device": device}})
+    configure_phase_diagnostic_runtime_env(config)
+    if device == "cuda" and enabled:
+        env = config.ray_kwargs.ray_init.runtime_env.env_vars
+        assert env.VERL_SPECO_PHASE_TIMING == "true"
+        assert "VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL" not in env
+    else:
+        assert "ray_kwargs" not in config

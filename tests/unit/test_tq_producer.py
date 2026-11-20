@@ -28,7 +28,6 @@ torch = pytest.importorskip("torch")
 
 from verl_speco.producer.vllm_feature_client import RawVllmFeature
 from verl_speco.standalone_tq_producer import (
-    _apply_direct_producer_defaults,
     _drain_pending_samples,
     run_producer,
     validate_producer_config,
@@ -38,25 +37,6 @@ from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION
 from verl_speco.transport.drafter_sample_protocol import decode_sample
 
 
-@pytest.mark.parametrize("preserve", [None, False, True])
-@pytest.mark.parametrize("prefix", ["", "++"])
-def test_direct_producer_prompt_context_default_and_override(preserve, prefix):
-    from omegaconf import OmegaConf
-
-    key = "actor_rollout_ref.rollout.drafter.training.preserve_prompt_hidden_states"
-    base = OmegaConf.load(
-        Path(__file__).resolve().parents[2] / "verl_speco/config/speco_base.yaml"
-    )
-    assert OmegaConf.select(base, key) is False
-    config = OmegaConf.merge(base)
-    overrides = ["speco.standalone_tq_producer.max_feature_length=3"]
-    if preserve is not None:
-        OmegaConf.update(config, key, preserve)
-        overrides.append(f"{prefix}{key}={str(preserve).lower()}")
-    _apply_direct_producer_defaults(config, overrides)
-    expected = True if preserve is None else preserve
-    assert OmegaConf.select(config, key) is expected
-    assert OmegaConf.select(base, key) is False
 
 
 @pytest.fixture(autouse=True)
@@ -498,6 +478,10 @@ def test_reference_producer_never_reads_or_normalizes_hidden(tmp_path, monkeypat
             assert timing["publish_transport"] == 0.01  # Full RPC latency, not divided by two.
             assert timing["publish_attempts"] == 2
             assert timing["metadata_submit"] > 0
+            parts = [timing[name] for name in ("metadata_build", "publish_enqueue", "publish_residence", "publish_batch_wait")]
+            assert all(value >= 0 for value in parts)
+            assert sum(parts) == pytest.approx(timing["publish_queue"], abs=0.005)
+            assert timing["metadata_ready_delay"] >= 0
             assert timing["active"] + timing["backpressure"] <= timing["e2e"] + 1e-5
             assert not any(key.startswith("tq_") for key in timing)
         return

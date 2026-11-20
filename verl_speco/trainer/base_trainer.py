@@ -59,10 +59,22 @@ from verl_speco.trainer.checkpoint import release_checkpoint_host_memory
 from verl_speco.trainer.data_buffer import DataBuffer
 from verl_speco.trainer.feature_store import DraftFeatureSample
 
+from verl_speco.integration.verify_trace import TRACE_KEY
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 device_name = get_device_name()
+
+_VAT_METRIC_KEYS = (
+    "kd_loss",
+    "accept_loss",
+    "self_cov_loss",
+    "ce_loss",
+    "mean_accepted",
+    "sim_vs_obs_visible_accept_gap",
+)
+_OPD_METRIC_KEYS = ("loss", "trace_blocks", "random_blocks", "visible_tokens")
 
 
 def _drafter_memory_snapshot() -> dict[str, int]:
@@ -228,6 +240,81 @@ def resolve_drafter_strategy(config) -> str:
             else None
         )
     return str(strategy or "").lower()
+
+
+@torch.no_grad()
+def _clip_dtensor_grad_norm_(
+    parameters,
+    max_norm: float,
+    *,
+    disjoint_plain_param_ids: set[int] | None = None,
+    replicated_world_size: int = 1,
+) -> torch.Tensor:
+    """Clip EP/FSDP2 gradients with the true global norm, one coefficient.
+
+    ``torch.nn.utils.clip_grad_norm_`` cannot handle the mixed DTensor
+    placements an EP run produces (FSDP2-sharded non-experts + rank-disjoint
+    expert slices), and a per-rank coefficient would scale the shared
+    parameters inconsistently across ranks. This computes the true global norm
+    and applies a single coefficient on every rank.
+
+    Per-parameter contribution semantics:
+    - DTensor grads: ``Replicate`` mesh dims are replicas (divide by their size
+      before the all-reduce); sharded/other dims are disjoint contributions.
+    - Plain-tensor grads (the EP+DDP path): params listed in
+      ``disjoint_plain_param_ids`` are rank-disjoint (EP expert slices, summed
+      as-is); every other plain param is a replica whose gradient
+      ``sync_non_expert_grads`` has already world-averaged, so its squared sum
+      is divided by ``replicated_world_size`` instead of being counted once per
+      rank.
+    """
+    params = [p for p in parameters if p.grad is not None]
+    local_total = None
+    for param in params:
+        grad = param.grad
+        is_dtensor = hasattr(grad, "to_local")
+        local_grad = grad.to_local() if is_dtensor else grad
+        squared = local_grad.detach().float().pow(2).sum()
+
+        if is_dtensor:
+            # Replicated DTensor dimensions would otherwise be counted once per
+            # rank by the all-reduce below. Sharded dims contain disjoint
+            # elements.
+            replication = 1
+            placements = getattr(grad, "placements", ())
+            mesh = getattr(grad, "device_mesh", None)
+            if mesh is not None:
+                from torch.distributed.tensor.placement_types import Replicate
+
+                for dim, placement in enumerate(placements):
+                    if isinstance(placement, Replicate):
+                        replication *= int(mesh.size(dim))
+        elif (
+            disjoint_plain_param_ids is not None
+            and id(param) not in disjoint_plain_param_ids
+        ):
+            # EP+DDP: already world-averaged replicated grad -- count it once.
+            replication = max(1, int(replicated_world_size))
+        else:
+            # Plain rank-disjoint contribution (EP expert slice).
+            replication = 1
+        if replication > 1:
+            squared = squared / replication
+        local_total = squared if local_total is None else local_total + squared
+
+    if local_total is None:
+        # Nothing to clip: return a plain CPU scalar (no accelerator device is
+        # required, unlike ``device=<current_device_idx>`` which fails on
+        # CPU-only torch builds). The caller only inspects ``isfinite``.
+        return torch.zeros(())
+    if dist.is_initialized():
+        dist.all_reduce(local_total, op=dist.ReduceOp.SUM)
+    total_norm = local_total.sqrt()
+    clip_coef = min(1.0, float(max_norm) / (float(total_norm.item()) + 1e-6))
+    if clip_coef < 1.0:
+        for param in params:
+            param.grad.mul_(clip_coef)
+    return total_norm
 
 
 class _DrafterOptimizerState:
@@ -679,6 +766,20 @@ class DrafterBaseTrainer:
         self.skip_heavy_cleanup_after_drafter_training = bool(
             training_cfg.get("skip_heavy_cleanup_after_drafter_training", False)
         )
+        from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
+
+        # These caches retain CPU storage only. Bubble uses them inside its
+        # existing activation/cleanup lease; no accelerator state survives reclaim.
+        self._gpu_head_host_reuse = gpu_transfer_enabled(
+            training_cfg, "gpu_head_host_reuse"
+        )
+        self._gpu_optimizer_host_reuse = gpu_transfer_enabled(training_cfg)
+        self._gpu_model_offload_reuse = gpu_transfer_enabled(
+            training_cfg, "gpu_model_offload_reuse"
+        )
+        self._gpu_offload_pool_max_bytes = int(
+            float(training_cfg.get("gpu_offload_pool_max_gib", 8)) * 1024**3
+        )
         self.park_hccl_after_drafter_training = bool(
             training_cfg.get("park_hccl_after_drafter_training", False)
         )
@@ -800,6 +901,12 @@ class DrafterBaseTrainer:
             self.training_group_world_size > 1
             and self.ulysses_sequence_parallel_size > 1
         )
+        if self.use_ulysses_sp and training_cfg.get("drafter_opd", {}).get(
+            "enable", False
+        ):
+            raise ValueError(
+                "Draft-OPD does not support Ulysses sequence parallelism > 1"
+            )
         setattr(self.backend, "use_ulysses_sp", self.use_ulysses_sp)
         self.use_native_dp_sp = (
             self.training_group_world_size > 1 and self.dp_group_world_size > 1
@@ -960,30 +1067,102 @@ class DrafterBaseTrainer:
                 self.optimizer, "_speco_first_blocking_optimizer_offload_done", False
             )
         )
-        if not first_offload and not self._use_blocking_npu_optimizer_offload():
-            offload_fsdp_optimizer(self.optimizer)
-            return
-
-        # Complete FSDP2's first accelerator-state transfer before activation
-        # cleanup; later calls retain verl's asynchronous path. Keep VeOmni's
-        # existing NPU safety policy blocking on every call.
-        offloaded = False
-        for state in self.optimizer.state.values():
-            if not isinstance(state, dict):
-                continue
-            for key, value in state.items():
-                local_value = (
-                    self._tensor_local_shard(value) if torch.is_tensor(value) else None
-                )
-                if local_value is not None and local_value.device.type != "cpu":
-                    state[key] = value.to("cpu", non_blocking=False)
-                    offloaded = True
-        # Empty/CPU-only initialization and failed copies must not consume the
-        # first-offload marker. A replacement optimizer gets its own lifecycle.
-        if first_offload and offloaded:
-            setattr(
-                self.optimizer, "_speco_first_blocking_optimizer_offload_done", True
+        diagnostic = (
+            device_name == "cuda"
+            and not self.__dict__.get("_bubble_time_enabled", False)
+            and logger.isEnabledFor(logging.DEBUG)
+        )
+        before = None
+        if diagnostic:
+            from verl_speco.trainer.performance_diagnostics import (
+                optimizer_state_metadata,
             )
+
+            before = optimizer_state_metadata(self.optimizer)
+        started = time.perf_counter()
+        try:
+            if (
+                device_name == "cuda"
+                and self._drafter_strategy() == "fsdp2"
+                and self.__dict__.get("_gpu_optimizer_host_reuse", False)
+            ):
+                from verl_speco.trainer.gpu_transfer import OptimizerHostBufferPool
+
+                model_pool = self.__dict__.get("_gpu_model_host_pool")
+                model_bytes = (
+                    sum(entry[2] for entry in model_pool.entries.values())
+                    if model_pool is not None
+                    else 0
+                )
+                budget = max(self._gpu_offload_pool_max_bytes - model_bytes, 0)
+                pool = getattr(self.optimizer, "_speco_host_buffer_pool", None)
+                if pool is None:
+                    pool = OptimizerHostBufferPool()
+                    self.optimizer._speco_host_buffer_pool = pool
+                try:
+                    used, stats = pool.offload(
+                        self.optimizer,
+                        max_bytes=budget,
+                        device_module=self.device_module,
+                    )
+                except Exception:
+                    # A copy/wait failure must never fall through to a second
+                    # offload or allow cleanup to report a safe boundary.
+                    self.optimizer._speco_host_transition_failed = True
+                    raise
+                self._record_gpu_transfer(
+                    "optimizer_offload",
+                    {
+                        "used_pool": int(used),
+                        "first_blocking": int(first_offload),
+                        "model_pool_bytes": model_bytes,
+                        **stats,
+                    },
+                )
+                if used:
+                    # The pool has completed every copy before exposing CPU
+                    # state, preserving PR130's first-success completion fence.
+                    if first_offload:
+                        self.optimizer._speco_first_blocking_optimizer_offload_done = (
+                            True
+                        )
+                    return
+            if not first_offload and not self._use_blocking_npu_optimizer_offload():
+                offload_fsdp_optimizer(self.optimizer)
+                return
+
+            # Complete FSDP2's first accelerator-state transfer before activation
+            # cleanup; later calls retain verl's asynchronous path. Keep VeOmni's
+            # existing NPU safety policy blocking on every call.
+            offloaded = False
+            for state in self.optimizer.state.values():
+                if not isinstance(state, dict):
+                    continue
+                for key, value in state.items():
+                    local_value = (
+                        self._tensor_local_shard(value)
+                        if torch.is_tensor(value)
+                        else None
+                    )
+                    if local_value is not None and local_value.device.type != "cpu":
+                        state[key] = value.to("cpu", non_blocking=False)
+                        offloaded = True
+            # Empty/CPU-only initialization and failed copies must not consume the
+            # first-offload marker. A replacement optimizer gets its own lifecycle.
+            if first_offload and offloaded:
+                self.optimizer._speco_first_blocking_optimizer_offload_done = True
+        finally:
+            if before is not None:
+                logger.debug(
+                    "[drafter optimizer transfer] action=offload rank=%s step=%s first_blocking=%s "
+                    "elapsed_s=%.6f before=%s after=%s timing_mode=host_wall_no_device_sync",
+                    getattr(self, "rank", None),
+                    getattr(self, "current_rl_step", None),
+                    first_offload,
+                    time.perf_counter() - started,
+                    before,
+                    optimizer_state_metadata(self.optimizer),
+                )
 
     def _drafter_strategy(self) -> str:
         """Drafter parallelism strategy (see :func:`resolve_drafter_strategy`)."""
@@ -1137,6 +1316,7 @@ class DrafterBaseTrainer:
             "dflash",
             "dflash2",
             "dspark",
+            "dsv4_dspark",
             "domino",
         }
 
@@ -1161,9 +1341,68 @@ class DrafterBaseTrainer:
 
     def _block_drafter_metric_prefix(self) -> str:
         model_type = str(getattr(self.backend, "model_type", "dflash") or "dflash")
-        if model_type in {"dspark", "domino", "eagle3", "dflash2"}:
+        if model_type in {"dspark", "dsv4_dspark", "domino", "eagle3", "dflash2"}:
             return model_type
         return "dflash"
+
+    # --- DSV4 DSpark Expert Parallelism (thin delegates) -------------------
+    # All logic lives in ``backends.dsv4_ep_utils``; these wrappers keep the
+    # shared trainer file small and avoid importing the DSV4 module tree unless
+    # the algorithm is actually selected.
+
+    def _is_ep_active(self) -> bool:
+        """EP is requested *and* possible (multi-rank process group).
+
+        Cached on first query, so it must not be called before
+        ``init_process_group`` (that would pin the result at False); every
+        current call site runs after initialization.
+        """
+        config = getattr(self, "config", None)
+        if config is None:
+            return False
+        cached = getattr(self, "_is_ep_active_cache", None)
+        if cached is None:
+            from verl_speco.backends.dsv4_ep_utils import is_ep_active
+
+            cached = bool(is_ep_active(config))
+            self._is_ep_active_cache = cached
+        return cached
+
+    def _is_ep_enabled(self) -> bool:
+        """Config-only EP request (no process-group check); see _is_ep_active."""
+        config = getattr(self, "config", None)
+        if config is None:
+            return False
+        from verl_speco.backends.dsv4_ep_utils import is_ep_enabled
+
+        return is_ep_enabled(config)
+
+    def _apply_ep_only(self, raw_model) -> None:
+        from verl_speco.backends.dsv4_ep_utils import apply_ep_only
+
+        apply_ep_only(self, raw_model)
+
+    def _apply_ep_fsdp2(self, raw_model, fsdp_kwargs, fsdp_config) -> None:
+        from verl_speco.backends.dsv4_ep_utils import apply_ep_fsdp2
+
+        apply_ep_fsdp2(self, raw_model, fsdp_kwargs, fsdp_config)
+
+    def _sync_non_expert_grads(self) -> None:
+        from verl_speco.backends.dsv4_ep_utils import sync_non_expert_grads
+
+        sync_non_expert_grads(self)
+
+    def _scale_ep_expert_grads(self, factor: float) -> None:
+        from verl_speco.backends.dsv4_ep_utils import scale_expert_grads
+
+        scale_expert_grads(self, factor)
+
+    def _dump_local_expert_slices(self, checkpoint_path: str) -> str | None:
+        if self.backend.model_type != "dsv4_dspark":
+            return None
+        from verl_speco.backends.dsv4_ep_utils import dump_local_expert_slices
+
+        return dump_local_expert_slices(self, checkpoint_path)
 
     def _block_drafter_config_value(self, suffix: str, default: Any) -> Any:
         training_cfg = self.config.rollout.drafter.training
@@ -1189,6 +1428,19 @@ class DrafterBaseTrainer:
         prefix = self._block_drafter_metric_prefix()
         if f"{prefix}/loss" in sums:
             metrics[f"{prefix}/loss"] = sums[f"{prefix}/loss"] / steps
+        vat_batches = sums.get(f"{prefix}/vat/batch_count", 0.0)
+        if vat_batches > 0:
+            for key in _VAT_METRIC_KEYS:
+                if f"{prefix}/vat/{key}" in sums:
+                    metrics[f"{prefix}/vat/{key}"] = (
+                        sums[f"{prefix}/vat/{key}"] / vat_batches
+                    )
+        opd_batches = sums.get(f"{prefix}/opd/batch_count", 0.0)
+        if opd_batches > 0:
+            for key in _OPD_METRIC_KEYS:
+                metrics[f"{prefix}/opd/{key}"] = (
+                    sums[f"{prefix}/opd/{key}"] / opd_batches
+                )
         selector_weight = sums.get(f"{prefix}/selector_weight_count", 0.0)
         if selector_weight > 0:
             metrics[f"{prefix}/selector_loss"] = (
@@ -1392,6 +1644,10 @@ class DrafterBaseTrainer:
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
             "loss_mode_id": f"{prefix}/loss_mode_id",
         }
+        for key in (*_VAT_METRIC_KEYS, "batch_count"):
+            scalar_keys[f"vat/{key}"] = f"{prefix}/vat/{key}"
+        for key in (*_OPD_METRIC_KEYS, "batch_count"):
+            scalar_keys[f"opd/{key}"] = f"{prefix}/opd/{key}"
         vector_keys = {
             "loss_sum_per_position": f"{prefix}/loss_sum_per_position",
             "correct_per_position": f"{prefix}/correct_per_position",
@@ -1585,7 +1841,7 @@ class DrafterBaseTrainer:
         """
 
         return bool(
-            self._bubble_time_enabled
+            getattr(self, "_bubble_time_enabled", False)
             and self.training_device_mesh is None
             and self.training_process_group is not None
             and self.training_group_world_size > 1
@@ -1601,7 +1857,7 @@ class DrafterBaseTrainer:
         pending_target_weight = self._pending_target_lm_head_weight
         if (
             getattr(self.backend, "model_type", None)
-            in {"eagle3", "dflash", "dflash2", "dspark", "domino"}
+            in {"eagle3", "dflash", "dflash2", "dspark", "dsv4_dspark", "domino"}
             and torch.is_tensor(pending_target_weight)
             and pending_target_weight.dim() == 2
         ):
@@ -1612,12 +1868,74 @@ class DrafterBaseTrainer:
             )
         else:
             setattr(self.backend, "_initial_target_lm_head_shape", None)
-        raw_model, drafter_model_config = self.backend.build_model()
+
+        # DSV4 DSpark supports meta/skip loading and expert parallelism. Both
+        # are no-ops for every other drafter backend.
+        init_on_meta = bool(
+            self.config.rollout.drafter.training.get("init_on_meta", False)
+        )
+        random_init = bool(
+            self.config.rollout.drafter.training.get("dsv4_dspark_random_init", False)
+        )
+        ep_enabled = self._is_ep_active()
+        if self._is_ep_enabled() and not ep_enabled:
+            # EP was requested but degraded (single-rank / no process group):
+            # make the fallback to the full expert set visible at the boundary.
+            logger.warning(
+                "DSV4 DSpark EP requested (dsv4_dspark_enable_ep=true) but the "
+                "process group is uninitialized or has a single rank; training "
+                "on the full expert set without expert parallelism."
+            )
+        # Under EP every rank must load its OWN released expert slice (the
+        # pre-configured model is already sliced), so init_on_meta must not make
+        # non-zero ranks skip loading. Short-circuit on the config flags first so
+        # runs that opt out never touch process-group queries.
+        use_skip_loading = (
+            (random_init or init_on_meta)
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and (
+                random_init
+                or (init_on_meta and dist.get_rank() != 0 and not ep_enabled)
+            )
+        )
+        if ep_enabled and self._drafter_strategy() != "fsdp2":
+            raise ValueError(
+                "DSV4 DSpark expert parallelism requires "
+                "actor_rollout_ref.actor.strategy=fsdp2 (got "
+                f"{self._drafter_strategy()!r}); DDP/FSDP1/VeOmni would "
+                "all-reduce or mismatch rank-local expert parameters."
+            )
+        if ep_enabled:
+            world_size = dist.get_world_size()
+            from verl_speco.backends.dsv4_ep_utils import (
+                ensure_ep_divisible,
+                resolve_routed_expert_count,
+            )
+            from verl_speco.models.dsv4_dspark.backbone import moe_ep
+
+            n_experts = resolve_routed_expert_count(self.config)
+            experts_per_rank = ensure_ep_divisible(n_experts, world_size)
+            moe_ep.configure(
+                group=dist.group.WORLD,
+                rank=dist.get_rank(),
+                size=world_size,
+                experts_per_rank=experts_per_rank,
+            )
+            moe_ep.enable()
+        if use_skip_loading:
+            self.backend._skip_weight_loading = True
+        try:
+            raw_model, drafter_model_config = self.backend.build_model()
+        finally:
+            if use_skip_loading:
+                delattr(self.backend, "_skip_weight_loading")
 
         # FSDP2 loads the full state through fsdp2_load_full_state_dict(), which
         # places only rank 0 on the accelerator during the broadcast. Moving the
         # raw model first would materialize a full drafter replica on every rank
-        # and can exhaust NPU memory during checkpoint resume.
+        # and can exhaust NPU memory during checkpoint resume. The EP paths move
+        # the model to the device inside apply_ep_only/apply_ep_fsdp2 instead.
         use_fsdp2 = (
             self._drafter_strategy() != "ddp"
             and self.fsdp_device_mesh is not None
@@ -1658,17 +1976,39 @@ class DrafterBaseTrainer:
                 "mp_policy": mp_policy,
                 "offload_policy": None,
             }
-            logger.debug("Building drafter model with its configured FSDP2 mesh")
-
-            full_state = raw_model.state_dict() if dist.get_rank() == 0 else {}
-            apply_fsdp2(raw_model, fsdp_kwargs, fsdp_config)
-
-            # Load full state dict using the same mesh as used by drafter FSDP wrapping
-            fsdp2_load_full_state_dict(
-                raw_model, full_state, self.fsdp_device_mesh, None
+            ep_no_fsdp = bool(
+                self.config.rollout.drafter.training.get(
+                    "dsv4_dspark_ep_no_fsdp", False
+                )
             )
+            if ep_enabled and ep_no_fsdp:
+                logger.debug(
+                    "Building DSV4 DSpark drafter with expert parallelism (no FSDP2)"
+                )
+                self._apply_ep_only(raw_model)
+            elif ep_enabled:
+                logger.debug("Building DSV4 DSpark drafter with EP + FSDP2")
+                ep_mp_policy = MixedPrecisionPolicy(
+                    param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+                )
+                self._apply_ep_fsdp2(
+                    raw_model,
+                    # ``apply_ep_fsdp2`` derives the FSDP2 mesh from the trainer's
+                    # raw (dp, sp) training mesh itself; only the mp policy is read.
+                    {"mp_policy": ep_mp_policy},
+                    fsdp_config,
+                )
+            else:
+                logger.debug("Building drafter model with its configured FSDP2 mesh")
+                full_state = raw_model.state_dict() if dist.get_rank() == 0 else {}
+                apply_fsdp2(raw_model, fsdp_kwargs, fsdp_config)
+
+                # Load full state dict using the same mesh as used by drafter FSDP wrapping
+                fsdp2_load_full_state_dict(
+                    raw_model, full_state, self.fsdp_device_mesh, None
+                )
+                del full_state
             self.model = raw_model
-            del full_state
         elif (
             self.training_process_group is not None
             and self.training_group_world_size > 1
@@ -1721,6 +2061,16 @@ class DrafterBaseTrainer:
                 forward_prefetch=fsdp_config.forward_prefetch,
                 cpu_offload=None,
             )
+            if self._use_replica_local_bubble_group():
+                logger.warning(
+                    "[BubbleTime] drafter_parallelism: rank=%s replica_rank=%s "
+                    "configured_strategy=%s effective_strategy=fsdp1 "
+                    "scope=replica_local group_size=%s",
+                    self.rank,
+                    self.rollout_dp_rank,
+                    self._drafter_strategy(),
+                    self.training_group_world_size,
+                )
         else:
             logger.debug(
                 "Building drafter model without FSDP (standalone/local trainer mode)"
@@ -1905,17 +2255,20 @@ class DrafterBaseTrainer:
     def _is_frozen_publish_param(self, name: str) -> bool:
         """Return whether a drafter state entry should be excluded from hot publish."""
 
+        if "vat_objective.accept_head." in name:
+            return True
         if any(frozen_name in name for frozen_name in self._frozen_param_names):
             return True
         if (
             getattr(self.backend, "model_type", None) == "dspark"
             and "confidence_head." in name
-            and float(getattr(self.backend, "confidence_head_alpha", 0.0)) <= 0.0
         ):
-            # A checkpoint's untrained head stays frozen. Trained confidence
-            # heads must be published on both MRV1 and MRV2 now that the
-            # runtimes can register and consume them.
-            return True
+            # VAT can train this head with the ordinary confidence loss disabled.
+            draft_model, _ = self._get_pretrained_export_model()
+            return not any(
+                param.requires_grad
+                for param in draft_model.confidence_head.parameters()
+            )
         if name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
             # Most backends seed the draft embedding from the target and freeze it,
             # so the engine already holds the same rows. Backends that fine-tune it
@@ -2034,7 +2387,17 @@ class DrafterBaseTrainer:
         to discard them, and cast before transfer rather than on the host.
         Checkpoint and Sync export retain their original state-dict paths.
         """
+        from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
+
         config = self.config.rollout.drafter.training
+        batch_copy = gpu_transfer_enabled(config, "gpu_publish_cast_before_copy")
+        copy_budget_mib = config.get("gpu_publish_fsdp1_copy_budget_mib", 256)
+        if type(copy_budget_mib) is not int or copy_budget_mib < 0:
+            raise ValueError(
+                "gpu_publish_fsdp1_copy_budget_mib must be a nonnegative integer"
+            )
+        copy_budget_bytes = copy_budget_mib * 1024 * 1024
+        batch_copy = batch_copy and copy_budget_bytes > 0
         dtype = {
             "bf16": torch.bfloat16,
             "bfloat16": torch.bfloat16,
@@ -2050,9 +2413,25 @@ class DrafterBaseTrainer:
         copied_bytes = 0
         skipped_bytes = 0
         leader = self._is_checkpoint_leader()
+        pending_bytes = 0
+        pending_devices: set[torch.device] = set()
+        cast_seconds = 0.0
+        copy_seconds = 0.0
+        wait_seconds = 0.0
+
+        def finish_copies():
+            nonlocal pending_bytes, wait_seconds
+            if pending_devices:
+                started = time.perf_counter()
+                for device in pending_devices:
+                    torch.cuda.current_stream(device).synchronize()
+                wait_seconds += time.perf_counter() - started
+                pending_devices.clear()
+                pending_bytes = 0
 
         def copy_entry(name, tensor):
-            nonlocal copied_bytes, skipped_bytes
+            nonlocal copied_bytes, skipped_bytes, pending_bytes
+            nonlocal cast_seconds, copy_seconds
             name = name.replace("_fsdp_wrapped_module.", "")
             skip = (
                 not torch.is_floating_point(tensor)
@@ -2070,11 +2449,29 @@ class DrafterBaseTrainer:
                 skipped_bytes += tensor.numel() * tensor.element_size()
             elif leader:
                 value = tensor.detach()
+                started = time.perf_counter()
                 if dtype is not None:
                     value = value.to(dtype=dtype)
-                value = value.to(device="cpu", copy=True).contiguous()
+                cast_seconds += time.perf_counter() - started
+                size_bytes = value.numel() * value.element_size()
+                non_blocking = (
+                    batch_copy
+                    and value.device.type == "cuda"
+                    and value.is_contiguous()
+                    and size_bytes <= copy_budget_bytes
+                )
+                if not non_blocking or pending_bytes + size_bytes > copy_budget_bytes:
+                    finish_copies()
+                if non_blocking:
+                    pending_devices.add(value.device)
+                    pending_bytes += size_bytes
+                started = time.perf_counter()
+                value = value.to(
+                    device="cpu", copy=True, non_blocking=non_blocking
+                ).contiguous()
+                copy_seconds += time.perf_counter() - started
                 result[name] = value
-                copied_bytes += value.numel() * value.element_size()
+                copied_bytes += size_bytes
 
         started = time.perf_counter()
         with FSDP.summon_full_params(
@@ -2084,24 +2481,38 @@ class DrafterBaseTrainer:
             rank0_only=False,
             offload_to_cpu=False,
         ):
-            for name, tensor in self.model.named_parameters(remove_duplicate=False):
-                copy_entry(name, tensor)
-            for prefix, module in self.model.named_modules(remove_duplicate=False):
-                for name, tensor in module._buffers.items():
-                    if (
-                        tensor is not None
-                        and name not in module._non_persistent_buffers_set
-                    ):
-                        copy_entry(f"{prefix}.{name}" if prefix else name, tensor)
+            gather_seconds = time.perf_counter() - started
+            try:
+                for name, tensor in self.model.named_parameters(remove_duplicate=False):
+                    copy_entry(name, tensor)
+                for prefix, module in self.model.named_modules(remove_duplicate=False):
+                    for name, tensor in module._buffers.items():
+                        if (
+                            tensor is not None
+                            and name not in module._non_persistent_buffers_set
+                        ):
+                            copy_entry(f"{prefix}.{name}" if prefix else name, tensor)
+            finally:
+                # Full parameter storage must survive every outstanding device copy.
+                finish_copies()
+            release_started = time.perf_counter()
+        release_seconds = time.perf_counter() - release_started
         logger.warning(
             "[BubbleTime] publish_trainable_only_export: rank=%s leader=%s "
-            "copied_bytes=%s skipped_bytes=%s entries=%s elapsed_s=%.4f",
+            "copied_bytes=%s skipped_bytes=%s entries=%s elapsed_s=%.4f "
+            "gather_s=%.4f cast_submit_s=%.4f host_copy_s=%.4f "
+            "copy_wait_s=%.4f release_s=%.4f",
             self.rank,
             leader,
             copied_bytes,
             skipped_bytes,
             len(result),
             time.perf_counter() - started,
+            gather_seconds,
+            cast_seconds,
+            copy_seconds,
+            wait_seconds,
+            release_seconds,
         )
         return result
 
@@ -2163,7 +2574,7 @@ class DrafterBaseTrainer:
 
     def _use_replica_local_bubble_group(self) -> bool:
         return bool(
-            self._bubble_time_enabled
+            getattr(self, "_bubble_time_enabled", False)
             and self.training_device_mesh is None
             and self.training_process_group is not None
         )
@@ -2297,6 +2708,43 @@ class DrafterBaseTrainer:
                 ) from error
             raise RuntimeError(f"Drafter checkpoint {phase} failed on another SP rank")
 
+    def _dump_ep_expert_slices_or_fail(self, checkpoint_path: str) -> None:
+        """Dump this rank's EP expert slice, failing all ranks on any error.
+
+        The leader's main checkpoint only contains its own expert slice, so
+        every EP rank's ``ep_experts/rank_<r>.pt`` file is required to
+        reconstruct the drafter. Capturing a local write failure and then
+        all-reducing a failure flag over the checkpoint group guarantees that:
+
+        * one rank's disk/permission/I/O error fails the whole checkpoint
+          instead of silently producing an incomplete one; and
+        * the failing rank does not raise before the other ranks enter the
+          subsequent save collectives (which would hang them).
+
+        Only a checkpoint that reaches the later save phases can be reported as
+        successfully saved.
+        """
+        if not self._is_ep_active():
+            return
+
+        error: BaseException | None = None
+        try:
+            slice_path = self._dump_local_expert_slices(checkpoint_path)
+            if not slice_path:
+                error = RuntimeError(
+                    "EP expert slice dump produced no file; the checkpoint "
+                    "would not be reconstructable"
+                )
+            elif not os.path.exists(slice_path):
+                error = RuntimeError(
+                    f"EP expert slice disappeared after write: {slice_path}"
+                )
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+        # Collective failure: every participating rank raises together, and the
+        # original exception is preserved on the rank that observed it.
+        self._sync_checkpoint_phase_error(error, "EP expert slice dump")
+
     def _save_optimizer_checkpoint(self, checkpoint_path: str) -> dict[str, Any]:
         if self.optimizer is None:
             raise RuntimeError("Cannot save drafter optimizer before it is initialized")
@@ -2322,16 +2770,21 @@ class DrafterBaseTrainer:
         save_error = None
         try:
             import torch.distributed.checkpoint as dcp
+            from verl_speco.trainer.auxiliary_state import DrafterAuxiliaryState
+
+            auxiliary = DrafterAuxiliaryState(self.model)
+            has_auxiliary = bool(auxiliary.state_dict())
 
             dcp.save(
                 {
+                    **({"auxiliary_model": auxiliary} if has_auxiliary else {}),
                     "optimizer": _DrafterOptimizerState(
                         self.model,
                         self.optimizer,
                         self._checkpoint_process_group()
                         if self._use_replica_local_bubble_group()
                         else None,
-                    )
+                    ),
                 },
                 checkpoint_id=temporary_path,
                 process_group=self._checkpoint_process_group(),
@@ -2369,6 +2822,8 @@ class DrafterBaseTrainer:
                 self.fsdp_device_mesh.size() if self.fsdp_device_mesh is not None else 1
             ),
         }
+        if has_auxiliary:
+            manifest["auxiliary_model"] = True
         if is_leader:
             try:
                 total_bytes = sum(
@@ -2404,6 +2859,21 @@ class DrafterBaseTrainer:
 
         try:
             import torch.distributed.checkpoint as dcp
+            from verl_speco.trainer.auxiliary_state import DrafterAuxiliaryState
+
+            auxiliary = DrafterAuxiliaryState(self.model)
+            if auxiliary.state_dict():
+                if not metadata["optimizer"].get("auxiliary_model", False):
+                    raise ValueError(
+                        "Checkpoint is missing VAT acceptance-head weights; "
+                        "disable resume_trainer_state_from_checkpoint to start fresh"
+                    )
+                # Restore auxiliary parameters before applying their optimizer moments.
+                dcp.load(
+                    {"auxiliary_model": auxiliary},
+                    checkpoint_id=optimizer_path,
+                    process_group=self._checkpoint_process_group(),
+                )
 
             dcp.load(
                 {
@@ -2634,6 +3104,11 @@ class DrafterBaseTrainer:
 
         checkpoint_started = time.perf_counter()
         checkpoint_path = os.path.join(self.checkpoint_dir, f"draft_step_{int(step)}")
+        # Expert-parallel ranks each hold a disjoint expert slice; dump every
+        # rank's slice before the leader-only export so the drafter can be
+        # reconstructed completely offline. A slice failure fails the checkpoint
+        # collectively instead of silently saving an incomplete one.
+        self._dump_ep_expert_slices_or_fail(checkpoint_path)
         if (
             self.rollout_dp_rank != 0
             and not self._use_flattened_drafter_fsdp_mesh()
@@ -2783,24 +3258,77 @@ class DrafterBaseTrainer:
             self._pending_full_checkpoint_future = None
         return {"waited": True, "completed": True, "reason": "completed"}
 
+    @contextmanager
+    def _residency_stage(self, phase: str, stage: str):
+        """Measure host wall time without adding device or distributed fences.
+
+        Transfers may be asynchronous: their queued work can be charged to a
+        later existing synchronization. These are diagnostic spans, not isolated
+        device transfer durations, and must not change exception handling.
+        """
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            timings = getattr(self, f"_last_{phase}_stage_timings")
+            timings[stage] = timings.get(stage, 0.0) + time.perf_counter() - started
+
+    def _record_gpu_transfer(self, scope, stats):
+        metrics = getattr(self, "_gpu_transfer_metrics", None)
+        if metrics is None:
+            metrics = self._gpu_transfer_metrics = {}
+        for key, value in stats.items():
+            if isinstance(value, (int, float)):
+                name = (
+                    f"timing_s/drafter_gpu_{scope}_{key[:-2]}"
+                    if key.endswith("_s")
+                    else f"drafter/gpu_{scope}_{key}"
+                )
+                metrics[name] = value
+        # Numeric step metrics above remain available without duplicating their
+        # successful payloads in every rank's warning log. Keep fallbacks visible.
+        fallback = stats.get("fallback_reason") not in (None, "none")
+        level = logging.WARNING if fallback else logging.DEBUG
+        if logger.isEnabledFor(level):
+            logger.log(
+                level,
+                "[drafter gpu transfer] rank=%s step=%s scope=%s details=%s",
+                self.rank,
+                getattr(self, "current_rl_step", None),
+                scope,
+                json.dumps(stats, sort_keys=True),
+            )
+
     async def activate_training_model(self) -> bool:
         # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态
         start_ts = time.time()
         self.last_activation_error = None
-        activation_stage = "enter"
-        build_draft_model_sec = 0.0
-        model_restore_sec = 0.0
-        optimizer_restore_sec = 0.0
         self._last_activation_stage_timings: dict[str, float] = {}
+        self._gpu_transfer_metrics = {}
+        activation_stage = "enter"
 
         def timed(stage, operation):
             started = time.perf_counter()
             try:
                 return operation()
             finally:
+                stage = timing_key(stage)
                 self._last_activation_stage_timings[stage] = (
                     time.perf_counter() - started
                 )
+
+        def timing_key(stage):
+            if not getattr(self, "_bubble_time_enabled", False):
+                return stage
+            return {
+                "apply_active_head": "head_apply",
+                "apply_host_head": "host_head_apply",
+                "build_model": "model_build",
+                "load_model": "model_restore",
+                "load_optimizer": "optimizer_restore",
+                "load_target_head": "head_move",
+                "apply_device_head": "head_apply",
+            }.get(stage, stage)
 
         try:
             # Activation can fail after moving only part of the state. A later
@@ -2811,7 +3339,7 @@ class DrafterBaseTrainer:
             )
 
             if self._training_active and self.model is not None:
-                timed("head_apply", self._apply_pending_target_lm_head_weight)
+                timed("apply_active_head", self._apply_pending_target_lm_head_weight)
                 logger.debug(
                     f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] activate_training_model reused active model "
                     f"elapsed={time.time() - start_ts:.2f}s"
@@ -2822,17 +3350,14 @@ class DrafterBaseTrainer:
             # Apply them before loading drafter model/optimizer state to keep
             # accelerator memory peaks low during activation.
             activation_stage = "apply_pending_target_head_on_host"
-            timed("host_head_apply", self._apply_pending_target_lm_head_weight)
+            timed("apply_host_head", self._apply_pending_target_lm_head_weight)
 
             if self.model is None:
                 logger.debug(
                     "Draft Model not initialized, calling build_draft_model during activation..."
                 )
                 activation_stage = "build_draft_model"
-                timed("model_build", self._build_draft_model)
-                build_draft_model_sec = self._last_activation_stage_timings[
-                    "model_build"
-                ]
+                timed("build_model", self._build_draft_model)
 
             # 只有当配置了 offload 或者当前模型不在 CUDA 上时执行加载
             first_param = next(self.model.parameters(), None)
@@ -2843,8 +3368,30 @@ class DrafterBaseTrainer:
             if self.is_offload_param or not is_on_cuda:
                 # 调用工具将 FSDP 分片移动到 GPU
                 activation_stage = "load_draft_model"
-                timed("model_restore", lambda: load_fsdp_model_to_gpu(self.model))
-                model_restore_sec = self._last_activation_stage_timings["model_restore"]
+
+                def restore_model():
+                    used_batched_load = False
+                    if (
+                        device_name == "cuda"
+                        and getattr(self, "_gpu_model_offload_reuse", False)
+                        and self._drafter_strategy() == "fsdp2"
+                        and self.training_device_mesh is not None
+                    ):
+                        from verl_speco.trainer.gpu_transfer import load_model_from_host
+
+                        used_batched_load, stats = load_model_from_host(
+                            self.model,
+                            self.runtime_device,
+                            device_module=self.device_module,
+                        )
+                        self._record_gpu_transfer(
+                            "model_load",
+                            {"used_batched_load": int(used_batched_load), **stats},
+                        )
+                    if not used_batched_load:
+                        load_fsdp_model_to_gpu(self.model)
+
+                timed("load_model", restore_model)
                 logger.debug("Loaded drafter model to GPU for training")
 
             if self.optimizer is not None and (
@@ -2854,21 +3401,47 @@ class DrafterBaseTrainer:
                 # 获取 device_id,否则在多卡环境优化器状态可能全部挤在 cuda:0 导致 OOM
                 current_dev_id = get_device_id()
                 activation_stage = "load_draft_optimizer"
-                timed(
-                    "optimizer_restore",
-                    lambda: load_fsdp_optimizer(
-                        optimizer=self.optimizer, device_id=current_dev_id
-                    ),
-                )
-                optimizer_restore_sec = self._last_activation_stage_timings[
-                    "optimizer_restore"
-                ]
+
+                def restore_optimizer():
+                    diagnostic = (
+                        device_name == "cuda"
+                        and not self.__dict__.get("_bubble_time_enabled", False)
+                        and logger.isEnabledFor(logging.DEBUG)
+                    )
+                    before = None
+                    if diagnostic:
+                        from verl_speco.trainer.performance_diagnostics import (
+                            optimizer_state_metadata,
+                        )
+
+                        before = optimizer_state_metadata(self.optimizer)
+                    started = time.perf_counter()
+                    try:
+                        return load_fsdp_optimizer(
+                            optimizer=self.optimizer, device_id=current_dev_id
+                        )
+                    finally:
+                        if before is not None:
+                            logger.debug(
+                                "[drafter optimizer transfer] action=load rank=%s step=%s "
+                                "elapsed_s=%.6f before=%s after=%s timing_mode=host_wall_no_device_sync",
+                                self.rank,
+                                getattr(self, "current_rl_step", None),
+                                time.perf_counter() - started,
+                                before,
+                                optimizer_state_metadata(self.optimizer),
+                            )
+
+                timed("load_optimizer", restore_optimizer)
                 logger.debug("Loaded drafter optimizer to GPU for training")
 
             activation_stage = "load_target_lm_head"
-            timed("head_move", lambda: self._move_target_lm_head(self.runtime_device))
+            timed(
+                "load_target_head",
+                lambda: self._move_target_lm_head(self.runtime_device),
+            )
             activation_stage = "apply_pending_target_head_on_device"
-            timed("head_apply", self._apply_pending_target_lm_head_weight)
+            timed("apply_device_head", self._apply_pending_target_lm_head_weight)
 
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
             self._training_initialized = True
@@ -2883,9 +3456,11 @@ class DrafterBaseTrainer:
                 "[speco timing] drafter_activation_s=%.3f build_s=%.3f "
                 "model_restore_s=%.3f optimizer_restore_s=%.3f rank=%s",
                 time.time() - start_ts,
-                build_draft_model_sec,
-                model_restore_sec,
-                optimizer_restore_sec,
+                self._last_activation_stage_timings.get(timing_key("build_model"), 0.0),
+                self._last_activation_stage_timings.get(timing_key("load_model"), 0.0),
+                self._last_activation_stage_timings.get(
+                    timing_key("load_optimizer"), 0.0
+                ),
                 self.rank,
             )
             return True
@@ -3334,6 +3909,67 @@ class DrafterBaseTrainer:
             target_head = getattr(self.backend, attribute, None)
             if target_head is None:
                 continue
+            cache_enabled = device_name == "cuda" and getattr(
+                self, "_gpu_head_host_reuse", False
+            )
+            if cache_enabled:
+                from verl_speco.trainer.gpu_transfer import FrozenHeadHostCache
+
+                cache = getattr(self, "_gpu_head_host_cache", None)
+                if cache is None:
+                    cache = self._gpu_head_host_cache = FrozenHeadHostCache()
+                head = self._target_lm_head_module()
+                parameters = list(target_head.parameters())
+                eligible = (
+                    head is not None
+                    and len(parameters) == 1
+                    and parameters[0] is head.weight
+                    and not head.weight.requires_grad
+                    and not list(target_head.buffers())
+                )
+                version = self._target_lm_head_weight_step
+                destination = torch.device(device)
+                if eligible and destination.type == "cpu":
+                    reused, reason, avoided = cache.restore(head.weight, version)
+                    self._record_gpu_transfer(
+                        "head_restore",
+                        {
+                            "cache_hit": int(reused),
+                            "avoided_d2h_bytes": avoided,
+                            "fallback_reason": reason,
+                            "version": version,
+                            "dtype": str(head.weight.dtype),
+                        },
+                    )
+                    if reused:
+                        return True
+                elif eligible and destination.type == "cuda":
+                    captured = cache.capture(head.weight, version)
+                    target_head.to(device)
+                    if captured:
+                        cache.arm(head.weight)
+                    self._record_gpu_transfer(
+                        "head_capture",
+                        {
+                            "captured": int(captured),
+                            "version": version,
+                            "host_bytes": head.weight.numel()
+                            * head.weight.element_size()
+                            if captured
+                            else 0,
+                            "dtype": str(head.weight.dtype),
+                        },
+                    )
+                    return True
+                else:
+                    cache.clear()
+                    self._record_gpu_transfer(
+                        "head_restore",
+                        {
+                            "cache_hit": 0,
+                            "fallback_reason": "unsupported_or_trainable_head",
+                        },
+                    )
             target_head.to(device)
             logger.debug(
                 "[Rank %s] Moved %s to %s",
@@ -3357,6 +3993,9 @@ class DrafterBaseTrainer:
         source_weight = self._pending_target_lm_head_weight
         source_row_indices = self._pending_target_lm_head_row_indices
         source_vocab_size = self._pending_target_lm_head_source_vocab_size
+        cache = getattr(self, "_gpu_head_host_cache", None)
+        if cache is not None:
+            cache.clear()
         if source_row_indices is not None:
             if source_weight.dim() != 2:
                 raise ValueError(
@@ -3454,6 +4093,27 @@ class DrafterBaseTrainer:
                     target_weight.dtype,
                     time.perf_counter() - copy_started,
                 )
+        elif (
+            device_name == "cuda"
+            and getattr(self, "_gpu_head_host_reuse", False)
+            and target_weight.device.type == "cpu"
+            and source_weight.device.type == "cpu"
+        ):
+            copy_started = time.perf_counter()
+            # copy_ performs the same dtype conversion without a full-size .to()
+            # temporary, retaining ownership of the backend's CPU head storage.
+            target_weight.copy_(source_weight)
+            self._record_gpu_transfer(
+                "head_apply",
+                {
+                    "elapsed_s": time.perf_counter() - copy_started,
+                    "bytes": target_weight.numel() * target_weight.element_size(),
+                    "direct_cpu_copy": 1,
+                    "version": self._target_lm_head_weight_step,
+                    "source_dtype": str(source_weight.dtype),
+                    "target_dtype": str(target_weight.dtype),
+                },
+            )
         else:
             target_weight.copy_(
                 source_weight.to(
@@ -4212,6 +4872,7 @@ class DrafterBaseTrainer:
                     batch.get("_verl_request_mean_accept_len"),
                     i,
                 ),
+                TRACE_KEY: _batch_item_value(batch.get(TRACE_KEY), i),
                 "_speco_vllm_request_id": _batch_item_value(
                     batch.get("_speco_vllm_request_id"), i
                 ),
@@ -4263,6 +4924,25 @@ class DrafterBaseTrainer:
                     else None
                 ),
             }
+            if data_item[TRACE_KEY] is not None:
+                from verl_speco.integration.verify_trace import align_trace_to_prompt
+
+                if cpu_prompts is None:
+                    raise ValueError(
+                        "Draft-OPD collection requires prompt token coordinates"
+                    )
+                data_item[TRACE_KEY] = align_trace_to_prompt(
+                    data_item[TRACE_KEY], cpu_prompts[i].numel()
+                )
+                if batch.get("response_mask") is None:
+                    raise ValueError(
+                        "Draft-OPD collection requires the agent response_mask"
+                    )
+                response_mask = (
+                    batch["response_mask"][i].detach().cpu().float()[:response_len]
+                )
+                full_loss_mask[prompt_len : prompt_len + response_len] = response_mask
+                data_item["loss_mask"] = full_loss_mask[feature_start:feature_end]
             if shifted_block_labels:
                 if not 0 <= feature_start < feature_end < input_seq_length:
                     raise ValueError(
@@ -5057,10 +5737,18 @@ class DrafterBaseTrainer:
         min_items_for_batch = 1
 
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
+        allow_cross_step_hidden = bool(
+            self.config.rollout.drafter.training.get("allow_cross_step_hidden", False)
+        )
+        # eagle3 的 target_logprobs 在 rollout 时预计算，依赖当时的 actor 权重，
+        # 需要同 step 限制（allow_cross_step_hidden=true 时显式放宽）。
+        # DSpark 的版本一致限制仅在 SFT 路径显式传入样本范围，见 speco_train_drafter，
+        # 不影响共享 base_trainer 上原有 PPO / 非 SFT 路径的最近 N 步采样行为。
         same_step_target_head_required = (
             self.backend.model_type == "eagle3"
             and not use_logits
-            and not self._bubble_time_enabled
+            and not getattr(self, "_bubble_time_enabled", False)
+            and not allow_cross_step_hidden
         )
 
         self._last_prepared_training_items = []
@@ -5089,7 +5777,7 @@ class DrafterBaseTrainer:
         # head version that produced those hidden states, so older buffered Eagle3
         # samples are not valid for the actor head synced for this rollout step.
         elif self.use_data_buffer and len(self.data_buffer) > 0:
-            if not self._bubble_time_enabled and (
+            if not getattr(self, "_bubble_time_enabled", False) and (
                 min_sample_step is not None or max_sample_step is not None
             ):
                 available_data = self._filter_training_data_by_step(
@@ -5113,6 +5801,7 @@ class DrafterBaseTrainer:
                 available_data = self.data_buffer.get_data_from_last_n_steps(
                     buffer_steps
                 )
+            # Filter out items that are already in the active accumulation set, if any.
             if len(available_data) < effective_batch_size:
                 if len(available_data) >= min_items_for_batch:
                     items = available_data
@@ -5184,6 +5873,8 @@ class DrafterBaseTrainer:
         packed_loss_tokens = 0
         trailing_label_rows = 0
         packing_enabled = self._packing_enabled()
+        if packing_enabled and "opd_trace" in preprocessed_lists:
+            raise ValueError("Draft-OPD currently requires packing=false")
 
         # Build training chunks inside each sample before packing. EAGLE3-style
         # models use next-token chunks, while DFlash keeps same-position blocks
@@ -5201,6 +5892,7 @@ class DrafterBaseTrainer:
         label_id_chunks = []
         label_mask_chunks = []
 
+        opd_trace_chunks = []
         ids_list = preprocessed_lists["ids"]
         hidden_list = preprocessed_lists["h_states"]
         mask_list = preprocessed_lists["masks"]
@@ -5222,7 +5914,7 @@ class DrafterBaseTrainer:
             self.config.rollout.drafter.training.get("lk_temperature", 1.0) or 1.0
         )
         block_distribution_loss_enabled = (
-            self.backend.model_type in {"dspark", "dflash"}
+            self.backend.model_type in {"dspark", "dsv4_dspark", "dflash"}
             and resolve_drafter_hidden_states_layout(
                 self.backend.model_type.upper(), self.config.rollout.drafter.training
             )
@@ -5654,6 +6346,10 @@ class DrafterBaseTrainer:
                             },
                         )
 
+            if "opd_trace" in preprocessed_lists:
+                opd_trace_chunks.append(
+                    preprocessed_lists["opd_trace"][item_idx][:train_seq_len]
+                )
             if uses_shifted_eagle_inputs or self.backend.model_type == "peagle":
                 input_id_chunks.append(ids[1 : 1 + train_seq_len])
                 hidden_state_chunks.append(h_states[:train_seq_len])
@@ -5936,7 +6632,7 @@ class DrafterBaseTrainer:
                 device=dev,
             )
         elif (
-            self.backend.model_type in {"dflash", "dspark"}
+            self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
             and target_last_hidden_state_chunks
         ):
             batch["target_last_hidden_states"] = target_last_hidden_states
@@ -5967,7 +6663,7 @@ class DrafterBaseTrainer:
             peagle_last_hidden_states = batch["last_hidden_states"]
             peagle_seq_lengths = batch["seq_lengths"]
         elif (
-            self.backend.model_type in {"dflash", "dspark"}
+            self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
             and "target_last_hidden_states" in batch
         ):
             target_last_hidden_states = batch["target_last_hidden_states"]
@@ -6014,7 +6710,7 @@ class DrafterBaseTrainer:
                                 target_logz, (0, pad_size), value=0.0
                             )
                 elif (
-                    self.backend.model_type in {"dflash", "dspark"}
+                    self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
                     and "target_last_hidden_states" in batch
                 ):
                     target_last_hidden_states = torch.nn.functional.pad(
@@ -6039,7 +6735,7 @@ class DrafterBaseTrainer:
                             target_logz, dim=1, padding=False
                         )
             elif (
-                self.backend.model_type in {"dflash", "dspark"}
+                self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
                 and "target_last_hidden_states" in batch
             ):
                 target_last_hidden_states = slice_input_tensor(
@@ -6076,10 +6772,16 @@ class DrafterBaseTrainer:
             batch["last_hidden_states"] = peagle_last_hidden_states
             batch["seq_lengths"] = peagle_seq_lengths
         elif (
-            self.backend.model_type in {"dflash", "dspark"}
+            self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
             and target_last_hidden_state_chunks
         ):
             batch["target_last_hidden_states"] = target_last_hidden_states
+        if opd_trace_chunks:
+            batch["opd_trace"] = torch.full(
+                (*input_ids.shape, 3), -1, dtype=torch.long, device=dev
+            )
+            for row, trace in enumerate(opd_trace_chunks):
+                batch["opd_trace"][row, : trace.size(0)] = trace
         if document_ids is not None:
             batch["document_ids"] = document_ids
         batch["_speco_pad_size"] = pad_size_for_batch
@@ -6503,10 +7205,14 @@ class DrafterBaseTrainer:
 
         current_step = int(self.current_rl_step)
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
+        allow_cross_step_hidden = bool(
+            self.config.rollout.drafter.training.get("allow_cross_step_hidden", False)
+        )
         same_step_data_required = (
             self.backend.model_type == "eagle3"
             and not use_logits
-            and not self._bubble_time_enabled
+            and not getattr(self, "_bubble_time_enabled", False)
+            and not allow_cross_step_hidden
         )
         current_step_data = [
             item
@@ -6578,7 +7284,7 @@ class DrafterBaseTrainer:
                 int(item.get("target_version", item.get("step", current_step)))
                 for item in recent_data
             ]
-            if self._bubble_time_enabled and not use_logits:
+            if getattr(self, "_bubble_time_enabled", False) and not use_logits:
                 cached_versions = set(self._target_lm_head_snapshots)
                 target_versions = [
                     version for version in target_versions if version in cached_versions
@@ -6788,7 +7494,14 @@ class DrafterBaseTrainer:
             if batch.get("hidden_source") == "standalone_vllm_reference":
                 batch = self._stage_standalone_cpu_batch(batch)
             with torch.enable_grad():
-                return await self._training_step_on_batch(batch, step)
+                result = await self._training_step_on_batch(batch, step)
+                if not result:
+                    logger.warning(
+                        f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] "
+                        f"training_step_from_batch returned False at step {step} "
+                        f"(keys={sorted(batch.keys())[:8]})"
+                    )
+                return result
         except Exception as e:  # noqa: BLE001
             self.last_standalone_training_error = e
             logger.exception(f"Standalone training step {step} failed with error: {e}")
@@ -6882,13 +7595,17 @@ class DrafterBaseTrainer:
                     self._sampling_micro_index = micro_index
                     # Only this micro-batch resides on device. Replay sampling
                     # has its own deterministic RNG/cursor, independent of forward.
-                    prepare_started = time.perf_counter()
+                    from verl_speco.trainer.performance_diagnostics import (
+                        training_stage_clock,
+                    )
+
+                    prepare_started = training_stage_clock(self)
                     batch = self._prepare_training_batch_for_step(
                         min_sample_step=min_sample_step, max_sample_step=max_sample_step
                     )
                     self.record_training_timing(
                         "timing_s/drafter_prepare_batch",
-                        time.perf_counter() - prepare_started,
+                        training_stage_clock(self) - prepare_started,
                     )
                     if batch is None:
                         self.optimizer.zero_grad(set_to_none=True)
@@ -6972,7 +7689,9 @@ class DrafterBaseTrainer:
             )
             return False
 
-        prepare_ts = time.time()
+        from verl_speco.trainer.performance_diagnostics import training_stage_clock
+
+        prepare_ts = training_stage_clock(self)
         bubble = getattr(self, "_bubble_time_enabled", False)
         if bubble:
             batch = self._prepare_training_batch_for_step(
@@ -6985,7 +7704,7 @@ class DrafterBaseTrainer:
                 min_sample_step=min_sample_step, max_sample_step=max_sample_step
             )
         self.record_training_timing(
-            "timing_s/drafter_prepare_batch", time.time() - prepare_ts
+            "timing_s/drafter_prepare_batch", training_stage_clock(self) - prepare_ts
         )
         if not bubble and not self._sync_batch_readiness(batch is not None):
             return False
@@ -7067,7 +7786,9 @@ class DrafterBaseTrainer:
         sample_count = int(batch.get("_speco_sample_count", 0) or 0)
 
         # Forward pass.
-        forward_ts = time.time()
+        from verl_speco.trainer.performance_diagnostics import training_stage_clock
+
+        forward_ts = training_stage_clock(self)
         with self._ulysses_group_context():
             with torch.amp.autocast(device_type=device_name, dtype=torch.bfloat16):
                 pad_size = int(
@@ -7090,11 +7811,11 @@ class DrafterBaseTrainer:
                         self._record_dflash_training_metrics(loss_dict) or {}
                     )
         self.record_training_timing(
-            "timing_s/drafter_forward_loss", time.time() - forward_ts
+            "timing_s/drafter_forward_loss", training_stage_clock(self) - forward_ts
         )
 
         # Reduce scalar loss statistics once across SP/DP groups.
-        reduce_ts = time.time()
+        reduce_ts = training_stage_clock(self)
         if getattr(self, "combine_standalone_metrics", False):
             statistics = self._reduce_standalone_step_statistics(loss_dict)
             step_accuracy = getattr(self, "_last_step_metrics", None) or {}
@@ -7102,12 +7823,16 @@ class DrafterBaseTrainer:
             statistics = self._reduce_loss_metrics(l_v, l_p, l_n)
         global_vloss, global_ploss, global_tokens, reduce_world_size = statistics
         self.record_training_timing(
-            "timing_s/drafter_reduce_loss", time.time() - reduce_ts
+            "timing_s/drafter_reduce_loss", training_stage_clock(self) - reduce_ts
         )
 
         if float(global_tokens.detach().float().item()) <= 0:
-            logger.debug(
-                f"Step {self.training_steps + 1}: no finite drafter target tokens, skipping optimizer step"
+            logger.warning(
+                f"[DrafterTrainer rank {self.rank}] Step {self.training_steps + 1}: "
+                "no finite drafter target tokens, skipping optimizer step "
+                f"(local_num_tokens={float(l_n.detach().float().item()) if torch.is_tensor(l_n) else l_n}, "
+                f"local_vloss={float(l_v.detach().float().item()) if torch.is_tensor(l_v) else l_v}, "
+                f"local_ploss={float(l_p.detach().float().item()) if torch.is_tensor(l_p) else l_p})"
             )
             return False
         self._current_accumulation_valid_tokens += int(
@@ -7140,6 +7865,7 @@ class DrafterBaseTrainer:
             "eagle3",
             "dflash",
             "dspark",
+            "dsv4_dspark",
             "dflash2",
         } and getattr(self.backend, "enable_standalone_training_metrics", False):
             # Log the actual globally reduced optimization objective, including
@@ -7153,30 +7879,56 @@ class DrafterBaseTrainer:
         # outside the autograd graph, so each rank's backward carries only its own
         # contribution, and FSDP then averages gradients across the same
         # `reduce_world_size` ranks. Scaling by `reduce_world_size` cancels that
-        # mean. Scaling by `reduce_world_size` cancels that mean. A single
+        # mean. A single
         # micro-batch divides here; accumulated loss-sum gradients divide once
         # by the combined valid-token count immediately before optimizer.step.
         local_loss_sum = loss_dict["v_weight"] * l_v + loss_dict["p_weight"] * l_p
         local_loss = local_loss_sum * float(reduce_world_size)
         if accumulation_steps == 1:
             local_loss = local_loss / denom
-        backward_ts = time.time()
+        backward_ts = training_stage_clock(self)
         local_loss.backward()
+        if self._is_ep_active():
+            # EP keeps each rank's experts local; non-expert params are
+            # replicated and need a manual gradient all-reduce.
+            self._sync_non_expert_grads()
+            # Rank-local expert grads are never averaged, so they still carry
+            # the ``reduce_world_size`` loss-scaling factor that replicated
+            # params cancel through their gradient mean. Rescale them before
+            # clipping so expert and shared gradients follow the same global
+            # objective.
+            self._scale_ep_expert_grads(1.0 / float(reduce_world_size))
         self.record_training_timing(
-            "timing_s/drafter_backward", time.time() - backward_ts
+            "timing_s/drafter_backward", training_stage_clock(self) - backward_ts
         )
 
         # 更新权重
         if accumulation_index + 1 < accumulation_steps:
             return True
 
-        optimizer_ts = time.time()
+        optimizer_ts = training_stage_clock(self)
         if accumulation_steps > 1:
             accumulation_denom = float(max(self._current_accumulation_valid_tokens, 1))
             for parameter in self.model.parameters():
                 if parameter.grad is not None:
                     parameter.grad.div_(accumulation_denom)
-        grad_norm = self._clip_training_grad_norm()
+        if self._is_ep_active():
+            # Mixed DTensor placements / rank-local expert grads: use the
+            # replication-corrected global norm so every rank clips identically.
+            # In the EP+DDP mode the non-expert grads are plain tensors that
+            # sync_non_expert_grads has already world-averaged -- count each
+            # replicated contribution once instead of once per rank.
+            ep_ddp_world_size = int(getattr(self, "_ep_ddp_world_size", 0) or 0)
+            grad_norm = _clip_dtensor_grad_norm_(
+                self.model.parameters(),
+                max_norm=1.0,
+                disjoint_plain_param_ids=getattr(self, "_ep_expert_param_ids", None),
+                replicated_world_size=(
+                    ep_ddp_world_size if ep_ddp_world_size > 1 else 1
+                ),
+            )
+        else:
+            grad_norm = self._clip_training_grad_norm()
         if not torch.isfinite(grad_norm):
             logger.error(
                 f"Step {self.training_steps + 1}: non-finite drafter grad norm, "
@@ -7192,7 +7944,7 @@ class DrafterBaseTrainer:
         self._last_optimizer_valid_tokens = int(self._current_accumulation_valid_tokens)
         self.optimizer.zero_grad(set_to_none=True)
         self.record_training_timing(
-            "timing_s/drafter_optimizer", time.time() - optimizer_ts
+            "timing_s/drafter_optimizer", training_stage_clock(self) - optimizer_ts
         )
 
         self.training_steps += 1
@@ -7263,6 +8015,42 @@ class DrafterBaseTrainer:
             load_fsdp_model_to_gpu(self.model)
 
         try:
+            training_cfg = self.config.rollout.drafter.training
+            if (
+                not getattr(self, "_bubble_time_enabled", False)
+                and self.training_device_mesh is not None
+                and not isinstance(self.model, FSDP)
+                and not self._is_ddp_wrapped()
+                and dist.is_initialized()
+                and training_cfg.get("publish_trainable_only_export", True)
+            ):
+                from verl_speco.trainer.publish_state import export_fsdp2_publish_state
+
+                dtype = {
+                    "float32": torch.float32,
+                    "fp32": torch.float32,
+                    "float16": torch.float16,
+                    "fp16": torch.float16,
+                    "bfloat16": torch.bfloat16,
+                    "bf16": torch.bfloat16,
+                }.get(training_cfg.get("publish_dtype"))
+                from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
+
+                publish_stats: dict[str, Any] = {}
+                snapshot = export_fsdp2_publish_state(
+                    self.model,
+                    is_frozen=self._is_frozen_publish_param,
+                    trains_lm_head=getattr(self.backend, "trains_draft_lm_head", False),
+                    patterns=training_cfg.get("publish_param_name_patterns"),
+                    dtype=dtype,
+                    cast_before_copy=gpu_transfer_enabled(
+                        training_cfg, "gpu_publish_cast_before_copy"
+                    ),
+                    diagnostics=publish_stats,
+                )
+                if snapshot is not None:
+                    self._record_gpu_transfer("publish_snapshot", publish_stats)
+                    return snapshot or None
             trainable_state = self._get_trainable_state_dict()
             if not trainable_state:
                 return None
@@ -7591,6 +8379,7 @@ class DrafterBaseTrainer:
             self.rank,
             clear_data,
         )
+        self._last_cleanup_stage_timings: dict[str, float] = {}
         self._last_keep_hot_cache_trim_elapsed_sec = 0.0
 
         # Wait for any pending async checkpoint save to complete
@@ -7606,7 +8395,10 @@ class DrafterBaseTrainer:
             try:
                 # Run the blocking .result() call in executor to avoid blocking the event loop
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self._pending_checkpoint_future.result)
+                with self._residency_stage("cleanup", "checkpoint_wait"):
+                    await loop.run_in_executor(
+                        None, self._pending_checkpoint_future.result
+                    )
                 logger.debug(f"[Rank {self.rank}] Pending checkpoint save completed")
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Pending checkpoint save failed: {e}")
@@ -7624,7 +8416,8 @@ class DrafterBaseTrainer:
                 f"[Rank {self.rank}] Waiting for pending full drafter checkpoint save to complete..."
             )
             try:
-                await asyncio.wrap_future(self._pending_full_checkpoint_future)
+                with self._residency_stage("cleanup", "full_checkpoint_wait"):
+                    await asyncio.wrap_future(self._pending_full_checkpoint_future)
                 logger.debug(
                     f"[Rank {self.rank}] Pending full drafter checkpoint save completed"
                 )
@@ -7638,7 +8431,8 @@ class DrafterBaseTrainer:
             )
         if self.optimizer is not None:
             try:
-                self.optimizer.zero_grad(set_to_none=True)
+                with self._residency_stage("cleanup", "zero_grad"):
+                    self.optimizer.zero_grad(set_to_none=True)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to clear drafter gradients during cleanup: {e}")
         # Training and publish collectives have completed before cleanup. These
@@ -7705,19 +8499,45 @@ class DrafterBaseTrainer:
         # serialize ranks and can add timeout windows without releasing memory.
 
         if self.model is not None and self.is_offload_param:
-            offload_model_started_at = time.perf_counter()
+            pooled_offload = False
             try:
-                offload_fsdp_model_to_cpu(self.model)
-                _log_drafter_phase(
-                    self.rank, "cleanup_model_offload_done", offload_model_started_at
-                )
-            except Exception as e:  # noqa: BLE001
-                _log_drafter_phase(
-                    self.rank,
-                    "cleanup_model_offload_failed",
-                    offload_model_started_at,
-                    error=type(e).__name__,
-                )
+                with self._residency_stage("cleanup", "offload_model"):
+                    if (
+                        device_name == "cuda"
+                        and getattr(self, "_gpu_model_offload_reuse", False)
+                        and self._drafter_strategy() == "fsdp2"
+                        and self.training_device_mesh is not None
+                    ):
+                        from verl_speco.trainer.gpu_transfer import ModelHostBufferPool
+
+                        pool = getattr(self, "_gpu_model_host_pool", None)
+                        if pool is None:
+                            pool = self._gpu_model_host_pool = ModelHostBufferPool(
+                                self._gpu_offload_pool_max_bytes,
+                                pinned=True,
+                            )
+                        pooled_offload = True
+                        used_pool, stats = pool.offload(
+                            self.model, device_module=self.device_module
+                        )
+                        self._record_gpu_transfer(
+                            "model_offload", {"used_pool": int(used_pool), **stats}
+                        )
+                        if not used_pool:
+                            pooled_offload = False
+                            offload_fsdp_model_to_cpu(self.model, empty_cache=False)
+                    elif device_name == "cuda":
+                        # Reclaim once after all offloads and the existing
+                        # synchronization, rather than inside the model helper.
+                        offload_fsdp_model_to_cpu(self.model, empty_cache=False)
+                    else:
+                        offload_fsdp_model_to_cpu(self.model)
+                logger.debug("Offloaded drafter model to CPU after training")
+            except Exception as e:
+                if pooled_offload:
+                    raise RuntimeError(
+                        "GPU pooled model offload failed; refusing partial residency state"
+                    ) from e
                 logger.debug(f"Failed to offload drafter model during cleanup: {e}")
         elif self.model is not None:
             logger.debug(
@@ -7726,21 +8546,15 @@ class DrafterBaseTrainer:
                 self.rank,
             )
         if self.optimizer is not None and self.is_offload_optimizer:
-            offload_optimizer_started_at = time.perf_counter()
             try:
-                self._offload_optimizer_state_to_cpu()
-                _log_drafter_phase(
-                    self.rank,
-                    "cleanup_optimizer_offload_done",
-                    offload_optimizer_started_at,
-                )
+                with self._residency_stage("cleanup", "offload_optimizer"):
+                    self._offload_optimizer_state_to_cpu()
+                logger.debug("Offloaded drafter optimizer state to CPU after training")
             except Exception as e:  # noqa: BLE001
-                _log_drafter_phase(
-                    self.rank,
-                    "cleanup_optimizer_offload_failed",
-                    offload_optimizer_started_at,
-                    error=type(e).__name__,
-                )
+                if getattr(self.optimizer, "_speco_host_transition_failed", False):
+                    raise RuntimeError(
+                        "GPU optimizer offload did not complete; refusing unsafe cleanup"
+                    ) from e
                 if self._use_blocking_npu_optimizer_offload():
                     raise RuntimeError(
                         "NPU VeOmni drafter optimizer blocking offload failed during cleanup"
@@ -7753,27 +8567,48 @@ class DrafterBaseTrainer:
                 self.rank,
             )
         try:
-            self._move_target_lm_head("cpu")
+            with self._residency_stage("cleanup", "offload_target_head"):
+                self._move_target_lm_head("cpu")
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Failed to offload drafter target head during cleanup: {e}")
         if clear_data:
-            self.collected_data.clear()
-            self.data_buffer.clear()  # Clear the cross-step data buffer
-            self._mark_buffer_changed()
+            with self._residency_stage("cleanup", "clear_data"):
+                self.collected_data.clear()
+                self.data_buffer.clear()  # Clear the cross-step data buffer
+                self._mark_buffer_changed()
         if self._full_checkpoint_executor is not None:
-            self._full_checkpoint_executor.shutdown(wait=False)
+            with self._residency_stage("cleanup", "executor_shutdown"):
+                self._full_checkpoint_executor.shutdown(wait=False)
             self._full_checkpoint_executor = None
         if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
-            empty_cache_started_at = time.perf_counter()
+            allocator_stages = {}
+            if device_name == "cuda":
+                from verl_speco.trainer.performance_diagnostics import (
+                    allocator_metadata,
+                )
+
+                allocator_stages["before_sync"] = allocator_metadata(self.device_module)
             if hasattr(self.device_module, "synchronize"):
-                self.device_module.synchronize()
-            self.device_module.empty_cache()
-            _log_drafter_phase(
-                self.rank, "cleanup_empty_cache_done", empty_cache_started_at
-            )
-        park_started_at = time.perf_counter()
-        self._park_idle_drafter_hccl()
-        _log_drafter_phase(self.rank, "cleanup_drafter_hccl_park_done", park_started_at)
+                with self._residency_stage("cleanup", "device_synchronize"):
+                    self.device_module.synchronize()
+            if device_name == "cuda":
+                allocator_stages["after_sync"] = allocator_metadata(self.device_module)
+            with self._residency_stage("cleanup", "empty_cache"):
+                self.device_module.empty_cache()
+            if device_name == "cuda":
+                allocator_stages["after_reclaim"] = allocator_metadata(
+                    self.device_module
+                )
+                self._record_gpu_transfer(
+                    "cleanup_allocator",
+                    {
+                        f"{stage}_{key}": value
+                        for stage, values in allocator_stages.items()
+                        for key, value in values.items()
+                    },
+                )
+        with self._residency_stage("cleanup", "park_hccl"):
+            self._park_idle_drafter_hccl()
         self._training_initialized = False
         self._training_active = False
         self._last_ckpt_step = -1
@@ -7793,10 +8628,41 @@ class DrafterBaseTrainer:
             operations.append(
                 ("clear_gradients", lambda: self.optimizer.zero_grad(set_to_none=True))
             )
+
+        pooled_model_transition = False
+
+        def offload_model():
+            nonlocal pooled_model_transition
+            if (
+                device_name == "cuda"
+                and getattr(self, "_gpu_model_offload_reuse", False)
+                and self._drafter_strategy() == "fsdp2"
+                and self.training_device_mesh is not None
+            ):
+                from verl_speco.trainer.gpu_transfer import ModelHostBufferPool
+
+                pool = getattr(self, "_gpu_model_host_pool", None)
+                if pool is None:
+                    pool = self._gpu_model_host_pool = ModelHostBufferPool(
+                        self._gpu_offload_pool_max_bytes, pinned=True
+                    )
+                pooled_model_transition = True
+                used, stats = pool.offload(self.model, device_module=self.device_module)
+                pooled_model_transition = False
+                self._record_gpu_transfer(
+                    "model_offload", {"used_pool": int(used), **stats}
+                )
+                if used:
+                    return
+            # Reclaim once after model, optimizer and head transfers finish.
+            # A pooled copy failure propagates; only a clean decline falls back.
+            if device_name == "cuda":
+                offload_fsdp_model_to_cpu(self.model, empty_cache=False)
+            else:
+                offload_fsdp_model_to_cpu(self.model)
+
         if self.model is not None:
-            operations.append(
-                ("offload_model", lambda: offload_fsdp_model_to_cpu(self.model))
-            )
+            operations.append(("offload_model", offload_model))
         if self.optimizer is not None:
             operations.append(
                 ("offload_optimizer", lambda: self._offload_optimizer_state_to_cpu())
@@ -7823,13 +8689,23 @@ class DrafterBaseTrainer:
                 failures.append((stage, error))
                 # Preserve the existing fatal NPU optimizer and device/stream
                 # errors even for best-effort warmup cleanup.
-                fatal_failure |= stage in {
-                    "device_synchronize",
-                    "empty_cache",
-                    "park_hccl",
-                } or (
-                    stage == "offload_optimizer"
-                    and self._use_blocking_npu_optimizer_offload()
+                fatal_failure |= (
+                    stage
+                    in {
+                        "device_synchronize",
+                        "empty_cache",
+                        "park_hccl",
+                    }
+                    or (
+                        stage == "offload_optimizer"
+                        and (
+                            self._use_blocking_npu_optimizer_offload()
+                            or getattr(
+                                self.optimizer, "_speco_host_transition_failed", False
+                            )
+                        )
+                    )
+                    or (stage == "offload_model" and pooled_model_transition)
                 )
                 logger.warning(
                     "Drafter parking failed: stage=%s strict=%s error=%s",
@@ -7840,7 +8716,7 @@ class DrafterBaseTrainer:
             finally:
                 stage_timings[stage] = time.perf_counter() - operation_started
         self._last_memory_park_stage_timings = stage_timings
-        if getattr(self, "_bubble_time_enabled", False) or _env_flag_enabled(
+        if _env_flag_enabled("VERL_SPECO_PHASE_TIMING") or _env_flag_enabled(
             "VERL_DRAFTER_MEMORY_DIAGNOSTICS"
         ):
             logger.warning(

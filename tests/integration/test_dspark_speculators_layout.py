@@ -199,6 +199,8 @@ def test_missing_pp_layers_fail_before_emitting_partial_width():
 
 
 def test_actual_npu_subclass_inherits_all_installed_capture_wrappers():
+    pytest.importorskip("megatron")
+    pytest.importorskip("mindspeed")
     from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
     from verl.workers.engine.mindspeed.transformer_impl import MindspeedEngineWithLMHead
     assert rt.install_oldlogprob_hidden_runtime_patch_megatron()

@@ -27,8 +27,6 @@ def _commands() -> PipelineCommands:
         vllm=None,
         vllm_endpoints=("http://127.0.0.1:8000/v1",),
         owner=["python", "-m", "verl_speco.tq_owner"],
-        producer=["producer"],
-        consumer=["consumer"],
         producer_overrides=("producer=true",),
         consumer_overrides=("consumer=true",),
     )
@@ -215,9 +213,10 @@ def test_ray_backend_rejects_multi_node_local_runtime() -> None:
             "ray", ["speco.draft_training.nnodes=2"]
         )
 
-    _validate_runtime_backend_topology(
-        "subprocess", ["speco.draft_training.nnodes=2"]
-    )
+    with pytest.raises(ValueError, match="subprocess training was removed"):
+        _validate_runtime_backend_topology(
+            "subprocess", ["speco.draft_training.nnodes=2"]
+        )
 
 
 @dataclass(frozen=True)
@@ -853,8 +852,9 @@ def test_trainer_propagates_consumer_error_and_stops_producer(monkeypatch) -> No
         trainer.run()
 
 
+@pytest.mark.parametrize("producer_node", ["driver-node", "other-node", None])
 @pytest.mark.parametrize("end", ["eos", "max_steps"])
-def test_mooncake_driver_cleans_tail_and_late_shutdown_references(monkeypatch, end):
+def test_mooncake_driver_cleans_tail_and_late_shutdown_references(monkeypatch, end, producer_node):
     from copy import deepcopy
     from verl_speco.producer import hidden_states_store
     from verl_speco.trainer.tq_feature_store import ReferenceFeatureStore
@@ -909,6 +909,10 @@ def test_mooncake_driver_cleans_tail_and_late_shutdown_references(monkeypatch, e
             consumers = [ref for ref in refs if ref.name.startswith("consumer")]
             return consumers[:1], [ref for ref in refs if ref not in consumers[:1]]
 
+    import time
+    monkeypatch.setattr("verl_speco.standalone_ray_runtime.current_ray_node_id", lambda: "driver-node")
+    items[1]["clock_node_id"] = producer_node
+    items[1]["sent_at"] = time.monotonic() - 1 if producer_node == "driver-node" else 10000.0
     configs = []
     def factory(cfg):
         configs.append(cfg)
@@ -926,3 +930,13 @@ def test_mooncake_driver_cleans_tail_and_late_shutdown_references(monkeypatch, e
     assert trainer.run() == 0
     assert configs[0]["hidden_states_store"]["mooncake"]["master_server_address"] == "host:50051"
     assert sorted(deleted) == expected
+    batches = [command for command in commands.items if command["kind"] == "batch"]
+    if end == "max_steps":
+        assert len(batches) == 1
+        command = batches[0]
+        assert command["clock_node_id"] == "driver-node"
+        assert command["delivery_times"]["scheduler_ready_wait_time"] >= 0
+        if producer_node == "driver-node":
+            assert 1 <= command["delivery_times"]["metadata_event_age_time"] < 10
+        else:
+            assert "metadata_event_age_time" not in command["delivery_times"]

@@ -26,6 +26,7 @@ PPO_EXAMPLES = [
     script
     for script in (ROOT / "examples").glob("*.sh")
     if not script.name.endswith("_separate_training.sh")
+    and not script.name.endswith("_sft.sh")
     and "_eval" not in script.name
 ]
 
@@ -64,7 +65,12 @@ def test_example_shell_syntax_is_valid(script: Path) -> None:
     path = str(script)
     if os.name == "nt":
         if "system32" in bash.lower():
-            path = "/mnt/" + script.drive.rstrip(":").lower() + "/" + script.relative_to(script.anchor).as_posix()
+            path = (
+                "/mnt/"
+                + script.drive.rstrip(":").lower()
+                + "/"
+                + script.relative_to(script.anchor).as_posix()
+            )
         else:
             path = script.as_posix()
     subprocess.run([bash, "-n", path], check=True)
@@ -82,6 +88,11 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
         assert f'exec bash "${{script_dir}}/{launch}"' in source
         source = (script.parent / launch).read_text(encoding="utf-8")
 
+    if "-vat_drafter_" in script.name or "-opd_drafter_" in script.name:
+        backend = "dflash" if "dflash" in script.name else "dspark"
+        assert "bash examples/" not in source
+        assert f"training.{backend}_loss_mode=full_vocab" in source
+
     assert (
         "python3 -m verl_speco.main" in source or "python -m verl_speco.main" in source
     )
@@ -96,6 +107,45 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
         "actor_rollout_ref.rollout.drafter.training.training_interval_steps=" in source
     )
     assert "actor_rollout_ref.rollout.drafter.training.publish_async=" in source
+
+
+@pytest.mark.parametrize("backend", ["dflash", "dspark"])
+@pytest.mark.parametrize("method", ["opd", "vat"])
+def test_standalone_objective_examples_launch_experiment_settings(
+    backend: str, method: str, tmp_path: Path,
+) -> None:
+    bash = _require_working_bash()
+    script = ROOT / "examples" / f"run_qwen3-8b-{method}_drafter_{backend}_vllm.sh"
+    path = script.as_posix()
+    if os.name == "nt" and "system32" in bash.lower():
+        path = "/mnt/" + script.drive.rstrip(":").lower() + "/" + script.relative_to(script.anchor).as_posix()
+    # Intercept the Python launch: exercise Bash expansion from another cwd,
+    # including paths with spaces and the user's trailing Hydra overrides.
+    result = subprocess.run(
+        [bash, "-c", 'python3() { printf "%s\\n" "$@"; }; source "$1" "${@:2}"',
+         "standalone-example", path, "trainer.total_training_steps=3"],
+        cwd=tmp_path, env={**os.environ, "MODEL_PATH": "/models/Qwen 3",
+                           "DRAFTER_PATH": "/models/drafter with spaces", "RUN_TIMESTAMP": "test"},
+        capture_output=True, text=True, check=True,
+    )
+    args = result.stdout.splitlines()
+    assert args[:2] == ["-m", "verl_speco.main"]
+    assert args[-1] == "trainer.total_training_steps=3"
+    assignments = dict(arg.split("=", 1) for arg in args[2:])
+    assert assignments["actor_rollout_ref.model.path"] == "/models/Qwen 3"
+    assert assignments["actor_rollout_ref.rollout.drafter.model_path"] == "/models/drafter with spaces"
+    assert assignments["data.train_batch_size"] == "32"
+    assert assignments["data.max_response_length"] == ("2048" if method == "opd" else "8192")
+    assert assignments["trainer.n_gpus_per_node"] == "2"
+    assert assignments["trainer.save_freq"] == "-1"
+    prefix = "actor_rollout_ref.rollout.drafter.training."
+    assert assignments[prefix + "collect_interval_steps"] == "2"
+    assert assignments[prefix + "training_interval_steps"] == "2"
+    assert assignments[prefix + "step"] == "10"
+    assert assignments[prefix + "drafter_opd.enable"] == ("true" if method == "opd" else "false")
+    if method == "vat":
+        assert assignments[prefix + f"{backend}_per_position_loss_weight"] == "vat"
+        assert assignments[prefix + "vat.accept_mode"] == "greedy"
 
 
 def test_v1_hard_freeze_longrun_uses_full_dimensions_and_normal_policy() -> None:
@@ -151,18 +201,16 @@ def test_standalone_tq_training_example_uses_unified_launcher() -> None:
     assert "DSPARK_MAX_WINDOW=${DSPARK_MAX_WINDOW:-0}" in source
     assert "DSPARK_MAX_WINDOW=${DSPARK_MAX_WINDOW:-512}" not in source
     assert "training.dspark_max_window=${DSPARK_MAX_WINDOW}" in source
-    assert (
-        "speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids=" in source
-    )
+    assert "speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids=" in source
     assert "training.dspark_target_layer_ids=" not in source
 
 
 def test_standalone_tq_hidden_state_vllm_uses_separate_devices() -> None:
-    source = (
-        ROOT / "tools" / "run_qwen3-8b_drafter_hidden_state_vllm.sh"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / "tools" / "run_qwen3-8b_drafter_hidden_state_vllm.sh").read_text(
+        encoding="utf-8"
+    )
 
-    assert 'VLLM_DEVICES=${VLLM_DEVICES:-0,1,2,3,4,5}' in source
+    assert "VLLM_DEVICES=${VLLM_DEVICES:-0,1,2,3,4,5}" in source
     assert "service_count=$((device_count / VLLM_TP))" in source
     assert 'env "${DEVICE_ENV}=${devices}" vllm serve "${MODEL_PATH}"' in source
     assert '--tensor-parallel-size "${VLLM_TP}"' in source
@@ -315,4 +363,7 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     assert "CKPTS_DIR=${CKPTS_DIR:-/path/to/checkpoint}" in mrv2_source
     assert "TRAIN_FILE=${TRAIN_FILE:-/path/to/train_file}" in mrv2_source
     assert "TEST_FILE=${TEST_FILE:-/path/to/test_file}" in mrv2_source
-    assert "DRAFTER_PATH=${DRAFTER_PATH:-/path/to/vllm-compatible-dspark-drafter}" in mrv2_source
+    assert (
+        "DRAFTER_PATH=${DRAFTER_PATH:-/path/to/vllm-compatible-dspark-drafter}"
+        in mrv2_source
+    )

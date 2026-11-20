@@ -180,21 +180,56 @@ def test_native_bypass_selects_required_upstream_runner(monkeypatch, use_v1) -> 
     assert "verl_speco.integration.task_runner" not in sys.modules
 
 
-def test_run_uses_speco_task_runner_when_drafter_enabled(monkeypatch) -> None:
+@pytest.mark.parametrize("diagnostic_enabled", [False, True])
+def test_run_uses_speco_task_runner_when_drafter_enabled(
+    monkeypatch, diagnostic_enabled
+) -> None:
     pytest.importorskip("verl", reason="dispatch contract needs verl")
     pytest.importorskip("ray", reason="dispatch contract needs ray")
 
-    from verl_speco.main import run
+    import ray
+    from verl_speco import main
+
+    env = {"VERL_SPECO_PHASE_TIMING": "1"} if diagnostic_enabled else {}
+    monkeypatch.setattr(main, "configure_compile_cache_runtime_env", lambda config: {})
+    monkeypatch.setattr(main, "drafter_diagnostic_env", lambda: env)
+    actors, options = [], []
+    sentinel = object()
+
+    class Actor:
+        def options(self, **kwargs):
+            options.append(kwargs)
+            return sentinel
+
+    actor = Actor()
+
+    def remote(**kwargs):
+        assert kwargs == {"num_cpus": 1}
+
+        def wrap(cls):
+            actors.append(cls)
+            return actor
+
+        return wrap
 
     calls = _patch_verl_entry(monkeypatch)
-    run(_config(enable=True))
+    from verl_speco.integration.task_runner import SpecoTaskRunner
+
+    # Import real runner classes before spying on entrypoint actor creation.
+    monkeypatch.setattr(ray, "remote", remote)
+    main.run(_config(enable=True))
 
     assert len(calls) == 1
     task_runner_class = calls[0]
     assert task_runner_class is not None
-    from verl_speco.integration.task_runner import SpecoTaskRunner
-
-    assert getattr(task_runner_class, "__ray_actor_class__", None) is SpecoTaskRunner
+    assert actors == [SpecoTaskRunner]
+    assert task_runner_class is sentinel
+    assert len(options) == 1
+    forwarded = options[0]["runtime_env"]["env_vars"]
+    from verl_speco.integration.drafter_config_env import SPECO_DRAFTER_CONFIG_ENV
+    import json
+    assert json.loads(forwarded[SPECO_DRAFTER_CONFIG_ENV])["enable"] is True
+    assert {key: value for key, value in forwarded.items() if key != SPECO_DRAFTER_CONFIG_ENV} == env
 
 
 def test_run_bypass_propagates_training_without_rollout_error(monkeypatch) -> None:
@@ -256,3 +291,21 @@ def test_run_bypass_strips_speco_overlay_before_native_run(monkeypatch) -> None:
     # The strip must be surgical: native rollout keys stay intact.
     assert native_config.actor_rollout_ref.rollout.name == "vllm"
     assert native_config.actor_rollout_ref.rollout.n == 1
+
+
+def test_drafter_runtime_config_is_resolved_before_ray_start():
+    import json
+    from verl_speco.main import configure_drafter_runtime_env
+    from verl_speco.integration.drafter_config_env import SPECO_DRAFTER_CONFIG_ENV
+
+    config = _config(enable=True, training=True)
+    config.actor_rollout_ref.rollout.drafter.training = {
+        "drafter_opd": {"enable": True, "method": "draft_opd"},
+        "window": "${actor_rollout_ref.rollout.drafter.enable}",
+    }
+    env = configure_drafter_runtime_env(config)
+    assert config.ray_kwargs.ray_init.runtime_env.env_vars[SPECO_DRAFTER_CONFIG_ENV] == env[SPECO_DRAFTER_CONFIG_ENV]
+    assert json.loads(env[SPECO_DRAFTER_CONFIG_ENV])["training"] == {
+        "drafter_opd": {"enable": True, "method": "draft_opd"}, "window": True,
+    }
+    assert configure_drafter_runtime_env(_config()) == {}

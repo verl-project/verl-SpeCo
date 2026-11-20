@@ -35,7 +35,7 @@ def test_drafter_config_env_reads_the_legacy_name(monkeypatch) -> None:
 
 
 def test_drafter_config_env_writes_only_the_canonical_name(monkeypatch) -> None:
-    monkeypatch.delenv(SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    monkeypatch.setenv(SPECO_DRAFTER_CONFIG_ENV, "")
     monkeypatch.setenv(LEGACY_SPECO_SGLANG_DRAFTER_CONFIG_ENV, "legacy-config")
 
     set_drafter_config_env("canonical-config")
@@ -76,7 +76,7 @@ def test_worker_payload_retains_locator_without_overriding_user_config(
 
 
 def test_worker_payload_allocates_and_reuses_run_locator(monkeypatch, tmp_path) -> None:
-    monkeypatch.delenv(SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    monkeypatch.setenv(SPECO_DRAFTER_CONFIG_ENV, "")
     monkeypatch.delenv(LEGACY_SPECO_SGLANG_DRAFTER_CONFIG_ENV, raising=False)
     config = {"enable": True, "model_path": "current"}
 

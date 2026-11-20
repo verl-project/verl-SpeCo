@@ -10,8 +10,8 @@ Results use torch multiprocessing reducers, then the existing pin thread.
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -23,8 +23,8 @@ from typing import Any
 import torch
 import torch.multiprocessing as mp
 
-from verl_speco.trainer.tq_retry import retry_io
-from verl_speco.trainer.tq_sample_source import TQPrefetchIterator
+from verl_speco.trainer.standalone_prefetch import StandalonePrefetchIterator
+from verl_speco.trainer.standalone_retry import retry_io
 
 _STORE: Any = None
 _OPTIONS: dict[str, Any] = {}
@@ -38,7 +38,7 @@ def _initialize_worker(config, options, attempts):
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ.setdefault(name, "1")
     torch.set_num_threads(1)
-    from verl_speco.trainer.tq_feature_store import ReferenceFeatureStore
+    from verl_speco.trainer.reference_feature_store import ReferenceFeatureStore
 
     _STORE = ReferenceFeatureStore(config)
     _STORE.connect()
@@ -58,10 +58,11 @@ def _prepare_batch(entries):
     from verl_speco.trainer.standalone_sample_cleanup import cleanup_standalone_samples
 
     cleanup_standalone_samples(_STORE, entries)
+    batch["_speco_worker_finished_at"] = time.monotonic()
     return batch, time.perf_counter() - started
 
 
-class ReferenceBatchPrefetchIterator(TQPrefetchIterator):
+class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
     """Dispatch up to depth batches without waiting for previous preparation.
 
     The collector drains results FIFO, independently of command reception.
@@ -145,6 +146,7 @@ class ReferenceBatchPrefetchIterator(TQPrefetchIterator):
                     assignment = next(source)
                     if assignment is None:
                         raise RuntimeError("Missing file batch assignment")
+                    assignment.delivery_times["_worker_submitted_at"] = time.monotonic()
                     result = self._pool.apply_async(
                         _prepare_batch, (assignment.file_entries,)
                     )
@@ -184,9 +186,11 @@ class ReferenceBatchPrefetchIterator(TQPrefetchIterator):
             while True:
                 with self._condition:
                     self._condition.wait_for(
-                        lambda: self.stop.is_set()
-                        or self._pending
-                        or self._assignments_done
+                        lambda: (
+                            self.stop.is_set()
+                            or self._pending
+                            or self._assignments_done
+                        )
                     )
                     if self.stop.is_set() or not self._pending:
                         return
@@ -203,6 +207,18 @@ class ReferenceBatchPrefetchIterator(TQPrefetchIterator):
                             ) from None
                 else:
                     return
+                received_at = time.monotonic()
+                delivery_times = dict(assignment.delivery_times)
+                submitted_at = delivery_times.pop("_worker_submitted_at")
+                delivery_times["loader_worker_result_wait_time"] = max(
+                    0.0, received_at - submitted_at - seconds
+                )
+                finished_at = prepared.pop("_speco_worker_finished_at", None)
+                if finished_at is not None:
+                    delivery_times["loader_ipc_collect_time"] = (
+                        received_at - finished_at
+                    )
+                delivery_times["_pin_queued_at"] = time.monotonic()
                 with self._condition:
                     self._pin_batches.append(
                         replace(
@@ -211,6 +227,7 @@ class ReferenceBatchPrefetchIterator(TQPrefetchIterator):
                             file_entries=None,
                             batch_prepare_seconds=seconds,
                             cleanup_after_load=True,
+                            delivery_times=delivery_times,
                         )
                     )
                     self._condition.notify_all()

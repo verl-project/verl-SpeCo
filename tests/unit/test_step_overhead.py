@@ -44,7 +44,9 @@ def _trainer():
     namespace = dict(torch=torch, logging=logging, logger=logging.getLogger("overhead-test"),
                      Any=Any, Optional=Optional, cast=cast, time=time, device_name="cpu",
                      dist=SimpleNamespace(all_reduce=reduce))
-    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(path), "exec"), namespace)
+    constants = [n for n in tree.body if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id in {"_VAT_METRIC_KEYS", "_OPD_METRIC_KEYS"} for t in n.targets)]
+    exec(compile(ast.Module(body=[*constants, cls], type_ignores=[]), str(path), "exec"), namespace)
     trainer = namespace[cls.name]()
     trainer._training_metric_sums, trainer._training_metric_steps = {}, 0
     trainer.training_device_mesh = None
@@ -89,6 +91,9 @@ def test_combined_statistics_preserve_actual_optimizer_update():
         trainer._ulysses_group_context = nullcontext
         trainer.record_training_timing = lambda *args: None
         trainer._is_checkpoint_leader = lambda: False
+        # EP helpers are out of scope for this AST-extracted harness.
+        trainer._is_ep_active = lambda: False
+        trainer._sync_non_expert_grads = lambda: None
 
         def compute_loss(model, batch, pad):
             loss = model(batch["hidden_states"]).float().square().sum()

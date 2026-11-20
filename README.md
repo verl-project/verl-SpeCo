@@ -1,574 +1,140 @@
-# verl-SpeCo: Co-Train to Accelerate RL and Inference
+<p align="center">
+  <a href="https://verl-project.github.io/posts/2026-11-16-verl-speco-v0-2-0/">
+    <img src="docs/assets/speco-logo.png" alt="verl-SpeCo" width="70%">
+  </a>
+</p>
 
-`verl-SpeCo` is a lightweight SPECO drafter-training overlay for
-[verl](https://github.com/verl-project/verl). It keeps upstream `verl` as an
-import-only dependency and adds speculative decoding drafter collection,
-training, and hot-update logic through `verl_speco`.
+<h3 align="center">verl-SpeCo: A Unified Training System for Speculative Drafters</h3>
 
-## Highlights
+<p align="center">
+  <a href="#getting-started">Quickstart</a> · <a href="#hardware-support">Hardware Support</a> · <a href="#co-training-results">Benchmarks</a> · <a href="docs/usage.md">Documentation</a> · <a href="https://verl-project.github.io/posts/2026-11-16-verl-speco-v0-2-0/">Blog</a> · <a href="https://github.com/verl-project/verl-SpeCo/releases">Releases</a> · <a href="#community--contributing">Developer Slack</a>
+</p>
 
-- **Import-only verl overlay**: composes upstream `verl` PPO/GRPO config and
-  runs through `python -m verl_speco.main` without patching the installed `verl`
-  tree.
-- **Drafter Co-Training in the RL loop**: collects hidden states during rollout or
-  old-logprob computation, trains a drafter periodically, and publishes updated
-  drafter weights back to the rollout engine.
-- **Bubble Time drafter training**: can run drafter optimizer steps on rollout
-  idle workers, then publish the trained drafter back to all rollout replicas,
-  so the generation benefit is preserved while less drafter training time lands
-  on the critical path.
-- **Multiple drafter backends**: includes EAGLE-1, EAGLE-2, EAGLE3, DFlash,
-  DSpark, Domino, and P-EAGLE trainer backends under `verl_speco.backends`.
-- **vLLM and SGLang integration**: supports EAGLE-1, EAGLE-2, EAGLE3, DFlash,
-  DFlash2, and DSpark speculative decoding on vLLM, plus EAGLE3 and DFlash on SGLang,
-  with drafter collection and hot-update logic integrated through the rollout
-  engine.
-- **GPU and NPU examples**: provides example scripts for vLLM, SGLang, and
-  vLLM-Ascend style graph settings.
-- **FSDP2 and VeOmni actors**: keeps the drafter trainer on FSDP2 while the
-  main actor can use verl's FSDP/FSDP2 or VeOmni model engine.
-- **Step-level observability**: exposes drafter timing and vLLM speculative
-  decoding acceptance metrics, including
-  `drafter/spec_decode/mean_acceptance_length`.
+SpeCo keeps speculative drafters aligned with evolving RL policies. It reuses
+training features, adapts the drafter online, and hot-updates rollout engines
+without restarting the RL job. Built as an import-only extension of
+[verl](https://github.com/verl-project/verl), it leaves upstream verl unmodified.
+Standalone training can also produce a deployable drafter or initialize co-training.
+
+In the Qwen3-8B + DSpark evaluation, async Train+Freeze achieved **1.50× GPU**
+and **1.58× Ascend NPU** end-to-end step speedup against each platform's
+synchronous baseline without speculative decoding. [See the comparison](#co-training-results).
+
+## Key Features
+
+- **Online adaptation:** reuse rollout responses and old-policy features; train from current data or replay, then safely publish drafter weights.
+- **Acceptance-guided control:** mix hard and uniform samples, and pause/resume updates as adaptation gains change.
+- **Flexible execution:** synchronous and asynchronous co-training; optional Bubble Time moves optimizer work into rollout-idle windows. Bubble Time currently requires the legacy trainer.
+- **Extensible infrastructure:** EAGLE-1/2/3, DFlash/DFlash2, DSpark, Domino, and P-EAGLE training backends, with backend-specific rollout support on GPU/NPU.
+- **Standalone training:** independently generate features and train deployable drafters using shared training infrastructure.
+- **Hardware portability:** CUDA GPU and Ascend NPU paths for co-training and standalone training; availability depends on the drafter and serving runtime.
 
 ## Architecture
 
-![verl-SpeCo architecture](docs/assets/speco-architecture.svg)
+![SpeCo unified training architecture](docs/assets/paper/framework.png)
 
-For the online drafter collection, training, and publish scheduling boundary,
-including how to add a new execution or collection strategy, see the
-[Drafter Scheduler guide](docs/drafter_scheduler.md).
+The scheduler coordinates **collect → train → publish**. Online co-training
+captures target features, performs distributed drafter updates, and publishes
+successful weights at rollout-safe points. Standalone and online workflows
+share training backends and checkpointing.
 
-For the rollout-idle Bubble Time execution path, including the quota lifecycle,
-safe writer switching, key metrics, and recommended configuration, see
-[Bubble Time drafter training](docs/bubble_time_drafter_training.md).
-For a paired 4-GPU DSpark/vLLM launch, use the
-[Bubble/Sync example](examples/bubble_time/run_qwen3-8b_drafter_dspark_vllm.sh).
+[Scheduler guide](docs/drafter_scheduler.md) · [Bubble Time guide](docs/bubble_time_drafter_training.md)
 
-## Performance Preview
+## Co-Training Results
 
-The current results cover both NPU EAGLE3 co-training and GPU DFlash Bubble
-Time training. Bubble Time uses rollout idle windows to repay drafter-training
-quota instead of reducing the requested drafter optimizer work.
+Paper Table 1 compares Qwen3-8B + DSpark on DAPO-Math-17k using GRPO and vLLM. All speedups use the synchronous baseline without speculative decoding on the same platform. End-to-end (E2E) step time includes adaptation costs and excludes checkpoint I/O and validation. Asynchronous rollout time measures exposed generation wait.
 
-On Qwen3-8B with an EAGLE3 drafter on vLLM-Ascend/NPU, a 100-step run shows
-that co-training increases mean acceptance length over the fixed-drafter setting
-and, compared with the baseline, delivers about 20% faster rollout and 11%
-faster end-to-end training without accuracy regression.
+![Paper Table 1. Qwen3-8B co-training results grouped by execution mode and hardware](docs/assets/paper/cotrain-table.png)
 
-| Mean Acceptance Length | Generation Time |
-| --- | --- |
-| ![Qwen3-8B EAGLE3 mean acceptance length on vLLM-Ascend](docs/assets/qwen3-8b_eagle3_npu_accept-len.png) | ![Qwen3-8B EAGLE3 generation time on vLLM-Ascend](docs/assets/qwen3-8b_eagle3_npu_gen.png) |
+Async Train+Freeze reaches **1.50× GPU** and **1.58× NPU** E2E step speedup in these single runs, combining asynchronous execution, speculative decoding, and online adaptation.
 
-| Step Time | Critic Reward |
-| --- | --- |
-| ![Qwen3-8B EAGLE3 step time on vLLM-Ascend](docs/assets/qwen3-8b_eagle3_npu_step.png) | ![Qwen3-8B EAGLE3 critic reward on vLLM-Ascend](docs/assets/qwen3-8b_eagle3_npu_critic-reward.png) |
+### Standalone Drafter Training Results
 
-On a Qwen3-4B DFlash GPU run, Bubble Time kept the drafter training quota
-aligned with the synchronous path while moving most drafter work off the main
-critical path. Excluding checkpoint-save steps, the observed end-to-end step
-time improved by about 6.7% compared with synchronous drafter training, with
-similar speculative-decoding acceptance length.
+Paper Table 2 compares average acceptance length (tokens per verification round)
+after three epochs of standalone drafter training under matched conditions.
 
-| Metric | Sync drafter training | Bubble Time | Change |
-| --- | ---: | ---: | ---: |
-| End-to-end step time, excluding checkpoint-save steps | 123.52 s | 115.23 s | 6.7% faster |
-| Drafter time on the critical path | 8.33 s | 2.08 s | 75.0% lower |
-| Generation time | 49.47 s | 47.43 s | 4.1% faster |
-| Mean acceptance length | 3.30 | 3.25 | Similar |
+![Paper Table 2. SpeCo and Speculators average acceptance lengths across five benchmarks on GPU and NPU](docs/assets/paper/standalone-table.png)
 
-## Draft Model Support
+Across the five benchmarks, the absolute difference is at most 0.08 tokens per
+verification round on GPU and 0.05 on NPU.
 
-| Draft model | Rollout engines | Training engine | Status |
-| :---: | :---: | :---: | :---: |
-| EAGLE-1 | vLLM | FSDP | Available |
-| EAGLE-2 | vLLM | FSDP | Available |
-| EAGLE3 | vLLM, SGLang | FSDP | Available |
-| DFlash | vLLM, SGLang | FSDP | Available |
-| DFlash2 | vLLM via DFlash, SGLang via DFLASH | FSDP | Available |
-| DSpark | vLLM | FSDP | Available |
-| Domino | vLLM, SGLang via DFlash | FSDP | Available |
-| P-EAGLE | Not wired in this overlay | FSDP | Training only |
+See the [evaluation guide](docs/evaluation.md) for the experiment curves and Bubble Time comparison.
 
-EAGLE-1 and EAGLE-2 share vLLM's native EAGLE draft method; EAGLE-2 adds the
-dynamic-tree decoding policy over the same draft head.
+## Hardware Support
 
-Standalone GPU training smoke tests for EAGLE-1/EAGLE-2, Domino, and P-EAGLE
-are kept under `tests/special_standalone/`. The scheduled/manual
-`gpu_drafter_training_smoke` workflow runs them with a configurable target
-model, optimizer step count, and learning rate.
+| Platform | Rollout runtime and examples | Support status |
+| --- | --- | --- |
+| NVIDIA GPU (CUDA) | [vLLM DSpark example](examples/run_qwen3-8b_drafter_dspark_vllm.sh); SGLang for supported drafters | Available in this repository |
+| Huawei Ascend NPU | [vLLM-Ascend DSpark example](examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh) | Available in this repository |
+| AMD Instinct MI355X (ROCm) | DFlash with SGLang or vLLM, and DSpark with vLLM | End-to-end runs reported in [PR #83](https://github.com/verl-project/verl-SpeCo/pull/83) |
 
-Domino is trained with `speculative_algorithm=DOMINO`, but it is served as a
-DFlash projector sub-mode. For rollout, use `speculative_algorithm=DFLASH`
-with a Domino checkpoint on an engine version that supports the Domino
-projector.
+See [runtime compatibility](docs/usage.md#runtime-compatibility) for supported drafter and engine combinations.
 
-Domino training does not support LK loss. Keep `dflash_lk_loss_alpha` and
-`dspark_lk_loss_alpha` at zero when selecting `DOMINO`; positive values are
-rejected during layout resolution and backend initialization. Use the DFlash
-or DSpark training backend for LK loss.
+## Getting Started
 
-P-EAGLE training is available, but its vLLM parallel-drafting rollout runtime
-is not wired into this overlay yet. Keep rollout drafter serving disabled and
-train or serve the checkpoint separately.
+[Full documentation](docs/usage.md)
 
-## Runtime Compatibility
+### Online Co-Training
 
-The runtime requirements are backend-specific. `REQUIRED_VERL.txt` only pins
-the upstream `verl` version; install the matching rollout runtime for the
-drafter backend you use.
+1. [Install SpeCo and upstream verl](docs/usage.md#installation), then check [runtime compatibility](docs/usage.md#runtime-compatibility).
+2. Prepare the target model, a compatible drafter checkpoint, and the training and validation datasets. Set their paths in the launch script. [Co-training setup](docs/usage.md#quickstart)
+3. For a first run on NVIDIA GPUs, use [`examples/run_qwen3-8b_drafter_dspark_vllm.sh`](examples/run_qwen3-8b_drafter_dspark_vllm.sh).
+4. For other modes or update policies, see [V1 examples](docs/usage.md#dspark-mrv2-launch-examples), [Hard Sampling and Freeze](docs/usage.md#dspark-hard-sampling-and-drafter-freeze), and [Bubble Time](docs/usage.md#bubble-time).
 
-| Draft model | vLLM | vLLM-Ascend | SGLang |
-| :---: | :---: | :---: | :---: |
-| EAGLE-1 / EAGLE-2 | Engine version with native EAGLE support | Runtime-specific | - |
-| EAGLE3 | &gt;= 0.18.0 | &gt;= 0.18.0 | &gt;= 0.5.10 |
-| DFlash | &gt;= 0.20.2 | &gt;= 0.20.2 | &gt;= 0.5.12 |
-| DFlash2 | &gt;= 0.28.0 (served as DFlash) | - | [main](https://github.com/sgl-project/sglang) (served as DFLASH; no tagged release up to 0.5.18) |
-| DSpark | GPU: [main](https://github.com/vllm-project/vllm/tree/main)<br>NPU: [`58d3918`](https://github.com/vllm-project/vllm/tree/58d3918e3ea0a544ffedadad2ba84559e9c51d8f) | NPU: [`6af9257`](https://github.com/vllm-project/vllm-ascend/tree/6af9257e449ca139ccd228f0d71ca7d2c09909c9)<br>NPU (MRV2): [`27a9476`](https://github.com/vllm-project/vllm-ascend/tree/27a94764b5ead50ed3e42ab52a257c2173032750) | - |
-| Domino | DFlash-compatible runtime with Domino projector support | Runtime-specific | Runtime-specific |
-| P-EAGLE | Not wired | Not wired | Not wired |
+For Ascend, use [`examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh`](examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh). See [hardware smoke tests](docs/usage.md#hardware-smoke-tests) for the CI cases.
 
-For vLLM DFlash, the drafter checkpoint must use the DFlash draft model config
-expected by the runtime.
+### Standalone Drafter Training
 
-For vLLM DFlash2, keep `speculative_algorithm=DFLASH2`: the overlay maps it onto
-vLLM's DFlash method and the engine picks the DFlash2 draft (dynamic
-convolutions plus candidate selector) from the checkpoint's `DFlash2DraftModel`
-architecture, so both the drafter training loop and the rollout drafter run
-DFlash2. The checkpoint must use the z-lab layout with the DFlash2 knobs under
-`dflash_config`; `python -m verl_speco.convert_speculators_dflash2` rewrites a
-speculators-format drafter (for example `mgoin/Qwen3-4B-speculator.dflash2`) into
-it. vLLM sizes the convolution block as the bonus token plus
-`rollout.spec_verify_tokens`, so set `spec_verify_tokens = dflash2_block_size - 1`
-(see `examples/run_qwen3-8b_drafter_dflash2_vllm.sh`).
+Train a DSpark drafter against a fixed target model for deployment or to
+initialize online co-training. Start with [`examples/run_qwen3-8b_drafter_dspark_separate_training.sh`](examples/run_qwen3-8b_drafter_dspark_separate_training.sh).
+The [standalone training guide](docs/usage.md#separate-draft-model-training)
+covers target model setup, streaming features, and reusing saved hidden states.
 
-For SGLang DFlash2, also keep `speculative_algorithm=DFLASH2`: the overlay maps
-it onto SGLang's DFLASH speculative worker, which builds the DFlash2 modules
-from the checkpoint's `DFlash2DraftModel` architecture and `dflash_config`.
-This needs an sglang build from main (no tagged release up to 0.5.18 ships the
-DFlash2 draft). Note the block contract differs from vLLM: SGLang uses
-`spec_verify_tokens` directly as the DFlash block size, so set
-`spec_verify_tokens = dflash2_block_size` (8 by default; see
-`examples/run_qwen3-8b_drafter_dflash2_sglang.sh`). sglang main also rejects
-`return_hidden_states` for the DFLASH worker, so collect the training hidden
-states from the old-logprob pass
-(`training.collect_hidden_states_from_old_logprob=true`) rather than
-`collect_hidden_states_from_sgl`.
+Advanced usage:
 
-For vLLM DSpark on GPU, use vLLM main. The NPU example uses vLLM's V1 engine
-with the native vLLM-Ascend ModelRunnerV2 DSpark implementation. The pinned
-pair above contains Qwen DSpark MRV2 support, FULL-graph support, and the
-scheduler/runtime changes through
-[vLLM-Ascend PR #13819](https://github.com/vllm-project/vllm-ascend/pull/13819).
-Set `VLLM_USE_V1=1` and `VLLM_USE_V2_MODEL_RUNNER=1`; SpeCo then passes the
-native `method=dspark` configuration instead of installing the legacy MRV1
-DFlash compatibility patches.
+- [Configuration](docs/usage.md#configuration) and [RL-Insight monitoring](docs/usage.md#online-monitoring-with-rl-insight)
+- [Evaluation results](docs/evaluation.md)
+- [Testing](docs/usage.md#testing)
 
-This integration deliberately supports fixed verification length only. Native
-MRV2 does not expose the MRV1 confidence-head/dynamic-length contract, so keep
-`dspark_confidence_loss_alpha=0`, do not publish confidence-head tensors, and
-do not enable dynamic verification length. The MRV1 vLLM path and the standalone
-trainer do support confidence-head training: set `dspark_confidence_loss_alpha>0`
-(optionally `dspark_confidence_head_with_markov`) to train the per-position
-acceptance head against `alpha = sum_v min(p_v, q_v) = 1 - TV`, matching
-`speculators`. The Qwen checkpoint must declare
-`architectures=["Qwen3DSparkModel"]` and use `sample_from_anchor=true` (or omit
-it for the native default); the fixed verification length must not exceed the
-checkpoint's training `block_size`.
+Support varies by drafter, engine, and hardware; P-EAGLE currently supports
+training only. For V1 and native MRV2 deployments, follow the verl 0.9 and
+runtime requirements in the detailed guide.
 
-### verl V1 runner (Phase 1)
+## What Can You Do with SpeCo?
 
-On `release/v0.9.0`, SPECO can now enter verl's native V1
-`TransferQueue` trainer with `trainer.use_v1=true`. Fixed-drafter serving and
-online DSpark drafter training support `sync`, `colocate_async`, and
-`separate_async` with vLLM rollout. The adapter preserves the configured
-agent-loop manager while wrapping vLLM actor workers with SPECO's runtime
-compatibility and draft-weight publication hooks. It does not add Uni-Agent
-fields.
+| Goal | Workflow | Start here |
+| --- | --- | --- |
+| Accelerate generation-heavy RL, such as long-reasoning GRPO | Adapt the drafter alongside the actor and evaluate generation savings against adaptation costs | [Co-training quickstart](docs/usage.md#quickstart) |
+| Address declining fixed-drafter acceptance | Train from current or replayed features with hard-sample mixing and freeze/resume control | [Scheduler guide](docs/drafter_scheduler.md) |
+| Use early-finishing workers in synchronous rollout | Run part of the configured optimizer quota through Bubble Time | [Bubble Time guide](docs/bubble_time_drafter_training.md) |
+| Add online adaptation to asynchronous RL | Coordinate feature capture, updates, and publication with V1 execution modes | [V1 support](docs/usage.md#verl-v1-runner-phase-1) |
+| Build a deployable drafter for a fixed target | Decouple feature generation and optimization, or reuse saved features, then deploy on a compatible engine | [Standalone training](docs/usage.md#separate-draft-model-training) |
+| Integrate drafter algorithms or study scheduling | Reuse training infrastructure while implementing algorithm-specific models, feature alignment, objectives, or scheduling policies | [Scheduling and extension](docs/drafter_scheduler.md) |
 
-Use the Phase 1 overlay from a checkout that exposes the `verl` config package:
+The paper evaluates DSpark, Qwen3-8B, GRPO, and vLLM; implemented backends do
+not imply equivalent speedups. Bubble Time currently requires the legacy
+trainer. Check compatibility and measure E2E gains for new configurations.
 
-```bash
-export PYTHONPATH=/path/to/verl:/path/to/verl-SpeCo
-python -m verl_speco.main --config-name=speco_v1_trainer \
-  actor_rollout_ref.model.path=/path/to/target \
-  data.train_files=/path/to/train.parquet \
-  data.val_files=/path/to/val.parquet \
-  trainer.v1.trainer_mode=sync
-```
+## News
 
-For every supported V1 mode, online drafter training uses the same
-old-logprob collector, scheduler, feature store, and weight-publication
-protocol as the legacy trainer, with V1's `KVBatchMeta`/TransferQueue boundary
-preserved. Start with ordinary single-turn PPO/GRPO batches and the existing
-fixed feature window. Agent trajectories, per-turn masking, context-plus-
-assistant layouts, and sliding-window-aware training are Phase 2 work; do not
-enable those options with this overlay yet. Online drafter training requires
-actor old-logprob inference, so it rejects
-`algorithm.rollout_correction.bypass_mode=true`.
+- [2026/11] [v0.2.0](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.2.0) released: V1 synchronous/asynchronous DSpark co-training, Bubble Time, acceptance-guided freezing and hard sampling, standalone training, and expanded runtime integration.
+- [2026/08] [v0.1.0](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.1.0) released: end-to-end DSpark support, decoupled feature collection/training, and more drafter backends.
+- [2026/06] [v0.1.0-pre](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.1.0-pre) pre-released: speculative drafter collection, training, and hot-updates on verl.
 
-### VeOmni Actor Compatibility
+## Community & Contributing
 
-VeOmni is an actor training engine in this integration; the drafter itself
-continues to use SpeCo's FSDP2 trainer. Match Uni-Agent's current source
-recommendation when installing VeOmni:
-
-```bash
-uv pip install --no-deps "git+https://github.com/ByteDance-Seed/VeOmni.git@main"
-```
-
-Use `--config-name=speco_veomni_trainer`. The adapter preserves verl's native
-VeOmni handling for dense, MoE, and multimodal actors and adds the SpeCo
-old-logprob hidden-state and lm-head synchronization paths. Ulysses SP, expert
-parallelism, multi-node execution, and router replay remain controlled by
-VeOmni/verl settings; for R3, rollout routing replay must also be enabled.
-
-| VeOmni capability | SpeCo integration |
-| --- | --- |
-| Dense and MoE actor | Supported through verl's VeOmni engine |
-| Ulysses SP | Selected hidden rows are merged over the VeOmni SP group |
-| Expert parallelism | Preserved; lm-head export avoids expert state-dict materialization |
-| Router replay R2 | Preserved through old-logprob and actor update |
-| Router replay R3 | Supported when the rollout backend returns `routed_experts` |
-| Qwen3-VL / Qwen3-Omni / Qwen3.5 text backbone | Explicit layer and final-norm discovery |
-| Multi-node | Uses the distributed groups and Ray ObjectRef routing supplied by verl |
-
-The GPU and NPU entrypoints are
-`examples/run_qwen3-8b_drafter_dspark_veomni_vllm.sh` and
-`examples/run_qwen3-8b_drafter_dspark_veomni_vllm_npu.sh`. Set
-`VEOMNI_SP_SIZE`, `VEOMNI_EP_SIZE`, `VEOMNI_ROUTER_REPLAY_MODE`, `NNODES`,
-`ROLLOUT_DP_SIZE`, and `ROLLOUT_EP_SIZE` to select the parallel layout. R3
-automatically enables rollout routing replay in these scripts.
-The NPU version pair listed in the DSpark compatibility table includes the
-vLLM and vLLM-Ascend routed-experts capture path required by R3.
-
-## Repository Layout
-
-```text
-verl_speco/
-  main.py                         # Hydra entrypoint
-  config/speco_base.yaml          # shared SPECO/drafter defaults
-  config/speco_trainer.yaml       # online PPO primary config
-  config/speco_veomni_trainer.yaml # online PPO with a VeOmni actor
-  config/draft_trainer.yaml       # standalone drafter primary config
-  trainer/speco_ray_trainer.py    # RayPPOTrainer adapter
-  workers/speco_worker.py         # drafter trainer worker
-  integration/                    # vLLM, SGLang, old-logprob, publish adapters
-  backends/                       # drafter-specific trainer backends
-  models/                         # drafter model definitions
-
-examples/                         # end-to-end command examples
-tests/                            # CPU-light contract tests
-ci/                               # smoke-test helpers and CI notes
-```
-
-## Installation
-
-Install the upstream `verl` release branch specified in
-[`REQUIRED_VERL.txt`](./REQUIRED_VERL.txt), which is mirrored in
-[`verl_speco/config/speco_base.yaml`](./verl_speco/config/speco_base.yaml).
-By default, unsupported `verl` versions produce a warning. Set
-`VERL_SPECO_STRICT_VERL=1` to fail closed when the importable `verl` does not
-match either the release/v0.8.0 or release/v0.9.0 API contract. The repository
-keeps release/v0.8.0 as the default and CI baseline; release/v0.9.0 is an
-additive compatibility path used by native vLLM MRV2 deployments.
-
-One typical editable setup is:
-
-```bash
-git clone https://github.com/verl-project/verl.git
-cd verl
-git checkout release/v0.8.0  # or release/v0.9.0 for native MRV2
-pip install -e .
-
-cd ..
-git clone https://github.com/verl-project/verl-SpeCo.git
-cd verl-SpeCo
-pip install -e .
-```
-
-The editable install exposes the `verl_speco` package without modifying
-`PYTHONPATH`. It also installs the `verl-speco`, `verl-speco-draft-train`, and
-`verl-speco-inspect-features` command-line entry points. Install the matching
-GPU or NPU rollout runtime separately; `verl-SpeCo` intentionally does not let
-pip replace accelerator-specific PyTorch, vLLM, SGLang, or vLLM-Ascend builds.
-
-### Docker Images
-
-You can also build GPU runtime images from the official `verlai/verl`
-development images and then use an importable upstream `verl` checkout from a
-supported branch. Separate `docker/verl0.8.0` and `docker/verl0.9.0`
-Dockerfiles keep the selected dependency explicit. The Dockerfiles below target
-GPU deployments; use the matching accelerator image for NPU or other runtimes.
-
-For GPU vLLM-based examples, use this Dockerfile:
-
-```dockerfile
-# GPU vLLM runtime image.
-FROM verlai/verl:vllm023.dev1
-
-ARG VERL_REF=release/v0.8.0
-ARG VERL_REPO=https://github.com/verl-project/verl.git
-
-WORKDIR /workspace
-
-RUN git clone ${VERL_REPO} /workspace/verl \
-    && cd /workspace/verl \
-    && git checkout ${VERL_REF} \
-    && pip install -e .
-
-COPY . /workspace/verl-SpeCo
-
-WORKDIR /workspace/verl-SpeCo
-RUN pip install -e .
-```
-
-Build it from the `verl-SpeCo` repository root:
-
-```bash
-docker build -f docker/verl0.8.0/Dockerfile.vllm \
-  -t verl-speco:vllm023-verl080 .
-```
-
-For GPU SGLang-based examples, use the same layout with the SGLang base image:
-
-```dockerfile
-# GPU SGLang runtime image.
-FROM verlai/verl:sgl0512.dev1
-
-ARG VERL_REF=release/v0.8.0
-ARG VERL_REPO=https://github.com/verl-project/verl.git
-
-WORKDIR /workspace
-
-RUN git clone ${VERL_REPO} /workspace/verl \
-    && cd /workspace/verl \
-    && git checkout ${VERL_REF} \
-    && pip install -e .
-
-COPY . /workspace/verl-SpeCo
-
-WORKDIR /workspace/verl-SpeCo
-RUN pip install -e .
-```
-
-Build it from the `verl-SpeCo` repository root:
-
-```bash
-docker build -f docker/verl0.8.0/Dockerfile.sglang \
-  -t verl-speco:sgl0512-verl080 .
-```
-
-For verl 0.9, use the corresponding files under `docker/verl0.9.0`. The Ascend
-Dockerfile also defaults to 0.8 and accepts
-`--build-arg VERL_REF=release/v0.9.0` for an explicit 0.9 image.
-
-Install the rollout engine and accelerator runtime that match the script you
-intend to run, for example vLLM on GPU, SGLang on GPU, or vLLM-Ascend on NPU.
-Those runtime packages are intentionally not pinned by this repository.
-
-## Quickstart
-
-Start from one of the example scripts and replace the model, drafter, dataset,
-and checkpoint paths:
-
-```bash
-bash examples/run_qwen3-8b_drafter_eagle3_vllm.sh
-```
-
-For NPU with vLLM-Ascend-style graph settings:
-
-```bash
-bash examples/run_qwen3-8b_drafter_eagle3_vllm_npu.sh
-```
-
-The vLLM-Ascend examples keep `FULL_DECODE_ONLY` and dense cudagraph capture
-sizes in the launch script so graph behavior is explicit.
-
-All examples use the same entrypoint:
-
-```bash
-python -m verl_speco.main
-```
-
-The main drafter switches are:
-
-```bash
-actor_rollout_ref.rollout.drafter.enable=True
-actor_rollout_ref.rollout.drafter.enable_drafter_training=True
-actor_rollout_ref.rollout.drafter.model_path=/path/to/drafter
-actor_rollout_ref.rollout.drafter.speculative_algorithm=EAGLE3
-```
-
-## Separate Draft Model Training
-
-verl-SpeCo also supports standalone DSpark draft-model training from a finite
-verl-style prompt Parquet or prompt/response JSONL/Parquet file. For prompt-only
-rows, a producer asks the target vLLM service to generate the response while
-extracting prompt/output hidden states. It transfers each global batch through
-TransferQueue, and a consumer trains the drafter independently of PPO.
-
-Quickstart:
-
-```bash
-bash examples/run_qwen3-8b_drafter_dspark_separate_training.sh
-```
-
-Set the same model, dataset, drafter, checkpoint, GPU, and optimization values
-used by ordinary standalone training near the top of the script. Transport
-identity, Ray/TQ connection settings, and the Producer/Consumer lifecycle are
-derived and managed internally. The target hidden-state vLLM service uses the
-local port 8000 convention.
-
-The main mode values are:
-
-| Mode | Meaning |
-| --- | --- |
-| `online` | Default. Collects rollout features, trains the drafter inside the online PPO/Ray workflow, and can publish updated drafter weights back to the rollout engine. |
-| `collect_only` | Collects rollout features into `feature_store.path` without running drafter training in the PPO/Ray workflow. |
-| `offline` | Reads collected features from `feature_store.path` and trains the drafter with the standalone multi-GPU workflow. |
-
-Offline training supports every drafter family the online workers support:
-EAGLE-1, EAGLE-2, EAGLE-3, DFlash, DSpark, Domino and P-EAGLE.
-
-DSpark offline training can additionally train the confidence head used for
-dynamic draft-length thresholding. Set `dspark_confidence_loss_alpha>0` (for
-example `0.2`) and the head is created automatically from the target's final
-hidden state; `dspark_confidence_head_with_markov` keeps the Markov previous-token
-embedding in the head input (default `true`). A positive value on either
-`dspark_confidence_head_alpha` or `dspark_confidence_loss_alpha` enables the head,
-while only `dspark_confidence_loss_alpha` weights its BCE term. The BCE target
-tracks the served proposal mode via `dspark_confidence_target_mode`: `greedy`
-(the serving default, one-hot draft) targets `p_target[argmax(p_draft)]`, while
-`probabilistic` targets `1 - TV = sum_v min(p_draft_v, p_target_v)`. Training the
-confidence head requires the target's final hidden state, so the DSpark hidden
-state collection switches to `dflash_aux_plus_last` whenever either it or the L1
-loss is enabled. The standalone scripts expose `DSPARK_CONFIDENCE_HEAD_ALPHA`,
-`DSPARK_CONFIDENCE_HEAD_WITH_MARKOV`, and `DSPARK_CONFIDENCE_LOSS_ALPHA`.
-
-Online co-training (`actor_rollout_ref.rollout.drafter.enable_drafter_training`)
-trains and hot-publishes the same head on the MRV1 path. The checkpoint's
-confidence topology is authoritative: the loader infers whether the head input
-includes the Markov embedding from the checkpoint tensor shape, and a training
-setting that disagrees (or a checkpoint carrying only half of
-`confidence_head.proj.{weight,bias}`) fails closed instead of silently loading
-an incompatible head. The vLLM engine registers the head only when the
-checkpoint declares `enable_confidence_head` and sizes it from
-`confidence_head_with_markov`, so any exported topology loads with the right
-shape. The vLLM-Ascend confidence-thresholded dynamic verify budget
-(`dynamic_spec_config.method=dspark`) assumes a Markov-fused head, so a
-markov-less head (`dspark_confidence_head_with_markov=false` with
-`dspark_markov_rank>0`) is rejected while that dynamic path is configured;
-static serving and offline training (`...training.mode=offline`) may be
-markov-less. The exported `config.json` always records the live topology, so a
-head added while fine-tuning an older checkpoint survives a reload. Enabling
-vLLM-Ascend's confidence-thresholded dynamic verify budget is
-opt-in: on the V1 runner through
-`rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method=dspark`
-(`VLLM_USE_V2_MODEL_RUNNER=0`, requires vllm-ascend#13216, and
-`async_scheduling=False` — the V1 budget consumer is only called when async is
-off), or on the MRV2 runner through
-`rollout.drafter.vllm.speculative_config_overrides.enable_adaptive_verification=true`
-(vllm-ascend#15098, async-compatible); see
-`examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_vllm_npu.sh`.
-
-Domino and P-EAGLE are training-time families with no engine-level speculative
-method of their own (engines serve Domino as a DFlash projector sub-mode, and
-P-EAGLE needs the parallel-drafting runtime), so the rollout stage collects
-features with the engine algorithm whose hidden-state layout they consume, and
-the offline stage trains them from that same feature store:
-
-| Drafter to train | Stage 1 `speculative_algorithm` | Feature layout | Stage 2 `speculative_algorithm` |
-| --- | --- | --- | --- |
-| Domino | `DFLASH` | `dflash_aux` | `DOMINO` |
-| P-EAGLE | `EAGLE3` | `eagle3_aux_plus_last` | `PEAGLE` |
-
-```bash
-DRAFT_ALGO=domino bash examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh
-DRAFT_ALGO=peagle bash examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh
-```
-
-Feature stores collected with `speculative_algorithm=DOMINO` before Domino was
-mapped to the DFlash layout carry `hidden_states_layout=eagle3_aux_plus_last`
-in their sample metadata. DFlash preprocessing fails closed on that layout, so
-those stores have to be collected again with `DFLASH`.
-
-Collected feature stores can be inspected before offline training:
-
-```bash
-python -m verl_speco.inspect_feature_store /path/to/features \
-  --max-samples 200 \
-  --show-ok \
-  --strict-exit
-```
-
-## Configuration
-
-SPECO-specific options live under:
-
-```text
-actor_rollout_ref.rollout.drafter.*
-```
-
-Important groups:
-
-- `drafter.enable`: enables speculative decoding at rollout time.
-- `drafter.enable_drafter_training`: enables online drafter trainer workers.
-- `drafter.rollout.*`: controls speculative steps, top-k, and verify tokens.
-- `drafter.training.*`: controls hidden-state collection, training interval,
-  publish interval, update mode, and DFlash/DSpark-specific training options.
-- `drafter.vllm.*`: contains vLLM-specific drafter overrides.
-
-Shared SPECO and drafter defaults are in
-[`verl_speco/config/speco_base.yaml`](./verl_speco/config/speco_base.yaml).
-The online PPO entrypoint composes them through
-[`speco_trainer.yaml`](./verl_speco/config/speco_trainer.yaml), while standalone
-feature-store training uses
-[`draft_trainer.yaml`](./verl_speco/config/draft_trainer.yaml).
-
-## Testing
-
-CPU-light contract tests can be run with:
-
-```bash
-pip install -r ci/requirements-ci.txt
-pytest tests
-```
-
-Some tests require an upstream `verl` checkout. CI uses release/v0.8.0 from
-`REQUIRED_VERL.txt`; the same contracts also recognize a release/v0.9.0
-checkout. Set `VERL_SPECO_UPSTREAM_ROOT` to the selected checkout root:
-
-```bash
-export VERL_SPECO_UPSTREAM_ROOT=/path/to/verl
-pytest tests/config/test_speco_config_overlay.py
-```
-
-Hardware smoke tests are kept under `ci/` and are intended for self-hosted GPU
-or NPU runners with matching model paths and runtime packages.
-
-## Community
-
-Scan the QR code below to join the verl-SpeCo Lark user group.
+Join the verl-SpeCo Feishu group to discuss setup and training.
 
 <p align="center">
-  <img src="docs/assets/Lark_QR_code.jpg" alt="verl-SpeCo Lark user group QR code" width="220">
+  <img src="docs/assets/Lark_QR_Code.png" alt="verl-SpeCo Feishu group QR code" width="220">
 </p>
 
-## Contributing
-
-Keep changes scoped to the overlay whenever possible. If a change requires
-upstream `verl` behavior, prefer adding a compatibility adapter in
-`verl_speco.integration` and document the supported `verl` version in
-`REQUIRED_VERL.txt`.
-
-Before proposing changes upstream or opening a PR, follow the repository rules
-in [`AGENTS.md`](./AGENTS.md), including duplicate-work checks and test
-reporting.
+Before contributing, follow [AGENTS.md](AGENTS.md), including duplicate-work
+checks and test reporting. See the usage guide for test commands.
 
 ## Acknowledgements
 
-This project builds on [verl](https://github.com/verl-project/verl),
+Built on [verl](https://github.com/verl-project/verl),
 [vLLM](https://github.com/vllm-project/vllm),
 [SGLang](https://github.com/sgl-project/sglang), and
 [vLLM-Ascend](https://github.com/vllm-project/vllm-ascend).

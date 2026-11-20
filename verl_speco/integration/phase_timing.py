@@ -202,7 +202,7 @@ class _TimedMode:
 def install_engine_phase_timing(engine, *, role, rank):
     """Instrument existing engine calls without adding work or changing results.
 
-    Call only for Bubble workers. Mode enter/exit include restore/offload;
+    Mode enter/exit include restore/offload for Bubble and opt-in CUDA Sync;
     engine.to logs its model/optimizer/grad flags without splitting the transfer.
     """
     if not phase_timing_enabled() or getattr(engine, "_speco_phase_timed", False):

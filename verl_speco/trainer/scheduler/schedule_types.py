@@ -15,9 +15,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, ClassVar, cast
+
+from .adaptive_schedule import AcceptanceFeedback, AdaptiveScheduleConfig
 
 
 def _as_int(value: object) -> int:
@@ -256,6 +258,9 @@ class DrafterScheduleConfig:
     # defeats Bubble Time's resource-isolation contract. Production Bubble
     # configurations should leave this disabled.
     training_quota_allow_critical_path_fallback: bool = False
+    adaptive_schedule: AdaptiveScheduleConfig = field(
+        default_factory=AdaptiveScheduleConfig
+    )
 
     @classmethod
     def from_mapping(cls, config) -> "DrafterScheduleConfig":
@@ -428,6 +433,9 @@ class DrafterScheduleConfig:
             ),
             training_quota_allow_critical_path_fallback=bool(
                 training_quota_get("allow_critical_path_fallback", False)
+            ),
+            adaptive_schedule=AdaptiveScheduleConfig.from_mapping(
+                get("adaptive_schedule", None)
             ),
         )
 
@@ -609,6 +617,7 @@ class DrafterScheduleContext:
     data_status: TrainingDataStatus | None = None
     pending_training_count: int = 0
     allow_cached_training: bool = False
+    acceptance_feedback: AcceptanceFeedback | None = None
 
 
 @dataclass(frozen=True)

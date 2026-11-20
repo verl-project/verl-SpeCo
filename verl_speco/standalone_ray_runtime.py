@@ -16,12 +16,14 @@ import os
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from itertools import islice
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 from verl_speco.config import prefetch_depth
+from verl_speco.producer.metrics import current_ray_node_id
 from verl_speco.standalone_tq_training_launcher import (
     _VLLM_HIDDEN_STATES_DIR,
     PipelineCommands,
@@ -41,14 +43,14 @@ from verl_speco.trainer.scheduler import (
     QueueStatus,
     StandaloneQueueState,
 )
+from verl_speco.trainer.standalone_retry import retry_io
+from verl_speco.trainer.standalone_sample_cleanup import cleanup_standalone_samples
 from verl_speco.trainer.standalone_tracking import (
     _build_standalone_tracking,
     _finish_standalone_tracking,
     _log_producer_tracking_metrics,
     _log_standalone_tracking_metrics,
 )
-from verl_speco.trainer.tq_retry import retry_io
-from verl_speco.trainer.standalone_sample_cleanup import cleanup_standalone_samples
 
 logger = logging.getLogger(__name__)
 _SCHEDULER_INFO_INTERVAL_STEPS = 50
@@ -171,6 +173,7 @@ class StandaloneProducerActor:
         self._run_gate = asyncio.Event()
         self._run_gate.set()
         self._events = events
+        self._clock_node_id = current_ray_node_id()
         self._paused_at: float | None = None
         self._published_total = 0
         self._notified_published_total = 0
@@ -207,6 +210,8 @@ class StandaloneProducerActor:
             "kind": "samples_ready",
             "batch_id": self._reference_batch_id,
             "entries": entries,
+            "sent_at": time.monotonic(),
+            "clock_node_id": self._clock_node_id,
         }
         metrics = {"attempts": 0.0, "transport_seconds": 0.0, "retry_wait_seconds": 0.0}
         last_finished: float | None = None
@@ -542,33 +547,39 @@ class StandaloneRayTrainer:
         consumer_wg = self.consumer_wg
         from queue import Empty
 
-        from verl_speco.trainer.tq_feature_store import (
-            ReferenceFeatureStore,
-            ReadyEntry,
-            TQFeatureStore,
-        )
-        from verl_speco.trainer.tq_sample_source import build_assignments
+        from verl_speco.trainer.reference_feature_store import ReferenceFeatureStore
+        from verl_speco.trainer.standalone_data import ReadyEntry, build_assignments
 
         assert self.commands_queue is not None and self.events_queue is not None
         config = self._queue_config()
         training_cfg = self.consumer_config.actor_rollout_ref.rollout.drafter.training
         tq_cfg = training_cfg.transfer_queue
         hidden_references = _uses_ray_reference(self.consumer_config)
+        clock_node_id = current_ray_node_id()
         source_cfg = tq_cfg
         if hidden_references:
             source_cfg = {
                 **tq_cfg,
+                "reference_lifetime": (
+                    "persistent"
+                    if self.consumer_config.speco.draft_training.get(
+                        "data_source", "online"
+                    )
+                    == "saved_hidden"
+                    else "temporary"
+                ),
                 "hidden_states_store": (
                     training_cfg.get("target_feature_replay") or {}
                 ).get("hidden_states_store"),
             }
-        store = (
-            self.feature_store_factory(source_cfg)
-            if self.feature_store_factory is not None
-            else (
-                ReferenceFeatureStore if hidden_references else TQFeatureStore
-            ).from_config(source_cfg)
-        )
+        if self.feature_store_factory is not None:
+            store = self.feature_store_factory(source_cfg)
+        elif hidden_references:
+            store = ReferenceFeatureStore.from_config(source_cfg)
+        else:
+            from verl_speco.trainer.tq_feature_store import TQFeatureStore
+
+            store = TQFeatureStore.from_config(source_cfg)
         store.connect()
         scheduler = DrafterScheduler()
         depth = prefetch_depth(tq_cfg)
@@ -602,6 +613,7 @@ class StandaloneRayTrainer:
         last_published_total = 0
         last_reference_batch_id = -1
         seen_file_keys: set[str] = set()
+        reference_received_times: dict[str, tuple[float, float | None]] = {}
         shutdown_entries: dict[str, ReadyEntry] = {}
         trackers: list[Any] = []
 
@@ -670,6 +682,21 @@ class StandaloneRayTrainer:
                     for rank_entries in assignments
                 ],
             }
+            if hidden_references:
+                now = time.monotonic()
+                received = [
+                    reference_received_times.pop(entry.key)
+                    for entry in selected_entries
+                ]
+                command["delivery_times"] = {
+                    "scheduler_ready_wait_time": now - max(at for at, _ in received),
+                }
+                if all(age is not None for _, age in received):
+                    command["delivery_times"]["metadata_event_age_time"] = max(
+                        age for _, age in received
+                    )
+                command["dispatched_at"] = now
+                command["clock_node_id"] = clock_node_id
             retry_io(
                 lambda: put_queue(
                     self.commands_queue,
@@ -906,13 +933,22 @@ class StandaloneRayTrainer:
                     from verl_speco.transport.drafter_sample_protocol import (
                         SampleMetadata,
                         make_sample_key,
-                        validate_reference_tag,
+                        validate_reference_envelope,
                     )
 
                     incoming = []
+                    received_at = time.monotonic()
+                    # Different Ray nodes need not share a monotonic clock origin.
+                    event_age = (
+                        received_at - float(event["sent_at"])
+                        if clock_node_id is not None
+                        and event.get("clock_node_id") == clock_node_id
+                        and "sent_at" in event
+                        else None
+                    )
                     for item in event["entries"]:
                         tag = item["tag"]
-                        validate_reference_tag(tag)
+                        validate_reference_envelope(tag)
                         meta = SampleMetadata.from_dict(tag)
                         key = str(item["key"])
                         if meta.run_id != store.run_id or key != make_sample_key(meta):
@@ -921,6 +957,7 @@ class StandaloneRayTrainer:
                             )
                         if key not in seen_file_keys:
                             incoming.append(ReadyEntry(key, tag))
+                            reference_received_times[key] = (received_at, event_age)
                             seen_file_keys.add(key)
                     plans.refresh([*plans.ready, *incoming])
                     ready_hint += len(incoming)
@@ -1088,6 +1125,9 @@ def run_ray_pipeline(
 ) -> int:
     """Keep service ownership local while Ray executes Producer and Consumer."""
 
+    if getattr(commands, "data_source", "online") == "saved_hidden":
+        # Persistent files need neither a vLLM service nor a hidden transfer store.
+        return run_ray_actors(commands, ray_module=ray_module)
     base_env = dict(os.environ if environ is None else environ)
     base_env["RAY_ADDRESS"] = ray_address
     # Mirror the subprocess path: fail fast when the selected TQ transport or

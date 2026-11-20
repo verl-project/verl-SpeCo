@@ -19,18 +19,18 @@ import asyncio
 import logging
 import math
 import os
-import numpy as np
 import time
 from collections import Counter, deque
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from functools import partial
-from typing import Any, Mapping
+from typing import Any
 
+import numpy as np
 import torch
 
 from verl_speco.config import config_int
-from verl_speco.integration import transferqueue_bridge as default_transport
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
@@ -45,29 +45,29 @@ from verl_speco.producer.input_reader import (
     TokenizedRequest,
     build_render_fn,
     iter_input_records,
-    prepare_generation_request,
     prepare_generated_prefill_request,
+    prepare_generation_request,
     tokenize_record,
     tokenize_record_with_render_boundary,
 )
-from verl_speco.producer.metrics import producer_window_metrics
+from verl_speco.producer.metrics import ProducerDiagnostics, producer_window_metrics
 from verl_speco.producer.vllm_feature_client import (
     RawVllmFeature,
-    VllmResponse,
     VllmEndpoint,
     VllmFeatureClientPool,
+    VllmResponse,
     delete_temporary_result,
 )
 from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.trainer.feature_store import DraftFeatureSample
 from verl_speco.trainer.standalone_resume import load_standalone_resume
+from verl_speco.trainer.standalone_retry import retry_io
 from verl_speco.trainer.target_feature_replay import (
     FeatureContract,
     HiddenStateAlignmentError,
     feature_from_vllm_payload,
     load_vllm_final_norm,
 )
-from verl_speco.trainer.tq_retry import retry_io
 from verl_speco.transport.drafter_sample_protocol import (
     DRAFTER_TQ_PARTITION,
     PROTOCOL_SCHEMA_VERSION,
@@ -79,7 +79,6 @@ from verl_speco.transport.drafter_sample_protocol import (
     make_reference_tag,
     make_sample_key,
 )
-
 
 logger = logging.getLogger(__name__)
 _INPUT_DONE = object()
@@ -326,7 +325,7 @@ def _read_on_missing_response(producer_cfg: Any) -> str:
 
 def _minimum_response_feature_rows(training_cfg: Mapping[str, Any]) -> int:
     algorithm = str(training_cfg.get("speculative_algorithm", "")).strip().upper()
-    if algorithm == "DSPARK":
+    if algorithm in ("DSPARK", "DSV4_DSPARK"):
         return 2
     if algorithm == "DFLASH":
         block_size = int(training_cfg.get("dflash_block_size", 16))
@@ -334,6 +333,22 @@ def _minimum_response_feature_rows(training_cfg: Mapping[str, Any]) -> int:
             raise ValueError("dflash_block_size must be at least 2 for training")
         return block_size
     return 1
+
+
+def standalone_token_config(producer_cfg, training_cfg):
+    """Keep saved features under the same supervision constraints as live features."""
+    algorithm = str(training_cfg["speculative_algorithm"]).strip().upper()
+    config = dict(producer_cfg)
+    config["response_feature_budget"] = algorithm in {"DFLASH", "DSPARK", "DSV4_DSPARK"}
+    config["min_feature_rows"] = 3 if algorithm == "EAGLE3" else 1
+    config["min_response_feature_rows"] = _minimum_response_feature_rows(training_cfg)
+    config["response_block_size"] = (
+        config["min_response_feature_rows"] if algorithm == "DFLASH" else 0
+    )
+    config["preserve_prompt_context"] = config["response_feature_budget"] and bool(
+        training_cfg.get("preserve_prompt_hidden_states", True)
+    )
+    return config
 
 
 def validate_producer_config(config: Any) -> str:
@@ -497,10 +512,12 @@ def _format_perf_sample(row: Mapping[str, Any]) -> str:
 
 
 async def _collect_reference_batch(
-    queue, first, batch_size: int, *, timeout: float = 0.2
+    queue, first, batch_size: int, *, timeout: float = 0.2, on_dequeue=None
 ):
     """Collect one training batch, flushing partial data on timeout or EOS."""
     batch = [first]
+    if on_dequeue is not None:
+        on_dequeue(first)
     deadline = time.monotonic() + timeout
     while len(batch) < batch_size:
         remaining = deadline - time.monotonic()
@@ -512,14 +529,239 @@ async def _collect_reference_batch(
             break
         if item is _PUBLISH_DONE:
             return batch, True
+        if on_dequeue is not None:
+            on_dequeue(item)
         batch.append(item)
     return batch, False
+
+
+def _saved_hidden_training_request(request, producer_cfg, training_cfg):
+    """Apply the existing Producer window rules to a full saved conversation."""
+    from verl_speco.producer.input_reader import _build_tokenized_request
+
+    mask = request["loss_mask"]
+    prompt_length = next(
+        (index for index, value in enumerate(mask) if value > 0), len(mask)
+    )
+    prepared = _build_tokenized_request(
+        sequence_no=0,
+        sample_id="saved_hidden",
+        prompt_length=prompt_length,
+        full_ids=request["input_ids"],
+        source_metadata=request["source_metadata"],
+        config=standalone_token_config(producer_cfg, training_cfg),
+        vllm_prompt_token_ids=request["vllm_prompt_token_ids"],
+    )
+    positions = prepared.feature_positions.tolist()
+    # Keep saved masks and original positions; select only the feature window.
+    return {
+        **request,
+        "feature_positions": positions,
+        "draft_position_ids": [
+            request["position_ids"][position] + 1 for position in positions
+        ],
+    }
+
+
+async def _publish_saved_hidden(
+    config,
+    *,
+    before_publish,
+    on_references,
+    reference_batch_size,
+    on_metrics=None,
+) -> ProducerStats:
+    """Index permanent files once; publish the existing reference protocol only."""
+    from pathlib import Path
+
+    from verl_speco.producer.hidden_states_store import (
+        bind_raw_hidden_contract,
+        load_raw_hidden_manifest,
+    )
+    from verl_speco.transport.drafter_sample_protocol import validate_reference_tag
+
+    plain = _plain_config(config)
+    producer_cfg, training_cfg, tq_cfg = _config_sections(config)
+    if (
+        plain["speco"]["draft_training"].get("data_transport", "ray_reference")
+        != "ray_reference"
+    ):
+        raise ValueError("saved_hidden requires data_transport=ray_reference")
+    if on_references is None or reference_batch_size < 1:
+        raise ValueError(
+            "saved_hidden requires scheduler reference publication with a positive batch size"
+        )
+    algorithm = str(training_cfg["speculative_algorithm"]).upper()
+    if algorithm not in {"DSPARK", "DFLASH", "EAGLE3"}:
+        raise ValueError(
+            "saved_hidden supports DSPARK, DFLASH and EAGLE3 reference training"
+        )
+    if training_cfg.get("use_logits", False):
+        raise ValueError(
+            "saved_hidden reference training does not support use_logits=true"
+        )
+    if int(training_cfg.get("gradient_accumulation_steps", 1)) != 1:
+        raise ValueError(
+            "saved_hidden reference training requires gradient_accumulation_steps=1"
+        )
+    root = Path(producer_cfg["input_path"]).resolve()
+    if not root.is_dir():
+        raise ValueError("saved_hidden input_path must be a dataset directory")
+    rows = await asyncio.to_thread(load_raw_hidden_manifest, root)
+    if not rows:
+        raise ValueError("Saved hidden dataset contains no committed samples")
+    expected = {
+        "algorithm": str(training_cfg["speculative_algorithm"]).upper(),
+        "target_model_id": producer_cfg["target_model_id"],
+        "target_model_revision": producer_cfg["target_model_revision"],
+        "tokenizer_fingerprint": producer_cfg["tokenizer_fingerprint"],
+        "target_layer_ids": list(producer_cfg["target_layer_ids"]),
+        "vllm_aux_hidden_state_layer_ids": list(
+            producer_cfg["vllm_aux_hidden_state_layer_ids"]
+        ),
+        "dtype": str(_parse_dtype(producer_cfg["hidden_dtype"])),
+        "hidden_states_layout": resolve_drafter_hidden_states_layout(
+            training_cfg["speculative_algorithm"], training_cfg
+        ),
+        "require_full_alignment": True,
+        "use_logits": False,
+    }
+    logger.info(
+        "Saved hidden Producer indexed directory=%s samples=%s", root, len(rows)
+    )
+    first_contract = rows[0]["feature_contract"]
+    training_rows: dict[int, dict[str, Any]] = {}
+    for index, row in enumerate(rows):
+        stored = row["feature_contract"]
+        if stored != first_contract:
+            raise ValueError("Saved hidden dataset contains mixed feature contracts")
+        contract = bind_raw_hidden_contract(stored, expected)
+        request = row["request"]
+        if stored.get("contract_type") == "raw_capture":
+            try:
+                request = _saved_hidden_training_request(
+                    request, producer_cfg, training_cfg
+                )
+            except SampleFilteredError as exc:
+                logger.info(
+                    "Skipping saved hidden sample %s: %s", row["sample_id"], exc
+                )
+                continue
+        row = {**row, "feature_contract": contract, "request": request}
+        # Validate arrays and metadata before exposing any sample to the scheduler.
+        tag = make_reference_tag(
+            SampleMetadata(
+                PROTOCOL_SCHEMA_VERSION, str(tq_cfg["run_id"]), row["sample_id"], 0
+            ),
+            path=str(root / row["path"]),
+            request=row["request"],
+            feature_contract=row["feature_contract"],
+        )
+        validate_reference_tag(tag)
+        positions = row["request"]["feature_positions"]
+        masks = row["request"]["loss_mask"]
+        if any(
+            int(position) < 0 or int(position) >= len(masks) for position in positions
+        ):
+            raise ValueError(
+                "Saved hidden feature positions are outside the token sequence"
+            )
+        supervised = sum(masks[int(position)] > 0 for position in positions)
+        minimum = _minimum_response_feature_rows(training_cfg)
+        if (
+            supervised < minimum
+            or len(positions) < (3 if algorithm == "EAGLE3" else 1)
+            or (algorithm == "DFLASH" and len(positions) <= minimum)
+        ):
+            logger.info(
+                "Skipping saved hidden sample %s: insufficient training rows",
+                row["sample_id"],
+            )
+            continue
+        training_rows[index] = row
+    if not training_rows:
+        raise ValueError(
+            "Saved hidden dataset has no samples with sufficient training rows"
+        )
+    consumed, resume_metadata = load_standalone_resume(
+        producer_cfg.get("resume_checkpoint_path"),
+        input_path=root,
+    )
+    shuffle, seed = (
+        bool(producer_cfg.get("shuffle", False)),
+        int(producer_cfg.get("shuffle_seed", 42)),
+    )
+    _assert_resume_shuffle_alignment(
+        resume_metadata,
+        shuffle=shuffle,
+        shuffle_seed=seed,
+        consumed_sequence_nos=consumed,
+    )
+    budget = int(producer_cfg.get("max_samples", 0) or 0)
+    if budget < 0:
+        raise ValueError("max_samples must be non-negative")
+    stats = ProducerStats()
+    epoch = 0
+    pending: list[dict[str, Any]] = []
+    while True:
+        order = (
+            np.random.default_rng(seed + epoch).permutation(len(rows))
+            if shuffle
+            else range(len(rows))
+        )
+        for position, index in enumerate(order):
+            sequence_no = epoch * len(rows) + position
+            if sequence_no in consumed:
+                continue
+            selected_row = training_rows.get(int(index))
+            if selected_row is None:
+                stats.filtered_count += 1
+                continue
+            if budget > 0 and stats.published_count + len(pending) >= budget:
+                break
+            if before_publish is not None:
+                await before_publish()
+            meta = SampleMetadata(
+                PROTOCOL_SCHEMA_VERSION,
+                str(tq_cfg["run_id"]),
+                selected_row["sample_id"],
+                sequence_no,
+            )
+            tag = make_reference_tag(
+                meta,
+                path=str(root / selected_row["path"]),
+                request=selected_row["request"],
+                feature_contract=selected_row["feature_contract"],
+            )
+            pending.append({"key": make_sample_key(meta), "tag": tag})
+            stats.input_count += 1
+            if len(pending) >= reference_batch_size:
+                await on_references(pending)
+                stats.published_count += len(pending)
+                pending = []
+        if budget == 0 or stats.published_count + len(pending) >= budget:
+            break
+        epoch += 1
+    if pending:
+        await on_references(pending)
+        stats.published_count += len(pending)
+    if on_metrics is not None:
+        await on_metrics(
+            stats.published_count,
+            {"producer/saved_hidden_samples": float(stats.published_count)},
+        )
+    logger.info(
+        "Saved hidden Producer finished directory=%s published=%s",
+        root,
+        stats.published_count,
+    )
+    return stats
 
 
 async def run_producer(
     config: Any,
     *,
-    transport: Any = default_transport,
+    transport: Any = None,
     tokenizer: Any | None = None,
     client_pool: Any | None = None,
     before_request: Any | None = None,
@@ -529,8 +771,24 @@ async def run_producer(
     on_metrics: Any | None = None,
     get_runtime_state: Any | None = None,
 ) -> ProducerStats:
-    """Run the bounded input -> vLLM -> publication pipeline."""
+    """Publish references from online vLLM or a persistent raw-hidden dataset."""
 
+    source = (
+        _plain_config(config)
+        .get("speco", {})
+        .get("draft_training", {})
+        .get("data_source", "online")
+    )
+    if source == "saved_hidden":
+        return await _publish_saved_hidden(
+            config,
+            before_publish=before_request,
+            on_references=on_references,
+            reference_batch_size=reference_batch_size,
+            on_metrics=on_metrics,
+        )
+    if source != "online":
+        raise ValueError("data_source must be online or saved_hidden")
     on_missing_response = validate_producer_config(config)
     producer_cfg, drafter_cfg, tq_cfg = _config_sections(config)
     run_id = str(tq_cfg["run_id"])
@@ -555,6 +813,9 @@ async def run_producer(
             producer_cfg["vllm_endpoints"],
         )
         if on_references is None:
+            if transport is None:
+                from verl_speco.integration import transferqueue_bridge as transport
+
             if not transport.configure_transfer_queue(tq_cfg):
                 raise RuntimeError("Standalone Producer requires TransferQueue==0.1.10")
             ray_cfg = tq_cfg["ray"]
@@ -624,20 +885,7 @@ async def run_producer(
         logger.info("Standalone Producer vLLM client pool started")
 
         algorithm = str(drafter_cfg["speculative_algorithm"]).strip().upper()
-        # Only standalone DFlash/DSpark use a response-only feature budget.
-        producer_cfg = dict(producer_cfg)
-        producer_cfg["response_feature_budget"] = algorithm in {"DFLASH", "DSPARK"}
-        # EAGLE3 shifts away two feature rows before computing its loss.
-        producer_cfg["min_feature_rows"] = 3 if algorithm == "EAGLE3" else 1
-        producer_cfg["min_response_feature_rows"] = _minimum_response_feature_rows(
-            drafter_cfg
-        )
-        producer_cfg["response_block_size"] = (
-            producer_cfg["min_response_feature_rows"] if algorithm == "DFLASH" else 0
-        )
-        producer_cfg["preserve_prompt_context"] = producer_cfg[
-            "response_feature_budget"
-        ] and bool(drafter_cfg.get("preserve_prompt_hidden_states", True))
+        producer_cfg = standalone_token_config(producer_cfg, drafter_cfg)
         target_layer_ids, vllm_aux_layer_ids = normalize_standalone_layer_ids(
             algorithm,
             producer_cfg.get("target_layer_ids"),
@@ -722,6 +970,8 @@ async def run_producer(
         sample_timings: dict[int, dict[str, float]] = {}
         unsubmitted_references: dict[str, VllmResponse] = {}
         perf_rows: list[dict[str, Any]] = []
+        diagnostics = getattr(pool, "diagnostics", None) or ProducerDiagnostics()
+        diagnostics.snapshot()  # Exclude model/client initialization from occupancy.
         perf_window_started = time.monotonic()
         peak_publish_queue = 0
         publish_inflight = 0
@@ -747,6 +997,12 @@ async def run_producer(
         def mark_stage(worker: str, stage: str, sample_id: str = "") -> None:
             stages[worker] = (stage, time.monotonic(), sample_id)
 
+        async def monitor_event_loop():
+            while True:
+                expected = time.monotonic() + 0.1
+                await asyncio.sleep(0.1)
+                diagnostics.loop_lag(max(0.0, time.monotonic() - expected))
+
         async def log_heartbeat() -> None:
             last_inputs = 0
             last_published = 0
@@ -767,7 +1023,8 @@ async def run_producer(
                     "published=%s filtered=%s dropped=%s request_failed=%s "
                     "input_rate=%.2f/s "
                     "publish_rate=%.2f/s input_queue=%s/%s publish_queue=%s/%s "
-                    "pending_tensor_bytes=%s seconds_since_publish=%.0f stages=%s oldest=%s",
+                    "pending_tensor_bytes=%s seconds_since_publish=%.0f stages=%s oldest=%s "
+                    "http_inflight=%s loop_lag_max=%.3fs",
                     get_runtime_state() if get_runtime_state is not None else "running",
                     stats.input_count,
                     stats.published_count,
@@ -787,6 +1044,8 @@ async def run_producer(
                         (worker, stage, sample_id, round(age))
                         for age, worker, stage, sample_id in oldest
                     ],
+                    diagnostics.http_inflight,
+                    diagnostics.snapshot(reset=False)["loop_lag_max"],
                 )
                 last_inputs = stats.input_count
                 last_published = stats.published_count
@@ -971,8 +1230,15 @@ async def run_producer(
             return request
 
         async def next_request_async() -> Any:
+            started = time.monotonic()
             async with request_generation_lock:
-                return await asyncio.to_thread(next_request)
+                request = await asyncio.to_thread(next_request)
+            if request is not _INPUT_DONE:
+                timing = sample_timings[int(request.sequence_no)]
+                timing["input_dispatch"] = max(
+                    0.0, time.monotonic() - started - timing["input_prepare"]
+                )
+            return request
 
         async def read_inputs() -> None:
             initial_count = 0
@@ -1066,14 +1332,18 @@ async def run_producer(
             while True:
                 if replacement_request is None:
                     mark_stage(worker, "input_queue_get")
+                    input_wait_started = time.monotonic()
                     request = await input_queue.get()
+                    input_get_wait = time.monotonic() - input_wait_started
                 else:
                     request = replacement_request
                     replacement_request = None
+                    input_get_wait = 0.0
                 if request is _INPUT_DONE:
                     stages.pop(worker, None)
                     return
                 timing = sample_timings[int(request.sequence_no)]
+                timing["input_get_wait"] = input_get_wait
                 now = time.monotonic()
                 input_queue_started = timing.pop("input_queue_started", now)
                 timing["input_queue"] = now - input_queue_started
@@ -1163,7 +1433,12 @@ async def run_producer(
                     account_request_failure(request, exc, stage="prefill")
                     replacement_request = await next_replacement(cause=exc)
                     continue
-                timing["prefill"] = time.monotonic() - prefill_started
+                reference_ready_at = time.monotonic()
+                timing["prefill"] = reference_ready_at - prefill_started
+                timing.update(
+                    (f"prefill_{key}", value) for key, value in raw.timings.items()
+                )
+                timing["reference_ready_at"] = reference_ready_at
                 if hidden_references:
                     reference = _as_vllm_reference(raw)
                     unsubmitted_references[reference.reference] = reference
@@ -1212,23 +1487,27 @@ async def run_producer(
                 mark_stage(worker, "publish_queue_put", request.sample_id)
                 timing["publish_queue_started"] = time.monotonic()
                 enqueue_started = time.monotonic()
-                await publish_queue.put(
-                    PreparedFeature(
-                        request=request,
-                        raw=raw,
-                        sample=sample,
-                        metadata=_sample_metadata(
-                            request, sample, feature_contract, run_id, tq_cfg
-                        ),
-                        timing=timing,
-                        reference_tag=(
-                            _reference_tag(
-                                request, raw, feature_contract, run_id, tq_cfg
-                            )
-                            if hidden_references
-                            else None
-                        ),
-                    )
+                metadata_started = time.monotonic()
+                prepared = PreparedFeature(
+                    request=request,
+                    raw=raw,
+                    sample=sample,
+                    metadata=_sample_metadata(
+                        request, sample, feature_contract, run_id, tq_cfg
+                    ),
+                    timing=timing,
+                    reference_tag=(
+                        _reference_tag(request, raw, feature_contract, run_id, tq_cfg)
+                        if hidden_references
+                        else None
+                    ),
+                )
+                timing["metadata_build"] = time.monotonic() - metadata_started
+                put_started = time.monotonic()
+                await publish_queue.put(prepared)
+                timing["reference_enqueued_at"] = time.monotonic()
+                timing["publish_enqueue"] = (
+                    timing["reference_enqueued_at"] - put_started
                 )
                 timing["publish_queue_wait"] = time.monotonic() - enqueue_started
                 peak_publish_queue = max(peak_publish_queue, publish_queue.qsize())
@@ -1244,11 +1523,25 @@ async def run_producer(
             if on_references is not None:
                 logger.info(
                     "Standalone Producer metadata samples=%s batch_size_avg=%.2f "
-                    "submit_avg=%.3fs enqueue_wait_avg=%.3fs",
+                    "submit_avg=%.3fs enqueue_wait_avg=%.3fs "
+                    "build_avg=%.3fs enqueue_block_avg=%.3fs residence_avg=%.3fs "
+                    "batch_wait_avg=%.3fs latest_ready_delay_avg=%.3fs full_sample_frac=%.3f",
                     len(perf_rows),
                     tracking_metrics["producer/metadata_batch_size"],
                     tracking_metrics["producer/metadata_submit_time"],
                     tracking_metrics["producer/publish_queue_wait_time"],
+                    *[
+                        sum(_timing_value(row["timing"], key) for row in perf_rows)
+                        / len(perf_rows)
+                        for key in (
+                            "metadata_build",
+                            "publish_enqueue",
+                            "publish_residence",
+                            "publish_batch_wait",
+                            "metadata_ready_delay",
+                            "metadata_full_batch",
+                        )
+                    ],
                 )
             timing_names = (
                 "e2e",
@@ -1278,6 +1571,25 @@ async def run_producer(
                 _timing_value(row["timing"], "publish_transport") for row in perf_rows
             ]
             total_mb = sum(float(row["mb"]) for row in perf_rows)
+            diagnostic_window = diagnostics.snapshot()
+            diagnostic_text = " ".join(
+                f"{key}={value:.4f}" for key, value in diagnostic_window.items()
+            )
+            diagnostic_text += " " + " ".join(
+                f"{key}_avg={sum(_timing_value(row['timing'], key) for row in perf_rows) / len(perf_rows):.4f}s"
+                for key in (
+                    "input_dispatch",
+                    "input_get_wait",
+                    "prefill_global_wait",
+                    "prefill_endpoint_wait",
+                    "prefill_http",
+                    "prefill_retry_backoff",
+                )
+            )
+            tracking_metrics.update(
+                (f"producer/{key}", float(value))
+                for key, value in diagnostic_window.items()
+            )
             logger.info(
                 "Standalone Producer perf samples=%s window=%.3fs rate=%.2f/s "
                 "e2e_avg=%.3fs e2e_p95=%.3fs e2e_max=%.3fs "
@@ -1293,7 +1605,7 @@ async def run_producer(
                 "tensor_payload_mb_per_second=%.2f tensor_payload_mb_per_transport_second=%.2f "
                 "prefill_tokens=%s prefill_tokens_per_second=%.2f "
                 "publish_queue_peak=%s "
-                "publish_inflight_peak=%s pending_tensor_mb_peak=%.2f",
+                "publish_inflight_peak=%s pending_tensor_mb_peak=%.2f %s",
                 len(perf_rows),
                 window,
                 len(perf_rows) / window,
@@ -1330,6 +1642,7 @@ async def run_producer(
                 peak_publish_queue,
                 peak_publish_inflight,
                 peak_pending_bytes / (1024 * 1024),
+                diagnostic_text,
             )
             ordered_by_sequence = sorted(
                 perf_rows, key=lambda row: int(row["sequence_no"])
@@ -1385,6 +1698,9 @@ async def run_producer(
                         publish_queue,
                         first,
                         reference_batch_size,
+                        on_dequeue=lambda item: item.timing.update(
+                            publisher_dequeued_at=time.monotonic()
+                        ),
                     )
                     buffered.extend(batch)
                     entries = []
@@ -1400,7 +1716,23 @@ async def run_producer(
                             }
                         )
                     submitted_at = time.monotonic()
+                    latest_ready_at = max(
+                        item.timing["reference_ready_at"] for item in buffered
+                    )
                     for item in buffered:
+                        item.timing["publish_residence"] = (
+                            item.timing["publisher_dequeued_at"]
+                            - item.timing["reference_enqueued_at"]
+                        )
+                        item.timing["publish_batch_wait"] = (
+                            submitted_at - item.timing["publisher_dequeued_at"]
+                        )
+                        item.timing["metadata_ready_delay"] = (
+                            submitted_at - latest_ready_at
+                        )
+                        item.timing["metadata_full_batch"] = float(
+                            len(entries) == reference_batch_size
+                        )
                         # Queue residence includes batching, but ends before the RPC.
                         item.timing["publish_queue"] = submitted_at - item.timing.pop(
                             "publish_queue_started"
@@ -1586,6 +1918,9 @@ async def run_producer(
             for index in range(publish_workers)
         )
         heartbeat = asyncio.create_task(log_heartbeat(), name="producer-heartbeat")
+        loop_monitor = asyncio.create_task(
+            monitor_event_loop(), name="producer-loop-monitor"
+        )
         try:
             done, pending = await asyncio.wait(
                 tasks, return_when=asyncio.FIRST_EXCEPTION
@@ -1641,7 +1976,8 @@ async def run_producer(
             if window_metrics is not None and on_metrics is not None:
                 await on_metrics(stats.published_count, window_metrics)
             heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
+            loop_monitor.cancel()
+            await asyncio.gather(heartbeat, loop_monitor, return_exceptions=True)
 
         if stats.published_count == 0:
             logger.error(
@@ -1902,42 +2238,9 @@ def _parse_dtype(value: Any) -> torch.dtype:
     return dtype
 
 
-def _apply_direct_producer_defaults(config: Any, overrides: list[str]) -> None:
-    from omegaconf import OmegaConf
-
-    key = "actor_rollout_ref.rollout.drafter.training.preserve_prompt_hidden_states"
-    # The direct entrypoint inherits cotrain defaults, but standalone retains
-    # prompt context unless the user explicitly overrides this option.
-    if not any(item.split("=", 1)[0].lstrip("+") == key for item in overrides):
-        OmegaConf.update(config, key, True)
-
-
-def _hydra_main(config: Any) -> None:
-    from hydra.core.hydra_config import HydraConfig
-
-    _apply_direct_producer_defaults(config, HydraConfig.get().overrides.task)
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(run_producer(config))
-
-
-def main() -> None:
-    try:
-        import hydra
-    except ImportError as exc:
-        raise RuntimeError("Standalone Producer requires hydra-core") from exc
-    hydra.main(config_path="config", config_name="speco_base", version_base=None)(
-        _hydra_main
-    )()
-
-
-if __name__ == "__main__":
-    main()
-
-
 __all__ = [
     "PreparedFeature",
     "ProducerStats",
-    "main",
     "publish_one",
     "run_producer",
     "validate_producer_config",

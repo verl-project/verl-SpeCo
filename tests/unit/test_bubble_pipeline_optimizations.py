@@ -120,10 +120,9 @@ def test_only_target_worker_resolves_head_and_ack_is_versioned(monkeypatch, rank
     captured = []
     worker.trainer = SimpleNamespace(
         _bubble_time_enabled=True,
-        sync_target_lm_head_weight=lambda weight, **kwargs: captured.append(
-            (weight, kwargs)
-        )
-        or {"accepted": True},
+        sync_target_lm_head_weight=lambda weight, **kwargs: (
+            captured.append((weight, kwargs)) or {"accepted": True}
+        ),
     )
     result = worker.sync_target_lm_head_weight(wrapped, global_step=8)
     assert result["accepted"] == (rank == 0)
@@ -212,6 +211,7 @@ def test_driver_reference_dispatch_does_not_materialize_or_change_version():
         "SpecoRayPPOTrainer",
         {"_speco_dispatch_target_lm_head_payload"},
         time=time,
+        target_lm_head_export_metrics=transport.target_lm_head_export_metrics,
     )
     driver = cls()
     driver.global_steps = 8
@@ -225,9 +225,9 @@ def test_driver_reference_dispatch_does_not_materialize_or_change_version():
         1,
     )
     calls = []
-    driver.speco_sync_target_lm_head_weight = lambda payload, **kwargs: calls.append(
-        (payload, kwargs)
-    ) or ["cpu-cache-ack"]
+    driver.speco_sync_target_lm_head_weight = lambda payload, **kwargs: (
+        calls.append((payload, kwargs)) or ["cpu-cache-ack"]
+    )
     driver._ray_get_if_needed = lambda refs: pytest.fail(
         "Driver must not resolve head data"
     )
@@ -291,9 +291,9 @@ def test_snapshot_async_rpc_is_cached_cpu_only_and_checks_source():
         8,
     )
     calls = []
-    worker.maybe_publish = lambda **kwargs: calls.append(kwargs) or {
-        "weights_ref": "snapshot"
-    }
+    worker.maybe_publish = lambda **kwargs: (
+        calls.append(kwargs) or {"weights_ref": "snapshot"}
+    )
     assert worker.maybe_publish_async(source_step=7) is None and not calls
     assert worker.maybe_publish_async(source_step=8) == {"weights_ref": "snapshot"}
     assert calls == [{"cached_snapshot_only": True}]
@@ -336,8 +336,9 @@ def test_driver_negotiates_reference_transport_without_changing_legacy_rpc(
     driver._speco_get_drafter_target_lm_head_row_selection = lambda: None
     calls = []
     driver.actor_rollout_wg = SimpleNamespace(
-        get_actor_lm_head_weight_async=lambda rows, **kwargs: calls.append(kwargs)
-        or ["export-ref"],
+        get_actor_lm_head_weight_async=lambda rows, **kwargs: (
+            calls.append(kwargs) or ["export-ref"]
+        ),
         get_actor_lm_head_export_capability=lambda: [
             {
                 "participating": True,
@@ -378,13 +379,14 @@ def _snapshot_driver():
     )
     ready, submissions, gets = [False], [], []
     driver._require_speco_worker_group = lambda: SimpleNamespace(
-        maybe_publish_async=lambda **kwargs: submissions.append(kwargs)
-        or ["snapshot-ref"]
+        maybe_publish_async=lambda **kwargs: (
+            submissions.append(kwargs) or ["snapshot-ref"]
+        )
     )
     driver._speco_ray_refs_ready = lambda refs: ready[0]
-    driver._ray_get_if_needed = lambda refs: gets.append(refs) or [
-        {"weights_ref": "immutable-host-snapshot"}
-    ]
+    driver._ray_get_if_needed = lambda refs: (
+        gets.append(refs) or [{"weights_ref": "immutable-host-snapshot"}]
+    )
     driver._first_non_null = lambda rows: next(
         (row for row in rows if row is not None), None
     )

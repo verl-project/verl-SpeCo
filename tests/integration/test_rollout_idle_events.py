@@ -20,6 +20,46 @@ def _local_event_bus():
     return rollout_idle_events._event_bus_actor_class(_LocalRay)()
 
 
+@pytest.mark.parametrize("strict", [False, True])
+def test_standalone_scope_does_not_alias_hybrid_rank_zero(strict):
+    bus = _local_event_bus()
+    bus.emit({"event_type": "GENERATION_STARTED", "replica_rank": 0, "worker_id": "0"})
+    bus.configure_replica_groups({7: ("0", "1"), 8: ("2", "3")}, strict_groups=strict)
+    assert len(bus.drain()) == (0 if strict else 1)
+    assert bus.reserve_training(["0", "1"], "standalone-training", 0)["acquired"]
+    acquired = bus.acquire_rollout(["0"], {"replica_rank": 0, "worker_id": "0"})
+    assert acquired["acquired"] is strict
+    assert bus.training_reclaim_status("standalone-training", "0")["requested"] is (
+        not strict
+    )
+    if strict:
+        assert acquired["managed"] is False
+        bus.release_rollout(["0"], {"replica_rank": 0, "worker_id": "0"})
+        bus.emit({"event_type": "WORKER_IDLE", "replica_rank": 0, "worker_id": "0"})
+        assert bus.drain() == []
+        actual = bus.acquire_rollout(["7"], {"replica_rank": 7, "worker_id": "7"})
+        assert not actual["acquired"]
+        assert actual["blocking_plan_ids"] == ["standalone-training"]
+        assert all(event["replica_rank"] == 7 for event in bus.drain())
+
+
+@pytest.mark.parametrize(
+    "reported", [{7: ["0", "1"]}, {7: ["2", "3"]}, {8: ["0", "1"]}]
+)
+def test_strict_group_configuration_requires_exact_ack(monkeypatch, reported):
+    def configure(groups, *, strict_groups):
+        assert strict_groups
+        assert groups == {7: ["0", "1"]}
+        return reported
+
+    actor = SimpleNamespace(configure_replica_groups=SimpleNamespace(remote=configure))
+    ray = SimpleNamespace(get=lambda value: value)
+    monkeypatch.setattr(rollout_idle_events, "_event_bus", lambda name: (ray, actor))
+    assert rollout_idle_events.configure_rollout_resource_groups(
+        "strict", {7: ("0", "1")}, strict_groups=True
+    ) == (reported == {7: ["0", "1"]})
+
+
 def test_event_poll_reuses_handle_but_always_drains_fresh_events(monkeypatch):
     lookups, drains = [], []
     actor = SimpleNamespace(

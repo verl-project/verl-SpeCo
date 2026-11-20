@@ -157,6 +157,35 @@ def test_vllm_server_restores_idle_event_config_from_server_config(monkeypatch) 
     assert _rollout_idle_event_bus_name(resolved) == "bubble-bus"
 
 
+@pytest.mark.parametrize("has_server_config", [False, True])
+def test_vllm_server_restores_sync_opd_config_without_idle_bus(
+    monkeypatch, has_server_config
+):
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    monkeypatch.delenv("VERL_SPECO_SGLANG_DRAFTER_CONFIG", raising=False)
+    runtime_config = _drafter(
+        training={
+            "scheduler": {"execution": {"strategy": "sync"}},
+            "drafter_opd": {"enable": True, "capture_verify_trace": True},
+        }
+    )
+    server_config = (
+        _drafter(
+            training={
+                "scheduler": {"execution": {"strategy": "sync"}},
+            }
+        )
+        if has_server_config
+        else {}
+    )
+    resolved, source = _ensure_vllm_server_drafter_env(
+        {"rollout": {"drafter": server_config}}, json.dumps(runtime_config)
+    )
+    assert source == ("server_config" if has_server_config else "server_class")
+    assert resolved == runtime_config
+    assert vllm_runtime._load_env_drafter_config() == runtime_config
+
+
 def test_vllm_server_uses_embedded_runtime_config_when_server_config_is_stale(
     monkeypatch,
 ) -> None:
@@ -213,11 +242,17 @@ def test_merged_server_launch_restores_bubble_config_before_initial_draft(
         async def generate(self, request_id):
             return SimpleNamespace(extra_fields={})
 
+    original_methods = {name: getattr(Upstream, name) for name in ("launch_server", "run_server", "generate")}
     if pre_remote_patch:
         assert vllm_runtime._patch_upstream_vllm_http_server_methods(Upstream)
     cls = vllm_runtime._build_speco_vllm_http_server_class(
         SimpleNamespace(vLLMHttpServer=Upstream)
     )
+    # A Ray worker imports the upstream base afresh: driver-side mutations
+    # are absent there. The serialized subclass must own its bridge methods.
+    if pre_remote_patch:
+        for name, method in original_methods.items():
+            setattr(Upstream, name, method)
     monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV)
     server = cls()
     server.config = {"name": "vllm"}
@@ -889,6 +924,8 @@ def test_vllm_generate_preserves_unscored_request_ids_and_transport_keys(
     scored = outputs["scored-request"].extra_fields
     unscored = outputs["unscored-request"].extra_fields
     assert scored.keys() == unscored.keys()
+    assert scored["_speco_acceptance_engine_fallback"] is False
+    assert unscored["_speco_acceptance_engine_fallback"] is False
     assert scored["_speco_vllm_request_id"] == "scored-request"
     assert scored["_verl_request_mean_accept_len"] == 4.0
     assert unscored["_speco_vllm_request_id"] == "unscored-request"
@@ -1256,6 +1293,45 @@ def test_vllm_speculative_config_maps_dflash_contract() -> None:
         "model": "/models/drafter",
         "num_speculative_tokens": 16,
     }
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+@pytest.mark.parametrize(
+    "algorithm,block_size,verify_tokens,valid",
+    [
+        ("DFLASH", 16, 16, False),
+        ("DFLASH", 16, 15, True),
+        ("DSPARK", 7, 6, False),
+        ("DSPARK", 7, 7, True),
+    ],
+)
+def test_opd_capacity_is_checked_before_rollout_start(
+    monkeypatch, algorithm, block_size, verify_tokens, valid, device
+):
+    bridge_calls = []
+    monkeypatch.setattr(
+        vllm_runtime,
+        "install_upstream_vllm_runtime_bridge",
+        lambda: bridge_calls.append(True) or True,
+    )
+    monkeypatch.setattr(vllm_runtime, "_is_vllm_ascend_runtime_hint", lambda: False)
+    drafter = _drafter(
+        speculative_algorithm=algorithm,
+        rollout={"spec_verify_tokens": verify_tokens},
+        training={
+            "drafter_opd": {"enable": True, "capture_verify_trace": True},
+            f"{algorithm.lower()}_block_size": block_size,
+        },
+    )
+    config = {"trainer": {"device": device}, "actor_rollout_ref": {"rollout": {"name": "vllm", "drafter": drafter}}}
+    if valid:
+        result = configure_vllm_runtime_from_config(config)
+        assert result["num_speculative_tokens"] == verify_tokens
+        assert bridge_calls == [True]
+    else:
+        with pytest.raises(ValueError, match="Draft-OPD.*spec_verify_tokens"):
+            configure_vllm_runtime_from_config(config)
+        assert bridge_calls == []
 
 
 def test_vllm_speculative_config_maps_dspark_to_native_gpu_contract(
@@ -2028,17 +2104,12 @@ def test_vllm_server_does_not_revive_stale_drafter_env_when_nested_disabled(
     assert "VERL_SPECO_DRAFTER_CONFIG" not in os.environ
 
 
+@pytest.mark.parametrize(
+    "config_source", [None, "class", "environment", "sidecar", "class_with_sidecar"]
+)
 def test_vllm_http_actor_installs_import_guard_before_deserialization(
-    monkeypatch,
+    monkeypatch, config_source
 ) -> None:
-    sidecar_dir = "/tmp/speco-acceptance/run-test"
-    drafter_env = json.dumps(
-        {
-            "enable": True,
-            "_speco_acceptance_stats_dir": sidecar_dir,
-        }
-    )
-    monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, drafter_env)
     captured = {}
 
     class FakeRemoteActorClass:
@@ -2055,6 +2126,19 @@ def test_vllm_http_actor_installs_import_guard_before_deserialization(
     class Server:
         pass
 
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    payload = json.dumps({"training": {"drafter_opd": {"enable": True}}})
+    if config_source in {"class", "class_with_sidecar"}:
+        Server._speco_drafter_config_env = payload
+    if config_source == "environment":
+        monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, payload)
+    elif config_source in {"sidecar", "class_with_sidecar"}:
+        sidecar_payload = json.dumps(
+            {"enable": True, "_speco_acceptance_stats_dir": "/tmp/speco-acceptance/run-test"}
+        )
+        monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, sidecar_payload)
+        if config_source == "sidecar":
+            payload = sidecar_payload
     actor_class = vllm_runtime._remote_speco_vllm_http_server(FakeRay, Server)
     assert (
         actor_class.options(
@@ -2070,11 +2154,13 @@ def test_vllm_http_actor_installs_import_guard_before_deserialization(
         "verl_speco.integration.verl_npu_vllm_compat."
         "install_verl_npu_vllm_worker_process_compat"
     )
-    assert runtime_env["env_vars"] == {
+    expected_env = {
         "EXISTING": "1",
         "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR": setup_hook_path,
-        vllm_runtime.SPECO_DRAFTER_CONFIG_ENV: drafter_env,
     }
+    if config_source:
+        expected_env[vllm_runtime.SPECO_DRAFTER_CONFIG_ENV] = payload
+    assert runtime_env["env_vars"] == expected_env
     assert runtime_env["worker_process_setup_hook"] == setup_hook_path
     assert json.loads(json.dumps(runtime_env)) == runtime_env
 
@@ -2497,6 +2583,7 @@ def test_vllm_http_server_transports_final_request_acceptance_stats() -> None:
     elapsed = output.extra_fields.pop("_speco_vllm_request_elapsed_sec")
     assert elapsed >= 0
     assert output.extra_fields == {
+        "_speco_acceptance_engine_fallback": False,
         "global_steps": 1,
         "spec_num_draft_tokens": 28.0,
         "spec_num_accepted_tokens": 9.0,
@@ -2745,6 +2832,7 @@ def test_vllm_http_server_transports_stats_with_positional_request_id() -> None:
     elapsed = output.extra_fields.pop("_speco_vllm_request_elapsed_sec")
     assert elapsed >= 0
     assert output.extra_fields == {
+        "_speco_acceptance_engine_fallback": False,
         "global_steps": 1,
         "spec_num_draft_tokens": 21.0,
         "spec_num_accepted_tokens": 5.0,
@@ -2958,6 +3046,17 @@ def test_trainer_keeps_public_acceptance_metric_name() -> None:
     assert '"drafter/spec_decode/mean_acceptance_length"' in trainer_source
 
 
+def test_vllm_length_stats_accumulate_rounds_and_accepted_tokens():
+    stats = _new_vllm_spec_decode_stats()
+    for rounds, accepted in ((1, 1), (99, 199)):
+        _record_vllm_spec_decode_scheduler_stats(stats, SimpleNamespace(
+            spec_decoding_stats=SimpleNamespace(
+                num_drafts=rounds, num_accepted_tokens=accepted,
+            )
+        ))
+    assert stats == {"drafts": 100, "draft_tokens": 0, "accepted_tokens": 200}
+
+
 def test_trainer_drains_async_publish_before_checkpoint_and_validation() -> None:
     trainer_source = (
         Path(__file__).resolve().parents[2]
@@ -3134,6 +3233,12 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(
         def __init__(self, value):
             self.value = value
 
+        def numel(self):
+            return 1
+
+        def element_size(self):
+            return 4
+
         def detach(self):
             raise AssertionError(
                 "streamed draft updates must not detach bucket tensors"
@@ -3237,6 +3342,8 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(
     assert inner_model.loaded == [[("fc.weight", "first")], second_bucket]
     skip_logged = "does not register 1 inference-only drafter param" in caplog.text
     assert skip_logged is not registers_confidence_head
+    assert f"payload_bytes={(len(second_bucket) + 1) * 4}" in caplog.text
+    assert "receive_s=" in caplog.text and "callback_submit_s=" in caplog.text
     assert inner_model.rebuilds == 1
     assert extension._speco_draft_runtime_revision == 1
     assert cache_events == ["rebuild", "synchronize", "empty_cache"]
@@ -3458,3 +3565,169 @@ def test_vllm_draft_loader_rejects_partial_online_update() -> None:
             {"layers.0.self_attn.qkv_proj.weight"},
             draft_method="dspark",
         )
+
+
+@pytest.mark.parametrize("serialized", [False, True])
+def test_ipc_cpu_handle_does_not_remap_cuda_device_slot(serialized):
+    torch = pytest.importorskip("torch")
+    from torch.multiprocessing.reductions import reduce_tensor
+
+    source = torch.arange(12).reshape(3, 4)
+    func, args = reduce_tensor(source)
+    assert len(args) == 3
+    rebuilt = vllm_runtime._speco_rebuild_ipc_compat(
+        ("rebuild_tensor" if serialized else func, args), 2
+    )
+    assert rebuilt.device.type == "cpu"
+    torch.testing.assert_close(rebuilt, source, rtol=0, atol=0)
+
+
+def test_ipc_cuda_handle_only_remaps_storage_device(monkeypatch):
+    pytest.importorskip("torch")
+    from torch.multiprocessing import reductions
+
+    def rebuild(*args):
+        return args
+
+    monkeypatch.setattr(reductions, "rebuild_cuda_tensor", rebuild)
+    args = tuple(range(15))
+    result = vllm_runtime._speco_rebuild_ipc_compat(("rebuild_cuda_tensor", args), 2)
+    assert result == args[:6] + (2,) + args[7:]
+    assert args == tuple(range(15))
+    with pytest.raises(ValueError, match="CUDA IPC"):
+        vllm_runtime._speco_rebuild_ipc_compat((rebuild, (1, 2, 3)), 2)
+
+
+@pytest.mark.parametrize("serialized", [False, True])
+@pytest.mark.parametrize("device_id", [None, 0, 2])
+def test_ipc_npu_handle_remaps_only_receiver_device(monkeypatch, serialized, device_id):
+    import sys
+    from types import ModuleType
+
+    pytest.importorskip("torch")
+
+    def rebuild_npu_tensor(*args):
+        return args
+
+    rebuild_npu_tensor.__module__ = "torch_npu.multiprocessing.reductions"
+    module = ModuleType("torch_npu.multiprocessing.reductions")
+    module.rebuild_npu_tensor = rebuild_npu_tensor
+    package = ModuleType("torch_npu.multiprocessing")
+    package.reductions = module
+    monkeypatch.setitem(sys.modules, "torch_npu.multiprocessing", package)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    func = module.__name__ + ".rebuild_npu_tensor" if serialized else rebuild_npu_tensor
+    args = tuple(range(15))
+    result = vllm_runtime._speco_rebuild_ipc_compat((func, args), device_id)
+    expected = args if device_id is None else args[:6] + (device_id,) + args[7:]
+    assert result == expected
+    assert args == tuple(range(15))
+    if device_id is not None:
+        with pytest.raises(ValueError, match="NPU IPC"):
+            vllm_runtime._speco_rebuild_ipc_compat((func, (1, 2, 3)), device_id)
+
+
+def test_reinstall_bridge_refreshes_config_after_early_install(monkeypatch):
+    class Server:
+        async def launch_server(self):
+            pass
+
+        async def run_server(self, args):
+            pass
+
+        async def generate(self):
+            pass
+
+    upstream = types.ModuleType("verl.workers.rollout.vllm_rollout.vllm_async_server")
+    upstream.vLLMHttpServer = Server
+    upstream.vLLMReplica = type("Replica", (), {})
+    modules = {
+        "ray": types.ModuleType("ray"),
+        "verl": types.ModuleType("verl"),
+        "verl.workers": types.ModuleType("verl.workers"),
+        "verl.workers.rollout": types.ModuleType("verl.workers.rollout"),
+        "verl.workers.rollout.replica": types.ModuleType("verl.workers.rollout.replica"),
+        "verl.workers.rollout.vllm_rollout": types.ModuleType("verl.workers.rollout.vllm_rollout"),
+        upstream.__name__: upstream,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+        if "." in name and name.rsplit(".", 1)[0] in modules:
+            setattr(modules[name.rsplit(".", 1)[0]], name.rsplit(".", 1)[1], module)
+    monkeypatch.setattr(vllm_runtime, "install_vllm_runtime_observability", lambda: None)
+    monkeypatch.setattr(vllm_runtime, "patch_vllm_server_adapter_update", lambda: None)
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    assert vllm_runtime.install_upstream_vllm_runtime_bridge()
+    server = upstream.vLLMHttpServer
+    assert server._speco_drafter_config_env is None
+    payload = json.dumps(_drafter(training={"drafter_opd": {"enable": True, "method": "draft_opd"}}))
+    monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, payload)
+    assert vllm_runtime.install_upstream_vllm_runtime_bridge()
+    assert upstream.vLLMHttpServer is server
+    assert server._speco_drafter_config_env == payload
+
+
+
+def test_http_bridge_survives_cloudpickle_fresh_import(tmp_path, monkeypatch):
+    import importlib.util
+    import os
+    import subprocess
+    cloudpickle = pytest.importorskip("cloudpickle")
+    module_name = "speco_fresh_http_probe"
+    source = tmp_path / (module_name + ".py")
+    source.write_text('class Upstream:\n    async def generate(self): return "native"\n    async def launch_server(self): return "native-launch"\n    async def run_server(self, args): return None\n', encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(module_name, source)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    spec.loader.exec_module(module)
+    native = module.Upstream.generate
+
+    async def patched(self):
+        return "bridge:" + await native(self)
+
+    module.Upstream.generate = patched
+    module.Upstream._speco_vllm_http_methods_patched = True
+    cls = vllm_runtime._build_speco_vllm_http_server_class(SimpleNamespace(vLLMHttpServer=module.Upstream))
+    payload = tmp_path / "server.pickle"
+    payload.write_bytes(cloudpickle.dumps(cls))
+    code = ('import asyncio,cloudpickle,sys; import speco_fresh_http_probe as m; '
+            'c=cloudpickle.loads(open(sys.argv[1],"rb").read()); '
+            'print(asyncio.run(m.Upstream().generate())); print(asyncio.run(c().generate()))')
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), str(Path(__file__).resolve().parents[2]), os.environ.get("PYTHONPATH", "")])}
+    result = subprocess.run([sys.executable, "-c", code, str(payload)], env=env, capture_output=True, text=True, check=True)
+    assert result.stdout.strip().splitlines()[-2:] == ["native", "bridge:native"]
+
+
+@pytest.mark.parametrize("snapshot_fails", [False, True])
+def test_performance_snapshot_runs_once_and_cannot_fail_generation(
+    monkeypatch, snapshot_fails
+):
+    from verl_speco.integration import rollout_performance as perf
+    from verl_speco.integration import generation_diagnostics as diagnostics
+
+    monkeypatch.setenv("VERL_SPECO_DIAGNOSTIC_ROLLOUT_PERF", "true")
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: _drafter())
+    monkeypatch.setattr(perf, "safe_runtime_snapshot", lambda *args: {})
+    monkeypatch.setattr(diagnostics, "emit_summary", lambda *args, **kwargs: None)
+    calls = []
+
+    class Upstream:
+        async def generate(self, request_id):
+            return SimpleNamespace(extra_fields={}, request_id=request_id)
+
+    class Server(_SpecoVLLMHttpServerMixin, Upstream):
+        async def collective_rpc(self, method):
+            calls.append(method)
+            await asyncio.sleep(0)
+            if snapshot_fails:
+                raise RuntimeError("diagnostic unavailable")
+            return [{"kv_cache_config": {"num_blocks": 10}}]
+
+    async def run():
+        server = Server()
+        outputs = await asyncio.gather(server.generate("a"), server.generate("b"))
+        assert [result.request_id for result in outputs] == ["a", "b"]
+        await server.generate("c")
+
+    asyncio.run(run())
+    assert calls == ["speco_performance_snapshot"]

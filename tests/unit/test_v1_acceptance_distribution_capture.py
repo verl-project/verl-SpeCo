@@ -103,6 +103,25 @@ def test_no_requests_does_not_mark_step_written(tmp_path, monkeypatch):
 def test_v1_oldlogprob_entrypoint_calls_capture():
     path = Path(__file__).resolve().parents[2] / "verl_speco/trainer/v1/speco_mixin.py"
     tree = ast.parse(path.read_text())
-    method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_compute_old_log_prob")
-    assert isinstance(method.body[0], ast.Expr)
-    assert method.body[0].value.func.attr == "_speco_v1_log_request_accept_len_distribution"
+    method = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_compute_old_log_prob"
+    )
+    branch = next(
+        node for node in method.body if isinstance(node, ast.If)
+    )
+    assert branch.test.func.attr == "_speco_rollout_idle_worker_enabled"
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_speco_log_request_accept_len_variance_from_batch"
+        for statement in branch.body
+        for node in ast.walk(statement)
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_speco_v1_log_request_accept_len_distribution"
+        for statement in branch.orelse
+        for node in ast.walk(statement)
+    )

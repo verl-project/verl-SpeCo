@@ -52,14 +52,19 @@ def prepare_standalone_cpu_batch(
     )
     read_deadline = time.monotonic() + read_timeout
     algorithm = feature_contract.algorithm.upper()
-    if algorithm not in {"DSPARK", "DFLASH", "EAGLE3"} or feature_contract.use_logits:
+    if algorithm not in {"DSPARK", "DSV4_DSPARK", "DFLASH", "EAGLE3"} or (
+        feature_contract.use_logits
+    ):
         raise ValueError(
-            "Reference prefetch supports DSPARK/DFLASH/EAGLE3 hidden supervision only"
+            "Reference prefetch supports DSPARK/DSV4_DSPARK/DFLASH/EAGLE3 hidden "
+            "supervision only"
         )
     if not feature_contract.require_full_alignment:
         raise ValueError("Reference prefetch requires full feature alignment")
     valid_layouts = {
         "DSPARK": {"dflash_aux", "dflash_aux_plus_last"},
+        # DSV4-Flash DSpark shares the DSpark block-drafter context layouts.
+        "DSV4_DSPARK": {"dflash_aux", "dflash_aux_plus_last"},
         "DFLASH": {"dflash_aux", "dflash_aux_plus_last"},
         "EAGLE3": {"eagle3_aux_plus_last"},
     }
@@ -134,7 +139,11 @@ def _prepare_chunk(
 ):
     """One scheduler-assigned sample; workers perform CPU work only."""
     reference = (
-        tag["handle"] if tag["backend"] == "mooncake" else tag["hidden_states_path"]
+        # The Mooncake store consumes the full transfer manifest the producer
+        # recorded; the bare handle lacks the tensor layout get_sample needs.
+        tag["transfer_params"]
+        if tag["backend"] == "mooncake"
+        else tag["hidden_states_path"]
     )
     if store.backend == "mooncake":
         remaining = read_deadline - time.monotonic()

@@ -1,8 +1,11 @@
 from types import SimpleNamespace as NS
 
 import pytest
-from verl.trainer.ppo.v1 import replay_buffer as rb_module
 from verl_speco.trainer.v1.speco_mixin import SpecoV1Mixin
+
+rb_module = pytest.importorskip(
+    "verl.trainer.ppo.v1.replay_buffer", exc_type=ImportError
+)
 
 
 class Upstream:
@@ -21,6 +24,8 @@ class Harness(SpecoV1Mixin, Upstream):
 
 
 def actual_buffer(monkeypatch, metadata, *, refill=None, threshold=8):
+    if not hasattr(rb_module.ReplayBufferAsync, "get_sampleable_count"):
+        pytest.skip("requires the uni-agent ReplayBufferAsync inventory API")
     monkeypatch.setattr(rb_module.tq, 'kv_list', lambda: metadata)
     def clear(*, partition_id, keys):
         for key in keys:
@@ -98,8 +103,10 @@ def test_consumed_prompt_is_not_counted_again(monkeypatch):
     assert trainer.prefetch_calls == 1
 
 
-@pytest.mark.parametrize('mode,step', [('sync', 5), ('separate_async', 5), ('colocate_async', 4)])
-def test_other_modes_and_nonfinal_steps_keep_upstream_behavior(mode, step):
+@pytest.mark.parametrize('mode,step', [
+    ('sync', 5), ('separate_async', 5), ('colocate_async', 4), ('colocate_async', 5),
+])
+def test_replay_without_inventory_keeps_upstream_behavior(mode, step):
     trainer = Harness(None, mode=mode, step=step)
     assert trainer.prepare_step() == {'prefetched': 1}
 

@@ -78,3 +78,20 @@ def test_verl_without_the_helper_is_a_no_op(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "verl.utils.device", None)
     with _ipc_safe_allocator(True):
         pass
+
+
+def test_publish_bucket_plan_bounds_storage_without_consuming_iterator():
+    from types import SimpleNamespace
+
+    from verl_speco.integration.vllm_runtime import _draft_publish_bucket_plan
+
+    def tensor(size):
+        return SimpleNamespace(numel=lambda: size, element_size=lambda: 2)
+
+    weights = {"a": tensor(700000), "b": tensor(200000)}
+    assert _draft_publish_bucket_plan(weights, 128) == (2, 1800000, 2)
+    assert _draft_publish_bucket_plan(weights, 1) == (1, 1800000, 2)
+    stream = iter(weights.items())
+    assert _draft_publish_bucket_plan(stream, 128) == (128, -1, -1)
+    assert list(stream) == list(weights.items())
+    assert _draft_publish_bucket_plan({}, 128) == (1, 0, 0)

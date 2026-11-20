@@ -13,6 +13,13 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from verl_speco.trainer.data_buffer import DataBuffer  # noqa: E402
+from verl_speco.trainer.scheduler import (  # noqa: E402
+    CallbackDrafterCollectionExecutor,
+    CollectionPayload,
+    CollectionPlan,
+    DrafterCollectionSource,
+    DrafterScheduler,
+)
 from verl_speco.workers import speco_worker  # noqa: E402
 from verl_speco.workers.speco_worker import SpecoWorker  # noqa: E402
 
@@ -74,6 +81,88 @@ def test_collection_rollback_restores_dedup_index_and_allows_retry() -> None:
     assert list(buffer.buffer) == [original]
     assert not buffer.add_batch(dict(original))
     assert buffer.add_batch(dict(new_sample))
+
+
+@pytest.mark.parametrize("teacher_key", ["teacher_ids", "teacher_logprobs"])
+def test_mixed_student_teacher_collection_rolls_back_partial_commit(
+    monkeypatch, caplog, teacher_key
+) -> None:
+    worker = _worker()
+    worker.enable_drafter = True
+    worker.in_drafter_train_group = True
+    worker.last_global_step = 4
+    stored = []
+    events = []
+
+    def store(**kwargs):
+        sample = kwargs["batch"]
+        stored.append(sample)
+        worker.trainer.collected_data.append(sample)
+        worker.trainer.data_buffer.add_batch(sample)
+        worker.trainer.buffer_version += 1
+        return True
+
+    monkeypatch.setattr(worker, "_store_rollout_sample", store)
+    student = {
+        "input_ids": torch.tensor([[1, 2]]),
+        "prompts": torch.tensor([[1]]),
+        "responses": torch.tensor([[2]]),
+        "hidden_states": torch.ones(1, 2, 4),
+        "_speco_global_sample_id": "student-sample",
+    }
+    teacher = {**student, teacher_key: torch.ones(1)}
+    payload = CollectionPayload(
+        source=DrafterCollectionSource.OLD_LOGPROB,
+        buckets=[[student, teacher]],
+        collected_samples=2,
+        raw_samples=2,
+        collection_id="mixed-collection",
+    )
+    plan = CollectionPlan(
+        collect=True,
+        reason="collection_enabled",
+        source=DrafterCollectionSource.OLD_LOGPROB,
+        source_global_step=4,
+        collect_interval_matched=True,
+        training_interval_matched=True,
+        sample_rate=1.0,
+        max_samples_per_replica=2,
+        max_tokens_per_replica=None,
+        hidden_window_mode="front",
+        hidden_window_tokens_per_sample=512,
+        hidden_window_min_rows=512,
+        collection_id=payload.collection_id,
+    )
+
+    def rollback(buckets):
+        events.append("rollback")
+        return [worker.rollback_rollout_features(buckets[0])]
+
+    executor = CallbackDrafterCollectionExecutor(
+        set_step=lambda step: None,
+        stage_submit=lambda buckets: [worker.stage_rollout_features(buckets[0])],
+        commit_submit=lambda buckets: [
+            asyncio.run(worker.commit_rollout_features(buckets[0]))
+        ],
+        abort_submit=lambda buckets: pytest.fail("Unexpected abort"),
+        rollback_submit=rollback,
+        finalize_submit=lambda buckets: pytest.fail("Failed collection finalized"),
+        resolve=lambda value: value,
+    )
+    with pytest.raises(ValueError, match="forbidden Teacher tensors: " + teacher_key):
+        DrafterScheduler(collection_executor=executor).execute_collection_plan(
+            plan, payload=payload
+        )
+
+    assert len(stored) == 1  # Failure occurred after the valid sample was stored.
+    assert events == ["rollback"]
+    assert list(worker.trainer.collected_data) == [{"value": "before"}]
+    assert list(worker.trainer.data_buffer.buffer) == [{"value": "before"}]
+    assert worker.trainer.buffer_version == 3
+    assert worker._collection_commit_journals == {}
+    assert worker._staged_rollout_features == {}
+    assert worker.trainer.data_buffer.add_batch(stored[0])  # Retry is not deduplicated.
+    assert "SpecoCollectionReceive" not in caplog.text
 
 
 def test_expired_collection_stages_are_removed() -> None:

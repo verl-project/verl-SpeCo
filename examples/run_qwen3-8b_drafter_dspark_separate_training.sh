@@ -31,9 +31,10 @@ TRAIN_LOGGERS=${TRAIN_LOGGERS:-'["console","swanlab"]'}
 
 draft_train_gpus_per_node=${TRAIN_GPUS:-2}
 
+DATA_SOURCE=${DATA_SOURCE:-online} # online | saved_hidden
 MODEL_PATH=${MODEL_PATH:-/path/to/Qwen3-8B}
-# Ordinary verl prompt Parquet is supported; target vLLM generates responses.
-TRAIN_FILE=${TRAIN_FILE:-/path/to/train_file.parquet}
+# online: JSONL/Parquet input; saved_hidden: directory containing metadata.json and manifest.jsonl.
+TRAIN_FILE=${TRAIN_FILE:-/path/to/train_file.jsonl}
 # Optional. Leave empty to initialize DSpark from the target-model/config
 # fallback; set it only when loading or resuming an existing drafter.
 DRAFTER_PATH=${DRAFTER_PATH:-}
@@ -50,8 +51,8 @@ export SPECO_STANDALONE_LOG_LEVEL=${SPECO_STANDALONE_LOG_LEVEL:-INFO}
 # process-wide request limit; PER_ENDPOINT_CONCURRENCY applies independently to
 # every URL in SPECO_VLLM_ENDPOINTS.
 VLLM_REQUEST_TIMEOUT=${VLLM_REQUEST_TIMEOUT:-120}
-VLLM_MAX_INFLIGHT_REQUESTS=${VLLM_MAX_INFLIGHT_REQUESTS:-16}
-VLLM_PER_ENDPOINT_CONCURRENCY=${VLLM_PER_ENDPOINT_CONCURRENCY:-4}
+VLLM_MAX_INFLIGHT_REQUESTS=${VLLM_MAX_INFLIGHT_REQUESTS:-64}
+VLLM_PER_ENDPOINT_CONCURRENCY=${VLLM_PER_ENDPOINT_CONCURRENCY:-32}
 VLLM_SUCCESS_LOG_INTERVAL=${VLLM_SUCCESS_LOG_INTERVAL:-100}
 PRODUCER_INPUT_QUEUE_SIZE=${PRODUCER_INPUT_QUEUE_SIZE:-32}
 PRODUCER_PUBLISH_QUEUE_SIZE=${PRODUCER_PUBLISH_QUEUE_SIZE:-16}
@@ -61,8 +62,8 @@ PRODUCER_PUBLISH_RETRY_BACKOFF_SECONDS=${PRODUCER_PUBLISH_RETRY_BACKOFF_SECONDS:
 PRODUCER_MAX_PENDING_SAMPLES=${PRODUCER_MAX_PENDING_SAMPLES:-1024}
 PRODUCER_PENDING_POLL_INTERVAL=${PRODUCER_PENDING_POLL_INTERVAL:-0.5}
 PRODUCER_MAX_SEQUENCE_LENGTH=${PRODUCER_MAX_SEQUENCE_LENGTH:-8192}
-PRODUCER_MAX_FEATURE_LENGTH=${PRODUCER_MAX_FEATURE_LENGTH:-512}
-PRODUCER_GENERATION_MAX_TOKENS=${PRODUCER_GENERATION_MAX_TOKENS:-512}
+PRODUCER_MAX_FEATURE_LENGTH=${PRODUCER_MAX_FEATURE_LENGTH:-0}
+PRODUCER_GENERATION_MAX_TOKENS=${PRODUCER_GENERATION_MAX_TOKENS:-8192}
 # Per-epoch input shuffle (speculators rng.permutation(seed, epoch) recipe).
 # JSONL inputs shuffle through a byte-offset index; Parquet inputs have no
 # bounded shuffled reader and the producer rejects shuffle=true for them, so
@@ -82,27 +83,27 @@ SCHEDULER_LOW_WATERMARK_SAMPLES=${SCHEDULER_LOW_WATERMARK_SAMPLES:-$((PRODUCER_M
 SCHEDULER_HIGH_WATERMARK_SAMPLES=${SCHEDULER_HIGH_WATERMARK_SAMPLES:-${PRODUCER_MAX_PENDING_SAMPLES}}
 
 # Standalone trainer.
-MAX_STEPS=${MAX_STEPS:-10}
-SAVE_INTERVAL_STEPS=${SAVE_INTERVAL_STEPS:-5}
+MAX_STEPS=${MAX_STEPS:-10000}
+SAVE_INTERVAL_STEPS=${SAVE_INTERVAL_STEPS:-2000}
 SAVE_FINAL_CHECKPOINT=${SAVE_FINAL_CHECKPOINT:-true}
-BATCH_SIZE_PER_GPU=${BATCH_SIZE_PER_GPU:-2}
-LEARNING_RATE=${LEARNING_RATE:-1e-6}
-LR_WARMUP_STEPS=${LR_WARMUP_STEPS:-0}
-LR_SCHEDULER_TYPE=${LR_SCHEDULER_TYPE:-constant}
-LR_DECAY_STEPS=${LR_DECAY_STEPS:-100}
+BATCH_SIZE_PER_GPU=${BATCH_SIZE_PER_GPU:-4}
+LEARNING_RATE=${LEARNING_RATE:-6e-4}
+LR_WARMUP_STEPS=${LR_WARMUP_STEPS:-100}
+LR_SCHEDULER_TYPE=${LR_SCHEDULER_TYPE:-global_cosine}
+LR_DECAY_STEPS=${LR_DECAY_STEPS:-10000}
 MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
-PARAM_OFFLOAD=${PARAM_OFFLOAD:-true}
-OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-true}
+PARAM_OFFLOAD=${PARAM_OFFLOAD:-false}
+OPTIMIZER_OFFLOAD=${OPTIMIZER_OFFLOAD:-false}
 
 # DSpark architecture, sampling and losses. These are vLLM hidden-state output
 # IDs; the launcher converts them to zero-based DSpark decoder-layer IDs.
-DSPARK_BLOCK_SIZE=${DSPARK_BLOCK_SIZE:-7}
-DSPARK_NUM_ANCHORS=${DSPARK_NUM_ANCHORS:-32}
+DSPARK_BLOCK_SIZE=${DSPARK_BLOCK_SIZE:-8}
+DSPARK_NUM_ANCHORS=${DSPARK_NUM_ANCHORS:-512}
 # Optional trainer-side crop. Zero keeps the full feature sequence.
 DSPARK_MAX_WINDOW=${DSPARK_MAX_WINDOW:-0}
 DSPARK_LOSS_MODE=${DSPARK_LOSS_MODE:-full_vocab}
 DSPARK_SAMPLED_CE_NEGATIVES=${DSPARK_SAMPLED_CE_NEGATIVES:-0}
-DSPARK_LOSS_DECAY_GAMMA=${DSPARK_LOSS_DECAY_GAMMA:-7}
+DSPARK_LOSS_DECAY_GAMMA=${DSPARK_LOSS_DECAY_GAMMA:-4}
 DSPARK_NUM_TARGET_LAYERS=${DSPARK_NUM_TARGET_LAYERS:-5}
 DSPARK_NUM_HIDDEN_LAYERS=${DSPARK_NUM_HIDDEN_LAYERS:-5}
 VLLM_AUX_HIDDEN_STATE_LAYER_IDS=${VLLM_AUX_HIDDEN_STATE_LAYER_IDS:-'[1,9,17,25,33]'}
@@ -130,11 +131,13 @@ export SPECO_VLLM_ENDPOINTS
 # Fail before entering the unified launcher when the separately managed vLLM
 # is absent. Otherwise a localhost endpoint would make the launcher start its
 # fallback vLLM inside the training process and on the training devices.
-if ! "${PYTHON_BIN}" tools/wait_for_vllm_endpoints.py \
-    --endpoints "${SPECO_VLLM_ENDPOINTS}" \
-    --timeout-seconds "${VLLM_READY_TIMEOUT_SECONDS}"; then
-    echo "Start tools/run_qwen3-8b_drafter_hidden_state_vllm.sh first" >&2
-    exit 1
+if [[ "${DATA_SOURCE}" == "online" ]]; then
+    if ! "${PYTHON_BIN}" tools/wait_for_vllm_endpoints.py \
+        --endpoints "${SPECO_VLLM_ENDPOINTS}" \
+        --timeout-seconds "${VLLM_READY_TIMEOUT_SECONDS}"; then
+        echo "Start tools/run_qwen3-8b_drafter_hidden_state_vllm.sh first" >&2
+        exit 1
+    fi
 fi
 
 PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher \
@@ -142,6 +145,7 @@ PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher
     speco.draft_training.num_gpus_per_node=${draft_train_gpus_per_node} \
     speco.draft_training.nnodes=1 \
     speco.draft_training.standalone=True \
+    speco.draft_training.data_source=${DATA_SOURCE} \
     speco.draft_training.scheduler.low_watermark_samples=${SCHEDULER_LOW_WATERMARK_SAMPLES} \
     speco.draft_training.scheduler.high_watermark_samples=${SCHEDULER_HIGH_WATERMARK_SAMPLES} \
     data.train_files=${TRAIN_FILE} \
@@ -156,10 +160,15 @@ PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher
     actor_rollout_ref.rollout.drafter.checkpoint_path=${DRAFT_CKPTS_DIR} \
     actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK \
     actor_rollout_ref.rollout.drafter.training.mode=offline \
+    actor_rollout_ref.rollout.drafter.training.strategy=ddp \
     actor_rollout_ref.rollout.drafter.training.max_steps=${MAX_STEPS} \
     actor_rollout_ref.rollout.drafter.training.save_interval_steps=${SAVE_INTERVAL_STEPS} \
     actor_rollout_ref.rollout.drafter.training.save_final_checkpoint=${SAVE_FINAL_CHECKPOINT} \
     actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu=${BATCH_SIZE_PER_GPU} \
+    actor_rollout_ref.rollout.drafter.training.packing.enable=true \
+    actor_rollout_ref.rollout.drafter.training.transfer_queue.consumer_batch_workers=12 \
+    actor_rollout_ref.rollout.drafter.training.transfer_queue.consumer_prefetch_batches=12 \
+    'actor_rollout_ref.rollout.drafter.training.adamw_betas=[0.9,0.999]' \
     actor_rollout_ref.rollout.drafter.training.lr=${LEARNING_RATE} \
     actor_rollout_ref.rollout.drafter.training.lr_warmup_steps=${LR_WARMUP_STEPS} \
     actor_rollout_ref.rollout.drafter.training.lr_scheduler_type=${LR_SCHEDULER_TYPE} \
@@ -182,6 +191,7 @@ PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher
     actor_rollout_ref.rollout.drafter.training.dspark_distribution_loss_impl=${DSPARK_DISTRIBUTION_LOSS_IMPL} \
     actor_rollout_ref.rollout.drafter.training.dspark_l1_chunk_size=${DSPARK_L1_CHUNK_SIZE} \
     actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha=${DSPARK_CONFIDENCE_HEAD_ALPHA} \
+    actor_rollout_ref.rollout.drafter.training.dspark_confidence_target_mode=probabilistic \
     actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_with_markov=${DSPARK_CONFIDENCE_HEAD_WITH_MARKOV} \
     actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=${DSPARK_CONFIDENCE_LOSS_ALPHA} \
     actor_rollout_ref.rollout.drafter.training.dspark_debug_log=${DSPARK_DEBUG_LOG} \

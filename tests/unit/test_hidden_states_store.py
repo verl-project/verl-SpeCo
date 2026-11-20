@@ -29,11 +29,19 @@ from verl_speco.producer.hidden_states_store import (
 
 
 class _FakeMooncake:
+    """Mirrors the hs_connectors MooncakeHiddenStatesStore contract.
+
+    ``get_sample`` takes the full transfer manifest (the packed tensor layout
+    it decodes with), ``delete_sample`` takes the bare handle string.
+    """
+
     def __init__(self, payload):
         self.payload = payload
+        self.loaded: list[dict] = []
         self.deleted: list[str] = []
 
-    def get_sample(self, key, *, timeout=120.0):
+    def get_sample(self, transfer_manifest, *, timeout=120.0):
+        self.loaded.append(transfer_manifest)
         return self.payload
 
     def delete_sample(self, key):
@@ -69,13 +77,30 @@ def test_mooncake_store_load_and_release_round_trip() -> None:
         }
     )
     store._store = fake
+    manifest = {
+        "handle": "key-1",
+        "version": 1,
+        "tensors": {},
+        "metadata": {"total_aligned_bytes": 20},
+    }
 
-    payload, byte_size = store.load("key-1")
+    payload, byte_size = store.load(manifest)
 
     assert set(payload) == {"hidden_states", "token_ids"}
     assert byte_size == 2 * 3 * 2 + 2 * 8
+    # The manifest reaches the store unchanged; release uses the bare handle.
+    assert fake.loaded == [manifest]
     store.release("key-1")
     assert fake.deleted == ["key-1"]
+
+
+def test_mooncake_store_load_rejects_bare_handle() -> None:
+    # A bare handle cannot be decoded (no tensor layout), so refuse it loudly
+    # instead of failing deep inside the store with an AttributeError.
+    store = MooncakeHiddenStatesStore(MooncakeStoreSettings())
+    store._store = _FakeMooncake({})
+    with pytest.raises(TypeError, match="full transfer manifest"):
+        store.load("key-1")
 
 
 def test_mooncake_store_release_propagates_deletion_failure() -> None:
@@ -181,3 +206,79 @@ def test_release_initializes_store_for_unread_reference(monkeypatch):
     monkeypatch.setattr(store, "_ensure_store", lambda: fake)
     store.release("never-read")
     assert fake.deleted == ["never-read"]
+
+
+def test_connector_publish_passes_transfer_manifest(monkeypatch) -> None:
+    """The publish path must hand the store the transfer manifest, not the key.
+
+    ``put_sample`` reads the packed tensor layout from the manifest; passing
+    the bare ``mooncake_key`` string (as an earlier revision did) fails against
+    the real hs_connectors store.
+    """
+    pytest.importorskip(
+        "hs_connectors", reason="optional vLLM hidden-state connector is not installed"
+    )
+    import contextlib
+    from types import SimpleNamespace
+
+    import verl_speco.mooncake_hidden_states_connector as connector_module
+    from verl_speco.mooncake_hidden_states_connector import (
+        SpecoMooncakeHiddenStatesConnector,
+    )
+
+    class _Stream:
+        def wait_event(self, event):
+            pass
+
+        def synchronize(self):
+            pass
+
+    class _Device:
+        def Stream(self):
+            return _Stream()
+
+        def stream(self, stream):
+            return contextlib.nullcontext()
+
+    connector = object.__new__(SpecoMooncakeHiddenStatesConnector)
+    connector._kv_cache = torch.zeros(8, 4)
+    connector._copy_stream = _Stream()
+    connector._block_size = 4
+    connector._store = _RecordingPublishStore()
+    manifest = {
+        "handle": "key-1",
+        "version": 1,
+        "tensors": {},
+        "metadata": {"total_aligned_bytes": 12},
+    }
+    pending = SimpleNamespace(
+        block_ids=[0],
+        token_ids=torch.tensor([1, 2]),
+        req_id="req-1",
+        mooncake_key="key-1",
+        transfer_manifest=manifest,
+    )
+
+    hidden = torch.zeros(2, 3, dtype=torch.float16)
+    monkeypatch.setattr(
+        connector_module._upstream_hs, "extract_from_kv_cache", lambda *a, **k: hidden
+    )
+    monkeypatch.setattr(connector_module._upstream_hs, "assert_finite", lambda *a: None)
+    monkeypatch.setattr(connector_module, "get_torch_device", lambda: _Device())
+
+    connector._publish_sample(pending, object())
+
+    assert connector._store.puts[0][0] is manifest
+    assert connector._store.errors == []
+
+
+class _RecordingPublishStore:
+    def __init__(self):
+        self.puts: list[tuple[dict, dict]] = []
+        self.errors: list[tuple[dict, str]] = []
+
+    def put_sample(self, transfer_manifest, tensors):
+        self.puts.append((transfer_manifest, tensors))
+
+    def put_error(self, transfer_manifest, error):
+        self.errors.append((transfer_manifest, error))
