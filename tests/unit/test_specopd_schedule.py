@@ -3,7 +3,12 @@ from types import SimpleNamespace
 from verl_speco.integration.specopd_driver import SpecOPDDriver
 
 
-def test_five_step_twenty_update_schedule_with_one_publication():
+def test_five_step_twenty_update_schedule_with_one_publication(monkeypatch):
+    from verl_speco.integration import specopd_training_transport
+
+    monkeypatch.setattr(specopd_training_transport, "dispatch_prepared_group",
+        lambda trainer, samples, step, revision, indices, metrics, spec:
+        trainer._require_speco_worker_group().train_specopd_group(samples, step, revision, indices))
     events = []
     training = dict(step=20, collect_interval_steps=5, training_interval_steps=5,
                     dspark_block_size=7, drafter_opd=dict(enable=True, method="spec_opd"))
@@ -11,7 +16,7 @@ def test_five_step_twenty_update_schedule_with_one_publication():
         actor=dict(strategy="fsdp2", ulysses_sequence_parallel_size=4),
         model=dict(use_remove_padding=True), rollout=dict(name="vllm", temperature=1.0,
             drafter=dict(enable=True, enable_drafter_training=True, speculative_algorithm="DSPARK",
-                         vllm=dict(draft_sample_method="probabilistic"), training=training))))
+                         vllm=dict(draft_sample_method="greedy"), training=training))))
     trainer = SimpleNamespace(config=cfg, global_steps=1, actor_revision=0)
     worker = SimpleNamespace(train_specopd_group=lambda samples, step, revision, indices: events.append(("train", step, 20)) or [dict(trained=True, revision=revision+1, optimizer_updates=20)])
     trainer._ray_get_if_needed = lambda x: x

@@ -35,7 +35,7 @@ from verl_speco.integration.specopd_driver import plan_microbatches, unwrap_rank
 from verl_speco.joint_actor import partition_joint_requests
 from verl_speco.joint_scoring import JointScoringRequest, DraftBranch
 from verl_speco.trainer.scheduler.specopd_cycle import SpecOPDCycle
-from verl_speco.backends.specopd_loss import e2e_tv_loss
+from verl_speco.backends.specopd_loss import e2e_tv_loss, specopd_distribution_loss
 
 
 def config():
@@ -50,7 +50,7 @@ def config():
                     "enable": True,
                     "enable_drafter_training": True,
                     "speculative_algorithm": "DFLASH",
-                    "vllm": {"draft_sample_method": "probabilistic"},
+                    "vllm": {"draft_sample_method": "greedy"},
                     "training": {
                         "dflash_block_size": 8,
                         "step": 1,
@@ -71,10 +71,13 @@ def test_configuration_requires_exact_block_and_sampling():
     with pytest.raises(ValueError, match="block size"):
         validate_specopd_config(cfg)
     cfg = config()
-    cfg["actor_rollout_ref"]["rollout"]["drafter"]["vllm"]["draft_sample_method"] = (
-        "greedy"
-    )
-    with pytest.raises(ValueError, match="probabilistic"):
+    for method in ("greedy", "probabilistic"):
+        cfg["actor_rollout_ref"]["rollout"]["drafter"]["vllm"]["draft_sample_method"] = method
+        assert validate_specopd_config(cfg).enable
+    cfg["actor_rollout_ref"]["rollout"]["drafter"]["vllm"] = {}
+    assert validate_specopd_config(cfg).enable  # Framework default is greedy.
+    cfg["actor_rollout_ref"]["rollout"]["drafter"]["vllm"]["draft_sample_method"] = "invalid"
+    with pytest.raises(ValueError, match="draft_sample_method"):
         validate_specopd_config(cfg)
 
 
@@ -85,6 +88,76 @@ def test_config_unknown_and_non_joint_modes_rejected():
         SpecOPDConfig.from_training(
             {"specopd": {"enable": True, "capture_rejected_tail": False}}
         )
+
+
+def test_training_input_cache_budget_accepts_zero_and_preserves_legacy_default():
+    options = {"enable": True}
+    assert SpecOPDConfig.from_training({"specopd": options}).training_input_cache_mib == 64
+    for limit in (0, 320):
+        spec = SpecOPDConfig.from_training({"specopd": {**options, "training_input_cache_mib": limit}})
+        assert spec.training_input_cache_mib == limit
+
+
+def test_specopd_inherits_shared_collection_settings_and_keeps_explicit_overrides():
+    training = {
+        "step": 10,
+        "hidden_state_window_mode": "random",
+        "hidden_state_window_tokens_per_sample": 256,
+        "hidden_state_random_max_offset": 0,
+        "drafter_opd": {"enable": True, "method": "spec_opd", "first_reject_weight": 3.0},
+        "specopd": {"anchor_count": 64, "window_response_tokens": 512},
+    }
+    spec = SpecOPDConfig.from_training(training)
+    assert (spec.window_mode, spec.window_response_tokens, spec.random_max_offset) == (
+        "random", 512, 0
+    )
+    assert spec.first_reject_weight == 3.0 and spec.optimizer_updates_per_collection == 10
+    assert (spec.random_anchor_count, spec.max_branches_per_request) == (16, 48)
+    assert spec.max_proposal_tokens_per_request == 48 * spec.proposal_width
+
+
+def test_specopd_inherits_width_temperature_and_mixed_anchors_from_drafter():
+    cfg = config()
+    rollout = cfg["actor_rollout_ref"]["rollout"]
+    rollout["temperature"] = 0.6
+    drafter = rollout["drafter"]
+    drafter["speculative_algorithm"] = "DSPARK"
+    drafter["rollout"] = {"spec_verify_tokens": 5}
+    training = drafter["training"]
+    training.update(dspark_block_size=5, dspark_num_anchors=64, dspark_loss_decay_gamma=0)
+    training["specopd"]["anchor_count"] = None
+    spec = validate_specopd_config(cfg)
+    assert spec == SpecOPDConfig.from_drafter(drafter, rollout_temperature=0.6)
+    assert spec.proposal_width == 5 and spec.max_proposal_tokens_per_request == 48 * 5
+    assert (spec.actor_temperature, spec.proposal_temperature, spec.target_temperature) == (0.6,) * 3
+    assert (spec.anchor_count, spec.random_anchor_count, spec.random_position_decay_gamma) == (64, 16, 0)
+
+    training["specopd"].update(anchor_count=0, random_position_decay_gamma=3)
+    legacy = validate_specopd_config(cfg)
+    assert legacy.anchor_count == 0 and legacy.max_proposal_tokens_per_request == 8 * 5
+    assert legacy.random_position_decay_gamma == 3
+    training["specopd"]["proposal_temperature"] = 1.0
+    with pytest.raises(ValueError, match="must match rollout.temperature"):
+        validate_specopd_config(cfg)
+
+
+@pytest.mark.parametrize("objective", ["tv", "l1"])
+def test_specopd_distribution_selection_validates_shared_coefficients(objective):
+    cfg = config()
+    drafter = cfg["actor_rollout_ref"]["rollout"]["drafter"]
+    drafter["speculative_algorithm"] = "DSPARK"
+    training = drafter["training"]
+    training["specopd"]["objective"] = objective
+    assert validate_specopd_config(cfg).objective == objective
+    training["dspark_l1_loss_alpha"] = -0.1
+    with pytest.raises(ValueError, match="CE and distribution weights"):
+        validate_specopd_config(cfg)
+
+
+@pytest.mark.parametrize("limit", [-1, True, 1.5, "320", None])
+def test_training_input_cache_budget_rejects_invalid_limits(limit):
+    with pytest.raises(ValueError, match="training_input_cache_mib must be a nonnegative integer"):
+        SpecOPDConfig.from_training({"specopd": {"enable": True, "training_input_cache_mib": limit}})
 
 
 def test_v1_sync_config_requires_one_publication_per_group():
@@ -285,6 +358,16 @@ def test_e2e_tv_hand_computed_loss_and_differentiable_prefixes():
     assert torch.isfinite(q.grad).all() and q.grad.abs().sum() > 0
     assert not p.requires_grad
     assert info["survival"][0, 1] < info["survival"][0, 0]
+
+
+def test_specopd_l1_is_positionwise_on_the_same_histories():
+    q = torch.tensor([[[0.5, 0.5], [0.5, 0.5]]]).log().requires_grad_()
+    p = torch.tensor([[[0.7, 0.3], [0.9, 0.1]]]).log()
+    valid = torch.ones((1, 2), dtype=torch.bool)
+    numerator, count, _ = specopd_distribution_loss(q, p, valid, use_l1=True)
+    torch.testing.assert_close(numerator / count, torch.tensor(0.6))
+    numerator.backward()
+    assert torch.isfinite(q.grad).all() and q.grad.abs().sum() > 0
 
 
 def test_candidate_support_keeps_teacher_mass_outside_support():

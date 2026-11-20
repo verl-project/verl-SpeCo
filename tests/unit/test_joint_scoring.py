@@ -71,6 +71,20 @@ def requests():
     )
 
 
+def test_prefix_feature_export_keeps_complete_normal_response_scores():
+    model = make_model()
+    request = JointScoringRequest("crop", tuple((i % 40) + 1 for i in range(48)), 3,
+                                  (DraftBranch("b", 5, (20, 21)),))
+    full, _ = score_joint_batch(model, (request,), hidden_state_indices=(1, 2))
+    cropped, _ = score_joint_batch(model, (request,), hidden_state_indices=(1, 2),
+                                  trunk_feature_prefix_only=True)
+    assert cropped[0].response_log_probs.numel() == 45
+    torch.testing.assert_close(cropped[0].response_log_probs, full[0].response_log_probs)
+    for layer in (1, 2):
+        assert cropped[0].trunk_features[layer].shape[0] == 6
+        torch.testing.assert_close(cropped[0].trunk_features[layer], full[0].trunk_features[layer][:6])
+
+
 @pytest.mark.parametrize("attention", ["eager", "sdpa"])
 @pytest.mark.parametrize("family", ["qwen2", "qwen3", "llama"])
 def test_real_joint_matches_independent_forwards(attention, family):

@@ -61,13 +61,15 @@ def request():
     return [JointScoringRequest("x", (1, 2, 3, 4), 2, (DraftBranch("b", 2, (5, 6)),))]
 
 
-def test_engine_context_and_original_training_states_restored():
+@pytest.mark.parametrize("return_target_logz", [True, False])
+def test_engine_context_and_original_training_states_restored(return_target_logz):
     actor, events = worker()
-    result, metrics = score_actor_joint(actor, request())
+    result, metrics = score_actor_joint(actor, request(), return_target_logz=return_target_logz)
     assert events == ["enter", "exit"]
     assert actor.actor.engine.module.training
     assert result[0].response_log_probs.shape == (2,)
     assert result[0].branches[0].target_logits.device.type == "cpu"
+    assert (result[0].branches[0].target_logz is not None) == return_target_logz
     assert metrics["model_forward_calls"] == 1
 
 
@@ -164,3 +166,113 @@ def test_invalid_microbatch_schedule_does_not_enter_engine(sizes):
     with pytest.raises(ValueError, match="partition"):
         score_actor_joint(actor, request() + request(), microbatch_sizes=sizes)
     assert not events
+
+
+def test_parallel_schedule_uses_all_dp_groups_for_long_trees():
+    from dataclasses import replace
+    from verl_speco.joint_actor import parallel_microbatch_sizes
+    tree = JointScoringRequest("x", tuple(range(8192)), 128)
+    trees = tuple(replace(tree, sample_id=str(i)) for i in range(320))
+    sizes = parallel_microbatch_sizes(trees, (1,) * 320, 4, 4,
+                                     {"max_packed_tokens": 9216, "max_mask_elements": 9216 ** 2})
+    assert sizes == (4,) * 80
+
+
+def test_parallel_schedule_respects_padded_local_mask_budget():
+    from dataclasses import replace
+    from verl_speco.joint_actor import parallel_microbatch_sizes
+    tree = JointScoringRequest("x", tuple(range(9)), 2)
+    trees = tuple(replace(tree, sample_id=str(i)) for i in range(5))
+    sizes = parallel_microbatch_sizes(trees, (2, 2, 1), 2, 4,
+                                     {"max_packed_tokens": 24, "max_mask_elements": 144})
+    assert sizes == (2, 2, 1)
+
+
+@pytest.mark.parametrize(
+    "fast_path,tree_count,expected_branched,expected_ids",
+    [
+        (False, 8, [True, True, True, True], ["0", "2", "4", "6"]),
+        (True, 8, [False, False, True, True], ["0", "1", "4", "5"]),
+        (True, 6, [False, False, True], ["1", "2", "5"]),
+    ],
+)
+def test_causal_schedule_groups_trunks_and_preserves_result_order(
+    monkeypatch, fast_path, tree_count, expected_branched, expected_ids,
+):
+    from dataclasses import replace
+
+    from verl_speco import joint_actor
+
+    branched = request()[0]
+    trees = tuple(
+        replace(branched, sample_id=str(i), branches=branched.branches if i % 2 == 0 else ())
+        for i in range(tree_count)
+    )
+    actor, _ = worker()
+    engine = actor.actor.engine
+    engine.ulysses_sequence_parallel_size = 2
+    engine.ulysses_parallel_group = object()
+    engine.use_remove_padding = True
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 4 if group is None else 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [0, 1])
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_object",
+        lambda gathered, value: gathered.__setitem__(slice(None), [value] * 4),
+    )
+    monkeypatch.setenv("VERL_SPECO_JOINT_CAUSAL_FAST_PATH", str(int(fast_path)))
+    batches = []
+
+    def score(_, requests, sp_size, group, dummy, nonleader, *, use_causal_fast_path, **options):
+        assert use_causal_fast_path == fast_path
+        assert len(requests) == 1 and not dummy
+        batches.append(bool(requests[0].branches))
+        return requests, {}
+
+    monkeypatch.setattr(joint_actor, "_score_local_joint_batch", score)
+    actual, _ = score_actor_joint(actor, trees, microbatch_sizes=(1,) * tree_count)
+    assert batches == expected_branched
+    assert [tree.sample_id for tree in actual] == expected_ids
+
+
+@pytest.mark.parametrize("bad_late_batch", [False, True])
+def test_schedule_checks_all_ranks_once_before_any_forward(monkeypatch, bad_late_batch):
+    from dataclasses import replace
+
+    actor, events = worker()
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    collectives = []
+
+    def gather(values, value):
+        assert not events
+        collectives.append(value)
+        values[0] = value
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    first = request()[0]
+    final = replace(first, sample_id="final", trunk_ids=(1, 2, 3, 32)) if bad_late_batch else first
+    trees = (first, first, final)
+    if bad_late_batch:
+        with pytest.raises(RuntimeError, match="preflight failed.*model vocabulary"):
+            score_actor_joint(actor, trees, microbatch_sizes=(1, 1, 1))
+        assert not events
+    else:
+        _, metrics = score_actor_joint(actor, trees, microbatch_sizes=(1, 1, 1))
+        assert metrics["model_forward_calls"] == 3
+        assert events == ["enter", "exit"]
+    assert len(collectives) == 2
+
+
+def test_preflight_validation_allocates_no_quadratic_mask(monkeypatch):
+    from verl_speco.joint_scoring import validate_joint_batch
+    def fail(*args, **kwargs):
+        raise AssertionError("preflight allocated a tensor")
+    monkeypatch.setattr(torch, "zeros", fail)
+    monkeypatch.setattr(torch, "eye", fail)
+    monkeypatch.setattr(torch, "ones", fail)
+    lengths, width, _ = validate_joint_batch(request(), dtype=torch.float32, vocab_size=32,
+                                            sequence_multiple=4)
+    assert lengths == [5] and width == 8
