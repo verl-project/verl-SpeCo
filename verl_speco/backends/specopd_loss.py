@@ -11,15 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Differentiable E2E-TV with fixed sampled histories and prefix masks."""
+"""Distribution losses with fixed sampled histories and prefix masks."""
 
-import torch
 import math
 
+import torch
+import torch.nn.functional as F
+
+from verl_speco.backends.opd_distribution import token_total_variation, use_fused_opd_loss
 from verl_speco.backends.opd_math import prefix_survival
+from verl_speco.ops.dspark_fused_loss import (
+    fused_label_cross_entropy,
+    fused_total_variation_and_teacher_ce,
+)
 
 
-def e2e_tv_loss(
+def specopd_distribution_loss(
     draft_logits,
     target_logits,
     valid_mask,
@@ -28,6 +35,12 @@ def e2e_tv_loss(
     target_temperature=1.0,
     candidate_ids=None,
     target_logz=None,
+    position_weights=None,
+    distribution_loss_impl="auto",
+    use_l1=False,
+    distribution_weight=1.0,
+    ce_weight=0.0,
+    ce_logits=None,
 ):
     if (
         draft_logits.shape[:-1] != valid_mask.shape
@@ -44,23 +57,78 @@ def e2e_tv_loss(
         math.isfinite(t) and t > 0 for t in (proposal_temperature, target_temperature)
     ):
         raise ValueError("positive scoring temperatures required")
-    q = (draft_logits.float() / proposal_temperature).softmax(-1)
-    with torch.no_grad():
-        scaled_target = target_logits.detach().float() / target_temperature
-        logz = (
-            scaled_target.logsumexp(-1)
-            if target_logz is None
-            else target_logz.detach().float()
+    joint_ce = (
+        ce_weight > 0
+        and ce_logits is None
+        and candidate_ids is None
+        and target_logz is None
+        and proposal_temperature == target_temperature == 1.0
+        and draft_logits.numel() > 0
+        and use_fused_opd_loss(draft_logits.device, distribution_loss_impl)
+    )
+    ce = None
+    if joint_ce:
+        tv, ce = fused_total_variation_and_teacher_ce(
+            draft_logits.flatten(0, 1), target_logits.flatten(0, 1)
         )
-        if candidate_ids is not None:
-            scaled_target = scaled_target.gather(-1, candidate_ids)
-        p = (scaled_target - logz.unsqueeze(-1)).exp()
-    if q.shape != p.shape:
-        raise ValueError("proposal and target supports differ")
-    alpha = torch.minimum(q, p).sum(-1)
-    alpha = alpha.clamp(max=1.0)
+        tv, ce = tv.reshape_as(valid_mask), ce.reshape_as(valid_mask)
+        alpha = 1.0 - tv
+    elif candidate_ids is None and target_logz is None:
+        tv = token_total_variation(
+            draft_logits, target_logits,
+            proposal_temperature=proposal_temperature, target_temperature=target_temperature,
+            implementation=distribution_loss_impl,
+        )
+        alpha = 1.0 - tv
+    else:
+        q = (draft_logits.float() / proposal_temperature).softmax(-1)
+        with torch.no_grad():
+            scaled_target = target_logits.detach().float() / target_temperature
+            logz = (
+                scaled_target.logsumexp(-1)
+                if target_logz is None
+                else target_logz.detach().float()
+            )
+            if candidate_ids is not None:
+                scaled_target = scaled_target.gather(-1, candidate_ids)
+            p = (scaled_target - logz.unsqueeze(-1)).exp()
+        if q.shape != p.shape:
+            raise ValueError("proposal and target supports differ")
+        alpha = torch.minimum(q, p).sum(-1).clamp(max=1.0)
+        tv = 1.0 - alpha
     alpha = torch.where(valid_mask, alpha, torch.ones_like(alpha))
     survival = prefix_survival(alpha)
-    numerator = ((1.0 - survival) * valid_mask).sum()
-    count = valid_mask.sum()
+    distance = 2.0 * tv if use_l1 else 1.0 - survival
+    numerator, count = reduce_specopd_loss(distance, valid_mask, position_weights)
+    if ce_weight:
+        if ce is None:
+            ce_logits = draft_logits if ce_logits is None else ce_logits
+            logits = ce_logits.flatten(0, 1)
+            labels = target_logits.detach().argmax(-1).flatten()
+            if logits.numel() and use_fused_opd_loss(logits.device, distribution_loss_impl):
+                ce = fused_label_cross_entropy(logits, labels)
+            else:
+                labels = labels.masked_fill(~valid_mask.flatten(), -100)
+                ce = F.cross_entropy(logits, labels, reduction="none")
+            ce = ce.reshape_as(valid_mask)
+        ce_numerator, _ = reduce_specopd_loss(ce, valid_mask, position_weights)
+        numerator = distribution_weight * numerator + ce_weight * ce_numerator
+    elif distribution_weight != 1.0:
+        numerator = distribution_weight * numerator
     return numerator, count, {"overlap": alpha.detach(), "survival": survival.detach()}
+
+
+def e2e_tv_loss(draft_logits, target_logits, valid_mask, **kwargs):
+    return specopd_distribution_loss(draft_logits, target_logits, valid_mask, **kwargs)
+
+
+def reduce_specopd_loss(loss, valid_mask, position_weights):
+    if position_weights is None:
+        return (loss * valid_mask).sum(), valid_mask.sum()
+    if position_weights.shape != valid_mask.shape:
+        raise ValueError("SpecOPD anchor weight dimensions differ")
+    # Match DraftOPDObjective: divide by valid length, then mean over nonempty blocks.
+    counts = valid_mask.sum(-1)
+    blocks = counts > 0
+    weighted = (loss * valid_mask * position_weights).sum(-1)
+    return ((weighted / counts.clamp_min(1)) * blocks).sum(), blocks.sum()

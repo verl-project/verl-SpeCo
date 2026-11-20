@@ -178,6 +178,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 "[dspark-trainer] confidence head is loaded but frozen because confidence loss is disabled"
             )
         if self.opd_objective is not None:
+            self.opd_objective.distribution_loss_impl = self.distribution_loss_impl
             if getattr(self.config, "dspark_bonus_anchor", False):
                 raise ValueError("Draft-OPD does not support DSpark bonus-anchor checkpoints")
             if self.ce_target_source != "labels":
@@ -955,6 +956,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     # than the dataset label. This makes `sim_acc_len` the same
                     # quantity that serving measures.
                     active_targets = ce_targets
+            opd_tv = self.opd_objective is not None and self.opd_objective.loss_type == "e2e_tv"
             if self.loss_mode in {"restricted_ce", "sampled_ce"}:
                 restricted_vocab = self._build_restricted_vocab(
                     input_ids, ce_targets, int(lm_head_weight.shape[0])
@@ -986,9 +988,9 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 if markov_bias is not None:
                     active_logits = active_logits + markov_bias
                 if use_fused_loss:
-                    active_loss = fused_label_cross_entropy(active_logits, ce_targets)
+                    active_loss = fused_label_cross_entropy(active_logits.detach() if opd_tv else active_logits, ce_targets)
                 else:
-                    active_log_probs = F.log_softmax(active_logits.float(), dim=-1)
+                    active_log_probs = F.log_softmax((active_logits.detach() if opd_tv else active_logits).float(), dim=-1)
                     active_loss = F.nll_loss(
                         active_log_probs, ce_targets, reduction="none"
                     )

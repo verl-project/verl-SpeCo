@@ -11,12 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fixed-anchor block proposal forward and E2E-TV, without reference-token CE."""
+"""Fixed-anchor block proposal forward and branch-conditioned distillation."""
 
 import torch
 import torch.nn.functional as F
 
-from verl_speco.backends.specopd_loss import e2e_tv_loss
+from verl_speco.backends.specopd_loss import specopd_distribution_loss
+from verl_speco.specopd_config import specopd_loss_weights
 
 
 def proposal_loss(wrapper, batch, lm_head_weight):
@@ -88,7 +89,8 @@ def proposal_loss(wrapper, batch, lm_head_weight):
             min(selector.top_k, unary.shape[-1]), dim=-1, sorted=False
         )
         supported = (candidate_ids == proposal.unsqueeze(-1)).any(-1)
-        if not supported[valid].all():
+        support_mask = batch.get("sampling_support_mask", valid)
+        if not supported[support_mask].all():
             raise ValueError(
                 "sampled proposal is outside reconstructed DFlash2 candidate support"
             )
@@ -113,20 +115,33 @@ def proposal_loss(wrapper, batch, lm_head_weight):
         teacher = F.linear(
             batch["target_last_hidden_states"].to(head.dtype), head
         ).float()
-    numerator, count, diagnostics = e2e_tv_loss(
+    distribution_weight, ce_weight = batch.get("loss_weights", (1.0, 0.0))
+    # DFlash2 uses full-vocabulary unary scores for labels outside its shortlist.
+    return specopd_distribution_loss(
         logits,
         teacher,
         valid,
         candidate_ids=candidate_ids,
+        position_weights=batch.get("position_weights"),
+        distribution_loss_impl=getattr(wrapper, "distribution_loss_impl", "auto"),
         proposal_temperature=batch["proposal_temperature"],
         target_temperature=batch["target_temperature"],
+        use_l1=batch.get("objective") == "l1",
+        distribution_weight=distribution_weight,
+        ce_weight=ce_weight,
+        ce_logits=unary if candidate_ids is not None else None,
     )
-    return numerator, count, diagnostics
 
 
 def compute_specopd_backend_loss(backend, model, batch):
     if backend.target_lm_head is None:
         raise RuntimeError("SpecOPD target head must be synchronized before training")
+    if batch.get("objective") in {"l1", "tv"}:
+        drafter = backend.config.rollout.drafter
+        batch = {
+            **batch,
+            "loss_weights": specopd_loss_weights(drafter.training, drafter.speculative_algorithm),
+        }
     numerator, count, diagnostics = model(
         input_ids=batch["input_ids"],
         hidden_states_list=[],
@@ -141,7 +156,7 @@ def compute_specopd_backend_loss(backend, model, batch):
         "local_num_tokens": count.to(numerator.dtype),
         "v_weight": 0.0,
         "p_weight": 1.0,
-        "accuracy": diagnostics["overlap"].masked_fill(~batch["proposal_mask"], 0).sum() / count.clamp_min(1),
+        "accuracy": diagnostics["overlap"].masked_fill(~batch["proposal_mask"], 0).sum() / batch["proposal_mask"].sum().clamp_min(1),
         "diagnostics": {},
     }
 
@@ -175,10 +190,31 @@ def build_specopd_training_batch(request, scores, device, config, feature_indice
         i not in scores.trunk_features for i in feature_indices
     ):
         raise ValueError("SpecOPD is missing the drafter's target auxiliary layers")
-    return {
-        "input_ids": torch.tensor([request.trunk_ids], dtype=torch.long, device=device),
+    position_weights = None
+    support_mask = None
+    if config.anchor_count:
+        support_mask = mask.clone()
+        for row, branch in enumerate(request.branches):
+            if branch.source == "trunk":
+                support_mask[row].zero_()
+        position_weights = torch.ones_like(proposal, dtype=torch.float32)
+        for row, branch in enumerate(request.branches):
+            if branch.source == "trunk":
+                if config.random_position_decay_gamma > 0:
+                    position_weights[row] = torch.exp(
+                        -torch.arange(width, device=device).float() / config.random_position_decay_gamma
+                    )
+            elif 0 <= branch.accepted_count < len(branch.token_ids):
+                position_weights[row, branch.accepted_count] = config.first_reject_weight
+            elif branch.accepted_count < 0:
+                raise ValueError("mixed SpecOPD proposal is missing acceptance diagnostics")
+    context_rows = max(b.anchor for b in request.branches) + 1
+    if any(scores.trunk_features[i].shape[0] < context_rows for i in feature_indices):
+        raise ValueError("SpecOPD auxiliary features do not cover the last branch anchor")
+    result = {
+        "input_ids": torch.tensor([request.trunk_ids[:context_rows]], dtype=torch.long, device=device),
         "hidden_states": torch.cat(
-            [scores.trunk_features[i].to(device) for i in feature_indices], -1
+            [scores.trunk_features[i][:context_rows].to(device) for i in feature_indices], -1
         ).unsqueeze(0),
         "anchor_positions": torch.tensor(
             [[b.anchor for b in request.branches]], device=device
@@ -189,16 +225,21 @@ def build_specopd_training_batch(request, scores, device, config, feature_indice
         "proposal_temperature": config.proposal_temperature,
         "proposal_block_width": config.proposal_width,
         "target_temperature": config.target_temperature,
+        "objective": config.objective,
         "specopd": True,
         "_speco_sample_count": len(request.branches),
         "_speco_sample_ids": tuple(b.branch_id for b in request.branches),
         "_specopd_trunk_digest": token_digest(request.trunk_ids),
     }
+    if position_weights is not None:
+        result["position_weights"] = position_weights
+        result["sampling_support_mask"] = support_mask
+    return result
 
 
 def plan_specopd_training_groups(selected, dp_size, max_trajectories, token_budget):
     """Use global slot maxima so every DP/SP rank chooses identical groups."""
-    lengths = [max(len(r.trunk_ids) for r, _ in selected[i:i + dp_size])
+    lengths = [max(max(b.anchor for b in r.branches) + 1 for r, _ in selected[i:i + dp_size])
                for i in range(0, len(selected), dp_size)]
     sizes, current, longest = [], 0, 0
     for length in lengths:
@@ -221,6 +262,8 @@ def merge_specopd_training_batches(batches):
         for key in ("proposal_temperature", "target_temperature", "proposal_block_width"):
             if batch[key] != first[key]:
                 raise ValueError("cannot merge incompatible SpecOPD sampling contracts")
+        if batch.get("objective", "e2e_tv") != first.get("objective", "e2e_tv"):
+            raise ValueError("cannot merge different SpecOPD objectives")
     length = max(b["input_ids"].shape[1] for b in batches)
     anchors = max(b["anchor_positions"].shape[1] for b in batches)
     width = max(b["proposal_ids"].shape[1] for b in batches)
@@ -228,7 +271,9 @@ def merge_specopd_training_batches(batches):
     result["input_ids"] = torch.cat([F.pad(b["input_ids"], (0, length-b["input_ids"].shape[1])) for b in batches])
     result["hidden_states"] = torch.cat([F.pad(b["hidden_states"], (0, 0, 0, length-b["hidden_states"].shape[1])) for b in batches])
     result["anchor_positions"] = torch.cat([F.pad(b["anchor_positions"], (0, anchors-b["anchor_positions"].shape[1])) for b in batches])
-    for key in ("proposal_ids", "proposal_mask"):
+    if any(("position_weights" in b) != ("position_weights" in first) for b in batches):
+        raise ValueError("cannot merge different SpecOPD loss reductions")
+    for key in ("proposal_ids", "proposal_mask") + (("position_weights", "sampling_support_mask") if "position_weights" in first else ()):
         result[key] = torch.cat([F.pad(b[key], (0, width-b[key].shape[1], 0, anchors-b[key].shape[0])) for b in batches])
     result["target_last_hidden_states"] = torch.cat([
         F.pad(b["target_last_hidden_states"], (0, 0, 0, width-b["proposal_ids"].shape[1], 0, anchors-b["proposal_ids"].shape[0]))
