@@ -64,9 +64,8 @@ on:
         default: "8"
         type: string
       tensor_parallel_size:
-        description: Rollout tensor parallel size
+        description: Rollout tensor parallel size (defaults to the selected drafter's CI topology)
         required: false
-        default: "1"
         type: string
       sequence_parallel_size:
         description: Actor/ref sequence parallel size
@@ -122,6 +121,8 @@ jobs:
           - drafter: dspark
             enable_training: true
             disable_eagle3_torch_compile: false
+            # Match the DSpark example's TP and reduce host memory at draft publication.
+            tensor_parallel_size: '2'
 
     steps:
       - name: Check out verl-SpeCo
@@ -223,7 +224,7 @@ jobs:
           SPECO_CI_RESULT_PATH: outputs/npu-ci/${{ matrix.drafter }}/result.json
           SPECO_CKPT_DIR: ${{ vars.SPECO_CKPT_DIR || format('outputs/npu-ci/{0}/checkpoints', matrix.drafter) }}
           SPECO_ACCELERATOR_COUNT: ${{ inputs.accelerator_count || env.SPECO_DEFAULT_ACCELERATOR_COUNT }}
-          SPECO_TENSOR_PARALLEL_SIZE: ${{ inputs.tensor_parallel_size || env.SPECO_DEFAULT_TENSOR_PARALLEL_SIZE }}
+          SPECO_TENSOR_PARALLEL_SIZE: ${{ inputs.tensor_parallel_size || vars.SPECO_TENSOR_PARALLEL_SIZE || matrix.tensor_parallel_size || env.SPECO_DEFAULT_TENSOR_PARALLEL_SIZE }}
           SPECO_SEQUENCE_PARALLEL_SIZE: ${{ inputs.sequence_parallel_size || env.SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE }}
           SPECO_ENABLE_TRAINING: ${{ matrix.enable_training && (github.event_name != 'workflow_dispatch' || inputs.run_training) && 'true' || 'false' }}
           SPECO_CI_VARIABLES_JSON: ${{ toJSON(vars) }}
