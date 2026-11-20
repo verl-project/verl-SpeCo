@@ -881,16 +881,28 @@ class SpecoV1Mixin(V1BubbleMixin):
                 "actor updates would mix policy/head snapshots under one quota "
                 "version"
             )
-        if bool(training.get("collect_hidden_states_from_vllm", False)):
-            raise ValueError(
-                "vLLM rollout capture currently requires the legacy trainer"
-            )
+        rollout_capture = bool(training.get("collect_hidden_states_from_vllm", False))
+        if training.get("vllm_capture_reference", False) and not rollout_capture:
+            raise ValueError("Reference capture requires vLLM hidden collection")
+        if training.get("vllm_capture_reference", False):
+            from verl_speco.trainer.scheduler import DrafterScheduler
+
+            DrafterScheduler.reference_collection_boundary(training)
+        if rollout_capture:
+            if mode != "sync" and local_updates != 1:
+                raise ValueError("Async rollout capture requires parameter_sync_step=1")
+            if bool(training.get("collect_hidden_states_from_old_logprob", False)):
+                raise ValueError(
+                    "V1 rollout and actor hidden collection must be exclusive"
+                )
         if bool(training.get("collect_hidden_states_from_sgl", False)):
             raise ValueError(
                 "verl V1 online SPECO training currently requires "
                 "collect_hidden_states_from_sgl=false; use old-logprob collection"
             )
-        if not bool(training.get("collect_hidden_states_from_old_logprob", False)):
+        if not rollout_capture and not bool(
+            training.get("collect_hidden_states_from_old_logprob", False)
+        ):
             raise ValueError(
                 "verl V1 online SPECO training requires "
                 "training.collect_hidden_states_from_old_logprob=true"
@@ -1065,7 +1077,58 @@ class SpecoV1Mixin(V1BubbleMixin):
             self.role_worker_mapping[role] = _remotify_like(worker_cls, wrapped)
             logger.info("SPECO V1 wrapped actor worker: %s", wrapped.__name__)
 
+    def _speco_async_rollout_capture_enabled(self):
+        training = self.config.actor_rollout_ref.rollout.get("drafter", {}).get(
+            "training", {}
+        )
+        return bool(training.get("collect_hidden_states_from_vllm", False)) and str(
+            self.config.trainer.v1.get("trainer_mode", "sync")
+        ) in {"colocate_async", "separate_async"}
+
+    def _speco_install_async_head_snapshots(self):
+        if not self._speco_async_rollout_capture_enabled():
+            return
+        import tempfile
+        from pathlib import Path
+
+        self._speco_async_head_directory = tempfile.TemporaryDirectory(
+            prefix="speco-versioned-head-"
+        )
+        self._speco_async_head_paths = {}
+        for name in ("checkpoint_manager", "standalone_checkpoint_manager"):
+            manager = getattr(self, name, None)
+            if manager is None:
+                continue
+            original = manager.update_weights
+
+            def update(version, *args, _original=original, **kwargs):
+                import torch
+
+                version = int(version)
+                if version not in self._speco_async_head_paths:
+                    payload = self._first_non_null(
+                        self._ray_get_if_needed(
+                            self.actor_rollout_wg.get_actor_lm_head_weight(
+                                None, keep_model_on_device=False
+                            )
+                        )
+                        or []
+                    )
+                    if not isinstance(payload, dict):
+                        raise RuntimeError(
+                            "Async rollout requires a metadata-bearing target head"
+                        )
+                    payload = dict(payload)
+                    payload["source_target_version"] = version
+                    path = Path(self._speco_async_head_directory.name) / f"{version}.pt"
+                    torch.save(payload, path)
+                    self._speco_async_head_paths[version] = path
+                return _original(version, *args, **kwargs)
+
+            manager.update_weights = update
+
     def on_init_end(self):
+        self._speco_install_async_head_snapshots()
         result = super().on_init_end()
         online_drafter = bool(
             self.config.actor_rollout_ref.rollout.get("drafter", {}).get(
@@ -1108,7 +1171,52 @@ class SpecoV1Mixin(V1BubbleMixin):
             "submit_sec": time.perf_counter() - started,
         }
 
+    def _speco_sync_rollout_capture_gate(self):
+        config = self.__dict__.get("config", getattr(type(self), "config", None))
+        if config is None:
+            return
+        training = (
+            config.actor_rollout_ref.rollout.get("drafter", {}).get("training", {})
+            or {}
+        )
+        if not training.get("collect_hidden_states_from_vllm", False):
+            return
+        if not (training.get("drafter_convergence_freeze") or {}).get("enabled", False):
+            return
+        allowed = not bool(getattr(self, "_speco_drafter_frozen", False))
+        acks = self._speco_rollout_admission_rpc(
+            "speco_set_rollout_capture_allowed", allowed
+        )
+        if not acks or any(
+            not isinstance(ack, dict) or ack.get("capture_allowed") is not allowed
+            for ack in acks
+        ):
+            raise RuntimeError(
+                "Rollout capture freeze gate was not acknowledged by every server"
+            )
+
     def on_step_end(self):
+        if self.__dict__.get("_speco_reference_deferred_batch") is not None:
+            raise RuntimeError("PPO step ended with uncommitted deferred references")
+        prefetcher = self.__dict__.pop("_speco_reference_prefetcher", None)
+        if prefetcher is not None:
+            prefetcher.close()
+        finalizer = self.__dict__.get("_speco_reference_finalizer")
+        if finalizer is not None:
+            started = time.perf_counter()
+            finalizer.drain()
+            logger.warning(
+                "[rollout reference] event=cleanup_drain step=%s seconds=%.6f",
+                self.global_steps,
+                time.perf_counter() - started,
+            )
+        if self.__dict__.get("_speco_sync_reference_receipts"):
+            raise RuntimeError(
+                "PPO step ended with unresolved reference commit receipts"
+            )
+        self.__dict__.pop("_speco_sync_reference_cache", None)
+        self.__dict__.pop("_speco_reference_committed_ids", None)
+        self._speco_sync_rollout_capture_gate()
         if self._speco_rollout_idle_worker_enabled():
             started = time.perf_counter()
             upstream_seconds = 0.0
@@ -1364,6 +1472,7 @@ class SpecoV1Mixin(V1BubbleMixin):
         mode.  The V1 agent-loop drain in ``fit`` makes any post-final queued
         work safe before teardown.
         """
+        self._speco_sync_rollout_capture_gate()
         mode = str(self.config.trainer.v1.get("trainer_mode", "sync")).lower()
         is_last_step = int(self.global_steps) >= int(self.total_training_steps)
         if mode == "colocate_async" and is_last_step:
@@ -1516,7 +1625,82 @@ class SpecoV1Mixin(V1BubbleMixin):
             for index in range(len(request_fields))
         ]
         result.meta_info["speco_v1_padding_rows"] = sum(padding)
+        rollout_capture = bool(
+            (
+                self.config.actor_rollout_ref.rollout.get("drafter", {}).get(
+                    "training", {}
+                )
+                or {}
+            ).get("collect_hidden_states_from_vllm", False)
+        )
+        if rollout_capture:
+            from verl_speco.integration.rollout_reference import resolve
+
+            cache = self.__dict__.setdefault("_speco_sync_reference_cache", {})
+            if cache.get("step") != self.global_steps:
+                cache.clear()
+                cache["step"] = self.global_steps
+            prefetcher = self.__dict__.get("_speco_reference_prefetcher")
+            prepared = {}
+            if prefetcher is not None:
+                references = [
+                    cell["drafter_sample"]
+                    for index, cell in enumerate(request_fields)
+                    if not padding[index]
+                    and isinstance(cell, dict)
+                    and isinstance(cell.get("drafter_sample"), dict)
+                    and cell["drafter_sample"].get("kind")
+                    == "speco_rollout_reference_v1"
+                ]
+                prepared = prefetcher.drain_ready(references)
+            converted = []
+            for index, cell in enumerate(request_fields):
+                reference = (
+                    cell.get("drafter_sample") if isinstance(cell, dict) else None
+                )
+                if (
+                    not padding[index]
+                    and isinstance(reference, dict)
+                    and reference.get("kind") == "speco_rollout_reference_v1"
+                ):
+                    identity = reference["plan"]["sample_id"]
+                    signature = (
+                        reference.get("request_id"),
+                        reference.get("target_version"),
+                        repr(sorted(reference["plan"].items())),
+                        tuple(reference.get("prompt", [])),
+                        tuple(reference.get("response", [])),
+                        json.dumps(reference.get("budget"), sort_keys=True),
+                    )
+                    signatures = cache.setdefault("reference_signatures", {})
+                    if identity in signatures and signatures[identity] != signature:
+                        raise RuntimeError(
+                            "Conflicting duplicate rollout reference identity"
+                        )
+                    signatures[identity] = signature
+                    if identity not in cache:
+                        if prefetcher is None:
+                            cache[identity] = resolve(reference)
+                        else:
+                            key = prefetcher.identity(reference)
+                            cache[identity] = (
+                                prepared[key]
+                                if key in prepared
+                                else prefetcher.take(reference)
+                            )
+                        self.__dict__.setdefault("_speco_sync_reference_receipts", {})[
+                            identity
+                        ] = reference
+                    cell = {**cell, "drafter_sample": cache[identity]}
+                converted.append(cell)
+            request_fields = converted
+        rollout_fields = (
+            ("drafter_sample", "_speco_capture_rows", "_speco_capture_skipped_capacity")
+            if rollout_capture
+            else ()
+        )
         for key in (
+            *rollout_fields,
             "_verl_request_mean_accept_len",
             "_speco_vllm_request_id",
             "_speco_vllm_request_verify_rounds",
@@ -1583,7 +1767,78 @@ class SpecoV1Mixin(V1BubbleMixin):
             # freeze windows use per-request, per-serving-revision projections.
             self._speco_populate_request_accept_len_records(evidence)
 
-    def _compute_old_log_prob(self, batch, metrics):
+    def _compute_old_log_prob(self, batch, metrics, *, _reference_resume=False):
+        # Only the opt-in sync reference path changes ordering: give serving
+        # background preparation the parent old-logprob compute window. This
+        # does not update actor parameters or alter the actor collection branch.
+        reference_training = (
+            self.config.actor_rollout_ref.rollout.get("drafter", {}).get("training", {})
+            or {}
+        )
+        parent_computed = bool(reference_training.get("vllm_capture_reference", False))
+        parent_result = batch if _reference_resume else None
+        if parent_computed and not _reference_resume:
+            if self.__dict__.get("_speco_reference_deferred_batch") is not None:
+                raise RuntimeError(
+                    "Deferred reference collection must drain before the next PPO batch"
+                )
+            # Fetch only control handles on the trainer thread. Background jobs
+            # perform file/CPU work and never touch TQ or actor collectives.
+            import transfer_queue as tq
+            from verl_speco.integration.rollout_reference import ReferencePrefetcher
+
+            prefetcher = self.__dict__.get("_speco_reference_prefetcher")
+            if prefetcher is None:
+                prefetcher = self._speco_reference_prefetcher = ReferencePrefetcher()
+            controls = tq.kv_batch_get(
+                keys=batch.keys,
+                partition_id=batch.partition_id,
+                select_fields=["extra_fields"],
+            ).get("extra_fields", [])
+            prefetch_admitted = prefetch_deferred = 0
+            for index, cell in enumerate(controls):
+                tags = getattr(batch, "tags", [])
+                if index < len(tags) and tags[index].get("is_padding", False):
+                    continue
+                cell = getattr(cell, "data", cell)
+                reference = (
+                    cell.get("drafter_sample") if isinstance(cell, dict) else None
+                )
+                if (
+                    isinstance(reference, dict)
+                    and reference.get("kind") == "speco_rollout_reference_v1"
+                ):
+                    from verl_speco.transport.drafter_sample_protocol import (
+                        validate_rollout_reference,
+                    )
+
+                    validate_rollout_reference(reference)
+                    if prefetcher.submit(reference, defer=True):
+                        prefetch_admitted += 1
+                    else:
+                        prefetch_deferred += 1
+            metrics["drafter/rollout_prefetch_admitted"] = prefetch_admitted
+            metrics["drafter/rollout_prefetch_deferred"] = prefetch_deferred
+            started = time.perf_counter()
+            parent_result = super()._compute_old_log_prob(batch, metrics)
+            metrics["timing_s/drafter_rollout_parent_oldlogprob"] = (
+                time.perf_counter() - started
+            )
+            batch = parent_result
+            from verl_speco.trainer.scheduler import DrafterScheduler
+
+            if (
+                DrafterScheduler.reference_collection_boundary(reference_training)
+                == "before_actor_update"
+            ):
+                self._speco_reference_deferred_batch = (int(self.global_steps), batch)
+                metrics["drafter/reference_collection_deferred"] = 1
+                return parent_result
+        if (
+            parent_computed
+            and self.__dict__.get("_speco_reference_prefetcher") is not None
+        ):
+            metrics.update(self._speco_reference_prefetcher.boundary_metrics())
         evidence = None
         if self._speco_rollout_idle_worker_enabled():
             _, evidence = self._speco_v1_batch_data(batch)
@@ -1612,6 +1867,163 @@ class SpecoV1Mixin(V1BubbleMixin):
                 self._speco_observe_rollout_evidence(evidence, policy.drafter_version)
             self._speco_v1_evidence_step = self.global_steps
             metrics.update(self._speco_freeze_metrics())
+        if (
+            self.config.actor_rollout_ref.rollout.get("drafter", {}).get("training", {})
+            or {}
+        ).get("collect_hidden_states_from_vllm", False):
+            evidence_started = time.perf_counter()
+            if evidence is None:
+                _, evidence = self._speco_v1_batch_data(batch)
+                metrics["timing_s/drafter_rollout_tq_fetch_convert"] = (
+                    time.perf_counter() - evidence_started
+                )
+            from verl_speco.trainer.v1.feature_adapter import validate_rollout_samples
+
+            validation_started = time.perf_counter()
+            async_capture = self._speco_async_rollout_capture_enabled()
+            if async_capture:
+                from verl_speco.trainer.v1.feature_adapter import (
+                    validate_async_rollout_versions,
+                )
+
+                validate_async_rollout_versions(
+                    evidence.non_tensor_batch.get("drafter_sample", []),
+                    self._speco_async_head_paths,
+                    self.global_steps,
+                )
+            validate_rollout_samples(
+                evidence, self.global_steps, allow_stale=async_capture
+            )
+            metrics["timing_s/drafter_rollout_validate"] = (
+                time.perf_counter() - validation_started
+            )
+            collection_started = time.perf_counter()
+            if parent_computed:
+                self._speco_last_collection_outcome = None
+            receipts = self.__dict__.get("_speco_sync_reference_receipts", {})
+            transaction_references = list(receipts.values()) if parent_computed else []
+            if transaction_references:
+                from verl_speco.integration.rollout_reference import begin_collection
+
+                begin_collection(transaction_references)
+            collect_started = time.perf_counter()
+            if parent_computed:
+                metrics["timing_s/reference_begin_receipts"] = (
+                    collect_started - collection_started
+                )
+                pool = self.__dict__.get("_speco_reference_prefetcher")
+                if pool is not None:
+                    metrics["drafter/reference_sync_resolves"] = pool.sync_resolves
+                    metrics["timing_s/reference_sync_resolve"] = pool.sync_resolve_s
+                    metrics["timing_s/reference_future_wait"] = pool.future_wait_s
+            dispatch_rows = {}
+            if parent_computed:
+                self._speco_reference_dispatch_rows = dispatch_rows
+            try:
+                collected = self._speco_collect_generation_samples(evidence)
+            finally:
+                self.__dict__.pop("_speco_reference_dispatch_rows", None)
+            if parent_computed:
+                finish_started = time.perf_counter()
+                metrics["timing_s/reference_collect_dispatch"] = (
+                    finish_started - collect_started
+                )
+                outcome = self.__dict__.get("_speco_last_collection_outcome")
+                from verl_speco.integration.rollout_reference import (
+                    committed_reference_metrics,
+                )
+
+                accepted_ids, receipt_metrics = committed_reference_metrics(
+                    outcome, dispatch_rows, transaction_references
+                )
+                metrics.update(receipt_metrics)
+                if transaction_references:
+                    from verl_speco.integration.rollout_reference import (
+                        finish_collection,
+                    )
+
+                    if collected > 0 and outcome is None:
+                        raise RuntimeError(
+                            "Reference collection returned samples without a commit receipt"
+                        )
+                    for accepted in (True, False):
+                        group = [
+                            ref
+                            for ref in transaction_references
+                            if (ref["plan"]["sample_id"] in accepted_ids) == accepted
+                        ]
+                        finish_collection(group, collected=accepted)
+                    self.__dict__.setdefault(
+                        "_speco_reference_committed_ids", set()
+                    ).update(ref["plan"]["sample_id"] for ref in transaction_references)
+                metrics["timing_s/reference_finish_receipts"] = (
+                    time.perf_counter() - finish_started
+                )
+            from verl_speco.integration.rollout_reference import acknowledge_batch
+
+            receipts = self.__dict__.get("_speco_sync_reference_receipts", {})
+            if receipts:
+                from functools import partial
+                from verl_speco.trainer.standalone_batch_finalize import (
+                    AsyncBatchFinalizer,
+                )
+
+                finalizer = self.__dict__.get("_speco_reference_finalizer")
+                if finalizer is None:
+                    finalizer = self._speco_reference_finalizer = AsyncBatchFinalizer(
+                        capacity=4
+                    )
+                submit_started = time.perf_counter()
+                finalizer.submit(partial(acknowledge_batch, tuple(receipts.values())))
+                receipts.clear()
+                metrics["timing_s/reference_ack_submit"] = (
+                    time.perf_counter() - submit_started
+                )
+            metrics["timing_s/drafter_rollout_receive_store"] = (
+                time.perf_counter() - collection_started
+            )
+            self._speco_v1_state["features_collected"] = int(
+                self._speco_v1_state.get("features_collected", 0) + collected
+            )
+            metrics["drafter/raw_drafter_samples"] = (
+                self._speco_last_raw_drafter_samples
+            )
+            metrics["drafter/collected_samples"] = collected
+            if (
+                int(getattr(self, "parameter_sync_step", 1)) > 1
+                and not self._speco_rollout_idle_worker_enabled()
+                and not getattr(self, "_speco_drafter_frozen", False)
+                and (int(getattr(self, "local_trigger_step", 0)) == 0 or collected > 0)
+                and getattr(self, "_speco_rollout_prepared_head_step", None)
+                != int(self.global_steps)
+            ):
+                head_metrics, pending = self._speco_start_target_lm_head_weight_sync(
+                    None
+                )
+                if pending is not None:
+                    head_metrics.update(
+                        self._speco_finish_target_lm_head_weight_sync(pending)
+                    )
+                metrics.update(head_metrics)
+                if head_metrics.get("drafter/target_lm_head_synced"):
+                    self._speco_rollout_prepared_head_step = int(self.global_steps)
+            if (
+                collected > 0
+                and self._speco_rollout_idle_worker_enabled()
+                and not getattr(self, "_speco_drafter_frozen", False)
+            ):
+                # Fence this immutable source head while the actor still owns
+                # the policy which produced the just-returned rollout.
+                self._speco_v1_cache_old_policy_head()
+            # PPO old-logprob computation stays on the parent's original path.
+            if parent_computed:
+                return parent_result
+            oldlog_started = time.perf_counter()
+            result = super()._compute_old_log_prob(batch, metrics)
+            metrics["timing_s/drafter_rollout_parent_oldlogprob"] = (
+                time.perf_counter() - oldlog_started
+            )
+            return result
         if not self._speco_oldlogprob_collection_enabled():
             return super()._compute_old_log_prob(batch, metrics)
 
@@ -2109,7 +2521,29 @@ class SpecoV1Mixin(V1BubbleMixin):
             self._speco_ci_result.record_metrics({"training/global_step": global_steps})
         return result
 
+    def _speco_finish_deferred_reference_collection(self, metrics):
+        pending = self.__dict__.get("_speco_reference_deferred_batch")
+        if pending is None:
+            return
+        step, original_batch = pending
+        if step != int(self.global_steps):
+            raise RuntimeError(
+                "Deferred reference collection crossed a target update boundary"
+            )
+        started = time.perf_counter()
+        # Re-enter just the collection half, with the original native PPO batch;
+        # the parent's old-logprob forward is never executed a second time.
+        SpecoV1Mixin._compute_old_log_prob(
+            self, original_batch, metrics, _reference_resume=True
+        )
+        self._speco_reference_deferred_batch = None
+        metrics["timing_s/drafter_reference_collection_tail"] = (
+            time.perf_counter() - started
+        )
+        metrics["drafter/reference_collection_deferred"] = 0
+
     def _update_actor(self, batch, metrics):
+        self._speco_finish_deferred_reference_collection(metrics)
         if not self._speco_online_enabled_from_config(self.config):
             return super()._update_actor(batch, metrics)
         if self._speco_rollout_idle_worker_enabled():
@@ -2365,17 +2799,39 @@ class SpecoV1Mixin(V1BubbleMixin):
         if not result_path:
             return self._speco_fit_impl(agent_loop_manager)
         self._speco_init_ci_result()
+        failed = False
         try:
             result = self._speco_fit_impl(agent_loop_manager)
             self._speco_ci_result.data["completed"] = True
             return result
         except BaseException as error:
+            failed = True
             self._speco_ci_result.data["errors"].append(
                 {"type": type(error).__name__, "message": str(error)}
             )
             raise
         finally:
-            self._speco_ci_result.write(result_path)
+            try:
+                self._speco_ci_result.write(result_path)
+            except Exception:
+                if not failed:
+                    raise
+                logger.exception("Could not write CI result after training failure")
+
+    def _speco_close_reference_workers(self, primary_error=None):
+        first_cleanup_error = None
+        for name in ("_speco_reference_prefetcher", "_speco_reference_finalizer"):
+            worker = self.__dict__.pop(name, None)
+            if worker is None:
+                continue
+            try:
+                worker.close()
+            except Exception as exc:
+                logger.exception("Reference cleanup failed in %s", name)
+                if first_cleanup_error is None:
+                    first_cleanup_error = exc
+        if primary_error is None and first_cleanup_error is not None:
+            raise first_cleanup_error
 
     def _speco_fit_impl(self, agent_loop_manager):
         completed = False
@@ -2387,32 +2843,52 @@ class SpecoV1Mixin(V1BubbleMixin):
             completed = True
             return result
         finally:
-            if self._speco_rollout_idle_worker_enabled():
-                self._speco_bubble_session().close("v1_fit_exit")
-            if self._speco_v1_async_rollout_enabled():
-                # ``fit`` may return or raise while async agent-loop actors
-                # still own vLLM requests or output handlers.  Drain them
-                # before any rollout/DataLoader teardown in either path.
+            first_cleanup_error = None
+
+            def attempt(action, *args):
+                nonlocal first_cleanup_error
+                try:
+                    return action(*args)
+                except Exception as exc:
+                    logger.exception("Training cleanup failed in %s", action.__name__)
+                    if first_cleanup_error is None:
+                        first_cleanup_error = exc
+                    return None
+
+            if attempt(self._speco_rollout_idle_worker_enabled):
+
+                def close_bubble():
+                    self._speco_bubble_session().close("v1_fit_exit")
+
+                attempt(close_bubble)
+            if attempt(self._speco_v1_async_rollout_enabled):
                 cancelled = False
                 if not completed:
-                    import ray
 
-                    refs = []
-                    for worker in (
-                        getattr(agent_loop_manager, "agent_loop_workers", ()) or ()
-                    ):
-                        cancel = getattr(worker, "speco_cancel_pending", None)
-                        if cancel is not None:
-                            refs.append(cancel.remote())
-                    if refs:
-                        ray.get(refs)
-                        cancelled = True
+                    def cancel_pending():
+                        import ray
+
+                        refs = []
+                        for worker in (
+                            getattr(agent_loop_manager, "agent_loop_workers", ()) or ()
+                        ):
+                            cancel = getattr(worker, "speco_cancel_pending", None)
+                            if cancel is not None:
+                                refs.append(cancel.remote())
+                        if refs:
+                            ray.get(refs)
+                        return bool(refs)
+
+                    cancelled = attempt(cancel_pending)
                 if not cancelled:
-                    self._speco_v1_drain_agent_loop(agent_loop_manager)
-            if self._speco_online_enabled_from_config(self.config):
-                self._speco_wait_pending_drafter_publish()
-                self._speco_wait_pending_drafter_checkpoint()
-            self._speco_v1_shutdown_dataloaders()
+                    attempt(self._speco_v1_drain_agent_loop, agent_loop_manager)
+            if attempt(self._speco_online_enabled_from_config, self.config):
+                attempt(self._speco_wait_pending_drafter_publish)
+                attempt(self._speco_wait_pending_drafter_checkpoint)
+            attempt(self._speco_v1_shutdown_dataloaders)
+            attempt(self._speco_close_reference_workers)
+            if completed and first_cleanup_error is not None:
+                raise first_cleanup_error
 
     def speco_v1_status(self) -> dict[str, Any]:
         """Return diagnostics used by smoke tests and startup logging."""

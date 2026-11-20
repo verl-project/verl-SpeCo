@@ -467,7 +467,6 @@ def test_online_training_accepts_bubble_configuration(mode, nested):
         assert trainer._speco_rollout_idle_worker_enabled()
 
 
-
 @pytest.mark.parametrize("mode", ["sync"])
 @pytest.mark.parametrize("nested", [False, True])
 def test_bubble_rejects_local_policy_head_aliasing_before_worker_creation(mode, nested):
@@ -1541,8 +1540,11 @@ def test_v1_adaptive_budget_uses_deduplicated_local_rollout_counts(monkeypatch):
     from unittest.mock import Mock
 
     from verl_speco.trainer.scheduler import (
-        AcceptanceFeedback, AdaptiveScheduleConfig, DrafterScheduleConfig,
-        DrafterScheduleContext, DrafterScheduler,
+        AcceptanceFeedback,
+        AdaptiveScheduleConfig,
+        DrafterScheduleConfig,
+        DrafterScheduleContext,
+        DrafterScheduler,
     )
 
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "unit"))
@@ -1551,7 +1553,8 @@ def test_v1_adaptive_budget_uses_deduplicated_local_rollout_counts(monkeypatch):
     drafts_key = "_speco_vllm_spec_decode_drafts"
     accepted_key = "_speco_vllm_spec_decode_accepted_tokens"
     facade = _methods(
-        "verl_speco/trainer/speco_ray_trainer.py", "SpecoRayPPOTrainer",
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
         {"_speco_acceptance_feedback"},
         AcceptanceFeedback=AcceptanceFeedback,
         _SPECO_VLLM_INVALID_FEEDBACK_KEY="_speco_vllm_invalid_acceptance_feedback",
@@ -1564,19 +1567,27 @@ def test_v1_adaptive_budget_uses_deduplicated_local_rollout_counts(monkeypatch):
         },
     )
     records = {}
-    monkeypatch.setitem(sys.modules, "transfer_queue", types.SimpleNamespace(
-        kv_batch_get=lambda keys, **kwargs: {"extra_fields": [records[k] for k in keys]}
-    ))
+    monkeypatch.setitem(
+        sys.modules,
+        "transfer_queue",
+        types.SimpleNamespace(
+            kv_batch_get=lambda keys, **kwargs: {
+                "extra_fields": [records[k] for k in keys]
+            }
+        ),
+    )
     cfg = DrafterScheduleConfig(
         training_interval_steps=1,
         adaptive_schedule=AdaptiveScheduleConfig(
-            enable=True, warmup_max_steps=0,
-            ema_fast_alpha=1.0, ema_slow_alpha=0.01,
+            enable=True,
+            warmup_max_steps=0,
+            ema_fast_alpha=1.0,
+            ema_slow_alpha=0.01,
         ),
     )
-    scheduler = DrafterScheduler(worker_executor=Mock(
-        get_training_data_status=Mock(return_value=[])
-    ))
+    scheduler = DrafterScheduler(
+        worker_executor=Mock(get_training_data_status=Mock(return_value=[]))
+    )
     controller = scheduler.configure_adaptive(cfg)
     controller.state.budget = 5
     observed = []
@@ -1593,27 +1604,41 @@ def test_v1_adaptive_budget_uses_deduplicated_local_rollout_counts(monkeypatch):
         def _speco_on_before_actor_update(self):
             feedback = self._speco_acceptance_feedback()
             observed.append(feedback)
-            scheduler.prepare_training_plan(DrafterScheduleContext(
-                global_step=self.global_steps, training_mode="online",
-                collected_samples_this_step=1, oldlogprob_collection_requested=True,
-                acceptance_feedback=feedback,
-            ), cfg)
+            scheduler.prepare_training_plan(
+                DrafterScheduleContext(
+                    global_step=self.global_steps,
+                    training_mode="online",
+                    collected_samples_this_step=1,
+                    oldlogprob_collection_requested=True,
+                    acceptance_feedback=feedback,
+                ),
+                cfg,
+            )
             return types.SimpleNamespace(training_plan=None, metrics={})
 
     trainer = Harness()
-    trainer.config.actor_rollout_ref.rollout.drafter.training["adaptive_schedule"] = {"enable": True}
+    trainer.config.actor_rollout_ref.rollout.drafter.training["adaptive_schedule"] = {
+        "enable": True
+    }
     for step, accepted in [(1, 140), (2, 0)]:
         trainer.global_steps = step
         for key in ("a", "b", "c", "padding"):
-            records[key] = {"spec_num_verify_steps": 20,
-                            "spec_num_accepted_tokens": accepted,
-                            "spec_num_draft_tokens": 140}
-        for local, keys in enumerate([
-            ["a", "b"], ["b", "c"], ["a", "padding"],
-        ]):
+            records[key] = {
+                "spec_num_verify_steps": 20,
+                "spec_num_accepted_tokens": accepted,
+                "spec_num_draft_tokens": 140,
+            }
+        for local, keys in enumerate(
+            [
+                ["a", "b"],
+                ["b", "c"],
+                ["a", "padding"],
+            ]
+        ):
             trainer.local_trigger_step = local
             batch = types.SimpleNamespace(
-                keys=keys, partition_id="train",
+                keys=keys,
+                partition_id="train",
                 tags=[{"is_padding": k == "padding"} for k in keys],
             )
             trainer._update_actor(batch, {})
@@ -1630,18 +1655,29 @@ def test_v1_checkpoint_saves_and_resumes_adaptive_state(monkeypatch, tmp_path):
     from pathlib import Path
 
     from verl_speco.integration.vllm_runtime import _get_nested
-    from verl_speco.trainer.scheduler import AdaptiveScheduleConfig, DrafterScheduleConfig, DrafterScheduler
+    from verl_speco.trainer.scheduler import (
+        AdaptiveScheduleConfig,
+        DrafterScheduleConfig,
+        DrafterScheduler,
+    )
     from verl_speco.trainer.scheduler.adaptive_schedule import AdaptiveScheduleState
 
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "unit"))
     from test_bubble_review_regressions import _methods
 
     facade = _methods(
-        "verl_speco/trainer/speco_ray_trainer.py", "SpecoRayPPOTrainer",
-        {"_speco_save_adaptive_state", "_speco_get_drafter_scheduler",
-         "_speco_restore_adaptive_state",
-         "_speco_freeze_state_resume_path"},
-        Path=Path, os=os, _get_nested=_get_nested, DrafterScheduler=DrafterScheduler,
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
+        {
+            "_speco_save_adaptive_state",
+            "_speco_get_drafter_scheduler",
+            "_speco_restore_adaptive_state",
+            "_speco_freeze_state_resume_path",
+        },
+        Path=Path,
+        os=os,
+        _get_nested=_get_nested,
+        DrafterScheduler=DrafterScheduler,
     )
     cfg = DrafterScheduleConfig(adaptive_schedule=AdaptiveScheduleConfig(enable=True))
     checkpoint = tmp_path / "global_step_10"
@@ -1677,14 +1713,23 @@ def test_v1_checkpoint_saves_and_resumes_adaptive_state(monkeypatch, tmp_path):
 
     trainer = Harness()
     trainer.config = _config()
-    trainer.config.trainer.update(default_local_dir=str(tmp_path), resume_mode="disable")
-    trainer.config.actor_rollout_ref.rollout.drafter.training["adaptive_schedule"] = {"enable": True}
+    trainer.config.trainer.update(
+        default_local_dir=str(tmp_path), resume_mode="disable"
+    )
+    trainer.config.actor_rollout_ref.rollout.drafter.training["adaptive_schedule"] = {
+        "enable": True
+    }
     trainer._speco_init_state()
     controller = trainer._speco_get_drafter_scheduler().adaptive_controller
     controller.state = AdaptiveScheduleState(
-        budget=0, fast=2.0, slow=2.5, observations=3,
-        last_valid_feedback_step=10, interval_trend_history=[[10, 2.0]],
-        warmup_acceptance_history=[2.0, 2.0], warmup_ended_after=5,
+        budget=0,
+        fast=2.0,
+        slow=2.5,
+        observations=3,
+        last_valid_feedback_step=10,
+        interval_trend_history=[[10, 2.0]],
+        warmup_acceptance_history=[2.0, 2.0],
+        warmup_ended_after=5,
     )
     expected = asdict(controller.state)
     assert trainer._save_checkpoint() == "saved"
@@ -1693,10 +1738,13 @@ def test_v1_checkpoint_saves_and_resumes_adaptive_state(monkeypatch, tmp_path):
     resumed = Harness()
     resumed.config = _config()
     resumed.config.trainer.update(
-        default_local_dir=str(tmp_path), resume_mode="resume_path",
+        default_local_dir=str(tmp_path),
+        resume_mode="resume_path",
         resume_from_path=str(checkpoint),
     )
-    resumed.config.actor_rollout_ref.rollout.drafter.training["adaptive_schedule"] = {"enable": True}
+    resumed.config.actor_rollout_ref.rollout.drafter.training["adaptive_schedule"] = {
+        "enable": True
+    }
     resumed._speco_init_state()
     restored = resumed._speco_get_drafter_scheduler().adaptive_controller
     assert asdict(restored.state) == expected
@@ -1770,3 +1818,263 @@ def test_v1_emits_trainer_phase_spans_for_prepare_train_and_publish(monkeypatch)
     assert [span[0] for span in spans] == ["drafter/publish"]
     assert spans[0][1] == "speco_trainer"
     assert spans[0][2]["deferred"] is True
+
+
+def test_v1_sync_accepts_exclusive_rollout_capture():
+    config = _config()
+    training = config.actor_rollout_ref.rollout.drafter.training
+    training["collect_hidden_states_from_vllm"] = True
+    training["collect_hidden_states_from_old_logprob"] = False
+    SpecoV1Mixin._speco_validate_v1_training_config(config)
+    training["collect_hidden_states_from_old_logprob"] = True
+    with pytest.raises(ValueError, match="exclusive"):
+        SpecoV1Mixin._speco_validate_v1_training_config(config)
+
+
+def test_v1_async_rollout_capture_remains_guarded():
+    config = _config(mode="separate_async")
+    config.actor_rollout_ref.rollout.drafter.training[
+        "collect_hidden_states_from_vllm"
+    ] = True
+    config.actor_rollout_ref.rollout.drafter.training[
+        "collect_hidden_states_from_old_logprob"
+    ] = False
+    SpecoV1Mixin._speco_validate_v1_training_config(config)
+    config.trainer.v1["separate_async"] = AttrDict(parameter_sync_step=2)
+    with pytest.raises(ValueError, match="parameter_sync_step"):
+        SpecoV1Mixin._speco_validate_v1_training_config(config)
+
+
+@pytest.mark.parametrize("collected,frozen", [(1, False), (0, False), (1, True)])
+def test_rollout_idle_head_is_fenced_before_actor_oldlogprob(
+    monkeypatch, collected, frozen
+):
+    from verl_speco.trainer.v1 import feature_adapter
+
+    calls = []
+    monkeypatch.setattr(
+        feature_adapter,
+        "validate_rollout_samples",
+        lambda batch, step, **kwargs: calls.append("validate"),
+    )
+
+    class Parent:
+        def _compute_old_log_prob(self, batch, metrics):
+            calls.append("ppo_oldlogprob")
+            return batch
+
+    class Harness(SpecoV1Mixin, Parent):
+        config = _config()
+        global_steps = 2
+        _speco_freeze_policy = None
+        _speco_drafter_frozen = frozen
+        _speco_last_raw_drafter_samples = collected
+
+        def _speco_rollout_idle_worker_enabled(self):
+            return True
+
+        def _speco_v1_batch_data(self, batch):
+            return None, object()
+
+        def _speco_log_request_accept_len_variance_from_batch(self, *args, **kwargs):
+            pass
+
+        def _speco_collect_generation_samples(self, batch):
+            calls.append("collect")
+            return collected
+
+        def _speco_v1_cache_old_policy_head(self):
+            calls.append("cache_head")
+
+    driver = Harness()
+    driver._speco_v1_state = {}
+    driver.config.actor_rollout_ref.rollout.drafter.training[
+        "collect_hidden_states_from_vllm"
+    ] = True
+    batch, metrics = object(), {}
+    assert driver._compute_old_log_prob(batch, metrics) is batch
+    assert calls == ["validate", "collect"] + (
+        ["cache_head"] if collected and not frozen else []
+    ) + ["ppo_oldlogprob"]
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_rollout_freeze_gate_requires_all_server_acknowledgements(frozen):
+    driver = SpecoV1Mixin()
+    driver.config = _config()
+    driver._speco_drafter_frozen = frozen
+    training = driver.config.actor_rollout_ref.rollout.drafter.training
+    training["collect_hidden_states_from_vllm"] = True
+    training["drafter_convergence_freeze"] = {"enabled": True}
+    calls = []
+    driver._speco_rollout_admission_rpc = lambda method, allowed: (
+        calls.append((method, allowed))
+        or [{"capture_allowed": allowed}, {"capture_allowed": allowed}]
+    )
+    driver._speco_sync_rollout_capture_gate()
+    assert calls == [("speco_set_rollout_capture_allowed", not frozen)]
+    driver._speco_rollout_admission_rpc = lambda method, allowed: [
+        {"capture_allowed": not allowed}
+    ]
+    with pytest.raises(RuntimeError, match="acknowledged"):
+        driver._speco_sync_rollout_capture_gate()
+
+
+def test_actor_hidden_collection_does_not_send_rollout_freeze_control():
+    driver = SpecoV1Mixin()
+    driver.config = _config()
+    training = driver.config.actor_rollout_ref.rollout.drafter.training
+    training["collect_hidden_states_from_vllm"] = False
+    training["drafter_convergence_freeze"] = {"enabled": True}
+
+    def unexpected(*args):
+        raise AssertionError("actor path must not send capture control")
+
+    driver._speco_rollout_admission_rpc = unexpected
+    driver._speco_sync_rollout_capture_gate()
+
+
+def test_v1_sync_idle_worker_accepts_rollout_capture():
+    config = _config()
+    training = config.actor_rollout_ref.rollout.drafter.training
+    training["collect_hidden_states_from_vllm"] = True
+    training["collect_hidden_states_from_old_logprob"] = False
+    training["scheduler"] = {"execution": {"strategy": "rollout_idle_worker"}}
+    SpecoV1Mixin._speco_validate_v1_training_config(config)
+
+
+def test_async_rollout_head_snapshot_precedes_publication_and_is_immutable():
+    import torch
+    from types import SimpleNamespace
+
+    calls = []
+    weight = torch.tensor([1.0])
+    config = _config(mode="colocate_async")
+    config.actor_rollout_ref.rollout.drafter.training.update(
+        collect_hidden_states_from_vllm=True,
+        collect_hidden_states_from_old_logprob=False,
+    )
+
+    class Harness(SpecoV1Mixin):
+        def __getattr__(self, name):
+            raise AttributeError(name)
+
+        def _first_non_null(self, values):
+            return next((v for v in values if v is not None), None)
+
+        def _ray_get_if_needed(self, value):
+            return value
+
+    trainer = Harness()
+    trainer.config = config
+
+    def fetch(*args, **kwargs):
+        calls.append("snapshot")
+        return [{"weight": weight}]
+
+    def publish(version):
+        calls.append(("publish", version))
+        weight.add_(1)
+
+    trainer.actor_rollout_wg = SimpleNamespace(get_actor_lm_head_weight=fetch)
+    trainer.checkpoint_manager = SimpleNamespace(update_weights=publish)
+    trainer._speco_install_async_head_snapshots()
+    try:
+        trainer.checkpoint_manager.update_weights(0)
+        trainer.checkpoint_manager.update_weights(1)
+        assert calls == ["snapshot", ("publish", 0), "snapshot", ("publish", 1)]
+        old = torch.load(trainer._speco_async_head_paths[0], weights_only=False)
+        new = torch.load(trainer._speco_async_head_paths[1], weights_only=False)
+        assert old["source_target_version"] == 0 and old["weight"].item() == 1
+        assert new["source_target_version"] == 1 and new["weight"].item() == 2
+        # A prefetched version-zero request must still resolve version zero.
+        assert (
+            torch.load(trainer._speco_async_head_paths[0], weights_only=False)[
+                "weight"
+            ].item()
+            == 1
+        )
+    finally:
+        trainer._speco_async_head_directory.cleanup()
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+def test_reference_capture_uses_existing_v1_mode_contract(mode):
+    config = _config(mode=mode)
+    training = config.actor_rollout_ref.rollout.drafter.training
+    training["collect_hidden_states_from_old_logprob"] = False
+    training["collect_hidden_states_from_vllm"] = True
+    training["vllm_capture_reference"] = True
+    SpecoV1Mixin._speco_validate_v1_training_config(config)
+
+
+def test_reference_capture_still_rejects_actor_collection():
+    config = _config()
+    training = config.actor_rollout_ref.rollout.drafter.training
+    training["vllm_capture_reference"] = True
+    with pytest.raises(ValueError, match="vLLM hidden collection"):
+        SpecoV1Mixin._speco_validate_v1_training_config(config)
+
+
+def test_reference_pending_policy_is_validated():
+    config = _config()
+    training = config.actor_rollout_ref.rollout.drafter.training
+    training.update(
+        collect_hidden_states_from_old_logprob=False,
+        collect_hidden_states_from_vllm=True,
+        vllm_capture_reference=True,
+        vllm_capture_pending_policy="drop",
+    )
+    with pytest.raises(ValueError, match="wait or defer"):
+        SpecoV1Mixin._speco_validate_v1_training_config(config)
+
+
+def test_reference_capture_accepts_sync_bubble_with_existing_quota_policy():
+    config = _config()
+    training = config.actor_rollout_ref.rollout.drafter.training
+    training.update(
+        collect_hidden_states_from_old_logprob=False,
+        collect_hidden_states_from_vllm=True,
+        vllm_capture_reference=True,
+        scheduler={"execution": {"strategy": "rollout_idle_worker"}},
+    )
+    SpecoV1Mixin._speco_validate_v1_training_config(config)
+
+
+@pytest.mark.parametrize("training_failed", [False, True])
+def test_fit_continues_cleanup_and_preserves_first_error(training_failed):
+    events = []
+
+    class Upstream:
+        def fit(self, manager):
+            if training_failed:
+                raise RuntimeError("training failure")
+
+    class Harness(SpecoV1Mixin, Upstream):
+        config = _config()
+        _speco_prepared_for_fit = True
+
+        def _speco_v1_async_rollout_enabled(self):
+            return False
+
+        def _speco_online_enabled_from_config(self, config):
+            return True
+
+        def _speco_wait_pending_drafter_publish(self):
+            raise RuntimeError("publish failure")
+
+        def _speco_wait_pending_drafter_checkpoint(self):
+            events.append("checkpoint")
+
+        def _speco_v1_shutdown_dataloaders(self):
+            events.append("shutdown")
+            raise RuntimeError("shutdown failure")
+
+        def _speco_close_reference_workers(self):
+            events.append("reference")
+
+    with pytest.raises(
+        RuntimeError, match="training failure" if training_failed else "publish failure"
+    ):
+        Harness().fit(object())
+    assert events == ["checkpoint", "shutdown", "reference"]

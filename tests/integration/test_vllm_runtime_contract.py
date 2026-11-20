@@ -230,6 +230,27 @@ def test_merged_server_launch_restores_bubble_config_before_initial_draft(
     assert not server._speco_initial_draft_weights_ready
 
 
+@pytest.mark.parametrize("prepatched", [False, True])
+def test_server_class_refreshes_capture_budget_snapshot(monkeypatch, prepatched):
+    class Upstream:
+        pass
+
+    if prepatched:
+        Upstream._speco_vllm_http_methods_patched = True
+    module = SimpleNamespace(vLLMHttpServer=Upstream)
+    for limit in (16, 32):
+        payload = {
+            "training": {
+                "collect_hidden_states_from_vllm": True,
+                "max_collect_samples_per_step_per_replica": limit,
+            }
+        }
+        monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, json.dumps(payload))
+        module.vLLMHttpServer = vllm_runtime._build_speco_vllm_http_server_class(module)
+        snapshot = json.loads(module.vLLMHttpServer._speco_drafter_config_env)
+        assert snapshot["training"]["max_collect_samples_per_step_per_replica"] == limit
+
+
 def test_sync_generation_does_not_enter_bubble_lease(monkeypatch):
     monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: _drafter())
     monkeypatch.setattr(
@@ -2772,11 +2793,15 @@ def test_trainer_keeps_public_acceptance_metric_name() -> None:
 def test_vllm_length_stats_accumulate_rounds_and_accepted_tokens():
     stats = _new_vllm_spec_decode_stats()
     for rounds, accepted in ((1, 1), (99, 199)):
-        _record_vllm_spec_decode_scheduler_stats(stats, SimpleNamespace(
-            spec_decoding_stats=SimpleNamespace(
-                num_drafts=rounds, num_accepted_tokens=accepted,
-            )
-        ))
+        _record_vllm_spec_decode_scheduler_stats(
+            stats,
+            SimpleNamespace(
+                spec_decoding_stats=SimpleNamespace(
+                    num_drafts=rounds,
+                    num_accepted_tokens=accepted,
+                )
+            ),
+        )
     assert stats == {"drafts": 100, "draft_tokens": 0, "accepted_tokens": 200}
 
 
@@ -3383,3 +3408,44 @@ def test_performance_snapshot_runs_once_and_cannot_fail_generation(
 
     asyncio.run(run())
     assert calls == ["speco_performance_snapshot"]
+
+
+def test_capture_config_survives_filtered_server_without_idle_bus(monkeypatch):
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    full = _drafter(
+        training={
+            "collect_hidden_states_from_vllm": True,
+            "hidden_state_window_tokens_per_sample": 32,
+        }
+    )
+    resolved, _ = _ensure_vllm_server_drafter_env(
+        {"rollout": {"drafter": _drafter(training={})}}, json.dumps(full)
+    )
+    assert resolved["training"]["collect_hidden_states_from_vllm"] is True
+    assert resolved["training"]["hidden_state_window_tokens_per_sample"] == 32
+    assert (
+        vllm_runtime._load_env_drafter_config()["training"][
+            "collect_hidden_states_from_vllm"
+        ]
+        is True
+    )
+
+
+def test_capture_freeze_control_does_not_mutate_serving_versions():
+    import asyncio
+    from types import SimpleNamespace
+
+    server = SimpleNamespace(global_steps=7, _speco_serving_drafter_revision=3)
+
+    async def run():
+        control = (
+            vllm_runtime._SpecoVLLMHttpServerMixin.speco_set_rollout_capture_allowed
+        )
+        assert await control(server, False) == {"capture_allowed": False}
+        assert server._speco_rollout_capture_allowed is False
+        assert await control(server, True) == {"capture_allowed": True}
+        assert server._speco_rollout_capture_allowed is True
+
+    asyncio.run(run())
+    assert server.global_steps == 7
+    assert server._speco_serving_drafter_revision == 3

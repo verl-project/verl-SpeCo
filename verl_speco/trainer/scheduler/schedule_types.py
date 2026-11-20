@@ -262,6 +262,8 @@ class DrafterScheduleConfig:
     adaptive_schedule: AdaptiveScheduleConfig = field(
         default_factory=AdaptiveScheduleConfig
     )
+    # Preserve positional compatibility of the existing schedule fields.
+    rollout_versioned_heads: bool = False
 
     @classmethod
     def from_mapping(cls, config) -> "DrafterScheduleConfig":
@@ -299,6 +301,7 @@ class DrafterScheduleConfig:
             publish_interval_steps=get("publish_interval_steps", 0),
             publish_async=bool(get("publish_async", False)),
             use_logits=bool(get("use_logits", False)),
+            rollout_versioned_heads=bool(get("collect_hidden_states_from_vllm", False)),
             use_data_buffer=bool(get("use_data_buffer", False)),
             train_batches_per_trigger=train_batches,
             collection_sample_rate=float(get("collection_sample_rate", 1.0) or 0.0),

@@ -32,6 +32,21 @@ def drafter_diagnostic_env() -> dict[str, str]:
     return {
         name: os.environ[name]
         for name in (
+            "SPECO_CAPTURE_DIAGNOSTICS",
+            "SPECO_CAPTURE_RUN_ID",
+            "SPECO_CAPTURE_GPU_FILTER",
+            "SPECO_CAPTURE_EXPORT_ROOT",
+            "SPECO_CAPTURE_PACK_CHUNKS",
+            "SPECO_REFERENCE_MAX_BYTES",
+            "SPECO_CAPTURE_EXPORT_MAX_BYTES",
+            "SPECO_CAPTURE_EXPORT_MAX_PENDING",
+            "SPECO_REFERENCE_SAMPLE_BYTES",
+            "SPECO_REFERENCE_PREFETCH_MAX_BYTES",
+            "SPECO_REFERENCE_PREFETCH_CAPACITY",
+            "SPECO_CAPTURE_GPU_TIMING_STRIDE",
+            "SPECO_CAPTURE_VERIFY_TRANSPORT",
+            "SPECO_CAPTURE_STAGE_NUMPY",
+            "SPECO_CAPTURE_DIAGNOSTICS_DETAIL",
             "VERL_DRAFTER_MEMORY_DIAGNOSTICS",
             "VERL_DRAFTER_KEEP_HOT_TRIM_CACHE",
             "VERL_SPECO_PHASE_TIMING",
@@ -56,6 +71,38 @@ def _config_get(config, *path, default=None):
         else:
             node = getattr(node, key, None)
     return default if node is None else node
+
+
+def configure_reference_run(config) -> None:
+    """Give reference files a run-scoped shared root and a fresh ownership epoch."""
+    if not _config_get(
+        config,
+        "actor_rollout_ref",
+        "rollout",
+        "drafter",
+        "training",
+        "vllm_capture_reference",
+        default=False,
+    ):
+        return
+    import uuid
+    from pathlib import Path
+
+    root = os.environ.get("SPECO_CAPTURE_EXPORT_ROOT")
+    if not root or not Path(root).is_absolute():
+        raise ValueError(
+            "Reference capture requires an absolute shared SPECO_CAPTURE_EXPORT_ROOT"
+        )
+    run_id = uuid.uuid4().hex
+    run_root = Path(root) / run_id
+    run_root.mkdir(parents=True, exist_ok=False)
+    (run_root / "run.json").write_text(json.dumps({"run_id": run_id}))
+    os.environ["SPECO_CAPTURE_RUN_ID"] = run_id
+    os.environ["SPECO_CAPTURE_EXPORT_ROOT"] = str(run_root)
+    print(
+        f"[rollout reference] event=run run_id={run_id} export_root={run_root}",
+        flush=True,
+    )
 
 
 def should_bypass_speco(config) -> bool:
@@ -122,6 +169,21 @@ def configure_phase_diagnostic_runtime_env(config) -> None:
     from omegaconf import OmegaConf
 
     for name in (
+        "SPECO_CAPTURE_DIAGNOSTICS",
+        "SPECO_CAPTURE_RUN_ID",
+        "SPECO_CAPTURE_GPU_FILTER",
+        "SPECO_CAPTURE_EXPORT_ROOT",
+        "SPECO_CAPTURE_PACK_CHUNKS",
+        "SPECO_REFERENCE_MAX_BYTES",
+        "SPECO_CAPTURE_EXPORT_MAX_BYTES",
+        "SPECO_CAPTURE_EXPORT_MAX_PENDING",
+        "SPECO_REFERENCE_SAMPLE_BYTES",
+        "SPECO_REFERENCE_PREFETCH_MAX_BYTES",
+        "SPECO_REFERENCE_PREFETCH_CAPACITY",
+        "SPECO_CAPTURE_GPU_TIMING_STRIDE",
+        "SPECO_CAPTURE_VERIFY_TRANSPORT",
+        "SPECO_CAPTURE_STAGE_NUMPY",
+        "SPECO_CAPTURE_DIAGNOSTICS_DETAIL",
         "VERL_SPECO_DIAGNOSTIC_GPU_FIRST_STEPS",
         "VERL_SPECO_DIAGNOSTIC_IDLE_REJECTIONS",
         "VERL_SPECO_DIAGNOSTIC_ROLLOUT_PERF",
@@ -355,6 +417,7 @@ def run(config) -> None:
     from verl_speco.integration.task_runner import SpecoTaskRunner
 
     _forward_rl_insight_worker_env(config)
+    configure_reference_run(config)
     configure_phase_diagnostic_runtime_env(config)
     runner = ray.remote(num_cpus=1)(SpecoTaskRunner)
     diagnostic_env = {

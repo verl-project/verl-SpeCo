@@ -5,6 +5,7 @@
 import ast
 import asyncio
 import logging
+import os
 import random
 import time
 from contextlib import nullcontext
@@ -22,6 +23,36 @@ from verl_speco.trainer.scheduler import (
     IdleWindowConfidence,
     TrainingDataStatus,
 )
+
+
+@pytest.mark.parametrize("source", [None, (8, 3)])
+def test_rollout_local_update_reuses_first_cycle_head(source):
+    cls = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
+        ["_speco_start_target_lm_head_weight_sync"],
+        time=time,
+    )
+    obj = cls()
+    obj.global_steps = 8
+    obj.local_trigger_step = 2
+    payload = {"weight": "immutable-old-policy"}
+    obj._speco_rollout_cycle_head = (8, payload, {"selected_rows": 4})
+    obj._speco_rollout_collected_target = source
+    calls = []
+    obj._speco_dispatch_target_lm_head_payload = lambda value, **kw: (
+        calls.append((value, kw)) or {"drafter/target_lm_head_synced": 1},
+        None,
+    )
+    metrics, pending = obj._speco_start_target_lm_head_weight_sync()
+    assert pending is None
+    if source is None:
+        assert metrics["drafter/target_lm_head_snapshot_cached"] == 1
+        assert not calls
+    else:
+        assert metrics["drafter/target_lm_head_synced"] == 1
+        assert calls[0][0] is payload
+        assert calls[0][1]["selected_rows"] == 4
 
 
 def _methods(path, class_name, names, **namespace):
@@ -53,6 +84,7 @@ def _methods(path, class_name, names, **namespace):
         ],
         type_ignores=[],
     )
+    namespace.setdefault("os", os)
     namespace.setdefault("logger", logging.getLogger(__name__))
     namespace.setdefault("__file__", str(path))
     namespace.setdefault(
@@ -242,6 +274,8 @@ def test_delayed_head_dispatch_keeps_captured_version(mesh, blocking_finish):
 
     def dispatch(payload, *, global_step):
         dispatched_versions.append(global_step)
+        first = payload[0] if isinstance(payload, list) else payload
+        assert first["source_target_version"] == 0
         assert global_step == (4 if mesh is None else [4, 4])
         return [_head_ack(worker) for worker in ("0", "1")]
 
@@ -249,6 +283,7 @@ def test_delayed_head_dispatch_keeps_captured_version(mesh, blocking_finish):
     driver._pending_target_lm_head_sync = {
         "stage": "fetch",
         "fetch_refs": [{"weight": "captured-at-4"}],
+        "source_target_version": 0,
         "target_version": 4,
         "global_step": 4,
         "sync_started": time.perf_counter(),
@@ -2547,3 +2582,367 @@ def test_normal_sync_outcome_does_not_publish_bubble_quota_metrics():
     scheduler._record_training_outcome(plan, outcome)
     assert scheduler._training_quota_debt_steps == 20
     assert "bubble/training_quota_debt_steps" not in outcome.metrics
+
+
+def test_rollout_head_snapshot_owns_storage_and_rejects_conflicting_version():
+    torch = pytest.importorskip("torch")
+    cls = _methods(
+        "verl_speco/trainer/base_trainer.py",
+        "DrafterBaseTrainer",
+        {"sync_target_lm_head_weight"},
+        torch=torch,
+    )
+    obj = cls()
+    obj._rollout_versioned_heads = True
+    obj._bubble_time_enabled = False
+    obj._target_lm_head_snapshots = {}
+    obj._target_lm_head_snapshot_limit = 2
+    weight = torch.ones(3, 2)
+    obj.sync_target_lm_head_weight(weight, global_step=2, defer_device_apply=True)
+    weight.zero_()
+    assert torch.equal(obj._target_lm_head_snapshots[2]["weight"], torch.ones(3, 2))
+    with pytest.raises(RuntimeError, match="Conflicting"):
+        obj.sync_target_lm_head_weight(weight, global_step=2, defer_device_apply=True)
+    assert obj._target_lm_head_weight_step == 2
+
+
+def test_rollout_head_version_includes_sparse_vocab_mapping():
+    torch = pytest.importorskip("torch")
+    cls = _methods(
+        "verl_speco/trainer/base_trainer.py",
+        "DrafterBaseTrainer",
+        {"sync_target_lm_head_weight"},
+        torch=torch,
+    )
+    obj = cls()
+    obj._rollout_versioned_heads = True
+    obj._bubble_time_enabled = False
+    obj._target_lm_head_snapshots = {}
+    obj._target_lm_head_snapshot_limit = 2
+    weight, rows = torch.ones(2, 3), torch.tensor([1, 4])
+    obj.sync_target_lm_head_weight(
+        weight,
+        global_step=0,
+        row_indices=rows,
+        source_vocab_size=8,
+        defer_device_apply=True,
+    )
+    rows[0] = 2
+    assert obj._target_lm_head_snapshots[0]["row_indices"].tolist() == [1, 4]
+    with pytest.raises(RuntimeError, match="Conflicting"):
+        obj.sync_target_lm_head_weight(
+            weight,
+            global_step=0,
+            row_indices=rows,
+            source_vocab_size=8,
+            defer_device_apply=True,
+        )
+    obj.sync_target_lm_head_weight(
+        weight,
+        global_step=0,
+        row_indices=[1, 4],
+        source_vocab_size=8,
+        defer_device_apply=True,
+    )
+    with pytest.raises(RuntimeError, match="Conflicting"):
+        obj.sync_target_lm_head_weight(
+            weight,
+            global_step=0,
+            row_indices=[1, 4],
+            source_vocab_size=9,
+            defer_device_apply=True,
+        )
+
+
+@pytest.mark.parametrize("buffered", [False, True])
+def test_rollout_live_sample_retains_head_until_ownership_ends(buffered):
+    torch = pytest.importorskip("torch")
+    cls = _methods(
+        "verl_speco/trainer/base_trainer.py",
+        "DrafterBaseTrainer",
+        {"sync_target_lm_head_weight"},
+        torch=torch,
+    )
+    obj = cls()
+    obj._rollout_versioned_heads = True
+    obj._bubble_time_enabled = False
+    obj._target_lm_head_snapshots = {}
+    obj._target_lm_head_snapshot_limit = 1
+    items = [{"target_version": 0}]
+    obj.collected_data = [] if buffered else items
+    obj.use_data_buffer = buffered
+    obj.data_buffer = SimpleNamespace(get_available_data=lambda: items)
+    for version in range(3):
+        obj.sync_target_lm_head_weight(
+            torch.full((2, 3), float(version)),
+            global_step=version,
+            defer_device_apply=True,
+        )
+    assert set(obj._target_lm_head_snapshots) == {0, 2}
+    items.clear()
+    obj.sync_target_lm_head_weight(
+        torch.full((2, 3), 3.0), global_step=3, defer_device_apply=True
+    )
+    assert set(obj._target_lm_head_snapshots) == {3}
+
+
+def test_rollout_training_selects_only_head_source_version():
+    cls = _methods(
+        "verl_speco/trainer/base_trainer.py",
+        "DrafterBaseTrainer",
+        {"_sample_training_items"},
+        random=random,
+    )
+    obj = cls()
+    obj._rollout_versioned_heads = True
+    obj._target_lm_head_weight_step = 5
+    obj._target_lm_head_snapshots = {5: {"source_target_version": 3}}
+    old = {"hidden_source": "vllm_rollout", "source_target_version": 2}
+    matching = {"hidden_source": "vllm_rollout", "source_target_version": 3}
+    assert obj._sample_training_items([old, matching], 4, random.Random(0)) == [
+        matching
+    ]
+    assert obj._sample_training_items([old], 4, random.Random(0)) == []
+    obj._rollout_versioned_heads = False
+    assert obj._sample_training_items([old, matching], 4, random.Random(0)) == [
+        old,
+        matching,
+    ]
+
+
+@pytest.mark.parametrize("snapshots", [{}, {5: {"weight": "unbound"}}])
+def test_rollout_training_never_uses_unbound_or_missing_head(snapshots):
+    cls = _methods(
+        "verl_speco/trainer/base_trainer.py",
+        "DrafterBaseTrainer",
+        {"_sample_training_items"},
+        random=random,
+    )
+    obj = cls()
+    obj._rollout_versioned_heads = True
+    obj._target_lm_head_weight_step = 5
+    obj._target_lm_head_snapshots = snapshots
+    data = [{"hidden_source": "vllm_rollout", "source_target_version": 3}]
+    with pytest.raises(RuntimeError, match="refusing to substitute"):
+        obj._sample_training_items(data, 4, random.Random(0))
+    assert obj._sample_training_items([], 4, random.Random(0)) == []
+    obj._rollout_versioned_heads = False
+    assert obj._sample_training_items(data, 4, random.Random(0)) == data
+
+
+def test_rollout_scheduler_counts_only_matching_source_head():
+    worker = _status_trainer(use_buffer=False)
+    worker._rollout_versioned_heads = True
+    worker._target_lm_head_snapshots = {9: {"source_target_version": 3}}
+    worker.collected_data = [
+        {"step": 4, "hidden_source": "vllm_rollout", "source_target_version": 2},
+        {"step": 4, "hidden_source": "vllm_rollout", "source_target_version": 3},
+    ]
+    status = worker.get_training_data_status()
+    assert status["trainable_samples"] == 1
+    worker._target_lm_head_snapshots = {}
+    status = worker.get_training_data_status()
+    assert status["trainable_samples"] == 0
+    assert status["target_version"] is None
+    worker._rollout_versioned_heads = False
+    assert worker.get_training_data_status()["trainable_samples"] == 2
+
+
+def test_sync_rollout_head_is_resolved_before_scheduler_admission():
+    calls = []
+    cls = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
+        {"_speco_on_before_actor_update"},
+        time=time,
+        _get_nested=lambda config, path, default: default,
+        BeforeActorUpdateContext=lambda **kwargs: SimpleNamespace(**kwargs),
+        replace=lambda event, **kwargs: SimpleNamespace(**{**vars(event), **kwargs}),
+    )
+    driver = cls()
+    driver.global_steps = 2
+    driver.config = {}
+    driver._speco_rollout_collected_target = (2, 0)
+    driver._speco_rollout_idle_worker_enabled = lambda: False
+    driver._speco_drafter_training_config = lambda: {
+        "collect_hidden_states_from_vllm": True
+    }
+    driver._speco_start_target_lm_head_weight_sync = lambda plan: (
+        calls.append("export") or {},
+        {"version": 2},
+    )
+    driver._speco_finish_target_lm_head_weight_sync = lambda pending: (
+        calls.append("resolved") or {"drafter/target_lm_head_synced": 1}
+    )
+    driver._speco_drafter_schedule_config = lambda: object()
+    driver._speco_drafter_schedule_context = lambda: object()
+    driver._speco_get_drafter_scheduler = lambda: SimpleNamespace(
+        on_before_actor_update=lambda context: (
+            calls.append("schedule") or SimpleNamespace(metrics={})
+        )
+    )
+    driver._speco_on_before_actor_update()
+    assert calls == ["export", "resolved", "schedule"]
+    driver._speco_on_before_actor_update()
+    assert calls == ["export", "resolved", "schedule", "schedule"]
+
+
+def test_rollout_head_binding_preserves_zero_source_version_and_is_immutable():
+    torch = pytest.importorskip("torch")
+    cls = _methods(
+        "verl_speco/trainer/base_trainer.py",
+        "DrafterBaseTrainer",
+        {"sync_target_lm_head_weight"},
+        torch=torch,
+    )
+    worker = cls()
+    worker._rollout_versioned_heads = True
+    worker._bubble_time_enabled = False
+    worker._target_lm_head_snapshots = {}
+    worker._target_lm_head_snapshot_limit = 2
+    weight = torch.ones(2, 3)
+    worker.sync_target_lm_head_weight(
+        weight, global_step=2, source_target_version=0, defer_device_apply=True
+    )
+    assert worker._target_lm_head_snapshots[2]["source_target_version"] == 0
+    with pytest.raises(RuntimeError, match="Conflicting target source version"):
+        worker.sync_target_lm_head_weight(
+            weight, global_step=2, source_target_version=1, defer_device_apply=True
+        )
+    assert worker._target_lm_head_snapshots[2]["source_target_version"] == 0
+
+
+def test_directly_committed_rollout_still_registers_head_source():
+    from verl_speco.trainer.scheduler import DrafterCollectionSource
+
+    cls = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
+        {"_speco_collect_generation_samples"},
+        cast=cast,
+        DrafterCollectionSource=DrafterCollectionSource,
+        pop_drafter_samples=lambda batch: batch,
+    )
+    driver = cls()
+    driver.global_steps = 2
+    driver._speco_direct_collected_samples = 1
+    driver._speco_direct_sample_ids = {"s"}
+    driver._speco_rollout_collection_source = lambda: DrafterCollectionSource.VLLM
+    driver._speco_plan_drafter_collection = lambda source: SimpleNamespace(
+        collect=True, collect_interval_matched=True
+    )
+    driver._speco_log_drafter_collection_plan = lambda plan: None
+    driver._speco_online_enabled = lambda: True
+    driver._speco_drafter_training_config = lambda: {}
+    assert (
+        driver._speco_collect_generation_samples(
+            [{"_speco_sample_id": "s", "target_version": 0}]
+        )
+        == 1
+    )
+    assert driver._speco_rollout_collected_target == (2, 0)
+
+
+@pytest.mark.parametrize("mode", ["colocate_async", "separate_async"])
+def test_rollout_head_admission_ignores_unused_sync_local_updates(mode):
+    def nested(config, path, default):
+        node = config
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+            if node is None:
+                return default
+        return node
+
+    cls = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
+        {"_speco_on_before_actor_update"},
+        time=time,
+        _get_nested=nested,
+        BeforeActorUpdateContext=lambda **kw: SimpleNamespace(**kw),
+        replace=lambda event, **kw: SimpleNamespace(**{**vars(event), **kw}),
+    )
+    driver = cls()
+    driver.global_steps = 2
+    driver.config = {
+        "trainer": {
+            "v1": {
+                "trainer_mode": mode,
+                "sync": {"parameter_sync_step": 3},
+                mode: {"parameter_sync_step": 1},
+            }
+        }
+    }
+    driver._speco_rollout_collected_target = (2, 1)
+    driver._speco_rollout_idle_worker_enabled = lambda: False
+    driver._speco_drafter_training_config = lambda: {
+        "collect_hidden_states_from_vllm": True
+    }
+    calls = []
+    driver._speco_start_target_lm_head_weight_sync = lambda plan: (
+        calls.append("head") or {"drafter/target_lm_head_synced": 1},
+        None,
+    )
+    driver._speco_drafter_schedule_context = driver._speco_drafter_schedule_config = (
+        lambda: None
+    )
+    driver._speco_get_drafter_scheduler = lambda: SimpleNamespace(
+        on_before_actor_update=lambda context: calls.append("schedule")
+        or SimpleNamespace(metrics={})
+    )
+    driver._speco_on_before_actor_update()
+    assert calls == ["head", "schedule"]
+
+
+def test_rollout_replay_plan_pins_data_head_while_actor_plan_keeps_current_head():
+    context = DrafterScheduleContext(
+        global_step=2,
+        training_mode="online",
+        collected_samples_this_step=0,
+        oldlogprob_collection_requested=False,
+        data_status=TrainingDataStatus(
+            current_step=2,
+            current_step_samples=0,
+            buffer_samples=8,
+            trainable_samples=8,
+            trainable_batches=4,
+            batch_size_per_gpu=2,
+            partial_batch_available=False,
+            oldest_sample_step=1,
+            newest_sample_step=1,
+            same_step_data_required=False,
+            target_version=1,
+            data_version=1,
+        ),
+    )
+    for rollout in (False, True):
+        config = DrafterScheduleConfig.from_mapping(
+            {
+                "use_data_buffer": True,
+                "training_interval_steps": 1,
+                "collect_hidden_states_from_vllm": rollout,
+            }
+        )
+        plan = DrafterScheduler().plan_training(context, config)
+        assert plan.launch
+        assert plan.required_target_version == (1 if rollout else 2)
+
+
+def test_rollout_historical_head_does_not_fetch_current_actor_weights():
+    cls = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
+        {"_speco_start_target_lm_head_weight_sync"},
+        time=time,
+    )
+    driver = cls()
+    driver.global_steps = 2
+    driver._speco_rollout_idle_worker_enabled = lambda: False
+    driver._speco_drafter_training_config = lambda: {
+        "collect_hidden_states_from_vllm": True
+    }
+    metrics, pending = driver._speco_start_target_lm_head_weight_sync(
+        SimpleNamespace(launch=True, required_target_version=1)
+    )
+    assert pending is None
+    assert metrics["drafter/target_lm_head_snapshot_reused"] == 1

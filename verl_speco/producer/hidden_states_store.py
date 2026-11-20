@@ -199,6 +199,9 @@ class FileHiddenStatesStore(HiddenStatesStore):
 
     backend = FILE_BACKEND
 
+    def __init__(self, *, wait_for_writer: bool = True):
+        self.wait_for_writer = wait_for_writer
+
     def load(
         self, reference: str | Mapping[str, Any], *, timeout: float = 30.0
     ) -> tuple[dict[str, torch.Tensor], int]:
@@ -209,7 +212,8 @@ class FileHiddenStatesStore(HiddenStatesStore):
         except ImportError as exc:  # pragma: no cover - dependency issue
             raise RuntimeError("vLLM hidden-state replay requires safetensors") from exc
         path = Path(reference)
-        _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
+        if self.wait_for_writer:
+            _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
         if not path.is_file():
             raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
         payload = dict(load_file(str(path), device="cpu"))

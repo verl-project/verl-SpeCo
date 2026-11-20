@@ -714,6 +714,11 @@ class DrafterBaseTrainer:
         self._applied_target_lm_head_weight_step: int | None = None
         self._target_lm_head_snapshots: dict[int, dict[str, Any]] = {}
         self._target_lm_head_snapshot_limit = 2
+        self._rollout_versioned_heads = bool(
+            self.config.rollout.drafter.training.get(
+                "collect_hidden_states_from_vllm", False
+            )
+        )
         self._protected_target_lm_head_versions: set[int] = set()
         self._active_training_reservation_id: str | None = None
         self._active_training_target_version: int | None = None
@@ -3024,13 +3029,55 @@ class DrafterBaseTrainer:
         source_vocab_size: Optional[int] = None,
         defer_device_apply: bool = False,
         protected_target_versions: tuple[int, ...] | None = None,
+        source_target_version: int | None = None,
     ) -> dict[str, Any]:
         """Update the frozen target lm_head used by last-hidden drafter training."""
         if weight is None or not torch.is_tensor(weight):
             return {"accepted": False, "applied": False, "reason": "missing_weight"}
 
+        versioned_rollout = getattr(self, "_rollout_versioned_heads", False)
+        if versioned_rollout and global_step is not None:
+            existing = self._target_lm_head_snapshots.get(int(global_step))
+            if (
+                existing is not None
+                and existing.get("source_target_version") != source_target_version
+            ):
+                raise RuntimeError(
+                    "Conflicting target source version for cached rollout head"
+                )
+            if existing is not None:
+                incoming_rows = None
+                if row_indices is not None:
+                    incoming_rows = (
+                        torch.as_tensor(row_indices).detach().cpu().long().reshape(-1)
+                    )
+                previous_rows = existing["row_indices"]
+                same_rows = (previous_rows is None and incoming_rows is None) or (
+                    previous_rows is not None
+                    and incoming_rows is not None
+                    and torch.equal(previous_rows, incoming_rows)
+                )
+                if (
+                    not torch.equal(existing["weight"], weight.detach().cpu())
+                    or not same_rows
+                    or existing["source_vocab_size"]
+                    != (
+                        int(source_vocab_size)
+                        if source_vocab_size is not None
+                        else None
+                    )
+                ):
+                    raise RuntimeError(
+                        "Conflicting target LM heads for the same rollout version"
+                    )
         weight_shape = tuple(weight.shape)
         self._pending_target_lm_head_weight = weight.detach().cpu().contiguous()
+        if versioned_rollout:
+            # CPU exports may alias reusable transport buffers. Own the bytes
+            # before the actor can mutate or recycle the exported payload.
+            self._pending_target_lm_head_weight = (
+                self._pending_target_lm_head_weight.clone()
+            )
         if row_indices is not None and torch.is_tensor(row_indices):
             self._pending_target_lm_head_row_indices = (
                 row_indices.detach().cpu().long().reshape(-1).contiguous()
@@ -3043,6 +3090,10 @@ class DrafterBaseTrainer:
             )
         else:
             self._pending_target_lm_head_row_indices = None
+        if versioned_rollout and self._pending_target_lm_head_row_indices is not None:
+            self._pending_target_lm_head_row_indices = (
+                self._pending_target_lm_head_row_indices.clone()
+            )
         self._pending_target_lm_head_source_vocab_size = (
             int(source_vocab_size) if source_vocab_size is not None else None
         )
@@ -3051,13 +3102,16 @@ class DrafterBaseTrainer:
         # A newly received payload may replace an earlier snapshot with the
         # same logical step. Force one apply before that version can train.
         self._applied_target_lm_head_weight_step = None
-        if global_step is not None and getattr(self, "_bubble_time_enabled", False):
+        if global_step is not None and (
+            getattr(self, "_bubble_time_enabled", False) or versioned_rollout
+        ):
             version = int(global_step)
             if protected_target_versions is not None:
                 self._protected_target_lm_head_versions = {
                     int(item) for item in protected_target_versions
                 }
             self._target_lm_head_snapshots[version] = {
+                "source_target_version": source_target_version,
                 "weight": self._pending_target_lm_head_weight,
                 "row_indices": self._pending_target_lm_head_row_indices,
                 "source_vocab_size": self._pending_target_lm_head_source_vocab_size,
@@ -3067,6 +3121,17 @@ class DrafterBaseTrainer:
                 getattr(self, "_protected_target_lm_head_versions", ())
             )
             protected_versions.update(getattr(self, "_training_replay_sessions", {}))
+            if versioned_rollout:
+                # The snapshot count is a soft cache limit: live sample owners
+                # take precedence. Recompute owners instead of pinning forever.
+                retained_items = list(getattr(self, "collected_data", ()))
+                if getattr(self, "use_data_buffer", False):
+                    retained_items.extend(self.data_buffer.get_available_data())
+                protected_versions.update(
+                    int(item["target_version"])
+                    for item in retained_items
+                    if item.get("target_version") is not None
+                )
             active_version = getattr(self, "_active_training_target_version", None)
             if active_version is not None:
                 protected_versions.add(active_version)
@@ -4628,6 +4693,25 @@ class DrafterBaseTrainer:
             # 同步 DataBuffer
             data_item["step"] = int(self.current_rl_step)
             data_item["target_version"] = int(self.current_rl_step)
+            if batch.get("hidden_source") == "vllm_rollout":
+                # Keep source provenance distinct from the existing scheduler
+                # target-head key. Never infer one version from the other.
+                data_item["hidden_source"] = "vllm_rollout"
+                data_item["source_target_version"] = _batch_item_int(
+                    batch.get("target_version"), i
+                )
+                data_item["source_global_step"] = _batch_item_int(
+                    batch.get("global_step"), i
+                )
+                data_item["_speco_sample_id"] = _batch_item_value(
+                    batch.get("_speco_sample_id"), i
+                )
+                data_item["source_drafter_revision_min"] = _batch_item_int(
+                    batch.get("_speco_drafter_revision_min"), i
+                )
+                data_item["source_drafter_revision_max"] = _batch_item_int(
+                    batch.get("_speco_drafter_revision_max"), i
+                )
             if self.use_data_buffer:
                 added = self.data_buffer.add_batch(data_item)
 
@@ -4870,6 +4954,25 @@ class DrafterBaseTrainer:
         *,
         sample_index: int | None = None,
     ) -> list[dict[str, Any]]:
+        if getattr(self, "_rollout_versioned_heads", False):
+            head = (
+                self._target_lm_head_snapshots.get(self._target_lm_head_weight_step, {})
+                if self._target_lm_head_weight_step is not None
+                else {}
+            )
+            source = head.get("source_target_version")
+            if available_data and source is None:
+                raise RuntimeError(
+                    "Rollout training requires a cached LM head with an explicit source target version; "
+                    "refusing to substitute the current head"
+                )
+            if source is not None:
+                available_data = [
+                    item
+                    for item in available_data
+                    if item.get("hidden_source") == "vllm_rollout"
+                    and item.get("source_target_version") == source
+                ]
         if len(available_data) <= batch_size:
             return list(available_data)
 
@@ -6834,6 +6937,23 @@ class DrafterBaseTrainer:
             trainable_data = (
                 current_step_data if selected_target_version is not None else []
             )
+
+        if getattr(self, "_rollout_versioned_heads", False):
+            selected_head = (
+                self._target_lm_head_snapshots.get(selected_target_version, {})
+                if selected_target_version is not None
+                else {}
+            )
+            source_version = selected_head.get("source_target_version")
+            trainable_data = [
+                item
+                for item in trainable_data
+                if source_version is not None
+                and item.get("hidden_source") == "vllm_rollout"
+                and item.get("source_target_version") == source_version
+            ]
+            if not trainable_data:
+                selected_target_version = None
 
         batch_size = max(int(self.batch_size), 1)
         trainable_samples = len(trainable_data)

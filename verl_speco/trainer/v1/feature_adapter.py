@@ -61,3 +61,85 @@ def from_transfer_queue_batch(
         target_logprobs=get("target_logprobs"),
         global_step=global_step,
     )
+
+
+def _rollout_hidden_isfinite(hidden):
+    from verl_speco.producer.feature_export import hidden_states_are_finite
+
+    return hidden_states_are_finite(hidden)
+
+
+def validate_rollout_samples(batch, global_step, *, allow_stale=False):
+    """Fail closed on stale or misrouted TQ side-channel samples."""
+    import torch
+
+    values = batch.non_tensor_batch.get("drafter_sample", [])
+    if len(values) != len(batch):
+        raise ValueError("V1 rollout samples must preserve every TQ request position")
+    seen = set()
+    for index, sample in enumerate(values):
+        if sample is None:
+            continue
+        if sample.get("hidden_source") != "vllm_rollout":
+            raise ValueError("V1 expected a vLLM rollout feature sample")
+        source_step = int(sample.get("global_step", -1))
+        if (
+            source_step < 0
+            or source_step > int(global_step)
+            or (not allow_stale and source_step != int(global_step))
+        ):
+            raise ValueError(
+                "V1 rollout sample collection step does not match trainer step"
+            )
+        identity = sample.get("_speco_sample_id")
+        if not identity or identity in seen:
+            raise ValueError("V1 rollout sample identity is missing or duplicated")
+        seen.add(identity)
+        response = batch.batch["responses"][index]
+        captured = sample["responses"].reshape(-1)
+        if captured.numel() > response.numel() or not torch.equal(
+            captured.cpu(), response[: captured.numel()].cpu()
+        ):
+            raise ValueError("V1 rollout sample response does not match its TQ row")
+        prompt = sample.get("prompts")
+        if prompt is not None and "prompts" in batch.batch:
+            source_prompt = batch.batch["prompts"][index]
+            prompt = prompt.reshape(-1)
+            if (
+                prompt.numel() == 0
+                or prompt.numel() > source_prompt.numel()
+                or not torch.equal(prompt.cpu(), source_prompt[-prompt.numel() :].cpu())
+            ):
+                raise ValueError("V1 rollout sample prompt does not match its TQ row")
+        hidden, positions = sample["hidden_states"], sample["hidden_positions"]
+        flat = positions.reshape(-1)
+        if flat.numel() == 0 or flat.dtype not in (torch.int32, torch.int64):
+            raise ValueError("V1 rollout hidden positions must be nonempty integers")
+        if flat.numel() > 1 and not torch.all(flat[1:] == flat[:-1] + 1):
+            raise ValueError("V1 rollout hidden positions must be contiguous")
+        if prompt is not None:
+            start = prompt.numel() - 1
+            end = prompt.numel() + captured.numel() - 1
+            if int(flat[0]) < start or int(flat[-1]) >= end:
+                raise ValueError(
+                    "V1 rollout hidden positions are outside the response prediction range"
+                )
+        if hidden.shape[1] != positions.numel() or not _rollout_hidden_isfinite(hidden):
+            raise ValueError("V1 rollout hidden rows are invalid or nonfinite")
+
+
+def validate_async_rollout_versions(samples, head_paths, current_step):
+    """Reject ambiguous provenance before any worker receives a sample."""
+    versions = {s.get("target_version") for s in samples if s is not None}
+    if versions and (None in versions or len(versions) != 1):
+        raise RuntimeError("Async rollout batch requires one explicit target version")
+    source = next(iter(versions)) if versions else None
+    if source is not None and (
+        type(source) is not int or source < 0 or source > int(current_step)
+    ):
+        raise RuntimeError("Invalid or future async rollout target version")
+    if source is not None and (
+        source not in head_paths or not head_paths[source].is_file()
+    ):
+        raise RuntimeError("Async rollout target head snapshot is missing")
+    return source

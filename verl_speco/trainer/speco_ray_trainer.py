@@ -743,7 +743,7 @@ def _speco_set_generation_meta_flag(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     key: str,
-    value: bool,
+    value: bool | int,
 ):
     """Set one request-scoped generation flag and return a restore callback."""
 
@@ -757,7 +757,7 @@ def _speco_set_generation_meta_flag(
         if not isinstance(meta_info, dict):
             continue
         previous = meta_info.get(key, missing)
-        meta_info[key] = bool(value)
+        meta_info[key] = int(value) if key == "_speco_collection_step" else bool(value)
 
         def restore(meta_info=meta_info, previous=previous) -> None:
             if previous is missing:
@@ -995,6 +995,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return self._require_speco_worker_group().set_global_step(global_step)
 
     def speco_stage_rollout_features(self, requests: list[list[dict]]):
+        if os.getenv("SPECO_CAPTURE_STAGE_NUMPY") == "1":
+            from verl_speco.integration.tensor_wire import encode_rollout_requests
+
+            requests = encode_rollout_requests(requests)
         return self._require_speco_worker_group().stage_rollout_features(requests)
 
     def speco_commit_rollout_features(self, requests: list[list[dict]]):
@@ -4236,6 +4240,55 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         idle_continuation_plan: TrainingPlan | None = None,
         force_quota_completion: bool = False,
     ):
+        head_metrics: dict[str, Any] = {}
+        source = getattr(self, "_speco_rollout_collected_target", None)
+        if (
+            source is not None
+            and source[0] == int(self.global_steps)
+            and not self._speco_rollout_idle_worker_enabled()
+        ):
+            training = self._speco_drafter_training_config()
+            mode = str(
+                _get_nested(self.config, ("trainer", "v1", "trainer_mode"), "sync")
+            )
+            local_updates = int(
+                _get_nested(
+                    self.config, ("trainer", "v1", mode, "parameter_sync_step"), 1
+                )
+            )
+            if (
+                local_updates > 1
+                and training.get("collect_hidden_states_from_vllm", False)
+                and not getattr(self, "_speco_drafter_frozen", False)
+                and getattr(self, "_speco_rollout_prepared_head_step", None)
+                != int(self.global_steps)
+            ):
+                raise RuntimeError(
+                    "Rollout source head must be bound before the final local actor update"
+                )
+            if (
+                training.get("collect_hidden_states_from_vllm", False)
+                and mode in {"sync", "colocate_async", "separate_async"}
+                and (
+                    local_updates == 1
+                    or int(getattr(self, "local_trigger_step", 0)) == 0
+                )
+                and not getattr(self, "_speco_drafter_frozen", False)
+                and getattr(self, "_speco_rollout_prepared_head_step", None)
+                != int(self.global_steps)
+            ):
+                head_metrics, pending = self._speco_start_target_lm_head_weight_sync(
+                    None
+                )
+                if pending is not None:
+                    head_metrics.update(
+                        self._speco_finish_target_lm_head_weight_sync(pending)
+                    )
+                if not head_metrics.get("drafter/target_lm_head_synced"):
+                    raise RuntimeError(
+                        "Rollout target head must be ready before scheduler admission"
+                    )
+                self._speco_rollout_prepared_head_step = int(self.global_steps)
         started = time.perf_counter()
         event = self._speco_get_drafter_scheduler().on_before_actor_update(
             BeforeActorUpdateContext(
@@ -4247,6 +4300,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 force_quota_completion=force_quota_completion,
             )
         )
+        if head_metrics:
+            event = replace(event, metrics={**(event.metrics or {}), **head_metrics})
         if self._speco_rollout_idle_worker_enabled():
             event = replace(
                 event,
@@ -5931,7 +5986,48 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return 0
         all_samples = pop_drafter_samples(gen_batch_output)
         self._speco_last_raw_drafter_samples = len(all_samples)
+        if (
+            self._speco_drafter_training_config().get(
+                "collect_hidden_states_from_vllm", False
+            )
+            or os.getenv("SPECO_CAPTURE_DIAGNOSTICS") == "1"
+        ):
+            from verl_speco.integration.vllm_rollout_capture import capture_trace
+
+            capture_trace(
+                "vLLM capture trainer_receive step=%s raw=%s direct=%s collect=%s reason=%s",
+                self.global_steps,
+                len(all_samples),
+                direct_collected,
+                collection_plan.collect,
+                collection_plan.reason,
+            )
+        if all_samples and collection_plan.collect:
+            if self._speco_rollout_collection_source() is DrafterCollectionSource.VLLM:
+                versions = {sample.get("target_version") for sample in all_samples}
+                version = next(iter(versions), None)
+                if version is None or len(versions) != 1:
+                    raise RuntimeError(
+                        "Rollout collection requires one explicit target serving version"
+                    )
+                previous_source = getattr(self, "_speco_rollout_collected_target", None)
+                if (
+                    previous_source is not None
+                    and previous_source[0] == int(self.global_steps)
+                    and previous_source[1] != int(version)
+                ):
+                    raise RuntimeError(
+                        "Rollout target serving version changed within one training step"
+                    )
+                self._speco_rollout_collected_target = (
+                    int(self.global_steps),
+                    int(version),
+                )
+
         committed_ids = cast(set[str], getattr(self, "_speco_direct_sample_ids", set()))
+        committed_ids = committed_ids | self.__dict__.get(
+            "_speco_reference_committed_ids", set()
+        )
         samples = [
             sample
             for sample in all_samples
@@ -5981,6 +6077,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             collection_id=collection_plan.collection_id,
         )
 
+        receipt_rows = self.__dict__.get("_speco_reference_dispatch_rows")
+        if receipt_rows is not None:
+            for bucket in payload.buckets:
+                for sample in bucket:
+                    sample_id = sample.get("_speco_sample_id")
+                    if not sample_id or sample_id in receipt_rows:
+                        raise RuntimeError(
+                            "Missing or duplicate rollout dispatch identity"
+                        )
+                    receipt_rows[sample_id] = (
+                        int(sample["hidden_states"].shape[-2]),
+                        bool(sample.get("_speco_reference_capacity_fallback")),
+                    )
         outcome = self._speco_execute_collection(
             collection_plan,
             payload,
@@ -6195,6 +6304,69 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         training_plan: TrainingPlan | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         sync_started = time.perf_counter()
+        required_version = getattr(training_plan, "required_target_version", None)
+        if (
+            training_plan is not None
+            and training_plan.launch
+            and required_version is not None
+            and int(required_version) < int(self.global_steps)
+            and not self._speco_rollout_idle_worker_enabled()
+            and self._speco_drafter_training_config().get(
+                "collect_hidden_states_from_vllm", False
+            )
+        ):
+            # A replay plan owns its original head, not the current actor's.
+            # Each worker must select and validate that cached version during
+            # preflight; an absent snapshot rejects the plan without fallback.
+            return {
+                "drafter/target_lm_head_synced": 1,
+                "drafter/target_lm_head_snapshot_reused": 1,
+            }, None
+        async_paths = self.__dict__.get("_speco_async_head_paths")
+        source = self.__dict__.get("_speco_rollout_collected_target")
+        if (
+            async_paths is not None
+            and source is not None
+            and source[0] == int(self.global_steps)
+        ):
+            import torch
+
+            if source[1] not in async_paths:
+                raise RuntimeError("Missing immutable serving target head")
+            payload = torch.load(
+                async_paths[source[1]], map_location="cpu", weights_only=False
+            )
+            if payload.get("source_target_version") != source[1]:
+                raise RuntimeError("Serving target head version mismatch")
+            return self._speco_dispatch_target_lm_head_payload(
+                payload,
+                sync_started=sync_started,
+                fetch_elapsed=0.0,
+                selected_rows=0,
+                source_vocab_size=0,
+            )
+        cycle_head = getattr(self, "_speco_rollout_cycle_head", None)
+        if cycle_head is not None and cycle_head[0] == int(self.global_steps):
+            source = getattr(self, "_speco_rollout_collected_target", None)
+            if source is None or source[0] != int(self.global_steps):
+                return {"drafter/target_lm_head_snapshot_cached": 1}, None
+            if getattr(self, "_speco_rollout_prepared_head_step", None) != int(
+                self.global_steps
+            ):
+                return self._speco_dispatch_target_lm_head_payload(
+                    cycle_head[1], sync_started=sync_started, **cycle_head[2]
+                )
+        if (
+            getattr(self, "_speco_rollout_prepared_head_step", None)
+            == int(self.global_steps)
+            and getattr(self, "_speco_rollout_collected_target", (None,))[0]
+            == int(self.global_steps)
+            and not self._speco_rollout_idle_worker_enabled()
+        ):
+            return {
+                "drafter/target_lm_head_synced": 1,
+                "drafter/target_lm_head_snapshot_reused": 1,
+            }, None
         training_cfg = self._speco_drafter_training_config()
         if bool(training_cfg.get("use_logits", False)):
             return {"drafter/target_lm_head_synced": 0}, None
@@ -6394,7 +6566,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         if bubble_prefetch:
             target_version = int(self.global_steps)
+            source = getattr(self, "_speco_rollout_collected_target", None)
+            source_version = (
+                source[1]
+                if source is not None and source[0] == target_version
+                else None
+            )
             pending = {
+                "source_target_version": source_version,
                 "stage": "fetch",
                 "fetch_refs": payload_refs,
                 "sync_started": sync_started,
@@ -6450,6 +6629,29 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     }
                 )
             return metrics, None
+
+        if (
+            training_cfg.get("collect_hidden_states_from_vllm", False)
+            and not self._speco_rollout_idle_worker_enabled()
+            and int(getattr(self, "parameter_sync_step", 1)) > 1
+        ):
+            if int(getattr(self, "local_trigger_step", 0)) != 0:
+                raise RuntimeError(
+                    "Rollout source head was not cached before the first local actor update"
+                )
+            self._speco_rollout_cycle_head = (
+                int(self.global_steps),
+                payload,
+                dict(
+                    fetch_elapsed=fetch_elapsed,
+                    selected_rows=selected_rows,
+                    source_vocab_size=source_vocab_size,
+                    target_worker_ids=target_worker_ids,
+                ),
+            )
+            source = getattr(self, "_speco_rollout_collected_target", None)
+            if source is None or source[0] != int(self.global_steps):
+                return {"drafter/target_lm_head_snapshot_cached": 1}, None
 
         metrics, pending = self._speco_dispatch_target_lm_head_payload(
             payload,
@@ -6625,6 +6827,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     flush=True,
                 )
                 return {"bubble/target_lm_head_prefetch_failed": 1, **phase_metrics}
+            if pending.get("source_target_version") is not None:
+                if not isinstance(payload, dict):
+                    raise RuntimeError(
+                        "Versioned rollout head export requires metadata payload"
+                    )
+                payload = {
+                    **payload,
+                    "source_target_version": pending["source_target_version"],
+                }
             metrics, dispatch_pending = self._speco_dispatch_target_lm_head_payload(
                 payload,
                 sync_started=float(pending["sync_started"]),
@@ -6900,6 +7111,34 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         defer_device_apply = isinstance(payload, dict)
         if defer_device_apply:
             payload = dict(payload)
+            source = getattr(self, "_speco_rollout_collected_target", None)
+            if (
+                source is not None
+                and "source_target_version" not in payload
+                and not self._speco_rollout_idle_worker_enabled()
+            ):
+                mode = str(
+                    _get_nested(self.config, ("trainer", "v1", "trainer_mode"), "sync")
+                )
+                local_updates = int(
+                    _get_nested(
+                        self.config, ("trainer", "v1", mode, "parameter_sync_step"), 1
+                    )
+                )
+                if (
+                    self._speco_drafter_training_config().get(
+                        "collect_hidden_states_from_vllm", False
+                    )
+                    and mode == "sync"
+                    and (
+                        local_updates == 1
+                        or int(getattr(self, "local_trigger_step", 0)) == 0
+                        or getattr(self, "_speco_rollout_cycle_head", (None,))[0]
+                        == int(self.global_steps)
+                    )
+                    and source[0] == int(self.global_steps)
+                ):
+                    payload["source_target_version"] = source[1]
             payload["defer_device_apply"] = True
             if self._speco_rollout_idle_worker_enabled():
                 payload["require_target_head_ack"] = True
@@ -6996,6 +7235,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "timing_s/drafter_target_lm_head_fetch_critical_path": (
                         fetch_finished - fetch_wait_started
                     ),
+                }
+            if pending.get("source_target_version") is not None:
+                if not isinstance(payload, dict):
+                    raise RuntimeError(
+                        "Versioned rollout head export requires metadata payload"
+                    )
+                payload = {
+                    **payload,
+                    "source_target_version": pending["source_target_version"],
                 }
             metrics, dispatch_pending = self._speco_dispatch_target_lm_head_payload(
                 payload,
@@ -8190,6 +8438,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
 
         def generate_sequences_with_speco(manager_self, *args, **kwargs):
+            if os.getenv("SPECO_CAPTURE_DIAGNOSTICS") == "1":
+                print(
+                    f"[vLLM capture trainer_hook_enter] step={self.global_steps} "
+                    f"pid={os.getpid()} file={__file__}",
+                    flush=True,
+                )
             diagnostic_started = time.perf_counter() if phase_diagnostics else None
             generation_metrics = self._speco_publish_boundary()
             input_is_validation = bool(
@@ -8263,6 +8517,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         config,
                     )
                 )
+            )
+            restore_collection_step = _speco_set_generation_meta_flag(
+                args, kwargs, "_speco_collection_step", int(self.global_steps)
             )
             restore_collection_flag = _speco_set_generation_meta_flag(
                 args,
@@ -8343,6 +8600,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                             time.perf_counter() - event_drain_started
                         )
                 restore_collection_flag()
+                restore_collection_step()
             is_validation_generation = (
                 input_is_validation
                 or _speco_is_validation_generation(args, kwargs, gen_batch_output)
@@ -8363,6 +8621,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 runtime_idle_events,
                 runtime_sample_events,
             )
+            if os.getenv("SPECO_CAPTURE_DIAGNOSTICS") == "1":
+                print(
+                    "[vLLM capture trainer_generation_return] "
+                    f"step={self.global_steps} validation={is_validation_generation} "
+                    f"frozen={getattr(self, '_speco_drafter_frozen', False)} "
+                    f"skip_quota={skip_collection_for_quota} "
+                    f"fields={tuple((getattr(gen_batch_output, 'non_tensor_batch', None) or {}).keys())}",
+                    flush=True,
+                )
             if not is_validation_generation:
 
                 def handle_post_rollout_completion(completed_plan, outcome):
@@ -9305,6 +9572,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             generate_sequences_with_speco,
             rollout_generation_target,
         )
+        if os.getenv("SPECO_CAPTURE_DIAGNOSTICS") == "1":
+            bound = rollout_generation_target.generate_sequences
+            function = getattr(bound, "__func__", bound)
+            print(
+                "[vLLM capture trainer_binding] "
+                f"pid={os.getpid()} file={__file__} "
+                f"target={type(rollout_generation_target).__module__}.{type(rollout_generation_target).__qualname__} "
+                f"method={getattr(function, '__qualname__', None)} "
+                f"installed={function is generate_sequences_with_speco}",
+                flush=True,
+            )
         if self._speco_oldlogprob_collection_requested():
             self._compute_old_log_prob = MethodType(
                 compute_old_log_prob_with_speco, self
