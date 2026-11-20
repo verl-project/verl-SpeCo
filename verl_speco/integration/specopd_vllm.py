@@ -21,7 +21,7 @@ worker result, so async scheduler placeholders never become training tokens.
 from functools import wraps
 import time
 
-from verl_speco.transport.specopd_protocol import (
+from verl_speco.integration.specopd_protocol import (
     PLAN_KEY,
     TRACE_KEY,
     SCHEMA,
@@ -32,7 +32,7 @@ from verl_speco.transport.specopd_protocol import (
     decode_bundle,
 )
 
-_COMPLETED = {}
+_COMPLETED: dict[str, tuple[str, float]] = {}
 
 
 def patch_draft_token_request_tracking(runner):
@@ -61,7 +61,9 @@ def patch_draft_token_request_tracking(runner):
     def removed(self, request_id, *args, **kwargs):
         result = remove(self, request_id, *args, **kwargs)
         getattr(self.draft_tokens_handler, "_specopd_plans", {}).pop(request_id, None)
-        getattr(self.draft_tokens_handler, "_specopd_result_counts", {}).pop(request_id, None)
+        getattr(self.draft_tokens_handler, "_specopd_result_counts", {}).pop(
+            request_id, None
+        )
         return result
 
     runner.add_requests, runner._remove_request = added, removed
@@ -116,7 +118,10 @@ def snapshot_scheduler_round(scheduler):
         selected = (
             plan["max_branches"] > 0
             and plan["start"] <= prefix_len - plan["prompt_len"] < plan["end"]
-            and (plan.get("reservoir") or len(getattr(request, "_specopd_records", ())) < plan["max_branches"])
+            and (
+                plan.get("reservoir")
+                or len(getattr(request, "_specopd_records", ())) < plan["max_branches"]
+            )
         )
         snapshots[request_id] = (
             request,
@@ -176,7 +181,9 @@ def capture_scheduler_round(scheduler_output, model_output, snapshots):
                 break
         accepted = min(len(raw), max(0, len(sampled[mapping[request_id]]) - 1))
         if list(sampled[mapping[request_id]][:accepted]) != raw[:accepted]:
-            raise RuntimeError("SpecOPD accepted tokens differ from the verified proposal")
+            raise RuntimeError(
+                "SpecOPD accepted tokens differ from the verified proposal"
+            )
         record = ProposalRecord(
             f"{plan['request_id']}:{round_id}",
             len(prefix),
@@ -187,6 +194,7 @@ def capture_scheduler_round(scheduler_output, model_output, snapshots):
         )
         if plan.get("reservoir"):
             from verl_speco.integration.specopd_anchors import retain_proposal
+
             retain_proposal(request, plan, record_dict(record))
         else:
             records.append(record_dict(record))
@@ -223,7 +231,10 @@ def install_specopd_vllm_patch():
 
     @wraps(update)
     def updated(self, scheduler_output, model_output):
-        from verl_speco.integration.specopd_async import VERIFIED_KEY, snapshot_result_round
+        from verl_speco.integration.specopd_async import (
+            VERIFIED_KEY,
+            snapshot_result_round,
+        )
 
         snapshots = getattr(self, "_specopd_schedules", {}).pop(
             id(scheduler_output), {}

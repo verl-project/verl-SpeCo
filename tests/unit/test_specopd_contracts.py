@@ -44,7 +44,7 @@ from verl_speco.specopd_config import (
     validate_specopd_config,
 )
 from verl_speco.trainer.scheduler.specopd_cycle import SpecOPDCycle
-from verl_speco.transport.specopd_protocol import (
+from verl_speco.integration.specopd_protocol import (
     ProposalRecord,
     decode_bundle,
     encode_bundle,

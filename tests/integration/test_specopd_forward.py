@@ -20,7 +20,9 @@ import weakref
 from types import ModuleType, SimpleNamespace
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
+
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from verl_speco.backends.specopd_forward import (

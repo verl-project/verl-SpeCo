@@ -4167,16 +4167,22 @@ class _SpecoVLLMHttpServerMixin:
     async def speco_resume_rollout_admission(self):
         self._speco_rollout_admission().resume()
 
-    async def speco_set_serving_drafter_revision(self, revision, *, collection_quota=None):
+    async def speco_set_serving_drafter_revision(
+        self, revision, *, collection_quota=None
+    ):
         # The trainer calls this only after all weight commit RPCs have settled,
         # while ordinary serving is quiescent behind the admission boundary.
         if collection_quota is not None:
             if type(collection_quota) is not int or collection_quota < 0:
-                raise ValueError("SpecOPD replica collection quota must be a nonnegative integer")
+                raise ValueError(
+                    "SpecOPD replica collection quota must be a nonnegative integer"
+                )
             self._specopd_collection_quota = collection_quota
         self._speco_serving_drafter_revision = int(revision)
-        reply = {"drafter_revision": self._speco_serving_drafter_revision,
-                 "actor_revision": self.global_steps}
+        reply = {
+            "drafter_revision": self._speco_serving_drafter_revision,
+            "actor_revision": self.global_steps,
+        }
         if collection_quota is not None:
             reply["collection_quota"] = collection_quota
         return reply
@@ -4255,39 +4261,81 @@ async def _speco_generate_with_request_stats_unblocked(
         specopd_revision = clean_params.pop("_specopd_drafter_revision", None)
         from verl_speco.specopd_config import SpecOPDConfig
         from verl_speco.integration.specopd_window import make_window
-        from verl_speco.transport.specopd_protocol import PLAN_KEY
+        from verl_speco.integration.specopd_protocol import PLAN_KEY
 
         drafter_cfg = _load_env_drafter_config()
         specopd_config = SpecOPDConfig.from_drafter(
             drafter_cfg,
             rollout_temperature=_get_nested(self, ("config", "temperature"), 1.0),
         )
-        specopd_collect = specopd_config.enable and not clean_params.get("_verl_skip_drafter_collection", False)
+        specopd_collect = specopd_config.enable and not clean_params.get(
+            "_verl_skip_drafter_collection", False
+        )
         if specopd_collect:
             if specopd_revision is None:
-                raise RuntimeError("SpecOPD request is missing its acknowledged drafter revision")
-            if specopd_revision != getattr(self, "_speco_serving_drafter_revision", None):
-                raise RuntimeError("SpecOPD request differs from the acknowledged serving drafter revision")
-            for key, default in (("top_p", 1.0), ("top_k", -1), ("min_p", 0.0), ("repetition_penalty", 1.0)):
+                raise RuntimeError(
+                    "SpecOPD request is missing its acknowledged drafter revision"
+                )
+            if specopd_revision != getattr(
+                self, "_speco_serving_drafter_revision", None
+            ):
+                raise RuntimeError(
+                    "SpecOPD request differs from the acknowledged serving drafter revision"
+                )
+            for key, default in (
+                ("top_p", 1.0),
+                ("top_k", -1),
+                ("min_p", 0.0),
+                ("repetition_penalty", 1.0),
+            ):
                 if clean_params.get(key, default) != default:
-                    raise ValueError(f"SpecOPD does not support modified proposal processing: {key}")
-            for key, default in (("min_tokens", 0), ("frequency_penalty", 0.0), ("presence_penalty", 0.0),
-                                 ("logit_bias", None), ("allowed_token_ids", None), ("bad_words", None),
-                                 ("structured_outputs", None), ("guided_decoding", None), ("stop", None), ("n", 1)):
+                    raise ValueError(
+                        f"SpecOPD does not support modified proposal processing: {key}"
+                    )
+            for key, default in (
+                ("min_tokens", 0),
+                ("frequency_penalty", 0.0),
+                ("presence_penalty", 0.0),
+                ("logit_bias", None),
+                ("allowed_token_ids", None),
+                ("bad_words", None),
+                ("structured_outputs", None),
+                ("guided_decoding", None),
+                ("stop", None),
+                ("n", 1),
+            ):
                 if clean_params.get(key, default) != default:
-                    raise ValueError(f"SpecOPD cannot reconstruct this sampling modifier: {key}")
-            if float(clean_params.get("temperature", 1.0)) != specopd_config.proposal_temperature:
+                    raise ValueError(
+                        f"SpecOPD cannot reconstruct this sampling modifier: {key}"
+                    )
+            if (
+                float(clean_params.get("temperature", 1.0))
+                != specopd_config.proposal_temperature
+            ):
                 raise ValueError("rollout and SpecOPD proposal temperatures differ")
             prompt = kwargs.get("prompt_ids", args[0] if args else None)
             rid = self._speco_request_id_from_generate_call(args, kwargs)
-            budget = int(clean_params.get("max_tokens", clean_params.get("max_new_tokens", self.config.response_length)))
+            budget = int(
+                clean_params.get(
+                    "max_tokens",
+                    clean_params.get("max_new_tokens", self.config.response_length),
+                )
+            )
             native_extra = dict(clean_params.get("extra_args") or {})
-            native_extra[PLAN_KEY] = make_window(specopd_config, rid, self.global_steps,
-                                                 specopd_revision, len(prompt), budget)
+            native_extra[PLAN_KEY] = make_window(
+                specopd_config,
+                rid,
+                self.global_steps,
+                specopd_revision,
+                len(prompt),
+                budget,
+            )
             eos = _get_nested(self.model_config, ("hf_config", "eos_token_id"), None)
             stop_ids = clean_params.get("stop_token_ids", []) or []
             native_extra[PLAN_KEY]["eos_token_ids"] = list(stop_ids) + (
-                [] if clean_params.get("ignore_eos", False) or eos is None else (eos if isinstance(eos, list) else [eos])
+                []
+                if clean_params.get("ignore_eos", False) or eos is None
+                else (eos if isinstance(eos, list) else [eos])
             )
             # Reuse the existing request-count budget, with an explicit empty
             # bundle for unselected requests so normal old-logprob still runs.
@@ -4297,16 +4345,28 @@ async def _speco_generate_with_request_stats_unblocked(
                 self._specopd_collection_epoch = epoch
                 self._specopd_collection_requests = 0
             rate = float(training_cfg.get("collection_sample_rate", 1.0))
-            sample_hash = int.from_bytes(hashlib.sha256(f"{rid}:{epoch}".encode()).digest()[:8], "little") / 2**64
-            limit = int(training_cfg.get("max_collect_samples_per_step_per_replica", 16))
+            sample_hash = (
+                int.from_bytes(
+                    hashlib.sha256(f"{rid}:{epoch}".encode()).digest()[:8], "little"
+                )
+                / 2**64
+            )
+            limit = int(
+                training_cfg.get("max_collect_samples_per_step_per_replica", 16)
+            )
             quota = None
             if specopd_config.max_collect_samples_per_step is not None:
                 quota = getattr(self, "_specopd_collection_quota", None)
                 if quota is None:
-                    raise RuntimeError("SpecOPD global collection limit has no acknowledged replica quota")
+                    raise RuntimeError(
+                        "SpecOPD global collection limit has no acknowledged replica quota"
+                    )
             captured = self._specopd_collection_requests
-            if (sample_hash >= rate or (limit > 0 and captured >= limit)
-                    or (quota is not None and captured >= quota)):
+            if (
+                sample_hash >= rate
+                or (limit > 0 and captured >= limit)
+                or (quota is not None and captured >= quota)
+            ):
                 native_extra[PLAN_KEY]["max_branches"] = 0
             else:
                 self._specopd_collection_requests += 1
@@ -4411,11 +4471,13 @@ async def _speco_generate_with_request_stats_unblocked(
         if isinstance(extra_fields, dict):
             if isinstance(sampling_params, dict) and specopd_collect:
                 from verl_speco.integration.specopd_vllm import pop_completed
-                from verl_speco.transport.specopd_protocol import PROPOSAL_KEY
+                from verl_speco.integration.specopd_protocol import PROPOSAL_KEY
 
                 wire = pop_completed(request_id)
                 if wire is None:
-                    raise RuntimeError("SpecOPD proposal channel missing from vLLM final output")
+                    raise RuntimeError(
+                        "SpecOPD proposal channel missing from vLLM final output"
+                    )
                 extra_fields[PROPOSAL_KEY] = wire
             revision_after = int(getattr(self, "_speco_serving_drafter_revision", 0))
             # Unscored requests must carry the same provenance key as requests
@@ -5577,7 +5639,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             )
 
             if not install_specopd_draft_token_transport_patch():
-                raise RuntimeError("SpecOPD worker requires the MRV2 proposal capture hooks")
+                raise RuntimeError(
+                    "SpecOPD worker requires the MRV2 proposal capture hooks"
+                )
             logger.warning("[SpecOPDCapture] model-worker proposal hooks installed")
         try:
             instance = super().__new__(cls, **kwargs)

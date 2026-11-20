@@ -60,7 +60,9 @@ class PackedJointBatch:
 class BranchScores:
     branch_id: str
     target_logits: torch.Tensor | None  # Optional raw predecessor logits.
-    target_logz: torch.Tensor | None  # Optional logsumexp(raw logits / target_temperature).
+    target_logz: (
+        torch.Tensor | None
+    )  # Optional logsumexp(raw logits / target_temperature).
     target_hidden: torch.Tensor
 
 
@@ -79,8 +81,13 @@ def _integer(value: object) -> bool:
 
 
 def validate_joint_batch(
-    requests, *, dtype, vocab_size, max_packed_tokens=8192,
-    max_mask_elements=16_777_216, sequence_multiple=1,
+    requests,
+    *,
+    dtype,
+    vocab_size,
+    max_packed_tokens=8192,
+    max_mask_elements=16_777_216,
+    sequence_multiple=1,
 ):
     """Check a local packed tree layout without allocating quadratic masks."""
     if not requests:
@@ -120,12 +127,24 @@ def validate_joint_batch(
                 raise ValueError("anchor must be at the prompt end or on the response")
             if not branch.token_ids:
                 raise ValueError("a proposal must contain at least one valid token")
-            if (branch.source not in {"proposal", "trunk"}
-                    or not _integer(branch.accepted_count)
-                    or not -1 <= branch.accepted_count <= len(branch.token_ids)):
+            if (
+                branch.source not in {"proposal", "trunk"}
+                or not _integer(branch.accepted_count)
+                or not -1 <= branch.accepted_count <= len(branch.token_ids)
+            ):
                 raise ValueError("invalid branch source or acceptance diagnostics")
-            if branch.source == "trunk" and tuple(request.trunk_ids[branch.anchor + 1:branch.anchor + 1 + len(branch.token_ids)]) != branch.token_ids:
-                raise ValueError("trunk anchor tokens differ from the rollout trajectory")
+            if (
+                branch.source == "trunk"
+                and tuple(
+                    request.trunk_ids[
+                        branch.anchor + 1 : branch.anchor + 1 + len(branch.token_ids)
+                    ]
+                )
+                != branch.token_ids
+            ):
+                raise ValueError(
+                    "trunk anchor tokens differ from the rollout trajectory"
+                )
             ids.extend(branch.token_ids)
             length += len(branch.token_ids) - 1
             independent_rows += branch.anchor + len(branch.token_ids)
@@ -168,18 +187,29 @@ def pack_joint_batch(
     """
     requests = tuple(requests)
     lengths, width, independent_rows = validate_joint_batch(
-        requests, dtype=dtype, vocab_size=vocab_size,
-        max_packed_tokens=max_packed_tokens, max_mask_elements=max_mask_elements,
+        requests,
+        dtype=dtype,
+        vocab_size=vocab_size,
+        max_packed_tokens=max_packed_tokens,
+        max_mask_elements=max_mask_elements,
         sequence_multiple=sequence_multiple,
     )
 
     input_ids = torch.zeros((len(requests), width), dtype=torch.long, device=device)
     positions = torch.zeros_like(input_ids)
-    mask_rows = sum(bool(request.branches) for request in requests) if omit_trunk_only_masks else len(requests)
+    mask_rows = (
+        sum(bool(request.branches) for request in requests)
+        if omit_trunk_only_masks
+        else len(requests)
+    )
     allowed = None
     if build_attention_mask and mask_rows:
-        allowed = torch.eye(width, dtype=torch.bool, device=device).expand(mask_rows, -1, -1).clone()
-    all_rows = []
+        allowed = (
+            torch.eye(width, dtype=torch.bool, device=device)
+            .expand(mask_rows, -1, -1)
+            .clone()
+        )
+    all_rows: list[tuple[tuple[int, ...], ...]] = []
     mask_row = 0
     for batch_index, request in enumerate(requests):
         n = len(request.trunk_ids)
@@ -205,10 +235,14 @@ def pack_joint_batch(
                     branch.anchor + 1, branch.anchor + 1 + count, device=device
                 )
                 if allowed is not None:
-                    allowed[mask_row, offset : offset + count, : branch.anchor + 1] = True
+                    allowed[mask_row, offset : offset + count, : branch.anchor + 1] = (
+                        True
+                    )
                     allowed[
                         mask_row, offset : offset + count, offset : offset + count
-                    ] = torch.ones((count, count), dtype=torch.bool, device=device).tril()
+                    ] = torch.ones(
+                        (count, count), dtype=torch.bool, device=device
+                    ).tril()
             offset += count
         all_rows.append(tuple(branch_rows))
         mask_row += 1
@@ -283,6 +317,8 @@ def score_joint_batch(
         max_mask_elements=max_mask_elements,
         sequence_multiple=sequence_multiple,
     )
+    mask = packed.attention_mask
+    assert mask is not None
     if int(packed.position_ids.max()) >= config.max_position_embeddings:
         raise ValueError(
             "a branch exceeds max_position_embeddings; prefixes must not be truncated"
@@ -293,7 +329,7 @@ def score_joint_batch(
         output = model(
             input_ids=packed.input_ids,
             position_ids=packed.position_ids,
-            attention_mask=packed.attention_mask,
+            attention_mask=mask,
             use_cache=False,
             output_hidden_states=True,
             return_dict=True,
@@ -328,21 +364,30 @@ def score_joint_batch(
             row_indices = torch.tensor(readout, device=rows.device)
             logits = (
                 output.logits[batch_index].index_select(0, row_indices)
-                if return_target_logits or return_target_logz else None
+                if return_target_logits or return_target_logz
+                else None
             )
             hidden = output.hidden_states[-1][batch_index].index_select(0, row_indices)
             branches.append(
                 BranchScores(
                     branch.branch_id,
                     logits if return_target_logits else None,
-                    (logits.float() / target_temperature).logsumexp(-1) if return_target_logz else None,
+                    (logits.float() / target_temperature).logsumexp(-1)
+                    if return_target_logz and logits is not None
+                    else None,
                     hidden,
                 )
             )
-        feature_rows = (max(b.anchor for b in request.branches) + 1
-                        if trunk_feature_prefix_only and request.branches else n)
+        feature_rows = (
+            max(b.anchor for b in request.branches) + 1
+            if trunk_feature_prefix_only and request.branches
+            else n
+        )
         features = (
-            {i: output.hidden_states[i][batch_index, :feature_rows].clone() for i in indices}
+            {
+                i: output.hidden_states[i][batch_index, :feature_rows].clone()
+                for i in indices
+            }
             if request.branches or capture_empty_trunk_features
             else {}
         )
@@ -356,5 +401,5 @@ def score_joint_batch(
         "logical_rows": packed.logical_rows,
         "independent_rows": packed.independent_rows,
         "padded_rows": packed.input_ids.numel(),
-        "mask_elements": packed.attention_mask.numel(),
+        "mask_elements": mask.numel(),
     }

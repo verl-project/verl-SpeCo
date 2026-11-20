@@ -7325,55 +7325,90 @@ class DrafterBaseTrainer:
 
     async def training_specopd_group(self, samples, step, spec, feature_indices):
         """Train one collected group for its configured updates, then publish once."""
-        from verl_speco.backends.specopd_forward import prepare_specopd_training_batches, partition_specopd_samples, plan_specopd_training_groups
+        from verl_speco.backends.specopd_forward import (
+            prepare_specopd_training_batches,
+            partition_specopd_samples,
+            plan_specopd_training_groups,
+        )
 
-        selected = [(request, scores) for request, scores in samples if request.branches]
+        selected = [
+            (request, scores) for request, scores in samples if request.branches
+        ]
         # Establish every loss-reduction communicator while peers are still at
         # the same entry boundary, rather than after rank-local preparation.
-        from verl_speco.integration.specopd_collectives import warm_specopd_training_collectives
+        from verl_speco.integration.specopd_collectives import (
+            warm_specopd_training_collectives,
+        )
 
         dp_size = self._get_dp_world_size()
         group_sizes = plan_specopd_training_groups(
-            selected, dp_size, spec.training_microbatch_trajectories, spec.training_microbatch_token_budget,
+            selected,
+            dp_size,
+            spec.training_microbatch_trajectories,
+            spec.training_microbatch_token_budget,
         )
         warm_specopd_training_collectives(self, step=step)
-        positions = sum(len(branch.token_ids) for request, _ in selected for branch in request.branches)
+        positions = sum(
+            len(branch.token_ids)
+            for request, _ in selected
+            for branch in request.branches
+        )
         if positions < spec.min_scored_positions_per_update:
             return False
         self._specopd_group_metrics = {}
         activation_started = time.perf_counter()
         if not await self.activate_training_model():
             raise RuntimeError("SpecOPD drafter activation failed")
-        self._specopd_group_metrics["timing_s/specopd_activation"] = time.perf_counter() - activation_started
+        self._specopd_group_metrics["timing_s/specopd_activation"] = (
+            time.perf_counter() - activation_started
+        )
         wrapper = self.model.module if hasattr(self.model, "module") else self.model
         layers = wrapper.draft_model.num_context_layers
         if len(feature_indices) != layers:
-            raise ValueError("SpecOPD auxiliary layer count differs from drafter checkpoint")
+            raise ValueError(
+                "SpecOPD auxiliary layer count differs from drafter checkpoint"
+            )
         if float(getattr(wrapper.draft_model.config, "attention_dropout", 0.0)) != 0:
-            raise ValueError("SpecOPD fixed-history probability reconstruction requires zero draft dropout")
+            raise ValueError(
+                "SpecOPD fixed-history probability reconstruction requires zero draft dropout"
+            )
         prepare_started = time.perf_counter()
         dp_rank = self._get_dp_local_rank()
         selected, real_slots = partition_specopd_samples(selected, dp_rank, dp_size)
         batches, cache_bytes = prepare_specopd_training_batches(
-            selected, self.runtime_device, spec, feature_indices,
+            selected,
+            self.runtime_device,
+            spec,
+            feature_indices,
             cache_bytes=spec.training_input_cache_mib * 1024**2,
-            group_sizes=group_sizes, real_slots=real_slots,
+            group_sizes=group_sizes,
+            real_slots=real_slots,
         )
-        self._specopd_group_metrics.update({
-            "timing_s/specopd_prepare": time.perf_counter() - prepare_started,
-            "specopd/prepared_batches": len(batches), "specopd/train_microbatch_trajectories": max(group_sizes), "specopd/train_dp_size": dp_size, "specopd/input_cache_bytes": cache_bytes,
-        })
+        self._specopd_group_metrics.update(
+            {
+                "timing_s/specopd_prepare": time.perf_counter() - prepare_started,
+                "specopd/prepared_batches": len(batches),
+                "specopd/train_microbatch_trajectories": max(group_sizes),
+                "specopd/train_dp_size": dp_size,
+                "specopd/input_cache_bytes": cache_bytes,
+            }
+        )
         optimizer_before = self.optimizer_steps_total
         train_started = time.perf_counter()
         for _ in range(spec.optimizer_updates_per_collection):
             for index, prepared in enumerate(batches):
                 batch = {
-                    key: value.to(self.runtime_device) if torch.is_tensor(value) else value
+                    key: value.to(self.runtime_device)
+                    if torch.is_tensor(value)
+                    else value
                     for key, value in prepared.items()
                 }
                 with torch.enable_grad():
                     ok = await self._training_step_on_batch(
-                        batch, step, accumulation_steps=len(batches), accumulation_index=index,
+                        batch,
+                        step,
+                        accumulation_steps=len(batches),
+                        accumulation_index=index,
                     )
                 # Backward has consumed this microbatch. Release uncached device
                 # inputs before staging the next one, rather than retaining both
@@ -7381,13 +7416,24 @@ class DrafterBaseTrainer:
                 del batch
                 if not ok:
                     self.optimizer.zero_grad(set_to_none=True)
-                    raise RuntimeError("SpecOPD update failed; this group must not be replayed")
-        self._specopd_group_metrics["timing_s/specopd_train_loop"] = time.perf_counter() - train_started
-        if self.optimizer_steps_total != optimizer_before + spec.optimizer_updates_per_collection:
-            raise RuntimeError("SpecOPD group optimizer update count differs from its configuration")
+                    raise RuntimeError(
+                        "SpecOPD update failed; this group must not be replayed"
+                    )
+        self._specopd_group_metrics["timing_s/specopd_train_loop"] = (
+            time.perf_counter() - train_started
+        )
+        if (
+            self.optimizer_steps_total
+            != optimizer_before + spec.optimizer_updates_per_collection
+        ):
+            raise RuntimeError(
+                "SpecOPD group optimizer update count differs from its configuration"
+            )
         snapshot_started = time.perf_counter()
         self.prepare_model_state_dict_for_publish(step)
-        self._specopd_group_metrics["timing_s/specopd_snapshot"] = time.perf_counter() - snapshot_started
+        self._specopd_group_metrics["timing_s/specopd_snapshot"] = (
+            time.perf_counter() - snapshot_started
+        )
         # Drop fixed input device tensors before the worker offloads its model.
         del batches, prepared
         return True
@@ -7923,7 +7969,6 @@ class DrafterBaseTrainer:
 
         try:
             training_cfg = self.config.rollout.drafter.training
-            from verl_speco.specopd_config import spec_opd_enabled
 
             if (
                 not getattr(self, "_bubble_time_enabled", False)

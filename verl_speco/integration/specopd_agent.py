@@ -4,9 +4,11 @@
 
 from contextvars import ContextVar
 
-from verl_speco.transport.specopd_protocol import PROPOSAL_KEY
+from verl_speco.integration.specopd_protocol import PROPOSAL_KEY
 
-PROPOSAL_TURNS = ContextVar("specopd_proposal_turns", default=None)
+PROPOSAL_TURNS: ContextVar[list[str] | None] = ContextVar(
+    "specopd_proposal_turns", default=None
+)
 
 
 def collect_proposal_output(output):

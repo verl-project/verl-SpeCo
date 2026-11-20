@@ -17,7 +17,6 @@ import math
 from dataclasses import dataclass, fields
 
 
-
 @dataclass(frozen=True)
 class SpecOPDConfig:
     enable: bool = False
@@ -98,7 +97,9 @@ class SpecOPDConfig:
             trunk_slots = anchors // 4 if anchors else cls.random_anchor_count
             branches = options.get("max_branches_per_request")
             if branches is None:
-                branches = anchors - trunk_slots if anchors else cls.max_branches_per_request
+                branches = (
+                    anchors - trunk_slots if anchors else cls.max_branches_per_request
+                )
             width = options.get("proposal_width")
             if width is None:
                 width = cls.proposal_width if verify_tokens is None else verify_tokens
@@ -108,7 +109,8 @@ class SpecOPDConfig:
                 "actor_temperature": rollout_temperature,
                 "proposal_temperature": rollout_temperature,
                 "target_temperature": rollout_temperature,
-                "window_mode": training.get("hidden_state_window_mode") or cls.window_mode,
+                "window_mode": training.get("hidden_state_window_mode")
+                or cls.window_mode,
                 "window_response_tokens": (
                     training.get("hidden_state_window_tokens_per_sample")
                     or cls.window_response_tokens
@@ -118,7 +120,9 @@ class SpecOPDConfig:
                     "first_reject_weight", cls.first_reject_weight
                 ),
                 "random_anchor_count": trunk_slots,
-                "random_position_decay_gamma": training.get(f"{algorithm}_loss_decay_gamma"),
+                "random_position_decay_gamma": training.get(
+                    f"{algorithm}_loss_decay_gamma"
+                ),
                 "max_branches_per_request": branches,
                 "max_proposal_tokens_per_request": (
                     branches * width
@@ -131,7 +135,9 @@ class SpecOPDConfig:
                     options[name] = getattr(cls, name) if default is None else default
         else:
             # Shared YAML uses null for values resolved only by enabled SpecOPD.
-            options = {name: value for name, value in options.items() if value is not None}
+            options = {
+                name: value for name, value in options.items() if value is not None
+            }
         options.setdefault("optimizer_updates_per_collection", training.get("step", 1))
         result = cls(**{**options, "enable": enabled})
         if enabled:
@@ -144,8 +150,10 @@ class SpecOPDConfig:
         trunk_slots = self.anchor_count // 4
         proposal_slots = self.anchor_count - trunk_slots
         if self.anchor_count and (
-            self.random_anchor_count != trunk_slots or self.max_branches_per_request != proposal_slots
-            or self.max_proposal_tokens_per_request < proposal_slots * self.proposal_width
+            self.random_anchor_count != trunk_slots
+            or self.max_branches_per_request != proposal_slots
+            or self.max_proposal_tokens_per_request
+            < proposal_slots * self.proposal_width
         ):
             raise ValueError(
                 f"{self.anchor_count}-anchor SpecOPD requires {proposal_slots} proposal slots "
@@ -155,7 +163,9 @@ class SpecOPDConfig:
             raise ValueError("SpecOPD first_reject_weight must be finite and positive")
         gamma = self.random_position_decay_gamma
         if not math.isfinite(gamma) or gamma < 0:
-            raise ValueError("SpecOPD random_position_decay_gamma must be finite and nonnegative")
+            raise ValueError(
+                "SpecOPD random_position_decay_gamma must be finite and nonnegative"
+            )
         if self.window_mode not in {"front", "random"}:
             raise ValueError("SpecOPD window_mode must be front or random")
         for name in (
@@ -178,11 +188,19 @@ class SpecOPDConfig:
         if type(self.random_max_offset) is not int or self.random_max_offset < 0:
             raise ValueError("SpecOPD random_max_offset must be nonnegative")
         if self.max_collect_samples_per_step is not None and (
-            type(self.max_collect_samples_per_step) is not int or self.max_collect_samples_per_step < 1
+            type(self.max_collect_samples_per_step) is not int
+            or self.max_collect_samples_per_step < 1
         ):
-            raise ValueError("SpecOPD max_collect_samples_per_step must be a positive integer or null")
-        if type(self.training_input_cache_mib) is not int or self.training_input_cache_mib < 0:
-            raise ValueError("SpecOPD training_input_cache_mib must be a nonnegative integer")
+            raise ValueError(
+                "SpecOPD max_collect_samples_per_step must be a positive integer or null"
+            )
+        if (
+            type(self.training_input_cache_mib) is not int
+            or self.training_input_cache_mib < 0
+        ):
+            raise ValueError(
+                "SpecOPD training_input_cache_mib must be a nonnegative integer"
+            )
         if type(self.score_target_logz) is not bool:
             raise ValueError("SpecOPD score_target_logz must be a boolean")
         for name in ("actor_temperature", "proposal_temperature", "target_temperature"):
@@ -191,11 +209,7 @@ class SpecOPDConfig:
                 raise ValueError(f"SpecOPD {name} must be finite and positive")
         if self.objective not in {"e2e_tv", "tv", "l1"}:
             raise ValueError("SpecOPD objective must be e2e_tv, tv or l1")
-        if (
-            self.replay
-            or self.mix_trunk_loss
-            or self.allow_bubble_training
-        ):
+        if self.replay or self.mix_trunk_loss or self.allow_bubble_training:
             raise ValueError(
                 "SpecOPD requires no cross-collection replay, no trunk loss and no Bubble"
             )
@@ -221,6 +235,14 @@ class SpecOPDConfig:
             raise ValueError("SpecOPD wire must fit the 1 MiB frontend transport limit")
 
 
+def specopd_training_config(config):
+    for key in ("actor_rollout_ref", "rollout", "drafter", "training"):
+        config = (
+            config.get(key, {}) if hasattr(config, "get") else getattr(config, key, {})
+        )
+    return config or {}
+
+
 def spec_opd_enabled(training):
     return (training.get("specopd") or {}).get("enable", False)
 
@@ -231,10 +253,9 @@ def specopd_loss_weights(training, algorithm):
         raise ValueError("SpecOPD requires DSpark")
     distribution = float(training.get("dspark_l1_loss_alpha", 0.9))
     ce = float(training.get("dspark_ce_loss_alpha", 0.1))
-    if (
-        not all(math.isfinite(weight) and weight >= 0 for weight in (distribution, ce))
-        or not (distribution or ce)
-    ):
+    if not all(
+        math.isfinite(weight) and weight >= 0 for weight in (distribution, ce)
+    ) or not (distribution or ce):
         raise ValueError(
             "SpecOPD CE and distribution weights must be finite, nonnegative and not both zero"
         )
@@ -292,11 +313,15 @@ def validate_specopd_config(config):
         raise ValueError(
             "SpecOPD requires enabled rollout drafter and drafter training"
         )
-    if rollout.get("name") != "vllm" or drafter.get(
-        "speculative_algorithm", ""
-    ).upper() != "DSPARK":
+    if (
+        rollout.get("name") != "vllm"
+        or drafter.get("speculative_algorithm", "").upper() != "DSPARK"
+    ):
         raise ValueError("SpecOPD requires DSpark on vLLM")
-    if drafter.get("vllm", {}).get("draft_sample_method", "greedy") not in {"greedy", "probabilistic"}:
+    if drafter.get("vllm", {}).get("draft_sample_method", "greedy") not in {
+        "greedy",
+        "probabilistic",
+    }:
         raise ValueError("SpecOPD draft_sample_method must be greedy or probabilistic")
     trainer = config.get("trainer", {})
     if trainer.get("use_v1", False):
@@ -310,17 +335,24 @@ def validate_specopd_config(config):
     if actor.get("actor", {}).get("strategy", "fsdp2") not in {"fsdp", "fsdp2"}:
         raise ValueError("SpecOPD requires the FSDP actor engine")
     model = actor.get("model", {})
-    if model.get("use_remove_padding", True) != (sp_size > 1) or model.get("use_fused_kernels", False):
+    if model.get("use_remove_padding", True) != (sp_size > 1) or model.get(
+        "use_fused_kernels", False
+    ):
         raise ValueError(
             "SpecOPD requires use_remove_padding=(SP>1) and use_fused_kernels=false"
         )
     if model.get("lora_rank", 0) or model.get("lora_adapter_path"):
         raise ValueError("SpecOPD LoRA actor scoring is not supported")
     interval = training.get("collect_interval_steps", 1)
-    if (type(interval) is not int or interval < 1
-            or training.get("training_interval_steps", 1) != interval
-            or training.get("step", 1) != spec.optimizer_updates_per_collection):
-        raise ValueError("SpecOPD requires equal positive collection/training intervals and step=optimizer_updates_per_collection")
+    if (
+        type(interval) is not int
+        or interval < 1
+        or training.get("training_interval_steps", 1) != interval
+        or training.get("step", 1) != spec.optimizer_updates_per_collection
+    ):
+        raise ValueError(
+            "SpecOPD requires equal positive collection/training intervals and step=optimizer_updates_per_collection"
+        )
     if training.get("collect_hidden_states_from_sgl", False) or training.get(
         "use_data_buffer", False
     ):

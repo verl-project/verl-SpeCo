@@ -83,7 +83,9 @@ def proposal_loss(wrapper, batch, lm_head_weight):
     if wrapper.draft_model.markov_head is None:
         raise ValueError("SpecOPD DSpark requires a conditional Markov head")
     logits = wrapper.draft_model.apply_markov_logits(
-        unary, prev_token_ids=predecessors, draft_hidden=hidden,
+        unary,
+        prev_token_ids=predecessors,
+        draft_hidden=hidden,
     )
     with torch.no_grad():
         teacher = F.linear(
@@ -111,7 +113,9 @@ def compute_specopd_backend_loss(backend, model, batch):
         drafter = backend.config.rollout.drafter
         batch = {
             **batch,
-            "loss_weights": specopd_loss_weights(drafter.training, drafter.speculative_algorithm),
+            "loss_weights": specopd_loss_weights(
+                drafter.training, drafter.speculative_algorithm
+            ),
         }
     numerator, count, diagnostics = model(
         input_ids=batch["input_ids"],
@@ -127,13 +131,14 @@ def compute_specopd_backend_loss(backend, model, batch):
         "local_num_tokens": count.to(numerator.dtype),
         "v_weight": 0.0,
         "p_weight": 1.0,
-        "accuracy": diagnostics["overlap"].masked_fill(~batch["proposal_mask"], 0).sum() / batch["proposal_mask"].sum().clamp_min(1),
+        "accuracy": diagnostics["overlap"].masked_fill(~batch["proposal_mask"], 0).sum()
+        / batch["proposal_mask"].sum().clamp_min(1),
         "diagnostics": {},
     }
 
 
 def build_specopd_training_batch(request, scores, device, config, feature_indices):
-    from verl_speco.transport.specopd_protocol import token_digest
+    from verl_speco.integration.specopd_protocol import token_digest
 
     if scores.sample_id != request.sample_id or len(scores.branches) != len(
         request.branches
@@ -173,19 +178,32 @@ def build_specopd_training_batch(request, scores, device, config, feature_indice
             if branch.source == "trunk":
                 if config.random_position_decay_gamma > 0:
                     position_weights[row] = torch.exp(
-                        -torch.arange(width, device=device).float() / config.random_position_decay_gamma
+                        -torch.arange(width, device=device).float()
+                        / config.random_position_decay_gamma
                     )
             elif 0 <= branch.accepted_count < len(branch.token_ids):
-                position_weights[row, branch.accepted_count] = config.first_reject_weight
+                position_weights[row, branch.accepted_count] = (
+                    config.first_reject_weight
+                )
             elif branch.accepted_count < 0:
-                raise ValueError("mixed SpecOPD proposal is missing acceptance diagnostics")
+                raise ValueError(
+                    "mixed SpecOPD proposal is missing acceptance diagnostics"
+                )
     context_rows = max(b.anchor for b in request.branches) + 1
     if any(scores.trunk_features[i].shape[0] < context_rows for i in feature_indices):
-        raise ValueError("SpecOPD auxiliary features do not cover the last branch anchor")
+        raise ValueError(
+            "SpecOPD auxiliary features do not cover the last branch anchor"
+        )
     result = {
-        "input_ids": torch.tensor([request.trunk_ids[:context_rows]], dtype=torch.long, device=device),
+        "input_ids": torch.tensor(
+            [request.trunk_ids[:context_rows]], dtype=torch.long, device=device
+        ),
         "hidden_states": torch.cat(
-            [scores.trunk_features[i][:context_rows].to(device) for i in feature_indices], -1
+            [
+                scores.trunk_features[i][:context_rows].to(device)
+                for i in feature_indices
+            ],
+            -1,
         ).unsqueeze(0),
         "anchor_positions": torch.tensor(
             [[b.anchor for b in request.branches]], device=device
@@ -210,11 +228,16 @@ def build_specopd_training_batch(request, scores, device, config, feature_indice
 
 def plan_specopd_training_groups(selected, dp_size, max_trajectories, token_budget):
     """Use global slot maxima so every DP/SP rank chooses identical groups."""
-    lengths = [max(max(b.anchor for b in r.branches) + 1 for r, _ in selected[i:i + dp_size])
-               for i in range(0, len(selected), dp_size)]
+    lengths = [
+        max(max(b.anchor for b in r.branches) + 1 for r, _ in selected[i : i + dp_size])
+        for i in range(0, len(selected), dp_size)
+    ]
     sizes, current, longest = [], 0, 0
     for length in lengths:
-        if current and (current == max_trajectories or (current + 1) * max(longest, length) > token_budget):
+        if current and (
+            current == max_trajectories
+            or (current + 1) * max(longest, length) > token_budget
+        ):
             sizes.append(current)
             current, longest = 0, 0
         current += 1
@@ -230,7 +253,11 @@ def merge_specopd_training_batches(batches):
         return batches[0]
     first = batches[0]
     for batch in batches:
-        for key in ("proposal_temperature", "target_temperature", "proposal_block_width"):
+        for key in (
+            "proposal_temperature",
+            "target_temperature",
+            "proposal_block_width",
+        ):
             if batch[key] != first[key]:
                 raise ValueError("cannot merge incompatible SpecOPD sampling contracts")
         if batch.get("objective", "e2e_tv") != first.get("objective", "e2e_tv"):
@@ -239,28 +266,76 @@ def merge_specopd_training_batches(batches):
     anchors = max(b["anchor_positions"].shape[1] for b in batches)
     width = max(b["proposal_ids"].shape[1] for b in batches)
     result = dict(first)
-    result["input_ids"] = torch.cat([F.pad(b["input_ids"], (0, length-b["input_ids"].shape[1])) for b in batches])
-    result["hidden_states"] = torch.cat([F.pad(b["hidden_states"], (0, 0, 0, length-b["hidden_states"].shape[1])) for b in batches])
-    result["anchor_positions"] = torch.cat([F.pad(b["anchor_positions"], (0, anchors-b["anchor_positions"].shape[1])) for b in batches])
+    result["input_ids"] = torch.cat(
+        [F.pad(b["input_ids"], (0, length - b["input_ids"].shape[1])) for b in batches]
+    )
+    result["hidden_states"] = torch.cat(
+        [
+            F.pad(b["hidden_states"], (0, 0, 0, length - b["hidden_states"].shape[1]))
+            for b in batches
+        ]
+    )
+    result["anchor_positions"] = torch.cat(
+        [
+            F.pad(b["anchor_positions"], (0, anchors - b["anchor_positions"].shape[1]))
+            for b in batches
+        ]
+    )
     if any(("position_weights" in b) != ("position_weights" in first) for b in batches):
         raise ValueError("cannot merge different SpecOPD loss reductions")
-    for key in ("proposal_ids", "proposal_mask") + (("position_weights", "sampling_support_mask") if "position_weights" in first else ()):
-        result[key] = torch.cat([F.pad(b[key], (0, width-b[key].shape[1], 0, anchors-b[key].shape[0])) for b in batches])
-    result["target_last_hidden_states"] = torch.cat([
-        F.pad(b["target_last_hidden_states"], (0, 0, 0, width-b["proposal_ids"].shape[1], 0, anchors-b["proposal_ids"].shape[0]))
-        for b in batches
-    ])
+    for key in ("proposal_ids", "proposal_mask") + (
+        ("position_weights", "sampling_support_mask")
+        if "position_weights" in first
+        else ()
+    ):
+        result[key] = torch.cat(
+            [
+                F.pad(
+                    b[key], (0, width - b[key].shape[1], 0, anchors - b[key].shape[0])
+                )
+                for b in batches
+            ]
+        )
+    result["target_last_hidden_states"] = torch.cat(
+        [
+            F.pad(
+                b["target_last_hidden_states"],
+                (
+                    0,
+                    0,
+                    0,
+                    width - b["proposal_ids"].shape[1],
+                    0,
+                    anchors - b["proposal_ids"].shape[0],
+                ),
+            )
+            for b in batches
+        ]
+    )
     result["_speco_sample_count"] = sum(b["_speco_sample_count"] for b in batches)
-    result["_speco_sample_ids"] = tuple(x for b in batches for x in b["_speco_sample_ids"])
+    result["_speco_sample_ids"] = tuple(
+        x for b in batches for x in b["_speco_sample_ids"]
+    )
     result["_specopd_trunk_digest"] = tuple(b["_specopd_trunk_digest"] for b in batches)
     return result
 
 
-def prepare_specopd_training_batches(selected, device, config, feature_indices, *, cache_bytes=64 * 1024**2, group_sizes=None, real_slots=None):
+def prepare_specopd_training_batches(
+    selected,
+    device,
+    config,
+    feature_indices,
+    *,
+    cache_bytes=64 * 1024**2,
+    group_sizes=None,
+    real_slots=None,
+):
     """Prepare once, merge independent rows, cache at most 64MiB on device."""
     prepared = []
     for index, (request, scores) in enumerate(selected):
-        batch = build_specopd_training_batch(request, scores, "cpu", config, feature_indices)
+        batch = build_specopd_training_batch(
+            request, scores, "cpu", config, feature_indices
+        )
         if real_slots is not None and not real_slots[index]:
             batch["proposal_mask"].zero_()
             batch["_speco_sample_count"] = 0
@@ -271,11 +346,15 @@ def prepare_specopd_training_batches(selected, device, config, feature_indices, 
         raise ValueError("invalid SpecOPD training microbatch partition")
     batches, used, offset = [], 0, 0
     for length in sizes:
-        batch = merge_specopd_training_batches(prepared[offset:offset + length])
+        batch = merge_specopd_training_batches(prepared[offset : offset + length])
         offset += length
-        size = sum(v.numel() * v.element_size() for v in batch.values() if torch.is_tensor(v))
+        size = sum(
+            v.numel() * v.element_size() for v in batch.values() if torch.is_tensor(v)
+        )
         if used + size <= cache_bytes:
-            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            batch = {
+                k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()
+            }
             used += size
         batches.append(batch)
     return batches, used
@@ -289,6 +368,14 @@ def partition_specopd_samples(selected, dp_rank, dp_size):
     """
     if not selected or not 0 <= dp_rank < dp_size:
         raise ValueError("invalid SpecOPD data-parallel schedule")
-    indices = range(dp_rank, ((len(selected) + dp_size - 1) // dp_size) * dp_size, dp_size)
-    slots = [(selected[i] if i < len(selected) else selected[(i // dp_size) * dp_size], i < len(selected)) for i in indices]
+    indices = range(
+        dp_rank, ((len(selected) + dp_size - 1) // dp_size) * dp_size, dp_size
+    )
+    slots = [
+        (
+            selected[i] if i < len(selected) else selected[(i // dp_size) * dp_size],
+            i < len(selected),
+        )
+        for i in indices
+    ]
     return [sample for sample, _ in slots], [real for _, real in slots]

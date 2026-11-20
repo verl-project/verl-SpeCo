@@ -780,8 +780,12 @@ def install_agent_loop_runtime_patch() -> bool:
             )
             sampling_params = _apply_probe_sampling_overrides(sampling_params)
             if kwargs.pop("_specopd_skip_collection", False):
-                sampling_params = dict(sampling_params, _verl_skip_drafter_collection=True)
-            revision = kwargs.pop("_specopd_drafter_revision", _CURRENT_SPECOPD_REVISION.get())
+                sampling_params = dict(
+                    sampling_params, _verl_skip_drafter_collection=True
+                )
+            revision = kwargs.pop(
+                "_specopd_drafter_revision", _CURRENT_SPECOPD_REVISION.get()
+            )
             token = _CURRENT_SPECOPD_REVISION.set(revision)
             try:
                 return await _run_agent_loop_with_student_timing(

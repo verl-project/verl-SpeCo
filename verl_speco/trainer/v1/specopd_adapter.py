@@ -5,18 +5,11 @@
 import os
 from functools import partial
 
-from verl_speco.specopd_config import spec_opd_enabled
-
-
-def training_config(trainer):
-    value = getattr(trainer, "config", None)
-    for key in ("actor_rollout_ref", "rollout", "drafter", "training"):
-        value = value.get(key, {}) if hasattr(value, "get") else getattr(value, key, {})
-    return value
+from verl_speco.specopd_config import spec_opd_enabled, specopd_training_config
 
 
 def enabled(trainer):
-    return spec_opd_enabled(training_config(trainer))
+    return spec_opd_enabled(specopd_training_config(getattr(trainer, "config", None)))
 
 
 def driver(trainer):
@@ -44,7 +37,10 @@ def _native_trunk_log_prob(trainer, batch, trunk, *, calculate_entropy):
     import torch
     import transfer_queue as tq
     from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
-    from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions
+    from verl.utils.seqlen_balancing import (
+        calculate_workload,
+        get_seqlen_balanced_partitions,
+    )
     from verl.workers.utils.padding import response_from_nested
 
     from verl_speco.joint_scoring import JointScores
@@ -59,35 +55,53 @@ def _native_trunk_log_prob(trainer, batch, trunk, *, calculate_entropy):
     worker_group = trainer.actor_rollout_wg
     # V1 _balance_batch initializes the native dispatch map before old-logprob.
     dp_size = max(worker_group._dispatch_info["actor"]) + 1
-    subset = upsample_batch_to_divisible_size(subset, dp_size, trainer.tokenizer.eos_token_id)
-    padding_keys = subset.keys[len(keys):]
+    subset = upsample_batch_to_divisible_size(
+        subset, dp_size, trainer.tokenizer.eos_token_id
+    )
+    padding_keys = subset.keys[len(keys) :]
     try:
         if dp_size > 1:
-            lengths = torch.tensor([tag["seq_len"] for tag in subset.tags], dtype=torch.int64)
+            lengths = torch.tensor(
+                [tag["seq_len"] for tag in subset.tags], dtype=torch.int64
+            )
             partitions = get_seqlen_balanced_partitions(
-                calculate_workload(lengths), k_partitions=dp_size, equal_size=True,
+                calculate_workload(lengths),
+                k_partitions=dp_size,
+                equal_size=True,
             )
             subset.reorder([i for partition in partitions for i in partition])
         output = worker_group.compute_log_prob(subset)
-        if set(output.keys) != set(subset.keys) or output.partition_id != batch.partition_id:
-            raise RuntimeError("native old-logprob did not return the requested TransferQueue keys")
+        if (
+            set(output.keys) != set(subset.keys)
+            or output.partition_id != batch.partition_id
+        ):
+            raise RuntimeError(
+                "native old-logprob did not return the requested TransferQueue keys"
+            )
     finally:
         if padding_keys:
             tq.kv_clear(keys=padding_keys, partition_id=batch.partition_id)
     fields = ["log_probs", "response_mask"]
     if calculate_entropy:
         fields.append("entropy")
-    data = tq.kv_batch_get(keys=keys, partition_id=batch.partition_id, select_fields=fields)
+    data = tq.kv_batch_get(
+        keys=keys, partition_id=batch.partition_id, select_fields=fields
+    )
     mask = data["response_mask"]
     log_probs = response_from_nested(data["log_probs"], mask).unbind()
     entropies = (
         response_from_nested(data["entropy"], mask).unbind()
-        if calculate_entropy else (None,) * len(trunk)
+        if calculate_entropy
+        else (None,) * len(trunk)
     )
     results = []
-    for (_, request), log_prob, entropy in zip(trunk, log_probs, entropies, strict=True):
+    for (_, request), log_prob, entropy in zip(
+        trunk, log_probs, entropies, strict=True
+    ):
         if log_prob.numel() != len(request.trunk_ids) - request.response_start:
-            raise RuntimeError("native old-logprob response length differs from the joint request")
+            raise RuntimeError(
+                "native old-logprob response length differs from the joint request"
+            )
         results.append(JointScores(request.sample_id, log_prob, (), {}, entropy))
     return tuple(results)
 
@@ -100,7 +114,9 @@ def old_log_prob(trainer, batch, metrics):
     nested, padded = trainer._speco_v1_batch_data(batch)
     value = driver(trainer)
     if os.environ.get("VERL_SPECO_V1_NATIVE_TRUNK_OLD_LOGPROB") == "1":
-        output, _ = value.old_log_prob(padded, native_trunk=partial(_native_trunk_log_prob, trainer, batch))
+        output, _ = value.old_log_prob(
+            padded, native_trunk=partial(_native_trunk_log_prob, trainer, batch)
+        )
     else:
         output, _ = value.old_log_prob(padded)
     log_probs = output.batch["old_log_probs"].float()
@@ -113,12 +129,16 @@ def old_log_prob(trainer, batch, metrics):
         fields=nested.select("old_log_probs", "entropy"),
     )
     config = trainer.config.actor_rollout_ref.actor
-    metrics["actor/entropy"] = agg_loss(
-        loss_mat=entropy,
-        loss_mask=padded.batch["response_mask"],
-        loss_agg_mode=config.loss_agg_mode,
-        loss_scale_factor=config.loss_scale_factor,
-    ).detach().item()
+    metrics["actor/entropy"] = (
+        agg_loss(
+            loss_mat=entropy,
+            loss_mask=padded.batch["response_mask"],
+            loss_agg_mode=config.loss_agg_mode,
+            loss_scale_factor=config.loss_scale_factor,
+        )
+        .detach()
+        .item()
+    )
     if trainer.config.actor_rollout_ref.rollout.get("calculate_log_probs", False):
         from verl.utils.debug.metrics import calculate_debug_metrics
 

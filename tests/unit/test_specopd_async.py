@@ -14,7 +14,7 @@ from verl_speco.integration.specopd_async import (
 from verl_speco.integration.specopd_vllm import capture_scheduler_round
 from verl_speco.integration.specopd_window import make_window
 from verl_speco.specopd_config import SpecOPDConfig
-from verl_speco.transport.specopd_protocol import PLAN_KEY, token_digest
+from verl_speco.integration.specopd_protocol import PLAN_KEY, token_digest
 
 
 def fixture():

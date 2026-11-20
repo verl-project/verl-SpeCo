@@ -18,7 +18,9 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
+
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from verl_speco.integration import specopd_driver, specopd_vllm, vllm_runtime
@@ -26,7 +28,7 @@ from verl_speco.integration.specopd_driver import SpecOPDDriver
 from verl_speco.integration.specopd_window import make_window
 from verl_speco.joint_scoring import score_joint_batch
 from verl_speco.specopd_config import SpecOPDConfig
-from verl_speco.transport.specopd_protocol import (
+from verl_speco.integration.specopd_protocol import (
     PLAN_KEY,
     decode_bundle,
     encode_bundle,
