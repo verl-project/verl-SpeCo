@@ -29,6 +29,8 @@ from verl_speco.trainer.bubble_lifecycle import BUBBLE_RUNTIME_FIELDS
 from verl_speco.trainer.v1.bubble_mixin import V1BubbleMixin
 from verl_speco.rl_insight_bridge import trace_state as _rl_insight_trace_state
 
+from verl_speco.integration.verify_trace import TRACE_KEY
+
 logger = logging.getLogger(__name__)
 
 # RL-Insight trace lane for the trainer-side phases owned by the V1 lifecycle.
@@ -1514,6 +1516,7 @@ class SpecoV1Mixin(V1BubbleMixin):
         result.meta_info["speco_v1_padding_rows"] = sum(padding)
         for key in (
             "_verl_request_mean_accept_len",
+            TRACE_KEY,
             "_speco_vllm_request_id",
             "_speco_vllm_request_verify_rounds",
             "_speco_vllm_request_accepted_tokens",
