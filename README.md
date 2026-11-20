@@ -31,6 +31,10 @@ synchronous baseline without speculative decoding. [See the comparison](#co-trai
 
 ## Architecture
 
+For experimental direct feature collection with vLLM 0.22.0, see
+[vLLM rollout hidden-state collection](docs/vllm_rollout_capture.md), including
+the supported configuration and CUDA validation procedure.
+
 ![SpeCo unified training architecture](docs/assets/paper/framework.png)
 
 The scheduler coordinates **collect → train → publish**. Online co-training

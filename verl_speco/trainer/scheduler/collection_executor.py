@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import time
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -15,6 +16,11 @@ from verl_speco.trainer.scheduler.schedule_types import (
     CollectionPayload,
     CollectionWorkerResult,
 )
+
+
+def _dispatch_trace(message, *args):
+    if os.getenv("SPECO_CAPTURE_DIAGNOSTICS") == "1":
+        print(message % args, flush=True)
 
 
 class DrafterCollectionExecutor(Protocol):
@@ -45,7 +51,12 @@ class CallbackDrafterCollectionExecutor:
     phase_timing: bool = False
 
     def _call(self, phase, submit, request, **labels):
-        enabled = self.phase_timing or phase_timing_enabled()
+        rollout = str(labels.get("collection_id", "")).endswith("-vllm")
+        enabled = (
+            self.phase_timing
+            or phase_timing_enabled()
+            or (rollout and os.getenv("SPECO_CAPTURE_DIAGNOSTICS") == "1")
+        )
         if not enabled:
             return self.resolve(submit(request))
         # One existing phase record includes both submission and awaited work.
@@ -65,6 +76,14 @@ class CallbackDrafterCollectionExecutor:
                 result = self.resolve(refs)
             finally:
                 stages["wait_s"] = time.perf_counter() - submitted_at
+                if rollout:
+                    _dispatch_trace(
+                        "[vLLM collection dispatch] phase=%s collection=%s submit_s=%.6f wait_s=%.6f",
+                        phase,
+                        labels.get("collection_id"),
+                        stages["submit_s"],
+                        stages["wait_s"],
+                    )
         return result
 
     def set_global_step(self, global_step: object) -> None:

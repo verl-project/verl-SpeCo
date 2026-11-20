@@ -86,6 +86,7 @@ from verl_speco.trainer.scheduler.collection_adapter import (
     DrafterCollectionAdapter,
     OldLogProbCollectionAdapter,
     SGLangCollectionAdapter,
+    VLLMCollectionAdapter,
 )
 from verl_speco.trainer.scheduler.training_outcome import TrainingOutcome
 from verl_speco.trainer.scheduler.drafter_runtime_state import (
@@ -256,6 +257,7 @@ class DrafterScheduler:
             DrafterCollectionSource, DrafterCollectionAdapter
         ] = {
             DrafterCollectionSource.SGLANG: SGLangCollectionAdapter(),
+            DrafterCollectionSource.VLLM: VLLMCollectionAdapter(),
             DrafterCollectionSource.OLD_LOGPROB: OldLogProbCollectionAdapter(),
         }
         self.rollout_idle_execution_strategy = RolloutIdleWorkerExecutionStrategy()
@@ -4287,6 +4289,14 @@ class DrafterScheduler:
             return CollectionPlan(collect=False, reason="sample_rate_zero", **common)
         return CollectionPlan(collect=True, reason="collection_enabled", **common)
 
+    @staticmethod
+    def reference_collection_boundary(training) -> str:
+        """Keep quota policy on the scheduler; deferral never crosses actor updates."""
+        policy = training.get("vllm_capture_pending_policy", "wait")
+        if policy not in {"wait", "defer"}:
+            raise ValueError("vllm_capture_pending_policy must be wait or defer")
+        return "oldlogprob" if policy == "wait" else "before_actor_update"
+
     def execute_collection_plan(self, plan: CollectionPlan, payload: CollectionPayload):
         if self._collection_executor is None:
             raise RuntimeError("Drafter collection executor has not been bound")
@@ -4971,14 +4981,17 @@ class DrafterScheduler:
                 context.data_status.data_version if context.data_status else None
             ),
             "required_target_version": (
-                # Sync exports the current step's head after this status query;
-                # only Bubble reuses the quota's historical target version.
+                # Actor Sync uses the current head; rollout replay and Bubble
+                # retain the immutable head belonging to their selected data.
                 None
                 if config.use_logits
                 else (
                     context.data_status.target_version
-                    if config.execution_strategy
-                    is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+                    if (
+                        config.execution_strategy
+                        is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+                        or config.rollout_versioned_heads
+                    )
                     and context.data_status is not None
                     else _as_int(context.global_step)
                 )

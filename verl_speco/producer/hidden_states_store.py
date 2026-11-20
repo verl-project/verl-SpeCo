@@ -203,7 +203,7 @@ class FileHiddenStatesStore(HiddenStatesStore):
 
     backend = FILE_BACKEND
 
-    def __init__(self, *, wait_for_writer=True):
+    def __init__(self, *, wait_for_writer: bool = True):
         self.wait_for_writer = wait_for_writer
 
     def load(

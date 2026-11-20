@@ -2884,16 +2884,17 @@ class _SpecoSGLangHttpServerMixin:
                 ):
                     drafter_sample = None
                 else:
+                    from verl_speco.producer.feature_export import (
+                        rollout_feature_fields,
+                    )
+
                     drafter_sample = {
-                        "input_ids": torch.cat(
-                            [prompt_tensor, response_tensor], dim=0
-                        ).unsqueeze(0),
-                        "prompts": prompt_tensor.unsqueeze(0),
-                        "responses": response_tensor.unsqueeze(0),
-                        "hidden_states": hidden_states.unsqueeze(0).cpu(),
-                        "hidden_positions": hidden_positions.unsqueeze(0).cpu()
-                        if hidden_positions is not None
-                        else None,
+                        **rollout_feature_fields(
+                            prompt_tensor,
+                            response_tensor,
+                            hidden_states,
+                            hidden_positions,
+                        ),
                         "hidden_position_start": hidden_position_start,
                         "hidden_position_end": hidden_position_end,
                         "hidden_prefix_cache_rows": hidden_prefix_cache_rows,

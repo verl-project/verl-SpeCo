@@ -51,6 +51,9 @@ def test_drafter_diagnostic_env_only_forwards_explicit_switches(monkeypatch) -> 
     monkeypatch.delenv("VERL_DRAFTER_KEEP_HOT_TRIM_CACHE", raising=False)
     monkeypatch.delenv("VERL_SPECO_PHASE_TIMING", raising=False)
     monkeypatch.delenv("VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL", raising=False)
+    monkeypatch.delenv("SPECO_CAPTURE_EXPORT_ROOT", raising=False)
+    monkeypatch.delenv("SPECO_CAPTURE_RUN_ID", raising=False)
+    monkeypatch.delenv("SPECO_CAPTURE_GPU_FILTER", raising=False)
     assert drafter_diagnostic_env() == {}
     monkeypatch.setenv("VERL_DRAFTER_MEMORY_DIAGNOSTICS", "true")
     monkeypatch.setenv("VERL_DRAFTER_KEEP_HOT_TRIM_CACHE", "false")
@@ -63,6 +66,11 @@ def test_drafter_diagnostic_env_only_forwards_explicit_switches(monkeypatch) -> 
     assert (
         drafter_diagnostic_env()["VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL"]
         == "true"
+    )
+    monkeypatch.setenv("SPECO_CAPTURE_EXPORT_ROOT", "/nas/shared/speco/run1")
+    assert (
+        drafter_diagnostic_env()["SPECO_CAPTURE_EXPORT_ROOT"]
+        == "/nas/shared/speco/run1"
     )
 
 

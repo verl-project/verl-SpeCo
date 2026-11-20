@@ -1270,7 +1270,18 @@ def _ensure_vllm_server_drafter_env(
         # config may have lost private drafter fields during validation. Carry
         # this opt-out separately, without changing event-bus source selection.
         resolved = candidate
-        embedded_training = embedded_config.get("training", {})
+        embedded_training = embedded_config.get("training") or {}
+        if embedded_training.get("collect_hidden_states_from_vllm"):
+            # Launcher's full training config survives upstream dataclass
+            # filtering. Preserve the selected candidate's live scheduler bus.
+            resolved = {**embedded_config, **candidate}
+            resolved["training"] = {
+                **(candidate.get("training") or {}),
+                **embedded_training,
+            }
+            candidate_scheduler = (candidate.get("training") or {}).get("scheduler")
+            if candidate_scheduler:
+                resolved["training"]["scheduler"] = candidate_scheduler
         if "drafter_opd" in embedded_training:
             resolved = dict(resolved)
             resolved["training"] = dict(resolved.get("training", {}))
@@ -1290,6 +1301,32 @@ def _ensure_vllm_server_drafter_env(
         if source != "environment" or resolved is not candidate:
             set_drafter_config_env(
                 json.dumps(_vllm_drafter_env_payload(resolved), sort_keys=True)
+            )
+        effective_training = resolved.get("training") or {}
+        if effective_training.get("collect_hidden_states_from_vllm"):
+            logger.warning(
+                "[vLLM capture effective_config] pid=%s source=%s "
+                "max_samples_per_replica=%s max_tokens_per_replica=%s "
+                "window_rows=%s sample_rate=%s embedded_max_samples=%s env_max_samples=%s",
+                os.getpid(),
+                source,
+                effective_training.get("max_collect_samples_per_step_per_replica", 16),
+                effective_training.get(
+                    "max_collect_tokens_per_step_per_replica", 16384
+                ),
+                effective_training.get("hidden_state_window_tokens_per_sample", 512),
+                effective_training.get("collection_sample_rate", 1.0),
+                embedded_training.get("max_collect_samples_per_step_per_replica"),
+                (env_config.get("training") or {}).get(
+                    "max_collect_samples_per_step_per_replica"
+                ),
+            )
+        if os.getenv("SPECO_CAPTURE_DIAGNOSTICS") == "1":
+            print(
+                f"[vLLM capture config_restore] pid={os.getpid()} source={source} "
+                f"embedded_capture={embedded_training.get('collect_hidden_states_from_vllm')} "
+                f"resolved_capture={(resolved.get('training') or {}).get('collect_hidden_states_from_vllm')}",
+                flush=True,
             )
         return resolved, source
 
@@ -4030,6 +4067,7 @@ class _SpecoVLLMHttpServerMixin:
             self.config,
             getattr(type(self), "_speco_drafter_config_env", None),
         )
+        _log_capture_server_binding(self)
         self._speco_initial_draft_weights_required = bool(
             drafter_cfg.get("enable")
             and _speculative_method_from_drafter(drafter_cfg) in {"dflash", "dspark"}
@@ -4157,6 +4195,10 @@ class _SpecoVLLMHttpServerMixin:
     async def speco_resume_rollout_admission(self):
         self._speco_rollout_admission().resume()
 
+    async def speco_set_rollout_capture_allowed(self, allowed):
+        self._speco_rollout_capture_allowed = bool(allowed)
+        return {"capture_allowed": self._speco_rollout_capture_allowed}
+
     async def speco_set_serving_drafter_revision(self, revision):
         # The trainer calls this only after all weight commit RPCs have settled,
         # while ordinary serving is quiescent behind the admission boundary.
@@ -4231,6 +4273,17 @@ async def _speco_generate_with_request_stats_unblocked(
     positional_params = "sampling_params" not in kwargs and len(args) >= 2
     if positional_params:
         sampling_params = args[1]
+    collection_step = (
+        sampling_params.get("_verl_global_steps")
+        if isinstance(sampling_params, dict)
+        else None
+    )
+    capture_skip = not bool(
+        getattr(self, "_speco_rollout_capture_allowed", True)
+    ) or bool(
+        isinstance(sampling_params, dict)
+        and sampling_params.get("_verl_skip_drafter_collection", False)
+    )
     if isinstance(sampling_params, dict):
         clean_params = dict(sampling_params)
         clean_params.pop("_verl_global_steps", None)
@@ -4239,6 +4292,39 @@ async def _speco_generate_with_request_stats_unblocked(
             args = (args[0], clean_params, *args[2:])
         else:
             kwargs = {**kwargs, "sampling_params": clean_params}
+    from verl_speco.integration.vllm_rollout_capture import (
+        enabled,
+        generate_with_capture,
+    )
+
+    capture_config = _load_env_drafter_config()
+    if enabled(capture_config) or os.getenv("SPECO_CAPTURE_DIAGNOSTICS") == "1":
+        from verl_speco.integration.vllm_rollout_capture import capture_trace
+
+        capture_trace(
+            "vLLM capture entry enabled=%s serving_step=%s submission_step=%s skip=%s replica=%s",
+            enabled(capture_config),
+            getattr(self, "global_steps", None),
+            sampling_params.get("_verl_global_steps")
+            if isinstance(sampling_params, dict)
+            else None,
+            capture_skip,
+            getattr(self, "replica_rank", None),
+        )
+    if enabled(capture_config):
+        original_generate = generate
+
+        async def generate(*call_args, **call_kwargs):
+            return await generate_with_capture(
+                self,
+                original_generate,
+                call_args,
+                call_kwargs,
+                capture_config,
+                skip=capture_skip,
+                collection_step=collection_step,
+            )
+
     revision_before = int(getattr(self, "_speco_serving_drafter_revision", 0))
     if not bool(getattr(self, "_speco_vllm_generate_entered", False)):
         logger.warning(
@@ -4378,6 +4464,12 @@ async def _speco_generate_with_request_stats_unblocked(
             )
 
             bridge_request_acceptance_counters(extra_fields)
+            if enabled(capture_config):
+                from verl_speco.integration.vllm_rollout_capture import (
+                    finalize_rollout_sample,
+                )
+
+                finalize_rollout_sample(output, capture_config.get("training") or {})
             if (
                 _load_env_drafter_config()
                 .get("training", {})
@@ -4655,6 +4747,33 @@ def _build_speco_vllm_http_server_class(upstream_module: Any):
     )
 
 
+def _log_capture_server_binding(server):
+    config = _load_env_drafter_config()
+    if not (
+        (config.get("training") or {}).get("collect_hidden_states_from_vllm")
+        or os.getenv("SPECO_CAPTURE_DIAGNOSTICS") == "1"
+    ):
+        return
+    method = getattr(server, "generate", None)
+    function = getattr(method, "__func__", method)
+    code = getattr(function, "__code__", None)
+    from verl_speco.integration import vllm_rollout_capture as capture_module
+
+    capture_path = capture_module.__file__
+    with open(capture_path, "rb") as capture_file:
+        capture_hash = hashlib.sha256(capture_file.read()).hexdigest()[:16]
+    print(
+        "[vLLM capture server_binding] "
+        f"pid={os.getpid()} class={type(server).__module__}.{type(server).__qualname__} "
+        f"generate={getattr(function, '__module__', None)}.{getattr(function, '__qualname__', None)} "
+        f"file={getattr(code, 'co_filename', None)} "
+        f"bridge={getattr(function, '_speco_vllm_http_method_bridge', False)} "
+        f"mixin={isinstance(server, _SpecoVLLMHttpServerMixin)} "
+        f"diagnostic_revision=3 capture_file={capture_path} capture_disk_sha256={capture_hash}",
+        flush=True,
+    )
+
+
 class _SpecoVLLMHttpServerActorClass:
     """Keep the worker setup hook when upstream supplies its own runtime env."""
 
@@ -4728,6 +4847,7 @@ def _patch_upstream_vllm_http_server_methods(upstream_cls: type[Any]) -> bool:
         "speco_wait_rollout_idle",
         "speco_resume_rollout_admission",
         "speco_set_serving_drafter_revision",
+        "speco_set_rollout_capture_allowed",
         "_speco_request_id_from_generate_call",
         "_speco_pop_vllm_spec_decode_stats",
         "_speco_capture_request_spec_decode_stats",
@@ -4758,6 +4878,7 @@ def _patch_upstream_vllm_http_server_methods(upstream_cls: type[Any]) -> bool:
         drafter_cfg, _ = _ensure_vllm_server_drafter_env(
             self.config, getattr(type(self), "_speco_drafter_config_env", None)
         )
+        _log_capture_server_binding(self)
         self._speco_initial_draft_weights_required = bool(
             drafter_cfg.get("enable")
             and _speculative_method_from_drafter(drafter_cfg) in {"dflash", "dspark"}
@@ -4853,6 +4974,11 @@ def install_upstream_vllm_runtime_bridge() -> bool:
     # Early worker bootstrap can precede configuration; refresh on reinstall.
     speco_http_server_cls = _build_speco_vllm_http_server_class(vllm_async_server)
     if bool(getattr(upstream_replica, "_speco_vllm_replica_bridge", False)):
+        # configure_vllm_runtime_from_config can run again after the worker has
+        # restored its full config. Do not retain the earlier class snapshot.
+        vllm_async_server.vLLMHttpServer = _build_speco_vllm_http_server_class(
+            vllm_async_server
+        )
         registry = getattr(replica_module, "RolloutReplicaRegistry", None)
         if registry is not None and hasattr(registry, "_registry"):
             registry._registry["vllm"] = lambda: upstream_replica
@@ -4874,7 +5000,8 @@ def install_upstream_vllm_runtime_bridge() -> bool:
         elif len(replica_args) >= 2:
             replica_args[1] = _rollout_config_without_drafter(replica_args[1])
         upstream_replica_base.__init__(self, *replica_args, **replica_kwargs)
-        self.server_class = _remote_speco_vllm_http_server(ray, speco_http_server_cls)
+        live_server_cls = _build_speco_vllm_http_server_class(vllm_async_server)
+        self.server_class = _remote_speco_vllm_http_server(ray, live_server_cls)
 
     SpecoVLLMReplica = types.new_class(
         "SpecoVLLMReplica",
@@ -4952,6 +5079,20 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     engine_kwargs = _ensure_nested_mapping(
         config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm")
     )
+    from verl_speco.integration.vllm_rollout_capture import validate_config
+
+    validate_config(drafter_cfg, _rollout_config_from_config(config), engine_kwargs)
+    if (drafter_cfg.get("training") or {}).get("collect_hidden_states_from_vllm"):
+        from verl_speco.integration import vllm_rollout_capture as capture_module
+
+        logger.warning(
+            "vLLM capture startup diagnostic_revision=3 runtime_file=%s capture_file=%s "
+            "algorithm=%s diagnostics=%s",
+            __file__,
+            capture_module.__file__,
+            drafter_cfg.get("speculative_algorithm"),
+            os.getenv("SPECO_CAPTURE_DIAGNOSTICS"),
+        )
     additional_config = _get_nested(engine_kwargs, ("additional_config",), {}) or {}
     additional_config = dict(additional_config)
     # Keep private transport metadata out of platform additional_config: some
@@ -5473,6 +5614,17 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         # WorkerDict-side installer runs in a different process and is too
         # early only for the frontend, not for this model-worker process.
         patch_vllm_dspark_draft_load_config()
+        from verl_speco.integration.vllm_rollout_capture import (
+            enabled,
+            install_runner_capture,
+        )
+
+        capture_config = _load_env_drafter_config()
+        if enabled(capture_config):
+            if str(capture_config.get("speculative_algorithm", "")).upper() == "DSPARK":
+                patch_vllm_dspark_registry_aliases()
+                patch_vllm_dspark_runtime()
+            install_runner_capture()
         try:
             instance = super().__new__(cls, **kwargs)
         except TypeError:

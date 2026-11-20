@@ -130,7 +130,10 @@ def test_mixed_acceptance_sources_have_concat_compatible_fields(fallback_first):
     )
 
     key = "_speco_acceptance_engine_fallback"
-    outputs = [SimpleNamespace(extra_fields={}), SimpleNamespace(extra_fields={key: True})]
+    outputs = [
+        SimpleNamespace(extra_fields={}),
+        SimpleNamespace(extra_fields={key: True}),
+    ]
     if fallback_first:
         outputs.reverse()
     agent_loop_runtime._speco_default_agent_loop_inputs(outputs)
@@ -140,16 +143,24 @@ def test_mixed_acceptance_sources_have_concat_compatible_fields(fallback_first):
     )
     DataProto = pytest.importorskip("verl.protocol").DataProto
     batches = [
-        DataProto(non_tensor_batch={k: np.array([v], dtype=object) for k, v in output.extra_fields.items()})
+        DataProto(
+            non_tensor_batch={
+                k: np.array([v], dtype=object) for k, v in output.extra_fields.items()
+            }
+        )
         for output in outputs
     ]
     combined = DataProto.concat(batches)
-    assert combined.non_tensor_batch[key].tolist() == ([True, False] if fallback_first else [False, True])
+    assert combined.non_tensor_batch[key].tolist() == (
+        [True, False] if fallback_first else [False, True]
+    )
 
     fields = next(output.extra_fields for output in outputs if output.extra_fields[key])
     fields.update(spec_num_verify_steps=100, spec_num_accepted_tokens=300)
     assert request_acceptance_counters(fields) is None
-    fields.update(_speco_vllm_request_verify_rounds=2, _speco_vllm_request_accepted_tokens=3)
+    fields.update(
+        _speco_vllm_request_verify_rounds=2, _speco_vllm_request_accepted_tokens=3
+    )
     assert bridge_request_acceptance_counters(fields)
     assert fields[key] is False
     assert request_acceptance_counters(fields) == (2, 3)
@@ -309,9 +320,7 @@ def test_phase_timing_survives_postprocess_defaults(
     assert agent_loop_runtime.install_agent_loop_runtime_patch()
     worker = AgentLoopWorker()
     worker.distillation_enabled = distillation_enabled
-    output = asyncio.run(
-        worker._run_agent_loop({}, {"step": 1, "validate": validate})
-    )
+    output = asyncio.run(worker._run_agent_loop({}, {"step": 1, "validate": validate}))
     assert output.extra_fields[agent_loop_runtime.SPECO_STUDENT_DECODE_TIME_KEY] == 1.0
     assert len(traced_calls) == 1  # Teacher scoring never enters the draft trace.
     teacher_time = output.extra_fields[agent_loop_runtime.SPECO_TEACHER_PREFILL_TIME_KEY]
@@ -576,6 +585,101 @@ def test_failed_or_cancelled_request_releases_idle_barrier(cancel):
             pass
 
     asyncio.run(scenario())
+
+
+def test_capture_metadata_keeps_skipped_request_positions():
+    np = pytest.importorskip("numpy")
+    inputs = [
+        SimpleNamespace(
+            extra_fields={"_speco_capture_rows": 512, "drafter_sample": {"sample": 1}}
+        ),
+        SimpleNamespace(extra_fields={}),
+        SimpleNamespace(extra_fields={"_speco_capture_rows": 0}),
+    ]
+    result = SimpleNamespace(
+        non_tensor_batch={
+            "other": np.zeros(3),
+            "_speco_capture_rows": np.array([512, 0]),
+        }
+    )
+    agent_loop_runtime._ensure_extra_field_defaults(result, inputs)
+    assert result.non_tensor_batch["_speco_capture_rows"].tolist() == [512, None, 0]
+    assert result.non_tensor_batch["drafter_sample"].tolist() == [
+        {"sample": 1},
+        None,
+        None,
+    ]
+    assert all(
+        len(result.non_tensor_batch[k]) == 3
+        for k in agent_loop_runtime._DEFAULT_EXTRA_KEYS
+    )
+
+
+def test_vllm_manager_binds_explicit_remote_worker(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(
+        sys.modules, "ray", SimpleNamespace(remote=lambda cls: ("remote", cls))
+    )
+    explicit_worker = type("ExplicitWorker", (), {})
+    monkeypatch.setattr(
+        agent_loop_runtime,
+        "_build_speco_agent_loop_worker_class",
+        lambda _: explicit_worker,
+    )
+    manager = SimpleNamespace(
+        config={
+            "actor_rollout_ref": {
+                "rollout": {
+                    "name": "vllm",
+                    "drafter": {"training": {"collect_hidden_states_from_vllm": True}},
+                }
+            }
+        }
+    )
+    agent_loop_runtime._configure_speco_agent_loop_manager_instance(manager, object)
+    assert manager.agent_loop_workers_class == ("remote", explicit_worker)
+    assert manager._speco_agent_loop_manager_configured
+    assert not hasattr(manager, "rollout_replica_class")
+
+
+def test_default_fields_use_tensor_batch_length():
+    np = pytest.importorskip("numpy")
+    result = SimpleNamespace(
+        batch=SimpleNamespace(batch_size=(4,)),
+        non_tensor_batch={"optional": np.zeros(2)},
+    )
+    agent_loop_runtime._ensure_extra_field_defaults(result)
+    assert len(result.non_tensor_batch["drafter_sample"]) == 4
+
+
+def test_actor_collection_does_not_replace_vllm_worker():
+    manager = SimpleNamespace(
+        config={
+            "actor_rollout_ref": {
+                "rollout": {
+                    "name": "vllm",
+                    "drafter": {
+                        "training": {"collect_hidden_states_from_old_logprob": True}
+                    },
+                }
+            }
+        }
+    )
+    agent_loop_runtime._configure_speco_agent_loop_manager_instance(manager, object)
+    assert not hasattr(manager, "agent_loop_workers_class")
+
+
+def test_capture_alignment_does_not_overwrite_other_metadata():
+    np = pytest.importorskip("numpy")
+    accepted = np.array([7, 8], dtype=object)
+    result = SimpleNamespace(
+        non_tensor_batch={"_speco_vllm_spec_decode_drafts": accepted}
+    )
+    agent_loop_runtime._ensure_extra_field_defaults(
+        result, [SimpleNamespace(extra_fields={}), SimpleNamespace(extra_fields={})]
+    )
+    assert result.non_tensor_batch["_speco_vllm_spec_decode_drafts"] is accepted
 
 
 @pytest.mark.parametrize("already_wrapped", [False, True])
