@@ -21,9 +21,9 @@ def snapshot_verified_proposals(runner):
     if state is None or not runner.is_last_pp_rank:
         return None
     batch = state.input_batch
-    counts = getattr(handler, "_specopd_result_counts", None)
-    if counts is None:
-        counts = handler._specopd_result_counts = {}
+    closed = getattr(handler, "_specopd_closed_windows", None)
+    if closed is None:
+        closed = handler._specopd_closed_windows = set()
     widths = batch.num_draft_tokens_per_req
     if widths is None:
         return {}
@@ -33,16 +33,14 @@ def snapshot_verified_proposals(runner):
         if rid in plans
         and int(widths[i]) > 0
         and not bool(batch.is_prefilling_np[i])
-        and (
-            counts.get(rid, 0) >= 0
-            if plans[rid].get("reservoir")
-            else counts.get(rid, 0) < plans[rid]["max_branches"]
-        )
+        and rid not in closed
     ]
     if not selected:
         return {}
     import torch
 
+    # Only the scheduler can charge the branch budget: a preempted result
+    # may be discarded before it ever reaches the committed trajectory.
     rows = [i for i, _, _ in selected]
     slots = torch.tensor(
         [int(batch.idx_mapping_np[i]) for i in rows],
@@ -62,15 +60,14 @@ def snapshot_verified_proposals(runner):
         prefix_len, *tokens = row
         offset = prefix_len - plan["prompt_len"]
         if not plan["start"] <= offset < plan["end"]:
-            if plan.get("reservoir") and offset >= plan["end"]:
-                counts[rid] = -1  # Monotone committed window has closed.
+            if offset >= plan["end"]:
+                closed.add(rid)
             continue
         result[rid] = {
             "prefix_len": prefix_len,
             "proposal_ids": tokens,
             "scheduled_drafts": int(widths[i]),
         }
-        counts[rid] = counts.get(rid, 0) + 1
     return result
 
 

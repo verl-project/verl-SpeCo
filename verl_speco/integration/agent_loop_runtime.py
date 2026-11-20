@@ -24,6 +24,7 @@ import types
 from functools import wraps
 from typing import Any, cast
 
+from verl_speco.integration.specopd_protocol import PROPOSAL_KEY
 from verl_speco.integration.verify_trace import TRACE_KEY
 
 logger = logging.getLogger(__file__)
@@ -33,7 +34,7 @@ SPECO_STUDENT_DECODE_TIME_KEY = "speco_student_decode_time_s"
 SPECO_TEACHER_PREFILL_TIME_KEY = "speco_teacher_prefill_time_s"
 _DEFAULT_EXTRA_KEYS = {
     TRACE_KEY: None,
-    "_specopd_proposals": "",
+    PROPOSAL_KEY: "",
     "_speco_vllm_spec_decode_accepted_tokens": None,
     "_speco_vllm_spec_decode_drafts": None,
     "turn_scores": None,
@@ -596,12 +597,6 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
         manager.agent_loop_workers_class = ray.remote(
             _build_speco_agent_loop_worker_class(worker_cls)
         )
-
-    if not is_sglang:
-        # Install patches again in the Ray process, where upstream classes are
-        # imported afresh. Driver-side monkey patches do not survive that import.
-        manager._speco_agent_loop_manager_configured = True
-        return
 
     if not is_sglang:
         # Install patches again in the Ray process, where upstream classes are

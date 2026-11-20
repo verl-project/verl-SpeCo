@@ -94,10 +94,10 @@ def test_joint_teacher_ce_matches_weighted_eager_specopd(use_l1) -> None:
     if not capability.available:
         pytest.skip(capability.reason)
     torch.manual_seed(28)
-    q = torch.randn(2, 3, 8201, device=device)
+    q = torch.randn(2, 3, 16385, device=device)
     p = torch.randn_like(q)
     # A tie spanning vocabulary tiles must use the first teacher label.
-    p[..., 7] = p[..., 4102] = 12.0
+    p[..., 7] = p[..., -1] = 12.0
     p.requires_grad_()
     valid = torch.tensor([[True, True, True], [True, False, False]], device=device)
     weights = torch.tensor([[1.0, 2.0, 1.0], [0.6, 0.0, 0.0]], device=device)

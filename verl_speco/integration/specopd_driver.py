@@ -90,6 +90,7 @@ def build_requests(batch, spec, revision):
                     prefix - 1,
                     tuple(record["proposal_ids"]),
                     accepted_count=record["accepted_count"],
+                    verified_count=record.get("verified_count"),
                 )
             )
         sample_id = str(bundle["request_id"])
@@ -145,16 +146,19 @@ def make_oldlogprob(batch, results):
     )
 
 
-def plan_microbatches(requests, spec):
+def plan_microbatches(requests, spec, sequence_multiple=1):
     """Bound the entire schedule before any model call; never split a tree."""
-    groups, current, lengths = [], [], []
+    groups, current, lengths, widths = [], [], [], []
     for request in requests:
         size = len(request.trunk_ids) + sum(
             len(b.token_ids) - 1 for b in request.branches
         )
+        width = (
+            (size + sequence_multiple - 1) // sequence_multiple
+        ) * sequence_multiple
         if (
             size > spec.scoring_token_budget
-            or size * size > spec.max_dense_mask_elements
+            or width * width > spec.max_dense_mask_elements
         ):
             raise ValueError(
                 f"SpecOPD complete trajectory {request.sample_id} exceeds the joint budget"
@@ -163,12 +167,13 @@ def plan_microbatches(requests, spec):
         if current and (
             len(proposed) > spec.microbatch_trajectories
             or sum(proposed) > spec.scoring_token_budget
-            or len(proposed) * max(proposed) ** 2 > spec.max_dense_mask_elements
+            or len(proposed) * max(widths + [width]) ** 2 > spec.max_dense_mask_elements
         ):
             groups.append(current)
-            current, lengths = [], []
+            current, lengths, widths = [], [], []
         current.append(request)
         lengths.append(size)
+        widths.append(width)
     if current:
         groups.append(current)
     return groups
@@ -187,6 +192,11 @@ class SpecOPDDriver:
         self._acknowledged_actor_revision = None
         training = trainer.config["actor_rollout_ref"]["rollout"]["drafter"]["training"]
         self.collection_interval = int(training.get("collect_interval_steps", 1))
+        self.scoring_sp_size = (
+            trainer.config["actor_rollout_ref"]
+            .get("actor", {})
+            .get("ulysses_sequence_parallel_size", 1)
+        )
         self.update_due = True
 
     def begin_step(self, step):
@@ -345,7 +355,10 @@ class SpecOPDDriver:
         )
         joint_requests = [r for r in requests if r.branches] if trunk else requests
         microbatch_sizes = tuple(
-            len(part) for part in plan_microbatches(joint_requests, self.spec)
+            len(part)
+            for part in plan_microbatches(
+                joint_requests, self.spec, self.scoring_sp_size
+            )
         )
         scored = ()
         if joint_requests:
@@ -358,7 +371,7 @@ class SpecOPDDriver:
                 hidden_state_indices=self.feature_indices,
                 calculate_entropy=calculate_entropy,
                 return_target_logits=False,
-                return_target_logz=getattr(self.spec, "score_target_logz", True),
+                return_target_logz=self.spec.score_target_logz,
                 capture_empty_trunk_features=False,
                 trunk_feature_prefix_only=True,
                 max_packed_tokens=self.spec.scoring_token_budget,
@@ -500,6 +513,9 @@ class SpecOPDDriver:
         self.acknowledge_serving_revision(self.cycle.drafter_revision)
         self.cycle.published()
         self.metrics["specopd/published"] = int(self.trained)
+        ci_result = getattr(self.trainer, "_speco_ci_result", None)
+        if ci_result is not None:
+            ci_result.record_metrics(self.metrics)
         self.metrics["specopd/published_drafter_revision"] = self.cycle.drafter_revision
         if not self.trained:
             self.metrics["drafter/published"] = 0
@@ -539,7 +555,8 @@ def specopd_fit_hooks(trainer):
                     driver.cycle.drafter_revision
                 )
             result = generate(*args, **kwargs)
-            trainer._speco_store_rollout_metrics(result)
+            if not validation:
+                trainer._speco_store_rollout_metrics(result)
             return result
         finally:
             batch.meta_info.clear()

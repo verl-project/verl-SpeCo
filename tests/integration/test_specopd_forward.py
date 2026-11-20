@@ -62,9 +62,11 @@ def classes(monkeypatch):
     }
 
 
-@pytest.mark.parametrize("objective", ["e2e_tv", "tv", "l1"])
+@pytest.mark.parametrize(
+    "objective,head_type", [("e2e_tv", "vanilla"), ("tv", "gated"), ("l1", "vanilla")]
+)
 def test_joint_actor_to_real_drafter_backward_without_resampling(
-    classes, objective, monkeypatch
+    classes, objective, head_type, monkeypatch
 ):
     torch.manual_seed(21)
     target_config = Qwen3Config(
@@ -83,7 +85,10 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
         "a",
         (1, 2, 3, 4, 5, 6),
         3,
-        (DraftBranch("b1", 2, (11, 12, 13)), DraftBranch("b2", 4, (14, 15, 16))),
+        (
+            DraftBranch("b1", 2, (11, 12, 13), accepted_count=1, verified_count=1),
+            DraftBranch("b2", 4, (14, 15, 16), accepted_count=1, verified_count=2),
+        ),
     )
     scored, metrics = score_joint_batch(
         target, [request], hidden_state_indices=(1, 2), return_target_logits=False
@@ -108,6 +113,7 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
         selector_top_k=32,
         conv_group_size=8,
         markov_rank=8,
+        markov_head_type=head_type,
     )
     draft = draft_class(cfg)
     wrapper = wrapper_class(
@@ -124,6 +130,13 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
     spec = SpecOPDConfig(proposal_width=3, objective=objective)
     batch = build_specopd_training_batch(
         request, scored[0], next(wrapper.parameters()).device, spec, (1, 2)
+    )
+    mixed_spec = SpecOPDConfig(proposal_width=3, objective=objective, anchor_count=32)
+    weighted = build_specopd_training_batch(
+        request, scored[0], next(wrapper.parameters()).device, mixed_spec, (1, 2)
+    )
+    torch.testing.assert_close(
+        weighted["position_weights"], torch.tensor([[1.0, 1.0, 1.0], [1.0, 2.0, 1.0]])
     )
     fixed_inputs = {k: v.clone() for k, v in batch.items() if torch.is_tensor(v)}
     dist_key, ce_key = "dspark_l1_loss_alpha", "dspark_ce_loss_alpha"
@@ -254,17 +267,17 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
 
 
 def test_accumulated_prefix_loss_matches_concatenated_gradient():
-    from verl_speco.backends.specopd_loss import e2e_tv_loss
+    from verl_speco.backends.specopd_loss import specopd_distribution_loss
 
     torch.manual_seed(4)
     logits = torch.randn(3, 3, 8, requires_grad=True)
     target = torch.randn_like(logits)
     mask = torch.tensor([[1, 1, 1], [1, 0, 0], [1, 1, 0]], dtype=torch.bool)
-    numerator, count, _ = e2e_tv_loss(logits, target, mask)
+    numerator, count, _ = specopd_distribution_loss(logits, target, mask)
     expected = torch.autograd.grad(numerator / count, logits)[0]
     copied = logits.detach().clone().requires_grad_()
     for start, end in ((0, 1), (1, 3)):
-        local, _, _ = e2e_tv_loss(copied[start:end], target[start:end], mask[start:end])
+        local, _, _ = specopd_distribution_loss(copied[start:end], target[start:end], mask[start:end])
         (local / count).backward()
     torch.testing.assert_close(copied.grad, expected)
 
@@ -374,7 +387,7 @@ def test_collected_group_executes_all_optimizer_updates_before_publication(monke
                     input_ids=torch.ones(1, 3, dtype=torch.long), hidden_states=torch.ones(1, 3, 1),
                     anchor_positions=torch.ones(1, 1, dtype=torch.long), proposal_ids=torch.ones(1, 2, dtype=torch.long),
                     target_last_hidden_states=torch.ones(1, 2, 1), proposal_temperature=1.0, target_temperature=1.0,
-                    proposal_block_width=7, _speco_sample_count=1, _speco_sample_ids=("b",), _specopd_trunk_digest="fixed")
+                    proposal_block_width=7, _speco_sample_count=1, _speco_sample_ids=("b",))
     monkeypatch.setattr(specopd_forward, "build_specopd_training_batch", build)
     request = SimpleNamespace(trunk_ids=(1, 2, 3), branches=[SimpleNamespace(anchor=2, token_ids=(1, 2))])
     result = asyncio.run(DrafterBaseTrainer.training_specopd_group(

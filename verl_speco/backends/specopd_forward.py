@@ -138,8 +138,6 @@ def compute_specopd_backend_loss(backend, model, batch):
 
 
 def build_specopd_training_batch(request, scores, device, config, feature_indices):
-    from verl_speco.integration.specopd_protocol import token_digest
-
     if scores.sample_id != request.sample_id or len(scores.branches) != len(
         request.branches
     ):
@@ -167,12 +165,7 @@ def build_specopd_training_batch(request, scores, device, config, feature_indice
     ):
         raise ValueError("SpecOPD is missing the drafter's target auxiliary layers")
     position_weights = None
-    support_mask = None
     if config.anchor_count:
-        support_mask = mask.clone()
-        for row, branch in enumerate(request.branches):
-            if branch.source == "trunk":
-                support_mask[row].zero_()
         position_weights = torch.ones_like(proposal, dtype=torch.float32)
         for row, branch in enumerate(request.branches):
             if branch.source == "trunk":
@@ -181,14 +174,18 @@ def build_specopd_training_batch(request, scores, device, config, feature_indice
                         -torch.arange(width, device=device).float()
                         / config.random_position_decay_gamma
                     )
-            elif 0 <= branch.accepted_count < len(branch.token_ids):
-                position_weights[row, branch.accepted_count] = (
-                    config.first_reject_weight
-                )
-            elif branch.accepted_count < 0:
-                raise ValueError(
-                    "mixed SpecOPD proposal is missing acceptance diagnostics"
-                )
+            else:
+                if branch.accepted_count < 0:
+                    raise ValueError(
+                        "mixed SpecOPD proposal is missing acceptance diagnostics"
+                    )
+                verified = branch.verified_count
+                if verified is None:
+                    verified = len(branch.token_ids)  # Legacy proposal records.
+                if branch.accepted_count < verified:
+                    position_weights[row, branch.accepted_count] = (
+                        config.first_reject_weight
+                    )
     context_rows = max(b.anchor for b in request.branches) + 1
     if any(scores.trunk_features[i].shape[0] < context_rows for i in feature_indices):
         raise ValueError(
@@ -218,11 +215,9 @@ def build_specopd_training_batch(request, scores, device, config, feature_indice
         "specopd": True,
         "_speco_sample_count": len(request.branches),
         "_speco_sample_ids": tuple(b.branch_id for b in request.branches),
-        "_specopd_trunk_digest": token_digest(request.trunk_ids),
     }
     if position_weights is not None:
         result["position_weights"] = position_weights
-        result["sampling_support_mask"] = support_mask
     return result
 
 
@@ -284,9 +279,7 @@ def merge_specopd_training_batches(batches):
     if any(("position_weights" in b) != ("position_weights" in first) for b in batches):
         raise ValueError("cannot merge different SpecOPD loss reductions")
     for key in ("proposal_ids", "proposal_mask") + (
-        ("position_weights", "sampling_support_mask")
-        if "position_weights" in first
-        else ()
+        ("position_weights",) if "position_weights" in first else ()
     ):
         result[key] = torch.cat(
             [
@@ -316,7 +309,6 @@ def merge_specopd_training_batches(batches):
     result["_speco_sample_ids"] = tuple(
         x for b in batches for x in b["_speco_sample_ids"]
     )
-    result["_specopd_trunk_digest"] = tuple(b["_specopd_trunk_digest"] for b in batches)
     return result
 
 

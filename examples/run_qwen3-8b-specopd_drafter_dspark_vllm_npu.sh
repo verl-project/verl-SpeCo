@@ -3,10 +3,10 @@ set -euo pipefail
 
 # V1 synchronous SpecOPD with DSpark and vLLM Ascend MRV2. Run from the repo root.
 # Set the actor, drafter, and dataset paths before launching. Hydra overrides follow the defaults.
-: "${MODEL_PATH:?Set MODEL_PATH to a Qwen3-8B checkpoint}"
-: "${DRAFTER_PATH:?Set DRAFTER_PATH to a compatible DSpark checkpoint}"
-: "${TRAIN_FILE:?Set TRAIN_FILE to the training dataset}"
-: "${TEST_FILE:?Set TEST_FILE to the validation dataset}"
+MODEL_PATH=${MODEL_PATH:-/path/to/model}
+DRAFTER_PATH=${DRAFTER_PATH:-/path/to/drafter}
+TRAIN_FILE=${TRAIN_FILE:-/path/to/train.parquet}
+TEST_FILE=${TEST_FILE:-/path/to/val.parquet}
 
 export VLLM_USE_V1=1
 export VLLM_USE_V2_MODEL_RUNNER=1
@@ -16,7 +16,7 @@ export VERL_SPECO_JOINT_PRESERVE_PV="${VERL_SPECO_JOINT_PRESERVE_PV:-1}"
 
 project_name=verl_specopd_dspark
 exp_name=qwen3_8b_dspark_specopd_v1_npu
-CKPTS_DIR=${CKPTS_DIR:-checkpoints/${exp_name}}
+CKPTS_DIR=${CKPTS_DIR:-/path/to/checkpoint}
 gen_tp=2
 train_sp=4
 ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-16}
@@ -24,8 +24,6 @@ ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-16}
 spec_verify_tokens=7
 dspark_num_anchors=64
-specopd_trunk_anchors=$((dspark_num_anchors / 4))
-specopd_proposal_anchors=$((dspark_num_anchors - specopd_trunk_anchors))
 
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_v1_trainer \
     algorithm.adv_estimator=grpo \
@@ -35,8 +33,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_v1_trainer \
     ray_kwargs.ray_init.num_cpus=${ray_num_cpus} \
     +ray_kwargs.ray_init._system_config.prestart_worker_first_driver=false \
     +ray_kwargs.ray_init._system_config.num_workers_soft_limit=${ray_worker_soft_limit} \
-    "    data.train_files=${TRAIN_FILE}" \
-    "    data.val_files=${TEST_FILE}" \
+    "data.train_files=${TRAIN_FILE}" \
+    "data.val_files=${TEST_FILE}" \
     data.train_batch_size=64 \
     data.max_prompt_length=512 \
     data.max_response_length=8192 \
@@ -44,7 +42,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_v1_trainer \
     data.filter_overlong_prompts_workers=256 \
     data.truncation='error' \
     actor_rollout_ref.rollout.temperature=1 \
-    "    actor_rollout_ref.model.path=${MODEL_PATH}" \
+    "actor_rollout_ref.model.path=${MODEL_PATH}" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=true \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
@@ -86,7 +84,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_v1_trainer \
     actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
     actor_rollout_ref.rollout.drafter.training.use_data_buffer=False \
     actor_rollout_ref.rollout.drafter.training.data_buffer_max_size=1024 \
-    "    actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH}" \
+    "actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH}" \
     actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK \
     actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True \
     actor_rollout_ref.rollout.drafter.training.old_logprob_hidden_capture_impl=forward_hook \
@@ -137,7 +135,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main --config-name=speco_v1_trainer \
     trainer.experiment_name=${exp_name} \
     trainer.n_gpus_per_node=${ppo_gpus_per_node} \
     trainer.nnodes=1 \
-    "    trainer.default_local_dir=${CKPTS_DIR}" \
+    "trainer.default_local_dir=${CKPTS_DIR}" \
     trainer.total_training_steps=200 \
     trainer.save_freq=100 \
     trainer.test_freq=5 \

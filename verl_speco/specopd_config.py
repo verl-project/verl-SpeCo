@@ -20,7 +20,6 @@ from dataclasses import dataclass, fields
 @dataclass(frozen=True)
 class SpecOPDConfig:
     enable: bool = False
-    collection_source: str = "rollout_proposals"
     window_mode: str = "front"
     window_response_tokens: int = 512
     random_max_offset: int = 512
@@ -28,9 +27,9 @@ class SpecOPDConfig:
     proposal_width: int = 7
     max_proposal_tokens_per_request: int = 56
     max_collect_samples_per_step: int | None = None
-    scoring_token_budget: int = 8192
-    score_target_logz: bool = True
-    max_dense_mask_elements: int = 16777216
+    scoring_token_budget: int = 9216
+    score_target_logz: bool = False
+    max_dense_mask_elements: int = 84934656
     max_wire_bytes: int = 1048576
     min_scored_positions_per_update: int = 1
     microbatch_trajectories: int = 1
@@ -46,21 +45,7 @@ class SpecOPDConfig:
     random_anchor_count: int = 8
     first_reject_weight: float = 2.0
     random_position_decay_gamma: float = 7.0
-    replay: bool = False
-    mix_trunk_loss: bool = False
-    allow_bubble_training: bool = False
-    capture_rejected_tail: bool = True
-    scoring_phase: str = "before_actor_update"
-    scorer: str = "actor"
-    scoring_impl: str = "joint_tree_old_logprob"
-    replace_normal_old_logprob_forward: bool = True
-    one_forward_per_trajectory: bool = True
-    independent_branches_for_validation_only: bool = True
     objective: str = "e2e_tv"
-    objective_weight: float = 1.0
-    confidence_loss_weight: float = 0.0
-    strict_versions: bool = True
-    max_drafter_revision_lag: int = 0
 
     @classmethod
     def from_drafter(cls, drafter, *, rollout_temperature):
@@ -209,26 +194,6 @@ class SpecOPDConfig:
                 raise ValueError(f"SpecOPD {name} must be finite and positive")
         if self.objective not in {"e2e_tv", "tv", "l1"}:
             raise ValueError("SpecOPD objective must be e2e_tv, tv or l1")
-        if self.replay or self.mix_trunk_loss or self.allow_bubble_training:
-            raise ValueError(
-                "SpecOPD requires no cross-collection replay, no trunk loss and no Bubble"
-            )
-        if (
-            self.collection_source != "rollout_proposals"
-            or self.scoring_phase != "before_actor_update"
-            or self.scorer != "actor"
-            or self.scoring_impl != "joint_tree_old_logprob"
-            or self.objective_weight != 1.0
-            or self.confidence_loss_weight != 0.0
-            or not self.capture_rejected_tail
-            or not self.replace_normal_old_logprob_forward
-            or not self.one_forward_per_trajectory
-            or not self.strict_versions
-            or self.max_drafter_revision_lag != 0
-        ):
-            raise ValueError(
-                "SpecOPD requires the strict joint-forward E2E-TV contract"
-            )
         if self.max_proposal_tokens_per_request < self.proposal_width:
             raise ValueError("proposal token budget cannot contain one complete branch")
         if self.max_wire_bytes > 1048576:
@@ -294,6 +259,29 @@ def validate_specopd_config(config):
     sp_size = actor.get("actor", {}).get("ulysses_sequence_parallel_size", 1)
     if type(sp_size) is not int or sp_size < 1:
         raise ValueError("SpecOPD Ulysses size must be a positive integer")
+    data = config.get("data", {})
+    prompt = data.get("max_prompt_length")
+    response = data.get("max_response_length")
+    if type(prompt) is int and prompt > 0 and type(response) is int and response > 0:
+        # Mixed groups fill unused proposal slots with trunk anchors.
+        branches = spec.anchor_count or min(
+            spec.max_branches_per_request,
+            spec.max_proposal_tokens_per_request // spec.proposal_width,
+        )
+        branches = min(branches, response, spec.window_response_tokens)
+        tokens = prompt + response + branches * (spec.proposal_width - 1)
+        width = ((tokens + sp_size - 1) // sp_size) * sp_size
+        mask_elements = width * width
+        if (
+            tokens > spec.scoring_token_budget
+            or mask_elements > spec.max_dense_mask_elements
+        ):
+            raise ValueError(
+                f"SpecOPD worst-case trajectory requires scoring_token_budget>={tokens} "
+                f"and max_dense_mask_elements>={mask_elements} (SP={sp_size}); "
+                "increase the scoring limits or reduce data.max_prompt_length, "
+                "data.max_response_length, or the branch budget"
+            )
     if any(
         t != float(temperature)
         for t in (
@@ -324,6 +312,10 @@ def validate_specopd_config(config):
     }:
         raise ValueError("SpecOPD draft_sample_method must be greedy or probabilistic")
     trainer = config.get("trainer", {})
+    if trainer.get("critic_warmup", 0) > 0:
+        raise ValueError(
+            "SpecOPD requires critic_warmup=0 so every collected step updates the actor"
+        )
     if trainer.get("use_v1", False):
         v1 = trainer.get("v1", {})
         if v1.get("trainer_mode", "sync") != "sync":
@@ -359,12 +351,12 @@ def validate_specopd_config(config):
         raise ValueError(
             "SpecOPD uses its own one-use scored group, not legacy collectors/replay"
         )
-    if training.get("adaptive_schedule", {}).get("enable", False) or training.get(
-        "freeze_policy", {}
-    ).get("enable", False):
-        raise ValueError("SpecOPD does not combine with adaptive/freeze scheduling")
-    if training.get("freeze", {}).get("enabled", False):
-        raise ValueError("SpecOPD does not combine with the legacy freeze policy")
+    if (training.get("adaptive_schedule") or {}).get("enable", False) or (
+        training.get("drafter_convergence_freeze") or {}
+    ).get("enabled", False):
+        raise ValueError(
+            "SpecOPD does not combine with adaptive scheduling or drafter_convergence_freeze"
+        )
     if training.get("publish_async", False) or training.get(
         "publish_interval_steps", 0
     ) not in {0, 1}:

@@ -4330,13 +4330,6 @@ async def _speco_generate_with_request_stats_unblocked(
                 len(prompt),
                 budget,
             )
-            eos = _get_nested(self.model_config, ("hf_config", "eos_token_id"), None)
-            stop_ids = clean_params.get("stop_token_ids", []) or []
-            native_extra[PLAN_KEY]["eos_token_ids"] = list(stop_ids) + (
-                []
-                if clean_params.get("ignore_eos", False) or eos is None
-                else (eos if isinstance(eos, list) else [eos])
-            )
             # Reuse the existing request-count budget, with an explicit empty
             # bundle for unselected requests so normal old-logprob still runs.
             training_cfg = drafter_cfg.get("training", {})

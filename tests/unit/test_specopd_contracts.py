@@ -24,7 +24,7 @@ import torch
 
 from verl_speco.backends import opd_distribution as distribution
 from verl_speco.backends.drafter_opd import DraftOPDObjective
-from verl_speco.backends.specopd_loss import e2e_tv_loss, specopd_distribution_loss
+from verl_speco.backends.specopd_loss import specopd_distribution_loss
 from verl_speco.integration.specopd_anchors import add_trunk_anchors, retain_proposal
 from verl_speco.integration.specopd_driver import (
     build_requests,
@@ -96,10 +96,38 @@ def test_configuration_requires_exact_block_and_sampling():
         validate_specopd_config(cfg)
 
 
+@pytest.mark.parametrize("prompt,response", [(512, 4096), (512, 8192)])
+def test_default_budgets_allow_long_trajectory(prompt, response):
+    cfg = config()
+    cfg["data"] = {"max_prompt_length": prompt, "max_response_length": response}
+    spec = validate_specopd_config(cfg)
+    branches = tuple(
+        DraftBranch(str(i), prompt - 1 + i, (1,) * spec.proposal_width)
+        for i in range(spec.max_branches_per_request)
+    )
+    request = JointScoringRequest("long", (1,) * (prompt + response), prompt, branches)
+    assert plan_microbatches([request], spec) == [[request]]
+    training = cfg["actor_rollout_ref"]["rollout"]["drafter"]["training"]
+    training["specopd"].update(scoring_token_budget=4096, max_dense_mask_elements=4096**2)
+    with pytest.raises(ValueError, match=r"scoring_token_budget>=\d+ and max_dense_mask_elements>=\d+"):
+        validate_specopd_config(cfg)
+
+
+@pytest.mark.parametrize("mode", ["critic_warmup", "drafter_convergence_freeze"])
+def test_config_rejects_schedules_that_skip_specopd_updates(mode):
+    cfg = config()
+    if mode == "critic_warmup":
+        cfg["trainer"][mode] = 1
+    else:
+        cfg["actor_rollout_ref"]["rollout"]["drafter"]["training"][mode] = {"enabled": True}
+    with pytest.raises(ValueError, match=mode):
+        validate_specopd_config(cfg)
+
+
 def test_config_unknown_and_non_joint_modes_rejected():
     with pytest.raises(ValueError, match="unknown"):
         SpecOPDConfig.from_training({"specopd": {"enable": True, "typo": 1}})
-    with pytest.raises(ValueError, match="contract"):
+    with pytest.raises(ValueError, match="unknown"):
         SpecOPDConfig.from_training(
             {"specopd": {"enable": True, "capture_rejected_tail": False}}
         )
@@ -199,7 +227,7 @@ def test_window_is_preplanned_deterministic_and_uses_response_offsets():
     assert make_window(SpecOPDConfig(), "r", 2, 3, 100, 1000)["start"] == 0
 
 
-def capture(raw=(11, 12, 13, 14, 15, 16, 17), generated=(11, 20), offset=0):
+def capture(raw=(11, 12, 13, 14, 15, 16, 17), generated=(11, 20), offset=0, verified=2):
     plan = make_window(SpecOPDConfig(), "r", 2, 3, 3, 1000)
     request = SimpleNamespace(
         sampling_params=SimpleNamespace(extra_args={"specopd_plan": plan}),
@@ -210,7 +238,7 @@ def capture(raw=(11, 12, 13, 14, 15, 16, 17), generated=(11, 20), offset=0):
     scheduler = SimpleNamespace(requests={"r": request})
     snapshot = snapshot_scheduler_round(scheduler)
     request.spec_token_ids.clear()  # Real Scheduler.schedule consumes this list.
-    output = SimpleNamespace(scheduled_spec_decode_tokens={"r": list(raw)[:2]})
+    output = SimpleNamespace(scheduled_spec_decode_tokens={"r": list(raw)[:verified]})
     result = SimpleNamespace(
         req_id_to_index={"r": 0}, sampled_token_ids=[list(generated)]
     )
@@ -231,9 +259,12 @@ def test_full_rejected_tail_survives_scheduler_shortening_and_mutation():
     [((20,), 0), ((11, 12, 20), 2), ((11, 12, 13, 14, 15, 16, 17, 20), 7)],
 )
 def test_acceptance_does_not_control_saved_tail(generated, accepted):
-    request, _, _, _ = capture(generated=generated)
-    assert len(request._specopd_records[0]["proposal_ids"]) == 7
-    assert request._specopd_records[0]["accepted_count"] == accepted
+    verified = max(2, accepted)
+    request, _, _, _ = capture(generated=generated, verified=verified)
+    record = request._specopd_records[0]
+    assert len(record["proposal_ids"]) == 7
+    assert record["accepted_count"] == accepted
+    assert record["verified_count"] == verified
 
 
 def test_window_boundary_keeps_whole_proposal():
@@ -254,12 +285,22 @@ def test_async_placeholder_rejected():
         snapshot_scheduler_round(SimpleNamespace(requests={"r": request}))
 
 
-def test_first_eos_keeps_rejected_prefix_and_masks_only_later_tokens():
+@pytest.mark.parametrize(
+    "ignore_eos,effective_eos,explicit,expected",
+    [(False, [13], [], 13), (True, [13], [], 17), (True, [13, 15], [15], 15),
+     (False, [], [], 14)],
+)
+def test_first_effective_stop_preserves_tail_through_stop_token(
+    ignore_eos, effective_eos, explicit, expected,
+):
     request, snapshot, scheduled, result = capture()
     request._specopd_records.clear()
-    snapshot["r"][1]["eos_token_ids"] = [13]
+    request.sampling_params.all_stop_token_ids = effective_eos
+    request.sampling_params.stop_token_ids = explicit
+    request.sampling_params.ignore_eos = ignore_eos
+    request.eos_token_id = 14
     capture_scheduler_round(scheduled, result, snapshot)
-    assert request._specopd_records[0]["proposal_ids"] == (11, 12, 13)
+    assert request._specopd_records[0]["proposal_ids"] == tuple(range(11, expected + 1))
 
 
 @pytest.mark.parametrize(
@@ -365,7 +406,7 @@ def test_e2e_tv_hand_computed_loss_and_differentiable_prefixes():
     )
     p = torch.tensor([[[0.7, 0.3], [0.9, 0.1]]], dtype=torch.float64).log()
     mask = torch.ones((1, 2), dtype=torch.bool)
-    numerator, count, info = e2e_tv_loss(q, p, mask)
+    numerator, count, info = specopd_distribution_loss(q, p, mask)
     torch.testing.assert_close(
         numerator / count, torch.tensor(0.36), atol=1e-6, rtol=1e-6
     )
@@ -391,11 +432,11 @@ def test_loss_padding_is_neutral_and_holes_rejected():
     q = torch.randn(2, 3, 5, requires_grad=True)
     p = torch.randn_like(q)
     mask = torch.tensor([[1, 1, 1], [1, 0, 0]], dtype=torch.bool)
-    numerator, count, _ = e2e_tv_loss(q, p, mask)
+    numerator, count, _ = specopd_distribution_loss(q, p, mask)
     numerator.backward()
     assert count == 4 and q.grad[1, 1:].abs().sum() == 0
     with pytest.raises(ValueError, match="prefix"):
-        e2e_tv_loss(q, p, torch.tensor([[1, 0, 1], [1, 1, 1]], dtype=torch.bool))
+        specopd_distribution_loss(q, p, torch.tensor([[1, 0, 1], [1, 1, 1]], dtype=torch.bool))
 
 
 def test_microbatch_planning_keeps_each_tree_once():
@@ -410,6 +451,13 @@ def test_microbatch_planning_keeps_each_tree_once():
     assert [tree.sample_id for group in groups for tree in group] == ["0", "1", "2"]
     with pytest.raises(ValueError, match="complete trajectory"):
         plan_microbatches(trees, SpecOPDConfig(scoring_token_budget=4))
+    with pytest.raises(ValueError, match="complete trajectory"):
+        plan_microbatches(trees, SpecOPDConfig(max_dense_mask_elements=63), sequence_multiple=4)
+    grouped = plan_microbatches(
+        trees, SpecOPDConfig(microbatch_trajectories=3, max_dense_mask_elements=128),
+        sequence_multiple=4,
+    )
+    assert [len(g) for g in grouped] == [2, 1]
 
 
 def test_distributed_dispatch_partitions_whole_trees_and_pads_empty_rank():
@@ -513,7 +561,7 @@ def test_mixed_loss_and_gradient_match_draft_opd_with_padding_and_weights():
     target = torch.randn(4, 4, 5)
     expected = objective(dense.reshape(-1, 13)[active], target.reshape(-1, 5)[active], head,
                          valid.reshape(1, 4, 4).float(), active, position_weights=weights)
-    numerator, count, _ = e2e_tv_loss(dense, torch.nn.functional.linear(target, head), valid,
+    numerator, count, _ = specopd_distribution_loss(dense, torch.nn.functional.linear(target, head), valid,
                                      position_weights=weights.reshape_as(valid))
     actual = numerator / count
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
@@ -534,10 +582,10 @@ def test_async_reservoir_keeps_capturing_after_24_and_stops_at_window_end():
     plan = make_window(_mixed_anchor_config(), "a", 5, 0, 3, 1024)
     batch = NS(req_ids=["a"], idx_mapping_np=[0], num_draft_tokens_per_req=[7],
                is_prefilling_np=[False], seq_lens=torch.tensor([100]))
-    runner = NS(draft_tokens_handler=NS(_specopd_plans={"a": plan}, _specopd_result_counts={"a": 24}),
+    runner = NS(draft_tokens_handler=NS(_specopd_plans={"a": plan}),
                 execute_model_state=NS(input_batch=batch), is_last_pp_rank=True,
                 req_states=NS(draft_tokens=torch.ones((1, 7), dtype=torch.int32)))
-    assert "a" in snapshot_verified_proposals(runner)
+    assert all("a" in snapshot_verified_proposals(runner) for _ in range(25))
     batch.seq_lens[0] = 700
     assert snapshot_verified_proposals(runner) == {}
     runner.req_states = None
@@ -582,6 +630,7 @@ def test_unit_temperature_preserves_outputs_gradients_and_teacher_stop(monkeypat
 
 def test_dspark_specopd_launch_defaults_to_pure_tv():
     OmegaConf = pytest.importorskip("omegaconf").OmegaConf
+    hydra_parser = pytest.importorskip("hydra.core.override_parser.overrides_parser")
     root = Path(__file__).resolve().parents[2]
     bash = shutil.which("bash")
     if bash is None and Path("C:/Program Files/Git/bin/bash.exe").exists():
@@ -589,12 +638,13 @@ def test_dspark_specopd_launch_defaults_to_pure_tv():
     if bash is None:
         pytest.skip("bash is unavailable")
     env = {**os.environ, **dict.fromkeys(("MODEL_PATH", "DRAFTER_PATH", "TRAIN_FILE", "TEST_FILE"), "/unused/test-path")}
-    harness = 'python3() { printf "%s\\0" "$@"; }; source "$1"'
+    harness = 'python3() { printf "%s\\0" "$@"; }; script=$1; shift; source "$script"'
     script = "examples/run_qwen3-8b-specopd_drafter_dspark_vllm_npu.sh"
     result = subprocess.run([bash, "-c", harness, "specopd-config-test", script], cwd=root,
                             env=env, capture_output=True, check=True)
     argv = result.stdout.decode().rstrip("\0").split("\0")
     assert argv[:3] == ["-m", "verl_speco.main", "--config-name=speco_v1_trainer"]
+    hydra_parser.OverridesParser.create().parse_overrides(argv[3:])
     config = OmegaConf.merge(OmegaConf.load(root / "verl_speco/config/speco_base.yaml"),
                              OmegaConf.from_dotlist([arg.lstrip("+") for arg in argv[3:]]))
     training = config.actor_rollout_ref.rollout.drafter.training

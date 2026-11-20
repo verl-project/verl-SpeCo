@@ -156,8 +156,6 @@ def patch_partial_rollout_client(client_cls):
                     kwargs["sampling_params"]
                 ),
             )
-        elif len(args) >= 2:
-            args = (args[0], _sampling_params_with_speco_context(args[1]), *args[2:])
         segments = []
         token = _SEGMENTS.set(segments)
         try:

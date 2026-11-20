@@ -53,6 +53,7 @@ def patch_draft_token_request_tracking(runner):
             params = getattr(request, "sampling_params", None)
             plan = (getattr(params, "extra_args", None) or {}).get(PLAN_KEY)
             plans.pop(request.req_id, None)
+            getattr(handler, "_specopd_closed_windows", set()).discard(request.req_id)
             if plan and plan.get("max_branches", 0) > 0:
                 plans[request.req_id] = plan
         return result
@@ -61,8 +62,8 @@ def patch_draft_token_request_tracking(runner):
     def removed(self, request_id, *args, **kwargs):
         result = remove(self, request_id, *args, **kwargs)
         getattr(self.draft_tokens_handler, "_specopd_plans", {}).pop(request_id, None)
-        getattr(self.draft_tokens_handler, "_specopd_result_counts", {}).pop(
-            request_id, None
+        getattr(self.draft_tokens_handler, "_specopd_closed_windows", set()).discard(
+            request_id
         )
         return result
 
@@ -102,6 +103,18 @@ def _plan(request):
     return (getattr(params, "extra_args", None) or {}).get(PLAN_KEY)
 
 
+def _stop_ids(request):
+    params = request.sampling_params
+    explicit = set(getattr(params, "stop_token_ids", None) or ())
+    if getattr(params, "ignore_eos", False):
+        return explicit
+    explicit.update(getattr(params, "all_stop_token_ids", None) or ())
+    eos = getattr(request, "eos_token_id", None)
+    if eos is not None:
+        explicit.add(eos)
+    return explicit
+
+
 def snapshot_scheduler_round(scheduler):
     snapshots = {}
     for request_id, request in getattr(scheduler, "requests", {}).items():
@@ -137,6 +150,7 @@ def capture_scheduler_round(scheduler_output, model_output, snapshots):
     sampled = getattr(model_output, "sampled_token_ids", None)
     mapping = getattr(model_output, "req_id_to_index", {})
     scheduled = getattr(scheduler_output, "scheduled_spec_decode_tokens", {})
+    invalid = getattr(scheduler_output, "num_invalid_spec_tokens", None) or {}
     for request_id, scheduled_ids in scheduled.items():
         entry = snapshots.get(request_id)
         if not entry:
@@ -174,13 +188,18 @@ def capture_scheduler_round(scheduler_output, model_output, snapshots):
                 f"invalid_types={sorted({type(i).__name__ for i in raw if type(i) is not int})}, "
                 f"negative_tokens={sum(1 for i in raw if i < 0)}, offset={offset}"
             )
-        stops = set(plan.get("eos_token_ids", []))
+        stops = _stop_ids(request)
         for index, token in enumerate(raw):
             if token in stops:
                 raw = raw[: index + 1]
                 break
-        accepted = min(len(raw), max(0, len(sampled[mapping[request_id]]) - 1))
-        if list(sampled[mapping[request_id]][:accepted]) != raw[:accepted]:
+        generated = sampled[mapping[request_id]]
+        verified = min(len(raw), len(scheduled_ids) - invalid.get(request_id, 0))
+        accepted = min(len(raw), len(generated) - 1)
+        if (
+            not 0 <= accepted <= verified
+            or list(generated[:accepted]) != raw[:accepted]
+        ):
             raise RuntimeError(
                 "SpecOPD accepted tokens differ from the verified proposal"
             )
@@ -191,6 +210,7 @@ def capture_scheduler_round(scheduler_output, model_output, snapshots):
             token_digest(prefix),
             round_id,
             accepted,
+            verified,
         )
         if plan.get("reservoir"):
             from verl_speco.integration.specopd_anchors import retain_proposal

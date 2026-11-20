@@ -35,6 +35,7 @@ class DraftBranch:
     token_ids: tuple[int, ...]  # Full valid proposal, excluding anchor/bonus.
     source: str = "proposal"
     accepted_count: int = -1  # -1 for unknown legacy diagnostics or trunk anchors.
+    verified_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -131,6 +132,16 @@ def validate_joint_batch(
                 branch.source not in {"proposal", "trunk"}
                 or not _integer(branch.accepted_count)
                 or not -1 <= branch.accepted_count <= len(branch.token_ids)
+                or (
+                    branch.verified_count is not None
+                    and (
+                        not _integer(branch.verified_count)
+                        or not 0
+                        <= branch.accepted_count
+                        <= branch.verified_count
+                        <= len(branch.token_ids)
+                    )
+                )
             ):
                 raise ValueError("invalid branch source or acceptance diagnostics")
             if (
@@ -261,6 +272,24 @@ def pack_joint_batch(
     )
 
 
+def response_scores(logits, labels, temperature, calculate_entropy):
+    """Normalize bounded chunks of vocabulary rows in float32."""
+    log_probs = logits.new_empty(len(labels), dtype=torch.float32)
+    entropy = torch.empty_like(log_probs) if calculate_entropy else None
+    for start in range(0, len(labels), 128):
+        sl = slice(start, start + 128)
+        scaled = logits[sl].float()
+        if temperature != 1.0:
+            scaled = scaled / temperature
+        log_probs[sl] = scaled.gather(-1, labels[sl, None]).squeeze(
+            -1
+        ) - scaled.logsumexp(-1)
+        if entropy is not None:
+            log_distribution = scaled.log_softmax(-1)
+            entropy[sl] = -(log_distribution.exp() * log_distribution).sum(-1)
+    return log_probs, entropy
+
+
 @torch.no_grad()
 def score_joint_batch(
     model,
@@ -343,20 +372,15 @@ def score_joint_batch(
     results = []
     for batch_index, request in enumerate(packed.requests):
         n = len(request.trunk_ids)
-        rows = output.logits[batch_index, request.response_start - 1 : n - 1].float()
+        rows = output.logits[batch_index, request.response_start - 1 : n - 1]
         labels = torch.tensor(
             request.trunk_ids[request.response_start :],
             device=rows.device,
             dtype=torch.long,
         )
-        scaled = rows / actor_temperature
-        log_probs = scaled.gather(-1, labels[:, None]).squeeze(-1) - scaled.logsumexp(
-            -1
+        log_probs, entropy = response_scores(
+            rows, labels, actor_temperature, calculate_entropy
         )
-        entropy = None
-        if calculate_entropy:
-            log_distribution = scaled.log_softmax(-1)
-            entropy = -(log_distribution.exp() * log_distribution).sum(-1)
         branches = []
         for branch, readout in zip(
             request.branches, packed.branch_rows[batch_index], strict=True

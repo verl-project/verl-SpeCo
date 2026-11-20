@@ -271,9 +271,10 @@ def test_v1_native_trunk_scores_disjoint_keys(monkeypatch, branch_indices, calcu
     value = object.__new__(specopd_driver.SpecOPDDriver)
     value.trainer, value.metrics, value.cycle = trainer, {}, SpecOPDCycle()
     value._acknowledged_actor_revision, value._bound_actor_revision = 7, False
+    value.scoring_sp_size = 1
     value.spec = SimpleNamespace(
         scoring_token_budget=64, max_dense_mask_elements=1024, microbatch_trajectories=4,
-        actor_temperature=0.6, target_temperature=0.6,
+        actor_temperature=0.6, target_temperature=0.6, score_target_logz=False,
     )
     value.cycle.begin(5)
     monkeypatch.setattr(specopd_adapter, "driver", lambda trainer: value)

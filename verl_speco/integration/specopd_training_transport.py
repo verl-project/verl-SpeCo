@@ -22,7 +22,14 @@ def training_payload_identity(samples):
             r.trunk_ids,
             r.response_start,
             [
-                (b.branch_id, b.anchor, b.token_ids, b.source, b.accepted_count)
+                (
+                    b.branch_id,
+                    b.anchor,
+                    b.token_ids,
+                    b.source,
+                    b.accepted_count,
+                    b.verified_count,
+                )
                 for b in r.branches
             ],
             [

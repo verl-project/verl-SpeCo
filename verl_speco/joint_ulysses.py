@@ -16,7 +16,12 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from verl_speco.joint_scoring import BranchScores, JointScores, pack_joint_batch
+from verl_speco.joint_scoring import (
+    BranchScores,
+    JointScores,
+    pack_joint_batch,
+    response_scores,
+)
 
 
 def validate_ulysses_model(model, size):
@@ -458,24 +463,23 @@ def score_ulysses_joint_batch(
         n = len(request.trunk_ids)
         rows = torch.arange(request.response_start - 1, n - 1, device=parameter.device)
         owned = (rows >= start) & (rows < start + width)
-        logits = (
-            output.logits[i].index_select(0, rows[owned] - start).float()
-            / actor_temperature
-        )
+        local_logits = output.logits[i].index_select(0, rows[owned] - start)
         labels = torch.tensor(
-            request.trunk_ids[request.response_start :], device=parameter.device
+            request.trunk_ids[request.response_start :],
+            device=parameter.device,
+            dtype=torch.long,
         )[owned]
-        log_probs = logits.new_zeros(len(rows))
-        log_probs[owned] = logits.gather(-1, labels[:, None]).squeeze(
-            -1
-        ) - logits.logsumexp(-1)
+        local_log_probs, local_entropy = response_scores(
+            local_logits, labels, actor_temperature, calculate_entropy
+        )
+        log_probs = local_log_probs.new_zeros(len(rows))
+        log_probs[owned] = local_log_probs
         if len(rows):
             dist.all_reduce(log_probs, group=group)
         entropy = None
-        if calculate_entropy:
-            local_logp = logits.log_softmax(-1)
-            entropy = logits.new_zeros(len(rows))
-            entropy[owned] = -(local_logp.exp() * local_logp).sum(-1)
+        if local_entropy is not None:
+            entropy = local_entropy.new_zeros(len(rows))
+            entropy[owned] = local_entropy
             if len(rows):
                 dist.all_reduce(entropy, group=group)
         branches = []

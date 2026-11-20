@@ -38,6 +38,7 @@ class ProposalRecord:
     prefix_digest: str
     round_id: int
     accepted_count: int
+    verified_count: int | None = None
 
     def validate(self):
         if (
@@ -56,6 +57,15 @@ class ProposalRecord:
             or type(self.round_id) is not int
             or not 0 <= self.accepted_count <= len(self.proposal_ids)
             or self.round_id < 0
+            or (
+                self.verified_count is not None
+                and (
+                    type(self.verified_count) is not int
+                    or not self.accepted_count
+                    <= self.verified_count
+                    <= len(self.proposal_ids)
+                )
+            )
         ):
             raise ValueError("invalid verification diagnostics")
         if (

@@ -75,6 +75,17 @@ def requests():
     )
 
 
+def test_response_scoring_matches_fp32_over_multiple_chunks():
+    from verl_speco.joint_scoring import response_scores
+
+    logits = torch.randn(257, 17, dtype=torch.bfloat16)
+    labels = torch.randint(logits.shape[-1], (len(logits),))
+    logp, entropy = response_scores(logits, labels, 0.7, True)
+    expected = (logits.float() / 0.7).log_softmax(-1)
+    torch.testing.assert_close(logp, expected.gather(-1, labels[:, None]).squeeze(-1))
+    torch.testing.assert_close(entropy, -(expected.exp() * expected).sum(-1))
+
+
 def test_prefix_feature_export_keeps_complete_normal_response_scores():
     model = make_model()
     request = JointScoringRequest("crop", tuple((i % 40) + 1 for i in range(48)), 3,

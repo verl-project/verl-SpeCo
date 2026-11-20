@@ -210,6 +210,9 @@ def test_fit_hooks_replace_normal_forward_and_train_before_actor_update(
             self.config = configuration()
             training = self.config["actor_rollout_ref"]["rollout"]["drafter"]["training"]
             training["specopd"]["score_target_logz"] = score_target_logz
+            from verl_speco.integration.ci_result import CIResult
+
+            self._speco_ci_result = CIResult(training=True)
             self.global_steps = 1
             self.actor_rollout_wg = ActorGroup()
             self.drafter_wg = DrafterGroup()
@@ -241,7 +244,7 @@ def test_fit_hooks_replace_normal_forward_and_train_before_actor_update(
             return self.generator
 
         def _speco_store_rollout_metrics(self, result):
-            pass
+            assert not result.meta_info.get("validate", False)
 
         def _speco_oldlogprob_aux_layer_ids(self):
             return [0, 1]
@@ -275,6 +278,8 @@ def test_fit_hooks_replace_normal_forward_and_train_before_actor_update(
     trainer = Trainer()
     original = trainer._compute_old_log_prob
     with specopd_driver.specopd_fit_hooks(trainer):
+        validation = SimpleNamespace(meta_info={"validate": True})
+        trainer.generator.generate_sequences(validation)
         trainer.generator.generate_sequences(batch)
         scored, mfu = trainer._compute_old_log_prob(batch)
         assert len(calls) == 1 and scored[0].response_log_probs.shape == (3,)
@@ -299,6 +304,8 @@ def test_fit_hooks_replace_normal_forward_and_train_before_actor_update(
         with pytest.raises(RuntimeError, match="exactly one rollout"):
             trainer._compute_old_log_prob(batch)
     assert trainer._compute_old_log_prob == original
+    assert trainer._speco_ci_result.data["optimizer_steps"] == 2
+    assert trainer._speco_ci_result.data["publications"] == 2
     assert events == [
         "set-step",
         "head-sync",

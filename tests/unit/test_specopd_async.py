@@ -63,11 +63,25 @@ def test_noncollection_does_not_access_model_or_device_state():
     assert snapshot_verified_proposals(NS(draft_tokens_handler=NS())) is None
 
 
-def test_worker_cap_stops_extra_copies_and_request_removal_can_reset_it():
-    runner, _, _, _ = fixture()
+def test_worker_does_not_spend_scheduler_quota_on_stale_delivery():
+    runner, scheduler, scheduled, output = fixture()
     for plan in runner.draft_tokens_handler._specopd_plans.values():
         plan["max_branches"] = 1
-    assert len(snapshot_verified_proposals(runner)) == 2
+    setattr(output, VERIFIED_KEY, snapshot_verified_proposals(runner))
+    scheduler.requests["a"].num_stale_output_tokens = 8
+    capture_scheduler_round(scheduled, output, snapshot_result_round(scheduler, scheduled, output))
+    assert not hasattr(scheduler.requests["a"], "_specopd_records")
+
+    scheduler.requests["a"].num_stale_output_tokens = 0
+    setattr(output, VERIFIED_KEY, snapshot_verified_proposals(runner))
+    capture_scheduler_round(scheduled, output, snapshot_result_round(scheduler, scheduled, output))
+    assert len(scheduler.requests["a"]._specopd_records) == 1
+
+
+def test_worker_stops_copying_after_plain_capture_window():
+    runner, _, _, _ = fixture()
+    runner.execute_model_state.input_batch.seq_lens.fill_(600)
+    assert snapshot_verified_proposals(runner) == {}
     runner.req_states = None  # any additional device access would fail
     assert snapshot_verified_proposals(runner) == {}
 

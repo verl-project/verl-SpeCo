@@ -35,14 +35,11 @@ def specopd_distribution_loss(
     *,
     proposal_temperature=1.0,
     target_temperature=1.0,
-    candidate_ids=None,
-    target_logz=None,
     position_weights=None,
     distribution_loss_impl="auto",
     use_l1=False,
     distribution_weight=1.0,
     ce_weight=0.0,
-    ce_logits=None,
 ):
     if (
         draft_logits.shape[:-1] != valid_mask.shape
@@ -61,9 +58,6 @@ def specopd_distribution_loss(
         raise ValueError("positive scoring temperatures required")
     joint_ce = (
         ce_weight > 0
-        and ce_logits is None
-        and candidate_ids is None
-        and target_logz is None
         and proposal_temperature == target_temperature == 1.0
         and draft_logits.numel() > 0
         and use_fused_opd_loss(draft_logits.device, distribution_loss_impl)
@@ -75,7 +69,7 @@ def specopd_distribution_loss(
         )
         tv, ce = tv.reshape_as(valid_mask), ce.reshape_as(valid_mask)
         alpha = 1.0 - tv
-    elif candidate_ids is None and target_logz is None:
+    else:
         tv = token_total_variation(
             draft_logits,
             target_logits,
@@ -84,30 +78,13 @@ def specopd_distribution_loss(
             implementation=distribution_loss_impl,
         )
         alpha = 1.0 - tv
-    else:
-        q = (draft_logits.float() / proposal_temperature).softmax(-1)
-        with torch.no_grad():
-            scaled_target = target_logits.detach().float() / target_temperature
-            logz = (
-                scaled_target.logsumexp(-1)
-                if target_logz is None
-                else target_logz.detach().float()
-            )
-            if candidate_ids is not None:
-                scaled_target = scaled_target.gather(-1, candidate_ids)
-            p = (scaled_target - logz.unsqueeze(-1)).exp()
-        if q.shape != p.shape:
-            raise ValueError("proposal and target supports differ")
-        alpha = torch.minimum(q, p).sum(-1).clamp(max=1.0)
-        tv = 1.0 - alpha
     alpha = torch.where(valid_mask, alpha, torch.ones_like(alpha))
     survival = alpha.cumprod(dim=-1)
     distance = 2.0 * tv if use_l1 else 1.0 - survival
     numerator, count = reduce_specopd_loss(distance, valid_mask, position_weights)
     if ce_weight:
         if ce is None:
-            ce_logits = draft_logits if ce_logits is None else ce_logits
-            logits = ce_logits.flatten(0, 1)
+            logits = draft_logits.flatten(0, 1)
             labels = target_logits.detach().argmax(-1).flatten()
             if logits.numel() and use_fused_opd_loss(
                 logits.device, distribution_loss_impl
@@ -122,10 +99,6 @@ def specopd_distribution_loss(
     elif distribution_weight != 1.0:
         numerator = distribution_weight * numerator
     return numerator, count, {"overlap": alpha.detach(), "survival": survival.detach()}
-
-
-def e2e_tv_loss(draft_logits, target_logits, valid_mask, **kwargs):
-    return specopd_distribution_loss(draft_logits, target_logits, valid_mask, **kwargs)
 
 
 def reduce_specopd_loss(loss, valid_mask, position_weights):

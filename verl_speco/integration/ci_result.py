@@ -47,11 +47,15 @@ class CIResult:
             return
         if "training/global_step" in metrics:
             self.data["generation_steps"] += 1
-        if metrics.get("drafter/trained", 0) > 0:
+        if "specopd/optimizer_updates" in metrics:
+            self.data["optimizer_steps"] += int(metrics["specopd/optimizer_updates"])
+        elif metrics.get("drafter/trained", 0) > 0:
             self.data["optimizer_steps"] += int(
                 metrics.get("drafter/train_successful_steps_max", 0)
             )
-        self.data["publications"] += int(metrics.get("drafter/published", 0))
+        self.data["publications"] += int(
+            metrics.get("specopd/published", metrics.get("drafter/published", 0))
+        )
         for key, bad in (
             ("drafter/train_activation_failed", 1),
             ("drafter/train_worker_results_consistent", 0),

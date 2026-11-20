@@ -28,7 +28,7 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel
 
 from verl_speco.backends.specopd_forward import partition_specopd_samples
-from verl_speco.backends.specopd_loss import e2e_tv_loss
+from verl_speco.backends.specopd_loss import specopd_distribution_loss
 from verl_speco.joint_actor import score_actor_joint
 from verl_speco.joint_scoring import DraftBranch, JointScoringRequest, score_joint_batch
 from verl_speco.joint_ulysses import score_ulysses_joint_batch
@@ -270,7 +270,7 @@ def _check(rank, world, sp, sample_count, init_file, aligned):
             token_total = 0
             for (x, teacher, mask), real in zip(local, real_slots, strict=True):
                 valid = mask if real else torch.zeros_like(mask)
-                numerator, count, _ = e2e_tv_loss(model(x), teacher, valid,
+                numerator, count, _ = specopd_distribution_loss(model(x), teacher, valid,
                     position_weights=torch.tensor([[1., 2., 1.]]) if aligned else None)
                 counts = count.detach().clone()
                 dist.all_reduce(counts)
@@ -280,7 +280,7 @@ def _check(rank, world, sp, sample_count, init_file, aligned):
                 parameter.grad.div_(token_total)
             ref_numerator, ref_count = 0, 0
             for x, teacher, mask in samples:
-                n, c, _ = e2e_tv_loss(reference(x), teacher, mask,
+                n, c, _ = specopd_distribution_loss(reference(x), teacher, mask,
                     position_weights=torch.tensor([[1., 2., 1.]]) if aligned else None)
                 ref_numerator += n
                 ref_count += c
