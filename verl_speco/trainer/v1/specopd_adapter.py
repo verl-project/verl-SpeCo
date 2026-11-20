@@ -2,14 +2,41 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 """V1 sync lifecycle and TransferQueue bridge for one-use SpecOPD groups."""
 
+import os
+from functools import partial
+
 from verl_speco.opd_method import spec_opd_enabled
 
 
-def enabled(trainer):
+def training_config(trainer):
     value = getattr(trainer, "config", None)
     for key in ("actor_rollout_ref", "rollout", "drafter", "training"):
         value = value.get(key, {}) if hasattr(value, "get") else getattr(value, key, {})
-    return spec_opd_enabled(value)
+    return value
+
+
+def enabled(trainer):
+    return spec_opd_enabled(training_config(trainer))
+
+
+def prepare_draft_rollout(trainer, batch):
+    """Carry Draft-OPD's collection decision through native V1 TQ prompts."""
+    from verl_speco.opd_method import draft_opd_enabled
+    if not draft_opd_enabled(training_config(trainer)):
+        return batch
+    from tensordict import NonTensorData
+    validate = batch.get("validate", False)
+    validate = bool(getattr(validate, "data", validate))
+    due = trainer._speco_opd_trace_collection_due(validation=validate)
+    config = trainer._speco_drafter_schedule_config()
+    blocked = trainer._speco_get_drafter_scheduler().training_quota_blocks_collection(
+        trainer.global_steps, config,
+    )
+    previous = batch.get("_specopd_skip_collection", False)
+    skip = bool(getattr(previous, "data", previous)) or not due or blocked
+    # Reuse the proven SpecOPD scalar channel, consumed before upstream generation.
+    batch["_specopd_skip_collection"] = NonTensorData(skip)
+    return batch
 
 
 def driver(trainer):
@@ -33,6 +60,58 @@ def prepare_rollout(trainer, batch):
     return batch
 
 
+def _native_trunk_log_prob(trainer, batch, trunk, *, calculate_entropy):
+    import torch
+    import transfer_queue as tq
+    from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
+    from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions
+    from verl.workers.utils.padding import response_from_nested
+
+    from verl_speco.joint_scoring import JointScores
+
+    keys = [batch.keys[i] for i, _ in trunk]
+    subset = batch.select_keys(keys)
+    subset.extra_info.update(
+        calculate_entropy=calculate_entropy,
+        compute_loss=False,
+        temperature=trainer.config.actor_rollout_ref.rollout.temperature,
+    )
+    worker_group = trainer.actor_rollout_wg
+    # V1 _balance_batch initializes the native dispatch map before old-logprob.
+    dp_size = max(worker_group._dispatch_info["actor"]) + 1
+    subset = upsample_batch_to_divisible_size(subset, dp_size, trainer.tokenizer.eos_token_id)
+    padding_keys = subset.keys[len(keys):]
+    try:
+        if dp_size > 1:
+            lengths = torch.tensor([tag["seq_len"] for tag in subset.tags], dtype=torch.int64)
+            partitions = get_seqlen_balanced_partitions(
+                calculate_workload(lengths), k_partitions=dp_size, equal_size=True,
+            )
+            subset.reorder([i for partition in partitions for i in partition])
+        output = worker_group.compute_log_prob(subset)
+        if set(output.keys) != set(subset.keys) or output.partition_id != batch.partition_id:
+            raise RuntimeError("native old-logprob did not return the requested TransferQueue keys")
+    finally:
+        if padding_keys:
+            tq.kv_clear(keys=padding_keys, partition_id=batch.partition_id)
+    fields = ["log_probs", "response_mask"]
+    if calculate_entropy:
+        fields.append("entropy")
+    data = tq.kv_batch_get(keys=keys, partition_id=batch.partition_id, select_fields=fields)
+    mask = data["response_mask"]
+    log_probs = response_from_nested(data["log_probs"], mask).unbind()
+    entropies = (
+        response_from_nested(data["entropy"], mask).unbind()
+        if calculate_entropy else (None,) * len(trunk)
+    )
+    results = []
+    for (_, request), log_prob, entropy in zip(trunk, log_probs, entropies, strict=True):
+        if log_prob.numel() != len(request.trunk_ids) - request.response_start:
+            raise RuntimeError("native old-logprob response length differs from the joint request")
+        results.append(JointScores(request.sample_id, log_prob, (), {}, entropy))
+    return tuple(results)
+
+
 def old_log_prob(trainer, batch, metrics):
     import transfer_queue as tq
     from verl.trainer.ppo.core_algos import agg_loss
@@ -40,7 +119,10 @@ def old_log_prob(trainer, batch, metrics):
 
     nested, padded = trainer._speco_v1_batch_data(batch)
     value = driver(trainer)
-    output, _ = value.old_log_prob(padded)
+    if os.environ.get("VERL_SPECO_V1_NATIVE_TRUNK_OLD_LOGPROB") == "1":
+        output, _ = value.old_log_prob(padded, native_trunk=partial(_native_trunk_log_prob, trainer, batch))
+    else:
+        output, _ = value.old_log_prob(padded)
     log_probs = output.batch["old_log_probs"].float()
     entropy = output.batch["entropys"].float()
     nested["old_log_probs"] = response_to_nested(log_probs, nested["response_mask"])

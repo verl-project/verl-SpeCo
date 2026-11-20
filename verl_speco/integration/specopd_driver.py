@@ -83,9 +83,13 @@ def build_requests(batch, spec, revision):
                 )
             seen.add(branch_id)
             branches.append(
-                DraftBranch(branch_id, prefix - 1, tuple(record["proposal_ids"]))
+                DraftBranch(branch_id, prefix - 1, tuple(record["proposal_ids"]),
+                            accepted_count=record["accepted_count"])
             )
         sample_id = str(bundle["request_id"])
+        if spec.anchor_count:
+            from verl_speco.integration.specopd_anchors import add_trunk_anchors
+            branches = add_trunk_anchors(branches, ids, prompt_len, bundle, spec)
         if any(r.sample_id == sample_id for r in requests):
             raise ValueError("SpecOPD request IDs are not unique after rollout merging")
         requests.append(
@@ -186,6 +190,7 @@ class SpecOPDDriver:
             "specopd/update_due": int(self.update_due),
             "specopd/trained": 0, "specopd/published": 0,
             "specopd/optimizer_updates": 0,
+            "specopd/training_trajectories": 0,
             "specopd/bootstrap_published": int(self.bootstrapped),
         }
         if self.update_due:
@@ -208,9 +213,18 @@ class SpecOPDDriver:
             servers = getattr(target, "server_handles", None)
         if not servers:
             raise RuntimeError("SpecOPD requires rollout server handles for serving revision ACKs")
-        replies = self.trainer._ray_get_if_needed([
-            server.speco_set_serving_drafter_revision.remote(revision) for server in servers
-        ])
+        total = self.spec.max_collect_samples_per_step
+        quotas = None
+        if total is None:
+            pending = [server.speco_set_serving_drafter_revision.remote(revision) for server in servers]
+        else:
+            quota, remainder = divmod(total, len(servers))
+            quotas = [quota + (i < remainder) for i in range(len(servers))]
+            pending = [
+                server.speco_set_serving_drafter_revision.remote(revision, collection_quota=share)
+                for server, share in zip(servers, quotas, strict=True)
+            ]
+        replies = self.trainer._ray_get_if_needed(pending)
         if not replies or any(
             not isinstance(reply, dict)
             or reply.get("drafter_revision") != revision
@@ -219,6 +233,8 @@ class SpecOPDDriver:
             for reply in replies
         ):
             raise RuntimeError("SpecOPD serving revision was not acknowledged by every replica")
+        if quotas is not None and [reply.get("collection_quota") for reply in replies] != quotas:
+            raise RuntimeError("SpecOPD collection quotas were not acknowledged by every replica")
         actors = {reply["actor_revision"] for reply in replies}
         if len(actors) != 1:
             raise RuntimeError("SpecOPD replicas acknowledge different actor revisions")
@@ -253,7 +269,7 @@ class SpecOPDDriver:
         self.bootstrapped = True
         self.metrics["specopd/bootstrap_published"] = 1
 
-    def old_log_prob(self, batch):
+    def old_log_prob(self, batch, *, native_trunk=None):
         if self.cycle.state != "collecting":
             raise RuntimeError(
                 "SpecOPD old-logprob must follow exactly one rollout collection"
@@ -279,53 +295,65 @@ class SpecOPDDriver:
         self.feature_indices = tuple(
             i + 1 if space == "decoder" else i for i in raw_indices
         )
-        results, metrics = (
-            [],
-            {
-                "specopd/model_forward_calls": 0,
-                "specopd/logical_rows": 0,
-                "specopd/independent_rows": 0,
-                "specopd/mfu_unavailable": 1,
-                "specopd/actor_revision": actor_revision,
-                "specopd/drafter_revision": self.cycle.drafter_revision,
-            },
+        metrics = {
+            "specopd/model_forward_calls": 0,
+            "specopd/logical_rows": 0,
+            "specopd/independent_rows": 0,
+            "specopd/mfu_unavailable": 1,
+            "specopd/actor_revision": actor_revision,
+            "specopd/drafter_revision": self.cycle.drafter_revision,
+        }
+        calculate_entropy = (
+            self.trainer._speco_oldlogprob_calculate_entropy()
+            if hasattr(self.trainer, "_speco_oldlogprob_calculate_entropy")
+            else True
         )
-        started = time.perf_counter()
-        output = self.trainer.actor_rollout_wg.compute_joint_old_log_prob(
-            requests,
-            microbatch_sizes=tuple(len(part) for part in plan_microbatches(requests, self.spec)),
-            actor_temperature=self.spec.actor_temperature,
-            target_temperature=self.spec.target_temperature,
-            hidden_state_indices=self.feature_indices,
-            calculate_entropy=(
-                self.trainer._speco_oldlogprob_calculate_entropy()
-                if hasattr(self.trainer, "_speco_oldlogprob_calculate_entropy")
-                else True
-            ),
-            return_target_logits=False,
-            capture_empty_trunk_features=False,
-            max_packed_tokens=self.spec.scoring_token_budget,
-            max_mask_elements=self.spec.max_dense_mask_elements,
-        )
-        scored, measured = unwrap_rank_result(
-            self.trainer._ray_get_if_needed(output)
-        )
-        indexed = {r.sample_id: r for r in scored}
-        if len(indexed) != len(scored) or set(indexed) != {
-            r.sample_id for r in requests
-        }:
-            raise RuntimeError(
-                "joint actor RPC lost or duplicated trajectory results"
+        trunk = tuple(
+            (i, request) for i, request in enumerate(requests) if not request.branches
+        ) if native_trunk is not None else ()
+        joint_requests = [r for r in requests if r.branches] if trunk else requests
+        microbatch_sizes = tuple(len(part) for part in plan_microbatches(joint_requests, self.spec))
+        scored = ()
+        if joint_requests:
+            started = time.perf_counter()
+            output = self.trainer.actor_rollout_wg.compute_joint_old_log_prob(
+                joint_requests,
+                microbatch_sizes=microbatch_sizes,
+                actor_temperature=self.spec.actor_temperature,
+                target_temperature=self.spec.target_temperature,
+                hidden_state_indices=self.feature_indices,
+                calculate_entropy=calculate_entropy,
+                return_target_logits=False,
+                return_target_logz=getattr(self.spec, "score_target_logz", True),
+                capture_empty_trunk_features=False,
+                trunk_feature_prefix_only=True,
+                max_packed_tokens=self.spec.scoring_token_budget,
+                max_mask_elements=self.spec.max_dense_mask_elements,
             )
-        scored = tuple(indexed[r.sample_id] for r in requests)
-        results.extend(scored)
-        metrics["specopd/actor_sp_size"] = measured.get("sp_size", 1)
-        for key in ("model_forward_calls", "logical_rows", "independent_rows"):
-            metrics[f"specopd/{key}"] += measured[key]
-        metrics["timing_s/specopd_joint_oldlogprob"] = time.perf_counter() - started
+            scored, measured = unwrap_rank_result(self.trainer._ray_get_if_needed(output))
+            indexed = {r.sample_id: r for r in scored}
+            if len(indexed) != len(scored) or set(indexed) != {r.sample_id for r in joint_requests}:
+                raise RuntimeError("joint actor RPC lost or duplicated trajectory results")
+            metrics["specopd/actor_sp_size"] = measured.get("sp_size", 1)
+            for key in ("model_forward_calls", "logical_rows", "independent_rows"):
+                metrics[f"specopd/{key}"] = measured[key]
+            metrics["timing_s/specopd_joint_oldlogprob"] = time.perf_counter() - started
+        else:
+            indexed = {}
+        if trunk:
+            started = time.perf_counter()
+            native_results = native_trunk(trunk, calculate_entropy=calculate_entropy)
+            if len(native_results) != len(trunk) or {r.sample_id for r in native_results} != {
+                req.sample_id for _, req in trunk
+            }:
+                raise RuntimeError("native actor RPC lost or duplicated trajectory results")
+            indexed.update((result.sample_id, result) for result in native_results)
+            metrics["specopd/native_trunk_trajectories"] = len(trunk)
+            metrics["timing_s/specopd_native_trunk_oldlogprob"] = time.perf_counter() - started
+        results = tuple(indexed[r.sample_id] for r in requests)
         self.metrics.update(metrics)
         self.cycle.scored(
-            tuple(zip(requests, results, strict=True)),
+            tuple((req, indexed[req.sample_id]) for req in joint_requests),
             actor_revision,
             self.cycle.drafter_revision,
         )
@@ -338,20 +366,19 @@ class SpecOPDDriver:
         positions = sum(
             len(b.token_ids) for request, _ in samples for b in request.branches
         )
+        self.metrics["specopd/proposal_anchors"] = sum(getattr(b, "source", "proposal") == "proposal" for r, _ in samples for b in r.branches)
+        self.metrics["specopd/trunk_anchors"] = sum(getattr(b, "source", "proposal") == "trunk" for r, _ in samples for b in r.branches)
         self.trained = False
         if positions >= self.spec.min_scored_positions_per_update:
             self.trainer._speco_set_drafter_global_step()
             self.metrics.update(self.trainer._speco_sync_target_lm_head_weight())
             training_started = time.perf_counter()
-            output = self.trainer._require_speco_worker_group().train_specopd_group(
-                samples,
-                int(self.cycle.step),
-                self.cycle.drafter_revision,
-                self.feature_indices,
+            from verl_speco.integration.specopd_training_transport import dispatch_prepared_group
+
+            statuses = dispatch_prepared_group(
+                self.trainer, samples, int(self.cycle.step),
+                self.cycle.drafter_revision, self.feature_indices, self.metrics, self.spec,
             )
-            statuses = [
-                s for s in self.trainer._ray_get_if_needed(output) if s is not None
-            ]
             self.metrics["timing_s/specopd_train_rpc"] = time.perf_counter() - training_started
             for key in ("prepare", "train_loop", "snapshot", "release", "activation"):
                 values = [s.get(f"timing_s/specopd_{key}") for s in statuses]
@@ -380,6 +407,9 @@ class SpecOPDDriver:
                 )
         self.metrics["specopd/scored_positions"] = positions
         self.metrics["specopd/trained"] = int(self.trained)
+        self.metrics["specopd/training_trajectories"] = (
+            sum(bool(request.branches) for request, _ in samples) if self.trained else 0
+        )
         self.cycle.updated(self.trained)
 
     def publish(self):
