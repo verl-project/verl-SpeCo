@@ -19,8 +19,8 @@ import json
 import logging
 import math
 import os
-import time
 import threading
+import time
 import uuid
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -37,6 +37,7 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.utils import Role
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
 from verl_speco.integration.agent_loop_runtime import (
     SPECO_AGENT_LOOP_MANAGER_CLASS,
     SPECO_STUDENT_DECODE_TIME_KEY,
@@ -47,30 +48,21 @@ from verl_speco.integration.opd_cotrain import (
     detach_student_feature,
     student_policy_batch_keys,
 )
-from verl_speco.integration.rollout_publish import (
-    resolve_drafter_publish_payload,
-    target_lm_head_export_metrics,
-)
-from verl_speco.integration.rollout_idle_events import (
-    DRAFTER_SAMPLE_READY_EVENT,
-    SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV,
-    configure_rollout_resource_groups,
-    drain_rollout_idle_events,
-    ensure_rollout_idle_event_bus,
-    release_rollout_training_resources,
-    reserve_rollout_training_resources,
-    request_rollout_training_reclaim,
+from verl_speco.integration.oldlogprob_layer_ids import (
+    assert_sglang_aux_last_layer_norm_safe,
+    resolve_drafter_hidden_states_layout,
+    resolve_oldlogprob_aux_layer_ids,
+    resolve_oldlogprob_aux_layer_id_space,
 )
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY,
-    OLD_LOGPROB_SOURCE_BATCH_INDICES_KEY,
     OLD_LOGPROB_AUX_LAYER_IDS_KEY,
     OLD_LOGPROB_COLLECT_MASK_KEY,
     OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
     OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
     OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
-    OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY,
     OLD_LOGPROB_HIDDEN_LAYOUT_KEY,
+    OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY,
     OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY,
     OLD_LOGPROB_HIDDEN_POSITIONS_KEY,
     OLD_LOGPROB_HIDDEN_REF_META_KEY,
@@ -79,13 +71,23 @@ from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY,
     OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY,
     OLD_LOGPROB_OWNER_RANK_KEY,
+    OLD_LOGPROB_SOURCE_BATCH_INDICES_KEY,
     OLD_LOGPROB_TARGET_LOGZ_TEMPERATURE_KEY,
     OLD_LOGPROB_TIMING_KEY,
 )
-from verl_speco.integration.oldlogprob_layer_ids import (
-    assert_sglang_aux_last_layer_norm_safe,
-    resolve_drafter_hidden_states_layout,
-    resolve_oldlogprob_aux_layer_ids,
+from verl_speco.integration.rollout_idle_events import (
+    DRAFTER_SAMPLE_READY_EVENT,
+    SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV,
+    configure_rollout_resource_groups,
+    drain_rollout_idle_events,
+    ensure_rollout_idle_event_bus,
+    release_rollout_training_resources,
+    request_rollout_training_reclaim,
+    reserve_rollout_training_resources,
+)
+from verl_speco.integration.rollout_publish import (
+    resolve_drafter_publish_payload,
+    target_lm_head_export_metrics,
 )
 from verl_speco.integration.sglang_adapter import (
     DRAFTER_SAMPLE_KEY,
@@ -99,6 +101,7 @@ from verl_speco.integration.sglang_runtime import (
     install_upstream_sglang_runtime_bridge,
     should_install_sglang_base_compat_runtime,
 )
+from verl_speco.integration.verify_trace import TRACE_KEY
 from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
     configure_vllm_runtime_from_config,
@@ -112,30 +115,27 @@ from verl_speco.trainer.scheduler import (
     AfterWeightUpdateContext,
     BeforeActorUpdateContext,
     CallbackDrafterCollectionExecutor,
-    CollectionFinalizeError,
     CallbackDrafterPublishExecutor,
     CallbackDrafterWorkerExecutor,
-    CollectionPlan,
-    CollectionPayload,
+    CollectionFinalizeError,
     CollectionOutcome,
+    CollectionPayload,
+    CollectionPlan,
     DrafterCollectionContext,
     DrafterCollectionSource,
     DrafterExecutionStrategy,
-    IdleWindowConfidence,
     DrafterRuntimeState,
     DrafterRuntimeStatus,
     DrafterScheduleConfig,
     DrafterScheduleContext,
     DrafterScheduler,
+    IdleWindowConfidence,
     RolloutWorkerEvent,
     RolloutWorkerEventType,
-    step_matches_interval,
     TrainingPlan,
+    step_matches_interval,
 )
 from verl_speco.workers import SpecoWorker
-
-
-from verl_speco.integration.verify_trace import TRACE_KEY
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -2415,7 +2415,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         import numpy as np
         from torchdata.stateful_dataloader import StatefulDataLoader
-
         from verl.trainer.ppo.utils import create_rl_dataset
         from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
@@ -3447,13 +3446,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
             return None, None
         poll_interval = self._speco_rollout_idle_poll_interval_sec()
-        from verl_speco.integration.phase_timing import phase_timing_enabled
         from verl_speco.integration.generation_diagnostics import (
             background_diagnostics,
             background_span,
             emit_runtime_identity,
             empty_idle_poll_ablation_allowed,
         )
+        from verl_speco.integration.phase_timing import phase_timing_enabled
 
         diagnostic_counts = {} if phase_timing_enabled() else None
         self._speco_idle_poll_diagnostics = diagnostic_counts
@@ -4631,21 +4630,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
 
     def _speco_oldlogprob_aux_layer_id_space(self) -> str:
-        algorithm = (
-            str(
-                _get_nested(
-                    self._speco_drafter_config(),
-                    ("speculative_algorithm",),
-                    "EAGLE3",
-                )
-                or "EAGLE3"
-            )
-            .strip()
-            .upper()
+        drafter_cfg = self._speco_drafter_config()
+        model_configs = [
+            self._speco_load_model_config(_get_nested(drafter_cfg, (key,), None))
+            for key in ("model_path", "checkpoint_path")
+        ]
+        return resolve_oldlogprob_aux_layer_id_space(
+            drafter_cfg, model_configs=model_configs
         )
-        # EAGLE3 config IDs are the same output IDs passed to vLLM serve.
-        # DFlash-family and EAGLE1/2 IDs remain decoder-layer indices.
-        return "output" if algorithm == "EAGLE3" else "decoder"
 
     @staticmethod
     def _speco_oldlogprob_window_train_rows(training_cfg) -> int:
@@ -4920,6 +4912,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             accept_len_var=accept_len_var,
         )
         if payload:
+            # Retain the exact input for offline distribution analysis; the legacy
+            # accept_lens/summary fields remain rounded for compatibility.
+            payload["accept_lens_full_precision"] = [
+                float(value)
+                for value in request_accept_lens
+                if value is not None and math.isfinite(float(value))
+            ]
             self._speco_pending_request_accept_len_payloads.append(payload)
         return bool(records)
 
@@ -5486,6 +5485,42 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return flattened
 
     @staticmethod
+    def _speco_merge_chunk_payload_rows(ref_rows: Any, meta_rows: Any):
+        """Flatten actor-DP chunks and globalize worker-local sample indices."""
+
+        if (
+            not isinstance(meta_rows, (list, tuple))
+            or not meta_rows
+            or not all(isinstance(item, (list, tuple)) for item in meta_rows)
+        ):
+            return (
+                SpecoRayPPOTrainer._speco_flatten_non_tensor_rows(ref_rows),
+                SpecoRayPPOTrainer._speco_flatten_non_tensor_rows(meta_rows),
+            )
+
+        merged_refs: list[Any] = []
+        if isinstance(ref_rows, (list, tuple)):
+            for row in ref_rows:
+                if isinstance(row, (list, tuple)):
+                    merged_refs.extend(row)
+
+        merged_meta: list[Any] = []
+        for global_row_offset, row in enumerate(meta_rows):
+            if not isinstance(row, (list, tuple)):
+                continue
+            for meta in row:
+                if not isinstance(meta, dict):
+                    merged_meta.append(meta)
+                    continue
+                remapped = dict(meta)
+                remapped["sample_indices"] = [
+                    int(global_row_offset) + int(sample_idx)
+                    for sample_idx in meta.get("sample_indices") or []
+                ]
+                merged_meta.append(remapped)
+        return merged_refs, merged_meta
+
+    @staticmethod
     def _speco_sum_timing_rows(tensor: torch.Tensor | None) -> torch.Tensor | None:
         if tensor is None:
             return None
@@ -5572,11 +5607,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         hidden_ref_meta = self._speco_flatten_non_tensor_rows(
             tu.get(output, OLD_LOGPROB_HIDDEN_REF_META_KEY)
         )
-        chunk_refs = self._speco_flatten_non_tensor_rows(
-            tu.get(output, OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY)
-        )
-        chunk_meta = self._speco_flatten_non_tensor_rows(
-            tu.get(output, OLD_LOGPROB_HIDDEN_CHUNK_META_KEY)
+        chunk_refs, chunk_meta = self._speco_merge_chunk_payload_rows(
+            tu.get(output, OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY),
+            tu.get(output, OLD_LOGPROB_HIDDEN_CHUNK_META_KEY),
         )
         # PP>1 single-put path: the last stage ray.put()s the concatenated
         # hidden tensor once and returns the ObjectRef.  Materialize it here
@@ -5739,7 +5772,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 if hidden is None:
                     skipped_missing_hidden += 1
                     continue
-                hidden = detach_student_feature(hidden)[:valid_rows].contiguous()
+                hidden = detach_student_feature(hidden)[:valid_rows].clone(
+                    memory_format=torch.contiguous_format
+                )
                 if hidden.numel() == 0:
                     skipped_empty_hidden += 1
                     continue
@@ -6182,6 +6217,45 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "Attach a rollout worker implementing DraftWeightPublishMixin."
             )
         return method
+
+    def _speco_park_actor_hccl_for_drafter(self) -> dict[str, Any]:
+        training_cfg = self._speco_drafter_training_config()
+        enabled = bool(
+            training_cfg.get(
+                "park_actor_hccl_during_drafter_training",
+                training_cfg.get("park_hccl_after_drafter_training", False),
+            )
+        )
+        if not enabled:
+            return {
+                "drafter/actor_hccl_park_attempted": 0,
+                "drafter/actor_hccl_parked": 0,
+            }
+
+        started_at = time.perf_counter()
+        results = self._ray_get_if_needed(
+            self._speco_actor_rollout_method("park_actor_hccl_for_drafter")()
+        )
+        if not isinstance(results, (list, tuple)):
+            results = [results]
+        active_results = [result for result in results if isinstance(result, dict)]
+        failures = [
+            result for result in active_results if not bool(result.get("parked", False))
+        ]
+        if not active_results or failures:
+            raise RuntimeError(
+                "SPECO failed to park actor HCCL before drafter training: "
+                f"{failures[:3] if failures else results}"
+            )
+        return {
+            "drafter/actor_hccl_park_attempted": 1,
+            "drafter/actor_hccl_parked": 1,
+            "drafter/actor_hccl_park_worker_count": len(active_results),
+            "drafter/actor_hccl_park_groups_min": min(
+                int(result.get("groups", 0) or 0) for result in active_results
+            ),
+            "timing_s/drafter_actor_hccl_park": (time.perf_counter() - started_at),
+        }
 
     def _speco_build_drafter_target_lm_head_sync_args(
         self,
@@ -7094,6 +7168,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self, training_plan: TrainingPlan
     ) -> tuple[bool, dict[str, Any]]:
         runtime_state = self._speco_get_drafter_runtime_state()
+        train_started_at = time.perf_counter()
+        logger.debug(
+            "[DrafterTiming] phase=training_rpc_start step=%s plan_id=%s",
+            training_plan.source_global_step,
+            training_plan.plan_id,
+        )
         try:
             logger.info(
                 "[DrafterRuntime] submitting training: step=%s strategy=%s "
@@ -7125,6 +7205,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 outcome.elapsed_sec,
             )
         except Exception:
+            logger.debug(
+                "[DrafterTiming] phase=training_rpc_failed elapsed_s=%.3f",
+                time.perf_counter() - train_started_at,
+            )
             logger.exception(
                 "[DrafterRuntime] synchronous training failed at step=%s",
                 training_plan.source_global_step,
@@ -8038,9 +8122,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     @contextmanager
     def _speco_online_fit_hooks(self):
         from verl_speco.integration.phase_timing import (
+            log_driver_phase_setup,
             phase_span,
             phase_timing_enabled,
-            log_driver_phase_setup,
             ref_dispatch_trace,
         )
 
@@ -8938,6 +9022,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     training_plan, launch=False, reason="drafter_convergence_frozen"
                 )
             if training_plan.launch:
+                metrics.update(self._speco_park_actor_hccl_for_drafter())
                 with _rl_insight_trace_state(
                     "drafter/train",
                     state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
@@ -9541,8 +9626,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             # the explicit publish wait below also preserves the upstream
             # barrier for synchronous and rollout-only configurations.
             from verl_speco.integration.generation_diagnostics import (
-                pipeline_boundary,
                 boundary_stage,
+                pipeline_boundary,
             )
 
             with pipeline_boundary(self, "checkpoint") as timings:
@@ -9588,8 +9673,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_validation_in_progress = True
         try:
             from verl_speco.integration.generation_diagnostics import (
-                pipeline_boundary,
                 boundary_stage,
+                pipeline_boundary,
             )
 
             with pipeline_boundary(self, "validation_body") as timings:

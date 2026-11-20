@@ -14,7 +14,8 @@
 import copy
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 from torch.nn import functional as F
 
 from verl_speco.backends.verification_aware import VATObjective

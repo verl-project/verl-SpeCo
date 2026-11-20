@@ -145,6 +145,9 @@ def collection_harness(monkeypatch):
         def _speco_oldlogprob_aux_layer_ids(self):
             return [1]
 
+        def _speco_oldlogprob_aux_layer_id_space(self):
+            return "decoder"
+
         def _speco_oldlogprob_hidden_capture_impl(self):
             return "forward_hook"
 

@@ -118,6 +118,7 @@ def test_version_mismatch_is_fatal_before_consumption():
 
 
 def test_upstream_sync_stays_between_prefetch_and_apply():
+    pytest.importorskip("ray")
     events = []
 
     class Parent:
@@ -186,6 +187,7 @@ def test_missing_prefetch_option_defaults_to_disabled():
 
 
 def test_lifecycle_spans_exclude_each_other_and_preserve_result(monkeypatch):
+    pytest.importorskip("ray")
     from verl_speco.trainer.v1 import speco_mixin
 
     clock = SimpleNamespace(now=0.0)

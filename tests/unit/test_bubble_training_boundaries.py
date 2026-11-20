@@ -5,6 +5,7 @@
 import ast
 import asyncio
 import logging
+import time
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -48,9 +49,9 @@ def continuation_driver_class():
 
 def _ready_idle_driver(cls, *, final=False, reclaimed=False):
     from verl_speco.trainer.scheduler import (
+        DrafterExecutionStrategy,
         DrafterRuntimeState,
         TrainingPlan,
-        DrafterExecutionStrategy,
     )
 
     driver = cls()
@@ -119,6 +120,7 @@ def test_service_retries_without_another_idle_event_after_ready_plan(
     continuation_driver_class,
 ):
     import threading
+
     from verl_speco.trainer.scheduler import DrafterRuntimeStatus
 
     driver, plan, outcome, state, calls = _ready_idle_driver(continuation_driver_class)
@@ -612,6 +614,7 @@ def test_all_rollout_groups_finished_skips_launch_before_head_or_data_rpc(
     continuation_driver_class,
 ):
     import threading
+
     from verl_speco.trainer.scheduler import DrafterRuntimeState
 
     driver = continuation_driver_class()
@@ -1127,10 +1130,13 @@ def test_cleanup_allocator_observation_preserves_sync_and_reclaim(device):
             "device_name": device,
             "asyncio": asyncio,
             "logger": logging.getLogger(__name__),
+            "time": time,
+            "_log_drafter_phase": lambda *args, **kwargs: None,
         },
     )
     events = []
     trainer = subject()
+    trainer.rank = 0
     trainer._pending_checkpoint_future = None
     trainer._pending_full_checkpoint_future = None
     trainer._full_checkpoint_executor = None

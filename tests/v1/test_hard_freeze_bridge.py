@@ -25,7 +25,7 @@ def test_v1_request_evidence_excludes_tagged_padding_without_hiding_duplicates(
     monkeypatch,
 ):
     import sys
-    import torch
+    torch = pytest.importorskip("torch")
     from omegaconf import OmegaConf
     from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
 
@@ -81,6 +81,7 @@ def test_v1_request_evidence_excludes_tagged_padding_without_hiding_duplicates(
 
 
 def test_publish_pairs_probes_after_target_sync_and_waits_before_after_arm():
+    pytest.importorskip("ray")
     calls = []
 
     class Harness(SpecoV1Mixin):
@@ -220,7 +221,7 @@ def test_v1_freeze_allows_only_modes_with_fixed_target_probe_boundary(mode):
 
 
 def test_async_freeze_projects_actual_revisions_without_changing_ppo_or_hard_batch():
-    import numpy as np
+    np = pytest.importorskip("numpy")
     from omegaconf import OmegaConf
     from verl.protocol import DataProto
     import json
@@ -311,6 +312,7 @@ def test_async_freeze_projects_actual_revisions_without_changing_ppo_or_hard_bat
 
 
 def test_v1_raw_prompt_probe_uses_continuous_tokens_once_and_caps_left(monkeypatch):
+    pytest.importorskip("transformers")
     import sys
     from omegaconf import OmegaConf
     from transformers import AutoConfig
@@ -363,9 +365,11 @@ def test_v1_raw_prompt_probe_uses_continuous_tokens_once_and_caps_left(monkeypat
 
 
 def test_freeze_transition_skips_collection_and_requests_branch_checkpoint():
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("torch")
+
     from omegaconf import OmegaConf
     from verl.protocol import DataProto
-    import numpy as np
 
     config = OmegaConf.create(
         {

@@ -187,6 +187,7 @@ def test_commit_cache_is_local_and_keeps_sample_order_and_accounting(
     worker = SimpleNamespace(
         trainer=SimpleNamespace(buffer_version=4),
         replica_rank=0,
+        last_global_step=5,
         _collection_worker_result=lambda **kwargs: dict(
             accepted_samples=0, rejected_samples=0, **kwargs
         ),
@@ -364,6 +365,7 @@ def test_commit_forwards_target_logz_with_hidden_features(production):
     worker = SimpleNamespace(
         trainer=SimpleNamespace(buffer_version=4),
         replica_rank=0,
+        last_global_step=5,
         _collection_worker_result=lambda **kwargs: dict(
             accepted_samples=0, rejected_samples=0, **kwargs
         ),

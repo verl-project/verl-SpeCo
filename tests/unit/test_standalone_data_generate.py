@@ -6,8 +6,9 @@ import asyncio
 import json
 from pathlib import Path
 
-import httpx
 import pytest
+
+httpx = pytest.importorskip("httpx")
 from omegaconf import OmegaConf
 
 from verl_speco import standalone_data_generate as generation

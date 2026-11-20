@@ -18,12 +18,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from verl_speco.trainer.scheduler import CallbackDrafterWorkerExecutor
+torch = pytest.importorskip("torch")
 
-torch = pytest.importorskip(
-    "torch",
-    reason="drafter runtime control contract needs PyTorch",
-)
+from verl_speco.trainer.scheduler import CallbackDrafterWorkerExecutor  # noqa: E402
 
 _speco_ray_trainer = pytest.importorskip(
     "verl_speco.trainer.speco_ray_trainer",
@@ -32,6 +29,46 @@ _speco_ray_trainer = pytest.importorskip(
 SpecoRayPPOTrainer = _speco_ray_trainer.SpecoRayPPOTrainer
 _base_trainer = pytest.importorskip("verl_speco.trainer.base_trainer")
 DrafterBaseTrainer = _base_trainer.DrafterBaseTrainer
+
+
+@pytest.mark.parametrize("source_step", [None, 0, 4])
+def test_training_status_handles_legacy_samples_without_collection_version(source_step):
+    from verl_speco.trainer.base_trainer import DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.current_rl_step = 5
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(drafter=SimpleNamespace(training={}))
+    )
+    trainer.backend = SimpleNamespace(model_type="dspark")
+    trainer.collected_data = [{"step": 5, "collection_source_global_step": source_step}]
+    trainer.use_data_buffer = False
+    trainer.batch_size = 1
+    trainer.buffer_version = 1
+
+    status = trainer.get_training_data_status()
+
+    expected_step = 5 if source_step is None else source_step
+    assert status["data_version"] == expected_step
+    assert status["collection_source_steps"] == [expected_step]
+
+
+def test_oldlogprob_chunk_payload_rows_remap_actor_dp_indices() -> None:
+    refs, metadata = SpecoRayPPOTrainer._speco_merge_chunk_payload_rows(
+        [["rank-0-chunk"], [], ["rank-1-chunk"], []],
+        [
+            [{"sample_indices": [0, 1]}],
+            [],
+            [{"sample_indices": [0, 1]}],
+            [],
+        ],
+    )
+
+    assert refs == ["rank-0-chunk", "rank-1-chunk"]
+    assert metadata == [
+        {"sample_indices": [0, 1]},
+        {"sample_indices": [2, 3]},
+    ]
 
 
 def test_adaptive_feedback_uses_only_current_step_weighted_counts():
@@ -356,6 +393,7 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
         {
             "training_interval_steps": 1,
             "publish_interval_steps": 0,
+            "park_hccl_after_drafter_training": True,
         },
         step=5,
     )
@@ -372,18 +410,23 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
         events.append("sync_target_lm_head")
         or ({"drafter/target_lm_head_synced": 1}, None)
     )
-    trainer._update_actor = lambda *args, **kwargs: events.append(
-        "update_actor"
-    ) or SimpleNamespace(meta_info={"metrics": {}})
-    trainer._speco_train_drafter = lambda plan: events.append(
-        ("train_drafter", plan.max_batches, plan.publish_after_success)
-    ) or (
-        True,
-        {"drafter/trained": 1},
+    trainer._update_actor = lambda *args, **kwargs: (
+        events.append("update_actor") or SimpleNamespace(meta_info={"metrics": {}})
     )
-    trainer._speco_publish_drafter_weights = lambda trained, plan: events.append(
-        ("publish", trained)
-    ) or {"drafter/publish_attempted": 1, "drafter/published": 1}
+    trainer._speco_park_actor_hccl_for_drafter = lambda: (
+        events.append("park_actor_hccl") or {"drafter/actor_hccl_parked": 1}
+    )
+    trainer._speco_train_drafter = lambda plan: (
+        events.append(("train_drafter", plan.max_batches, plan.publish_after_success))
+        or (
+            True,
+            {"drafter/trained": 1},
+        )
+    )
+    trainer._speco_publish_drafter_weights = lambda trained, plan: (
+        events.append(("publish", trained))
+        or {"drafter/publish_attempted": 1, "drafter/published": 1}
+    )
 
     with trainer._speco_online_fit_hooks():
         output = trainer._update_actor("batch")
@@ -392,6 +435,7 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
         "set_global_step",
         "sync_target_lm_head",
         "update_actor",
+        "park_actor_hccl",
         ("train_drafter", 100, True),
         ("publish", True),
     ]
@@ -522,6 +566,7 @@ def test_no_drafter_run_refuses_and_leaves_vllm_config_untouched(
         reason="no-drafter runner contract needs verl and Ray",
     )
     from omegaconf import OmegaConf
+
     from verl_speco.integration import vllm_runtime
 
     bridge_calls = []
@@ -565,6 +610,7 @@ def test_task_runner_installs_vllm_import_compat_in_its_own_process(
         reason="task-runner import compatibility needs verl and Ray",
     )
     from omegaconf import OmegaConf
+
     from verl_speco.integration import verl_npu_vllm_compat
 
     calls = []
@@ -589,6 +635,7 @@ def test_no_drafter_run_does_not_install_vllm_import_compat(monkeypatch) -> None
         reason="no-drafter runner contract needs verl and Ray",
     )
     from omegaconf import OmegaConf
+
     from verl_speco.integration import verl_npu_vllm_compat
 
     compat_calls = []
@@ -749,8 +796,8 @@ def test_target_head_sync_defers_for_all_lm_head_drafters(
         trainer.global_steps,
         1,
     )
-    trainer.speco_sync_target_lm_head_weight = (
-        lambda value, global_step=None: received.append((value, global_step))
+    trainer.speco_sync_target_lm_head_weight = lambda value, global_step=None: (
+        received.append((value, global_step))
     )
 
     metrics = trainer._speco_sync_target_lm_head_weight()
@@ -779,8 +826,8 @@ def test_target_head_transfer_waits_after_actor_update() -> None:
         trainer.global_steps,
         1,
     )
-    trainer.speco_sync_target_lm_head_weight = (
-        lambda value, global_step=None: pending_refs
+    trainer.speco_sync_target_lm_head_weight = lambda value, global_step=None: (
+        pending_refs
     )
 
     metrics, pending = trainer._speco_start_target_lm_head_weight_sync()
@@ -806,13 +853,15 @@ def test_bubble_target_head_prefetch_resolves_fetch_before_dispatch() -> None:
     trainer._ray_get_if_needed = lambda value: resolved.append(value) or value
     trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
     trainer._speco_actor_rollout_method = lambda name: lambda rows, **kwargs: [payload]
-    trainer._speco_build_drafter_target_lm_head_sync_args = lambda value, global_step=None: (
-        value,
-        trainer.global_steps,
-        1,
+    trainer._speco_build_drafter_target_lm_head_sync_args = (
+        lambda value, global_step=None: (
+            value,
+            trainer.global_steps,
+            1,
+        )
     )
-    trainer.speco_sync_target_lm_head_weight = (
-        lambda value, global_step=None: pending_refs
+    trainer.speco_sync_target_lm_head_weight = lambda value, global_step=None: (
+        pending_refs
     )
 
     metrics, pending = trainer._speco_start_target_lm_head_weight_sync()
@@ -826,7 +875,9 @@ def test_bubble_target_head_prefetch_resolves_fetch_before_dispatch() -> None:
     # boundary resolves it before dispatching the snapshot to the drafter.
     assert resolved == []
     assert metrics["timing_s/drafter_target_lm_head_fetch_submit"] >= 0.0
-    assert metrics["timing_s/drafter_target_lm_head_prefetch_submit_critical_path"] >= 0.0
+    assert (
+        metrics["timing_s/drafter_target_lm_head_prefetch_submit_critical_path"] >= 0.0
+    )
 
     metrics.update(trainer._speco_finish_target_lm_head_weight_sync(pending))
 
@@ -922,6 +973,7 @@ def test_target_head_sync_is_skipped_when_training_uses_logits() -> None:
 
 def test_target_head_worker_dispatch_is_nonblocking() -> None:
     from verl.single_controller.base.decorator import MAGIC_ATTR
+
     from verl_speco.workers.speco_worker import SpecoWorker
 
     attrs = getattr(SpecoWorker.sync_target_lm_head_weight, MAGIC_ATTR)
@@ -1555,8 +1607,8 @@ def test_rollout_diagnostic_failure_does_not_skip_collection(
     trainer._speco_set_drafter_global_step = lambda **kwargs: None
     trainer._speco_store_rollout_metrics = lambda output: None
     collected_outputs = []
-    trainer._speco_collect_generation_samples = (
-        lambda output: collected_outputs.append(output) or 0
+    trainer._speco_collect_generation_samples = lambda output: (
+        collected_outputs.append(output) or 0
     )
     with trainer._speco_online_fit_hooks():
         assert trainer.actor_rollout_wg.generate_sequences() is batch
@@ -1614,6 +1666,7 @@ def test_oldlogprob_collection_materializes_whole_refs_from_all_dp_shards(
     import ray
     from tensordict import TensorDict
     from verl.utils import tensordict_utils as tu
+
     from verl_speco.integration.oldlogprob_runtime import (
         OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY,
         OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY,

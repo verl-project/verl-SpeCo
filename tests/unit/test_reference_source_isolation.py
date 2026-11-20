@@ -8,7 +8,8 @@ from pathlib import Path
 from queue import Queue
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.trainer.reference_feature_store import ReferenceFeatureStore
 from verl_speco.trainer.reference_sample_source import ReferenceFeatureDataLoader

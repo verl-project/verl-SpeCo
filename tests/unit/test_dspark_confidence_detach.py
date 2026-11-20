@@ -13,7 +13,9 @@
 # limitations under the License.
 from __future__ import annotations
 
-import torch
+import pytest
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.models.dspark.modeling_dspark import (
     DSparkConfidenceHead,

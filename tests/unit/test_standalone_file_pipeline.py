@@ -5,7 +5,8 @@ from functools import partial
 from queue import Queue
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 from safetensors.torch import save_file
 
 from verl_speco.trainer.standalone_sample_cleanup import cleanup_standalone_samples

@@ -9,9 +9,11 @@ import shutil
 from pathlib import Path
 from queue import Queue
 
-import numpy as np
 import pytest
-import torch
+
+np = pytest.importorskip("numpy")
+
+torch = pytest.importorskip("torch")
 from omegaconf import OmegaConf
 
 from verl_speco.checkpoint_tensor import checkpoint_fingerprint

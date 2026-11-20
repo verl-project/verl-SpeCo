@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("torch")
+
 from verl_speco.trainer.scheduler import StandaloneQueueState
 from verl_speco.config import prefetch_depth
 from verl_speco.trainer.tq_retry import retry_io

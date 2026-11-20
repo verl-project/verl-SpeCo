@@ -50,6 +50,23 @@ def _plain_config(value):
         return value
 
 
+def _serialize_v1_worker_drafter_config(drafter_config):
+    """Serialize the drafter payload with its runtime sidecar locator.
+
+    V1's actor worker wrapper replaces ``VERL_SPECO_DRAFTER_CONFIG`` inside
+    the worker process. Preserve the run-scoped acceptance directory there so
+    the spawned vLLM EngineCore inherits the same locator as the trainer.
+    """
+    from verl_speco.integration.drafter_config_env import (
+        serialize_worker_drafter_config,
+    )
+
+    payload = _plain_config(drafter_config or {})
+    if not isinstance(payload, dict):
+        payload = {}
+    return serialize_worker_drafter_config(payload)
+
+
 def _unwrap_remote(cls):
     return getattr(cls, "__ray_actor_class__", cls)
 
@@ -85,9 +102,7 @@ class SpecoV1Mixin(V1BubbleMixin):
         vLLM rollout already has the required IPC receiver.  Add the narrow
         publish facade before the standalone replicas are created.
         """
-        serialized_drafter_config = json.dumps(
-            _plain_config(drafter_config or {}), sort_keys=True
-        )
+        serialized_drafter_config = _serialize_v1_worker_drafter_config(drafter_config)
         cached = getattr(
             SpecoV1Mixin, "_speco_v1_standalone_publish_worker_remote", None
         )
@@ -1036,7 +1051,7 @@ class SpecoV1Mixin(V1BubbleMixin):
         )
 
         for role, worker_cls in list(self.role_worker_mapping.items()):
-            if role not in {Role.ActorRollout, Role.ActorRolloutRef}:
+            if role not in {Role.Actor, Role.ActorRollout, Role.ActorRolloutRef}:
                 continue
             raw = _unwrap_remote(worker_cls)
             bases = []
@@ -1054,9 +1069,8 @@ class SpecoV1Mixin(V1BubbleMixin):
                 {
                     "__module__": __name__,
                     "__doc__": raw.__doc__,
-                    "_speco_drafter_config_env": json.dumps(
-                        _plain_config(drafter_config or rollout.get("drafter", {})),
-                        sort_keys=True,
+                    "_speco_drafter_config_env": _serialize_v1_worker_drafter_config(
+                        drafter_config or rollout.get("drafter", {})
                     ),
                 },
             )
@@ -1345,32 +1359,42 @@ class SpecoV1Mixin(V1BubbleMixin):
         return ray.get([getattr(server, method).remote(*args) for server in servers])
 
     def prepare_step(self):
-        """Avoid creating an unconsumed rollout at the async loop boundary.
+        """Avoid a new final batch when unconsumed prompt inventory suffices.
 
-        V1 calls ``prepare_step`` before sampling the current batch.  In
-        ``colocate_async`` that method submits a batch which becomes
-        unconsumed at the final loop boundary, because upstream ``fit``
-        returns immediately after the step.  Its agent-loop request then
-        races Ray's rollout-server teardown and surfaces as an
-        ``ActorDiedError`` or vLLM ``EngineDeadError``.
-
-        Sync mode must retain the parent behavior because it creates the batch
-        consumed by the current step rather than maintaining an async prefetch
-        buffer.  ``separate_async`` must also retain its parent behavior: its
-        final ``prepare_step`` submits the batch that is consumed by the final
-        update, then waits for it and switches hybrid workers back to trainer
-        mode.  The V1 agent-loop drain in ``fit`` makes any post-final queued
-        work safe before teardown.
+        Pending/running groups already cover the final update. Terminal groups
+        that need replacement also count: the existing replay-buffer wait path
+        evicts and refills failures, stale groups, and filtered groups itself.
+        Count the whole update, including all parameter-sync mini-batches.
+        Keep upstream admission when inventory is short (including warmup=0),
+        and preserve Sync/separate-async behavior.
         """
         mode = str(self.config.trainer.v1.get("trainer_mode", "sync")).lower()
         is_last_step = int(self.global_steps) >= int(self.total_training_steps)
         if mode == "colocate_async" and is_last_step:
-            logger.info(
-                "SPECO V1 skipping final async rollout prefetch at step=%s; "
-                "the batch cannot be consumed before trainer teardown",
-                self.global_steps,
+            get_sampleable_count = getattr(
+                self.replay_buffer, "get_sampleable_count", None
             )
-            return {}
+            if not callable(get_sampleable_count):
+                return super().prepare_step()
+            required = int(self.config.data.train_batch_size)
+            sampleable = get_sampleable_count(self.global_steps, "train")
+            # get_sampleable_count refreshes this TQ snapshot. Consumed prompt
+            # UIDs have already been cleared by ReplayBuffer._materialize_batch.
+            prompt_steps = getattr(self.replay_buffer, "prompt_global_steps", None)
+            registered = (
+                len(prompt_steps.get("train", {}))
+                if isinstance(prompt_steps, dict)
+                else sampleable  # Preserve custom samplers without inventory metadata.
+            )
+            inventory = max(int(sampleable), registered)
+            print(
+                "[SPECO V1 final async rollout admission] "
+                f"step={self.global_steps} sampleable={sampleable} "
+                f"inventory={inventory} required={required} prefetch={inventory < required}",
+                flush=True,
+            )
+            if inventory >= required:
+                return {}
         return super().prepare_step()
 
     @staticmethod
@@ -1442,10 +1466,10 @@ class SpecoV1Mixin(V1BubbleMixin):
         from verl.trainer.ppo.utils import Role
         from verl_speco.workers import SpecoWorker
 
-        actor_role = (
-            Role.ActorRolloutRef
-            if Role.ActorRolloutRef in self.role_worker_mapping
-            else Role.ActorRollout
+        actor_role = next(
+            role
+            for role in (Role.Actor, Role.ActorRolloutRef, Role.ActorRollout)
+            if role in self.role_worker_mapping
         )
         resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
         worker_cls = self.speco_worker_cls or SpecoWorker
@@ -1582,6 +1606,26 @@ class SpecoV1Mixin(V1BubbleMixin):
             # freeze windows use per-request, per-serving-revision projections.
             self._speco_populate_request_accept_len_records(evidence)
 
+    def _speco_v1_log_request_accept_len_distribution(self, batch):
+        """Use the existing JSONL interface without altering sampling/freeze state."""
+        if not os.getenv("VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH"):
+            return
+        if getattr(self, "_speco_v1_accept_len_logged_step", None) == self.global_steps:
+            return
+        _, evidence = self._speco_v1_batch_data(batch)
+        previous_records = self._speco_last_request_accept_len_records
+        previous_var = self._speco_last_request_accept_len_var
+        try:
+            recorded = self._speco_log_request_accept_len_variance_from_batch(
+                evidence, source="v1_rollout"
+            )
+            if recorded:
+                self._speco_flush_request_accept_len_payloads()
+                self._speco_v1_accept_len_logged_step = self.global_steps
+        finally:
+            self._speco_last_request_accept_len_records = previous_records
+            self._speco_last_request_accept_len_var = previous_var
+
     def _compute_old_log_prob(self, batch, metrics):
         evidence = None
         if self._speco_rollout_idle_worker_enabled():
@@ -1591,6 +1635,8 @@ class SpecoV1Mixin(V1BubbleMixin):
             self._speco_log_request_accept_len_variance_from_batch(
                 evidence, source="v1_oldlogprob"
             )
+        else:
+            self._speco_v1_log_request_accept_len_distribution(batch)
         policy = getattr(self, "_speco_freeze_policy", None)
         if (
             policy is not None
@@ -1639,6 +1685,7 @@ class SpecoV1Mixin(V1BubbleMixin):
             response_to_nested,
         )
         from verl_speco.integration.oldlogprob_runtime import (
+            OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY,
             OLD_LOGPROB_AUX_LAYER_IDS_KEY,
             OLD_LOGPROB_COLLECT_MASK_KEY,
             OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
@@ -1675,6 +1722,11 @@ class SpecoV1Mixin(V1BubbleMixin):
             control,
             OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
             self._speco_oldlogprob_hidden_capture_impl(),
+        )
+        tu.assign_non_tensor_data(
+            control,
+            OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY,
+            self._speco_oldlogprob_aux_layer_id_space(),
         )
         tu.assign_non_tensor_data(
             control,
@@ -1883,6 +1935,7 @@ class SpecoV1Mixin(V1BubbleMixin):
             _drafter_config_from_config,
             _vllm_acceptance_sidecar_enabled,
             SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY,
+            _vllm_spec_decode_sidecar_dir,
             read_vllm_spec_decode_sidecar_totals,
         )
 
@@ -1901,7 +1954,13 @@ class SpecoV1Mixin(V1BubbleMixin):
         engine_kwargs = rollout.get("engine_kwargs", {}) or {}
         vllm_kwargs = engine_kwargs.get("vllm", {}) or {}
         additional_config = vllm_kwargs.get("additional_config", {}) or {}
-        directory = additional_config.get(SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY)
+        # Accept legacy configs, but prefer the SpeCo runtime channel.  The
+        # private sidecar locator must not be forwarded to newer validated
+        # ``VllmConfig.additional_config`` mappings.
+        directory = (
+            additional_config.get(SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY)
+            or _vllm_spec_decode_sidecar_dir()
+        )
         if not directory and run_dir:
             # Compatibility fallback for launchers configured before per-run
             # sidecar directories were introduced.
@@ -2169,6 +2228,7 @@ class SpecoV1Mixin(V1BubbleMixin):
             self._pending_target_lm_head_sync = None
         if plan is not None:
             if plan.launch:
+                metrics.update(self._speco_park_actor_hccl_for_drafter())
                 started = time.perf_counter()
                 execution_strategy = getattr(plan, "execution_strategy", "")
                 with _rl_insight_trace_state(
@@ -2279,6 +2339,19 @@ class SpecoV1Mixin(V1BubbleMixin):
             return
         self._speco_init_ci_result()
         if self._speco_online_enabled_from_config(self.config):
+            # The initial online-drafter activation builds the drafter model
+            # and its process groups before ``fit`` enters the normal actor
+            # update path.  Async V1 therefore needs the same HCCL exclusion
+            # used by ``_update_actor``; otherwise actor (and, when enabled,
+            # colocated rollout) groups remain live during the first
+            # HcclBroadcast and can exhaust the device stream budget.
+            if self._speco_v1_async_rollout_enabled():
+                prefit_park = self._speco_park_actor_hccl_for_drafter()
+                if prefit_park.get("drafter/actor_hccl_parked", 0):
+                    logger.info(
+                        "SPECO V1 pre-fit actor HCCL parked before drafter activation: %s",
+                        prefit_park,
+                    )
             if self._speco_rollout_idle_worker_enabled():
                 with self._speco_v1_quiescent_boundary():
                     self.checkpoint_manager.sleep_replicas()
@@ -2328,6 +2401,27 @@ class SpecoV1Mixin(V1BubbleMixin):
                 )
         if self._speco_v1_async_rollout_enabled():
             self._speco_run_async_prefit_rollout_warmup(agent_loop_manager)
+            # The async replay-backed loader can report length zero until its
+            # first sample is materialized.  The pre-fit warmup above has
+            # already waited for one complete training batch, so retain the
+            # configured training horizon as the epoch length for V1's epoch
+            # bookkeeping.  Without this, upstream ``fit`` divides by zero
+            # before consuming the ready batch.
+            if int(getattr(self, "steps_per_epoch", 0) or 0) <= 0:
+                trainer_config = getattr(self.config, "trainer", {})
+                if hasattr(trainer_config, "get"):
+                    configured_steps = int(
+                        trainer_config.get("total_training_steps", 0) or 0
+                    )
+                else:
+                    configured_steps = int(
+                        getattr(trainer_config, "total_training_steps", 0) or 0
+                    )
+                self.steps_per_epoch = max(configured_steps, 1)
+                logger.info(
+                    "SPECO V1 repaired async steps_per_epoch=%s after pre-fit warmup",
+                    self.steps_per_epoch,
+                )
         self._speco_prepared_for_fit = True
 
     def _reissue_inflight_prompts(self, *args, **kwargs):

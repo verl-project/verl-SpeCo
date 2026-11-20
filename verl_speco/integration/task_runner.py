@@ -13,7 +13,6 @@
 # limitations under the License.
 """TaskRunner hook for the SPECO trainer."""
 
-import json
 import logging
 import os
 import socket
@@ -21,6 +20,9 @@ from pprint import pprint
 
 import ray
 from omegaconf import OmegaConf
+from verl_speco.integration.drafter_config_env import (
+    serialize_worker_drafter_config,
+)
 from verl.trainer.ppo.utils import (
     need_critic,
     need_reference_policy,
@@ -44,13 +46,29 @@ logger = logging.getLogger(__name__)
 
 
 def _serialize_drafter_config(config):
+    """Serialize the worker payload, retaining generated private runtime state.
+
+    ``configure_vllm_runtime_from_config`` creates a fresh acceptance-sidecar
+    directory for every launch and puts it in ``VERL_SPECO_DRAFTER_CONFIG``.
+    That locator is deliberately absent from the user-facing Hydra drafter
+    block.  The rollout-worker wrapper must therefore preserve it when it
+    serializes the config again; otherwise the V2 model worker receives a
+    smaller payload and cannot publish acceptance counters.
+    """
     try:
         drafter = OmegaConf.to_container(
             config.actor_rollout_ref.rollout.drafter, resolve=True
         )
     except Exception:  # noqa: BLE001
         return ""
-    return json.dumps(drafter, sort_keys=True) if isinstance(drafter, dict) else ""
+    if not isinstance(drafter, dict):
+        return ""
+
+    try:
+        run_dir = config.trainer.default_local_dir
+    except (AttributeError, KeyError, TypeError):
+        run_dir = None
+    return serialize_worker_drafter_config(drafter, run_dir=run_dir)
 
 
 def _unwrap_ray_remote_actor_class(worker_cls):

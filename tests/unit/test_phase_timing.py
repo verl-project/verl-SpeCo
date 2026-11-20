@@ -521,7 +521,7 @@ def test_worker_init_instruments_bubble_and_opt_in_cuda(
 ):
     from verl_speco.integration import rollout_publish as publish
 
-    import torch
+    torch = pytest.importorskip("torch")
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
     monkeypatch.setenv("VERL_SPECO_PHASE_TIMING", "true" if enabled else "false")

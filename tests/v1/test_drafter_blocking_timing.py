@@ -71,6 +71,9 @@ def test_drafter_total_excludes_actor_and_target_sync_and_resets(
             clock.advance(0.2)
             return {}
 
+        def _speco_park_actor_hccl_for_drafter(self):
+            return {}
+
         def _speco_train_drafter(self, plan):
             clock.advance(6)
             return True, {"drafter/trained": 1}

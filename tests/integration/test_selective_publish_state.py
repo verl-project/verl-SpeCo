@@ -16,6 +16,7 @@
 import ast
 import fnmatch
 import logging
+import time
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -74,6 +75,8 @@ def _trainer_type(device_name="cuda"):
         "FSDP": FSDP,
         "fnmatch": fnmatch,
         "logger": logging.getLogger(__name__),
+        "time": time,
+        "_log_drafter_phase": lambda *args, **kwargs: None,
         "device_name": device_name,
         "get_fsdp_full_state_dict": legacy_full_state,
         "load_fsdp_model_to_gpu": lambda model: None,

@@ -13,7 +13,8 @@ from types import SimpleNamespace
 from typing import Any, Optional, cast
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.trainer.standalone_batch_finalize import AsyncBatchFinalizer
 from verl_speco.trainer.tq_retry import retry_io
