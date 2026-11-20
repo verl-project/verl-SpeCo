@@ -7262,6 +7262,15 @@ class DrafterBaseTrainer:
         from verl_speco.backends.specopd_forward import prepare_specopd_training_batches, partition_specopd_samples, plan_specopd_training_groups
 
         selected = [(request, scores) for request, scores in samples if request.branches]
+        # Establish every loss-reduction communicator while peers are still at
+        # the same entry boundary, rather than after rank-local preparation.
+        from verl_speco.integration.specopd_collectives import warm_specopd_training_collectives
+
+        dp_size = self._get_dp_world_size()
+        group_sizes = plan_specopd_training_groups(
+            selected, dp_size, spec.training_microbatch_trajectories, spec.training_microbatch_token_budget,
+        )
+        warm_specopd_training_collectives(self, step=step)
         positions = sum(len(branch.token_ids) for request, _ in selected for branch in request.branches)
         if positions < spec.min_scored_positions_per_update:
             return False
@@ -7277,14 +7286,11 @@ class DrafterBaseTrainer:
         if float(getattr(wrapper.draft_model.config, "attention_dropout", 0.0)) != 0:
             raise ValueError("SpecOPD fixed-history probability reconstruction requires zero draft dropout")
         prepare_started = time.perf_counter()
-        dp_size = self._get_dp_world_size()
         dp_rank = self._get_dp_local_rank()
-        group_sizes = plan_specopd_training_groups(
-            selected, dp_size, spec.training_microbatch_trajectories, spec.training_microbatch_token_budget,
-        )
         selected, real_slots = partition_specopd_samples(selected, dp_rank, dp_size)
         batches, cache_bytes = prepare_specopd_training_batches(
             selected, self.runtime_device, spec, feature_indices,
+            cache_bytes=spec.training_input_cache_mib * 1024**2,
             group_sizes=group_sizes, real_slots=real_slots,
         )
         self._specopd_group_metrics.update({
@@ -7303,6 +7309,10 @@ class DrafterBaseTrainer:
                     ok = await self._training_step_on_batch(
                         batch, step, accumulation_steps=len(batches), accumulation_index=index,
                     )
+                # Backward has consumed this microbatch. Release uncached device
+                # inputs before staging the next one, rather than retaining both
+                # input sets while the next dict comprehension evaluates .to().
+                del batch
                 if not ok:
                     self.optimizer.zero_grad(set_to_none=True)
                     raise RuntimeError("SpecOPD update failed; this group must not be replayed")
@@ -7313,7 +7323,7 @@ class DrafterBaseTrainer:
         self.prepare_model_state_dict_for_publish(step)
         self._specopd_group_metrics["timing_s/specopd_snapshot"] = time.perf_counter() - snapshot_started
         # Drop fixed input device tensors before the worker offloads its model.
-        del batches, batch, prepared
+        del batches, prepared
         return True
 
     async def training_step_from_batch(
@@ -8366,7 +8376,9 @@ class DrafterBaseTrainer:
         self._last_ckpt_step = -1
         self.training_steps = 0
 
-    async def release_training_memory_after_activation(self, *, strict: bool = False):
+    async def release_training_memory_after_activation(
+        self, *, strict: bool = False, single_cache_reclaim: bool = False
+    ):
         """Park training tensors on CPU, preserving optimizer and replay progress.
 
         Warmup retains best-effort cleanup. Bubble main-workload boundaries use
@@ -8407,7 +8419,7 @@ class DrafterBaseTrainer:
                     return
             # Reclaim once after model, optimizer and head transfers finish.
             # A pooled copy failure propagates; only a clean decline falls back.
-            if device_name == "cuda":
+            if device_name == "cuda" or single_cache_reclaim:
                 offload_fsdp_model_to_cpu(self.model, empty_cache=False)
             else:
                 offload_fsdp_model_to_cpu(self.model)
