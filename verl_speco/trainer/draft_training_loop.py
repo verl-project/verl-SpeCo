@@ -22,6 +22,7 @@ import os
 import sys
 import time
 from copy import deepcopy
+from dataclasses import fields
 from datetime import timedelta
 from functools import partial
 from typing import Any, cast
@@ -73,6 +74,20 @@ logger = logging.getLogger(__name__)
 _TQ_GET_MAX_SYNC_INTERVAL_STEPS = 50
 _TQ_CLEAR_MAX_ATTEMPTS = 3
 _TQ_CLEAR_RETRY_BACKOFF_SECONDS = 0.5
+
+_FILE_LOADER_CONFIG_FIELDS = frozenset(
+    field.name for field in fields(DraftFeatureDataLoaderConfig) if field.init
+)
+_FILE_STORE_ONLY_CONFIG_KEYS = frozenset(
+    {
+        "strict_schema",
+        "max_seq_len",
+        "window_mode",
+        "tokenizer_path",
+        "train_on",
+        "trust_remote_code",
+    }
+)
 
 
 def _should_log_batch_progress(attempted_batches: int) -> bool:
@@ -420,16 +435,11 @@ async def _run_standalone_draft_training_async(
         else:
             if file_loader_config is None:
                 raise RuntimeError("File feature store requires a loader config")
-            loader = DraftFeatureDataLoader(
+            loader = _build_file_feature_data_loader(
                 store,
-                DraftFeatureDataLoaderConfig(
-                    **file_loader_config,
-                    rank=rank,
-                    start_epoch=int((file_data_progress or {}).get("epoch", 0) or 0),
-                    skip_batches=int(
-                        (file_data_progress or {}).get("batch_index", 0) or 0
-                    ),
-                ),
+                file_loader_config,
+                rank=rank,
+                data_progress=file_data_progress,
             )
         logger.info(
             "[standalone rank=%s] dataloader ready batch_size_per_gpu=%s "
@@ -1222,6 +1232,42 @@ def _standalone_loader_config(
             }
         )
     return config
+
+
+def _build_file_feature_data_loader(
+    store: Any,
+    file_loader_config: dict[str, Any],
+    *,
+    rank: int,
+    data_progress: dict[str, Any] | None,
+) -> DraftFeatureDataLoader:
+    """Build the file-store loader from the loader fingerprint.
+
+    The fingerprint also carries store-only settings (``strict_schema`` and the
+    JSONL decoding keys) so they can be validated on resume. Those keys are not
+    part of ``DraftFeatureDataLoaderConfig`` and must not be forwarded.
+    """
+
+    unsupported = (
+        set(file_loader_config)
+        - _FILE_LOADER_CONFIG_FIELDS
+        - _FILE_STORE_ONLY_CONFIG_KEYS
+    )
+    if unsupported:
+        raise ValueError(
+            f"Unsupported file feature loader config keys: {sorted(unsupported)}"
+        )
+    kwargs = {
+        key: value
+        for key, value in file_loader_config.items()
+        if key in _FILE_LOADER_CONFIG_FIELDS
+    }
+    kwargs.update(
+        rank=rank,
+        start_epoch=int((data_progress or {}).get("epoch", 0) or 0),
+        skip_batches=int((data_progress or {}).get("batch_index", 0) or 0),
+    )
+    return DraftFeatureDataLoader(store, DraftFeatureDataLoaderConfig(**kwargs))
 
 
 def _standalone_data_progress(

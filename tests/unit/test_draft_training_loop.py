@@ -28,6 +28,7 @@ from verl_speco.trainer.base_trainer import DrafterBaseTrainer  # noqa: E402
 from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _assert_standalone_layer_migration,
     _build_backend,
+    _build_file_feature_data_loader,
     _build_standalone_tracking,
     _clear_tq_batch_across_ranks,
     _connect_tq_store_across_ranks,
@@ -1300,3 +1301,48 @@ def test_standalone_loader_config_omits_jsonl_only_settings_for_other_stores() -
     assert "max_seq_len" not in config
     assert "window_mode" not in config
     assert "tokenizer_path" not in config
+
+
+def test_file_data_loader_accepts_production_loader_config() -> None:
+    stores = (
+        ("torch_shard", {}),
+        (
+            "jsonl_token_replay",
+            {
+                "max_seq_len": 4096,
+                "window_mode": "front",
+                "tokenizer_path": "/tmp/tokenizer",
+                "train_on": "last_assistant",
+                "trust_remote_code": True,
+            },
+        ),
+    )
+    for feature_store_type, settings in stores:
+        loader_config = _standalone_loader_config(
+            {"batch_size_per_gpu": 4, "seed": 7},
+            {"type": feature_store_type, "strict_schema": True, **settings},
+            world_size=2,
+            feature_store_type=feature_store_type,
+        )
+        loader = _build_file_feature_data_loader(
+            SimpleNamespace(),
+            loader_config,
+            rank=1,
+            data_progress={"epoch": 2, "batch_index": 5},
+        )
+        assert loader.config.batch_size == 4
+        assert loader.config.world_size == 2
+        assert loader.config.rank == 1
+        assert loader.config.seed == 7
+        assert loader.config.start_epoch == 2
+        assert loader.config.skip_batches == 5
+
+
+def test_file_data_loader_rejects_unknown_loader_config_key() -> None:
+    with pytest.raises(ValueError, match="Unsupported file feature loader config keys"):
+        _build_file_feature_data_loader(
+            SimpleNamespace(),
+            {"batch_size": 2, "batch_siz": 4},
+            rank=0,
+            data_progress=None,
+        )
