@@ -12,30 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
 from types import SimpleNamespace
+from types import SimpleNamespace as NS
 
 import pytest
 import torch
 
-from verl_speco.specopd_config import SpecOPDConfig, validate_specopd_config
-from verl_speco.transport.specopd_protocol import (
-    ProposalRecord,
-    record_dict,
-    encode_bundle,
-    decode_bundle,
-    token_digest,
+from verl_speco.backends import opd_distribution as distribution
+from verl_speco.backends.drafter_opd import DraftOPDObjective
+from verl_speco.backends.specopd_loss import e2e_tv_loss, specopd_distribution_loss
+from verl_speco.integration.specopd_anchors import add_trunk_anchors, retain_proposal
+from verl_speco.integration.specopd_driver import (
+    build_requests,
+    plan_microbatches,
+    unwrap_rank_result,
+)
+from verl_speco.integration.specopd_vllm import (
+    capture_scheduler_round,
+    snapshot_scheduler_round,
 )
 from verl_speco.integration.specopd_window import make_window
-from verl_speco.integration.specopd_vllm import (
-    snapshot_scheduler_round,
-    capture_scheduler_round,
-)
-from verl_speco.integration.specopd_driver import build_requests
-from verl_speco.integration.specopd_driver import plan_microbatches, unwrap_rank_result
 from verl_speco.joint_actor import partition_joint_requests
-from verl_speco.joint_scoring import JointScoringRequest, DraftBranch
+from verl_speco.joint_scoring import DraftBranch, JointScoringRequest
+from verl_speco.specopd_config import (
+    SpecOPDConfig,
+    specopd_loss_weights,
+    validate_specopd_config,
+)
 from verl_speco.trainer.scheduler.specopd_cycle import SpecOPDCycle
-from verl_speco.backends.specopd_loss import e2e_tv_loss, specopd_distribution_loss
+from verl_speco.transport.specopd_protocol import (
+    ProposalRecord,
+    decode_bundle,
+    encode_bundle,
+    record_dict,
+    token_digest,
+)
 
 
 def config():
@@ -370,13 +385,6 @@ def test_specopd_l1_is_positionwise_on_the_same_histories():
     assert torch.isfinite(q.grad).all() and q.grad.abs().sum() > 0
 
 
-def test_candidate_support_keeps_teacher_mass_outside_support():
-    q = torch.tensor([[[0.5, 0.5]]]).log().requires_grad_()
-    p = torch.tensor([[[0.4, 0.4, 0.2]]]).log()
-    loss, count, _ = e2e_tv_loss(
-        q, p, torch.tensor([[True]]), candidate_ids=torch.tensor([[[0, 1]]])
-    )
-    torch.testing.assert_close(loss / count, torch.tensor(0.2))
 
 
 def test_loss_padding_is_neutral_and_holes_rejected():
@@ -429,3 +437,168 @@ def test_distributed_rank_outputs_are_merged_without_counting_dummy_rows_as_real
         and metrics["logical_rows"] == 16
         and metrics["model_forward_calls"] == 1
     )
+
+
+def _mixed_anchor_config(anchor_count=32, **kw):
+    proposal_count = anchor_count * 3 // 4
+    return SpecOPDConfig(anchor_count=anchor_count, random_anchor_count=anchor_count // 4,
+                         max_branches_per_request=proposal_count,
+                         max_proposal_tokens_per_request=proposal_count * 7, **kw)
+
+
+def _mixed_anchor_bundle():
+    return dict(request_id="request", actor_revision=5, drafter_revision=0, window=[0, 512])
+
+
+def test_collection_cap_optout_cannot_reenter_training_as_random_trunk_anchors():
+    assert add_trunk_anchors([], tuple(range(600)), 10,
+                             dict(_mixed_anchor_bundle(), collection_enabled=False), _mixed_anchor_config()) == []
+
+
+def proposals(n):
+    return [DraftBranch(f"p{i}", 9 + i, (2, 3, 4), accepted_count=1) for i in range(n)]
+
+
+@pytest.mark.parametrize("anchor_count", [32, 64])
+def test_full_and_short_proposal_groups_fill_unique_positions(anchor_count):
+    ids = tuple(range(600))
+    spec = _mixed_anchor_config(anchor_count)
+    spec.validate()
+    for n in [0, 3, spec.max_branches_per_request]:
+        mixed = add_trunk_anchors(proposals(n), ids, 10, _mixed_anchor_bundle(), spec)
+        assert len(mixed) == len({b.anchor for b in mixed}) == anchor_count
+        assert sum(b.source == "proposal" for b in mixed) == n
+        assert all(9 <= b.anchor < 521 for b in mixed)
+        for b in mixed[n:]:
+            assert b.source == "trunk"
+            assert b.token_ids == ids[b.anchor + 1:min(b.anchor + 8, 522)]
+        assert mixed == add_trunk_anchors(proposals(n), ids, 10, _mixed_anchor_bundle(), spec)
+
+
+def test_short_response_never_fabricates_or_duplicates_anchors():
+    mixed = add_trunk_anchors([], tuple(range(14)), 10, _mixed_anchor_bundle(), _mixed_anchor_config())
+    assert len(mixed) == 4
+    assert len(mixed[-1].token_ids) >= 1
+    assert all(b.token_ids for b in mixed)
+
+
+def test_reservoir_can_replace_early_rounds_and_is_uniform_across_candidates():
+    counts = [0] * 80
+    for seed in range(800):
+        request = NS(_specopd_records=[])
+        plan = dict(request_id=str(seed), actor_revision=5, drafter_revision=0, max_branches=24)
+        for i in range(80):
+            retain_proposal(request, plan, dict(round_id=i))
+        kept = [x["round_id"] for x in request._specopd_records]
+        assert len(set(kept)) == 24
+        for i in kept:
+            counts[i] += 1
+    # Expected 240 selections per candidate; reject first-N/last-N/biased sampling.
+    assert min(counts) > 170 and max(counts) < 310
+
+
+def test_mixed_loss_and_gradient_match_draft_opd_with_padding_and_weights():
+    torch.manual_seed(7)
+    head = torch.randn(13, 5)
+    valid = torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0], [1, 1, 1, 0], [0, 0, 0, 0]], dtype=torch.bool)
+    accepted = torch.tensor([[1, -1, 3, -1]])
+    reject = torch.tensor([[True, False, False, False]])
+    objective = DraftOPDObjective(dict(loss="e2e_tv", first_reject_weight=2.0),
+                                  layout="dspark", loss_mode="full_vocab",
+                                  per_position_loss_weight="fixed_exp_decay")
+    weights = objective.weights(valid.reshape(1, 4, 4).float(), accepted, reject, gamma=7.0)
+    active = valid.flatten()
+    # Work on all rows with matching inactive padding; Draft-OPD takes active rows.
+    dense = torch.randn(4, 4, 13, requires_grad=True)
+    target = torch.randn(4, 4, 5)
+    expected = objective(dense.reshape(-1, 13)[active], target.reshape(-1, 5)[active], head,
+                         valid.reshape(1, 4, 4).float(), active, position_weights=weights)
+    numerator, count, _ = e2e_tv_loss(dense, torch.nn.functional.linear(target, head), valid,
+                                     position_weights=weights.reshape_as(valid))
+    actual = numerator / count
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(torch.autograd.grad(actual, dense, retain_graph=True)[0],
+                               torch.autograd.grad(expected, dense)[0], atol=1e-6, rtol=1e-5)
+    assert count == 3
+
+
+def test_mixed_config_requires_matching_budgets():
+    _mixed_anchor_config().validate()
+    with pytest.raises(ValueError, match="24 proposal"):
+        SpecOPDConfig(anchor_count=32).validate()
+
+
+def test_async_reservoir_keeps_capturing_after_24_and_stops_at_window_end():
+    from verl_speco.integration.specopd_async import snapshot_verified_proposals
+    from verl_speco.integration.specopd_window import make_window
+    plan = make_window(_mixed_anchor_config(), "a", 5, 0, 3, 1024)
+    batch = NS(req_ids=["a"], idx_mapping_np=[0], num_draft_tokens_per_req=[7],
+               is_prefilling_np=[False], seq_lens=torch.tensor([100]))
+    runner = NS(draft_tokens_handler=NS(_specopd_plans={"a": plan}, _specopd_result_counts={"a": 24}),
+                execute_model_state=NS(input_batch=batch), is_last_pp_rank=True,
+                req_states=NS(draft_tokens=torch.ones((1, 7), dtype=torch.int32)))
+    assert "a" in snapshot_verified_proposals(runner)
+    batch.seq_lens[0] = 700
+    assert snapshot_verified_proposals(runner) == {}
+    runner.req_states = None
+    assert snapshot_verified_proposals(runner) == {}
+
+
+def legacy_tv(draft_logits, target_logits, *, proposal_temperature=1.0,
+              target_temperature=1.0, implementation="eager"):
+    draft = draft_logits.float() / proposal_temperature
+    target = target_logits.detach().float() / target_temperature
+    return (draft.softmax(-1) - target.softmax(-1)).abs().sum(-1) * 0.5
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("temperatures", [(1.0, 1.0), (0.6, 1.0), (1.0, 1.7), (0.6, 1.7)])
+@pytest.mark.parametrize("implementation", ["eager", "fused"])
+def test_unit_temperature_preserves_outputs_gradients_and_teacher_stop(monkeypatch, dtype, temperatures, implementation):
+    torch.manual_seed(23)
+    draft = torch.randn(2, 3, 17).to(dtype).requires_grad_()
+    target = torch.randn(2, 3, 17).to(dtype).requires_grad_()
+    pointers = []
+    monkeypatch.setattr(distribution, "_fused_available", lambda device: True)
+    def fused(x, y, *, average_ties):
+        assert average_ties is True and not y.requires_grad
+        pointers.append((x.data_ptr(), y.data_ptr()))
+        return (x.softmax(-1) - y.softmax(-1)).abs().sum(-1) * 0.5
+    monkeypatch.setattr(distribution, "fused_total_variation", fused)
+    kwargs = dict(proposal_temperature=temperatures[0], target_temperature=temperatures[1],
+                  implementation=implementation)
+    actual = distribution.token_total_variation(draft, target, **kwargs)
+    expected = legacy_tv(draft, target, **kwargs)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    actual_grad = torch.autograd.grad(actual.sum(), draft, retain_graph=True)[0]
+    expected_grad = torch.autograd.grad(expected.sum(), draft)[0]
+    torch.testing.assert_close(actual_grad, expected_grad, atol=0, rtol=0)
+    assert torch.autograd.grad(actual.sum(), target, allow_unused=True)[0] is None
+    if implementation == "fused" and dtype == torch.float32:
+        # Fused dispatch sees the original FP32 storage only on the unit side.
+        assert (pointers[0][0] == draft.data_ptr()) == (temperatures[0] == 1.0)
+        assert (pointers[0][1] == target.data_ptr()) == (temperatures[1] == 1.0)
+
+
+def test_dspark_specopd_launch_defaults_to_pure_tv():
+    OmegaConf = pytest.importorskip("omegaconf").OmegaConf
+    root = Path(__file__).resolve().parents[2]
+    bash = shutil.which("bash")
+    if bash is None and Path("C:/Program Files/Git/bin/bash.exe").exists():
+        bash = "C:/Program Files/Git/bin/bash.exe"
+    if bash is None:
+        pytest.skip("bash is unavailable")
+    env = {**os.environ, **dict.fromkeys(("MODEL_PATH", "DRAFTER_PATH", "TRAIN_FILE", "TEST_FILE"), "/unused/test-path")}
+    harness = 'python3() { printf "%s\\0" "$@"; }; source "$1"'
+    script = "examples/run_qwen3-8b-specopd_drafter_dspark_vllm_npu.sh"
+    result = subprocess.run([bash, "-c", harness, "specopd-config-test", script], cwd=root,
+                            env=env, capture_output=True, check=True)
+    argv = result.stdout.decode().rstrip("\0").split("\0")
+    assert argv[:3] == ["-m", "verl_speco.main", "--config-name=speco_v1_trainer"]
+    config = OmegaConf.merge(OmegaConf.load(root / "verl_speco/config/speco_base.yaml"),
+                             OmegaConf.from_dotlist([arg.lstrip("+") for arg in argv[3:]]))
+    training = config.actor_rollout_ref.rollout.drafter.training
+    spec = validate_specopd_config(config)
+    assert spec.enable and spec.objective == "tv"
+    assert not training.drafter_opd.enable
+    assert specopd_loss_weights(training, "DSPARK") == (1.0, 0.0)

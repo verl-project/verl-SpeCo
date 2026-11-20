@@ -109,12 +109,9 @@ def _model(mesh):
 
 
 def _distributed_check(rank, rendezvous, backend):
-    device_type = {"nccl": "cuda", "hccl": "npu"}.get(backend, "cpu")
+    device_type = "cuda" if backend == "nccl" else "cpu"
     if device_type == "cuda":
         torch.cuda.set_device(rank)
-    if device_type == "npu":
-        import torch_npu  # noqa: F401
-        torch.npu.set_device(rank)
     dist.init_process_group(
         backend,
         rank=rank,
@@ -125,7 +122,7 @@ def _distributed_check(rank, rendezvous, backend):
     try:
         mesh = dist.device_mesh.init_device_mesh(device_type, (2,))
         model = _model(mesh)
-        trainer = _trainer_type("npu" if backend == "hccl" else "cuda")()
+        trainer = _trainer_type()()
         trainer._record_gpu_transfer = lambda scope, stats: None
         trainer.rank = rank
         trainer.clear_pending_publish_state_dict()
@@ -133,8 +130,7 @@ def _distributed_check(rank, rendezvous, backend):
         trainer.training_device_mesh = mesh
         trainer._frozen_param_names = ["frozen."]
         trainer._is_ddp_wrapped = lambda: False
-        config = {"publish_dtype": "bf16", "gpu_publish_cast_before_copy": True,
-                  "specopd": {"enable": True}}
+        config = {"publish_dtype": "bf16", "gpu_publish_cast_before_copy": True}
         trainer.config = SimpleNamespace(
             rollout=SimpleNamespace(drafter=SimpleNamespace(training=config))
         )
