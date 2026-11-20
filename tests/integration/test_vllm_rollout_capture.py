@@ -7,7 +7,7 @@ import sys
 from types import SimpleNamespace as NS
 
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 
 from verl_speco.integration import vllm_rollout_capture as capture
 from verl_speco.trainer.scheduler import (
