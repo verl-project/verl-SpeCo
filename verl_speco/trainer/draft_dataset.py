@@ -122,6 +122,11 @@ class DraftFeatureDataLoaderConfig:
     max_sample_step: int | None = None
     group_by_length: bool = False
     group_by_length_megabatch: int = 8
+    # Standalone file-store resume: the loader order is a pure function of
+    # ``(seed + epoch, store)``, so an exact continuation only needs the
+    # epoch/batch cursor rather than a per-sample consumed set.
+    start_epoch: int = 0
+    skip_batches: int = 0
     # Read-side filters, equivalent to the standalone TQ Producer input path.
     on_error: str = "skip"
     max_consecutive_errors: int = 20
@@ -163,12 +168,36 @@ class DraftFeatureDataLoader:
             )
         if int(config.min_supervised_tokens) < 0:
             raise ValueError("min_supervised_tokens must be >= 0")
+        if int(config.start_epoch) < 0:
+            raise ValueError("start_epoch must be >= 0")
+        if int(config.skip_batches) < 0:
+            raise ValueError("skip_batches must be >= 0")
         self.filter_stats = {
             "kept": 0,
             "read_errors": 0,
             "dropped_misaligned": 0,
             "dropped_min_supervised": 0,
         }
+        self._data_progress = {
+            "epoch": int(config.start_epoch),
+            "batch_index": 0,
+        }
+        # Read errors are the only non-deterministic filter: validation drops
+        # are a pure function of the sample and the loader config. A resume may
+        # only skip batches when the replayed epoch had no read errors,
+        # otherwise the post-filter list (and therefore the batch boundary)
+        # changed since the checkpoint was written.
+        self._epoch_read_errors = 0
+
+    def progress(self) -> dict[str, int]:
+        """Epoch/batch cursor of the last yielded batch (for resume sidecars)."""
+
+        return dict(self._data_progress)
+
+    def epoch_read_errors(self) -> int:
+        """Unreadable samples seen while building the current epoch's batches."""
+
+        return int(self._epoch_read_errors)
 
     def format_filter_stats(self) -> str:
         stats = self.filter_stats
@@ -328,8 +357,10 @@ class DraftFeatureDataLoader:
         return grouped
 
     def __iter__(self) -> Iterator[list[DraftStoredSample]]:
-        epoch = 0
+        epoch = int(self.config.start_epoch)
         while True:
+            read_errors_start = int(self.filter_stats["read_errors"])
+            self._epoch_read_errors = 0
             keys = list(
                 self.store.iter_keys(
                     shuffle=bool(self.config.shuffle),
@@ -373,6 +404,23 @@ class DraftFeatureDataLoader:
                 rank_samples = self._read_filtered(rank_keys)
             rank_samples = self._synchronize_length(rank_samples)
             rank_samples = self._maybe_group_by_length(rank_samples)
+            self._epoch_read_errors = (
+                int(self.filter_stats["read_errors"]) - read_errors_start
+            )
+            skip_batches = (
+                int(self.config.skip_batches)
+                if epoch == int(self.config.start_epoch)
+                else 0
+            )
+            if skip_batches > 0 and self._epoch_read_errors > 0:
+                raise ValueError(
+                    "DraftFeatureDataLoader cannot resume at "
+                    f"epoch={epoch} batch_index={skip_batches}: "
+                    f"{self._epoch_read_errors} feature samples were unreadable "
+                    "while rebuilding the epoch, so skipping the saved number of "
+                    "batches would land on a different boundary and could repeat "
+                    "or skip samples. Fix the store or start a fresh run."
+                )
             if not rank_samples:
                 raise RuntimeError(
                     f"DraftFeatureDataLoader epoch={epoch} rank={rank} produced no "
@@ -381,13 +429,39 @@ class DraftFeatureDataLoader:
                     "read-side filters"
                 )
             batch: list[DraftStoredSample] = []
+            batch_index = 0
+            skip_remaining = skip_batches
             for sample in rank_samples:
                 batch.append(sample)
                 if len(batch) >= int(self.config.batch_size):
+                    batch_index += 1
+                    if skip_remaining > 0:
+                        skip_remaining -= 1
+                        batch = []
+                        continue
+                    self._data_progress = {
+                        "epoch": epoch,
+                        "batch_index": batch_index,
+                    }
                     yield batch
                     batch = []
             if batch:
-                yield batch
+                batch_index += 1
+                if skip_remaining > 0:
+                    skip_remaining -= 1
+                else:
+                    self._data_progress = {
+                        "epoch": epoch,
+                        "batch_index": batch_index,
+                    }
+                    yield batch
+            if skip_remaining > 0:
+                raise ValueError(
+                    "DraftFeatureDataLoader resume cursor "
+                    f"epoch={epoch} batch_index={self.config.skip_batches} "
+                    f"exceeds the {batch_index} batches available in this epoch; "
+                    "the checkpoint and feature store are inconsistent."
+                )
             logger.info(
                 "DraftFeatureDataLoader epoch=%s rank=%s %s",
                 epoch,

@@ -22,6 +22,7 @@ import os
 import sys
 import time
 from copy import deepcopy
+from dataclasses import fields
 from datetime import timedelta
 from functools import partial
 from typing import Any, cast
@@ -58,6 +59,7 @@ from verl_speco.trainer.standalone_prefetch import StandalonePrefetchIterator
 from verl_speco.trainer.standalone_resume import (
     load_standalone_resume,
     save_standalone_resume,
+    validate_standalone_loader_config,
 )
 from verl_speco.trainer.standalone_retry import retry_io
 from verl_speco.trainer.standalone_tracking import (
@@ -72,6 +74,20 @@ logger = logging.getLogger(__name__)
 _TQ_GET_MAX_SYNC_INTERVAL_STEPS = 50
 _TQ_CLEAR_MAX_ATTEMPTS = 3
 _TQ_CLEAR_RETRY_BACKOFF_SECONDS = 0.5
+
+_FILE_LOADER_CONFIG_FIELDS = frozenset(
+    field.name for field in fields(DraftFeatureDataLoaderConfig) if field.init
+)
+_FILE_STORE_ONLY_CONFIG_KEYS = frozenset(
+    {
+        "strict_schema",
+        "max_seq_len",
+        "window_mode",
+        "tokenizer_path",
+        "train_on",
+        "trust_remote_code",
+    }
+)
 
 
 def _should_log_batch_progress(attempted_batches: int) -> bool:
@@ -167,7 +183,6 @@ async def _run_standalone_draft_training_async(
     last_save_result: dict[str, Any] | None = None
     last_saved_step = 0
     consumed_sequence_nos: set[int] = set()
-    standalone_input_path = _standalone_input_path(config)
     standalone_producer_shuffle = _standalone_producer_shuffle(config)
     trainer.combine_standalone_metrics = feature_store_type == "ray_reference"
     store = None
@@ -201,23 +216,70 @@ async def _run_standalone_draft_training_async(
         initial_optimizer_step = int(trainer.optimizer_steps_total)
         optimizer_step = initial_optimizer_step
         last_saved_step = optimizer_step
-        if feature_store_type in {"tq", "ray_reference"}:
+        resume_input_path = _standalone_resume_input_path(
+            config, feature_store_type, feature_store_cfg
+        )
+        file_loader_config = (
+            _standalone_loader_config(
+                training_cfg,
+                feature_store_cfg,
+                world_size=world_size,
+                feature_store_type=feature_store_type,
+            )
+            if feature_store_type not in {"tq", "ray_reference"}
+            else None
+        )
+        file_data_progress = None
+        if resume_input_path is not None:
             consumed_sequence_nos, resume_metadata = load_standalone_resume(
                 drafter_cfg.get("model_path"),
-                input_path=standalone_input_path,
+                input_path=resume_input_path,
             )
             if initial_optimizer_step > 0 and resume_metadata is None:
-                raise ValueError(
-                    "Standalone TQ checkpoint restored optimizer state but has no "
-                    "standalone_resume.json; exact data resume is unavailable"
+                if feature_store_type in {"tq", "ray_reference"}:
+                    raise ValueError(
+                        "Standalone TQ checkpoint restored optimizer state but has no "
+                        "standalone_resume.json; exact data resume is unavailable"
+                    )
+                logger.warning(
+                    "[standalone rank=%s] checkpoint restored optimizer state but has "
+                    "no standalone_resume.json; file-store data cursor restarts at "
+                    "batch 0 (functional, not exact resume)",
+                    rank,
                 )
+            if feature_store_type not in {"tq", "ray_reference"} and resume_metadata:
+                file_data_progress = resume_metadata.get("data_progress")
+                if file_data_progress is not None and file_loader_config is not None:
+                    saved_loader = resume_metadata.get("data_loader")
+                    validate_standalone_loader_config(saved_loader, file_loader_config)
+                    if saved_loader is None:
+                        logger.warning(
+                            "[standalone rank=%s] checkpoint has no data_loader "
+                            "fingerprint; resume settings cannot be validated",
+                            rank,
+                        )
+                    read_errors_exact = file_data_progress.get("read_errors_exact")
+                    if read_errors_exact is False:
+                        raise ValueError(
+                            "Standalone file-store resume cursor is not exact: the "
+                            "checkpoint was saved after unreadable samples changed the "
+                            "batch composition. Fix the feature store or start a fresh "
+                            "run."
+                        )
+                    if read_errors_exact is None:
+                        logger.warning(
+                            "[standalone rank=%s] checkpoint has no read-error marker; "
+                            "the saved batch cursor cannot be verified",
+                            rank,
+                        )
             logger.info(
-                "[standalone rank=%s] resume progress optimizer_step=%s consumed=%s",
+                "[standalone rank=%s] resume progress optimizer_step=%s consumed=%s "
+                "data_progress=%s",
                 rank,
                 initial_optimizer_step,
                 len(consumed_sequence_nos),
+                file_data_progress,
             )
-
         current_stage = "open_feature_store"
         stage_started = time.perf_counter()
         logger.info(
@@ -371,37 +433,13 @@ async def _run_standalone_draft_training_async(
                     "Failed to notify Scheduler that Consumer is ready"
                 ) from ready_error
         else:
-            loader = DraftFeatureDataLoader(
+            if file_loader_config is None:
+                raise RuntimeError("File feature store requires a loader config")
+            loader = _build_file_feature_data_loader(
                 store,
-                DraftFeatureDataLoaderConfig(
-                    batch_size=int(training_cfg.get("batch_size_per_gpu", 4)),
-                    rank=rank,
-                    world_size=world_size,
-                    shuffle=bool(feature_store_cfg.get("shuffle", True)),
-                    repeat=bool(feature_store_cfg.get("repeat", True)),
-                    seed=int(training_cfg.get("seed", 0) or 0),
-                    min_sample_step=_optional_int(
-                        feature_store_cfg.get("min_sample_step")
-                    ),
-                    max_sample_step=_optional_int(
-                        feature_store_cfg.get("max_sample_step")
-                    ),
-                    group_by_length=bool(training_cfg.get("group_by_length", False)),
-                    group_by_length_megabatch=int(
-                        training_cfg.get("group_by_length_megabatch", 8) or 8
-                    ),
-                    on_error=str(feature_store_cfg.get("on_error", "skip") or "skip"),
-                    max_consecutive_errors=config_int(
-                        feature_store_cfg, "max_consecutive_errors", 20
-                    ),
-                    min_supervised_tokens=int(
-                        feature_store_cfg.get("min_supervised_tokens", 1) or 0
-                    ),
-                    strict_token_alignment=str(
-                        feature_store_cfg.get("strict_token_alignment", "warn")
-                        or "warn"
-                    ),
-                ),
+                file_loader_config,
+                rank=rank,
+                data_progress=file_data_progress,
             )
         logger.info(
             "[standalone rank=%s] dataloader ready batch_size_per_gpu=%s "
@@ -664,20 +702,23 @@ async def _run_standalone_draft_training_async(
                         rank,
                         optimizer_step,
                     )
+                data_progress = (
+                    _standalone_data_progress(loader, trainer)
+                    if feature_store_type not in {"tq", "ray_reference"}
+                    else None
+                )
                 last_save_result = _save_standalone_checkpoint(
                     trainer,
                     optimizer_step,
                     consumed_sequence_nos=consumed_sequence_nos,
-                    input_path=(
-                        standalone_input_path
-                        if feature_store_type in {"tq", "ray_reference"}
-                        else None
-                    ),
+                    input_path=resume_input_path,
                     producer_shuffle=(
                         standalone_producer_shuffle
                         if feature_store_type in {"tq", "ray_reference"}
                         else None
                     ),
+                    data_progress=data_progress,
+                    loader_config=file_loader_config,
                 )
                 if rank == 0:
                     logger.info(
@@ -705,21 +746,24 @@ async def _run_standalone_draft_training_async(
                     rank,
                     optimizer_step,
                 )
+            data_progress = (
+                _standalone_data_progress(loader, trainer)
+                if feature_store_type not in {"tq", "ray_reference"}
+                else None
+            )
             last_save_result = _save_standalone_checkpoint(
                 trainer,
                 optimizer_step,
                 wait=True,
                 consumed_sequence_nos=consumed_sequence_nos,
-                input_path=(
-                    standalone_input_path
-                    if feature_store_type in {"tq", "ray_reference"}
-                    else None
-                ),
+                input_path=resume_input_path,
                 producer_shuffle=(
                     standalone_producer_shuffle
                     if feature_store_type in {"tq", "ray_reference"}
                     else None
                 ),
+                data_progress=data_progress,
+                loader_config=file_loader_config,
             )
             if rank == 0:
                 logger.info(
@@ -841,6 +885,8 @@ def _save_standalone_checkpoint(
     consumed_sequence_nos: set[int] | None = None,
     input_path: str | None = None,
     producer_shuffle: dict[str, Any] | None = None,
+    data_progress: dict[str, Any] | None = None,
+    loader_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     consumed_snapshot = torch.tensor(
         sorted(consumed_sequence_nos or ()), dtype=torch.int64
@@ -859,6 +905,8 @@ def _save_standalone_checkpoint(
                     step=step,
                     input_path=input_path,
                     producer_shuffle=producer_shuffle,
+                    data_progress=data_progress,
+                    loader_config=loader_config,
                 )
             else:
                 future = getattr(trainer, "_pending_full_checkpoint_future", None)
@@ -872,6 +920,8 @@ def _save_standalone_checkpoint(
                             step=step,
                             input_path=input_path,
                             producer_shuffle=producer_shuffle,
+                            data_progress=data_progress,
+                            loader_config=loader_config,
                         )
                     )
         return result
@@ -908,6 +958,8 @@ def _save_standalone_checkpoint(
             step=step,
             input_path=input_path,
             producer_shuffle=producer_shuffle,
+            data_progress=data_progress,
+            loader_config=loader_config,
         )
     elif future is not None:
         future.add_done_callback(
@@ -919,6 +971,8 @@ def _save_standalone_checkpoint(
                 step=step,
                 input_path=input_path,
                 producer_shuffle=producer_shuffle,
+                data_progress=data_progress,
+                loader_config=loader_config,
             )
         )
     return {
@@ -959,6 +1013,8 @@ def _finalize_standalone_checkpoint(
     step: int | None = None,
     input_path: str | None = None,
     producer_shuffle: dict[str, Any] | None = None,
+    data_progress: dict[str, Any] | None = None,
+    loader_config: dict[str, Any] | None = None,
 ) -> None:
     try:
         completed_future.result()
@@ -991,6 +1047,8 @@ def _finalize_standalone_checkpoint(
             step=step,
             input_path=input_path,
             producer_shuffle=producer_shuffle,
+            data_progress=data_progress,
+            loader_config=loader_config,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception(
@@ -1010,8 +1068,15 @@ def _finalize_standalone_checkpoint_files(
     step: int | None,
     input_path: str | None,
     producer_shuffle: dict[str, Any] | None = None,
+    data_progress: dict[str, Any] | None = None,
+    loader_config: dict[str, Any] | None = None,
 ) -> None:
-    """Commit standalone-only files before publishing a managed checkpoint."""
+    """Commit standalone-only files before publishing a managed checkpoint.
+
+    ``complete=true`` is only written after every sidecar is durable. A crash
+    or export failure in between leaves ``complete=false`` so the checkpoint is
+    never resumed with a partial cursor.
+    """
 
     _set_standalone_checkpoint_complete(checkpoint_path, complete=False)
     _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
@@ -1021,6 +1086,8 @@ def _finalize_standalone_checkpoint_files(
         step=step,
         input_path=input_path,
         producer_shuffle=producer_shuffle,
+        data_progress=data_progress,
+        loader_config=loader_config,
     )
     _set_standalone_checkpoint_complete(checkpoint_path, complete=True)
 
@@ -1056,6 +1123,8 @@ def _save_resume_sidecar(
     step: int | None,
     input_path: str | None,
     producer_shuffle: dict[str, Any] | None = None,
+    data_progress: dict[str, Any] | None = None,
+    loader_config: dict[str, Any] | None = None,
 ) -> None:
     if consumed_snapshot is None or step is None or input_path is None:
         return
@@ -1065,6 +1134,8 @@ def _save_resume_sidecar(
         optimizer_step=step,
         input_path=input_path,
         producer_shuffle=producer_shuffle,
+        data_progress=data_progress,
+        loader_config=loader_config,
     )
 
 
@@ -1078,6 +1149,147 @@ def _standalone_input_path(config: Any) -> str | None:
     if train_files is not None and len(train_files) == 1:
         return str(train_files[0])
     return None
+
+
+def _standalone_resume_input_path(
+    config: Any, feature_store_type: str, feature_store_cfg: Any
+) -> str | None:
+    """Input identity used by the standalone resume sidecar.
+
+    TQ/ray-reference producers consume ``data.train_files``; deterministic file
+    stores are identified by their manifest (falling back to the store dir).
+    """
+    if feature_store_type in {"tq", "ray_reference"}:
+        return _standalone_input_path(config)
+    path = feature_store_cfg.get("path")
+    if not path:
+        return None
+    path = str(path)
+    manifest = os.path.join(path, "manifest.jsonl")
+    return manifest if os.path.isfile(manifest) else path
+
+
+def _standalone_loader_config(
+    training_cfg: Any,
+    feature_store_cfg: Any,
+    *,
+    world_size: int,
+    feature_store_type: str,
+) -> dict[str, Any]:
+    """Effective file-store loader settings that define the resume cursor.
+
+    Every field here changes the filtered key order or the batch boundary, so
+    the same dict is persisted beside the cursor and validated on resume.
+    ``rank`` is intentionally absent: it is a per-process view of the same
+    global order, while ``world_size`` changes the sharding and must match.
+    Stores that rewrite rows (JSONL token replay) also expose length/window and
+    tokenizer settings that change sequence lengths and therefore filtering and
+    length-based ordering.
+    """
+
+    config: dict[str, Any] = {
+        "batch_size": int(training_cfg.get("batch_size_per_gpu", 4)),
+        "world_size": int(world_size),
+        "shuffle": bool(feature_store_cfg.get("shuffle", True)),
+        "repeat": bool(feature_store_cfg.get("repeat", True)),
+        "seed": int(training_cfg.get("seed", 0) or 0),
+        "min_sample_step": _optional_int(feature_store_cfg.get("min_sample_step")),
+        "max_sample_step": _optional_int(feature_store_cfg.get("max_sample_step")),
+        "group_by_length": bool(training_cfg.get("group_by_length", False)),
+        "group_by_length_megabatch": int(
+            training_cfg.get("group_by_length_megabatch", 8) or 8
+        ),
+        "on_error": str(feature_store_cfg.get("on_error", "skip") or "skip"),
+        "max_consecutive_errors": config_int(
+            feature_store_cfg, "max_consecutive_errors", 20
+        ),
+        "min_supervised_tokens": int(
+            feature_store_cfg.get("min_supervised_tokens", 1) or 0
+        ),
+        "strict_token_alignment": str(
+            feature_store_cfg.get("strict_token_alignment", "warn") or "warn"
+        ),
+        "strict_schema": bool(feature_store_cfg.get("strict_schema", True)),
+    }
+    if feature_store_type in {"jsonl_token_replay", "jsonl"}:
+        tokenizer_path = feature_store_cfg.get("tokenizer_path")
+        config.update(
+            {
+                "max_seq_len": int(feature_store_cfg.get("max_seq_len", 512) or 0),
+                "window_mode": str(
+                    feature_store_cfg.get("window_mode", "loss") or "loss"
+                ),
+                "tokenizer_path": (
+                    os.fspath(tokenizer_path) if tokenizer_path else None
+                ),
+                "train_on": str(
+                    feature_store_cfg.get("train_on", "last_assistant")
+                    or "last_assistant"
+                ),
+                "trust_remote_code": bool(
+                    feature_store_cfg.get("trust_remote_code", False)
+                ),
+            }
+        )
+    return config
+
+
+def _build_file_feature_data_loader(
+    store: Any,
+    file_loader_config: dict[str, Any],
+    *,
+    rank: int,
+    data_progress: dict[str, Any] | None,
+) -> DraftFeatureDataLoader:
+    """Build the file-store loader from the loader fingerprint.
+
+    The fingerprint also carries store-only settings (``strict_schema`` and the
+    JSONL decoding keys) so they can be validated on resume. Those keys are not
+    part of ``DraftFeatureDataLoaderConfig`` and must not be forwarded.
+    """
+
+    unsupported = (
+        set(file_loader_config)
+        - _FILE_LOADER_CONFIG_FIELDS
+        - _FILE_STORE_ONLY_CONFIG_KEYS
+    )
+    if unsupported:
+        raise ValueError(
+            f"Unsupported file feature loader config keys: {sorted(unsupported)}"
+        )
+    kwargs = {
+        key: value
+        for key, value in file_loader_config.items()
+        if key in _FILE_LOADER_CONFIG_FIELDS
+    }
+    kwargs.update(
+        rank=rank,
+        start_epoch=int((data_progress or {}).get("epoch", 0) or 0),
+        skip_batches=int((data_progress or {}).get("batch_index", 0) or 0),
+    )
+    return DraftFeatureDataLoader(store, DraftFeatureDataLoaderConfig(**kwargs))
+
+
+def _standalone_data_progress(
+    loader: Any, trainer: DrafterBaseTrainer
+) -> dict[str, Any] | None:
+    """Cursor plus a cluster-wide "the saved epoch had no read errors" flag.
+
+    The cursor is only exact when every rank rebuilt the epoch from the same
+    readable samples. A rank-local read failure changes the post-filter list,
+    so persist the all-reduced result and reject the cursor on resume if any
+    rank skipped a sample.
+    """
+
+    if not hasattr(loader, "progress"):
+        return None
+    progress = loader.progress()
+    read_errors = int(getattr(loader, "epoch_read_errors", lambda: 0)())
+    progress["read_errors"] = read_errors
+    progress["read_errors_exact"] = _all_ranks_true(
+        read_errors == 0, trainer.runtime_device
+    )
+    return progress
 
 
 def _standalone_producer_shuffle(config: Any) -> dict[str, Any] | None:

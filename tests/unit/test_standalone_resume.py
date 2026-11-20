@@ -19,8 +19,10 @@ import pytest
 pytest.importorskip("torch")
 
 from verl_speco.trainer.standalone_resume import (
+    build_input_fingerprint,
     load_standalone_resume,
     save_standalone_resume,
+    validate_standalone_loader_config,
 )
 
 
@@ -94,3 +96,120 @@ def test_ray_reference_checkpoint_preserves_upstream_shuffle_resume_settings(tmp
     assert metadata["producer_shuffle"] == settings
     _assert_resume_shuffle_alignment(metadata, shuffle=True, shuffle_seed=73,
                                      consumed_sequence_nos=consumed)
+
+
+def test_standalone_resume_round_trips_file_store_data_progress(tmp_path: Path) -> None:
+    input_path = tmp_path / "manifest.jsonl"
+    input_path.write_text('{"num_samples": 10}\n', encoding="utf-8")
+    checkpoint_path = tmp_path / "draft_step_4"
+
+    save_standalone_resume(
+        checkpoint_path,
+        [],
+        optimizer_step=4,
+        input_path=input_path,
+        data_progress={"epoch": 2, "batch_index": 5},
+    )
+
+    consumed, metadata = load_standalone_resume(
+        checkpoint_path, input_path=input_path
+    )
+    assert consumed == set()
+    assert metadata is not None
+    assert metadata["data_progress"] == {"epoch": 2, "batch_index": 5}
+
+    with pytest.raises(ValueError, match="data_progress must be non-negative"):
+        save_standalone_resume(
+            tmp_path / "bad",
+            [],
+            optimizer_step=1,
+            input_path=input_path,
+            data_progress={"epoch": -1, "batch_index": 0},
+        )
+
+
+def test_standalone_resume_persists_loader_config_and_read_error_state(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "manifest.jsonl"
+    input_path.write_text('{"num_samples": 10}\n', encoding="utf-8")
+    checkpoint_path = tmp_path / "draft_step_6"
+    loader_config = {
+        "batch_size": 2,
+        "world_size": 2,
+        "shuffle": True,
+        "seed": 7,
+        "min_supervised_tokens": 1,
+    }
+
+    save_standalone_resume(
+        checkpoint_path,
+        [],
+        optimizer_step=6,
+        input_path=input_path,
+        data_progress={
+            "epoch": 0,
+            "batch_index": 4,
+            "read_errors": 0,
+            "read_errors_exact": True,
+        },
+        loader_config=loader_config,
+    )
+
+    _, metadata = load_standalone_resume(checkpoint_path, input_path=input_path)
+    assert metadata is not None
+    assert metadata["data_loader"] == loader_config
+    assert metadata["data_progress"] == {
+        "epoch": 0,
+        "batch_index": 4,
+        "read_errors": 0,
+        "read_errors_exact": True,
+    }
+
+
+def test_loader_config_validation_rejects_changed_settings() -> None:
+    saved = {"batch_size": 2, "world_size": 1, "seed": 0, "shuffle": True}
+    validate_standalone_loader_config(saved, dict(saved))
+    validate_standalone_loader_config(None, {"batch_size": 4})
+
+    with pytest.raises(ValueError, match="loader configuration changed"):
+        validate_standalone_loader_config(saved, {**saved, "batch_size": 4})
+
+    with pytest.raises(ValueError, match="loader configuration changed"):
+        validate_standalone_loader_config(saved, {k: v for k, v in saved.items() if k != "seed"})
+
+
+def test_build_input_fingerprint_handles_plain_jsonl_directory(tmp_path: Path) -> None:
+    data_dir = tmp_path / "jsonl"
+    data_dir.mkdir()
+    (data_dir / "a.jsonl").write_text('{"input_ids": [1, 2]}\n', encoding="utf-8")
+    (data_dir / "b.jsonl").write_text('{"input_ids": [3, 4]}\n', encoding="utf-8")
+
+    fingerprint = build_input_fingerprint(data_dir)
+    assert fingerprint["format"] == "jsonl_token_replay"
+    assert set(fingerprint["files"]) == {"a.jsonl", "b.jsonl"}
+
+    checkpoint_path = tmp_path / "draft_step_1"
+    save_standalone_resume(
+        checkpoint_path,
+        [],
+        optimizer_step=1,
+        input_path=data_dir,
+        data_progress={"epoch": 0, "batch_index": 1},
+        loader_config={"batch_size": 2},
+    )
+    _, metadata = load_standalone_resume(checkpoint_path, input_path=data_dir)
+    assert metadata is not None
+    assert metadata["input_fingerprint"] == fingerprint
+
+
+def test_build_input_fingerprint_handles_generic_directory(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "shard.bin").write_bytes(b"abc")
+    (data_dir / "nested").mkdir()
+    (data_dir / "nested" / "index.json").write_text("{}", encoding="utf-8")
+
+    fingerprint = build_input_fingerprint(data_dir)
+    assert fingerprint["format"] == "directory"
+    assert set(fingerprint["files"]) == {"shard.bin", "nested/index.json"}
