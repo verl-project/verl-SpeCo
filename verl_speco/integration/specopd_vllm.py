@@ -14,8 +14,8 @@
 """vLLM V1 scheduler proposal capture and explicit trace-header transport.
 
 Only token/identity metadata crosses this channel. Requests opt in through the
-native SamplingParams.extra_args field. Async placeholder scheduling is rejected
-because a committed prefix cannot be inferred from its speculative placeholders.
+native SamplingParams.extra_args field. MRV2 captures verified proposals in the
+worker result, so async scheduler placeholders never become training tokens.
 """
 
 from functools import wraps
@@ -35,61 +35,6 @@ from verl_speco.transport.specopd_protocol import (
 _COMPLETED = {}
 
 
-class _DraftCopyBatch:
-    """Select native token copying without changing the real batch's grammar flag."""
-
-    has_structured_output_reqs = True
-
-    def __init__(self, batch):
-        self._batch = batch
-
-    def __getattr__(self, name):
-        return getattr(self._batch, name)
-
-
-def patch_draft_token_handler(handler):
-    """MRV2 otherwise sends only -1 placeholders to the synchronous scheduler."""
-    if getattr(handler, "_specopd_copy_installed", False):
-        return True
-    original = handler.set_draft_tokens
-    original_get = handler.get_draft_tokens
-
-    @wraps(original)
-    def copied(self, input_batch, draft_tokens):
-        from verl_speco.integration.vllm_runtime import _load_env_drafter_config
-        from verl_speco.opd_method import spec_opd_enabled
-
-        self._specopd_real_draft_ids = None
-        collecting = getattr(self, "_specopd_collecting_requests", set())
-        if (spec_opd_enabled(_load_env_drafter_config().get("training", {}))
-                and any(rid in collecting for rid in input_batch.req_ids)):
-            if getattr(getattr(draft_tokens, "device", None), "type", None) == "npu":
-                # Ascend MRV2 constructs this CUDA helper under a native shim,
-                # but its transport setter runs outside that shim. Copy these
-                # small ID rows synchronously rather than calling CUDA streams.
-                result = original(self, input_batch, draft_tokens)
-                self._specopd_real_draft_ids = draft_tokens.detach().cpu().tolist()
-                return result
-            # Reuse the backend's existing async copy/event/record_stream path.
-            # This proxy is consumed only by the token transport setter; neither
-            # the scheduler nor sampling/grammar code sees a modified batch.
-            input_batch = _DraftCopyBatch(input_batch)
-        return original(self, input_batch, draft_tokens)
-
-    @wraps(original_get)
-    def retrieved(self):
-        result = original_get(self)
-        ids = getattr(self, "_specopd_real_draft_ids", None)
-        if ids is not None and result is not None:
-            result.draft_token_ids = ids
-        return result
-
-    handler.set_draft_tokens = copied
-    handler.get_draft_tokens = retrieved
-    handler._specopd_copy_installed = True
-    return True
-
-
 def patch_draft_token_request_tracking(runner):
     """Track opt-in requests on each runner's own handler, including eviction."""
     if getattr(runner, "_specopd_request_tracking_installed", False):
@@ -101,21 +46,22 @@ def patch_draft_token_request_tracking(runner):
     def added(self, scheduler_output, *args, **kwargs):
         result = add(self, scheduler_output, *args, **kwargs)
         handler = self.draft_tokens_handler
-        collecting = getattr(handler, "_specopd_collecting_requests", None)
-        if collecting is None:
-            collecting = handler._specopd_collecting_requests = set()
+        plans = getattr(handler, "_specopd_plans", None)
+        if plans is None:
+            plans = handler._specopd_plans = {}
         for request in scheduler_output.scheduled_new_reqs:
             params = getattr(request, "sampling_params", None)
             plan = (getattr(params, "extra_args", None) or {}).get(PLAN_KEY)
-            collecting.discard(request.req_id)
+            plans.pop(request.req_id, None)
             if plan and plan.get("max_branches", 0) > 0:
-                collecting.add(request.req_id)
+                plans[request.req_id] = plan
         return result
 
     @wraps(remove)
     def removed(self, request_id, *args, **kwargs):
         result = remove(self, request_id, *args, **kwargs)
-        getattr(self.draft_tokens_handler, "_specopd_collecting_requests", set()).discard(request_id)
+        getattr(self.draft_tokens_handler, "_specopd_plans", {}).pop(request_id, None)
+        getattr(self.draft_tokens_handler, "_specopd_result_counts", {}).pop(request_id, None)
         return result
 
     runner.add_requests, runner._remove_request = added, removed
@@ -125,14 +71,13 @@ def patch_draft_token_request_tracking(runner):
 
 def install_specopd_draft_token_transport_patch():
     try:
-        from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner
     except ImportError:
-        # MRV1 already returns real draft IDs through take_draft_token_ids.
-        return False
-    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+        return False  # Legacy runners retain synchronous scheduler capture.
+    from verl_speco.integration.specopd_async import patch_result_transport
 
     patch_draft_token_request_tracking(GPUModelRunner)
-    return patch_draft_token_handler(DraftTokensHandler)
+    return patch_result_transport(GPUModelRunner)
 
 
 def stage_completed(request_id, wire):
@@ -169,8 +114,9 @@ def snapshot_scheduler_round(scheduler):
         if prefix_len < plan["prompt_len"]:
             raise RuntimeError("SpecOPD vLLM prefix is shorter than the prompt")
         selected = (
-            plan["start"] <= prefix_len - plan["prompt_len"] < plan["end"]
-            and len(getattr(request, "_specopd_records", ())) < plan["max_branches"]
+            plan["max_branches"] > 0
+            and plan["start"] <= prefix_len - plan["prompt_len"] < plan["end"]
+            and (plan.get("reservoir") or len(getattr(request, "_specopd_records", ())) < plan["max_branches"])
         )
         snapshots[request_id] = (
             request,
@@ -204,8 +150,9 @@ def capture_scheduler_round(scheduler_output, model_output, snapshots):
         request._specopd_round = round_id + 1
         offset = len(prefix) - plan["prompt_len"]
         if (
-            not plan["start"] <= offset < plan["end"]
-            or len(records) >= plan["max_branches"]
+            plan["max_branches"] <= 0
+            or not plan["start"] <= offset < plan["end"]
+            or (not plan.get("reservoir") and len(records) >= plan["max_branches"])
         ):
             continue
         if not raw:
@@ -228,6 +175,8 @@ def capture_scheduler_round(scheduler_output, model_output, snapshots):
                 raw = raw[: index + 1]
                 break
         accepted = min(len(raw), max(0, len(sampled[mapping[request_id]]) - 1))
+        if list(sampled[mapping[request_id]][:accepted]) != raw[:accepted]:
+            raise RuntimeError("SpecOPD accepted tokens differ from the verified proposal")
         record = ProposalRecord(
             f"{plan['request_id']}:{round_id}",
             len(prefix),
@@ -236,7 +185,11 @@ def capture_scheduler_round(scheduler_output, model_output, snapshots):
             round_id,
             accepted,
         )
-        records.append(record_dict(record))
+        if plan.get("reservoir"):
+            from verl_speco.integration.specopd_anchors import retain_proposal
+            retain_proposal(request, plan, record_dict(record))
+        else:
+            records.append(record_dict(record))
 
 
 def install_specopd_vllm_patch():
@@ -253,6 +206,8 @@ def install_specopd_vllm_patch():
 
     @wraps(schedule)
     def scheduled(self, *args, **kwargs):
+        if getattr(getattr(self, "scheduler_config", None), "async_scheduling", False):
+            return schedule(self, *args, **kwargs)
         snapshots = snapshot_scheduler_round(self)
         result = schedule(self, *args, **kwargs)
         if snapshots and getattr(result, "scheduled_spec_decode_tokens", None):
@@ -268,13 +223,20 @@ def install_specopd_vllm_patch():
 
     @wraps(update)
     def updated(self, scheduler_output, model_output):
+        from verl_speco.integration.specopd_async import VERIFIED_KEY, snapshot_result_round
+
         snapshots = getattr(self, "_specopd_schedules", {}).pop(
             id(scheduler_output), {}
         )
+        result_transport = hasattr(model_output, VERIFIED_KEY) or getattr(
+            getattr(self, "scheduler_config", None), "async_scheduling", False
+        )
+        if result_transport:
+            snapshots = snapshot_result_round(self, scheduler_output, model_output)
         # Include newly admitted requests so even no-proposal responses carry
         # an explicit empty bundle instead of silently losing the channel.
         for rid, request in getattr(self, "requests", {}).items():
-            if rid not in snapshots and _plan(request):
+            if not result_transport and rid not in snapshots and _plan(request):
                 snapshots[rid] = (
                     request,
                     _plan(request),
@@ -300,6 +262,8 @@ def install_specopd_vllm_patch():
                         "drafter_revision": plan["drafter_revision"],
                         "proposal_temperature": plan["proposal_temperature"],
                         "records": getattr(request, "_specopd_records", []),
+                        "collection_enabled": plan["max_branches"] > 0,
+                        "window": [plan["start"], plan["end"]],
                     }
                     headers = dict(getattr(output, "trace_headers", None) or {})
                     headers[TRACE_KEY] = encode_bundle(bundle, plan["max_wire_bytes"])

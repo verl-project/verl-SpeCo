@@ -42,6 +42,7 @@ def make_window(
             config.max_proposal_tokens_per_request // config.proposal_width,
         ),
         "proposal_width": config.proposal_width,
+        "reservoir": bool(config.anchor_count),
         "proposal_temperature": config.proposal_temperature,
         "max_wire_bytes": config.max_wire_bytes,
     }

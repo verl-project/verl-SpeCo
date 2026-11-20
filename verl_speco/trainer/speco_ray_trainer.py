@@ -8032,10 +8032,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     @contextmanager
     def _speco_online_fit_hooks(self):
-        from verl_speco.specopd_config import SpecOPDConfig
+        from verl_speco.opd_method import spec_opd_enabled
 
         training = self.config.actor_rollout_ref.rollout.drafter.training
-        if SpecOPDConfig.from_training(training).enable:
+        if spec_opd_enabled(training):
             from verl_speco.integration.specopd_driver import specopd_fit_hooks
 
             with specopd_fit_hooks(self):

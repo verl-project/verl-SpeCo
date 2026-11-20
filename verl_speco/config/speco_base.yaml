@@ -180,26 +180,35 @@ actor_rollout_ref:
 
       training:
         mode: online
-        # Opt-in joint trajectory/branch old-logprob and one-use E2E-TV.
+        # Opt-in joint trajectory/branch old-logprob and one-use distillation.
         specopd:
           # Deprecated compatibility flag. Prefer drafter_opd.method=spec_opd.
           enable: false
-          window_mode: front
-          window_response_tokens: 512
-          random_max_offset: 512
-          max_branches_per_request: 8
-          proposal_width: 7
-          max_proposal_tokens_per_request: 56
+          # e2e_tv retains the original pure objective. tv/l1 use shared CE and distribution weights.
+          objective: e2e_tv
+          window_mode: null # Defaults to training.hidden_state_window_mode.
+          window_response_tokens: null # Defaults to training.hidden_state_window_tokens_per_sample.
+          random_max_offset: null # Defaults to training.hidden_state_random_max_offset, then 512.
+          anchor_count: 0 # 0 uses only proposals. null uses the backend's existing num_anchors.
+          random_anchor_count: null # Derived from anchor_count for mixed anchors.
+          first_reject_weight: null # Defaults to training.drafter_opd.first_reject_weight.
+          random_position_decay_gamma: null # Defaults to the backend's loss_decay_gamma.
+          max_branches_per_request: null # Derived from anchor_count, or 8 for legacy anchors.
+          proposal_width: null # Defaults to drafter.rollout.spec_verify_tokens.
+          max_proposal_tokens_per_request: null # Defaults to max_branches_per_request * proposal_width.
+          max_collect_samples_per_step: null
           scoring_token_budget: 8192
+          score_target_logz: true
           max_dense_mask_elements: 16777216
           max_wire_bytes: 1048576
           min_scored_positions_per_update: 1
           microbatch_trajectories: 1
           training_microbatch_trajectories: 4
           training_microbatch_token_budget: 16384
-          actor_temperature: 1.0
-          proposal_temperature: 1.0
-          target_temperature: 1.0
+          training_input_cache_mib: 64
+          actor_temperature: null # The three temperatures default to rollout.temperature.
+          proposal_temperature: null
+          target_temperature: null
         # Consumed by the standalone DFlash/DSpark producer only.
         # Cotrain collection keeps its existing behavior.
         preserve_prompt_hidden_states: false

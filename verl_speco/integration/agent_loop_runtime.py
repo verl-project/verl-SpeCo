@@ -563,6 +563,8 @@ def _build_speco_agent_loop_worker_class(worker_cls):
         attrs["_postprocess"] = _speco_worker_postprocess
 
     speco_worker_cls = type("SpecoAgentLoopWorker", (worker_cls,), attrs)
+    from verl_speco.integration.request_stage_diagnostics import install_request_stage_diagnostics
+    install_request_stage_diagnostics(speco_worker_cls)
     speco_worker_cls.__qualname__ = "SpecoAgentLoopWorker"
     worker_cls._speco_remote_worker_cls = speco_worker_cls
     return speco_worker_cls
@@ -922,6 +924,8 @@ def install_agent_loop_runtime_patch() -> bool:
         )
         manager_cls._speco_patched_generate_sequences = True
 
+    from verl_speco.integration.request_stage_diagnostics import install_request_stage_diagnostics
+    install_request_stage_diagnostics(worker_cls, llm_server_client_cls)
     _PATCHED = True
     logger.warning("Installed SPECO agent-loop runtime patch.")
     return True

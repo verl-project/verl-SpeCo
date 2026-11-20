@@ -13,6 +13,7 @@
 # limitations under the License.
 """Configuration contract for synchronous rollout-proposal distillation."""
 
+import math
 from dataclasses import dataclass, fields
 
 from verl_speco.opd_method import spec_opd_enabled
@@ -28,17 +29,25 @@ class SpecOPDConfig:
     max_branches_per_request: int = 8
     proposal_width: int = 7
     max_proposal_tokens_per_request: int = 56
+    max_collect_samples_per_step: int | None = None
     scoring_token_budget: int = 8192
+    score_target_logz: bool = True
     max_dense_mask_elements: int = 16777216
     max_wire_bytes: int = 1048576
     min_scored_positions_per_update: int = 1
     microbatch_trajectories: int = 1
     training_microbatch_trajectories: int = 4
     training_microbatch_token_budget: int = 16384
+    training_input_cache_mib: int = 64
     actor_temperature: float = 1.0
     proposal_temperature: float = 1.0
     target_temperature: float = 1.0
     optimizer_updates_per_collection: int = 1
+    # Zero retains the legacy branch-only path. Mixed modes reserve a quarter for trunk anchors.
+    anchor_count: int = 0
+    random_anchor_count: int = 8
+    first_reject_weight: float = 2.0
+    random_position_decay_gamma: float = 7.0
     replay: bool = False
     mix_trunk_loss: bool = False
     allow_bubble_training: bool = False
@@ -56,23 +65,98 @@ class SpecOPDConfig:
     max_drafter_revision_lag: int = 0
 
     @classmethod
-    def from_training(cls, training):
-        raw = training.get("specopd", {}) or {}
+    def from_drafter(cls, drafter, *, rollout_temperature):
+        return cls.from_training(
+            drafter.get("training") or {},
+            algorithm=drafter.get("speculative_algorithm") or "",
+            verify_tokens=(drafter.get("rollout") or {}).get("spec_verify_tokens"),
+            rollout_temperature=rollout_temperature,
+        )
+
+    @classmethod
+    def from_training(
+        cls, training, *, algorithm="", verify_tokens=None, rollout_temperature=None
+    ):
+        options = dict(training.get("specopd", {}) or {})
         allowed = {f.name for f in fields(cls)}
-        unknown = set(raw) - allowed
+        unknown = set(options) - allowed
         if unknown:
             raise ValueError(f"unknown SpecOPD options: {sorted(unknown)}")
-        result = cls(**{
-            "optimizer_updates_per_collection": training.get("step", 1),
-            **dict(raw), "enable": spec_opd_enabled(training),
-        })
-        if result.enable:
+        enabled = spec_opd_enabled(training)
+        if enabled:
+            algorithm = algorithm.lower()
+            if rollout_temperature is not None:
+                rollout_temperature = float(rollout_temperature)
+            anchors = options.get("anchor_count", cls.anchor_count)
+            if anchors is None:
+                anchors = training.get(f"{algorithm}_num_anchors")
+                if anchors not in (32, 64):
+                    raise ValueError(
+                        f"SpecOPD anchor_count=null requires {algorithm}_num_anchors=32 or 64"
+                    )
+            if type(anchors) is not int or anchors not in (0, 32, 64):
+                raise ValueError("SpecOPD anchor_count must be 0 (legacy), 32 or 64")
+            trunk_slots = anchors // 4 if anchors else cls.random_anchor_count
+            branches = options.get("max_branches_per_request")
+            if branches is None:
+                branches = anchors - trunk_slots if anchors else cls.max_branches_per_request
+            width = options.get("proposal_width")
+            if width is None:
+                width = cls.proposal_width if verify_tokens is None else verify_tokens
+            defaults = {
+                "anchor_count": anchors,
+                "proposal_width": width,
+                "actor_temperature": rollout_temperature,
+                "proposal_temperature": rollout_temperature,
+                "target_temperature": rollout_temperature,
+                "window_mode": training.get("hidden_state_window_mode") or cls.window_mode,
+                "window_response_tokens": (
+                    training.get("hidden_state_window_tokens_per_sample")
+                    or cls.window_response_tokens
+                ),
+                "random_max_offset": training.get("hidden_state_random_max_offset"),
+                "first_reject_weight": (training.get("drafter_opd") or {}).get(
+                    "first_reject_weight", cls.first_reject_weight
+                ),
+                "random_anchor_count": trunk_slots,
+                "random_position_decay_gamma": training.get(f"{algorithm}_loss_decay_gamma"),
+                "max_branches_per_request": branches,
+                "max_proposal_tokens_per_request": (
+                    branches * width
+                    if type(branches) is int and type(width) is int
+                    else cls.max_proposal_tokens_per_request
+                ),
+            }
+            for name, default in defaults.items():
+                if options.get(name) is None:
+                    options[name] = getattr(cls, name) if default is None else default
+        else:
+            # Shared YAML uses null for values resolved only by enabled SpecOPD.
+            options = {name: value for name, value in options.items() if value is not None}
+        options.setdefault("optimizer_updates_per_collection", training.get("step", 1))
+        result = cls(**{**options, "enable": enabled})
+        if enabled:
             result.validate()
         return result
 
     def validate(self):
-        import math
-
+        if type(self.anchor_count) is not int or self.anchor_count not in (0, 32, 64):
+            raise ValueError("SpecOPD anchor_count must be 0 (legacy), 32 or 64")
+        trunk_slots = self.anchor_count // 4
+        proposal_slots = self.anchor_count - trunk_slots
+        if self.anchor_count and (
+            self.random_anchor_count != trunk_slots or self.max_branches_per_request != proposal_slots
+            or self.max_proposal_tokens_per_request < proposal_slots * self.proposal_width
+        ):
+            raise ValueError(
+                f"{self.anchor_count}-anchor SpecOPD requires {proposal_slots} proposal slots "
+                f"and {trunk_slots} random trunk slots"
+            )
+        if not math.isfinite(self.first_reject_weight) or self.first_reject_weight <= 0:
+            raise ValueError("SpecOPD first_reject_weight must be finite and positive")
+        gamma = self.random_position_decay_gamma
+        if not math.isfinite(gamma) or gamma < 0:
+            raise ValueError("SpecOPD random_position_decay_gamma must be finite and nonnegative")
         if self.window_mode not in {"front", "random"}:
             raise ValueError("SpecOPD window_mode must be front or random")
         for name in (
@@ -94,10 +178,20 @@ class SpecOPDConfig:
                 raise ValueError(f"SpecOPD {name} must be a positive integer")
         if type(self.random_max_offset) is not int or self.random_max_offset < 0:
             raise ValueError("SpecOPD random_max_offset must be nonnegative")
+        if self.max_collect_samples_per_step is not None and (
+            type(self.max_collect_samples_per_step) is not int or self.max_collect_samples_per_step < 1
+        ):
+            raise ValueError("SpecOPD max_collect_samples_per_step must be a positive integer or null")
+        if type(self.training_input_cache_mib) is not int or self.training_input_cache_mib < 0:
+            raise ValueError("SpecOPD training_input_cache_mib must be a nonnegative integer")
+        if type(self.score_target_logz) is not bool:
+            raise ValueError("SpecOPD score_target_logz must be a boolean")
         for name in ("actor_temperature", "proposal_temperature", "target_temperature"):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"SpecOPD {name} must be finite and positive")
+        if self.objective not in {"e2e_tv", "tv", "l1"}:
+            raise ValueError("SpecOPD objective must be e2e_tv, tv or l1")
         if (
             self.replay
             or self.mix_trunk_loss
@@ -111,7 +205,6 @@ class SpecOPDConfig:
             or self.scoring_phase != "before_actor_update"
             or self.scorer != "actor"
             or self.scoring_impl != "joint_tree_old_logprob"
-            or self.objective != "e2e_tv"
             or self.objective_weight != 1.0
             or self.confidence_loss_weight != 0.0
             or not self.capture_rejected_tail
@@ -129,12 +222,31 @@ class SpecOPDConfig:
             raise ValueError("SpecOPD wire must fit the 1 MiB frontend transport limit")
 
 
+def specopd_loss_weights(training, algorithm):
+    """Read the existing drafter CE and distribution-loss coefficients."""
+    if algorithm.lower() == "dspark":
+        distribution = float(training.get("dspark_l1_loss_alpha", 0.9))
+        ce = float(training.get("dspark_ce_loss_alpha", 0.1))
+    else:
+        distribution = float(training.get("dflash_lk_loss_alpha", 0.0))
+        ce = float(training.get("dflash_ce_loss_alpha", 1.0))
+    if (
+        not all(math.isfinite(weight) and weight >= 0 for weight in (distribution, ce))
+        or not (distribution or ce)
+    ):
+        raise ValueError(
+            "SpecOPD CE and distribution weights must be finite, nonnegative and not both zero"
+        )
+    return distribution, ce
+
+
 def validate_specopd_config(config):
     actor = config.get("actor_rollout_ref", {})
     rollout = actor.get("rollout", {})
     drafter = rollout.get("drafter", {}) or {}
     training = drafter.get("training", {}) or {}
-    spec = SpecOPDConfig.from_training(training)
+    temperature = rollout.get("temperature", 1.0)
+    spec = SpecOPDConfig.from_drafter(drafter, rollout_temperature=temperature)
     if not spec.enable:
         return spec
     if training.get("mode", "online") != "online" or training.get("use_logits", False):
@@ -145,8 +257,6 @@ def validate_specopd_config(config):
         raise ValueError(
             "SpecOPD requires target_lm_head_row_restricted_sync=false for full target mass"
         )
-    import math
-
     rate = training.get("collection_sample_rate", 1.0)
     if (
         not isinstance(rate, (float, int))
@@ -160,9 +270,8 @@ def validate_specopd_config(config):
     sp_size = actor.get("actor", {}).get("ulysses_sequence_parallel_size", 1)
     if type(sp_size) is not int or sp_size < 1:
         raise ValueError("SpecOPD Ulysses size must be a positive integer")
-    temperature = float(rollout.get("temperature", 1.0))
     if any(
-        t != temperature
+        t != float(temperature)
         for t in (
             spec.actor_temperature,
             spec.proposal_temperature,
@@ -184,8 +293,8 @@ def validate_specopd_config(config):
         "speculative_algorithm", ""
     ).upper() not in {"DFLASH", "DSPARK", "DFLASH2"}:
         raise ValueError("SpecOPD supports vLLM DFlash/DSpark/DFlash2 only")
-    if drafter.get("vllm", {}).get("draft_sample_method", "greedy") != "probabilistic":
-        raise ValueError("SpecOPD requires vllm.draft_sample_method=probabilistic")
+    if drafter.get("vllm", {}).get("draft_sample_method", "greedy") not in {"greedy", "probabilistic"}:
+        raise ValueError("SpecOPD draft_sample_method must be greedy or probabilistic")
     trainer = config.get("trainer", {})
     if trainer.get("use_v1", False):
         v1 = trainer.get("v1", {})
@@ -254,6 +363,8 @@ def validate_specopd_config(config):
             "SpecOPD joint old-logprob does not yet support external teacher distillation outputs"
         )
     name = drafter.get("speculative_algorithm", "").lower()
+    if spec.objective in {"tv", "l1"}:
+        specopd_loss_weights(training, name)
     capacity = training.get(
         f"{name}_block_size", {"dspark": 7, "dflash2": 8}.get(name, 16)
     )
