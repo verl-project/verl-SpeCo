@@ -1656,10 +1656,16 @@ class SpecoWorker(Worker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     async def prepare_specopd_bootstrap(self, step):
         """Publish the actual restored trainer state before collecting fresh proposals."""
-        if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
+        if (
+            not self.enable_drafter
+            or not self.in_drafter_train_group
+            or self.trainer is None
+        ):
             return None
         if self.last_global_step != step:
-            raise RuntimeError("SpecOPD bootstrap must follow target-head synchronization")
+            raise RuntimeError(
+                "SpecOPD bootstrap must follow target-head synchronization"
+            )
         if not await self.trainer.activate_training_model():
             raise RuntimeError("SpecOPD bootstrap activation failed")
         self._specopd_revision = int(self.trainer.optimizer_steps_total)
@@ -1671,30 +1677,52 @@ class SpecoWorker(Worker):
         return {"revision": self._specopd_revision}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    async def prepare_specopd_group(self, payload_refs, step, revision, feature_indices):
-        if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
+    async def prepare_specopd_group(
+        self, payload_refs, step, revision, feature_indices
+    ):
+        if (
+            not self.enable_drafter
+            or not self.in_drafter_train_group
+            or self.trainer is None
+        ):
             return None
-        if revision != getattr(self, "_specopd_revision", 0) or self.last_global_step != step:
-            raise RuntimeError("SpecOPD preparation step/revision differs from synchronized state")
-        from verl_speco.integration.specopd_training_transport import stage_training_group
+        if (
+            revision != getattr(self, "_specopd_revision", 0)
+            or self.last_global_step != step
+        ):
+            raise RuntimeError(
+                "SpecOPD preparation step/revision differs from synchronized state"
+            )
+        from verl_speco.integration.specopd_training_transport import (
+            stage_training_group,
+        )
 
         from verl_speco.specopd_config import SpecOPDConfig
+
         rollout = self.config.rollout
         spec = SpecOPDConfig.from_drafter(
             rollout.drafter, rollout_temperature=rollout.temperature
         )
-        return await stage_training_group(self, payload_refs, step, revision, feature_indices, spec=spec)
+        return await stage_training_group(
+            self, payload_refs, step, revision, feature_indices, spec=spec
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def discard_specopd_group(self, step, revision, feature_indices):
-        from verl_speco.integration.specopd_training_transport import discard_training_group
+        from verl_speco.integration.specopd_training_transport import (
+            discard_training_group,
+        )
 
         return discard_training_group(self, step, revision, feature_indices)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     async def train_specopd_group(self, samples, step, revision, feature_indices):
         """Synchronous, one-use proposal update; no legacy replay/quota execution."""
-        if not self.enable_drafter or not self.in_drafter_train_group or self.trainer is None:
+        if (
+            not self.enable_drafter
+            or not self.in_drafter_train_group
+            or self.trainer is None
+        ):
             return None
         from verl_speco.specopd_config import SpecOPDConfig
 
@@ -1705,19 +1733,29 @@ class SpecoWorker(Worker):
         if not spec.enable:
             raise RuntimeError("SpecOPD RPC invoked while disabled")
         local_revision = getattr(self, "_specopd_revision", 0)
-        if revision != local_revision or step <= getattr(self, "_specopd_consumed_step", -1):
+        if revision != local_revision or step <= getattr(
+            self, "_specopd_consumed_step", -1
+        ):
             raise RuntimeError("SpecOPD revision mismatch or already consumed group")
         if self.last_global_step != step:
-            raise RuntimeError("SpecOPD group does not match synchronized target-head step")
+            raise RuntimeError(
+                "SpecOPD group does not match synchronized target-head step"
+            )
         if samples is not None:
-            raise RuntimeError("SpecOPD bulk training RPC is removed; prepare the input group first")
-        from verl_speco.integration.specopd_training_transport import take_training_group
+            raise RuntimeError(
+                "SpecOPD bulk training RPC is removed; prepare the input group first"
+            )
+        from verl_speco.integration.specopd_training_transport import (
+            take_training_group,
+        )
 
         samples = take_training_group(self, step, revision, feature_indices)
         self._specopd_consumed_step = step
         optimizer_before = self.trainer.optimizer_steps_total
         with _preserve_process_rng_state(self.device_name):
-            trained = await self.trainer.training_specopd_group(samples, step, spec, feature_indices)
+            trained = await self.trainer.training_specopd_group(
+                samples, step, spec, feature_indices
+            )
         if trained:
             self._specopd_revision = local_revision + 1
             self.last_trained_step = step
@@ -1730,7 +1768,8 @@ class SpecoWorker(Worker):
         return {
             **getattr(self.trainer, "_specopd_group_metrics", {}),
             "timing_s/specopd_release": time.perf_counter() - release_started,
-            "trained": trained, "revision": getattr(self, "_specopd_revision", 0),
+            "trained": trained,
+            "revision": getattr(self, "_specopd_revision", 0),
             "optimizer_updates": self.trainer.optimizer_steps_total - optimizer_before,
         }
 

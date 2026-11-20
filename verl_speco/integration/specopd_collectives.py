@@ -23,7 +23,15 @@ def training_schedule_digest(
         groups=list(group_sizes),
         updates=spec.optimizer_updates_per_collection,
         minimum=spec.min_scored_positions_per_update,
-        anchor_loss=tuple(getattr(spec, key, default) for key, default in (("anchor_count", 0), ("random_anchor_count", 8), ("first_reject_weight", 2.0), ("random_position_decay_gamma", 7.0))),
+        anchor_loss=tuple(
+            getattr(spec, key, default)
+            for key, default in (
+                ("anchor_count", 0),
+                ("random_anchor_count", 8),
+                ("first_reject_weight", 2.0),
+                ("random_position_decay_gamma", 7.0),
+            )
+        ),
         sp=trainer._get_sp_world_size(),
         dp=trainer._get_dp_world_size(),
     )

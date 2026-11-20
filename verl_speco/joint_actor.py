@@ -51,14 +51,18 @@ def parallel_microbatch_sizes(requests, sizes, dp_size, sp_size, options):
     groups, count = [], 0
     totals, widths, counts = [0] * dp_size, [0] * dp_size, [0] * dp_size
     for request in requests:
-        length = len(request.trunk_ids) + sum(len(b.token_ids) - 1 for b in request.branches)
+        length = len(request.trunk_ids) + sum(
+            len(b.token_ids) - 1 for b in request.branches
+        )
         width = ((length + sp_size - 1) // sp_size) * sp_size
         if length > token_budget or width * width > mask_budget:
             raise ValueError("joint trajectory exceeds its per-rank token/mask budget")
         rank = count % dp_size
-        if (totals[rank] + length > token_budget
-                or (counts[rank] + 1) * max(widths[rank], width) ** 2 > mask_budget
-                or counts[rank] + 1 > local_limit):
+        if (
+            totals[rank] + length > token_budget
+            or (counts[rank] + 1) * max(widths[rank], width) ** 2 > mask_budget
+            or counts[rank] + 1 > local_limit
+        ):
             groups.append(count)
             count = 0
             totals, widths, counts = [0] * dp_size, [0] * dp_size, [0] * dp_size
@@ -98,7 +102,8 @@ def score_actor_joint(worker, requests, *, microbatch_sizes=None, **options):
         if len(set(schedules)) != 1:
             message = (
                 "joint actor ranks must receive the same complete trajectory schedule"
-                if sizes is None else "joint actor ranks received different microbatch schedules"
+                if sizes is None
+                else "joint actor ranks received different microbatch schedules"
             )
             raise RuntimeError(message)
 
@@ -108,25 +113,38 @@ def score_actor_joint(worker, requests, *, microbatch_sizes=None, **options):
     # Preflight every local batch before any rank enters an FSDP forward.
     try:
         rank = torch.distributed.get_rank() if distributed else 0
-        _validate_actor_engine(worker, engine, sp_size, sp_group, rank, world, distributed, options)
+        _validate_actor_engine(
+            worker, engine, sp_size, sp_group, rank, world, distributed, options
+        )
         dp_size, dp_rank = world // sp_size, rank // sp_size
         nonleader = sp_size > 1 and torch.distributed.get_rank(sp_group) != 0
         if sizes is None:
             sizes = (len(requests),)
         else:
-            if not sizes or any(type(n) is not int or n <= 0 for n in sizes) or sum(sizes) != len(requests):
-                raise ValueError("joint microbatch sizes must partition the complete request schedule")
-            requests, sizes, ordered_indices = _plan_actor_batches(requests, sizes, dp_size, sp_size, options)
+            if (
+                not sizes
+                or any(type(n) is not int or n <= 0 for n in sizes)
+                or sum(sizes) != len(requests)
+            ):
+                raise ValueError(
+                    "joint microbatch sizes must partition the complete request schedule"
+                )
+            requests, sizes, ordered_indices = _plan_actor_batches(
+                requests, sizes, dp_size, sp_size, options
+            )
         offset = 0
         for length in sizes:
-            batch = requests[offset:offset + length]
+            batch = requests[offset : offset + length]
             if len({request.sample_id for request in batch}) != len(batch):
                 raise ValueError("sample IDs must be nonempty and unique")
             local_requests, dummy = partition_joint_requests(batch, dp_rank, dp_size)
-            _validate_local_batch(local_requests, engine.module.config, sp_size, options)
+            _validate_local_batch(
+                local_requests, engine.module.config, sp_size, options
+            )
             indices = (
-                ordered_indices[offset + dp_rank:offset + length:dp_size]
-                if ordered_indices is not None else ()
+                ordered_indices[offset + dp_rank : offset + length : dp_size]
+                if ordered_indices is not None
+                else ()
             )
             batches.append((local_requests, dummy, indices))
             offset += length
@@ -147,7 +165,13 @@ def score_actor_joint(worker, requests, *, microbatch_sizes=None, **options):
         with engine.eval_mode():
             for local_requests, dummy, indices in batches:
                 scored, measured = _score_local_joint_batch(
-                    engine, local_requests, sp_size, sp_group, dummy, nonleader, **options,
+                    engine,
+                    local_requests,
+                    sp_size,
+                    sp_group,
+                    dummy,
+                    nonleader,
+                    **options,
                 )
                 results.extend(scored)
                 if scored:
@@ -163,7 +187,9 @@ def score_actor_joint(worker, requests, *, microbatch_sizes=None, **options):
         for module, training in states:
             module.training = training
     if ordered_indices is not None:
-        results = [sample for _, sample in sorted(zip(result_indices, results, strict=True))]
+        results = [
+            sample for _, sample in sorted(zip(result_indices, results, strict=True))
+        ]
     return tuple(results), totals
 
 
@@ -174,15 +200,25 @@ def _plan_actor_batches(requests, sizes, dp_size, sp_size, options):
         branch_indices = []
         for index, request in enumerate(requests):
             (branch_indices if request.branches else trunk_indices).append(index)
-        if trunk_indices and branch_indices and len({r.sample_id for r in requests}) == len(requests):
+        if (
+            trunk_indices
+            and branch_indices
+            and len({r.sample_id for r in requests}) == len(requests)
+        ):
             # Group trunk-only work into the same DP rounds. Use the original
             # packing rule at the class boundary to avoid an extra dummy round.
             ordered_indices = trunk_indices + branch_indices
             requests = tuple(requests[i] for i in ordered_indices)
-    return requests, parallel_microbatch_sizes(requests, sizes, dp_size, sp_size, options), ordered_indices
+    return (
+        requests,
+        parallel_microbatch_sizes(requests, sizes, dp_size, sp_size, options),
+        ordered_indices,
+    )
 
 
-def _validate_actor_engine(worker, engine, sp_size, sp_group, rank, world, distributed, options):
+def _validate_actor_engine(
+    worker, engine, sp_size, sp_group, rank, world, distributed, options
+):
     if not getattr(worker, "_is_actor", False):
         raise ValueError("joint scoring must run on the RL actor worker")
     if engine is None or not callable(getattr(engine, "eval_mode", None)):
@@ -190,30 +226,49 @@ def _validate_actor_engine(worker, engine, sp_size, sp_group, rank, world, distr
     if sp_size < 1 or world % sp_size:
         raise ValueError("joint actor SP size must divide the actor world size")
     if getattr(engine, "use_remove_padding", True) and sp_size == 1:
-        raise NotImplementedError("joint scoring requires model.use_remove_padding=false")
+        raise NotImplementedError(
+            "joint scoring requires model.use_remove_padding=false"
+        )
     if getattr(engine, "use_ulysses_sp", False) and sp_size == 1:
         raise NotImplementedError("joint Ulysses requires an explicit SP size")
     if sp_size > 1:
-        if not distributed or sp_group is None or torch.distributed.get_world_size(sp_group) != sp_size:
-            raise ValueError("joint Ulysses requires the actor engine's initialized SP group")
+        if (
+            not distributed
+            or sp_group is None
+            or torch.distributed.get_world_size(sp_group) != sp_size
+        ):
+            raise ValueError(
+                "joint Ulysses requires the actor engine's initialized SP group"
+            )
         if not getattr(engine, "use_remove_padding", False):
             raise ValueError("upstream Ulysses requires use_remove_padding=true")
         members = torch.distributed.get_process_group_ranks(sp_group)
-        expected_members = list(range(rank // sp_size * sp_size, (rank // sp_size + 1) * sp_size))
+        expected_members = list(
+            range(rank // sp_size * sp_size, (rank // sp_size + 1) * sp_size)
+        )
         if members != expected_members:
-            raise ValueError("joint Ulysses requires the upstream contiguous [dp, sp] mesh")
+            raise ValueError(
+                "joint Ulysses requires the upstream contiguous [dp, sp] mesh"
+            )
     model_config = getattr(engine, "model_config", None)
     if getattr(model_config, "use_fused_kernels", False):
         raise NotImplementedError("joint scoring requires use_fused_kernels=false")
-    if getattr(model_config, "lora_rank", 0) or getattr(model_config, "lora_adapter_path", None):
+    if getattr(model_config, "lora_rank", 0) or getattr(
+        model_config, "lora_adapter_path", None
+    ):
         raise NotImplementedError("joint scoring has not validated LoRA actor wrappers")
     config = engine.module.config
     if config.model_type not in {"qwen2", "qwen3", "llama"} or getattr(
         config, "_attn_implementation", None
-    ) not in ({"eager", "sdpa", "flash_attention_2"} if sp_size > 1 else {"eager", "sdpa"}):
-        raise ValueError("joint actor requires a supported full-attention eager/SDPA model")
+    ) not in (
+        {"eager", "sdpa", "flash_attention_2"} if sp_size > 1 else {"eager", "sdpa"}
+    ):
+        raise ValueError(
+            "joint actor requires a supported full-attention eager/SDPA model"
+        )
     if getattr(config, "sliding_window", None) is not None or any(
-        layer != "full_attention" for layer in (getattr(config, "layer_types", None) or ())
+        layer != "full_attention"
+        for layer in (getattr(config, "layer_types", None) or ())
     ):
         raise ValueError("joint actor does not support sliding/hybrid attention")
     if sp_size > 1:
@@ -227,29 +282,42 @@ def _validate_actor_engine(worker, engine, sp_size, sp_group, rank, world, distr
 
 def _validate_local_batch(requests, config, sp_size, options):
     validate_joint_batch(
-        requests, dtype=torch.float32, vocab_size=config.vocab_size,
+        requests,
+        dtype=torch.float32,
+        vocab_size=config.vocab_size,
         max_packed_tokens=options.get("max_packed_tokens", 8192),
         max_mask_elements=options.get("max_mask_elements", 16777216),
         sequence_multiple=sp_size,
     )
     max_position = max(
-        max(len(r.trunk_ids) - 1, max((b.anchor + len(b.token_ids) - 1 for b in r.branches), default=0))
+        max(
+            len(r.trunk_ids) - 1,
+            max((b.anchor + len(b.token_ids) - 1 for b in r.branches), default=0),
+        )
         for r in requests
     )
     if max_position >= config.max_position_embeddings:
         raise ValueError("joint actor exceeds max_position_embeddings")
 
 
-def _score_local_joint_batch(engine, requests, sp_size, sp_group, dummy, nonleader, **options):
+def _score_local_joint_batch(
+    engine, requests, sp_size, sp_group, dummy, nonleader, **options
+):
     model = engine.module
     dtype = getattr(engine, "_autocast_dtype", torch.float32)
     device_type = next(model.parameters()).device.type
-    autocast = nullcontext() if dtype == torch.float32 else torch.autocast(device_type, dtype=dtype)
+    autocast = (
+        nullcontext()
+        if dtype == torch.float32
+        else torch.autocast(device_type, dtype=dtype)
+    )
     with autocast:
         if sp_size > 1:
             from verl_speco.joint_ulysses import score_ulysses_joint_batch
 
-            result, metrics = score_ulysses_joint_batch(model, requests, sp_group, **options)
+            result, metrics = score_ulysses_joint_batch(
+                model, requests, sp_group, **options
+            )
         else:
             result, metrics = score_joint_batch(model, requests, **options)
     # Only one SP rank exports a tree. Other members finish the same
@@ -263,7 +331,9 @@ def _score_local_joint_batch(engine, requests, sp_size, sp_group, dummy, nonlead
         sample.response_log_probs = sample.response_log_probs.cpu()
         if sample.response_entropy is not None:
             sample.response_entropy = sample.response_entropy.cpu()
-        sample.trunk_features = {i: value.cpu() for i, value in sample.trunk_features.items()}
+        sample.trunk_features = {
+            i: value.cpu() for i, value in sample.trunk_features.items()
+        }
         for branch in sample.branches:
             if branch.target_logits is not None:
                 branch.target_logits = branch.target_logits.cpu()

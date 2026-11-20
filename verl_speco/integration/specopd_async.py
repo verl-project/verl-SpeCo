@@ -30,10 +30,14 @@ def snapshot_verified_proposals(runner):
     selected = [
         (i, rid, plans[rid])
         for i, rid in enumerate(batch.req_ids)
-        if rid in plans and int(widths[i]) > 0
+        if rid in plans
+        and int(widths[i]) > 0
         and not bool(batch.is_prefilling_np[i])
-        and (counts.get(rid, 0) >= 0 if plans[rid].get("reservoir")
-             else counts.get(rid, 0) < plans[rid]["max_branches"])
+        and (
+            counts.get(rid, 0) >= 0
+            if plans[rid].get("reservoir")
+            else counts.get(rid, 0) < plans[rid]["max_branches"]
+        )
     ]
     if not selected:
         return {}
@@ -42,7 +46,8 @@ def snapshot_verified_proposals(runner):
     rows = [i for i, _, _ in selected]
     slots = torch.tensor(
         [int(batch.idx_mapping_np[i]) for i in rows],
-        device=runner.req_states.draft_tokens.device, dtype=torch.long,
+        device=runner.req_states.draft_tokens.device,
+        dtype=torch.long,
     )
     # Full fixed-width proposals, including tokens not admitted by the scheduler.
     drafts = runner.req_states.draft_tokens[slots]
@@ -60,8 +65,11 @@ def snapshot_verified_proposals(runner):
             if plan.get("reservoir") and offset >= plan["end"]:
                 counts[rid] = -1  # Monotone committed window has closed.
             continue
-        result[rid] = {"prefix_len": prefix_len, "proposal_ids": tokens,
-                       "scheduled_drafts": int(widths[i])}
+        result[rid] = {
+            "prefix_len": prefix_len,
+            "proposal_ids": tokens,
+            "scheduled_drafts": int(widths[i]),
+        }
         counts[rid] = counts.get(rid, 0) + 1
     return result
 
@@ -113,8 +121,14 @@ def snapshot_result_round(scheduler, scheduled, output):
             continue
         prefix_len = len(request.all_token_ids)
         offset = prefix_len - plan["prompt_len"]
-        active = (plan["max_branches"] > 0 and plan["start"] <= offset < plan["end"]
-                  and (plan.get("reservoir") or len(getattr(request, "_specopd_records", ())) < plan["max_branches"]))
+        active = (
+            plan["max_branches"] > 0
+            and plan["start"] <= offset < plan["end"]
+            and (
+                plan.get("reservoir")
+                or len(getattr(request, "_specopd_records", ())) < plan["max_branches"]
+            )
+        )
         if not active:
             # Retain the request/plan for final bundle delivery without copying
             # an ever-growing history after the capture window/budget closes.
@@ -125,9 +139,15 @@ def snapshot_result_round(scheduler, scheduled, output):
         row = evidence.get(rid) if evidence is not None else None
         if row is not None:
             if row["prefix_len"] != len(prefix):
-                raise RuntimeError("SpecOPD verified proposal prefix differs from committed history")
-            if row["scheduled_drafts"] != len(scheduled.scheduled_spec_decode_tokens.get(rid, ())):
-                raise RuntimeError("SpecOPD verified proposal belongs to a different scheduling round")
+                raise RuntimeError(
+                    "SpecOPD verified proposal prefix differs from committed history"
+                )
+            if row["scheduled_drafts"] != len(
+                scheduled.scheduled_spec_decode_tokens.get(rid, ())
+            ):
+                raise RuntimeError(
+                    "SpecOPD verified proposal belongs to a different scheduling round"
+                )
             raw = list(row["proposal_ids"])
         if active and scheduled.scheduled_spec_decode_tokens.get(rid) and not raw:
             raise RuntimeError(

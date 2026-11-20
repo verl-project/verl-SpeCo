@@ -2134,7 +2134,9 @@ class SpecoV1Mixin(V1BubbleMixin):
             actor_elapsed = time.perf_counter() - actor_started
             metrics.update(value.metrics)
             metrics["timing_s/actor_update_without_drafter"] = actor_elapsed
-            metrics["timing_s/specopd_before_actor_update"] = actor_started - drafter_started
+            metrics["timing_s/specopd_before_actor_update"] = (
+                actor_started - drafter_started
+            )
             return result
         if not self._speco_online_enabled_from_config(self.config):
             return super()._update_actor(batch, metrics)

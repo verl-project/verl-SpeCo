@@ -6,7 +6,10 @@ from functools import lru_cache
 
 import torch
 
-from verl_speco.ops.dspark_fused_loss import fused_loss_capability, fused_total_variation
+from verl_speco.ops.dspark_fused_loss import (
+    fused_loss_capability,
+    fused_total_variation,
+)
 
 
 @lru_cache(maxsize=8)
@@ -23,8 +26,14 @@ def use_fused_opd_loss(device, implementation):
     return fused
 
 
-def token_total_variation(draft_logits, target_logits, *, proposal_temperature=1.0,
-                          target_temperature=1.0, implementation="auto"):
+def token_total_variation(
+    draft_logits,
+    target_logits,
+    *,
+    proposal_temperature=1.0,
+    target_temperature=1.0,
+    implementation="auto",
+):
     if draft_logits.shape != target_logits.shape:
         raise ValueError("proposal and target supports differ")
     draft = draft_logits.float()
@@ -35,8 +44,11 @@ def token_total_variation(draft_logits, target_logits, *, proposal_temperature=1
         target = target / target_temperature
     fused = use_fused_opd_loss(draft.device, implementation)
     if fused and draft.numel():
-        return fused_total_variation(draft.reshape(-1, draft.shape[-1]),
-                                     target.reshape(-1, target.shape[-1]), average_ties=True).reshape(draft.shape[:-1])
+        return fused_total_variation(
+            draft.reshape(-1, draft.shape[-1]),
+            target.reshape(-1, target.shape[-1]),
+            average_ties=True,
+        ).reshape(draft.shape[:-1])
     with torch.no_grad():
         p = target.softmax(-1)
     q = draft.softmax(-1)

@@ -125,7 +125,9 @@ if triton is not None:
         return block_size, num_warps
 
     @triton.jit
-    def _online_stats(row_ptr, n_cols, BLOCK_SIZE: tl.constexpr, GET_LABEL: tl.constexpr):
+    def _online_stats(
+        row_ptr, n_cols, BLOCK_SIZE: tl.constexpr, GET_LABEL: tl.constexpr
+    ):
         m = float("-inf")
         d = 0.0
         label = 0
@@ -336,7 +338,10 @@ def fused_label_cross_entropy(
 
 
 def fused_total_variation(
-    draft_logits: torch.Tensor, target_logits: torch.Tensor, *, average_ties: bool = False
+    draft_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+    *,
+    average_ties: bool = False,
 ) -> torch.Tensor:
     _validate_logits(draft_logits, "draft_logits")
     _validate_logits(target_logits, "target_logits")
@@ -344,7 +349,9 @@ def fused_total_variation(
         raise ValueError("draft_logits and target_logits must have identical shapes")
     if draft_logits.device != target_logits.device:
         raise ValueError("draft_logits and target_logits must be on the same device")
-    return _FusedLoss.apply(draft_logits, target_logits.detach(), None, _OP_TV.value, average_ties)
+    return _FusedLoss.apply(
+        draft_logits, target_logits.detach(), None, _OP_TV.value, average_ties
+    )
 
 
 def fused_total_variation_and_teacher_ce(
@@ -353,6 +360,11 @@ def fused_total_variation_and_teacher_ce(
     """Unit-temperature TV and teacher-top-1 CE with one logits gradient."""
     _validate_logits(draft_logits, "draft_logits")
     _validate_logits(target_logits, "target_logits")
-    if draft_logits.shape != target_logits.shape or draft_logits.device != target_logits.device:
+    if (
+        draft_logits.shape != target_logits.shape
+        or draft_logits.device != target_logits.device
+    ):
         raise ValueError("Joint TV and CE require matching draft and target logits")
-    return _FusedLoss.apply(draft_logits, target_logits.detach(), None, _OP_TV_CE.value, True)
+    return _FusedLoss.apply(
+        draft_logits, target_logits.detach(), None, _OP_TV_CE.value, True
+    )

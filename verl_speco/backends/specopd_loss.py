@@ -18,7 +18,10 @@ import math
 import torch
 import torch.nn.functional as F
 
-from verl_speco.backends.opd_distribution import token_total_variation, use_fused_opd_loss
+from verl_speco.backends.opd_distribution import (
+    token_total_variation,
+    use_fused_opd_loss,
+)
 from verl_speco.ops.dspark_fused_loss import (
     fused_label_cross_entropy,
     fused_total_variation_and_teacher_ce,
@@ -74,8 +77,10 @@ def specopd_distribution_loss(
         alpha = 1.0 - tv
     elif candidate_ids is None and target_logz is None:
         tv = token_total_variation(
-            draft_logits, target_logits,
-            proposal_temperature=proposal_temperature, target_temperature=target_temperature,
+            draft_logits,
+            target_logits,
+            proposal_temperature=proposal_temperature,
+            target_temperature=target_temperature,
             implementation=distribution_loss_impl,
         )
         alpha = 1.0 - tv
@@ -104,7 +109,9 @@ def specopd_distribution_loss(
             ce_logits = draft_logits if ce_logits is None else ce_logits
             logits = ce_logits.flatten(0, 1)
             labels = target_logits.detach().argmax(-1).flatten()
-            if logits.numel() and use_fused_opd_loss(logits.device, distribution_loss_impl):
+            if logits.numel() and use_fused_opd_loss(
+                logits.device, distribution_loss_impl
+            ):
                 ce = fused_label_cross_entropy(logits, labels)
             else:
                 labels = labels.masked_fill(~valid_mask.flatten(), -100)

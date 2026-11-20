@@ -21,7 +21,10 @@ def training_payload_identity(samples):
             r.sample_id,
             r.trunk_ids,
             r.response_start,
-            [(b.branch_id, b.anchor, b.token_ids, b.source, b.accepted_count) for b in r.branches],
+            [
+                (b.branch_id, b.anchor, b.token_ids, b.source, b.accepted_count)
+                for b in r.branches
+            ],
             [
                 (i, tuple(t.shape), str(t.dtype))
                 for i, t in sorted(s.trunk_features.items())
