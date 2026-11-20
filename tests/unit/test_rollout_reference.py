@@ -48,6 +48,10 @@ def test_background_reference_roundtrip_and_cleanup(window_reference):
     assert torch.equal(
         result["hidden_states"], torch.ones(1, 2, 3, dtype=torch.bfloat16)
     )
+    replay = reference.resolve(handle)
+    assert torch.equal(result["hidden_states"], replay["hidden_states"])
+    assert (directory / "window.safetensors").exists()
+    assert not (directory / "assembled.ready").exists()
     assert result["target_version"] == 1
     assert result["_verl_hard_score"] == 4.0
     assert directory.exists()
@@ -74,23 +78,6 @@ def test_reference_rejects_wrong_version_before_cleanup(window_reference):
 
 def test_inline_fallback_does_not_create_an_assembled_reference():
     assert reference.submit({}, [], [], "r", 0) is None
-
-
-def test_ready_reference_can_be_replayed_until_ack(window_reference):
-    handle, directory = window_reference
-    first = reference.resolve(handle)
-    second = reference.resolve(handle)
-    assert torch.equal(first["hidden_states"], second["hidden_states"])
-    assert (directory / "window.safetensors").exists()
-    assert not (directory / "assembled.ready").exists()
-
-
-def test_background_error_is_visible_and_source_preserved(window_reference):
-    handle, directory = window_reference
-    (directory / "error").touch()
-    with pytest.raises(RuntimeError, match="export failed"):
-        reference.resolve(handle)
-    assert (directory / "error").exists()
 
 
 def test_byte_budget_held_until_ack(tmp_path, monkeypatch):
@@ -587,15 +574,17 @@ def test_window_metadata_contract_is_checked_before_consume(
     assert (directory / "window.safetensors").exists()
 
 
-def test_export_error_is_not_hidden_by_short_response_or_ack(window_reference):
+@pytest.mark.parametrize("empty_response", [False, True], ids=["normal", "empty"])
+def test_export_error_rejects_resolve_and_ack(window_reference, empty_response):
     handle, directory = window_reference
-    handle["response"] = []
+    if empty_response:
+        handle["response"] = []
     (directory / "error").touch()
     with pytest.raises(RuntimeError, match="export failed"):
         reference.resolve(handle)
     with pytest.raises(RuntimeError, match="source retained"):
         reference.acknowledge(handle)
-    assert directory.exists()
+    assert (directory / "error").exists()
 
 
 def test_reference_reservation_identity_cannot_be_substituted(window_reference):

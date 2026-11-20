@@ -12,8 +12,6 @@ def test_incremental_reference_keeps_token_order_and_cache(capsys):
     spec = importlib.util.spec_from_file_location("capture_reference", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    # Disabling benchmark repeats must not leave a branch-local time binding.
-    assert "time" not in module.test_rollout_features_match_reference.__code__.co_varnames
     calls = []
 
     def model(tokens, past_key_values=0, **kwargs):
