@@ -2323,7 +2323,7 @@ def _collection_alignment_driver(
 def test_interval_collection_matches_sync_before_routing(
     owners, hard_ratio, token_budget
 ):
-    import torch
+    torch = pytest.importorskip("torch")
 
     common = dict(owners=owners, hard_ratio=hard_ratio, token_budget=token_budget)
     sync, batch = _collection_alignment_driver(bubble=False, routed=(), **common)
@@ -2389,7 +2389,7 @@ def _bind_collection_writer(driver, *, owners, tp):
 def test_first_quota_writer_replay_contains_entire_sync_sample_set(
     owners, tp, hard_ratio
 ):
-    import torch
+    torch = pytest.importorskip("torch")
 
     from verl_speco.trainer.data_buffer import DataBuffer
     from verl_speco.trainer.scheduler import DrafterCollectionSource
@@ -2451,6 +2451,7 @@ def test_first_quota_writer_replay_contains_entire_sync_sample_set(
 
 
 def test_empty_interval_collection_does_not_pin_bootstrap_writer():
+    pytest.importorskip("torch")
     driver, batch = _collection_alignment_driver(bubble=True, owners=2, routed=())
     scheduler, _ = _bind_collection_writer(driver, owners=2, tp=2)
     batch.batch["response_mask"].zero_()
@@ -2459,6 +2460,7 @@ def test_empty_interval_collection_does_not_pin_bootstrap_writer():
 
 
 def test_adaptive_collection_does_not_elect_bootstrap_writer():
+    pytest.importorskip("torch")
     driver, batch = _collection_alignment_driver(
         bubble=True, owners=2, routed=(), mode="adaptive"
     )
@@ -2468,6 +2470,7 @@ def test_adaptive_collection_does_not_elect_bootstrap_writer():
 
 
 def test_adaptive_collection_retains_existing_writer_minimum():
+    pytest.importorskip("torch")
     driver, batch = _collection_alignment_driver(
         bubble=True,
         owners=2,
@@ -2481,7 +2484,7 @@ def test_adaptive_collection_retains_existing_writer_minimum():
 
 @pytest.mark.parametrize("algorithm", ["DFLASH", "EAGLE3"])
 def test_interval_collection_alignment_is_not_dspark_specific(algorithm):
-    import torch
+    torch = pytest.importorskip("torch")
 
     sync, batch = _collection_alignment_driver(
         bubble=False,

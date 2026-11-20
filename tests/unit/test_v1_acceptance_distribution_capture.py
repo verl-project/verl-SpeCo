@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Execute deployed-method ASTs: existing JSONL pipeline and V1 integration."""
 import ast
 import json
@@ -7,8 +10,9 @@ import os
 from pathlib import Path
 from typing import Any, cast
 
-import numpy as np
 import pytest
+
+np = pytest.importorskip("numpy")
 
 
 

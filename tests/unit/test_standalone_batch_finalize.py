@@ -8,7 +8,8 @@ from threading import Event, Thread, get_ident
 from types import SimpleNamespace
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.trainer.standalone_batch_finalize import AsyncBatchFinalizer
 

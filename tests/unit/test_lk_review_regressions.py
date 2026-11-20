@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any, Optional, cast
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 ROOT = Path(__file__).resolve().parents[2]
 

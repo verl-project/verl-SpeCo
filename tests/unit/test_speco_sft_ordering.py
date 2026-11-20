@@ -9,7 +9,8 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 # ---------------------------------------------------------------------------
 # verl 路径解析：CI 中 verl 被 clone 到 .ci/upstream-verl，本地环境可能通过

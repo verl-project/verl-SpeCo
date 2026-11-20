@@ -11,7 +11,8 @@ from queue import Queue
 from types import SimpleNamespace
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 import torch.distributed as dist
 import torch.multiprocessing as mp
 

@@ -10,7 +10,8 @@ from types import SimpleNamespace
 from typing import Any, Optional, cast
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 import verl_speco.trainer.target_feature_replay as replay
 from verl_speco.backends.target_hidden import gather_aligned_target_hidden
 

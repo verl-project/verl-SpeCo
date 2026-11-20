@@ -8,7 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 from safetensors.torch import load_file, save_file
 
 from verl_speco.producer.hidden_states_store import (

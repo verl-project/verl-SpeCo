@@ -188,9 +188,14 @@ def test_convert_checkpoint_can_symlink_weights_and_overwrites(tmp_path) -> None
     output.mkdir()
     (output / "model.safetensors").write_bytes(b"stale")
 
-    convert_speculators_dflash2_checkpoint(
-        str(source), str(target), str(output), link_weights=True
-    )
+    try:
+        convert_speculators_dflash2_checkpoint(
+            str(source), str(target), str(output), link_weights=True
+        )
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("the Windows test process cannot create symbolic links")
+        raise
 
     assert os.path.islink(output / "model.safetensors")
     assert (output / "model.safetensors").read_bytes() == b"weights"

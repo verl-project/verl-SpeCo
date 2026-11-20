@@ -106,6 +106,7 @@ def test_worker_group_facade_delegates_attach_and_require(monkeypatch):
 
 
 def test_update_actor_skips_drafter_execution_when_plan_does_not_launch():
+    pytest.importorskip("ray")
     class Plan:
         launch = False
         reason = "training_interval_not_reached"
@@ -139,6 +140,7 @@ def test_update_actor_skips_drafter_execution_when_plan_does_not_launch():
 
 
 def test_online_drafter_trains_only_on_last_local_update_of_global_step():
+    pytest.importorskip("ray")
     events = []
 
     class Plan:
@@ -622,6 +624,7 @@ def test_bubble_head_export_is_fenced_before_restoring_current_policy(
 def test_separate_async_collection_shares_parent_old_policy_snapshots(
     collect_steps, old_policy_trainer
 ):
+    pytest.importorskip("ray")
     class Parent:
         # Same CPU-slot contract as native PPOTrainerSeparateAsync. Its path
         # must remain compatible when collection is skipped between forwards.
@@ -682,7 +685,7 @@ def test_separate_async_collection_restores_weights_on_failure(
 def test_old_logprob_collection_forward_runs_under_old_policy(
     monkeypatch, old_policy_trainer
 ):
-    import torch
+    torch = pytest.importorskip("torch")
     from verl.utils import tensordict_utils as tu
     from verl.workers.utils import padding
 
@@ -727,6 +730,7 @@ def test_old_logprob_collection_forward_runs_under_old_policy(
 
 
 def test_async_publish_waits_after_upstream_weight_sync():
+    pytest.importorskip("ray")
     events = []
 
     class Upstream:
@@ -761,6 +765,7 @@ def test_async_publish_waits_after_upstream_weight_sync():
 
 @pytest.mark.parametrize("failure", [None, "abort", "publish"])
 def test_colocate_probe_boundary_holds_admission_and_releases_on_failure(failure):
+    pytest.importorskip("ray")
     events = []
 
     class Upstream:
@@ -1033,6 +1038,7 @@ def test_fit_shuts_down_stateful_dataloader_workers_before_ray_teardown():
 
 
 def test_async_prefit_warmup_is_sampleable_before_upstream_fit(monkeypatch):
+    pytest.importorskip("ray")
     events = []
     fake_skip_manager = types.SimpleNamespace(
         init=lambda config: events.append("skip_init"),
@@ -1120,6 +1126,7 @@ def test_async_prefit_warmup_is_sampleable_before_upstream_fit(monkeypatch):
 
 
 def test_joint_checkpoint_manifest_records_drafter_and_feature_store(tmp_path):
+    pytest.importorskip("ray")
     class Harness(SpecoV1Mixin):
         global_steps = 7
         trainer_mode = "colocate_async"
@@ -1139,6 +1146,7 @@ def test_joint_checkpoint_manifest_records_drafter_and_feature_store(tmp_path):
 
 
 def test_bubble_manifest_restores_writer_and_versions_without_feature_store(tmp_path):
+    pytest.importorskip("ray")
     trainer = SpecoV1Mixin()
     trainer.config = _config(mode="sync")
     trainer.config.trainer.default_local_dir = str(tmp_path)
@@ -1742,6 +1750,7 @@ def test_v1_checkpoint_saves_and_resumes_adaptive_state(monkeypatch, tmp_path):
 
 
 def test_v1_emits_trainer_phase_spans_for_prepare_train_and_publish(monkeypatch):
+    pytest.importorskip("ray")
     from contextlib import nullcontext
 
     import verl_speco.trainer.v1.speco_mixin as mixin

@@ -1,7 +1,11 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from types import SimpleNamespace as NS
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 from torch import nn
 from verl_speco.integration import oldlogprob_runtime as rt
 from verl_speco.integration.oldlogprob_layer_ids import (

@@ -21,8 +21,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pytest
+
+np = pytest.importorskip("numpy")
 
 torch = pytest.importorskip("torch")
 

@@ -975,7 +975,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_log_probs = None
         restricted_vocab = None
         use_fused_loss = self._use_fused_distribution_loss(device)
-        unused_projections = []
+        unused_projections: list[torch.nn.Module | None] = []
         confidence_evaluated = False
         vat_loss = flat_hidden[:0].sum()
         vat_metrics = {}
@@ -1015,7 +1015,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
             # Even a rank without active labels must enter the model's
             # backward collectives when its peers have valid tokens.
             loss = flat_hidden[:0].sum()
-            if active_prev_embeddings is not None:
+            if markov_head is not None and active_prev_embeddings is not None:
                 loss = loss + active_prev_embeddings.sum()
                 unused_projections.extend(
                     (markov_head.markov_w2, getattr(markov_head, "gate_proj", None))

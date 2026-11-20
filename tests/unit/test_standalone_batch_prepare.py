@@ -9,7 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 from safetensors.torch import save_file
 
 from verl_speco.trainer.standalone_batch_prepare import prepare_standalone_cpu_batch
