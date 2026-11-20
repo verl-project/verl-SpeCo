@@ -15,15 +15,17 @@ from verl_speco.specopd_config import validate_specopd_config
 
 
 @pytest.mark.parametrize(
-    "script,method",
+    "script,method,objective",
     [
-        ("run_qwen3-8b-specopd_drafter_dflash_vllm.sh", "spec_opd"),
-        ("run_qwen3-8b-specopd_drafter_dflash_vllm.sh", "draft_opd"),
-        ("run_qwen3-8b-draftopd_drafter_dflash_vllm.sh", "draft_opd"),
-        ("run_qwen3-8b-draftopd_drafter_dspark_vllm.sh", "draft_opd"),
+        ("run_qwen3-8b-specopd_drafter_dflash_vllm.sh", "spec_opd", None),
+        ("run_qwen3-8b-specopd_drafter_dflash_vllm.sh", "draft_opd", None),
+        ("run_qwen3-8b-draftopd_drafter_dflash_vllm.sh", "draft_opd", None),
+        ("run_qwen3-8b-draftopd_drafter_dspark_vllm.sh", "draft_opd", None),
+        ("run_qwen3-8b-specopd_drafter_dflash_vllm.sh", "spec_opd", "tv"),
+        ("run_qwen3-8b-specopd_drafter_dflash_vllm.sh", "spec_opd", "l1"),
     ],
 )
-def test_resolved_launch_selects_one_runnable_config(script, method):
+def test_resolved_launch_selects_one_runnable_config(script, method, objective):
     root = Path(__file__).resolve().parents[2]
     bash = shutil.which("bash")
     if bash is None and Path("C:/Program Files/Git/bin/bash.exe").exists():
@@ -35,9 +37,18 @@ def test_resolved_launch_selects_one_runnable_config(script, method):
         env[key] = "/unused/test-path"
     # Follow the existing wrapper/base scripts. Intercept only the final
     # training command and emit its exact argv, including rightmost overrides.
-    harness = 'bash() { source "$@"; }; python3() { printf "%s\\0" "$@"; }; source "$1"'
+    harness = 'python() { python3 "$@"; }; bash() { source "$@"; }; python3() { printf "%s\\0" "$@"; }; source "$1" "${@:2}"'
+    overrides = (
+        [
+            f"actor_rollout_ref.rollout.drafter.training.specopd.objective={objective}",
+            "actor_rollout_ref.rollout.drafter.training.dflash_ce_loss_alpha=0.1",
+            "actor_rollout_ref.rollout.drafter.training.dflash_lk_loss_alpha=0.9",
+        ]
+        if objective
+        else []
+    )
     output = subprocess.run(
-        [bash, "-c", harness, "opd-config-test", f"examples/{script}"],
+        [bash, "-c", harness, "opd-config-test", f"examples/{script}", *overrides],
         cwd=root,
         env=env,
         capture_output=True,
@@ -49,13 +60,20 @@ def test_resolved_launch_selects_one_runnable_config(script, method):
         OmegaConf.load(root / "verl_speco/config/speco_base.yaml"),
         OmegaConf.from_dotlist([arg.lstrip("+") for arg in argv[2:]]),
     )
+    assert config.actor_rollout_ref.rollout.drafter.vllm.draft_sample_method == "greedy"
     training = config.actor_rollout_ref.rollout.drafter.training
     assert resolve_opd_method(training) == method
     spec = validate_specopd_config(config)
     assert spec.enable == (method == "spec_opd")
+    assert spec.objective == (objective or "e2e_tv")
     assert config.actor_rollout_ref.model.use_remove_padding == (method == "draft_opd")
     assert bool(capture_verify_trace_enabled(training)) == (method == "draft_opd")
     if spec.enable:
+        rollout = config.actor_rollout_ref.rollout
+        assert spec.proposal_width == rollout.drafter.rollout.spec_verify_tokens
+        assert (spec.actor_temperature, spec.proposal_temperature, spec.target_temperature) == (
+            rollout.temperature,
+        ) * 3
         assert (
             config.actor_rollout_ref.model.override_config.attn_implementation
             == "eager"

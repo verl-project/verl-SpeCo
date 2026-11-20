@@ -279,6 +279,46 @@ def test_specopd_request_rejects_unacknowledged_revision_before_generation(monke
         ))
 
 
+def test_specopd_vllm_uses_the_server_temperature_and_existing_verify_width(monkeypatch):
+    from verl_speco.integration import specopd_window
+
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: {
+        "speculative_algorithm": "DSPARK",
+        "rollout": {"spec_verify_tokens": 5},
+        "training": {
+            "dspark_num_anchors": 32,
+            "drafter_opd": {"enable": True, "method": "spec_opd"},
+            "specopd": {"anchor_count": None},
+        },
+    })
+    server = SimpleNamespace(
+        config=SimpleNamespace(temperature=0.6, response_length=32),
+        global_steps=1,
+        _speco_serving_drafter_revision=2,
+        _speco_request_id_from_generate_call=lambda *_: "request",
+    )
+
+    class WindowReady(Exception):
+        pass
+
+    def inspect_window(spec, *args):
+        assert (spec.proposal_temperature, spec.proposal_width) == (0.6, 5)
+        assert spec.max_proposal_tokens_per_request == 24 * 5
+        raise WindowReady
+
+    monkeypatch.setattr(specopd_window, "make_window", inspect_window)
+    for temperature, failure in ((0.6, WindowReady), (1.0, ValueError)):
+        with pytest.raises(failure):
+            asyncio.run(vllm_runtime._speco_generate_with_request_stats_unblocked(
+                server, None, (), {
+                    "prompt_ids": [10],
+                    "sampling_params": {
+                        "temperature": temperature, "_specopd_drafter_revision": 2,
+                    },
+                },
+            ))
+
+
 def test_reinstall_bridge_refreshes_config_after_early_install(monkeypatch):
     class Server:
         async def launch_server(self):

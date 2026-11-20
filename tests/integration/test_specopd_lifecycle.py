@@ -31,49 +31,6 @@ from verl_speco.transport.specopd_protocol import (
 )
 
 
-@pytest.mark.parametrize("collect", [False, True])
-@pytest.mark.parametrize("method", ["draft_opd", "spec_opd"])
-@pytest.mark.parametrize("npu", [False, True])
-def test_mrv2_copies_real_draft_ids_only_for_specopd(monkeypatch, method, npu, collect):
-    from verl_speco.integration import vllm_runtime
-
-    class Handler:
-        def set_draft_tokens(self, batch, tokens):
-            self.req_ids = batch.req_ids
-            self.tokens = tokens if batch.has_structured_output_reqs else [[-1] * len(tokens[0])]
-
-        def get_draft_tokens(self):
-            return SimpleNamespace(draft_token_ids=self.tokens)
-
-    class NPUTokens(list):
-        device = SimpleNamespace(type="npu")
-
-        def detach(self):
-            return self
-
-        def cpu(self):
-            return self
-
-        def tolist(self):
-            return list(self)
-
-    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: {
-        "training": {"drafter_opd": {"enable": True, "method": method}},
-    })
-    batch = SimpleNamespace(req_ids=["r"], has_structured_output_reqs=False)
-    tokens = [[11, 12, 13]]
-    if npu:
-        tokens = NPUTokens(tokens)
-    handler = Handler()
-    handler._specopd_collecting_requests = {"r"} if collect else set()
-    assert specopd_vllm.patch_draft_token_handler(Handler)
-    assert specopd_vllm.patch_draft_token_handler(Handler)
-    handler.set_draft_tokens(batch, tokens)
-    assert handler.get_draft_tokens().draft_token_ids == (tokens if method == "spec_opd" and collect else [[-1, -1, -1]])
-    assert not batch.has_structured_output_reqs
-    assert handler.req_ids == ["r"]
-
-
 def test_vllm_scheduler_to_final_output_channel(monkeypatch):
     plan = make_window(SpecOPDConfig(proposal_width=3), "external", 0, 0, 3, 20)
     request = SimpleNamespace(
@@ -174,7 +131,15 @@ def configuration():
 
 
 @pytest.mark.parametrize("separate_llm_manager", [False, True])
-def test_fit_hooks_replace_normal_forward_and_train_before_actor_update(monkeypatch, separate_llm_manager):
+@pytest.mark.parametrize("score_target_logz", [False, True])
+def test_fit_hooks_replace_normal_forward_and_train_before_actor_update(
+    monkeypatch, separate_llm_manager, score_target_logz,
+):
+    from verl_speco.integration import specopd_training_transport
+
+    monkeypatch.setattr(specopd_training_transport, "dispatch_prepared_group",
+        lambda trainer, samples, step, revision, indices, metrics, spec:
+        trainer._require_speco_worker_group().train_specopd_group(samples, step, revision, indices))
     events, calls = [], []
     acknowledgements = []
     cfg = Qwen3Config(
@@ -224,6 +189,7 @@ def test_fit_hooks_replace_normal_forward_and_train_before_actor_update(monkeypa
     class ActorGroup:
         def compute_joint_old_log_prob(self, requests, **options):
             events.append("joint")
+            assert options["return_target_logz"] == score_target_logz
             options.pop("microbatch_sizes", None)
             return [score_joint_batch(model, requests, **options)]
 
@@ -235,12 +201,15 @@ def test_fit_hooks_replace_normal_forward_and_train_before_actor_update(monkeypa
         def train_specopd_group(self, samples, step, revision, indices):
             events.append("draft-update")
             assert len(samples[0][0].branches[0].token_ids) == 3
+            assert (samples[0][1].branches[0].target_logz is not None) == score_target_logz
             assert indices == (1, 2)
             return [{"trained": True, "revision": revision + 1}]
 
     class Trainer:
         def __init__(self):
             self.config = configuration()
+            training = self.config["actor_rollout_ref"]["rollout"]["drafter"]["training"]
+            training["specopd"]["score_target_logz"] = score_target_logz
             self.global_steps = 1
             self.actor_rollout_wg = ActorGroup()
             self.drafter_wg = DrafterGroup()
@@ -418,6 +387,23 @@ def test_serving_ack_rejects_wrong_draft_or_inconsistent_actor_revisions(replies
         driver.acknowledge_serving_revision(0)
 
 
+@pytest.mark.parametrize("limit,quotas", [(80, [10] * 8), (3, [1] * 3 + [0] * 5)])
+def test_serving_ack_distributes_global_collection_limit(limit, quotas):
+    cfg = configuration()
+    cfg["actor_rollout_ref"]["rollout"]["drafter"]["training"]["specopd"]["max_collect_samples_per_step"] = limit
+    received = []
+
+    def acknowledge(revision, *, collection_quota):
+        received.append(collection_quota)
+        return {"actor_revision": 4, "drafter_revision": revision, "collection_quota": collection_quota}
+
+    server = SimpleNamespace(speco_set_serving_drafter_revision=SimpleNamespace(remote=acknowledge))
+    trainer = SimpleNamespace(config=cfg, llm_server_manager=SimpleNamespace(server_handles=[server] * 8),
+                              _ray_get_if_needed=lambda values: values)
+    specopd_driver.SpecOPDDriver(trainer).acknowledge_serving_revision(0)
+    assert received == quotas
+
+
 def test_mrv2_request_tracking_is_runner_local_and_cleans_evictions():
     class Runner:
         def __init__(self):
@@ -433,7 +419,7 @@ def test_mrv2_request_tracking_is_runner_local_and_cleans_evictions():
             extra_args={"specopd_plan": {"max_branches": branches}}))
     assert left.add_requests(SimpleNamespace(scheduled_new_reqs=[request("yes", 8), request("no", 0)])) == "added"
     right.add_requests(SimpleNamespace(scheduled_new_reqs=[]))
-    assert left.draft_tokens_handler._specopd_collecting_requests == {"yes"}
-    assert right.draft_tokens_handler._specopd_collecting_requests == set()
+    assert set(left.draft_tokens_handler._specopd_plans) == {"yes"}
+    assert right.draft_tokens_handler._specopd_plans == {}
     assert left._remove_request("yes") == "removed"
-    assert left.draft_tokens_handler._specopd_collecting_requests == set()
+    assert left.draft_tokens_handler._specopd_plans == {}

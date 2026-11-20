@@ -65,8 +65,9 @@ def classes(monkeypatch):
 
 
 @pytest.mark.parametrize("algorithm", ["dflash", "dspark", "dflash2"])
+@pytest.mark.parametrize("objective", ["e2e_tv", "tv", "l1"])
 def test_joint_actor_to_real_drafter_backward_without_resampling(
-    classes, algorithm, monkeypatch
+    classes, algorithm, objective, monkeypatch
 ):
     torch.manual_seed(21)
     target_config = Qwen3Config(
@@ -128,26 +129,73 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
         "_sample_anchor_positions",
         lambda *a, **k: pytest.fail("anchors were resampled"),
     )
+    spec = SpecOPDConfig(proposal_width=3, objective=objective)
     batch = build_specopd_training_batch(
-        request, scored[0], next(wrapper.parameters()).device, SpecOPDConfig(proposal_width=3), (1, 2)
+        request, scored[0], next(wrapper.parameters()).device, spec, (1, 2)
     )
     fixed_inputs = {k: v.clone() for k, v in batch.items() if torch.is_tensor(v)}
-    backend = SimpleNamespace(target_lm_head=SimpleNamespace(fc=target.lm_head))
+    dist_key, ce_key = (
+        ("dspark_l1_loss_alpha", "dspark_ce_loss_alpha")
+        if algorithm == "dspark"
+        else ("dflash_lk_loss_alpha", "dflash_ce_loss_alpha")
+    )
+    training = {dist_key: 0.9, ce_key: 0.1}
+    drafter = SimpleNamespace(speculative_algorithm=algorithm.upper(), training=training)
+    backend = SimpleNamespace(
+        target_lm_head=SimpleNamespace(fc=target.lm_head),
+        config=SimpleNamespace(rollout=SimpleNamespace(drafter=drafter)),
+    )
     # Teacher projection weights are inputs to draft logits, but the target is
     # frozen; backward must update only the actual draft network.
     target.requires_grad_(False)
     optimizer = torch.optim.SGD(wrapper.parameters(), lr=0.1)
     before = draft.fc.weight.detach().clone()
     loss = compute_specopd_backend_loss(backend, wrapper, batch)
+    if objective != "e2e_tv":
+        training.update({dist_key: 1.0, ce_key: 0.0})
+        distribution = compute_specopd_backend_loss(backend, wrapper, batch)
+        training.update({dist_key: 0.0, ce_key: 1.0})
+        ce = compute_specopd_backend_loss(backend, wrapper, batch)
+        training.update({dist_key: 0.9, ce_key: 0.1})
+        assert ce["total_local_ploss"] > 0
+        torch.testing.assert_close(
+            loss["total_local_ploss"],
+            0.9 * distribution["total_local_ploss"] + 0.1 * ce["total_local_ploss"],
+        )
     changed = dict(batch)
-    changed["input_ids"] = batch["input_ids"].clone()
+    # Restore a full response suffix to compare against the cropped context.
+    assert batch["input_ids"].shape[1] == 5
+    changed["input_ids"] = torch.tensor([request.trunk_ids])
     changed["input_ids"][0, -1] = 22
-    changed["hidden_states"] = batch["hidden_states"].clone()
+    changed["hidden_states"] = torch.cat([scored[0].trunk_features[i] for i in (1, 2)], -1).unsqueeze(0).clone()
     changed["hidden_states"][:, -1] = torch.randn_like(changed["hidden_states"][:, -1])
     unchanged = compute_specopd_backend_loss(backend, wrapper, changed)
     torch.testing.assert_close(
         loss["total_local_ploss"], unchanged["total_local_ploss"]
     )
+    parameters = tuple(wrapper.parameters())
+    cropped_grad = torch.autograd.grad(loss["total_local_ploss"], parameters, retain_graph=True, allow_unused=True)
+    if algorithm == "dspark":
+        lean_scores, _ = score_joint_batch(
+            target, [request], hidden_state_indices=(1, 2),
+            return_target_logits=False, return_target_logz=False,
+        )
+        assert all(branch.target_logz is None for branch in lean_scores[0].branches)
+        lean_batch = build_specopd_training_batch(
+            request, lean_scores[0], next(wrapper.parameters()).device,
+            spec, (1, 2),
+        )
+        lean_loss = compute_specopd_backend_loss(backend, wrapper, lean_batch)
+        torch.testing.assert_close(lean_loss["total_local_ploss"], loss["total_local_ploss"], atol=0, rtol=0)
+        lean_grad = torch.autograd.grad(lean_loss["total_local_ploss"], parameters, allow_unused=True)
+        for actual, expected in zip(lean_grad, cropped_grad, strict=True):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    full_grad = torch.autograd.grad(unchanged["total_local_ploss"], parameters, retain_graph=True, allow_unused=True)
+    for a, b in zip(cropped_grad, full_grad, strict=True):
+        if a is None or b is None:
+            assert a is b
+        else:
+            torch.testing.assert_close(a, b, atol=2e-5, rtol=2e-4)
     assert loss["local_num_tokens"] == 6
     assert metrics["model_forward_calls"] == 1
     (loss["total_local_ploss"] / loss["local_num_tokens"]).backward()
@@ -174,7 +222,7 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
     for key, value in fixed_inputs.items():
         torch.testing.assert_close(batch[key], value)
     fresh = build_specopd_training_batch(
-        request, scored[0], next(wrapper.parameters()).device, SpecOPDConfig(proposal_width=3), (1, 2)
+        request, scored[0], next(wrapper.parameters()).device, spec, (1, 2)
     )
     reused_loss = compute_specopd_backend_loss(backend, wrapper, batch)
     fresh_loss = compute_specopd_backend_loss(backend, wrapper, fresh)
@@ -198,7 +246,7 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
         req = replace(request, sample_id=f"sample-{index}", branches=branches,
                       trunk_ids=request.trunk_ids[:-1] if index == 2 else request.trunk_ids)
         scores, _ = score_joint_batch(target, [req], hidden_state_indices=(1, 2), return_target_logits=False)
-        item = build_specopd_training_batch(req, scores[0], 'cpu', SpecOPDConfig(proposal_width=3), (1, 2))
+        item = build_specopd_training_batch(req, scores[0], 'cpu', spec, (1, 2))
         if index == 3:
             item['proposal_mask'].zero_()  # DP dummy row
         ragged.append(item)
@@ -300,3 +348,67 @@ def test_preserved_draftopd_baseline_real_backward(
     assert torch.isfinite(wrapper.draft_model.fc.weight.grad).all()
     if not empty:
         assert wrapper.draft_model.fc.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("objective", ["e2e_tv", "tv", "l1"])
+def test_mixed_dspark_joint_forward_backward_and_dummy_batch(classes, objective):
+    from verl_speco.backends.specopd_forward import merge_specopd_training_batches
+
+    torch.manual_seed(29)
+    target_config = Qwen3Config(vocab_size=32, hidden_size=16, intermediate_size=32,
+        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+        head_dim=8, max_position_embeddings=128)
+    target_config._attn_implementation = "eager"
+    target = Qwen3ForCausalLM(target_config).eval().requires_grad_(False)
+    from verl_speco.integration.specopd_anchors import add_trunk_anchors
+    config = SpecOPDConfig(anchor_count=32, max_branches_per_request=24,
+                          max_proposal_tokens_per_request=72, proposal_width=3,
+                          objective=objective)
+    ids = tuple(i % 30 for i in range(43))
+    proposals = [DraftBranch(f"proposal{i}", 2+i, (11, 12, 13), accepted_count=1) for i in range(24)]
+    branches = add_trunk_anchors(proposals, ids, 3,
+        dict(request_id="mixed", actor_revision=0, drafter_revision=0, window=[0, 40]), config)
+    request = JointScoringRequest("mixed", ids, 3, tuple(branches))
+    scores, measured = score_joint_batch(target, [request], hidden_state_indices=(1, 2), return_target_logits=False)
+    batch = build_specopd_training_batch(request, scores[0], "cpu", config, (1, 2))
+    torch.testing.assert_close(batch["position_weights"][0], torch.tensor([1., 2., 1.]))
+    torch.testing.assert_close(batch["position_weights"][24], torch.exp(-torch.arange(3).float()/7))
+    cfg_cls, draft_cls, wrapper_cls = classes["dspark"]
+    draft = draft_cls(cfg_cls(vocab_size=32, hidden_size=16, intermediate_size=32,
+        num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1, head_dim=8,
+        num_context_layers=2, target_hidden_size=16, target_num_hidden_layers=2,
+        mask_token_id=31, max_position_embeddings=128, block_size=3,
+        conv_group_size=8, markov_rank=8))
+    model = wrapper_cls(draft_model=draft, block_size=3, num_anchors=2)
+    drafter = SimpleNamespace(speculative_algorithm="DSPARK", training={})
+    backend = SimpleNamespace(
+        target_lm_head=SimpleNamespace(fc=target.lm_head),
+        config=SimpleNamespace(rollout=SimpleNamespace(drafter=drafter)),
+    )
+    loss = compute_specopd_backend_loss(backend, model, batch)
+    assert measured["model_forward_calls"] == 1
+    assert loss["local_num_tokens"] == 32  # Equal anchor, rather than token, weight.
+    dummy = dict(batch, proposal_mask=torch.zeros_like(batch["proposal_mask"]))
+    combined = compute_specopd_backend_loss(backend, model, merge_specopd_training_batches([batch, dummy]))
+    torch.testing.assert_close(combined["total_local_ploss"], loss["total_local_ploss"])
+    assert combined["local_num_tokens"] == 32
+    # The optional ten-trajectory profile must preserve the same complete-group
+    # objective and gradients as the default [4, 4, 2] accumulation schedule.
+    ten = compute_specopd_backend_loss(backend, model, merge_specopd_training_batches([batch] * 10))
+    parts = [compute_specopd_backend_loss(backend, model, merge_specopd_training_batches([batch] * n))
+             for n in (4, 4, 2)]
+    parts_sum = sum(part["total_local_ploss"] for part in parts)
+    parts_count = sum(part["local_num_tokens"] for part in parts)
+    assert ten["local_num_tokens"] == parts_count == 320
+    torch.testing.assert_close(ten["total_local_ploss"], parts_sum)
+    parameters = tuple(model.parameters())
+    ten_grads = torch.autograd.grad(ten["total_local_ploss"] / parts_count, parameters, allow_unused=True)
+    parts_grads = torch.autograd.grad(parts_sum / parts_count, parameters, allow_unused=True)
+    for actual, expected in zip(ten_grads, parts_grads, strict=True):
+        if actual is None or expected is None:
+            assert actual is expected
+        else:
+            torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    (loss["total_local_ploss"] / loss["local_num_tokens"]).backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in draft.markov_head.parameters())
+    assert all(p.grad is None for p in target.parameters())

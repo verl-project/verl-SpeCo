@@ -11,7 +11,7 @@ from verl_speco.backends.specopd_forward import partition_specopd_samples
 from verl_speco.backends.specopd_loss import e2e_tv_loss
 
 
-def _check(rank, world, sp, sample_count, init_file):
+def _check(rank, world, sp, sample_count, init_file, aligned):
     torch.set_num_threads(1)
     dist.init_process_group('gloo', init_method='file://' + init_file, rank=rank, world_size=world)
     try:
@@ -33,7 +33,8 @@ def _check(rank, world, sp, sample_count, init_file):
             token_total = 0
             for (x, teacher, mask), real in zip(local, real_slots, strict=True):
                 valid = mask if real else torch.zeros_like(mask)
-                numerator, count, _ = e2e_tv_loss(model(x), teacher, valid)
+                numerator, count, _ = e2e_tv_loss(model(x), teacher, valid,
+                    position_weights=torch.tensor([[1., 2., 1.]]) if aligned else None)
                 counts = count.detach().clone()
                 dist.all_reduce(counts)
                 token_total += int(counts)
@@ -42,7 +43,8 @@ def _check(rank, world, sp, sample_count, init_file):
                 parameter.grad.div_(token_total)
             ref_numerator, ref_count = 0, 0
             for x, teacher, mask in samples:
-                n, c, _ = e2e_tv_loss(reference(x), teacher, mask)
+                n, c, _ = e2e_tv_loss(reference(x), teacher, mask,
+                    position_weights=torch.tensor([[1., 2., 1.]]) if aligned else None)
                 ref_numerator += n
                 ref_count += c
             (ref_numerator / ref_count).backward()
@@ -56,8 +58,9 @@ def _check(rank, world, sp, sample_count, init_file):
         dist.destroy_process_group()
 
 
+@pytest.mark.parametrize('aligned', [False, True])
 @pytest.mark.parametrize('world,sp,samples', [(2, 1, 3), (4, 2, 1)])
-def test_dp_partition_preserves_twenty_group_updates(tmp_path, world, sp, samples):
+def test_dp_partition_preserves_twenty_group_updates(tmp_path, world, sp, samples, aligned):
     if not dist.is_gloo_available():
         pytest.skip('requires CPU Gloo')
-    mp.spawn(_check, args=(world, sp, samples, str(tmp_path / 'init')), nprocs=world, join=True)
+    mp.spawn(_check, args=(world, sp, samples, str(tmp_path / 'init'), aligned), nprocs=world, join=True)

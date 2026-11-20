@@ -3,6 +3,7 @@
 from dataclasses import replace
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -23,18 +24,18 @@ def _requests():
     )
 
 
-def _assert_scores(actual, expected):
+def _assert_scores(actual, expected, *, atol=2e-5, rtol=2e-5):
     assert len(actual) == len(expected)
     for a, b in zip(actual, expected, strict=True):
         assert a.sample_id == b.sample_id
-        torch.testing.assert_close(a.response_log_probs, b.response_log_probs, atol=2e-5, rtol=2e-5)
-        torch.testing.assert_close(a.response_entropy, b.response_entropy, atol=2e-5, rtol=2e-5)
+        torch.testing.assert_close(a.response_log_probs, b.response_log_probs, atol=atol, rtol=rtol)
+        torch.testing.assert_close(a.response_entropy, b.response_entropy, atol=atol, rtol=rtol)
         for index in a.trunk_features:
-            torch.testing.assert_close(a.trunk_features[index], b.trunk_features[index], atol=2e-5, rtol=2e-5)
+            torch.testing.assert_close(a.trunk_features[index], b.trunk_features[index], atol=atol, rtol=rtol)
         for x, y in zip(a.branches, b.branches, strict=True):
             assert x.branch_id == y.branch_id
             for field in ("target_logits", "target_logz", "target_hidden"):
-                torch.testing.assert_close(getattr(x, field), getattr(y, field), atol=2e-5, rtol=2e-5)
+                torch.testing.assert_close(getattr(x, field), getattr(y, field), atol=atol, rtol=rtol)
 
 
 def _run(rank, size, init_file, kv_heads, kind):
@@ -49,16 +50,42 @@ def _run(rank, size, init_file, kv_heads, kind):
             "qwen2": (Qwen2Config, Qwen2ForCausalLM),
             "llama": (LlamaConfig, LlamaForCausalLM),
         }[kind]
-        cfg = config_cls(vocab_size=32, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
-                         num_attention_heads=4, num_key_value_heads=kv_heads, head_dim=8,
+        q_heads = 2 * size
+        cfg = config_cls(vocab_size=32, hidden_size=q_heads * 8, intermediate_size=64, num_hidden_layers=2,
+                         num_attention_heads=q_heads, num_key_value_heads=kv_heads, head_dim=8,
                          max_position_embeddings=128, attention_dropout=0.0)
         cfg._attn_implementation = "eager"
         model = model_cls(cfg).eval()
         before = [layer.self_attn.forward.__func__ for layer in model.model.layers]
         options = dict(hidden_state_indices=(0, 1, 2), calculate_entropy=True, return_target_logits=True)
         expected, _ = score_joint_batch(model, _requests(), sequence_multiple=size, **options)
-        actual, metrics = score_ulysses_joint_batch(model, _requests(), dist.group.WORLD, **options)
+        with patch.object(dist, "all_to_all_single", wraps=dist.all_to_all_single) as collective:
+            actual, metrics = score_ulysses_joint_batch(
+                model, _requests(), dist.group.WORLD, use_packed_qkv=False, **options,
+            )
+            assert collective.call_count == 4 * cfg.num_hidden_layers
+            collective.reset_mock()
+            packed, _ = score_ulysses_joint_batch(
+                model, _requests(), dist.group.WORLD, use_packed_qkv=True, **options,
+            )
+            assert collective.call_count == 2 * cfg.num_hidden_layers
+        _assert_scores(packed, actual, atol=0, rtol=0)
         _assert_scores(actual, expected)
+        if kind == "qwen3" and size == 2:
+            training_options = dict(options, return_target_logits=False, use_packed_qkv=False)
+            with patch.object(dist, "all_reduce", wraps=dist.all_reduce) as collective:
+                original, _ = score_ulysses_joint_batch(model, _requests(), dist.group.WORLD, **training_options)
+                original_reductions = collective.call_count
+                collective.reset_mock()
+                lean, _ = score_ulysses_joint_batch(
+                    model, _requests(), dist.group.WORLD, return_target_logz=False, **training_options,
+                )
+                assert original_reductions - collective.call_count == len(_requests())
+            expected_lean = tuple(
+                replace(row, branches=tuple(replace(branch, target_logz=None) for branch in row.branches))
+                for row in original
+            )
+            _assert_scores(lean, expected_lean, atol=0, rtol=0)
         assert metrics["sp_size"] == size and metrics["model_forward_calls"] == 1
         assert before == [layer.self_attn.forward.__func__ for layer in model.model.layers]
         # Future trunk and sibling history must never leak into branch a0.
@@ -67,11 +94,96 @@ def _run(rank, size, init_file, kv_heads, kind):
         isolated, _ = score_ulysses_joint_batch(model, (changed,), dist.group.WORLD, **options)
         torch.testing.assert_close(isolated[0].branches[0].target_logits, actual[0].branches[0].target_logits, atol=2e-5, rtol=2e-5)
         if size == 4:
+            trunks = tuple(replace(r, branches=()) for r in _requests())
+            mixed = (_requests()[0], trunks[1])
+            for batch, has_tree in ((trunks, False), (mixed, True)):
+                reference, baseline_metrics = score_ulysses_joint_batch(
+                    model, batch, dist.group.WORLD, use_causal_fast_path=False, **options,
+                )
+                fast, measured = score_ulysses_joint_batch(
+                    model, batch, dist.group.WORLD, use_causal_fast_path=True, **options,
+                )
+                _assert_scores(fast, reference)
+                assert (measured["mask_elements"] > 0) == has_tree
+                if has_tree:
+                    assert measured["mask_elements"] * 2 == baseline_metrics["mask_elements"]
+                assert measured["model_forward_calls"] == 1
+                if has_tree:
+                    # A neighboring trunk-only row cannot change the tree's scores.
+                    for a, b in zip(fast[0].branches, reference[0].branches, strict=True):
+                        torch.testing.assert_close(a.target_logits, b.target_logits, atol=0, rtol=0)
+            short = replace(mixed[1], sample_id="short", branches=(DraftBranch("anchor-only", 4, (10,)),))
+            mixed = (*mixed, short)
+            reference, dense_mixed = score_ulysses_joint_batch(model, mixed, dist.group.WORLD, **options)
+            segmented, measured = score_ulysses_joint_batch(
+                model, mixed, dist.group.WORLD, use_segmented_attention=True, use_packed_qkv=True, **options,
+            )
+            _assert_scores(segmented, reference)
+            assert measured["model_forward_calls"] == 1
+            # Four branch-tail queries see six prefix and four branch columns.
+            assert measured["mask_elements"] == 4 * (6 + 4)
+            separate, _ = score_ulysses_joint_batch(
+                model, (short,), dist.group.WORLD, use_segmented_attention=True, **options,
+            )
+            _assert_scores(separate, segmented[2:])
+            isolated, _ = score_ulysses_joint_batch(
+                model, (changed, *mixed[1:]), dist.group.WORLD,
+                use_segmented_attention=True, use_packed_qkv=True, **options,
+            )
+            torch.testing.assert_close(
+                isolated[0].branches[0].target_logits, segmented[0].branches[0].target_logits, atol=0, rtol=0,
+            )
+            precise, measured = score_ulysses_joint_batch(
+                model, mixed, dist.group.WORLD, use_segmented_dense_prefix=True,
+                use_packed_qkv=True, **options,
+            )
+            _assert_scores(precise, reference)
+            assert measured["model_forward_calls"] == 1
+            width = 16
+            assert measured["mask_elements"] == (6 + 4 + 5) * width
+            for row, readers in ((0, 6), (2, 5)):
+                # Full key width protects the dense prefix and branch states.
+                for index in precise[row].trunk_features:
+                    torch.testing.assert_close(
+                        precise[row].trunk_features[index][:readers],
+                        reference[row].trunk_features[index][:readers], atol=2e-6, rtol=2e-6,
+                    )
+                for actual_branch, expected_branch in zip(precise[row].branches, reference[row].branches, strict=True):
+                    torch.testing.assert_close(
+                        actual_branch.target_logits, expected_branch.target_logits, atol=2e-6, rtol=2e-6,
+                    )
+            precise_changed, _ = score_ulysses_joint_batch(
+                model, (changed, *mixed[1:]), dist.group.WORLD,
+                use_segmented_dense_prefix=True, use_packed_qkv=True, **options,
+            )
+            torch.testing.assert_close(
+                precise_changed[0].branches[0].target_logits, precise[0].branches[0].target_logits, atol=0, rtol=0,
+            )
+            dense_one, _ = score_ulysses_joint_batch(model, (req,), dist.group.WORLD, **options)
+            with patch.object(torch, "matmul", wraps=torch.matmul) as matmul:
+                preserved, measured = score_ulysses_joint_batch(
+                    model, (req,), dist.group.WORLD, use_preserve_pv=True, **options,
+                )
+            assert measured["model_forward_calls"] == 1
+            assert measured["mask_elements"] == (6 + 4) * width
+            # Preserve the original, square query/key geometry specifically for P@V.
+            value_calls = [call.args for call in matmul.call_args_list if call.args[0].shape[-2:] == (width, width)]
+            assert len(value_calls) == cfg.num_hidden_layers
+            _assert_scores(preserved, dense_one)
+            fallback, measured = score_ulysses_joint_batch(
+                model, mixed, dist.group.WORLD, use_preserve_pv=True,
+                use_segmented_dense_prefix=True, use_causal_fast_path=True, **options,
+            )
+            assert measured["mask_elements"] == dense_mixed["mask_elements"]
+            _assert_scores(fallback, reference, atol=0, rtol=0)
             engine_schedule = SimpleNamespace(module=model, eval_mode=nullcontext,
                 use_remove_padding=True, use_ulysses_sp=True, ulysses_sequence_parallel_size=size,
                 ulysses_parallel_group=dist.group.WORLD, model_config=SimpleNamespace(use_fused_kernels=False),
                 _autocast_dtype=torch.float32)
             schedule_worker = SimpleNamespace(_is_actor=True, actor=SimpleNamespace(engine=engine_schedule))
+            with patch.dict("os.environ", {"VERL_SPECO_JOINT_PRESERVE_PV": str(int(rank == 0))}):
+                with pytest.raises(RuntimeError, match="same complete trajectory schedule"):
+                    score_actor_joint(schedule_worker, (req,), **options)
             exported, measured = score_actor_joint(schedule_worker, _requests(), microbatch_sizes=(1, 1), **options)
             if rank == 0:
                 _assert_scores(exported, expected)
