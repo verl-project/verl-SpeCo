@@ -2051,18 +2051,29 @@ class StandaloneRayTrainer:
                 producer_args.append(self._queue_config().global_batch_size)
             if self.native_transport is not None:
                 producer_args.append(self.native_transport)
-            producer_options = {"name": f"speco_standalone_producer_{uuid.uuid4().hex}", "num_cpus": 1}
-            producer_ip = self.consumer_config.speco.draft_training.get("producer_node_ip")
+            producer_options = {
+                "name": f"speco_standalone_producer_{uuid.uuid4().hex}",
+                "num_cpus": 1,
+            }
+            producer_ip = self.consumer_config.speco.draft_training.get(
+                "producer_node_ip"
+            )
             if producer_ip is not None:
                 resource = f"node:{producer_ip}"
                 if not any(
-                    node["Alive"] and node["NodeManagerAddress"] == producer_ip
-                    and node["Resources"].get(resource, 0) >= 0.001 and node["Resources"].get("CPU", 0) >= 1
+                    node["Alive"]
+                    and node["NodeManagerAddress"] == producer_ip
+                    and node["Resources"].get(resource, 0) >= 0.001
+                    and node["Resources"].get("CPU", 0) >= 1
                     for node in self.ray.nodes()
                 ):
-                    raise ValueError(f"Ray Producer node {producer_ip!r} lacks the required node resource or CPU")
+                    raise ValueError(
+                        f"Ray Producer node {producer_ip!r} lacks the required node resource or CPU"
+                    )
                 producer_options["resources"] = {resource: 0.001}
-            self.producer = producer_cls.options(**producer_options).remote(*producer_args)
+            self.producer = producer_cls.options(**producer_options).remote(
+                *producer_args
+            )
             worker_options = {
                 "ray_module": self.ray,
                 "scheduled_commands": self.commands_queue,

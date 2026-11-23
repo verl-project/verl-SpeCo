@@ -200,7 +200,12 @@ def prepare(client, args, role, name, token, generation):
     env += 'export PYTHONPATH="$REPO:${PYTHONPATH:-}"\n'
     env += f'export NO_PROXY="127.0.0.1,localhost,{args.consumer},{args.producer},${{NO_PROXY:-}}"\nexport no_proxy="$NO_PROXY"\n'
     with client.open_sftp() as sftp:
-        for filename in ("train.sh", "ray.sh", "vllm.sh", "job.env"):
+        for filename in (
+            "run_qwen3-8b_drafter_dspark_separate_training.sh",
+            "ray.sh",
+            "vllm.sh",
+            "job.env",
+        ):
             contents = (
                 env
                 if filename == "job.env"
@@ -257,7 +262,7 @@ PY""",
         execute(
             producer,
             f"""cd {shlex.quote(p)}
-            if ! timeout 30m env DSPARK_TWO_NODE_JOB={shlex.quote(p)} bash train.sh {action} {shlex.quote(args.data)} {shlex.quote(checkpoint)} >{log} 2>&1; then
+            if ! timeout 30m env DSPARK_TWO_NODE_JOB={shlex.quote(p)} bash run_qwen3-8b_drafter_dspark_separate_training.sh {action} {shlex.quote(args.data)} {shlex.quote(checkpoint)} >{log} 2>&1; then
                 tail -30 {log}; exit 1
             fi
             grep -Eq 'optimizer_step_total={50 if resume else 25} ' {log}

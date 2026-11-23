@@ -48,9 +48,11 @@ ASYNC_TRAINER_MODES = (("colocate", "async"), ("separate", "async"))
 SFT_SUFFIX = "sft"
 
 DEFAULT_IGNORE_DIRS: tuple[str, ...] = ()
-# Hidden-state service entry points are not drafter training examples.
+# Cluster and hidden-state service entry points are not drafter training examples.
 # Keep explicit paths so training scripts in the same directory remain checked.
 DEFAULT_IGNORE_FILES: tuple[str, ...] = (
+    "examples/dspark_two_node/ray.sh",
+    "examples/dspark_two_node/vllm.sh",
     "examples/glm53-train/glm53_hidden_serve_node0.sh",
     "examples/glm53-train/glm53_hidden_serve_node1.sh",
 )

@@ -304,7 +304,10 @@ class SpecoNativeHiddenStatesConnector(SpecoMooncakeHiddenStatesConnector):
                 # The control thread polls with a short deadline. Cold actor startup
                 # belongs to initialization, before the first lease RPC can be issued.
                 try:
-                    ray.get([q.actor.qsize.remote() for q in (requests, responses)], timeout=timeout)
+                    ray.get(
+                        [q.actor.qsize.remote() for q in (requests, responses)],
+                        timeout=timeout,
+                    )
                 except Exception:
                     for queue in (requests, responses):
                         queue.shutdown(force=True)
