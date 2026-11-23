@@ -1,4 +1,7 @@
 {
+  "npu-glm53-hidden-node0": "examples/glm53-train/glm53_hidden_serve_node0.sh",
+  "npu-glm53-hidden-node1": "examples/glm53-train/glm53_hidden_serve_node1.sh",
+  "npu-glm53-dspark-separate": "examples/glm53-train/run_glm53_drafter_dspark_separate_training.sh",
   "gpu-dspark-bubble": "examples/bubble_time/run_qwen3-8b_drafter_dspark_vllm.sh",
   "gpu-dspark-mrv2": "examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_vllm.sh",
   "gpu-dspark-colocate-async": "examples/dspark_mrv2/run_qwen3-4b_drafter_dspark_colocate_async_vllm.sh",
