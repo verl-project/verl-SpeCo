@@ -51,10 +51,7 @@ def parallel_microbatch_sizes(requests, sizes, dp_size, sp_size, options):
     groups, count = [], 0
     totals, widths, counts = [0] * dp_size, [0] * dp_size, [0] * dp_size
     for request in requests:
-        length = len(request.trunk_ids) + sum(
-            len(b.token_ids) - 1 for b in request.branches
-        )
-        width = ((length + sp_size - 1) // sp_size) * sp_size
+        length, width = request.packed_size(sp_size)
         if length > token_budget or width * width > mask_budget:
             raise ValueError("joint trajectory exceeds its per-rank token/mask budget")
         rank = count % dp_size

@@ -45,6 +45,13 @@ class JointScoringRequest:
     response_start: int  # Index of first response token, not prediction row.
     branches: tuple[DraftBranch, ...] = ()
 
+    def packed_size(self, sequence_multiple):
+        """Return logical token count and SP-aligned mask width."""
+        length = len(self.trunk_ids) + sum(len(b.token_ids) - 1 for b in self.branches)
+        return length, (
+            (length + sequence_multiple - 1) // sequence_multiple
+        ) * sequence_multiple
+
 
 @dataclass
 class PackedJointBatch:

@@ -274,7 +274,7 @@ def test_v1_native_trunk_scores_disjoint_keys(monkeypatch, branch_indices, calcu
     value.scoring_sp_size = 1
     value.spec = SimpleNamespace(
         scoring_token_budget=64, max_dense_mask_elements=1024, microbatch_trajectories=4,
-        actor_temperature=0.6, target_temperature=0.6, score_target_logz=False,
+        temperature=0.6, score_target_logz=False,
     )
     value.cycle.begin(5)
     monkeypatch.setattr(specopd_adapter, "driver", lambda trainer: value)

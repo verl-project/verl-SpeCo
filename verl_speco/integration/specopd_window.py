@@ -43,6 +43,6 @@ def make_window(
         ),
         "proposal_width": config.proposal_width,
         "reservoir": bool(config.anchor_count),
-        "proposal_temperature": config.proposal_temperature,
+        "proposal_temperature": config.temperature,
         "max_wire_bytes": config.max_wire_bytes,
     }

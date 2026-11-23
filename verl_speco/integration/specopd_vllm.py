@@ -115,6 +115,16 @@ def _stop_ids(request):
     return explicit
 
 
+def _capture_active(request, plan, offset):
+    limit = plan["max_branches"]
+    if limit <= 0 or not plan["start"] <= offset < plan["end"]:
+        return False
+    return (
+        bool(plan.get("reservoir"))
+        or len(getattr(request, "_specopd_records", ())) < limit
+    )
+
+
 def snapshot_scheduler_round(scheduler):
     snapshots = {}
     for request_id, request in getattr(scheduler, "requests", {}).items():
@@ -128,14 +138,7 @@ def snapshot_scheduler_round(scheduler):
         prefix_len = len(request.all_token_ids)
         if prefix_len < plan["prompt_len"]:
             raise RuntimeError("SpecOPD vLLM prefix is shorter than the prompt")
-        selected = (
-            plan["max_branches"] > 0
-            and plan["start"] <= prefix_len - plan["prompt_len"] < plan["end"]
-            and (
-                plan.get("reservoir")
-                or len(getattr(request, "_specopd_records", ())) < plan["max_branches"]
-            )
-        )
+        selected = _capture_active(request, plan, prefix_len - plan["prompt_len"])
         snapshots[request_id] = (
             request,
             plan,
@@ -168,11 +171,7 @@ def capture_scheduler_round(scheduler_output, model_output, snapshots):
         round_id = int(getattr(request, "_specopd_round", 0))
         request._specopd_round = round_id + 1
         offset = len(prefix) - plan["prompt_len"]
-        if (
-            plan["max_branches"] <= 0
-            or not plan["start"] <= offset < plan["end"]
-            or (not plan.get("reservoir") and len(records) >= plan["max_branches"])
-        ):
+        if not _capture_active(request, plan, offset):
             continue
         if not raw:
             # vLLM may expose only the scheduled list; do not claim an unseen

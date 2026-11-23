@@ -49,7 +49,7 @@ def build_requests(batch, spec, revision):
         bundle = decode_bundle(wire, spec.max_wire_bytes)
         if (
             bundle["drafter_revision"] != revision
-            or bundle["proposal_temperature"] != spec.proposal_temperature
+            or bundle["proposal_temperature"] != spec.temperature
         ):
             raise ValueError(
                 "SpecOPD drafter revision/sampling configuration differs from the rollout"
@@ -148,14 +148,10 @@ def make_oldlogprob(batch, results):
 
 def plan_microbatches(requests, spec, sequence_multiple=1):
     """Bound the entire schedule before any model call; never split a tree."""
-    groups, current, lengths, widths = [], [], [], []
+    groups, current = [], []
+    tokens = widest = 0
     for request in requests:
-        size = len(request.trunk_ids) + sum(
-            len(b.token_ids) - 1 for b in request.branches
-        )
-        width = (
-            (size + sequence_multiple - 1) // sequence_multiple
-        ) * sequence_multiple
+        size, width = request.packed_size(sequence_multiple)
         if (
             size > spec.scoring_token_budget
             or width * width > spec.max_dense_mask_elements
@@ -163,17 +159,18 @@ def plan_microbatches(requests, spec, sequence_multiple=1):
             raise ValueError(
                 f"SpecOPD complete trajectory {request.sample_id} exceeds the joint budget"
             )
-        proposed = lengths + [size]
         if current and (
-            len(proposed) > spec.microbatch_trajectories
-            or sum(proposed) > spec.scoring_token_budget
-            or len(proposed) * max(widths + [width]) ** 2 > spec.max_dense_mask_elements
+            len(current) >= spec.microbatch_trajectories
+            or tokens + size > spec.scoring_token_budget
+            or (len(current) + 1) * max(widest, width) ** 2
+            > spec.max_dense_mask_elements
         ):
             groups.append(current)
-            current, lengths, widths = [], [], []
+            current = []
+            tokens = widest = 0
         current.append(request)
-        lengths.append(size)
-        widths.append(width)
+        tokens += size
+        widest = max(widest, width)
     if current:
         groups.append(current)
     return groups
@@ -366,8 +363,8 @@ class SpecOPDDriver:
             output = self.trainer.actor_rollout_wg.compute_joint_old_log_prob(
                 joint_requests,
                 microbatch_sizes=microbatch_sizes,
-                actor_temperature=self.spec.actor_temperature,
-                target_temperature=self.spec.target_temperature,
+                actor_temperature=self.spec.temperature,
+                target_temperature=self.spec.temperature,
                 hidden_state_indices=self.feature_indices,
                 calculate_entropy=calculate_entropy,
                 return_target_logits=False,

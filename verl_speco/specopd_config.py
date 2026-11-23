@@ -36,9 +36,7 @@ class SpecOPDConfig:
     training_microbatch_trajectories: int = 4
     training_microbatch_token_budget: int = 16384
     training_input_cache_mib: int = 64
-    actor_temperature: float = 1.0
-    proposal_temperature: float = 1.0
-    target_temperature: float = 1.0
+    temperature: float = 1.0
     optimizer_updates_per_collection: int = 1
     # Zero retains the legacy branch-only path. Mixed modes reserve a quarter for trunk anchors.
     anchor_count: int = 0
@@ -61,15 +59,26 @@ class SpecOPDConfig:
         cls, training, *, algorithm="", verify_tokens=None, rollout_temperature=None
     ):
         options = dict(training.get("specopd", {}) or {})
-        allowed = {f.name for f in fields(cls)}
-        unknown = set(options) - allowed
+        aliases = ("actor_temperature", "proposal_temperature", "target_temperature")
+        temperatures = [options.pop(name, None) for name in aliases]
+        unknown = options.keys() - ({f.name for f in fields(cls)} - {"temperature"})
         if unknown:
             raise ValueError(f"unknown SpecOPD options: {sorted(unknown)}")
         enabled = spec_opd_enabled(training)
         if enabled:
             algorithm = algorithm.lower()
-            if rollout_temperature is not None:
-                rollout_temperature = float(rollout_temperature)
+            temperature = (
+                cls.temperature
+                if rollout_temperature is None
+                else float(rollout_temperature)
+            )
+            if any(
+                value is not None and value != temperature for value in temperatures
+            ):
+                raise ValueError(
+                    "SpecOPD actor/proposal/target temperatures must match rollout.temperature"
+                )
+            options["temperature"] = temperature
             anchors = options.get("anchor_count", cls.anchor_count)
             if anchors is None:
                 anchors = training.get(f"{algorithm}_num_anchors")
@@ -91,9 +100,6 @@ class SpecOPDConfig:
             defaults = {
                 "anchor_count": anchors,
                 "proposal_width": width,
-                "actor_temperature": rollout_temperature,
-                "proposal_temperature": rollout_temperature,
-                "target_temperature": rollout_temperature,
                 "window_mode": training.get("hidden_state_window_mode")
                 or cls.window_mode,
                 "window_response_tokens": (
@@ -123,7 +129,12 @@ class SpecOPDConfig:
             options = {
                 name: value for name, value in options.items() if value is not None
             }
-        options.setdefault("optimizer_updates_per_collection", training.get("step", 1))
+        updates = training.get("step", 1)
+        options.setdefault("optimizer_updates_per_collection", updates)
+        if enabled and options["optimizer_updates_per_collection"] != updates:
+            raise ValueError(
+                "SpecOPD optimizer_updates_per_collection must match training.step"
+            )
         result = cls(**{**options, "enable": enabled})
         if enabled:
             result.validate()
@@ -188,10 +199,8 @@ class SpecOPDConfig:
             )
         if type(self.score_target_logz) is not bool:
             raise ValueError("SpecOPD score_target_logz must be a boolean")
-        for name in ("actor_temperature", "proposal_temperature", "target_temperature"):
-            value = getattr(self, name)
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"SpecOPD {name} must be finite and positive")
+        if not math.isfinite(self.temperature) or self.temperature <= 0:
+            raise ValueError("SpecOPD temperature must be finite and positive")
         if self.objective not in {"e2e_tv", "tv", "l1"}:
             raise ValueError("SpecOPD objective must be e2e_tv, tv or l1")
         if self.max_proposal_tokens_per_request < self.proposal_width:
@@ -282,17 +291,6 @@ def validate_specopd_config(config):
                 "increase the scoring limits or reduce data.max_prompt_length, "
                 "data.max_response_length, or the branch budget"
             )
-    if any(
-        t != float(temperature)
-        for t in (
-            spec.actor_temperature,
-            spec.proposal_temperature,
-            spec.target_temperature,
-        )
-    ):
-        raise ValueError(
-            "SpecOPD actor/proposal/target temperatures must match rollout.temperature"
-        )
     if config.get("algorithm", {}).get("adv_estimator", "gae") not in {"gae", "grpo"}:
         raise ValueError(
             "SpecOPD joint output currently supports PPO/GAE and GRPO only"
@@ -340,10 +338,9 @@ def validate_specopd_config(config):
         type(interval) is not int
         or interval < 1
         or training.get("training_interval_steps", 1) != interval
-        or training.get("step", 1) != spec.optimizer_updates_per_collection
     ):
         raise ValueError(
-            "SpecOPD requires equal positive collection/training intervals and step=optimizer_updates_per_collection"
+            "SpecOPD requires equal positive collection/training intervals"
         )
     if training.get("collect_hidden_states_from_sgl", False) or training.get(
         "use_data_buffer", False

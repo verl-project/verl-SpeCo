@@ -94,7 +94,7 @@ def patch_result_transport(runner_class):
 
 def snapshot_result_round(scheduler, scheduled, output):
     """Use committed history at result delivery, just like Draft-OPD trace."""
-    from verl_speco.integration.specopd_vllm import _plan
+    from verl_speco.integration.specopd_vllm import _capture_active, _plan
 
     evidence = getattr(output, VERIFIED_KEY, None)
     sampled = getattr(output, "sampled_token_ids", None)
@@ -116,17 +116,8 @@ def snapshot_result_round(scheduler, scheduled, output):
             # but require proposal evidence only for an actual sampled result.
             snapshots[rid] = (request, plan, [], [])
             continue
-        prefix_len = len(request.all_token_ids)
-        offset = prefix_len - plan["prompt_len"]
-        active = (
-            plan["max_branches"] > 0
-            and plan["start"] <= offset < plan["end"]
-            and (
-                plan.get("reservoir")
-                or len(getattr(request, "_specopd_records", ())) < plan["max_branches"]
-            )
-        )
-        if not active:
+        offset = len(request.all_token_ids) - plan["prompt_len"]
+        if not _capture_active(request, plan, offset):
             # Retain the request/plan for final bundle delivery without copying
             # an ever-growing history after the capture window/budget closes.
             snapshots[rid] = (request, plan, [], [])
@@ -146,7 +137,7 @@ def snapshot_result_round(scheduler, scheduled, output):
                     "SpecOPD verified proposal belongs to a different scheduling round"
                 )
             raw = list(row["proposal_ids"])
-        if active and scheduled.scheduled_spec_decode_tokens.get(rid) and not raw:
+        if scheduled.scheduled_spec_decode_tokens.get(rid) and not raw:
             raise RuntimeError(
                 "SpecOPD async capture requires complete verified MRV2 proposal metadata: "
                 f"request={rid}, offset={offset}, "

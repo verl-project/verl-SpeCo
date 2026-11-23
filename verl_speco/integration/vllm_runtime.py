@@ -4310,7 +4310,7 @@ async def _speco_generate_with_request_stats_unblocked(
                     )
             if (
                 float(clean_params.get("temperature", 1.0))
-                != specopd_config.proposal_temperature
+                != specopd_config.temperature
             ):
                 raise ValueError("rollout and SpecOPD proposal temperatures differ")
             prompt = kwargs.get("prompt_ids", args[0] if args else None)

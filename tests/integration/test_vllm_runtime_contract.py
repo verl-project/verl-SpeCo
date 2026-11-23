@@ -301,7 +301,7 @@ def test_specopd_vllm_uses_the_server_temperature_and_existing_verify_width(monk
         pass
 
     def inspect_window(spec, *args):
-        assert (spec.proposal_temperature, spec.proposal_width) == (0.6, 5)
+        assert (spec.temperature, spec.proposal_width) == (0.6, 5)
         assert spec.max_proposal_tokens_per_request == 24 * 5
         raise WindowReady
 

@@ -68,18 +68,27 @@ def test_worker_does_not_spend_scheduler_quota_on_stale_delivery():
     for plan in runner.draft_tokens_handler._specopd_plans.values():
         plan["max_branches"] = 1
     setattr(output, VERIFIED_KEY, snapshot_verified_proposals(runner))
-    scheduler.requests["a"].num_stale_output_tokens = 8
-    capture_scheduler_round(scheduled, output, snapshot_result_round(scheduler, scheduled, output))
-    assert not hasattr(scheduler.requests["a"], "_specopd_records")
+    a, b = scheduler.requests["a"], scheduler.requests["b"]
+    a.num_stale_output_tokens = 8
+    snapshots = snapshot_result_round(scheduler, scheduled, output)
+    assert set(snapshots) == {"b"}
+    capture_scheduler_round(scheduled, output, snapshots)
+    assert not hasattr(a, "_specopd_records")
+    assert len(b._specopd_records) == 1
 
-    scheduler.requests["a"].num_stale_output_tokens = 0
+    a.num_stale_output_tokens = 0
     setattr(output, VERIFIED_KEY, snapshot_verified_proposals(runner))
     capture_scheduler_round(scheduled, output, snapshot_result_round(scheduler, scheduled, output))
-    assert len(scheduler.requests["a"]._specopd_records) == 1
+    assert len(a._specopd_records) == len(b._specopd_records) == 1
 
 
-def test_worker_stops_copying_after_plain_capture_window():
+@pytest.mark.parametrize("reservoir", [False, True])
+def test_worker_stops_copying_when_capture_window_closes(reservoir):
     runner, _, _, _ = fixture()
+    if reservoir:
+        for plan in runner.draft_tokens_handler._specopd_plans.values():
+            plan.update(reservoir=True, max_branches=24)
+        assert all(len(snapshot_verified_proposals(runner)) == 2 for _ in range(25))
     runner.execute_model_state.input_batch.seq_lens.fill_(600)
     assert snapshot_verified_proposals(runner) == {}
     runner.req_states = None  # any additional device access would fail
@@ -99,14 +108,6 @@ def test_async_result_must_match_committed_prefix_and_scheduling_round(bad):
     setattr(output, VERIFIED_KEY, evidence)
     with pytest.raises(RuntimeError):
         snapshot_result_round(scheduler, scheduled, output)
-
-
-def test_preempted_stale_delivery_never_creates_a_branch():
-    runner, scheduler, scheduled, output = fixture()
-    setattr(output, VERIFIED_KEY, snapshot_verified_proposals(runner))
-    scheduler.requests["a"].num_stale_output_tokens = 8
-    snapshots = snapshot_result_round(scheduler, scheduled, output)
-    assert "a" not in snapshots and "b" in snapshots
 
 
 def test_hook_attaches_evidence_to_own_output_before_async_delivery():

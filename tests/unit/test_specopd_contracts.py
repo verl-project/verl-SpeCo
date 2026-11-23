@@ -172,7 +172,12 @@ def test_specopd_inherits_width_temperature_and_mixed_anchors_from_drafter():
     spec = validate_specopd_config(cfg)
     assert spec == SpecOPDConfig.from_drafter(drafter, rollout_temperature=0.6)
     assert spec.proposal_width == 5 and spec.max_proposal_tokens_per_request == 48 * 5
-    assert (spec.actor_temperature, spec.proposal_temperature, spec.target_temperature) == (0.6,) * 3
+    assert spec.temperature == 0.6
+    training["specopd"].update(
+        actor_temperature=0.6, proposal_temperature=0.6, target_temperature=0.6,
+        optimizer_updates_per_collection=training["step"],
+    )
+    assert validate_specopd_config(cfg) == spec
     assert (spec.anchor_count, spec.random_anchor_count, spec.random_position_decay_gamma) == (64, 16, 0)
 
     training["specopd"].update(anchor_count=0, random_position_decay_gamma=3)
@@ -574,22 +579,6 @@ def test_mixed_config_requires_matching_budgets():
     _mixed_anchor_config().validate()
     with pytest.raises(ValueError, match="24 proposal"):
         SpecOPDConfig(anchor_count=32).validate()
-
-
-def test_async_reservoir_keeps_capturing_after_24_and_stops_at_window_end():
-    from verl_speco.integration.specopd_async import snapshot_verified_proposals
-    from verl_speco.integration.specopd_window import make_window
-    plan = make_window(_mixed_anchor_config(), "a", 5, 0, 3, 1024)
-    batch = NS(req_ids=["a"], idx_mapping_np=[0], num_draft_tokens_per_req=[7],
-               is_prefilling_np=[False], seq_lens=torch.tensor([100]))
-    runner = NS(draft_tokens_handler=NS(_specopd_plans={"a": plan}),
-                execute_model_state=NS(input_batch=batch), is_last_pp_rank=True,
-                req_states=NS(draft_tokens=torch.ones((1, 7), dtype=torch.int32)))
-    assert all("a" in snapshot_verified_proposals(runner) for _ in range(25))
-    batch.seq_lens[0] = 700
-    assert snapshot_verified_proposals(runner) == {}
-    runner.req_states = None
-    assert snapshot_verified_proposals(runner) == {}
 
 
 def legacy_tv(draft_logits, target_logits, *, proposal_temperature=1.0,

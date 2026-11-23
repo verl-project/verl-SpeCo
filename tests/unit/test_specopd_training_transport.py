@@ -26,7 +26,7 @@ def sample(length=8192):
     score = JointScores(
         "r",
         torch.zeros(length - 2),
-        (BranchScores("b", None, torch.zeros(3), torch.ones(3, 4)),),
+        (BranchScores("b", torch.ones(3, 8), torch.zeros(3), torch.ones(3, 4)),),
         {1: torch.arange(length * 4, dtype=torch.bfloat16).reshape(length, 4)},
     )
     return request, score
@@ -36,7 +36,10 @@ def test_numpy_wire_crops_storage_and_preserves_bf16_exactly():
     request, score = sample()
     payload, size = transport.encode_training_payload([(request, score)])
     decoded = transport.decode_training_payload(payload)
-    assert size == 10 * 4 * 2 + 3 * 4 * 4 + 3 * 4
+    assert size == 10 * 4 * 2 + 3 * 4 * 4
+    [decoded_branch] = decoded[0][1].branches
+    assert decoded_branch.target_logits is decoded_branch.target_logz is None
+    torch.testing.assert_close(decoded_branch.target_hidden, score.branches[0].target_hidden)
     assert decoded[0][0].trunk_ids == request.trunk_ids
     torch.testing.assert_close(
         decoded[0][1].trunk_features[1], score.trunk_features[1][:10], rtol=0, atol=0
@@ -68,35 +71,6 @@ def test_payload_identity_rejects_reordered_or_corrupt_request_metadata():
     )
     with pytest.raises(ValueError, match="identity"):
         transport.decode_training_payload(payload)
-
-
-def test_hidden_only_wire_omits_logz_and_produces_identical_train_batch():
-    from dataclasses import replace
-
-    from verl_speco.backends.specopd_forward import build_specopd_training_batch
-    from verl_speco.specopd_config import SpecOPDConfig
-
-    request, score = sample(32)
-    original, original_bytes = transport.encode_training_payload([(request, score)])
-    score_without_logz = replace(score, branches=(replace(score.branches[0], target_logz=None),))
-    lean, lean_bytes = transport.encode_training_payload([(request, score_without_logz)])
-    assert original_bytes - lean_bytes == 3 * torch.float32.itemsize
-    assert original["samples"][0][2][0][2] == "0/b/0/z"
-    assert lean["samples"][0][2][0][2] is None
-    [(request, decoded_full)] = transport.decode_training_payload(original)
-    [(_, decoded_lean)] = transport.decode_training_payload(lean)
-    assert decoded_full.branches[0].target_logz is not None
-    assert decoded_lean.branches[0].target_logz is None
-    assert original["identity"] != lean["identity"]
-
-    full_batch = build_specopd_training_batch(request, decoded_full, "cpu", SpecOPDConfig(), (1,))
-    lean_batch = build_specopd_training_batch(request, decoded_lean, "cpu", SpecOPDConfig(), (1,))
-    assert full_batch.keys() == lean_batch.keys()
-    for key, value in full_batch.items():
-        if torch.is_tensor(value):
-            torch.testing.assert_close(lean_batch[key], value, atol=0, rtol=0)
-        else:
-            assert lean_batch[key] == value
 
 
 def worker(rank=0):

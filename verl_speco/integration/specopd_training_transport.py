@@ -9,13 +9,21 @@ import time
 
 import torch
 
-from verl_speco.integration.tensor_wire import encode_cpu_tensors, decode_cpu_tensors
+from verl_speco.integration.tensor_wire import (
+    encode_cpu_tensors,
+    decode_cpu_tensors,
+    tensor_payload_bytes,
+)
 from verl_speco.joint_scoring import BranchScores, JointScores
 
 logger = logging.getLogger(__name__)
 
 
-def training_payload_identity(samples):
+def _training_payload_identity(samples, tensors):
+    def signature(name):
+        tensor = tensors[name]
+        return tuple(tensor.shape), str(tensor.dtype)
+
     identity = [
         [
             r.sample_id,
@@ -32,20 +40,10 @@ def training_payload_identity(samples):
                 )
                 for b in r.branches
             ],
-            [
-                (i, tuple(t.shape), str(t.dtype))
-                for i, t in sorted(s.trunk_features.items())
-            ],
-            [
-                (
-                    b.branch_id,
-                    tuple(b.target_hidden.shape),
-                    tuple(b.target_logz.shape) if b.target_logz is not None else None,
-                )
-                for b in s.branches
-            ],
+            [(i, signature(name)) for i, name in sorted(features.items())],
+            [(bid, signature(name)) for bid, name in branches],
         ]
-        for r, s in samples
+        for r, features, branches in samples
     ]
     return hashlib.sha256(
         json.dumps(identity, separators=(",", ":")).encode()
@@ -57,8 +55,6 @@ def encode_training_payload(samples):
     tensors, metadata = {}, []
 
     def store(name, tensor):
-        if tensor is None:
-            return None
         if tensor.device.type != "cpu":
             raise ValueError(
                 "SpecOPD training transport requires independent CPU scores"
@@ -75,48 +71,41 @@ def encode_training_payload(samples):
             for i, value in scores.trunk_features.items()
         }
         branches = [
-            (
-                b.branch_id,
-                store(f"{index}/b/{j}/h", b.target_hidden),
-                store(f"{index}/b/{j}/z", b.target_logz),
-                store(f"{index}/b/{j}/l", b.target_logits),
-            )
+            (b.branch_id, store(f"{index}/b/{j}/h", b.target_hidden))
             for j, b in enumerate(scores.branches)
         ]
         metadata.append((request, features, branches))
     wire = encode_cpu_tensors(tensors)
     if wire is None:
         raise ValueError("SpecOPD training tensors cannot use the CPU wire format")
-    payload = {"samples": metadata, "tensors": wire}
-    # Hash the actual trimmed payload, not possibly overlong caller buffers.
-    payload["identity"] = training_payload_identity(
-        decode_training_payload(payload, verify=False)
-    )
-    return payload, sum(t.numel() * t.element_size() for t in tensors.values())
+    payload = {
+        "samples": metadata,
+        "tensors": wire,
+        "identity": _training_payload_identity(metadata, tensors),
+    }
+    return payload, tensor_payload_bytes(tensors)
 
 
-def decode_training_payload(payload, *, verify=True):
+def decode_training_payload(payload):
     tensors = decode_cpu_tensors(payload["tensors"])
-    samples = []
-    for request, features, branches in payload["samples"]:
-        scores = JointScores(
-            request.sample_id,
-            torch.empty(0),
-            tuple(
-                BranchScores(
-                    bid,
-                    tensors[logits] if logits else None,
-                    tensors[logz] if logz is not None else None,
-                    tensors[hidden],
-                )
-                for bid, hidden, logz, logits in branches
-            ),
-            {i: tensors[name] for i, name in features.items()},
-        )
-        samples.append((request, scores))
-    if verify and training_payload_identity(samples) != payload["identity"]:
+    samples = payload["samples"]
+    if _training_payload_identity(samples, tensors) != payload["identity"]:
         raise ValueError("SpecOPD staged training payload identity mismatch")
-    return tuple(samples)
+    return tuple(
+        (
+            request,
+            JointScores(
+                request.sample_id,
+                torch.empty(0),
+                tuple(
+                    BranchScores(bid, None, None, tensors[name])
+                    for bid, name in branches
+                ),
+                {i: tensors[name] for i, name in features.items()},
+            ),
+        )
+        for request, features, branches in samples
+    )
 
 
 def preparation_key(step, revision, feature_indices):
