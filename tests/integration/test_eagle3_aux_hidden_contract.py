@@ -176,7 +176,8 @@ def _eagle_empty_rank_worker(rank, port, strategy, ttt_length, results):
 def test_eagle3_empty_supervision_rank_matches_reference(strategy, ttt_length):
     import multiprocessing
     import socket
-    import torch
+
+    torch = pytest.importorskip("torch")
     if not torch.distributed.is_gloo_available():
         pytest.skip("Gloo is unavailable")
     context = multiprocessing.get_context("spawn")
