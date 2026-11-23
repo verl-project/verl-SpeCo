@@ -267,9 +267,23 @@ def test_native_connector_registers_source_and_retains_ambiguous_setup(monkeypat
     from queue import Queue
     from types import SimpleNamespace
     from verl_speco.transport import native_feature_transport as native
+    ready_queues = set()
+
+    class ControlQueue(Queue):
+        def __init__(self, maxsize):
+            super().__init__(maxsize)
+            self.actor = SimpleNamespace(qsize=SimpleNamespace(remote=lambda: self))
+
+    def ray_get(value, timeout):
+        if isinstance(value, list):
+            ready_queues.update(value)
+            return [queue.qsize() for queue in value]
+        return value
+
     registrations, errors = [], []
     entered, proceed, second_done = threading.Event(), threading.Event(), threading.Event()
     def register(endpoint, source_id, options, source_settings):
+        assert ready_queues == {options["request_queue"], options["response_queue"]}
         registrations.append((endpoint, source_id, options, source_settings))
         entered.set()
         assert proceed.wait(3)
@@ -281,9 +295,9 @@ def test_native_connector_registers_source_and_retains_ambiguous_setup(monkeypat
     ray.__path__ = []
     ray.is_initialized = lambda: True
     ray.get_actor = lambda name, namespace: directory
-    ray.get = lambda value, timeout: value
+    ray.get = ray_get
     ray_util, ray_queue = types.ModuleType("ray.util"), types.ModuleType("ray.util.queue")
-    ray_util.__path__, ray_queue.Queue = [], Queue
+    ray_util.__path__, ray_queue.Queue = [], ControlQueue
     monkeypatch.setitem(sys.modules, "ray", ray)
     monkeypatch.setitem(sys.modules, "ray.util", ray_util)
     monkeypatch.setitem(sys.modules, "ray.util.queue", ray_queue)
