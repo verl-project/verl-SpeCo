@@ -270,7 +270,7 @@ def dispatch_prepared_group(
         metrics["specopd/prepared_ranks"] = len(ready)
         # Only this small RPC enters device collectives. Bulk data is resident
         # everywhere and every participant has acknowledged the same plan.
-        output = group.train_specopd_group(None, step, revision, feature_indices)
+        output = group.train_specopd_group(step, revision, feature_indices)
         statuses = [s for s in trainer._ray_get_if_needed(output) if s is not None]
     except BaseException:
         group.discard_specopd_group(step, revision, feature_indices)

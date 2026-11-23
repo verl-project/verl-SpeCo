@@ -1716,7 +1716,7 @@ class SpecoWorker(Worker):
         return discard_training_group(self, step, revision, feature_indices)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    async def train_specopd_group(self, samples, step, revision, feature_indices):
+    async def train_specopd_group(self, step, revision, feature_indices):
         """Synchronous, one-use proposal update; no legacy replay/quota execution."""
         if (
             not self.enable_drafter
@@ -1740,10 +1740,6 @@ class SpecoWorker(Worker):
         if self.last_global_step != step:
             raise RuntimeError(
                 "SpecOPD group does not match synchronized target-head step"
-            )
-        if samples is not None:
-            raise RuntimeError(
-                "SpecOPD bulk training RPC is removed; prepare the input group first"
             )
         from verl_speco.integration.specopd_training_transport import (
             take_training_group,

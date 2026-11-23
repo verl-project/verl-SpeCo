@@ -24,6 +24,19 @@ from verl_speco.joint_scoring import (
 )
 
 
+ULYSSES_ENV_FLAGS = {
+    "use_causal_fast_path": "VERL_SPECO_JOINT_CAUSAL_FAST_PATH",
+    "use_packed_qkv": "VERL_SPECO_JOINT_PACK_QKV",
+    "use_segmented_attention": "VERL_SPECO_JOINT_SEGMENTED_ATTENTION",
+    "use_segmented_dense_prefix": "VERL_SPECO_JOINT_SEGMENTED_DENSE_PREFIX",
+    "use_preserve_pv": "VERL_SPECO_JOINT_PRESERVE_PV",
+}
+
+
+def resolve_ulysses_flag(name, value):
+    return os.environ.get(ULYSSES_ENV_FLAGS[name]) == "1" if value is None else value
+
+
 def validate_ulysses_model(model, size):
     cfg = model.config
     if (
@@ -377,22 +390,17 @@ def score_ulysses_joint_batch(
     cfg = model.config
     validate_ulysses_model(model, size)
     parameter = next(model.parameters())
-    if use_causal_fast_path is None:
-        use_causal_fast_path = (
-            os.environ.get("VERL_SPECO_JOINT_CAUSAL_FAST_PATH") == "1"
-        )
-    if use_packed_qkv is None:
-        use_packed_qkv = os.environ.get("VERL_SPECO_JOINT_PACK_QKV") == "1"
-    if use_segmented_attention is None:
-        use_segmented_attention = (
-            os.environ.get("VERL_SPECO_JOINT_SEGMENTED_ATTENTION") == "1"
-        )
-    if use_segmented_dense_prefix is None:
-        use_segmented_dense_prefix = (
-            os.environ.get("VERL_SPECO_JOINT_SEGMENTED_DENSE_PREFIX") == "1"
-        )
-    if use_preserve_pv is None:
-        use_preserve_pv = os.environ.get("VERL_SPECO_JOINT_PRESERVE_PV") == "1"
+    use_causal_fast_path = resolve_ulysses_flag(
+        "use_causal_fast_path", use_causal_fast_path
+    )
+    use_packed_qkv = resolve_ulysses_flag("use_packed_qkv", use_packed_qkv)
+    use_segmented_attention = resolve_ulysses_flag(
+        "use_segmented_attention", use_segmented_attention
+    )
+    use_segmented_dense_prefix = resolve_ulysses_flag(
+        "use_segmented_dense_prefix", use_segmented_dense_prefix
+    )
+    use_preserve_pv = resolve_ulysses_flag("use_preserve_pv", use_preserve_pv)
     if use_preserve_pv and len(requests) != 1:
         # Only one local row has been validated with the original PV geometry.
         use_preserve_pv = use_causal_fast_path = use_segmented_attention = (

@@ -1,6 +1,7 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 # Licensed under the Apache License, Version 2.0 (the "License");
 import asyncio
+from dataclasses import replace
 import sys
 from types import SimpleNamespace
 from types import SimpleNamespace as NS
@@ -11,6 +12,7 @@ import torch
 
 from verl_speco.integration import specopd_collectives as module
 from verl_speco.integration import specopd_training_transport as transport
+from verl_speco.specopd_config import SpecOPDConfig
 from verl_speco.joint_scoring import (
     BranchScores,
     DraftBranch,
@@ -154,8 +156,8 @@ def test_driver_never_dispatches_training_before_all_16_readiness_acks(
                 status[-1]["identity"] = "wrong"
             return status
 
-        def train_specopd_group(self, data, step, revision, features):
-            assert data is None and events == ["put-once", "all-data-loaded"]
+        def train_specopd_group(self, step, revision, features):
+            assert events == ["put-once", "all-data-loaded"]
             events.append("device-collectives")
             return [dict(trained=True)] * 16
 
@@ -191,20 +193,11 @@ def _collective_inputs():
         _get_sp_world_size=lambda: 1,
         _get_dp_world_size=lambda: 8,
     )
-    request = SimpleNamespace(
-        sample_id="r",
-        trunk_ids=[1, 2],
-        response_start=1,
-        branches=[SimpleNamespace(branch_id="b", anchor=0, token_ids=[3, 4])],
-    )
     options = dict(
         step=5,
-        selected=[(request, None)],
         feature_indices=(1,),
         group_sizes=[1],
-        spec=SimpleNamespace(
-            optimizer_updates_per_collection=1, min_scored_positions_per_update=1
-        ),
+        spec=SpecOPDConfig(),
     )
     return trainer, options
 
@@ -224,10 +217,9 @@ def test_preflight_uses_same_dp_group_as_loss_reduction(monkeypatch):
 
 def test_cpu_schedule_signature_covers_optimizer_policy():
     trainer, options = _collective_inputs()
-    options.pop("selected")
     options["payload_identity"] = "shared-data"
     before = module.training_schedule_digest(trainer, **options)
-    options["spec"].optimizer_updates_per_collection += 1
+    options["spec"] = replace(options["spec"], optimizer_updates_per_collection=2)
     assert module.training_schedule_digest(trainer, **options) != before
 
 

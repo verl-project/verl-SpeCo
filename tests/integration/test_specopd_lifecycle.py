@@ -284,7 +284,7 @@ def test_five_step_twenty_update_schedule_with_one_publication(monkeypatch):
 
     monkeypatch.setattr(specopd_training_transport, "dispatch_prepared_group",
         lambda trainer, samples, step, revision, indices, metrics, spec:
-        trainer._require_speco_worker_group().train_specopd_group(samples, step, revision, indices))
+        trainer._require_speco_worker_group().train_specopd_group(step, revision, indices))
     events = []
     training = dict(step=20, collect_interval_steps=5, training_interval_steps=5,
                     dspark_block_size=7, specopd=dict(enable=True))
@@ -295,7 +295,7 @@ def test_five_step_twenty_update_schedule_with_one_publication(monkeypatch):
                          vllm=dict(draft_sample_method="greedy"), training=training))))
     ci = CIResult(training=True)
     trainer = SimpleNamespace(config=cfg, global_steps=1, actor_revision=0, _speco_ci_result=ci)
-    worker = SimpleNamespace(train_specopd_group=lambda samples, step, revision, indices: events.append(("train", step, 20)) or [dict(trained=True, revision=revision+1, optimizer_updates=20)])
+    worker = SimpleNamespace(train_specopd_group=lambda step, revision, indices: events.append(("train", step, 20)) or [dict(trained=True, revision=revision+1, optimizer_updates=20)])
     trainer._ray_get_if_needed = lambda x: x
     trainer._require_speco_worker_group = lambda: worker
     trainer._speco_set_drafter_global_step = lambda: None

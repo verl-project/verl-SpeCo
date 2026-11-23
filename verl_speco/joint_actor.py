@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 from contextlib import nullcontext
 
 import torch
@@ -82,15 +81,10 @@ def score_actor_joint(worker, requests, *, microbatch_sizes=None, **options):
     distributed = torch.distributed.is_initialized()
     world = torch.distributed.get_world_size() if distributed else 1
     if sp_size > 1:
-        for option, env in (
-            ("use_causal_fast_path", "VERL_SPECO_JOINT_CAUSAL_FAST_PATH"),
-            ("use_packed_qkv", "VERL_SPECO_JOINT_PACK_QKV"),
-            ("use_segmented_attention", "VERL_SPECO_JOINT_SEGMENTED_ATTENTION"),
-            ("use_segmented_dense_prefix", "VERL_SPECO_JOINT_SEGMENTED_DENSE_PREFIX"),
-            ("use_preserve_pv", "VERL_SPECO_JOINT_PRESERVE_PV"),
-        ):
-            if options.get(option) is None:
-                options[option] = os.environ.get(env) == "1"
+        from verl_speco.joint_ulysses import ULYSSES_ENV_FLAGS, resolve_ulysses_flag
+
+        for name in ULYSSES_ENV_FLAGS:
+            options[name] = resolve_ulysses_flag(name, options.get(name))
     if distributed:
         signature = (requests, sizes, sp_size, sorted(options.items()))
         digest = hashlib.sha256(repr(signature).encode()).hexdigest()

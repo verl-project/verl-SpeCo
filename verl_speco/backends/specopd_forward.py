@@ -21,11 +21,6 @@ from verl_speco.specopd_config import specopd_loss_weights
 
 
 def proposal_loss(wrapper, batch, lm_head_weight):
-    from verl_speco.backends.dflash_trainer_backend import (
-        build_dflash_attention_masks,
-        _resolve_sliding_windows,
-    )
-
     ids = batch["input_ids"]
     anchors = batch["anchor_positions"]
     valid = batch["proposal_mask"]
@@ -56,24 +51,9 @@ def proposal_loss(wrapper, batch, lm_head_weight):
     context = wrapper.draft_model.extract_context_feature(
         list(base.chunk(layers, dim=-1))
     )
-    context_pos, draft_pos = wrapper._create_position_ids(anchors, ids.shape[1])
-    mask, dense = build_dflash_attention_masks(
-        anchor_positions=anchors,
-        block_keep_mask=keep,
-        ctx_len=ids.shape[1],
-        block_size=wrapper.block_size,
-        device=ids.device,
-        windows=_resolve_sliding_windows(wrapper.draft_model.config),
-    )
-    hidden = wrapper.draft_model(
-        draft_input_ids=None,
-        context_feature=context,
-        draft_position_ids=draft_pos,
-        context_position_ids=context_pos,
-        block_mask=mask,
-        dense_attention_mask=dense,
-        noise_embedding=wrapper._create_noise_embed(ids, anchors, keep),
-    ).reshape(bsz * n, wrapper.block_size, -1)[:, :width]
+    hidden = wrapper._forward_anchor_blocks(ids, context, anchors, keep).reshape(
+        bsz * n, wrapper.block_size, -1
+    )[:, :width]
     head = lm_head_weight
     if head.shape[0] != wrapper.draft_model.config.vocab_size:
         raise ValueError("SpecOPD currently requires the complete target LM head")

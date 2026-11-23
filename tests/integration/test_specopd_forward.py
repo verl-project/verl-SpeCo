@@ -34,7 +34,7 @@ from verl_speco.specopd_config import SpecOPDConfig
 
 
 @pytest.fixture
-def classes(monkeypatch):
+def dspark_model(monkeypatch):
     if importlib.util.find_spec("verl") is None:
         device = ModuleType("verl.utils.device")
         device.get_device_name = lambda: "cpu"
@@ -57,30 +57,37 @@ def classes(monkeypatch):
     from verl_speco.backends.dspark_trainer_backend import DSparkTrainingModel
     from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
 
-    return {
-        "dspark": (DSparkConfig, DSparkDraftModel, DSparkTrainingModel),
-    }
+    def create_model(**overrides):
+        config = DSparkConfig(
+            vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+            num_attention_heads=2, num_key_value_heads=1, head_dim=8,
+            num_context_layers=2, target_hidden_size=16, target_num_hidden_layers=2,
+            mask_token_id=31, max_position_embeddings=128, block_size=3,
+            conv_group_size=8, markov_rank=8, **overrides,
+        )
+        return DSparkTrainingModel(DSparkDraftModel(config), block_size=3, num_anchors=2)
+
+    return create_model
+
+
+def _actor():
+    config = Qwen3Config(
+        vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+        num_attention_heads=2, num_key_value_heads=1, head_dim=8,
+        max_position_embeddings=128,
+    )
+    config._attn_implementation = "eager"
+    return Qwen3ForCausalLM(config).eval()
 
 
 @pytest.mark.parametrize(
     "objective,head_type", [("e2e_tv", "vanilla"), ("tv", "gated"), ("l1", "vanilla")]
 )
 def test_joint_actor_to_real_drafter_backward_without_resampling(
-    classes, objective, head_type, monkeypatch
+    dspark_model, objective, head_type, monkeypatch
 ):
     torch.manual_seed(21)
-    target_config = Qwen3Config(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=8,
-        max_position_embeddings=128,
-    )
-    target_config._attn_implementation = "eager"
-    target = Qwen3ForCausalLM(target_config).eval()
+    target = _actor()
     request = JointScoringRequest(
         "a",
         (1, 2, 3, 4, 5, 6),
@@ -93,34 +100,8 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
     scored, metrics = score_joint_batch(
         target, [request], hidden_state_indices=(1, 2), return_target_logits=False
     )
-    config_class, draft_class, wrapper_class = classes["dspark"]
-    block_size = 3
-    cfg = config_class(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=8,
-        num_context_layers=2,
-        target_hidden_size=16,
-        target_num_hidden_layers=2,
-        mask_token_id=31,
-        max_position_embeddings=128,
-        block_size=block_size,
-        selector_rank=8,
-        selector_top_k=32,
-        conv_group_size=8,
-        markov_rank=8,
-        markov_head_type=head_type,
-    )
-    draft = draft_class(cfg)
-    wrapper = wrapper_class(
-        draft_model=draft,
-        block_size=block_size,
-        num_anchors=2,
-    )
+    wrapper = dspark_model(selector_rank=8, selector_top_k=32, markov_head_type=head_type)
+    draft = wrapper.draft_model
     assert wrapper.opd_objective is None
     monkeypatch.setattr(
         wrapper,
@@ -283,15 +264,11 @@ def test_accumulated_prefix_loss_matches_concatenated_gradient():
 
 
 @pytest.mark.parametrize("objective", ["e2e_tv", "tv", "l1"])
-def test_mixed_dspark_joint_forward_backward_and_dummy_batch(classes, objective):
+def test_mixed_dspark_joint_forward_backward_and_dummy_batch(dspark_model, objective):
     from verl_speco.backends.specopd_forward import merge_specopd_training_batches
 
     torch.manual_seed(29)
-    target_config = Qwen3Config(vocab_size=32, hidden_size=16, intermediate_size=32,
-        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
-        head_dim=8, max_position_embeddings=128)
-    target_config._attn_implementation = "eager"
-    target = Qwen3ForCausalLM(target_config).eval().requires_grad_(False)
+    target = _actor().requires_grad_(False)
     from verl_speco.integration.specopd_anchors import add_trunk_anchors
     config = SpecOPDConfig(anchor_count=32, max_branches_per_request=24,
                           max_proposal_tokens_per_request=72, proposal_width=3,
@@ -305,13 +282,7 @@ def test_mixed_dspark_joint_forward_backward_and_dummy_batch(classes, objective)
     batch = build_specopd_training_batch(request, scores[0], "cpu", config, (1, 2))
     torch.testing.assert_close(batch["position_weights"][0], torch.tensor([1., 2., 1.]))
     torch.testing.assert_close(batch["position_weights"][24], torch.exp(-torch.arange(3).float()/7))
-    cfg_cls, draft_cls, wrapper_cls = classes["dspark"]
-    draft = draft_cls(cfg_cls(vocab_size=32, hidden_size=16, intermediate_size=32,
-        num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1, head_dim=8,
-        num_context_layers=2, target_hidden_size=16, target_num_hidden_layers=2,
-        mask_token_id=31, max_position_embeddings=128, block_size=3,
-        conv_group_size=8, markov_rank=8))
-    model = wrapper_cls(draft_model=draft, block_size=3, num_anchors=2)
+    model = dspark_model()
     drafter = SimpleNamespace(speculative_algorithm="DSPARK", training={})
     backend = SimpleNamespace(
         target_lm_head=SimpleNamespace(fc=target.lm_head),
@@ -342,7 +313,7 @@ def test_mixed_dspark_joint_forward_backward_and_dummy_batch(classes, objective)
         else:
             torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
     (loss["total_local_ploss"] / loss["local_num_tokens"]).backward()
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in draft.markov_head.parameters())
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.draft_model.markov_head.parameters())
     assert all(p.grad is None for p in target.parameters())
 
 

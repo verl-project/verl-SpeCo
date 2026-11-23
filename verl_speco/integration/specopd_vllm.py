@@ -306,17 +306,15 @@ def install_specopd_vllm_patch():
             wire = (getattr(output, "trace_headers", None) or {}).get(TRACE_KEY)
             state = getattr(self, "request_states", {}).get(output.request_id)
             if wire is not None and state is not None:
-                decode_bundle(wire)
-                state._specopd_wire = wire
+                state._specopd_wire = (decode_bundle(wire)["request_id"], wire)
         return process(self, engine_core_outputs, *args, **kwargs)
 
     @wraps(make_output)
     def made(self, *args, **kwargs):
         output = make_output(self, *args, **kwargs)
-        wire = getattr(self, "_specopd_wire", None)
-        if output is not None and wire is not None:
-            bundle = decode_bundle(wire)
-            stage_completed(bundle["request_id"], wire)
+        completed = getattr(self, "_specopd_wire", None)
+        if output is not None and completed is not None:
+            stage_completed(*completed)
             del self._specopd_wire
         return output
 
