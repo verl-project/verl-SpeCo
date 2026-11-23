@@ -139,6 +139,10 @@ def check_filename(path: Path, display: str | None = None) -> list[str]:
             )
         return errors
 
+    # Explicit rollout-side hidden collection on the vLLM backend.
+    if spec_tokens[-2:] == ["vllm", "rollout"]:
+        spec_tokens = spec_tokens[:-1]
+
     suffix = (
         spec_tokens[-1]
         if spec_tokens and spec_tokens[-1] in OPTIONAL_SUFFIXES

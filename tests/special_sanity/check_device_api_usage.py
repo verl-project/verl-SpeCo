@@ -36,6 +36,8 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl_speco/backends/dspark_trainer_backend.py",
     "verl_speco/integration/sglang_patch.py",
     "verl_speco/integration/sglang_runtime.py",
+    # Version-gated CUDA runner capture is an explicit engine boundary.
+    "verl_speco/integration/vllm_rollout_capture.py",
     # GPU-only transfer dispatch at the actor/drafter publication boundary.
     "verl_speco/integration/rollout_publish.py",
     # Host residency and snapshot copy implementations own device dispatch.

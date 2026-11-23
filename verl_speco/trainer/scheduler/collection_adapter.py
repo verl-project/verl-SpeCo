@@ -67,8 +67,10 @@ def _build_payload(
     )
 
 
-class SGLangCollectionAdapter:
-    source = DrafterCollectionSource.SGLANG
+class RolloutCollectionAdapter:
+    """Common routing for request samples collected by either rollout engine."""
+
+    source: DrafterCollectionSource
 
     def prepare_payload(
         self,
@@ -100,6 +102,16 @@ class SGLangCollectionAdapter:
             raw_samples=raw_samples,
             collection_id=collection_id,
         )
+
+
+class SGLangCollectionAdapter(RolloutCollectionAdapter):
+    source = DrafterCollectionSource.SGLANG
+
+
+class VLLMCollectionAdapter(RolloutCollectionAdapter):
+    """Use the same request-sample contract with a distinct source identity."""
+
+    source = DrafterCollectionSource.VLLM
 
 
 class OldLogProbCollectionAdapter:

@@ -597,3 +597,51 @@ __all__ = [
     "make_sample_key",
     "parse_ready_tag",
 ]
+
+
+def validate_rollout_reference(reference):
+    """Shared control-plane validation for online fixed-window references."""
+    if reference.get("kind") != "speco_rollout_reference_v1":
+        raise ValueError("Unsupported rollout reference schema")
+    plan = reference.get("plan")
+    if not isinstance(plan, dict) or not isinstance(plan.get("sample_id"), str):
+        raise ValueError("Rollout reference requires sample identity")
+    if (
+        type(reference.get("target_version")) is not int
+        or reference["target_version"] < 0
+    ):
+        raise ValueError("Rollout reference requires serving target version")
+    if not isinstance(reference.get("request_id"), str) or not reference["request_id"]:
+        raise ValueError("Rollout reference requires request identity")
+    if plan.get("window_store"):
+        import os
+
+        current_run = os.environ.get("SPECO_CAPTURE_RUN_ID")
+        if current_run is not None and plan.get("run_id") != current_run:
+            raise ValueError(
+                "Rollout reference belongs to another run; restore a consistent checkpoint"
+            )
+        if plan.get("reference_budget") is not None and plan[
+            "reference_budget"
+        ] != reference.get("budget"):
+            raise ValueError("Rollout reference reservation mismatch")
+        if (
+            plan.get("request_id") != reference["request_id"]
+            or plan.get("target_version") != reference["target_version"]
+        ):
+            raise ValueError("Rollout reference plan/version mismatch")
+        if (
+            type(plan.get("start")) is not int
+            or type(plan.get("end")) is not int
+            or plan["start"] < 0
+            or plan["end"] <= plan["start"]
+        ):
+            raise ValueError("Invalid rollout window range")
+
+    if plan.get("window_store"):
+        for name in ("prompt", "response"):
+            tokens = reference.get(name)
+            if not isinstance(tokens, list) or any(
+                type(token) is not int or token < 0 for token in tokens
+            ):
+                raise ValueError("Rollout reference requires valid token lists")

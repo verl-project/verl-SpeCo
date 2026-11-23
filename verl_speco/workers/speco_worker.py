@@ -1288,6 +1288,10 @@ class SpecoWorker(Worker):
         request = self._collection_request(requests)
         collection_id = str(request.get("collection_id", ""))
         samples = request.get("samples")
+        if collection_id.endswith("-vllm") and isinstance(samples, list):
+            from verl_speco.integration.tensor_wire import decode_rollout_sample
+
+            samples = [decode_rollout_sample(sample) for sample in samples]
         if (
             not self.enable_drafter
             or not self.in_drafter_train_group
@@ -1451,6 +1455,15 @@ class SpecoWorker(Worker):
                 "hidden_last_hidden_filter",
                 "hidden_last_hidden_select",
                 "hidden_states_layout",
+                "hidden_source",
+                "request_id",
+                "target_version",
+                "_speco_sample_id",
+                "_speco_drafter_revision_min",
+                "_speco_drafter_revision_max",
+                "_verl_accept_len",
+                "hidden_layer_ids",
+                "last_hidden_state_norm",
                 "target_layer_ids",
                 "_verl_request_mean_accept_len",
                 TRACE_KEY,
@@ -1848,6 +1861,8 @@ class SpecoWorker(Worker):
         defer_device_apply = bool(payload.get("defer_device_apply", False))
         name = payload.get("name")
         head_kwargs: dict[str, Any] = {}
+        if payload.get("source_target_version") is not None:
+            head_kwargs["source_target_version"] = int(payload["source_target_version"])
         if getattr(self.trainer, "_bubble_time_enabled", False):
             protected_versions = payload.get("protected_target_versions")
             if protected_versions is not None:
@@ -2241,11 +2256,13 @@ class SpecoWorker(Worker):
             result["reason"] = "buffer_version_changed"
             return result
         required_target_version = training_plan.get("required_target_version")
-        # Sync validates the freshly staged head below without a historical
-        # cache. Bubble (including synchronous top-up) must select its pinned
-        # quota head instead of substituting the latest actor head.
+        # Rollout replay and Bubble select the data's pinned head. Actor Sync
+        # continues using its freshly staged current-step head.
+        versioned_head = getattr(
+            self.trainer, "_bubble_time_enabled", False
+        ) or getattr(self.trainer, "_rollout_versioned_heads", False)
         if (
-            getattr(self.trainer, "_bubble_time_enabled", False)
+            versioned_head
             and required_target_version is not None
             and not self.trainer.select_target_lm_head_version(
                 int(required_target_version)
@@ -2293,8 +2310,7 @@ class SpecoWorker(Worker):
             require_full_batch=bool(training_plan.get("require_full_batch", False)),
             target_version=(
                 int(required_target_version)
-                if getattr(self.trainer, "_bubble_time_enabled", False)
-                and required_target_version is not None
+                if versioned_head and required_target_version is not None
                 else None
             ),
             **{

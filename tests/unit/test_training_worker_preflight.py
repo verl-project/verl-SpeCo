@@ -946,3 +946,32 @@ def test_replica_local_checkpoint_leader_is_local_group_rank_zero() -> None:
     trainer.rollout_dp_rank = 1
 
     assert trainer._is_checkpoint_leader()
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_sync_rollout_replay_selects_original_head_before_activation(available):
+    worker = _worker(data_version=3)
+    worker.trainer._bubble_time_enabled = False
+    worker.trainer._rollout_versioned_heads = True
+    selected = []
+
+    def select(version):
+        selected.append(version)
+        if available:
+            worker.trainer._target_lm_head_weight_step = version
+        return available
+
+    worker.trainer.select_target_lm_head_version = select
+    plan = _plan()
+    plan.update(data_version=3, required_target_version=3)
+    plan["worker_snapshots"]["0"]["data_version"] = 3
+    result = asyncio.run(worker.preflight_drafter_training(plan))
+    assert selected == [3]
+    if available:
+        assert result["ready"]
+        assert result["target_version"] == 3
+        assert worker.trainer.requested_target_version == 3
+    else:
+        assert not result["ready"]
+        assert result["reason"] == "target_version_unavailable"
+        assert worker.trainer.activation_calls == 0

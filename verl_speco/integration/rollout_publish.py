@@ -276,6 +276,7 @@ def resolve_target_head_reference(payload: dict, target_version: int | None) -> 
             "require_target_head_ack",
             "target_worker_ids",
             "protected_target_versions",
+            "source_target_version",
         ):
             if key in payload:
                 result[key] = payload[key]

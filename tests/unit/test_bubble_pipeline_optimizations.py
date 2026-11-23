@@ -78,12 +78,14 @@ def test_head_reference_forwards_no_driver_tensor_and_preserves_bits(monkeypatch
         defer_device_apply=True,
         require_target_head_ack=True,
         protected_target_versions=(8,),
+        source_target_version=0,
         target_worker_ids=("0",),
     )
     decoded = transport.resolve_target_head_reference(wrapped, 8)
     assert decoded["weight"].dtype == "bf16"
     assert (decoded["weight"].bits == bits).all()
     assert decoded["protected_target_versions"] == (8,)
+    assert decoded["source_target_version"] == 0
     assert decoded["defer_device_apply"] and len(gets) == 1
 
 

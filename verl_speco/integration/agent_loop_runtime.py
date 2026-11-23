@@ -41,6 +41,8 @@ _DEFAULT_EXTRA_KEYS = {
     "max_global_steps": None,
     "extras": None,
     "drafter_sample": None,
+    "_speco_capture_skipped_capacity": None,
+    "_speco_capture_rows": None,
     "_speco_acceptance_engine_fallback": False,
     SPECO_STUDENT_DECODE_TIME_KEY: None,
     SPECO_TEACHER_PREFILL_TIME_KEY: None,
@@ -108,12 +110,18 @@ def _is_sglang_rollout_config(config: Any) -> bool:
     return getattr(rollout_config, "name", None) == "sglang"
 
 
-def _ensure_extra_field_defaults(result: Any) -> Any:
+def _ensure_extra_field_defaults(result: Any, inputs: Any = None) -> Any:
     non_tensor_batch = getattr(result, "non_tensor_batch", None)
     if not isinstance(non_tensor_batch, dict):
         return result
-    batch_len = None
+    tensor_batch = getattr(result, "batch", None)
+    batch_size = getattr(tensor_batch, "batch_size", None)
+    batch_len = (
+        int(batch_size[0]) if batch_size is not None and len(batch_size) else None
+    )
     for value in non_tensor_batch.values():
+        if batch_len is not None:
+            break
         if isinstance(value, dict):
             continue
         try:
@@ -129,13 +137,30 @@ def _ensure_extra_field_defaults(result: Any) -> Any:
     except Exception:  # noqa: BLE001
         return result
 
+    if inputs is not None:
+        # Build one entry per request, including skipped captures. Upstream
+        # postprocessing can omit optional fields instead of padding them.
+        items = list(inputs)
+        for key, default in _DEFAULT_EXTRA_KEYS.items():
+            if key not in {
+                "drafter_sample",
+                "_speco_capture_rows",
+                "_speco_capture_skipped_capacity",
+            }:
+                continue
+            values = np.empty(len(items), dtype=object)
+            for index, item in enumerate(items):
+                fields = getattr(item, "extra_fields", None) or {}
+                values[index] = fields.get(key, default)
+            non_tensor_batch[key] = values
+
     for key in _DEFAULT_EXTRA_KEYS:
         if key not in non_tensor_batch:
-            values: np.ndarray[Any, np.dtype[np.object_]] = np.empty(
+            defaults: np.ndarray[Any, np.dtype[np.object_]] = np.empty(
                 batch_len, dtype=object
             )
-            values[:] = [_DEFAULT_EXTRA_KEYS[key] for _ in range(batch_len)]
-            non_tensor_batch[key] = values
+            defaults[:] = [_DEFAULT_EXTRA_KEYS[key] for _ in range(batch_len)]
+            non_tensor_batch[key] = defaults
     return result
 
 
@@ -201,7 +226,9 @@ def _speco_default_agent_loop_inputs(inputs: Any) -> Any:
 def _speco_context_from_batch(batch: Any) -> tuple[Any, ...]:
     meta_info = getattr(batch, "meta_info", None)
     meta_info = meta_info if isinstance(meta_info, dict) else {}
-    global_steps_token = _CURRENT_GLOBAL_STEPS.set(meta_info.get("global_steps"))
+    global_steps_token = _CURRENT_GLOBAL_STEPS.set(
+        meta_info.get("_speco_collection_step", meta_info.get("global_steps"))
+    )
     validate_token = _CURRENT_VALIDATE.set(bool(meta_info.get("validate", False)))
     skip_collection_token = _CURRENT_SKIP_DRAFTER_COLLECTION.set(
         bool(meta_info.get("skip_drafter_collection", False))
@@ -469,7 +496,7 @@ def _speco_worker_postprocess(
     if "validate" in signature.parameters:
         kwargs["validate"] = validate
     result = postprocess(self, inputs, **kwargs)
-    return _ensure_extra_field_defaults(result)
+    return _ensure_extra_field_defaults(result, inputs)
 
 
 def _load_agent_loop_module():
@@ -550,11 +577,45 @@ def _build_speco_agent_loop_worker_class(worker_cls):
 
 
 def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) -> None:
-    is_sglang = _is_sglang_rollout_config(getattr(manager, "config", None))
-    rollout = getattr(
-        getattr(manager.config, "actor_rollout_ref", None), "rollout", None
+    config = getattr(manager, "config", None)
+    is_sglang = _is_sglang_rollout_config(config)
+    actor = (
+        config.get("actor_rollout_ref", {})
+        if config is not None and hasattr(config, "get")
+        else getattr(config, "actor_rollout_ref", None)
     )
-    if not is_sglang and getattr(rollout, "name", None) != "vllm":
+    rollout = (
+        actor.get("rollout", {})
+        if actor is not None and hasattr(actor, "get")
+        else getattr(actor, "rollout", None)
+    )
+    name = (
+        rollout.get("name")
+        if rollout is not None and hasattr(rollout, "get")
+        else getattr(rollout, "name", None)
+    )
+    drafter = (
+        rollout.get("drafter", {})
+        if rollout is not None and hasattr(rollout, "get")
+        else getattr(rollout, "drafter", {})
+    )
+    training = (
+        drafter.get("training", {})
+        if drafter is not None and hasattr(drafter, "get")
+        else getattr(drafter, "training", {})
+    )
+    capture_enabled = (
+        training.get("collect_hidden_states_from_vllm", False)
+        if hasattr(training, "get")
+        else False
+    )
+    has_native_worker = getattr(manager, "agent_loop_workers_class", None) is not None
+    if not is_sglang and (
+        name != "vllm"
+        or not (
+            capture_enabled or has_native_worker or (training or {}).get("drafter_opd")
+        )
+    ):
         return
     if getattr(manager, "_speco_agent_loop_manager_configured", False):
         return
@@ -571,8 +632,10 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
         )
 
     if not is_sglang:
-        # Install patches again in the Ray process, where upstream classes are
-        # imported afresh. Driver-side monkey patches do not survive that import.
+        logger.warning(
+            "SPECO AgentLoopManager explicit worker bridge active for vLLM: %s",
+            manager.agent_loop_workers_class,
+        )
         manager._speco_agent_loop_manager_configured = True
         return
 
@@ -825,7 +888,7 @@ def install_agent_loop_runtime_patch() -> bool:
             if "validate" in signature.parameters:
                 kwargs["validate"] = validate
             result = postprocess(self, inputs, **kwargs)
-            return _ensure_extra_field_defaults(result)
+            return _ensure_extra_field_defaults(result, inputs)
 
         worker_cls._postprocess = speco_postprocess
         worker_cls._speco_patched_postprocess = True

@@ -20,6 +20,49 @@ import numpy as np
 import torch
 
 _MARKER = "_speco_cpu_tensor_wire_v1"
+
+
+def encode_rollout_requests(requests):
+    """Opt-in lossless transport only for vLLM collection requests."""
+    result = []
+    for bucket in requests:
+        encoded = []
+        for request in bucket:
+            if not str(request.get("collection_id", "")).endswith("-vllm"):
+                encoded.append(request)
+                continue
+            samples = []
+            for sample in request.get("samples") or []:
+                tensors = {
+                    k: v for k, v in sample.items() if isinstance(v, torch.Tensor)
+                }
+                wire = encode_cpu_tensors(tensors)
+                if wire is None:
+                    samples.append(sample)
+                else:
+                    if "_speco_rollout_tensor_wire" in sample:
+                        raise ValueError("Reserved rollout wire field collision")
+                    samples.append(
+                        {
+                            **{k: v for k, v in sample.items() if k not in tensors},
+                            "_speco_rollout_tensor_wire": wire,
+                        }
+                    )
+            encoded.append({**request, "samples": samples})
+        result.append(encoded)
+    return result
+
+
+def decode_rollout_sample(sample):
+    if "_speco_rollout_tensor_wire" not in sample:
+        return sample
+    metadata = {k: v for k, v in sample.items() if k != "_speco_rollout_tensor_wire"}
+    tensors = decode_cpu_tensors(sample["_speco_rollout_tensor_wire"])
+    if tensors is None or metadata.keys() & tensors.keys():
+        raise ValueError("Invalid rollout tensor envelope")
+    return {**metadata, **tensors}
+
+
 _DTYPES = {
     name: getattr(torch, name)
     for name in (
