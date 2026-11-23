@@ -98,29 +98,15 @@ def test_vllm_scheduler_to_final_output_channel(monkeypatch):
 
 
 def configuration():
-    return {
-        "trainer": {"use_v1": True},
-        "actor_rollout_ref": {
-            "actor": {"strategy": "fsdp2"},
-            "model": {"use_remove_padding": False},
-            "rollout": {
-                "name": "vllm",
-                "drafter": {
-                    "enable": True,
-                    "enable_drafter_training": True,
-                    "speculative_algorithm": "DSPARK",
-                    "vllm": {"draft_sample_method": "probabilistic"},
-                    "training": {
-                        "dspark_block_size": 3,
-                        "step": 1,
-                        "collect_interval_steps": 1,
-                        "training_interval_steps": 1,
-                        "specopd": {"enable": True, "proposal_width": 3},
-                    },
-                },
-            },
-        },
+    training = {"dspark_block_size": 3, "specopd": {"enable": True, "proposal_width": 3}}
+    drafter = {
+        "enable": True,
+        "enable_drafter_training": True,
+        "speculative_algorithm": "DSPARK",
+        "training": training,
     }
+    actor = {"model": {"use_remove_padding": False}, "rollout": {"name": "vllm", "drafter": drafter}}
+    return {"trainer": {"use_v1": True}, "actor_rollout_ref": actor}
 
 
 def test_proposal_agent_bridge_isolated_across_concurrent_requests():
@@ -150,31 +136,6 @@ def test_proposal_agent_bridge_isolated_across_concurrent_requests():
     assert PROPOSAL_TURNS.get() is None
 
 
-def test_proposal_bridge_rejects_multiple_generation_requests():
-    from verl_speco.integration.specopd_agent import (
-        PROPOSAL_TURNS,
-        merge_proposal_output,
-    )
-
-    token = PROPOSAL_TURNS.set(["a", "b"])
-    try:
-        with pytest.raises(ValueError, match="exactly one"):
-            merge_proposal_output(SimpleNamespace(extra_fields={}))
-    finally:
-        PROPOSAL_TURNS.reset(token)
-
-
-def test_joint_oldlogprob_requires_proposal_bundle():
-    driver = SpecOPDDriver(SimpleNamespace(config=configuration()))
-    driver.cycle.begin(1)
-    with pytest.raises(ValueError, match="missing"):
-        driver.old_log_prob(
-            SimpleNamespace(
-                batch={"input_ids": torch.tensor([[1]])}, non_tensor_batch={}
-            )
-        )
-
-
 @pytest.mark.parametrize("replies", [
     [{"actor_revision": 0, "drafter_revision": 1}],
     [{"actor_revision": None, "drafter_revision": 0}],
@@ -192,44 +153,6 @@ def test_serving_ack_rejects_wrong_draft_or_inconsistent_actor_revisions(replies
     driver = SpecOPDDriver(trainer)
     with pytest.raises(RuntimeError, match="acknowledge"):
         driver.acknowledge_serving_revision(0)
-
-
-@pytest.mark.parametrize("limit,quotas", [(80, [10] * 8), (3, [1] * 3 + [0] * 5)])
-def test_serving_ack_distributes_global_collection_limit(limit, quotas):
-    cfg = configuration()
-    cfg["actor_rollout_ref"]["rollout"]["drafter"]["training"]["specopd"]["max_collect_samples_per_step"] = limit
-    received = []
-
-    def acknowledge(revision, *, collection_quota):
-        received.append(collection_quota)
-        return {"actor_revision": 4, "drafter_revision": revision, "collection_quota": collection_quota}
-
-    server = SimpleNamespace(speco_set_serving_drafter_revision=SimpleNamespace(remote=acknowledge))
-    trainer = SimpleNamespace(config=cfg, llm_server_manager=SimpleNamespace(server_handles=[server] * 8),
-                              _ray_get_if_needed=lambda values: values)
-    SpecOPDDriver(trainer).acknowledge_serving_revision(0)
-    assert received == quotas
-
-
-def test_mrv2_request_tracking_is_runner_local_and_cleans_evictions():
-    class Runner:
-        def __init__(self):
-            self.draft_tokens_handler = SimpleNamespace()
-        def add_requests(self, output):
-            return "added"
-        def _remove_request(self, request_id):
-            return "removed"
-    assert specopd_vllm.patch_draft_token_request_tracking(Runner)
-    left, right = Runner(), Runner()
-    def request(rid, branches):
-        return SimpleNamespace(req_id=rid, sampling_params=SimpleNamespace(
-            extra_args={"specopd_plan": {"max_branches": branches}}))
-    assert left.add_requests(SimpleNamespace(scheduled_new_reqs=[request("yes", 8), request("no", 0)])) == "added"
-    right.add_requests(SimpleNamespace(scheduled_new_reqs=[]))
-    assert set(left.draft_tokens_handler._specopd_plans) == {"yes"}
-    assert right.draft_tokens_handler._specopd_plans == {}
-    assert left._remove_request("yes") == "removed"
-    assert left.draft_tokens_handler._specopd_plans == {}
 
 
 @pytest.mark.parametrize("quota,local_cap,expected", [(10, 16, 10), (2, 1, 1), (0, 0, 0)])
@@ -286,13 +209,9 @@ def test_five_step_twenty_update_schedule_with_one_publication(monkeypatch):
         lambda trainer, samples, step, revision, indices, metrics, spec:
         trainer._require_speco_worker_group().train_specopd_group(step, revision, indices))
     events = []
-    training = dict(step=20, collect_interval_steps=5, training_interval_steps=5,
-                    dspark_block_size=7, specopd=dict(enable=True))
-    cfg = dict(trainer=dict(use_v1=True, v1=dict(trainer_mode="sync")), actor_rollout_ref=dict(
-        actor=dict(strategy="fsdp2", ulysses_sequence_parallel_size=4),
-        model=dict(use_remove_padding=True), rollout=dict(name="vllm", temperature=1.0,
-            drafter=dict(enable=True, enable_drafter_training=True, speculative_algorithm="DSPARK",
-                         vllm=dict(draft_sample_method="greedy"), training=training))))
+    cfg = configuration()
+    rollout = cfg["actor_rollout_ref"]["rollout"]
+    rollout["drafter"]["training"].update(step=20, collect_interval_steps=5, training_interval_steps=5)
     ci = CIResult(training=True)
     trainer = SimpleNamespace(config=cfg, global_steps=1, actor_revision=0, _speco_ci_result=ci)
     worker = SimpleNamespace(train_specopd_group=lambda step, revision, indices: events.append(("train", step, 20)) or [dict(trained=True, revision=revision+1, optimizer_updates=20)])

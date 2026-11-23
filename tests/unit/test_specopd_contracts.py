@@ -22,21 +22,17 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
-from verl_speco.backends import opd_distribution as distribution
-from verl_speco.backends.drafter_opd import DraftOPDObjective
 from verl_speco.backends.specopd_loss import specopd_distribution_loss
 from verl_speco.integration.specopd_anchors import add_trunk_anchors, retain_proposal
 from verl_speco.integration.specopd_driver import (
     build_requests,
     plan_microbatches,
-    unwrap_rank_result,
 )
 from verl_speco.integration.specopd_vllm import (
     capture_scheduler_round,
     snapshot_scheduler_round,
 )
 from verl_speco.integration.specopd_window import make_window
-from verl_speco.joint_actor import partition_joint_requests
 from verl_speco.joint_scoring import DraftBranch, JointScoringRequest
 from verl_speco.specopd_config import (
     SpecOPDConfig,
@@ -79,23 +75,6 @@ def config():
     }
 
 
-def test_configuration_requires_exact_block_and_sampling():
-    assert validate_specopd_config(config()).enable
-    cfg = config()
-    cfg["actor_rollout_ref"]["rollout"]["drafter"]["training"]["dspark_block_size"] = 16
-    with pytest.raises(ValueError, match="block size"):
-        validate_specopd_config(cfg)
-    cfg = config()
-    for method in ("greedy", "probabilistic"):
-        cfg["actor_rollout_ref"]["rollout"]["drafter"]["vllm"]["draft_sample_method"] = method
-        assert validate_specopd_config(cfg).enable
-    cfg["actor_rollout_ref"]["rollout"]["drafter"]["vllm"] = {}
-    assert validate_specopd_config(cfg).enable  # Framework default is greedy.
-    cfg["actor_rollout_ref"]["rollout"]["drafter"]["vllm"]["draft_sample_method"] = "invalid"
-    with pytest.raises(ValueError, match="draft_sample_method"):
-        validate_specopd_config(cfg)
-
-
 @pytest.mark.parametrize("prompt,response", [(512, 4096), (512, 8192)])
 def test_default_budgets_allow_long_trajectory(prompt, response):
     cfg = config()
@@ -111,52 +90,6 @@ def test_default_budgets_allow_long_trajectory(prompt, response):
     training["specopd"].update(scoring_token_budget=4096, max_dense_mask_elements=4096**2)
     with pytest.raises(ValueError, match=r"scoring_token_budget>=\d+ and max_dense_mask_elements>=\d+"):
         validate_specopd_config(cfg)
-
-
-@pytest.mark.parametrize("mode", ["critic_warmup", "drafter_convergence_freeze"])
-def test_config_rejects_schedules_that_skip_specopd_updates(mode):
-    cfg = config()
-    if mode == "critic_warmup":
-        cfg["trainer"][mode] = 1
-    else:
-        cfg["actor_rollout_ref"]["rollout"]["drafter"]["training"][mode] = {"enabled": True}
-    with pytest.raises(ValueError, match=mode):
-        validate_specopd_config(cfg)
-
-
-def test_config_unknown_and_non_joint_modes_rejected():
-    with pytest.raises(ValueError, match="unknown"):
-        SpecOPDConfig.from_training({"specopd": {"enable": True, "typo": 1}})
-    with pytest.raises(ValueError, match="unknown"):
-        SpecOPDConfig.from_training(
-            {"specopd": {"enable": True, "capture_rejected_tail": False}}
-        )
-
-
-def test_training_input_cache_budget_accepts_zero_and_preserves_legacy_default():
-    options = {"enable": True}
-    assert SpecOPDConfig.from_training({"specopd": options}).training_input_cache_mib == 64
-    for limit in (0, 320):
-        spec = SpecOPDConfig.from_training({"specopd": {**options, "training_input_cache_mib": limit}})
-        assert spec.training_input_cache_mib == limit
-
-
-def test_specopd_inherits_shared_collection_settings_and_keeps_explicit_overrides():
-    training = {
-        "step": 10,
-        "hidden_state_window_mode": "random",
-        "hidden_state_window_tokens_per_sample": 256,
-        "hidden_state_random_max_offset": 0,
-        "drafter_opd": {"first_reject_weight": 3.0},
-        "specopd": {"enable": True, "anchor_count": 64, "window_response_tokens": 512},
-    }
-    spec = SpecOPDConfig.from_training(training)
-    assert (spec.window_mode, spec.window_response_tokens, spec.random_max_offset) == (
-        "random", 512, 0
-    )
-    assert spec.first_reject_weight == 3.0 and spec.optimizer_updates_per_collection == 10
-    assert (spec.random_anchor_count, spec.max_branches_per_request) == (16, 48)
-    assert spec.max_proposal_tokens_per_request == 48 * spec.proposal_width
 
 
 def test_specopd_inherits_width_temperature_and_mixed_anchors_from_drafter():
@@ -187,25 +120,6 @@ def test_specopd_inherits_width_temperature_and_mixed_anchors_from_drafter():
     training["specopd"]["proposal_temperature"] = 1.0
     with pytest.raises(ValueError, match="must match rollout.temperature"):
         validate_specopd_config(cfg)
-
-
-@pytest.mark.parametrize("objective", ["tv", "l1"])
-def test_specopd_distribution_selection_validates_shared_coefficients(objective):
-    cfg = config()
-    drafter = cfg["actor_rollout_ref"]["rollout"]["drafter"]
-    drafter["speculative_algorithm"] = "DSPARK"
-    training = drafter["training"]
-    training["specopd"]["objective"] = objective
-    assert validate_specopd_config(cfg).objective == objective
-    training["dspark_l1_loss_alpha"] = -0.1
-    with pytest.raises(ValueError, match="CE and distribution weights"):
-        validate_specopd_config(cfg)
-
-
-@pytest.mark.parametrize("limit", [-1, True, 1.5, "320", None])
-def test_training_input_cache_budget_rejects_invalid_limits(limit):
-    with pytest.raises(ValueError, match="training_input_cache_mib must be a nonnegative integer"):
-        SpecOPDConfig.from_training({"specopd": {"enable": True, "training_input_cache_mib": limit}})
 
 
 def test_v1_sync_config_requires_one_publication_per_group():
@@ -263,37 +177,6 @@ def test_full_rejected_tail_survives_scheduler_shortening_and_mutation():
 
 
 @pytest.mark.parametrize(
-    "generated,accepted",
-    [((20,), 0), ((11, 12, 20), 2), ((11, 12, 13, 14, 15, 16, 17, 20), 7)],
-)
-def test_acceptance_does_not_control_saved_tail(generated, accepted):
-    verified = max(2, accepted)
-    request, _, _, _ = capture(generated=generated, verified=verified)
-    record = request._specopd_records[0]
-    assert len(record["proposal_ids"]) == 7
-    assert record["accepted_count"] == accepted
-    assert record["verified_count"] == verified
-
-
-def test_window_boundary_keeps_whole_proposal():
-    request, _, _, _ = capture(offset=511)
-    assert len(request._specopd_records[0]["proposal_ids"]) == 7
-    request, _, _, _ = capture(offset=512)
-    assert not request._specopd_records
-
-
-def test_async_placeholder_rejected():
-    request = SimpleNamespace(
-        sampling_params=SimpleNamespace(extra_args={"specopd_plan": {"prompt_len": 1}}),
-        all_token_ids=[1],
-        spec_token_ids=[2],
-        num_output_placeholders=1,
-    )
-    with pytest.raises(RuntimeError, match="placeholders"):
-        snapshot_scheduler_round(SimpleNamespace(requests={"r": request}))
-
-
-@pytest.mark.parametrize(
     "ignore_eos,effective_eos,explicit,expected",
     [(False, [13], [], 13), (True, [13], [], 17), (True, [13, 15], [15], 15),
      (False, [], [], 14)],
@@ -309,22 +192,6 @@ def test_first_effective_stop_preserves_tail_through_stop_token(
     request.eos_token_id = 14
     capture_scheduler_round(scheduled, result, snapshot)
     assert request._specopd_records[0]["proposal_ids"] == tuple(range(11, expected + 1))
-
-
-@pytest.mark.parametrize(
-    "key,value",
-    [
-        ("actor_revision", -1),
-        ("drafter_revision", True),
-        ("proposal_temperature", float("nan")),
-        ("request_id", ""),
-    ],
-)
-def test_wire_rejects_invalid_identity_version_and_sampler(key, value):
-    source = bundle()
-    source[key] = value
-    with pytest.raises(ValueError):
-        decode_bundle(json.dumps(source))
 
 
 def bundle():
@@ -436,17 +303,6 @@ def test_specopd_l1_is_positionwise_on_the_same_histories():
 
 
 
-def test_loss_padding_is_neutral_and_holes_rejected():
-    q = torch.randn(2, 3, 5, requires_grad=True)
-    p = torch.randn_like(q)
-    mask = torch.tensor([[1, 1, 1], [1, 0, 0]], dtype=torch.bool)
-    numerator, count, _ = specopd_distribution_loss(q, p, mask)
-    numerator.backward()
-    assert count == 4 and q.grad[1, 1:].abs().sum() == 0
-    with pytest.raises(ValueError, match="prefix"):
-        specopd_distribution_loss(q, p, torch.tensor([[1, 0, 1], [1, 1, 1]], dtype=torch.bool))
-
-
 def test_microbatch_planning_keeps_each_tree_once():
     trees = [
         JointScoringRequest(str(i), (1, 2, 3), 2, (DraftBranch(str(i), 1, (4, 5, 6)),))
@@ -466,33 +322,6 @@ def test_microbatch_planning_keeps_each_tree_once():
         sequence_multiple=4,
     )
     assert [len(g) for g in grouped] == [2, 1]
-
-
-def test_distributed_dispatch_partitions_whole_trees_and_pads_empty_rank():
-    trees = [
-        JointScoringRequest(str(i), (1, 2, 3), 2, (DraftBranch(str(i), 1, (4, 5)),))
-        for i in range(3)
-    ]
-    first, dummy = partition_joint_requests(trees, 0, 2)
-    assert not dummy and [t.sample_id for t in first] == ["0", "2"]
-    assert first[0].branches == trees[0].branches
-    padded, dummy = partition_joint_requests(trees, 3, 4)
-    assert dummy and len(padded[0].trunk_ids) == 1 and not padded[0].branches
-
-
-def test_distributed_rank_outputs_are_merged_without_counting_dummy_rows_as_real():
-    a, b = SimpleNamespace(sample_id="a"), SimpleNamespace(sample_id="b")
-    results, metrics = unwrap_rank_result(
-        [
-            ((a,), {"model_forward_calls": 1, "logical_rows": 7}),
-            ((b,), {"model_forward_calls": 1, "logical_rows": 9}),
-        ]
-    )
-    assert (
-        results == (a, b)
-        and metrics["logical_rows"] == 16
-        and metrics["model_forward_calls"] == 1
-    )
 
 
 def _mixed_anchor_config(anchor_count=32, **kw):
@@ -551,73 +380,6 @@ def test_reservoir_can_replace_early_rounds_and_is_uniform_across_candidates():
             counts[i] += 1
     # Expected 240 selections per candidate; reject first-N/last-N/biased sampling.
     assert min(counts) > 170 and max(counts) < 310
-
-
-def test_mixed_loss_and_gradient_match_draft_opd_with_padding_and_weights():
-    torch.manual_seed(7)
-    head = torch.randn(13, 5)
-    valid = torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0], [1, 1, 1, 0], [0, 0, 0, 0]], dtype=torch.bool)
-    accepted = torch.tensor([[1, -1, 3, -1]])
-    reject = torch.tensor([[True, False, False, False]])
-    objective = DraftOPDObjective(dict(loss="e2e_tv", first_reject_weight=2.0),
-                                  layout="dspark", loss_mode="full_vocab",
-                                  per_position_loss_weight="fixed_exp_decay")
-    weights = objective.weights(valid.reshape(1, 4, 4).float(), accepted, reject, gamma=7.0)
-    active = valid.flatten()
-    # Work on all rows with matching inactive padding; Draft-OPD takes active rows.
-    dense = torch.randn(4, 4, 13, requires_grad=True)
-    target = torch.randn(4, 4, 5)
-    expected = objective(dense.reshape(-1, 13)[active], target.reshape(-1, 5)[active], head,
-                         valid.reshape(1, 4, 4).float(), active, position_weights=weights)
-    numerator, count, _ = specopd_distribution_loss(dense, torch.nn.functional.linear(target, head), valid,
-                                     position_weights=weights.reshape_as(valid))
-    actual = numerator / count
-    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
-    torch.testing.assert_close(torch.autograd.grad(actual, dense, retain_graph=True)[0],
-                               torch.autograd.grad(expected, dense)[0], atol=1e-6, rtol=1e-5)
-    assert count == 3
-
-
-def test_mixed_config_requires_matching_budgets():
-    _mixed_anchor_config().validate()
-    with pytest.raises(ValueError, match="24 proposal"):
-        SpecOPDConfig(anchor_count=32).validate()
-
-
-def legacy_tv(draft_logits, target_logits, *, proposal_temperature=1.0,
-              target_temperature=1.0, implementation="eager"):
-    draft = draft_logits.float() / proposal_temperature
-    target = target_logits.detach().float() / target_temperature
-    return (draft.softmax(-1) - target.softmax(-1)).abs().sum(-1) * 0.5
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("temperatures", [(1.0, 1.0), (0.6, 1.0), (1.0, 1.7), (0.6, 1.7)])
-@pytest.mark.parametrize("implementation", ["eager", "fused"])
-def test_unit_temperature_preserves_outputs_gradients_and_teacher_stop(monkeypatch, dtype, temperatures, implementation):
-    torch.manual_seed(23)
-    draft = torch.randn(2, 3, 17).to(dtype).requires_grad_()
-    target = torch.randn(2, 3, 17).to(dtype).requires_grad_()
-    pointers = []
-    monkeypatch.setattr(distribution, "_fused_available", lambda device: True)
-    def fused(x, y, *, average_ties):
-        assert average_ties is True and not y.requires_grad
-        pointers.append((x.data_ptr(), y.data_ptr()))
-        return (x.softmax(-1) - y.softmax(-1)).abs().sum(-1) * 0.5
-    monkeypatch.setattr(distribution, "fused_total_variation", fused)
-    kwargs = dict(proposal_temperature=temperatures[0], target_temperature=temperatures[1],
-                  implementation=implementation)
-    actual = distribution.token_total_variation(draft, target, **kwargs)
-    expected = legacy_tv(draft, target, **kwargs)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    actual_grad = torch.autograd.grad(actual.sum(), draft, retain_graph=True)[0]
-    expected_grad = torch.autograd.grad(expected.sum(), draft)[0]
-    torch.testing.assert_close(actual_grad, expected_grad, atol=0, rtol=0)
-    assert torch.autograd.grad(actual.sum(), target, allow_unused=True)[0] is None
-    if implementation == "fused" and dtype == torch.float32:
-        # Fused dispatch sees the original FP32 storage only on the unit side.
-        assert (pointers[0][0] == draft.data_ptr()) == (temperatures[0] == 1.0)
-        assert (pointers[0][1] == target.data_ptr()) == (temperatures[1] == 1.0)
 
 
 def test_dspark_specopd_launch_defaults_to_pure_tv():

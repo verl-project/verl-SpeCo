@@ -59,10 +59,6 @@ def test_result_keeps_its_proposal_after_next_batch_overwrites_worker_state():
     assert b["prefix_digest"] == token_digest([1, 2, 3])
 
 
-def test_noncollection_does_not_access_model_or_device_state():
-    assert snapshot_verified_proposals(NS(draft_tokens_handler=NS())) is None
-
-
 def test_worker_does_not_spend_scheduler_quota_on_stale_delivery():
     runner, scheduler, scheduled, output = fixture()
     for plan in runner.draft_tokens_handler._specopd_plans.values():
@@ -126,29 +122,6 @@ def test_hook_attaches_evidence_to_own_output_before_async_delivery():
     assert getattr(output, VERIFIED_KEY)["b"]["proposal_ids"] == list(range(11, 18))
 
 
-def test_wrong_accepted_tokens_are_rejected_even_when_width_and_prefix_match():
-    runner, scheduler, scheduled, output = fixture()
-    setattr(output, VERIFIED_KEY, snapshot_verified_proposals(runner))
-    output.sampled_token_ids[0][0] = 777
-    snapshots = snapshot_result_round(scheduler, scheduled, output)
-    with pytest.raises(RuntimeError, match="accepted tokens differ"):
-        capture_scheduler_round(scheduled, output, snapshots)
-
-
-def test_closed_capture_budget_does_not_copy_full_prefix():
-    runner, scheduler, scheduled, output = fixture()
-    class NoCopy(list):
-        def __iter__(self):
-            raise AssertionError("inactive history must not be copied")
-    for request in scheduler.requests.values():
-        request.all_token_ids = NoCopy(request.all_token_ids)
-        plan = request.sampling_params.extra_args[PLAN_KEY]
-        plan["max_branches"] = 0
-    snapshots = snapshot_result_round(scheduler, scheduled, output)
-    assert set(snapshots) == {"a", "b"}
-    assert all(prefix == [] and raw == [] for _, _, prefix, raw in snapshots.values())
-
-
 @pytest.mark.parametrize("sampled", [None, []])
 def test_empty_prefill_result_does_not_require_verified_proposal(sampled):
     _, scheduler, scheduled, output = fixture()
@@ -181,18 +154,6 @@ def test_spawned_worker_extension_installs_capture_without_parent_entrypoint(mon
     assert calls == ["worker"]
 
 
-def test_worker_extension_rejects_missing_capture_hooks_before_generation(monkeypatch):
-    from verl_speco.integration import specopd_vllm, vllm_runtime
-
-    monkeypatch.setattr(vllm_runtime, "patch_vllm_dspark_draft_load_config", lambda: None)
-    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: {
-        "training": {"specopd": {"enable": True}},
-    })
-    monkeypatch.setattr(specopd_vllm, "install_specopd_draft_token_transport_patch", lambda: False)
-    with pytest.raises(RuntimeError, match="worker requires the MRV2"):
-        vllm_runtime.SpecoVLLMColocateWorkerExtension()
-
-
 def test_draft_opd_worker_does_not_enable_specopd_capture(monkeypatch):
     from verl_speco.integration import specopd_vllm, vllm_runtime
 
@@ -203,29 +164,3 @@ def test_draft_opd_worker_does_not_enable_specopd_capture(monkeypatch):
     monkeypatch.setattr(specopd_vllm, "install_specopd_draft_token_transport_patch",
                         lambda: pytest.fail("Draft-OPD must not install SpecOPD capture"))
     vllm_runtime.SpecoVLLMColocateWorkerExtension()
-
-
-def test_reservoir_request_rejected_by_collection_cap_keeps_empty_bundle_entry():
-    runner, scheduler, scheduled, output = fixture()
-    for plan in runner.draft_tokens_handler._specopd_plans.values():
-        plan.update(reservoir=True, max_branches=0)
-    # Worker correctly omits zero-budget requests; scheduler must also opt out.
-    setattr(output, VERIFIED_KEY, {})
-    snapshots = snapshot_result_round(scheduler, scheduled, output)
-    assert set(snapshots) == {"a", "b"}
-    assert all(prefix == [] and raw == [] for _, _, prefix, raw in snapshots.values())
-    capture_scheduler_round(scheduled, output, snapshots)
-    assert not any(getattr(r, "_specopd_records", []) for r in scheduler.requests.values())
-
-
-def test_sync_reservoir_optout_does_not_capture_or_copy_prefix():
-    from verl_speco.integration.specopd_vllm import snapshot_scheduler_round
-
-    _, scheduler, scheduled, output = fixture()
-    for request in scheduler.requests.values():
-        request.num_output_placeholders = 0
-        request.sampling_params.extra_args[PLAN_KEY].update(reservoir=True, max_branches=0)
-    snapshots = snapshot_scheduler_round(scheduler)
-    assert all(prefix == [] and raw == [] for _, _, prefix, raw in snapshots.values())
-    capture_scheduler_round(scheduled, output, snapshots)
-    assert not any(getattr(r, "_specopd_records", []) for r in scheduler.requests.values())

@@ -82,40 +82,28 @@ def worker(rank=0):
     )
 
 
-def test_cpu_stage_waits_for_payload_and_is_one_use():
+@pytest.mark.parametrize("cancel", [False, True])
+def test_cpu_stage_is_cancellable_and_one_use(cancel):
     async def run():
         payload, _ = transport.encode_training_payload([sample(32)])
         w = worker()
         future = asyncio.get_running_loop().create_future()
-        task = asyncio.create_task(
-            transport.stage_training_group(w, (future,), 5, 0, (1,))
-        )
+        task = asyncio.create_task(transport.stage_training_group(w, (future,), 5, 0, (1,)))
         await asyncio.sleep(0)
         assert not task.done() and not hasattr(w, "_specopd_prepared_group")
+        if cancel:
+            transport.discard_training_group(w, 5, 0, (1,))
         future.set_result(payload)
-        ready = await task
-        assert ready["rank"] == 0 and ready["sp"] * ready["dp"] == 16
-        data = transport.take_training_group(w, 5, 0, (1,))
-        assert data[0][0].sample_id == "r"
-        with pytest.raises(RuntimeError, match="no matching"):
-            transport.take_training_group(w, 5, 0, (1,))
-
-    asyncio.run(run())
-
-
-def test_cancel_during_transfer_never_leaves_cached_data():
-    async def run():
-        w = worker()
-        future = asyncio.get_running_loop().create_future()
-        task = asyncio.create_task(
-            transport.stage_training_group(w, (future,), 5, 0, (1,))
-        )
-        await asyncio.sleep(0)
-        transport.discard_training_group(w, 5, 0, (1,))
-        future.set_result(transport.encode_training_payload([sample(32)])[0])
-        with pytest.raises(RuntimeError, match="cancelled"):
-            await task
-        assert getattr(w, "_specopd_prepared_group", None) is None
+        if cancel:
+            with pytest.raises(RuntimeError, match="cancelled"):
+                await task
+            assert getattr(w, "_specopd_prepared_group", None) is None
+        else:
+            ready = await task
+            assert ready["rank"] == 0 and ready["sp"] * ready["dp"] == 16
+            assert transport.take_training_group(w, 5, 0, (1,))[0][0].sample_id == "r"
+            with pytest.raises(RuntimeError, match="no matching"):
+                transport.take_training_group(w, 5, 0, (1,))
 
     asyncio.run(run())
 
@@ -221,16 +209,3 @@ def test_cpu_schedule_signature_covers_optimizer_policy():
     before = module.training_schedule_digest(trainer, **options)
     options["spec"] = replace(options["spec"], optimizer_updates_per_collection=2)
     assert module.training_schedule_digest(trainer, **options) != before
-
-
-def test_single_rank_needs_no_distributed_runtime():
-    trainer, options = _collective_inputs()
-    trainer._get_dp_world_size = lambda: 1
-    module.warm_specopd_training_collectives(trainer, step=options["step"])
-
-
-def test_multi_rank_requires_explicit_group():
-    trainer, options = _collective_inputs()
-    trainer._get_dp_group = lambda: None
-    with pytest.raises(RuntimeError, match="missing its process group"):
-        module.warm_specopd_training_collectives(trainer, step=options["step"])

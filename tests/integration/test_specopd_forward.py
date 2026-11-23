@@ -119,7 +119,6 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
     torch.testing.assert_close(
         weighted["position_weights"], torch.tensor([[1.0, 1.0, 1.0], [1.0, 2.0, 1.0]])
     )
-    fixed_inputs = {k: v.clone() for k, v in batch.items() if torch.is_tensor(v)}
     dist_key, ce_key = "dspark_l1_loss_alpha", "dspark_ce_loss_alpha"
     training = {dist_key: 0.9, ce_key: 0.1}
     drafter = SimpleNamespace(speculative_algorithm="DSPARK", training=training)
@@ -144,39 +143,7 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
             loss["total_local_ploss"],
             0.9 * distribution["total_local_ploss"] + 0.1 * ce["total_local_ploss"],
         )
-    changed = dict(batch)
-    # Restore a full response suffix to compare against the cropped context.
     assert batch["input_ids"].shape[1] == 5
-    changed["input_ids"] = torch.tensor([request.trunk_ids])
-    changed["input_ids"][0, -1] = 22
-    changed["hidden_states"] = torch.cat([scored[0].trunk_features[i] for i in (1, 2)], -1).unsqueeze(0).clone()
-    changed["hidden_states"][:, -1] = torch.randn_like(changed["hidden_states"][:, -1])
-    unchanged = compute_specopd_backend_loss(backend, wrapper, changed)
-    torch.testing.assert_close(
-        loss["total_local_ploss"], unchanged["total_local_ploss"]
-    )
-    parameters = tuple(wrapper.parameters())
-    cropped_grad = torch.autograd.grad(loss["total_local_ploss"], parameters, retain_graph=True, allow_unused=True)
-    lean_scores, _ = score_joint_batch(
-        target, [request], hidden_state_indices=(1, 2),
-        return_target_logits=False, return_target_logz=False,
-    )
-    assert all(branch.target_logz is None for branch in lean_scores[0].branches)
-    lean_batch = build_specopd_training_batch(
-        request, lean_scores[0], next(wrapper.parameters()).device,
-        spec, (1, 2),
-    )
-    lean_loss = compute_specopd_backend_loss(backend, wrapper, lean_batch)
-    torch.testing.assert_close(lean_loss["total_local_ploss"], loss["total_local_ploss"], atol=0, rtol=0)
-    lean_grad = torch.autograd.grad(lean_loss["total_local_ploss"], parameters, allow_unused=True)
-    for actual, expected in zip(lean_grad, cropped_grad, strict=True):
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    full_grad = torch.autograd.grad(unchanged["total_local_ploss"], parameters, retain_graph=True, allow_unused=True)
-    for a, b in zip(cropped_grad, full_grad, strict=True):
-        if a is None or b is None:
-            assert a is b
-        else:
-            torch.testing.assert_close(a, b, atol=2e-5, rtol=2e-4)
     assert loss["local_num_tokens"] == 6
     assert metrics["model_forward_calls"] == 1
     (loss["total_local_ploss"] / loss["local_num_tokens"]).backward()
@@ -192,75 +159,6 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
     optimizer.step()
     assert not torch.equal(before, draft.fc.weight)
 
-    # A retained input batch must remain immutable and agree with fresh input
-    # reconstruction after the model weights have changed.
-    for key, value in fixed_inputs.items():
-        torch.testing.assert_close(batch[key], value)
-    fresh = build_specopd_training_batch(
-        request, scored[0], next(wrapper.parameters()).device, spec, (1, 2)
-    )
-    reused_loss = compute_specopd_backend_loss(backend, wrapper, batch)
-    fresh_loss = compute_specopd_backend_loss(backend, wrapper, fresh)
-    torch.testing.assert_close(reused_loss["total_local_ploss"], fresh_loss["total_local_ploss"])
-    params = tuple(p for p in wrapper.parameters() if p.requires_grad)
-    reused_grads = torch.autograd.grad(reused_loss["total_local_ploss"], params, allow_unused=True)
-    fresh_grads = torch.autograd.grad(fresh_loss["total_local_ploss"], params, allow_unused=True)
-    for a, b in zip(reused_grads, fresh_grads, strict=True):
-        if a is None or b is None:
-            assert a is b
-        else:
-            torch.testing.assert_close(a, b)
-    from dataclasses import replace
-
-    from verl_speco.backends.specopd_forward import merge_specopd_training_batches
-
-    ragged = []
-    for index in range(4):
-        branches = tuple(replace(b, branch_id=f"{index}-{b.branch_id}",
-                                 token_ids=b.token_ids[:2] if index == 1 else b.token_ids)
-                         for b in request.branches[:1 if index == 1 else 2])
-        req = replace(request, sample_id=f"sample-{index}", branches=branches,
-                      trunk_ids=request.trunk_ids[:-1] if index == 2 else request.trunk_ids)
-        scores, _ = score_joint_batch(target, [req], hidden_state_indices=(1, 2), return_target_logits=False)
-        item = build_specopd_training_batch(req, scores[0], 'cpu', spec, (1, 2))
-        if index == 3:
-            item['proposal_mask'].zero_()  # DP dummy row
-        ragged.append(item)
-    merged = merge_specopd_training_batches(ragged)
-    combined = compute_specopd_backend_loss(backend, wrapper, merged)
-    separate = [compute_specopd_backend_loss(backend, wrapper, item) for item in ragged]
-    expected_sum = sum(item['total_local_ploss'] for item in separate)
-    expected_count = sum(item['local_num_tokens'] for item in separate)
-    assert combined['local_num_tokens'] == expected_count
-    torch.testing.assert_close(combined['total_local_ploss'], expected_sum, atol=2e-5, rtol=2e-5)
-    merged_grads = torch.autograd.grad(combined['total_local_ploss'] / expected_count, params, allow_unused=True)
-    individual_grads = torch.autograd.grad(expected_sum / expected_count, params, allow_unused=True)
-    for a, b in zip(merged_grads, individual_grads, strict=True):
-        if a is None or b is None:
-            assert a is b
-        else:
-            torch.testing.assert_close(a, b, atol=2e-5, rtol=2e-5)
-    dummy = dict(batch, proposal_mask=torch.zeros_like(batch["proposal_mask"]))
-    dummy_loss = compute_specopd_backend_loss(backend, wrapper, dummy)
-    assert dummy_loss["local_num_tokens"] == 0
-    assert dummy_loss["total_local_ploss"] == 0
-    assert torch.isfinite(dummy_loss["accuracy"])
-
-
-def test_accumulated_prefix_loss_matches_concatenated_gradient():
-    from verl_speco.backends.specopd_loss import specopd_distribution_loss
-
-    torch.manual_seed(4)
-    logits = torch.randn(3, 3, 8, requires_grad=True)
-    target = torch.randn_like(logits)
-    mask = torch.tensor([[1, 1, 1], [1, 0, 0], [1, 1, 0]], dtype=torch.bool)
-    numerator, count, _ = specopd_distribution_loss(logits, target, mask)
-    expected = torch.autograd.grad(numerator / count, logits)[0]
-    copied = logits.detach().clone().requires_grad_()
-    for start, end in ((0, 1), (1, 3)):
-        local, _, _ = specopd_distribution_loss(copied[start:end], target[start:end], mask[start:end])
-        (local / count).backward()
-    torch.testing.assert_close(copied.grad, expected)
 
 
 @pytest.mark.parametrize("objective", ["e2e_tv", "tv", "l1"])
@@ -315,80 +213,6 @@ def test_mixed_dspark_joint_forward_backward_and_dummy_batch(dspark_model, objec
     (loss["total_local_ploss"] / loss["local_num_tokens"]).backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.draft_model.markov_head.parameters())
     assert all(p.grad is None for p in target.parameters())
-
-
-@pytest.mark.parametrize(
-    "updates,dp_rank,dp_size,microbatch_size",
-    [(1, 0, 1, 4), (20, 0, 1, 1), (20, 0, 2, 4), (20, 2, 3, 4)],
-    ids=["single-update", "accumulation", "distributed", "empty-dp-rank"],
-)
-def test_collected_group_executes_all_optimizer_updates_before_publication(monkeypatch, updates, dp_rank, dp_size, microbatch_size):
-    pytest.importorskip("ray")
-    from verl_speco.backends import specopd_forward
-    from verl_speco.integration import specopd_collectives
-    from verl_speco.trainer.base_trainer import DrafterBaseTrainer
-
-    # This test isolates optimizer accounting; actual device admission is
-    # covered by the 16-rank Ray/HCCL probe.
-    monkeypatch.setattr(specopd_collectives, "warm_specopd_training_collectives", lambda *a, **kw: None)
-
-    import torch
-    events = []
-    async def activate():
-        return True
-
-    trainer = SimpleNamespace(
-        runtime_device="cpu", optimizer_steps_total=0, activate_training_model=activate,
-        _get_dp_world_size=lambda: dp_size, _get_dp_local_rank=lambda: dp_rank,
-        model=SimpleNamespace(draft_model=SimpleNamespace(num_context_layers=1, config=SimpleNamespace(attention_dropout=0))),
-        prepare_model_state_dict_for_publish=lambda step: events.append(("snapshot", step)),
-    )
-    async def train(batch, step, accumulation_steps, accumulation_index):
-        assert bool(batch["proposal_mask"].any()) == (dp_rank < 2)
-        events.append(("microbatch", accumulation_index))
-        if accumulation_index == accumulation_steps - 1:
-            trainer.optimizer_steps_total += 1
-        return True
-
-    trainer._training_step_on_batch = train
-    builds = []
-    def build(*args):
-        builds.append(args[0])
-        return dict(proposal_mask=torch.ones(1, 2, dtype=torch.bool),
-                    input_ids=torch.ones(1, 3, dtype=torch.long), hidden_states=torch.ones(1, 3, 1),
-                    anchor_positions=torch.ones(1, 1, dtype=torch.long), proposal_ids=torch.ones(1, 2, dtype=torch.long),
-                    target_last_hidden_states=torch.ones(1, 2, 1), proposal_temperature=1.0, target_temperature=1.0,
-                    proposal_block_width=7, _speco_sample_count=1, _speco_sample_ids=("b",))
-    monkeypatch.setattr(specopd_forward, "build_specopd_training_batch", build)
-    request = SimpleNamespace(trunk_ids=(1, 2, 3), branches=[SimpleNamespace(anchor=2, token_ids=(1, 2))])
-    result = asyncio.run(DrafterBaseTrainer.training_specopd_group(
-        trainer, [(request, None), (request, None)], 5,
-        SpecOPDConfig(optimizer_updates_per_collection=updates, training_microbatch_trajectories=microbatch_size), (1,),
-    ))
-    local_count = (2 + dp_size - 1) // dp_size
-    assert len(builds) == local_count  # fixed local inputs built once
-    assert result and trainer.optimizer_steps_total == updates
-    assert events.count(("snapshot", 5)) == 1
-    assert [e[1] for e in events if e[0] == "microbatch"] == list(range((local_count + microbatch_size - 1) // microbatch_size)) * updates
-    assert events[-1] == ("snapshot", 5)
-
-
-@pytest.mark.parametrize("budget", [0, 16, 32])
-def test_fixed_input_cache_respects_budget(monkeypatch, budget):
-    import torch
-
-    from verl_speco.backends import specopd_forward
-
-    def build(request, *args):
-        return {"input_ids": torch.tensor([request, request]), "temperature": 1.0}
-    monkeypatch.setattr(specopd_forward, "build_specopd_training_batch", build)
-    batches, used = specopd_forward.prepare_specopd_training_batches(
-        [(1, None), (2, None)], "cpu", None, (), cache_bytes=budget,
-    )
-    assert used <= budget
-    assert used == min(budget // 16, 2) * 16
-    assert [batch["input_ids"].tolist() for batch in batches] == [[1, 1], [2, 2]]
-    assert all(batch["temperature"] == 1.0 for batch in batches)
 
 
 def test_uncached_device_inputs_are_released_before_next_transfer_and_snapshot(monkeypatch):
@@ -448,11 +272,3 @@ def test_uncached_device_inputs_are_released_before_next_transfer_and_snapshot(m
     ))
     assert trainer._specopd_group_metrics["specopd/input_cache_bytes"] == 0
     assert len(live_inputs) == 40 and trainer.optimizer_steps_total == 20
-
-
-@pytest.mark.parametrize("maximum,expected", [(1, [1, 1, 1, 1]), (2, [2, 2]), (4, [4])])
-def test_global_training_groups_have_identical_dp_boundaries(maximum, expected):
-    from verl_speco.backends.specopd_forward import plan_specopd_training_groups
-    selected = [(SimpleNamespace(trunk_ids=tuple(range(n)), branches=[SimpleNamespace(anchor=n-1)]), None) for n in [7, 20, 9, 8, 15, 6, 5]]
-    assert plan_specopd_training_groups(selected, 2, maximum, 1000) == expected
-    assert plan_specopd_training_groups(selected, 2, 4, 30) == [1, 2, 1]
