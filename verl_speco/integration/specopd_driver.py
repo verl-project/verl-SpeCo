@@ -11,10 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Legacy PPO/GRPO lifecycle adapter: replace old-logprob, train, then publish."""
+"""Synchronous V1 lifecycle: score the rollout, train, then publish."""
 
-from contextlib import contextmanager
-from types import MethodType
 import time
 
 import torch
@@ -226,9 +224,6 @@ class SpecOPDDriver:
         server_manager = getattr(self.trainer, "llm_server_manager", None)
         servers = getattr(server_manager, "server_handles", None)
         if not servers:
-            target = self.trainer._speco_rollout_generation_target()
-            servers = getattr(target, "server_handles", None)
-        if not servers:
             raise RuntimeError(
                 "SpecOPD requires rollout server handles for serving revision ACKs"
             )
@@ -314,7 +309,7 @@ class SpecOPDDriver:
             )
         if self._bound_actor_revision and actor_revision < self.cycle.actor_revision:
             raise RuntimeError("SpecOPD rollout actor revision regressed")
-        # Under synchronous legacy hooks the actor cannot update between this
+        # In synchronous V1 the actor cannot update between this
         # rollout and old-logprob. Bind the actual serving revision (not prompt
         # submission global_step, which can be off by one at startup/resume).
         self.cycle.actor_revision = actor_revision
@@ -516,84 +511,3 @@ class SpecOPDDriver:
         self.metrics["specopd/published_drafter_revision"] = self.cycle.drafter_revision
         if not self.trained:
             self.metrics["drafter/published"] = 0
-
-
-@contextmanager
-def specopd_fit_hooks(trainer):
-    """Replace, rather than stack on top of, the legacy replay training hooks."""
-    driver = SpecOPDDriver(trainer)
-    target = trainer._speco_rollout_generation_target()
-    generate, oldlog, update = (
-        target.generate_sequences,
-        trainer._compute_old_log_prob,
-        trainer._update_actor,
-    )
-    manager = getattr(trainer, "checkpoint_manager", None)
-    weight_update = getattr(manager, "update_weights", None)
-    last_actor_output = None
-
-    def generated(_manager, *args, **kwargs):
-        driver.bootstrap()
-        driver.publish()  # Fallback publication after the previous actor weight update.
-        batch = args[0] if args else kwargs.get("batch", kwargs.get("prompts"))
-        if batch is None:
-            raise ValueError("SpecOPD rollout requires a DataProto input")
-        validation = batch.meta_info.get("validate", False) or getattr(
-            trainer, "_speco_validation_in_progress", False
-        )
-        previous = dict(batch.meta_info)
-        try:
-            if validation:
-                batch.meta_info["skip_drafter_collection"] = True
-            else:
-                due = driver.begin_step(trainer.global_steps)
-                batch.meta_info["skip_drafter_collection"] = not due
-                batch.meta_info["specopd_drafter_revision"] = (
-                    driver.cycle.drafter_revision
-                )
-            result = generate(*args, **kwargs)
-            if not validation:
-                trainer._speco_store_rollout_metrics(result)
-            return result
-        finally:
-            batch.meta_info.clear()
-            batch.meta_info.update(previous)
-
-    def old_log_prob(_trainer, batch):
-        if not driver.update_due:
-            return oldlog(batch)
-        return driver.old_log_prob(batch)
-
-    def updated(_trainer, *args, **kwargs):
-        nonlocal last_actor_output
-        driver.before_actor_update()
-        result = update(*args, **kwargs)
-        trainer._speco_update_output_metrics(result, driver.metrics)
-        last_actor_output = result
-        return result
-
-    def weights_updated(_manager, *args, **kwargs):
-        result = weight_update(*args, **kwargs)
-        driver.finish_step()
-        if last_actor_output is not None:
-            # Upstream logs actor_output only after weight publication. Include
-            # the completed ACK instead of leaving its metrics one step behind.
-            trainer._speco_update_output_metrics(last_actor_output, driver.metrics)
-        return result
-
-    target.generate_sequences = MethodType(generated, target)
-    trainer._compute_old_log_prob = MethodType(old_log_prob, trainer)
-    trainer._update_actor = MethodType(updated, trainer)
-    if callable(weight_update):
-        manager.update_weights = MethodType(weights_updated, manager)
-    try:
-        yield
-        driver.publish()
-    finally:
-        (
-            target.generate_sequences,
-            trainer._compute_old_log_prob,
-            trainer._update_actor,
-        ) = generate, oldlog, update
-        if callable(weight_update):
-            manager.update_weights = weight_update

@@ -310,18 +310,19 @@ def validate_specopd_config(config):
     }:
         raise ValueError("SpecOPD draft_sample_method must be greedy or probabilistic")
     trainer = config.get("trainer", {})
+    if not trainer.get("use_v1", False):
+        raise ValueError("SpecOPD requires trainer.use_v1=true")
     if trainer.get("critic_warmup", 0) > 0:
         raise ValueError(
             "SpecOPD requires critic_warmup=0 so every collected step updates the actor"
         )
-    if trainer.get("use_v1", False):
-        v1 = trainer.get("v1", {})
-        if v1.get("trainer_mode", "sync") != "sync":
-            raise ValueError("SpecOPD V1 requires trainer_mode=sync")
-        if v1.get("separate_async", {}).get("parameter_sync_step", 1) != 1:
-            raise ValueError("SpecOPD V1 requires parameter_sync_step=1")
-        if config.get("algorithm", {}).get("filter_groups", {}).get("enable", False):
-            raise ValueError("SpecOPD V1 does not support group-filter refill")
+    v1 = trainer.get("v1", {})
+    if v1.get("trainer_mode", "sync") != "sync":
+        raise ValueError("SpecOPD V1 requires trainer_mode=sync")
+    if v1.get("separate_async", {}).get("parameter_sync_step", 1) != 1:
+        raise ValueError("SpecOPD V1 requires parameter_sync_step=1")
+    if config.get("algorithm", {}).get("filter_groups", {}).get("enable", False):
+        raise ValueError("SpecOPD V1 does not support group-filter refill")
     if actor.get("actor", {}).get("strategy", "fsdp2") not in {"fsdp", "fsdp2"}:
         raise ValueError("SpecOPD requires the FSDP actor engine")
     model = actor.get("model", {})

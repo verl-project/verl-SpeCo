@@ -48,6 +48,12 @@ def test_manual_workflow_covers_every_example_and_routes_hardware():
         manifest["examples/run_qwen3.6-35b-a3b_drafter_dspark_separate_training.sh"]
         == "npu"
     )
+    npu = workflow["jobs"]["npu"]
+    release = npu["env"]["SPECO_EXAMPLE_VERL_REF"]
+    assert "run_qwen3-8b-specopd_drafter_dspark_vllm_npu.sh" in release
+    assert "'release/v0.9.0' || inputs.verl_ref" in release
+    assert npu["steps"][1]["with"]["ref"] == "${{ env.SPECO_EXAMPLE_VERL_REF }}"
+
 
 
 @pytest.mark.parametrize("example", [

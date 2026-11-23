@@ -21,19 +21,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from transformers import Qwen3Config, Qwen3ForCausalLM
-
-from verl_speco.integration import specopd_driver, specopd_vllm, vllm_runtime
+from verl_speco.integration import specopd_vllm, vllm_runtime
+from verl_speco.integration.ci_result import CIResult
 from verl_speco.integration.specopd_driver import SpecOPDDriver
 from verl_speco.integration.specopd_window import make_window
-from verl_speco.joint_scoring import score_joint_batch
 from verl_speco.specopd_config import SpecOPDConfig
-from verl_speco.integration.specopd_protocol import (
-    PLAN_KEY,
-    decode_bundle,
-    encode_bundle,
-    token_digest,
-)
+from verl_speco.integration.specopd_protocol import PLAN_KEY, decode_bundle
 
 
 def test_vllm_scheduler_to_final_output_channel(monkeypatch):
@@ -106,7 +99,7 @@ def test_vllm_scheduler_to_final_output_channel(monkeypatch):
 
 def configuration():
     return {
-        "trainer": {"use_v1": False},
+        "trainer": {"use_v1": True},
         "actor_rollout_ref": {
             "actor": {"strategy": "fsdp2"},
             "model": {"use_remove_padding": False},
@@ -128,206 +121,6 @@ def configuration():
             },
         },
     }
-
-
-@pytest.mark.parametrize("separate_llm_manager", [False, True])
-@pytest.mark.parametrize("score_target_logz", [False, True])
-def test_fit_hooks_replace_normal_forward_and_train_before_actor_update(
-    monkeypatch, separate_llm_manager, score_target_logz,
-):
-    from verl_speco.integration import specopd_training_transport
-
-    monkeypatch.setattr(specopd_training_transport, "dispatch_prepared_group",
-        lambda trainer, samples, step, revision, indices, metrics, spec:
-        trainer._require_speco_worker_group().train_specopd_group(samples, step, revision, indices))
-    events, calls = [], []
-    acknowledgements = []
-    cfg = Qwen3Config(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=8,
-        max_position_embeddings=128,
-    )
-    cfg._attn_implementation = "eager"
-    model = Qwen3ForCausalLM(cfg)
-    model.register_forward_hook(lambda *args: calls.append("actor-forward"))
-    wire = encode_bundle(
-        {
-            "schema": 1,
-            "request_id": "r",
-            "actor_revision": 0,
-            "drafter_revision": 0,
-            "proposal_temperature": 1.0,
-            "records": [
-                {
-                    "branch_id": "r:0",
-                    "prefix_len": 3,
-                    "proposal_ids": [11, 12, 13],
-                    "prefix_digest": token_digest([1, 2, 3]),
-                    "round_id": 0,
-                    "accepted_count": 0,
-                }
-            ],
-        },
-        10000,
-    )
-    batch = SimpleNamespace(
-        meta_info={},
-        non_tensor_batch={"_specopd_proposals": [wire]},
-        batch={
-            "prompts": torch.tensor([[1, 2, 3]]),
-            "responses": torch.tensor([[4, 5, 6]]),
-            "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6]]),
-            "attention_mask": torch.ones(1, 6),
-        },
-    )
-
-    class ActorGroup:
-        def compute_joint_old_log_prob(self, requests, **options):
-            events.append("joint")
-            assert options["return_target_logz"] == score_target_logz
-            options.pop("microbatch_sizes", None)
-            return [score_joint_batch(model, requests, **options)]
-
-    class DrafterGroup:
-        def prepare_specopd_bootstrap(self, step):
-            events.append("bootstrap")
-            return [{"revision": 0}]
-
-        def train_specopd_group(self, samples, step, revision, indices):
-            events.append("draft-update")
-            assert len(samples[0][0].branches[0].token_ids) == 3
-            assert (samples[0][1].branches[0].target_logz is not None) == score_target_logz
-            assert indices == (1, 2)
-            return [{"trained": True, "revision": revision + 1}]
-
-    class Trainer:
-        def __init__(self):
-            self.config = configuration()
-            training = self.config["actor_rollout_ref"]["rollout"]["drafter"]["training"]
-            training["specopd"]["score_target_logz"] = score_target_logz
-            from verl_speco.integration.ci_result import CIResult
-
-            self._speco_ci_result = CIResult(training=True)
-            self.global_steps = 1
-            self.actor_rollout_wg = ActorGroup()
-            self.drafter_wg = DrafterGroup()
-            self.serving_actor_revision = 0
-            def publish_actor():
-                events.append("actor-publish")
-                self.serving_actor_revision = self.global_steps
-            def acknowledge(revision):
-                acknowledgements.append((self.serving_actor_revision, revision))
-                return {"actor_revision": self.serving_actor_revision, "drafter_revision": revision}
-            self.checkpoint_manager = SimpleNamespace(
-                update_weights=publish_actor
-            )
-            self.generator = SimpleNamespace(generate_sequences=lambda data: data, server_handles=[
-                SimpleNamespace(speco_set_serving_drafter_revision=SimpleNamespace(remote=acknowledge)),
-            ])
-            if separate_llm_manager:
-                self.llm_server_manager = SimpleNamespace(server_handles=self.generator.server_handles)
-                del self.generator.server_handles
-
-        def _compute_old_log_prob(self, data):
-            pytest.fail("legacy old-logprob must not run after the joint forward")
-
-        def _update_actor(self, data):
-            events.append("actor-update")
-            return {}
-
-        def _speco_rollout_generation_target(self):
-            return self.generator
-
-        def _speco_store_rollout_metrics(self, result):
-            assert not result.meta_info.get("validate", False)
-
-        def _speco_oldlogprob_aux_layer_ids(self):
-            return [0, 1]
-
-        def _speco_oldlogprob_aux_layer_id_space(self):
-            return "decoder"
-
-        def _ray_get_if_needed(self, value):
-            return value
-
-        def _require_speco_worker_group(self):
-            return self.drafter_wg
-
-        def _speco_set_drafter_global_step(self):
-            events.append("set-step")
-
-        def _speco_sync_target_lm_head_weight(self):
-            events.append("head-sync")
-            return {}
-
-        def _speco_publish_drafter_weights(self, *args, **kwargs):
-            events.append("draft-publish")
-            return {"drafter/published": 1}
-
-        def _speco_update_output_metrics(self, output, metrics):
-            output.update(metrics)
-
-    monkeypatch.setattr(
-        specopd_driver, "make_oldlogprob", lambda batch, results: results
-    )
-    trainer = Trainer()
-    original = trainer._compute_old_log_prob
-    with specopd_driver.specopd_fit_hooks(trainer):
-        validation = SimpleNamespace(meta_info={"validate": True})
-        trainer.generator.generate_sequences(validation)
-        trainer.generator.generate_sequences(batch)
-        scored, mfu = trainer._compute_old_log_prob(batch)
-        assert len(calls) == 1 and scored[0].response_log_probs.shape == (3,)
-        actor_output = trainer._update_actor(batch)
-        trainer.checkpoint_manager.update_weights()
-        assert actor_output["specopd/published"] == 1
-        assert actor_output["specopd/published_drafter_revision"] == 1
-        assert actor_output["specopd/actor_revision"] == 0
-        # The next serving target revision advances after actor publication,
-        # while drafter publication has its own independent acknowledged ID.
-        trainer.global_steps = 2
-        next_bundle = decode_bundle(wire)
-        next_bundle.update(actor_revision=1, drafter_revision=1)
-        batch.non_tensor_batch["_specopd_proposals"] = [encode_bundle(next_bundle, 10000)]
-        trainer.generator.generate_sequences(batch)
-        scored, _ = trainer._compute_old_log_prob(batch)
-        assert len(calls) == 2
-        actor_output = trainer._update_actor(batch)
-        trainer.checkpoint_manager.update_weights()
-        assert actor_output["specopd/published_drafter_revision"] == 2
-        assert actor_output["specopd/actor_revision"] == 1
-        with pytest.raises(RuntimeError, match="exactly one rollout"):
-            trainer._compute_old_log_prob(batch)
-    assert trainer._compute_old_log_prob == original
-    assert trainer._speco_ci_result.data["optimizer_steps"] == 2
-    assert trainer._speco_ci_result.data["publications"] == 2
-    assert events == [
-        "set-step",
-        "head-sync",
-        "bootstrap",
-        "draft-publish",
-        "joint",
-        "set-step",
-        "head-sync",
-        "draft-update",
-        "actor-update",
-        "actor-publish",
-        "draft-publish",
-        "joint",
-        "set-step",
-        "head-sync",
-        "draft-update",
-        "actor-update",
-        "actor-publish",
-        "draft-publish",
-    ]
-    assert batch.meta_info == {}
-    assert acknowledgements == [(0, 0), (1, 1), (2, 2)]
 
 
 def test_proposal_agent_bridge_isolated_across_concurrent_requests():
@@ -371,11 +164,8 @@ def test_proposal_bridge_rejects_multiple_generation_requests():
         PROPOSAL_TURNS.reset(token)
 
 
-def test_failed_joint_forward_never_calls_legacy_fallback(monkeypatch):
-    # An exception is intentionally propagated: the trainer must not run a
-    # second normal forward and pretend the auxiliary path succeeded.
-    trainer = SimpleNamespace(config=configuration())
-    driver = specopd_driver.SpecOPDDriver(trainer)
+def test_joint_oldlogprob_requires_proposal_bundle():
+    driver = SpecOPDDriver(SimpleNamespace(config=configuration()))
     driver.cycle.begin(1)
     with pytest.raises(ValueError, match="missing"):
         driver.old_log_prob(
@@ -396,10 +186,10 @@ def test_serving_ack_rejects_wrong_draft_or_inconsistent_actor_revisions(replies
     )) for reply in replies]
     trainer = SimpleNamespace(
         config=configuration(),
-        _speco_rollout_generation_target=lambda: SimpleNamespace(server_handles=servers),
+        llm_server_manager=SimpleNamespace(server_handles=servers),
         _ray_get_if_needed=lambda values: values,
     )
-    driver = specopd_driver.SpecOPDDriver(trainer)
+    driver = SpecOPDDriver(trainer)
     with pytest.raises(RuntimeError, match="acknowledge"):
         driver.acknowledge_serving_revision(0)
 
@@ -417,7 +207,7 @@ def test_serving_ack_distributes_global_collection_limit(limit, quotas):
     server = SimpleNamespace(speco_set_serving_drafter_revision=SimpleNamespace(remote=acknowledge))
     trainer = SimpleNamespace(config=cfg, llm_server_manager=SimpleNamespace(server_handles=[server] * 8),
                               _ray_get_if_needed=lambda values: values)
-    specopd_driver.SpecOPDDriver(trainer).acknowledge_serving_revision(0)
+    SpecOPDDriver(trainer).acknowledge_serving_revision(0)
     assert received == quotas
 
 
@@ -503,7 +293,8 @@ def test_five_step_twenty_update_schedule_with_one_publication(monkeypatch):
         model=dict(use_remove_padding=True), rollout=dict(name="vllm", temperature=1.0,
             drafter=dict(enable=True, enable_drafter_training=True, speculative_algorithm="DSPARK",
                          vllm=dict(draft_sample_method="greedy"), training=training))))
-    trainer = SimpleNamespace(config=cfg, global_steps=1, actor_revision=0)
+    ci = CIResult(training=True)
+    trainer = SimpleNamespace(config=cfg, global_steps=1, actor_revision=0, _speco_ci_result=ci)
     worker = SimpleNamespace(train_specopd_group=lambda samples, step, revision, indices: events.append(("train", step, 20)) or [dict(trained=True, revision=revision+1, optimizer_updates=20)])
     trainer._ray_get_if_needed = lambda x: x
     trainer._require_speco_worker_group = lambda: worker
@@ -530,3 +321,5 @@ def test_five_step_twenty_update_schedule_with_one_publication(monkeypatch):
         assert driver.metrics["specopd/optimizer_updates"] == (20 if due else 0)
         assert driver.metrics["specopd/published"] == int(due)
     assert events == [("train", 5, 20), ("publish", 5), ("train", 10, 20), ("publish", 10)]
+    assert ci.data["optimizer_steps"] == 40
+    assert ci.data["publications"] == 2

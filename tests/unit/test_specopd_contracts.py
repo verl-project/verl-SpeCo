@@ -55,7 +55,7 @@ from verl_speco.integration.specopd_protocol import (
 
 def config():
     return {
-        "trainer": {"use_v1": False},
+        "trainer": {"use_v1": True},
         "actor_rollout_ref": {
             "actor": {"strategy": "fsdp2"},
             "model": {"use_remove_padding": False},
@@ -210,6 +210,9 @@ def test_training_input_cache_budget_rejects_invalid_limits(limit):
 
 def test_v1_sync_config_requires_one_publication_per_group():
     cfg = config()
+    cfg["trainer"]["use_v1"] = False
+    with pytest.raises(ValueError, match="trainer.use_v1=true"):
+        validate_specopd_config(cfg)
     cfg["trainer"] = {"use_v1": True, "v1": {"trainer_mode": "sync"}}
     assert validate_specopd_config(cfg).enable
     cfg["trainer"]["v1"]["trainer_mode"] = "colocate_async"
@@ -634,8 +637,11 @@ def test_dspark_specopd_launch_defaults_to_pure_tv():
     argv = result.stdout.decode().rstrip("\0").split("\0")
     assert argv[:3] == ["-m", "verl_speco.main", "--config-name=speco_v1_trainer"]
     hydra_parser.OverridesParser.create().parse_overrides(argv[3:])
-    config = OmegaConf.merge(OmegaConf.load(root / "verl_speco/config/speco_base.yaml"),
-                             OmegaConf.from_dotlist([arg.lstrip("+") for arg in argv[3:]]))
+    config = OmegaConf.merge(
+        OmegaConf.load(root / "verl_speco/config/speco_base.yaml"),
+        OmegaConf.load(root / "verl_speco/config/speco_v1_trainer.yaml"),
+        OmegaConf.from_dotlist([arg.lstrip("+") for arg in argv[3:]]),
+    )
     training = config.actor_rollout_ref.rollout.drafter.training
     spec = validate_specopd_config(config)
     assert spec.enable and spec.objective == "tv"
