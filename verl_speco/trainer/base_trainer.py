@@ -25,7 +25,7 @@ from uuid import uuid4
 from collections import deque
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Any, Callable, cast
+from typing import Optional, Any, Callable, TYPE_CHECKING, cast
 from omegaconf import open_dict
 from contextlib import contextmanager, nullcontext
 
@@ -59,10 +59,22 @@ from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
 
+from verl_speco.integration.verify_trace import TRACE_KEY
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 device_name = get_device_name()
+
+_VAT_METRIC_KEYS = (
+    "kd_loss",
+    "accept_loss",
+    "self_cov_loss",
+    "ce_loss",
+    "mean_accepted",
+    "sim_vs_obs_visible_accept_gap",
+)
+_OPD_METRIC_KEYS = ("loss", "trace_blocks", "random_blocks", "visible_tokens")
 
 _ALIGNMENT_DEBUG_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG"
 _ALIGNMENT_DEBUG_EVERY_N_STEPS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_EVERY_N_STEPS"
@@ -186,6 +198,81 @@ def resolve_drafter_strategy(config) -> str:
             else None
         )
     return str(strategy or "").lower()
+
+
+@torch.no_grad()
+def _clip_dtensor_grad_norm_(
+    parameters,
+    max_norm: float,
+    *,
+    disjoint_plain_param_ids: set[int] | None = None,
+    replicated_world_size: int = 1,
+) -> torch.Tensor:
+    """Clip EP/FSDP2 gradients with the true global norm, one coefficient.
+
+    ``torch.nn.utils.clip_grad_norm_`` cannot handle the mixed DTensor
+    placements an EP run produces (FSDP2-sharded non-experts + rank-disjoint
+    expert slices), and a per-rank coefficient would scale the shared
+    parameters inconsistently across ranks. This computes the true global norm
+    and applies a single coefficient on every rank.
+
+    Per-parameter contribution semantics:
+    - DTensor grads: ``Replicate`` mesh dims are replicas (divide by their size
+      before the all-reduce); sharded/other dims are disjoint contributions.
+    - Plain-tensor grads (the EP+DDP path): params listed in
+      ``disjoint_plain_param_ids`` are rank-disjoint (EP expert slices, summed
+      as-is); every other plain param is a replica whose gradient
+      ``sync_non_expert_grads`` has already world-averaged, so its squared sum
+      is divided by ``replicated_world_size`` instead of being counted once per
+      rank.
+    """
+    params = [p for p in parameters if p.grad is not None]
+    local_total = None
+    for param in params:
+        grad = param.grad
+        is_dtensor = hasattr(grad, "to_local")
+        local_grad = grad.to_local() if is_dtensor else grad
+        squared = local_grad.detach().float().pow(2).sum()
+
+        if is_dtensor:
+            # Replicated DTensor dimensions would otherwise be counted once per
+            # rank by the all-reduce below. Sharded dims contain disjoint
+            # elements.
+            replication = 1
+            placements = getattr(grad, "placements", ())
+            mesh = getattr(grad, "device_mesh", None)
+            if mesh is not None:
+                from torch.distributed.tensor.placement_types import Replicate
+
+                for dim, placement in enumerate(placements):
+                    if isinstance(placement, Replicate):
+                        replication *= int(mesh.size(dim))
+        elif (
+            disjoint_plain_param_ids is not None
+            and id(param) not in disjoint_plain_param_ids
+        ):
+            # EP+DDP: already world-averaged replicated grad -- count it once.
+            replication = max(1, int(replicated_world_size))
+        else:
+            # Plain rank-disjoint contribution (EP expert slice).
+            replication = 1
+        if replication > 1:
+            squared = squared / replication
+        local_total = squared if local_total is None else local_total + squared
+
+    if local_total is None:
+        # Nothing to clip: return a plain CPU scalar (no accelerator device is
+        # required, unlike ``device=<current_device_idx>`` which fails on
+        # CPU-only torch builds). The caller only inspects ``isfinite``.
+        return torch.zeros(())
+    if dist.is_initialized():
+        dist.all_reduce(local_total, op=dist.ReduceOp.SUM)
+    total_norm = local_total.sqrt()
+    clip_coef = min(1.0, float(max_norm) / (float(total_norm.item()) + 1e-6))
+    if clip_coef < 1.0:
+        for param in params:
+            param.grad.mul_(clip_coef)
+    return total_norm
 
 
 class _DrafterOptimizerState:
@@ -531,8 +618,24 @@ def _alignment_window_rows(
     return rows
 
 
+if TYPE_CHECKING:
+    from verl_speco.trainer.checkpoint import StandaloneCheckpointDirectoryLease
+
+
 class DrafterBaseTrainer:
     combine_standalone_metrics: bool = False
+    _standalone_lease_snapshot_provider: Callable[[], dict[str, Any]]
+    _standalone_resume_format: str
+    _standalone_preserve_packed_samples: bool
+    _standalone_validate_grad_graph: bool
+    _standalone_training_plan: dict[str, Any]
+    _standalone_retention_keep_last: int
+    _standalone_retention_delete: bool
+    _standalone_retention_run_id: str
+    _standalone_retention_protected: tuple[str, ...]
+    _standalone_checkpoint_timeout: float
+    _standalone_checkpoint_directory_lease: "StandaloneCheckpointDirectoryLease"
+    _standalone_input_identity: dict[str, Any] | None
 
     def __init__(
         self,
@@ -763,6 +866,12 @@ class DrafterBaseTrainer:
             self.training_group_world_size > 1
             and self.ulysses_sequence_parallel_size > 1
         )
+        if self.use_ulysses_sp and training_cfg.get("drafter_opd", {}).get(
+            "enable", False
+        ):
+            raise ValueError(
+                "Draft-OPD does not support Ulysses sequence parallelism > 1"
+            )
         setattr(self.backend, "use_ulysses_sp", self.use_ulysses_sp)
         self.use_native_dp_sp = (
             self.training_group_world_size > 1 and self.dp_group_world_size > 1
@@ -1118,6 +1227,7 @@ class DrafterBaseTrainer:
             "dflash",
             "dflash2",
             "dspark",
+            "dsv4_dspark",
             "domino",
         }
 
@@ -1142,9 +1252,68 @@ class DrafterBaseTrainer:
 
     def _block_drafter_metric_prefix(self) -> str:
         model_type = str(getattr(self.backend, "model_type", "dflash") or "dflash")
-        if model_type in {"dspark", "domino", "eagle3", "dflash2"}:
+        if model_type in {"dspark", "dsv4_dspark", "domino", "eagle3", "dflash2"}:
             return model_type
         return "dflash"
+
+    # --- DSV4 DSpark Expert Parallelism (thin delegates) -------------------
+    # All logic lives in ``backends.dsv4_ep_utils``; these wrappers keep the
+    # shared trainer file small and avoid importing the DSV4 module tree unless
+    # the algorithm is actually selected.
+
+    def _is_ep_active(self) -> bool:
+        """EP is requested *and* possible (multi-rank process group).
+
+        Cached on first query, so it must not be called before
+        ``init_process_group`` (that would pin the result at False); every
+        current call site runs after initialization.
+        """
+        config = getattr(self, "config", None)
+        if config is None:
+            return False
+        cached = getattr(self, "_is_ep_active_cache", None)
+        if cached is None:
+            from verl_speco.backends.dsv4_ep_utils import is_ep_active
+
+            cached = bool(is_ep_active(config))
+            self._is_ep_active_cache = cached
+        return cached
+
+    def _is_ep_enabled(self) -> bool:
+        """Config-only EP request (no process-group check); see _is_ep_active."""
+        config = getattr(self, "config", None)
+        if config is None:
+            return False
+        from verl_speco.backends.dsv4_ep_utils import is_ep_enabled
+
+        return is_ep_enabled(config)
+
+    def _apply_ep_only(self, raw_model) -> None:
+        from verl_speco.backends.dsv4_ep_utils import apply_ep_only
+
+        apply_ep_only(self, raw_model)
+
+    def _apply_ep_fsdp2(self, raw_model, fsdp_kwargs, fsdp_config) -> None:
+        from verl_speco.backends.dsv4_ep_utils import apply_ep_fsdp2
+
+        apply_ep_fsdp2(self, raw_model, fsdp_kwargs, fsdp_config)
+
+    def _sync_non_expert_grads(self) -> None:
+        from verl_speco.backends.dsv4_ep_utils import sync_non_expert_grads
+
+        sync_non_expert_grads(self)
+
+    def _scale_ep_expert_grads(self, factor: float) -> None:
+        from verl_speco.backends.dsv4_ep_utils import scale_expert_grads
+
+        scale_expert_grads(self, factor)
+
+    def _dump_local_expert_slices(self, checkpoint_path: str) -> str | None:
+        if self.backend.model_type != "dsv4_dspark":
+            return None
+        from verl_speco.backends.dsv4_ep_utils import dump_local_expert_slices
+
+        return dump_local_expert_slices(self, checkpoint_path)
 
     def _block_drafter_config_value(self, suffix: str, default: Any) -> Any:
         training_cfg = self.config.rollout.drafter.training
@@ -1170,6 +1339,19 @@ class DrafterBaseTrainer:
         prefix = self._block_drafter_metric_prefix()
         if f"{prefix}/loss" in sums:
             metrics[f"{prefix}/loss"] = sums[f"{prefix}/loss"] / steps
+        vat_batches = sums.get(f"{prefix}/vat/batch_count", 0.0)
+        if vat_batches > 0:
+            for key in _VAT_METRIC_KEYS:
+                if f"{prefix}/vat/{key}" in sums:
+                    metrics[f"{prefix}/vat/{key}"] = (
+                        sums[f"{prefix}/vat/{key}"] / vat_batches
+                    )
+        opd_batches = sums.get(f"{prefix}/opd/batch_count", 0.0)
+        if opd_batches > 0:
+            for key in _OPD_METRIC_KEYS:
+                metrics[f"{prefix}/opd/{key}"] = (
+                    sums[f"{prefix}/opd/{key}"] / opd_batches
+                )
         selector_weight = sums.get(f"{prefix}/selector_weight_count", 0.0)
         if selector_weight > 0:
             metrics[f"{prefix}/selector_loss"] = (
@@ -1373,6 +1555,10 @@ class DrafterBaseTrainer:
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
             "loss_mode_id": f"{prefix}/loss_mode_id",
         }
+        for key in (*_VAT_METRIC_KEYS, "batch_count"):
+            scalar_keys[f"vat/{key}"] = f"{prefix}/vat/{key}"
+        for key in (*_OPD_METRIC_KEYS, "batch_count"):
+            scalar_keys[f"opd/{key}"] = f"{prefix}/opd/{key}"
         vector_keys = {
             "loss_sum_per_position": f"{prefix}/loss_sum_per_position",
             "correct_per_position": f"{prefix}/correct_per_position",
@@ -1462,14 +1648,25 @@ class DrafterBaseTrainer:
         self._last_step_metrics = self._summarize_step_metrics(keys, reduced)
         return self._last_step_metrics
 
-    def _reduce_standalone_step_statistics(self, loss_dict: dict[str, Any], *, check_grad_graph: bool = False):
-        loss_values = [loss_dict[name].detach() for name in (
-            "total_local_vloss", "total_local_ploss", "local_num_tokens",
-        )]
+    def _reduce_standalone_step_statistics(
+        self, loss_dict: dict[str, Any], *, check_grad_graph: bool = False
+    ):
+        loss_values = [
+            loss_dict[name].detach()
+            for name in (
+                "total_local_vloss",
+                "total_local_ploss",
+                "local_num_tokens",
+            )
+        ]
         if check_grad_graph:
-            local_graph = (loss_dict["v_weight"] * loss_dict["total_local_vloss"]
-                           + loss_dict["p_weight"] * loss_dict["total_local_ploss"])
-            loss_values.append(loss_values[2].new_tensor(float(not local_graph.requires_grad)))
+            local_graph = (
+                loss_dict["v_weight"] * loss_dict["total_local_vloss"]
+                + loss_dict["p_weight"] * loss_dict["total_local_ploss"]
+            )
+            loss_values.append(
+                loss_values[2].new_tensor(float(not local_graph.requires_grad))
+            )
         loss_values = torch.stack(loss_values)
         keys, diagnostics = self._pack_training_diagnostics(loss_dict)
         if (
@@ -1483,11 +1680,15 @@ class DrafterBaseTrainer:
                 return self._reduce_loss_metrics(*loss_values.unbind())
             reduced, world_size = self._reduce_loss_statistics(loss_values)
         else:
-            reduced, world_size = self._reduce_loss_statistics(torch.cat([loss_values, diagnostics]))
+            reduced, world_size = self._reduce_loss_statistics(
+                torch.cat([loss_values, diagnostics])
+            )
             self._training_metric_steps += 1
-            diagnostic_values = reduced[len(loss_values):].cpu().tolist()
+            diagnostic_values = reduced[len(loss_values) :].cpu().tolist()
             self._accumulate_training_diagnostics(keys, diagnostic_values)
-            self._last_step_metrics = self._summarize_step_metrics(keys, diagnostic_values)
+            self._last_step_metrics = self._summarize_step_metrics(
+                keys, diagnostic_values
+            )
         if check_grad_graph:
             self._standalone_missing_grad_graph = bool(reduced[3].item())
         return reduced[0], reduced[1], reduced[2], world_size
@@ -1583,7 +1784,7 @@ class DrafterBaseTrainer:
         pending_target_weight = self._pending_target_lm_head_weight
         if (
             getattr(self.backend, "model_type", None)
-            in {"eagle3", "dflash", "dflash2", "dspark", "domino"}
+            in {"eagle3", "dflash", "dflash2", "dspark", "dsv4_dspark", "domino"}
             and torch.is_tensor(pending_target_weight)
             and pending_target_weight.dim() == 2
         ):
@@ -1594,12 +1795,74 @@ class DrafterBaseTrainer:
             )
         else:
             setattr(self.backend, "_initial_target_lm_head_shape", None)
-        raw_model, drafter_model_config = self.backend.build_model()
+
+        # DSV4 DSpark supports meta/skip loading and expert parallelism. Both
+        # are no-ops for every other drafter backend.
+        init_on_meta = bool(
+            self.config.rollout.drafter.training.get("init_on_meta", False)
+        )
+        random_init = bool(
+            self.config.rollout.drafter.training.get("dsv4_dspark_random_init", False)
+        )
+        ep_enabled = self._is_ep_active()
+        if self._is_ep_enabled() and not ep_enabled:
+            # EP was requested but degraded (single-rank / no process group):
+            # make the fallback to the full expert set visible at the boundary.
+            logger.warning(
+                "DSV4 DSpark EP requested (dsv4_dspark_enable_ep=true) but the "
+                "process group is uninitialized or has a single rank; training "
+                "on the full expert set without expert parallelism."
+            )
+        # Under EP every rank must load its OWN released expert slice (the
+        # pre-configured model is already sliced), so init_on_meta must not make
+        # non-zero ranks skip loading. Short-circuit on the config flags first so
+        # runs that opt out never touch process-group queries.
+        use_skip_loading = (
+            (random_init or init_on_meta)
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and (
+                random_init
+                or (init_on_meta and dist.get_rank() != 0 and not ep_enabled)
+            )
+        )
+        if ep_enabled and self._drafter_strategy() != "fsdp2":
+            raise ValueError(
+                "DSV4 DSpark expert parallelism requires "
+                "actor_rollout_ref.actor.strategy=fsdp2 (got "
+                f"{self._drafter_strategy()!r}); DDP/FSDP1/VeOmni would "
+                "all-reduce or mismatch rank-local expert parameters."
+            )
+        if ep_enabled:
+            world_size = dist.get_world_size()
+            from verl_speco.backends.dsv4_ep_utils import (
+                ensure_ep_divisible,
+                resolve_routed_expert_count,
+            )
+            from verl_speco.models.dsv4_dspark.backbone import moe_ep
+
+            n_experts = resolve_routed_expert_count(self.config)
+            experts_per_rank = ensure_ep_divisible(n_experts, world_size)
+            moe_ep.configure(
+                group=dist.group.WORLD,
+                rank=dist.get_rank(),
+                size=world_size,
+                experts_per_rank=experts_per_rank,
+            )
+            moe_ep.enable()
+        if use_skip_loading:
+            self.backend._skip_weight_loading = True
+        try:
+            raw_model, drafter_model_config = self.backend.build_model()
+        finally:
+            if use_skip_loading:
+                delattr(self.backend, "_skip_weight_loading")
 
         # FSDP2 loads the full state through fsdp2_load_full_state_dict(), which
         # places only rank 0 on the accelerator during the broadcast. Moving the
         # raw model first would materialize a full drafter replica on every rank
-        # and can exhaust NPU memory during checkpoint resume.
+        # and can exhaust NPU memory during checkpoint resume. The EP paths move
+        # the model to the device inside apply_ep_only/apply_ep_fsdp2 instead.
         use_fsdp2 = (
             self._drafter_strategy() != "ddp"
             and self.fsdp_device_mesh is not None
@@ -1640,17 +1903,39 @@ class DrafterBaseTrainer:
                 "mp_policy": mp_policy,
                 "offload_policy": None,
             }
-            logger.debug("Building drafter model with its configured FSDP2 mesh")
-
-            full_state = raw_model.state_dict()
-            apply_fsdp2(raw_model, fsdp_kwargs, fsdp_config)
-
-            # Load full state dict using the same mesh as used by drafter FSDP wrapping
-            fsdp2_load_full_state_dict(
-                raw_model, full_state, self.fsdp_device_mesh, None
+            ep_no_fsdp = bool(
+                self.config.rollout.drafter.training.get(
+                    "dsv4_dspark_ep_no_fsdp", False
+                )
             )
+            if ep_enabled and ep_no_fsdp:
+                logger.debug(
+                    "Building DSV4 DSpark drafter with expert parallelism (no FSDP2)"
+                )
+                self._apply_ep_only(raw_model)
+            elif ep_enabled:
+                logger.debug("Building DSV4 DSpark drafter with EP + FSDP2")
+                ep_mp_policy = MixedPrecisionPolicy(
+                    param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+                )
+                self._apply_ep_fsdp2(
+                    raw_model,
+                    # ``apply_ep_fsdp2`` derives the FSDP2 mesh from the trainer's
+                    # raw (dp, sp) training mesh itself; only the mp policy is read.
+                    {"mp_policy": ep_mp_policy},
+                    fsdp_config,
+                )
+            else:
+                logger.debug("Building drafter model with its configured FSDP2 mesh")
+                full_state = raw_model.state_dict()
+                apply_fsdp2(raw_model, fsdp_kwargs, fsdp_config)
+
+                # Load full state dict using the same mesh as used by drafter FSDP wrapping
+                fsdp2_load_full_state_dict(
+                    raw_model, full_state, self.fsdp_device_mesh, None
+                )
+                del full_state
             self.model = raw_model
-            del full_state
         elif (
             self.training_process_group is not None
             and self.training_group_world_size > 1
@@ -1897,17 +2182,20 @@ class DrafterBaseTrainer:
     def _is_frozen_publish_param(self, name: str) -> bool:
         """Return whether a drafter state entry should be excluded from hot publish."""
 
+        if "vat_objective.accept_head." in name:
+            return True
         if any(frozen_name in name for frozen_name in self._frozen_param_names):
             return True
         if (
             getattr(self.backend, "model_type", None) == "dspark"
             and "confidence_head." in name
-            and float(getattr(self.backend, "confidence_head_alpha", 0.0)) <= 0.0
         ):
-            # A checkpoint's untrained head stays frozen. Trained confidence
-            # heads must be published on both MRV1 and MRV2 now that the
-            # runtimes can register and consume them.
-            return True
+            # VAT can train this head with the ordinary confidence loss disabled.
+            draft_model, _ = self._get_pretrained_export_model()
+            return not any(
+                param.requires_grad
+                for param in draft_model.confidence_head.parameters()
+            )
         if name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
             # Most backends seed the draft embedding from the target and freeze it,
             # so the engine already holds the same rows. Backends that fine-tune it
@@ -2324,6 +2612,43 @@ class DrafterBaseTrainer:
                 ) from error
             raise RuntimeError(f"Drafter checkpoint {phase} failed on another SP rank")
 
+    def _dump_ep_expert_slices_or_fail(self, checkpoint_path: str) -> None:
+        """Dump this rank's EP expert slice, failing all ranks on any error.
+
+        The leader's main checkpoint only contains its own expert slice, so
+        every EP rank's ``ep_experts/rank_<r>.pt`` file is required to
+        reconstruct the drafter. Capturing a local write failure and then
+        all-reducing a failure flag over the checkpoint group guarantees that:
+
+        * one rank's disk/permission/I/O error fails the whole checkpoint
+          instead of silently producing an incomplete one; and
+        * the failing rank does not raise before the other ranks enter the
+          subsequent save collectives (which would hang them).
+
+        Only a checkpoint that reaches the later save phases can be reported as
+        successfully saved.
+        """
+        if not self._is_ep_active():
+            return
+
+        error: BaseException | None = None
+        try:
+            slice_path = self._dump_local_expert_slices(checkpoint_path)
+            if not slice_path:
+                error = RuntimeError(
+                    "EP expert slice dump produced no file; the checkpoint "
+                    "would not be reconstructable"
+                )
+            elif not os.path.exists(slice_path):
+                error = RuntimeError(
+                    f"EP expert slice disappeared after write: {slice_path}"
+                )
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+        # Collective failure: every participating rank raises together, and the
+        # original exception is preserved on the rank that observed it.
+        self._sync_checkpoint_phase_error(error, "EP expert slice dump")
+
     def _save_optimizer_checkpoint(self, checkpoint_path: str) -> dict[str, Any]:
         if self.optimizer is None:
             raise RuntimeError("Cannot save drafter optimizer before it is initialized")
@@ -2349,18 +2674,31 @@ class DrafterBaseTrainer:
         save_error = None
         try:
             import torch.distributed.checkpoint as dcp
+            from verl_speco.trainer.auxiliary_state import DrafterAuxiliaryState
 
-            saved_optimizer_metadata = dcp.save(
+            auxiliary = DrafterAuxiliaryState(self.model)
+            has_auxiliary = bool(auxiliary.state_dict())
+
+            storage_writer = None
+            if getattr(self, "_standalone_retention_keep_last", 0):
+                from verl_speco.trainer.checkpoint import (
+                    standalone_optimizer_storage_writer,
+                )
+
+                storage_writer = standalone_optimizer_storage_writer(temporary_path)
+            dcp.save(
                 {
+                    **({"auxiliary_model": auxiliary} if has_auxiliary else {}),
                     "optimizer": _DrafterOptimizerState(
                         self.model,
                         self.optimizer,
                         self._checkpoint_process_group()
                         if self._use_replica_local_bubble_group()
                         else None,
-                    )
+                    ),
                 },
                 checkpoint_id=temporary_path,
+                storage_writer=storage_writer,
                 process_group=self._checkpoint_process_group(),
             )
         except Exception as exc:  # noqa: BLE001
@@ -2370,9 +2708,6 @@ class DrafterBaseTrainer:
         finalize_error = None
         if is_leader:
             try:
-                if getattr(self, "_standalone_retention_keep_last", 0):
-                    from verl_speco.trainer.checkpoint import write_standalone_optimizer_layout
-                    write_standalone_optimizer_layout(temporary_path, saved_optimizer_metadata)
                 self._atomic_torch_save(
                     {
                         "version": 1,
@@ -2399,6 +2734,8 @@ class DrafterBaseTrainer:
                 self.fsdp_device_mesh.size() if self.fsdp_device_mesh is not None else 1
             ),
         }
+        if has_auxiliary:
+            manifest["auxiliary_model"] = True
         if is_leader:
             try:
                 total_bytes = sum(
@@ -2434,6 +2771,21 @@ class DrafterBaseTrainer:
 
         try:
             import torch.distributed.checkpoint as dcp
+            from verl_speco.trainer.auxiliary_state import DrafterAuxiliaryState
+
+            auxiliary = DrafterAuxiliaryState(self.model)
+            if auxiliary.state_dict():
+                if not metadata["optimizer"].get("auxiliary_model", False):
+                    raise ValueError(
+                        "Checkpoint is missing VAT acceptance-head weights; "
+                        "disable resume_trainer_state_from_checkpoint to start fresh"
+                    )
+                # Restore auxiliary parameters before applying their optimizer moments.
+                dcp.load(
+                    {"auxiliary_model": auxiliary},
+                    checkpoint_id=optimizer_path,
+                    process_group=self._checkpoint_process_group(),
+                )
 
             dcp.load(
                 {
@@ -2664,6 +3016,11 @@ class DrafterBaseTrainer:
 
         checkpoint_started = time.perf_counter()
         checkpoint_path = os.path.join(self.checkpoint_dir, f"draft_step_{int(step)}")
+        # Expert-parallel ranks each hold a disjoint expert slice; dump every
+        # rank's slice before the leader-only export so the drafter can be
+        # reconstructed completely offline. A slice failure fails the checkpoint
+        # collectively instead of silently saving an incomplete one.
+        self._dump_ep_expert_slices_or_fail(checkpoint_path)
         if (
             self.rollout_dp_rank != 0
             and not self._use_flattened_drafter_fsdp_mesh()
@@ -2687,7 +3044,9 @@ class DrafterBaseTrainer:
         previous_error = None
         if self._is_checkpoint_leader() and pending_full_checkpoint is not None:
             try:
-                pending_full_checkpoint.result(timeout=getattr(self, "_standalone_checkpoint_timeout", None))
+                pending_full_checkpoint.result(
+                    timeout=getattr(self, "_standalone_checkpoint_timeout", None)
+                )
             except Exception as exc:  # noqa: BLE001
                 previous_error = exc
             finally:
@@ -2740,7 +3099,9 @@ class DrafterBaseTrainer:
             )
             if wait and future is not None:
                 try:
-                    write_result = future.result(timeout=getattr(self, "_standalone_checkpoint_timeout", None))
+                    write_result = future.result(
+                        timeout=getattr(self, "_standalone_checkpoint_timeout", None)
+                    )
                 finally:
                     if future.done():
                         self._pending_full_checkpoint_future = None
@@ -4414,6 +4775,7 @@ class DrafterBaseTrainer:
                     batch.get("_verl_request_mean_accept_len"),
                     i,
                 ),
+                TRACE_KEY: _batch_item_value(batch.get(TRACE_KEY), i),
                 "_speco_vllm_request_id": _batch_item_value(
                     batch.get("_speco_vllm_request_id"), i
                 ),
@@ -4461,6 +4823,25 @@ class DrafterBaseTrainer:
                     else None
                 ),
             }
+            if data_item[TRACE_KEY] is not None:
+                from verl_speco.integration.verify_trace import align_trace_to_prompt
+
+                if cpu_prompts is None:
+                    raise ValueError(
+                        "Draft-OPD collection requires prompt token coordinates"
+                    )
+                data_item[TRACE_KEY] = align_trace_to_prompt(
+                    data_item[TRACE_KEY], cpu_prompts[i].numel()
+                )
+                if batch.get("response_mask") is None:
+                    raise ValueError(
+                        "Draft-OPD collection requires the agent response_mask"
+                    )
+                response_mask = (
+                    batch["response_mask"][i].detach().cpu().float()[:response_len]
+                )
+                full_loss_mask[prompt_len : prompt_len + response_len] = response_mask
+                data_item["loss_mask"] = full_loss_mask[feature_start:feature_end]
             if shifted_block_labels:
                 if not 0 <= feature_start < feature_end < input_seq_length:
                     raise ValueError(
@@ -5017,28 +5398,62 @@ class DrafterBaseTrainer:
         if getattr(self, "_standalone_preserve_packed_samples", False):
             from verl_speco.trainer.standalone_batch_prepare import _pack
 
-            if not (len(input_id_chunks) == len(loss_mask_chunks)
-                    == len(hidden_state_chunks) == len(position_id_chunks)):
-                raise ValueError("Standalone packing requires aligned per-sample fields")
+            if not (
+                len(input_id_chunks)
+                == len(loss_mask_chunks)
+                == len(hidden_state_chunks)
+                == len(position_id_chunks)
+            ):
+                raise ValueError(
+                    "Standalone packing requires aligned per-sample fields"
+                )
             chunks = []
-            for index, (ids, mask, hidden, position) in enumerate(zip(
-                input_id_chunks, loss_mask_chunks, hidden_state_chunks, position_id_chunks,
-                strict=True,
-            )):
-                chunk = {"input_ids": ids, "loss_mask": mask,
-                         "hidden_states": hidden, "position_ids": position}
+            for index, (ids, mask, hidden, position) in enumerate(
+                zip(
+                    input_id_chunks,
+                    loss_mask_chunks,
+                    hidden_state_chunks,
+                    position_id_chunks,
+                    strict=True,
+                )
+            ):
+                chunk = {
+                    "input_ids": ids,
+                    "loss_mask": mask,
+                    "hidden_states": hidden,
+                    "position_ids": position,
+                }
                 if target_last_hidden_state_chunks:
-                    chunk["target_last_hidden_states"] = target_last_hidden_state_chunks[index]
+                    chunk["target_last_hidden_states"] = (
+                        target_last_hidden_state_chunks[index]
+                    )
                 if has_next_token_labels:
-                    chunk["next_token_ids"] = cast(list[torch.Tensor], next_token_id_chunks)[index]
-                    chunk["next_token_loss_mask"] = cast(list[torch.Tensor], next_token_loss_mask_chunks)[index]
+                    chunk["next_token_ids"] = cast(
+                        list[torch.Tensor], next_token_id_chunks
+                    )[index]
+                    chunk["next_token_loss_mask"] = cast(
+                        list[torch.Tensor], next_token_loss_mask_chunks
+                    )[index]
                 chunks.append(chunk)
-            batch = _pack(chunks, block_size, max_packed_len,
-                          cast_hidden_bfloat=False, flatten_hidden=False)
-            return (batch["input_ids"], batch["loss_mask"], batch["hidden_states"],
-                    batch["position_ids"], batch["attention_mask"], batch["document_ids"],
-                    batch.get("target_last_hidden_states"), batch.get("next_token_ids"),
-                    batch.get("next_token_loss_mask"), len(chunks))
+            batch = _pack(
+                chunks,
+                block_size,
+                max_packed_len,
+                cast_hidden_bfloat=False,
+                flatten_hidden=False,
+            )
+            return (
+                batch["input_ids"],
+                batch["loss_mask"],
+                batch["hidden_states"],
+                batch["position_ids"],
+                batch["attention_mask"],
+                batch["document_ids"],
+                batch.get("target_last_hidden_states"),
+                batch.get("next_token_ids"),
+                batch.get("next_token_loss_mask"),
+                len(chunks),
+            )
 
         ids_out: list[torch.Tensor] = []
         mask_out: list[torch.Tensor] = []
@@ -5417,6 +5832,8 @@ class DrafterBaseTrainer:
         packed_loss_tokens = 0
         trailing_label_rows = 0
         packing_enabled = self._packing_enabled()
+        if packing_enabled and "opd_trace" in preprocessed_lists:
+            raise ValueError("Draft-OPD currently requires packing=false")
 
         # Build training chunks inside each sample before packing. EAGLE3-style
         # models use next-token chunks, while DFlash keeps same-position blocks
@@ -5434,6 +5851,7 @@ class DrafterBaseTrainer:
         label_id_chunks = []
         label_mask_chunks = []
 
+        opd_trace_chunks = []
         ids_list = preprocessed_lists["ids"]
         hidden_list = preprocessed_lists["h_states"]
         mask_list = preprocessed_lists["masks"]
@@ -5455,7 +5873,7 @@ class DrafterBaseTrainer:
             self.config.rollout.drafter.training.get("lk_temperature", 1.0) or 1.0
         )
         block_distribution_loss_enabled = (
-            self.backend.model_type in {"dspark", "dflash"}
+            self.backend.model_type in {"dspark", "dsv4_dspark", "dflash"}
             and resolve_drafter_hidden_states_layout(
                 self.backend.model_type.upper(), self.config.rollout.drafter.training
             )
@@ -5887,6 +6305,10 @@ class DrafterBaseTrainer:
                             },
                         )
 
+            if "opd_trace" in preprocessed_lists:
+                opd_trace_chunks.append(
+                    preprocessed_lists["opd_trace"][item_idx][:train_seq_len]
+                )
             if uses_shifted_eagle_inputs or self.backend.model_type == "peagle":
                 input_id_chunks.append(ids[1 : 1 + train_seq_len])
                 hidden_state_chunks.append(h_states[:train_seq_len])
@@ -6169,7 +6591,7 @@ class DrafterBaseTrainer:
                 device=dev,
             )
         elif (
-            self.backend.model_type in {"dflash", "dspark"}
+            self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
             and target_last_hidden_state_chunks
         ):
             batch["target_last_hidden_states"] = target_last_hidden_states
@@ -6200,7 +6622,7 @@ class DrafterBaseTrainer:
             peagle_last_hidden_states = batch["last_hidden_states"]
             peagle_seq_lengths = batch["seq_lengths"]
         elif (
-            self.backend.model_type in {"dflash", "dspark"}
+            self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
             and "target_last_hidden_states" in batch
         ):
             target_last_hidden_states = batch["target_last_hidden_states"]
@@ -6247,7 +6669,7 @@ class DrafterBaseTrainer:
                                 target_logz, (0, pad_size), value=0.0
                             )
                 elif (
-                    self.backend.model_type in {"dflash", "dspark"}
+                    self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
                     and "target_last_hidden_states" in batch
                 ):
                     target_last_hidden_states = torch.nn.functional.pad(
@@ -6272,7 +6694,7 @@ class DrafterBaseTrainer:
                             target_logz, dim=1, padding=False
                         )
             elif (
-                self.backend.model_type in {"dflash", "dspark"}
+                self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
                 and "target_last_hidden_states" in batch
             ):
                 target_last_hidden_states = slice_input_tensor(
@@ -6309,10 +6731,16 @@ class DrafterBaseTrainer:
             batch["last_hidden_states"] = peagle_last_hidden_states
             batch["seq_lengths"] = peagle_seq_lengths
         elif (
-            self.backend.model_type in {"dflash", "dspark"}
+            self.backend.model_type in {"dflash", "dspark", "dsv4_dspark"}
             and target_last_hidden_state_chunks
         ):
             batch["target_last_hidden_states"] = target_last_hidden_states
+        if opd_trace_chunks:
+            batch["opd_trace"] = torch.full(
+                (*input_ids.shape, 3), -1, dtype=torch.long, device=dev
+            )
+            for row, trace in enumerate(opd_trace_chunks):
+                batch["opd_trace"][row, : trace.size(0)] = trace
         if document_ids is not None:
             batch["document_ids"] = document_ids
         batch["_speco_pad_size"] = pad_size_for_batch
@@ -7002,14 +7430,23 @@ class DrafterBaseTrainer:
             self._last_prepared_training_items = previous_prepared_items
 
     async def training_step_from_batch(
-        self, batch: dict[str, torch.Tensor], step: int, *, raise_on_error: bool = False,
-        accumulation_steps: int = 1, accumulation_index: int = 0,
+        self,
+        batch: dict[str, torch.Tensor],
+        step: int,
+        *,
+        raise_on_error: bool = False,
+        accumulation_steps: int = 1,
+        accumulation_index: int = 0,
     ) -> bool:
         """Execute a standalone batch, optionally as part of one optimizer step."""
         self.last_standalone_training_error = None
         try:
-            if (type(accumulation_steps) is not int or accumulation_steps < 1
-                    or type(accumulation_index) is not int or not 0 <= accumulation_index < accumulation_steps):
+            if (
+                type(accumulation_steps) is not int
+                or accumulation_steps < 1
+                or type(accumulation_index) is not int
+                or not 0 <= accumulation_index < accumulation_steps
+            ):
                 raise ValueError("Invalid standalone accumulation index or count")
             if batch.get("hidden_source") == "standalone_vllm_reference":
                 if batch.get("_speco_reference_staged") is True:
@@ -7019,9 +7456,21 @@ class DrafterBaseTrainer:
                     batch = self._stage_standalone_cpu_batch(batch)
             with torch.enable_grad():
                 if accumulation_steps == 1:
-                    return await self._training_step_on_batch(batch, step)
-                return await self._training_step_on_batch(batch, step, accumulation_steps=accumulation_steps,
-                                                          accumulation_index=accumulation_index)
+                    result = await self._training_step_on_batch(batch, step)
+                else:
+                    result = await self._training_step_on_batch(
+                        batch,
+                        step,
+                        accumulation_steps=accumulation_steps,
+                        accumulation_index=accumulation_index,
+                    )
+                if not result:
+                    logger.warning(
+                        f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] "
+                        f"training_step_from_batch returned False at step {step} "
+                        f"(keys={sorted(batch.keys())[:8]})"
+                    )
+                return result
         except Exception as e:  # noqa: BLE001
             self.last_standalone_training_error = e
             logger.exception(f"Standalone training step {step} failed with error: {e}")
@@ -7241,7 +7690,11 @@ class DrafterBaseTrainer:
         return step_ok
 
     def _reduce_loss_metrics(
-        self, l_v: torch.Tensor, l_p: torch.Tensor, l_n: torch.Tensor, *,
+        self,
+        l_v: torch.Tensor,
+        l_p: torch.Tensor,
+        l_n: torch.Tensor,
+        *,
         check_grad_graph: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """All-reduce detached loss/token sums across the SP/DP groups.
@@ -7253,7 +7706,11 @@ class DrafterBaseTrainer:
         """
         values = [l_v.detach(), l_p.detach(), l_n.detach()]
         if check_grad_graph:
-            values.append(l_n.detach().new_tensor(float(not (l_v.requires_grad or l_p.requires_grad))))
+            values.append(
+                l_n.detach().new_tensor(
+                    float(not (l_v.requires_grad or l_p.requires_grad))
+                )
+            )
         metrics, world_size = self._reduce_loss_statistics(torch.stack(values))
         if check_grad_graph:
             self._standalone_missing_grad_graph = bool(metrics[3].item())
@@ -7284,8 +7741,10 @@ class DrafterBaseTrainer:
         return metrics, reduce_world_size
 
     def _clip_training_grad_norm(self):
-        if (getattr(self, "_bubble_time_enabled", False)
-                or getattr(self, "_standalone_validate_grad_graph", False)) and isinstance(self.model, FSDP):
+        if (
+            getattr(self, "_bubble_time_enabled", False)
+            or getattr(self, "_standalone_validate_grad_graph", False)
+        ) and isinstance(self.model, FSDP):
             # Original-parameter FSDP1 gradients are local shards. All writer
             # ranks must clip against the same full-model norm, not each shard.
             return self.model.clip_grad_norm_(max_norm=1.0)
@@ -7341,10 +7800,15 @@ class DrafterBaseTrainer:
 
         # Reduce scalar loss statistics once across SP/DP groups.
         reduce_ts = training_stage_clock(self)
-        graph_options = ({"check_grad_graph": True}
-                         if getattr(self, "_standalone_validate_grad_graph", False) else {})
+        graph_options = (
+            {"check_grad_graph": True}
+            if getattr(self, "_standalone_validate_grad_graph", False)
+            else {}
+        )
         if getattr(self, "combine_standalone_metrics", False):
-            statistics = self._reduce_standalone_step_statistics(loss_dict, **graph_options)
+            statistics = self._reduce_standalone_step_statistics(
+                loss_dict, **graph_options
+            )
             step_accuracy = getattr(self, "_last_step_metrics", None) or {}
         else:
             statistics = self._reduce_loss_metrics(l_v, l_p, l_n, **graph_options)
@@ -7353,18 +7817,27 @@ class DrafterBaseTrainer:
             "timing_s/drafter_reduce_loss", training_stage_clock(self) - reduce_ts
         )
 
-        if (getattr(self, "_standalone_validate_grad_graph", False)
-                and getattr(self, "_standalone_missing_grad_graph", False)
-                and (float(global_tokens.detach().float().item()) > 0
-                     or (accumulation_steps > 1 and allow_zero_accumulation))):
+        if (
+            getattr(self, "_standalone_validate_grad_graph", False)
+            and getattr(self, "_standalone_missing_grad_graph", False)
+            and (
+                float(global_tokens.detach().float().item()) > 0
+                or (accumulation_steps > 1 and allow_zero_accumulation)
+            )
+        ):
             raise RuntimeError(
                 "A standalone rank has no loss gradient graph while the distributed "
                 "batch requires backward; refusing distributed backward"
             )
-        if (float(global_tokens.detach().float().item()) <= 0
-                and (accumulation_steps == 1 or not allow_zero_accumulation)):
-            logger.debug(
-                f"Step {self.training_steps + 1}: no finite drafter target tokens, skipping optimizer step"
+        if float(global_tokens.detach().float().item()) <= 0 and (
+            accumulation_steps == 1 or not allow_zero_accumulation
+        ):
+            logger.warning(
+                f"[DrafterTrainer rank {self.rank}] Step {self.training_steps + 1}: "
+                "no finite drafter target tokens, skipping optimizer step "
+                f"(local_num_tokens={float(l_n.detach().float().item()) if torch.is_tensor(l_n) else l_n}, "
+                f"local_vloss={float(l_v.detach().float().item()) if torch.is_tensor(l_v) else l_v}, "
+                f"local_ploss={float(l_p.detach().float().item()) if torch.is_tensor(l_p) else l_p})"
             )
             return False
         self._current_accumulation_valid_tokens += float(
@@ -7397,6 +7870,7 @@ class DrafterBaseTrainer:
             "eagle3",
             "dflash",
             "dspark",
+            "dsv4_dspark",
             "dflash2",
         } and getattr(self.backend, "enable_standalone_training_metrics", False):
             # Log the actual globally reduced optimization objective, including
@@ -7419,6 +7893,16 @@ class DrafterBaseTrainer:
             local_loss = local_loss / denom
         backward_ts = training_stage_clock(self)
         local_loss.backward()
+        if self._is_ep_active():
+            # EP keeps each rank's experts local; non-expert params are
+            # replicated and need a manual gradient all-reduce.
+            self._sync_non_expert_grads()
+            # Rank-local expert grads are never averaged, so they still carry
+            # the ``reduce_world_size`` loss-scaling factor that replicated
+            # params cancel through their gradient mean. Rescale them before
+            # clipping so expert and shared gradients follow the same global
+            # objective.
+            self._scale_ep_expert_grads(1.0 / float(reduce_world_size))
         self.record_training_timing(
             "timing_s/drafter_backward", training_stage_clock(self) - backward_ts
         )
@@ -7430,14 +7914,32 @@ class DrafterBaseTrainer:
         optimizer_ts = training_stage_clock(self)
         if self._current_accumulation_valid_tokens <= 0:
             self.optimizer.zero_grad(set_to_none=True)
-            logger.debug("No finite drafter target tokens in the accumulated batch; skipping optimizer step")
+            logger.debug(
+                "No finite drafter target tokens in the accumulated batch; skipping optimizer step"
+            )
             return False
         if accumulation_steps > 1:
             accumulation_denom = float(max(self._current_accumulation_valid_tokens, 1))
             for parameter in self.model.parameters():
                 if parameter.grad is not None:
                     parameter.grad.div_(accumulation_denom)
-        grad_norm = self._clip_training_grad_norm()
+        if self._is_ep_active():
+            # Mixed DTensor placements / rank-local expert grads: use the
+            # replication-corrected global norm so every rank clips identically.
+            # In the EP+DDP mode the non-expert grads are plain tensors that
+            # sync_non_expert_grads has already world-averaged -- count each
+            # replicated contribution once instead of once per rank.
+            ep_ddp_world_size = int(getattr(self, "_ep_ddp_world_size", 0) or 0)
+            grad_norm = _clip_dtensor_grad_norm_(
+                self.model.parameters(),
+                max_norm=1.0,
+                disjoint_plain_param_ids=getattr(self, "_ep_expert_param_ids", None),
+                replicated_world_size=(
+                    ep_ddp_world_size if ep_ddp_world_size > 1 else 1
+                ),
+            )
+        else:
+            grad_norm = self._clip_training_grad_norm()
         if not torch.isfinite(grad_norm):
             logger.error(
                 f"Step {self.training_steps + 1}: non-finite drafter grad norm, "
@@ -7526,8 +8028,7 @@ class DrafterBaseTrainer:
         try:
             training_cfg = self.config.rollout.drafter.training
             if (
-                device_name == "cuda"
-                and not getattr(self, "_bubble_time_enabled", False)
+                not getattr(self, "_bubble_time_enabled", False)
                 and self.training_device_mesh is not None
                 and not isinstance(self.model, FSDP)
                 and not self._is_ddp_wrapped()

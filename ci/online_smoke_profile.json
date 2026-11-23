@@ -110,5 +110,9 @@
   "SPECO_TEST_FREQ": {
     "key": "trainer.test_freq",
     "default": "-1"
+  },
+  "SPECO_FILTER_OVERLONG_PROMPTS_WORKERS": {
+    "key": "data.filter_overlong_prompts_workers",
+    "default": "1"
   }
 }

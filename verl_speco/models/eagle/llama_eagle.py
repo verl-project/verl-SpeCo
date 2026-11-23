@@ -1409,9 +1409,7 @@ class LlamaDecoderLayer(nn.Module):
         past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-    ) -> Tuple[
-        torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
-    ]:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -1433,6 +1431,7 @@ class LlamaDecoderLayer(nn.Module):
 
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
         # Self Attention
+        cached_steps = len(cache_hidden[0]) if cache_hidden is not None else 0
         hidden_states = self.self_attn(
             cache_hidden=cache_hidden,
             hidden_states=hidden_states,
@@ -1450,8 +1449,10 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        # outputs = (hidden_states, return_hidden)
-        return hidden_states
+        new_kv = None
+        if cache_hidden is not None and len(cache_hidden[0]) > cached_steps:
+            new_kv = cache_hidden[0][-1], cache_hidden[1][-1]
+        return hidden_states, new_kv
 
 
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
@@ -1648,23 +1649,30 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self,
         input_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
-        cache_hidden: torch.Tensor,
+        cache_hidden: list[list[torch.Tensor]] | None,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = True,
     ) -> torch.Tensor:
-        return self.midlayer(
+        # FSDP2 reconstructs the input containers when it adds autograd hooks.
+        # Return the new cache tensors through the wrapped layer's output.
+        hidden_states, new_kv = self.midlayer(
             input_emb=input_embeds,
             hidden_states=hidden_states,
-            cache_hidden=cache_hidden,
+            cache_hidden=cache_hidden.copy() if cache_hidden is not None else None,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
+        if cache_hidden is not None and new_kv is not None:
+            key_states, value_states = new_kv
+            cache_hidden[0].append(key_states)
+            cache_hidden[1].append(value_states)
+        return hidden_states
 
     def _shift_right(self, x: torch.Tensor):
         """瀹炵幇 Teacher Forcing 涓嬬殑鍙崇Щ濉厖锛氳垗寮冮浣嶏紝鏈綅琛?"""

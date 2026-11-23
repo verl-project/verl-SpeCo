@@ -31,7 +31,7 @@ import torch
 from verl_speco.data.parse import clean_conversation_roles
 
 logger = logging.getLogger(__name__)
-DEFAULT_MAX_JSONL_LINE_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_JSONL_LINE_BYTES = 0
 DEFAULT_MAX_INDEXED_RECORDS = 10_000_000
 
 
@@ -144,7 +144,9 @@ def iter_input_records(
             ) from error
 
     sequence_no = 0
-    for location, payload in _iter_payloads(input_path, handle_error, max_jsonl_line_bytes):
+    for location, payload in _iter_payloads(
+        input_path, handle_error, max_jsonl_line_bytes
+    ):
         try:
             record = _record_from_payload(
                 payload, location, sequence_no, parser_strict_roles
@@ -193,9 +195,15 @@ class ShuffledJsonlReader:
             raise ValueError("max_consecutive_errors must be >= 0")
         if type(stable_source_ids) is not bool:
             raise ValueError("stable_source_ids must be a boolean")
-        if (type(max_jsonl_line_bytes) is not int or max_jsonl_line_bytes < 0
-                or type(max_indexed_records) is not int or max_indexed_records < 0):
-            raise ValueError("JSONL line and index limits must be non-negative integers")
+        if (
+            type(max_jsonl_line_bytes) is not int
+            or max_jsonl_line_bytes < 0
+            or type(max_indexed_records) is not int
+            or max_indexed_records < 0
+        ):
+            raise ValueError(
+                "JSONL line and index limits must be non-negative integers"
+            )
         if type(verify_indexed_input) is not bool:
             raise ValueError("verify_indexed_input must be a boolean")
         input_path = Path(path)
@@ -213,8 +221,15 @@ class ShuffledJsonlReader:
         self._line_numbers = array("q")
         self._source_field = source_field
         self._stable_source_ids = stable_source_ids
-        self._line_limit = (min(max_jsonl_line_bytes, 4 * 1024 * 1024) if max_jsonl_line_bytes
-                            else 4 * 1024 * 1024) if source_field else max_jsonl_line_bytes
+        self._line_limit = (
+            (
+                min(max_jsonl_line_bytes, 4 * 1024 * 1024)
+                if max_jsonl_line_bytes
+                else 4 * 1024 * 1024
+            )
+            if source_field
+            else max_jsonl_line_bytes
+        )
         self._verify_lines = bool(source_field or verify_indexed_input)
         self._source_labels: list[str] = []
         self._line_digests = bytearray()
@@ -229,20 +244,38 @@ class ShuffledJsonlReader:
                     break
                 line_number += 1
                 if raw_line.strip():
-                    if max_indexed_records and len(self._offsets) >= max_indexed_records:
-                        raise ValueError(f"JSONL input exceeds max_indexed_records={max_indexed_records}")
+                    if (
+                        max_indexed_records
+                        and len(self._offsets) >= max_indexed_records
+                    ):
+                        raise ValueError(
+                            f"JSONL input exceeds max_indexed_records={max_indexed_records}"
+                        )
                     if source_field:
                         if len(self._offsets) >= 1_000_000:
-                            raise ValueError("Source-proportional input exceeds 1000000 records")
+                            raise ValueError(
+                                "Source-proportional input exceeds 1000000 records"
+                            )
                         try:
                             payload = json.loads(raw_line)
                             label = payload[source_field]
-                        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
-                            raise ValueError(f"Invalid source label at {input_path}:{line_number}") from exc
+                        except (
+                            UnicodeDecodeError,
+                            json.JSONDecodeError,
+                            KeyError,
+                            TypeError,
+                        ) as exc:
+                            raise ValueError(
+                                f"Invalid source label at {input_path}:{line_number}"
+                            ) from exc
                         if not isinstance(label, str) or not label or len(label) > 1024:
-                            raise ValueError(f"Invalid source label at {input_path}:{line_number}")
+                            raise ValueError(
+                                f"Invalid source label at {input_path}:{line_number}"
+                            )
                         if label not in unique_sources and len(unique_sources) >= 256:
-                            raise ValueError("Source-proportional input exceeds 256 sources")
+                            raise ValueError(
+                                "Source-proportional input exceeds 256 sources"
+                            )
                         label = unique_sources.setdefault(label, label)
                         self._source_labels.append(label)
                     if self._verify_lines:
@@ -252,7 +285,10 @@ class ShuffledJsonlReader:
                 offset += len(raw_line)
             final_stat = os.fstat(input_file.fileno())
         self._source_signature = self._signature(final_stat)
-        if self._signature(initial_stat) != self._source_signature or self._signature(input_path.stat()) != self._source_signature:
+        if (
+            self._signature(initial_stat) != self._source_signature
+            or self._signature(input_path.stat()) != self._source_signature
+        ):
             raise ValueError("JSONL input changed during indexing")
 
     @staticmethod
@@ -260,19 +296,24 @@ class ShuffledJsonlReader:
         return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
 
     def _check_input(self, input_file) -> None:
-        if (self._signature(os.fstat(input_file.fileno())) != self._source_signature
-                or self._signature(self._input_path.stat()) != self._source_signature):
+        if (
+            self._signature(os.fstat(input_file.fileno())) != self._source_signature
+            or self._signature(self._input_path.stat()) != self._source_signature
+        ):
             raise ValueError("JSONL input changed after indexing")
 
     def source_proportional_order(self, *, seed: int | None = None) -> Iterator[int]:
         """Visit every original row once, distributing source counts over the epoch."""
         if not self._source_field:
             raise ValueError("Source-proportional order requires a source field")
-        groups: dict[str, deque[int]] = {label: deque() for label in sorted(set(self._source_labels))}
+        groups: dict[str, deque[int]] = {
+            label: deque() for label in sorted(set(self._source_labels))
+        }
         if seed is None:
             indices: Iterable[int] = range(self.record_count)
         else:
             import numpy as np
+
             indices = np.random.default_rng(seed).permutation(self.record_count)
         for index in indices:
             groups[self._source_labels[int(index)]].append(int(index))
@@ -281,7 +322,10 @@ class ShuffledJsonlReader:
         total = self.record_count
         for position in range(total):
             eligible = (label for label, group in groups.items() if group)
-            label = max(eligible, key=lambda name: counts[name] * (position + 1) - used[name] * total)
+            label = max(
+                eligible,
+                key=lambda name: counts[name] * (position + 1) - used[name] * total,
+            )
             used[label] += 1
             yield groups[label].popleft()
 
@@ -322,7 +366,11 @@ class ShuffledJsonlReader:
                 input_file.seek(self._offsets[index])
                 raw_line = _bounded_jsonl_line(input_file, self._line_limit)
                 self._check_input(input_file)
-                if self._verify_lines and hashlib.sha256(raw_line).digest() != self._line_digests[32 * index:32 * (index + 1)]:
+                if (
+                    self._verify_lines
+                    and hashlib.sha256(raw_line).digest()
+                    != self._line_digests[32 * index : 32 * (index + 1)]
+                ):
                     raise ValueError("JSONL input changed after indexing")
                 line_number = self._line_numbers[index]
                 location = f"{self._input_path}:{line_number}"
@@ -336,8 +384,12 @@ class ShuffledJsonlReader:
                     continue
                 try:
                     record = _record_from_payload(
-                        payload, location, int(index) if self._source_field or self._stable_source_ids else sequence_no,
-                        self._parser_strict_roles
+                        payload,
+                        location,
+                        int(index)
+                        if self._source_field or self._stable_source_ids
+                        else sequence_no,
+                        self._parser_strict_roles,
                     )
                     if self._stable_source_ids or self._source_field:
                         record = replace(record, sequence_no=sequence_no)

@@ -15,8 +15,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from verl_speco.integration.transferqueue_bridge import (
     clear_samples,
@@ -28,20 +29,14 @@ from verl_speco.integration.transferqueue_bridge import (
     list_samples,
 )
 from verl_speco.trainer.feature_store import DraftFeatureSample
+from verl_speco.trainer.reference_feature_store import ReferenceFeatureStore
+from verl_speco.trainer.standalone_data import ReadyEntry
 from verl_speco.transport.drafter_sample_protocol import (
     PROTOCOL_SCHEMA_VERSION,
     ExpectedFeatureConfig,
     decode_sample,
     parse_ready_tag,
 )
-
-
-@dataclass(frozen=True)
-class ReadyEntry:
-    """One discoverable sample record; payload tensors are not loaded yet."""
-
-    key: str
-    tag: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -99,7 +94,7 @@ class TQFeatureStore:
         )
 
     @classmethod
-    def from_config(cls, config: Any) -> "TQFeatureStore":
+    def from_config(cls, config: Any) -> TQFeatureStore:
         return cls(_plain_dict(config))
 
     def connect(self) -> None:
@@ -170,59 +165,9 @@ class TQFeatureStore:
             )
         return samples
 
-    def prepare_batch(self, entries: Sequence[ReadyEntry], **options) -> dict[str, Any]:
-        """Materialize only scheduler-assigned file tags; never fetch TQ fields."""
-        from verl_speco.trainer.standalone_batch_prepare import (
-            prepare_standalone_cpu_batch,
-        )
-        return prepare_standalone_cpu_batch(
-            [entry.tag for entry in entries],
-            self.reference_contract(entries),
-            hidden_states_store=getattr(self, "hidden_states_store", None),
-            read_timeout=float(self.config.get("io_timeout_seconds", 30)),
-            **options,
-        )
-
-    def reference_contract(self, entries: Sequence[ReadyEntry]):
-        """Validate assigned identities before either full or windowed reads."""
-        from verl_speco.trainer.target_feature_replay import FeatureContract
-        from verl_speco.transport.drafter_sample_protocol import (
-            SampleMetadata,
-            make_sample_key,
-        )
-        import torch
-
-        self._require_connected()
-        if not entries:
-            raise ValueError("Cannot prepare an empty file batch")
-        expected = self.expected_config
-        for entry in entries:
-            meta = SampleMetadata.from_dict(entry.tag)
-            if meta.run_id != self.run_id or entry.key != make_sample_key(meta):
-                raise ValueError("Hidden reference identity mismatch")
-            contract = entry.tag["feature_contract"]
-            for name, actual in (
-                ("algorithm", contract.get("algorithm")),
-                ("target_model_path", contract.get("target_model_id")),
-                ("target_revision", contract.get("target_model_revision")),
-                ("tokenizer_fingerprint", contract.get("tokenizer_fingerprint")),
-                ("hidden_states_layout", contract.get("hidden_states_layout")),
-                ("hidden_dtype", str(contract.get("dtype", "")).removeprefix("torch.")),
-                ("target_layer_ids", tuple(contract.get("target_layer_ids", []))),
-            ):
-                wanted = getattr(expected, name)
-                if wanted is not None and actual != wanted:
-                    raise ValueError(
-                        f"Unexpected file feature {name}: {actual!r} != {wanted!r}"
-                    )
-        values = dict(entries[0].tag["feature_contract"])
-        values["dtype"] = getattr(torch, values["dtype"].removeprefix("torch."))
-        contract = FeatureContract(**values)
-        from verl_speco.producer.hidden_states_store import FileHiddenStatesStore
-        from verl_speco.trainer.standalone_batch_prepare import _validate_reference_contracts
-        _validate_reference_contracts([entry.tag for entry in entries], contract,
-                                      getattr(self, "hidden_states_store", None) or FileHiddenStatesStore())
-        return contract
+    # Some scheduled callers can still materialize file tags through this adapter.
+    prepare_batch = ReferenceFeatureStore.prepare_batch
+    reference_contract = ReferenceFeatureStore.reference_contract
 
     def clear_many(self, keys: Sequence[str]) -> None:
         self._require_connected()
@@ -265,47 +210,6 @@ class TQFeatureStore:
             )
 
 
-class ReferenceFeatureStore(TQFeatureStore):
-    """Prepare hidden references without connecting to TransferQueue.
-
-    Ready metadata is owned by the Driver's scheduler, not this rank-local adapter.
-    An explicitly injected hidden-state store is owned and closed by this adapter.
-    """
-
-    uses_transfer_queue = False
-
-    def __init__(self, config: Mapping[str, Any], *, hidden_states_store: Any | None = None):
-        super().__init__(config)
-        from verl_speco.producer.hidden_states_store import build_hidden_states_store
-
-        # Client setup is lazy; spawned workers construct their own store.
-        self.hidden_states_store = (hidden_states_store if hidden_states_store is not None
-                                    else build_hidden_states_store(self.config.get("hidden_states_store")))
-
-    def connect(self) -> None:
-        self._connected = True
-
-    def owner_ready(self) -> bool:
-        self._require_connected()
-        return True
-
-    def clear_many(self, keys: Sequence[str]) -> None:
-        self._require_connected()
-        # Only scheduler completion releases metadata; cleanup releases hidden references.
-
-    def list_ready(self, run_id: str | None = None) -> list[ReadyEntry]:
-        raise RuntimeError(
-            "Hidden references must arrive through scheduler assignments"
-        )
-
-    def get_many(self, entries: Sequence[ReadyEntry]) -> list[DraftFeatureSample]:
-        raise RuntimeError("Hidden references require CPU batch preparation")
-
-    def close_local(self) -> None:
-        self.hidden_states_store.close()
-        self._connected = False
-
-
 def _plain_dict(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
@@ -339,4 +243,4 @@ def _optional_string(value: Any) -> str | None:
     return normalized or None
 
 
-__all__ = ["EosMetadata", "ReadyEntry", "TQFeatureStore"]
+__all__ = ["EosMetadata", "ReadyEntry", "ReferenceFeatureStore", "TQFeatureStore"]

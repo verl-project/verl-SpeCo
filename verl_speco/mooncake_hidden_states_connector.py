@@ -261,22 +261,37 @@ class SpecoNativeHiddenStatesConnector(SpecoMooncakeHiddenStatesConnector):
             return
         with self._native_init_lock:
             if self._native_init_failed:
-                raise RuntimeError("Native source initialization failed; retain its resources")
+                raise RuntimeError(
+                    "Native source initialization failed; retain its resources"
+                )
             if self._native_ready:
                 return
             import ray
             from ray.util.queue import Queue
-            from verl_speco.transport.native_feature_transport import NativeFeatureTransport, NativeSourceControlService
+            from verl_speco.transport.native_feature_transport import (
+                NativeFeatureTransport,
+                NativeSourceControlService,
+            )
 
             try:
-                namespace = os.environ.get("SPECO_NATIVE_RAY_NAMESPACE", "transfer_queue")
+                namespace = os.environ.get(
+                    "SPECO_NATIVE_RAY_NAMESPACE", "transfer_queue"
+                )
                 if not ray.is_initialized():
-                    ray.init(address=os.environ["SPECO_NATIVE_RAY_ADDRESS"], namespace=namespace)
-                directory = ray.get_actor(os.environ["SPECO_NATIVE_DIRECTORY"], namespace=namespace)
+                    ray.init(
+                        address=os.environ["SPECO_NATIVE_RAY_ADDRESS"],
+                        namespace=namespace,
+                    )
+                directory = ray.get_actor(
+                    os.environ["SPECO_NATIVE_DIRECTORY"], namespace=namespace
+                )
                 timeout = float(os.environ.get("SPECO_NATIVE_CONTROL_TIMEOUT", "30"))
                 run_id = os.environ["SPECO_NATIVE_RUN_ID"]
                 generation = int(os.environ["SPECO_NATIVE_GENERATION"])
-                if ray.get(directory.scope.remote(), timeout=timeout) != {"run_id": run_id, "generation": generation}:
+                if ray.get(directory.scope.remote(), timeout=timeout) != {
+                    "run_id": run_id,
+                    "generation": generation,
+                }:
                     raise ValueError("Native source directory scope differs")
                 endpoint = os.environ["SPECO_NATIVE_SOURCE_ENDPOINT"]
                 source_settings = {
@@ -285,19 +300,43 @@ class SpecoNativeHiddenStatesConnector(SpecoMooncakeHiddenStatesConnector):
                     "max_slots": int(os.environ["SPECO_NATIVE_SOURCE_MAX_SLOTS"]),
                     "chunk_bytes": int(os.environ["SPECO_NATIVE_CHUNK_BYTES"]),
                 }
-                source = NativeFeatureTransport(
-                    run_id=run_id, generation=generation, endpoint=endpoint,
-                    device=self._kv_cache.device, **source_settings,
-                )
                 requests, responses = Queue(maxsize=1), Queue(maxsize=1)
-                options = {"request_queue": requests, "response_queue": responses,
-                           "channel_id": uuid.uuid4().hex, "timeout": timeout}
+                # The control thread polls with a short deadline. Cold actor startup
+                # belongs to initialization, before the first lease RPC can be issued.
+                try:
+                    ray.get([q.actor.qsize.remote() for q in (requests, responses)], timeout=timeout)
+                except Exception:
+                    for queue in (requests, responses):
+                        queue.shutdown(force=True)
+                    raise
+                source = NativeFeatureTransport(
+                    run_id=run_id,
+                    generation=generation,
+                    endpoint=endpoint,
+                    device=self._kv_cache.device,
+                    **source_settings,
+                )
+                options = {
+                    "request_queue": requests,
+                    "response_queue": responses,
+                    "channel_id": uuid.uuid4().hex,
+                    "timeout": timeout,
+                }
                 service = NativeSourceControlService(source, **options)
                 # Keep all resources reachable if registration succeeds but its reply is lost.
-                self._native_source, self._native_service, self._native_directory = source, service, directory
+                self._native_source, self._native_service, self._native_directory = (
+                    source,
+                    service,
+                    directory,
+                )
                 self._native_control_options = options
                 self._native_control_timeout = timeout
-                ray.get(directory.register_source.remote(endpoint, uuid.uuid4().hex, options, source_settings), timeout=timeout)
+                ray.get(
+                    directory.register_source.remote(
+                        source.endpoint, uuid.uuid4().hex, options, source_settings
+                    ),
+                    timeout=timeout,
+                )
                 self._native_ready = True
             except BaseException:
                 self._native_init_failed = True
@@ -315,26 +354,38 @@ class SpecoNativeHiddenStatesConnector(SpecoMooncakeHiddenStatesConnector):
         stream.wait_event(ready_event)
         block_ids = torch.tensor(pending.block_ids, dtype=torch.long)
         offsets = torch.arange(self._block_size, dtype=torch.long)
-        slots = (offsets.reshape(1, self._block_size) + block_ids.reshape(-1, 1) * self._block_size).flatten()
+        slots = (
+            offsets.reshape(1, self._block_size)
+            + block_ids.reshape(-1, 1) * self._block_size
+        ).flatten()
         with get_torch_device().stream(stream):
             slots = slots.to(self._kv_cache.device, non_blocking=True)
-            hidden = _upstream_hs.extract_from_kv_cache(self._kv_cache, slots, pending.token_ids.shape[0])
+            hidden = _upstream_hs.extract_from_kv_cache(
+                self._kv_cache, slots, pending.token_ids.shape[0]
+            )
             _upstream_hs.assert_finite("hidden_states", hidden)
         stream.synchronize()
         try:
             descriptor = self._native_source.publish(
-                {"hidden_states": hidden.contiguous(), "token_ids": pending.token_ids.contiguous()},
+                {
+                    "hidden_states": hidden.contiguous(),
+                    "token_ids": pending.token_ids.contiguous(),
+                },
                 lease_id=pending.mooncake_key,
             )
             # A lost publication reply is ambiguous; never free this source here.
-            ray.get(self._native_directory.publish.remote(pending.mooncake_key, descriptor),
-                    timeout=self._native_control_timeout)
+            ray.get(
+                self._native_directory.publish.remote(pending.mooncake_key, descriptor),
+                timeout=self._native_control_timeout,
+            )
         except BaseException:
             self._native_publish_failed = True
             try:
                 self._native_source.stop_publication()
             except BaseException:
-                logger.exception("Native publication failed and local source stop was not confirmed")
+                logger.exception(
+                    "Native publication failed and local source stop was not confirmed"
+                )
             raise
 
 

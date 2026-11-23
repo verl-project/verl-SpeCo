@@ -28,13 +28,21 @@ _CONSOLE_TRACKING_BACKEND = "console"
 class StandaloneTokenWindow:
     """Aggregate successful CPU-prepared batches without per-step collectives."""
 
-    _FIELDS = ("source_tokens", "window_tokens", "supervised_tokens", "padding_tokens", "samples")
+    _FIELDS = (
+        "source_tokens",
+        "window_tokens",
+        "supervised_tokens",
+        "padding_tokens",
+        "samples",
+    )
     _NAMES = ("source", "window", "supervised", "padding", "samples")
     _WORK_FIELDS = ("window_train_input_positions", "window_statistics_input_positions")
 
     def __init__(self, interval: int):
         if type(interval) is not int or interval < 0:
-            raise ValueError("token_metrics_interval_steps must be a non-negative integer")
+            raise ValueError(
+                "token_metrics_interval_steps must be a non-negative integer"
+            )
         self.interval = interval
         self.totals = [0] * 9
         self.steps = 0
@@ -52,7 +60,17 @@ class StandaloneTokenWindow:
             self.checkpoint_seconds += seconds
             self.run_checkpoint_seconds += seconds
 
-    def update(self, counts, *, successful_steps, optimizer_step, max_steps, start_time, device, world_size):
+    def update(
+        self,
+        counts,
+        *,
+        successful_steps,
+        optimizer_step,
+        max_steps,
+        start_time,
+        device,
+        world_size,
+    ):
         if not self.interval:
             return {}
         if self.steps == 0 and self.started == 0.0:
@@ -77,12 +95,16 @@ class StandaloneTokenWindow:
                 for index, field in enumerate(self._WORK_FIELDS, 6):
                     value = counts[field]
                     if type(value) is not int or value < 0:
-                        raise ValueError(f"Invalid standalone window work count: {field}")
+                        raise ValueError(
+                            f"Invalid standalone window work count: {field}"
+                        )
                     self.totals[index] += value
                     self.run_totals[index] += value
                 self.totals[8] += 1
                 self.run_totals[8] += 1
-        if successful_steps % self.interval and not (max_steps > 0 and optimizer_step >= max_steps):
+        if successful_steps % self.interval and not (
+            max_steps > 0 and optimizer_step >= max_steps
+        ):
             return {}
         import torch
         import torch.distributed as dist
@@ -90,13 +112,20 @@ class StandaloneTokenWindow:
         totals = torch.tensor(self.totals, dtype=torch.int64, device=device)
         if world_size > 1:
             if not dist.is_initialized() or dist.get_world_size() != world_size:
-                raise RuntimeError("Token metrics require the matching distributed group")
+                raise RuntimeError(
+                    "Token metrics require the matching distributed group"
+                )
             dist.all_reduce(totals, op=dist.ReduceOp.SUM)
         values = totals.tolist()
         elapsed = max(time.perf_counter() - self.started, 0.0)
         timings = torch.tensor(
-            [elapsed, max(elapsed - self.checkpoint_seconds, 0.0), self.checkpoint_seconds],
-            dtype=torch.float32, device=device,
+            [
+                elapsed,
+                max(elapsed - self.checkpoint_seconds, 0.0),
+                self.checkpoint_seconds,
+            ],
+            dtype=torch.float32,
+            device=device,
         )
         if world_size > 1:
             # Compare durations, never timestamps from different node clocks.
@@ -104,16 +133,24 @@ class StandaloneTokenWindow:
         elapsed, excluding_checkpoints, checkpoint_seconds = timings.tolist()
         result = {}
         if values[5] == self.steps * world_size:
-            result = {f"tokens/{key}": float(value)
-                      for key, value in zip(self._NAMES, values[:5], strict=True)}
+            result = {
+                f"tokens/{key}": float(value)
+                for key, value in zip(self._NAMES, values[:5], strict=True)
+            }
             if elapsed > 0:
                 result["tokens/source_per_second"] = values[0] / elapsed
             if excluding_checkpoints > 0:
-                result["tokens/source_per_second_excluding_checkpoints"] = values[0] / excluding_checkpoints
+                result["tokens/source_per_second_excluding_checkpoints"] = (
+                    values[0] / excluding_checkpoints
+                )
             result["perf/checkpoint_blocking_time"] = checkpoint_seconds
             if values[8] == self.steps * world_size:
-                result.update({f"tokens/{field}": float(values[index])
-                               for index, field in enumerate(self._WORK_FIELDS, 6)})
+                result.update(
+                    {
+                        f"tokens/{field}": float(values[index])
+                        for index, field in enumerate(self._WORK_FIELDS, 6)
+                    }
+                )
         else:
             logger.warning("Skipping incomplete standalone token metrics window")
         self.totals = [0] * 9
@@ -129,28 +166,52 @@ class StandaloneTokenWindow:
         import torch
         import torch.distributed as dist
 
-        totals = torch.tensor(self.run_totals + [self.run_steps], dtype=torch.int64, device=device)
+        totals = torch.tensor(
+            self.run_totals + [self.run_steps], dtype=torch.int64, device=device
+        )
         elapsed = max(time.perf_counter() - self.run_started, 0.0)
-        times = torch.tensor([elapsed, max(elapsed - self.run_checkpoint_seconds, 0.0),
-                              self.run_checkpoint_seconds], dtype=torch.float32, device=device)
+        times = torch.tensor(
+            [
+                elapsed,
+                max(elapsed - self.run_checkpoint_seconds, 0.0),
+                self.run_checkpoint_seconds,
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
         if world_size > 1:
             if not dist.is_initialized() or dist.get_world_size() != world_size:
-                raise RuntimeError("Token metrics require the matching distributed group")
+                raise RuntimeError(
+                    "Token metrics require the matching distributed group"
+                )
             dist.all_reduce(totals, op=dist.ReduceOp.SUM)
             dist.all_reduce(times, op=dist.ReduceOp.MAX)
         values = totals.tolist()
         elapsed, excluding_checkpoints, checkpoint_seconds = times.tolist()
-        result = {"perf/run_training_time": elapsed, "perf/run_checkpoint_blocking_time": checkpoint_seconds}
+        result = {
+            "perf/run_training_time": elapsed,
+            "perf/run_checkpoint_blocking_time": checkpoint_seconds,
+        }
         if values[5] == values[9]:
-            result.update({f"tokens/run_{key}": float(value)
-                           for key, value in zip(self._NAMES, values[:5], strict=True)})
+            result.update(
+                {
+                    f"tokens/run_{key}": float(value)
+                    for key, value in zip(self._NAMES, values[:5], strict=True)
+                }
+            )
             if elapsed > 0:
                 result["tokens/run_source_per_second"] = values[0] / elapsed
             if excluding_checkpoints > 0:
-                result["tokens/run_source_per_second_excluding_checkpoints"] = values[0] / excluding_checkpoints
+                result["tokens/run_source_per_second_excluding_checkpoints"] = (
+                    values[0] / excluding_checkpoints
+                )
             if values[8] == values[9]:
-                result.update({f"tokens/run_{field}": float(values[index])
-                               for index, field in enumerate(self._WORK_FIELDS, 6)})
+                result.update(
+                    {
+                        f"tokens/run_{field}": float(values[index])
+                        for index, field in enumerate(self._WORK_FIELDS, 6)
+                    }
+                )
         else:
             logger.warning("Skipping incomplete standalone run token metrics")
         return result
@@ -232,6 +293,15 @@ def _build_standalone_tracking(config: Any, *, rank: int) -> list[Any]:
             "dspark_loss_mode",
             "dspark_ce_loss_alpha",
             "dspark_l1_loss_alpha",
+            "dsv4_dspark_block_size",
+            "dsv4_dspark_num_anchors",
+            "dsv4_dspark_loss_mode",
+            "dsv4_dspark_ce_loss_alpha",
+            "dsv4_dspark_l1_loss_alpha",
+            "dsv4_dspark_tv_loss_alpha",
+            "dsv4_dspark_markov_rank",
+            "dsv4_dspark_num_target_layers",
+            "dsv4_dspark_num_hidden_layers",
             "dflash_block_size",
             "dflash_num_anchors",
             "dflash_loss_mode",

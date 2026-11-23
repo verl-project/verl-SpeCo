@@ -28,21 +28,21 @@ import json
 import logging
 import math
 import os
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
-from functools import lru_cache
-from pathlib import Path
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
-import uuid
 
 from omegaconf import OmegaConf
 
@@ -101,6 +101,7 @@ _ALGORITHM_TARGET_LAYER_IDS_KEYS = {
     "EAGLE3": "actor_rollout_ref.rollout.drafter.training.eagle3_target_layer_ids",
     "DFLASH": "actor_rollout_ref.rollout.drafter.training.dflash_target_layer_ids",
     "DSPARK": "actor_rollout_ref.rollout.drafter.training.dspark_target_layer_ids",
+    "DSV4_DSPARK": "actor_rollout_ref.rollout.drafter.training.dsv4_dspark_target_layer_ids",
     "DOMINO": "actor_rollout_ref.rollout.drafter.training.domino_target_layer_ids",
 }
 _MAX_STEPS_KEY = "actor_rollout_ref.rollout.drafter.training.max_steps"
@@ -124,6 +125,8 @@ _TQ_PREFIX = "actor_rollout_ref.rollout.drafter.training.transfer_queue"
 _FEATURE_STORE_PREFIX = "actor_rollout_ref.rollout.drafter.training.feature_store"
 _PRODUCER_PREFIX = "speco.standalone_tq_producer"
 _RUNTIME_BACKEND_KEY = "speco.draft_training.runtime_backend"
+_DATA_TRANSPORT_KEY = "speco.draft_training.data_transport"
+_DATA_SOURCE_KEY = "speco.draft_training.data_source"
 # Every user override under this prefix is forwarded to the Producer, except the
 # fields the unified launcher computes and sets itself (paths, identities,
 # endpoints, and the sample budget). Forwarding the whole prefix keeps newly
@@ -170,6 +173,7 @@ _INTERNAL_OVERRIDE_KEYS = frozenset(
         f"{_TQ_PREFIX}.expected_feature.hidden_states_layout",
         f"{_TQ_PREFIX}.expected_feature.hidden_dtype",
         _RUNTIME_BACKEND_KEY,
+        _DATA_TRANSPORT_KEY,
     }
 )
 
@@ -198,6 +202,8 @@ class PipelineConfig:
     vllm_aux_hidden_state_layer_ids: tuple[int, ...]
     vllm_endpoints: tuple[str, ...]
     run_id: str
+    data_source: str = "online"
+    saved_hidden_contract: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -205,10 +211,9 @@ class PipelineCommands:
     vllm: list[str] | None
     vllm_endpoints: tuple[str, ...]
     owner: list[str]
-    producer: list[str]
-    consumer: list[str]
     producer_overrides: tuple[str, ...]
     consumer_overrides: tuple[str, ...]
+    data_source: str = "online"
     local_model_cache: tuple[str, str] | None = None
     native_settings: dict[str, Any] | None = None
 
@@ -442,24 +447,81 @@ def _stable_path_identity(kind: str, path: str) -> str:
     return f"{kind}-path-sha256-{digest}"
 
 
+def _saved_hidden_tokenizer_fingerprint(path: str) -> str:
+    """Identify the tokenizer used to capture or train on saved hidden states."""
+    names = (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "vocab.json",
+        "merges.txt",
+        "tokenizer.model",
+        "spiece.model",
+        "chat_template.jinja",
+    )
+    digest = hashlib.sha256()
+    found = False
+    for name in names:
+        source = Path(path) / name
+        if not Path(path).is_dir():
+            from transformers.utils.hub import cached_file
+
+            resolved = cached_file(
+                path, name, _raise_exceptions_for_missing_entries=False
+            )
+            if resolved is None:
+                continue
+            source = Path(resolved)
+        if source.is_file():
+            found = True
+            digest.update(name.encode())
+            with source.open("rb") as stream:
+                file_digest = hashlib.sha256()
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    file_digest.update(chunk)
+                digest.update(file_digest.digest())
+    if not found:
+        # Some old local models bundle tokenizer settings in config.json only.
+        source = Path(path) / "config.json"
+        if not source.is_file():
+            raise ValueError(f"Cannot identify tokenizer files at {path}")
+        digest.update(source.read_bytes())
+    return f"tokenizer-files-sha256-{digest.hexdigest()}"
+
+
 def _verify_local_model_cache(source: str, cache: str) -> None:
     """Compare every local model file before launching a cache-backed service."""
+
     def inventory(root_name: str) -> dict[str, Path]:
         root = Path(root_name)
-        if root.is_symlink() or getattr(os.path, "isjunction", lambda _: False)(root) or not root.is_dir():
-            raise ValueError(f"Model cache comparison requires a real directory: {root}")
+        if (
+            root.is_symlink()
+            or getattr(os.path, "isjunction", lambda _: False)(root)
+            or not root.is_dir()
+        ):
+            raise ValueError(
+                f"Model cache comparison requires a real directory: {root}"
+            )
         files: dict[str, Path] = {}
+
         def fail(error: OSError) -> None:
             raise error
+
         for directory, dirs, names in os.walk(root, followlinks=False, onerror=fail):
             for name in dirs:
                 candidate = Path(directory) / name
-                if candidate.is_symlink() or getattr(os.path, "isjunction", lambda _: False)(candidate):
-                    raise ValueError(f"Model cache directory contains a link: {candidate}")
+                if candidate.is_symlink() or getattr(
+                    os.path, "isjunction", lambda _: False
+                )(candidate):
+                    raise ValueError(
+                        f"Model cache directory contains a link: {candidate}"
+                    )
             for name in names:
                 candidate = Path(directory) / name
                 if not stat.S_ISREG(candidate.lstat().st_mode):
-                    raise ValueError(f"Model cache contains a non-regular file: {candidate}")
+                    raise ValueError(
+                        f"Model cache contains a non-regular file: {candidate}"
+                    )
                 files[candidate.relative_to(root).as_posix()] = candidate
                 if len(files) > 100_000:
                     raise ValueError("Model cache has too many files")
@@ -471,7 +533,13 @@ def _verify_local_model_cache(source: str, cache: str) -> None:
         value = path.lstat()
         if not stat.S_ISREG(value.st_mode):
             raise ValueError(f"Model cache file changed type: {path}")
-        return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
 
     def digest(path: Path) -> bytes:
         result = hashlib.sha256()
@@ -482,7 +550,9 @@ def _verify_local_model_cache(source: str, cache: str) -> None:
 
     source_files, cache_files = inventory(source), inventory(cache)
     if source_files.keys() != cache_files.keys():
-        raise ValueError("Local model cache file inventory differs from the source model")
+        raise ValueError(
+            "Local model cache file inventory differs from the source model"
+        )
     signatures = {}
     for name in sorted(source_files):
         original, replica = source_files[name], cache_files[name]
@@ -492,7 +562,10 @@ def _verify_local_model_cache(source: str, cache: str) -> None:
         if (signature(original), signature(replica)) != before:
             raise ValueError(f"Model file changed during cache verification: {name}")
         signatures[name] = before
-    if inventory(source).keys() != source_files.keys() or inventory(cache).keys() != cache_files.keys():
+    if (
+        inventory(source).keys() != source_files.keys()
+        or inventory(cache).keys() != cache_files.keys()
+    ):
         raise ValueError("Model file inventory changed during cache verification")
     for name, before in signatures.items():
         if (signature(source_files[name]), signature(cache_files[name])) != before:
@@ -549,8 +622,42 @@ def resolve_pipeline_config(
     ).upper()
     if not algorithm:
         raise ValueError(f"{_ALGORITHM_KEY} must not be empty")
-    vllm_aux_layer_ids, target_layer_ids = _resolve_layer_ids(training_args, algorithm)
-    endpoints = _parse_vllm_endpoints(env)
+    data_source = _strip_quotes(
+        _find_override(training_args, _DATA_SOURCE_KEY, normalize_key=True) or "online"
+    )
+    if data_source not in {"online", "saved_hidden"}:
+        raise ValueError(f"{_DATA_SOURCE_KEY} must be online or saved_hidden")
+    layer_args = list(training_args)
+    saved_hidden_contract = None
+    if data_source == "saved_hidden":
+        from verl_speco.producer.hidden_states_store import load_raw_hidden_manifest
+
+        if not Path(input_path).is_dir():
+            raise ValueError(
+                "saved_hidden requires data.train_files to be a dataset directory"
+            )
+        rows = load_raw_hidden_manifest(input_path)
+        if not rows:
+            raise ValueError("Saved hidden dataset contains no committed samples")
+        contract = rows[0]["feature_contract"]
+        saved_hidden_contract = dict(contract)
+        if any(row["feature_contract"] != contract for row in rows):
+            raise ValueError("Saved hidden dataset contains mixed feature contracts")
+        layer_keys = (
+            _PRODUCER_TARGET_LAYER_IDS_KEY,
+            _PRODUCER_VLLM_AUX_LAYER_IDS_KEY,
+            _ALGORITHM_TARGET_LAYER_IDS_KEYS.get(algorithm, ""),
+        )
+        if not any(
+            _find_override(training_args, key, normalize_key=True) is not None
+            for key in layer_keys
+        ):
+            layer_args.append(
+                f"{_PRODUCER_VLLM_AUX_LAYER_IDS_KEY}="
+                + _hydra_list(contract["vllm_aux_hidden_state_layer_ids"])
+            )
+    vllm_aux_layer_ids, target_layer_ids = _resolve_layer_ids(layer_args, algorithm)
+    endpoints = () if data_source == "saved_hidden" else _parse_vllm_endpoints(env)
     return PipelineConfig(
         input_path=input_path,
         model_path=model_path,
@@ -559,9 +666,14 @@ def resolve_pipeline_config(
         target_layer_ids=target_layer_ids,
         vllm_aux_hidden_state_layer_ids=vllm_aux_layer_ids,
         vllm_endpoints=endpoints,
-        run_id=(str(env.get("SPECO_NATIVE_RUN_ID", "")).strip()
-                if _resolve_hidden_states_store(env) == "native" and env.get("SPECO_NATIVE_RUN_ID")
-                else f"{algorithm.lower()}-{uuid.uuid4().hex}"),
+        run_id=(
+            str(env.get("SPECO_NATIVE_RUN_ID", "")).strip()
+            if _resolve_hidden_states_store(env) == "native"
+            and env.get("SPECO_NATIVE_RUN_ID")
+            else f"{algorithm.lower()}-{uuid.uuid4().hex}"
+        ),
+        data_source=data_source,
+        saved_hidden_contract=saved_hidden_contract,
     )
 
 
@@ -625,9 +737,14 @@ def _external_ray_address(env: Mapping[str, str]) -> str:
     try:
         parsed = urlparse("//" + address)
         if (
-            not parsed.hostname or parsed.port is None or not 0 < parsed.port < 65536
-            or parsed.username is not None or parsed.password is not None
-            or parsed.path or parsed.query or parsed.fragment
+            not parsed.hostname
+            or parsed.port is None
+            or not 0 < parsed.port < 65536
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
             or any(char.isspace() for char in address)
         ):
             raise ValueError
@@ -640,13 +757,17 @@ def _external_ray_address(env: Mapping[str, str]) -> str:
 
 
 def _validate_runtime_backend_topology(
-    runtime_backend: str, training_args: Sequence[str],
-    *, environ: Mapping[str, str] | None = None,
+    runtime_backend: str,
+    training_args: Sequence[str],
+    *,
+    environ: Mapping[str, str] | None = None,
 ) -> None:
     """Keep unsupported multi-node data paths from failing after model startup."""
 
     if runtime_backend != "ray":
-        return
+        raise ValueError(
+            "Standalone subprocess training was removed; runtime_backend must be ray"
+        )
     env = os.environ if environ is None else environ
     external_address = _external_ray_address(env)
     nnodes = _positive_int_override(training_args, _NNODES_KEYS, default=1)
@@ -659,7 +780,8 @@ def _validate_runtime_backend_topology(
     if nnodes != 1:
         _trainer_node_ips(training_args, nnodes)
     shared_root = _shared_hidden_states_root(env)
-    if external_address:
+    source = _strip_quotes(_find_override(training_args, _DATA_SOURCE_KEY) or "online")
+    if external_address and source == "online":
         backend = _resolve_hidden_states_store(env)
         if backend not in {"mooncake", "native"} and shared_root is None:
             raise ValueError(
@@ -667,14 +789,20 @@ def _validate_runtime_backend_topology(
                 "local temporary file references are not shared across nodes"
             )
         endpoints = _parse_vllm_endpoints(env)
-        if any(urlparse(endpoint).hostname in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
-               for endpoint in endpoints):
-            raise ValueError("Multi-node Ray requires remotely reachable vLLM endpoints")
+        if any(
+            urlparse(endpoint).hostname in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+            for endpoint in endpoints
+        ):
+            raise ValueError(
+                "Multi-node Ray requires remotely reachable vLLM endpoints"
+            )
         if backend == "mooncake":
             settings = _hidden_states_mooncake_settings(env)
             host = urlparse("//" + settings["master_server_address"]).hostname
             if host in {None, "localhost", "127.0.0.1", "0.0.0.0", "::1"}:
-                raise ValueError("Multi-node Ray requires a remotely reachable Mooncake master")
+                raise ValueError(
+                    "Multi-node Ray requires a remotely reachable Mooncake master"
+                )
             if settings["local_hostname"]:
                 raise ValueError(
                     "Multi-node Ray must resolve Mooncake local_hostname on each worker; "
@@ -683,7 +811,9 @@ def _validate_runtime_backend_topology(
 
 
 def _trainer_node_ips(training_args: Sequence[str], nnodes: int) -> list[str]:
-    raw = _find_override(training_args, "speco.draft_training.trainer_node_ips", normalize_key=True)
+    raw = _find_override(
+        training_args, "speco.draft_training.trainer_node_ips", normalize_key=True
+    )
     try:
         value = _strip_quotes(raw or "")
         if not value.startswith("[") or not value.endswith("]"):
@@ -697,22 +827,40 @@ def _trainer_node_ips(training_args: Sequence[str], nnodes: int) -> list[str]:
         # verl's WorkerGroup orders placement groups by node IP for rank assignment.
         return sorted(nodes)
     except (ValueError, TypeError):
-        raise ValueError("trainer_node_ips must contain one distinct IP per trainer node") from None
+        raise ValueError(
+            "trainer_node_ips must contain one distinct IP per trainer node"
+        ) from None
 
 
-def _trainer_topology_plan(runtime_backend: str, training_args: Sequence[str]) -> dict[str, Any]:
+def _trainer_topology_plan(
+    runtime_backend: str, training_args: Sequence[str]
+) -> dict[str, Any]:
     """Describe logical trainer ranks without allocating Ray or devices."""
     nnodes = _positive_int_override(training_args, _NNODES_KEYS, default=1)
     nproc = _positive_int_override(training_args, _NPROC_KEYS, default=1)
-    addresses = _trainer_node_ips(training_args, nnodes) if nnodes > 1 and runtime_backend == "ray" else None
+    addresses = (
+        _trainer_node_ips(training_args, nnodes)
+        if nnodes > 1 and runtime_backend == "ray"
+        else None
+    )
     nodes = [
-        {"node_rank": rank, "address": addresses[rank] if addresses else None,
-         "ranks": [{"local_rank": local, "global_rank": rank * nproc + local}
-                   for local in range(nproc)]}
+        {
+            "node_rank": rank,
+            "address": addresses[rank] if addresses else None,
+            "ranks": [
+                {"local_rank": local, "global_rank": rank * nproc + local}
+                for local in range(nproc)
+            ],
+        }
         for rank in range(nnodes)
     ]
-    plan = {"schema_version": 1, "backend": runtime_backend, "nodes": nodes,
-            "processes_per_node": nproc, "world_size": nnodes * nproc}
+    plan = {
+        "schema_version": 1,
+        "backend": runtime_backend,
+        "nodes": nodes,
+        "processes_per_node": nproc,
+        "world_size": nnodes * nproc,
+    }
     payload = json.dumps(plan, sort_keys=True, separators=(",", ":")).encode("utf-8")
     plan["topology_sha256"] = hashlib.sha256(payload).hexdigest()
     return plan
@@ -862,7 +1010,9 @@ def _shared_hidden_states_root(env: Mapping[str, str]) -> str | None:
     if not raw:
         return None
     if not Path(raw).is_absolute() or _resolve_hidden_states_store(env) != "file":
-        raise ValueError("SPECO_VLLM_SHARED_HIDDEN_STATES_ROOT requires an absolute path and file store")
+        raise ValueError(
+            "SPECO_VLLM_SHARED_HIDDEN_STATES_ROOT requires an absolute path and file store"
+        )
     return raw
 
 
@@ -881,14 +1031,11 @@ def _hidden_states_mooncake_settings(env: Mapping[str, str]) -> dict[str, Any]:
                 f"{name} (or {fallback}) must be an integer, got {raw!r}"
             ) from exc
 
-    local_hostname = (
-        pick(
-            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_LOCAL_HOSTNAME",
-            "SPECO_TQ_MOONCAKE_LOCAL_HOSTNAME",
-            "",
-        )
-        or ("" if _external_ray_address(env) else _local_ip())
-    )
+    local_hostname = pick(
+        "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_LOCAL_HOSTNAME",
+        "SPECO_TQ_MOONCAKE_LOCAL_HOSTNAME",
+        "",
+    ) or ("" if _external_ray_address(env) else _local_ip())
     return {
         "local_hostname": local_hostname,
         "metadata_server": pick(
@@ -935,8 +1082,11 @@ def _vllm_kv_transfer_config(env: Mapping[str, str]) -> dict[str, Any]:
     backend = _resolve_hidden_states_store(env)
     if backend in {"mooncake", "native"}:
         return {
-            "kv_connector": ("SpecoNativeHiddenStatesConnector" if backend == "native"
-                             else "SpecoMooncakeHiddenStatesConnector"),
+            "kv_connector": (
+                "SpecoNativeHiddenStatesConnector"
+                if backend == "native"
+                else "SpecoMooncakeHiddenStatesConnector"
+            ),
             "kv_connector_module_path": "verl_speco.mooncake_hidden_states_connector",
             "kv_role": "kv_producer",
             "kv_connector_extra_config": {
@@ -960,7 +1110,13 @@ def _hidden_states_store_overrides(env: Mapping[str, str]) -> list[str]:
     if backend == "native":
         return [f"{_PRODUCER_PREFIX}.hidden_states_store.backend=native"]
     if backend != "mooncake":
-        return [] if root is None else [f"{_PRODUCER_PREFIX}.hidden_states_store.file_root={json.dumps(root, ensure_ascii=False)}"]
+        return (
+            []
+            if root is None
+            else [
+                f"{_PRODUCER_PREFIX}.hidden_states_store.file_root={json.dumps(root, ensure_ascii=False)}"
+            ]
+        )
     settings = _hidden_states_mooncake_settings(env)
     prefix = f"{_PRODUCER_PREFIX}.hidden_states_store"
     return [
@@ -976,14 +1132,28 @@ def _hidden_states_store_overrides(env: Mapping[str, str]) -> list[str]:
     ]
 
 
-def _native_launch_settings(config: PipelineConfig, training_args: Sequence[str], env: Mapping[str, str],
-                            *, launcher_owned: bool) -> tuple[dict[str, Any], list[str], list[str]]:
+def _native_launch_settings(
+    config: PipelineConfig,
+    training_args: Sequence[str],
+    env: Mapping[str, str],
+    *,
+    launcher_owned: bool,
+) -> tuple[dict[str, Any], list[str], list[str]]:
     """Resolve bounded source/reader resources and scheduler preconditions."""
-    if _strip_quotes(_find_override(training_args, _RUNTIME_BACKEND_KEY, normalize_key=True) or "ray") != "ray":
+    if (
+        _strip_quotes(
+            _find_override(training_args, _RUNTIME_BACKEND_KEY, normalize_key=True)
+            or "ray"
+        )
+        != "ray"
+    ):
         raise ValueError("Native hidden states require the Ray runtime")
-    world_size = (_positive_int_override(training_args, _NNODES_KEYS, default=1)
-                  * _positive_int_override(training_args, _NPROC_KEYS, default=1))
-    batch = world_size * _positive_int_override(training_args, (_BATCH_SIZE_PER_GPU_KEY,), default=4)
+    world_size = _positive_int_override(
+        training_args, _NNODES_KEYS, default=1
+    ) * _positive_int_override(training_args, _NPROC_KEYS, default=1)
+    batch = world_size * _positive_int_override(
+        training_args, (_BATCH_SIZE_PER_GPU_KEY,), default=4
+    )
 
     def integer(name, default, minimum, maximum):
         try:
@@ -998,48 +1168,91 @@ def _native_launch_settings(config: PipelineConfig, training_args: Sequence[str]
         endpoints = json.loads(_env(env, "SPECO_NATIVE_READER_ENDPOINTS", "[]"))
     except (TypeError, ValueError):
         raise ValueError("SPECO_NATIVE_READER_ENDPOINTS must be a JSON array") from None
-    if (not isinstance(endpoints, list) or len(endpoints) != world_size
-            or any(not isinstance(item, str) or not item.strip() or item != item.strip() or len(item) > 256
-                   for item in endpoints) or len(set(endpoints)) != world_size):
-        raise ValueError("SPECO_NATIVE_READER_ENDPOINTS must contain one distinct endpoint per rank")
+    if (
+        not isinstance(endpoints, list)
+        or len(endpoints) != world_size
+        or any(
+            not isinstance(item, str)
+            or not item.strip()
+            or item != item.strip()
+            or len(item) > 256
+            for item in endpoints
+        )
+        or len(set(endpoints)) != world_size
+    ):
+        raise ValueError(
+            "SPECO_NATIVE_READER_ENDPOINTS must contain one distinct endpoint per rank"
+        )
     source_endpoint = _env(env, "SPECO_NATIVE_SOURCE_ENDPOINT")
-    if launcher_owned and (not source_endpoint or len(source_endpoint) > 256 or source_endpoint in endpoints):
-        raise ValueError("Launcher-owned native vLLM needs a source endpoint distinct from reader endpoints")
+    if launcher_owned and (
+        not source_endpoint
+        or len(source_endpoint) > 256
+        or source_endpoint in endpoints
+    ):
+        raise ValueError(
+            "Launcher-owned native vLLM needs a source endpoint distinct from reader endpoints"
+        )
     directory = _env(env, "SPECO_NATIVE_DIRECTORY")
     reuse_existing = bool(directory and _env(env, "SPECO_NATIVE_RUN_ID"))
     if not directory:
         if not launcher_owned:
-            raise ValueError("External native vLLM requires SPECO_NATIVE_DIRECTORY and SPECO_NATIVE_RUN_ID")
+            raise ValueError(
+                "External native vLLM requires SPECO_NATIVE_DIRECTORY and SPECO_NATIVE_RUN_ID"
+            )
         directory = f"speco_native_{uuid.uuid4().hex}"
     if not launcher_owned and not _env(env, "SPECO_NATIVE_RUN_ID"):
-        raise ValueError("External native vLLM requires SPECO_NATIVE_DIRECTORY and SPECO_NATIVE_RUN_ID")
+        raise ValueError(
+            "External native vLLM requires SPECO_NATIVE_DIRECTORY and SPECO_NATIVE_RUN_ID"
+        )
     if reuse_existing and _env(env, "SPECO_NATIVE_RUN_ID") != config.run_id:
         raise ValueError("Native vLLM and launcher must use the same run identity")
     if len(directory) > 256 or not config.run_id or len(config.run_id) > 256:
         raise ValueError("Invalid native directory name or run identity")
     align = 2 * 1024**2
     source_slots = integer("SPECO_NATIVE_SOURCE_MAX_SLOTS", max(batch, 16), batch, 4096)
-    source_bytes = integer("SPECO_NATIVE_SOURCE_MAX_BYTES", source_slots * (2 * align - 1),
-                           batch * (2 * align - 1), 2**63 - 1)
-    reader_bytes = integer("SPECO_NATIVE_READER_MAX_BYTES", 2 * 1024**3, 2 * align - 1, 2**63 - 1)
+    source_bytes = integer(
+        "SPECO_NATIVE_SOURCE_MAX_BYTES",
+        source_slots * (2 * align - 1),
+        batch * (2 * align - 1),
+        2**63 - 1,
+    )
+    reader_bytes = integer(
+        "SPECO_NATIVE_READER_MAX_BYTES", 2 * 1024**3, 2 * align - 1, 2**63 - 1
+    )
     chunk = integer("SPECO_NATIVE_CHUNK_BYTES", align, align, 2**63 - 1)
     if chunk % align:
         raise ValueError("SPECO_NATIVE_CHUNK_BYTES must be a multiple of 2 MiB")
     try:
         timeout = float(_env(env, "SPECO_NATIVE_CONTROL_TIMEOUT", "30"))
     except ValueError:
-        raise ValueError("SPECO_NATIVE_CONTROL_TIMEOUT must be a positive finite number") from None
+        raise ValueError(
+            "SPECO_NATIVE_CONTROL_TIMEOUT must be a positive finite number"
+        ) from None
     if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("SPECO_NATIVE_CONTROL_TIMEOUT must be a positive finite number")
-    settings = {"directory": directory, "run_id": config.run_id, "reuse_existing": reuse_existing,
-                "namespace": _env(env, "SPECO_NATIVE_RAY_NAMESPACE", "transfer_queue"),
-                "generation": integer("SPECO_NATIVE_GENERATION", 0, 0, 2**63 - 1),
-                "max_sources": integer("SPECO_NATIVE_MAX_SOURCES", len(config.vllm_endpoints), 1, 4096),
-                "max_records": integer("SPECO_NATIVE_MAX_RECORDS", 1_000_000, 1, 10_000_000),
-                "max_descriptor_bytes": integer("SPECO_NATIVE_MAX_DESCRIPTOR_BYTES", 256 * 1024**2, 1, 16 * 1024**3),
-                "metadata_server": _env(env, "SPECO_NATIVE_METADATA_SERVER", "P2PHANDSHAKE"),
-                "source_endpoint": source_endpoint, "reader_endpoints": endpoints, "source_max_bytes": source_bytes,
-                "source_max_slots": source_slots, "chunk_bytes": chunk, "timeout": timeout}
+        raise ValueError(
+            "SPECO_NATIVE_CONTROL_TIMEOUT must be a positive finite number"
+        )
+    settings = {
+        "directory": directory,
+        "run_id": config.run_id,
+        "reuse_existing": reuse_existing,
+        "namespace": _env(env, "SPECO_NATIVE_RAY_NAMESPACE", "transfer_queue"),
+        "generation": integer("SPECO_NATIVE_GENERATION", 0, 0, 2**63 - 1),
+        "max_sources": integer(
+            "SPECO_NATIVE_MAX_SOURCES", len(config.vllm_endpoints), 1, 4096
+        ),
+        "max_records": integer("SPECO_NATIVE_MAX_RECORDS", 1_000_000, 1, 10_000_000),
+        "max_descriptor_bytes": integer(
+            "SPECO_NATIVE_MAX_DESCRIPTOR_BYTES", 256 * 1024**2, 1, 16 * 1024**3
+        ),
+        "metadata_server": _env(env, "SPECO_NATIVE_METADATA_SERVER", "P2PHANDSHAKE"),
+        "source_endpoint": source_endpoint,
+        "reader_endpoints": endpoints,
+        "source_max_bytes": source_bytes,
+        "source_max_slots": source_slots,
+        "chunk_bytes": chunk,
+        "timeout": timeout,
+    }
     if not settings["namespace"] or not settings["metadata_server"]:
         raise ValueError("Native Ray namespace and metadata server must not be empty")
     source_overrides, consumer_overrides = [], []
@@ -1047,29 +1260,47 @@ def _native_launch_settings(config: PipelineConfig, training_args: Sequence[str]
         full = f"{_PRODUCER_PREFIX}.{key}"
         raw = _find_override(training_args, full, normalize_key=True)
         value = int(_strip_quotes(raw)) if raw is not None else batch
-        if value < batch or (key == "max_reference_execution_slots" and value > source_slots):
-            raise ValueError(f"{full} must cover one batch and execution slots must fit the source")
-        if key == "max_reference_execution_slots" and source_bytes < value * (2 * align - 1):
-            raise ValueError("SPECO_NATIVE_SOURCE_MAX_BYTES must cover the minimum allocation for each execution slot")
+        if value < batch or (
+            key == "max_reference_execution_slots" and value > source_slots
+        ):
+            raise ValueError(
+                f"{full} must cover one batch and execution slots must fit the source"
+            )
+        if key == "max_reference_execution_slots" and source_bytes < value * (
+            2 * align - 1
+        ):
+            raise ValueError(
+                "SPECO_NATIVE_SOURCE_MAX_BYTES must cover the minimum allocation for each execution slot"
+            )
         if raw is None:
             source_overrides.append(f"{full}={value}")
             consumer_overrides.append(f"{full}={value}")
-    for key, required in (("speco.draft_training.scheduler.per_rank_reference_ack", "true"),
-                          (f"{_TQ_PREFIX}.consumer_batch_workers", "0")):
+    for key, required in (
+        ("speco.draft_training.scheduler.per_rank_reference_ack", "true"),
+        (f"{_TQ_PREFIX}.consumer_batch_workers", "0"),
+    ):
         raw = _find_override(training_args, key, normalize_key=True)
         if raw is None:
             consumer_overrides.append(f"{key}={required}")
         elif _strip_quotes(raw).lower() != required:
             raise ValueError(f"Native hidden states require {key}={required}")
-    for key in (f"{_TQ_PREFIX}.consumer_node_reference_owner",
-                "actor_rollout_ref.rollout.drafter.training.reference_owned_windows"):
+    for key in (
+        f"{_TQ_PREFIX}.consumer_node_reference_owner",
+        "actor_rollout_ref.rollout.drafter.training.reference_owned_windows",
+    ):
         raw = _find_override(training_args, key, normalize_key=True)
         if raw is not None and _strip_quotes(raw).lower() != "false":
             raise ValueError(f"Native hidden states require {key}=false")
     prefix = "actor_rollout_ref.rollout.drafter.training.target_feature_replay.hidden_states_store.native"
-    consumer_overrides.extend([f"{prefix}.endpoints={json.dumps(endpoints, separators=(',', ':'))}",
-        f"{prefix}.metadata_server={json.dumps(settings['metadata_server'])}", f"{prefix}.generation={settings['generation']}",
-        f"{prefix}.max_bytes={reader_bytes}", f"{prefix}.chunk_bytes={chunk}"])
+    consumer_overrides.extend(
+        [
+            f"{prefix}.endpoints={json.dumps(endpoints, separators=(',', ':'))}",
+            f"{prefix}.metadata_server={json.dumps(settings['metadata_server'])}",
+            f"{prefix}.generation={settings['generation']}",
+            f"{prefix}.max_bytes={reader_bytes}",
+            f"{prefix}.chunk_bytes={chunk}",
+        ]
+    )
     return settings, source_overrides, consumer_overrides
 
 
@@ -1113,10 +1344,88 @@ def build_pipeline_commands(
     """Build the internal commands without exposing transport options.
 
     ``env`` selects the TQ storage backend (defaults to ``os.environ``); pass
-    the same mapping to :func:`run_pipeline` so backend selection and master
+    the same mapping to ``run_ray_pipeline`` so backend selection and master
     validation read one source.
     """
     backend_env = os.environ if env is None else env
+    target_identity = _stable_path_identity("target", config.model_path)
+    tokenizer_identity = _stable_path_identity("tokenizer", config.tokenizer_path)
+    pinned_model_override = []
+    capture: Mapping[str, Any] | None = None
+    if config.data_source == "saved_hidden":
+        from verl_speco.producer.hidden_states_store import (
+            bind_raw_hidden_contract,
+            load_raw_hidden_manifest,
+            require_saved_hidden_checkpoint_fingerprint,
+        )
+
+        from verl_speco.checkpoint_tensor import (
+            checkpoint_fingerprint,
+            resolve_checkpoint_path,
+        )
+
+        if config.algorithm not in {"DSPARK", "DFLASH", "EAGLE3"}:
+            raise ValueError(
+                "saved_hidden supports DSPARK, DFLASH and EAGLE3 reference training"
+            )
+        use_logits = (
+            _find_override(
+                training_args,
+                "actor_rollout_ref.rollout.drafter.training.use_logits",
+                normalize_key=True,
+            )
+            or "false"
+        )
+        if _strip_quotes(use_logits).lower() not in {"false", "0"}:
+            raise ValueError(
+                "saved_hidden reference training does not support use_logits=true"
+            )
+        accumulation = (
+            _find_override(
+                training_args,
+                "actor_rollout_ref.rollout.drafter.training.gradient_accumulation_steps",
+                normalize_key=True,
+            )
+            or "1"
+        )
+        if int(_strip_quotes(accumulation)) != 1:
+            raise ValueError(
+                "saved_hidden reference training requires gradient_accumulation_steps=1"
+            )
+        capture = config.saved_hidden_contract
+        if capture is None:
+            rows = load_raw_hidden_manifest(config.input_path)
+            if not rows:
+                raise ValueError("Saved hidden dataset contains no committed samples")
+            capture = rows[0]["feature_contract"]
+            if any(row["feature_contract"] != capture for row in rows):
+                raise ValueError(
+                    "Saved hidden dataset contains mixed feature contracts"
+                )
+        require_saved_hidden_checkpoint_fingerprint(capture)
+        checkpoint_path = resolve_checkpoint_path(config.model_path)
+        target_identity = checkpoint_fingerprint(checkpoint_path)
+        # Point training at the same snapshot that supplied the fingerprint.
+        runtime_model_path = checkpoint_path.as_posix()
+        if runtime_model_path != config.model_path:
+            encoded_path = json.dumps(runtime_model_path, ensure_ascii=False)
+            pinned_model_override.append(f"{_MODEL_PATH_KEY}={encoded_path}")
+            config = replace(
+                config,
+                model_path=runtime_model_path,
+                tokenizer_path=(
+                    runtime_model_path
+                    if config.tokenizer_path == config.model_path
+                    else config.tokenizer_path
+                ),
+            )
+        tokenizer_identity = _saved_hidden_tokenizer_fingerprint(config.tokenizer_path)
+        # Ambient Mooncake/TQ settings must not initialize transports for disk input.
+        backend_env = {
+            **backend_env,
+            "SPECO_VLLM_HIDDEN_STATES_STORE": "file",
+            "SPECO_TQ_STORAGE_BACKEND": "SimpleStorage",
+        }
 
     drafter_path = _strip_quotes(_find_override(training_args, _DRAFTER_PATH_KEY) or "")
     _, resume_metadata = load_standalone_resume(
@@ -1137,56 +1446,64 @@ def build_pipeline_commands(
         f"{_TQ_PREFIX}.drop_last=true",
         *_tq_backend_overrides(backend_env),
     ]
-    parsed_endpoint = urlparse(config.vllm_endpoints[0])
-    vllm_port = parsed_endpoint.port or (
-        443 if parsed_endpoint.scheme == "https" else 80
+    cache_override = _find_override(
+        training_args,
+        "speco.draft_training.local_target_cache_path",
+        normalize_key=True,
     )
-    # extract_hidden_states uses the model's layer-output convention. Qwen3-4B/8B
-    # have 36 transformer layers; the default DSpark auxiliary selection ends at
-    # 33 and requests the final layer output as 36.
-    final_layer_id = _target_final_layer_id(
-        config.model_path, config.vllm_aux_hidden_state_layer_ids
-    )
-    capture_layer_ids = _vllm_capture_layer_ids(
-        config.vllm_aux_hidden_state_layer_ids, final_layer_id
-    )
-    speculative_config = {
-        "method": "extract_hidden_states",
-        "num_speculative_tokens": 1,
-        "draft_model_config": {
-            "hf_config": {"eagle_aux_hidden_state_layer_ids": capture_layer_ids}
-        },
-    }
-    kv_transfer_config = _vllm_kv_transfer_config(backend_env)
-    cache_override = _find_override(training_args, "speco.draft_training.local_target_cache_path", normalize_key=True)
     cache_path = _strip_quotes(cache_override) if cache_override else ""
     if cache_path.lower() in {"null", "none"}:
         cache_path = ""
     vllm = None
-    if len(config.vllm_endpoints) == 1 and parsed_endpoint.hostname in {
-        "127.0.0.1",
-        "localhost",
-        "0.0.0.0",
-    }:
-        vllm = [
-            "vllm",
-            "serve",
-            cache_path or config.model_path,
-            *(["--served-model-name", config.model_path] if cache_path else []),
-            "--host",
+    if config.data_source == "online":
+        parsed_endpoint = urlparse(config.vllm_endpoints[0])
+        vllm_port = parsed_endpoint.port or (
+            443 if parsed_endpoint.scheme == "https" else 80
+        )
+        # extract_hidden_states uses the model's layer-output convention. Qwen3-4B/8B
+        # have 36 transformer layers; the default DSpark auxiliary selection ends at
+        # 33 and requests the final layer output as 36.
+        final_layer_id = _target_final_layer_id(
+            config.model_path, config.vllm_aux_hidden_state_layer_ids
+        )
+        capture_layer_ids = _vllm_capture_layer_ids(
+            config.vllm_aux_hidden_state_layer_ids, final_layer_id
+        )
+        speculative_config = {
+            "method": "extract_hidden_states",
+            "num_speculative_tokens": 1,
+            "draft_model_config": {
+                "hf_config": {"eagle_aux_hidden_state_layer_ids": capture_layer_ids}
+            },
+        }
+        kv_transfer_config = _vllm_kv_transfer_config(backend_env)
+        vllm = None
+        if len(config.vllm_endpoints) == 1 and parsed_endpoint.hostname in {
             "127.0.0.1",
-            "--port",
-            str(vllm_port),
-            "--gpu-memory-utilization",
-            _DEFAULT_VLLM_GPU_MEMORY_UTILIZATION,
-            "--speculative-config",
-            json.dumps(speculative_config, separators=(",", ":")),
-            "--kv-transfer-config",
-            json.dumps(kv_transfer_config, separators=(",", ":")),
-            "--no-enable-chunked-prefill",
-        ]
+            "localhost",
+            "0.0.0.0",
+        }:
+            vllm = [
+                "vllm",
+                "serve",
+                cache_path or config.model_path,
+                *(["--served-model-name", config.model_path] if cache_path else []),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(vllm_port),
+                "--gpu-memory-utilization",
+                _DEFAULT_VLLM_GPU_MEMORY_UTILIZATION,
+                "--speculative-config",
+                json.dumps(speculative_config, separators=(",", ":")),
+                "--kv-transfer-config",
+                json.dumps(kv_transfer_config, separators=(",", ":")),
+                "--no-enable-chunked-prefill",
+            ]
     if cache_path and vllm is None:
-        raise ValueError("Local target cache requires a launcher-owned local vLLM endpoint")
+        raise ValueError(
+            "Local target cache requires a launcher-owned local vLLM endpoint"
+        )
     owner = [
         python_executable,
         "-m",
@@ -1209,6 +1526,7 @@ def build_pipeline_commands(
             )
         producer_tuning_overrides.append(item)
     producer_overrides = [
+        f"{_DATA_SOURCE_KEY}={config.data_source}",
         f"{_ALGORITHM_KEY}={config.algorithm}",
         "actor_rollout_ref.rollout.drafter.training.dflash_block_size="
         + (
@@ -1234,11 +1552,10 @@ def build_pipeline_commands(
         "speco.standalone_tq_producer.resume_checkpoint_path="
         + (drafter_path if resume_metadata is not None else "null"),
         f"speco.standalone_tq_producer.tokenizer_path={config.tokenizer_path}",
-        "speco.standalone_tq_producer.tokenizer_fingerprint="
-        + _stable_path_identity("tokenizer", config.tokenizer_path),
-        f"speco.standalone_tq_producer.target_model_id={config.model_path}",
-        "speco.standalone_tq_producer.target_model_revision="
-        + _stable_path_identity("target", config.model_path),
+        "speco.standalone_tq_producer.tokenizer_fingerprint=" + tokenizer_identity,
+        "speco.standalone_tq_producer.target_model_id="
+        + json.dumps(config.model_path, ensure_ascii=False),
+        "speco.standalone_tq_producer.target_model_revision=" + target_identity,
         "speco.standalone_tq_producer.target_layer_ids="
         + _hydra_list(config.target_layer_ids),
         "speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids="
@@ -1262,25 +1579,57 @@ def build_pipeline_commands(
         f"{_FEATURE_STORE_PREFIX}.repeat=false",
         *tq_overrides,
     ]
-    hidden_references = (
-        _strip_quotes(_find_override(training_args, _RUNTIME_BACKEND_KEY) or "ray")
-        == "ray"
+    runtime_backend = _strip_quotes(
+        _find_override(training_args, _RUNTIME_BACKEND_KEY) or "ray"
     )
+    _validate_runtime_backend_topology(
+        runtime_backend, training_args, environ=backend_env
+    )
+    data_transport = _strip_quotes(
+        _find_override(training_args, _DATA_TRANSPORT_KEY) or "ray_reference"
+    )
+    if data_transport not in {"ray_reference", "tq"}:
+        raise ValueError(f"{_DATA_TRANSPORT_KEY} must be ray_reference or tq")
+    if config.data_source == "saved_hidden" and data_transport != "ray_reference":
+        raise ValueError("saved_hidden requires data_transport=ray_reference")
+    hidden_references = data_transport == "ray_reference"
+    consumer_internal.append(f"{_DATA_SOURCE_KEY}={config.data_source}")
+    consumer_internal.append(f"{_DATA_TRANSPORT_KEY}={data_transport}")
+    producer_overrides.append(f"{_DATA_TRANSPORT_KEY}={data_transport}")
+    if not hidden_references:
+        producer_overrides.append(f"{_FEATURE_STORE_PREFIX}.type=tq")
+        consumer_internal.append(f"{_TQ_PREFIX}.expected_feature.payload_kind=null")
     native_settings = None
     if _resolve_hidden_states_store(backend_env) == "native":
-        controlled = (f"{_PRODUCER_PREFIX}.hidden_states_store",
-                      "actor_rollout_ref.rollout.drafter.training.target_feature_replay.hidden_states_store")
+        if not hidden_references:
+            raise ValueError(
+                "Native hidden states require data_transport=ray_reference"
+            )
+        controlled = (
+            f"{_PRODUCER_PREFIX}.hidden_states_store",
+            "actor_rollout_ref.rollout.drafter.training.target_feature_replay.hidden_states_store",
+        )
         for item in training_args:
             parsed = _split_override(item)
-            if parsed and any(parsed[0].lstrip("+") == prefix or parsed[0].lstrip("+").startswith(prefix + ".")
-                              for prefix in controlled):
-                raise ValueError("Native hidden-state store settings are configured by SPECO_NATIVE_* environment variables")
+            if parsed and any(
+                parsed[0].lstrip("+") == prefix
+                or parsed[0].lstrip("+").startswith(prefix + ".")
+                for prefix in controlled
+            ):
+                raise ValueError(
+                    "Native hidden-state store settings are configured by SPECO_NATIVE_* environment variables"
+                )
         native_settings, source_native, consumer_native = _native_launch_settings(
-            config, training_args, backend_env, launcher_owned=vllm is not None)
-        sample_budget = _producer_max_samples(training_args, resumed_optimizer_step=resumed_optimizer_step)
+            config, training_args, backend_env, launcher_owned=vllm is not None
+        )
+        sample_budget = _producer_max_samples(
+            training_args, resumed_optimizer_step=resumed_optimizer_step
+        )
         if sample_budget > native_settings["max_records"]:
-            raise ValueError("SPECO_NATIVE_MAX_RECORDS must cover the requested sample budget; "
-                             "allow extra records for filtered samples")
+            raise ValueError(
+                "SPECO_NATIVE_MAX_RECORDS must cover the requested sample budget; "
+                "allow extra records for filtered samples"
+            )
         producer_overrides.extend(source_native)
         consumer_internal.extend(consumer_native)
     if hidden_references:
@@ -1358,56 +1707,87 @@ def build_pipeline_commands(
             "ce_target_source": ce_target_source,
         },
     )
+    if capture is not None:
+        hidden_dtype = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}.get(
+            hidden_dtype.removeprefix("torch."), hidden_dtype.removeprefix("torch.")
+        )
+        producer_overrides.extend(
+            [
+                f"{_PRODUCER_PREFIX}.hidden_dtype={hidden_dtype}",
+                f"{_PRODUCER_PREFIX}.hidden_states_store.backend=file",
+            ]
+        )
+        consumer_internal.append(
+            "actor_rollout_ref.rollout.drafter.training.target_feature_replay.hidden_states_store.backend=file"
+        )
+        expected = {
+            "algorithm": config.algorithm,
+            "target_model_id": config.model_path,
+            "target_model_revision": target_identity,
+            "tokenizer_fingerprint": tokenizer_identity,
+            "target_layer_ids": list(config.target_layer_ids),
+            "vllm_aux_hidden_state_layer_ids": list(
+                config.vllm_aux_hidden_state_layer_ids
+            ),
+            "hidden_states_layout": hidden_layout,
+            "dtype": "torch." + hidden_dtype.removeprefix("torch."),
+            "require_full_alignment": True,
+            "use_logits": False,
+        }
+        bind_raw_hidden_contract(capture, expected)
+        if Path(config.model_path, "config.json").is_file():
+            depth = _target_final_layer_id(
+                config.model_path, config.vllm_aux_hidden_state_layer_ids
+            )
+            if capture.get("target_num_hidden_layers") != depth:
+                raise ValueError("Saved hidden target model depth mismatch")
     consumer_internal.extend(
         [
             f"{_TQ_PREFIX}.expected_feature.algorithm={config.algorithm}",
             f"{_TQ_PREFIX}.expected_feature.target_model_path="
-            + json.dumps(config.model_path),
-            f"{_TQ_PREFIX}.expected_feature.target_revision="
-            + _stable_path_identity("target", config.model_path),
+            + json.dumps(config.model_path, ensure_ascii=False),
+            f"{_TQ_PREFIX}.expected_feature.target_revision=" + target_identity,
             f"{_TQ_PREFIX}.expected_feature.tokenizer_fingerprint="
-            + _stable_path_identity("tokenizer", config.tokenizer_path),
+            + tokenizer_identity,
             f"{_TQ_PREFIX}.expected_feature.target_layer_ids="
             + _hydra_list(config.target_layer_ids),
             f"{_TQ_PREFIX}.expected_feature.hidden_states_layout={hidden_layout}",
             f"{_TQ_PREFIX}.expected_feature.hidden_dtype={hidden_dtype}",
         ]
     )
+    if config.data_source == "saved_hidden" and config.algorithm in {
+        "DSPARK",
+        "DFLASH",
+    }:
+        count_key = f"actor_rollout_ref.rollout.drafter.training.{config.algorithm.lower()}_num_target_layers"
+        explicit_count = _find_override(training_args, count_key, normalize_key=True)
+        if explicit_count is not None and int(_strip_quotes(explicit_count)) != len(
+            config.target_layer_ids
+        ):
+            raise ValueError(
+                "Saved hidden auxiliary count differs from training num_target_layers"
+            )
+        consumer_internal.append(f"{count_key}={len(config.target_layer_ids)}")
     algorithm_layer_ids_key = _ALGORITHM_TARGET_LAYER_IDS_KEYS.get(config.algorithm)
     if algorithm_layer_ids_key is not None:
         consumer_internal.append(
             f"{algorithm_layer_ids_key}={_hydra_list(config.target_layer_ids)}"
         )
-    # The subprocess path normally passes through draft_train_launcher, which
-    # removes user-facing aliases such as num_gpus_per_node before Hydra sees
-    # them. Ray composes Hydra directly, so apply the exact same normalization.
+    # Ray composes Hydra directly; normalize user-facing aliases before composition.
     launch_config = resolve_launch_config(list(training_args))
     normalized_training_args = normalize_training_args(
         list(training_args), launch_config
     )
     consumer_overrides = _replace_internal_overrides(
-        normalized_training_args, consumer_internal
+        normalized_training_args, [*consumer_internal, *pinned_model_override]
     )
-    producer = [
-        python_executable,
-        "-m",
-        "verl_speco.standalone_tq_producer",
-        *producer_overrides,
-    ]
-    consumer = [
-        python_executable,
-        "-m",
-        "verl_speco.draft_train_launcher",
-        *consumer_overrides,
-    ]
     return PipelineCommands(
         vllm=vllm,
         vllm_endpoints=config.vllm_endpoints,
         owner=owner,
-        producer=producer,
-        consumer=consumer,
         producer_overrides=tuple(producer_overrides),
         consumer_overrides=tuple(consumer_overrides),
+        data_source=config.data_source,
         local_model_cache=(config.model_path, cache_path) if cache_path else None,
         native_settings=native_settings,
     )
@@ -1464,10 +1844,14 @@ def _wait_for_vllm_ready(
 
 def _cleanup_hidden_states_directory(path):
     import shutil
+
     path = Path(path)
     resolved = path.resolve()
-    if (path.is_symlink() or resolved.parent != Path(tempfile.gettempdir()).resolve()
-            or not resolved.name.startswith("speco-vllm-hidden-states-")):
+    if (
+        path.is_symlink()
+        or resolved.parent != Path(tempfile.gettempdir()).resolve()
+        or not resolved.name.startswith("speco-vllm-hidden-states-")
+    ):
         raise RuntimeError("Refusing to remove an unowned hidden-state directory")
     shutil.rmtree(resolved)
 
@@ -1475,7 +1859,9 @@ def _cleanup_hidden_states_directory(path):
 def _start_process(popen, command, *, env):
     # Only real, task-owned Linux children get a dedicated process session.
     grouped = os.name == "posix" and popen is subprocess.Popen
-    process = popen(command, env=env, **({"start_new_session": True} if grouped else {}))
+    process = popen(
+        command, env=env, **({"start_new_session": True} if grouped else {})
+    )
     if grouped:
         process._speco_process_group = process.pid
     return process
@@ -1496,7 +1882,9 @@ def _stop_process(process: subprocess.Popen[Any] | None) -> None:
                 return
             # The leader may already have been reaped and its PID reused. Do
             # not signal an unproven group; keep resources for explicit recovery.
-            raise RuntimeError(f"Process group {group} exit is unconfirmed; retaining resources")
+            raise RuntimeError(
+                f"Process group {group} exit is unconfirmed; retaining resources"
+            )
 
     if process.poll() is not None:
         confirm_group_exit()
@@ -1512,6 +1900,7 @@ def _stop_process(process: subprocess.Popen[Any] | None) -> None:
             except ProcessLookupError:
                 return
         process.kill() if kill else process.terminate()
+
     stop()
     try:
         process.wait(timeout=10)
@@ -1521,135 +1910,15 @@ def _stop_process(process: subprocess.Popen[Any] | None) -> None:
     confirm_group_exit()
 
 
-def run_pipeline(
-    commands: PipelineCommands,
-    *,
-    ray_address: str,
-    environ: Mapping[str, str] | None = None,
-    popen: Callable[..., subprocess.Popen[Any]] = subprocess.Popen,
-    poll_interval_seconds: float = 0.2,
-    owner_ready_timeout_seconds: float = 120,
-    vllm_ready_timeout_seconds: float = 900,
-    endpoint_ready: Callable[[str], bool] = _vllm_is_ready,
-) -> int:
-    """Run the internal processes and return the training Consumer status."""
-
-    base_env = dict(os.environ if environ is None else environ)
-    # Ray itself also reads RAY_ADDRESS.  Pin every child (including the
-    # torchrun ranks created by the Consumer launcher) to the control plane
-    # created above instead of allowing a stale inherited value to win.
-    base_env["RAY_ADDRESS"] = ray_address
-    validate_tq_backend(base_env)
-    validate_hidden_states_store(base_env)
-    owner: subprocess.Popen[Any] | None = None
-    producer: subprocess.Popen[Any] | None = None
-    consumer: subprocess.Popen[Any] | None = None
-    vllm: subprocess.Popen[Any] | None = None
-    hidden_states_temp: Path | None = None
-    try:
-        with tempfile.TemporaryDirectory(prefix="speco-tq-launch-") as temp_dir:
-            ready_file = Path(temp_dir) / "owner.ready"
-            hidden_states_temp = Path(tempfile.mkdtemp(
-                prefix="speco-vllm-hidden-states-"
-            ))
-            hidden_states_dir = hidden_states_temp
-            unavailable_endpoints = [
-                endpoint
-                for endpoint in commands.vllm_endpoints
-                if not endpoint_ready(endpoint)
-            ]
-            if commands.local_model_cache and not unavailable_endpoints:
-                raise RuntimeError("Local model cache requires a new launcher-owned vLLM service")
-            if unavailable_endpoints:
-                if commands.local_model_cache:
-                    _verify_local_model_cache(*commands.local_model_cache)
-                if commands.vllm is None:
-                    raise RuntimeError(
-                        "The configured hidden-state vLLM endpoints are unavailable: "
-                        + ", ".join(unavailable_endpoints)
-                    )
-                config_endpoint = commands.vllm_endpoints[0]
-                vllm_command = [
-                    part.replace(_VLLM_HIDDEN_STATES_DIR, str(hidden_states_dir))
-                    for part in commands.vllm
-                ]
-                logger.info("Starting hidden-state vLLM at %s", config_endpoint)
-                vllm = _start_process(popen, vllm_command, env=base_env)
-            owner_env = {**base_env, "SPECO_TQ_OWNER_READY_FILE": str(ready_file)}
-            logger.info("Starting TransferQueue owner")
-            owner = _start_process(popen, commands.owner, env=owner_env)
-            _wait_for_owner_ready(
-                owner,
-                ready_file,
-                timeout_seconds=owner_ready_timeout_seconds,
-            )
-            if vllm is not None:
-                _wait_for_vllm_ready(
-                    vllm,
-                    config_endpoint,
-                    timeout_seconds=vllm_ready_timeout_seconds,
-                    endpoint_ready=endpoint_ready,
-                )
-            else:
-                unavailable_endpoints = [
-                    endpoint
-                    for endpoint in commands.vllm_endpoints
-                    if not endpoint_ready(endpoint)
-                ]
-                if unavailable_endpoints:
-                    raise RuntimeError(
-                        "hidden-state vLLM became unavailable at: "
-                        + ", ".join(unavailable_endpoints)
-                    )
-            logger.info("Starting standalone DSpark Consumer")
-            consumer = _start_process(popen, commands.consumer, env=base_env)
-            logger.info("Starting standalone vLLM Producer")
-            producer = _start_process(popen, commands.producer, env=base_env)
-
-            while True:
-                owner_status = owner.poll()
-                vllm_status = None if vllm is None else vllm.poll()
-                producer_status = producer.poll()
-                consumer_status = consumer.poll()
-                if owner_status is not None:
-                    raise RuntimeError(
-                        f"TransferQueue owner exited during training ({owner_status})"
-                    )
-                if producer_status is not None and producer_status != 0:
-                    return int(producer_status)
-                if vllm_status is not None:
-                    raise RuntimeError(
-                        f"hidden-state vLLM exited during training ({vllm_status})"
-                    )
-                if consumer_status is not None:
-                    return int(consumer_status)
-                time.sleep(poll_interval_seconds)
-    except KeyboardInterrupt:
-        logger.warning("Standalone DSpark training interrupted")
-        return 130
-    finally:
-        failures = []
-        for process in (producer, consumer, owner, vllm):
-            try:
-                _stop_process(process)
-            except Exception as exc:
-                failures.append(exc)
-                logger.exception("Task-owned process shutdown was not confirmed")
-        if failures and hidden_states_temp is not None:
-            logger.error("Preserving hidden-state directory after incomplete process shutdown: %s", hidden_states_temp)
-        elif hidden_states_temp is not None:
-            _cleanup_hidden_states_directory(hidden_states_temp)
-        if failures:
-            raise RuntimeError("Standalone subprocess shutdown was not confirmed") from failures[0]
-
-
 def _format_command(command: Sequence[str]) -> str:
     import shlex
 
     return " ".join(shlex.quote(part) for part in command)
 
 
-def _preflight_input_file(input_path: str, *, max_jsonl_line_bytes: int | None = None) -> None:
+def _preflight_input_file(
+    input_path: str, *, max_jsonl_line_bytes: int | None = None
+) -> None:
     path = Path(input_path)
     if path.is_dir():
         from verl_speco.producer.sequence_replay import SequenceReplayReader
@@ -1662,14 +1931,20 @@ def _preflight_input_file(input_path: str, *, max_jsonl_line_bytes: int | None =
     from verl_speco.producer.input_reader import iter_input_records
 
     try:
-        kwargs = {} if max_jsonl_line_bytes is None else {"max_jsonl_line_bytes": max_jsonl_line_bytes}
-        next(iter_input_records(path, **kwargs))
+        records = (
+            iter_input_records(path)
+            if max_jsonl_line_bytes is None
+            else iter_input_records(path, max_jsonl_line_bytes=max_jsonl_line_bytes)
+        )
+        next(records)
     except StopIteration as exc:
         raise ValueError(f"Training file contains no samples: {input_path}") from exc
 
 
 def _resolve_checkpoint_rollback(
-    training_args: Sequence[str], *, require_input: bool = True,
+    training_args: Sequence[str],
+    *,
+    require_input: bool = True,
 ) -> list[str]:
     """Resolve an explicitly enabled rollback before Producer and Consumer diverge."""
     key = "actor_rollout_ref.rollout.drafter.training.checkpoint_auto_rollback"
@@ -1686,20 +1961,36 @@ def _resolve_checkpoint_rollback(
         raise ValueError(f"{key} must be true or false")
     if value == "false":
         return list(training_args)
-    requested = _strip_quotes(_find_override(training_args, _DRAFTER_PATH_KEY, normalize_key=True) or "")
+    requested = _strip_quotes(
+        _find_override(training_args, _DRAFTER_PATH_KEY, normalize_key=True) or ""
+    )
     if not requested:
         raise ValueError("Automatic rollback requires a requested drafter checkpoint")
-    input_path = _single_train_file(_find_override(training_args, _TRAIN_FILES_KEY)) if require_input else None
+    input_path = (
+        _single_train_file(_find_override(training_args, _TRAIN_FILES_KEY))
+        if require_input
+        else None
+    )
     from verl_speco.trainer.checkpoint import resolve_verified_standalone_checkpoint
 
     selected = resolve_verified_standalone_checkpoint(requested, input_path=input_path)
-    if os.path.normcase(os.path.abspath(selected)) == os.path.normcase(os.path.abspath(requested)):
+    if os.path.normcase(os.path.abspath(selected)) == os.path.normcase(
+        os.path.abspath(requested)
+    ):
         return list(training_args)
-    logger.warning("Rolling back standalone checkpoint from %s to %s", requested, selected)
-    filtered = [item for item in training_args if not (
-        _split_override(item) and _split_override(item)[0].lstrip("+") == _DRAFTER_PATH_KEY
-    )]
-    return [*filtered, f"{_DRAFTER_PATH_KEY}={json.dumps(selected.replace(chr(92), '/'), ensure_ascii=False)}"]
+    logger.warning(
+        "Rolling back standalone checkpoint from %s to %s", requested, selected
+    )
+    filtered = [
+        item
+        for item in training_args
+        if (override := _split_override(item)) is None
+        or override[0].lstrip("+") != _DRAFTER_PATH_KEY
+    ]
+    return [
+        *filtered,
+        f"{_DRAFTER_PATH_KEY}={json.dumps(selected.replace(chr(92), '/'), ensure_ascii=False)}",
+    ]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1708,13 +1999,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
-        "--dry-run-topology", action="store_true",
+        "--dry-run-topology",
+        action="store_true",
         help="Print the logical topology without loading models or connecting to services.",
     )
     parser.add_argument("--python-executable", default=sys.executable)
     parser.add_argument(
         "--runtime-backend",
-        choices=("subprocess", "ray"),
+        choices=("ray",),
         default=None,
         help="Override speco.draft_training.runtime_backend.",
     )
@@ -1726,8 +2018,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             _find_override(training_args, _RUNTIME_BACKEND_KEY) or "ray"
         ).lower()
     )
-    if runtime_backend not in {"subprocess", "ray"}:
-        parser.error(f"{_RUNTIME_BACKEND_KEY} must be either subprocess or ray")
+    if runtime_backend != "ray":
+        parser.error(
+            "Standalone subprocess training was removed; runtime_backend must be ray"
+        )
     # Keep command composition consistent with the explicit CLI backend too.
     training_args = [*training_args, f"{_RUNTIME_BACKEND_KEY}={runtime_backend}"]
 
@@ -1738,9 +2032,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             plan["ray_address"] = _external_ray_address(os.environ) or "local"
             plan["hidden_states_store"] = _resolve_hidden_states_store(os.environ)
             plan["vllm_endpoints"] = _parse_vllm_endpoints(os.environ)
-            canonical = {key: value for key, value in plan.items() if key != "topology_sha256"}
+            canonical = {
+                key: value for key, value in plan.items() if key != "topology_sha256"
+            }
             plan["topology_sha256"] = hashlib.sha256(
-                json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
             ).hexdigest()
             print(json.dumps(plan, sort_keys=True))
             return 0
@@ -1750,31 +2048,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run:
             nnodes = _positive_int_override(training_args, _NNODES_KEYS, default=1)
             nproc = _positive_int_override(training_args, _NPROC_KEYS, default=1)
-            print("runtime: " + json.dumps({
-                "backend": runtime_backend,
-                "ray_address": _external_ray_address(os.environ) or "local",
-                "trainer_nodes": nnodes,
-                "trainer_node_ips": _trainer_node_ips(training_args, nnodes) if nnodes > 1 and runtime_backend == "ray" else None,
-                "processes_per_node": nproc,
-                "world_size": nnodes * nproc,
-                "trainer_topology": _trainer_topology_plan(runtime_backend, training_args),
-                "hidden_states_store": _resolve_hidden_states_store(os.environ),
-                "vllm_endpoints": config.vllm_endpoints,
-            }, sort_keys=True))
+            print(
+                "runtime: "
+                + json.dumps(
+                    {
+                        "backend": runtime_backend,
+                        "ray_address": _external_ray_address(os.environ) or "local",
+                        "trainer_nodes": nnodes,
+                        "trainer_node_ips": _trainer_node_ips(training_args, nnodes)
+                        if nnodes > 1 and runtime_backend == "ray"
+                        else None,
+                        "processes_per_node": nproc,
+                        "world_size": nnodes * nproc,
+                        "trainer_topology": _trainer_topology_plan(
+                            runtime_backend, training_args
+                        ),
+                        "hidden_states_store": _resolve_hidden_states_store(os.environ),
+                        "vllm_endpoints": config.vllm_endpoints,
+                    },
+                    sort_keys=True,
+                )
+            )
             commands = build_pipeline_commands(
                 config,
                 training_args,
                 ray_address=_external_ray_address(os.environ) or "127.0.0.1:6379",
                 python_executable=args.python_executable,
             )
+            if config.data_source == "saved_hidden":
+                print(f"saved hidden directory: {config.input_path}")
             printable_commands = [
                 ("vllm", commands.vllm),
                 ("owner", commands.owner),
-                ("producer", commands.producer),
-                ("consumer", commands.consumer),
             ]
             for role, command in printable_commands:
                 if role == "owner" and not command:
+                    continue
+                if command is None and config.data_source == "saved_hidden":
                     continue
                 if command is None:
                     print(
@@ -1783,12 +2093,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     continue
                 print(f"{role}: {_format_command(command)}")
+            print("producer: Ray actor (StandaloneProducerActor)")
+            print("producer overrides: " + _format_command(commands.producer_overrides))
+            print("consumer: Ray WorkerGroup (StandaloneDrafterWorker)")
+            print("consumer overrides: " + _format_command(commands.consumer_overrides))
             return 0
-        line_limit = _find_override(training_args, "speco.standalone_tq_producer.max_jsonl_line_bytes", normalize_key=True)
-        if line_limit is None:
-            _preflight_input_file(config.input_path)
-        else:
-            _preflight_input_file(config.input_path, max_jsonl_line_bytes=int(_strip_quotes(line_limit)))
+        if config.data_source == "online":
+            line_limit = _find_override(
+                training_args,
+                "speco.standalone_tq_producer.max_jsonl_line_bytes",
+                normalize_key=True,
+            )
+            if line_limit is None:
+                _preflight_input_file(config.input_path)
+            else:
+                _preflight_input_file(
+                    config.input_path,
+                    max_jsonl_line_bytes=int(_strip_quotes(line_limit)),
+                )
         ray_session = start_ray_session()
         try:
             commands = build_pipeline_commands(
@@ -1798,15 +2120,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 python_executable=args.python_executable,
             )
             logger.info("Using Ray control plane at %s", ray_session.address)
-            if runtime_backend == "ray":
-                from verl_speco.standalone_ray_runtime import run_ray_pipeline
+            from verl_speco.standalone_ray_runtime import run_ray_pipeline
 
-                return run_ray_pipeline(
-                    commands,
-                    ray_module=ray_session.module,
-                    ray_address=ray_session.address,
-                )
-            return run_pipeline(commands, ray_address=ray_session.address)
+            return run_ray_pipeline(
+                commands,
+                ray_module=ray_session.module,
+                ray_address=ray_session.address,
+            )
         finally:
             ray_session.close()
     except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
@@ -1825,6 +2145,5 @@ __all__ = [
     "build_pipeline_commands",
     "main",
     "resolve_pipeline_config",
-    "run_pipeline",
     "start_ray_session",
 ]

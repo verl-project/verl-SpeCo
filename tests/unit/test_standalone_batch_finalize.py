@@ -1187,18 +1187,20 @@ def test_nonzero_checkpoint_writer_receives_rank_zero_progress():
     assert dict(outputs) == {0: [], 1: [0, 65539]}
 
 
-def _gloo_real_checkpoint_worker(rank, port, directory, source, release, entered, results, fail_rank):
+def _gloo_real_checkpoint_worker(rank, port, directory, source, release, publication, results, fail_rank):
     from concurrent.futures import Future
     from datetime import timedelta
     import json
+    import traceback
     from types import SimpleNamespace
     import torch.distributed as dist
     import torch.distributed.checkpoint as dcp
+    from verl_speco.trainer.checkpoint import standalone_optimizer_storage_writer
     from verl_speco.trainer.draft_training_loop import _save_standalone_checkpoint_across_ranks
 
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=40))
     try:
+        dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
+                                rank=rank, world_size=2, timeout=timedelta(seconds=40))
         checkpoint = Path(directory) / "draft_step_1"
         class Trainer:
             _pending_full_checkpoint_future = None
@@ -1207,10 +1209,9 @@ def _gloo_real_checkpoint_worker(rank, port, directory, source, release, entered
             backend = SimpleNamespace(model_type="eagle3")
             def save_checkpoint(self, step, *, wait, defer_completion):
                 assert step == 1 and defer_completion and not wait
-                metadata = dcp.save({"weights": torch.tensor([7])}, checkpoint_id=str(checkpoint / "optimizer"))
+                dcp.save({"weights": torch.tensor([7])},
+                         storage_writer=standalone_optimizer_storage_writer(checkpoint / "optimizer"))
                 if rank == 0:
-                    from verl_speco.trainer.checkpoint import write_standalone_optimizer_layout
-                    write_standalone_optimizer_layout(checkpoint / "optimizer", metadata)
                     (checkpoint / "config.json").write_text("{}", encoding="utf-8")
                     torch.save({"weight": torch.tensor([7])}, checkpoint / "pytorch_model.bin")
                     torch.save({"optimizer_steps_total": 1}, checkpoint / "optimizer" / "trainer_state.pt")
@@ -1220,7 +1221,7 @@ def _gloo_real_checkpoint_worker(rank, port, directory, source, release, entered
                                       "trainer_state_file": "trainer_state.pt"}}), encoding="utf-8")
                     self._pending_full_checkpoint_future = Future()
                     self._pending_full_checkpoint_future.set_result(None)
-                    entered.set()
+                    publication.put(None)
                     return {"saved": True, "path": str(checkpoint), "reason": "scheduled"}
                 assert release.wait(20)
                 if fail_rank:
@@ -1234,9 +1235,16 @@ def _gloo_real_checkpoint_worker(rank, port, directory, source, release, entered
             dcp.load(restored, checkpoint_id=str(checkpoint / "optimizer"))
             results.put((rank, int(restored["weights"].item())))
         except RuntimeError as exc:
+            if rank == 0:
+                publication.put(traceback.format_exc())
             results.put((rank, str(exc)))
+    except BaseException:
+        if rank == 0:
+            publication.put(traceback.format_exc())
+        raise
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
@@ -1252,16 +1260,17 @@ def test_real_dcp_checkpoint_publication_and_recovery(tmp_path, fail_rank):
     source.write_text("{}\n", encoding="utf-8")
     checkpoint = tmp_path / "draft_step_1"
     context = multiprocessing.get_context("spawn")
-    entered, release, results = context.Event(), context.Event(), context.Queue()
+    publication, release, results = context.Queue(), context.Event(), context.Queue()
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     processes = [context.Process(target=_gloo_real_checkpoint_worker,
-        args=(rank, port, str(tmp_path), str(source), release, entered, results, fail_rank)) for rank in range(2)]
+        args=(rank, port, str(tmp_path), str(source), release, publication, results, fail_rank)) for rank in range(2)]
     for process in processes:
         process.start()
     try:
-        assert entered.wait(40)
+        error = publication.get(timeout=40)
+        assert error is None, error
         assert json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))["complete"] is False
         release.set()
         outputs = [results.get(timeout=40) for _ in processes]
@@ -1284,6 +1293,7 @@ def test_real_dcp_checkpoint_publication_and_recovery(tmp_path, fail_rank):
             if process.is_alive():
                 process.terminate()
             process.join(timeout=5)
+        publication.close()
         results.close()
 
 

@@ -66,21 +66,31 @@ class StandaloneCheckpointDirectoryLease:
         try:
             fd = os.open(self.path, flags, 0o600)
         except FileExistsError as exc:
-            raise RuntimeError(f"Checkpoint directory already has an owner marker: {self.path}") from exc
+            raise RuntimeError(
+                f"Checkpoint directory already has an owner marker: {self.path}"
+            ) from exc
         with os.fdopen(fd, "w", encoding="ascii") as stream:
             stream.write(self.token)
             stream.flush()
             os.fsync(stream.fileno())
         if os.name == "posix":
-            parent = os.open(self.directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            parent = os.open(
+                self.directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
             try:
                 os.fsync(parent)
             finally:
                 os.close(parent)
 
     def verify(self):
-        if self.path.is_symlink() or not self.path.is_file() or self.path.stat().st_size != 32:
-            raise RuntimeError("Checkpoint directory ownership marker is missing or invalid")
+        if (
+            self.path.is_symlink()
+            or not self.path.is_file()
+            or self.path.stat().st_size != 32
+        ):
+            raise RuntimeError(
+                "Checkpoint directory ownership marker is missing or invalid"
+            )
         if self.path.read_text(encoding="ascii") != self.token:
             raise RuntimeError("Checkpoint directory ownership token differs")
 
@@ -89,15 +99,32 @@ class StandaloneCheckpointDirectoryLease:
         self.path.unlink()
 
 
+def _checkpoint_file_sha256(stream) -> str:
+    digest = hashlib.sha256()
+    for block in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(block)
+    return digest.hexdigest()
+
+
 def write_standalone_trainable_snapshot(directory, *, step, tensors, training_plan):
     """Publish a separate trainable-only export; it cannot restore optimizer state."""
     import torch
     from safetensors.torch import save_file
 
-    if type(step) is not int or step < 0 or not isinstance(tensors, dict) or not tensors or not isinstance(training_plan, dict):
-        raise ValueError("Trainable snapshot requires a step and nonempty tensor mapping")
-    if any(not isinstance(name, str) or not name or not torch.is_tensor(value)
-           for name, value in tensors.items()):
+    if (
+        type(step) is not int
+        or step < 0
+        or not isinstance(tensors, dict)
+        or not tensors
+        or not isinstance(training_plan, dict)
+    ):
+        raise ValueError(
+            "Trainable snapshot requires a step and nonempty tensor mapping"
+        )
+    if any(
+        not isinstance(name, str) or not name or not torch.is_tensor(value)
+        for name, value in tensors.items()
+    ):
         raise ValueError("Invalid trainable snapshot tensor mapping")
     identity = json.loads(json.dumps(training_plan, sort_keys=True, allow_nan=False))
     destination = Path(directory)
@@ -105,17 +132,26 @@ def write_standalone_trainable_snapshot(directory, *, step, tensors, training_pl
     payload = destination / "trainable.safetensors"
     temporary = destination / "trainable.safetensors.incomplete"
     try:
-        weights = {name: value.detach().to(device="cpu").contiguous() for name, value in tensors.items()}
+        weights = {
+            name: value.detach().to(device="cpu").contiguous()
+            for name, value in tensors.items()
+        }
         save_file(weights, str(temporary))
         with temporary.open("rb+") as source:
-            checksum = hashlib.file_digest(source, "sha256").hexdigest()
+            checksum = _checkpoint_file_sha256(source)
             os.fsync(source.fileno())
         os.replace(temporary, payload)
         metadata = {
-            "schema_version": 1, "kind": "trainable_parameters_only", "optimizer_step": step,
-            "training_plan": identity, "weights_file": payload.name, "weights_sha256": checksum,
-            "parameters": {name: {"shape": list(value.shape), "dtype": str(value.dtype)}
-                           for name, value in weights.items()},
+            "schema_version": 1,
+            "kind": "trainable_parameters_only",
+            "optimizer_step": step,
+            "training_plan": identity,
+            "weights_file": payload.name,
+            "weights_sha256": checksum,
+            "parameters": {
+                name: {"shape": list(value.shape), "dtype": str(value.dtype)}
+                for name, value in weights.items()
+            },
         }
         temp_manifest = destination / "manifest.json.incomplete"
         with temp_manifest.open("x", encoding="utf-8") as target:
@@ -133,33 +169,66 @@ def read_standalone_trainable_snapshot(directory, *, expected_training_plan=None
     from safetensors.torch import load_file
 
     directory = Path(directory)
-    manifest_path, payload = directory / "manifest.json", directory / "trainable.safetensors"
-    if (directory.is_symlink() or manifest_path.is_symlink() or payload.is_symlink()
-            or not manifest_path.is_file() or manifest_path.stat().st_size > 16 * 1024 * 1024
-            or not payload.is_file()):
+    manifest_path, payload = (
+        directory / "manifest.json",
+        directory / "trainable.safetensors",
+    )
+    if (
+        directory.is_symlink()
+        or manifest_path.is_symlink()
+        or payload.is_symlink()
+        or not manifest_path.is_file()
+        or manifest_path.stat().st_size > 16 * 1024 * 1024
+        or not payload.is_file()
+    ):
         raise ValueError("Invalid trainable snapshot files")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if (not isinstance(manifest, dict) or manifest.get("schema_version") != 1
-            or manifest.get("kind") != "trainable_parameters_only"
-            or manifest.get("weights_file") != payload.name
-            or type(manifest.get("optimizer_step")) is not int or manifest["optimizer_step"] < 0):
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != 1
+        or manifest.get("kind") != "trainable_parameters_only"
+        or manifest.get("weights_file") != payload.name
+        or type(manifest.get("optimizer_step")) is not int
+        or manifest["optimizer_step"] < 0
+    ):
         raise ValueError("Invalid trainable snapshot manifest")
-    if expected_training_plan is not None and manifest.get("training_plan") != expected_training_plan:
+    if (
+        expected_training_plan is not None
+        and manifest.get("training_plan") != expected_training_plan
+    ):
         raise ValueError("Trainable snapshot training identity differs")
     before = payload.stat()
     with payload.open("rb") as source:
         opened = os.fstat(source.fileno())
         if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-                opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns):
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+        ):
             raise ValueError("Trainable snapshot changed while opening")
-        if hashlib.file_digest(source, "sha256").hexdigest() != manifest.get("weights_sha256"):
+        if _checkpoint_file_sha256(source) != manifest.get("weights_sha256"):
             raise ValueError("Trainable snapshot checksum differs")
     weights = load_file(str(payload), device="cpu")
     after = payload.stat()
-    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
         raise ValueError("Trainable snapshot changed while reading")
-    schema = {name: {"shape": list(value.shape), "dtype": str(value.dtype)} for name, value in weights.items()}
+    schema = {
+        name: {"shape": list(value.shape), "dtype": str(value.dtype)}
+        for name, value in weights.items()
+    }
     if not weights or schema != manifest.get("parameters"):
         raise ValueError("Trainable snapshot parameter schema differs")
     return weights, manifest
@@ -168,11 +237,19 @@ def read_standalone_trainable_snapshot(directory, *, expected_training_plan=None
 def _standalone_integrity_run_id(path: Path) -> str | None:
     manifest_path = path / _STANDALONE_INTEGRITY
     try:
-        if manifest_path.is_symlink() or not manifest_path.is_file() or manifest_path.stat().st_size > 16 * 1024 * 1024:
+        if (
+            manifest_path.is_symlink()
+            or not manifest_path.is_file()
+            or manifest_path.stat().st_size > 16 * 1024 * 1024
+        ):
             return None
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         run_id = manifest.get("run_id") if isinstance(manifest, dict) else None
-        return run_id if isinstance(run_id, str) and re.fullmatch(r"[0-9a-f]{32}", run_id) else None
+        return (
+            run_id
+            if isinstance(run_id, str) and re.fullmatch(r"[0-9a-f]{32}", run_id)
+            else None
+        )
     except (OSError, ValueError):
         return None
 
@@ -182,8 +259,10 @@ def _standalone_checkpoint_inventory(path: Path) -> dict[str, dict[str, Any]]:
     if path.is_symlink() or not path.is_dir():
         raise ValueError("Checkpoint must be a real directory")
     inventory = {}
+
     def fail(error):
         raise error
+
     for root, directories, files in os.walk(path, followlinks=False, onerror=fail):
         for name in directories:
             if (Path(root) / name).is_symlink():
@@ -204,9 +283,14 @@ def _standalone_checkpoint_inventory(path: Path) -> dict[str, dict[str, Any]]:
                     digest.update(block)
             after = item.stat()
             if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
             ):
-                raise ValueError(f"Checkpoint file changed during verification: {relative}")
+                raise ValueError(
+                    f"Checkpoint file changed during verification: {relative}"
+                )
             inventory[relative] = {"size": before.st_size, "sha256": digest.hexdigest()}
             if len(inventory) > 100_000:
                 raise ValueError("Checkpoint contains too many files")
@@ -215,7 +299,9 @@ def _standalone_checkpoint_inventory(path: Path) -> dict[str, dict[str, Any]]:
 
 def _standalone_metadata_digest(metadata: dict[str, Any]) -> str:
     stable = {key: value for key, value in metadata.items() if key != "complete"}
-    data = json.dumps(stable, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    data = json.dumps(
+        stable, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode()
     return hashlib.sha256(data).hexdigest()
 
 
@@ -228,89 +314,153 @@ def _optimizer_relative_path(value: Any) -> str:
     return path.as_posix()
 
 
-def write_standalone_optimizer_layout(directory: str | os.PathLike, metadata: Any) -> None:
-    """Record DCP dependencies returned by the save operation without unpickling metadata."""
+def standalone_optimizer_storage_writer(directory: str | os.PathLike):
+    """Record the shard extents from the same write results DCP uses to publish metadata."""
+    from torch.distributed.checkpoint import FileSystemWriter
+
+    class StandaloneOptimizerWriter(FileSystemWriter):
+        def finish(self, metadata, results):
+            super().finish(metadata, results)
+            entries = {
+                result.index: result.storage_data for rank in results for result in rank
+            }
+            _write_standalone_optimizer_layout(self.path, entries)
+
+    return StandaloneOptimizerWriter(directory)
+
+
+def _write_standalone_optimizer_layout(
+    directory: str | os.PathLike, entries: dict
+) -> None:
     root = Path(directory)
-    entries = getattr(metadata, "storage_data", None)
-    if not isinstance(entries, dict) or not entries or len(entries) > 1_000_000:
+    if not entries or len(entries) > 1_000_000:
         raise ValueError("Optimizer checkpoint has no supported DCP storage layout")
     files: dict[str, int] = {}
     for item in entries.values():
         relative = _optimizer_relative_path(getattr(item, "relative_path", None))
         offset, length = getattr(item, "offset", None), getattr(item, "length", None)
-        if type(offset) is not int or offset < 0 or type(length) is not int or length <= 0:
+        if (
+            type(offset) is not int
+            or offset < 0
+            or type(length) is not int
+            or length <= 0
+        ):
             raise ValueError("Invalid optimizer checkpoint storage extent")
         files[relative] = max(files.get(relative, 0), offset + length)
     metadata_path = root / _OPTIMIZER_DCP_METADATA
     if metadata_path.is_symlink() or not metadata_path.is_file():
         raise ValueError("Optimizer checkpoint metadata is missing")
     with metadata_path.open("rb") as stream:
-        metadata_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+        metadata_hash = _checkpoint_file_sha256(stream)
     for relative, end in files.items():
         path = root / relative
         if path.is_symlink() or not path.is_file() or path.stat().st_size < end:
             raise ValueError("Optimizer checkpoint dependency is missing or truncated")
-    atomic_write_json(root / _OPTIMIZER_LAYOUT, {"schema_version": 1, "metadata_sha256": metadata_hash, "files": files})
+    atomic_write_json(
+        root / _OPTIMIZER_LAYOUT,
+        {"schema_version": 1, "metadata_sha256": metadata_hash, "files": files},
+    )
 
 
-def _validate_standalone_optimizer_layout(path: Path, inventory: dict[str, dict[str, Any]]) -> None:
+def _validate_standalone_optimizer_layout(
+    path: Path, inventory: dict[str, dict[str, Any]]
+) -> None:
     optimizer = get_drafter_optimizer_checkpoint_path(path)
     if not optimizer:
         raise ValueError("Standalone integrity requires optimizer state")
     relative_root = Path(optimizer).relative_to(path)
     layout_path = Path(optimizer) / _OPTIMIZER_LAYOUT
-    if layout_path.is_symlink() or not layout_path.is_file() or layout_path.stat().st_size > 16 * 1024 * 1024:
+    if (
+        layout_path.is_symlink()
+        or not layout_path.is_file()
+        or layout_path.stat().st_size > 16 * 1024 * 1024
+    ):
         raise ValueError("Standalone optimizer dependency layout is missing")
     layout = json.loads(layout_path.read_text(encoding="utf-8"))
-    if not isinstance(layout, dict) or set(layout) != {"schema_version", "metadata_sha256", "files"}:
+    if not isinstance(layout, dict) or set(layout) != {
+        "schema_version",
+        "metadata_sha256",
+        "files",
+    }:
         raise ValueError("Invalid standalone optimizer dependency layout")
     files = layout["files"]
     metadata_key = (relative_root / _OPTIMIZER_DCP_METADATA).as_posix()
-    if (type(layout["schema_version"]) is not int or layout["schema_version"] != 1
-            or not isinstance(files, dict) or not 1 <= len(files) <= 100_000
-            or inventory.get(metadata_key, {}).get("sha256") != layout["metadata_sha256"]):
+    if (
+        type(layout["schema_version"]) is not int
+        or layout["schema_version"] != 1
+        or not isinstance(files, dict)
+        or not 1 <= len(files) <= 100_000
+        or inventory.get(metadata_key, {}).get("sha256") != layout["metadata_sha256"]
+    ):
         raise ValueError("Optimizer checkpoint dependency metadata differs")
     for name, end in files.items():
         relative = _optimizer_relative_path(name)
         record = inventory.get((relative_root / relative).as_posix())
-        if type(end) is not int or end <= 0 or not isinstance(record, dict) or record["size"] < end:
+        if (
+            type(end) is not int
+            or end <= 0
+            or not isinstance(record, dict)
+            or record["size"] < end
+        ):
             raise ValueError("Optimizer checkpoint dependency is missing or truncated")
 
 
 def write_standalone_integrity_manifest(
-    checkpoint_path: str | os.PathLike, *, run_id: str, require_resume: bool = False,
+    checkpoint_path: str | os.PathLike,
+    *,
+    run_id: str,
+    require_resume: bool = False,
 ) -> None:
     """Record the finished files before standalone marks the checkpoint complete."""
     path = Path(checkpoint_path)
-    if (not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{32}", run_id) is None
-            or type(require_resume) is not bool):
+    if (
+        not isinstance(run_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", run_id) is None
+        or type(require_resume) is not bool
+    ):
         raise ValueError("Standalone integrity requires a unique run ID")
     metadata = get_drafter_checkpoint_metadata(path)
     step = _managed_checkpoint_step(str(path))
-    if step is None or metadata.get("step") != step or metadata.get("complete") is not False:
+    if (
+        step is None
+        or metadata.get("step") != step
+        or metadata.get("complete") is not False
+    ):
         raise ValueError("Standalone checkpoint is not ready for integrity sealing")
     if not get_drafter_optimizer_checkpoint_path(path):
-        raise ValueError("Standalone integrity requires a complete optimizer checkpoint")
+        raise ValueError(
+            "Standalone integrity requires a complete optimizer checkpoint"
+        )
     if require_resume:
         from verl_speco.trainer.standalone_resume import load_standalone_resume
 
         _, resume = load_standalone_resume(path)
         if resume is None or resume.get("optimizer_step") != step:
-            raise ValueError("Standalone checkpoint is missing matching replay progress")
+            raise ValueError(
+                "Standalone checkpoint is missing matching replay progress"
+            )
     inventory = _standalone_checkpoint_inventory(path)
     _validate_standalone_optimizer_layout(path, inventory)
     if "config.json" not in inventory or not any(
         name.endswith((".safetensors", ".bin")) for name in inventory
     ):
         raise ValueError("Standalone checkpoint is missing model config or weights")
-    atomic_write_json(str(path / _STANDALONE_INTEGRITY), {
-        "schema_version": 2, "step": step, "run_id": run_id,
-        "resume_required": bool(require_resume),
-        "metadata_sha256": _standalone_metadata_digest(metadata), "files": inventory,
-    })
+    atomic_write_json(
+        str(path / _STANDALONE_INTEGRITY),
+        {
+            "schema_version": 2,
+            "step": step,
+            "run_id": run_id,
+            "resume_required": bool(require_resume),
+            "metadata_sha256": _standalone_metadata_digest(metadata),
+            "files": inventory,
+        },
+    )
 
 
-def verify_standalone_checkpoint_integrity(checkpoint_path: str | os.PathLike, *, require_optimizer_layout: bool = False) -> bool:
+def verify_standalone_checkpoint_integrity(
+    checkpoint_path: str | os.PathLike, *, require_optimizer_layout: bool = False
+) -> bool:
     """Validate the complete checkpoint and all files against its sealed inventory."""
     path = Path(checkpoint_path)
     manifest_path = path / _STANDALONE_INTEGRITY
@@ -338,7 +488,8 @@ def verify_standalone_checkpoint_integrity(checkpoint_path: str | os.PathLike, *
                 return False
         return bool(
             isinstance(manifest, dict)
-            and type(version) is int and version in {1, 2}
+            and type(version) is int
+            and version in {1, 2}
             and type(manifest.get("resume_required")) is bool
             and isinstance(manifest.get("run_id"), str)
             and re.fullmatch(r"[0-9a-f]{32}", manifest["run_id"]) is not None
@@ -350,7 +501,14 @@ def verify_standalone_checkpoint_integrity(checkpoint_path: str | os.PathLike, *
             and get_drafter_optimizer_checkpoint_path(path)
             and manifest.get("files") == inventory
         )
-    except (OSError, ValueError, TypeError, RuntimeError, EOFError, pickle.UnpicklingError):
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        RuntimeError,
+        EOFError,
+        pickle.UnpicklingError,
+    ):
         return False
 
 
@@ -362,50 +520,84 @@ def standalone_retention_resume_identity(root, checkpoint_path, *, optimizer_ste
     rollback or a conflicting writer as a continuation of the same lineage.
     """
     root, checkpoint = Path(root), Path(checkpoint_path)
-    if (type(optimizer_step) is not int or optimizer_step <= 0 or root.is_symlink()
-            or not root.is_dir() or checkpoint.is_symlink()
-            or checkpoint.name != f"draft_step_{optimizer_step}"
-            or checkpoint.resolve().parent != root.resolve()
-            or not verify_standalone_checkpoint_integrity(checkpoint)):
-        raise ValueError("Retention inheritance requires a verified checkpoint in the owned directory")
-    manifest = json.loads((checkpoint / _STANDALONE_INTEGRITY).read_text(encoding="utf-8"))
+    if (
+        type(optimizer_step) is not int
+        or optimizer_step <= 0
+        or root.is_symlink()
+        or not root.is_dir()
+        or checkpoint.is_symlink()
+        or checkpoint.name != f"draft_step_{optimizer_step}"
+        or checkpoint.resolve().parent != root.resolve()
+        or not verify_standalone_checkpoint_integrity(checkpoint)
+    ):
+        raise ValueError(
+            "Retention inheritance requires a verified checkpoint in the owned directory"
+        )
+    manifest = json.loads(
+        (checkpoint / _STANDALONE_INTEGRITY).read_text(encoding="utf-8")
+    )
     if manifest.get("resume_required") is not True:
         raise ValueError("Retention inheritance requires sealed replay progress")
-    if any((step := _managed_checkpoint_step(str(path))) is not None and step > optimizer_step
-           for path in root.iterdir()):
-        raise ValueError("Retention inheritance cannot resume before an existing later checkpoint")
+    if any(
+        (step := _managed_checkpoint_step(str(path))) is not None
+        and step > optimizer_step
+        for path in root.iterdir()
+    ):
+        raise ValueError(
+            "Retention inheritance cannot resume before an existing later checkpoint"
+        )
     return manifest["run_id"]
 
 
 def retire_standalone_checkpoints(
-    root: str | os.PathLike, *, current_step: int, keep_last: int,
-    protected_paths: tuple[str, ...] = (), delete: bool = False, ownership_check=None,
+    root: str | os.PathLike,
+    *,
+    current_step: int,
+    keep_last: int,
+    protected_paths: tuple[str, ...] = (),
+    delete: bool = False,
+    ownership_check=None,
 ) -> list[str]:
     """Plan, or explicitly remove, old sealed checkpoints after two verified successors."""
-    if (type(keep_last) is not int or keep_last < 2 or type(current_step) is not int
-            or current_step < 0 or type(delete) is not bool
-            or (ownership_check is not None and not callable(ownership_check))):
-        raise ValueError("Checkpoint retention requires keep_last >= 2, a valid current step and boolean delete")
+    if (
+        type(keep_last) is not int
+        or keep_last < 2
+        or type(current_step) is not int
+        or current_step < 0
+        or type(delete) is not bool
+        or (ownership_check is not None and not callable(ownership_check))
+    ):
+        raise ValueError(
+            "Checkpoint retention requires keep_last >= 2, a valid current step and boolean delete"
+        )
     original_root = Path(root)
     if original_root.is_symlink() or not original_root.is_dir():
         raise ValueError("Checkpoint retention root must be a real directory")
     base = original_root.resolve()
     protected = [Path(path).resolve() for path in protected_paths if path]
     current = base / f"draft_step_{current_step}"
-    if not verify_standalone_checkpoint_integrity(current, require_optimizer_layout=True):
+    if not verify_standalone_checkpoint_integrity(
+        current, require_optimizer_layout=True
+    ):
         raise ValueError("Current checkpoint is not verified for retention")
     run_id = _standalone_integrity_run_id(current)
     valid = []
     for path in base.iterdir():
         step = _managed_checkpoint_step(str(path))
-        if (step is not None and not path.is_symlink()
-                and _standalone_integrity_run_id(path) == run_id
-                and verify_standalone_checkpoint_integrity(path, require_optimizer_layout=True)):
+        if (
+            step is not None
+            and not path.is_symlink()
+            and _standalone_integrity_run_id(path) == run_id
+            and verify_standalone_checkpoint_integrity(
+                path, require_optimizer_layout=True
+            )
+        ):
             valid.append((step, path))
     valid.sort(key=lambda item: item[0])
     if not any(step == current_step for step, _ in valid):
         raise ValueError("Current checkpoint is not verified for retention")
-    protected_steps = {step for step, _ in valid[-keep_last:]}
+    survivors = valid[-keep_last:]
+    protected_steps = {step for step, _ in survivors}
     candidates = []
     for step, path in valid:
         if step >= current_step or step in protected_steps:
@@ -418,20 +610,33 @@ def retire_standalone_checkpoints(
             if ownership_check is not None:
                 ownership_check()
             # Recheck the candidate and all selected successors before each deletion.
-            survivors = [(step, item) for step, item in valid if step > _managed_checkpoint_step(str(path))]
-            if (len(survivors) < 2 or path.is_symlink() or path.resolve().parent != base
-                    or not verify_standalone_checkpoint_integrity(path, require_optimizer_layout=True)
-                    or not all(verify_standalone_checkpoint_integrity(item, require_optimizer_layout=True)
-                               for _, item in survivors)):
+            if (
+                len(survivors) < 2
+                or path.is_symlink()
+                or path.resolve().parent != base
+                or not verify_standalone_checkpoint_integrity(
+                    path, require_optimizer_layout=True
+                )
+                or not all(
+                    verify_standalone_checkpoint_integrity(
+                        item, require_optimizer_layout=True
+                    )
+                    for _, item in survivors
+                )
+            ):
                 raise RuntimeError("Checkpoint retention revalidation failed")
             # Make an interrupted removal unambiguously non-resumable before
             # deleting any payload file. Never change the sealed run identity.
             before = path.stat()
             metadata = get_drafter_checkpoint_metadata(path)
-            if (metadata.get("complete") is not True
-                    or metadata.get("step") != _managed_checkpoint_step(str(path))
-                    or _standalone_integrity_run_id(path) != run_id):
-                raise RuntimeError("Checkpoint retention identity changed before removal")
+            if (
+                metadata.get("complete") is not True
+                or metadata.get("step") != _managed_checkpoint_step(str(path))
+                or _standalone_integrity_run_id(path) != run_id
+            ):
+                raise RuntimeError(
+                    "Checkpoint retention identity changed before removal"
+                )
             atomic_write_json(path / "metadata.json", {**metadata, "complete": False})
             if os.name == "posix":
                 fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -440,10 +645,15 @@ def retire_standalone_checkpoints(
                 finally:
                     os.close(fd)
             after = path.stat()
-            if (path.is_symlink() or path.resolve().parent != base
-                    or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
-                    or _standalone_integrity_run_id(path) != run_id):
-                raise RuntimeError("Checkpoint retention identity changed after invalidation")
+            if (
+                path.is_symlink()
+                or path.resolve().parent != base
+                or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                or _standalone_integrity_run_id(path) != run_id
+            ):
+                raise RuntimeError(
+                    "Checkpoint retention identity changed after invalidation"
+                )
             if ownership_check is not None:
                 ownership_check()
             shutil.rmtree(path)
@@ -451,7 +661,9 @@ def retire_standalone_checkpoints(
 
 
 def resolve_verified_standalone_checkpoint(
-    requested: str | os.PathLike, *, input_path: str | os.PathLike | None = None,
+    requested: str | os.PathLike,
+    *,
+    input_path: str | os.PathLike | None = None,
 ) -> str:
     """Return the newest verified checkpoint no later than the requested one.
 
@@ -468,8 +680,13 @@ def resolve_verified_standalone_checkpoint(
     candidates = []
     for candidate in path.parent.iterdir():
         step = _managed_checkpoint_step(str(candidate))
-        if (step is None or candidate.name != f"draft_step_{step}" or step > requested_step
-                or candidate.is_symlink() or _standalone_integrity_run_id(candidate) != run_id):
+        if (
+            step is None
+            or candidate.name != f"draft_step_{step}"
+            or step > requested_step
+            or candidate.is_symlink()
+            or _standalone_integrity_run_id(candidate) != run_id
+        ):
             continue
         candidates.append((step, candidate))
     input_fingerprints: dict[bool, dict[str, Any]] = {}
@@ -478,7 +695,10 @@ def resolve_verified_standalone_checkpoint(
             continue
         if input_path is not None:
             from verl_speco.trainer.standalone_resume import (
-                build_input_fingerprint, input_content_identity, load_standalone_resume, validate_input_identity,
+                build_input_fingerprint,
+                input_content_identity,
+                load_standalone_resume,
+                validate_input_identity,
             )
 
             try:
@@ -490,17 +710,33 @@ def resolve_verified_standalone_checkpoint(
                 saved_identity = resume.get("input_content_identity")
                 if has_identity:
                     saved_identity = validate_input_identity(saved_identity)
-                    if input_content_identity(saved) != saved_identity:
+                    if (
+                        not isinstance(saved, dict)
+                        or input_content_identity(saved) != saved_identity
+                    ):
                         continue
-                has_hash = saved_identity is not None or (isinstance(saved, dict) and "sha256" in saved)
+                has_hash = saved_identity is not None or (
+                    isinstance(saved, dict) and "sha256" in saved
+                )
                 if has_hash not in input_fingerprints:
                     input_fingerprints[has_hash] = build_input_fingerprint(
-                        input_path, include_content_hash=has_hash,
+                        input_path,
+                        include_content_hash=has_hash,
                     )
                 current = input_fingerprints[has_hash]
-                if (input_content_identity(current) != saved_identity if saved_identity is not None else saved != current):
+                if (
+                    input_content_identity(current) != saved_identity
+                    if saved_identity is not None
+                    else saved != current
+                ):
                     continue
-            except (OSError, ValueError, RuntimeError, EOFError, pickle.UnpicklingError):
+            except (
+                OSError,
+                ValueError,
+                RuntimeError,
+                EOFError,
+                pickle.UnpicklingError,
+            ):
                 continue
             if resume.get("optimizer_step") != step:
                 continue
@@ -995,7 +1231,8 @@ def freeze_policy_sidecar_path(
 def atomic_write_json(
     path: Union[str, os.PathLike],
     payload: dict[str, Any],
-    *, compact: bool = False,
+    *,
+    compact: bool = False,
 ) -> str:
     """Write JSON to ``path`` atomically (tmp file + ``os.replace``)."""
     target = os.fspath(path)
@@ -1004,8 +1241,14 @@ def atomic_write_json(
     tmp_path = f"{target}.tmp.{os.getpid()}"
     try:
         with open(tmp_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=None if compact else 2,
-                      separators=(",", ":") if compact else None, allow_nan=not compact)
+            json.dump(
+                payload,
+                handle,
+                ensure_ascii=False,
+                indent=None if compact else 2,
+                separators=(",", ":") if compact else None,
+                allow_nan=not compact,
+            )
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())

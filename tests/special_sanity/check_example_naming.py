@@ -48,7 +48,12 @@ ASYNC_TRAINER_MODES = (("colocate", "async"), ("separate", "async"))
 SFT_SUFFIX = "sft"
 
 DEFAULT_IGNORE_DIRS: tuple[str, ...] = ()
-DEFAULT_IGNORE_FILES: tuple[str, ...] = ()
+# Hidden-state service entry points are not drafter training examples.
+# Keep explicit paths so training scripts in the same directory remain checked.
+DEFAULT_IGNORE_FILES: tuple[str, ...] = (
+    "examples/glm53-train/glm53_hidden_serve_node0.sh",
+    "examples/glm53-train/glm53_hidden_serve_node1.sh",
+)
 
 
 def _split_tokens(stem: str) -> list[str]:

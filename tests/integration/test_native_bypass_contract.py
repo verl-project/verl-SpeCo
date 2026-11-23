@@ -223,10 +223,13 @@ def test_run_uses_speco_task_runner_when_drafter_enabled(
     task_runner_class = calls[0]
     assert task_runner_class is not None
     assert actors == [SpecoTaskRunner]
-    assert task_runner_class is (sentinel if diagnostic_enabled else actor)
-    assert options == (
-        [{"runtime_env": {"env_vars": env}}] if diagnostic_enabled else []
-    )
+    assert task_runner_class is sentinel
+    assert len(options) == 1
+    forwarded = options[0]["runtime_env"]["env_vars"]
+    from verl_speco.integration.drafter_config_env import SPECO_DRAFTER_CONFIG_ENV
+    import json
+    assert json.loads(forwarded[SPECO_DRAFTER_CONFIG_ENV])["enable"] is True
+    assert {key: value for key, value in forwarded.items() if key != SPECO_DRAFTER_CONFIG_ENV} == env
 
 
 def test_run_bypass_propagates_training_without_rollout_error(monkeypatch) -> None:
@@ -288,3 +291,21 @@ def test_run_bypass_strips_speco_overlay_before_native_run(monkeypatch) -> None:
     # The strip must be surgical: native rollout keys stay intact.
     assert native_config.actor_rollout_ref.rollout.name == "vllm"
     assert native_config.actor_rollout_ref.rollout.n == 1
+
+
+def test_drafter_runtime_config_is_resolved_before_ray_start():
+    import json
+    from verl_speco.main import configure_drafter_runtime_env
+    from verl_speco.integration.drafter_config_env import SPECO_DRAFTER_CONFIG_ENV
+
+    config = _config(enable=True, training=True)
+    config.actor_rollout_ref.rollout.drafter.training = {
+        "drafter_opd": {"enable": True, "method": "draft_opd"},
+        "window": "${actor_rollout_ref.rollout.drafter.enable}",
+    }
+    env = configure_drafter_runtime_env(config)
+    assert config.ray_kwargs.ray_init.runtime_env.env_vars[SPECO_DRAFTER_CONFIG_ENV] == env[SPECO_DRAFTER_CONFIG_ENV]
+    assert json.loads(env[SPECO_DRAFTER_CONFIG_ENV])["training"] == {
+        "drafter_opd": {"enable": True, "method": "draft_opd"}, "window": True,
+    }
+    assert configure_drafter_runtime_env(_config()) == {}

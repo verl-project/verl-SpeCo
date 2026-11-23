@@ -19,18 +19,18 @@ import asyncio
 import logging
 import math
 import os
-import numpy as np
 import time
 from collections import Counter, deque
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from functools import partial
-from typing import Any, Mapping
+from typing import Any
 
+import numpy as np
 import torch
 
 from verl_speco.config import config_int
-from verl_speco.integration import transferqueue_bridge as default_transport
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
@@ -47,31 +47,35 @@ from verl_speco.producer.input_reader import (
     TokenizedRequest,
     build_render_fn,
     iter_input_records,
-    prepare_generation_request,
     prepare_generated_prefill_request,
+    prepare_generation_request,
     tokenize_record,
     tokenize_record_with_render_boundary,
 )
 from verl_speco.producer.metrics import ProducerDiagnostics, producer_window_metrics
 from verl_speco.producer.vllm_feature_client import (
     RawVllmFeature,
-    VllmResponse,
     VllmEndpoint,
     VllmFeatureClientPool,
+    VllmResponse,
     delete_temporary_result,
 )
 from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.trainer.feature_store import DraftFeatureSample
 from verl_speco.trainer.standalone_resume import (
-    build_input_fingerprint, input_content_identity, load_standalone_resume, producer_data_recipe, validate_input_identity,
+    build_input_fingerprint,
+    input_content_identity,
+    load_standalone_resume,
+    producer_data_recipe,
+    validate_input_identity,
 )
+from verl_speco.trainer.standalone_retry import retry_io
 from verl_speco.trainer.target_feature_replay import (
     FeatureContract,
     HiddenStateAlignmentError,
     feature_from_vllm_payload,
     load_vllm_final_norm,
 )
-from verl_speco.trainer.tq_retry import retry_io
 from verl_speco.transport.drafter_sample_protocol import (
     DRAFTER_TQ_PARTITION,
     PROTOCOL_SCHEMA_VERSION,
@@ -83,7 +87,6 @@ from verl_speco.transport.drafter_sample_protocol import (
     make_reference_tag,
     make_sample_key,
 )
-
 
 logger = logging.getLogger(__name__)
 _INPUT_DONE = object()
@@ -297,12 +300,18 @@ def _assert_resume_shuffle_alignment(
     """
     saved = (resume_metadata or {}).get("producer_shuffle")
     saved_recipe = saved.get("data_recipe") if saved else None
-    if consumed_sequence_nos and saved_recipe is not None and saved_recipe != data_recipe:
+    if (
+        consumed_sequence_nos
+        and saved_recipe is not None
+        and saved_recipe != data_recipe
+    ):
         raise ValueError("Standalone resume Producer data recipe changed")
     saved_source = saved.get("source_proportional_field") if saved else None
     if consumed_sequence_nos and saved_source != source_proportional_field:
         raise ValueError("Standalone resume source-proportional ordering changed")
-    saved_ordered = bool(saved.get("deterministic_publication", False)) if saved else False
+    saved_ordered = (
+        bool(saved.get("deterministic_publication", False)) if saved else False
+    )
     if consumed_sequence_nos and saved_ordered != deterministic_publication:
         raise ValueError("Standalone resume deterministic publication setting changed")
     if saved is None:
@@ -342,7 +351,7 @@ def _read_on_missing_response(producer_cfg: Any) -> str:
 
 def _minimum_response_feature_rows(training_cfg: Mapping[str, Any]) -> int:
     algorithm = str(training_cfg.get("speculative_algorithm", "")).strip().upper()
-    if algorithm == "DSPARK":
+    if algorithm in ("DSPARK", "DSV4_DSPARK"):
         return 2
     if algorithm == "DFLASH":
         block_size = int(training_cfg.get("dflash_block_size", 16))
@@ -350,6 +359,22 @@ def _minimum_response_feature_rows(training_cfg: Mapping[str, Any]) -> int:
             raise ValueError("dflash_block_size must be at least 2 for training")
         return block_size
     return 1
+
+
+def standalone_token_config(producer_cfg, training_cfg):
+    """Keep saved features under the same supervision constraints as live features."""
+    algorithm = str(training_cfg["speculative_algorithm"]).strip().upper()
+    config = dict(producer_cfg)
+    config["response_feature_budget"] = algorithm in {"DFLASH", "DSPARK", "DSV4_DSPARK"}
+    config["min_feature_rows"] = 3 if algorithm == "EAGLE3" else 1
+    config["min_response_feature_rows"] = _minimum_response_feature_rows(training_cfg)
+    config["response_block_size"] = (
+        config["min_response_feature_rows"] if algorithm == "DFLASH" else 0
+    )
+    config["preserve_prompt_context"] = config["response_feature_budget"] and bool(
+        training_cfg.get("preserve_prompt_hidden_states", True)
+    )
+    return config
 
 
 def validate_producer_config(config: Any, *, allow_native: bool = False) -> str:
@@ -367,24 +392,45 @@ def validate_producer_config(config: Any, *, allow_native: bool = False) -> str:
         raise ValueError(f"standalone_tq_producer missing required fields: {missing}")
     source_field = producer_cfg.get("source_proportional_field")
     journal_path = producer_cfg.get("reference_lease_journal_path")
-    if journal_path is not None and (not isinstance(journal_path, str) or not os.path.isabs(journal_path)):
-        raise ValueError("reference_lease_journal_path must be an absolute path or null")
-    for name, default in (("source_route_wave_samples", 0), ("source_route_max_samples", 64),
-                          ("source_route_max_tokens", 1048576), ("source_route_max_sequence_tokens", 65536)):
+    if journal_path is not None and (
+        not isinstance(journal_path, str) or not os.path.isabs(journal_path)
+    ):
+        raise ValueError(
+            "reference_lease_journal_path must be an absolute path or null"
+        )
+    for name, default in (
+        ("source_route_wave_samples", 0),
+        ("source_route_max_samples", 64),
+        ("source_route_max_tokens", 1048576),
+        ("source_route_max_sequence_tokens", 65536),
+    ):
         value = producer_cfg.get(name, default)
-        if type(value) is not int or value < (0 if name == "source_route_wave_samples" else 1):
+        if type(value) is not int or value < (
+            0 if name == "source_route_wave_samples" else 1
+        ):
             raise ValueError(f"Invalid {name}")
     if type(producer_cfg.get("stable_source_ids", False)) is not bool:
         raise ValueError("stable_source_ids must be a boolean")
-    for name, default in (("max_jsonl_line_bytes", DEFAULT_MAX_JSONL_LINE_BYTES), ("max_indexed_records", DEFAULT_MAX_INDEXED_RECORDS)):
+    for name, default in (
+        ("max_jsonl_line_bytes", DEFAULT_MAX_JSONL_LINE_BYTES),
+        ("max_indexed_records", DEFAULT_MAX_INDEXED_RECORDS),
+    ):
         value = producer_cfg.get(name, default)
         if type(value) is not int or value < 0:
             raise ValueError(f"{name} must be a non-negative integer")
     if type(producer_cfg.get("verify_indexed_input", False)) is not bool:
         raise ValueError("verify_indexed_input must be a boolean")
-    if source_field is not None and (not isinstance(source_field, str) or not source_field.strip() or source_field != source_field.strip()):
-        raise ValueError("source_proportional_field must be a nonempty field name or null")
-    if source_field is not None and os.path.isdir(str(producer_cfg.get("input_path") or "")):
+    if source_field is not None and (
+        not isinstance(source_field, str)
+        or not source_field.strip()
+        or source_field != source_field.strip()
+    ):
+        raise ValueError(
+            "source_proportional_field must be a nonempty field name or null"
+        )
+    if source_field is not None and os.path.isdir(
+        str(producer_cfg.get("input_path") or "")
+    ):
         raise ValueError("source-proportional ordering requires a JSONL input file")
     if bool(producer_cfg.get("shuffle", False)) or source_field is not None:
         input_path = str(producer_cfg.get("input_path") or "")
@@ -405,9 +451,16 @@ def validate_producer_config(config: Any, *, allow_native: bool = False) -> str:
         )
     wave = producer_cfg.get("source_route_wave_samples", 0)
     if wave:
-        if (not all(isinstance(endpoint, str) for endpoint in endpoints)
-                or len(set(endpoints)) != len(endpoints) or len(endpoints) > 4096
-                or wave > min(5_000_000, len(endpoints) * producer_cfg.get("source_route_max_samples", 64))):
+        if (
+            not all(isinstance(endpoint, str) for endpoint in endpoints)
+            or len(set(endpoints)) != len(endpoints)
+            or len(endpoints) > 4096
+            or wave
+            > min(
+                5_000_000,
+                len(endpoints) * producer_cfg.get("source_route_max_samples", 64),
+            )
+        ):
             raise ValueError("Invalid source route endpoints or wave sample capacity")
     algorithm = str(training_cfg.get("speculative_algorithm", "") or "").strip()
     if not algorithm:
@@ -467,7 +520,9 @@ def validate_producer_config(config: Any, *, allow_native: bool = False) -> str:
     store_cfg = producer_cfg.get("hidden_states_store")
     if store_cfg and store_cfg.get("backend") == "native":
         if not allow_native:
-            raise ValueError("Native producer store requires an injected native reference store")
+            raise ValueError(
+                "Native producer store requires an injected native reference store"
+            )
     elif store_cfg:
         # Raises on an unsupported backend before the pool is built, without
         # constructing a throwaway store (the pool builds the real one).
@@ -564,14 +619,19 @@ class _OrderedReferenceQueue:
             while self.next_order not in self.pending:
                 if self.ended:
                     if self.pending:
-                        raise RuntimeError("Ordered publication ended with missing requests")
+                        raise RuntimeError(
+                            "Ordered publication ended with missing requests"
+                        )
                     return _PUBLISH_DONE
                 item = await self.queue.get()
                 if item is _PUBLISH_DONE:
                     self.ended = True
                     continue
-                sequence_no = int(item.sequence_no if isinstance(item, _SkippedReference)
-                                  else item.request.sequence_no)
+                sequence_no = int(
+                    item.sequence_no
+                    if isinstance(item, _SkippedReference)
+                    else item.request.sequence_no
+                )
                 order = self.order_by_sequence[sequence_no]
                 if order < self.next_order or order in self.pending:
                     raise ValueError("Duplicate ordered publication")
@@ -610,10 +670,233 @@ async def _collect_reference_batch(
     return batch, False
 
 
+def _saved_hidden_training_request(request, producer_cfg, training_cfg):
+    """Apply the existing Producer window rules to a full saved conversation."""
+    from verl_speco.producer.input_reader import _build_tokenized_request
+
+    mask = request["loss_mask"]
+    prompt_length = next(
+        (index for index, value in enumerate(mask) if value > 0), len(mask)
+    )
+    prepared = _build_tokenized_request(
+        sequence_no=0,
+        sample_id="saved_hidden",
+        prompt_length=prompt_length,
+        full_ids=request["input_ids"],
+        source_metadata=request["source_metadata"],
+        config=standalone_token_config(producer_cfg, training_cfg),
+        vllm_prompt_token_ids=request["vllm_prompt_token_ids"],
+    )
+    positions = prepared.feature_positions.tolist()
+    # Keep saved masks and original positions; select only the feature window.
+    return {
+        **request,
+        "feature_positions": positions,
+        "draft_position_ids": [
+            request["position_ids"][position] + 1 for position in positions
+        ],
+    }
+
+
+async def _publish_saved_hidden(
+    config,
+    *,
+    before_publish,
+    on_references,
+    reference_batch_size,
+    on_metrics=None,
+) -> ProducerStats:
+    """Index permanent files once; publish the existing reference protocol only."""
+    from pathlib import Path
+
+    from verl_speco.producer.hidden_states_store import (
+        bind_raw_hidden_contract,
+        load_raw_hidden_manifest,
+    )
+    from verl_speco.transport.drafter_sample_protocol import validate_reference_tag
+
+    plain = _plain_config(config)
+    producer_cfg, training_cfg, tq_cfg = _config_sections(config)
+    if (
+        plain["speco"]["draft_training"].get("data_transport", "ray_reference")
+        != "ray_reference"
+    ):
+        raise ValueError("saved_hidden requires data_transport=ray_reference")
+    if on_references is None or reference_batch_size < 1:
+        raise ValueError(
+            "saved_hidden requires scheduler reference publication with a positive batch size"
+        )
+    algorithm = str(training_cfg["speculative_algorithm"]).upper()
+    if algorithm not in {"DSPARK", "DFLASH", "EAGLE3"}:
+        raise ValueError(
+            "saved_hidden supports DSPARK, DFLASH and EAGLE3 reference training"
+        )
+    if training_cfg.get("use_logits", False):
+        raise ValueError(
+            "saved_hidden reference training does not support use_logits=true"
+        )
+    if int(training_cfg.get("gradient_accumulation_steps", 1)) != 1:
+        raise ValueError(
+            "saved_hidden reference training requires gradient_accumulation_steps=1"
+        )
+    root = Path(producer_cfg["input_path"]).resolve()
+    if not root.is_dir():
+        raise ValueError("saved_hidden input_path must be a dataset directory")
+    rows = await asyncio.to_thread(load_raw_hidden_manifest, root)
+    if not rows:
+        raise ValueError("Saved hidden dataset contains no committed samples")
+    expected = {
+        "algorithm": str(training_cfg["speculative_algorithm"]).upper(),
+        "target_model_id": producer_cfg["target_model_id"],
+        "target_model_revision": producer_cfg["target_model_revision"],
+        "tokenizer_fingerprint": producer_cfg["tokenizer_fingerprint"],
+        "target_layer_ids": list(producer_cfg["target_layer_ids"]),
+        "vllm_aux_hidden_state_layer_ids": list(
+            producer_cfg["vllm_aux_hidden_state_layer_ids"]
+        ),
+        "dtype": str(_parse_dtype(producer_cfg["hidden_dtype"])),
+        "hidden_states_layout": resolve_drafter_hidden_states_layout(
+            training_cfg["speculative_algorithm"], training_cfg
+        ),
+        "require_full_alignment": True,
+        "use_logits": False,
+    }
+    logger.info(
+        "Saved hidden Producer indexed directory=%s samples=%s", root, len(rows)
+    )
+    first_contract = rows[0]["feature_contract"]
+    training_rows: dict[int, dict[str, Any]] = {}
+    for index, row in enumerate(rows):
+        stored = row["feature_contract"]
+        if stored != first_contract:
+            raise ValueError("Saved hidden dataset contains mixed feature contracts")
+        contract = bind_raw_hidden_contract(stored, expected)
+        request = row["request"]
+        if stored.get("contract_type") == "raw_capture":
+            try:
+                request = _saved_hidden_training_request(
+                    request, producer_cfg, training_cfg
+                )
+            except SampleFilteredError as exc:
+                logger.info(
+                    "Skipping saved hidden sample %s: %s", row["sample_id"], exc
+                )
+                continue
+        row = {**row, "feature_contract": contract, "request": request}
+        # Validate arrays and metadata before exposing any sample to the scheduler.
+        tag = make_reference_tag(
+            SampleMetadata(
+                PROTOCOL_SCHEMA_VERSION, str(tq_cfg["run_id"]), row["sample_id"], 0
+            ),
+            path=str(root / row["path"]),
+            request=row["request"],
+            feature_contract=row["feature_contract"],
+        )
+        validate_reference_tag(tag)
+        positions = row["request"]["feature_positions"]
+        masks = row["request"]["loss_mask"]
+        if any(
+            int(position) < 0 or int(position) >= len(masks) for position in positions
+        ):
+            raise ValueError(
+                "Saved hidden feature positions are outside the token sequence"
+            )
+        supervised = sum(masks[int(position)] > 0 for position in positions)
+        minimum = _minimum_response_feature_rows(training_cfg)
+        if (
+            supervised < minimum
+            or len(positions) < (3 if algorithm == "EAGLE3" else 1)
+            or (algorithm == "DFLASH" and len(positions) <= minimum)
+        ):
+            logger.info(
+                "Skipping saved hidden sample %s: insufficient training rows",
+                row["sample_id"],
+            )
+            continue
+        training_rows[index] = row
+    if not training_rows:
+        raise ValueError(
+            "Saved hidden dataset has no samples with sufficient training rows"
+        )
+    consumed, resume_metadata = load_standalone_resume(
+        producer_cfg.get("resume_checkpoint_path"),
+        input_path=root,
+    )
+    shuffle, seed = (
+        bool(producer_cfg.get("shuffle", False)),
+        int(producer_cfg.get("shuffle_seed", 42)),
+    )
+    _assert_resume_shuffle_alignment(
+        resume_metadata,
+        shuffle=shuffle,
+        shuffle_seed=seed,
+        consumed_sequence_nos=consumed,
+    )
+    budget = int(producer_cfg.get("max_samples", 0) or 0)
+    if budget < 0:
+        raise ValueError("max_samples must be non-negative")
+    stats = ProducerStats()
+    epoch = 0
+    pending: list[dict[str, Any]] = []
+    while True:
+        order = (
+            np.random.default_rng(seed + epoch).permutation(len(rows))
+            if shuffle
+            else range(len(rows))
+        )
+        for position, index in enumerate(order):
+            sequence_no = epoch * len(rows) + position
+            if sequence_no in consumed:
+                continue
+            selected_row = training_rows.get(int(index))
+            if selected_row is None:
+                stats.filtered_count += 1
+                continue
+            if budget > 0 and stats.published_count + len(pending) >= budget:
+                break
+            if before_publish is not None:
+                await before_publish()
+            meta = SampleMetadata(
+                PROTOCOL_SCHEMA_VERSION,
+                str(tq_cfg["run_id"]),
+                selected_row["sample_id"],
+                sequence_no,
+            )
+            tag = make_reference_tag(
+                meta,
+                path=str(root / selected_row["path"]),
+                request=selected_row["request"],
+                feature_contract=selected_row["feature_contract"],
+            )
+            pending.append({"key": make_sample_key(meta), "tag": tag})
+            stats.input_count += 1
+            if len(pending) >= reference_batch_size:
+                await on_references(pending)
+                stats.published_count += len(pending)
+                pending = []
+        if budget == 0 or stats.published_count + len(pending) >= budget:
+            break
+        epoch += 1
+    if pending:
+        await on_references(pending)
+        stats.published_count += len(pending)
+    if on_metrics is not None:
+        await on_metrics(
+            stats.published_count,
+            {"producer/saved_hidden_samples": float(stats.published_count)},
+        )
+    logger.info(
+        "Saved hidden Producer finished directory=%s published=%s",
+        root,
+        stats.published_count,
+    )
+    return stats
+
+
 async def run_producer(
     config: Any,
     *,
-    transport: Any = default_transport,
+    transport: Any = None,
     tokenizer: Any | None = None,
     client_pool: Any | None = None,
     hidden_states_store: Any | None = None,
@@ -628,22 +911,53 @@ async def run_producer(
     on_metrics: Any | None = None,
     get_runtime_state: Any | None = None,
 ) -> ProducerStats:
-    """Run the bounded input -> vLLM -> publication pipeline."""
+    """Publish references from online vLLM or a persistent raw-hidden dataset."""
 
-    callbacks = (acquire_reference_slot, release_unpublished_slot, transfer_unpublished_slot)
-    if any(callback is not None for callback in callbacks) and any(callback is None for callback in callbacks):
+    source = (
+        _plain_config(config)
+        .get("speco", {})
+        .get("draft_training", {})
+        .get("data_source", "online")
+    )
+    if source == "saved_hidden":
+        return await _publish_saved_hidden(
+            config,
+            before_publish=before_request,
+            on_references=on_references,
+            reference_batch_size=reference_batch_size,
+            on_metrics=on_metrics,
+        )
+    if source != "online":
+        raise ValueError("data_source must be online or saved_hidden")
+    callbacks = (
+        acquire_reference_slot,
+        release_unpublished_slot,
+        transfer_unpublished_slot,
+    )
+    if any(callback is not None for callback in callbacks) and any(
+        callback is None for callback in callbacks
+    ):
         raise ValueError("Reference execution slot callbacks must be supplied together")
     if acquire_reference_slot is not None and on_references is None:
         raise ValueError("Reference execution slots require reference publication")
-    if hidden_states_store is not None and (client_pool is not None or on_references is None):
-        raise ValueError("An injected producer store requires reference publication and an internally built client pool")
+    if hidden_states_store is not None and (
+        client_pool is not None or on_references is None
+    ):
+        raise ValueError(
+            "An injected producer store requires reference publication and an internally built client pool"
+        )
     on_missing_response = validate_producer_config(
         config, allow_native=getattr(hidden_states_store, "backend", None) == "native"
     )
     producer_cfg, drafter_cfg, tq_cfg = _config_sections(config)
     run_id = str(tq_cfg["run_id"])
-    if producer_cfg.get("reference_lease_journal_path") is not None and on_references is None:
-        raise ValueError("reference_lease_journal_path requires Ray reference publication")
+    if (
+        producer_cfg.get("reference_lease_journal_path") is not None
+        and on_references is None
+    ):
+        raise ValueError(
+            "reference_lease_journal_path requires Ray reference publication"
+        )
     stats = ProducerStats()
     if reference_batch_size < 1:
         raise ValueError("reference_batch_size must be positive")
@@ -655,8 +969,14 @@ async def run_producer(
         raise ValueError("max_ordered_inflight must be a non-negative integer")
     if deterministic_publication and on_references is None:
         raise ValueError("deterministic_publication requires ray_reference publication")
-    if producer_cfg.get("source_route_wave_samples", 0) and on_references is not None and not deterministic_publication:
-        raise ValueError("Fixed source routing requires deterministic_publication for ray_reference publication")
+    if (
+        producer_cfg.get("source_route_wave_samples", 0)
+        and on_references is not None
+        and not deterministic_publication
+    ):
+        raise ValueError(
+            "Fixed source routing requires deterministic_publication for ray_reference publication"
+        )
     max_consecutive_feature_drops = config_int(
         producer_cfg, "max_consecutive_feature_drops", 20
     )
@@ -669,8 +989,14 @@ async def run_producer(
     publish_executor: ThreadPoolExecutor | None = None
     try:
         if expected_input_identity is not None:
-            fingerprint = await asyncio.to_thread(build_input_fingerprint, producer_cfg["input_path"], include_content_hash=True)
-            if input_content_identity(fingerprint) != validate_input_identity(expected_input_identity):
+            fingerprint = await asyncio.to_thread(
+                build_input_fingerprint,
+                producer_cfg["input_path"],
+                include_content_hash=True,
+            )
+            if input_content_identity(fingerprint) != validate_input_identity(
+                expected_input_identity
+            ):
                 raise ValueError("Standalone Producer input changed before reading")
         logger.info(
             "Standalone Producer starting run_id=%s input=%s endpoints=%s",
@@ -679,6 +1005,9 @@ async def run_producer(
             producer_cfg["vllm_endpoints"],
         )
         if on_references is None:
+            if transport is None:
+                from verl_speco.integration import transferqueue_bridge as transport
+
             if not transport.configure_transfer_queue(tq_cfg):
                 raise RuntimeError("Standalone Producer requires TransferQueue==0.1.10")
             ray_cfg = tq_cfg["ray"]
@@ -743,31 +1072,25 @@ async def run_producer(
                 request_timeout=float(producer_cfg["request_timeout"]),
                 token_balanced=producer_cfg.get("token_balanced", False),
                 max_inflight_tokens=producer_cfg.get("max_inflight_tokens", 0),
-                max_inflight_tokens_per_endpoint=producer_cfg.get("max_inflight_tokens_per_endpoint", 0),
+                max_inflight_tokens_per_endpoint=producer_cfg.get(
+                    "max_inflight_tokens_per_endpoint", 0
+                ),
                 success_log_interval=int(
                     producer_cfg.get("vllm_success_log_interval", 100)
                 ),
-                hidden_states_store=(hidden_states_store if hidden_states_store is not None
-                                     else build_hidden_states_store(producer_cfg.get("hidden_states_store"))),
+                hidden_states_store=(
+                    hidden_states_store
+                    if hidden_states_store is not None
+                    else build_hidden_states_store(
+                        producer_cfg.get("hidden_states_store")
+                    )
+                ),
             )
         await pool.start()
         logger.info("Standalone Producer vLLM client pool started")
 
         algorithm = str(drafter_cfg["speculative_algorithm"]).strip().upper()
-        # Only standalone DFlash/DSpark use a response-only feature budget.
-        producer_cfg = dict(producer_cfg)
-        producer_cfg["response_feature_budget"] = algorithm in {"DFLASH", "DSPARK"}
-        # EAGLE3 shifts away two feature rows before computing its loss.
-        producer_cfg["min_feature_rows"] = 3 if algorithm == "EAGLE3" else 1
-        producer_cfg["min_response_feature_rows"] = _minimum_response_feature_rows(
-            drafter_cfg
-        )
-        producer_cfg["response_block_size"] = (
-            producer_cfg["min_response_feature_rows"] if algorithm == "DFLASH" else 0
-        )
-        producer_cfg["preserve_prompt_context"] = producer_cfg[
-            "response_feature_budget"
-        ] and bool(drafter_cfg.get("preserve_prompt_hidden_states", True))
+        producer_cfg = standalone_token_config(producer_cfg, drafter_cfg)
         target_layer_ids, vllm_aux_layer_ids = normalize_standalone_layer_ids(
             algorithm,
             producer_cfg.get("target_layer_ids"),
@@ -850,12 +1173,18 @@ async def run_producer(
         )
         order_by_sequence: dict[int, int] = {}
         next_admission_order = 0
-        order_slots = asyncio.Semaphore(
-            max_ordered_inflight or (worker_count + input_queue.maxsize + publish_queue.maxsize)
-        ) if deterministic_publication else None
+        order_slots = (
+            asyncio.Semaphore(
+                max_ordered_inflight
+                or (worker_count + input_queue.maxsize + publish_queue.maxsize)
+            )
+            if deterministic_publication
+            else None
+        )
         ordered_publish_queue = (
             _OrderedReferenceQueue(publish_queue, order_by_sequence, order_slots)
-            if deterministic_publication else publish_queue
+            if deterministic_publication
+            else publish_queue
         )
         stages: dict[str, tuple[str, float, str]] = {}
         sample_timings: dict[int, dict[str, float]] = {}
@@ -961,7 +1290,9 @@ async def run_producer(
                     "tokenizer_fingerprint": str(producer_cfg["tokenizer_fingerprint"]),
                 }
                 if any(identity.get(key) != value for key, value in expected.items()):
-                    raise ValueError("Sequence replay target or tokenizer identity differs")
+                    raise ValueError(
+                        "Sequence replay target or tokenizer identity differs"
+                    )
             shuffled_reader: ShuffledJsonlReader | None = None
             if (shuffle or source_field is not None) and replay_reader is None:
                 # Parquet+shuffle is rejected up front in
@@ -978,9 +1309,15 @@ async def run_producer(
                     ),
                     source_field=source_field,
                     stable_source_ids=producer_cfg.get("stable_source_ids", False),
-                    max_jsonl_line_bytes=producer_cfg.get("max_jsonl_line_bytes", DEFAULT_MAX_JSONL_LINE_BYTES),
-                    max_indexed_records=producer_cfg.get("max_indexed_records", DEFAULT_MAX_INDEXED_RECORDS),
-                    verify_indexed_input=producer_cfg.get("verify_indexed_input", False),
+                    max_jsonl_line_bytes=producer_cfg.get(
+                        "max_jsonl_line_bytes", DEFAULT_MAX_JSONL_LINE_BYTES
+                    ),
+                    max_indexed_records=producer_cfg.get(
+                        "max_indexed_records", DEFAULT_MAX_INDEXED_RECORDS
+                    ),
+                    verify_indexed_input=producer_cfg.get(
+                        "verify_indexed_input", False
+                    ),
                 )
                 logger.info(
                     "Standalone TQ Producer indexed %s JSONL lines for shuffle_seed=%s",
@@ -991,7 +1328,10 @@ async def run_producer(
             source_sequence_no = 0
             render_boundary_cfg = producer_cfg.get("render_boundary", {}) or {}
             render_fn = None
-            if bool(render_boundary_cfg.get("enabled", False)) and replay_reader is None:
+            if (
+                bool(render_boundary_cfg.get("enabled", False))
+                and replay_reader is None
+            ):
                 endpoints = list(producer_cfg.get("vllm_endpoints") or [])
                 if not endpoints:
                     raise ValueError(
@@ -1012,9 +1352,20 @@ async def run_producer(
                 if replay_reader is not None:
                     from verl_speco.producer.sequence_replay import _sha256
 
-                    if _sha256(replay_reader.directory / "manifest.json") != replay_reader.manifest_sha256:
-                        raise ValueError("Sequence replay manifest changed during training")
-                    order = np.random.default_rng(shuffle_seed + epoch).permutation(len(replay_reader)) if shuffle else None
+                    if (
+                        _sha256(replay_reader.directory / "manifest.json")
+                        != replay_reader.manifest_sha256
+                    ):
+                        raise ValueError(
+                            "Sequence replay manifest changed during training"
+                        )
+                    order = (
+                        np.random.default_rng(shuffle_seed + epoch).permutation(
+                            len(replay_reader)
+                        )
+                        if shuffle
+                        else None
+                    )
                     record_iter = replay_reader.iter_rows(order)
                 elif shuffled_reader is not None:
                     # Deterministic per-epoch permutation (seed + epoch), so a
@@ -1035,7 +1386,9 @@ async def run_producer(
                 else:
                     record_iter = iter_input_records(
                         str(producer_cfg["input_path"]),
-                        max_jsonl_line_bytes=producer_cfg.get("max_jsonl_line_bytes", DEFAULT_MAX_JSONL_LINE_BYTES),
+                        max_jsonl_line_bytes=producer_cfg.get(
+                            "max_jsonl_line_bytes", DEFAULT_MAX_JSONL_LINE_BYTES
+                        ),
                         on_error=str(producer_cfg.get("on_error", "skip") or "skip"),
                         max_consecutive_errors=config_int(
                             producer_cfg, "max_consecutive_errors", 20
@@ -1048,23 +1401,34 @@ async def run_producer(
                     sequence_no = source_sequence_no
                     source_sequence_no += 1
                     scanned_count += 1
-                    if sequence_no in consumed_sequence_nos and not producer_cfg.get("source_route_wave_samples", 0):
+                    if sequence_no in consumed_sequence_nos and not producer_cfg.get(
+                        "source_route_wave_samples", 0
+                    ):
                         # Already consumed by a previous run; not a filtered row.
                         continue
                     considered_count += 1
                     # iter_input_records restarts sequence_no at zero on every
                     # pass. TQ keys require a run-global sequence number so a
                     # repeated sample never overwrites an earlier pending copy.
-                    record = (source_record if replay_reader is not None else
-                              replace(source_record, sequence_no=sequence_no))
-                    sample_id = record["sample_id"] if replay_reader is not None else record.sample_id
+                    record = (
+                        source_record
+                        if replay_reader is not None
+                        else replace(source_record, sequence_no=sequence_no)
+                    )
+                    sample_id = (
+                        record["sample_id"]
+                        if replay_reader is not None
+                        else record.sample_id
+                    )
                     try:
                         if replay_reader is not None:
                             from verl_speco.producer.sequence_replay import (
                                 prepare_replay_request,
                             )
 
-                            request = prepare_replay_request(record, sequence_no=sequence_no, config=producer_cfg)
+                            request = prepare_replay_request(
+                                record, sequence_no=sequence_no, config=producer_cfg
+                            )
                         elif record.response is None:
                             if on_missing_response == "skip":
                                 raise SampleFilteredError(
@@ -1109,7 +1473,11 @@ async def run_producer(
                     yield request
                 if scanned_count == 0:
                     raise ValueError("Standalone Producer input contains no samples")
-                if produced_count == 0 and considered_count == scanned_count and max_samples > 0:
+                if (
+                    produced_count == 0
+                    and considered_count == scanned_count
+                    and max_samples > 0
+                ):
                     # Only a complete unskipped epoch proves every row is filtered.
                     # Previously consumed rows may become usable in the next epoch.
                     raise ValueError(
@@ -1135,11 +1503,14 @@ async def run_producer(
             from verl_speco.producer.sequence_replay import iter_source_route_waves
 
             requests = iter_source_route_waves(
-                requests, wave_samples=producer_cfg["source_route_wave_samples"],
+                requests,
+                wave_samples=producer_cfg["source_route_wave_samples"],
                 endpoints=list(producer_cfg.get("vllm_endpoints") or []),
                 max_samples=producer_cfg.get("source_route_max_samples", 64),
                 max_tokens=producer_cfg.get("source_route_max_tokens", 1048576),
-                max_sequence_tokens=producer_cfg.get("source_route_max_sequence_tokens", 65536),
+                max_sequence_tokens=producer_cfg.get(
+                    "source_route_max_sequence_tokens", 65536
+                ),
                 consumed=consumed_sequence_nos,
             )
         # Tokenization (and the synchronous vLLM /render calls it can make when
@@ -1178,7 +1549,11 @@ async def run_producer(
                 if request is not _INPUT_DONE and deterministic_publication:
                     order_by_sequence[int(request.sequence_no)] = next_admission_order
                     next_admission_order += 1
-            if request is not _INPUT_DONE and acquire_slot and acquire_reference_slot is not None:
+            if (
+                request is not _INPUT_DONE
+                and acquire_slot
+                and acquire_reference_slot is not None
+            ):
                 # FIFO admission prevents starving the next ordered publication.
                 await acquire_reference_slot(request)
             if request is not _INPUT_DONE:
@@ -1219,7 +1594,9 @@ async def run_producer(
         consecutive_replacements = 0
 
         async def next_replacement(
-            *, cause: BaseException | None = None, transfer_from: Any | None = None,
+            *,
+            cause: BaseException | None = None,
+            transfer_from: Any | None = None,
             ordered_filtered: bool = False,
         ) -> TokenizedRequest | GenerationRequest | None:
             """Count a dropped sample and return the next replacement request.
@@ -1251,6 +1628,7 @@ async def run_producer(
                 raise RuntimeError(message)
             if max_samples <= 0:
                 if transfer_from is not None:
+                    assert release_unpublished_slot is not None
                     await release_unpublished_slot(transfer_from)
                 return None
             replacement = await next_request_async(acquire_slot=transfer_from is None)
@@ -1258,9 +1636,11 @@ async def run_producer(
             # defensive; in unbounded mode we returned None above.
             if replacement is _INPUT_DONE:
                 if transfer_from is not None:
+                    assert release_unpublished_slot is not None
                     await release_unpublished_slot(transfer_from)
                 return None
             if transfer_from is not None:
+                assert transfer_unpublished_slot is not None
                 await transfer_unpublished_slot(transfer_from, replacement)
             logger.info(
                 "Standalone Producer requesting replacement sample "
@@ -1361,7 +1741,9 @@ async def run_producer(
                         timing["generate"] = time.monotonic() - generate_started
                         account_request_failure(request, exc, stage="generate")
                         if acquire_reference_slot is not None:
-                            raise RuntimeError("Reference generation failed; execution slot retained") from exc
+                            raise RuntimeError(
+                                "Reference generation failed; execution slot retained"
+                            ) from exc
                         replacement_request = await next_replacement(cause=exc)
                         continue
                     timing["generate"] = time.monotonic() - generate_started
@@ -1374,8 +1756,11 @@ async def run_producer(
                                 generated.generated_token_ids,
                                 producer_cfg,
                             )
-                            request = replace(request, source_route=generation_request.source_route,
-                                              source_plan_sha256=generation_request.source_plan_sha256)
+                            request = replace(
+                                request,
+                                source_route=generation_request.source_route,
+                                source_plan_sha256=generation_request.source_plan_sha256,
+                            )
                         except SampleFilteredError as exc:
                             stats.filtered_count += 1
                             sample_timings.pop(int(request.sequence_no), None)
@@ -1387,20 +1772,30 @@ async def run_producer(
                                 stats.filtered_count,
                                 exc,
                             )
-                            if acquire_reference_slot is not None or deterministic_publication:
+                            if (
+                                acquire_reference_slot is not None
+                                or deterministic_publication
+                            ):
                                 await asyncio.to_thread(
-                                    retry_io, partial(delete_temporary_result, generated),
+                                    retry_io,
+                                    partial(delete_temporary_result, generated),
                                     name="Filtered generated reference cleanup",
                                     retry_if=lambda error: True,
                                 )
                                 generated_deleted = True
                             if deterministic_publication:
                                 # A replacement inherits the filtered request's order slot.
-                                await publish_queue.put(_SkippedReference(
-                                    int(request.sequence_no), release_slot=max_samples <= 0,
-                                ))
+                                await publish_queue.put(
+                                    _SkippedReference(
+                                        int(request.sequence_no),
+                                        release_slot=max_samples <= 0,
+                                    )
+                                )
                             replacement_request = await next_replacement(
-                                cause=exc, transfer_from=request if acquire_reference_slot is not None else None,
+                                cause=exc,
+                                transfer_from=request
+                                if acquire_reference_slot is not None
+                                else None,
                                 ordered_filtered=deterministic_publication,
                             )
                             continue
@@ -1413,7 +1808,8 @@ async def run_producer(
                                 # Reusing a slot while its generation payload remains
                                 # allocated would invalidate the admission bound.
                                 await asyncio.to_thread(
-                                    retry_io, partial(delete_temporary_result, generated),
+                                    retry_io,
+                                    partial(delete_temporary_result, generated),
                                     name="Generated reference cleanup before prefill",
                                     retry_if=lambda error: True,
                                 )
@@ -1431,7 +1827,9 @@ async def run_producer(
                     timing["prefill"] = time.monotonic() - prefill_started
                     account_request_failure(request, exc, stage="prefill")
                     if acquire_reference_slot is not None:
-                        raise RuntimeError("Reference prefill failed; execution slot retained") from exc
+                        raise RuntimeError(
+                            "Reference prefill failed; execution slot retained"
+                        ) from exc
                     replacement_request = await next_replacement(cause=exc)
                     continue
                 reference_ready_at = time.monotonic()
@@ -1758,7 +2156,8 @@ async def run_producer(
                     except BaseException:
                         logger.warning(
                             "Preserving %s references after uncertain metadata delivery; "
-                            "reclaim only after remote readers are fenced", len(entries),
+                            "reclaim only after remote readers are fenced",
+                            len(entries),
                         )
                         raise
                     finally:
@@ -2159,8 +2558,14 @@ def _reference_tag(request, response, contract, run_id, tq_cfg):
     values["dtype"] = str(contract.dtype)
     return make_reference_tag(
         _sample_metadata(request, None, contract, run_id, tq_cfg),
-        backend=("native" if response.is_handle and getattr(getattr(response, "store", None), "backend", None) == "native"
-                 else "mooncake" if response.is_handle else "file"),
+        backend=(
+            "native"
+            if response.is_handle
+            and getattr(getattr(response, "store", None), "backend", None) == "native"
+            else "mooncake"
+            if response.is_handle
+            else "file"
+        ),
         path=response.hidden_states_path,
         handle=response.handle,
         transfer_params=response.transfer_params,
@@ -2254,42 +2659,9 @@ def _parse_dtype(value: Any) -> torch.dtype:
     return dtype
 
 
-def _apply_direct_producer_defaults(config: Any, overrides: list[str]) -> None:
-    from omegaconf import OmegaConf
-
-    key = "actor_rollout_ref.rollout.drafter.training.preserve_prompt_hidden_states"
-    # The direct entrypoint inherits cotrain defaults, but standalone retains
-    # prompt context unless the user explicitly overrides this option.
-    if not any(item.split("=", 1)[0].lstrip("+") == key for item in overrides):
-        OmegaConf.update(config, key, True)
-
-
-def _hydra_main(config: Any) -> None:
-    from hydra.core.hydra_config import HydraConfig
-
-    _apply_direct_producer_defaults(config, HydraConfig.get().overrides.task)
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(run_producer(config))
-
-
-def main() -> None:
-    try:
-        import hydra
-    except ImportError as exc:
-        raise RuntimeError("Standalone Producer requires hydra-core") from exc
-    hydra.main(config_path="config", config_name="speco_base", version_base=None)(
-        _hydra_main
-    )()
-
-
-if __name__ == "__main__":
-    main()
-
-
 __all__ = [
     "PreparedFeature",
     "ProducerStats",
-    "main",
     "publish_one",
     "run_producer",
     "validate_producer_config",

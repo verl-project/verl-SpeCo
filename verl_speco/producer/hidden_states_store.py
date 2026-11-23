@@ -36,10 +36,12 @@ import json
 import logging
 import math
 import os
+import shutil
 import socket
+import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -161,9 +163,15 @@ class HiddenStatesStoreConfig:
                 f"Unsupported hidden-state store backend {self.backend!r}; "
                 f"expected one of {SUPPORTED_BACKENDS}"
             )
-        if self.file_root is not None and (self.backend != FILE_BACKEND or not isinstance(self.file_root, str)
-                                           or not self.file_root or not Path(self.file_root).is_absolute()):
-            raise ValueError("Shared file root requires an absolute path and file backend")
+        if self.file_root is not None and (
+            self.backend != FILE_BACKEND
+            or not isinstance(self.file_root, str)
+            or not self.file_root
+            or not Path(self.file_root).is_absolute()
+        ):
+            raise ValueError(
+                "Shared file root requires an absolute path and file backend"
+            )
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any] | None) -> HiddenStatesStoreConfig:
@@ -180,6 +188,7 @@ class HiddenStatesStore:
     """Loads and releases hidden-state payloads from one backend."""
 
     backend: str = FILE_BACKEND
+    wait_for_writer: bool = True
 
     def load(
         self, reference: str | Mapping[str, Any], *, timeout: float = 120.0
@@ -214,14 +223,23 @@ def file_reference_tensor_bytes(reference: str) -> int:
         if len(prefix) != 8:
             raise ValueError("Truncated safetensors reference")
         header_bytes = int.from_bytes(prefix, "little")
-        if header_bytes <= 0 or header_bytes > 16 * 1024 * 1024 or header_bytes + 8 > before.st_size:
+        if (
+            header_bytes <= 0
+            or header_bytes > 16 * 1024 * 1024
+            or header_bytes + 8 > before.st_size
+        ):
             raise ValueError("Invalid safetensors reference header size")
         with safe_open(str(path), framework="pt", device="cpu") as tensors:
             if not tensors.keys():
                 raise ValueError("Empty safetensors reference")
         after, current = os.fstat(stream.fileno()), path.stat()
-        signature = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
-        if signature(before) != signature(after) or signature(before) != signature(current):
+
+        def signature(info):
+            return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+        if signature(before) != signature(after) or signature(before) != signature(
+            current
+        ):
             raise ValueError("Safetensors reference changed during byte accounting")
         payload_bytes = before.st_size - header_bytes - 8
         if payload_bytes <= 0:
@@ -234,11 +252,18 @@ class FileHiddenStatesStore(HiddenStatesStore):
 
     backend = FILE_BACKEND
 
-    def __init__(self, root: str | None = None):
+    def __init__(self, root: str | None = None, *, wait_for_writer: bool = True):
+        self.wait_for_writer = wait_for_writer
         self.root = None if root is None else Path(root)
-        if self.root is not None and (not self.root.is_absolute() or self.root == Path(self.root.anchor)
-                                      or self.root.is_symlink() or not self.root.is_dir()):
-            raise ValueError("Shared file root must be an existing absolute non-symlink directory")
+        if self.root is not None and (
+            not self.root.is_absolute()
+            or self.root == Path(self.root.anchor)
+            or self.root.is_symlink()
+            or not self.root.is_dir()
+        ):
+            raise ValueError(
+                "Shared file root must be an existing absolute non-symlink directory"
+            )
         if self.root is not None:
             info = self.root.stat()
             self._root_identity = (self.root.resolve(), info.st_dev, info.st_ino)
@@ -248,76 +273,144 @@ class FileHiddenStatesStore(HiddenStatesStore):
         if self.root is not None:
             root = self.root.resolve()
             info = self.root.stat()
-            if self.root.is_symlink() or (root, info.st_dev, info.st_ino) != self._root_identity:
+            if (
+                self.root.is_symlink()
+                or (root, info.st_dev, info.st_ino) != self._root_identity
+            ):
                 raise ValueError("Configured shared file root changed")
-            if (not path.is_absolute() or path.is_symlink() or path.resolve() == root
-                    or not path.resolve().is_relative_to(root)):
-                raise ValueError("Hidden reference is outside the configured shared file root")
+            if (
+                not path.is_absolute()
+                or path.is_symlink()
+                or path.resolve() == root
+                or not path.resolve().is_relative_to(root)
+            ):
+                raise ValueError(
+                    "Hidden reference is outside the configured shared file root"
+                )
         return path
 
-    def scan_bad_auxiliary_rows(self, reference, *, all_positions, selected_positions, prompt_ids,
-                                auxiliary_layers, required_layers, feature_dtype, clip_value,
-                                chunk_rows=512, timeout=30.0):
+    def scan_bad_auxiliary_rows(
+        self,
+        reference,
+        *,
+        all_positions,
+        selected_positions,
+        prompt_ids,
+        auxiliary_layers,
+        required_layers,
+        feature_dtype,
+        clip_value,
+        chunk_rows=512,
+        timeout=30.0,
+    ):
         """Check rows with bounded hidden-state reads and baseline BF16 conversion."""
         from safetensors import safe_open
         from verl_speco.trainer.target_feature_replay import HiddenStateAlignmentError
 
-        if (not isinstance(all_positions, (list, tuple)) or not all_positions
-                or not isinstance(selected_positions, (list, tuple)) or not selected_positions
-                or any(type(position) is not int or position < 0 for position in all_positions)
-                or any(type(position) is not int or position < 0 for position in selected_positions)
-                or type(auxiliary_layers) is not int or auxiliary_layers < 1
-                or type(required_layers) is not int or required_layers < auxiliary_layers
-                or type(chunk_rows) is not int or not 1 <= chunk_rows <= 512
-                or not isinstance(feature_dtype, torch.dtype)
-                or (clip_value is not None and (isinstance(clip_value, bool)
-                    or not isinstance(clip_value, (int, float)) or not math.isfinite(clip_value) or clip_value <= 0))
-                or isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-                or not math.isfinite(timeout) or timeout <= 0):
+        if (
+            not isinstance(all_positions, (list, tuple))
+            or not all_positions
+            or not isinstance(selected_positions, (list, tuple))
+            or not selected_positions
+            or any(
+                type(position) is not int or position < 0 for position in all_positions
+            )
+            or any(
+                type(position) is not int or position < 0
+                for position in selected_positions
+            )
+            or type(auxiliary_layers) is not int
+            or auxiliary_layers < 1
+            or type(required_layers) is not int
+            or required_layers < auxiliary_layers
+            or type(chunk_rows) is not int
+            or not 1 <= chunk_rows <= 512
+            or not isinstance(feature_dtype, torch.dtype)
+            or (
+                clip_value is not None
+                and (
+                    isinstance(clip_value, bool)
+                    or not isinstance(clip_value, (int, float))
+                    or not math.isfinite(clip_value)
+                    or clip_value <= 0
+                )
+            )
+            or isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
             raise ValueError("Invalid hidden-row scan configuration")
         deadline = time.monotonic() + timeout
         path = self.validate_reference(reference)
-        _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
+        if self.wait_for_writer:
+            _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
         with safe_open(str(path), framework="pt", device="cpu") as data:
             if "token_ids" not in data.keys() or "hidden_states" not in data.keys():
-                raise ValueError("vLLM hidden-states payload must contain token_ids and hidden_states")
+                raise ValueError(
+                    "vLLM hidden-states payload must contain token_ids and hidden_states"
+                )
             if data.get_tensor("token_ids").long().tolist() != list(prompt_ids):
-                raise HiddenStateAlignmentError("vLLM hidden-states token_ids do not match replay input")
+                raise HiddenStateAlignmentError(
+                    "vLLM hidden-states token_ids do not match replay input"
+                )
             hidden = data.get_slice("hidden_states")
             shape = hidden.get_shape()
             if len(shape) != 3 or shape[1] < required_layers or shape[2] <= 0:
-                raise HiddenStateAlignmentError("vLLM hidden-state shape does not satisfy the feature contract")
+                raise HiddenStateAlignmentError(
+                    "vLLM hidden-state shape does not satisfy the feature contract"
+                )
             offset = max(len(prompt_ids) - shape[0], 0)
             if min(all_positions) < offset or max(all_positions) >= offset + shape[0]:
-                raise HiddenStateAlignmentError("vLLM hidden-state rows do not cover the complete feature window")
-            if min(selected_positions) < offset or max(selected_positions) >= offset + shape[0]:
-                raise HiddenStateAlignmentError("Selected hidden-state rows are outside the original payload")
+                raise HiddenStateAlignmentError(
+                    "vLLM hidden-state rows do not cover the complete feature window"
+                )
+            if (
+                min(selected_positions) < offset
+                or max(selected_positions) >= offset + shape[0]
+            ):
+                raise HiddenStateAlignmentError(
+                    "Selected hidden-state rows are outside the original payload"
+                )
             bad = []
             for start in range(0, len(selected_positions), chunk_rows):
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Reference batch read deadline exceeded")
-                rows = [position - offset for position in selected_positions[start:start + chunk_rows]]
+                rows = [
+                    position - offset
+                    for position in selected_positions[start : start + chunk_rows]
+                ]
                 first, last = min(rows), max(rows) + 1
                 if last - first <= 2 * len(rows):
                     block = hidden[first:last][:, :auxiliary_layers, :]
-                    indices = torch.tensor([row - first for row in rows], dtype=torch.long)
+                    indices = torch.tensor(
+                        [row - first for row in rows], dtype=torch.long
+                    )
                     values = block.index_select(0, indices)
                 else:
-                    runs = []
+                    runs: list[list[int]] = []
                     for row in rows:
                         if runs and row == runs[-1][1]:
                             runs[-1][1] += 1
                         else:
                             runs.append([row, row + 1])
-                    chunks = [hidden[first:last][:, :auxiliary_layers, :] for first, last in runs]
+                    chunks = [
+                        hidden[first:last][:, :auxiliary_layers, :]
+                        for first, last in runs
+                    ]
                     values = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
                 if feature_dtype != torch.bfloat16:
                     values = values.to(dtype=feature_dtype)
                 values = values.to(dtype=torch.bfloat16)
                 invalid = ~torch.isfinite(values).flatten(start_dim=1).all(dim=1)
                 if clip_value is not None:
-                    sanitized = torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
-                    invalid |= sanitized.float().abs().flatten(start_dim=1).amax(dim=1) > clip_value
+                    sanitized = torch.nan_to_num(
+                        values, nan=0.0, posinf=0.0, neginf=0.0
+                    )
+                    invalid |= (
+                        sanitized.float().abs().flatten(start_dim=1).amax(dim=1)
+                        > clip_value
+                    )
                 bad.extend(invalid.tolist())
             return bad
 
@@ -326,13 +419,18 @@ class FileHiddenStatesStore(HiddenStatesStore):
         from safetensors import safe_open
 
         path = self.validate_reference(reference)
-        _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
+        if self.wait_for_writer:
+            _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
         with safe_open(str(path), framework="pt", device="cpu") as data:
             if "hidden_states" not in data.keys():
-                raise ValueError("vLLM hidden-states payload must contain hidden_states")
+                raise ValueError(
+                    "vLLM hidden-states payload must contain hidden_states"
+                )
             shape = tuple(data.get_slice("hidden_states").get_shape())
         if len(shape) != 3 or any(size <= 0 for size in shape):
-            raise ValueError("vLLM hidden_states must have non-empty [seq, layers, hidden] shape")
+            raise ValueError(
+                "vLLM hidden_states must have non-empty [seq, layers, hidden] shape"
+            )
         return shape
 
     def load(
@@ -345,15 +443,22 @@ class FileHiddenStatesStore(HiddenStatesStore):
         except ImportError as exc:  # pragma: no cover - dependency issue
             raise RuntimeError("vLLM hidden-state replay requires safetensors") from exc
         path = self.validate_reference(reference)
-        _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
+        if self.wait_for_writer:
+            _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
         if not path.is_file():
             raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
         payload = dict(load_file(str(path), device="cpu"))
         return payload, int(path.stat().st_size)
 
     def load_window(
-        self, reference: str, *, all_positions: list[int], selected_positions: list[int],
-        prompt_length: int, timeout: float = 30.0, compact: bool = False,
+        self,
+        reference: str,
+        *,
+        all_positions: list[int],
+        selected_positions: list[int],
+        prompt_length: int,
+        timeout: float = 30.0,
+        compact: bool = False,
     ) -> tuple[dict[str, torch.Tensor], int | list[int]]:
         """Load only selected hidden rows after checking full original coverage."""
         from safetensors import safe_open
@@ -365,24 +470,36 @@ class FileHiddenStatesStore(HiddenStatesStore):
             raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
         with safe_open(str(path), framework="pt", device="cpu") as data:
             if "token_ids" not in data.keys() or "hidden_states" not in data.keys():
-                raise ValueError("vLLM hidden-states payload must contain token_ids and hidden_states")
+                raise ValueError(
+                    "vLLM hidden-states payload must contain token_ids and hidden_states"
+                )
             hidden = data.get_slice("hidden_states")
             shape = hidden.get_shape()
             if len(shape) != 3:
-                raise ValueError(f"vLLM hidden_states must have shape [seq, layers, hidden], got {tuple(shape)}")
+                raise ValueError(
+                    f"vLLM hidden_states must have shape [seq, layers, hidden], got {tuple(shape)}"
+                )
             original_offset = max(prompt_length - shape[0], 0)
-            if any(position < original_offset or position >= original_offset + shape[0]
-                   for position in all_positions):
-                raise HiddenStateAlignmentError("vLLM hidden-state rows do not cover the complete feature window")
+            if any(
+                position < original_offset or position >= original_offset + shape[0]
+                for position in all_positions
+            ):
+                raise HiddenStateAlignmentError(
+                    "vLLM hidden-state rows do not cover the complete feature window"
+                )
             if not selected_positions:
                 raise ValueError("Reference window cannot be empty")
-            if any(position < original_offset or position >= original_offset + shape[0]
-                   for position in selected_positions):
-                raise HiddenStateAlignmentError("Selected hidden-state rows are outside the original payload")
+            if any(
+                position < original_offset or position >= original_offset + shape[0]
+                for position in selected_positions
+            ):
+                raise HiddenStateAlignmentError(
+                    "Selected hidden-state rows are outside the original payload"
+                )
             first = min(selected_positions) - original_offset
             last = max(selected_positions) - original_offset + 1
             if compact and last - first > 2 * len(selected_positions):
-                runs = []
+                runs: list[list[int]] = []
                 for position in selected_positions:
                     row = position - original_offset
                     if runs and row == runs[-1][1]:
@@ -393,8 +510,14 @@ class FileHiddenStatesStore(HiddenStatesStore):
                 if len(runs) <= 1024:
                     chunks = [hidden[start:end] for start, end in runs]
                     rows = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
-                    return {"token_ids": data.get_tensor("token_ids"), "hidden_states": rows}, list(selected_positions)
-            return {"token_ids": data.get_tensor("token_ids"), "hidden_states": hidden[first:last]}, original_offset + first
+                    return {
+                        "token_ids": data.get_tensor("token_ids"),
+                        "hidden_states": rows,
+                    }, list(selected_positions)
+            return {
+                "token_ids": data.get_tensor("token_ids"),
+                "hidden_states": hidden[first:last],
+            }, original_offset + first
 
     def release(self, reference: str) -> None:
         path = self.validate_reference(reference)
@@ -484,8 +607,12 @@ class NativeHiddenStatesStore(HiddenStatesStore):
         return metrics() if callable(metrics) else {}
 
     def __init__(self, transport: Any, release_callback: Any):
-        if not callable(getattr(transport, "read", None)) or not callable(release_callback):
-            raise ValueError("Native store requires a reader and an explicit source-release callback")
+        if not callable(getattr(transport, "read", None)) or not callable(
+            release_callback
+        ):
+            raise ValueError(
+                "Native store requires a reader and an explicit source-release callback"
+            )
         self._transport = transport
         self._release_callback = release_callback
 
@@ -503,25 +630,43 @@ class NativeHiddenStatesStore(HiddenStatesStore):
             raise ValueError("Invalid native hidden reference descriptor")
         return value
 
-    def load(self, reference: str, *, timeout: float = 120.0) -> tuple[dict[str, torch.Tensor], int]:
-        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-                or not math.isfinite(timeout) or timeout <= 0):
+    def load(
+        self, reference: str | Mapping[str, Any], *, timeout: float = 120.0
+    ) -> tuple[dict[str, torch.Tensor], int]:
+        if not isinstance(reference, str):
+            raise ValueError("Malformed native hidden reference")
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
             raise ValueError("Native reference timeout must be positive and finite")
         deadline = time.monotonic() + timeout
         payload = self._transport.read(self._descriptor(reference), output_device="cpu")
         if time.monotonic() >= deadline:
             raise TimeoutError("Native reference read exceeded its deadline")
-        if (not isinstance(payload, dict) or not payload
-                or any(not isinstance(value, torch.Tensor) or value.device.type != "cpu" for value in payload.values())):
+        if (
+            not isinstance(payload, dict)
+            or not payload
+            or any(
+                not isinstance(value, torch.Tensor) or value.device.type != "cpu"
+                for value in payload.values()
+            )
+        ):
             raise ValueError("Native reference must produce CPU tensor fields")
-        return payload, sum(value.numel() * value.element_size() for value in payload.values())
+        return payload, sum(
+            value.numel() * value.element_size() for value in payload.values()
+        )
 
     def release(self, reference: str) -> None:
         result = self._release_callback(self._descriptor(reference))
         if result is not None:
             if inspect.iscoroutine(result):
                 result.close()
-            raise RuntimeError("Native source release callback must complete synchronously and return None")
+            raise RuntimeError(
+                "Native source release callback must complete synchronously and return None"
+            )
 
     def close(self) -> None:
         close = getattr(self._transport, "close", None)
@@ -529,24 +674,52 @@ class NativeHiddenStatesStore(HiddenStatesStore):
             close()
 
 
-def build_managed_native_reader(config: Mapping[str, Any], *, run_id: str, rank: int,
-                                world_size: int, device: Any, engine_factory: Any = None) -> NativeHiddenStatesStore:
+def build_managed_native_reader(
+    config: Mapping[str, Any],
+    *,
+    run_id: str,
+    rank: int,
+    world_size: int,
+    device: Any,
+    engine_factory: Any = None,
+) -> NativeHiddenStatesStore:
     """Build a rank-local reader whose source lifetime is owned by the scheduler."""
     settings = dict(config)
-    expected = {"endpoints", "metadata_server", "generation", "max_bytes", "chunk_bytes"}
+    expected = {
+        "endpoints",
+        "metadata_server",
+        "generation",
+        "max_bytes",
+        "chunk_bytes",
+    }
     if set(settings) != expected:
-        raise ValueError("Native reader settings require endpoints, metadata_server, generation, max_bytes and chunk_bytes")
+        raise ValueError(
+            "Native reader settings require endpoints, metadata_server, generation, max_bytes and chunk_bytes"
+        )
     endpoints = settings["endpoints"]
-    if (type(rank) is not int or type(world_size) is not int or not 0 <= rank < world_size
-            or not isinstance(endpoints, (list, tuple)) or len(endpoints) != world_size
-            or any(not isinstance(value, str) or not value for value in endpoints)
-            or len(set(endpoints)) != len(endpoints)):
+    if (
+        type(rank) is not int
+        or type(world_size) is not int
+        or not 0 <= rank < world_size
+        or not isinstance(endpoints, (list, tuple))
+        or len(endpoints) != world_size
+        or any(not isinstance(value, str) or not value for value in endpoints)
+        or len(set(endpoints)) != len(endpoints)
+    ):
         raise ValueError("Native reader requires a distinct endpoint for every rank")
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport
-    transport = NativeFeatureTransport(run_id=run_id, generation=settings["generation"], endpoint=endpoints[rank],
-                                       metadata_server=settings["metadata_server"], device=device,
-                                       max_bytes=settings["max_bytes"], max_slots=1,
-                                       chunk_bytes=settings["chunk_bytes"], engine_factory=engine_factory)
+
+    transport = NativeFeatureTransport(
+        run_id=run_id,
+        generation=settings["generation"],
+        endpoint=endpoints[rank],
+        metadata_server=settings["metadata_server"],
+        device=device,
+        max_bytes=settings["max_bytes"],
+        max_slots=1,
+        chunk_bytes=settings["chunk_bytes"],
+        engine_factory=engine_factory,
+    )
     # Only the producer can free the source after its dispatch-wide ACKs. Local
     # cleanup must not independently release a buffer another rank may read.
     return NativeHiddenStatesStore(transport, lambda _descriptor: None)
@@ -606,9 +779,418 @@ def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
                 time.sleep(0.01)
 
 
+RAW_HIDDEN_FORMAT = "standalone_raw_hidden"
+RAW_HIDDEN_VERSION = 1
+
+
+@dataclass(frozen=True)
+class RawHiddenSample:
+    payload: dict[str, torch.Tensor]
+    sample_id: str
+    sequence_no: int
+    request: dict[str, Any]
+    feature_contract: dict[str, Any]
+
+
+def prepare_raw_hidden_sample(raw, request, contract, *, validate_outputs=True):
+    """Validate alignment without transforming, normalizing or cropping tensors."""
+    payload = raw.payload
+    tokens, hidden = payload.get("token_ids"), payload.get("hidden_states")
+    if not isinstance(tokens, torch.Tensor) or not isinstance(hidden, torch.Tensor):
+        raise TypeError(
+            "Raw hidden payload requires token_ids and hidden_states tensors"
+        )
+    if tokens.ndim != 1 or hidden.ndim != 3:
+        raise ValueError(
+            "Raw hidden payload requires [T] token_ids and [T,K,H] hidden_states"
+        )
+    if any(
+        not isinstance(t, torch.Tensor) or t.device.type != "cpu"
+        for t in payload.values()
+    ):
+        raise ValueError("Raw hidden payload must contain CPU tensors only")
+    if not hidden.is_floating_point() or (
+        validate_outputs and not torch.isfinite(hidden).all()
+    ):
+        raise ValueError("Raw hidden states must be finite floating-point tensors")
+    return _raw_hidden_metadata(
+        tokens, hidden.shape, str(hidden.dtype), request, contract, payload
+    )
+
+
+def _raw_hidden_metadata(tokens, shape, dtype, request, contract, payload):
+    if tokens.ndim != 1 or len(shape) != 3:
+        raise ValueError(
+            "Raw hidden payload requires [T] token_ids and [T,K,H] hidden_states"
+        )
+    if tokens.tolist() != list(request.prompt_token_ids):
+        raise ValueError("Raw hidden token_ids do not match the requested prefill")
+    rows, layers, width = shape
+    offset = tokens.numel() - rows
+    positions = request.feature_positions
+    if (
+        rows <= 0
+        or width <= 0
+        or offset < 0
+        or positions.numel() == 0
+        or int(positions.min()) < offset
+        or int(positions.max()) >= tokens.numel()
+    ):
+        raise ValueError("Raw hidden rows do not cover the requested feature window")
+    if isinstance(contract, Mapping):
+        values = dict(contract)
+        if values.get("contract_type") != "raw_capture":
+            raise ValueError("Unknown raw hidden capture descriptor")
+        aux_ids = values["vllm_aux_hidden_state_layer_ids"]
+        final_layer = values["target_num_hidden_layers"]
+        required = len(aux_ids) + int(
+            values["include_final_hidden"] and final_layer not in aux_ids
+        )
+        if layers != required:
+            raise ValueError(
+                f"Captured hidden layer count is {layers}, configured capture plan requires {required}"
+            )
+        values["raw_hidden_dtype"] = dtype
+    else:
+        # Previously generated raw datasets carried a bound training contract.
+        aux_ids = contract.vllm_aux_hidden_state_layer_ids or contract.target_layer_ids
+        include_final = contract.hidden_states_layout.endswith("_plus_last")
+        required = len(aux_ids) + int(
+            include_final and contract.target_num_hidden_layers not in aux_ids
+        )
+        if layers < required:
+            raise ValueError(
+                f"Raw hidden layer count is {layers}, expected at least {required}"
+            )
+        values = asdict(contract)
+        values["dtype"] = str(contract.dtype)
+    request_values = {
+        name: getattr(request, name).tolist()
+        for name in (
+            "input_ids",
+            "loss_mask",
+            "position_ids",
+            "feature_positions",
+            "draft_position_ids",
+        )
+    }
+    request_values.update(
+        vllm_prompt_token_ids=list(request.prompt_token_ids),
+        source_metadata=request.source_metadata,
+    )
+    return RawHiddenSample(
+        dict(payload), request.sample_id, request.sequence_no, request_values, values
+    )
+
+
+def require_saved_hidden_checkpoint_fingerprint(stored):
+    from verl_speco.checkpoint_tensor import CHECKPOINT_FINGERPRINT_PREFIX
+
+    revision = stored.get("target_model_revision")
+    if not isinstance(revision, str) or not revision.startswith(
+        CHECKPOINT_FINGERPRINT_PREFIX
+    ):
+        raise ValueError(
+            "Saved hidden dataset has no target checkpoint fingerprint. "
+            "Capture it again from the original checkpoint in a new directory."
+        )
+
+
+def bind_raw_hidden_contract(stored, expected):
+    """Bind capture metadata to the selected training algorithm at training time."""
+    require_saved_hidden_checkpoint_fingerprint(stored)
+    if stored.get("contract_type") != "raw_capture":
+        for name, wanted in expected.items():
+            if name != "target_model_id" and stored.get(name) != wanted:
+                raise ValueError(
+                    f"Saved hidden feature contract mismatch for {name}: {stored.get(name)!r} != {wanted!r}"
+                )
+        return {**stored, "target_model_id": expected["target_model_id"]}
+    for name in (
+        "target_model_revision",
+        "tokenizer_fingerprint",
+        "vllm_aux_hidden_state_layer_ids",
+    ):
+        if stored.get(name) != expected[name]:
+            raise ValueError(f"Saved hidden capture metadata mismatch for {name}")
+    depth = int(stored["target_num_hidden_layers"])
+    has_final = (
+        bool(stored.get("include_final_hidden"))
+        or depth in stored["vllm_aux_hidden_state_layer_ids"]
+    )
+    if expected["hidden_states_layout"].endswith("_plus_last") and not has_final:
+        raise ValueError(
+            "Training losses require final hidden states absent from the saved capture"
+        )
+    return {
+        **expected,
+        "target_num_hidden_layers": depth,
+        "target_config_fingerprint": stored.get("target_config_fingerprint"),
+        "source": stored.get("source", "standalone_data_generate"),
+    }
+
+
+def repair_jsonl_tail(path):
+    """Recover an interrupted append; reject corruption in committed lines."""
+    path = Path(path)
+    if not path.exists():
+        return
+    with path.open("r+b") as stream:
+        while True:
+            offset = stream.tell()
+            line = stream.readline()
+            if not line:
+                return
+            try:
+                if line.strip():
+                    json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                if line.endswith(b"\n"):
+                    raise
+                stream.truncate(offset)
+                logger.warning("Removed interrupted JSONL tail from %s", path)
+                return
+            if not line.endswith(b"\n"):
+                stream.write(b"\n")
+                return
+
+
+def load_raw_hidden_manifest(path):
+    """Require an explicit format marker; never interpret normalized features as raw."""
+    path = Path(path)
+    metadata = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
+    if (
+        metadata.get("format") != RAW_HIDDEN_FORMAT
+        or metadata.get("schema_version") != RAW_HIDDEN_VERSION
+    ):
+        raise ValueError(
+            "Expected standalone_raw_hidden dataset; normalized feature stores are incompatible"
+        )
+    manifest = path / "manifest.jsonl"
+    if not manifest.exists():
+        return []
+    with manifest.open(encoding="utf-8") as stream:
+        entries = [json.loads(line) for line in stream if line.strip()]
+    for entry in entries:
+        if (
+            not isinstance(entry.get("sample_id"), str)
+            or not entry["sample_id"]
+            or not isinstance(entry.get("request"), dict)
+            or not isinstance(entry.get("feature_contract"), dict)
+            or not entry["feature_contract"]
+        ):
+            raise ValueError(
+                "Raw hidden manifest requires sample_id, request and feature_contract"
+            )
+        if (
+            entry.get("format") != RAW_HIDDEN_FORMAT
+            or entry.get("schema_version") != RAW_HIDDEN_VERSION
+        ):
+            raise ValueError("Raw hidden manifest format/version mismatch")
+        relative = Path(entry["path"])
+        if relative.name != entry["path"] or relative.suffix != ".safetensors":
+            raise ValueError(
+                "Raw hidden manifest must reference a local safetensors basename"
+            )
+        if not (path / relative).is_file():
+            raise FileNotFoundError(path / relative)
+    return entries
+
+
+def _replace_hidden_file(source, destination):
+    # Windows file scanners can briefly retain a just-closed connector file.
+    # Linux permission errors must propagate immediately, as do persistent errors.
+    for attempt in range(6):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == 5:
+                raise
+            time.sleep(0.01 * (attempt + 1))
+
+
+class RawHiddenDatasetWriter:
+    """One writer: atomic tensor file first, manifest commit second."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.mkdir(parents=True, exist_ok=True)
+        metadata_path = self.path / "metadata.json"
+        if metadata_path.exists():
+            load_raw_hidden_manifest(self.path)
+        else:
+            if any(self.path.iterdir()):
+                raise ValueError(
+                    "Refusing to append raw hidden data to an unmarked directory"
+                )
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "format": RAW_HIDDEN_FORMAT,
+                        "schema_version": RAW_HIDDEN_VERSION,
+                        "last_hidden_state_norm": "raw_target_residual",
+                        "created_by": "verl_speco.standalone_data_generate",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        # Include files left before an interrupted manifest commit; never overwrite.
+        self.next_index = (
+            max(
+                (
+                    int(p.stem[3:])
+                    for p in self.path.glob("hs_*.safetensors")
+                    if p.stem[3:].isdigit()
+                ),
+                default=-1,
+            )
+            + 1
+        )
+        self._index_lock = threading.Lock()
+        self._manifest = None
+        self._closed = False
+
+    def _entry(self, sample):
+        with self._index_lock:
+            name = f"hs_{self.next_index:06d}.safetensors"
+            self.next_index += 1
+        entry = {
+            "format": RAW_HIDDEN_FORMAT,
+            "schema_version": RAW_HIDDEN_VERSION,
+            "path": name,
+            "sample_id": sample.sample_id,
+            "sequence_no": sample.sequence_no,
+            "num_samples": 1,
+            "num_tokens": sum(sample.request["loss_mask"]),
+            "sequence_length": len(sample.request["feature_positions"]),
+            "request": sample.request,
+            "feature_contract": sample.feature_contract,
+        }
+        # Reject unsupported metadata before moving or saving a payload.
+        json.dumps(entry, ensure_ascii=False, allow_nan=False)
+        return entry
+
+    def stage_file(
+        self, reference, request, contract, *, validate_outputs=False, timings=None
+    ):
+        """Adopt a connector file without materializing its hidden tensor."""
+        from safetensors import safe_open
+
+        if timings is None:
+            timings = {}
+        source = Path(reference)
+        started = time.perf_counter()
+        _wait_for_lock(Path(f"{source}.lock"))
+        timings["file_lock"] = time.perf_counter() - started
+        started = time.perf_counter()
+        timings["file_bytes"] = source.stat().st_size
+        with safe_open(str(source), framework="pt", device="cpu") as saved:
+            tokens = saved.get_tensor("token_ids").clone()
+            hidden = saved.get_slice("hidden_states")
+            dtype = {
+                "F16": "torch.float16",
+                "BF16": "torch.bfloat16",
+                "F32": "torch.float32",
+                "F64": "torch.float64",
+            }.get(hidden.get_dtype())
+            if dtype is None:
+                raise ValueError("Raw hidden states require a supported floating dtype")
+            sample = _raw_hidden_metadata(
+                tokens, hidden.get_shape(), dtype, request, contract, {}
+            )
+        # Release safetensors mappings before renaming (also required on Windows).
+        del saved, tokens, hidden
+        timings["file_inspect"] = time.perf_counter() - started
+        started = time.perf_counter()
+        if validate_outputs:
+            with safe_open(str(source), framework="pt", device="cpu") as saved:
+                if not torch.isfinite(saved.get_tensor("hidden_states")).all():
+                    raise ValueError(
+                        "Raw hidden states must be finite floating-point tensors"
+                    )
+            del saved
+        timings["file_validate"] = time.perf_counter() - started
+        entry = self._entry(sample)
+        with tempfile.NamedTemporaryFile(
+            dir=self.path, suffix=".tmp", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+        try:
+            started = time.perf_counter()
+            timings["cross_fs"] = 0
+            try:
+                _replace_hidden_file(source, temporary)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                # Cross-filesystem copies remain invisible until the final rename.
+                timings["cross_fs"] = 1
+                copying = time.perf_counter()
+                shutil.copyfile(source, temporary)
+                timings["file_copy"] = time.perf_counter() - copying
+            _replace_hidden_file(temporary, self.path / entry["path"])
+            source.unlink(missing_ok=True)
+            timings["file_move"] = time.perf_counter() - started
+        finally:
+            temporary.unlink(missing_ok=True)
+        return entry
+
+    def stage_sample(self, sample):
+        """Persist an in-memory backend payload; leave its manifest uncommitted."""
+        from safetensors import SafetensorError
+        from safetensors.torch import save_file
+
+        if not isinstance(sample, RawHiddenSample):
+            raise TypeError("Raw hidden writer requires RawHiddenSample")
+        entry = self._entry(sample)
+        with tempfile.NamedTemporaryFile(
+            dir=self.path, suffix=".tmp", delete=False
+        ) as stream:
+            temporary = stream.name
+        try:
+            try:
+                save_file(
+                    {key: value.contiguous() for key, value in sample.payload.items()},
+                    temporary,
+                )
+            except SafetensorError as exc:
+                raise OSError(f"Failed to save raw hidden payload: {exc}") from exc
+            os.replace(temporary, self.path / entry["path"])
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        return entry
+
+    def commit(self, entry):
+        """Single-writer metadata commit, after the payload is in its final place."""
+        if self._closed:
+            raise ValueError("Raw hidden writer is closed")
+        line = json.dumps(entry, ensure_ascii=False, allow_nan=False) + "\n"
+        if not (self.path / entry["path"]).is_file():
+            raise FileNotFoundError(self.path / entry["path"])
+        if self._manifest is None:
+            self._manifest = (self.path / "manifest.jsonl").open("a", encoding="utf-8")
+        self._manifest.write(line)
+        self._manifest.flush()
+        return entry["path"]
+
+    def write_many(self, samples):
+        return [self.commit(self.stage_sample(sample)) for sample in samples]
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self._manifest is not None:
+            self._manifest.close()
+
+
 __all__ = [
     "FILE_BACKEND",
     "MOONCAKE_BACKEND",
+    "RAW_HIDDEN_FORMAT",
+    "RAW_HIDDEN_VERSION",
     "NATIVE_BACKEND",
     "SUPPORTED_BACKENDS",
     "FileHiddenStatesStore",
@@ -616,7 +1198,12 @@ __all__ = [
     "HiddenStatesStoreConfig",
     "MooncakeHiddenStatesStore",
     "MooncakeStoreSettings",
+    "RawHiddenDatasetWriter",
+    "RawHiddenSample",
     "NativeHiddenStatesStore",
     "build_managed_native_reader",
     "build_hidden_states_store",
+    "load_raw_hidden_manifest",
+    "bind_raw_hidden_contract",
+    "prepare_raw_hidden_sample",
 ]

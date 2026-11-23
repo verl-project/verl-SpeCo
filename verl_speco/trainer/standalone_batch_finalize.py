@@ -18,8 +18,12 @@ class AsyncBatchFinalizer:
     def __init__(self, capacity: int, *, timeout: float | None = None):
         if capacity < 1:
             raise ValueError("Finalization capacity must be positive")
-        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-                                    or not math.isfinite(timeout) or timeout <= 0):
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
             raise ValueError("Finalization timeout must be a positive finite number")
         self.capacity = capacity
         self.timeout = timeout
@@ -35,7 +39,9 @@ class AsyncBatchFinalizer:
         if self._stopped.is_set():
             raise RuntimeError("Finalization stopped after a timeout")
         if self._failure is not None:
-            raise RuntimeError("Earlier batch finalization failed; later operations were fenced") from self._failure
+            raise RuntimeError(
+                "Earlier batch finalization failed; later operations were fenced"
+            ) from self._failure
         try:
             operation()
         except BaseException as error:
@@ -65,12 +71,18 @@ class AsyncBatchFinalizer:
         self._pending.append(self._executor.submit(self._run, operation))
 
     def drain(self, *, timeout: float | None = None) -> None:
-        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-                                    or not math.isfinite(timeout) or timeout <= 0):
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
             raise ValueError("Finalization timeout must be a positive finite number")
         deadline = None if timeout is None else time.monotonic() + timeout
         while self._pending:
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
             try:
                 self._pending[0].result(timeout=remaining)
             except TimeoutError:

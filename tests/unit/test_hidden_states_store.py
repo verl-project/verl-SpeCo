@@ -287,7 +287,7 @@ def test_native_connector_registers_source_and_retains_ambiguous_setup(monkeypat
     monkeypatch.setitem(sys.modules, "ray", ray)
     monkeypatch.setitem(sys.modules, "ray.util", ray_util)
     monkeypatch.setitem(sys.modules, "ray.util.queue", ray_queue)
-    monkeypatch.setattr(native, "NativeFeatureTransport", lambda **kwargs: SimpleNamespace(settings=kwargs))
+    monkeypatch.setattr(native, "NativeFeatureTransport", lambda **kwargs: SimpleNamespace(settings=kwargs, endpoint="source:actual"))
     monkeypatch.setattr(native, "NativeSourceControlService", lambda source, **kwargs: SimpleNamespace(source=source))
     for name, value in {"SPECO_NATIVE_DIRECTORY": "dir", "SPECO_NATIVE_RUN_ID": "run",
                         "SPECO_NATIVE_GENERATION": "1", "SPECO_NATIVE_SOURCE_ENDPOINT": "source",
@@ -321,7 +321,7 @@ def test_native_connector_registers_source_and_retains_ambiguous_setup(monkeypat
         assert not errors and connector._native_ready
         connector._ensure_store()
     assert len(registrations) == 1 and connector._native_source is connector._native_service.source
-    assert registrations[0][0] == "source" and len(registrations[0][1]) == 32
+    assert registrations[0][0] == "source:actual" and len(registrations[0][1]) == 32
     assert connector._native_source.settings["device"] == torch.device("cpu")
 
 

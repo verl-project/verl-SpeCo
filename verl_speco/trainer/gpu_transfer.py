@@ -21,6 +21,9 @@ from torch.distributed.tensor import DTensor
 
 logger = logging.getLogger(__name__)
 
+# Ray resource labels for the accelerator types used by torch.
+RAY_ACCELERATOR_RESOURCES = {"cuda": "GPU", "npu": "NPU"}
+
 
 def gpu_transfer_enabled(training_config, legacy_key=None):
     """One public switch; preserve explicit legacy overrides for older configs."""

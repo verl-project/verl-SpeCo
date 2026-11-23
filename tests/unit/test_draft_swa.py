@@ -1300,12 +1300,12 @@ def test_zero_supervision_row_has_finite_zero_gradient(algorithm, markov, confid
                              and torch.count_nonzero(gradient) == 0 for gradient in gradients)
 
 
-def _zero_supervision_ddp_worker(rank, port, algorithm, confidence, strategy, results):
+def _zero_supervision_ddp_worker(rank, rendezvous, algorithm, confidence, strategy, results):
     from copy import deepcopy
     from datetime import timedelta
     import torch.distributed as dist
     torch.set_num_threads(1)
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
+    dist.init_process_group("gloo", init_method=rendezvous,
                             rank=rank, world_size=2, timeout=timedelta(seconds=45))
     try:
         torch.manual_seed(17)
@@ -1370,16 +1370,13 @@ def _zero_supervision_ddp_worker(rank, port, algorithm, confidence, strategy, re
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 @pytest.mark.parametrize("algorithm,confidence", [("dspark", False), ("dspark", True), ("dflash", False)])
 @pytest.mark.parametrize("strategy", ["ddp", "fsdp2"])
-def test_zero_supervision_rank_matches_real_model_reference(algorithm, confidence, strategy):
+def test_zero_supervision_rank_matches_real_model_reference(tmp_path, algorithm, confidence, strategy):
     import multiprocessing
-    import socket
     context = multiprocessing.get_context("spawn")
     results = context.Queue()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
+    rendezvous = (tmp_path / "gloo-rendezvous").as_uri()
     processes = [context.Process(target=_zero_supervision_ddp_worker,
-                                 args=(rank, port, algorithm, confidence, strategy, results)) for rank in range(2)]
+                                 args=(rank, rendezvous, algorithm, confidence, strategy, results)) for rank in range(2)]
     for process in processes:
         process.start()
     try:

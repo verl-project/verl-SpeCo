@@ -34,7 +34,6 @@ from verl_speco.standalone_tq_training_launcher import (
     _vllm_kv_transfer_config,
     build_pipeline_commands,
     resolve_pipeline_config,
-    run_pipeline,
     start_ray_session,
     validate_hidden_states_store,
     validate_tq_backend,
@@ -85,12 +84,12 @@ def test_process_stop_retains_resources_when_descendants_may_survive(monkeypatch
     assert signals == ([0] if already_exited else [signal.SIGTERM, 0])
 
 
-@pytest.mark.parametrize("hidden_store,runtime,is_reference", [
-    ("file", "ray", True), ("mooncake", "ray", True), ("file", "subprocess", False),
+@pytest.mark.parametrize("hidden_store,data_transport,is_reference", [
+    ("file", "ray_reference", True), ("mooncake", "ray_reference", True), ("file", "tq", False),
 ])
-def test_reference_mode_uses_existing_ray_prefetch(hidden_store, runtime, is_reference):
+def test_reference_mode_uses_existing_ray_prefetch(hidden_store, data_transport, is_reference):
     env = {"SPECO_VLLM_HIDDEN_STATES_STORE": hidden_store}
-    args = [*_training_args(), f"speco.draft_training.runtime_backend={runtime}"]
+    args = [*_training_args(), f"speco.draft_training.data_transport={data_transport}"]
     commands = build_pipeline_commands(
         resolve_pipeline_config(args, environ=env), args, ray_address="10.0.0.1:6379", env=env,
     )
@@ -156,7 +155,7 @@ def test_native_launcher_builds_bounded_reader_and_scheduler_settings():
     ({"SPECO_NATIVE_MAX_RECORDS": "1"}, [], "MAX_RECORDS"),
     ({}, ["speco.draft_training.scheduler.per_rank_reference_ack=false"], "per_rank_reference_ack"),
     ({}, ["actor_rollout_ref.rollout.drafter.training.transfer_queue.consumer_batch_workers=1"], "consumer_batch_workers"),
-    ({}, ["speco.draft_training.runtime_backend=subprocess"], "Ray runtime"),
+    ({}, ["speco.draft_training.runtime_backend=subprocess"], "runtime_backend must be ray"),
 ])
 def test_native_launcher_rejects_unsafe_settings(changes, args, error):
     env = {"SPECO_VLLM_HIDDEN_STATES_STORE": "native", "SPECO_NATIVE_SOURCE_ENDPOINT": "source:1",
@@ -217,13 +216,11 @@ def test_prefixed_producer_credits_reach_both_roles_and_internal_values_cannot_o
         assert composed.actor_rollout_ref.rollout.drafter.training.transfer_queue.run_id == config.run_id
 
 
-def test_prefixed_runtime_backend_selects_subprocess_path():
+def test_prefixed_runtime_backend_rejects_retired_subprocess_path():
     args = [*_training_args(), "++speco.draft_training.runtime_backend=subprocess"]
-    commands = build_pipeline_commands(resolve_pipeline_config(args, environ={}), args,
-                                       ray_address="ray:6379", env={})
-    assert commands.owner and not any(item.endswith("feature_store.type=ray_reference")
-                                      for item in commands.consumer_overrides)
-    assert not any("runtime_backend=" in item for item in commands.consumer_overrides)
+    config = resolve_pipeline_config(args, environ={})
+    with pytest.raises(ValueError, match="runtime_backend must be ray"):
+        build_pipeline_commands(config, args, ray_address="ray:6379", env={})
 
 
 def _training_args() -> list[str]:
@@ -657,25 +654,15 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
     assert commands.vllm[:3] == ["vllm", "serve", "/models/Qwen3-8B"]
     assert "ExampleHiddenStatesConnector" in " ".join(commands.vllm)
     assert commands.vllm_endpoints == ("http://127.0.0.1:8000/v1",)
-    assert commands.producer[:3] == [
-        "python",
-        "-m",
-        "verl_speco.standalone_tq_producer",
-    ]
-    assert commands.consumer[:3] == [
-        "python",
-        "-m",
-        "verl_speco.draft_train_launcher",
-    ]
-    assert any(item.endswith("feature_store.type=ray_reference") for item in commands.consumer)
-    assert not any("run_id=user-value" in item for item in commands.consumer)
+    assert any(item.endswith("feature_store.type=ray_reference") for item in commands.consumer_overrides)
+    assert not any("run_id=user-value" in item for item in commands.consumer_overrides)
     assert not any("runtime_backend" in item for item in commands.consumer_overrides)
     assert not any("num_gpus_per_node" in item for item in commands.consumer_overrides)
     assert not any("num_nodes" in item for item in commands.consumer_overrides)
     assert "speco.draft_training.nproc_per_node=8" in commands.consumer_overrides
     assert "speco.draft_training.nnodes=1" in commands.consumer_overrides
-    assert any(f"run_id={config.run_id}" in item for item in commands.consumer)
-    expected_contract = " ".join(commands.consumer)
+    assert any(f"run_id={config.run_id}" in item for item in commands.consumer_overrides)
+    expected_contract = " ".join(commands.consumer_overrides)
     assert "expected_feature.algorithm=DSPARK" in expected_contract
     assert 'expected_feature.target_model_path="/models/Qwen3-8B"' in expected_contract
     assert "expected_feature.target_revision=target-path-sha256-" in expected_contract
@@ -691,10 +678,10 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
     assert "expected_feature.hidden_dtype=bfloat16" in expected_contract
     assert any(
         "vllm_endpoints=[http://127.0.0.1:8000/v1]" in item
-        for item in commands.producer
+        for item in commands.producer_overrides
     )
     # 10 steps * default batch_size_per_gpu=4 * 8 GPUs * 1 node.
-    assert any("max_samples=320" in item for item in commands.producer)
+    assert any("max_samples=320" in item for item in commands.producer_overrides)
 
 
 def test_pipeline_commands_pass_all_external_vllm_endpoints_to_producer() -> None:
@@ -713,7 +700,7 @@ def test_pipeline_commands_pass_all_external_vllm_endpoints_to_producer() -> Non
     # Multiple services are started by the dedicated shell script. The unified
     # launcher only verifies them and passes both URLs into the Producer pool.
     assert commands.vllm is None
-    assert any(f"vllm_endpoints={endpoints}" in item for item in commands.producer)
+    assert any(f"vllm_endpoints={endpoints}" in item for item in commands.producer_overrides)
 
 
 def test_pipeline_commands_forward_producer_tuning_overrides() -> None:
@@ -763,7 +750,7 @@ def test_pipeline_commands_forward_producer_tuning_overrides() -> None:
         "speco.standalone_tq_producer.max_indexed_records=42",
         "speco.standalone_tq_producer.verify_indexed_input=true",
     ):
-        assert override in commands.producer
+        assert override in commands.producer_overrides
     assert "speco.standalone_tq_producer.source_proportional_field=source" in commands.consumer_overrides
 
 
@@ -782,9 +769,9 @@ def test_pipeline_commands_ignore_launcher_owned_producer_overrides() -> None:
         python_executable="python",
     )
 
-    assert "speco.standalone_tq_producer.input_path=/data/train.jsonl" in commands.producer
-    assert "speco.standalone_tq_producer.input_path=/evil.jsonl" not in commands.producer
-    assert "speco.standalone_tq_producer.max_samples=999" not in commands.producer
+    assert "speco.standalone_tq_producer.input_path=/data/train.jsonl" in commands.producer_overrides
+    assert "speco.standalone_tq_producer.input_path=/evil.jsonl" not in commands.producer_overrides
+    assert "speco.standalone_tq_producer.max_samples=999" not in commands.producer_overrides
 
 
 def test_pipeline_commands_reject_unknown_producer_override() -> None:
@@ -939,89 +926,6 @@ class _FakeProcess:
         self.returncode = -9
 
 
-@pytest.mark.parametrize("use_cache", [False, True])
-@pytest.mark.parametrize("shutdown_unconfirmed", [False, True])
-def test_pipeline_starts_owner_then_consumer_then_producer(tmp_path, use_cache, shutdown_unconfirmed, monkeypatch) -> None:
-    from contextlib import nullcontext
-    from verl_speco import standalone_tq_training_launcher as launcher
-    import gc
-
-    directories = []
-    mkdtemp = launcher.tempfile.mkdtemp
-    def make_directory(*args, **kwargs):
-        directory = mkdtemp(*args, **kwargs)
-        if kwargs.get("prefix") == "speco-vllm-hidden-states-":
-            directories.append(Path(directory))
-        return directory
-    monkeypatch.setattr(launcher.tempfile, "mkdtemp", make_directory)
-    stop_process = launcher._stop_process
-    def stop(process):
-        stop_process(process)
-        if shutdown_unconfirmed and process is not None and process.role == "vllm":
-            raise RuntimeError("descendants remain")
-    monkeypatch.setattr(launcher, "_stop_process", stop)
-    started: list[str] = []
-    processes: list[_FakeProcess] = []
-    child_environments: list[dict[str, str]] = []
-    vllm_started = False
-
-    def fake_popen(command, *, env):
-        nonlocal vllm_started
-        if command[0] == "vllm":
-            if use_cache:
-                assert command[2:5] == [cache.as_posix(), "--served-model-name", source.as_posix()]
-            role = "vllm"
-            vllm_started = True
-        else:
-            module = command[2]
-            role = {
-                "verl_speco.tq_owner": "owner",
-                "verl_speco.draft_train_launcher": "consumer",
-                "verl_speco.standalone_tq_producer": "producer",
-            }[module]
-        process = _FakeProcess(role)
-        started.append(role)
-        processes.append(process)
-        child_environments.append(dict(env))
-        if role == "owner":
-            Path(env["SPECO_TQ_OWNER_READY_FILE"]).touch()
-        return process
-
-    args = [*_training_args(), "speco.draft_training.runtime_backend=subprocess"]
-    if use_cache:
-        source, cache = tmp_path / "source", tmp_path / "cache"
-        source.mkdir()
-        cache.mkdir()
-        (source / "weights.bin").write_bytes(b"weights")
-        (cache / "weights.bin").write_bytes(b"weights")
-        args += [f"actor_rollout_ref.model.path={source.as_posix()}",
-                 f"speco.draft_training.local_target_cache_path={cache.as_posix()}"]
-    config = resolve_pipeline_config(args, environ={})
-    commands = build_pipeline_commands(
-        config,
-        args,
-        ray_address="127.0.0.1:61234",
-    )
-
-    with (pytest.raises(RuntimeError, match="shutdown was not confirmed") if shutdown_unconfirmed else nullcontext()):
-        assert run_pipeline(
-            commands,
-            ray_address="127.0.0.1:61234",
-            environ={"RAY_ADDRESS": "172.51.9.253:35195"},
-            popen=fake_popen,
-            endpoint_ready=lambda _: vllm_started,
-        ) == 0
-    assert started == ["vllm", "owner", "consumer", "producer"]
-    assert all(env["RAY_ADDRESS"] == "127.0.0.1:61234" for env in child_environments)
-    assert all(process.poll() is not None for process in processes)
-    gc.collect()
-    assert len(directories) == 1
-    assert directories[0].exists() == shutdown_unconfirmed
-    if shutdown_unconfirmed:
-        launcher._cleanup_hidden_states_directory(directories[0])
-    with pytest.raises(RuntimeError, match="unowned"):
-        launcher._cleanup_hidden_states_directory(tmp_path)
-    assert tmp_path.exists()
 
 
 def test_owner_writes_internal_ready_file(monkeypatch, tmp_path) -> None:
@@ -1177,8 +1081,8 @@ def test_pipeline_commands_use_provided_env_for_backend() -> None:
         env={"SPECO_TQ_STORAGE_BACKEND": "MooncakeStore"},
     )
 
-    assert any("storage_backend=MooncakeStore" in item for item in commands.consumer)
-    assert not any("storage_backend=SimpleStorage" in item for item in commands.consumer)
+    assert any("storage_backend=MooncakeStore" in item for item in commands.consumer_overrides)
+    assert not any("storage_backend=SimpleStorage" in item for item in commands.consumer_overrides)
 
 
 def test_resolve_hidden_states_store_defaults_to_file() -> None:
@@ -1339,11 +1243,11 @@ def test_pipeline_commands_select_mooncake_hidden_states_store() -> None:
     assert "SpecoMooncakeHiddenStatesConnector" in joined_vllm
     assert "verl_speco.mooncake_hidden_states_connector" in joined_vllm
     assert any(
-        "hidden_states_store.backend=mooncake" in item for item in commands.producer
+        "hidden_states_store.backend=mooncake" in item for item in commands.producer_overrides
     )
     assert any(
         "mooncake.master_server_address=10.0.0.7:50051" in item
-        for item in commands.producer
+        for item in commands.producer_overrides
     )
 
 
@@ -1421,7 +1325,7 @@ def test_topology_dry_run_fingerprint_tracks_placement_and_services(monkeypatch,
     monkeypatch.delenv("SPECO_EXTERNAL_RAY_ADDRESS", raising=False)
     monkeypatch.delenv("SPECO_VLLM_ENDPOINTS", raising=False)
     monkeypatch.setenv("SPECO_VLLM_ENDPOINT", "http://localhost:8000/v1")
-    args = ["--dry-run-topology", "--runtime-backend", "subprocess", "speco.draft_training.nproc_per_node=2"]
+    args = ["--dry-run-topology", "--runtime-backend", "ray", "speco.draft_training.nproc_per_node=2"]
     assert launcher.main(args) == 0
     first = json.loads(capsys.readouterr().out)
     assert launcher.main(args) == 0
@@ -1473,11 +1377,9 @@ def test_local_cache_command_preserves_logical_model_identity(tmp_path):
                for item in commands.consumer_overrides)
 
 
-@pytest.mark.parametrize("backend", ["subprocess", "ray"])
 @pytest.mark.parametrize("endpoint_alive", [False, True])
-def test_cache_verification_occurs_before_local_service_start(monkeypatch, tmp_path, backend, endpoint_alive):
+def test_cache_verification_occurs_before_local_service_start(monkeypatch, tmp_path, endpoint_alive):
     from dataclasses import replace
-    import verl_speco.standalone_tq_training_launcher as launcher
     import verl_speco.standalone_ray_runtime as ray_runtime
 
     args = _training_args()
@@ -1485,28 +1387,21 @@ def test_cache_verification_occurs_before_local_service_start(monkeypatch, tmp_p
                                        ray_address="127.0.0.1:6379", env={})
     commands = replace(commands, local_model_cache=("source", "cache"))
     calls = []
-    module = launcher if backend == "subprocess" else ray_runtime
-    monkeypatch.setattr(module, "validate_tq_backend", lambda *_: None)
-    monkeypatch.setattr(module, "validate_hidden_states_store", lambda *_: None)
-    monkeypatch.setattr(module, "_verify_local_model_cache", lambda *paths: calls.append(paths))
+    monkeypatch.setattr(ray_runtime, "validate_tq_backend", lambda *_: None)
+    monkeypatch.setattr(ray_runtime, "validate_hidden_states_store", lambda *_: None)
+    monkeypatch.setattr(ray_runtime, "_verify_local_model_cache", lambda *paths: calls.append(paths))
     def popen(*args, **kwargs):
         assert calls == [("source", "cache")]
         raise RuntimeError("stopped after verification")
     options = dict(commands=commands, ray_address="127.0.0.1:6379", environ={},
                    endpoint_ready=lambda _: endpoint_alive, popen=popen)
-    if backend == "ray":
-        options["ray_module"] = object()
-        run = ray_runtime.run_ray_pipeline
-    else:
-        run = launcher.run_pipeline
+    options["ray_module"] = object()
     with pytest.raises(RuntimeError, match="requires a new" if endpoint_alive else "stopped after verification"):
-        run(**options)
+        ray_runtime.run_ray_pipeline(**options)
     assert calls == ([] if endpoint_alive else [("source", "cache")])
 
 
-@pytest.mark.parametrize("backend", ["subprocess", "ray"])
-def test_corrupted_model_cache_never_starts_service(monkeypatch, tmp_path, backend):
-    import verl_speco.standalone_tq_training_launcher as launcher
+def test_corrupted_model_cache_never_starts_service(monkeypatch, tmp_path):
     import verl_speco.standalone_ray_runtime as ray_runtime
 
     source, cache = tmp_path / "source", tmp_path / "cache"
@@ -1518,19 +1413,14 @@ def test_corrupted_model_cache_never_starts_service(monkeypatch, tmp_path, backe
             f"speco.draft_training.local_target_cache_path={cache.as_posix()}"]
     commands = build_pipeline_commands(resolve_pipeline_config(args, environ={}), args,
                                        ray_address="127.0.0.1:6379", env={})
-    module = launcher if backend == "subprocess" else ray_runtime
-    monkeypatch.setattr(module, "validate_tq_backend", lambda *_: None)
-    monkeypatch.setattr(module, "validate_hidden_states_store", lambda *_: None)
+    monkeypatch.setattr(ray_runtime, "validate_tq_backend", lambda *_: None)
+    monkeypatch.setattr(ray_runtime, "validate_hidden_states_store", lambda *_: None)
     options = dict(commands=commands, ray_address="127.0.0.1:6379", environ={},
                    endpoint_ready=lambda _: False,
                    popen=lambda *args, **kwargs: pytest.fail("must not start an unverified model"))
-    if backend == "ray":
-        options["ray_module"] = object()
-        run = ray_runtime.run_ray_pipeline
-    else:
-        run = launcher.run_pipeline
+    options["ray_module"] = object()
     with pytest.raises(ValueError, match="content differs"):
-        run(**options)
+        ray_runtime.run_ray_pipeline(**options)
 
 
 def test_ray_pipeline_starts_vllm_from_verified_local_cache(monkeypatch, tmp_path):
@@ -1571,7 +1461,7 @@ def test_model_cache_rejects_source_change_during_verification(tmp_path, monkeyp
     original_open = Path.open
     def mutate_before_cache_read(path, *args, **kwargs):
         if path == cache_file:
-            source_file.write_bytes(b"evil")
+            source_file.write_bytes(b"changed")
         return original_open(path, *args, **kwargs)
     monkeypatch.setattr(Path, "open", mutate_before_cache_read)
     with pytest.raises(ValueError, match="changed during cache verification"):

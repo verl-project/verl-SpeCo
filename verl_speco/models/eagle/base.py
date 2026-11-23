@@ -138,7 +138,7 @@ class DraftModel(PreTrainedModel):
         self,
         input_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
-        cache_hidden: torch.Tensor,
+        cache_hidden: list[list[torch.Tensor]] | None,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         past_key_values: Optional[Cache] = None,

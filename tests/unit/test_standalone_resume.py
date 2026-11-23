@@ -337,15 +337,14 @@ def test_bound_replay_identity_allows_equivalent_mount_and_rejects_changed_segme
 
 def _sealed_checkpoint(root, step, run_id, *, input_path=None, input_identity=None):
     import torch.distributed.checkpoint as dcp
-    from verl_speco.trainer.checkpoint import write_standalone_integrity_manifest, write_standalone_optimizer_layout
+    from verl_speco.trainer.checkpoint import standalone_optimizer_storage_writer, write_standalone_integrity_manifest
 
     checkpoint = root / f"draft_step_{step}"
     optimizer = checkpoint / "optimizer"
     optimizer.mkdir(parents=True)
     (checkpoint / "config.json").write_text("{}", encoding="utf-8")
     (checkpoint / "pytorch_model.bin").write_bytes(f"weights-{step}".encode())
-    dcp_metadata = dcp.save({"state": torch.tensor([step])}, checkpoint_id=optimizer, no_dist=True)
-    write_standalone_optimizer_layout(optimizer, dcp_metadata)
+    dcp.save({"state": torch.tensor([step])}, storage_writer=standalone_optimizer_storage_writer(optimizer), no_dist=True)
     (optimizer / "trainer_state.pt").write_bytes(b"state")
     metadata = {"step": step, "complete": False, "optimizer": {
         "format": "torch_distributed_checkpoint", "path": "optimizer",

@@ -27,8 +27,6 @@ def _commands() -> PipelineCommands:
         vllm=None,
         vllm_endpoints=("http://127.0.0.1:8000/v1",),
         owner=["python", "-m", "verl_speco.tq_owner"],
-        producer=["producer"],
-        consumer=["consumer"],
         producer_overrides=("producer=true",),
         consumer_overrides=("consumer=true",),
     )
@@ -870,7 +868,7 @@ def test_file_reference_tensor_byte_budget_rejects_unsafe_input(tmp_path):
 
 def test_reference_incarnation_is_included_in_event_size_budget():
     from queue import Queue
-    from verl_speco.standalone_ray_runtime import _bounded_metadata_size
+    from verl_speco.transport.reference_dispatch import bounded_metadata_size
     queue = Queue()
     actor = StandaloneProducerActor({"speco": {"standalone_tq_producer": {
         "max_published_references": 2, "reference_event_max_bytes": 1024}}},
@@ -879,7 +877,7 @@ def test_reference_incarnation_is_included_in_event_size_budget():
         await actor._on_references([{"key": str(i), "tag": {"text": "x" * 500}} for i in range(2)])
         events = [queue.get_nowait(), queue.get_nowait()]
         assert all(event["producer_incarnation"] == actor._incarnation for event in events)
-        assert all(_bounded_metadata_size(event, 1024) <= 1024 for event in events)
+        assert all(bounded_metadata_size(event, 1024) <= 1024 for event in events)
     asyncio.run(run())
 
 
@@ -1436,9 +1434,10 @@ def test_ray_backend_rejects_multi_node_local_runtime() -> None:
             "ray", ["speco.draft_training.nnodes=2"], environ={},
         )
 
-    _validate_runtime_backend_topology(
-        "subprocess", ["speco.draft_training.nnodes=2"]
-    )
+    with pytest.raises(ValueError, match="subprocess training was removed"):
+        _validate_runtime_backend_topology(
+            "subprocess", ["speco.draft_training.nnodes=2"]
+        )
 
 
 def test_multinode_ray_requires_shared_handles_and_remote_endpoints():
@@ -1599,7 +1598,8 @@ def test_single_node_worker_group_failure_removes_placement(monkeypatch):
     assert removed == [group]
 
 
-def test_worker_group_uses_the_pinned_placement_groups(monkeypatch):
+@pytest.mark.parametrize("driver_device", ["npu", "cpu"])
+def test_worker_group_uses_the_pinned_placement_groups(monkeypatch, driver_device):
     from omegaconf import OmegaConf
     from verl_speco import standalone_ray_runtime as runtime
     import verl.utils.device
@@ -1625,8 +1625,14 @@ def test_worker_group_uses_the_pinned_placement_groups(monkeypatch):
         return groups
     monkeypatch.setattr(runtime, "_ray_controller_types", lambda: (make_worker, Pool, make_group))
     monkeypatch.setattr(runtime, "_create_pinned_trainer_groups", reserve)
-    monkeypatch.setattr(verl.utils.device, "get_device_name", lambda: "npu")
-    ray = SimpleNamespace(remote=lambda cls: cls)
+    monkeypatch.setattr(verl.utils.device, "get_device_name", lambda: driver_device)
+    ray = SimpleNamespace(
+        remote=lambda cls: cls,
+        nodes=lambda: [
+            {"Alive": True, "NodeManagerAddress": ip, "Resources": {"NPU": 4}}
+            for ip in ("10.0.0.1", "10.0.0.2")
+        ],
+    )
     assert runtime.build_consumer_worker_group(config, ray_module=ray) == "worker-group"
     assert observed["pool"]["process_on_nodes"] == [4, 4]
     assert observed["reservation"]["node_ips"] == ["10.0.0.1", "10.0.0.2"]
@@ -2772,7 +2778,8 @@ def test_rank_token_balance_validates_configuration_before_workers(monkeypatch):
 
 def test_disk_reference_identity_ledger_rejects_conflicts_and_enforces_capacity():
     from copy import deepcopy
-    from verl_speco.standalone_ray_runtime import _ReferenceIdentityLedger, _accept_reference_entries, _release_reference_entries
+    from verl_speco.producer.reference_ledger import _ReferenceIdentityLedger
+    from verl_speco.standalone_ray_runtime import _accept_reference_entries, _release_reference_entries
     from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION, SampleMetadata, make_reference_tag, make_sample_key
     def entry(index):
         meta = SampleMetadata(PROTOCOL_SCHEMA_VERSION, "run", str(index), index)
@@ -3085,7 +3092,7 @@ def test_driver_rejects_untrusted_training_completion(monkeypatch, successful):
 
 def test_reference_metadata_is_split_by_bytes_and_retried_in_order(monkeypatch):
     import json
-    from verl_speco.standalone_ray_runtime import _bounded_metadata_size
+    from verl_speco.transport.reference_dispatch import bounded_metadata_size
 
     class Queue:
         def __init__(self):
@@ -3107,7 +3114,7 @@ def test_reference_metadata_is_split_by_bytes_and_retried_in_order(monkeypatch):
     assert events[1] == events[2]
     delivered = [event for i, event in enumerate(events) if i != 2]
     assert [entry for event in delivered for entry in event["entries"]] == entries
-    assert all(_bounded_metadata_size(event, 1024) == len(json.dumps(
+    assert all(bounded_metadata_size(event, 1024) == len(json.dumps(
         event, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False).encode())
                for event in delivered)
 

@@ -43,8 +43,8 @@ from verl.utils.device import get_device_name, get_torch_device
 
 from verl_speco.backends.factory import build_trainer_backend
 from verl_speco.config import config_int, prefetch_depth
-from verl_speco.standalone_ray_runtime import put_queue
 from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
+from verl_speco.standalone_ray_runtime import put_queue
 from verl_speco.trainer.base_trainer import (
     DrafterBaseTrainer,
     resolve_drafter_strategy,
@@ -54,8 +54,21 @@ from verl_speco.trainer.draft_dataset import (
     DraftFeatureDataLoaderConfig,
 )
 from verl_speco.trainer.feature_store import (
-    DraftReplaySample,
     build_feature_store_from_config,
+)
+from verl_speco.trainer.reference_batch_prefetch import (
+    ReferenceBatchPrefetchIterator,
+    ReferenceDevicePrefetchIterator,
+)
+from verl_speco.trainer.reference_sample_source import ReferenceFeatureDataLoader
+from verl_speco.trainer.standalone_batch_finalize import AsyncBatchFinalizer
+from verl_speco.trainer.standalone_data import (
+    StandaloneLocalBatch,
+    validate_standalone_training_source,
+)
+from verl_speco.trainer.standalone_prefetch import (
+    StandalonePrefetchIterator,
+    _reference_device_transfer_bytes,
 )
 from verl_speco.trainer.standalone_resume import (
     build_input_fingerprint,
@@ -66,21 +79,13 @@ from verl_speco.trainer.standalone_resume import (
     save_standalone_resume,
     validate_input_identity,
 )
+from verl_speco.trainer.standalone_retry import retry_io
 from verl_speco.trainer.standalone_tracking import (
     StandaloneTokenWindow,
     _build_standalone_tracking,
     _finish_standalone_tracking,
     _log_standalone_tracking_metrics,
     _select_standalone_tracking_metrics,
-)
-from verl_speco.trainer.tq_retry import retry_io
-from verl_speco.trainer.standalone_batch_finalize import AsyncBatchFinalizer
-from verl_speco.trainer.reference_batch_prefetch import ReferenceBatchPrefetchIterator, ReferenceDevicePrefetchIterator
-from verl_speco.trainer.tq_sample_source import (
-    TQFeatureDataLoader,
-    TQLocalBatch,
-    TQPrefetchIterator,
-    _reference_device_transfer_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,11 +106,9 @@ def _is_out_of_memory_error(error: BaseException) -> bool:
     return error.__class__.__name__ in {"OutOfMemoryError", "CudaOutOfMemoryError"}
 
 
-def _contains_replay_samples(samples: list[Any]) -> bool:
-    return any(isinstance(sample, DraftReplaySample) for sample in samples)
-
-
-def _verify_rollback_checkpoint_across_ranks(training_cfg, model_path, world_size: int) -> None:
+def _verify_rollback_checkpoint_across_ranks(
+    training_cfg, model_path, world_size: int
+) -> None:
     """Require every rank to see the same intact, launcher-selected checkpoint."""
     enabled = training_cfg.get("checkpoint_auto_rollback", False)
     if type(enabled) is not bool:
@@ -118,17 +121,24 @@ def _verify_rollback_checkpoint_across_ranks(training_cfg, model_path, world_siz
         path = Path(model_path)
         if not verify_standalone_checkpoint_integrity(path):
             raise ValueError("checkpoint integrity verification failed")
-        identity = hashlib.sha256((path / "standalone_integrity.json").read_bytes()).hexdigest()
-        local = (identity, None)
+        identity = hashlib.sha256(
+            (path / "standalone_integrity.json").read_bytes()
+        ).hexdigest()
+        local: tuple[str | None, str | None] = (identity, None)
     except Exception as exc:  # noqa: BLE001 - every rank must enter the collective
         local = (None, f"{type(exc).__name__}: {exc}")
-    gathered = [None] * world_size
+    gathered: list[Any] = [None] * world_size
     if dist.is_initialized() and world_size > 1:
         dist.all_gather_object(gathered, local)
     else:
         gathered = [local]
-    if any(item[1] is not None for item in gathered) or len({item[0] for item in gathered}) != 1:
-        raise ValueError(f"Standalone rollback checkpoint differs or is invalid across ranks: {gathered}")
+    if (
+        any(item[1] is not None for item in gathered)
+        or len({item[0] for item in gathered}) != 1
+    ):
+        raise ValueError(
+            f"Standalone rollback checkpoint differs or is invalid across ranks: {gathered}"
+        )
 
 
 def _zero_standalone_padding_batch(batch: dict[str, Any]) -> dict[str, Any]:
@@ -172,38 +182,62 @@ def _standalone_rng_identity(enabled, device):
         return {}
     device_type = getattr(device, "type", None) or torch.device(device).type
     if device_type not in {"cpu", "cuda", "npu"}:
-        raise ValueError("deterministic_step_rng requires a supported CPU, CUDA or NPU device")
+        raise ValueError(
+            "deterministic_step_rng requires a supported CPU, CUDA or NPU device"
+        )
     return {"rng_device_type": device_type}
 
 
 def _valid_checkpoint_retention(keep, delete, exclusive, inherit=False):
-    return (type(keep) is int and (keep == 0 or keep >= 2)
-            and type(delete) is bool and type(exclusive) is bool and type(inherit) is bool
-            and (not (delete or inherit) or (keep >= 2 and exclusive)))
+    return (
+        type(keep) is int
+        and (keep == 0 or keep >= 2)
+        and type(delete) is bool
+        and type(exclusive) is bool
+        and type(inherit) is bool
+        and (not (delete or inherit) or (keep >= 2 and exclusive))
+    )
 
 
 def _validate_node_window_host_budget(host_bytes, frame_bytes):
-    if (type(host_bytes) is not int or type(frame_bytes) is not int
-            or frame_bytes <= 0 or host_bytes < 3 * frame_bytes):
-        raise ValueError("Node-owned windows require a positive frame limit and a three-frame host reservation")
+    if (
+        type(host_bytes) is not int
+        or type(frame_bytes) is not int
+        or frame_bytes <= 0
+        or host_bytes < 3 * frame_bytes
+    ):
+        raise ValueError(
+            "Node-owned windows require a positive frame limit and a three-frame host reservation"
+        )
 
 
 def _validate_checkpoint_retention_across_ranks(settings, *, rank, device):
     leader_settings = [settings if rank == 0 else None]
     if dist.is_initialized() and dist.get_world_size() > 1:
         dist.broadcast_object_list(leader_settings, src=0)
-    if not _all_ranks_true(_valid_checkpoint_retention(*settings)
-                           and settings == leader_settings[0], device):
-        raise ValueError("Checkpoint retention settings must agree across ranks; deletion or inheritance requires "
-                         "keep_last >= 2 and cooperative exclusive directory ownership")
+    if not _all_ranks_true(
+        _valid_checkpoint_retention(*settings) and settings == leader_settings[0],
+        device,
+    ):
+        raise ValueError(
+            "Checkpoint retention settings must agree across ranks; deletion or inheritance requires "
+            "keep_last >= 2 and cooperative exclusive directory ownership"
+        )
 
 
-def _retention_resume_identity_across_ranks(root, checkpoint, step, resume_metadata, world_size):
+def _retention_resume_identity_across_ranks(
+    root, checkpoint, step, resume_metadata, world_size
+):
     from verl_speco.trainer.checkpoint import standalone_retention_resume_identity
+
     try:
         if resume_metadata is None or resume_metadata.get("optimizer_step") != step:
-            raise ValueError("Retention inheritance requires verified restored replay progress")
-        identity = standalone_retention_resume_identity(root, checkpoint, optimizer_step=step)
+            raise ValueError(
+                "Retention inheritance requires verified restored replay progress"
+            )
+        identity = standalone_retention_resume_identity(
+            root, checkpoint, optimizer_step=step
+        )
         local = {"identity": identity}
     except Exception as exc:
         local = {"error": f"{type(exc).__name__}: {exc}"}
@@ -212,12 +246,18 @@ def _retention_resume_identity_across_ranks(root, checkpoint, step, resume_metad
         dist.all_gather_object(gathered, local)
     else:
         gathered = [local]
-    if any(item.get("error") for item in gathered) or any(item != gathered[0] for item in gathered):
-        raise ValueError(f"Checkpoint retention inheritance failed across ranks: {gathered}")
+    if any(item.get("error") for item in gathered) or any(
+        item != gathered[0] for item in gathered
+    ):
+        raise ValueError(
+            f"Checkpoint retention inheritance failed across ranks: {gathered}"
+        )
     return local["identity"]
 
 
-def _verify_shared_file_root_across_ranks(store, producer_handle, *, rank, device, timeout):
+def _verify_shared_file_root_across_ranks(
+    store, producer_handle, *, rank, device, timeout
+):
     """Check that every trainer can read a witness created on the Producer node."""
     hidden_store = getattr(store, "hidden_states_store", None)
     root = getattr(hidden_store, "root", None)
@@ -226,7 +266,11 @@ def _verify_shared_file_root_across_ranks(store, producer_handle, *, rank, devic
     selected = [local_root if rank == 0 else None]
     if distributed:
         dist.broadcast_object_list(selected, src=0)
-    if not _all_ranks_true(local_root == selected[0] and (local_root is None or producer_handle is not None), device):
+    if not _all_ranks_true(
+        local_root == selected[0]
+        and (local_root is None or producer_handle is not None),
+        device,
+    ):
         raise RuntimeError("Shared file root or Producer handle differs across ranks")
     if local_root is None:
         return
@@ -234,22 +278,36 @@ def _verify_shared_file_root_across_ranks(store, producer_handle, *, rank, devic
     if rank == 0:
         try:
             import ray
-            response[0] = {"probe": ray.get(producer_handle.create_shared_file_probe.remote(), timeout=timeout)}
+
+            response[0] = {
+                "probe": ray.get(
+                    producer_handle.create_shared_file_probe.remote(), timeout=timeout
+                )
+            }
         except Exception as exc:
             response[0] = {"error": f"{type(exc).__name__}: {exc}"}
     if distributed:
         dist.broadcast_object_list(response, src=0)
     if "error" in response[0]:
-        raise RuntimeError("Failed to create Producer shared-file witness: " + response[0]["error"])
+        raise RuntimeError(
+            "Failed to create Producer shared-file witness: " + response[0]["error"]
+        )
     probe, error = response[0]["probe"], None
     try:
-        if (not isinstance(probe, dict) or set(probe) != {"path", "token"}
-                or not isinstance(probe["token"], str) or len(probe["token"]) != 32
-                or any(c not in "0123456789abcdef" for c in probe["token"])):
+        if (
+            not isinstance(probe, dict)
+            or set(probe) != {"path", "token"}
+            or not isinstance(probe["token"], str)
+            or len(probe["token"]) != 32
+            or any(c not in "0123456789abcdef" for c in probe["token"])
+        ):
             raise ValueError("Invalid Producer shared-file witness")
         path = hidden_store.validate_reference(probe["path"])
-        if (path.name != ".speco-shared-probe-" + probe["token"] or path.stat().st_size != 32
-                or path.read_text(encoding="ascii") != probe["token"]):
+        if (
+            path.name != ".speco-shared-probe-" + probe["token"]
+            or path.stat().st_size != 32
+            or path.read_text(encoding="ascii") != probe["token"]
+        ):
             raise ValueError("Producer shared-file witness is not visible or differs")
     except Exception as exc:
         error = exc
@@ -258,23 +316,34 @@ def _verify_shared_file_root_across_ranks(store, producer_handle, *, rank, devic
     if rank == 0:
         try:
             import ray
-            ray.get(producer_handle.remove_shared_file_probe.remote(probe["path"], probe["token"]), timeout=timeout)
+
+            ray.get(
+                producer_handle.remove_shared_file_probe.remote(
+                    probe["path"], probe["token"]
+                ),
+                timeout=timeout,
+            )
         except Exception as exc:
             cleanup_error = exc
     cleaned = _all_ranks_true(cleanup_error is None, device)
     if not visible or not cleaned:
-        raise RuntimeError("Shared file root is not consistently visible or its witness cleanup failed") from (error or cleanup_error)
+        raise RuntimeError(
+            "Shared file root is not consistently visible or its witness cleanup failed"
+        ) from (error or cleanup_error)
 
 
 def _acquire_checkpoint_directory_across_ranks(directory, enabled, *, rank, device):
     """Optionally reserve one shared directory until every writer has stopped."""
     from verl_speco.trainer.checkpoint import StandaloneCheckpointDirectoryLease
+
     distributed = dist.is_initialized() and dist.get_world_size() > 1
     setting = [enabled if rank == 0 else None]
     if distributed:
         dist.broadcast_object_list(setting, src=0)
     if not _all_ranks_true(type(enabled) is bool and enabled == setting[0], device):
-        raise ValueError("checkpoint_directory_exclusive must match on every rank and be boolean")
+        raise ValueError(
+            "checkpoint_directory_exclusive must match on every rank and be boolean"
+        )
     if not enabled:
         return None
     response = [None]
@@ -291,7 +360,9 @@ def _acquire_checkpoint_directory_across_ranks(directory, enabled, *, rank, devi
     if distributed:
         dist.broadcast_object_list(response, src=0)
     if "error" in response[0]:
-        raise RuntimeError("Cannot acquire checkpoint directory: " + response[0]["error"])
+        raise RuntimeError(
+            "Cannot acquire checkpoint directory: " + response[0]["error"]
+        )
     try:
         lease = StandaloneCheckpointDirectoryLease(directory, response[0]["token"])
         lease.verify()
@@ -299,34 +370,85 @@ def _acquire_checkpoint_directory_across_ranks(directory, enabled, *, rank, devi
     except Exception:
         visible = False
     if not _all_ranks_true(visible, device):
-        raise RuntimeError("Checkpoint directory marker is not visible to every rank; it remains reserved")
+        raise RuntimeError(
+            "Checkpoint directory marker is not visible to every rank; it remains reserved"
+        )
     return lease
 
 
-def _standalone_recipe(training_cfg: Any, target_model_path: str | None) -> dict[str, Any]:
+def _standalone_recipe(
+    training_cfg: Any, target_model_path: str | None
+) -> dict[str, Any]:
     """Capture configuration that changes training data, numerics or optimizer state."""
     explicit = {
-        "strategy", "execution_strategy", "fsdp_shard_size", "ddp_find_unused_parameters", "lr", "optimizer", "weight_decay",
-        "adamw_betas", "muon_lr", "muon_momentum", "muon_nesterov", "muon_weight_decay",
-        "muon_ns_steps", "muon_adjust_lr_fn", "muon_adamw_name_hints", "lr_warmup_steps",
-        "lr_scheduler_type", "lr_decay_steps", "min_lr_ratio", "warmup_style", "use_logits",
-        "ttt_length", "packing", "group_by_length", "group_by_length_megabatch", "lk_temperature",
-        "lk_target_logz_tolerance", "lk_chunk_size", "ce_target_source", "vocab_mapping_path",
-        "preserve_prompt_hidden_states", "max_seq_len", "hidden_state_clip_value",
-        "resume_trainer_state_from_checkpoint", "logits_topk", "logits_sparse_min_intersection",
-        "logits_sparse_min_mass", "logits_coverage_mask_min_ratio", "logits_coverage_mask_require_top1",
+        "strategy",
+        "execution_strategy",
+        "fsdp_shard_size",
+        "ddp_find_unused_parameters",
+        "lr",
+        "optimizer",
+        "weight_decay",
+        "adamw_betas",
+        "muon_lr",
+        "muon_momentum",
+        "muon_nesterov",
+        "muon_weight_decay",
+        "muon_ns_steps",
+        "muon_adjust_lr_fn",
+        "muon_adamw_name_hints",
+        "lr_warmup_steps",
+        "lr_scheduler_type",
+        "lr_decay_steps",
+        "min_lr_ratio",
+        "warmup_style",
+        "use_logits",
+        "ttt_length",
+        "packing",
+        "group_by_length",
+        "group_by_length_megabatch",
+        "lk_temperature",
+        "lk_target_logz_tolerance",
+        "lk_chunk_size",
+        "ce_target_source",
+        "vocab_mapping_path",
+        "preserve_prompt_hidden_states",
+        "max_seq_len",
+        "hidden_state_clip_value",
+        "resume_trainer_state_from_checkpoint",
+        "logits_topk",
+        "logits_sparse_min_intersection",
+        "logits_sparse_min_mass",
+        "logits_coverage_mask_min_ratio",
+        "logits_coverage_mask_require_top1",
     }
-    prefixes = ("dspark_", "dflash_", "dflash2_", "eagle1_", "eagle3_", "domino_", "peagle_")
+    prefixes = (
+        "dspark_",
+        "dflash_",
+        "dflash2_",
+        "eagle1_",
+        "eagle3_",
+        "domino_",
+        "peagle_",
+    )
     selected = {
-        str(key): training_cfg.get(key) for key in training_cfg.keys()
-        if key in explicit or (str(key).startswith(prefixes) and "debug" not in str(key))
+        str(key): training_cfg.get(key)
+        for key in training_cfg.keys()
+        if key in explicit
+        or (str(key).startswith(prefixes) and "debug" not in str(key))
     }
     if training_cfg.get("reference_owned_windows", False):
         selected["reference_owned_windows"] = True
     feature_store = training_cfg.get("feature_store") or {}
     selected["feature_store"] = {
-        key: feature_store.get(key) for key in ("type", "max_seq_len", "window_mode", "train_on",
-                                               "min_supervised_tokens", "strict_token_alignment")
+        key: feature_store.get(key)
+        for key in (
+            "type",
+            "max_seq_len",
+            "window_mode",
+            "train_on",
+            "min_supervised_tokens",
+            "strict_token_alignment",
+        )
     }
     tq = training_cfg.get("transfer_queue") or {}
     expected_feature = tq.get("expected_feature") or {}
@@ -335,10 +457,18 @@ def _standalone_recipe(training_cfg: Any, target_model_path: str | None) -> dict
         raise ValueError("target_model_cache_content_identity must be a boolean")
     if cache_identity:
         logical_id = training_cfg.get("target_model_logical_id")
-        if not isinstance(logical_id, str) or not logical_id.strip() or logical_id != logical_id.strip():
-            raise ValueError("Content-verified model cache requires target_model_logical_id")
+        if (
+            not isinstance(logical_id, str)
+            or not logical_id.strip()
+            or logical_id != logical_id.strip()
+        ):
+            raise ValueError(
+                "Content-verified model cache requires target_model_logical_id"
+            )
         if not isinstance(target_model_path, str) or not target_model_path:
-            raise ValueError("Content-verified model cache requires a local target model path")
+            raise ValueError(
+                "Content-verified model cache requires a local target model path"
+            )
         expected_feature = dict(expected_feature)
         if expected_feature.get("target_model_path") == target_model_path:
             expected_feature["target_model_path"] = logical_id
@@ -346,7 +476,9 @@ def _standalone_recipe(training_cfg: Any, target_model_path: str | None) -> dict
     else:
         selected["target_model_path"] = target_model_path
     selected["expected_feature"] = expected_feature
-    target_config = Path(target_model_path) / "config.json" if target_model_path else None
+    target_config = (
+        Path(target_model_path) / "config.json" if target_model_path else None
+    )
     if target_config is not None and target_config.is_file():
         before = target_config.stat()
         if before.st_size > 8 * 1024 * 1024:
@@ -354,16 +486,27 @@ def _standalone_recipe(training_cfg: Any, target_model_path: str | None) -> dict
         content = target_config.read_bytes()
         after = target_config.stat()
         if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
         ):
             raise ValueError("Target model config changed during fingerprinting")
         selected["target_config_sha256"] = hashlib.sha256(content).hexdigest()
     else:
         selected["target_config_sha256"] = None
     if cache_identity:
-        selected["target_model_cache_sha256"] = model_cache_content_sha256(target_model_path)
-        if hashlib.sha256(target_config.read_bytes()).hexdigest() != selected["target_config_sha256"]:
-            raise ValueError("Target model config changed while fingerprinting its cache")
+        assert target_model_path is not None and target_config is not None
+        selected["target_model_cache_sha256"] = model_cache_content_sha256(
+            target_model_path
+        )
+        if (
+            hashlib.sha256(target_config.read_bytes()).hexdigest()
+            != selected["target_config_sha256"]
+        ):
+            raise ValueError(
+                "Target model config changed while fingerprinting its cache"
+            )
 
     def plain(value):
         if OmegaConf.is_config(value):
@@ -375,10 +518,16 @@ def _standalone_recipe(training_cfg: Any, target_model_path: str | None) -> dict
         return value
 
     normalized = plain(selected)
-    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    encoded = json.dumps(
+        normalized, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
     if len(encoded) > 65536:
         raise ValueError("Standalone training recipe exceeds 64 KiB")
-    return {"version": 1, "sha256": hashlib.sha256(encoded).hexdigest(), "settings": normalized}
+    return {
+        "version": 1,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "settings": normalized,
+    }
 
 
 def _standalone_recipe_across_ranks(training_cfg, target_model_path, world_size):
@@ -387,64 +536,109 @@ def _standalone_recipe_across_ranks(training_cfg, target_model_path, world_size)
     try:
         snapshot_interval = training_cfg.get("trainable_snapshot_interval_steps", 0)
         if type(snapshot_interval) is not int or snapshot_interval < 0:
-            raise ValueError("trainable_snapshot_interval_steps must be a non-negative integer")
+            raise ValueError(
+                "trainable_snapshot_interval_steps must be a non-negative integer"
+            )
         snapshot_max_bytes = training_cfg.get("trainable_snapshot_max_bytes", 0)
         if type(snapshot_max_bytes) is not int or snapshot_max_bytes < 0:
-            raise ValueError("trainable_snapshot_max_bytes must be a non-negative integer")
+            raise ValueError(
+                "trainable_snapshot_max_bytes must be a non-negative integer"
+            )
         snapshot_init = training_cfg.get("trainable_snapshot_initialization_path")
-        if snapshot_init is not None and (not isinstance(snapshot_init, str) or not snapshot_init.strip()):
-            raise ValueError("trainable_snapshot_initialization_path must be a nonempty path or null")
+        if snapshot_init is not None and (
+            not isinstance(snapshot_init, str) or not snapshot_init.strip()
+        ):
+            raise ValueError(
+                "trainable_snapshot_initialization_path must be a nonempty path or null"
+            )
         recipe = _standalone_recipe(training_cfg, target_model_path)
     except Exception as exc:  # All ranks must reach the same startup collective.
         error = f"{type(exc).__name__}: {exc}"
-    local = {"error": error, "sha256": recipe["sha256"] if recipe else None,
-             "snapshot_interval": snapshot_interval if error is None else None,
-             "snapshot_max_bytes": snapshot_max_bytes if error is None else None,
-             "snapshot_init": snapshot_init if error is None else None}
+    local = {
+        "error": error,
+        "sha256": recipe["sha256"] if recipe else None,
+        "snapshot_interval": snapshot_interval if error is None else None,
+        "snapshot_max_bytes": snapshot_max_bytes if error is None else None,
+        "snapshot_init": snapshot_init if error is None else None,
+    }
     if dist.is_initialized() and world_size > 1:
         gathered = [None] * world_size
         dist.all_gather_object(gathered, local)
     else:
         gathered = [local]
-    if any(item["error"] for item in gathered) or any(item != gathered[0] for item in gathered):
-        raise ValueError(f"Standalone recipe differs or failed across ranks: {gathered}")
+    if any(item["error"] for item in gathered) or any(
+        item != gathered[0] for item in gathered
+    ):
+        raise ValueError(
+            f"Standalone recipe differs or failed across ranks: {gathered}"
+        )
     return recipe
 
 
-def _validate_resume_training_plan(metadata, optimizer_step: int, training_plan: dict[str, Any]) -> None:
+def _validate_resume_training_plan(
+    metadata, optimizer_step: int, training_plan: dict[str, Any]
+) -> None:
     if metadata is None:
         return
     if int(metadata.get("optimizer_step", -1)) != optimizer_step:
-        raise ValueError("Standalone resume progress does not match restored optimizer step")
+        raise ValueError(
+            "Standalone resume progress does not match restored optimizer step"
+        )
     saved_plan = metadata.get("training_plan")
-    if (isinstance(saved_plan, dict) and "tail_policy" not in saved_plan
-            and "tail_policy" in training_plan):
+    if (
+        isinstance(saved_plan, dict)
+        and "tail_policy" not in saved_plan
+        and "tail_policy" in training_plan
+    ):
         # Checkpoints created before tail support always used the drop policy.
         saved_plan = {**saved_plan, "tail_policy": "drop"}
     if isinstance(saved_plan, dict) and "recipe" not in saved_plan:
         # Legacy sidecars did not record these settings. Check their known
         # fields but cannot retroactively establish recipe equivalence.
-        training_plan = {key: value for key, value in training_plan.items() if key != "recipe"}
-    if (isinstance(saved_plan, dict) and saved_plan.get("deterministic_step_rng") is True
-            and "rng_device_type" not in saved_plan and "rng_device_type" in training_plan):
-        logger.warning("Legacy checkpoint does not record the RNG device type; cross-device reproducibility cannot be verified")
-        training_plan = {key: value for key, value in training_plan.items() if key != "rng_device_type"}
+        training_plan = {
+            key: value for key, value in training_plan.items() if key != "recipe"
+        }
+    if (
+        isinstance(saved_plan, dict)
+        and saved_plan.get("deterministic_step_rng") is True
+        and "rng_device_type" not in saved_plan
+        and "rng_device_type" in training_plan
+    ):
+        logger.warning(
+            "Legacy checkpoint does not record the RNG device type; cross-device reproducibility cannot be verified"
+        )
+        training_plan = {
+            key: value
+            for key, value in training_plan.items()
+            if key != "rng_device_type"
+        }
     if saved_plan is not None and saved_plan != training_plan:
-        raise ValueError(f"Standalone resume training plan changed: saved={saved_plan}, current={training_plan}")
+        raise ValueError(
+            f"Standalone resume training plan changed: saved={saved_plan}, current={training_plan}"
+        )
 
 
-def _load_resume_across_ranks(model_path, input_path, optimizer_step, training_plan, world_size):
+def _load_resume_across_ranks(
+    model_path, input_path, optimizer_step, training_plan, world_size
+):
     """Make local resume failures and differing progress visible on every rank."""
     consumed, metadata = set(), None
     try:
         consumed, metadata = load_standalone_resume(model_path, input_path=input_path)
         if optimizer_step > 0 and metadata is None:
-            raise ValueError("Standalone TQ checkpoint restored optimizer state but has no standalone_resume.json")
+            raise ValueError(
+                "Standalone TQ checkpoint restored optimizer state but has no standalone_resume.json"
+            )
         _validate_resume_training_plan(metadata, optimizer_step, training_plan)
         digest = hashlib.sha256()
         for sequence_no in sorted(consumed):
             digest.update(f"{sequence_no},".encode("ascii"))
-        local = {"error": None, "progress": digest.hexdigest(), "step": optimizer_step, "plan": training_plan}
+        local = {
+            "error": None,
+            "progress": digest.hexdigest(),
+            "step": optimizer_step,
+            "plan": training_plan,
+        }
     except Exception as exc:  # noqa: BLE001 - all ranks must enter the collective
         local = {"error": f"{type(exc).__name__}: {exc}"}
     gathered = [None] * world_size
@@ -452,8 +646,12 @@ def _load_resume_across_ranks(model_path, input_path, optimizer_step, training_p
         dist.all_gather_object(gathered, local)
     else:
         gathered = [local]
-    if any(item.get("error") for item in gathered) or any(item != gathered[0] for item in gathered):
-        raise ValueError(f"Standalone resume differs or failed across ranks: {gathered}")
+    if any(item.get("error") for item in gathered) or any(
+        item != gathered[0] for item in gathered
+    ):
+        raise ValueError(
+            f"Standalone resume differs or failed across ranks: {gathered}"
+        )
     return consumed, metadata
 
 
@@ -461,11 +659,16 @@ def _input_identity_across_ranks(input_path, world_size: int):
     """Bind all trainers to rank zero's input content before accepting batches."""
     distributed = dist.is_initialized() and world_size > 1
     rank = dist.get_rank() if distributed else 0
-    result = [None]
+    result: list[dict[str, Any] | None] = [None]
     if rank == 0:
         try:
-            result[0] = {"identity": input_content_identity(
-                build_input_fingerprint(input_path, include_content_hash=True)) if input_path else None}
+            result[0] = {
+                "identity": input_content_identity(
+                    build_input_fingerprint(input_path, include_content_hash=True)
+                )
+                if input_path
+                else None
+            }
         except FileNotFoundError as exc:
             # A wholly absent source can be mounted only on the Producer node.
             # An existing but incomplete replay directory is corruption instead.
@@ -474,14 +677,20 @@ def _input_identity_across_ranks(input_path, world_size: int):
             except Exception as probe_error:  # Still notify every live rank.
                 result[0] = {"error": f"{type(probe_error).__name__}: {probe_error}"}
             else:
-                result[0] = ({"error": f"{type(exc).__name__}: {exc}"} if exists else {"identity": None})
+                if exists:
+                    result[0] = {"error": f"{type(exc).__name__}: {exc}"}
+                else:
+                    result[0] = {"identity": None}
         except Exception as exc:  # Other ranks must receive the failure too.
             result[0] = {"error": f"{type(exc).__name__}: {exc}"}
     if distributed:
         dist.broadcast_object_list(result, src=0)
-    if result[0].get("error"):
-        raise RuntimeError(f"Failed to bind standalone input: {result[0]['error']}")
-    return result[0]["identity"]
+    binding = result[0]
+    if binding is None:
+        raise RuntimeError("Missing standalone input identity from rank zero")
+    if binding.get("error"):
+        raise RuntimeError(f"Failed to bind standalone input: {binding['error']}")
+    return binding["identity"]
 
 
 def _validate_live_trainer_topology(records, node_ips, processes_per_node):
@@ -492,7 +701,11 @@ def _validate_live_trainer_topology(records, node_ips, processes_per_node):
         nodes = sorted(str(ipaddress.ip_address(str(ip))) for ip in node_ips)
     except (TypeError, ValueError) as exc:
         raise ValueError("Invalid trainer node IP list") from exc
-    if not nodes or len(set(nodes)) != len(nodes) or len(records) != len(nodes) * processes_per_node:
+    if (
+        not nodes
+        or len(set(nodes)) != len(nodes)
+        or len(records) != len(nodes) * processes_per_node
+    ):
         raise ValueError("Live trainer topology does not match configured world size")
     seen_ranks, node_ids, devices = set(), {}, set()
     for item in records:
@@ -507,10 +720,18 @@ def _validate_live_trainer_topology(records, node_ips, processes_per_node):
         except (ValueError, TypeError) as exc:
             raise ValueError("Live trainer node address is invalid") from exc
         node_id, assigned = item.get("node_id"), item.get("accelerators")
-        if (address != nodes[rank // processes_per_node] or not isinstance(node_id, str) or not node_id
-                or not isinstance(assigned, list) or len(assigned) != 1
-                or not isinstance(assigned[0], str) or not assigned[0]):
-            raise ValueError("Live trainer placement or accelerator assignment differs from the plan")
+        if (
+            address != nodes[rank // processes_per_node]
+            or not isinstance(node_id, str)
+            or not node_id
+            or not isinstance(assigned, list)
+            or len(assigned) != 1
+            or not isinstance(assigned[0], str)
+            or not assigned[0]
+        ):
+            raise ValueError(
+                "Live trainer placement or accelerator assignment differs from the plan"
+            )
         previous = node_ids.setdefault(address, node_id)
         if previous != node_id:
             raise ValueError("One trainer address resolved to multiple Ray nodes")
@@ -522,8 +743,15 @@ def _validate_live_trainer_topology(records, node_ips, processes_per_node):
         raise ValueError("Multiple trainer addresses resolved to one Ray node")
 
 
-def _verify_live_trainer_topology(config, *, rank, world_size, scheduled,
-                                  events_available=None, producer_available=None):
+def _verify_live_trainer_topology(
+    config,
+    *,
+    rank,
+    world_size,
+    scheduled,
+    events_available=None,
+    producer_available=None,
+):
     if not scheduled or world_size <= 1:
         return
     record = {"rank": rank}
@@ -532,49 +760,86 @@ def _verify_live_trainer_topology(config, *, rank, world_size, scheduled,
         nnodes = int(settings.nnodes)
         nproc = int(settings.nproc_per_node)
         if nnodes < 1 or nproc < 1 or nnodes * nproc != world_size:
-            raise ValueError("Configured trainer topology differs from distributed world size")
+            raise ValueError(
+                "Configured trainer topology differs from distributed world size"
+            )
         raw_nodes = settings.trainer_node_ips
         nodes = None if raw_nodes is None else sorted(str(ip) for ip in raw_nodes)
         training = config.actor_rollout_ref.rollout.drafter.training
         transport = training.get("transfer_queue") or {}
-        budget_keys = ("consumer_device_batch_bytes", "consumer_device_prefetch_bytes", "consumer_prefetch_host_bytes",
-                       "consumer_prefetch_batch_bytes", "consumer_prefetch_batches", "consumer_batch_workers",
-                       "consumer_node_reference_owner")
-        record["plan"] = {"nnodes": nnodes, "nproc_per_node": nproc, "node_ips": nodes,
-                          "feature_store": (training.get("feature_store") or {}).get("type"),
-                          "reference_owned_windows": training.get("reference_owned_windows", False),
-                          "per_rank_reference_ack": (getattr(settings, "scheduler", None) or {}).get("per_rank_reference_ack", False),
-                          "release_payload_on_materialization": (getattr(settings, "scheduler", None) or {}).get("release_payload_on_materialization", False),
-                          "commit_gate_timeout": (getattr(settings, "scheduler", None) or {}).get("commit_gate_timeout_seconds", 180),
-                          "prefetch": {key: transport.get(key) for key in budget_keys}}
-        hidden_store = (training.get("target_feature_replay") or {}).get("hidden_states_store") or {}
-        record["plan"]["hidden_backend"] = str(hidden_store.get("backend", "file")).strip().lower()
+        budget_keys = (
+            "consumer_device_batch_bytes",
+            "consumer_device_prefetch_bytes",
+            "consumer_prefetch_host_bytes",
+            "consumer_prefetch_batch_bytes",
+            "consumer_prefetch_batches",
+            "consumer_batch_workers",
+            "consumer_node_reference_owner",
+        )
+        record["plan"] = {
+            "nnodes": nnodes,
+            "nproc_per_node": nproc,
+            "node_ips": nodes,
+            "feature_store": (training.get("feature_store") or {}).get("type"),
+            "reference_owned_windows": training.get("reference_owned_windows", False),
+            "per_rank_reference_ack": (getattr(settings, "scheduler", None) or {}).get(
+                "per_rank_reference_ack", False
+            ),
+            "release_payload_on_materialization": (
+                getattr(settings, "scheduler", None) or {}
+            ).get("release_payload_on_materialization", False),
+            "commit_gate_timeout": (getattr(settings, "scheduler", None) or {}).get(
+                "commit_gate_timeout_seconds", 180
+            ),
+            "prefetch": {key: transport.get(key) for key in budget_keys},
+        }
+        hidden_store = (training.get("target_feature_replay") or {}).get(
+            "hidden_states_store"
+        ) or {}
+        record["plan"]["hidden_backend"] = (
+            str(hidden_store.get("backend", "file")).strip().lower()
+        )
         if record["plan"]["hidden_backend"] == "native":
-            from verl_speco.trainer.tq_feature_store import _plain_dict
+            from verl_speco.trainer.reference_feature_store import _plain_dict
+
             producer = config.speco.get("standalone_tq_producer") or {}
-            record["plan"]["native_reader"] = {"settings": _plain_dict(hidden_store.get("native")),
-                                                "run_id": transport.get("run_id"),
-                                                "publication_after_parent_commit": producer.get("publication_after_parent_commit", False),
-                                                "max_published_references": producer.get("max_published_references", 0),
-                                                "max_reference_execution_slots": producer.get("max_reference_execution_slots", 0)}
+            record["plan"]["native_reader"] = {
+                "settings": _plain_dict(hidden_store.get("native")),
+                "run_id": transport.get("run_id"),
+                "publication_after_parent_commit": producer.get(
+                    "publication_after_parent_commit", False
+                ),
+                "max_published_references": producer.get("max_published_references", 0),
+                "max_reference_execution_slots": producer.get(
+                    "max_reference_execution_slots", 0
+                ),
+            }
         if record["plan"]["per_rank_reference_ack"]:
             record["plan"]["events_available"] = events_available
             record["plan"]["producer_available"] = producer_available
         if transport.get("consumer_node_reference_owner", False):
             import ray
+
             node_id = ray.get_runtime_context().get_node_id()
             if node_id is None or not str(node_id).strip():
                 raise ValueError("Node reference owner requires a verified Ray node ID")
             record["node_owner_node_id"] = str(node_id)
         if nnodes > 1:
             import ray
+
             context = ray.get_runtime_context()
             kind = {"cuda": "GPU", "npu": "NPU"}.get(str(get_device_name()).lower())
             if kind is None:
-                raise ValueError("Multi-node Ray requires CUDA or NPU accelerator placement")
-            record.update(ip=ray.util.get_node_ip_address().strip("[]"),
-                          node_id=str(context.get_node_id()),
-                          accelerators=[str(value) for value in context.get_accelerator_ids().get(kind, [])])
+                raise ValueError(
+                    "Multi-node Ray requires CUDA or NPU accelerator placement"
+                )
+            record.update(
+                ip=ray.util.get_node_ip_address().strip("[]"),
+                node_id=str(context.get_node_id()),
+                accelerators=[
+                    str(value) for value in context.get_accelerator_ids().get(kind, [])
+                ],
+            )
     except Exception as exc:  # All ranks must still enter the collective.
         record["error"] = f"{type(exc).__name__}: {exc}"
     gathered = [None] * world_size
@@ -590,16 +855,25 @@ def _verify_live_trainer_topology(config, *, rank, world_size, scheduled,
         ordered = sorted(gathered, key=lambda item: item["rank"])
         node_ids = []
         for start in range(0, world_size, plan["nproc_per_node"]):
-            ids = {item.get("node_owner_node_id") for item in ordered[start:start + plan["nproc_per_node"]]}
+            ids = {
+                item.get("node_owner_node_id")
+                for item in ordered[start : start + plan["nproc_per_node"]]
+            }
             if len(ids) != 1 or not next(iter(ids)):
-                raise ValueError("Node reference owner ranks must share one verified Ray node")
+                raise ValueError(
+                    "Node reference owner ranks must share one verified Ray node"
+                )
             node_ids.append(next(iter(ids)))
         if len(set(node_ids)) != len(node_ids):
-            raise ValueError("Different node reference owner groups cannot share a Ray node")
+            raise ValueError(
+                "Different node reference owner groups cannot share a Ray node"
+            )
     if plan["nnodes"] > 1:
         if not plan["node_ips"] or len(plan["node_ips"]) != plan["nnodes"]:
             raise ValueError("Configured trainer node count does not match its IP list")
-        _validate_live_trainer_topology(gathered, plan["node_ips"], plan["nproc_per_node"])
+        _validate_live_trainer_topology(
+            gathered, plan["node_ips"], plan["nproc_per_node"]
+        )
 
 
 def run_standalone_draft_training(config) -> dict[str, Any]:
@@ -607,14 +881,25 @@ def run_standalone_draft_training(config) -> dict[str, Any]:
     return asyncio.run(_run_standalone_draft_training_async(config))
 
 
-def _validate_native_reader(*, per_rank_ack, node_reference_owner, owned_windows, tq_cfg, producer_cfg):
-    if (not per_rank_ack or node_reference_owner or owned_windows
-            or int(tq_cfg.get("consumer_batch_workers", 2)) != 0
-            or not (producer_cfg.get("publication_after_parent_commit", False)
-                    or producer_cfg.get("max_published_references", 0)
-                    or producer_cfg.get("max_reference_execution_slots", 0))
-            or (tq_cfg.get("expected_feature") or {}).get("payload_kind") != "vllm_reference"):
-        raise ValueError("Native reader requires scheduled per-rank ACK, producer credits and in-process reference prefetch")
+def _validate_native_reader(
+    *, per_rank_ack, node_reference_owner, owned_windows, tq_cfg, producer_cfg
+):
+    if (
+        not per_rank_ack
+        or node_reference_owner
+        or owned_windows
+        or int(tq_cfg.get("consumer_batch_workers", 2)) != 0
+        or not (
+            producer_cfg.get("publication_after_parent_commit", False)
+            or producer_cfg.get("max_published_references", 0)
+            or producer_cfg.get("max_reference_execution_slots", 0)
+        )
+        or (tq_cfg.get("expected_feature") or {}).get("payload_kind")
+        != "vllm_reference"
+    ):
+        raise ValueError(
+            "Native reader requires scheduled per-rank ACK, producer credits and in-process reference prefetch"
+        )
 
 
 async def _run_standalone_draft_training_async(
@@ -632,17 +917,23 @@ async def _run_standalone_draft_training_async(
         local_rank,
         world_size,
     )
-    _verify_live_trainer_topology(config, rank=rank, world_size=world_size,
-                                  scheduled=scheduled_commands is not None,
-                                  events_available=training_events is not None,
-                                  producer_available=producer_handle is not None)
+    _verify_live_trainer_topology(
+        config,
+        rank=rank,
+        world_size=world_size,
+        scheduled=scheduled_commands is not None,
+        events_available=training_events is not None,
+        producer_available=producer_handle is not None,
+    )
     draft_config = config.actor_rollout_ref
     drafter_cfg = draft_config.rollout.drafter
     training_cfg = drafter_cfg.training
     resume_format = training_cfg.get("checkpoint_resume_format", "tensor")
     if not isinstance(resume_format, str) or resume_format not in {"tensor", "gzip"}:
         raise ValueError("checkpoint_resume_format must be tensor or gzip")
-    _verify_rollback_checkpoint_across_ranks(training_cfg, drafter_cfg.get("model_path"), world_size)
+    _verify_rollback_checkpoint_across_ranks(
+        training_cfg, drafter_cfg.get("model_path"), world_size
+    )
     feature_store_cfg = training_cfg.feature_store
     feature_store_type = (
         str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
@@ -653,66 +944,156 @@ async def _run_standalone_draft_training_async(
     node_reference_owner = tq_cfg.get("consumer_node_reference_owner", False)
     if type(node_reference_owner) is not bool:
         raise ValueError("consumer_node_reference_owner must be a boolean")
-    node_ranks_per_host = int(config.speco.draft_training.get("nproc_per_node", world_size)) if node_reference_owner else 0
-    if node_reference_owner and (feature_store_type != "ray_reference" or node_ranks_per_host < 2
-            or world_size % node_ranks_per_host or not hasattr(os, "memfd_create")):
-        raise ValueError("Node reference owner requires Linux ray_reference with at least two ranks per node")
-    device_batch_bytes = _reference_device_budget(training_cfg.get("transfer_queue") or {}, feature_store_type)
+    node_ranks_per_host = (
+        int(config.speco.draft_training.get("nproc_per_node", world_size))
+        if node_reference_owner
+        else 0
+    )
+    if node_reference_owner and (
+        feature_store_type != "ray_reference"
+        or node_ranks_per_host < 2
+        or world_size % node_ranks_per_host
+        or not hasattr(os, "memfd_create")
+    ):
+        raise ValueError(
+            "Node reference owner requires Linux ray_reference with at least two ranks per node"
+        )
+    device_batch_bytes = _reference_device_budget(
+        training_cfg.get("transfer_queue") or {}, feature_store_type
+    )
     device_prefetch_bytes = _reference_device_prefetch_budget(
-        training_cfg.get("transfer_queue") or {}, feature_store_type, str(get_device_name()).lower(), device_batch_bytes)
+        training_cfg.get("transfer_queue") or {},
+        feature_store_type,
+        str(get_device_name()).lower(),
+        device_batch_bytes,
+    )
     owned_windows = training_cfg.get("reference_owned_windows", False)
     if type(owned_windows) is not bool:
         raise ValueError("reference_owned_windows must be a boolean")
-    if owned_windows and (feature_store_type != "ray_reference" or scheduled_commands is None or training_events is None
-            or str(drafter_cfg.get("speculative_algorithm", "")).lower() != "dspark"
-            or str(((training_cfg.get("target_feature_replay") or {}).get("hidden_states_store") or {}).get("backend", "file")).lower() != "file"
-            or device_prefetch_bytes or (not node_reference_owner and tq_cfg.get("consumer_prefetch_host_bytes", 0))):
-        raise ValueError("Owned windows require scheduled file references, block training and no device prefetch")
+    if owned_windows and (
+        feature_store_type != "ray_reference"
+        or scheduled_commands is None
+        or training_events is None
+        or str(drafter_cfg.get("speculative_algorithm", "")).lower() != "dspark"
+        or str(
+            (
+                (training_cfg.get("target_feature_replay") or {}).get(
+                    "hidden_states_store"
+                )
+                or {}
+            ).get("backend", "file")
+        ).lower()
+        != "file"
+        or device_prefetch_bytes
+        or (not node_reference_owner and tq_cfg.get("consumer_prefetch_host_bytes", 0))
+    ):
+        raise ValueError(
+            "Owned windows require scheduled file references, block training and no device prefetch"
+        )
     scheduler_cfg = config.speco.draft_training.get("scheduler") or {}
     commit_gate_timeout = scheduler_cfg.get("commit_gate_timeout_seconds", 180)
-    if (isinstance(commit_gate_timeout, bool) or not isinstance(commit_gate_timeout, (int, float))
-            or not math.isfinite(commit_gate_timeout) or commit_gate_timeout <= 0):
+    if (
+        isinstance(commit_gate_timeout, bool)
+        or not isinstance(commit_gate_timeout, (int, float))
+        or not math.isfinite(commit_gate_timeout)
+        or commit_gate_timeout <= 0
+    ):
         raise ValueError("commit_gate_timeout_seconds must be a positive finite number")
-    checkpoint_timeout = scheduler_cfg.get("checkpoint_finalization_timeout_seconds", 1800)
-    if (isinstance(checkpoint_timeout, bool) or not isinstance(checkpoint_timeout, (int, float))
-            or not math.isfinite(checkpoint_timeout) or checkpoint_timeout <= 0):
-        raise ValueError("checkpoint_finalization_timeout_seconds must be a positive finite number")
-    producer_options = (config.speco.get("standalone_tq_producer") if hasattr(config.speco, "get")
-                        else getattr(config.speco, "standalone_tq_producer", None)) or {}
-    journal_path = (producer_options.get("reference_lease_journal_path") if hasattr(producer_options, "get")
-                    else getattr(producer_options, "reference_lease_journal_path", None))
+    checkpoint_timeout = scheduler_cfg.get(
+        "checkpoint_finalization_timeout_seconds", 1800
+    )
+    if (
+        isinstance(checkpoint_timeout, bool)
+        or not isinstance(checkpoint_timeout, (int, float))
+        or not math.isfinite(checkpoint_timeout)
+        or checkpoint_timeout <= 0
+    ):
+        raise ValueError(
+            "checkpoint_finalization_timeout_seconds must be a positive finite number"
+        )
+    producer_options = (
+        config.speco.get("standalone_tq_producer")
+        if hasattr(config.speco, "get")
+        else getattr(config.speco, "standalone_tq_producer", None)
+    ) or {}
+    journal_path = (
+        producer_options.get("reference_lease_journal_path")
+        if hasattr(producer_options, "get")
+        else getattr(producer_options, "reference_lease_journal_path", None)
+    )
     lease_snapshot_provider = None
     if journal_path is not None:
-        if (producer_handle is None or scheduled_commands is None or feature_store_type != "ray_reference"
-                or scheduler_cfg.get("per_rank_reference_ack", False) is not True):
-            raise ValueError("Persistent lease checkpoint requires scheduled reference input and a Producer handle")
+        if (
+            producer_handle is None
+            or scheduled_commands is None
+            or feature_store_type != "ray_reference"
+            or scheduler_cfg.get("per_rank_reference_ack", False) is not True
+        ):
+            raise ValueError(
+                "Persistent lease checkpoint requires scheduled reference input and a Producer handle"
+            )
+
         def lease_snapshot_provider():
             import ray
-            return ray.get(producer_handle.reference_lease_snapshot.remote(), timeout=checkpoint_timeout)
+
+            return ray.get(
+                producer_handle.reference_lease_snapshot.remote(),
+                timeout=checkpoint_timeout,
+            )
+
     per_rank_ack = scheduler_cfg.get("per_rank_reference_ack", False)
-    early_payload_release = scheduler_cfg.get("release_payload_on_materialization", False)
-    if type(early_payload_release) is not bool or (early_payload_release and not per_rank_ack):
+    early_payload_release = scheduler_cfg.get(
+        "release_payload_on_materialization", False
+    )
+    if type(early_payload_release) is not bool or (
+        early_payload_release and not per_rank_ack
+    ):
         raise ValueError("release_payload_on_materialization requires per-rank ACK")
-    if (type(per_rank_ack) is not bool or (per_rank_ack and
-            (feature_store_type != "ray_reference" or scheduled_commands is None
-             or training_events is None or producer_handle is None))):
-        raise ValueError("per_rank_reference_ack requires scheduled ray_reference input, events and Producer handle")
-    hidden_store_cfg = (training_cfg.get("target_feature_replay") or {}).get("hidden_states_store") or {}
-    native_reader = str(hidden_store_cfg.get("backend", "file")).strip().lower() == "native"
+    if type(per_rank_ack) is not bool or (
+        per_rank_ack
+        and (
+            feature_store_type != "ray_reference"
+            or scheduled_commands is None
+            or training_events is None
+            or producer_handle is None
+        )
+    ):
+        raise ValueError(
+            "per_rank_reference_ack requires scheduled ray_reference input, events and Producer handle"
+        )
+    hidden_store_cfg = (training_cfg.get("target_feature_replay") or {}).get(
+        "hidden_states_store"
+    ) or {}
+    native_reader = (
+        str(hidden_store_cfg.get("backend", "file")).strip().lower() == "native"
+    )
     if early_payload_release and not native_reader and not owned_windows:
         batch_limit = tq_cfg.get("consumer_prefetch_batch_bytes", 0)
         host_limit = tq_cfg.get("consumer_prefetch_host_bytes", 0)
-        if (device_prefetch_bytes or type(batch_limit) is not int or batch_limit <= 0
-                or type(host_limit) is not int or host_limit < 2 * batch_limit):
-            raise ValueError("Early file/Mooncake release requires a batch byte limit, twice its host budget and no device prefetch")
+        if (
+            device_prefetch_bytes
+            or type(batch_limit) is not int
+            or batch_limit <= 0
+            or type(host_limit) is not int
+            or host_limit < 2 * batch_limit
+        ):
+            raise ValueError(
+                "Early file/Mooncake release requires a batch byte limit, twice its host budget and no device prefetch"
+            )
     if native_reader:
-        _validate_native_reader(per_rank_ack=per_rank_ack, node_reference_owner=node_reference_owner,
-                                owned_windows=owned_windows, tq_cfg=tq_cfg,
-                                producer_cfg=config.speco.get("standalone_tq_producer") or {})
+        _validate_native_reader(
+            per_rank_ack=per_rank_ack,
+            node_reference_owner=node_reference_owner,
+            owned_windows=owned_windows,
+            tq_cfg=tq_cfg,
+            producer_cfg=config.speco.get("standalone_tq_producer") or {},
+        )
     training_mode = (
         str(training_cfg.get("mode", "offline") or "offline").strip().lower()
     )
-    replay_feature_store_types = {"token_replay", "jsonl_token_replay", "jsonl"}
+    validate_standalone_training_source(
+        training_cfg, scheduled_commands=scheduled_commands
+    )
     if feature_store_type not in {"tq", "ray_reference"} and not feature_store_cfg.get(
         "path"
     ):
@@ -722,11 +1103,6 @@ async def _run_standalone_draft_training_async(
     if feature_store_type in {"tq", "ray_reference"} and training_mode != "offline":
         raise ValueError(
             f"feature_store.type={feature_store_type} requires standalone training.mode=offline"
-        )
-    if feature_store_type in replay_feature_store_types and training_mode != "offline":
-        raise ValueError(
-            f"feature_store.type={feature_store_type} is supported only by "
-            "standalone training.mode=offline"
         )
     _disable_standalone_sequence_parallel(draft_config)
     _apply_standalone_fsdp_shard_default(draft_config)
@@ -761,23 +1137,37 @@ async def _run_standalone_draft_training_async(
     trainer._standalone_training_plan = {
         "world_size": world_size,
         "nnodes": int(config.speco.draft_training.get("nnodes", 1)),
-        "nproc_per_node": int(config.speco.draft_training.get("nproc_per_node", world_size)),
+        "nproc_per_node": int(
+            config.speco.draft_training.get("nproc_per_node", world_size)
+        ),
         "algorithm": str(drafter_cfg.get("speculative_algorithm", "")),
         "batch_size_per_gpu": int(training_cfg.get("batch_size_per_gpu", 1)),
-        "gradient_accumulation_steps": int(training_cfg.get("gradient_accumulation_steps", 1)),
+        "gradient_accumulation_steps": int(
+            training_cfg.get("gradient_accumulation_steps", 1)
+        ),
         "seed": int(training_cfg.get("seed", 0) or 0),
         "deterministic_step_rng": training_cfg.get("deterministic_step_rng", False),
-        **_standalone_rng_identity(training_cfg.get("deterministic_step_rng", False), trainer.runtime_device),
+        **_standalone_rng_identity(
+            training_cfg.get("deterministic_step_rng", False), trainer.runtime_device
+        ),
         "balance_by_tokens": scheduler_cfg.get("balance_by_tokens", False),
         "tail_policy": scheduler_cfg.get("tail_policy", "drop"),
-        "recipe": _standalone_recipe_across_ranks(training_cfg, draft_config.model.get("path"), world_size),
+        "recipe": _standalone_recipe_across_ranks(
+            training_cfg, draft_config.model.get("path"), world_size
+        ),
     }
     retention_keep = training_cfg.get("checkpoint_retention_keep_last", 0)
     retention_delete = training_cfg.get("checkpoint_retention_delete", False)
     retention_inherit = training_cfg.get("checkpoint_retention_inherit_run", False)
-    retention_settings = (retention_keep, retention_delete, training_cfg.get("checkpoint_directory_exclusive", False),
-                          retention_inherit)
-    _validate_checkpoint_retention_across_ranks(retention_settings, rank=rank, device=trainer.runtime_device)
+    retention_settings = (
+        retention_keep,
+        retention_delete,
+        training_cfg.get("checkpoint_directory_exclusive", False),
+        retention_inherit,
+    )
+    _validate_checkpoint_retention_across_ranks(
+        retention_settings, rank=rank, device=trainer.runtime_device
+    )
     trainer._standalone_retention_keep_last = retention_keep
     trainer._standalone_retention_delete = retention_delete
     trainer._standalone_retention_run_id = uuid.uuid4().hex
@@ -790,10 +1180,16 @@ async def _run_standalone_draft_training_async(
     snapshot_interval = training_cfg.get("trainable_snapshot_interval_steps", 0)
     snapshot_max_bytes = training_cfg.get("trainable_snapshot_max_bytes", 0)
     if type(snapshot_interval) is not int or snapshot_interval < 0:
-        raise ValueError("trainable_snapshot_interval_steps must be a non-negative integer")
-    if snapshot_interval and not _all_ranks_true(bool(getattr(trainer, "checkpoint_dir", None)), trainer.runtime_device):
+        raise ValueError(
+            "trainable_snapshot_interval_steps must be a non-negative integer"
+        )
+    if snapshot_interval and not _all_ranks_true(
+        bool(getattr(trainer, "checkpoint_dir", None)), trainer.runtime_device
+    ):
         raise ValueError("Trainable snapshot export requires a checkpoint directory")
-    token_window = StandaloneTokenWindow(training_cfg.get("token_metrics_interval_steps", 50))
+    token_window = StandaloneTokenWindow(
+        training_cfg.get("token_metrics_interval_steps", 50)
+    )
     successful_steps = 0
     initial_optimizer_step = 0
     optimizer_step = 0
@@ -804,24 +1200,28 @@ async def _run_standalone_draft_training_async(
     resume_metadata = None
     standalone_input_path = _standalone_input_path(config)
     trainer._standalone_retention_protected = tuple(
-        str(path) for path in (drafter_cfg.get("model_path"), standalone_input_path) if path
+        str(path)
+        for path in (drafter_cfg.get("model_path"), standalone_input_path)
+        if path
     )
     standalone_producer_shuffle = _standalone_producer_shuffle(config)
     trainer.combine_standalone_metrics = feature_store_type == "ray_reference"
     trainer._standalone_checkpoint_timeout = float(checkpoint_timeout)
     store = None
-    feature_replayer = None
-    feature_producer = None
-    tq_prefetch: TQPrefetchIterator | ReferenceBatchPrefetchIterator | None = None
-    device_prefetch: ReferenceDevicePrefetchIterator | None = None
+    tq_prefetch: StandalonePrefetchIterator | ReferenceBatchPrefetchIterator | None = (
+        None
+    )
+    device_prefetch = None
     tq_prefetch_group = None
     batch_finalizer = None
     checkpoint_directory_lease = None
     current_stage = "activate_training_model"
     try:
         checkpoint_directory_lease = _acquire_checkpoint_directory_across_ranks(
-            getattr(trainer, "checkpoint_dir", None), training_cfg.get("checkpoint_directory_exclusive", False),
-            rank=rank, device=trainer.runtime_device,
+            getattr(trainer, "checkpoint_dir", None),
+            training_cfg.get("checkpoint_directory_exclusive", False),
+            rank=rank,
+            device=trainer.runtime_device,
         )
         trainer._standalone_checkpoint_directory_lease = checkpoint_directory_lease
         # Scheduled Ray training delegates tracking to its Driver, which also
@@ -850,11 +1250,16 @@ async def _run_standalone_draft_training_async(
         snapshot_init = training_cfg.get("trainable_snapshot_initialization_path")
         if feature_store_type in {"tq", "ray_reference"}:
             consumed_sequence_nos, resume_metadata = _load_resume_across_ranks(
-                drafter_cfg.get("model_path"), standalone_input_path, initial_optimizer_step,
-                trainer._standalone_training_plan, world_size,
+                drafter_cfg.get("model_path"),
+                standalone_input_path,
+                initial_optimizer_step,
+                trainer._standalone_training_plan,
+                world_size,
             )
             if feature_store_type == "ray_reference":
-                trainer._standalone_input_identity = _input_identity_across_ranks(standalone_input_path, world_size)
+                trainer._standalone_input_identity = _input_identity_across_ranks(
+                    standalone_input_path, world_size
+                )
             logger.info(
                 "[standalone rank=%s] resume progress optimizer_step=%s consumed=%s",
                 rank,
@@ -862,18 +1267,35 @@ async def _run_standalone_draft_training_async(
                 len(consumed_sequence_nos),
             )
         if retention_inherit:
-            trainer._standalone_retention_run_id = _retention_resume_identity_across_ranks(
-                getattr(trainer, "checkpoint_dir", None), drafter_cfg.get("model_path"), initial_optimizer_step,
-                resume_metadata, world_size)
+            trainer._standalone_retention_run_id = (
+                _retention_resume_identity_across_ranks(
+                    getattr(trainer, "checkpoint_dir", None),
+                    drafter_cfg.get("model_path"),
+                    initial_optimizer_step,
+                    resume_metadata,
+                    world_size,
+                )
+            )
         if snapshot_init is not None:
             current_stage = "initialize_trainable_snapshot"
             optimizer = getattr(trainer, "optimizer", None)
-            fresh = (initial_optimizer_step == 0 and not consumed_sequence_nos and optimizer is not None
-                     and hasattr(optimizer, "state") and not bool(optimizer.state))
+            fresh = (
+                initial_optimizer_step == 0
+                and not consumed_sequence_nos
+                and optimizer is not None
+                and hasattr(optimizer, "state")
+                and not bool(optimizer.state)
+            )
             if not _all_ranks_true(fresh, trainer.runtime_device):
-                raise ValueError("Trainable snapshot initialization requires fresh optimizer and data progress on every rank")
-            _load_trainable_snapshot_across_ranks(trainer, snapshot_init, device=trainer.runtime_device,
-                                                   max_bytes=snapshot_max_bytes)
+                raise ValueError(
+                    "Trainable snapshot initialization requires fresh optimizer and data progress on every rank"
+                )
+            _load_trainable_snapshot_across_ranks(
+                trainer,
+                snapshot_init,
+                device=trainer.runtime_device,
+                max_bytes=snapshot_max_bytes,
+            )
 
         current_stage = "open_feature_store"
         stage_started = time.perf_counter()
@@ -883,23 +1305,22 @@ async def _run_standalone_draft_training_async(
             feature_store_type,
             feature_store_cfg.get("path"),
         )
-        if feature_store_type in {"jsonl_token_replay", "jsonl"} and not (
-            feature_store_cfg.get("tokenizer_path")
-        ):
-            tokenizer_path = draft_config.model.path
-            try:
-                feature_store_cfg.tokenizer_path = tokenizer_path
-            except AttributeError:
-                feature_store_cfg["tokenizer_path"] = tokenizer_path
         store_error = None
         native_store = None
         try:
             if native_reader:
-                from verl_speco.producer.hidden_states_store import build_managed_native_reader
-                from verl_speco.trainer.tq_feature_store import _plain_dict
+                from verl_speco.producer.hidden_states_store import (
+                    build_managed_native_reader,
+                )
+                from verl_speco.trainer.reference_feature_store import _plain_dict
+
                 native_store = build_managed_native_reader(
-                    _plain_dict(hidden_store_cfg.get("native")), run_id=str(tq_cfg.get("run_id") or ""),
-                    rank=rank, world_size=world_size, device=trainer.runtime_device)
+                    _plain_dict(hidden_store_cfg.get("native")),
+                    run_id=str(tq_cfg.get("run_id") or ""),
+                    rank=rank,
+                    world_size=world_size,
+                    device=trainer.runtime_device,
+                )
             store = build_feature_store_from_config(
                 feature_store_cfg,
                 read_only=True,
@@ -908,6 +1329,12 @@ async def _run_standalone_draft_training_async(
                     training_cfg.get("target_feature_replay") or {}
                 ).get("hidden_states_store"),
                 hidden_states_store=native_store,
+                reference_lifetime=(
+                    "persistent"
+                    if config.speco.draft_training.get("data_source", "online")
+                    == "saved_hidden"
+                    else "temporary"
+                ),
             )
         except Exception as exc:
             if native_store is not None:
@@ -915,9 +1342,15 @@ async def _run_standalone_draft_training_async(
             store_error = exc
         if feature_store_type in {"tq", "ray_reference"}:
             if not _all_ranks_true(store_error is None, trainer.runtime_device):
-                raise RuntimeError("Feature store construction failed on at least one rank") from store_error
+                raise RuntimeError(
+                    "Feature store construction failed on at least one rank"
+                ) from store_error
         elif store_error is not None:
             raise store_error
+        if store is None:
+            raise RuntimeError(
+                "Feature store construction returned no store"
+            ) from store_error
         if feature_store_type in {"tq", "ray_reference"}:
             current_stage = "connect_feature_store"
             _connect_tq_store_across_ranks(
@@ -927,46 +1360,26 @@ async def _run_standalone_draft_training_async(
             )
         if feature_store_type == "ray_reference":
             current_stage = "verify_shared_file_root"
-            _verify_shared_file_root_across_ranks(store, producer_handle, rank=rank, device=trainer.runtime_device,
-                                                   timeout=float(tq_cfg.get("io_timeout_seconds", 30)))
+            _verify_shared_file_root_across_ranks(
+                store,
+                producer_handle,
+                rank=rank,
+                device=trainer.runtime_device,
+                timeout=float(tq_cfg.get("io_timeout_seconds", 30)),
+            )
         logger.info(
             "[standalone rank=%s] feature store opened elapsed=%.3fs",
             rank,
             time.perf_counter() - stage_started,
         )
-        if feature_store_type in replay_feature_store_types:
-            # Keep the large target model entirely outside online training imports
-            # and lifetime. The standalone loop materializes ordinary feature
-            # samples before handing them to the shared trainer.
-            from verl_speco.trainer.target_feature_replay import (
-                TargetFeatureReplayer,
-            )
-
-            current_stage = "initialize_target_feature_replayer"
-            stage_started = time.perf_counter()
-            logger.info(
-                "[standalone rank=%s] initializing target feature replayer",
-                rank,
-            )
-            feature_replayer = TargetFeatureReplayer(
-                config,
-                rank=rank,
-                world_size=world_size,
-                device=trainer.runtime_device,
-            )
-            logger.info(
-                "[standalone rank=%s] target feature replayer initialized "
-                "backend=%s elapsed=%.3fs",
-                rank,
-                feature_replayer.backend,
-                time.perf_counter() - stage_started,
-            )
         current_stage = "create_dataloader"
         loader: Any
         if feature_store_type in {"tq", "ray_reference"}:
             depth = prefetch_depth(tq_cfg)
             if feature_store_type == "ray_reference" and rank == 0:
-                batch_finalizer = AsyncBatchFinalizer(capacity=depth + 1, timeout=commit_gate_timeout)
+                batch_finalizer = AsyncBatchFinalizer(
+                    capacity=depth + 1, timeout=commit_gate_timeout
+                )
             hidden_references = (tq_cfg.get("expected_feature") or {}).get(
                 "payload_kind"
             ) == "vllm_reference"
@@ -986,7 +1399,9 @@ async def _run_standalone_draft_training_async(
                     )
                 algorithm = str(drafter_cfg.speculative_algorithm).lower()
                 packing_cfg = training_cfg.get("packing") or {}
-                streaming_prepare = training_cfg.get("reference_streaming_prepare", False)
+                streaming_prepare = training_cfg.get(
+                    "reference_streaming_prepare", False
+                )
                 if type(streaming_prepare) is not bool:
                     raise ValueError("reference_streaming_prepare must be a boolean")
                 prepare_batch = partial(
@@ -1038,7 +1453,14 @@ async def _run_standalone_draft_training_async(
                         )
                     ),
                 )
-            loader = TQFeatureDataLoader(
+            loader_cls: Any
+            if feature_store_type == "ray_reference":
+                loader_cls = ReferenceFeatureDataLoader
+            else:
+                from verl_speco.trainer.tq_sample_source import TQFeatureDataLoader
+
+                loader_cls = TQFeatureDataLoader
+            loader = loader_cls(
                 store,
                 batch_size=int(training_cfg.get("batch_size_per_gpu", 4)),
                 rank=rank,
@@ -1052,8 +1474,12 @@ async def _run_standalone_draft_training_async(
                 io_retry_max_attempts=int(tq_cfg.get("io_retry_max_attempts", 3)),
                 io_timeout_seconds=float(tq_cfg.get("io_timeout_seconds", 30)),
                 prepare_batch=prepare_batch,
-                reference_command_max_bytes=scheduler_cfg.get("reference_command_max_bytes", 256 * 1024 * 1024),
-                reference_command_frame_bytes=scheduler_cfg.get("reference_command_frame_bytes", 4 * 1024 * 1024),
+                reference_command_max_bytes=scheduler_cfg.get(
+                    "reference_command_max_bytes", 256 * 1024 * 1024
+                ),
+                reference_command_frame_bytes=scheduler_cfg.get(
+                    "reference_command_frame_bytes", 4 * 1024 * 1024
+                ),
                 node_ranks_per_host=node_ranks_per_host,
                 # References are released only after materialization ACK and
                 # all-rank optimizer success, never in background readers.
@@ -1068,9 +1494,18 @@ async def _run_standalone_draft_training_async(
                             {
                                 "kind": "consumer_ready",
                                 "initial_optimizer_step": initial_optimizer_step,
-                                **({"input_identity": trainer._standalone_input_identity}
-                                   if getattr(trainer, "_standalone_input_identity", None) is not None
-                                   else {"input_identity_unavailable": True} if feature_store_type == "ray_reference" else {}),
+                                **(
+                                    {
+                                        "input_identity": trainer._standalone_input_identity
+                                    }
+                                    if getattr(
+                                        trainer, "_standalone_input_identity", None
+                                    )
+                                    is not None
+                                    else {"input_identity_unavailable": True}
+                                    if feature_store_type == "ray_reference"
+                                    else {}
+                                ),
                             },
                         ),
                         name="Consumer ready event",
@@ -1136,8 +1571,14 @@ async def _run_standalone_draft_training_async(
         if device_prefetch_bytes and prefetch_host_bytes:
             # One pinned batch is held outside the source queue during copy.
             prefetch_host_bytes -= prefetch_batch_bytes
-        if ((prefetch_host_bytes or prefetch_batch_bytes) and
-                (feature_store_type != "ray_reference" or (not depth and not early_payload_release and not (owned_windows and node_reference_owner)))):
+        if (prefetch_host_bytes or prefetch_batch_bytes) and (
+            feature_store_type != "ray_reference"
+            or (
+                not depth
+                and not early_payload_release
+                and not (owned_windows and node_reference_owner)
+            )
+        ):
             raise ValueError("Prefetch host byte limits require ray_reference prefetch")
         if owned_windows:
             sample_source = loader.iter_assignments()
@@ -1167,8 +1608,10 @@ async def _run_standalone_draft_training_async(
                 )
             else:
                 if node_reference_owner:
-                    raise ValueError("Node reference owner requires a process prefetch worker")
-                tq_prefetch = TQPrefetchIterator(
+                    raise ValueError(
+                        "Node reference owner requires a process prefetch worker"
+                    )
+                tq_prefetch = StandalonePrefetchIterator(
                     loader,
                     depth,
                     pin_memory=hidden_references,
@@ -1180,54 +1623,22 @@ async def _run_standalone_draft_training_async(
             sample_source = tq_prefetch
             if device_prefetch_bytes:
                 device_prefetch = ReferenceDevicePrefetchIterator(
-                    tq_prefetch, device=trainer.runtime_device, backend=get_torch_device(),
-                    max_batch_bytes=device_batch_bytes, close_timeout=prefetch_options["close_timeout"],
+                    tq_prefetch,
+                    device=trainer.runtime_device,
+                    backend=get_torch_device(),
+                    max_batch_bytes=device_batch_bytes,
+                    close_timeout=prefetch_options["close_timeout"],
                 )
                 sample_source = device_prefetch
-        pipeline_cfg = training_cfg.get("target_feature_pipeline", {}) or {}
-        pipeline_enabled = bool(pipeline_cfg.get("enabled", False))
-        if feature_store_type in {"tq", "ray_reference"} and pipeline_enabled:
-            raise ValueError(
-                "feature_store.type=tq already contains target hidden states and cannot be "
-                "combined with target_feature_pipeline.enabled=true"
-            )
-        if pipeline_enabled:
-            if feature_replayer is None or not feature_replayer.backend.startswith(
-                "vllm_"
-            ):
-                raise ValueError(
-                    "target_feature_pipeline.enabled=true requires a vLLM replay "
-                    "backend (vllm_file)"
-                )
-            from verl_speco.trainer.target_feature_pipeline import (
-                TargetFeatureProducer,
-            )
-
-            feature_producer = TargetFeatureProducer(
-                loader,
-                feature_replayer,
-                rank=rank,
-                concurrency=max(
-                    math.ceil(
-                        int(pipeline_cfg.get("concurrency", 16) or 16) / world_size
-                    ),
-                    1,
-                ),
-                producer_prefetch_depth=int(
-                    pipeline_cfg.get("producer_prefetch_depth", 4) or 4
-                ),
-                prefetch_depth=int(pipeline_cfg.get("prefetch_depth", 2) or 2),
-                queue_timeout=float(pipeline_cfg.get("queue_timeout", 300.0) or 300.0),
-            )
-            sample_source = feature_producer
         sample_iterator = iter(sample_source)
         while max_steps <= 0 or optimizer_step < max_steps:
             load_started = time.perf_counter()
             commit_gate_seconds = 0.0
             if feature_store_type == "ray_reference" and successful_steps:
                 current_stage = "wait_previous_batch_commit"
-                _drain_batch_finalizer_across_ranks(batch_finalizer, trainer.runtime_device,
-                                                    timeout=commit_gate_timeout)
+                _drain_batch_finalizer_across_ranks(
+                    batch_finalizer, trainer.runtime_device, timeout=commit_gate_timeout
+                )
                 commit_gate_seconds = time.perf_counter() - load_started
             current_stage = "load_next_batch"
             fetch_started = time.perf_counter()
@@ -1236,21 +1647,32 @@ async def _run_standalone_draft_training_async(
                 sample_iterator,
                 rank=rank,
                 device=trainer.runtime_device,
-                require_prepared=feature_store_type == "ray_reference" and not owned_windows,
+                require_prepared=feature_store_type == "ray_reference"
+                and not owned_windows,
                 require_reference_metadata=owned_windows,
                 node_ranks_per_host=node_ranks_per_host if owned_windows else 0,
-                expected_input_identity=getattr(trainer, "_standalone_input_identity", None),
+                expected_input_identity=getattr(
+                    trainer, "_standalone_input_identity", None
+                ),
                 timings=fetch_timings,
             )
             batch_ready_wait_seconds = time.perf_counter() - fetch_started
             if loaded_batch is None:
                 break
             tq_local_batch = (
-                loaded_batch if isinstance(loaded_batch, TQLocalBatch) else None
+                loaded_batch if isinstance(loaded_batch, StandaloneLocalBatch) else None
             )
-            if feature_store_type == "ray_reference" and tq_local_batch is not None and tq_local_batch.input_identity is not None:
+            if (
+                feature_store_type == "ray_reference"
+                and tq_local_batch is not None
+                and tq_local_batch.input_identity is not None
+            ):
                 trainer._standalone_input_identity = tq_local_batch.input_identity
-            if feature_store_type == "ray_reference" and training_events is not None and not owned_windows:
+            if (
+                feature_store_type == "ray_reference"
+                and training_events is not None
+                and not owned_windows
+            ):
                 if early_payload_release and not native_reader:
                     detach_error = None
                     try:
@@ -1258,11 +1680,19 @@ async def _run_standalone_draft_training_async(
                         loaded_batch = tq_local_batch
                     except Exception as exc:
                         detach_error = exc
-                    if not _all_ranks_true(detach_error is None, trainer.runtime_device):
-                        raise RuntimeError("Independent reference copy failed on at least one rank; source retained") from detach_error
+                    if not _all_ranks_true(
+                        detach_error is None, trainer.runtime_device
+                    ):
+                        raise RuntimeError(
+                            "Independent reference copy failed on at least one rank; source retained"
+                        ) from detach_error
                 _ack_reference_materialization_across_ranks(
-                    tq_local_batch, rank=rank, device=trainer.runtime_device,
-                    events=training_events, config=tq_cfg, per_rank=per_rank_ack,
+                    tq_local_batch,
+                    rank=rank,
+                    device=trainer.runtime_device,
+                    events=training_events,
+                    config=tq_cfg,
+                    per_rank=per_rank_ack,
                     producer_handle=producer_handle,
                     **({"source_payload_safe": True} if early_payload_release else {}),
                 )
@@ -1308,59 +1738,20 @@ async def _run_standalone_draft_training_async(
                     else len(samples),
                     successful_steps,
                 )
-            current_stage = "materialize_target_features"
-            if feature_replayer is None and _contains_replay_samples(samples):
-                logger.warning(
-                    "[standalone rank=%s] feature store type=%s yielded replay "
-                    "samples without an initialized target feature replayer; "
-                    "initializing replayer lazily",
-                    rank,
-                    feature_store_type,
-                )
-                from verl_speco.trainer.target_feature_replay import (
-                    TargetFeatureReplayer,
-                )
-
-                feature_replayer = TargetFeatureReplayer(
-                    config,
-                    rank=rank,
-                    world_size=world_size,
-                    device=trainer.runtime_device,
-                )
-            if feature_replayer is not None and feature_producer is None:
-                materialize_started = time.perf_counter()
-                if log_batch_progress:
-                    logger.info(
-                        "[standalone rank=%s] batch=%s materializing target features "
-                        "backend=%s",
-                        rank,
-                        attempted_batches,
-                        feature_replayer.backend,
-                    )
-                materialized_samples = feature_replayer.materialize(samples)
-                if log_batch_progress:
-                    logger.info(
-                        "[standalone rank=%s] batch=%s target features materialized "
-                        "samples=%s elapsed=%.3fs",
-                        rank,
-                        attempted_batches,
-                        len(materialized_samples),
-                        time.perf_counter() - materialize_started,
-                    )
-            else:
-                materialized_samples = samples
             current_stage = "prepare_training_batch"
             batch: dict[str, Any] | None
             batch_prepare_started = time.perf_counter()
             if owned_windows:
                 batch = {}  # File parts are materialized during the training step.
-            elif tq_local_batch is not None and tq_local_batch.prepared_batch is not None:
+            elif (
+                tq_local_batch is not None and tq_local_batch.prepared_batch is not None
+            ):
                 batch = tq_local_batch.prepared_batch
                 # Background work is not part of this main-thread wall time.
                 batch_prepare_seconds = 0.0
             else:
                 batch = trainer.prepare_training_batch_from_samples(
-                    cast(list[Any], materialized_samples),
+                    cast(list[Any], samples),
                     step=optimizer_step,
                 )
                 batch_prepare_seconds = time.perf_counter() - batch_prepare_started
@@ -1392,23 +1783,41 @@ async def _run_standalone_draft_training_async(
                     optimizer_step,
                 )
             if trainer._standalone_training_plan["deterministic_step_rng"]:
-                _seed_standalone_step(trainer._standalone_training_plan["seed"], optimizer_step, rank)
+                _seed_standalone_step(
+                    trainer._standalone_training_plan["seed"], optimizer_step, rank
+                )
             train_started = time.perf_counter()
             if owned_windows:
-                token_counts = {}
+                token_counts: dict[str, int] = {}
+                assert prepare_batch is not None
                 ok = await _execute_owned_reference_batch(
-                    trainer, store, tq_local_batch, optimizer_step, rank=rank, device=trainer.runtime_device,
-                    events=training_events, transport_config=tq_cfg, per_rank=per_rank_ack,
+                    trainer,
+                    store,
+                    tq_local_batch,
+                    optimizer_step,
+                    rank=rank,
+                    device=trainer.runtime_device,
+                    events=training_events,
+                    transport_config=tq_cfg,
+                    per_rank=per_rank_ack,
                     **({"source_payload_safe": True} if early_payload_release else {}),
-                    producer_handle=producer_handle, max_window=training_cfg.get("dspark_max_window"),
-                    max_host_bytes=prefetch_batch_bytes, max_device_bytes=device_batch_bytes, token_counts=token_counts,
-                    packing=prepare_batch.keywords["packing"], packing_block_size=prepare_batch.keywords["block_size"],
-                    max_packed_len=prepare_batch.keywords["max_packed_len"], node_ranks_per_host=node_ranks_per_host,
+                    producer_handle=producer_handle,
+                    max_window=training_cfg.get("dspark_max_window"),
+                    max_host_bytes=prefetch_batch_bytes,
+                    max_device_bytes=device_batch_bytes,
+                    token_counts=token_counts,
+                    packing=prepare_batch.keywords["packing"],
+                    packing_block_size=prepare_batch.keywords["block_size"],
+                    max_packed_len=prepare_batch.keywords["max_packed_len"],
+                    node_ranks_per_host=node_ranks_per_host,
                 )
                 batch["_speco_token_counts"] = token_counts
             elif feature_store_type == "ray_reference":
                 ok = await _reference_training_step_across_ranks(
-                    trainer, batch, optimizer_step, device=trainer.runtime_device,
+                    trainer,
+                    batch,
+                    optimizer_step,
+                    device=trainer.runtime_device,
                     max_device_bytes=device_batch_bytes,
                 )
             else:
@@ -1436,7 +1845,7 @@ async def _run_standalone_draft_training_async(
                 current_stage = "finalize_completed_batch"
                 tq_clear_started = time.perf_counter()
                 _clear_tq_batch_across_ranks(
-                    cast(TQFeatureDataLoader, loader),
+                    loader,
                     tq_local_batch.global_keys,
                     rank=rank,
                     device=trainer.runtime_device,
@@ -1450,11 +1859,14 @@ async def _run_standalone_draft_training_async(
                     },
                     finalizer=batch_finalizer,
                     synchronize=feature_store_type != "ray_reference",
-                    cleanup_after_load=tq_local_batch.cleanup_after_load or early_payload_release,
+                    cleanup_after_load=tq_local_batch.cleanup_after_load
+                    or early_payload_release,
                     synchronize_before_cleanup=(
                         feature_store_type == "ray_reference"
-                        and (int(config.speco.draft_training.nnodes) > 1
-                             or tq_local_batch.has_padding_ranks)
+                        and (
+                            int(config.speco.draft_training.nnodes) > 1
+                            or tq_local_batch.has_padding_ranks
+                        )
                     ),
                 )
                 tq_clear_seconds = time.perf_counter() - tq_clear_started
@@ -1482,11 +1894,17 @@ async def _run_standalone_draft_training_async(
             if feature_store_type == "ray_reference":
                 step_metrics["perf/commit_gate_wait_time"] = commit_gate_seconds
             if feature_store_type == "ray_reference":
-                step_metrics.update(token_window.update(
-                    batch.get("_speco_token_counts"), successful_steps=successful_steps,
-                    optimizer_step=optimizer_step, max_steps=max_steps, start_time=load_started,
-                    device=trainer.runtime_device, world_size=world_size,
-                ))
+                step_metrics.update(
+                    token_window.update(
+                        batch.get("_speco_token_counts"),
+                        successful_steps=successful_steps,
+                        optimizer_step=optimizer_step,
+                        max_steps=max_steps,
+                        start_time=load_started,
+                        device=trainer.runtime_device,
+                        world_size=world_size,
+                    )
+                )
             if tq_local_batch is not None:
                 step_metrics["perf/batch_ready_wait_time"] = batch_ready_wait_seconds
                 step_metrics.update(
@@ -1505,10 +1923,6 @@ async def _run_standalone_draft_training_async(
                     step_metrics["perf/loader_batch_prepare_time"] = float(
                         tq_local_batch.batch_prepare_seconds
                     )
-            if feature_replayer is not None:
-                step_metrics.update(feature_replayer.metrics())
-            if feature_producer is not None:
-                step_metrics.update(feature_producer.metrics())
             _log_standalone_step_metrics(step_metrics, rank=rank)
             tracking_metrics = _select_standalone_tracking_metrics(step_metrics)
             if training_events is not None and rank == 0:
@@ -1533,17 +1947,28 @@ async def _run_standalone_draft_training_async(
                 current_stage = "save_trainable_snapshot"
                 snapshot_started = time.perf_counter()
                 if feature_store_type == "ray_reference":
-                    _drain_batch_finalizer_across_ranks(batch_finalizer, trainer.runtime_device,
-                                                        timeout=commit_gate_timeout)
-                _save_trainable_snapshot_across_ranks(trainer, optimizer_step, device=trainer.runtime_device,
-                                                       max_bytes=snapshot_max_bytes)
+                    _drain_batch_finalizer_across_ranks(
+                        batch_finalizer,
+                        trainer.runtime_device,
+                        timeout=commit_gate_timeout,
+                    )
+                _save_trainable_snapshot_across_ranks(
+                    trainer,
+                    optimizer_step,
+                    device=trainer.runtime_device,
+                    max_bytes=snapshot_max_bytes,
+                )
                 if feature_store_type == "ray_reference":
-                    token_window.record_checkpoint(time.perf_counter() - snapshot_started)
+                    token_window.record_checkpoint(
+                        time.perf_counter() - snapshot_started
+                    )
             if save_interval > 0 and optimizer_step % save_interval == 0:
                 checkpoint_block_started = time.perf_counter()
                 if feature_store_type == "ray_reference":
                     _drain_batch_finalizer_across_ranks(
-                        batch_finalizer, trainer.runtime_device, timeout=commit_gate_timeout
+                        batch_finalizer,
+                        trainer.runtime_device,
+                        timeout=commit_gate_timeout,
                     )
                 _sync_standalone_export_error(trainer, trainer.runtime_device)
                 current_stage = "save_checkpoint"
@@ -1581,14 +2006,18 @@ async def _run_standalone_draft_training_async(
                     last_saved_step = optimizer_step
                 _barrier()
                 if feature_store_type == "ray_reference":
-                    token_window.record_checkpoint(time.perf_counter() - checkpoint_block_started)
+                    token_window.record_checkpoint(
+                        time.perf_counter() - checkpoint_block_started
+                    )
             if device_prefetch is not None:
                 # Release the previous input before taking the next one, so the
                 # lookahead owns no more than the current and one future batch.
                 del batch, loaded_batch, tq_local_batch
             current_stage = "load_next_batch"
         if feature_store_type == "ray_reference":
-            _drain_batch_finalizer_across_ranks(batch_finalizer, trainer.runtime_device, timeout=commit_gate_timeout)
+            _drain_batch_finalizer_across_ranks(
+                batch_finalizer, trainer.runtime_device, timeout=commit_gate_timeout
+            )
         # Catch an export failure reported after the last in-loop check, before
         # the final save can succeed and end the run as a silent partial export.
         _sync_standalone_export_error(trainer, trainer.runtime_device)
@@ -1630,15 +2059,25 @@ async def _run_standalone_draft_training_async(
             if feature_store_type == "ray_reference":
                 token_window.record_checkpoint(time.perf_counter() - checkpoint_started)
         if feature_store_type == "ray_reference" and successful_steps:
-            run_metrics = token_window.finish(device=trainer.runtime_device, world_size=world_size)
+            run_metrics = token_window.finish(
+                device=trainer.runtime_device, world_size=world_size
+            )
             if run_metrics and training_events is not None and rank == 0:
-                event = {"kind": "training_metrics", "step": optimizer_step, "metrics": run_metrics}
+                event = {
+                    "kind": "training_metrics",
+                    "step": optimizer_step,
+                    "metrics": run_metrics,
+                }
                 if batch_finalizer is not None:
-                    _submit_standalone_metrics(batch_finalizer, training_events, event, tq_cfg)
+                    _submit_standalone_metrics(
+                        batch_finalizer, training_events, event, tq_cfg
+                    )
                 else:
                     training_events.put(event)
             elif run_metrics and training_events is None:
-                _log_standalone_tracking_metrics(standalone_trackers, run_metrics, step=optimizer_step)
+                _log_standalone_tracking_metrics(
+                    standalone_trackers, run_metrics, step=optimizer_step
+                )
     except Exception as training_error:
         logger.exception(
             "[standalone rank=%s] training failed stage=%s attempted_batches=%s "
@@ -1681,8 +2120,6 @@ async def _run_standalone_draft_training_async(
             attempted_batches,
             successful_steps,
         )
-        if feature_producer is not None:
-            feature_producer.close()
         if device_prefetch is not None:
             try:
                 device_prefetch.close()
@@ -1696,10 +2133,15 @@ async def _run_standalone_draft_training_async(
             except Exception as error:  # noqa: BLE001 - still release the remaining resources
                 prefetch_cleanup_error = error
                 logger.exception("Failed to close TQ prefetch thread")
-        prefetch_running = any(bool(getattr(prefetch, "has_running_work", False))
-                               for prefetch in (device_prefetch, tq_prefetch) if prefetch is not None)
+        prefetch_running = any(
+            bool(getattr(prefetch, "has_running_work", False))
+            for prefetch in (device_prefetch, tq_prefetch)
+            if prefetch is not None
+        )
         if prefetch_running and prefetch_cleanup_error is None:
-            prefetch_cleanup_error = RuntimeError("Prefetch work is still running after shutdown")
+            prefetch_cleanup_error = RuntimeError(
+                "Prefetch work is still running after shutdown"
+            )
         if tq_prefetch_group is not None and not prefetch_running:
             try:
                 dist.destroy_process_group(tq_prefetch_group)
@@ -1707,49 +2149,81 @@ async def _run_standalone_draft_training_async(
                 if prefetch_cleanup_error is None:
                     prefetch_cleanup_error = error
                 logger.exception("Failed to destroy TQ prefetch process group")
-        if feature_replayer is not None and not prefetch_running:
-            feature_replayer.close()
         if store is not None:
-            if prefetch_running or (batch_finalizer is not None and batch_finalizer.has_running_work):
-                logger.error("Preserving the reference store while background I/O remains in flight")
+            if prefetch_running or (
+                batch_finalizer is not None and batch_finalizer.has_running_work
+            ):
+                logger.error(
+                    "Preserving the reference store while background I/O remains in flight"
+                )
             else:
                 store.close()
         finalization = getattr(trainer, "_standalone_finalization_event", None)
         checkpoint_wait_started = time.monotonic()
-        checkpoint_wait_timeout = getattr(trainer, "_standalone_checkpoint_timeout", None)
+        checkpoint_wait_timeout = getattr(
+            trainer, "_standalone_checkpoint_timeout", None
+        )
         checkpoint_running = False
         if finalization is not None:
-            if original_error is not None or prefetch_cleanup_error is not None or prefetch_running:
+            if (
+                original_error is not None
+                or prefetch_cleanup_error is not None
+                or prefetch_running
+            ):
                 checkpoint_running = not finalization.is_set()
             else:
-                checkpoint_running = not finalization.wait(timeout=checkpoint_wait_timeout)
+                checkpoint_running = not finalization.wait(
+                    timeout=checkpoint_wait_timeout
+                )
                 if checkpoint_running and prefetch_cleanup_error is None:
-                    prefetch_cleanup_error = TimeoutError("Checkpoint finalization did not stop before its deadline")
-        pending_saves = [future for future in (getattr(trainer, "_pending_full_checkpoint_future", None),
-                                                getattr(trainer, "_pending_checkpoint_future", None))
-                         if future is not None and not future.done()]
-        if pending_saves and not (original_error is not None or prefetch_cleanup_error is not None
-                                  or prefetch_running or checkpoint_running):
+                    prefetch_cleanup_error = TimeoutError(
+                        "Checkpoint finalization did not stop before its deadline"
+                    )
+        pending_saves = [
+            future
+            for future in (
+                getattr(trainer, "_pending_full_checkpoint_future", None),
+                getattr(trainer, "_pending_checkpoint_future", None),
+            )
+            if future is not None and not future.done()
+        ]
+        if pending_saves and not (
+            original_error is not None
+            or prefetch_cleanup_error is not None
+            or prefetch_running
+            or checkpoint_running
+        ):
             wrapped = [asyncio.wrap_future(future) for future in pending_saves]
-            remaining = (None if checkpoint_wait_timeout is None else
-                         max(0.0, checkpoint_wait_timeout - (time.monotonic() - checkpoint_wait_started)))
+            remaining = (
+                None
+                if checkpoint_wait_timeout is None
+                else max(
+                    0.0,
+                    checkpoint_wait_timeout
+                    - (time.monotonic() - checkpoint_wait_started),
+                )
+            )
             finished, pending = await asyncio.wait(wrapped, timeout=remaining)
             for future in finished:
                 if not future.cancelled():
                     future.exception()  # The trainer will report the original save error.
             checkpoint_running = bool(pending)
             if checkpoint_running and prefetch_cleanup_error is None:
-                prefetch_cleanup_error = TimeoutError("Checkpoint save did not stop before its deadline")
+                prefetch_cleanup_error = TimeoutError(
+                    "Checkpoint save did not stop before its deadline"
+                )
         else:
             checkpoint_running = checkpoint_running or bool(pending_saves)
         resource_running = prefetch_running or checkpoint_running
         logger.info("[standalone rank=%s] cleaning trainer resources", rank)
         if resource_running:
-            logger.error("Preserving trainer and communication resources until background work is fenced")
+            logger.error(
+                "Preserving trainer and communication resources until background work is fenced"
+            )
         else:
             await trainer.cleanup_training(clear_data=True)
-        failed_file_run = (
-            feature_store_type == "ray_reference" and (original_error is not None or resource_running)
+        failed_file_run = feature_store_type == "ray_reference" and (
+            original_error is not None or resource_running
         )
         final_export_failed = (
             False
@@ -1758,12 +2232,18 @@ async def _run_standalone_draft_training_async(
                 trainer, trainer.runtime_device, raise_on_error=False
             )
         )
-        all_ranks_clean = (original_error is None and prefetch_cleanup_error is None
-                           and not final_export_failed and not resource_running)
+        all_ranks_clean = (
+            original_error is None
+            and prefetch_cleanup_error is None
+            and not final_export_failed
+            and not resource_running
+        )
         if dist.is_initialized() and not resource_running:
             if not failed_file_run:
                 if training_cfg.get("checkpoint_directory_exclusive", False):
-                    all_ranks_clean = _all_ranks_true(all_ranks_clean, trainer.runtime_device)
+                    all_ranks_clean = _all_ranks_true(
+                        all_ranks_clean, trainer.runtime_device
+                    )
                 logger.info(
                     "[standalone rank=%s] entering final process-group barrier", rank
                 )
@@ -1775,7 +2255,11 @@ async def _run_standalone_draft_training_async(
                 checkpoint_directory_lease.release()
                 checkpoint_directory_lease = None
             dist.destroy_process_group()
-        elif not dist.is_initialized() and checkpoint_directory_lease is not None and all_ranks_clean:
+        elif (
+            not dist.is_initialized()
+            and checkpoint_directory_lease is not None
+            and all_ranks_clean
+        ):
             checkpoint_directory_lease.release()
         logger.info("[standalone rank=%s] cleanup complete", rank)
         # cleanup_training waits for the pending full-checkpoint writer. Its
@@ -1826,29 +2310,45 @@ def _save_trainable_snapshot_across_ranks(trainer, step, *, device, max_bytes=0)
     model = trainer.model
     distributed = dist.is_initialized() and dist.get_world_size() > 1
     rank = dist.get_rank() if distributed else 0
-    context = (FSDP.summon_full_params(model, recurse=True, writeback=False, rank0_only=False)
-               if isinstance(model, FSDP) else contextlib.nullcontext())
+    context = (
+        FSDP.summon_full_params(model, recurse=True, writeback=False, rank0_only=False)
+        if isinstance(model, FSDP)
+        else contextlib.nullcontext()
+    )
     parameters, weights, error = {}, {}, None
     try:
         with context:
             try:
                 if type(max_bytes) is not int or max_bytes < 0:
-                    raise ValueError("Trainable snapshot max_bytes must be a non-negative integer")
+                    raise ValueError(
+                        "Trainable snapshot max_bytes must be a non-negative integer"
+                    )
                 parameters = _trainable_snapshot_parameters(model)
-                logical_bytes = sum(parameter.numel() * parameter.element_size() for parameter in parameters.values())
+                logical_bytes = sum(
+                    parameter.numel() * parameter.element_size()
+                    for parameter in parameters.values()
+                )
                 if max_bytes and logical_bytes > max_bytes:
-                    raise ValueError("Trainable snapshot exceeds its logical tensor byte limit")
+                    raise ValueError(
+                        "Trainable snapshot exceeds its logical tensor byte limit"
+                    )
             except Exception as exc:  # noqa: BLE001
                 error = exc
             if not _all_ranks_true(error is None, device):
-                raise RuntimeError("Trainable snapshot parameter discovery failed on a rank") from error
-            schema = [(name, list(parameter.shape), str(parameter.dtype))
-                      for name, parameter in sorted(parameters.items())]
+                raise RuntimeError(
+                    "Trainable snapshot parameter discovery failed on a rank"
+                ) from error
+            schema = [
+                (name, list(parameter.shape), str(parameter.dtype))
+                for name, parameter in sorted(parameters.items())
+            ]
             if distributed:
                 schemas = [None] * dist.get_world_size()
                 dist.all_gather_object(schemas, (schema, max_bytes))
                 if any(item != schemas[0] for item in schemas):
-                    raise ValueError("Trainable snapshot parameter schemas differ across ranks")
+                    raise ValueError(
+                        "Trainable snapshot parameter schemas differ across ranks"
+                    )
             for name, parameter in sorted(parameters.items()):
                 error = None
                 try:
@@ -1860,7 +2360,9 @@ def _save_trainable_snapshot_across_ranks(trainer, step, *, device, max_bytes=0)
                 except Exception as exc:  # noqa: BLE001
                     error = exc
                 if not _all_ranks_true(error is None, device):
-                    raise RuntimeError(f"Trainable snapshot gathering failed for {name}") from error
+                    raise RuntimeError(
+                        f"Trainable snapshot gathering failed for {name}"
+                    ) from error
     except Exception as exc:  # noqa: BLE001
         error = exc
     if not _all_ranks_true(error is None, device):
@@ -1868,16 +2370,30 @@ def _save_trainable_snapshot_across_ranks(trainer, step, *, device, max_bytes=0)
     result = [None]
     if rank == 0:
         try:
-            path = Path(trainer.checkpoint_dir) / f"trainable_step_{step}_{uuid.uuid4().hex}"
-            result[0] = {"path": write_standalone_trainable_snapshot(
-                path, step=step, tensors=weights, training_plan=trainer._standalone_training_plan), "error": None}
+            path = (
+                Path(trainer.checkpoint_dir)
+                / f"trainable_step_{step}_{uuid.uuid4().hex}"
+            )
+            result[0] = {
+                "path": write_standalone_trainable_snapshot(
+                    path,
+                    step=step,
+                    tensors=weights,
+                    training_plan=trainer._standalone_training_plan,
+                ),
+                "error": None,
+            }
         except Exception as exc:  # noqa: BLE001
             result[0] = {"path": None, "error": f"{type(exc).__name__}: {exc}"}
     if distributed:
         dist.broadcast_object_list(result, src=0)
     if result[0]["error"] is not None:
-        raise RuntimeError(f"Trainable snapshot publication failed: {result[0]['error']}")
-    logger.info("Standalone trainable-only snapshot step=%s path=%s", step, result[0]["path"])
+        raise RuntimeError(
+            f"Trainable snapshot publication failed: {result[0]['error']}"
+        )
+    logger.info(
+        "Standalone trainable-only snapshot step=%s path=%s", step, result[0]["path"]
+    )
     return result[0]["path"]
 
 
@@ -1890,64 +2406,112 @@ def _load_trainable_snapshot_across_ranks(trainer, path, *, device, max_bytes=0)
 
     model = trainer.model
     distributed = dist.is_initialized() and dist.get_world_size() > 1
-    context = (FSDP.summon_full_params(model, recurse=True, writeback=True, rank0_only=False)
-               if isinstance(model, FSDP) else contextlib.nullcontext())
+    context = (
+        FSDP.summon_full_params(model, recurse=True, writeback=True, rank0_only=False)
+        if isinstance(model, FSDP)
+        else contextlib.nullcontext()
+    )
     error, manifest, parameters, staged = None, None, {}, {}
     try:
         with context:
             try:
                 if type(max_bytes) is not int or max_bytes < 0:
-                    raise ValueError("Trainable snapshot max_bytes must be a non-negative integer")
+                    raise ValueError(
+                        "Trainable snapshot max_bytes must be a non-negative integer"
+                    )
                 weights, manifest = read_standalone_trainable_snapshot(
-                    path, expected_training_plan=trainer._standalone_training_plan)
-                if max_bytes and sum(tensor.numel() * tensor.element_size() for tensor in weights.values()) > max_bytes:
-                    raise ValueError("Trainable snapshot exceeds its logical tensor byte limit")
+                    path, expected_training_plan=trainer._standalone_training_plan
+                )
+                if (
+                    max_bytes
+                    and sum(
+                        tensor.numel() * tensor.element_size()
+                        for tensor in weights.values()
+                    )
+                    > max_bytes
+                ):
+                    raise ValueError(
+                        "Trainable snapshot exceeds its logical tensor byte limit"
+                    )
                 parameters = _trainable_snapshot_parameters(model)
                 if set(weights) != set(parameters):
                     raise ValueError("Trainable snapshot parameter names differ")
                 aliases = {}
                 for name, parameter in parameters.items():
                     tensor = weights[name]
-                    if tuple(tensor.shape) != tuple(parameter.shape) or tensor.dtype != parameter.dtype:
+                    if (
+                        tuple(tensor.shape) != tuple(parameter.shape)
+                        or tensor.dtype != parameter.dtype
+                    ):
                         raise ValueError(f"Trainable snapshot tensor differs: {name}")
                     previous = aliases.setdefault(id(parameter), name)
-                    if previous != name and not torch.equal(tensor.contiguous().reshape(-1).view(torch.uint8),
-                                                             weights[previous].contiguous().reshape(-1).view(torch.uint8)):
-                        raise ValueError("Trainable snapshot contains conflicting tied parameters")
+                    if previous != name and not torch.equal(
+                        tensor.contiguous().reshape(-1).view(torch.uint8),
+                        weights[previous].contiguous().reshape(-1).view(torch.uint8),
+                    ):
+                        raise ValueError(
+                            "Trainable snapshot contains conflicting tied parameters"
+                        )
                     local = parameter
                     if hasattr(parameter, "placements"):
-                        if any(not isinstance(item, Replicate) and not (isinstance(item, Shard) and item.dim == 0)
-                               for item in parameter.placements):
-                            raise ValueError("Trainable snapshot supports only replication and shard(0)")
+                        if any(
+                            not isinstance(item, Replicate)
+                            and not (isinstance(item, Shard) and item.dim == 0)
+                            for item in parameter.placements
+                        ):
+                            raise ValueError(
+                                "Trainable snapshot supports only replication and shard(0)"
+                            )
                         shape, offset = compute_local_shape_and_global_offset(
-                            parameter.shape, parameter.device_mesh, parameter.placements)
-                        tensor = tensor[tuple(slice(start, start + length) for start, length in zip(offset, shape, strict=True))]
+                            parameter.shape, parameter.device_mesh, parameter.placements
+                        )
+                        tensor = tensor[
+                            tuple(
+                                slice(start, start + length)
+                                for start, length in zip(offset, shape, strict=True)
+                            )
+                        ]
                         local = parameter.to_local()
                     if tuple(tensor.shape) != tuple(local.shape):
-                        raise ValueError(f"Trainable snapshot local tensor differs: {name}")
+                        raise ValueError(
+                            f"Trainable snapshot local tensor differs: {name}"
+                        )
                     staged[name] = tensor.to(device=local.device).contiguous().clone()
             except Exception as exc:  # noqa: BLE001
                 error = exc
             if not _all_ranks_true(error is None, device):
-                raise RuntimeError("Trainable snapshot validation failed on a rank") from error
+                raise RuntimeError(
+                    "Trainable snapshot validation failed on a rank"
+                ) from error
             if distributed:
                 identities = [None] * dist.get_world_size()
-                dist.all_gather_object(identities, (manifest["weights_sha256"], manifest["optimizer_step"], max_bytes))
+                dist.all_gather_object(
+                    identities,
+                    (manifest["weights_sha256"], manifest["optimizer_step"], max_bytes),
+                )
                 if any(item != identities[0] for item in identities):
                     raise ValueError("Trainable snapshot differs across ranks")
             try:
                 with torch.no_grad():
                     for name, parameter in parameters.items():
-                        local = parameter.to_local() if hasattr(parameter, "placements") else parameter
+                        local = (
+                            parameter.to_local()
+                            if hasattr(parameter, "placements")
+                            else parameter
+                        )
                         local.copy_(staged[name])
             except Exception as exc:  # noqa: BLE001
                 error = exc
             if not _all_ranks_true(error is None, device):
-                raise RuntimeError("Trainable snapshot apply failed; discard the model") from error
+                raise RuntimeError(
+                    "Trainable snapshot apply failed; discard the model"
+                ) from error
     except Exception as exc:  # noqa: BLE001
         error = exc
     if not _all_ranks_true(error is None, device):
-        raise RuntimeError("Trainable snapshot initialization failed on a rank; discard the model") from error
+        raise RuntimeError(
+            "Trainable snapshot initialization failed on a rank; discard the model"
+        ) from error
     return manifest
 
 
@@ -1955,7 +2519,9 @@ def _wait_standalone_finalization(trainer) -> None:
     event = getattr(trainer, "_standalone_finalization_event", None)
     timeout = getattr(trainer, "_standalone_checkpoint_timeout", None)
     if event is not None and not event.wait(timeout=timeout):
-        error = TimeoutError("Standalone checkpoint finalization timed out; checkpoint remains unresolved")
+        error = TimeoutError(
+            "Standalone checkpoint finalization timed out; checkpoint remains unresolved"
+        )
         if getattr(trainer, "_standalone_export_error", None) is None:
             trainer._standalone_export_error = error
         raise error
@@ -1977,14 +2543,20 @@ def _save_standalone_checkpoint(
     _raise_standalone_export_error(trainer)
     consumed_snapshot = (
         torch.tensor(sorted(consumed_sequence_nos or ()), dtype=torch.int64)
-        if not defer_finalization else None
+        if not defer_finalization
+        else None
     )
     save_checkpoint = getattr(trainer, "save_checkpoint", None)
     if callable(save_checkpoint):
         result = save_checkpoint(int(step), wait=wait, defer_completion=True)
         checkpoint_path = result.get("path")
         is_export_leader = result.get("reason") in {"saved", "scheduled"}
-        if result.get("saved") and checkpoint_path and is_export_leader and not defer_finalization:
+        if (
+            result.get("saved")
+            and checkpoint_path
+            and is_export_leader
+            and not defer_finalization
+        ):
             if wait:
                 _finalize_standalone_checkpoint_files(
                     trainer,
@@ -1998,9 +2570,13 @@ def _save_standalone_checkpoint(
                 future = getattr(trainer, "_pending_full_checkpoint_future", None)
                 if future is not None:
                     _attach_standalone_finalizer(
-                        trainer, future, checkpoint_path,
-                        consumed_snapshot=consumed_snapshot, step=step,
-                        input_path=input_path, producer_shuffle=producer_shuffle,
+                        trainer,
+                        future,
+                        checkpoint_path,
+                        consumed_snapshot=consumed_snapshot,
+                        step=step,
+                        input_path=input_path,
+                        producer_shuffle=producer_shuffle,
                     )
         return result
 
@@ -2028,7 +2604,9 @@ def _save_standalone_checkpoint(
     future = save_async(int(step))
     if future is not None and wait:
         try:
-            future.result(timeout=getattr(trainer, "_standalone_checkpoint_timeout", None))
+            future.result(
+                timeout=getattr(trainer, "_standalone_checkpoint_timeout", None)
+            )
         finally:
             if future.done():
                 trainer._pending_full_checkpoint_future = None
@@ -2043,9 +2621,13 @@ def _save_standalone_checkpoint(
             )
     elif future is not None and not defer_finalization:
         _attach_standalone_finalizer(
-            trainer, future, checkpoint_path,
-            consumed_snapshot=consumed_snapshot, step=step,
-            input_path=input_path, producer_shuffle=producer_shuffle,
+            trainer,
+            future,
+            checkpoint_path,
+            consumed_snapshot=consumed_snapshot,
+            step=step,
+            input_path=input_path,
+            producer_shuffle=producer_shuffle,
         )
     return {
         "saved": future is not None,
@@ -2060,18 +2642,25 @@ def _save_standalone_checkpoint(
     }
 
 
-def _broadcast_checkpoint_progress(consumed_sequence_nos, *, writer_rank: int, device: torch.device):
+def _broadcast_checkpoint_progress(
+    consumed_sequence_nos, *, writer_rank: int, device: torch.device
+):
     """Copy rank-zero progress to a nonzero writer in bounded device chunks."""
     rank = dist.get_rank()
-    count = torch.tensor([len(consumed_sequence_nos or ()) if rank == 0 else 0],
-                         dtype=torch.int64, device=device)
+    count = torch.tensor(
+        [len(consumed_sequence_nos or ()) if rank == 0 else 0],
+        dtype=torch.int64,
+        device=device,
+    )
     dist.broadcast(count, src=0)
     total = int(count.item())
     error = None
     source, target, scratch = None, None, None
     try:
         if rank == 0:
-            source = torch.tensor(sorted(consumed_sequence_nos or ()), dtype=torch.int64)
+            source = torch.tensor(
+                sorted(consumed_sequence_nos or ()), dtype=torch.int64
+            )
         if rank == writer_rank:
             target = torch.empty(total, dtype=torch.int64)
         if total:
@@ -2084,12 +2673,15 @@ def _broadcast_checkpoint_progress(consumed_sequence_nos, *, writer_rank: int, d
         raise RuntimeError("Failed to allocate checkpoint progress transfer") from error
     for start in range(0, total, 65536):
         length = min(65536, total - start)
+        assert scratch is not None
         chunk = scratch[:length]
         if rank == 0:
-            chunk.copy_(source[start:start + length])
+            assert source is not None
+            chunk.copy_(source[start : start + length])
         dist.broadcast(chunk, src=0)
         if rank == writer_rank:
-            target[start:start + length].copy_(chunk)
+            assert target is not None
+            target[start : start + length].copy_(chunk)
     return target
 
 
@@ -2108,39 +2700,70 @@ def _save_standalone_checkpoint_across_ranks(
     local_error: BaseException | None = None
     try:
         result = _save_standalone_checkpoint(
-            trainer, step, wait=wait, consumed_sequence_nos=consumed_sequence_nos,
-            input_path=input_path, producer_shuffle=producer_shuffle, defer_finalization=True,
+            trainer,
+            step,
+            wait=wait,
+            consumed_sequence_nos=consumed_sequence_nos,
+            input_path=input_path,
+            producer_shuffle=producer_shuffle,
+            defer_finalization=True,
         )
     except Exception as exc:  # all live ranks must reach the agreement
         local_error = exc
-    writer = bool(result.get("saved") and result.get("path")
-                  and result.get("reason") in {"saved", "scheduled"})
+    writer = bool(
+        result.get("saved")
+        and result.get("path")
+        and result.get("reason") in {"saved", "scheduled"}
+    )
     distributed = dist.is_initialized() and dist.get_world_size() > 1
     rank = dist.get_rank() if distributed else 0
-    state = torch.tensor([int(local_error is not None), int(writer), int(bool(result.get("saved"))),
-                          rank + 1 if writer else 0], dtype=torch.int32, device=device)
+    state = torch.tensor(
+        [
+            int(local_error is not None),
+            int(writer),
+            int(bool(result.get("saved"))),
+            rank + 1 if writer else 0,
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
     if distributed:
         dist.all_reduce(state, op=dist.ReduceOp.SUM)
     failures, writers, saved, writer_rank_plus_one = state.tolist()
     if failures:
-        raise RuntimeError("Standalone checkpoint save failed on at least one rank") from local_error
+        raise RuntimeError(
+            "Standalone checkpoint save failed on at least one rank"
+        ) from local_error
     if saved and writers != 1:
-        raise RuntimeError(f"Standalone checkpoint requires exactly one export writer, got {writers}")
+        raise RuntimeError(
+            f"Standalone checkpoint requires exactly one export writer, got {writers}"
+        )
     if saved and saved != (dist.get_world_size() if distributed else 1):
         raise RuntimeError("Standalone checkpoint was not saved on every rank")
     writer_rank = writer_rank_plus_one - 1
     transferred_snapshot = None
     if distributed and writers == 1 and writer_rank != 0:
         transferred_snapshot = _broadcast_checkpoint_progress(
-            consumed_sequence_nos, writer_rank=writer_rank, device=device,
+            consumed_sequence_nos,
+            writer_rank=writer_rank,
+            device=device,
         )
     publication_error: BaseException | None = None
     if writer:
         try:
-            snapshot = (transferred_snapshot if transferred_snapshot is not None
-                        else torch.tensor(sorted(consumed_sequence_nos or ()), dtype=torch.int64))
-            kwargs = dict(consumed_snapshot=snapshot, step=step, input_path=input_path,
-                          producer_shuffle=producer_shuffle)
+            snapshot = (
+                transferred_snapshot
+                if transferred_snapshot is not None
+                else torch.tensor(
+                    sorted(consumed_sequence_nos or ()), dtype=torch.int64
+                )
+            )
+            kwargs = dict(
+                consumed_snapshot=snapshot,
+                step=step,
+                input_path=input_path,
+                producer_shuffle=producer_shuffle,
+            )
             if wait:
                 _finalize_standalone_checkpoint_files(trainer, result["path"], **kwargs)
             else:
@@ -2151,11 +2774,15 @@ def _save_standalone_checkpoint_across_ranks(
                 publication_error = getattr(trainer, "_standalone_export_error", None)
         except Exception as exc:
             publication_error = exc
-    state = torch.tensor([int(publication_error is not None)], dtype=torch.int32, device=device)
+    state = torch.tensor(
+        [int(publication_error is not None)], dtype=torch.int32, device=device
+    )
     if dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(state, op=dist.ReduceOp.MAX)
     if bool(state.item()):
-        raise RuntimeError("Standalone checkpoint publication failed on at least one rank") from publication_error
+        raise RuntimeError(
+            "Standalone checkpoint publication failed on at least one rank"
+        ) from publication_error
     return result
 
 
@@ -2182,7 +2809,9 @@ def _attach_standalone_finalizer(trainer, future, checkpoint_path, **kwargs):
 
     def finalize(finished):
         try:
-            _finalize_standalone_checkpoint(trainer, checkpoint_path, finished, **kwargs)
+            _finalize_standalone_checkpoint(
+                trainer, checkpoint_path, finished, **kwargs
+            )
         finally:
             complete.set()
 
@@ -2261,12 +2890,21 @@ def _finalize_standalone_checkpoint_files(
     lease_snapshot = None
     provider = getattr(trainer, "_standalone_lease_snapshot_provider", None)
     if provider is not None:
-        from verl_speco.trainer.standalone_resume import validate_reference_lease_snapshot
+        from verl_speco.trainer.standalone_resume import (
+            validate_reference_lease_snapshot,
+        )
         from verl_speco.trainer.checkpoint import atomic_write_json
+
         lease_snapshot = validate_reference_lease_snapshot(provider())
-        atomic_write_json(os.path.join(checkpoint_path, "reference_leases.json"), lease_snapshot, compact=True)
+        atomic_write_json(
+            os.path.join(checkpoint_path, "reference_leases.json"),
+            lease_snapshot,
+            compact=True,
+        )
     elif os.path.lexists(os.path.join(checkpoint_path, "reference_leases.json")):
-        raise ValueError("Cannot publish a checkpoint containing an unbound reference lease snapshot")
+        raise ValueError(
+            "Cannot publish a checkpoint containing an unbound reference lease snapshot"
+        )
     _save_resume_sidecar(
         checkpoint_path,
         consumed_snapshot,
@@ -2276,14 +2914,19 @@ def _finalize_standalone_checkpoint_files(
         training_plan=getattr(trainer, "_standalone_training_plan", None),
         storage_format=getattr(trainer, "_standalone_resume_format", "tensor"),
         expected_input_identity=getattr(trainer, "_standalone_input_identity", None),
-        **({"lease_snapshot_sha256": lease_snapshot["sha256"]} if lease_snapshot is not None else {}),
+        **(
+            {"lease_snapshot_sha256": lease_snapshot["sha256"]}
+            if lease_snapshot is not None
+            else {}
+        ),
     )
     retention_keep = getattr(trainer, "_standalone_retention_keep_last", 0)
     if retention_keep:
         from verl_speco.trainer.checkpoint import write_standalone_integrity_manifest
 
         write_standalone_integrity_manifest(
-            checkpoint_path, run_id=trainer._standalone_retention_run_id,
+            checkpoint_path,
+            run_id=trainer._standalone_retention_run_id,
             require_resume=input_path is not None and consumed_snapshot is not None,
         )
     _set_standalone_checkpoint_complete(checkpoint_path, complete=True)
@@ -2293,20 +2936,38 @@ def _finalize_standalone_checkpoint_files(
         try:
             lease = getattr(trainer, "_standalone_checkpoint_directory_lease", None)
             if getattr(trainer, "_standalone_retention_delete", False):
-                if lease is None or lease.directory.resolve() != Path(checkpoint_path).resolve().parent:
-                    raise RuntimeError("Checkpoint retention requires the owned checkpoint directory")
+                if (
+                    lease is None
+                    or lease.directory.resolve()
+                    != Path(checkpoint_path).resolve().parent
+                ):
+                    raise RuntimeError(
+                        "Checkpoint retention requires the owned checkpoint directory"
+                    )
                 lease.verify()
+            if step is None:
+                raise ValueError("Checkpoint retention requires the optimizer step")
             candidates = retire_standalone_checkpoints(
-                os.path.dirname(checkpoint_path), current_step=int(step), keep_last=retention_keep,
+                os.path.dirname(checkpoint_path),
+                current_step=int(step),
+                keep_last=retention_keep,
                 protected_paths=getattr(trainer, "_standalone_retention_protected", ()),
                 delete=getattr(trainer, "_standalone_retention_delete", False),
-                ownership_check=lease.verify if lease is not None and getattr(trainer, "_standalone_retention_delete", False) else None,
+                ownership_check=lease.verify
+                if lease is not None
+                and getattr(trainer, "_standalone_retention_delete", False)
+                else None,
             )
-            logger.info("Standalone checkpoint retention delete=%s candidates=%s",
-                        trainer._standalone_retention_delete, candidates)
+            logger.info(
+                "Standalone checkpoint retention delete=%s candidates=%s",
+                trainer._standalone_retention_delete,
+                candidates,
+            )
         except Exception:
             # Retention must not invalidate a successfully committed checkpoint.
-            logger.exception("Standalone checkpoint retention skipped after verification failure")
+            logger.exception(
+                "Standalone checkpoint retention skipped after verification failure"
+            )
 
 
 def _set_standalone_checkpoint_complete(
@@ -2318,7 +2979,7 @@ def _set_standalone_checkpoint_complete(
     if not os.path.exists(metadata_path):
         return
     try:
-        with open(metadata_path, "r", encoding="utf-8") as f:
+        with open(metadata_path, encoding="utf-8") as f:
             metadata = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(
@@ -2347,7 +3008,9 @@ def _save_resume_sidecar(
 ) -> None:
     if consumed_snapshot is None or step is None or input_path is None:
         if expected_input_identity is not None or lease_snapshot_sha256 is not None:
-            raise ValueError("Cannot publish a bound checkpoint without input path and progress")
+            raise ValueError(
+                "Cannot publish a bound checkpoint without input path and progress"
+            )
         return
     save_standalone_resume(
         checkpoint_path,
@@ -2358,7 +3021,11 @@ def _save_resume_sidecar(
         training_plan=training_plan,
         storage_format=storage_format,
         expected_input_identity=expected_input_identity,
-        **({"lease_snapshot_sha256": lease_snapshot_sha256} if lease_snapshot_sha256 is not None else {}),
+        **(
+            {"lease_snapshot_sha256": lease_snapshot_sha256}
+            if lease_snapshot_sha256 is not None
+            else {}
+        ),
     )
 
 
@@ -2397,7 +3064,9 @@ def _standalone_producer_shuffle(config: Any) -> dict[str, Any] | None:
     if producer_cfg.get("deterministic_publication", False):
         settings["deterministic_publication"] = True
     if producer_cfg.get("source_proportional_field") is not None:
-        settings["source_proportional_field"] = producer_cfg.get("source_proportional_field")
+        settings["source_proportional_field"] = producer_cfg.get(
+            "source_proportional_field"
+        )
     return settings
 
 
@@ -2421,7 +3090,7 @@ def _load_source_drafter_config(trainer: DrafterBaseTrainer) -> dict[str, Any] |
     if not os.path.exists(config_path):
         return None
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             loaded = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("Failed to load source drafter config %s: %s", config_path, exc)
@@ -2493,12 +3162,54 @@ _VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
             "mask_token_id",
         ),
     ),
+    "dsv4_dspark": (
+        "dsv4_dspark_config",
+        (
+            "block_size",
+            "num_anchors",
+            "markov_rank",
+            "markov_head_type",
+            "confidence_head_alpha",
+            "confidence_head_with_markov",
+            "ce_loss_alpha",
+            "l1_loss_alpha",
+            "loss_decay_gamma",
+            "target_layer_ids",
+            "num_context_layers",
+            "num_target_layers",
+            "target_num_hidden_layers",
+            "mask_token_id",
+            "dsv4_num_heads",
+            "dsv4_head_dim",
+            "dsv4_rope_head_dim",
+            "dsv4_q_lora_rank",
+            "dsv4_o_lora_rank",
+            "dsv4_o_groups",
+            "dsv4_window_size",
+            "dsv4_rope_theta",
+            "dsv4_rope_factor",
+            "dsv4_original_seq_len",
+            "dsv4_beta_fast",
+            "dsv4_beta_slow",
+            "dsv4_n_routed_experts",
+            "dsv4_n_shared_experts",
+            "dsv4_n_activated_experts",
+            "dsv4_moe_inter_dim",
+            "dsv4_score_func",
+            "dsv4_route_scale",
+            "dsv4_swiglu_limit",
+            "dsv4_hc_mult",
+            "dsv4_hc_sinkhorn_iters",
+            "dsv4_hc_eps",
+        ),
+    ),
 }
 
 _STANDALONE_TRAINING_LAYER_KEYS = {
     "dflash": "dflash_target_layer_ids",
     "dflash2": "dflash2_target_layer_ids",
     "dspark": "dspark_target_layer_ids",
+    "dsv4_dspark": "dsv4_dspark_target_layer_ids",
     "domino": "domino_target_layer_ids",
 }
 
@@ -2652,7 +3363,7 @@ def _rewrite_standalone_block_runtime_config(
     contract and only merge the alias fields needed by vLLM/SGLang.
     """
     backend_type = getattr(getattr(trainer, "backend", None), "model_type", None)
-    if backend_type not in {"dflash", "dflash2", "dspark", "domino"}:
+    if backend_type not in {"dflash", "dflash2", "dspark", "dsv4_dspark", "domino"}:
         return
 
     if completed_future is not None:
@@ -2672,7 +3383,7 @@ def _rewrite_standalone_block_runtime_config(
         )
 
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             training_config = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(
@@ -2763,8 +3474,21 @@ def _rewrite_standalone_block_runtime_config(
     if runtime_config is None:
         runtime_config = deepcopy(training_config)
         logger.warning(
-            "Source drafter config is unavailable; standalone checkpoint keeps SpeCo training config as runtime config"
+            "Source drafter config is unavailable; deriving runtime config from SpeCo training config"
         )
+
+    if (
+        source_runtime_config is None
+        and backend_type == "dspark"
+        and runtime_config.get("model_type") == "dspark"
+        and runtime_config.get("architectures")
+        in (["DSparkDraftModel"], ["Qwen3DSparkModel"])
+        and runtime_config.get("speculators_config") is None
+    ):
+        # save_pretrained records SpeCo's training class name. vLLM uses that
+        # name for DeepSeek-V4, so export the identity of this draft backbone.
+        runtime_config["model_type"] = "qwen3"
+        runtime_config["architectures"] = ["Qwen3DSparkModel"]
 
     runtime_config["speco_training_model_type"] = backend_type
     common_alias_keys = ("target_layer_ids", "mask_token_id", "num_context_layers")
@@ -2838,7 +3562,7 @@ def _build_training_device_mesh(draft_config, world_size: int) -> DeviceMesh | N
 
 def _block_metric_prefix(trainer: DrafterBaseTrainer) -> str | None:
     model_type = str(getattr(getattr(trainer, "backend", None), "model_type", "") or "")
-    if model_type in {"dflash", "dspark", "eagle3", "dflash2"}:
+    if model_type in {"dflash", "dspark", "eagle3", "dflash2", "dsv4_dspark"}:
         return model_type
     return None
 
@@ -2981,11 +3705,6 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         ("perf/train_time", "train_time"),
         ("perf/batch_finalize_time", "batch_finalize_time"),
         ("perf/commit_gate_wait_time", "commit_gate_wait_time"),
-        ("replay/cache_hit_ratio", "cache_hit"),
-        ("replay/target_forward_time_total", "target_forward_total"),
-        ("replay/vllm_request_time_total", "vllm_request_total"),
-        ("producer/consumer_wait_time_total", "producer_wait_total"),
-        ("producer/ready_queue_size", "ready_batches"),
     ):
         if key not in metrics:
             continue
@@ -2995,11 +3714,7 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         elif (
             key.endswith("_time_total")
             or key.startswith("perf/")
-            or key
-            in {
-                "perf/step_time",
-                "replay/target_forward_time_total",
-            }
+            or key == "perf/step_time"
         ):
             fields.append(f"{label}={value:.3f}s")
         else:
@@ -3032,6 +3747,13 @@ def _configure_device(local_rank: int) -> None:
     device_name = get_device_name()
     device_module = get_torch_device()
     if device_name == "cpu":
+        return
+    if device_name == "npu":
+        # torch_npu exposes set_device on the ``torch_npu.npu`` submodule, not on
+        # the top-level module get_torch_device() returns, so bind explicitly.
+        import torch_npu
+
+        torch_npu.npu.set_device(int(local_rank))
         return
     set_device = getattr(device_module, "set_device", None)
     if callable(set_device):
@@ -3073,25 +3795,47 @@ def _reference_device_budget(transfer_config, feature_store_type):
     return value
 
 
-def _reference_device_prefetch_budget(transfer_config, feature_store_type, device_type, batch_limit):
+def _reference_device_prefetch_budget(
+    transfer_config, feature_store_type, device_type, batch_limit
+):
     value = transfer_config.get("consumer_device_prefetch_bytes", 0)
     if type(value) is not int or value < 0:
-        raise ValueError("consumer_device_prefetch_bytes must be a non-negative integer")
-    if value and (feature_store_type != "ray_reference" or device_type not in {"cuda", "npu"}
-                  or not batch_limit or value < 2 * batch_limit):
-        raise ValueError("Device prefetch requires ray_reference, CUDA/NPU and two device batch budgets")
+        raise ValueError(
+            "consumer_device_prefetch_bytes must be a non-negative integer"
+        )
+    if value and (
+        feature_store_type != "ray_reference"
+        or device_type not in {"cuda", "npu"}
+        or not batch_limit
+        or value < 2 * batch_limit
+    ):
+        raise ValueError(
+            "Device prefetch requires ray_reference, CUDA/NPU and two device batch budgets"
+        )
     if value:
         if not prefetch_depth(transfer_config):
-            raise ValueError("Device prefetch requires a positive Consumer prefetch depth")
+            raise ValueError(
+                "Device prefetch requires a positive Consumer prefetch depth"
+            )
         host = transfer_config.get("consumer_prefetch_host_bytes", 0)
         per_batch = transfer_config.get("consumer_prefetch_batch_bytes", 0)
-        if (type(host) is not int or host < 0 or type(per_batch) is not int or per_batch < 0
-                or bool(host) != bool(per_batch) or (host and host < 2 * per_batch)):
-            raise ValueError("Device prefetch requires host budget for two maximum batches")
+        if (
+            type(host) is not int
+            or host < 0
+            or type(per_batch) is not int
+            or per_batch < 0
+            or bool(host) != bool(per_batch)
+            or (host and host < 2 * per_batch)
+        ):
+            raise ValueError(
+                "Device prefetch requires host budget for two maximum batches"
+            )
     return value
 
 
-async def _reference_training_step_across_ranks(trainer, batch, step, *, device, max_device_bytes=0) -> bool:
+async def _reference_training_step_across_ranks(
+    trainer, batch, step, *, device, max_device_bytes=0
+) -> bool:
     """Do not release or credit a reference batch unless all live ranks succeed."""
     if max_device_bytes:
         error = None
@@ -3101,7 +3845,9 @@ async def _reference_training_step_across_ranks(trainer, batch, step, *, device,
         except Exception as exc:
             error = exc
         if not _all_ranks_true(error is None, device):
-            raise RuntimeError("Reference device byte budget exceeded or invalid on at least one rank; source references retained") from error
+            raise RuntimeError(
+                "Reference device byte budget exceeded or invalid on at least one rank; source references retained"
+            ) from error
     error = None
     staged = batch
     try:
@@ -3111,15 +3857,21 @@ async def _reference_training_step_across_ranks(trainer, batch, step, *, device,
     except Exception as exc:
         error = exc
     if not _all_ranks_true(error is None, device):
-        raise RuntimeError("Reference device staging failed on at least one rank; source references retained") from error
+        raise RuntimeError(
+            "Reference device staging failed on at least one rank; source references retained"
+        ) from error
     error = None
     ok = False
     try:
-        ok = bool(await trainer.training_step_from_batch(staged, step, raise_on_error=True))
+        ok = bool(
+            await trainer.training_step_from_batch(staged, step, raise_on_error=True)
+        )
     except Exception as exc:  # ranks that returned must agree before cleanup
         error = exc
     if not _all_ranks_true(ok and error is None, device):
-        raise RuntimeError("Reference training failed on at least one rank; source references retained") from error
+        raise RuntimeError(
+            "Reference training failed on at least one rank; source references retained"
+        ) from error
     return True
 
 
@@ -3140,116 +3892,273 @@ def _validate_reference_part_loss_recipe(trainer):
         if inner is None:
             raise ValueError("Cannot inspect the reference part loss recipe")
         model = inner
-    if (getattr(model, "loss_mode", None) not in {"full_vocab", "restricted_ce", "sampled_ce"}
-            or getattr(model, "per_position_loss_weight", None) not in {"fixed_exp_decay", "dpace"}
-            or getattr(model, "ce_target_source", None) not in {"labels", "target_argmax"}
-            or (getattr(model, "loss_mode", None) in {"restricted_ce", "sampled_ce"}
-                and getattr(model, "ce_target_source", None) != "labels")
-            or (getattr(model, "ce_target_source", None) == "target_argmax"
-                and getattr(model, "l1_chunk_size", None) != 0)):
-        raise ValueError("Reference parts require full-vocabulary fixed-weight CE or D-PACE CE, or restricted CE with labels")
+    if (
+        getattr(model, "loss_mode", None)
+        not in {"full_vocab", "restricted_ce", "sampled_ce"}
+        or getattr(model, "per_position_loss_weight", None)
+        not in {"fixed_exp_decay", "dpace"}
+        or getattr(model, "ce_target_source", None) not in {"labels", "target_argmax"}
+        or (
+            getattr(model, "loss_mode", None) in {"restricted_ce", "sampled_ce"}
+            and getattr(model, "ce_target_source", None) != "labels"
+        )
+        or (
+            getattr(model, "ce_target_source", None) == "target_argmax"
+            and getattr(model, "l1_chunk_size", None) != 0
+        )
+    ):
+        raise ValueError(
+            "Reference parts require full-vocabulary fixed-weight CE or D-PACE CE, or restricted CE with labels"
+        )
     for name in ("l1_loss_alpha", "lk_loss_alpha", "confidence_head_alpha"):
         value = getattr(model, name, None)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-            raise ValueError("Reference part auxiliary weights must be finite and non-negative")
-    if model.lk_loss_alpha > 0 and getattr(model, "lk_loss_type", None) not in {"alpha", "adaptive_hybrid"}:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(
+                "Reference part auxiliary weights must be finite and non-negative"
+            )
+    if model.lk_loss_alpha > 0 and getattr(model, "lk_loss_type", None) not in {
+        "alpha",
+        "adaptive_hybrid",
+    }:
         raise ValueError("Reference parts do not support this LK loss type")
-    adaptive = model.lk_loss_alpha > 0 and getattr(model, "lk_loss_type", None) == "adaptive_hybrid"
+    adaptive = (
+        model.lk_loss_alpha > 0
+        and getattr(model, "lk_loss_type", None) == "adaptive_hybrid"
+    )
     confidence = model.confidence_head_alpha > 0
     if model.per_position_loss_weight == "dpace":
         alpha = getattr(model, "dpace_alpha", None)
-        if (isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not math.isfinite(alpha)
-                or not 0 <= alpha <= 1):
+        if (
+            isinstance(alpha, bool)
+            or not isinstance(alpha, (int, float))
+            or not math.isfinite(alpha)
+            or not 0 <= alpha <= 1
+        ):
             raise ValueError("Reference D-PACE requires alpha in [0, 1]")
-    if confidence and (getattr(model, "confidence_loss_enabled", False) is not True
-                       or getattr(getattr(model, "draft_model", None), "confidence_head", None) is None):
-        raise ValueError("Reference confidence loss requires an enabled confidence head")
+    if confidence and (
+        getattr(model, "confidence_loss_enabled", False) is not True
+        or getattr(getattr(model, "draft_model", None), "confidence_head", None) is None
+    ):
+        raise ValueError(
+            "Reference confidence loss requires an enabled confidence head"
+        )
     if adaptive:
         eta = getattr(model, "lk_hybrid_eta", None)
-        if isinstance(eta, bool) or not isinstance(eta, (int, float)) or not math.isfinite(eta) or eta < 0:
-            raise ValueError("Reference adaptive LK coefficient must be finite and non-negative")
-    if adaptive or confidence or model.loss_mode == "sampled_ce" or model.per_position_loss_weight == "dpace":
-        if any((isinstance(module, torch.nn.modules.dropout._DropoutNd) and module.p > 0)
-               or (isinstance(module, torch.nn.modules.batchnorm._BatchNorm) and module.track_running_stats)
-               or (isinstance(module, torch.nn.RNNBase) and module.dropout > 0)
-               or (isinstance(getattr(module, "attention_dropout", None), (int, float))
-                   and module.attention_dropout > 0) for module in model.modules()):
-            raise ValueError("Reference loss prepass requires deterministic model dropout and state")
-    gamma, block_size = getattr(model, "loss_decay_gamma", None), getattr(model, "block_size", None)
-    if (type(block_size) is not int or block_size < 1
-            or (gamma is not None and (isinstance(gamma, bool) or not isinstance(gamma, (int, float))
-                or not math.isfinite(gamma)))
-            or (model.per_position_loss_weight != "dpace" and gamma is not None and gamma > 0
-                and (block_size - 1) / gamma >= -math.log(1e-6))):
-        raise ValueError("Reference part position weights can fall below the supported normalization floor")
+        if (
+            isinstance(eta, bool)
+            or not isinstance(eta, (int, float))
+            or not math.isfinite(eta)
+            or eta < 0
+        ):
+            raise ValueError(
+                "Reference adaptive LK coefficient must be finite and non-negative"
+            )
+    if (
+        adaptive
+        or confidence
+        or model.loss_mode == "sampled_ce"
+        or model.per_position_loss_weight == "dpace"
+    ):
+        if any(
+            (isinstance(module, torch.nn.modules.dropout._DropoutNd) and module.p > 0)
+            or (
+                isinstance(module, torch.nn.modules.batchnorm._BatchNorm)
+                and module.track_running_stats
+            )
+            or (isinstance(module, torch.nn.RNNBase) and module.dropout > 0)
+            or (
+                isinstance(getattr(module, "attention_dropout", None), (int, float))
+                and module.attention_dropout > 0
+            )
+            for module in model.modules()
+        ):
+            raise ValueError(
+                "Reference loss prepass requires deterministic model dropout and state"
+            )
+    gamma, block_size = (
+        getattr(model, "loss_decay_gamma", None),
+        getattr(model, "block_size", None),
+    )
+    if (
+        type(block_size) is not int
+        or block_size < 1
+        or (
+            gamma is not None
+            and (
+                isinstance(gamma, bool)
+                or not isinstance(gamma, (int, float))
+                or not math.isfinite(gamma)
+            )
+        )
+        or (
+            model.per_position_loss_weight != "dpace"
+            and gamma is not None
+            and gamma > 0
+            and (block_size - 1) / gamma >= -math.log(1e-6)
+        )
+    ):
+        raise ValueError(
+            "Reference part position weights can fall below the supported normalization floor"
+        )
     return model
 
 
-async def _execute_owned_reference_batch(trainer, store, batch, step, *, rank, device, events,
-                                         transport_config, per_rank=False, producer_handle=None,
-                                         max_window=None, max_host_bytes=0, max_device_bytes=0, token_counts=None,
-                                         packing=False, packing_block_size=None, max_packed_len=0,
-                                         node_ranks_per_host=0, source_payload_safe=False):
+async def _execute_owned_reference_batch(
+    trainer,
+    store,
+    batch,
+    step,
+    *,
+    rank,
+    device,
+    events,
+    transport_config,
+    per_rank=False,
+    producer_handle=None,
+    max_window=None,
+    max_host_bytes=0,
+    max_device_bytes=0,
+    token_counts=None,
+    packing=False,
+    packing_block_size=None,
+    max_packed_len=0,
+    node_ranks_per_host=0,
+    source_payload_safe=False,
+):
     """Read all owned parts before acknowledging materialization to the producer."""
     contract, clip_value, read_timeout, error = None, None, None, None
     try:
         contract = store.reference_contract(batch.file_entries)
         clip_value = trainer._get_hidden_state_clip_value()
         read_timeout = float(transport_config.get("io_timeout_seconds", 30))
-        if (type(max_host_bytes) is not int or max_host_bytes < 0
-                or type(max_device_bytes) is not int or max_device_bytes < 0):
+        if (
+            type(max_host_bytes) is not int
+            or max_host_bytes < 0
+            or type(max_device_bytes) is not int
+            or max_device_bytes < 0
+        ):
             raise ValueError("Owned window byte limits must be non-negative integers")
     except Exception as exc:
         error = exc
     if not _all_ranks_true(error is None, device):
-        raise RuntimeError("Owned reference contract failed on at least one rank; source references retained") from error
+        raise RuntimeError(
+            "Owned reference contract failed on at least one rank; source references retained"
+        ) from error
     ok = await _owned_reference_training_step(
-        trainer, [entry.tag for entry in batch.file_entries], contract, step, device=device,
-        max_window=max_window, clip_value=clip_value, read_timeout=read_timeout,
-        max_host_bytes=max_host_bytes, max_device_bytes=max_device_bytes, padding_rank=batch.is_padding_rank,
-        token_counts=token_counts, packing=packing, packing_block_size=packing_block_size, max_packed_len=max_packed_len,
+        trainer,
+        [entry.tag for entry in batch.file_entries],
+        contract,
+        step,
+        device=device,
+        max_window=max_window,
+        clip_value=clip_value,
+        read_timeout=read_timeout,
+        max_host_bytes=max_host_bytes,
+        max_device_bytes=max_device_bytes,
+        padding_rank=batch.is_padding_rank,
+        token_counts=token_counts,
+        packing=packing,
+        packing_block_size=packing_block_size,
+        max_packed_len=max_packed_len,
         hidden_states_store=getattr(store, "hidden_states_store", None),
-        node_context=({"rank": rank, "ranks_per_host": node_ranks_per_host,
-                       "entries": batch.node_file_entries, "run_id": store.run_id,
-                       "plan_id": batch.plan_id, "receipt_token": batch.receipt_token}
-                      if node_ranks_per_host else None),
+        node_context=(
+            {
+                "rank": rank,
+                "ranks_per_host": node_ranks_per_host,
+                "entries": batch.node_file_entries,
+                "run_id": store.run_id,
+                "plan_id": batch.plan_id,
+                "receipt_token": batch.receipt_token,
+            }
+            if node_ranks_per_host
+            else None
+        ),
     )
-    _ack_reference_materialization_across_ranks(batch, rank=rank, device=device, events=events,
-                                                config=transport_config, per_rank=per_rank,
-                                                producer_handle=producer_handle,
-                                                **({"source_payload_safe": True} if source_payload_safe else {}))
+    _ack_reference_materialization_across_ranks(
+        batch,
+        rank=rank,
+        device=device,
+        events=events,
+        config=transport_config,
+        per_rank=per_rank,
+        producer_handle=producer_handle,
+        **({"source_payload_safe": True} if source_payload_safe else {}),
+    )
     return ok
 
 
-async def _owned_reference_training_step(trainer, tags, feature_contract, step, *, device, windows=None,
-                                         max_window=None, clip_value=1.0e4, chunk_rows=512,
-                                         read_timeout=30.0, max_host_bytes=0, max_device_bytes=0,
-                                         padding_rank=False, token_counts=None, packing=False,
-                                         packing_block_size=None, max_packed_len=0, node_context=None,
-                                         hidden_states_store=None):
+async def _owned_reference_training_step(
+    trainer,
+    tags,
+    feature_contract,
+    step,
+    *,
+    device,
+    windows=None,
+    max_window=None,
+    clip_value=1.0e4,
+    chunk_rows=512,
+    read_timeout=30.0,
+    max_host_bytes=0,
+    max_device_bytes=0,
+    padding_rank=False,
+    token_counts=None,
+    packing=False,
+    packing_block_size=None,
+    max_packed_len=0,
+    node_context=None,
+    hidden_states_store=None,
+):
     """Sample a local file assignment and execute globally padded lazy parts.
 
     This primitive does not acknowledge or release references. Its caller must
     retain them through the last read and coordinate the scheduler lifecycle.
     """
     from verl_speco.trainer.standalone_batch_prepare import (
-        prepare_empty_owned_window, prepare_owned_anchor_window, sample_owned_anchor_windows,
+        prepare_empty_owned_window,
+        prepare_owned_anchor_window,
+        sample_owned_anchor_windows,
     )
+
     error, model, plans, vocabulary = None, None, None, None
     try:
         model = _validate_reference_part_loss_recipe(trainer)
         if model is None:
-            raise ValueError("Owned reference sampling requires the block training backend")
+            raise ValueError(
+                "Owned reference sampling requires the block training backend"
+            )
         if windows is None:
-            from verl_speco.backends.dflash_trainer_backend import _resolve_sliding_windows
+            from verl_speco.backends.dflash_trainer_backend import (
+                _resolve_sliding_windows,
+            )
+
             windows = _resolve_sliding_windows(model.draft_model.config)
         if model.loss_mode in {"restricted_ce", "sampled_ce"}:
-            vocabulary = {"size": int(trainer.backend.target_lm_head.fc.weight.shape[0])}
+            vocabulary = {
+                "size": int(trainer.backend.target_lm_head.fc.weight.shape[0])
+            }
         _, _, plans = sample_owned_anchor_windows(
-            tags, feature_contract, model, device=device, windows=windows, max_window=max_window,
-            clip_value=clip_value, chunk_rows=chunk_rows, read_timeout=read_timeout, padding_rank=padding_rank,
-            token_counts=token_counts, packing=packing, packing_block_size=packing_block_size, max_packed_len=max_packed_len,
-            vocabulary=vocabulary, hidden_states_store=hidden_states_store,
+            tags,
+            feature_contract,
+            model,
+            device=device,
+            windows=windows,
+            max_window=max_window,
+            clip_value=clip_value,
+            chunk_rows=chunk_rows,
+            read_timeout=read_timeout,
+            padding_rank=padding_rank,
+            token_counts=token_counts,
+            packing=packing,
+            packing_block_size=packing_block_size,
+            max_packed_len=max_packed_len,
+            vocabulary=vocabulary,
+            hidden_states_store=hidden_states_store,
         )
         if len(plans) > 4096:
             raise ValueError("Owned reference batch exceeds the part limit")
@@ -3258,9 +4167,19 @@ async def _owned_reference_training_step(trainer, tags, feature_contract, step, 
     if not _all_ranks_true(error is None, device):
         if getattr(trainer, "optimizer", None) is not None:
             trainer.optimizer.zero_grad(set_to_none=True)
-        raise RuntimeError("Owned reference planning failed on at least one rank; source references retained") from error
-    sampled_probe = vocabulary is not None and model.loss_mode == "sampled_ce" and model.sampled_ce_negatives > 0
-    count = torch.tensor([len(plans), int(sampled_probe), -int(sampled_probe)], dtype=torch.int32, device=device)
+        raise RuntimeError(
+            "Owned reference planning failed on at least one rank; source references retained"
+        ) from error
+    sampled_probe = (
+        vocabulary is not None
+        and model.loss_mode == "sampled_ce"
+        and model.sampled_ce_negatives > 0
+    )
+    count = torch.tensor(
+        [len(plans), int(sampled_probe), -int(sampled_probe)],
+        dtype=torch.int32,
+        device=device,
+    )
     if dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(count, op=dist.ReduceOp.MAX)
     if int(count[1]) != -int(count[2]):
@@ -3268,86 +4187,191 @@ async def _owned_reference_training_step(trainer, tags, feature_contract, step, 
             trainer.optimizer.zero_grad(set_to_none=True)
         raise RuntimeError("Sampled vocabulary probe differs across ranks")
     count = max(int(count[0]), 1)
-    parts = [partial(prepare_owned_anchor_window, tags[plan["sample_index"]], feature_contract,
-                     start=plan["start"], end=plan["end"], anchor=plan["anchor"],
-                     block_size=model.block_size, windows=windows, source_window=plan["source_window"],
-                     read_timeout=read_timeout, max_output_bytes=max_host_bytes,
-                     hidden_states_store=hidden_states_store) for plan in plans]
-    parts.extend(partial(prepare_empty_owned_window, tags[0], feature_contract,
-                         read_timeout=read_timeout, max_output_bytes=max_host_bytes, hidden_states_store=hidden_states_store)
-                 for _ in range(count - len(parts)))
+    parts = [
+        partial(
+            prepare_owned_anchor_window,
+            tags[plan["sample_index"]],
+            feature_contract,
+            start=plan["start"],
+            end=plan["end"],
+            anchor=plan["anchor"],
+            block_size=model.block_size,
+            windows=windows,
+            source_window=plan["source_window"],
+            read_timeout=read_timeout,
+            max_output_bytes=max_host_bytes,
+            hidden_states_store=hidden_states_store,
+        )
+        for plan in plans
+    ]
+    parts.extend(
+        partial(
+            prepare_empty_owned_window,
+            tags[0],
+            feature_contract,
+            read_timeout=read_timeout,
+            max_output_bytes=max_host_bytes,
+            hidden_states_store=hidden_states_store,
+        )
+        for _ in range(count - len(parts))
+    )
     if node_context is not None:
         try:
             parts = _node_owned_window_parts(
-                plans, count, node_context, feature_contract, windows=windows, block_size=model.block_size,
-                read_timeout=read_timeout, max_host_bytes=max_host_bytes, device=device,
-                hidden_states_store=hidden_states_store)
+                plans,
+                count,
+                node_context,
+                feature_contract,
+                windows=windows,
+                block_size=model.block_size,
+                read_timeout=read_timeout,
+                max_host_bytes=max_host_bytes,
+                device=device,
+                hidden_states_store=hidden_states_store,
+            )
         except Exception:
             if getattr(trainer, "optimizer", None) is not None:
                 trainer.optimizer.zero_grad(set_to_none=True)
             raise
     if vocabulary is not None:
+
         def with_vocabulary(part):
             return {**part(), "preselected_restricted_vocab": vocabulary["ids"]}
+
         parts = [partial(with_vocabulary, part) for part in parts]
     probe_counts, probe_fingerprints = None, None
     if sampled_probe:
-        statistics = {"values": torch.zeros(7, dtype=torch.float32, device=device), "fingerprints": [],
-                      "input_fingerprints": []}
-        probe_counts = {"window_statistics_input_positions": 0} if token_counts is not None else None
-        await _reference_training_parts_across_ranks(trainer, parts, step, device=device, max_device_bytes=max_device_bytes,
-                                                     work_counts=probe_counts, _loss_statistics=statistics)
+        statistics = {
+            "values": torch.zeros(7, dtype=torch.float32, device=device),
+            "fingerprints": [],
+            "input_fingerprints": [],
+        }
+        probe_counts = (
+            {"window_statistics_input_positions": 0}
+            if token_counts is not None
+            else None
+        )
+        await _reference_training_parts_across_ranks(
+            trainer,
+            parts,
+            step,
+            device=device,
+            max_device_bytes=max_device_bytes,
+            work_counts=probe_counts,
+            _loss_statistics=statistics,
+        )
         probe_fingerprints = statistics["input_fingerprints"]
         if statistics["values"][6] > 0:
-            negatives = torch.randint(0, vocabulary["size"], (model.sampled_ce_negatives,),
-                                      dtype=torch.long, device=device).cpu()
-            vocabulary["ids"] = torch.unique(torch.cat((vocabulary["ids"], negatives)), sorted=True)
+            negatives = torch.randint(
+                0,
+                vocabulary["size"],
+                (model.sampled_ce_negatives,),
+                dtype=torch.long,
+                device=device,
+            ).cpu()
+            vocabulary["ids"] = torch.unique(
+                torch.cat((vocabulary["ids"], negatives)), sorted=True
+            )
         del statistics
-    ok = await _reference_training_parts_across_ranks(trainer, parts, step, device=device,
-                                                       max_device_bytes=max_device_bytes, work_counts=token_counts,
-                                                       _input_fingerprints=probe_fingerprints)
+    ok = await _reference_training_parts_across_ranks(
+        trainer,
+        parts,
+        step,
+        device=device,
+        max_device_bytes=max_device_bytes,
+        work_counts=token_counts,
+        _input_fingerprints=probe_fingerprints,
+    )
     if probe_counts is not None:
-        token_counts["window_statistics_input_positions"] += probe_counts["window_statistics_input_positions"]
+        token_counts["window_statistics_input_positions"] += probe_counts[
+            "window_statistics_input_positions"
+        ]
     return ok
 
 
-def _node_owned_window_parts(plans, count, context, feature_contract, *, windows, block_size,
-                             read_timeout, max_host_bytes, device, hidden_states_store=None):
+def _node_owned_window_parts(
+    plans,
+    count,
+    context,
+    feature_contract,
+    *,
+    windows,
+    block_size,
+    read_timeout,
+    max_host_bytes,
+    device,
+    hidden_states_store=None,
+):
     """Route each aligned window through its node owner using bounded local frames."""
-    from verl_speco.trainer.reference_shared_frame import serve_node_batches, receive_node_batch
-    from verl_speco.trainer.standalone_batch_prepare import prepare_empty_owned_window, prepare_owned_anchor_window
+    from verl_speco.trainer.reference_shared_frame import (
+        serve_node_batches,
+        receive_node_batch,
+    )
+    from verl_speco.trainer.standalone_batch_prepare import (
+        prepare_empty_owned_window,
+        prepare_owned_anchor_window,
+    )
 
     error, encoded = None, None
     try:
         rank, local_size = context["rank"], context["ranks_per_host"]
         world = dist.get_world_size() if dist.is_initialized() else 1
-        if (type(rank) is not int or type(local_size) is not int or local_size < 2
-                or not 0 <= rank < world or world % local_size or not dist.is_initialized()
-                or rank != dist.get_rank() or type(max_host_bytes) is not int or max_host_bytes <= 0
-                or type(context["plan_id"]) is not int or context["plan_id"] < 0
-                or not isinstance(context["run_id"], str) or not 1 <= len(context["run_id"]) <= 256
-                or not isinstance(context["receipt_token"], str) or not 1 <= len(context["receipt_token"]) <= 256
-                or isinstance(read_timeout, bool) or not isinstance(read_timeout, (int, float))
-                or not math.isfinite(read_timeout) or read_timeout <= 0):
+        if (
+            type(rank) is not int
+            or type(local_size) is not int
+            or local_size < 2
+            or not 0 <= rank < world
+            or world % local_size
+            or not dist.is_initialized()
+            or rank != dist.get_rank()
+            or type(max_host_bytes) is not int
+            or max_host_bytes <= 0
+            or type(context["plan_id"]) is not int
+            or context["plan_id"] < 0
+            or not isinstance(context["run_id"], str)
+            or not 1 <= len(context["run_id"]) <= 256
+            or not isinstance(context["receipt_token"], str)
+            or not 1 <= len(context["receipt_token"]) <= 256
+            or isinstance(read_timeout, bool)
+            or not isinstance(read_timeout, (int, float))
+            or not math.isfinite(read_timeout)
+            or read_timeout <= 0
+        ):
             raise ValueError("Invalid node-owned window context")
         owner = rank // local_size * local_size
         entries = context.get("entries")
-        if rank == owner and (not isinstance(entries, dict)
-                or set(entries) != set(range(owner, owner + local_size))
-                or any(not isinstance(value, list) or not value for value in entries.values())):
+        if rank == owner and (
+            not isinstance(entries, dict)
+            or set(entries) != set(range(owner, owner + local_size))
+            or any(
+                not isinstance(value, list) or not value for value in entries.values()
+            )
+        ):
             raise ValueError("Node owner lacks its rank assignments")
-        common = {"run_id": context["run_id"], "plan_id": context["plan_id"],
-                  "receipt_token": context["receipt_token"], "windows": windows,
-                  "block_size": block_size, "frame_bytes": max_host_bytes, "read_timeout": read_timeout,
-                  "ranks_per_host": local_size}
-        encoded = json.dumps({"common": common, "plans": plans}, separators=(",", ":"), allow_nan=False)
+        common = {
+            "run_id": context["run_id"],
+            "plan_id": context["plan_id"],
+            "receipt_token": context["receipt_token"],
+            "windows": windows,
+            "block_size": block_size,
+            "frame_bytes": max_host_bytes,
+            "read_timeout": read_timeout,
+            "ranks_per_host": local_size,
+        }
+        encoded = json.dumps(
+            {"common": common, "plans": plans}, separators=(",", ":"), allow_nan=False
+        )
         if len(encoded.encode()) > 1024 * 1024:
             raise ValueError("Node-owned window plan exceeds its metadata limit")
     except Exception as exc:
         error = exc
     if not _all_ranks_true(error is None, device):
-        raise RuntimeError("Node-owned window plan is invalid on at least one rank") from error
-    metadata_bytes = torch.tensor([len(encoded.encode())], dtype=torch.int64, device=device)
+        raise RuntimeError(
+            "Node-owned window plan is invalid on at least one rank"
+        ) from error
+    metadata_bytes = torch.tensor(
+        [len(encoded.encode())], dtype=torch.int64, device=device
+    )
     dist.all_reduce(metadata_bytes, op=dist.ReduceOp.SUM)
     if int(metadata_bytes.item()) > 16 * 1024 * 1024:
         raise RuntimeError("Node-owned window plans exceed the global metadata limit")
@@ -3356,8 +4380,13 @@ def _node_owned_window_parts(plans, count, context, feature_contract, *, windows
     error, groups = None, None
     try:
         records = [json.loads(item) for item in all_plans]
-        if any(not isinstance(item, dict) or item.get("common") != records[0].get("common") for item in records):
-            raise ValueError("Node-owned window identity or configuration differs across ranks")
+        if any(
+            not isinstance(item, dict) or item.get("common") != records[0].get("common")
+            for item in records
+        ):
+            raise ValueError(
+                "Node-owned window identity or configuration differs across ranks"
+            )
         parsed = [item.get("plans") for item in records]
         if any(not isinstance(items, list) or len(items) > count for items in parsed):
             raise ValueError("Node-owned window part count differs")
@@ -3367,14 +4396,21 @@ def _node_owned_window_parts(plans, count, context, feature_contract, *, windows
                 tags = [entry.tag for entry in entries[peer]]
                 peer_plans = parsed[peer]
                 for plan in peer_plans:
-                    if (not isinstance(plan, dict) or type(plan.get("sample_index")) is not int
-                            or not 0 <= plan["sample_index"] < len(tags)):
-                        raise ValueError("Node-owned window references an unassigned sample")
+                    if (
+                        not isinstance(plan, dict)
+                        or type(plan.get("sample_index")) is not int
+                        or not 0 <= plan["sample_index"] < len(tags)
+                    ):
+                        raise ValueError(
+                            "Node-owned window references an unassigned sample"
+                        )
                 groups[peer] = (tags, peer_plans)
     except Exception as exc:
         error = exc
     if not _all_ranks_true(error is None, device):
-        raise RuntimeError("Node-owned window assignments differ across ranks") from error
+        raise RuntimeError(
+            "Node-owned window assignments differ across ranks"
+        ) from error
 
     counter = [0]
     timeout = max(30.0, float(read_timeout) * (local_size + 1))
@@ -3382,28 +4418,62 @@ def _node_owned_window_parts(plans, count, context, feature_contract, *, windows
     def materialize(index):
         serial = counter[0]
         counter[0] += 1
-        receipt = hashlib.sha256(f"{context['receipt_token']}:{serial}".encode()).hexdigest()
-        binding = {"run_id": context["run_id"], "generation": 0, "batch_id": context["plan_id"],
-                   "rank": rank, "receipt_token": receipt}
+        receipt = hashlib.sha256(
+            f"{context['receipt_token']}:{serial}".encode()
+        ).hexdigest()
+        binding = {
+            "run_id": context["run_id"],
+            "generation": 0,
+            "batch_id": context["plan_id"],
+            "rank": rank,
+            "receipt_token": receipt,
+        }
         if rank != owner:
-            return receive_node_batch(binding=binding, owner_rank=owner, max_bytes=max_host_bytes, timeout=timeout)[0]
+            return receive_node_batch(
+                binding=binding,
+                owner_rank=owner,
+                max_bytes=max_host_bytes,
+                timeout=timeout,
+            )[0]
 
-        requests = {peer: [(tags, peer_plans[index] if index < len(peer_plans) else None)]
-                    for peer, (tags, peer_plans) in groups.items()}
+        requests = {
+            peer: [(tags, peer_plans[index] if index < len(peer_plans) else None)]
+            for peer, (tags, peer_plans) in groups.items()
+        }
+
         def prepare(request):
             tags, plan = request[0]
             if plan is None:
-                batch = prepare_empty_owned_window(tags[0], feature_contract, read_timeout=read_timeout,
-                                                   max_output_bytes=max_host_bytes, hidden_states_store=hidden_states_store)
+                batch = prepare_empty_owned_window(
+                    tags[0],
+                    feature_contract,
+                    read_timeout=read_timeout,
+                    max_output_bytes=max_host_bytes,
+                    hidden_states_store=hidden_states_store,
+                )
             else:
                 batch = prepare_owned_anchor_window(
-                    tags[plan["sample_index"]], feature_contract, start=plan["start"], end=plan["end"],
-                    anchor=plan["anchor"], block_size=block_size, windows=windows,
-                    source_window=plan["source_window"], read_timeout=read_timeout, max_output_bytes=max_host_bytes,
-                    hidden_states_store=hidden_states_store)
+                    tags[plan["sample_index"]],
+                    feature_contract,
+                    start=plan["start"],
+                    end=plan["end"],
+                    anchor=plan["anchor"],
+                    block_size=block_size,
+                    windows=windows,
+                    source_window=plan["source_window"],
+                    read_timeout=read_timeout,
+                    max_output_bytes=max_host_bytes,
+                    hidden_states_store=hidden_states_store,
+                )
             return batch, 0.0
-        return serve_node_batches(requests, binding=binding, prepare=prepare,
-                                  max_bytes=max_host_bytes, timeout=timeout)[0]
+
+        return serve_node_batches(
+            requests,
+            binding=binding,
+            prepare=prepare,
+            max_bytes=max_host_bytes,
+            timeout=timeout,
+        )[0]
 
     return [partial(materialize, index) for index in range(count)]
 
@@ -3416,18 +4486,37 @@ def _reference_part_fingerprint(batch):
         if torch.is_tensor(value):
             if value.layout != torch.strided or not value.is_contiguous():
                 raise ValueError("Adaptive reference inputs must be contiguous")
-            digest.update(json.dumps([name, str(value.dtype), list(value.shape)], separators=(",", ":")).encode())
+            digest.update(
+                json.dumps(
+                    [name, str(value.dtype), list(value.shape)], separators=(",", ":")
+                ).encode()
+            )
             raw = value.detach().reshape(-1).view(torch.uint8)
             for offset in range(0, raw.numel(), 8 * 1024 * 1024):
-                chunk = raw[offset:offset + 8 * 1024 * 1024].to(device="cpu", copy=True)
+                chunk = raw[offset : offset + 8 * 1024 * 1024].to(
+                    device="cpu", copy=True
+                )
                 digest.update(memoryview(chunk.numpy()))
         elif name in {"hidden_source", "last_hidden_state_norm", "_speco_pad_size"}:
-            digest.update(json.dumps([name, value], separators=(",", ":"), allow_nan=False).encode())
+            digest.update(
+                json.dumps(
+                    [name, value], separators=(",", ":"), allow_nan=False
+                ).encode()
+            )
     return digest.digest()
 
 
-async def _reference_training_parts_across_ranks(trainer, parts, step, *, device, max_device_bytes=0,
-                                                 work_counts=None, _loss_statistics=None, _input_fingerprints=None) -> bool:
+async def _reference_training_parts_across_ranks(
+    trainer,
+    parts,
+    step,
+    *,
+    device,
+    max_device_bytes=0,
+    work_counts=None,
+    _loss_statistics=None,
+    _input_fingerprints=None,
+) -> bool:
     """Train equal-length lazy part plans with one globally normalized optimizer step.
 
     Each plan entry is a batch or a zero-argument materializer. Callers must
@@ -3442,17 +4531,39 @@ async def _reference_training_parts_across_ranks(trainer, parts, step, *, device
     if not _all_ranks_true(error is None, device):
         if getattr(trainer, "optimizer", None) is not None:
             trainer.optimizer.zero_grad(set_to_none=True)
-        raise RuntimeError("Reference part loss recipe is unsupported on at least one rank") from error
+        raise RuntimeError(
+            "Reference part loss recipe is unsupported on at least one rank"
+        ) from error
     count = len(parts) if isinstance(parts, (list, tuple)) else 0
-    valid = 0 < count <= 4096 and type(max_device_bytes) is int and max_device_bytes >= 0
-    adaptive = (part_model is not None and getattr(part_model, "lk_loss_alpha", 0) > 0
-                and getattr(part_model, "lk_loss_type", None) == "adaptive_hybrid")
-    confidence = part_model is not None and getattr(part_model, "confidence_head_alpha", 0) > 0
-    dpace = part_model is not None and getattr(part_model, "per_position_loss_weight", None) == "dpace"
-    counts = torch.tensor([count if valid else 0, -count if valid else 0,
-                           int(adaptive), -int(adaptive), int(confidence), -int(confidence),
-                           int(dpace), -int(dpace)],
-                          dtype=torch.int32, device=device)
+    valid = (
+        0 < count <= 4096 and type(max_device_bytes) is int and max_device_bytes >= 0
+    )
+    adaptive = (
+        part_model is not None
+        and getattr(part_model, "lk_loss_alpha", 0) > 0
+        and getattr(part_model, "lk_loss_type", None) == "adaptive_hybrid"
+    )
+    confidence = (
+        part_model is not None and getattr(part_model, "confidence_head_alpha", 0) > 0
+    )
+    dpace = (
+        part_model is not None
+        and getattr(part_model, "per_position_loss_weight", None) == "dpace"
+    )
+    counts = torch.tensor(
+        [
+            count if valid else 0,
+            -count if valid else 0,
+            int(adaptive),
+            -int(adaptive),
+            int(confidence),
+            -int(confidence),
+            int(dpace),
+            -int(dpace),
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
     if dist.is_initialized() and dist.get_world_size() > 1:
         dist.all_reduce(counts, op=dist.ReduceOp.MAX)
     if not valid or int(counts[0]) == 0 or int(counts[0]) != -int(counts[1]):
@@ -3467,15 +4578,30 @@ async def _reference_training_parts_across_ranks(trainer, parts, step, *, device
     fingerprints = None
     vocabulary_fingerprint = None
     if work_counts is not None and _loss_statistics is None:
-        work_counts.update(window_train_input_positions=0, window_statistics_input_positions=0)
+        work_counts.update(
+            window_train_input_positions=0, window_statistics_input_positions=0
+        )
     if (adaptive or confidence or dpace) and _loss_statistics is None:
-        statistics = {"values": torch.zeros(7, dtype=torch.float32, device=device), "fingerprints": []}
-        await _reference_training_parts_across_ranks(trainer, parts, step, device=device,
-                                                     max_device_bytes=max_device_bytes, work_counts=work_counts,
-                                                     _loss_statistics=statistics, _input_fingerprints=_input_fingerprints)
+        statistics = {
+            "values": torch.zeros(7, dtype=torch.float32, device=device),
+            "fingerprints": [],
+        }
+        await _reference_training_parts_across_ranks(
+            trainer,
+            parts,
+            step,
+            device=device,
+            max_device_bytes=max_device_bytes,
+            work_counts=work_counts,
+            _loss_statistics=statistics,
+            _input_fingerprints=_input_fingerprints,
+        )
+        assert part_model is not None
         values, fingerprints = statistics["values"], statistics["fingerprints"]
         if adaptive:
-            lk_weight = torch.exp(-part_model.lk_hybrid_eta * (values[0] / values[1].clamp_min(1.0))).detach()
+            lk_weight = torch.exp(
+                -part_model.lk_hybrid_eta * (values[0] / values[1].clamp_min(1.0))
+            ).detach()
         if confidence:
             confidence_scale = (values[2] / values[3].clamp_min(1e-6)).detach()
         if dpace:
@@ -3492,104 +4618,250 @@ async def _reference_training_parts_across_ranks(trainer, parts, step, *, device
                 batch = item() if callable(item) else item
                 if not isinstance(batch, dict):
                     raise ValueError("Reference part must materialize a batch mapping")
-                if max_device_bytes and (_reference_device_transfer_bytes(batch)
-                                         + (lk_weight.numel() * lk_weight.element_size() if lk_weight is not None else 0)
-                                         + (confidence_scale.numel() * confidence_scale.element_size() if confidence_scale is not None else 0)
-                                         + (l1_scale.numel() * l1_scale.element_size() if l1_scale is not None else 0)
-                                         + (lk_scale.numel() * lk_scale.element_size() if lk_scale is not None else 0)
-                                         + (ce_scale.numel() * ce_scale.element_size() if ce_scale is not None else 0)
-                                         > max_device_bytes):
-                    raise ValueError("Reference part exceeds consumer_device_batch_bytes")
+                if max_device_bytes and (
+                    _reference_device_transfer_bytes(batch)
+                    + (
+                        lk_weight.numel() * lk_weight.element_size()
+                        if lk_weight is not None
+                        else 0
+                    )
+                    + (
+                        confidence_scale.numel() * confidence_scale.element_size()
+                        if confidence_scale is not None
+                        else 0
+                    )
+                    + (
+                        l1_scale.numel() * l1_scale.element_size()
+                        if l1_scale is not None
+                        else 0
+                    )
+                    + (
+                        lk_scale.numel() * lk_scale.element_size()
+                        if lk_scale is not None
+                        else 0
+                    )
+                    + (
+                        ce_scale.numel() * ce_scale.element_size()
+                        if ce_scale is not None
+                        else 0
+                    )
+                    > max_device_bytes
+                ):
+                    raise ValueError(
+                        "Reference part exceeds consumer_device_batch_bytes"
+                    )
                 if batch.get("hidden_source") == "standalone_vllm_reference":
                     staged = dict(trainer._stage_standalone_cpu_batch(batch))
                     staged["_speco_reference_staged"] = True
                 else:
                     staged = dict(batch)
                 if part_model is not None:
-                    ids, mask, hidden = staged["input_ids"], staged["loss_mask"], staged["hidden_states"]
+                    ids, mask, hidden = (
+                        staged["input_ids"],
+                        staged["loss_mask"],
+                        staged["hidden_states"],
+                    )
                     if part_model.loss_mode in {"restricted_ce", "sampled_ce"}:
                         vocab = staged.get("preselected_restricted_vocab")
-                        if not isinstance(vocab, torch.Tensor) or staged.get("next_token_ids") is not None:
-                            raise ValueError("Reference restricted CE requires the original input vocabulary and labels")
-                        current_vocab = _reference_part_fingerprint({"preselected_restricted_vocab": vocab})
-                        if vocabulary_fingerprint is not None and current_vocab != vocabulary_fingerprint:
-                            raise ValueError("Reference restricted vocabulary changed between parts")
+                        if (
+                            not isinstance(vocab, torch.Tensor)
+                            or staged.get("next_token_ids") is not None
+                        ):
+                            raise ValueError(
+                                "Reference restricted CE requires the original input vocabulary and labels"
+                            )
+                        current_vocab = _reference_part_fingerprint(
+                            {"preselected_restricted_vocab": vocab}
+                        )
+                        if (
+                            vocabulary_fingerprint is not None
+                            and current_vocab != vocabulary_fingerprint
+                        ):
+                            raise ValueError(
+                                "Reference restricted vocabulary changed between parts"
+                            )
                         vocabulary_fingerprint = current_vocab
-                    if (not isinstance(ids, torch.Tensor) or ids.ndim != 2 or ids.dtype != torch.long
-                            or not isinstance(mask, torch.Tensor) or mask.shape != ids.shape or mask.device != ids.device
-                            or not isinstance(hidden, torch.Tensor) or hidden.ndim != 3
-                            or hidden.shape[:2] != ids.shape or hidden.device != ids.device):
-                        raise ValueError("Reference part input, mask and hidden tensors are incompatible")
+                    if (
+                        not isinstance(ids, torch.Tensor)
+                        or ids.ndim != 2
+                        or ids.dtype != torch.long
+                        or not isinstance(mask, torch.Tensor)
+                        or mask.shape != ids.shape
+                        or mask.device != ids.device
+                        or not isinstance(hidden, torch.Tensor)
+                        or hidden.ndim != 3
+                        or hidden.shape[:2] != ids.shape
+                        or hidden.device != ids.device
+                    ):
+                        raise ValueError(
+                            "Reference part input, mask and hidden tensors are incompatible"
+                        )
                     draft = part_model.draft_model
-                    if hidden.size(-1) != draft.num_context_layers * draft.target_hidden_size:
-                        raise ValueError("Reference part hidden feature width is incompatible")
+                    if (
+                        hidden.size(-1)
+                        != draft.num_context_layers * draft.target_hidden_size
+                    ):
+                        raise ValueError(
+                            "Reference part hidden feature width is incompatible"
+                        )
                     target = staged.get("target_last_hidden_states")
-                    if getattr(part_model, "ce_target_source", None) == "target_argmax" and target is None:
-                        raise ValueError("Reference part target-argmax loss requires target hidden states")
+                    if (
+                        getattr(part_model, "ce_target_source", None) == "target_argmax"
+                        and target is None
+                    ):
+                        raise ValueError(
+                            "Reference part target-argmax loss requires target hidden states"
+                        )
                     # Raw targets are normalized and sanitized before the model
                     # forms CE and distribution masks. With fixed position
                     # weights these losses then share the same denominator.
-                    if (getattr(part_model, "l1_loss_alpha", 0) > 0 or getattr(part_model, "lk_loss_alpha", 0) > 0
-                            or getattr(part_model, "confidence_head_alpha", 0) > 0) and (
-                            target is None or staged.get("last_hidden_state_norm") != "raw_target_residual"):
-                        raise ValueError("Reference part distribution losses require normalized raw target supervision")
-                    if target is not None and (not isinstance(target, torch.Tensor) or target.ndim != 3
-                            or target.shape[:2] != ids.shape or target.size(-1) != draft.target_hidden_size
-                            or target.device != ids.device):
-                        raise ValueError("Reference part target hidden tensor is incompatible")
-                    if staged.get("last_hidden_state_norm") == "raw_target_residual" and (
-                            staged.get("hidden_source") != "standalone_vllm_reference"
-                            or getattr(part_model, "verifier_norm", None) is None or target is None):
-                        raise ValueError("Reference part raw target requires a verifier norm and target tensor")
+                    if (
+                        getattr(part_model, "l1_loss_alpha", 0) > 0
+                        or getattr(part_model, "lk_loss_alpha", 0) > 0
+                        or getattr(part_model, "confidence_head_alpha", 0) > 0
+                    ) and (
+                        target is None
+                        or staged.get("last_hidden_state_norm") != "raw_target_residual"
+                    ):
+                        raise ValueError(
+                            "Reference part distribution losses require normalized raw target supervision"
+                        )
+                    if target is not None and (
+                        not isinstance(target, torch.Tensor)
+                        or target.ndim != 3
+                        or target.shape[:2] != ids.shape
+                        or target.size(-1) != draft.target_hidden_size
+                        or target.device != ids.device
+                    ):
+                        raise ValueError(
+                            "Reference part target hidden tensor is incompatible"
+                        )
+                    if staged.get(
+                        "last_hidden_state_norm"
+                    ) == "raw_target_residual" and (
+                        staged.get("hidden_source") != "standalone_vllm_reference"
+                        or getattr(part_model, "verifier_norm", None) is None
+                        or target is None
+                    ):
+                        raise ValueError(
+                            "Reference part raw target requires a verifier norm and target tensor"
+                        )
                     labels = staged.get("label_ids", ids)
                     label_mask = staged.get("label_mask", mask)
-                    if (not isinstance(labels, torch.Tensor) or labels.dtype != torch.long or labels.ndim != 2
-                            or labels.size(0) != ids.size(0) or labels.device != ids.device
-                            or not isinstance(label_mask, torch.Tensor) or label_mask.shape != labels.shape
-                            or label_mask.device != ids.device):
-                        raise ValueError("Reference part label tensors are incompatible")
+                    if (
+                        not isinstance(labels, torch.Tensor)
+                        or labels.dtype != torch.long
+                        or labels.ndim != 2
+                        or labels.size(0) != ids.size(0)
+                        or labels.device != ids.device
+                        or not isinstance(label_mask, torch.Tensor)
+                        or label_mask.shape != labels.shape
+                        or label_mask.device != ids.device
+                    ):
+                        raise ValueError(
+                            "Reference part label tensors are incompatible"
+                        )
                     next_mask = staged.get("next_token_loss_mask")
                     part_model._validate_preselected_anchors(
-                        staged.get("preselected_anchor_positions"), staged.get("preselected_anchor_keep_mask"),
-                        seq_len=ids.size(1), label_mask=mask if next_mask is not None else label_mask,
-                        document_ids=staged.get("document_ids"), next_token_loss_mask=next_mask,
+                        staged.get("preselected_anchor_positions"),
+                        staged.get("preselected_anchor_keep_mask"),
+                        seq_len=ids.size(1),
+                        label_mask=mask if next_mask is not None else label_mask,
+                        document_ids=staged.get("document_ids"),
+                        next_token_loss_mask=next_mask,
                     )
-                if (_input_fingerprints is not None
-                        or (_loss_statistics is not None and "input_fingerprints" in _loss_statistics)):
+                if _input_fingerprints is not None or (
+                    _loss_statistics is not None
+                    and "input_fingerprints" in _loss_statistics
+                ):
                     fingerprint = _reference_part_fingerprint(
-                        {key: value for key, value in staged.items() if key != "preselected_restricted_vocab"})
-                    if _input_fingerprints is not None and fingerprint != _input_fingerprints[index]:
-                        raise ValueError("Reference part changed after vocabulary sampling probe")
-                    if _loss_statistics is not None and "input_fingerprints" in _loss_statistics:
+                        {
+                            key: value
+                            for key, value in staged.items()
+                            if key != "preselected_restricted_vocab"
+                        }
+                    )
+                    if (
+                        _input_fingerprints is not None
+                        and fingerprint != _input_fingerprints[index]
+                    ):
+                        raise ValueError(
+                            "Reference part changed after vocabulary sampling probe"
+                        )
+                    if (
+                        _loss_statistics is not None
+                        and "input_fingerprints" in _loss_statistics
+                    ):
                         _loss_statistics["input_fingerprints"].append(fingerprint)
                 if _loss_statistics is not None:
-                    _loss_statistics["fingerprints"].append(_reference_part_fingerprint(staged))
-                elif fingerprints is not None and _reference_part_fingerprint(staged) != fingerprints[index]:
+                    _loss_statistics["fingerprints"].append(
+                        _reference_part_fingerprint(staged)
+                    )
+                elif (
+                    fingerprints is not None
+                    and _reference_part_fingerprint(staged) != fingerprints[index]
+                ):
                     raise ValueError("Reference part changed after loss statistics")
             except Exception as exc:
                 error = exc
             if not _all_ranks_true(error is None, device):
-                raise RuntimeError("Reference part materialization or staging failed; source references retained") from error
+                raise RuntimeError(
+                    "Reference part materialization or staging failed; source references retained"
+                ) from error
+            assert staged is not None
             if _loss_statistics is not None:
                 error = None
                 try:
                     trainer.model.train()
-                    inputs = {key: value for key, value in staged.items() if not key.startswith("_speco_")}
-                    with torch.no_grad(), trainer._ulysses_group_context(), torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
-                        diagnostic = trainer.backend.compute_loss(trainer.model, inputs, int(staged.get("_speco_pad_size", 0) or 0))["diagnostics"]
-                    values = [diagnostic[name].detach().float() for name in (
-                        "lk_acceptance_sum", "lk_diagnostic_token_count", "ce_weighted_token_count",
-                        "confidence_weighted_token_count", "l1_weighted_token_count", "lk_weighted_token_count",
-                        "active_target_count")]
-                    if any(value.numel() != 1 or not bool(torch.isfinite(value).all()) or float(value) < 0 for value in values):
+                    inputs = {
+                        key: value
+                        for key, value in staged.items()
+                        if not key.startswith("_speco_")
+                    }
+                    with (
+                        torch.no_grad(),
+                        trainer._ulysses_group_context(),
+                        torch.amp.autocast(
+                            device_type=device.type, dtype=torch.bfloat16
+                        ),
+                    ):
+                        diagnostic = trainer.backend.compute_loss(
+                            trainer.model,
+                            inputs,
+                            int(staged.get("_speco_pad_size", 0) or 0),
+                        )["diagnostics"]
+                    values = [
+                        diagnostic[name].detach().float()
+                        for name in (
+                            "lk_acceptance_sum",
+                            "lk_diagnostic_token_count",
+                            "ce_weighted_token_count",
+                            "confidence_weighted_token_count",
+                            "l1_weighted_token_count",
+                            "lk_weighted_token_count",
+                            "active_target_count",
+                        )
+                    ]
+                    if any(
+                        value.numel() != 1
+                        or not bool(torch.isfinite(value).all())
+                        or float(value) < 0
+                        for value in values
+                    ):
                         raise ValueError("Invalid reference loss statistics")
-                    _loss_statistics["values"].add_(torch.stack([value.reshape(()) for value in values]))
+                    _loss_statistics["values"].add_(
+                        torch.stack([value.reshape(()) for value in values])
+                    )
                 except Exception as exc:
                     error = exc
                 if not _all_ranks_true(error is None, device):
-                    raise RuntimeError("Reference loss statistics failed; source references retained") from error
+                    raise RuntimeError(
+                        "Reference loss statistics failed; source references retained"
+                    ) from error
                 if work_counts is not None:
-                    work_counts["window_statistics_input_positions"] += staged["input_ids"].numel()
+                    work_counts["window_statistics_input_positions"] += staged[
+                        "input_ids"
+                    ].numel()
                 del staged, batch
                 continue
             if lk_weight is not None:
@@ -3605,14 +4877,25 @@ async def _reference_training_parts_across_ranks(trainer, parts, step, *, device
             staged["_speco_allow_zero_accumulation"] = True
             error, ok = None, False
             try:
-                ok = bool(await trainer.training_step_from_batch(
-                    staged, step, raise_on_error=True, accumulation_steps=count, accumulation_index=index))
+                ok = bool(
+                    await trainer.training_step_from_batch(
+                        staged,
+                        step,
+                        raise_on_error=True,
+                        accumulation_steps=count,
+                        accumulation_index=index,
+                    )
+                )
             except Exception as exc:
                 error = exc
             if not _all_ranks_true(ok and error is None, device):
-                raise RuntimeError("Reference part training failed; source references retained") from error
+                raise RuntimeError(
+                    "Reference part training failed; source references retained"
+                ) from error
             if work_counts is not None:
-                work_counts["window_train_input_positions"] += staged["input_ids"].numel()
+                work_counts["window_train_input_positions"] += staged[
+                    "input_ids"
+                ].numel()
             del staged, batch
     except BaseException:
         if getattr(trainer, "optimizer", None) is not None:
@@ -3623,8 +4906,15 @@ async def _reference_training_parts_across_ranks(trainer, parts, step, *, device
 
 def _detach_reference_batch(batch, config):
     limit = config.get("consumer_prefetch_batch_bytes", 0)
-    if not isinstance(batch, TQLocalBatch) or batch.prepared_batch is None or batch.local_samples:
-        raise ValueError("Early source release requires a prepared batch without source samples")
+    if (
+        not isinstance(batch, StandaloneLocalBatch)
+        or batch.prepared_batch is None
+        or batch.local_samples
+    ):
+        raise ValueError(
+            "Early source release requires a prepared batch without source samples"
+        )
+
     def tensors(value):
         if isinstance(value, torch.Tensor):
             yield value
@@ -3634,64 +4924,113 @@ def _detach_reference_batch(batch, config):
         elif isinstance(value, (list, tuple)):
             for item in value:
                 yield from tensors(item)
+
     size = 0
     for value in tensors(batch.prepared_batch):
         if value.device.type != "cpu":
-            raise ValueError("Detached source materialization must precede device prefetch")
-        size += 2 * max(value.untyped_storage().nbytes(), value.numel() * value.element_size())
+            raise ValueError(
+                "Detached source materialization must precede device prefetch"
+            )
+        size += 2 * max(
+            value.untyped_storage().nbytes(), value.numel() * value.element_size()
+        )
     if type(limit) is not int or limit <= 0 or size > limit:
-        raise ValueError("Detached materialization requires an explicit sufficient batch byte budget")
+        raise ValueError(
+            "Detached materialization requires an explicit sufficient batch byte budget"
+        )
+
     def detach(value):
         if isinstance(value, torch.Tensor):
             if value.device.type != "cpu":
-                raise ValueError("Detached source materialization must precede device prefetch")
+                raise ValueError(
+                    "Detached source materialization must precede device prefetch"
+                )
             return value.detach().clone()
         if isinstance(value, dict):
             return {key: detach(item) for key, item in value.items()}
         if isinstance(value, (list, tuple)):
             return type(value)(detach(item) for item in value)
         return value
+
     return replace(batch, prepared_batch=detach(batch.prepared_batch))
 
 
-def _ack_reference_materialization_across_ranks(batch, *, rank, device, events, config, per_rank=False,
-                                                producer_handle=None, source_payload_safe=False) -> None:
+def _ack_reference_materialization_across_ranks(
+    batch,
+    *,
+    rank,
+    device,
+    events,
+    config,
+    per_rank=False,
+    producer_handle=None,
+    source_payload_safe=False,
+) -> None:
     """Confirm rank preparation before sending the aggregate materialization event."""
+
     def agree(error):
-        failed = torch.tensor([int(error is not None)], dtype=torch.int32, device=device)
+        failed = torch.tensor(
+            [int(error is not None)], dtype=torch.int32, device=device
+        )
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(failed, op=dist.ReduceOp.MAX)
         if failed.item():
-            raise RuntimeError("Reference materialization acknowledgement failed on at least one rank") from error
+            raise RuntimeError(
+                "Reference materialization acknowledgement failed on at least one rank"
+            ) from error
 
     error = None
     try:
-        if (not isinstance(batch, TQLocalBatch) or type(batch.plan_id) is not int or batch.plan_id < 0
-                or not isinstance(batch.receipt_token, str) or not batch.receipt_token):
-            raise ValueError("Reference materialization requires a plan and receipt token")
+        if (
+            not isinstance(batch, StandaloneLocalBatch)
+            or type(batch.plan_id) is not int
+            or batch.plan_id < 0
+            or not isinstance(batch.receipt_token, str)
+            or not batch.receipt_token
+        ):
+            raise ValueError(
+                "Reference materialization requires a plan and receipt token"
+            )
         if type(source_payload_safe) is not bool:
             raise ValueError("Source payload safety receipt must be a boolean")
         if per_rank:
             incarnation = batch.producer_incarnation
-            if (not isinstance(incarnation, str) or len(incarnation) != 32
-                    or any(char not in "0123456789abcdef" for char in incarnation)
-                    or producer_handle is None):
-                raise ValueError("Reference rank acknowledgement requires Producer identity and handle")
+            if (
+                not isinstance(incarnation, str)
+                or len(incarnation) != 32
+                or any(char not in "0123456789abcdef" for char in incarnation)
+                or producer_handle is None
+            ):
+                raise ValueError(
+                    "Reference rank acknowledgement requires Producer identity and handle"
+                )
             import ray
+
             retry_io(
-                lambda: ray.get(producer_handle.acknowledge_reference_rank.remote(
-                    incarnation, batch.plan_id, batch.receipt_token, rank),
-                    timeout=float(config.get("io_timeout_seconds", 30))),
+                lambda: ray.get(
+                    producer_handle.acknowledge_reference_rank.remote(
+                        incarnation, batch.plan_id, batch.receipt_token, rank
+                    ),
+                    timeout=float(config.get("io_timeout_seconds", 30)),
+                ),
                 name="Producer reference rank acknowledgement",
                 attempts=int(config.get("io_retry_max_attempts", 3)),
             )
-            event = {"kind": "reference_rank_materialized", "plan_id": batch.plan_id,
-                     "receipt_token": batch.receipt_token, "rank": rank}
+            event = {
+                "kind": "reference_rank_materialized",
+                "plan_id": batch.plan_id,
+                "receipt_token": batch.receipt_token,
+                "rank": rank,
+            }
             if source_payload_safe:
                 event["source_payload_safe"] = True
-            retry_io(lambda: put_queue(events, event, timeout=float(config.get("io_timeout_seconds", 30))),
-                     name="Reference rank materialization acknowledgement",
-                     attempts=int(config.get("io_retry_max_attempts", 3)))
+            retry_io(
+                lambda: put_queue(
+                    events, event, timeout=float(config.get("io_timeout_seconds", 30))
+                ),
+                name="Reference rank materialization acknowledgement",
+                attempts=int(config.get("io_retry_max_attempts", 3)),
+            )
     except Exception as exc:
         error = exc
     if per_rank:
@@ -3699,13 +5038,20 @@ def _ack_reference_materialization_across_ranks(batch, *, rank, device, events, 
         error = None
     if error is None and rank == 0:
         try:
-            event = {"kind": "training_materialized", "plan_id": batch.plan_id,
-                     "receipt_token": batch.receipt_token}
+            event = {
+                "kind": "training_materialized",
+                "plan_id": batch.plan_id,
+                "receipt_token": batch.receipt_token,
+            }
             if source_payload_safe:
                 event["source_payload_safe"] = True
-            retry_io(lambda: put_queue(events, event, timeout=float(config.get("io_timeout_seconds", 30))),
-                     name="Reference materialization acknowledgement",
-                     attempts=int(config.get("io_retry_max_attempts", 3)))
+            retry_io(
+                lambda: put_queue(
+                    events, event, timeout=float(config.get("io_timeout_seconds", 30))
+                ),
+                name="Reference materialization acknowledgement",
+                attempts=int(config.get("io_retry_max_attempts", 3)),
+            )
         except Exception as exc:
             error = exc
     agree(error)
@@ -3744,7 +5090,7 @@ def _submit_standalone_metrics(finalizer, events, event, config) -> None:
 
 
 def _clear_tq_batch_across_ranks(
-    loader: TQFeatureDataLoader,
+    loader: Any,
     global_keys: list[str] | None,
     *,
     rank: int,
@@ -3759,12 +5105,22 @@ def _clear_tq_batch_across_ranks(
     """Finalize on rank 0; ray_reference uses async ACK without a per-step collective."""
 
     def complete() -> None:
-        if training_events is not None and completion_event and completion_event.get("receipt_token"):
-            applied_event = {"kind": "training_applied", "plan_id": completion_event["plan_id"],
-                             "receipt_token": completion_event["receipt_token"]}
+        if (
+            training_events is not None
+            and completion_event
+            and completion_event.get("receipt_token")
+        ):
+            applied_event = {
+                "kind": "training_applied",
+                "plan_id": completion_event["plan_id"],
+                "receipt_token": completion_event["receipt_token"],
+            }
             retry_io(
-                lambda: put_queue(training_events, applied_event,
-                                  timeout=getattr(loader, "io_timeout_seconds", 30)),
+                lambda: put_queue(
+                    training_events,
+                    applied_event,
+                    timeout=getattr(loader, "io_timeout_seconds", 30),
+                ),
                 name="Reference optimizer acknowledgement",
                 attempts=getattr(loader, "io_retry_max_attempts", 3),
             )
@@ -3795,7 +5151,9 @@ def _clear_tq_batch_across_ranks(
 
     if synchronize_before_cleanup:
         if not dist.is_initialized() or dist.get_world_size() <= 1:
-            raise RuntimeError("Multi-node cleanup requires an initialized distributed group")
+            raise RuntimeError(
+                "Multi-node cleanup requires an initialized distributed group"
+            )
         # No owner may release shared payloads until all ranks finish this step.
         dist.barrier()
 
@@ -3899,7 +5257,7 @@ def _next_batch_across_ranks(
 ) -> Any | None:
     """Fetch one batch and make producer failures visible to every rank.
 
-    Producer and replay errors happen before the FSDP training step. Every
+    Producer and feature-loading errors happen before the FSDP training step. Every
     rank therefore reports its fetch result through the same collective before
     any rank is allowed to enter model collectives.  This prevents healthy
     ranks from waiting in FSDP after another rank has already started cleanup.
@@ -3910,81 +5268,159 @@ def _next_batch_across_ranks(
     exhausted = False
     identity_words = [0, 0, 0, 0]
     try:
-        if type(require_reference_metadata) is not bool or (require_reference_metadata and require_prepared):
+        if type(require_reference_metadata) is not bool or (
+            require_reference_metadata and require_prepared
+        ):
             raise ValueError("Reference fetch must select one batch representation")
-        if type(node_ranks_per_host) is not int or node_ranks_per_host < 0 or (node_ranks_per_host and not require_reference_metadata):
-            raise ValueError("Node reference assignments require deferred reference metadata")
+        if (
+            type(node_ranks_per_host) is not int
+            or node_ranks_per_host < 0
+            or (node_ranks_per_host and not require_reference_metadata)
+        ):
+            raise ValueError(
+                "Node reference assignments require deferred reference metadata"
+            )
         samples = next(source)
         if samples is None:
             raise RuntimeError("Successful batch fetch returned no samples")
         if require_prepared and (
-            not isinstance(samples, TQLocalBatch) or not samples.prepared_batch
+            not isinstance(samples, StandaloneLocalBatch) or not samples.prepared_batch
         ):
             raise RuntimeError("Reference input returned no prepared training batch")
         if require_reference_metadata:
-            from verl_speco.trainer.tq_feature_store import ReadyEntry
-            if (not isinstance(samples, TQLocalBatch) or samples.prepared_batch is not None
-                    or not isinstance(samples.file_entries, list) or not samples.file_entries
-                    or any(not isinstance(entry, ReadyEntry) for entry in samples.file_entries)
-                    or samples.local_samples or samples.cleanup_after_load
-                    or (not samples.is_padding_rank and samples.local_keys != [entry.key for entry in samples.file_entries])
-                    or (samples.is_padding_rank and samples.local_keys)):
-                raise RuntimeError("Reference input returned invalid deferred file assignments")
+            from verl_speco.trainer.standalone_data import ReadyEntry
+
+            if (
+                not isinstance(samples, StandaloneLocalBatch)
+                or samples.prepared_batch is not None
+                or not isinstance(samples.file_entries, list)
+                or not samples.file_entries
+                or any(
+                    not isinstance(entry, ReadyEntry) for entry in samples.file_entries
+                )
+                or samples.local_samples
+                or samples.cleanup_after_load
+                or (
+                    not samples.is_padding_rank
+                    and samples.local_keys
+                    != [entry.key for entry in samples.file_entries]
+                )
+                or (samples.is_padding_rank and samples.local_keys)
+            ):
+                raise RuntimeError(
+                    "Reference input returned invalid deferred file assignments"
+                )
             node_entries = samples.node_file_entries
             if node_ranks_per_host:
                 world = dist.get_world_size() if dist.is_initialized() else 1
                 owner = rank // node_ranks_per_host * node_ranks_per_host
-                if (node_ranks_per_host < 2 or world % node_ranks_per_host or not 0 <= rank < world
-                        or (rank != owner and node_entries is not None)
-                        or (rank == owner and (not isinstance(node_entries, dict)
-                            or set(node_entries) != set(range(owner, owner + node_ranks_per_host))
-                            or any(not isinstance(entries, list) or not entries
-                                   or any(not isinstance(entry, ReadyEntry) for entry in entries)
-                                   for entries in node_entries.values())
-                            or node_entries[rank] != samples.file_entries))):
-                    raise RuntimeError("Reference input returned invalid node assignments")
+                if (
+                    node_ranks_per_host < 2
+                    or world % node_ranks_per_host
+                    or not 0 <= rank < world
+                    or (rank != owner and node_entries is not None)
+                    or (
+                        rank == owner
+                        and (
+                            not isinstance(node_entries, dict)
+                            or set(node_entries)
+                            != set(range(owner, owner + node_ranks_per_host))
+                            or any(
+                                not isinstance(entries, list)
+                                or not entries
+                                or any(
+                                    not isinstance(entry, ReadyEntry)
+                                    for entry in entries
+                                )
+                                for entries in node_entries.values()
+                            )
+                            or node_entries[rank] != samples.file_entries
+                        )
+                    )
+                ):
+                    raise RuntimeError(
+                        "Reference input returned invalid node assignments"
+                    )
             elif node_entries is not None:
-                raise RuntimeError("Reference input returned unexpected node assignments")
-            if (type(samples.plan_id) is not int or samples.plan_id < 0
-                    or not isinstance(samples.receipt_token, str) or not samples.receipt_token
-                    or samples.assignment_digest is None):
-                raise RuntimeError("Deferred reference assignment requires complete dispatch identity")
-        if (require_prepared or require_reference_metadata) and isinstance(samples, TQLocalBatch):
+                raise RuntimeError(
+                    "Reference input returned unexpected node assignments"
+                )
+            if (
+                type(samples.plan_id) is not int
+                or samples.plan_id < 0
+                or not isinstance(samples.receipt_token, str)
+                or not samples.receipt_token
+                or samples.assignment_digest is None
+            ):
+                raise RuntimeError(
+                    "Deferred reference assignment requires complete dispatch identity"
+                )
+        if (require_prepared or require_reference_metadata) and isinstance(
+            samples, StandaloneLocalBatch
+        ):
             plan_id, token = samples.plan_id, samples.receipt_token
-            if ((plan_id is not None and (type(plan_id) is not int or plan_id < 0))
-                    or (token is not None and (not isinstance(token, str) or not token or len(token) > 128))):
+            if (plan_id is not None and (type(plan_id) is not int or plan_id < 0)) or (
+                token is not None
+                and (not isinstance(token, str) or not token or len(token) > 128)
+            ):
                 raise RuntimeError("Invalid reference dispatch identity")
             input_identity = samples.input_identity
             if input_identity is not None:
                 input_identity = validate_input_identity(input_identity)
-                if expected_input_identity is not None and input_identity != expected_input_identity:
-                    raise RuntimeError("Reference batch input content differs from training baseline")
+                if (
+                    expected_input_identity is not None
+                    and input_identity != expected_input_identity
+                ):
+                    raise RuntimeError(
+                        "Reference batch input content differs from training baseline"
+                    )
             incarnation = samples.producer_incarnation
-            if incarnation is not None and (not isinstance(incarnation, str) or len(incarnation) != 32
-                    or any(char not in "0123456789abcdef" for char in incarnation)):
+            if incarnation is not None and (
+                not isinstance(incarnation, str)
+                or len(incarnation) != 32
+                or any(char not in "0123456789abcdef" for char in incarnation)
+            ):
                 raise RuntimeError("Invalid reference Producer incarnation")
             assignment_digest = samples.assignment_digest
-            if assignment_digest is not None and (not isinstance(assignment_digest, str) or len(assignment_digest) != 64
-                    or any(char not in "0123456789abcdef" for char in assignment_digest)):
+            if assignment_digest is not None and (
+                not isinstance(assignment_digest, str)
+                or len(assignment_digest) != 64
+                or any(char not in "0123456789abcdef" for char in assignment_digest)
+            ):
                 raise RuntimeError("Invalid reference assignment digest")
-            encoded = json.dumps([plan_id, token, input_identity, incarnation, assignment_digest], sort_keys=True, separators=(",", ":")).encode("utf-8")
+            encoded = json.dumps(
+                [plan_id, token, input_identity, incarnation, assignment_digest],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
             digest = hashlib.sha256(encoded).digest()
-            identity_words = [int.from_bytes(digest[i:i + 4], "big") & 0x7fffffff for i in range(0, 16, 4)]
-        if isinstance(samples, TQLocalBatch) and samples.is_padding_rank:
+            identity_words = [
+                int.from_bytes(digest[i : i + 4], "big") & 0x7FFFFFFF
+                for i in range(0, 16, 4)
+            ]
+        if isinstance(samples, StandaloneLocalBatch) and samples.is_padding_rank:
             if require_reference_metadata:
                 pass  # Mask the template after sampling geometry is known.
             elif not require_prepared or samples.prepared_batch is None:
                 raise RuntimeError("Padding rank requires a prepared reference batch")
             else:
-                samples = replace(samples, prepared_batch=_zero_standalone_padding_batch(samples.prepared_batch))
+                samples = replace(
+                    samples,
+                    prepared_batch=_zero_standalone_padding_batch(
+                        samples.prepared_batch
+                    ),
+                )
     except StopIteration:
         exhausted = True
     except BaseException as exc:  # noqa: BLE001
         local_error = exc
 
     sync_started = time.perf_counter() if timings is not None else 0.0
-    values = [1 if local_error is not None else 0, 1 if exhausted else 0,
-              1 if samples is not None and local_error is None else 0]
+    values = [
+        1 if local_error is not None else 0,
+        1 if exhausted else 0,
+        1 if samples is not None and local_error is None else 0,
+    ]
     if require_prepared or require_reference_metadata:
         # MAX of both positive and negative words gives each word's max/min in
         # the readiness collective, without exchanging payloads or another RPC.
@@ -4027,8 +5463,12 @@ def _next_batch_across_ranks(
         raise RuntimeError(
             f"Rank={rank} reported a successful batch fetch without samples"
         )
-    if (require_prepared or require_reference_metadata) and any(state_values[i] != -state_values[i + 1] for i in range(3, 11, 2)):
-        raise RuntimeError("Standalone reference dispatch identity differs across ranks")
+    if (require_prepared or require_reference_metadata) and any(
+        state_values[i] != -state_values[i + 1] for i in range(3, 11, 2)
+    ):
+        raise RuntimeError(
+            "Standalone reference dispatch identity differs across ranks"
+        )
     return samples
 
 

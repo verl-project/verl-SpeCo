@@ -24,12 +24,15 @@ import types
 from functools import wraps
 from typing import Any, cast
 
+from verl_speco.integration.verify_trace import TRACE_KEY
+
 logger = logging.getLogger(__file__)
 
 _PATCHED = False
 SPECO_STUDENT_DECODE_TIME_KEY = "speco_student_decode_time_s"
 SPECO_TEACHER_PREFILL_TIME_KEY = "speco_teacher_prefill_time_s"
 _DEFAULT_EXTRA_KEYS = {
+    TRACE_KEY: None,
     "_speco_vllm_spec_decode_accepted_tokens": None,
     "_speco_vllm_spec_decode_drafts": None,
     "turn_scores": None,
@@ -288,6 +291,9 @@ async def _run_agent_loop_with_student_timing(call: Any, *args, **kwargs) -> Any
         return result
 
     student_decode_times: list[float] = []
+    from verl_speco.integration.verify_trace import TURN_TRACES
+
+    trace_token = TURN_TRACES.set([])
     token = _CURRENT_STUDENT_DECODE_TIMES.set(student_decode_times)
     try:
         result = call(*args, **kwargs)
@@ -295,6 +301,7 @@ async def _run_agent_loop_with_student_timing(call: Any, *args, **kwargs) -> Any
             result = await result
     finally:
         _CURRENT_STUDENT_DECODE_TIMES.reset(token)
+        TURN_TRACES.reset(trace_token)
     _record_phase_time(
         result,
         SPECO_STUDENT_DECODE_TIME_KEY,
@@ -358,6 +365,9 @@ async def _speco_worker_run_agent_loop(
 
 
 async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs):
+    from verl_speco.integration.verify_trace import merge_turn_traces
+
+    merge_turn_traces(output)
     _speco_default_agent_loop_extra_fields(output)
     agent_loop_postprocess = _speco_parent_method(self, "_agent_loop_postprocess")
     if not callable(agent_loop_postprocess):
@@ -540,16 +550,31 @@ def _build_speco_agent_loop_worker_class(worker_cls):
 
 
 def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) -> None:
-    if not _is_sglang_rollout_config(getattr(manager, "config", None)):
+    is_sglang = _is_sglang_rollout_config(getattr(manager, "config", None))
+    rollout = getattr(
+        getattr(manager.config, "actor_rollout_ref", None), "rollout", None
+    )
+    if not is_sglang and getattr(rollout, "name", None) != "vllm":
         return
     if getattr(manager, "_speco_agent_loop_manager_configured", False):
         return
 
     import ray
 
-    manager.agent_loop_workers_class = ray.remote(
-        _build_speco_agent_loop_worker_class(worker_cls)
-    )
+    existing_worker = getattr(manager, "agent_loop_workers_class", None)
+    existing_raw = getattr(existing_worker, "__ray_actor_class__", None)
+    if existing_raw is not None:
+        worker_cls = existing_raw
+    if not worker_cls.__dict__.get("_speco_explicit_worker_runtime", False):
+        manager.agent_loop_workers_class = ray.remote(
+            _build_speco_agent_loop_worker_class(worker_cls)
+        )
+
+    if not is_sglang:
+        # Install patches again in the Ray process, where upstream classes are
+        # imported afresh. Driver-side monkey patches do not survive that import.
+        manager._speco_agent_loop_manager_configured = True
+        return
 
     try:
         from verl.workers.rollout.sglang_rollout import async_sglang_server
@@ -663,6 +688,10 @@ def install_agent_loop_runtime_patch() -> bool:
             )
 
             record_serving_segment(result)
+            if student_decode_times is not None:
+                from verl_speco.integration.verify_trace import collect_turn_trace
+
+                collect_turn_trace(result)
             return result
 
         llm_server_client_cls.generate = speco_llm_server_generate
@@ -733,6 +762,9 @@ def install_agent_loop_runtime_patch() -> bool:
 
         @wraps(agent_loop_postprocess)
         async def speco_agent_loop_postprocess(self, output, validate, **kwargs):
+            from verl_speco.integration.verify_trace import merge_turn_traces
+
+            merge_turn_traces(output)
             extra_fields = getattr(output, "extra_fields", None)
             if isinstance(extra_fields, dict):
                 for key in _DEFAULT_EXTRA_KEYS:

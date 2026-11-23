@@ -712,13 +712,13 @@ def test_consumer_preserves_dispatch_receipt_token():
 
 
 def test_reference_command_frames_reassemble_and_retry_without_duplicates():
-    from verl_speco.standalone_ray_runtime import _reference_command_frames
-    from verl_speco.trainer.tq_sample_source import _ReferenceCommandAssembler
+    from verl_speco.transport.reference_dispatch import reference_command_frames
+    from verl_speco.transport.reference_dispatch import ReferenceCommandAssembler
 
     value = {**command(0), "receipt_token": "identity", "large": "中" * 800}
-    frames = list(_reference_command_frames(value, max_bytes=8192, frame_bytes=1024))
+    frames = list(reference_command_frames(value, max_bytes=8192, frame_bytes=1024))
     assert len(frames) > 2 and all(len(frame["data"]) <= 1024 for frame in frames)
-    assembler = _ReferenceCommandAssembler(8192, 1024)
+    assembler = ReferenceCommandAssembler(8192, 1024)
     assert assembler.add(frames[0]) is None
     assert assembler.add(frames[0]) is None
     for frame in frames[1:-1]:
@@ -732,12 +732,12 @@ def test_reference_command_frames_reassemble_and_retry_without_duplicates():
 
 @pytest.mark.parametrize("failure", ["out_of_order", "identity", "checksum", "truncated"])
 def test_reference_command_frames_reject_corruption(failure):
-    from verl_speco.standalone_ray_runtime import _reference_command_frames
-    from verl_speco.trainer.tq_sample_source import _ReferenceCommandAssembler
+    from verl_speco.transport.reference_dispatch import reference_command_frames
+    from verl_speco.transport.reference_dispatch import ReferenceCommandAssembler
 
     value = {**command(0), "receipt_token": "identity", "large": "x" * 3000}
-    frames = list(_reference_command_frames(value, max_bytes=8192, frame_bytes=1024))
-    assembler = _ReferenceCommandAssembler(8192, 1024)
+    frames = list(reference_command_frames(value, max_bytes=8192, frame_bytes=1024))
+    assembler = ReferenceCommandAssembler(8192, 1024)
     if failure == "out_of_order":
         with pytest.raises(ValueError, match="out-of-order"):
             assembler.add(frames[1])
@@ -757,10 +757,10 @@ def test_reference_command_frames_reject_corruption(failure):
 
 
 def test_fragmented_command_fetches_each_sample_once():
-    from verl_speco.standalone_ray_runtime import _reference_command_frames
+    from verl_speco.transport.reference_dispatch import reference_command_frames
 
     first = {**command(0), "receipt_token": "identity", "large": "x" * 3000}
-    frames = list(_reference_command_frames(first, max_bytes=8192, frame_bytes=1024))
+    frames = list(reference_command_frames(first, max_bytes=8192, frame_bytes=1024))
     commands = Queue()
     for frame in [frames[0], frames[0], *frames[1:], frames[-1], command(1), {"kind": "stop"}]:
         commands.put(frame)
@@ -773,10 +773,10 @@ def test_fragmented_command_fetches_each_sample_once():
 
 
 def test_incomplete_fragmented_command_is_never_fetched():
-    from verl_speco.standalone_ray_runtime import _reference_command_frames
+    from verl_speco.transport.reference_dispatch import reference_command_frames
 
     first = {**command(0), "receipt_token": "identity", "large": "x" * 3000}
-    frames = list(_reference_command_frames(first, max_bytes=8192, frame_bytes=1024))
+    frames = list(reference_command_frames(first, max_bytes=8192, frame_bytes=1024))
     commands = Queue()
     commands.put(frames[0])
     commands.put({"kind": "stop"})
@@ -790,24 +790,24 @@ def test_incomplete_fragmented_command_is_never_fetched():
 
 
 def test_reference_command_frame_payload_must_match_header_identity():
-    from verl_speco.standalone_ray_runtime import _reference_command_frames
-    from verl_speco.trainer.tq_sample_source import _ReferenceCommandAssembler
+    from verl_speco.transport.reference_dispatch import reference_command_frames
+    from verl_speco.transport.reference_dispatch import ReferenceCommandAssembler
 
     command_value = {**command(0), "receipt_token": "original", "large": "x" * 3000}
-    frames = list(_reference_command_frames(command_value, max_bytes=8192, frame_bytes=1024))
+    frames = list(reference_command_frames(command_value, max_bytes=8192, frame_bytes=1024))
     forged = [{**frame, "receipt_token": "forged"} for frame in frames]
-    assembler = _ReferenceCommandAssembler(8192, 1024)
+    assembler = ReferenceCommandAssembler(8192, 1024)
     with pytest.raises(ValueError, match="payload identity differs"):
         for frame in forged:
             assembler.add(frame)
 
 
 def test_reference_command_total_limit_remains_enforced():
-    from verl_speco.standalone_ray_runtime import _reference_command_frames
+    from verl_speco.transport.reference_dispatch import reference_command_frames
 
     value = {**command(0), "receipt_token": "identity", "large": "x" * 9000}
     with pytest.raises(ValueError, match="control metadata exceeds"):
-        list(_reference_command_frames(value, max_bytes=8192, frame_bytes=1024))
+        list(reference_command_frames(value, max_bytes=8192, frame_bytes=1024))
 
 
 def test_rank_ack_rejects_missing_producer_handle_before_sending():

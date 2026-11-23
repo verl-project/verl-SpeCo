@@ -25,9 +25,9 @@ import argparse
 import shlex
 import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 
 _NPROC_KEYS = (
@@ -61,12 +61,6 @@ _STANDALONE_KEYS = (
 _FEATURE_STORE_TYPE_KEY = (
     "actor_rollout_ref.rollout.drafter.training.feature_store.type"
 )
-_TQ_ENABLE_KEY = "actor_rollout_ref.rollout.drafter.training.transfer_queue.enable"
-_TQ_RAY_ADDRESS_KEY = (
-    "actor_rollout_ref.rollout.drafter.training.transfer_queue.ray.address"
-)
-_TQ_RUN_ID_KEY = "actor_rollout_ref.rollout.drafter.training.transfer_queue.run_id"
-
 _LAUNCH_OVERRIDE_KEYS = frozenset(
     _NPROC_KEYS
     + _NNODES_KEYS
@@ -175,26 +169,20 @@ def normalize_training_args(
     return normalized
 
 
-def validate_tq_launch_config(overrides: list[str]) -> None:
-    """Fail early when the standalone TQ Consumer lacks connection identity."""
-
-    store_type = _find_override(overrides, (_FEATURE_STORE_TYPE_KEY,))
-    if str(store_type or "").strip().lower() != "tq":
-        return
-    enabled = _find_override(overrides, (_TQ_ENABLE_KEY,))
-    if not _parse_bool(enabled, default=False):
+def validate_feature_store_launch_config(overrides: list[str]) -> None:
+    """The torchrun entrypoint accepts complete offline features only."""
+    store_type = (
+        str(_find_override(overrides, (_FEATURE_STORE_TYPE_KEY,)) or "").strip().lower()
+    )
+    if store_type in {"tq", "ray_reference"}:
         raise ValueError(
-            "feature_store.type=tq requires training.transfer_queue.enable=true"
+            "Streaming training requires verl_speco.standalone_tq_training_launcher; "
+            "the direct torchrun Consumer was removed."
         )
-    ray_address = str(_find_override(overrides, (_TQ_RAY_ADDRESS_KEY,)) or "").strip()
-    if not ray_address or ray_address.lower() in {"null", "none"}:
+    if store_type in {"token_replay", "jsonl_token_replay", "jsonl"}:
         raise ValueError(
-            "feature_store.type=tq requires training.transfer_queue.ray.address"
-        )
-    run_id = str(_find_override(overrides, (_TQ_RUN_ID_KEY,)) or "").strip()
-    if not run_id or run_id.lower() in {"null", "none"}:
-        raise ValueError(
-            "feature_store.type=tq requires training.transfer_queue.run_id"
+            "Token replay training was removed; generate complete features with "
+            "verl_speco.vllm_hidden_states_generate first."
         )
 
 
@@ -255,21 +243,38 @@ def main(argv: list[str] | None = None) -> int:
     # Resolve before torchrun so all workers receive the same selected path.
     rollback_key = "actor_rollout_ref.rollout.drafter.training.checkpoint_auto_rollback"
     from omegaconf import OmegaConf
+
     base = OmegaConf.load(Path(__file__).with_name("config") / "draft_trainer.yaml")
     default_rollback = OmegaConf.select(base, rollback_key, default=False)
     if type(default_rollback) is not bool:
         raise ValueError(f"{rollback_key} must be a boolean")
-    rollback_value = next((item.split("=", 1)[1] for item in reversed(training_args)
-                           if "=" in item and item.split("=", 1)[0].lstrip("+") == rollback_key), None)
+    rollback_value = next(
+        (
+            item.split("=", 1)[1]
+            for item in reversed(training_args)
+            if "=" in item and item.split("=", 1)[0].lstrip("+") == rollback_key
+        ),
+        None,
+    )
     if _parse_bool(rollback_value, default=default_rollback):
-        from verl_speco.standalone_tq_training_launcher import _resolve_checkpoint_rollback
-
-        store_type = str(_find_override(training_args, (_FEATURE_STORE_TYPE_KEY,)) or "torch_shard").strip().lower()
-        training_args = _resolve_checkpoint_rollback(
-            training_args, require_input=store_type in {"tq", "ray_reference"},
+        from verl_speco.standalone_tq_training_launcher import (
+            _resolve_checkpoint_rollback,
         )
 
-    validate_tq_launch_config(training_args)
+        store_type = (
+            str(
+                _find_override(training_args, (_FEATURE_STORE_TYPE_KEY,))
+                or "torch_shard"
+            )
+            .strip()
+            .lower()
+        )
+        training_args = _resolve_checkpoint_rollback(
+            training_args,
+            require_input=store_type in {"tq", "ray_reference"},
+        )
+
+    validate_feature_store_launch_config(training_args)
     launch_config = resolve_launch_config(training_args, module=args.module)
     normalized_training_args = normalize_training_args(training_args, launch_config)
     command = build_torch_distributed_command(

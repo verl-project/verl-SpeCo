@@ -13,6 +13,7 @@ import hashlib
 import json
 import operator
 import os
+import sys
 import sqlite3
 import tempfile
 import threading
@@ -29,14 +30,20 @@ _MAX_ROW_BYTES = 16 * 1024 * 1024
 _MAX_RECORDS = 5_000_000
 
 
-def plan_source_routes(lengths, *, source_count, max_samples, max_tokens, max_sequence_tokens):
+def plan_source_routes(
+    lengths, *, source_count, max_samples, max_tokens, max_sequence_tokens
+):
     """Plan one bounded capture wave without changing logical sample order.
 
     Returned routes are indexed by logical position. Empty sources are valid;
     a wave that cannot fit is rejected rather than dropping or copying samples.
     """
-    for name, value in (("source_count", source_count), ("max_samples", max_samples),
-                        ("max_tokens", max_tokens), ("max_sequence_tokens", max_sequence_tokens)):
+    for name, value in (
+        ("source_count", source_count),
+        ("max_samples", max_samples),
+        ("max_tokens", max_tokens),
+        ("max_sequence_tokens", max_sequence_tokens),
+    ):
         if type(value) is not int or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
     if source_count > 4096 or source_count * max_samples > _MAX_RECORDS:
@@ -45,55 +52,105 @@ def plan_source_routes(lengths, *, source_count, max_samples, max_tokens, max_se
     for length in lengths:
         if len(sizes) >= source_count * max_samples:
             raise ValueError("Capture wave exceeds source sample capacity")
-        if type(length) is not int or not 0 < length <= min(max_sequence_tokens, max_tokens):
-            raise ValueError("Sequence exceeds source token limits or has invalid length")
+        if type(length) is not int or not 0 < length <= min(
+            max_sequence_tokens, max_tokens
+        ):
+            raise ValueError(
+                "Sequence exceeds source token limits or has invalid length"
+            )
         sizes.append(length)
     loads, counts = [0] * source_count, [0] * source_count
     routes = [0] * len(sizes)
     for index in sorted(range(len(sizes)), key=lambda i: (-sizes[i], i)):
-        eligible = [source for source in range(source_count)
-                    if counts[source] < max_samples and loads[source] + sizes[index] <= max_tokens]
+        eligible = [
+            source
+            for source in range(source_count)
+            if counts[source] < max_samples
+            and loads[source] + sizes[index] <= max_tokens
+        ]
         if not eligible:
             raise ValueError("Capture wave cannot fit source token and sample limits")
-        source = min(eligible, key=lambda source: (loads[source], counts[source], source))
+        source = min(
+            eligible, key=lambda source: (loads[source], counts[source], source)
+        )
         routes[index] = source
         loads[source] += sizes[index]
         counts[source] += 1
-    plan = {"version": 1, "lengths": sizes, "routes": routes, "source_count": source_count,
-            "max_samples": max_samples, "max_tokens": max_tokens,
-            "max_sequence_tokens": max_sequence_tokens}
-    plan["sha256"] = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    plan = {
+        "version": 1,
+        "lengths": sizes,
+        "routes": routes,
+        "source_count": source_count,
+        "max_samples": max_samples,
+        "max_tokens": max_tokens,
+        "max_sequence_tokens": max_sequence_tokens,
+    }
+    plan["sha256"] = hashlib.sha256(
+        json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     return plan
 
 
-def iter_source_route_waves(requests, *, wave_samples, endpoints, max_samples, max_tokens,
-                            max_sequence_tokens, consumed=()):
+def iter_source_route_waves(
+    requests,
+    *,
+    wave_samples,
+    endpoints,
+    max_samples,
+    max_tokens,
+    max_sequence_tokens,
+    consumed=(),
+):
     """Route full logical waves before excluding committed occurrences."""
     if type(wave_samples) is not int or not 1 <= wave_samples <= _MAX_RECORDS:
         raise ValueError("Invalid routing wave sample limit")
     endpoints = tuple(endpoints)
     if not endpoints or len(endpoints) > 4096 or len(set(endpoints)) != len(endpoints):
         raise ValueError("Source routing requires unique ordered endpoints")
-    plan_source_routes([], source_count=len(endpoints), max_samples=max_samples,
-                       max_tokens=max_tokens, max_sequence_tokens=max_sequence_tokens)
+    plan_source_routes(
+        [],
+        source_count=len(endpoints),
+        max_samples=max_samples,
+        max_tokens=max_tokens,
+        max_sequence_tokens=max_sequence_tokens,
+    )
     if wave_samples > len(endpoints) * max_samples:
         raise ValueError("Routing wave exceeds source sample capacity")
     consumed = set(consumed)
+
     def emit(wave):
-        costs = [len(request.prompt_token_ids) + max(0, getattr(request, "max_tokens", 0)) for request in wave]
-        plan = plan_source_routes(costs, source_count=len(endpoints), max_samples=max_samples,
-                                  max_tokens=max_tokens, max_sequence_tokens=max_sequence_tokens)
-        identity = {"plan": plan, "endpoints": endpoints,
-                    "occurrences": [(request.sequence_no, request.sample_id) for request in wave]}
-        digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        costs = [
+            len(request.prompt_token_ids) + max(0, getattr(request, "max_tokens", 0))
+            for request in wave
+        ]
+        plan = plan_source_routes(
+            costs,
+            source_count=len(endpoints),
+            max_samples=max_samples,
+            max_tokens=max_tokens,
+            max_sequence_tokens=max_sequence_tokens,
+        )
+        identity = {
+            "plan": plan,
+            "endpoints": endpoints,
+            "occurrences": [
+                (request.sequence_no, request.sample_id) for request in wave
+            ],
+        }
+        digest = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         for request, route in zip(wave, plan["routes"]):
             if request.sequence_no not in consumed:
                 yield replace(request, source_route=route, source_plan_sha256=digest)
+
     wave, wave_id, previous, wave_tokens = [], None, -1, 0
     for request in requests:
         sequence = request.sequence_no
         if type(sequence) is not int or sequence <= previous:
-            raise ValueError("Source routing requires increasing occurrence sequence numbers")
+            raise ValueError(
+                "Source routing requires increasing occurrence sequence numbers"
+            )
         current = sequence // wave_samples
         if wave and current != wave_id:
             yield from emit(wave)
@@ -101,7 +158,9 @@ def iter_source_route_waves(requests, *, wave_samples, endpoints, max_samples, m
             wave_tokens = 0
         cost = len(request.prompt_token_ids) + max(0, getattr(request, "max_tokens", 0))
         if not 0 < cost <= min(max_sequence_tokens, max_tokens):
-            raise ValueError("Sequence exceeds source token limits or has invalid length")
+            raise ValueError(
+                "Sequence exceeds source token limits or has invalid length"
+            )
         if wave_tokens + cost > len(endpoints) * max_tokens:
             raise ValueError("Routing wave exceeds aggregate source token capacity")
         wave.append(request)
@@ -180,7 +239,7 @@ def _validate_row(row: Mapping[str, Any]) -> None:
 def _lock_file(path: Path):
     stream = path.open("a+b")
     try:
-        if os.name == "nt":
+        if sys.platform == "win32":
             import msvcrt
 
             stream.seek(0, os.SEEK_END)
@@ -222,26 +281,36 @@ class _ReplayIndex(Mapping):
         self._db = None
         self._count = 0
         try:
-            self._db = sqlite3.connect(str(Path(self._directory.name) / "index.sqlite"), check_same_thread=False)
+            self._db = sqlite3.connect(
+                str(Path(self._directory.name) / "index.sqlite"),
+                check_same_thread=False,
+            )
             self._db.execute("PRAGMA cache_size=-4096")
             self._db.execute("PRAGMA temp_store=FILE")
             self._db.execute("PRAGMA journal_mode=OFF")
             self._db.execute("PRAGMA synchronous=OFF")
-            self._db.execute("CREATE TABLE rows (seq TEXT PRIMARY KEY, sample TEXT NOT NULL, digest BLOB NOT NULL) WITHOUT ROWID")
+            self._db.execute(
+                "CREATE TABLE rows (seq TEXT PRIMARY KEY, sample TEXT NOT NULL, digest BLOB NOT NULL) WITHOUT ROWID"
+            )
         except BaseException:
             self.close()
             raise
 
     def add(self, sequence_no: int, sample_id: str, digest: bytes) -> bool:
         try:
-            self._db.execute("INSERT INTO rows VALUES (?, ?, ?)", (str(sequence_no), sample_id, digest))
+            self._db.execute(
+                "INSERT INTO rows VALUES (?, ?, ?)",
+                (str(sequence_no), sample_id, digest),
+            )
         except sqlite3.IntegrityError:
             return False
         self._count += 1
         return True
 
     def get(self, sequence_no: int, default=None):
-        row = self._db.execute("SELECT sample, digest FROM rows WHERE seq = ?", (str(sequence_no),)).fetchone()
+        row = self._db.execute(
+            "SELECT sample, digest FROM rows WHERE seq = ?", (str(sequence_no),)
+        ).fetchone()
         return default if row is None else (row[0], bytes(row[1]).hex())
 
     def __len__(self):
@@ -346,7 +415,9 @@ class SequenceReplayReader:
                         sequence_no = row["sequence_no"]
                         row_digest = hashlib.sha256(_encoded(row)).digest()
                         if not self.seen.add(sequence_no, row["sample_id"], row_digest):
-                            raise ValueError("Duplicate sequence number in replay manifest")
+                            raise ValueError(
+                                "Duplicate sequence number in replay manifest"
+                            )
                         self.row_hashes.extend(row_digest)
                         self.file_ids.append(index)
                         self.offsets.append(offset)
@@ -358,7 +429,9 @@ class SequenceReplayReader:
                     or count != segment["rows"]
                     or count == 0
                 ):
-                    raise ValueError(f"Sequence replay segment row count mismatch: {name}")
+                    raise ValueError(
+                        f"Sequence replay segment row count mismatch: {name}"
+                    )
                 if digest.hexdigest() != segment.get("sha256"):
                     raise ValueError(
                         f"Sequence replay segment missing or checksum mismatch: {name}"
@@ -366,6 +439,7 @@ class SequenceReplayReader:
         except BaseException:
             self.seen.close()
             raise
+
     def close(self) -> None:
         """Release the temporary identity index; row iteration remains available."""
         self.seen.close()
@@ -392,7 +466,7 @@ class SequenceReplayReader:
                 if not 0 <= position < len(self):
                     raise ValueError("Sequence replay order contains an invalid index")
                 index = self.file_ids[position]
-                if index != current_id:
+                if stream is None or index != current_id:
                     if stream is not None:
                         stream.close()
                     stream = self.files[index].open("rb")
@@ -401,7 +475,10 @@ class SequenceReplayReader:
                 row = json.loads(stream.readline(_MAX_ROW_BYTES + 1))
                 _validate_row(row)
                 start = position * 32
-                if hashlib.sha256(_encoded(row)).digest() != self.row_hashes[start:start + 32]:
+                if (
+                    hashlib.sha256(_encoded(row)).digest()
+                    != self.row_hashes[start : start + 32]
+                ):
                     raise ValueError("Sequence replay row changed after indexing")
                 yield row
         finally:
@@ -532,8 +609,14 @@ class SequenceReplayWriter:
             _atomic_write(self.directory / name, payload)
             _atomic_write(self.directory / _MANIFEST, encoded_manifest)
             for row, data in self.pending:
-                if not self.seen.add(row["sequence_no"], row["sample_id"], hashlib.sha256(data[:-1]).digest()):
-                    raise RuntimeError("Sequence replay index conflicts after publication")
+                if not self.seen.add(
+                    row["sequence_no"],
+                    row["sample_id"],
+                    hashlib.sha256(data[:-1]).digest(),
+                ):
+                    raise RuntimeError(
+                        "Sequence replay index conflicts after publication"
+                    )
         except BaseException:
             self._broken = True
             raise
@@ -548,7 +631,9 @@ class SequenceReplayWriter:
             try:
                 if commit:
                     if self._broken:
-                        raise RuntimeError("Cannot commit a failed sequence replay writer")
+                        raise RuntimeError(
+                            "Cannot commit a failed sequence replay writer"
+                        )
                     self._flush_locked()
                     if not self.seen:
                         raise ValueError("Cannot complete an empty sequence replay")

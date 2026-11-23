@@ -10,7 +10,7 @@ from functools import partial
 from typing import Any
 
 from verl_speco.producer.hidden_states_store import FileHiddenStatesStore
-from verl_speco.trainer.tq_retry import retry_io
+from verl_speco.trainer.standalone_retry import retry_io
 from verl_speco.transport.drafter_sample_protocol import validate_reference_envelope
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,14 @@ def cleanup_standalone_samples(
     All references are validated before mutation. An uncertain TQ clear preserves
     payloads. Release failures have independent retries and never republish data.
     """
+    if not entries:
+        return []
+    if not getattr(store, "uses_transfer_queue", True) and not getattr(
+        store, "release_hidden_states_after_use", True
+    ):
+        # Permanent file references have no storage cleanup. The caller still
+        # completes scheduler bookkeeping and sends its training acknowledgement.
+        return []
     references = []
     hidden_store = getattr(store, "hidden_states_store", None)
     if hidden_store is None:
@@ -33,15 +41,15 @@ def cleanup_standalone_samples(
             validate_reference_envelope(entry.tag)
             if entry.tag["backend"] != hidden_store.backend:
                 raise ValueError("Cleanup reference backend does not match store")
-            if entry.tag["backend"] == "file" and callable(getattr(hidden_store, "validate_reference", None)):
+            if entry.tag["backend"] == "file" and callable(
+                getattr(hidden_store, "validate_reference", None)
+            ):
                 hidden_store.validate_reference(entry.tag["hidden_states_path"])
             references.append(
                 entry.tag["hidden_states_path"]
                 if entry.tag["backend"] == "file"
                 else entry.tag["handle"]
             )
-    if not entries:
-        return []
     if getattr(store, "uses_transfer_queue", True):
         retry_io(
             lambda: store.clear_many([e.key for e in entries]),
@@ -49,6 +57,9 @@ def cleanup_standalone_samples(
             attempts=attempts,
             retry_if=lambda exc: True,
         )
+    if not getattr(store, "release_hidden_states_after_use", True):
+        # Completion releases scheduler metadata, never permanent dataset files.
+        return []
     remaining = []
     for reference in dict.fromkeys(references):
         try:
