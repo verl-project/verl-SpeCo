@@ -116,6 +116,20 @@ def test_repo_tree_passes():
     assert main(["--root", "examples", "--repo-root", "."]) == 0
 
 
+def test_hidden_service_exceptions_do_not_skip_other_glm_scripts(tmp_path):
+    examples = tmp_path / "examples"
+    glm = examples / "glm53-train"
+    glm.mkdir(parents=True)
+    for name in ("glm53_hidden_serve_node0.sh", "glm53_hidden_serve_node1.sh"):
+        (glm / name).write_text("#!/bin/bash\n")
+    (glm / "run_glm53_drafter_dspark_separate_training.sh").write_text("#!/bin/bash\n")
+    args = ["--root", str(examples), "--repo-root", str(tmp_path)]
+    assert main(args) == 0
+
+    (glm / "invalid_training_name.sh").write_text("#!/bin/bash\n")
+    assert main(args) == 1
+
+
 def test_synthetic_violation_fails(tmp_path):
     fake = tmp_path / "examples"
     fake.mkdir(parents=True)
