@@ -218,9 +218,20 @@ def _dflash_target_layer_ids_from_config(config: Any) -> list[int] | None:
         raise ValueError(
             f"DFlash target_layer_ids conflict with dspark_config.target_layer_ids: {nested} != {dspark_nested}"
         )
-    if top_level is not None:
-        return top_level
-    return nested if nested is not None else dspark_nested
+    legacy = (
+        top_level
+        if top_level is not None
+        else (nested if nested is not None else dspark_nested)
+    )
+    speculators = _normalize_layer_ids(
+        _get_nested(config, ("aux_hidden_state_layer_ids",), None)
+    )
+    if speculators is not None and legacy is not None and speculators != legacy:
+        raise ValueError(
+            "Speculators aux_hidden_state_layer_ids conflict with target_layer_ids: "
+            f"{speculators} != {legacy}"
+        )
+    return speculators if speculators is not None else legacy
 
 
 def _build_dflash_target_layer_ids(
@@ -386,3 +397,25 @@ def resolve_oldlogprob_aux_layer_ids(
     if target_num_hidden_layers is None:
         return None
     return _default_eagle3_aux_layer_ids(target_num_hidden_layers)
+
+
+def resolve_oldlogprob_aux_layer_id_space(
+    drafter_cfg: Any, *, model_configs: list[Any] | tuple[Any, ...] = ()
+) -> str:
+    """Preserve the convention of the config that supplied the selected IDs.
+
+    Released speculators IDs index HF output_hidden_states (embedding=0).
+    Legacy DFlash target_layer_ids index decoder layers (first layer=0).
+    """
+    model_configs = tuple(config for config in model_configs if config is not None)
+    if _is_dflash_config(drafter_cfg, model_configs):
+        for config in (drafter_cfg, *model_configs):
+            if _dflash_target_layer_ids_from_config(config) is not None:
+                return (
+                    "output"
+                    if _get_nested(config, ("aux_hidden_state_layer_ids",), None)
+                    is not None
+                    else "decoder"
+                )
+        return "decoder"
+    return "output" if _drafter_algorithm(drafter_cfg) in {"", "EAGLE3"} else "decoder"

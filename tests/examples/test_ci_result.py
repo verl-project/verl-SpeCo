@@ -212,6 +212,7 @@ def test_worker_retains_error_when_second_batch_succeeds():
 
     worker = SimpleNamespace(
         rank=0,
+        replica_rank=0,
         worker_incarnation="worker-0",
         is_global_publish_leader=True,
         is_drafter_group_leader=False,

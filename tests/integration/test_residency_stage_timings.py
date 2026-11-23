@@ -54,12 +54,15 @@ def _trainer(events, *, fail_offload=False, skip=False, device="cuda"):
     ]
     cls.bases, cls.decorator_list = [], []
     module = ast.parse("from __future__ import annotations")
-    module.body.append(
-        next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_env_flag_enabled"
-        )
+    module.body.extend(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {
+            "_drafter_memory_snapshot",
+            "_env_flag_enabled",
+            "_log_drafter_phase",
+        }
     )
     module.body.append(cls)
 
@@ -129,8 +132,8 @@ def _trainer(events, *, fail_offload=False, skip=False, device="cuda"):
     trainer.runtime_device = torch.device("cpu")
     trainer._apply_pending_target_lm_head_weight = lambda: events.append("apply_head")
     trainer._optimizer_state_on_runtime_device = lambda: False
-    trainer.is_offload_param = False
-    trainer.is_offload_optimizer = False
+    trainer.is_offload_param = True
+    trainer.is_offload_optimizer = True
     trainer.skip_heavy_cleanup_after_drafter_training = skip
     trainer._training_active = True
     trainer.optimizer_steps_total = 40

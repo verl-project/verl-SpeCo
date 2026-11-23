@@ -87,6 +87,56 @@ _BATCH_POSTPROCESS_PATCHED_MODULES: set[str] = set()
 _POSTPROCESS_PATCHED = False
 
 
+def _worker_payload_rows(value: Any, *, batch_size: int, per_sample: bool) -> list[Any]:
+    """Represent worker-local metadata on the TensorDict batch dimension.
+
+    Verl concatenates the outputs from every actor DP rank with
+    ``TensorDict.cat``. Scalar ``NonTensorData`` is metadata, so that concat
+    keeps only one rank's value. A ``NonTensorStack`` survives the gather, but
+    worker-level chunk payloads must occupy only the first local row to avoid
+    duplicating the same ObjectRefs for every sample.
+    """
+
+    batch_size = max(int(batch_size), 0)
+    if batch_size == 0:
+        return []
+    if per_sample and isinstance(value, (list, tuple)) and len(value) == batch_size:
+        return list(value)
+    return [value, *([] for _ in range(batch_size - 1))]
+
+
+def _assign_worker_payload(
+    tensor_dict: Any,
+    key: str,
+    value: Any,
+    *,
+    per_sample: bool,
+) -> None:
+    """Attach worker output so Verl's actor-DP gather preserves every rank."""
+
+    from verl.utils import tensordict_utils as tu
+
+    batch_size = int(tensor_dict.batch_size[0]) if tensor_dict.batch_size else 0
+    if batch_size <= 0:
+        tu.assign_non_tensor_data(tensor_dict, key, value)
+        return
+    rows = _worker_payload_rows(
+        value,
+        batch_size=batch_size,
+        per_sample=per_sample,
+    )
+    assign_stack = getattr(tu, "assign_non_tensor_stack", None)
+    if callable(assign_stack):
+        assign_stack(tensor_dict, key, rows)
+        return
+
+    # Compatibility with older Verl releases whose helper predates
+    # ``assign_non_tensor_stack``.
+    from tensordict.tensorclass import NonTensorData, NonTensorStack
+
+    tensor_dict[key] = NonTensorStack.from_list([NonTensorData(item) for item in rows])
+
+
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
     current = config
     for key in path:
@@ -1224,6 +1274,33 @@ def _remap_chunk_meta_sample_indices(
     return remapped
 
 
+def _non_tensor_output_sample_count(model_output: dict[str, Any]) -> int:
+    """Infer a micro-batch size when FSDP returns chunk refs only.
+
+    The FSDP2 path may omit per-sample ``hidden_refs`` and retain only compact
+    chunk metadata.  Treating that output as an empty micro-batch leaves the
+    fallback offset unchanged, so later chunks are remapped onto earlier
+    samples.  ``sample_indices`` are local micro-batch indices and therefore
+    provide an exact upper bound for the number of represented samples.
+    """
+    hidden_refs = model_output.get(OLD_LOGPROB_HIDDEN_REFS_KEY)
+    if isinstance(hidden_refs, (list, tuple)):
+        return len(hidden_refs)
+
+    largest_index = -1
+    chunk_meta = model_output.get(OLD_LOGPROB_HIDDEN_CHUNK_META_KEY)
+    meta_values = chunk_meta if isinstance(chunk_meta, (list, tuple)) else [chunk_meta]
+    for meta in meta_values:
+        if not isinstance(meta, dict):
+            continue
+        for sample_idx in meta.get("sample_indices") or []:
+            try:
+                largest_index = max(largest_index, int(sample_idx))
+            except (TypeError, ValueError):
+                continue
+    return largest_index + 1
+
+
 def _extract_oldlogprob_non_tensor_model_output(
     output_lst: list[dict[str, Any]],
     indices: Any = None,
@@ -1240,11 +1317,15 @@ def _extract_oldlogprob_non_tensor_model_output(
         model_output = output.get("model_output") if isinstance(output, dict) else None
         if not isinstance(model_output, dict):
             continue
-        hidden_refs = model_output.get(OLD_LOGPROB_HIDDEN_REFS_KEY)
-        sample_count = len(hidden_refs) if isinstance(hidden_refs, (list, tuple)) else 0
+        sample_count = _non_tensor_output_sample_count(model_output)
         index_map = _micro_batch_index_map(
             indices, micro_batch_idx, batch_offset, sample_count
         )
+        # ``indices`` is the source of truth when Verl split/reordered the
+        # batch.  It also covers chunk-ref-only output where there are no
+        # per-sample refs to count.
+        if index_map:
+            sample_count = len(index_map)
         for key in tuple(extracted):
             if key not in model_output:
                 continue
@@ -2445,26 +2526,17 @@ def _consume_oldlogprob_hidden_capture(
             required_keys.append(context["final_key"])
         missing = [key for key in required_keys if key not in captures]
         if missing:
-            # For Megatron PP>1, cross-stage communication may have failed
-            # (e.g., HCCL port conflicts on NPU).  Skip missing keys instead
-            # of crashing; the drafter will train with fewer hidden states.
-            pp_size = context.get("pp_size", 1)
-            if pp_size > 1:
-                logger.warning(
-                    "SPECO old-logprob Megatron PP>1: skipping missing hidden "
-                    "tensors %s (cross-stage communication may have failed)",
-                    missing,
-                )
-            else:
-                raise RuntimeError(
-                    f"SPECO old-logprob forward-hook capture missed hidden tensors: {missing}"
-                )
+            raise RuntimeError(
+                "SPECO old-logprob forward-hook capture missed hidden tensors: "
+                f"missing={missing}, expected={required_keys}, captured={list(captures)}, "
+                f"pp_rank={context.get('pp_rank')}, pp_size={context.get('pp_size')}, "
+                f"num_global_layers={context.get('num_global_layers')}. "
+                "Refusing to train on a partial hidden layout."
+            )
 
-        # Only include keys that were actually captured (skip missing).
-        aux_keys_present = [k for k in context["aux_keys"] if k in captures]
-        hidden_parts = [captures[key] for key in aux_keys_present]
+        hidden_parts = [captures[key] for key in context["aux_keys"]]
         final_key = context.get("final_key")
-        if final_key is not None and final_key in captures:
+        if final_key is not None:
             hidden_parts.append(captures[final_key])
         if not hidden_parts:
             logger.warning(
@@ -2478,6 +2550,19 @@ def _consume_oldlogprob_hidden_capture(
             hidden_parts,
             already_selected=True,
         )
+        if selected is not None and not getattr(
+            engine, "_speco_oldlogprob_layout_verified_logged", False
+        ):
+            selected_rows = (
+                selected["rows"] if _is_sparse_selected(selected) else selected
+            )
+            print(
+                "[SPECO oldlogprob layout INFO] "
+                f"pp_rank={context.get('pp_rank')} pp_size={context.get('pp_size')} "
+                f"keys={required_keys} hidden_shape={tuple(selected_rows.shape)}",
+                flush=True,
+            )
+            engine._speco_oldlogprob_layout_verified_logged = True
         target_logz = (
             _select_oldlogprob_target_logz(
                 context,
@@ -2805,12 +2890,17 @@ def _find_megatron_layers_and_final_norm(engine: Any, model: Any):
         if eu is not None and all(eu is not existing for existing in roots):
             roots.append(eu)
 
-    # mcore GPTModel layout: decoder.layers + decoder.final_layernorm
+    # VL wrappers register the vision decoder before the language decoder.
+    # Select the text stack explicitly; intermediate PP stages correctly have
+    # no final norm, which must not send them into the generic fallback.
     for root in roots:
-        layers = _get_module_by_path(root, "decoder.layers")
-        if isinstance(layers, (nn.ModuleList, list, tuple)) and len(layers) > 0:
-            final_norm = _get_module_by_path(root, "decoder.final_layernorm")
-            if final_norm is not None:
+        for decoder_path in ("language_model.decoder", "decoder"):
+            layers = _get_module_by_path(root, f"{decoder_path}.layers")
+            if isinstance(layers, (nn.ModuleList, list, tuple)) and len(layers) > 0:
+                final_norm = _get_module_by_path(
+                    root, f"{decoder_path}.final_layernorm"
+                )
+                engine._speco_oldlogprob_decoder_path = f"{decoder_path}.layers"
                 return list(layers), final_norm
 
     # Fallback: search named_modules for a ModuleList ending in "layers" or "h"
@@ -2818,6 +2908,14 @@ def _find_megatron_layers_and_final_norm(engine: Any, model: Any):
     # attribute names.
     for root in roots:
         for name, child in root.named_modules():
+            if set(name.split(".")) & {
+                "vision_model",
+                "visual",
+                "vision_encoder",
+                "image_encoder",
+                "vision_tower",
+            }:
+                continue
             if not isinstance(child, (nn.ModuleList, list, tuple)) or len(child) <= 0:
                 continue
             if not (name.endswith("layers") or name.endswith("h")):
@@ -2828,7 +2926,9 @@ def _find_megatron_layers_and_final_norm(engine: Any, model: Any):
                 norm_path = f"{parent_path}.{norm_name}" if parent_path else norm_name
                 final_norm = _get_module_by_path(root, norm_path)
                 if final_norm is not None:
+                    engine._speco_oldlogprob_decoder_path = name
                     return list(child), final_norm
+            engine._speco_oldlogprob_decoder_path = name
             return list(child), None
 
     return None, None
@@ -3175,6 +3275,20 @@ def _install_megatron_hidden_hooks(engine: Any, model: Any, micro_batch: Any) ->
         "stage_capture_keys": stage_capture_keys,
         "num_global_layers": num_global_layers,
     }
+    if not getattr(engine, "_speco_oldlogprob_capture_provenance_logged", False):
+        # Use one stdout record: backend logging reconfiguration may disable
+        # this already-created module logger during worker initialization.
+        print(
+            "[SPECO oldlogprob capture INFO] "
+            f"engine={type(engine).__module__}.{type(engine).__qualname__} "
+            f"pp_rank={pp_rank} pp_size={pp_size} num_global_layers={num_global_layers} "
+            f"num_local_layers={len(layers)} aux_ids={aux_layer_ids} "
+            f"decoder_path={getattr(engine, '_speco_oldlogprob_decoder_path', None)} "
+            f"id_space={layer_id_space} layout={hidden_layout} "
+            f"local_keys={stage_capture_keys}",
+            flush=True,
+        )
+        engine._speco_oldlogprob_capture_provenance_logged = True
     for key, module in required_modules.items():
         context["handles"].append(
             module.register_forward_hook(_make_capture_hook(context, key))
@@ -3207,6 +3321,25 @@ def _speco_pp_exchange_dir() -> str:
     import tempfile
 
     return os.path.join(tempfile.gettempdir(), "speco_pp_exchange")
+
+
+def _megatron_pp_exchange_tag(mpu: Any, *, tp_rank: int, sp_size: int) -> str:
+    """Return a node-local file namespace for one Megatron model-parallel group.
+
+    PP stages in the same TP/CP/DP coordinate must exchange the same files,
+    while independent context/data-parallel groups must never share paths.
+    In particular, CP ranks execute the same PP schedule concurrently, so
+    omitting the CP rank lets them race on the same ``.tmp`` file.
+    """
+
+    get_cp_rank = getattr(mpu, "get_context_parallel_rank", None)
+    get_dp_rank = getattr(mpu, "get_data_parallel_rank", None)
+    cp_rank = int(get_cp_rank()) if callable(get_cp_rank) else 0
+    dp_rank = int(get_dp_rank()) if callable(get_dp_rank) else 0
+    axes = [f"dp{dp_rank}", f"cp{cp_rank}"]
+    if int(sp_size) > 1:
+        axes.append(f"tp{int(tp_rank)}")
+    return "fbb_" + "_".join(axes)
 
 
 def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) -> None:
@@ -3255,8 +3388,9 @@ def _megatron_post_stage_exchange_and_consume(engine: Any, losses_reduced: Any) 
     # Use a unique temp dir per engine instance
     tmp_dir = _speco_pp_exchange_dir()
     os.makedirs(tmp_dir, exist_ok=True)
-    # Tag includes tp_rank when SP=True (each TP rank has different captures).
-    tag = f"fbb_tp{tp_rank}" if sp_size > 1 else "fbb"
+    # Namespace by every non-PP model-parallel coordinate. PP stages within one
+    # group intentionally share files; independent CP/DP groups must not.
+    tag = _megatron_pp_exchange_tag(mpu, tp_rank=tp_rank, sp_size=sp_size)
 
     if not is_last_stage and is_io_rank:
         # Non-last stage: pickle CPU captures directly to a file (no ray.put/get

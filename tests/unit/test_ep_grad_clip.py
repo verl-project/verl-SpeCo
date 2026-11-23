@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
-import torch
+import pytest
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.trainer.base_trainer import _clip_dtensor_grad_norm_
 

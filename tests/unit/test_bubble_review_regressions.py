@@ -356,9 +356,13 @@ def test_fsdp1_bubble_uses_full_model_norm_and_sync_retains_its_path(bubble, fsd
 @pytest.mark.parametrize("fail", [False, True])
 def test_cold_bubble_cleanup_requires_parking_and_preserves_training_progress(fail):
     cls = _methods(
-        "verl_speco/trainer/base_trainer.py", "DrafterBaseTrainer", {"cleanup_training"}
+        "verl_speco/trainer/base_trainer.py",
+        "DrafterBaseTrainer",
+        {"cleanup_training"},
+        time=time,
     )
     obj = cls()
+    obj.rank = 0
     obj._bubble_time_enabled = True
     obj._pending_checkpoint_future = None
     obj._pending_full_checkpoint_future = None
@@ -1364,6 +1368,7 @@ def test_skipped_or_empty_oldlogprob_collection_cannot_prefetch_stale_head(
 ):
     from contextlib import contextmanager
     from types import MethodType
+
     from verl_speco.trainer.scheduler import DrafterCollectionSource
 
     cls = _methods(
@@ -2238,7 +2243,9 @@ def _collection_alignment_driver(
 ):
     import hashlib
     import math
+
     import torch
+
     from verl_speco.trainer.hard_sample_selection import partition_hard_candidates
     from verl_speco.trainer.scheduler import DrafterCollectionSource
 
@@ -2316,7 +2323,7 @@ def _collection_alignment_driver(
 def test_interval_collection_matches_sync_before_routing(
     owners, hard_ratio, token_budget
 ):
-    import torch
+    torch = pytest.importorskip("torch")
 
     common = dict(owners=owners, hard_ratio=hard_ratio, token_budget=token_budget)
     sync, batch = _collection_alignment_driver(bubble=False, routed=(), **common)
@@ -2382,10 +2389,11 @@ def _bind_collection_writer(driver, *, owners, tp):
 def test_first_quota_writer_replay_contains_entire_sync_sample_set(
     owners, tp, hard_ratio
 ):
-    import torch
+    torch = pytest.importorskip("torch")
+
     from verl_speco.trainer.data_buffer import DataBuffer
-    from verl_speco.trainer.scheduler.collection_adapter import _build_payload
     from verl_speco.trainer.scheduler import DrafterCollectionSource
+    from verl_speco.trainer.scheduler.collection_adapter import _build_payload
 
     common = dict(owners=owners, hard_ratio=hard_ratio)
     sync, batch = _collection_alignment_driver(bubble=False, routed=(), **common)
@@ -2443,6 +2451,7 @@ def test_first_quota_writer_replay_contains_entire_sync_sample_set(
 
 
 def test_empty_interval_collection_does_not_pin_bootstrap_writer():
+    pytest.importorskip("torch")
     driver, batch = _collection_alignment_driver(bubble=True, owners=2, routed=())
     scheduler, _ = _bind_collection_writer(driver, owners=2, tp=2)
     batch.batch["response_mask"].zero_()
@@ -2451,6 +2460,7 @@ def test_empty_interval_collection_does_not_pin_bootstrap_writer():
 
 
 def test_adaptive_collection_does_not_elect_bootstrap_writer():
+    pytest.importorskip("torch")
     driver, batch = _collection_alignment_driver(
         bubble=True, owners=2, routed=(), mode="adaptive"
     )
@@ -2460,6 +2470,7 @@ def test_adaptive_collection_does_not_elect_bootstrap_writer():
 
 
 def test_adaptive_collection_retains_existing_writer_minimum():
+    pytest.importorskip("torch")
     driver, batch = _collection_alignment_driver(
         bubble=True,
         owners=2,
@@ -2473,7 +2484,7 @@ def test_adaptive_collection_retains_existing_writer_minimum():
 
 @pytest.mark.parametrize("algorithm", ["DFLASH", "EAGLE3"])
 def test_interval_collection_alignment_is_not_dspark_specific(algorithm):
-    import torch
+    torch = pytest.importorskip("torch")
 
     sync, batch = _collection_alignment_driver(
         bubble=False,
@@ -2533,6 +2544,7 @@ def test_quota_outcome_metrics_report_post_execution_debt(completed):
 
 def test_normal_sync_outcome_does_not_publish_bubble_quota_metrics():
     from dataclasses import replace
+
     from verl_speco.trainer.scheduler import TrainingOutcome
 
     scheduler = DrafterScheduler()

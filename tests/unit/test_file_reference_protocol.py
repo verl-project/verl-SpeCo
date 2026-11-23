@@ -1,7 +1,8 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 # Licensed under the Apache License, Version 2.0
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION, SampleMetadata
 from verl_speco.transport.drafter_sample_protocol import make_reference_tag, validate_reference_tag

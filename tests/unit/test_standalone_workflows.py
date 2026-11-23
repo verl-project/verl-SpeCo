@@ -5,7 +5,8 @@
 from types import SimpleNamespace
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 from omegaconf import OmegaConf
 
 from verl_speco.standalone_tq_training_launcher import (

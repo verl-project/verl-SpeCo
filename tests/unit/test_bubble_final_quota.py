@@ -244,6 +244,7 @@ def test_final_actor_hook_trains_and_publishes_before_returning_to_save(monkeypa
     driver._speco_log_drafter_training_plan = lambda *args: None
     driver._speco_should_prefetch_target_lm_head = lambda: False
     driver._speco_park_drafter_training_memory = lambda *args: {}
+    driver._speco_park_actor_hccl_for_drafter = lambda: {}
     driver._speco_wait_target_lm_head_prefetch = (
         lambda: calls.append("head_ready") or {}
     )

@@ -2318,7 +2318,7 @@ def test_dspark_vat_acceptance_includes_markov_bias(draft_id, expected):
     base = _tiny_dspark_training_model()
     model = DSparkTrainingModel(base.draft_model, block_size=2, num_anchors=2,
                                 per_position_loss_weight="vat", l1_loss_alpha=0.)
-    def bias(*, active_hidden, active_prev_tokens, restricted_vocab):
+    def bias(*, active_hidden, active_prev_tokens, restricted_vocab, prev_embeddings=None):
         result = active_hidden.new_zeros(active_hidden.shape[0], 32)
         result[:, draft_id] = 1.
         return result

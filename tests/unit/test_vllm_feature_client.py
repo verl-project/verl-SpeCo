@@ -17,8 +17,9 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-import torch
 import pytest
+
+torch = pytest.importorskip("torch")
 
 import verl_speco.producer.vllm_feature_client as client_module
 from verl_speco.producer.hidden_states_store import HiddenStatesStore

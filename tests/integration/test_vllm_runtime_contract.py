@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import os
 import re
 import sys
 import types
@@ -26,9 +27,8 @@ from textwrap import dedent
 from types import SimpleNamespace
 
 import pytest
+
 import verl_speco.integration.vllm_runtime as vllm_runtime
-
-
 from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_REQUEST_STATS_TRACE_HEADER,
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
@@ -36,7 +36,6 @@ from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_WORKER_EXTENSION_CLS,
     SpecoVLLMColocateWorkerExtension,
     SpecoVLLMWeightSyncCompatExtension,
-    _SpecoVLLMHttpServerMixin,
     _attach_vllm_request_stats_to_trace_headers,
     _decode_vllm_request_stats_trace_header,
     _describe_vllm_draft_logits,
@@ -49,20 +48,21 @@ from verl_speco.integration.vllm_runtime import (
     _pop_vllm_request_stats_for_rollout_output,
     _record_vllm_request_acceptance_stats,
     _record_vllm_spec_decode_scheduler_stats,
+    _record_vllm_worker_spec_decode_output,
     _rollout_idle_event_bus_name,
     _rollout_idle_worker_id_for_replica,
-    _record_vllm_worker_spec_decode_output,
+    _set_vllm_request_stats_on_output,
     _speco_can_use_npu_target_staging,
     _speco_npu_target_staging,
     _speco_npu_target_staging_decision,
     _speco_persistent_weight_shm_name,
-    _set_vllm_request_stats_on_output,
+    _SpecoVLLMHttpServerMixin,
     _stage_vllm_request_stats_for_rollout_output,
+    _validate_vllm_dflash_drafter_config,
+    _vllm_ascend_has_dspark_pr11153_k_query_runtime,
     _vllm_generate_request_id,
     _vllm_request_accept_stats_to_extra_fields,
     _vllm_request_accept_stats_to_scalar_extra_fields,
-    _validate_vllm_dflash_drafter_config,
-    _vllm_ascend_has_dspark_pr11153_k_query_runtime,
     _vllm_spec_decode_stats_to_metrics,
     attach_update_draft_weights_to_rollout,
     build_vllm_speculative_config_from_drafter,
@@ -1022,6 +1022,19 @@ def test_vllm_level1_wake_keeps_online_draft_revision(monkeypatch) -> None:
     assert reload_calls == []
 
 
+def test_vllm_wake_refreshes_block_table_device_pointers() -> None:
+    extension = SpecoVLLMColocateWorkerExtension()
+    calls = []
+    extension.model_runner = SimpleNamespace(
+        block_tables=SimpleNamespace(
+            init_block_table_layout_tensors=lambda: calls.append("refresh")
+        )
+    )
+
+    assert extension._speco_refresh_vllm_block_table_pointers(["kv_cache"])
+    assert calls == ["refresh"]
+
+
 def test_vllm_level2_wake_restores_matching_online_revision() -> None:
     extension, draft, torch = _revision_runtime_extension()
     extension._speco_draft_runtime_revision = 4
@@ -1923,9 +1936,12 @@ def test_vllm_ascend_dspark_runtime_detector_rejects_old_full_block_layout(
     assert _vllm_ascend_has_dspark_pr11153_k_query_runtime() is False
 
 
+@pytest.mark.parametrize("runtime_payload", ["invalid json", "[]", "null"])
 def test_vllm_runtime_injects_native_config_and_worker_extension(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, runtime_payload
 ) -> None:
+    monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, runtime_payload)
+    monkeypatch.delenv("VERL_SPECO_SGLANG_DRAFTER_CONFIG", raising=False)
     monkeypatch.setattr(
         "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
         lambda: True,
@@ -1982,10 +1998,118 @@ def test_vllm_runtime_installs_replica_bridge_without_drafter(monkeypatch) -> No
 
     assert configure_vllm_runtime_from_config(config) == {}
     assert bridge_calls == [True]
+    engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
+    assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
 
 
-@pytest.mark.parametrize("config_source", [None, "class", "environment"])
-def test_vllm_http_actor_installs_import_guard_before_deserialization(monkeypatch, config_source) -> None:
+def test_vllm_runtime_strips_speculative_config_from_struct_mode_without_drafter(
+    monkeypatch,
+) -> None:
+    omegaconf = pytest.importorskip("omegaconf")
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    config = omegaconf.OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {
+                    "name": "vllm",
+                    "drafter": {"enable": False},
+                    "engine_kwargs": {
+                        "vllm": {"speculative_config": {"method": "eagle3"}}
+                    },
+                }
+            }
+        }
+    )
+    omegaconf.OmegaConf.set_struct(config, True)
+
+    configure_vllm_runtime_from_config(config)
+
+    engine_kwargs = config.actor_rollout_ref.rollout.engine_kwargs.vllm
+    assert "speculative_config" not in engine_kwargs
+    assert engine_kwargs.worker_extension_cls == SPECO_VLLM_WORKER_EXTENSION_CLS
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_vllm_server_bridge_strips_legacy_acceptance_sidecar_key(
+    monkeypatch, structured
+) -> None:
+    monkeypatch.setenv(
+        "VERL_SPECO_DRAFTER_CONFIG",
+        json.dumps(_drafter(), sort_keys=True),
+    )
+    rollout_cfg = {
+        "engine_kwargs": {
+            "vllm": {
+                "additional_config": {
+                    vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY: "/tmp/stats"
+                }
+            }
+        }
+    }
+
+    if structured:
+        from omegaconf import OmegaConf
+
+        rollout_cfg = OmegaConf.create(rollout_cfg)
+        OmegaConf.set_struct(rollout_cfg, True)
+
+    vllm_runtime._ensure_vllm_drafter_speculative_config_from_env(rollout_cfg)
+
+    assert (
+        vllm_runtime.SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY
+        not in rollout_cfg["engine_kwargs"]["vllm"]["additional_config"]
+    )
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_vllm_server_does_not_revive_stale_drafter_env_when_disabled(
+    monkeypatch, structured
+) -> None:
+    monkeypatch.setenv(
+        "VERL_SPECO_DRAFTER_CONFIG",
+        json.dumps(_drafter(), sort_keys=True),
+    )
+    rollout_cfg = {
+        "drafter": {"enable": False},
+        "engine_kwargs": {"vllm": {"speculative_config": {"model": "/stale"}}},
+    }
+
+    if structured:
+        from omegaconf import OmegaConf
+
+        rollout_cfg = OmegaConf.create(rollout_cfg)
+        OmegaConf.set_struct(rollout_cfg, True)
+
+    vllm_runtime._ensure_vllm_drafter_speculative_config_from_env(rollout_cfg)
+
+    assert "speculative_config" not in rollout_cfg["engine_kwargs"]["vllm"]
+    assert "VERL_SPECO_DRAFTER_CONFIG" not in os.environ
+
+
+def test_vllm_server_does_not_revive_stale_drafter_env_when_nested_disabled(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "VERL_SPECO_DRAFTER_CONFIG",
+        json.dumps(_drafter(), sort_keys=True),
+    )
+    rollout_cfg = {"actor_rollout_ref": {"rollout": {"drafter": {"enable": False}}}}
+
+    vllm_runtime._ensure_vllm_drafter_speculative_config_from_env(rollout_cfg)
+
+    assert "engine_kwargs" not in rollout_cfg
+    assert "VERL_SPECO_DRAFTER_CONFIG" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "config_source", [None, "class", "environment", "sidecar", "class_with_sidecar"]
+)
+def test_vllm_http_actor_installs_import_guard_before_deserialization(
+    monkeypatch, config_source
+) -> None:
     captured = {}
 
     class FakeRemoteActorClass:
@@ -2004,10 +2128,17 @@ def test_vllm_http_actor_installs_import_guard_before_deserialization(monkeypatc
 
     monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
     payload = json.dumps({"training": {"drafter_opd": {"enable": True}}})
-    if config_source == "class":
+    if config_source in {"class", "class_with_sidecar"}:
         Server._speco_drafter_config_env = payload
-    elif config_source == "environment":
+    if config_source == "environment":
         monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, payload)
+    elif config_source in {"sidecar", "class_with_sidecar"}:
+        sidecar_payload = json.dumps(
+            {"enable": True, "_speco_acceptance_stats_dir": "/tmp/speco-acceptance/run-test"}
+        )
+        monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, sidecar_payload)
+        if config_source == "sidecar":
+            payload = sidecar_payload
     actor_class = vllm_runtime._remote_speco_vllm_http_server(FakeRay, Server)
     assert (
         actor_class.options(
@@ -2032,6 +2163,24 @@ def test_vllm_http_actor_installs_import_guard_before_deserialization(monkeypatc
     assert runtime_env["env_vars"] == expected_env
     assert runtime_env["worker_process_setup_hook"] == setup_hook_path
     assert json.loads(json.dumps(runtime_env)) == runtime_env
+
+
+def test_vllm_http_actor_does_not_forward_drafter_without_sidecar(monkeypatch) -> None:
+    monkeypatch.setenv(
+        vllm_runtime.SPECO_DRAFTER_CONFIG_ENV,
+        json.dumps({"enable": True}),
+    )
+    captured = {}
+
+    class FakeRemoteActorClass:
+        def options(self, **options):
+            captured.update(options)
+            return self
+
+    vllm_runtime._SpecoVLLMHttpServerActorClass(FakeRemoteActorClass()).options()
+    assert (
+        vllm_runtime.SPECO_DRAFTER_CONFIG_ENV not in captured["runtime_env"]["env_vars"]
+    )
 
 
 @pytest.mark.parametrize("actor_override", [None, "false"])
@@ -2169,6 +2318,50 @@ def test_vllm_mrv2_rejects_final_engine_speculative_override(
 
     with pytest.raises(ValueError, match="final speculative config"):
         configure_vllm_runtime_from_config(config)
+
+
+def test_vllm_mrv2_resume_uses_serialized_checkpoint_over_stale_env(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    source_model = tmp_path / "source-drafter"
+    resumed_model = tmp_path / "draft_step_1"
+    for model_path in (source_model, resumed_model):
+        model_path.mkdir()
+        (model_path / "config.json").write_text(
+            '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}'
+        )
+
+    stale_drafter = _drafter(
+        speculative_algorithm="DSPARK",
+        model_path=str(source_model),
+        rollout={"spec_verify_tokens": 5},
+    )
+    monkeypatch.setenv(
+        "VERL_SPECO_DRAFTER_CONFIG", json.dumps(stale_drafter, sort_keys=True)
+    )
+    rollout_cfg = {
+        "engine_kwargs": {
+            "vllm": {
+                "speculative_config": {
+                    "draft_sample_method": "greedy",
+                    "draft_load_config": {"load_format": "auto"},
+                    "method": "dspark",
+                    "model": str(resumed_model),
+                    "num_speculative_tokens": 5,
+                }
+            }
+        },
+    }
+
+    vllm_runtime._ensure_vllm_drafter_speculative_config_from_env(rollout_cfg)
+
+    assert rollout_cfg["engine_kwargs"]["vllm"]["speculative_config"]["model"] == str(
+        resumed_model
+    )
 
 
 def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None:

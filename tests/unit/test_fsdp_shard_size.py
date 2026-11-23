@@ -279,6 +279,14 @@ def test_npu_veomni_helpers_follow_drafter_strategy(monkeypatch) -> None:
     assert not ddp._use_flattened_drafter_fsdp_mesh()
     assert not ddp._use_blocking_npu_optimizer_offload()
     assert not ddp._should_park_drafter_hccl()
+    ddp.config.rollout.drafter.training.use_full_shard_fsdp_mesh = True
+    assert not ddp._use_flattened_drafter_fsdp_mesh()
+
+    fsdp2 = _npu_trainer("fsdp2")
+    assert not fsdp2._use_flattened_drafter_fsdp_mesh()
+    assert fsdp2._should_park_drafter_hccl()
+    fsdp2.config.rollout.drafter.training.use_full_shard_fsdp_mesh = True
+    assert fsdp2._use_flattened_drafter_fsdp_mesh()
 
     veomni = _npu_trainer("veomni")
     assert veomni._use_flattened_drafter_fsdp_mesh()

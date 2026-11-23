@@ -64,10 +64,16 @@ class DSparkVanillaMarkovHead(nn.Module):
         return self.markov_w1(token_ids.long())
 
     def compute_step_bias(
-        self, token_ids: torch.Tensor, hidden_states: Optional[torch.Tensor] = None
+        self,
+        token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor] = None,
+        *,
+        prev_embeddings: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         del hidden_states
-        return self.markov_w2(self.get_prev_embeddings(token_ids))
+        if prev_embeddings is None:
+            prev_embeddings = self.get_prev_embeddings(token_ids)
+        return self.markov_w2(prev_embeddings)
 
     def apply_block_logits(
         self,
@@ -86,11 +92,16 @@ class DSparkGatedMarkovHead(DSparkVanillaMarkovHead):
         self.gate_proj = nn.Linear(hidden_size + markov_rank, markov_rank)
 
     def compute_step_bias(
-        self, token_ids: torch.Tensor, hidden_states: Optional[torch.Tensor] = None
+        self,
+        token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor] = None,
+        *,
+        prev_embeddings: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if hidden_states is None:
             raise ValueError("gated DSpark Markov head requires hidden_states")
-        prev_embeddings = self.get_prev_embeddings(token_ids)
+        if prev_embeddings is None:
+            prev_embeddings = self.get_prev_embeddings(token_ids)
         gate = torch.sigmoid(
             self.gate_proj(torch.cat([hidden_states, prev_embeddings], dim=-1))
         )
@@ -225,6 +236,7 @@ class DSparkDraftModel(DFlashDraftModel):
         draft_hidden: torch.Tensor,
         *,
         prev_token_ids: torch.Tensor,
+        prev_embeddings: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         if self.confidence_head is None:
             return None
@@ -233,9 +245,9 @@ class DSparkDraftModel(DFlashDraftModel):
         if self.confidence_head_with_markov:
             if self.markov_head is None:
                 return None
-            prev_embeddings = self.markov_head.get_prev_embeddings(prev_token_ids).to(
-                dtype=draft_hidden.dtype
-            )
+            if prev_embeddings is None:
+                prev_embeddings = self.markov_head.get_prev_embeddings(prev_token_ids)
+            prev_embeddings = prev_embeddings.to(dtype=draft_hidden.dtype)
             if self.confidence_detach_backbone:
                 prev_embeddings = prev_embeddings.detach()
             return self.confidence_head(

@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 
-def _methods(path, class_name, names):
+def _methods(path, class_name, names, **dependencies):
     path = Path(__file__).resolve().parents[2] / path
     tree = ast.parse(path.read_text(encoding="utf-8"))
     cls = next(
@@ -25,7 +25,7 @@ def _methods(path, class_name, names):
     assert {n.name for n in methods} == names
     for method in methods:
         method.decorator_list = []
-    namespace = {"time": time, "logger": logging.getLogger(__name__)}
+    namespace = {"time": time, "logger": logging.getLogger(__name__), **dependencies}
     module = ast.Module(
         body=[
             ast.ImportFrom(
@@ -292,6 +292,8 @@ def test_same_step_snapshot_preparation_reuses_cache_without_export():
             "prepare_model_state_dict_for_publish",
             "pop_model_state_dict_for_publish",
         },
+        torch=SimpleNamespace(Tensor=()),
+        _log_drafter_phase=lambda *args, **kwargs: None,
     )
     trainer = cls()
     trainer.clear_pending_publish_state_dict()

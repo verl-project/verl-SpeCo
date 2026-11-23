@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.backends.dpace_loss import dpace_position_weights
 

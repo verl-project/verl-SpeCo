@@ -15,7 +15,8 @@
 from __future__ import annotations
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.producer.hidden_states_store import (
     FILE_BACKEND,

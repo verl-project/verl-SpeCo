@@ -6,7 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from verl_speco.trainer.standalone_data import StandaloneLocalBatch
 

@@ -23,8 +23,8 @@ import asyncio
 import logging
 import os
 import random
-import time
 import threading
+import time
 import uuid
 from collections import deque
 from contextlib import contextmanager
@@ -37,10 +37,8 @@ import numpy as np
 import ray
 import torch
 import torch.distributed as dist
-from verl_speco.integration.rollout_idle_events import TrainingReclaimWatcher
-from torch.distributed.device_mesh import DeviceMesh
 from omegaconf import DictConfig, open_dict
-
+from torch.distributed.device_mesh import DeviceMesh
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import get_torch_device
@@ -48,10 +46,12 @@ from verl.utils.distributed import (
     initialize_global_process_group_ray,
     set_numa_affinity,
 )
+
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
 from verl_speco.integration.opd_cotrain import ensure_student_only_feature_payload
+from verl_speco.integration.rollout_idle_events import TrainingReclaimWatcher
 from verl_speco.integration.rollout_publish import release_draft_weights_payload
 from verl_speco.rl_insight_bridge import (
     log_scalar_metrics as _rl_insight_log_scalar_metrics,
@@ -654,6 +654,7 @@ class SpecoWorker(Worker):
         if self._training_group_initialized:
             return
 
+        group_init_started = time.perf_counter()
         self._ensure_process_group_initialized()
         if not dist.is_initialized():
             return
@@ -727,6 +728,13 @@ class SpecoWorker(Worker):
             is_collect=True,
         )
         self._training_group_initialized = True
+        logger.warning(
+            "[speco timing] drafter_hccl_group_init_s=%.3f rank=%s sp=%s dp=%s",
+            time.perf_counter() - group_init_started,
+            self.rank,
+            self.training_group_world_size,
+            self.dp_group_world_size,
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -1432,6 +1440,12 @@ class SpecoWorker(Worker):
                 "input_ids": sample["input_ids"],
                 "prompts": sample["prompts"],
                 "responses": sample["responses"],
+                # Preserve the immutable collection transaction in the
+                # trainer buffer.  DataBuffer's mutable ``step`` is used for
+                # retention, while this source version is used to validate a
+                # distributed training plan.
+                "collection_id": collection_id,
+                "collection_source_global_step": int(self.last_global_step or 0),
             }
             for key in (
                 "hidden_position_start",
@@ -2861,6 +2875,13 @@ class SpecoWorker(Worker):
             self.trainer.clear_pending_publish_state_dict()
             try:
                 train_loop_ts = time.time()
+                logger.debug(
+                    "[DrafterTiming replica=%s rank=%s] phase=training_loop_start step=%s max_batches=%s",
+                    self.replica_rank,
+                    self.rank,
+                    self.last_global_step,
+                    max_batches,
+                )
                 self.trainer.reset_training_metrics()
                 get_data_stats = getattr(self.trainer, "get_training_data_stats", None)
                 data_stats = get_data_stats() if callable(get_data_stats) else None
@@ -3300,6 +3321,14 @@ class SpecoWorker(Worker):
                     result["optimizer_warmup_steps"],
                 )
                 result.update(self.trainer.get_training_metrics())
+                logger.debug(
+                    "[DrafterTiming replica=%s rank=%s] phase=training_loop_done elapsed_s=%.3f successful_steps=%s optimizer_step=%s",
+                    self.replica_rank,
+                    self.rank,
+                    result["training_loop_elapsed_sec"],
+                    result["successful_steps"],
+                    self.trainer.optimizer_steps_total,
+                )
                 if self.is_drafter_group_leader:
                     logger.warning(
                         "[drafter data used] rl_step=%s replica=%s "
@@ -3334,6 +3363,12 @@ class SpecoWorker(Worker):
                         and (not defer_snapshot or snapshot_staged_in_idle)
                     ):
                         snapshot_ts = time.time()
+                        logger.debug(
+                            "[DrafterTiming replica=%s rank=%s] phase=publish_snapshot_call_start step=%s",
+                            self.replica_rank,
+                            self.rank,
+                            self.last_global_step,
+                        )
                         with _rl_insight_trace_state(
                             "drafter/worker_publish_snapshot",
                             state_lane_id=rl_insight_lane,
@@ -3358,6 +3393,13 @@ class SpecoWorker(Worker):
                                 "timing_s/drafter_publish_snapshot",
                                 result["publish_snapshot_elapsed_sec"],
                             )
+                        logger.debug(
+                            "[DrafterTiming replica=%s rank=%s] phase=publish_snapshot_call_done elapsed_s=%.3f cached=%s",
+                            self.replica_rank,
+                            self.rank,
+                            result["publish_snapshot_elapsed_sec"],
+                            result["publish_snapshot_cached"],
+                        )
                     else:
                         # A final Bubble or forced-completion plan may still be
                         # interrupted. Never cache a partially trained snapshot;
