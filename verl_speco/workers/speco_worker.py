@@ -1652,7 +1652,9 @@ class SpecoWorker(Worker):
         self._flush_rollout_features_for_step()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def set_global_step(self, global_step: int):
+    def set_global_step(
+        self, global_step: int, opd_drafter_revision: int | None = None
+    ):
         if (
             not self.enable_drafter
             or not self.in_drafter_train_group
@@ -1661,6 +1663,8 @@ class SpecoWorker(Worker):
             return
         if global_step is None:
             return
+        if opd_drafter_revision is not None:
+            self.trainer.opd_drafter_revision = opd_drafter_revision
         if self.last_global_step == global_step:
             return
         self.last_global_step = global_step

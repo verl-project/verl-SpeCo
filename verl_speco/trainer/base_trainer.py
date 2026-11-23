@@ -777,6 +777,7 @@ class DrafterBaseTrainer:
         self._pending_target_lm_head_source_vocab_size: int | None = None
         self._pending_target_lm_head_chunked_apply = False
         self._target_lm_head_weight_step: int | None = None
+        self.opd_drafter_revision: int | None = None
         # Version currently materialized in the backend target head. Keep this
         # separate from ``_target_lm_head_weight_step``: the latter is also set
         # when a deferred CPU snapshot is merely staged.
@@ -5637,6 +5638,7 @@ class DrafterBaseTrainer:
                 available_data = self.data_buffer.get_data_from_last_n_steps(
                     buffer_steps
                 )
+            available_data = self._filter_opd_training_data(available_data)
             # Filter out items that are already in the active accumulation set, if any.
             if len(available_data) < effective_batch_size:
                 if len(available_data) >= min_items_for_batch:
@@ -5662,6 +5664,7 @@ class DrafterBaseTrainer:
                 min_sample_step=min_sample_step,
                 max_sample_step=max_sample_step,
             )
+            current_step_data = self._filter_opd_training_data(current_step_data)
             if len(current_step_data) < effective_batch_size:
                 if len(current_step_data) >= min_items_for_batch:
                     items = current_step_data
@@ -6780,6 +6783,30 @@ class DrafterBaseTrainer:
             if min_step <= int(item.get("step", current_step)) <= max_step
         ]
 
+    def _filter_opd_training_data(self, items):
+        """Recheck V1 replay against the current target and drafter versions."""
+        revision = getattr(self, "opd_drafter_revision", None)
+        if revision is None:
+            return items
+        from verl_speco.integration.verify_trace import TRACE_KEY, trace_staleness
+
+        target = int(self.current_rl_step) - 1
+        opd = self.config.rollout.drafter.training.drafter_opd
+        eligible = []
+        for item in items:
+            trace = item.get(TRACE_KEY)
+            # A buffer restored from older code may lack version evidence.
+            if not trace or "target_revision_min" not in trace:
+                continue
+            policy_lag, drafter_lag, _ = trace_staleness(
+                trace, target_version=target, drafter_revision=revision
+            )
+            if policy_lag <= opd.get(
+                "max_policy_staleness", 0
+            ) and drafter_lag <= opd.get("max_drafter_staleness", 0):
+                eligible.append(item)
+        return eligible
+
     def prepare_training_batch(
         self,
         *,
@@ -7158,6 +7185,7 @@ class DrafterBaseTrainer:
                 current_step_data if selected_target_version is not None else []
             )
 
+        trainable_data = self._filter_opd_training_data(trainable_data)
         batch_size = max(int(self.batch_size), 1)
         trainable_samples = len(trainable_data)
         full_batches, remainder = divmod(trainable_samples, batch_size)
@@ -7228,6 +7256,7 @@ class DrafterBaseTrainer:
                 == int(self.current_rl_step)
             ]
 
+        eligible_items = self._filter_opd_training_data(eligible_items)
         step_counts: dict[int, int] = {}
         for item in eligible_items:
             source_step = int(item.get("step", self.current_rl_step))

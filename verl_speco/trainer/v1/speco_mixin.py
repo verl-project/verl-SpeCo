@@ -20,6 +20,7 @@ import inspect
 import json
 import logging
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import tempfile
 import time
@@ -301,6 +302,12 @@ class SpecoV1Mixin(V1BubbleMixin):
                 True, training_plan, after_weight_update=True
             )
             waited = self._speco_wait_pending_drafter_publish()
+            if self._speco_v1_opd_config() and metrics.get("drafter/published", False):
+                revision = self.__dict__.get("_speco_v1_opd_drafter_revision", 0)
+                self._speco_rollout_admission_rpc(
+                    "speco_set_serving_drafter_revision", revision
+                )
+                metrics["opd/serving_drafter_revision"] = revision
             if (
                 getattr(self, "_speco_colocate_admission_closed", False)
                 and policy is not None
@@ -520,6 +527,8 @@ class SpecoV1Mixin(V1BubbleMixin):
             ),
             "feature_store": feature_store,
         }
+        if "_speco_v1_opd_drafter_revision" in self.__dict__:
+            manifest["opd_drafter_revision"] = self._speco_v1_opd_drafter_revision
         async_evidence = getattr(self, "_speco_v1_async_checkpoint_evidence", None)
         if self._speco_rollout_idle_worker_enabled():
             from verl_speco.trainer.v1.checkpoint_commit import saved_drafter_entries
@@ -831,8 +840,108 @@ class SpecoV1Mixin(V1BubbleMixin):
             drafter.get("enable", False)
         )
 
+    def _speco_v1_opd_config(self):
+        config = getattr(self, "config", None)
+        if config is None:
+            return {}
+        from verl_speco.trainer.speco_ray_trainer import _get_nested
+
+        opd = (
+            _get_nested(
+                config,
+                ("actor_rollout_ref", "rollout", "drafter", "training", "drafter_opd"),
+            )
+            or {}
+        )
+        return opd if opd.get("enable", False) else {}
+
+    @staticmethod
+    def _speco_validate_v1_drafter_opd_config(config) -> None:
+        drafter = config.actor_rollout_ref.rollout.get("drafter", {}) or {}
+        training = drafter.get("training", {}) or {}
+        opd = training.get("drafter_opd", {}) or {}
+        if not opd.get("enable", False):
+            return
+        from verl_speco.trainer.scheduler import DrafterScheduleConfig
+
+        def require(condition, setting):
+            if not condition:
+                raise ValueError(f"V1 Draft-OPD requires {setting}")
+
+        require(drafter.get("enable", False), "drafter.enable=true")
+        require(
+            drafter.get("enable_drafter_training", False),
+            "enable_drafter_training=true",
+        )
+        require(
+            opd.get("capture_verify_trace", False),
+            "drafter_opd.capture_verify_trace=true",
+        )
+        algorithm = str(drafter.get("speculative_algorithm", "")).upper()
+        require(
+            algorithm in {"DFLASH", "DSPARK"}, "speculative_algorithm=DFLASH or DSPARK"
+        )
+        require(
+            str(training.get(f"{algorithm.lower()}_loss_mode", "full_vocab"))
+            == "full_vocab",
+            f"{algorithm.lower()}_loss_mode=full_vocab",
+        )
+        require(
+            not (training.get("packing", {}) or {}).get("enable", False),
+            "packing.enable=false",
+        )
+        mode = str(config.trainer.v1.get("trainer_mode", "sync"))
+        require(
+            mode in {"sync", "colocate_async", "separate_async"},
+            "trainer.v1.trainer_mode=sync, colocate_async or separate_async",
+        )
+        schedule = DrafterScheduleConfig.from_mapping(training)
+        require(
+            schedule.execution_strategy.value == "sync",
+            "scheduler.execution.strategy=sync (Bubble is P3)",
+        )
+        local_updates = int(
+            (config.trainer.v1.get(mode) or {}).get("parameter_sync_step", 1)
+        )
+        require(local_updates > 0, f"trainer.v1.{mode}.parameter_sync_step >= 1")
+        if mode != "separate_async":
+            require(local_updates == 1, f"trainer.v1.{mode}.parameter_sync_step=1")
+        for key in ("max_policy_staleness", "max_drafter_staleness"):
+            value = opd.get(key, 0)
+            require(
+                type(value) is int and value >= 0,
+                f"drafter_opd.{key} to be a nonnegative integer",
+            )
+        if opd.get("max_drafter_staleness", 0) == 0:
+            publish_period = int(schedule.publish_interval_steps or 0)
+            train_period = schedule.training_interval_steps
+            train_period = 1 if train_period is None else int(train_period)
+            require(
+                publish_period <= 1
+                or (
+                    not schedule.adaptive_schedule.enable
+                    and train_period % publish_period == 0
+                ),
+                "publication on every drafter training step when max_drafter_staleness=0 "
+                "(set publish_interval_steps=0 or align it with training_interval_steps)",
+            )
+        if mode == "sync":
+            require(
+                not training.get("use_data_buffer", False)
+                or int(training.get("sample_last_n_steps", 1)) == 1,
+                "use_data_buffer=false or sample_last_n_steps=1 in sync mode",
+            )
+        require(not training.get("publish_async", False), "publish_async=false")
+        require(
+            not (training.get("drafter_convergence_freeze", {}) or {}).get(
+                "enabled", False
+            ),
+            "drafter_convergence_freeze.enabled=false (freeze is P3)",
+        )
+
     @staticmethod
     def _speco_validate_v1_training_config(config) -> None:
+        SpecoV1Mixin._speco_validate_v1_drafter_opd_config(config)
         drafter = config.actor_rollout_ref.rollout.get("drafter", {}) or {}
         training = drafter.get("training", {}) or {}
         if not bool(drafter.get("enable", False)) or not bool(
@@ -1143,6 +1252,14 @@ class SpecoV1Mixin(V1BubbleMixin):
                 )
         try:
             lifecycle_started = time.perf_counter()
+            opd_async = (
+                self._speco_v1_opd_config() and self._speco_v1_async_rollout_enabled()
+            )
+            if opd_async and self.config.trainer.v1.trainer_mode == "separate_async":
+                self._speco_rollout_admission_rpc("speco_close_rollout_admission")
+                self._speco_colocate_admission_closed = True
+                self.standalone_checkpoint_manager.abort_replicas()
+                self._speco_rollout_admission_rpc("speco_wait_rollout_idle", True)
             self._speco_prefetch_sync_cpu_snapshot()
             prefetch_submitted = bool(
                 (self.__dict__.get("_speco_publish_snapshot_prefetch") or {}).get(
@@ -1309,7 +1426,14 @@ class SpecoV1Mixin(V1BubbleMixin):
                 "drafter_v1_sample_end", time.perf_counter() - started
             )
             return super().on_sample_end()
-        if not self._speco_colocate_probe_boundary_enabled():
+        if not (
+            self._speco_colocate_probe_boundary_enabled()
+            or (
+                self._speco_v1_opd_config()
+                and self.config.trainer.v1.get("trainer_mode", "sync")
+                == "colocate_async"
+            )
+        ):
             return super().on_sample_end()
         self._speco_rollout_admission_rpc("speco_close_rollout_admission")
         self._speco_colocate_admission_closed = True
@@ -1317,7 +1441,10 @@ class SpecoV1Mixin(V1BubbleMixin):
             # Wait only for serving RPCs after abort, not for TQ agent loops:
             # those loops can be waiting to retry when cards are returned.
             self.checkpoint_manager.abort_replicas()
-            self._speco_rollout_admission_rpc("speco_wait_rollout_idle")
+            if self._speco_v1_opd_config():
+                self._speco_rollout_admission_rpc("speco_wait_rollout_idle", True)
+            else:
+                self._speco_rollout_admission_rpc("speco_wait_rollout_idle")
             self.checkpoint_manager.sleep_replicas()
         except BaseException:
             self._speco_rollout_admission_rpc("speco_resume_rollout_admission")
@@ -1332,13 +1459,19 @@ class SpecoV1Mixin(V1BubbleMixin):
             training.get("drafter_convergence_freeze", {}).get("enabled", False)
         )
 
-    def _speco_rollout_admission_rpc(self, method, *args):
+    def _speco_rollout_admission_rpc(self, method, *args, include_hybrid=False):
         import ray
 
-        servers = self._speco_v1_probe_servers()
+        if self.config.trainer.v1.get("trainer_mode", "sync") == "separate_async":
+            servers = list(self.standalone_server_manager.server_handles)
+            if include_hybrid:
+                # Upstream also pools hybrid servers during the initial warmup.
+                servers.extend(self._speco_v1_probe_servers())
+        else:
+            servers = self._speco_v1_probe_servers()
         if not servers:
             raise RuntimeError(
-                "V1 async probe boundary requires initialized rollout servers"
+                "V1 rollout admission requires initialized serving replicas"
             )
         return ray.get([getattr(server, method).remote(*args) for server in servers])
 
@@ -1512,6 +1645,9 @@ class SpecoV1Mixin(V1BubbleMixin):
             for index in range(len(request_fields))
         ]
         result.meta_info["speco_v1_padding_rows"] = sum(padding)
+        result.non_tensor_batch["_speco_v1_is_padding"] = np.asarray(
+            padding, dtype=bool
+        )
         for key in (
             "_verl_request_mean_accept_len",
             "_speco_verify_trace",
@@ -1530,6 +1666,34 @@ class SpecoV1Mixin(V1BubbleMixin):
             ]
             if len(values) == len(result):
                 result.non_tensor_batch[key] = np.asarray(values, dtype=object)
+        if self._speco_v1_opd_config():
+            from verl_speco.integration.verify_trace import TRACE_KEY, trace_staleness
+
+            target = int(self.global_steps) - 1
+            revision = self.__dict__.get("_speco_v1_opd_drafter_revision", 0)
+            for name in ("policy_lag", "drafter_lag", "mixed_revision_turns"):
+                result.non_tensor_batch[f"_speco_opd_{name}"] = np.zeros(
+                    len(result), dtype=int
+                )
+            for index, trace in enumerate(result.non_tensor_batch[TRACE_KEY]):
+                if trace is None:
+                    continue
+                tag = tags[index].get("min_global_steps") if index < len(tags) else None
+                policy, drafter, mixed = trace_staleness(
+                    trace,
+                    target_version=target,
+                    drafter_revision=revision,
+                    policy_tag=tag,
+                )
+                result.non_tensor_batch[TRACE_KEY][index] = {
+                    **trace,
+                    "target_revision_min": target - policy,
+                }
+                result.non_tensor_batch["_speco_opd_policy_lag"][index] = policy
+                result.non_tensor_batch["_speco_opd_drafter_lag"][index] = drafter
+                result.non_tensor_batch["_speco_opd_mixed_revision_turns"][index] = (
+                    mixed
+                )
         return data, result
 
     def _speco_observe_async_revision_evidence(self, evidence, metrics):
@@ -1650,6 +1814,25 @@ class SpecoV1Mixin(V1BubbleMixin):
 
         nested_data, data_proto = self._speco_v1_batch_data(batch)
         collect_plan = self._speco_build_oldlogprob_collect_plan(data_proto)
+        if self._speco_v1_opd_config():
+            for name in ("policy_lag", "drafter_lag"):
+                values = data_proto.non_tensor_batch[f"_speco_opd_{name}"]
+                metrics[f"opd/{name}_max"] = int(values.max(initial=0))
+            if self.__dict__.get("_speco_v1_opd_counts_step") != self.global_steps:
+                self._speco_v1_opd_counts_step = self.global_steps
+                self._speco_v1_opd_counts = {}
+            for name, count in {
+                **self._speco_last_opd_stale_samples_skipped,
+                "mixed_revision_turns": data_proto.non_tensor_batch[
+                    "_speco_opd_mixed_revision_turns"
+                ].sum(),
+            }.items():
+                self._speco_v1_opd_counts[f"opd/{name}"] = (
+                    self._speco_v1_opd_counts.get(f"opd/{name}", 0) + int(count)
+                )
+        metrics["drafter/oldlogprob_padding_skipped"] = int(
+            getattr(self, "_speco_last_oldlogprob_padding_skipped", 0)
+        )
         if collect_plan is None:
             return super()._compute_old_log_prob(batch, metrics)
 
@@ -1850,29 +2033,57 @@ class SpecoV1Mixin(V1BubbleMixin):
         interleaved within the same parameter-sync cycle.
         """
         worker = self.actor_rollout_wg
-        if self.config.trainer.v1.get("trainer_mode", "sync") != "separate_async":
-            output = worker.compute_log_prob(control)
-            self._speco_v1_cache_old_policy_head()
-            return output
-
-        local_step = self.local_trigger_step
-        if local_step == 0:
+        if (
+            self.config.trainer.v1.get("trainer_mode", "sync") == "separate_async"
+            and self.local_trigger_step == 0
+        ):
             worker.save_model_to_cpu(0)
+        with self._speco_v1_old_policy():
             output = worker.compute_log_prob(control)
             self._speco_v1_cache_old_policy_head()
             return output
 
+    @contextmanager
+    def _speco_v1_old_policy(self):
+        local_step = getattr(self, "local_trigger_step", 0)
+        if (
+            self.config.trainer.v1.get("trainer_mode", "sync") != "separate_async"
+            or local_step == 0
+        ):
+            yield
+            return
+        worker = self.actor_rollout_wg
         worker.save_model_to_cpu(local_step)
         try:
             worker.restore_model_from_cpu(0)
-            output = worker.compute_log_prob(control)
-            self._speco_v1_cache_old_policy_head()
-            return output
+            yield
         finally:
             # Restore before releasing the only copy of the training weights;
             # if restoration fails, leave that snapshot available for recovery.
             worker.restore_model_from_cpu(local_step)
             worker.clear_cpu_model(local_step)
+
+    def _speco_start_target_lm_head_weight_sync(self, training_plan):
+        from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
+
+        start = SpecoRayPPOTrainer._speco_start_target_lm_head_weight_sync
+        if not self._speco_v1_opd_config():
+            return start(self, training_plan)
+        # Separate-async's final local update sees a newer actor. Export the
+        # head from the same proximal snapshot that produced the features.
+        with self._speco_v1_old_policy():
+            return start(self, training_plan)
+
+    def speco_set_global_step(self, global_step):
+        worker = self._require_speco_worker_group()
+        if self._speco_v1_opd_config():
+            return worker.set_global_step(
+                global_step,
+                opd_drafter_revision=self.__dict__.get(
+                    "_speco_v1_opd_drafter_revision", 0
+                ),
+            )
+        return worker.set_global_step(global_step)
 
     def _speco_v1_spec_decode_sidecar_metrics(self) -> dict[str, float]:
         """Read cumulative EngineCore counters when RequestOutput has no stats."""
@@ -2078,6 +2289,8 @@ class SpecoV1Mixin(V1BubbleMixin):
             batch, metrics, timing_raw, global_steps, epoch
         )
         metrics.update(self._speco_v1_spec_decode_metrics(batch))
+        if self.__dict__.get("_speco_v1_opd_counts_step") == global_steps:
+            metrics.update(self._speco_v1_opd_counts)
         if self.__dict__.get("_speco_v1_timing_step") == global_steps:
             metrics.update(self._speco_v1_timing_metrics())
         scheduler = self.__dict__.get("_drafter_scheduler")
@@ -2143,6 +2356,12 @@ class SpecoV1Mixin(V1BubbleMixin):
             return result
 
         before_started = time.perf_counter()
+        if self._speco_v1_opd_config() and self._speco_drafter_training_config().get(
+            "use_data_buffer"
+        ):
+            # Even an entirely stale batch (or a disabled collection interval)
+            # must advance the workers' replay filter before scheduler preflight.
+            self._speco_set_drafter_global_step()
         with _rl_insight_trace_state(
             "drafter/prepare",
             state_lane_id=_SPECO_RL_INSIGHT_TRAINER_LANE,
@@ -2191,6 +2410,10 @@ class SpecoV1Mixin(V1BubbleMixin):
                     "drafter/train_activation_failed": 0,
                 }
             metrics.update(train_metrics)
+            if trained and self._speco_v1_opd_config():
+                self._speco_v1_opd_drafter_revision = (
+                    self.__dict__.get("_speco_v1_opd_drafter_revision", 0) + 1
+                )
             self._speco_v1_pending_training = bool(trained)
             self._speco_v1_training_plan = plan
         if getattr(self, "_speco_freeze_policy", None) is not None:
@@ -2296,6 +2519,21 @@ class SpecoV1Mixin(V1BubbleMixin):
                     "V1 Bubble checkpoint and freeze-policy revisions disagree"
                 )
             self._speco_validate_freeze_branch_config()
+            if self._speco_v1_opd_config():
+                resume_step = int(self.global_steps)
+                manifest = (
+                    self._speco_read_v1_resume_manifest(resume_step)
+                    if resume_step
+                    else {}
+                )
+                # Older manifests have no per-training-cycle revision. Start
+                # from the resume step to distinguish new serving from old
+                # traces which were all stamped as revision zero.
+                revision = int(manifest.get("opd_drafter_revision", resume_step))
+                self._speco_v1_opd_drafter_revision = revision
+                self._speco_rollout_admission_rpc(
+                    "speco_set_serving_drafter_revision", revision, include_hybrid=True
+                )
             if (
                 self._speco_rollout_idle_worker_enabled()
                 and self._speco_freeze_policy is not None

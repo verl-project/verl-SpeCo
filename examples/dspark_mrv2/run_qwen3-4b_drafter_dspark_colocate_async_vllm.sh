@@ -5,7 +5,7 @@
 set -euo pipefail
 set -x
 
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 export VLLM_USE_V1=1
 export VLLM_USE_V2_MODEL_RUNNER=1
 

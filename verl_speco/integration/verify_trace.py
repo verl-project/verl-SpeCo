@@ -4,8 +4,10 @@
 
 import contextvars
 import hashlib
+from numbers import Integral
 
 TRACE_KEY = "_speco_verify_trace"
+TRACE_DELTA_KEY = "_speco_verify_trace_delta"
 TURN_TRACES: contextvars.ContextVar[list[dict] | None] = contextvars.ContextVar(
     "speco_verify_turns", default=None
 )
@@ -94,6 +96,61 @@ def token_digest(ids):
     return hashlib.sha256(",".join(map(str, ids)).encode("ascii")).hexdigest()
 
 
+def finish_serving_trace(
+    output, prompt_ids, drafter_before, drafter_after, *, target_version=None
+):
+    """Bind the evidence to the exact prefix returned by this serving call."""
+    fields = output.extra_fields
+    trace = fields.get(TRACE_KEY)
+    token_ids = output.token_ids
+    if trace is None:
+        if not token_ids and output.stop_reason in {"abort", "aborted"}:
+            return
+        raise ValueError("Draft-OPD verification trace missing from serving output")
+    if trace["response_length"] != len(token_ids):
+        raise ValueError("Draft-OPD trace and returned response length differ")
+    if not token_ids and output.stop_reason in {"abort", "aborted"}:
+        fields.pop(TRACE_KEY)
+        return
+    trace["prefix_digest"] = token_digest([*prompt_ids, *token_ids])
+    trace["drafter_revision_min"] = min(drafter_before, drafter_after)
+    trace["drafter_revision_max"] = max(drafter_before, drafter_after)
+    if target_version is not None:
+        trace["target_revision_min"] = target_version
+
+
+def trace_staleness(trace, *, target_version, drafter_revision, policy_tag=None):
+    """Use the oldest version contributing tokens, including mixed segments."""
+    if not trace:
+        raise ValueError(
+            "Draft-OPD verification trace missing at old-logprob collection"
+        )
+    policy = trace.get("target_revision_min", policy_tag)
+    turns = trace.get("turns", [trace])
+    revisions = [
+        (t.get("drafter_revision_min"), t.get("drafter_revision_max")) for t in turns
+    ]
+    if (
+        not isinstance(policy, Integral)
+        or not 0 <= policy <= target_version
+        or not revisions
+        or any(
+            not isinstance(lo, Integral)
+            or not isinstance(hi, Integral)
+            or not 0 <= lo <= hi <= drafter_revision
+            for lo, hi in revisions
+        )
+    ):
+        raise ValueError(
+            "Draft-OPD trace has missing or invalid policy/drafter versions"
+        )
+    return (
+        target_version - int(policy),
+        drafter_revision - min(int(lo) for lo, _ in revisions),
+        sum(lo != hi for lo, hi in revisions),
+    )
+
+
 def align_trace_to_prompt(trace, prompt_width):
     first = trace["turns"][0] if "turns" in trace else trace
     padding = prompt_width - first["prompt_length"]
@@ -113,6 +170,18 @@ def collect_turn_trace(output):
         turns.append(fields[TRACE_KEY])
 
 
+def merge_turn_traces_for_outputs(output, *, opd_enabled=False):
+    """Normalize V1 singleton lists; multiple evidence owners require P3 support."""
+    outputs = output if isinstance(output, list) else [output]
+    if len(outputs) > 1 and (opd_enabled or TURN_TRACES.get()):
+        raise ValueError(
+            "Draft-OPD supports only a single agent-loop output; "
+            "multi-output agent loops require P3 trajectory assignment"
+        )
+    for item in outputs:
+        merge_turn_traces(item)
+
+
 def merge_turn_traces(output):
     """Keep each request's absolute coordinates across tool turns and resumes."""
     turns = TURN_TRACES.get()
@@ -125,3 +194,6 @@ def merge_turn_traces(output):
                     "Draft-OPD request tokens differ from the final agent trajectory"
                 )
         output.extra_fields[TRACE_KEY] = {"turns": list(turns)}
+        target_versions = [turn.get("target_revision_min") for turn in turns]
+        if all(isinstance(v, Integral) for v in target_versions):
+            output.extra_fields[TRACE_KEY]["target_revision_min"] = min(target_versions)

@@ -14,6 +14,8 @@ trainer:
 
   v1:
     trainer_mode: sync
+    sync:
+      parameter_sync_step: 1
     # Async V1 normally submits its first rollout batch from on_train_begin and
     # charges the first real vLLM/MRV2 decode to step 1. SPECO completes that
     # same batch before trainer.fit; set false only for upstream timing parity.

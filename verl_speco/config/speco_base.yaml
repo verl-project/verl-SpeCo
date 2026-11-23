@@ -331,6 +331,9 @@ actor_rollout_ref:
         drafter_opd:
           enable: false
           capture_verify_trace: false
+          # V1 only. Maximum age of the oldest token-producing rollout version.
+          max_policy_staleness: 0
+          max_drafter_staleness: 0
           anchor_planner: mixed
           random_anchor_ratio: 0.25
           loss: e2e_tv

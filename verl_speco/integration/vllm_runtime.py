@@ -3122,6 +3122,7 @@ def patch_vllm_request_acceptance_stats() -> bool:
             )
             if capture:
                 from verl_speco.integration.verify_trace import (
+                    TRACE_DELTA_KEY,
                     TRACE_KEY,
                     finish_verify_step,
                 )
@@ -3153,17 +3154,32 @@ def patch_vllm_request_acceptance_stats() -> bool:
                         is_finished = bool(
                             getattr(engine_core_output, "finished", False)
                         )
-                        if (
-                            not is_finished
-                            and getattr(engine_core_output, "finish_reason", None)
-                            is None
-                        ):
-                            continue
                         request_id = getattr(engine_core_output, "request_id", None)
-                        if request_id is not None:
+                        if request_id is None:
+                            continue
+                        if (
+                            is_finished
+                            or getattr(engine_core_output, "finish_reason", None)
+                            is not None
+                        ):
                             finished_outputs.append(
                                 (str(request_id), engine_core_output)
                             )
+                        elif capture and engine_core_output.new_token_ids:
+                            trace = traces.get(request_id)
+                            if trace is not None:
+                                # A core-generated abort can bypass the scheduler's
+                                # terminal output. Mirror each emitted step once so
+                                # RequestState can finalize the delivered prefix.
+                                _attach_vllm_request_stats_to_trace_headers(
+                                    engine_core_output,
+                                    {
+                                        TRACE_DELTA_KEY: {
+                                            **trace,
+                                            "steps": trace["steps"][-1:],
+                                        }
+                                    },
+                                )
                 if finished_outputs:
                     summaries, _ = _pop_vllm_request_stats_for_ids(
                         self,
@@ -3222,6 +3238,8 @@ def patch_vllm_request_acceptance_stats() -> bool:
     ):
 
         def patched_process_outputs(self, engine_core_outputs, *args, **kwargs):
+            from verl_speco.integration.verify_trace import TRACE_DELTA_KEY, TRACE_KEY
+
             try:
                 for engine_core_output in engine_core_outputs:
                     request_id = getattr(engine_core_output, "request_id", None)
@@ -3239,7 +3257,15 @@ def patch_vllm_request_acceptance_stats() -> bool:
                     summary = _decode_vllm_request_stats_trace_header(
                         trace_headers.get(SPECO_VLLM_REQUEST_STATS_TRACE_HEADER)
                     )
-                    if summary:
+                    if summary and TRACE_DELTA_KEY in summary:
+                        delta = summary[TRACE_DELTA_KEY]
+                        prefix = getattr(req_state, TRACE_KEY, None)
+                        if prefix is None:
+                            setattr(req_state, TRACE_KEY, delta)
+                        else:
+                            prefix["steps"].extend(delta["steps"])
+                            prefix["response_length"] = delta["response_length"]
+                    elif summary:
                         setattr(
                             req_state, "_speco_vllm_request_accept_summary", summary
                         )
@@ -3265,10 +3291,25 @@ def patch_vllm_request_acceptance_stats() -> bool:
     ):
 
         def patched_make_request_output(self, *args, **kwargs):
+            from verl_speco.integration.verify_trace import TRACE_KEY
+
             request_output = original_make_request_output(self, *args, **kwargs)
             if request_output is None:
                 return request_output
             summary = getattr(self, "_speco_vllm_request_accept_summary", None)
+            if summary is None and getattr(request_output, "finished", False):
+                prefix = getattr(self, TRACE_KEY, None)
+                if prefix is not None:
+                    summary = {
+                        TRACE_KEY: prefix,
+                        "verify_rounds": sum(
+                            step["drafts"] > 0 for step in prefix["steps"]
+                        ),
+                        "draft_tokens": sum(step["drafts"] for step in prefix["steps"]),
+                        "accepted_tokens": sum(
+                            step["accepted"] for step in prefix["steps"]
+                        ),
+                    }
             if not isinstance(summary, dict) or not summary:
                 return request_output
             request_id = getattr(request_output, "request_id", None) or getattr(
@@ -4152,8 +4193,26 @@ class _SpecoVLLMHttpServerMixin:
     async def speco_close_rollout_admission(self):
         self._speco_rollout_admission().close()
 
-    async def speco_wait_rollout_idle(self):
-        await self._speco_rollout_admission().wait_idle()
+    async def speco_wait_rollout_idle(self, abort_racing_requests=False):
+        admission = self._speco_rollout_admission()
+        if not abort_racing_requests:
+            await admission.wait_idle()
+            return
+
+        import asyncio
+
+        while True:
+            try:
+                await asyncio.wait_for(admission.wait_idle(), timeout=0.05)
+                return
+            except asyncio.TimeoutError:
+                # An already-admitted RPC can submit to the paused engine
+                # after the first abort (for example after a LoRA RPC).
+                result = await self.abort_all_requests(reset_prefix_cache=False)
+                if result and result.get("error"):
+                    raise RuntimeError(
+                        f"Unable to drain Draft-OPD rollout: {result['error']}"
+                    )
 
     async def speco_resume_rollout_admission(self):
         self._speco_rollout_admission().resume()
@@ -4240,7 +4299,6 @@ async def _speco_generate_with_request_stats_unblocked(
             args = (args[0], clean_params, *args[2:])
         else:
             kwargs = {**kwargs, "sampling_params": clean_params}
-    revision_before = int(getattr(self, "_speco_serving_drafter_revision", 0))
     if not bool(getattr(self, "_speco_vllm_generate_entered", False)):
         logger.warning(
             "[speco acceptance bridge] generate wrapper entered class=%s mro=%s",
@@ -4314,6 +4372,8 @@ async def _speco_generate_with_request_stats_unblocked(
                         elapsed_s=time.perf_counter() - snapshot_started,
                     )
         request_started = time.perf_counter()
+        revision_before = int(getattr(self, "_speco_serving_drafter_revision", 0))
+        target_before = getattr(self, "global_steps", None)
         if use_idle_lease and _rollout_idle_worker_config(_load_env_drafter_config()):
             output = await _speco_generate_with_idle_lease(
                 self, generate, args, kwargs, diagnostics=diagnostics
@@ -4385,17 +4445,16 @@ async def _speco_generate_with_request_stats_unblocked(
                 .get("drafter_opd", {})
                 .get("capture_verify_trace", False)
             ):
-                from verl_speco.integration.verify_trace import TRACE_KEY, token_digest
+                from verl_speco.integration.verify_trace import finish_serving_trace
 
-                trace = extra_fields[TRACE_KEY]
                 prompt_ids = kwargs["prompt_ids"] if "prompt_ids" in kwargs else args[0]
-                if trace["response_length"] != len(output.token_ids):
-                    raise ValueError(
-                        "Draft-OPD trace and returned response length differ"
-                    )
-                trace["prefix_digest"] = token_digest([*prompt_ids, *output.token_ids])
-                trace["drafter_revision_min"] = min(revision_before, revision_after)
-                trace["drafter_revision_max"] = max(revision_before, revision_after)
+                finish_serving_trace(
+                    output,
+                    prompt_ids,
+                    revision_before,
+                    revision_after,
+                    target_version=target_before,
+                )
             elapsed_key = f"{SPECO_VLLM_REQUEST_STATS_EXTRA_PREFIX}_elapsed_sec"
             if (
                 extra_fields.get("_verl_request_mean_accept_len") is not None

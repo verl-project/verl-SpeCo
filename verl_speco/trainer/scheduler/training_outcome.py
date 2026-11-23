@@ -72,6 +72,12 @@ _BLOCK_METRIC_PASSTHROUGH_SUFFIXES = frozenset(
 )
 
 
+_OPD_METRIC_PASSTHROUGH_SUFFIXES = frozenset(
+    f"opd/{name}"
+    for name in ("loss", "trace_blocks", "random_blocks", "visible_tokens", "batch_count")
+)
+
+
 def _forward_block_metrics(
     results: list[dict[str, object]],
 ) -> dict[str, float]:
@@ -88,7 +94,10 @@ def _forward_block_metrics(
         for key, raw_value in result.items():
             if not isinstance(key, str) or "/" not in key:
                 continue
-            if key.rsplit("/", 1)[-1] not in _BLOCK_METRIC_PASSTHROUGH_SUFFIXES:
+            if (
+                key.rsplit("/", 1)[-1] not in _BLOCK_METRIC_PASSTHROUGH_SUFFIXES
+                and key.partition("/")[2] not in _OPD_METRIC_PASSTHROUGH_SUFFIXES
+            ):
                 continue
             value = _metric_float(raw_value)
             if value is not None:

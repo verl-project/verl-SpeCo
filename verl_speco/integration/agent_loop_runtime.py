@@ -183,6 +183,10 @@ def _speco_parent_method(instance: Any, method_name: str) -> Any:
 
 
 def _speco_default_agent_loop_extra_fields(output: Any) -> Any:
+    if isinstance(output, list):
+        for item in output:
+            _speco_default_agent_loop_extra_fields(item)
+        return output
     extra_fields = getattr(output, "extra_fields", None)
     if isinstance(extra_fields, dict):
         for key in _DEFAULT_EXTRA_KEYS:
@@ -362,10 +366,19 @@ async def _speco_worker_run_agent_loop(
     )
 
 
-async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs):
-    from verl_speco.integration.verify_trace import merge_turn_traces
+def _speco_merge_agent_loop_traces(worker, output):
+    from verl_speco.integration.verify_trace import merge_turn_traces_for_outputs
 
-    merge_turn_traces(output)
+    value = getattr(worker, "config", {})
+    for key in ("actor_rollout_ref", "rollout", "drafter", "training", "drafter_opd"):
+        value = value.get(key, {}) if hasattr(value, "get") else getattr(value, key, {})
+        value = value or {}
+    opd = value
+    merge_turn_traces_for_outputs(output, opd_enabled=bool(opd.get("enable", False)))
+
+
+async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs):
+    _speco_merge_agent_loop_traces(self, output)
     _speco_default_agent_loop_extra_fields(output)
     agent_loop_postprocess = _speco_parent_method(self, "_agent_loop_postprocess")
     if not callable(agent_loop_postprocess):
@@ -760,20 +773,12 @@ def install_agent_loop_runtime_patch() -> bool:
 
         @wraps(agent_loop_postprocess)
         async def speco_agent_loop_postprocess(self, output, validate, **kwargs):
-            from verl_speco.integration.verify_trace import merge_turn_traces
-
-            merge_turn_traces(output)
-            extra_fields = getattr(output, "extra_fields", None)
-            if isinstance(extra_fields, dict):
-                for key in _DEFAULT_EXTRA_KEYS:
-                    extra_fields.setdefault(key, _DEFAULT_EXTRA_KEYS[key])
+            _speco_merge_agent_loop_traces(self, output)
+            _speco_default_agent_loop_extra_fields(output)
             result = agent_loop_postprocess(self, output, validate, **kwargs)
             if inspect.isawaitable(result):
                 result = await result
-            extra_fields = getattr(result, "extra_fields", None)
-            if isinstance(extra_fields, dict):
-                for key in _DEFAULT_EXTRA_KEYS:
-                    extra_fields.setdefault(key, _DEFAULT_EXTRA_KEYS[key])
+            _speco_default_agent_loop_extra_fields(result)
             return result
 
         worker_cls._agent_loop_postprocess = speco_agent_loop_postprocess

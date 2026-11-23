@@ -5008,6 +5008,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_build_oldlogprob_collect_plan(
         self, batch: DataProto
     ) -> dict[str, Any] | None:
+        self._speco_last_oldlogprob_padding_skipped = 0
+        self._speco_last_opd_stale_samples_skipped = {
+            "stale_samples_skipped_policy": 0,
+            "stale_samples_skipped_drafter": 0,
+        }
         if not self._speco_oldlogprob_collection_enabled():
             return None
         collection_plan = self._speco_plan_drafter_collection(
@@ -5187,6 +5192,21 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         candidate_count = 0
         short_response_skipped = 0
+        padding_skipped = 0
+        non_tensor = getattr(batch, "non_tensor_batch", {}) or {}
+        padding_rows = non_tensor.get("_speco_v1_is_padding", [False] * batch_size)
+        opd = training_cfg.get("drafter_opd") or {}
+        lag_filters = [
+            (
+                axis,
+                non_tensor[f"_speco_opd_{axis}_lag"],
+                opd.get(f"max_{axis}_staleness", 0),
+            )
+            for axis in ("policy", "drafter")
+            if f"_speco_opd_{axis}_lag" in non_tensor
+        ]
+        if len(padding_rows) != batch_size:
+            raise ValueError("_speco_v1_is_padding must have one flag per batch row")
         selected_count = 0
         candidates: list[dict[str, Any]] = []
         for batch_idx in range(batch_size):
@@ -5205,10 +5225,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
             prompt_lens.append(prompt_len)
             response_lens.append(response_len)
+            if bool(padding_rows[batch_idx]):
+                padding_skipped += 1
+                continue
             if prompt_len <= 0:
                 continue
             if response_len < hidden_rows:
                 short_response_skipped += 1
+                continue
+            stale = False
+            for axis, lag, limit in lag_filters:
+                if lag[batch_idx] > limit:
+                    self._speco_last_opd_stale_samples_skipped[
+                        f"stale_samples_skipped_{axis}"
+                    ] += 1
+                    stale = True
+            if stale:
                 continue
             candidate_count += 1
             sample_key = f"{step_key}:{batch_idx}:{prompt_len}:{response_len}"
@@ -5424,6 +5456,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_raw_drafter_samples = candidate_count
         self._speco_last_oldlogprob_candidate_samples = candidate_count
         self._speco_last_oldlogprob_short_response_skipped = short_response_skipped
+        self._speco_last_oldlogprob_padding_skipped = padding_skipped
         self._speco_last_oldlogprob_planned_samples = selected_count
         if selected_count <= 0:
             return None

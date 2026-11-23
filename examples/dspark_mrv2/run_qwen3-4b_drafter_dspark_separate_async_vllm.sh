@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Two-GPU native MRV2 DSpark smoke test, derived from the NPU example.
+# Three-GPU native MRV2 DSpark smoke test, derived from the NPU example.
 # Requires a CUDA vLLM build with native MRV2 DSpark support.
 # The sync script retains the original legacy SPECO trainer; async uses V1/TQ.
 set -euo pipefail
 set -x
 
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2}
 export VLLM_USE_V1=1
 export VLLM_USE_V2_MODEL_RUNNER=1
 
@@ -15,7 +15,7 @@ gen_tp=1
 train_sp=2
 ppo_gpus_per_node=2
 rollout_gpus_per_node=1
-# Separate pools: one trainer GPU plus one standalone rollout GPU (two total).
+# Separate pools: two trainer GPUs plus one standalone rollout GPU.
 # train_batch_size=8 equals parameter_sync_step=2 * ppo_mini_batch_size=4.
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}

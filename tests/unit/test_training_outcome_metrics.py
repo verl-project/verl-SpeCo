@@ -237,3 +237,24 @@ def test_preflight_failure_keeps_reason_and_logs_worker_control_step(caplog):
     assert not outcome.trained and outcome.successful_steps == 0
     assert "stale_training_plan" in caplog.text
     assert "worker_global_step" in caplog.text
+
+
+def test_from_execution_forwards_draft_opd_metrics_for_both_backends() -> None:
+    plan = _plan()
+    expected = {
+        f"{backend}/opd/{name}": float(index + 1)
+        for backend in ("dflash", "dspark")
+        for index, name in enumerate(
+            ("loss", "trace_blocks", "random_blocks", "visible_tokens", "batch_count")
+        )
+    }
+    outcome = TrainingOutcome.from_execution(
+        ExecutionOutcome(raw_results=[_result(**expected)], elapsed_sec=1.0),
+        runtime_state=_running_state(plan),
+        plan=plan,
+    )
+    for key, value in expected.items():
+        assert outcome.metrics[key] == value
+    assert "dspark/opd/not_a_metric" not in _forward_block_metrics(
+        [{"dspark/opd/not_a_metric": 1, "dspark/other/trace_blocks": 2}]
+    )

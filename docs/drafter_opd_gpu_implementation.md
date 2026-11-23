@@ -307,3 +307,130 @@ For VAT, speedups against a frozen drafter measure the combined benefit of onlin
 training and VAT. Isolating the VAT objective requires an ordinary online-training
 baseline with the same update frequency and rollout settings. CPU regression tests
 do not replace a distributed GPU/NPU training run.
+
+## V1 sync (P1, 2026-11-19)
+
+P1 covers `trainer.v1.trainer_mode=sync`,
+`trainer.v1.sync.parameter_sync_step=1`, synchronous drafter execution and
+publication. Async, Bubble, freeze and multiple agent-loop outputs remain outside
+P1. Unsupported configurations fail in the V1 setup validation. Singleton output
+lists retain digest validation. TQ synthetic padding rows are explicitly excluded
+from drafter collection and counted as `drafter/oldlogprob_padding_skipped`, even
+when no real sample is selected. See [the design](draft_opd_v1_trainer_design.md).
+
+Standalone GPU recipes:
+
+- `examples/run_qwen3-8b-opd_v1_drafter_dflash_vllm.sh`
+- `examples/run_qwen3-8b-opd_v1_drafter_dspark_vllm.sh`
+
+### Compare V1 co-train with Draft-OPD
+
+Run on a Linux training host with the supported verl/V1, TransferQueue and patched
+vLLM dependencies, two visible GPUs, real model/drafter checkpoints and parquet
+data. The filename's historical `8b` label does not constrain the supplied model;
+its architecture and drafter checkpoint must match.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python tools/compare_v1_cotrain_draft_opd.py \
+  --backend dspark \
+  --model /models/Qwen3-4B \
+  --drafter /models/dspark_qwen3_4b_block7 \
+  --train-file /data/train.parquet \
+  --val-file /data/aime-2024.parquet \
+  --steps 5 --output experiments/v1_dspark_smoke
+```
+
+For DFlash use `--backend dflash` and a compatible block-16 checkpoint. Both arms
+use `examples/run_qwen3-8b_drafter_{backend}_vllm.sh` with trailing overrides: V1
+sync/TQ, identical data seed, rollout temperature, batch sizes, GPUs, collection,
+training and publication frequencies. They start fresh from the same checkpoints
+in separate processes and write separate checkpoint/rollout directories. DFlash
+uses 15 speculative verification tokens in both arms. Actor training remains the
+existing example's GRPO co-training; actor teacher OPD is a separate feature.
+
+By default baseline retains its original restricted-CE objective and random
+anchors; treatment uses full-vocabulary E2E-TV and mixed trace/random anchors.
+This compares the complete methods. Add `--matched-full-vocab` to also give the
+baseline full-vocabulary fixed-decay loss, reducing objective/layout differences.
+The inherited loss coefficients remain identical between arms. Neither comparison
+isolates every factor; matched seeds do not guarantee identical sampled tokens.
+
+- `--dry-run`: print exact commands without launching or creating files.
+- `--compose-only`: resolve both Hydra configurations without Ray/worker startup.
+- `--override KEY=VALUE`: repeat for shared experiment settings; e.g.
+  `--override trainer.total_epochs=100` for a long experiment. Avoid overriding
+  method-specific flags or the step count used by the completeness checker.
+
+Use a fresh output directory for each run. It contains `commands.json`,
+`co_train.log`, `draft_opd.log` and `summary.json` (all finite scalar console
+metrics with means, min/max and observed counts). Missing training steps, absent
+optimizer updates/publication or zero OPD trace blocks fail the comparison.
+Per-metric counts expose metrics that are emitted only on training steps. Logs
+remain available if either launch fails. For steady-state measurements use more
+steps and inspect warmup separately; the five-step run is a smoke test, not a
+performance conclusion. No GPU/NPU results are claimed by the CPU checks.
+
+P1 CPU verification (2026-11-19): targeted V1 mixin/factory/batch-adapter,
+Draft-OPD, training-metric and example contracts: **191 passed, 6 skipped**.
+The six skipped tests require Bash; Windows sandbox process initialization
+prevents launching Git Bash here. The corresponding six configurations passed
+the independent source-argument/Hydra composition tests. Shared old-logprob
+collection regression tests: **44 passed**. Ruff, example naming (42 recipes)
+and `git diff --check` passed.
+
+The worker-result whitelist was found to omit OPD diagnostics despite the design
+snapshot's expectation. P1 now forwards the five supported `opd/*` scalars for
+both backends; disabling this forwarding reproduces the regression test failure.
+The full `tests/v1` collection with `SPECO_REQUIRE_V1=1` remains blocked by the
+missing `transfer_queue` dependency in two upstream/Bubble integration modules.
+No distributed GPU/NPU smoke test or baseline performance run was performed.
+
+## V1 async (P2)
+
+`colocate_async` uses one actor update per synchronization. `separate_async`
+also supports multiple local updates. Each local update and the drafter's
+target LM head use the same proximal actor snapshot. Draft training and
+publication run synchronously at the global-step boundary.
+
+Abort/resume retains the verification steps for the delivered prefix, including
+when vLLM emits a terminal abort without a scheduler trace. An empty abort
+contributes no trace turn. A nonempty turn must match the returned tokens in
+length and the final agent trajectory in prefix digest. Rollout admission
+stays closed during async target synchronization and drafter publication,
+including the rollout revision update.
+
+`training.drafter_opd.max_policy_staleness` and
+`training.drafter_opd.max_drafter_staleness` both default to `0`. The policy
+lag compares the oldest token-producing segment with the proximal actor
+(`global_steps - 1`). Drafter lag compares the oldest segment with the current
+training revision. A successful training cycle advances the training revision,
+and serving adopts it after publication. With a zero drafter lag limit,
+configure publication on every training cycle.
+
+Samples over either limit are excluded from Drafter feature collection. Worker
+replay checks both limits again against the current versions. Positive policy
+limits allow cross-step replay with the existing block-drafter LM-head behavior,
+which reconstructs supervision from the buffered hidden states and the current
+proximal head. The policy and drafter skip counts may both include the same
+sample. Track `opd/stale_samples_skipped_policy`,
+`opd/stale_samples_skipped_drafter`, `opd/policy_lag_max`,
+`opd/drafter_lag_max`, and `opd/mixed_revision_turns`.
+
+The comparison tool uses the native Qwen3-4B DSpark MRV2 V1 recipe for each
+async mode. `colocate_async` defaults to two shared GPUs.
+`separate_async` defaults to two trainer GPUs and one standalone rollout GPU,
+with `parameter_sync_step=2`.
+
+```bash
+python tools/compare_v1_cotrain_draft_opd.py \
+  --mode colocate_async --matched-full-vocab \
+  --model /models/Qwen3-4B --drafter /models/dspark_qwen3_4b_block7 \
+  --train-file /data/train.parquet --val-file /data/aime-2024.parquet \
+  --steps 5 --output experiments/v1_dspark_colocate
+```
+
+For the second comparison, set `--mode separate_async` and use a fresh output
+directory. Add `--max-policy-staleness 1` or `--max-drafter-staleness 1` to test
+an explicit off-policy budget if the strict run drops most samples. Review
+`dspark/opd/trace_blocks`, the drafter optimizer step, and successful publication
+alongside the lag counts. Both modes require distributed GPU smoke validation.
