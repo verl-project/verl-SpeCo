@@ -265,6 +265,129 @@ def test_merged_server_launch_restores_bubble_config_before_initial_draft(
     assert not server._speco_initial_draft_weights_ready
 
 
+@pytest.mark.parametrize("serving_revision", [None, 0])
+def test_specopd_request_rejects_unacknowledged_revision_before_generation(monkeypatch, serving_revision):
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: {
+        "training": {"specopd": {"enable": True}},
+    })
+    server = SimpleNamespace(_speco_serving_drafter_revision=serving_revision)
+    async def generate(**kwargs):
+        pytest.fail("an unacknowledged proposal revision must not reach generation")
+    with pytest.raises(RuntimeError, match="acknowledged serving drafter revision"):
+        asyncio.run(vllm_runtime._speco_generate_with_request_stats_unblocked(
+            server, generate, (), {"sampling_params": {"_specopd_drafter_revision": 1}},
+        ))
+
+
+def test_specopd_vllm_uses_the_server_temperature_and_existing_verify_width(monkeypatch):
+    from verl_speco.integration import specopd_window
+
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: {
+        "speculative_algorithm": "DSPARK",
+        "rollout": {"spec_verify_tokens": 5},
+        "training": {
+            "dspark_num_anchors": 32,
+            "specopd": {"enable": True, "anchor_count": None},
+        },
+    })
+    server = SimpleNamespace(
+        config=SimpleNamespace(temperature=0.6, response_length=32),
+        global_steps=1,
+        _speco_serving_drafter_revision=2,
+        _speco_request_id_from_generate_call=lambda *_: "request",
+    )
+
+    class WindowReady(Exception):
+        pass
+
+    def inspect_window(spec, *args):
+        assert (spec.temperature, spec.proposal_width) == (0.6, 5)
+        assert spec.max_proposal_tokens_per_request == 24 * 5
+        raise WindowReady
+
+    monkeypatch.setattr(specopd_window, "make_window", inspect_window)
+    for temperature, failure in ((0.6, WindowReady), (1.0, ValueError)):
+        with pytest.raises(failure):
+            asyncio.run(vllm_runtime._speco_generate_with_request_stats_unblocked(
+                server, None, (), {
+                    "prompt_ids": [10],
+                    "sampling_params": {
+                        "temperature": temperature, "_specopd_drafter_revision": 2,
+                    },
+                },
+            ))
+
+
+def test_reinstall_bridge_refreshes_config_after_early_install(monkeypatch):
+    class Server:
+        async def launch_server(self):
+            pass
+
+        async def run_server(self, args):
+            pass
+
+        async def generate(self):
+            pass
+
+    upstream = types.ModuleType("verl.workers.rollout.vllm_rollout.vllm_async_server")
+    upstream.vLLMHttpServer = Server
+    upstream.vLLMReplica = type("Replica", (), {})
+    modules = {
+        "ray": types.ModuleType("ray"),
+        "verl": types.ModuleType("verl"),
+        "verl.workers": types.ModuleType("verl.workers"),
+        "verl.workers.rollout": types.ModuleType("verl.workers.rollout"),
+        "verl.workers.rollout.replica": types.ModuleType("verl.workers.rollout.replica"),
+        "verl.workers.rollout.vllm_rollout": types.ModuleType("verl.workers.rollout.vllm_rollout"),
+        upstream.__name__: upstream,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+        if "." in name and name.rsplit(".", 1)[0] in modules:
+            setattr(modules[name.rsplit(".", 1)[0]], name.rsplit(".", 1)[1], module)
+    monkeypatch.setattr(vllm_runtime, "install_vllm_runtime_observability", lambda: None)
+    monkeypatch.setattr(vllm_runtime, "patch_vllm_server_adapter_update", lambda: None)
+    monkeypatch.delenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
+    assert vllm_runtime.install_upstream_vllm_runtime_bridge()
+    server = upstream.vLLMHttpServer
+    assert server._speco_drafter_config_env is None
+    payload = json.dumps(_drafter(training={"drafter_opd": {"enable": True, "method": "draft_opd"}}))
+    monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, payload)
+    assert vllm_runtime.install_upstream_vllm_runtime_bridge()
+    assert upstream.vLLMHttpServer is server
+    assert server._speco_drafter_config_env == payload
+
+
+def test_http_bridge_survives_cloudpickle_fresh_import(tmp_path, monkeypatch):
+    import importlib.util
+    import os
+    import subprocess
+    cloudpickle = pytest.importorskip("cloudpickle")
+    module_name = "speco_fresh_http_probe"
+    source = tmp_path / (module_name + ".py")
+    source.write_text('class Upstream:\n    async def generate(self): return "native"\n    async def launch_server(self): return "native-launch"\n    async def run_server(self, args): return None\n', encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(module_name, source)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    spec.loader.exec_module(module)
+    native = module.Upstream.generate
+
+    async def patched(self):
+        return "bridge:" + await native(self)
+
+    module.Upstream.generate = patched
+    module.Upstream._speco_vllm_http_methods_patched = True
+    cls = vllm_runtime._build_speco_vllm_http_server_class(SimpleNamespace(vLLMHttpServer=module.Upstream))
+    payload = tmp_path / "server.pickle"
+    payload.write_bytes(cloudpickle.dumps(cls))
+    code = ('import asyncio,cloudpickle,sys; import speco_fresh_http_probe as m; '
+            'c=cloudpickle.loads(open(sys.argv[1],"rb").read()); '
+            'print(asyncio.run(m.Upstream().generate())); print(asyncio.run(c().generate()))')
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), str(Path(__file__).resolve().parents[2]), os.environ.get("PYTHONPATH", "")])}
+    result = subprocess.run([sys.executable, "-c", code, str(payload)], env=env, capture_output=True, text=True, check=True)
+    assert result.stdout.strip().splitlines()[-2:] == ["native", "bridge:native"]
+
+
 def test_sync_generation_does_not_enter_bubble_lease(monkeypatch):
     monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: _drafter())
     monkeypatch.setattr(
@@ -2171,6 +2294,35 @@ def test_vllm_mrv2_rejects_final_engine_speculative_override(
         configure_vllm_runtime_from_config(config)
 
 
+@pytest.mark.parametrize("entry", ["driver", "server"])
+@pytest.mark.parametrize("enabled,width", [(True, 3), (True, 7), (False, 3)])
+def test_specopd_checks_final_proposal_width_on_all_runtime_paths(monkeypatch, tmp_path, entry, enabled, width):
+    monkeypatch.setattr(vllm_runtime, "_is_vllm_ascend_runtime_hint", lambda: False)
+    monkeypatch.setattr(vllm_runtime, "install_upstream_vllm_runtime_bridge", lambda: True)
+    model = tmp_path / "drafter"
+    model.mkdir()
+    (model / "config.json").write_text(
+        '{"architectures":["Qwen3DSparkModel"],"markov_head_type":"vanilla"}', encoding="utf-8")
+    drafter = _drafter(speculative_algorithm="DSPARK", model_path=str(model),
+        rollout={"spec_verify_tokens": 7}, training={"specopd": {"enable": enabled}})
+    rollout = dict(name="vllm", drafter=drafter,
+        engine_kwargs={"vllm": {"speculative_config": {"num_speculative_tokens": width}}})
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: drafter)
+
+    def configure():
+        if entry == "driver":
+            configure_vllm_runtime_from_config({"actor_rollout_ref": {"rollout": rollout}})
+        else:
+            vllm_runtime._ensure_vllm_drafter_speculative_config_from_env(rollout)
+
+    if enabled and width != 7:
+        with pytest.raises(ValueError, match="SpecOPD.*num_speculative_tokens.*7.*3"):
+            configure()
+    else:
+        configure()
+        assert rollout["engine_kwargs"]["vllm"]["speculative_config"]["num_speculative_tokens"] == width
+
+
 def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None:
     transformers_module = types.ModuleType("transformers")
     configuration_utils_module = types.ModuleType("transformers.configuration_utils")
@@ -2948,7 +3100,8 @@ def test_vllm_failed_draft_update_does_not_resume_generation(monkeypatch) -> Non
     assert calls == ["abort_all_requests"]
 
 
-def test_vllm_draft_update_pauses_flushes_and_resumes_after_commit(monkeypatch) -> None:
+@pytest.mark.parametrize("method", [None, "draft_opd", "spec_opd"])
+def test_vllm_draft_update_pauses_flushes_and_resumes_after_commit(monkeypatch, method) -> None:
     from contextlib import nullcontext
 
     import verl_speco.integration.vllm_runtime as runtime
@@ -2988,6 +3141,8 @@ def test_vllm_draft_update_pauses_flushes_and_resumes_after_commit(monkeypatch) 
         "_load_env_drafter_config",
         lambda: {
             "training": {
+                "drafter_opd": {"enable": method == "draft_opd"},
+                "specopd": {"enable": method == "spec_opd"},
                 "draft_update_pause_generation": True,
                 "draft_update_flush_before": True,
                 "draft_update_flush_after": True,
@@ -3015,17 +3170,20 @@ def test_vllm_draft_update_pauses_flushes_and_resumes_after_commit(monkeypatch) 
         speco_vllm_update_draft_weights(adapter, {"weight": object()}, global_steps=9)
     )
 
-    assert [name for name, *_ in calls] == [
+    expected = [
         "abort_all_requests",
         "update_draft_weights_from_ipc",
         "send_weights",
         "finish_update",
         "clear_kv_cache",
-        "set_global_steps",
         "resume_generation",
     ]
+    if method != "spec_opd":
+        expected.insert(-1, "set_global_steps")
+    assert [name for name, *_ in calls] == expected
     assert calls[0][2] == {"reset_prefix_cache": True}
-    assert calls[-2][1] == (9,)
+    if method != "spec_opd":
+        assert calls[-2][1] == (9,)
 
 
 @pytest.mark.parametrize("registers_confidence_head", [True, False])

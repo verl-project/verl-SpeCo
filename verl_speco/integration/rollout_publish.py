@@ -1474,6 +1474,19 @@ class DraftWeightPublishMixin:
     rollout: Any
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
+    def compute_joint_old_log_prob(self, requests, **options):
+        """Experimental single-rank joint trajectory/branch scoring RPC.
+
+        Explicit invocation only: normal compute_log_prob and training are not
+        intercepted until rollout proposal metadata and distributed routing are
+        available. This RPC returns response-ordered logprobs and branch scores
+        from the same forward, not an additional forward after old-logprob.
+        """
+        from verl_speco.joint_actor import score_actor_joint
+
+        return score_actor_joint(self, requests, **options)
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
     def init_model(self, *args, **kwargs):
         install_rollout_runtime_for_worker(self)
         install_oldlogprob_hidden_runtime_for_worker(self)

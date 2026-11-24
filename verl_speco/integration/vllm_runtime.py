@@ -27,6 +27,12 @@ import hashlib
 import inspect
 import json
 import logging
+
+from verl_speco.integration.specopd_protocol import (
+    PROPOSAL_KEY,
+    TRACE_KEY as SPECOPD_TRACE_KEY,
+)
+from verl_speco.specopd_config import spec_opd_enabled
 import os
 import sys
 import threading
@@ -2110,6 +2116,24 @@ def _enforce_mrv2_dspark_runtime_contract(
             )
 
 
+def _enforce_specopd_proposal_width(drafter_cfg, rollout_cfg, final_speculative_config):
+    if not spec_opd_enabled(drafter_cfg.get("training", {})):
+        return
+    from verl_speco.specopd_config import SpecOPDConfig
+
+    spec = SpecOPDConfig.from_drafter(
+        drafter_cfg, rollout_temperature=_get_nested(rollout_cfg, ("temperature",), 1.0)
+    )
+    actual = final_speculative_config.get("num_speculative_tokens")
+    if actual != spec.proposal_width:
+        raise ValueError(
+            "SpecOPD final num_speculative_tokens must match resolved "
+            f"proposal_width={spec.proposal_width}; got {actual!r}. "
+            "Change the SpeCo drafter configuration instead of "
+            "engine_kwargs.vllm.speculative_config."
+        )
+
+
 def _int_or_zero(value: Any) -> int:
     try:
         return int(value)
@@ -2966,6 +2990,26 @@ def _stage_vllm_request_stats_for_rollout_output(
 ) -> None:
     if request_id is None or not summaries:
         return
+    if any(PROPOSAL_KEY in item for item in summaries.values()):
+        # Keep the former proposal channel's lifetime/size bounds in this store.
+        now, pending = time.monotonic(), 0
+        for key, (stored, _) in list(_SPECO_VLLM_REQUEST_OUTPUT_STATS_BY_ID.items()):
+            stamps = [
+                item["_specopd_staged_sec"]
+                for item in stored.values()
+                if "_specopd_staged_sec" in item
+            ]
+            if stamps and now - max(stamps) > 300:
+                _SPECO_VLLM_REQUEST_OUTPUT_STATS_BY_ID.pop(key, None)
+            elif stamps:
+                pending += 1
+        if pending >= 4096:
+            raise RuntimeError(
+                "SpecOPD completed request transport is not being drained"
+            )
+        for item in summaries.values():
+            if PROPOSAL_KEY in item:
+                item["_specopd_staged_sec"] = now
     _SPECO_VLLM_REQUEST_OUTPUT_STATS_BY_ID[str(request_id)] = (
         summaries,
         completion_order,
@@ -3240,6 +3284,10 @@ def patch_vllm_request_acceptance_stats() -> bool:
                     summary = _decode_vllm_request_stats_trace_header(
                         trace_headers.get(SPECO_VLLM_REQUEST_STATS_TRACE_HEADER)
                     )
+                    wire = trace_headers.get(SPECOPD_TRACE_KEY)
+                    if wire is not None:
+                        summary = dict(summary or {})
+                        summary[PROPOSAL_KEY] = wire
                     if summary:
                         setattr(
                             req_state, "_speco_vllm_request_accept_summary", summary
@@ -3489,6 +3537,14 @@ def install_vllm_spec_decode_acceptance_logging() -> bool:
     global _ACCEPTANCE_HOOK_STATUS
     scheduler_patched = patch_vllm_spec_decode_acceptance_logging()
     request_acceptance_patched = patch_vllm_request_acceptance_stats()
+    if spec_opd_enabled(_load_env_drafter_config().get("training", {})):
+        from verl_speco.integration.specopd_vllm import (
+            install_specopd_vllm_patch,
+            install_specopd_draft_token_transport_patch,
+        )
+
+        install_specopd_vllm_patch()
+        install_specopd_draft_token_transport_patch()
     engine_core_patched = patch_vllm_engine_core_entrypoint()
     status = (scheduler_patched, request_acceptance_patched, engine_core_patched)
     if status != _ACCEPTANCE_HOOK_STATUS:
@@ -3641,6 +3697,8 @@ def _vllm_request_accept_fields_from_summaries(
     }
     if any(TRACE_KEY in summaries[rid] for rid in ordered_ids):
         fields[TRACE_KEY] = [summaries[rid].get(TRACE_KEY) for rid in ordered_ids]
+    if any(PROPOSAL_KEY in summaries[rid] for rid in ordered_ids):
+        fields[PROPOSAL_KEY] = [summaries[rid].get(PROPOSAL_KEY) for rid in ordered_ids]
     return fields
 
 
@@ -3833,6 +3891,7 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
             )
         ),
     )
+    _enforce_specopd_proposal_width(drafter_cfg, rollout_cfg, merged_speculative_config)
     _enforce_mrv2_dspark_runtime_contract(speculative_config, merged_speculative_config)
     _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
     if bool(merged_speculative_config.get("enforce_eager")):
@@ -4157,10 +4216,25 @@ class _SpecoVLLMHttpServerMixin:
     async def speco_resume_rollout_admission(self):
         self._speco_rollout_admission().resume()
 
-    async def speco_set_serving_drafter_revision(self, revision):
+    async def speco_set_serving_drafter_revision(
+        self, revision, *, collection_quota=None
+    ):
         # The trainer calls this only after all weight commit RPCs have settled,
         # while ordinary serving is quiescent behind the admission boundary.
+        if collection_quota is not None:
+            if type(collection_quota) is not int or collection_quota < 0:
+                raise ValueError(
+                    "SpecOPD replica collection quota must be a nonnegative integer"
+                )
+            self._specopd_collection_quota = collection_quota
         self._speco_serving_drafter_revision = int(revision)
+        reply = {
+            "drafter_revision": self._speco_serving_drafter_revision,
+            "actor_revision": self.global_steps,
+        }
+        if collection_quota is not None:
+            reply["collection_quota"] = collection_quota
+        return reply
 
     async def speco_generate_probe(self, *args, **kwargs):
         # Dedicated RPC: public generation cannot opt out of admission by
@@ -4233,6 +4307,112 @@ async def _speco_generate_with_request_stats_unblocked(
         sampling_params = args[1]
     if isinstance(sampling_params, dict):
         clean_params = dict(sampling_params)
+        specopd_revision = clean_params.pop("_specopd_drafter_revision", None)
+        from verl_speco.specopd_config import SpecOPDConfig
+        from verl_speco.integration.specopd_window import make_window
+        from verl_speco.integration.specopd_protocol import PLAN_KEY
+
+        drafter_cfg = _load_env_drafter_config()
+        specopd_config = SpecOPDConfig.from_drafter(
+            drafter_cfg,
+            rollout_temperature=_get_nested(self, ("config", "temperature"), 1.0),
+        )
+        specopd_collect = specopd_config.enable and not clean_params.get(
+            "_verl_skip_drafter_collection", False
+        )
+        if specopd_collect:
+            if specopd_revision is None:
+                raise RuntimeError(
+                    "SpecOPD request is missing its acknowledged drafter revision"
+                )
+            if specopd_revision != getattr(
+                self, "_speco_serving_drafter_revision", None
+            ):
+                raise RuntimeError(
+                    "SpecOPD request differs from the acknowledged serving drafter revision"
+                )
+            for key, default in (
+                ("top_p", 1.0),
+                ("top_k", -1),
+                ("min_p", 0.0),
+                ("repetition_penalty", 1.0),
+            ):
+                if clean_params.get(key, default) != default:
+                    raise ValueError(
+                        f"SpecOPD does not support modified proposal processing: {key}"
+                    )
+            for key, default in (
+                ("min_tokens", 0),
+                ("frequency_penalty", 0.0),
+                ("presence_penalty", 0.0),
+                ("logit_bias", None),
+                ("allowed_token_ids", None),
+                ("bad_words", None),
+                ("structured_outputs", None),
+                ("guided_decoding", None),
+                ("stop", None),
+                ("n", 1),
+            ):
+                if clean_params.get(key, default) != default:
+                    raise ValueError(
+                        f"SpecOPD cannot reconstruct this sampling modifier: {key}"
+                    )
+            if (
+                float(clean_params.get("temperature", 1.0))
+                != specopd_config.temperature
+            ):
+                raise ValueError("rollout and SpecOPD proposal temperatures differ")
+            prompt = kwargs.get("prompt_ids", args[0] if args else None)
+            rid = self._speco_request_id_from_generate_call(args, kwargs)
+            budget = int(
+                clean_params.get(
+                    "max_tokens",
+                    clean_params.get("max_new_tokens", self.config.response_length),
+                )
+            )
+            native_extra = dict(clean_params.get("extra_args") or {})
+            native_extra[PLAN_KEY] = make_window(
+                specopd_config,
+                rid,
+                self.global_steps,
+                specopd_revision,
+                len(prompt),
+                budget,
+            )
+            # Reuse the existing request-count budget, with an explicit empty
+            # bundle for unselected requests so normal old-logprob still runs.
+            training_cfg = drafter_cfg.get("training", {})
+            epoch = int(self.global_steps)
+            if getattr(self, "_specopd_collection_epoch", None) != epoch:
+                self._specopd_collection_epoch = epoch
+                self._specopd_collection_requests = 0
+            rate = float(training_cfg.get("collection_sample_rate", 1.0))
+            sample_hash = (
+                int.from_bytes(
+                    hashlib.sha256(f"{rid}:{epoch}".encode()).digest()[:8], "little"
+                )
+                / 2**64
+            )
+            limit = int(
+                training_cfg.get("max_collect_samples_per_step_per_replica", 16)
+            )
+            quota = None
+            if specopd_config.max_collect_samples_per_step is not None:
+                quota = getattr(self, "_specopd_collection_quota", None)
+                if quota is None:
+                    raise RuntimeError(
+                        "SpecOPD global collection limit has no acknowledged replica quota"
+                    )
+            captured = self._specopd_collection_requests
+            if (
+                sample_hash >= rate
+                or (limit > 0 and captured >= limit)
+                or (quota is not None and captured >= quota)
+            ):
+                native_extra[PLAN_KEY]["max_branches"] = 0
+            else:
+                self._specopd_collection_requests += 1
+            clean_params["extra_args"] = native_extra
         clean_params.pop("_verl_global_steps", None)
         clean_params.pop("_verl_skip_drafter_collection", None)
         if positional_params:
@@ -4372,6 +4552,14 @@ async def _speco_generate_with_request_stats_unblocked(
                 )
                 extra_fields.update(
                     _vllm_request_accept_stats_to_scalar_extra_fields(proxy_output)
+                )
+            if (
+                isinstance(sampling_params, dict)
+                and specopd_collect
+                and not extra_fields.get(PROPOSAL_KEY)
+            ):
+                raise RuntimeError(
+                    "SpecOPD proposal channel missing from vLLM final output"
                 )
             from verl_speco.integration.acceptance_metrics import (
                 bridge_request_acceptance_counters,
@@ -4952,6 +5140,9 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     engine_kwargs = _ensure_nested_mapping(
         config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm")
     )
+    # SpecOPD MRV2 transports complete verified proposals in their own model
+    # results. Preserve vLLM's async scheduling default and explicit overrides,
+    # exactly as for Draft-OPD; placeholders are never used as proposal IDs.
     additional_config = _get_nested(engine_kwargs, ("additional_config",), {}) or {}
     additional_config = dict(additional_config)
     # Keep private transport metadata out of platform additional_config: some
@@ -5018,6 +5209,7 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
             )
         ),
     )
+    _enforce_specopd_proposal_width(drafter_cfg, rollout_cfg, merged_speculative_config)
     _enforce_mrv2_dspark_runtime_contract(speculative_config, merged_speculative_config)
     _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
     if bool(drafter_cfg.get("enable")):
@@ -5319,7 +5511,10 @@ async def speco_vllm_update_draft_weights(
         if self.rollout_rank == 0:
             if flush_after:
                 await _maybe_call_vllm_server_method(self, "clear_kv_cache")
-            if global_steps is not None:
+            # Native global_steps identifies the target/actor snapshot. SpecOPD
+            # acknowledges its drafter revision separately; a draft-only publish
+            # must not relabel target weights (including the initial bootstrap).
+            if global_steps is not None and not spec_opd_enabled(training_cfg):
                 await _maybe_call_vllm_server_method(
                     self, "set_global_steps", global_steps
                 )
@@ -5473,6 +5668,18 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         # WorkerDict-side installer runs in a different process and is too
         # early only for the frontend, not for this model-worker process.
         patch_vllm_dspark_draft_load_config()
+        # Spawned model workers need their own capture hooks. Installing on the
+        # frontend/EngineCore class alone does not survive every vLLM launcher.
+        if spec_opd_enabled(_load_env_drafter_config().get("training", {})):
+            from verl_speco.integration.specopd_vllm import (
+                install_specopd_draft_token_transport_patch,
+            )
+
+            if not install_specopd_draft_token_transport_patch():
+                raise RuntimeError(
+                    "SpecOPD worker requires the MRV2 proposal capture hooks"
+                )
+            logger.warning("[SpecOPDCapture] model-worker proposal hooks installed")
         try:
             instance = super().__new__(cls, **kwargs)
         except TypeError:

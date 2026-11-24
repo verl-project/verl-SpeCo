@@ -172,6 +172,13 @@ class SpecoTaskRunner(_TaskRunnerBase):
         return _remotify_like_worker_mapping_value(worker_cls, wrapped_cls)
 
     def run(self, config):
+        from verl_speco.specopd_config import validate_specopd_config
+
+        specopd = validate_specopd_config(config)
+        if specopd.enable and _VERL_TASK_RUNNER_API != "0.9":
+            raise RuntimeError(
+                "SpecOPD requires verl release/v0.9.0 for the V1 trainer"
+            )
         validate_sync_opd_cotrain_config(config)
         from verl_speco.integration.compat import check_compatible_verl
 

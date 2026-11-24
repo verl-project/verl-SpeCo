@@ -145,6 +145,17 @@ def patch_partial_rollout_client(client_cls):
 
     @wraps(original)
     async def generate(self, *args, **kwargs):
+        from verl_speco.integration.agent_loop_runtime import (
+            _sampling_params_with_speco_context,
+        )
+
+        if "sampling_params" in kwargs:
+            kwargs = dict(
+                kwargs,
+                sampling_params=_sampling_params_with_speco_context(
+                    kwargs["sampling_params"]
+                ),
+            )
         segments = []
         token = _SEGMENTS.set(segments)
         try:

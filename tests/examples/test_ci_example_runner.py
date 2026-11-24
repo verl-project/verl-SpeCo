@@ -408,8 +408,18 @@ def test_npu_workflow_default_topology_and_configured_device_count(drafter) -> N
         "default"
     ]
     assert count == "8"
-    stdout = _dry_run(drafter, platform="npu", accelerator_count=count)
+    matrix = workflow["jobs"]["example"]["strategy"]["matrix"]["include"]
+    case = next(entry for entry in matrix if entry["drafter"] == drafter)
+    tensor_parallel_size = case.get("tensor_parallel_size", "1")
+    assert tensor_parallel_size == ("2" if drafter == "dspark" else "1")
+    stdout = _dry_run(
+        drafter,
+        platform="npu",
+        accelerator_count=count,
+        tensor_parallel_size=tensor_parallel_size,
+    )
     assert "trainer.n_gpus_per_node=8" in stdout
+    assert f"actor_rollout_ref.rollout.tensor_model_parallel_size={tensor_parallel_size}" in stdout
     assert "ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7" in stdout
     configured = _dry_run(drafter, platform="npu", accelerator_count="4")
     assert "trainer.n_gpus_per_node=4" in configured
@@ -446,6 +456,7 @@ def _dry_run(
     accelerator_count: str = "1",
     extra_hydra_args: str | None = None,
     ci_variables: str | None = None,
+    tensor_parallel_size: str = "1",
 ) -> str:
     """Dump the Hydra overrides the runner would pass, without launching a job."""
     bash = _require_working_bash()
@@ -459,6 +470,7 @@ def _dry_run(
         "SPECO_TEST_FILE": "/data/test.parquet",
         "SPECO_CKPT_DIR": "/tmp/speco",
         "SPECO_ACCELERATOR_COUNT": accelerator_count,
+        "SPECO_TENSOR_PARALLEL_SIZE": tensor_parallel_size,
     }
     if extra_hydra_args is not None:
         env["SPECO_EXTRA_HYDRA_ARGS"] = extra_hydra_args

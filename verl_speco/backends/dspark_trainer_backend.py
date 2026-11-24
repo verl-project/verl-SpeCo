@@ -761,6 +761,43 @@ class DSparkTrainingModel(DFlashTrainingModel):
             float(loss.detach().float().cpu().item()),
         )
 
+    def _forward_anchor_blocks(
+        self,
+        input_ids,
+        context_feature,
+        anchor_positions,
+        block_keep_mask,
+        *,
+        document_ids=None,
+    ):
+        seq_len = input_ids.shape[1]
+        device = input_ids.device
+        noise_embedding = self._create_noise_embed(
+            input_ids, anchor_positions, block_keep_mask
+        )
+        context_position_ids, draft_position_ids = self._create_position_ids(
+            anchor_positions, seq_len
+        )
+        block_mask, dense_attention_mask = build_dflash_attention_masks(
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            ctx_len=seq_len,
+            block_size=self.block_size,
+            device=device,
+            windows=_resolve_sliding_windows(self.draft_model.config),
+            document_ids=document_ids,
+        )
+
+        return self.draft_model(
+            draft_input_ids=None,
+            context_feature=context_feature,
+            draft_position_ids=draft_position_ids,
+            context_position_ids=context_position_ids,
+            block_mask=block_mask,
+            dense_attention_mask=dense_attention_mask,
+            noise_embedding=noise_embedding,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -776,7 +813,12 @@ class DSparkTrainingModel(DFlashTrainingModel):
         opd_trace: Optional[torch.Tensor] = None,
         next_token_ids: Optional[torch.Tensor] = None,
         next_token_loss_mask: Optional[torch.Tensor] = None,
+        specopd_batch: Optional[dict] = None,
     ):
+        if specopd_batch is not None:
+            from verl_speco.backends.specopd_forward import proposal_loss
+
+            return proposal_loss(self, specopd_batch, lm_head_weight)
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         self._debug_forward_count += 1
@@ -802,30 +844,12 @@ class DSparkTrainingModel(DFlashTrainingModel):
             )
         block_keep_mask = block_keep_mask & (anchor_positions < seq_len)
         n_blocks = anchor_positions.shape[1]
-        noise_embedding = self._create_noise_embed(
-            input_ids, anchor_positions, block_keep_mask
-        )
-        context_position_ids, draft_position_ids = self._create_position_ids(
-            anchor_positions, seq_len
-        )
-        block_mask, dense_attention_mask = build_dflash_attention_masks(
-            anchor_positions=anchor_positions,
-            block_keep_mask=block_keep_mask,
-            ctx_len=seq_len,
-            block_size=self.block_size,
-            device=device,
-            windows=_resolve_sliding_windows(self.draft_model.config),
+        draft_hidden = self._forward_anchor_blocks(
+            input_ids,
+            context_feature,
+            anchor_positions,
+            block_keep_mask,
             document_ids=document_ids,
-        )
-
-        draft_hidden = self.draft_model(
-            draft_input_ids=None,
-            context_feature=context_feature,
-            draft_position_ids=draft_position_ids,
-            context_position_ids=context_position_ids,
-            block_mask=block_mask,
-            dense_attention_mask=dense_attention_mask,
-            noise_embedding=noise_embedding,
         ).view(bsz, n_blocks, self.block_size, -1)
 
         label_source_ids = input_ids if uses_aligned_next_tokens else label_ids
@@ -2017,6 +2041,10 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         return res
 
     def compute_loss(self, model, batch, _current_pad_size):
+        if batch.get("specopd", False):
+            from verl_speco.backends.specopd_forward import compute_specopd_backend_loss
+
+            return compute_specopd_backend_loss(self, model, batch)
         if getattr(self, "use_ulysses_sp", False):
             raise NotImplementedError(
                 "DSpark drafter training does not support Ulysses sequence parallel yet"
