@@ -188,12 +188,12 @@ def build_specopd_training_batch(request, scores, device, config, feature_indice
         "proposal_ids": proposal,
         "proposal_mask": mask,
         "target_last_hidden_states": torch.stack(targets),
-        "proposal_temperature": config.temperature,
-        "proposal_block_width": config.proposal_width,
-        "target_temperature": config.temperature,
-        "objective": config.objective,
-        "specopd": True,
         "_speco_sample_count": len(request.branches),
+        "_speco_position_count": sum(len(b.token_ids) for b in request.branches),
+        "_specopd_request_id": request.sample_id,
+        "_specopd_proposal_anchors": sum(
+            b.source == "proposal" for b in request.branches
+        ),
         "_speco_sample_ids": tuple(b.branch_id for b in request.branches),
     }
     if position_weights is not None:
@@ -204,7 +204,7 @@ def build_specopd_training_batch(request, scores, device, config, feature_indice
 def plan_specopd_training_groups(selected, dp_size, max_trajectories, token_budget):
     """Use global slot maxima so every DP/SP rank chooses identical groups."""
     lengths = [
-        max(max(b.anchor for b in r.branches) + 1 for r, _ in selected[i : i + dp_size])
+        max(b["input_ids"].shape[1] for b in selected[i : i + dp_size])
         for i in range(0, len(selected), dp_size)
     ]
     sizes, current, longest = [], 0, 0
@@ -227,65 +227,39 @@ def merge_specopd_training_batches(batches):
     if len(batches) == 1:
         return batches[0]
     first = batches[0]
-    for batch in batches:
-        for key in (
-            "proposal_temperature",
-            "target_temperature",
-            "proposal_block_width",
-        ):
-            if batch[key] != first[key]:
-                raise ValueError("cannot merge incompatible SpecOPD sampling contracts")
-        if batch.get("objective", "e2e_tv") != first.get("objective", "e2e_tv"):
-            raise ValueError("cannot merge different SpecOPD objectives")
     length = max(b["input_ids"].shape[1] for b in batches)
     anchors = max(b["anchor_positions"].shape[1] for b in batches)
     width = max(b["proposal_ids"].shape[1] for b in batches)
     result = dict(first)
-    result["input_ids"] = torch.cat(
-        [F.pad(b["input_ids"], (0, length - b["input_ids"].shape[1])) for b in batches]
-    )
-    result["hidden_states"] = torch.cat(
-        [
-            F.pad(b["hidden_states"], (0, 0, 0, length - b["hidden_states"].shape[1]))
-            for b in batches
-        ]
-    )
-    result["anchor_positions"] = torch.cat(
-        [
-            F.pad(b["anchor_positions"], (0, anchors - b["anchor_positions"].shape[1]))
-            for b in batches
-        ]
-    )
     if any(("position_weights" in b) != ("position_weights" in first) for b in batches):
         raise ValueError("cannot merge different SpecOPD loss reductions")
-    for key in ("proposal_ids", "proposal_mask") + (
-        ("position_weights",) if "position_weights" in first else ()
+    # Pad from the trailing dimensions, preserving each independent trajectory.
+    shapes = {
+        "input_ids": (length,),
+        "hidden_states": (length, None),
+        "anchor_positions": (anchors,),
+        "proposal_ids": (anchors, width),
+        "proposal_mask": (anchors, width),
+        "target_last_hidden_states": (anchors, width, None),
+    }
+    if "position_weights" in first:
+        shapes["position_weights"] = (anchors, width)
+    for key, shape in shapes.items():
+        padded = []
+        for batch in batches:
+            tensor = batch[key]
+            padding = []
+            for actual, target in zip(reversed(tensor.shape), reversed(shape)):
+                padding.extend((0, 0 if target is None else target - actual))
+            padded.append(F.pad(tensor, padding))
+        result[key] = torch.cat(padded)
+    for key in (
+        "_speco_sample_count",
+        "_speco_position_count",
+        "_specopd_proposal_anchors",
     ):
-        result[key] = torch.cat(
-            [
-                F.pad(
-                    b[key], (0, width - b[key].shape[1], 0, anchors - b[key].shape[0])
-                )
-                for b in batches
-            ]
-        )
-    result["target_last_hidden_states"] = torch.cat(
-        [
-            F.pad(
-                b["target_last_hidden_states"],
-                (
-                    0,
-                    0,
-                    0,
-                    width - b["proposal_ids"].shape[1],
-                    0,
-                    anchors - b["proposal_ids"].shape[0],
-                ),
-            )
-            for b in batches
-        ]
-    )
-    result["_speco_sample_count"] = sum(b["_speco_sample_count"] for b in batches)
+        if key in first:
+            result[key] = sum(b[key] for b in batches)
     result["_speco_sample_ids"] = tuple(
         x for b in batches for x in b["_speco_sample_ids"]
     )
@@ -295,22 +269,23 @@ def merge_specopd_training_batches(batches):
 def prepare_specopd_training_batches(
     selected,
     device,
-    config,
-    feature_indices,
     *,
     cache_bytes=64 * 1024**2,
     group_sizes=None,
     real_slots=None,
 ):
-    """Prepare once, merge independent rows, cache at most 64MiB on device."""
+    """Merge fixed CPU inputs and cache within the configured device budget."""
     prepared = []
-    for index, (request, scores) in enumerate(selected):
-        batch = build_specopd_training_batch(
-            request, scores, "cpu", config, feature_indices
-        )
+    for index, inputs in enumerate(selected):
+        batch = dict(inputs)
         if real_slots is not None and not real_slots[index]:
-            batch["proposal_mask"].zero_()
-            batch["_speco_sample_count"] = 0
+            batch["proposal_mask"] = torch.zeros_like(batch["proposal_mask"])
+            for key in (
+                "_speco_sample_count",
+                "_speco_position_count",
+                "_specopd_proposal_anchors",
+            ):
+                batch[key] = 0
             batch["_speco_sample_ids"] = ()
         prepared.append(batch)
     sizes = group_sizes if group_sizes is not None else [1] * len(prepared)

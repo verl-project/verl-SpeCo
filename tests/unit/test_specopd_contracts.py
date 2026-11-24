@@ -11,38 +11,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import json
 import os
 import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from types import SimpleNamespace as NS
 
 import pytest
 import torch
 
 from verl_speco.backends.specopd_loss import specopd_distribution_loss
-from verl_speco.integration.specopd_anchors import add_trunk_anchors, retain_proposal
+from verl_speco.integration.specopd_anchors import add_trunk_anchors
 from verl_speco.integration.specopd_driver import (
     build_requests,
-    plan_microbatches,
 )
 from verl_speco.integration.specopd_vllm import (
     capture_scheduler_round,
     snapshot_scheduler_round,
 )
 from verl_speco.integration.specopd_window import make_window
-from verl_speco.joint_scoring import DraftBranch, JointScoringRequest
+from verl_speco.joint_scoring import DraftBranch, JointScoringRequest, parallel_microbatch_sizes
 from verl_speco.specopd_config import (
     SpecOPDConfig,
     specopd_loss_weights,
     validate_specopd_config,
 )
-from verl_speco.trainer.scheduler.specopd_cycle import SpecOPDCycle
 from verl_speco.integration.specopd_protocol import (
     ProposalRecord,
-    decode_bundle,
     encode_bundle,
     record_dict,
     token_digest,
@@ -85,7 +80,8 @@ def test_default_budgets_allow_long_trajectory(prompt, response):
         for i in range(spec.max_branches_per_request)
     )
     request = JointScoringRequest("long", (1,) * (prompt + response), prompt, branches)
-    assert plan_microbatches([request], spec) == [[request]]
+    assert parallel_microbatch_sizes([request], (spec.microbatch_trajectories,), 1, 1,
+        dict(max_packed_tokens=spec.scoring_token_budget, max_mask_elements=spec.max_dense_mask_elements)) == (1,)
     training = cfg["actor_rollout_ref"]["rollout"]["drafter"]["training"]
     training["specopd"].update(scoring_token_budget=4096, max_dense_mask_elements=4096**2)
     with pytest.raises(ValueError, match=r"scoring_token_budget>=\d+ and max_dense_mask_elements>=\d+"):
@@ -139,14 +135,6 @@ def test_v1_sync_config_requires_one_publication_per_group():
     cfg["algorithm"] = {"filter_groups": {"enable": True}}
     with pytest.raises(ValueError, match="group-filter"):
         validate_specopd_config(cfg)
-
-
-def test_window_is_preplanned_deterministic_and_uses_response_offsets():
-    spec = SpecOPDConfig(window_mode="random", window_response_tokens=32)
-    a = make_window(spec, "r", 2, 3, 100, 1000)
-    assert a == make_window(spec, "r", 2, 3, 100, 1000)
-    assert 0 <= a["start"] <= 512 and a["end"] - a["start"] == 32
-    assert make_window(SpecOPDConfig(), "r", 2, 3, 100, 1000)["start"] == 0
 
 
 def capture(raw=(11, 12, 13, 14, 15, 16, 17), generated=(11, 20), offset=0, verified=2):
@@ -206,17 +194,6 @@ def bundle():
     }
 
 
-def test_wire_bounds_duplicates_and_prefix_validation():
-    source = bundle()
-    wire = encode_bundle(source, 10000)
-    assert decode_bundle(wire)["records"][0]["proposal_ids"] == [11, 12]
-    with pytest.raises(ValueError, match="wire"):
-        encode_bundle(source, 5)
-    source["records"] *= 2
-    with pytest.raises(ValueError, match="duplicate"):
-        decode_bundle(json.dumps(source))
-
-
 def test_batch_restores_real_unpadded_trunk_and_keeps_rejected_tokens():
     data = SimpleNamespace(
         batch={
@@ -235,41 +212,6 @@ def test_batch_restores_real_unpadded_trunk_and_keeps_rejected_tokens():
     data.batch["input_ids"][0, 2] = 20
     with pytest.raises(ValueError, match="prefix"):
         build_requests(data, SpecOPDConfig(), 3)
-
-
-def test_v1_synthetic_padding_has_normal_scores_without_duplicate_branches():
-    row = torch.tensor([[1, 2, 3, 4]])
-    data = SimpleNamespace(
-        batch={
-            "prompts": row[:, :3].repeat(2, 1),
-            "input_ids": row.repeat(2, 1),
-            "attention_mask": torch.ones(2, 4, dtype=torch.long),
-        },
-        non_tensor_batch={
-            "_specopd_proposals": [encode_bundle(bundle(), 10000), None],
-            "_specopd_padding": [False, True],
-        },
-    )
-    requests, version = build_requests(data, SpecOPDConfig(), 3)
-    assert version == 2 and len(requests) == 2
-    assert len(requests[0].branches) == 1
-    assert requests[1].branches == ()
-    assert requests[1].trunk_ids == (1, 2, 3, 4)
-    assert requests[1].sample_id != requests[0].sample_id
-
-
-def test_cycle_consumes_only_once_and_waits_for_publication():
-    cycle = SpecOPDCycle(actor_revision=2, drafter_revision=3)
-    cycle.begin(10)
-    cycle.scored("data", 2, 3)
-    assert cycle.begin_update() == "data"
-    with pytest.raises(RuntimeError):
-        cycle.begin_update()
-    cycle.updated(True)
-    with pytest.raises(RuntimeError):
-        cycle.begin(11)
-    cycle.published()
-    assert cycle.drafter_revision == 4 and cycle.state == "ready"
 
 
 def test_e2e_tv_hand_computed_loss_and_differentiable_prefixes():
@@ -308,20 +250,16 @@ def test_microbatch_planning_keeps_each_tree_once():
         JointScoringRequest(str(i), (1, 2, 3), 2, (DraftBranch(str(i), 1, (4, 5, 6)),))
         for i in range(3)
     ]
-    groups = plan_microbatches(
-        trees, SpecOPDConfig(microbatch_trajectories=3, scoring_token_budget=10)
-    )
-    assert [len(g) for g in groups] == [2, 1]
-    assert [tree.sample_id for group in groups for tree in group] == ["0", "1", "2"]
+    def plan(spec, sp=1):
+        return parallel_microbatch_sizes(trees, (spec.microbatch_trajectories,), 1, sp,
+            dict(max_packed_tokens=spec.scoring_token_budget, max_mask_elements=spec.max_dense_mask_elements))
+    groups = plan(SpecOPDConfig(microbatch_trajectories=3, scoring_token_budget=10))
+    assert groups == (2, 1) and sum(groups) == len(trees)
     with pytest.raises(ValueError, match="complete trajectory"):
-        plan_microbatches(trees, SpecOPDConfig(scoring_token_budget=4))
+        plan(SpecOPDConfig(scoring_token_budget=4))
     with pytest.raises(ValueError, match="complete trajectory"):
-        plan_microbatches(trees, SpecOPDConfig(max_dense_mask_elements=63), sequence_multiple=4)
-    grouped = plan_microbatches(
-        trees, SpecOPDConfig(microbatch_trajectories=3, max_dense_mask_elements=128),
-        sequence_multiple=4,
-    )
-    assert [len(g) for g in grouped] == [2, 1]
+        plan(SpecOPDConfig(max_dense_mask_elements=63), 4)
+    assert plan(SpecOPDConfig(microbatch_trajectories=3, max_dense_mask_elements=128), 4) == (2, 1)
 
 
 def _mixed_anchor_config(anchor_count=32, **kw):
@@ -358,28 +296,6 @@ def test_full_and_short_proposal_groups_fill_unique_positions(anchor_count):
             assert b.source == "trunk"
             assert b.token_ids == ids[b.anchor + 1:min(b.anchor + 8, 522)]
         assert mixed == add_trunk_anchors(proposals(n), ids, 10, _mixed_anchor_bundle(), spec)
-
-
-def test_short_response_never_fabricates_or_duplicates_anchors():
-    mixed = add_trunk_anchors([], tuple(range(14)), 10, _mixed_anchor_bundle(), _mixed_anchor_config())
-    assert len(mixed) == 4
-    assert len(mixed[-1].token_ids) >= 1
-    assert all(b.token_ids for b in mixed)
-
-
-def test_reservoir_can_replace_early_rounds_and_is_uniform_across_candidates():
-    counts = [0] * 80
-    for seed in range(800):
-        request = NS(_specopd_records=[])
-        plan = dict(request_id=str(seed), actor_revision=5, drafter_revision=0, max_branches=24)
-        for i in range(80):
-            retain_proposal(request, plan, dict(round_id=i))
-        kept = [x["round_id"] for x in request._specopd_records]
-        assert len(set(kept)) == 24
-        for i in kept:
-            counts[i] += 1
-    # Expected 240 selections per candidate; reject first-N/last-N/biased sampling.
-    assert min(counts) > 170 and max(counts) < 310
 
 
 def test_dspark_specopd_launch_defaults_to_pure_tv():

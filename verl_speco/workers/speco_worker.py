@@ -1697,14 +1697,12 @@ class SpecoWorker(Worker):
             stage_training_group,
         )
 
-        from verl_speco.specopd_config import SpecOPDConfig
+        from verl_speco.specopd_config import spec_opd_enabled
 
-        rollout = self.config.rollout
-        spec = SpecOPDConfig.from_drafter(
-            rollout.drafter, rollout_temperature=rollout.temperature
-        )
+        if not spec_opd_enabled(self.config.rollout.drafter.training):
+            raise RuntimeError("SpecOPD RPC invoked while disabled")
         return await stage_training_group(
-            self, payload_refs, step, revision, feature_indices, spec=spec
+            self, payload_refs, step, revision, feature_indices
         )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -1724,14 +1722,6 @@ class SpecoWorker(Worker):
             or self.trainer is None
         ):
             return None
-        from verl_speco.specopd_config import SpecOPDConfig
-
-        rollout = self.config.rollout
-        spec = SpecOPDConfig.from_drafter(
-            rollout.drafter, rollout_temperature=rollout.temperature
-        )
-        if not spec.enable:
-            raise RuntimeError("SpecOPD RPC invoked while disabled")
         local_revision = getattr(self, "_specopd_revision", 0)
         if revision != local_revision or step <= getattr(
             self, "_specopd_consumed_step", -1
@@ -1745,13 +1735,11 @@ class SpecoWorker(Worker):
             take_training_group,
         )
 
-        samples = take_training_group(self, step, revision, feature_indices)
+        prepared = take_training_group(self, step, revision, feature_indices)
         self._specopd_consumed_step = step
         optimizer_before = self.trainer.optimizer_steps_total
         with _preserve_process_rng_state(self.device_name):
-            trained = await self.trainer.training_specopd_group(
-                samples, step, spec, feature_indices
-            )
+            trained = await self.trainer.training_specopd_group(prepared)
         if trained:
             self._specopd_revision = local_revision + 1
             self.last_trained_step = step

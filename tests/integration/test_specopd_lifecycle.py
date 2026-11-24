@@ -29,23 +29,30 @@ from verl_speco.specopd_config import SpecOPDConfig
 from verl_speco.integration.specopd_protocol import PLAN_KEY, decode_bundle
 
 
-def test_vllm_scheduler_to_final_output_channel(monkeypatch):
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("collect", [False, True])
+def test_vllm_scheduler_to_final_output_channel(monkeypatch, async_scheduling, collect):
     plan = make_window(SpecOPDConfig(proposal_width=3), "external", 0, 0, 3, 20)
+    if not collect:
+        plan["max_branches"] = 0
     request = SimpleNamespace(
         all_token_ids=[1, 2, 3],
         spec_token_ids=[11, 12, 13],
-        num_output_placeholders=0,
+        num_output_placeholders=16 if async_scheduling else 0,
+        is_finished=lambda: False,
         sampling_params=SimpleNamespace(extra_args={"specopd_plan": plan}),
     )
 
     class Scheduler:
         def __init__(self):
             self.requests = {"internal": request}
+            self.scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
 
         def schedule(self):
             request.spec_token_ids = []
             return SimpleNamespace(
-                scheduled_spec_decode_tokens={"internal": [11, 12, 13]}
+                num_scheduled_tokens={"internal": 4},
+                scheduled_spec_decode_tokens={"internal": [-1] * 3 if async_scheduling else [11, 12, 13]}
             )
 
         def update_from_output(self, schedule, result):
@@ -54,7 +61,9 @@ def test_vllm_scheduler_to_final_output_channel(monkeypatch):
                 0: SimpleNamespace(
                     outputs=[
                         SimpleNamespace(
-                            request_id="internal", finished=True, trace_headers=None
+                            request_id="internal", finished=True,
+                            trace_headers={vllm_runtime.SPECO_VLLM_REQUEST_STATS_TRACE_HEADER:
+                                '{"verify_rounds":2,"draft_tokens":6,"accepted_tokens":3}'},
                         )
                     ]
                 )
@@ -86,15 +95,25 @@ def test_vllm_scheduler_to_final_output_channel(monkeypatch):
     assert specopd_vllm.install_specopd_vllm_patch()
     scheduler = Scheduler()
     schedule = scheduler.schedule()
-    outputs = scheduler.update_from_output(
-        schedule,
-        SimpleNamespace(req_id_to_index={"internal": 0}, sampled_token_ids=[[20]]),
-    )
-    OutputProcessor().process_outputs(outputs[0].outputs)
-    wire = specopd_vllm.pop_completed("external")
-    assert decode_bundle(wire)["records"][0]["proposal_ids"] == [11, 12, 13]
-    assert specopd_vllm.pop_completed("external") is None
-    assert not scheduler._specopd_schedules
+    result = SimpleNamespace(req_id_to_index={"internal": 0}, sampled_token_ids=[[20]])
+    if async_scheduling and collect:
+        from verl_speco.integration.specopd_async import VERIFIED_KEY
+        setattr(result, VERIFIED_KEY, {"internal": dict(prefix_len=3, proposal_ids=[11, 12, 13], scheduled_drafts=3)})
+    outputs = scheduler.update_from_output(schedule, result)
+    [final] = OutputProcessor().process_outputs(outputs[0].outputs)
+    fields = vllm_runtime._vllm_request_accept_stats_to_scalar_extra_fields(final)
+    assert fields["_speco_vllm_request_verify_rounds"] == 2
+    assert fields["_speco_vllm_request_accepted_tokens"] == 3
+    summaries, _ = vllm_runtime._pop_vllm_request_stats_for_rollout_output("external")
+    wire = summaries["external"]["_specopd_proposals"]
+    assert fields["_specopd_proposals"] == wire
+    bundle = decode_bundle(wire)
+    assert bundle["collection_enabled"] is collect
+    assert len(bundle["records"]) == int(collect)
+    if collect:
+        assert bundle["records"][0]["proposal_ids"] == [11, 12, 13]
+    assert not vllm_runtime._pop_vllm_request_stats_for_rollout_output("external")[0]
+    assert not getattr(scheduler, "_specopd_schedules", {})
 
 
 def configuration():
@@ -107,52 +126,6 @@ def configuration():
     }
     actor = {"model": {"use_remove_padding": False}, "rollout": {"name": "vllm", "drafter": drafter}}
     return {"trainer": {"use_v1": True}, "actor_rollout_ref": actor}
-
-
-def test_proposal_agent_bridge_isolated_across_concurrent_requests():
-    import asyncio
-
-    from verl_speco.integration.agent_loop_runtime import (
-        _run_agent_loop_with_student_timing,
-    )
-    from verl_speco.integration.specopd_agent import (
-        PROPOSAL_TURNS,
-        collect_proposal_output,
-        merge_proposal_output,
-    )
-
-    async def trajectory(identity):
-        collect_proposal_output(SimpleNamespace(extra_fields={"_specopd_proposals": identity}))
-        await asyncio.sleep(0)
-        output = SimpleNamespace(extra_fields={})
-        merge_proposal_output(output)
-        return output
-
-    async def run():
-        return await asyncio.gather(*(_run_agent_loop_with_student_timing(trajectory, name) for name in ("a", "b")))
-
-    outputs = asyncio.run(run())
-    assert [o.extra_fields["_specopd_proposals"] for o in outputs] == ["a", "b"]
-    assert PROPOSAL_TURNS.get() is None
-
-
-@pytest.mark.parametrize("replies", [
-    [{"actor_revision": 0, "drafter_revision": 1}],
-    [{"actor_revision": None, "drafter_revision": 0}],
-    [{"actor_revision": 0, "drafter_revision": 0}, {"actor_revision": 1, "drafter_revision": 0}],
-])
-def test_serving_ack_rejects_wrong_draft_or_inconsistent_actor_revisions(replies):
-    servers = [SimpleNamespace(speco_set_serving_drafter_revision=SimpleNamespace(
-        remote=lambda revision, reply=reply: reply,
-    )) for reply in replies]
-    trainer = SimpleNamespace(
-        config=configuration(),
-        llm_server_manager=SimpleNamespace(server_handles=servers),
-        _ray_get_if_needed=lambda values: values,
-    )
-    driver = SpecOPDDriver(trainer)
-    with pytest.raises(RuntimeError, match="acknowledge"):
-        driver.acknowledge_serving_revision(0)
 
 
 @pytest.mark.parametrize("quota,local_cap,expected", [(10, 16, 10), (2, 1, 1), (0, 0, 0)])
@@ -229,9 +202,9 @@ def test_five_step_twenty_update_schedule_with_one_publication(monkeypatch):
         due = driver.begin_step(step)
         assert due == (step in (5, 10))
         if due:
-            driver.cycle.actor_revision = trainer.actor_revision
-            request = SimpleNamespace(branches=[SimpleNamespace(token_ids=(1, 2))])
-            driver.cycle.scored(((request, None),), trainer.actor_revision, driver.cycle.drafter_revision)
+            driver.actor_revision = trainer.actor_revision
+            driver.pending = ({"_speco_position_count": 2, "_specopd_proposal_anchors": 1, "_speco_sample_count": 1},)
+            driver.state = "scored"
         driver.before_actor_update()
         trainer.actor_revision = step
         driver.finish_step()
@@ -242,3 +215,7 @@ def test_five_step_twenty_update_schedule_with_one_publication(monkeypatch):
     assert events == [("train", 5, 20), ("publish", 5), ("train", 10, 20), ("publish", 10)]
     assert ci.data["optimizer_steps"] == 40
     assert ci.data["publications"] == 2
+
+    assert driver.pending is None and driver.state == "ready"
+    with pytest.raises(RuntimeError, match="already been consumed"):
+        driver.before_actor_update()

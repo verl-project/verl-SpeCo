@@ -28,7 +28,7 @@ def prepare_rollout(trainer, batch):
     value = driver(trainer)
     value.bootstrap()
     due = value.begin_step(trainer.global_steps)
-    batch["_specopd_drafter_revision"] = NonTensorData(value.cycle.drafter_revision)
+    batch["_specopd_drafter_revision"] = NonTensorData(value.drafter_revision)
     batch["_specopd_skip_collection"] = NonTensorData(not due)
     return batch
 
@@ -114,13 +114,13 @@ def old_log_prob(trainer, batch, metrics):
     nested, padded = trainer._speco_v1_batch_data(batch)
     value = driver(trainer)
     if os.environ.get("VERL_SPECO_V1_NATIVE_TRUNK_OLD_LOGPROB") == "1":
-        output, _ = value.old_log_prob(
+        output = value.old_log_prob(
             padded, native_trunk=partial(_native_trunk_log_prob, trainer, batch)
         )
     else:
-        output, _ = value.old_log_prob(padded)
-    log_probs = output.batch["old_log_probs"].float()
-    entropy = output.batch["entropys"].float()
+        output = value.old_log_prob(padded)
+    log_probs = output["old_log_probs"].float()
+    entropy = output["entropy"].float()
     nested["old_log_probs"] = response_to_nested(log_probs, nested["response_mask"])
     nested["entropy"] = response_to_nested(entropy, nested["response_mask"])
     result = tq.kv_batch_put(

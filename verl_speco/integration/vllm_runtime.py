@@ -28,6 +28,10 @@ import inspect
 import json
 import logging
 
+from verl_speco.integration.specopd_protocol import (
+    PROPOSAL_KEY,
+    TRACE_KEY as SPECOPD_TRACE_KEY,
+)
 from verl_speco.specopd_config import spec_opd_enabled
 import os
 import sys
@@ -2968,6 +2972,26 @@ def _stage_vllm_request_stats_for_rollout_output(
 ) -> None:
     if request_id is None or not summaries:
         return
+    if any(PROPOSAL_KEY in item for item in summaries.values()):
+        # Keep the former proposal channel's lifetime/size bounds in this store.
+        now, pending = time.monotonic(), 0
+        for key, (stored, _) in list(_SPECO_VLLM_REQUEST_OUTPUT_STATS_BY_ID.items()):
+            stamps = [
+                item["_specopd_staged_sec"]
+                for item in stored.values()
+                if "_specopd_staged_sec" in item
+            ]
+            if stamps and now - max(stamps) > 300:
+                _SPECO_VLLM_REQUEST_OUTPUT_STATS_BY_ID.pop(key, None)
+            elif stamps:
+                pending += 1
+        if pending >= 4096:
+            raise RuntimeError(
+                "SpecOPD completed request transport is not being drained"
+            )
+        for item in summaries.values():
+            if PROPOSAL_KEY in item:
+                item["_specopd_staged_sec"] = now
     _SPECO_VLLM_REQUEST_OUTPUT_STATS_BY_ID[str(request_id)] = (
         summaries,
         completion_order,
@@ -3242,6 +3266,10 @@ def patch_vllm_request_acceptance_stats() -> bool:
                     summary = _decode_vllm_request_stats_trace_header(
                         trace_headers.get(SPECO_VLLM_REQUEST_STATS_TRACE_HEADER)
                     )
+                    wire = trace_headers.get(SPECOPD_TRACE_KEY)
+                    if wire is not None:
+                        summary = dict(summary or {})
+                        summary[PROPOSAL_KEY] = wire
                     if summary:
                         setattr(
                             req_state, "_speco_vllm_request_accept_summary", summary
@@ -3651,6 +3679,8 @@ def _vllm_request_accept_fields_from_summaries(
     }
     if any(TRACE_KEY in summaries[rid] for rid in ordered_ids):
         fields[TRACE_KEY] = [summaries[rid].get(TRACE_KEY) for rid in ordered_ids]
+    if any(PROPOSAL_KEY in summaries[rid] for rid in ordered_ids):
+        fields[PROPOSAL_KEY] = [summaries[rid].get(PROPOSAL_KEY) for rid in ordered_ids]
     return fields
 
 
@@ -4462,16 +4492,6 @@ async def _speco_generate_with_request_stats_unblocked(
         request_elapsed = time.perf_counter() - request_started
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
-            if isinstance(sampling_params, dict) and specopd_collect:
-                from verl_speco.integration.specopd_vllm import pop_completed
-                from verl_speco.integration.specopd_protocol import PROPOSAL_KEY
-
-                wire = pop_completed(request_id)
-                if wire is None:
-                    raise RuntimeError(
-                        "SpecOPD proposal channel missing from vLLM final output"
-                    )
-                extra_fields[PROPOSAL_KEY] = wire
             revision_after = int(getattr(self, "_speco_serving_drafter_revision", 0))
             # Unscored requests must carry the same provenance key as requests
             # with exact counters or an engine fallback before batch merging.
@@ -4513,6 +4533,14 @@ async def _speco_generate_with_request_stats_unblocked(
                 )
                 extra_fields.update(
                     _vllm_request_accept_stats_to_scalar_extra_fields(proxy_output)
+                )
+            if (
+                isinstance(sampling_params, dict)
+                and specopd_collect
+                and not extra_fields.get(PROPOSAL_KEY)
+            ):
+                raise RuntimeError(
+                    "SpecOPD proposal channel missing from vLLM final output"
                 )
             from verl_speco.integration.acceptance_metrics import (
                 bridge_request_acceptance_counters,
@@ -4582,10 +4610,6 @@ async def _speco_generate_with_request_stats_unblocked(
         if isinstance(pending, dict):
             pending.pop(str(request_id), None)
         _pop_vllm_request_stats_for_rollout_output(request_id)
-        if isinstance(sampling_params, dict) and specopd_config.enable:
-            from verl_speco.integration.specopd_vllm import pop_completed
-
-            pop_completed(request_id)
 
 
 async def _speco_generate_with_idle_lease(

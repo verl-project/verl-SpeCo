@@ -1,40 +1,13 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 # Licensed under the Apache License, Version 2.0 (the "License");
-"""Admit an identical SpecOPD schedule before rank-local preparation/forward."""
+"""Warm loss-reduction groups after every rank acknowledges the shared plan."""
 
-import hashlib
-import json
 import logging
 
 import torch
 import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
-
-
-def training_schedule_digest(
-    trainer, *, step, payload_identity, spec, feature_indices, group_sizes
-):
-    """CPU-only plan signature, checked by the all-rank prepare acknowledgements."""
-    identity = dict(
-        step=int(step),
-        payload=payload_identity,
-        features=list(feature_indices),
-        groups=list(group_sizes),
-        updates=spec.optimizer_updates_per_collection,
-        minimum=spec.min_scored_positions_per_update,
-        anchor_loss=(
-            spec.anchor_count,
-            spec.random_anchor_count,
-            spec.first_reject_weight,
-            spec.random_position_decay_gamma,
-        ),
-        sp=trainer._get_sp_world_size(),
-        dp=trainer._get_dp_world_size(),
-    )
-    return hashlib.sha256(
-        json.dumps(identity, separators=(",", ":")).encode()
-    ).hexdigest()
 
 
 def warm_specopd_training_collectives(trainer, *, step):

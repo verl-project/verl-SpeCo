@@ -112,6 +112,17 @@ def test_joint_actor_to_real_drafter_backward_without_resampling(
     batch = build_specopd_training_batch(
         request, scored[0], next(wrapper.parameters()).device, spec, (1, 2)
     )
+    from verl_speco.integration.specopd_training_transport import encode_training_payload, decode_training_payload
+
+    payload, _ = encode_training_payload([batch], spec)
+    [transported] = decode_training_payload(payload)
+    assert transported.keys() == batch.keys()
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            torch.testing.assert_close(transported[key], value, atol=0, rtol=0)
+        else:
+            assert transported[key] == value
+    batch = {**transported, **spec.batch_options}
     mixed_spec = SpecOPDConfig(proposal_width=3, objective=objective, anchor_count=32)
     weighted = build_specopd_training_batch(
         request, scored[0], next(wrapper.parameters()).device, mixed_spec, (1, 2)
@@ -177,7 +188,7 @@ def test_mixed_dspark_joint_forward_backward_and_dummy_batch(dspark_model, objec
         dict(request_id="mixed", actor_revision=0, drafter_revision=0, window=[0, 40]), config)
     request = JointScoringRequest("mixed", ids, 3, tuple(branches))
     scores, measured = score_joint_batch(target, [request], hidden_state_indices=(1, 2), return_target_logits=False)
-    batch = build_specopd_training_batch(request, scores[0], "cpu", config, (1, 2))
+    batch = {**build_specopd_training_batch(request, scores[0], "cpu", config, (1, 2)), **config.batch_options}
     torch.testing.assert_close(batch["position_weights"][0], torch.tensor([1., 2., 1.]))
     torch.testing.assert_close(batch["position_weights"][24], torch.exp(-torch.arange(3).float()/7))
     model = dspark_model()
@@ -222,7 +233,6 @@ def test_uncached_device_inputs_are_released_before_next_transfer_and_snapshot(m
 
     import torch
 
-    from verl_speco.backends import specopd_forward
     from verl_speco.integration import specopd_collectives
 
     # Exercise the production coroutine without importing the Ray deployment
@@ -244,9 +254,10 @@ def test_uncached_device_inputs_are_released_before_next_transfer_and_snapshot(m
         assert all(reference() is None for reference in live_inputs)
         return original_to(tensor, *args, **kwargs).clone()
     monkeypatch.setattr(torch.Tensor, "to", transfer)
-    monkeypatch.setattr(specopd_forward, "build_specopd_training_batch", lambda *args: {
-        "input_ids": torch.ones(1, 2), "proposal_mask": torch.ones(1, 2, dtype=torch.bool),
-    })
+    inputs = {
+        "input_ids": torch.ones(1, 2), "proposal_mask": torch.ones(1, 2, dtype=torch.bool), "_speco_position_count": 2,
+    }
+
 
     async def activate():
         return True
@@ -264,11 +275,10 @@ def test_uncached_device_inputs_are_released_before_next_transfer_and_snapshot(m
             trainer.optimizer_steps_total += 1
         return True
     trainer._training_step_on_batch = train
-    request = SimpleNamespace(branches=[SimpleNamespace(anchor=1, token_ids=(1, 2))])
-    assert asyncio.run(namespace["training_specopd_group"](
-        trainer, [(request, None), (request, None)], 5,
-        SpecOPDConfig(optimizer_updates_per_collection=20, training_microbatch_trajectories=1,
-                      training_input_cache_mib=0), (1,),
-    ))
+    from verl_speco.integration.specopd_training_transport import PreparedTrainingGroup
+
+    spec = SpecOPDConfig(optimizer_updates_per_collection=20, training_input_cache_mib=0)
+    group = PreparedTrainingGroup((5, 0, (1,)), (inputs, inputs), (1, 1), spec, {})
+    assert asyncio.run(namespace["training_specopd_group"](trainer, group))
     assert trainer._specopd_group_metrics["specopd/input_cache_bytes"] == 0
     assert len(live_inputs) == 40 and trainer.optimizer_steps_total == 20

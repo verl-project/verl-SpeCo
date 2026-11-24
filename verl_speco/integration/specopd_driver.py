@@ -17,14 +17,17 @@ import time
 
 import torch
 
-from verl_speco.joint_scoring import JointScoringRequest, DraftBranch
+from verl_speco.joint_scoring import (
+    JointScoringRequest,
+    DraftBranch,
+)
 from verl_speco.specopd_config import validate_specopd_config
 from verl_speco.integration.specopd_protocol import (
     PROPOSAL_KEY,
     decode_bundle,
     token_digest,
 )
-from verl_speco.trainer.scheduler import SpecOPDCycle
+from verl_speco.backends.specopd_forward import build_specopd_training_batch
 
 
 def build_requests(batch, spec, revision):
@@ -107,8 +110,6 @@ def build_requests(batch, spec, revision):
 
 
 def unwrap_rank_result(result):
-    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
-        return result
     active = [item for item in result if item is not None]
     if not active:
         raise RuntimeError("joint actor RPC returned no participating ranks")
@@ -128,8 +129,6 @@ def unwrap_rank_result(result):
 
 
 def make_oldlogprob(batch, results):
-    from verl import DataProto
-
     log_probs = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
     entropy = torch.zeros_like(log_probs)
     for index, result in enumerate(results):
@@ -139,46 +138,15 @@ def make_oldlogprob(batch, results):
         log_probs[index, :n] = result.response_log_probs.to(log_probs.device)
         if result.response_entropy is not None:
             entropy[index, :n] = result.response_entropy.to(entropy.device)
-    return DataProto.from_dict(
-        tensors={"old_log_probs": log_probs, "entropys": entropy}
-    )
-
-
-def plan_microbatches(requests, spec, sequence_multiple=1):
-    """Bound the entire schedule before any model call; never split a tree."""
-    groups, current = [], []
-    tokens = widest = 0
-    for request in requests:
-        size, width = request.packed_size(sequence_multiple)
-        if (
-            size > spec.scoring_token_budget
-            or width * width > spec.max_dense_mask_elements
-        ):
-            raise ValueError(
-                f"SpecOPD complete trajectory {request.sample_id} exceeds the joint budget"
-            )
-        if current and (
-            len(current) >= spec.microbatch_trajectories
-            or tokens + size > spec.scoring_token_budget
-            or (len(current) + 1) * max(widest, width) ** 2
-            > spec.max_dense_mask_elements
-        ):
-            groups.append(current)
-            current = []
-            tokens = widest = 0
-        current.append(request)
-        tokens += size
-        widest = max(widest, width)
-    if current:
-        groups.append(current)
-    return groups
+    return {"old_log_probs": log_probs, "entropy": entropy}
 
 
 class SpecOPDDriver:
     def __init__(self, trainer):
         self.trainer = trainer
         self.spec = validate_specopd_config(trainer.config)
-        self.cycle = SpecOPDCycle()
+        self.state, self.pending, self.step = "ready", None, None
+        self.actor_revision = self.drafter_revision = 0
         self.feature_indices = ()
         self.trained = False
         self.metrics = {}
@@ -187,15 +155,10 @@ class SpecOPDDriver:
         self._acknowledged_actor_revision = None
         training = trainer.config["actor_rollout_ref"]["rollout"]["drafter"]["training"]
         self.collection_interval = int(training.get("collect_interval_steps", 1))
-        self.scoring_sp_size = (
-            trainer.config["actor_rollout_ref"]
-            .get("actor", {})
-            .get("ulysses_sequence_parallel_size", 1)
-        )
         self.update_due = True
 
     def begin_step(self, step):
-        if self.cycle.state != "ready":
+        if self.state != "ready":
             raise RuntimeError(
                 "previous SpecOPD collection has not completed publication"
             )
@@ -209,14 +172,14 @@ class SpecOPDDriver:
             "specopd/bootstrap_published": int(self.bootstrapped),
         }
         if self.update_due:
-            self.cycle.begin(step)
+            self.step, self.state = int(step), "collecting"
         return self.update_due
 
     def finish_step(self):
-        if self.cycle.state == "awaiting_publish":
+        if self.state == "awaiting_publish":
             self.publish()
-        elif self.cycle.state == "ready":
-            self.acknowledge_serving_revision(self.cycle.drafter_revision)
+        elif self.state == "ready":
+            self.acknowledge_serving_revision(self.drafter_revision)
         else:
             raise RuntimeError("SpecOPD step ended with an unfinished collection")
 
@@ -229,20 +192,15 @@ class SpecOPDDriver:
             )
         total = self.spec.max_collect_samples_per_step
         quotas = None
-        if total is None:
-            pending = [
-                server.speco_set_serving_drafter_revision.remote(revision)
-                for server in servers
-            ]
-        else:
+        if total is not None:
             quota, remainder = divmod(total, len(servers))
             quotas = [quota + (i < remainder) for i in range(len(servers))]
-            pending = [
-                server.speco_set_serving_drafter_revision.remote(
-                    revision, collection_quota=share
-                )
-                for server, share in zip(servers, quotas, strict=True)
-            ]
+        pending = [
+            server.speco_set_serving_drafter_revision.remote(
+                revision, **({} if quotas is None else {"collection_quota": quotas[i]})
+            )
+            for i, server in enumerate(servers)
+        ]
         replies = self.trainer._ray_get_if_needed(pending)
         if not replies or any(
             not isinstance(reply, dict)
@@ -290,29 +248,29 @@ class SpecOPDDriver:
             raise RuntimeError(
                 "SpecOPD initial/restored drafter state was not acknowledged by rollout"
             )
-        self.cycle.drafter_revision = statuses[0]["revision"]
-        self.acknowledge_serving_revision(self.cycle.drafter_revision)
+        self.drafter_revision = statuses[0]["revision"]
+        self.acknowledge_serving_revision(self.drafter_revision)
         self.bootstrapped = True
         self.metrics["specopd/bootstrap_published"] = 1
 
     def old_log_prob(self, batch, *, native_trunk=None):
-        if self.cycle.state != "collecting":
+        if self.state != "collecting":
             raise RuntimeError(
                 "SpecOPD old-logprob must follow exactly one rollout collection"
             )
         requests, actor_revision = build_requests(
-            batch, self.spec, self.cycle.drafter_revision
+            batch, self.spec, self.drafter_revision
         )
         if actor_revision != self._acknowledged_actor_revision:
             raise RuntimeError(
                 "SpecOPD rollout differs from the acknowledged serving actor revision"
             )
-        if self._bound_actor_revision and actor_revision < self.cycle.actor_revision:
+        if self._bound_actor_revision and actor_revision < self.actor_revision:
             raise RuntimeError("SpecOPD rollout actor revision regressed")
         # In synchronous V1 the actor cannot update between this
         # rollout and old-logprob. Bind the actual serving revision (not prompt
         # submission global_step, which can be off by one at startup/resume).
-        self.cycle.actor_revision = actor_revision
+        self.actor_revision = actor_revision
         self._bound_actor_revision = True
         raw_indices = self.trainer._speco_oldlogprob_aux_layer_ids()
         space = self.trainer._speco_oldlogprob_aux_layer_id_space()
@@ -329,13 +287,9 @@ class SpecOPDDriver:
             "specopd/independent_rows": 0,
             "specopd/mfu_unavailable": 1,
             "specopd/actor_revision": actor_revision,
-            "specopd/drafter_revision": self.cycle.drafter_revision,
+            "specopd/drafter_revision": self.drafter_revision,
         }
-        calculate_entropy = (
-            self.trainer._speco_oldlogprob_calculate_entropy()
-            if hasattr(self.trainer, "_speco_oldlogprob_calculate_entropy")
-            else True
-        )
+        calculate_entropy = self.trainer._speco_oldlogprob_calculate_entropy()
         trunk = (
             tuple(
                 (i, request)
@@ -346,18 +300,12 @@ class SpecOPDDriver:
             else ()
         )
         joint_requests = [r for r in requests if r.branches] if trunk else requests
-        microbatch_sizes = tuple(
-            len(part)
-            for part in plan_microbatches(
-                joint_requests, self.spec, self.scoring_sp_size
-            )
-        )
         scored = ()
         if joint_requests:
             started = time.perf_counter()
             output = self.trainer.actor_rollout_wg.compute_joint_old_log_prob(
                 joint_requests,
-                microbatch_sizes=microbatch_sizes,
+                microbatch_trajectories=self.spec.microbatch_trajectories,
                 actor_temperature=self.spec.temperature,
                 target_temperature=self.spec.temperature,
                 hidden_state_indices=self.feature_indices,
@@ -401,29 +349,29 @@ class SpecOPDDriver:
             )
         results = tuple(indexed[r.sample_id] for r in requests)
         self.metrics.update(metrics)
-        self.cycle.scored(
-            tuple((req, indexed[req.sample_id]) for req in joint_requests),
-            actor_revision,
-            self.cycle.drafter_revision,
+        self.pending = tuple(
+            build_specopd_training_batch(
+                req, indexed[req.sample_id], "cpu", self.spec, self.feature_indices
+            )
+            for req in joint_requests
+            if req.branches
         )
-        return make_oldlogprob(batch, results), 0.0  # No fabricated MFU estimate.
+        self.state = "scored"
+        return make_oldlogprob(batch, results)
 
     def before_actor_update(self):
         if not self.update_due:
             return
-        samples = self.cycle.begin_update()
-        positions = sum(
-            len(b.token_ids) for request, _ in samples for b in request.branches
-        )
-        self.metrics["specopd/proposal_anchors"] = sum(
-            getattr(b, "source", "proposal") == "proposal"
-            for r, _ in samples
-            for b in r.branches
-        )
-        self.metrics["specopd/trunk_anchors"] = sum(
-            getattr(b, "source", "proposal") == "trunk"
-            for r, _ in samples
-            for b in r.branches
+        if self.state != "scored":
+            raise RuntimeError(
+                "SpecOPD group is not scored or has already been consumed"
+            )
+        samples, self.pending, self.state = self.pending, None, "updating"
+        positions = sum(b["_speco_position_count"] for b in samples)
+        proposals = sum(b["_specopd_proposal_anchors"] for b in samples)
+        self.metrics["specopd/proposal_anchors"] = proposals
+        self.metrics["specopd/trunk_anchors"] = (
+            sum(b["_speco_sample_count"] for b in samples) - proposals
         )
         self.trained = False
         if positions >= self.spec.min_scored_positions_per_update:
@@ -437,8 +385,8 @@ class SpecOPDDriver:
             statuses = dispatch_prepared_group(
                 self.trainer,
                 samples,
-                int(self.cycle.step),
-                self.cycle.drafter_revision,
+                int(self.step),
+                self.drafter_revision,
                 self.feature_indices,
                 self.metrics,
                 self.spec,
@@ -446,52 +394,48 @@ class SpecOPDDriver:
             self.metrics["timing_s/specopd_train_rpc"] = (
                 time.perf_counter() - training_started
             )
-            for key in ("prepare", "train_loop", "snapshot", "release", "activation"):
-                values = [s.get(f"timing_s/specopd_{key}") for s in statuses]
-                if values and all(v is not None for v in values):
-                    self.metrics[f"timing_s/specopd_{key}"] = max(values)
             for key in (
-                "prepared_batches",
-                "input_cache_bytes",
-                "train_dp_size",
-                "train_microbatch_trajectories",
+                "timing_s/specopd_prepare",
+                "timing_s/specopd_train_loop",
+                "timing_s/specopd_snapshot",
+                "timing_s/specopd_release",
+                "timing_s/specopd_activation",
+                "specopd/prepared_batches",
+                "specopd/input_cache_bytes",
+                "specopd/train_dp_size",
+                "specopd/train_microbatch_trajectories",
             ):
-                values = [s.get(f"specopd/{key}") for s in statuses]
+                values = [s.get(key) for s in statuses]
                 if values and all(v is not None for v in values):
-                    self.metrics[f"specopd/{key}"] = max(values)
-            if (
-                not statuses
-                or len({(s["trained"], s["revision"]) for s in statuses}) != 1
-            ):
-                raise RuntimeError(
-                    "SpecOPD drafter ranks disagree about the optimizer update"
-                )
+                    self.metrics[key] = max(values)
+            if not statuses:
+                raise RuntimeError("SpecOPD drafter ranks returned no optimizer result")
             self.trained = bool(statuses[0]["trained"])
             updates = self.spec.optimizer_updates_per_collection if self.trained else 0
-            if any(s.get("optimizer_updates", updates) != updates for s in statuses):
+            expected = self.trained, self.drafter_revision + int(self.trained), updates
+            if any(
+                (s["trained"], s["revision"], s["optimizer_updates"]) != expected
+                for s in statuses
+            ):
                 raise RuntimeError(
-                    "SpecOPD drafter ranks did not complete the configured optimizer updates"
+                    "SpecOPD drafter ranks disagree about optimizer updates/revision"
                 )
             self.metrics["specopd/optimizer_updates"] = updates
-            expected = self.cycle.drafter_revision + int(self.trained)
-            if statuses[0]["revision"] != expected:
-                raise RuntimeError(
-                    "SpecOPD serving/training revision did not advance exactly once"
-                )
         self.metrics["specopd/scored_positions"] = positions
         self.metrics["specopd/trained"] = int(self.trained)
         self.metrics["specopd/training_trajectories"] = (
-            sum(bool(request.branches) for request, _ in samples) if self.trained else 0
+            len(samples) if self.trained else 0
         )
-        self.cycle.updated(self.trained)
+        self.drafter_revision += int(self.trained)
+        self.state = "awaiting_publish"
 
     def publish(self):
-        if self.cycle.state != "awaiting_publish":
+        if self.state != "awaiting_publish":
             return
         if self.trained:
             previous_step = self.trainer.global_steps
             try:
-                self.trainer.global_steps = self.cycle.step
+                self.trainer.global_steps = self.step
                 metrics = self.trainer._speco_publish_drafter_weights(
                     True, after_weight_update=True
                 )
@@ -502,12 +446,13 @@ class SpecOPDDriver:
                 self.metrics.update(metrics)
             finally:
                 self.trainer.global_steps = previous_step
-        self.acknowledge_serving_revision(self.cycle.drafter_revision)
-        self.cycle.published()
+        self.acknowledge_serving_revision(self.drafter_revision)
+        self.actor_revision += 1
+        self.state = "ready"
         self.metrics["specopd/published"] = int(self.trained)
         ci_result = getattr(self.trainer, "_speco_ci_result", None)
         if ci_result is not None:
             ci_result.record_metrics(self.metrics)
-        self.metrics["specopd/published_drafter_revision"] = self.cycle.drafter_revision
+        self.metrics["specopd/published_drafter_revision"] = self.drafter_revision
         if not self.trained:
             self.metrics["drafter/published"] = 0

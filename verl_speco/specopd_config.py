@@ -45,6 +45,17 @@ class SpecOPDConfig:
     random_position_decay_gamma: float = 7.0
     objective: str = "e2e_tv"
 
+    @property
+    def batch_options(self):
+        """One sampling/loss contract for every trajectory in a prepared group."""
+        return dict(
+            specopd=True,
+            objective=self.objective,
+            proposal_temperature=self.temperature,
+            target_temperature=self.temperature,
+            proposal_block_width=self.proposal_width,
+        )
+
     @classmethod
     def from_drafter(cls, drafter, *, rollout_temperature):
         return cls.from_training(
@@ -247,13 +258,28 @@ def validate_specopd_config(config):
         return spec
     if (training.get("drafter_opd") or {}).get("enable", False):
         raise ValueError("Enable only one of SpecOPD and Draft-OPD")
+    # Reject unsupported features before initializing model workers.
+    for path in (
+        "actor_rollout_ref.rollout.drafter.training.target_lm_head_row_restricted_sync",
+        "actor_rollout_ref.model.lora_rank",
+        "actor_rollout_ref.model.lora_adapter_path",
+        "actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_sgl",
+        "actor_rollout_ref.rollout.drafter.training.use_data_buffer",
+        "actor_rollout_ref.rollout.drafter.training.adaptive_schedule.enable",
+        "actor_rollout_ref.rollout.drafter.training.drafter_convergence_freeze.enabled",
+        "actor_rollout_ref.rollout.drafter.training.publish_async",
+        "actor_rollout_ref.rollout.drafter.training.scheduler.training_quota.enable",
+        "algorithm.rollout_correction.bypass_mode",
+        "distillation.enabled",
+    ):
+        value = config
+        for key in path.split("."):
+            value = (value or {}).get(key, {})
+        if value:
+            raise ValueError(f"SpecOPD requires {path} to be disabled")
     if training.get("mode", "online") != "online" or training.get("use_logits", False):
         raise ValueError(
             "SpecOPD requires online hidden-state supervision and a synchronized target head"
-        )
-    if training.get("target_lm_head_row_restricted_sync", False):
-        raise ValueError(
-            "SpecOPD requires target_lm_head_row_restricted_sync=false for full target mass"
         )
     rate = training.get("collection_sample_rate", 1.0)
     if (
@@ -332,8 +358,6 @@ def validate_specopd_config(config):
         raise ValueError(
             "SpecOPD requires use_remove_padding=(SP>1) and use_fused_kernels=false"
         )
-    if model.get("lora_rank", 0) or model.get("lora_adapter_path"):
-        raise ValueError("SpecOPD LoRA actor scoring is not supported")
     interval = training.get("collect_interval_steps", 1)
     if (
         type(interval) is not int
@@ -343,26 +367,10 @@ def validate_specopd_config(config):
         raise ValueError(
             "SpecOPD requires equal positive collection/training intervals"
         )
-    if training.get("collect_hidden_states_from_sgl", False) or training.get(
-        "use_data_buffer", False
-    ):
-        raise ValueError(
-            "SpecOPD uses its own one-use scored group, not legacy collectors/replay"
-        )
-    if (training.get("adaptive_schedule") or {}).get("enable", False) or (
-        training.get("drafter_convergence_freeze") or {}
-    ).get("enabled", False):
-        raise ValueError(
-            "SpecOPD does not combine with adaptive scheduling or drafter_convergence_freeze"
-        )
-    if training.get("publish_async", False) or training.get(
-        "publish_interval_steps", 0
-    ) not in {0, 1}:
+    if training.get("publish_interval_steps", 0) not in {0, 1}:
         raise ValueError(
             "SpecOPD requires an acknowledged synchronous publish after each update"
         )
-    if training.get("scheduler", {}).get("training_quota", {}).get("enable", False):
-        raise ValueError("SpecOPD does not execute legacy training quotas")
     strategy = (
         training.get("scheduler", {}).get("execution", {}).get("strategy", "sync")
     )
@@ -374,18 +382,6 @@ def validate_specopd_config(config):
     ):
         raise ValueError(
             "SpecOPD currently supports exact single-turn token histories only"
-        )
-    if (
-        config.get("algorithm", {})
-        .get("rollout_correction", {})
-        .get("bypass_mode", False)
-    ):
-        raise ValueError(
-            "SpecOPD requires actor old-logprob inference; bypass_mode must be false"
-        )
-    if config.get("distillation", {}).get("enabled", False):
-        raise ValueError(
-            "SpecOPD joint old-logprob does not yet support external teacher distillation outputs"
         )
     name = drafter.get("speculative_algorithm", "").lower()
     if spec.objective in {"tv", "l1"}:

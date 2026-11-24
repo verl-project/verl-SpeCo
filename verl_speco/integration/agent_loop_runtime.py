@@ -293,33 +293,40 @@ async def _compute_teacher_logprobs_with_timing(
 async def _run_agent_loop_with_student_timing(call: Any, *args, **kwargs) -> Any:
     """Measure student LLM request wall time across all turns of one trajectory."""
 
-    if _CURRENT_STUDENT_DECODE_TIMES.get() is not None:
-        result = call(*args, **kwargs)
-        if inspect.isawaitable(result):
-            result = await result
-        return result
-
-    student_decode_times: list[float] = []
-    from verl_speco.integration.specopd_agent import PROPOSAL_TURNS
-    from verl_speco.integration.verify_trace import TURN_TRACES
-
-    trace_token = TURN_TRACES.set([])
-    proposal_token = PROPOSAL_TURNS.set([])
-    token = _CURRENT_STUDENT_DECODE_TIMES.set(student_decode_times)
+    if kwargs.pop("_specopd_skip_collection", False):
+        args = (args[0], dict(args[1], _verl_skip_drafter_collection=True), *args[2:])
+    revision = kwargs.pop("_specopd_drafter_revision", _CURRENT_SPECOPD_REVISION.get())
+    revision_token = _CURRENT_SPECOPD_REVISION.set(revision)
     try:
-        result = call(*args, **kwargs)
-        if inspect.isawaitable(result):
-            result = await result
+        if _CURRENT_STUDENT_DECODE_TIMES.get() is not None:
+            result = call(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+
+        student_decode_times: list[float] = []
+        from verl_speco.integration.specopd_agent import PROPOSAL_TURNS
+        from verl_speco.integration.verify_trace import TURN_TRACES
+
+        trace_token = TURN_TRACES.set([])
+        proposal_token = PROPOSAL_TURNS.set([])
+        token = _CURRENT_STUDENT_DECODE_TIMES.set(student_decode_times)
+        try:
+            result = call(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+        finally:
+            _CURRENT_STUDENT_DECODE_TIMES.reset(token)
+            TURN_TRACES.reset(trace_token)
+            PROPOSAL_TURNS.reset(proposal_token)
+        _record_phase_time(
+            result,
+            SPECO_STUDENT_DECODE_TIME_KEY,
+            sum(student_decode_times),
+        )
+        return result
     finally:
-        _CURRENT_STUDENT_DECODE_TIMES.reset(token)
-        TURN_TRACES.reset(trace_token)
-        PROPOSAL_TURNS.reset(proposal_token)
-    _record_phase_time(
-        result,
-        SPECO_STUDENT_DECODE_TIME_KEY,
-        sum(student_decode_times),
-    )
-    return result
+        _CURRENT_SPECOPD_REVISION.reset(revision_token)
 
 
 def _speco_worker_init(self, *args, **kwargs):
@@ -361,26 +368,19 @@ async def _speco_worker_run_agent_loop(
         skip_drafter_collection=bool(trajectory.get("skip_drafter_collection", False)),
     )
     sampling_params = _apply_probe_sampling_overrides(sampling_params)
-    if kwargs.pop("_specopd_skip_collection", False):
-        sampling_params = dict(sampling_params, _verl_skip_drafter_collection=True)
     run_agent_loop = _speco_parent_method(self, "_run_agent_loop")
     if not callable(run_agent_loop):
         raise AttributeError(
             "SPECO AgentLoop worker parent has no _run_agent_loop method"
         )
-    revision = kwargs.pop("_specopd_drafter_revision", _CURRENT_SPECOPD_REVISION.get())
-    token = _CURRENT_SPECOPD_REVISION.set(revision)
-    try:
-        return await _run_agent_loop_with_student_timing(
-            run_agent_loop,
-            self,
-            sampling_params,
-            trajectory,
-            *args,
-            **kwargs,
-        )
-    finally:
-        _CURRENT_SPECOPD_REVISION.reset(token)
+    return await _run_agent_loop_with_student_timing(
+        run_agent_loop,
+        self,
+        sampling_params,
+        trajectory,
+        *args,
+        **kwargs,
+    )
 
 
 async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs):
@@ -774,25 +774,14 @@ def install_agent_loop_runtime_patch() -> bool:
                 ),
             )
             sampling_params = _apply_probe_sampling_overrides(sampling_params)
-            if kwargs.pop("_specopd_skip_collection", False):
-                sampling_params = dict(
-                    sampling_params, _verl_skip_drafter_collection=True
-                )
-            revision = kwargs.pop(
-                "_specopd_drafter_revision", _CURRENT_SPECOPD_REVISION.get()
+            return await _run_agent_loop_with_student_timing(
+                run_agent_loop,
+                self,
+                sampling_params,
+                trajectory,
+                *args,
+                **kwargs,
             )
-            token = _CURRENT_SPECOPD_REVISION.set(revision)
-            try:
-                return await _run_agent_loop_with_student_timing(
-                    run_agent_loop,
-                    self,
-                    sampling_params,
-                    trajectory,
-                    *args,
-                    **kwargs,
-                )
-            finally:
-                _CURRENT_SPECOPD_REVISION.reset(token)
 
         worker_cls._run_agent_loop = speco_run_agent_loop
         worker_cls._speco_patched_run_agent_loop = True

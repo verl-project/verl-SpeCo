@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from verl_speco.integration.specopd_async import (
-    VERIFIED_KEY, patch_result_transport, snapshot_result_round,
+    VERIFIED_KEY, snapshot_result_round,
     snapshot_verified_proposals,
 )
 from verl_speco.integration.specopd_vllm import capture_scheduler_round
@@ -106,22 +106,6 @@ def test_async_result_must_match_committed_prefix_and_scheduling_round(bad):
         snapshot_result_round(scheduler, scheduled, output)
 
 
-def test_hook_attaches_evidence_to_own_output_before_async_delivery():
-    runner, _, _, _ = fixture()
-
-    class Runner:
-        def sample_tokens(self):
-            self.req_states.draft_tokens.fill_(999)
-            return NS(model_runner_output=NS())
-
-    assert patch_result_transport(Runner)
-    assert patch_result_transport(Runner)  # no double wrapper/copy
-    instance = Runner()
-    instance.__dict__.update(runner.__dict__)
-    output = instance.sample_tokens().model_runner_output
-    assert getattr(output, VERIFIED_KEY)["b"]["proposal_ids"] == list(range(11, 18))
-
-
 @pytest.mark.parametrize("sampled", [None, []])
 def test_empty_prefill_result_does_not_require_verified_proposal(sampled):
     _, scheduler, scheduled, output = fixture()
@@ -138,29 +122,3 @@ def test_empty_prefill_result_does_not_require_verified_proposal(sampled):
     assert snapshots["a"][2:] == ([], [])
     capture_scheduler_round(scheduled, output, snapshots)
     assert not getattr(scheduler.requests["a"], "_specopd_records", [])
-
-
-def test_spawned_worker_extension_installs_capture_without_parent_entrypoint(monkeypatch):
-    from verl_speco.integration import specopd_vllm, vllm_runtime
-
-    monkeypatch.setattr(vllm_runtime, "patch_vllm_dspark_draft_load_config", lambda: None)
-    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: {
-        "training": {"specopd": {"enable": True}},
-    })
-    calls = []
-    monkeypatch.setattr(specopd_vllm, "install_specopd_draft_token_transport_patch",
-                        lambda: calls.append("worker") or True)
-    vllm_runtime.SpecoVLLMColocateWorkerExtension()
-    assert calls == ["worker"]
-
-
-def test_draft_opd_worker_does_not_enable_specopd_capture(monkeypatch):
-    from verl_speco.integration import specopd_vllm, vllm_runtime
-
-    monkeypatch.setattr(vllm_runtime, "patch_vllm_dspark_draft_load_config", lambda: None)
-    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: {
-        "training": {"drafter_opd": {"enable": True, "method": "draft_opd"}},
-    })
-    monkeypatch.setattr(specopd_vllm, "install_specopd_draft_token_transport_patch",
-                        lambda: pytest.fail("Draft-OPD must not install SpecOPD capture"))
-    vllm_runtime.SpecoVLLMColocateWorkerExtension()

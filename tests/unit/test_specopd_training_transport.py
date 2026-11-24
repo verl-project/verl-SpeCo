@@ -13,6 +13,7 @@ import torch
 from verl_speco.integration import specopd_collectives as module
 from verl_speco.integration import specopd_training_transport as transport
 from verl_speco.specopd_config import SpecOPDConfig
+from verl_speco.backends.specopd_forward import build_specopd_training_batch
 from verl_speco.joint_scoring import (
     BranchScores,
     DraftBranch,
@@ -31,22 +32,30 @@ def sample(length=8192):
         (BranchScores("b", torch.ones(3, 8), torch.zeros(3), torch.ones(3, 4)),),
         {1: torch.arange(length * 4, dtype=torch.bfloat16).reshape(length, 4)},
     )
-    return request, score
+    return build_specopd_training_batch(request, score, "cpu", SpecOPDConfig(), (1,))
 
 
 def test_numpy_wire_crops_storage_and_preserves_bf16_exactly():
-    request, score = sample()
-    payload, size = transport.encode_training_payload([(request, score)])
+    expected = sample()
+    payload, size = transport.encode_training_payload([expected], SpecOPDConfig())
     decoded = transport.decode_training_payload(payload)
-    assert size == 10 * 4 * 2 + 3 * 4 * 4
-    [decoded_branch] = decoded[0][1].branches
-    assert decoded_branch.target_logits is decoded_branch.target_logz is None
-    torch.testing.assert_close(decoded_branch.target_hidden, score.branches[0].target_hidden)
-    assert decoded[0][0].trunk_ids == request.trunk_ids
-    torch.testing.assert_close(
-        decoded[0][1].trunk_features[1], score.trunk_features[1][:10], rtol=0, atol=0
+    batch = decoded[0]
+    assert size == sum(t.numel() * t.element_size() for t in expected.values() if torch.is_tensor(t))
+    assert batch["_specopd_request_id"] == "r"
+    assert batch.keys() == expected.keys()
+    for key, value in expected.items():
+        if torch.is_tensor(value):
+            torch.testing.assert_close(batch[key], value, rtol=0, atol=0)
+        else:
+            assert batch[key] == value
+
+    from verl_speco.backends.specopd_forward import prepare_specopd_training_batches
+
+    [dummy], _ = prepare_specopd_training_batches(
+        decoded, "cpu", real_slots=[False],
     )
-    assert decoded[0][1].response_log_probs.numel() == 0
+    assert not dummy["proposal_mask"].any()
+    assert batch["proposal_mask"].all()  # A dummy rank cannot mutate shared input.
 
     def check(value):
         assert not torch.is_tensor(value)
@@ -59,18 +68,13 @@ def test_numpy_wire_crops_storage_and_preserves_bf16_exactly():
 
     check(payload)
     assert isinstance(
-        next(iter(payload["tensors"].values()))["0/f/1"]["data"], np.ndarray
+        next(iter(payload["tensors"].values()))["0/hidden_states"]["data"], np.ndarray
     )
 
 
 def test_payload_identity_rejects_reordered_or_corrupt_request_metadata():
-    payload, _ = transport.encode_training_payload([sample(32)])
-    request, features, branches = payload["samples"][0]
-    payload["samples"][0] = (
-        JointScoringRequest("wrong", request.trunk_ids, 2, request.branches),
-        features,
-        branches,
-    )
+    payload, _ = transport.encode_training_payload([sample(32)], SpecOPDConfig(enable=True))
+    payload["samples"][0]["_specopd_request_id"] = "wrong"
     with pytest.raises(ValueError, match="identity"):
         transport.decode_training_payload(payload)
 
@@ -85,7 +89,7 @@ def worker(rank=0):
 @pytest.mark.parametrize("cancel", [False, True])
 def test_cpu_stage_is_cancellable_and_one_use(cancel):
     async def run():
-        payload, _ = transport.encode_training_payload([sample(32)])
+        payload, _ = transport.encode_training_payload([sample(32)], SpecOPDConfig(enable=True))
         w = worker()
         future = asyncio.get_running_loop().create_future()
         task = asyncio.create_task(transport.stage_training_group(w, (future,), 5, 0, (1,)))
@@ -101,14 +105,14 @@ def test_cpu_stage_is_cancellable_and_one_use(cancel):
         else:
             ready = await task
             assert ready["rank"] == 0 and ready["sp"] * ready["dp"] == 16
-            assert transport.take_training_group(w, 5, 0, (1,))[0][0].sample_id == "r"
+            assert transport.take_training_group(w, 5, 0, (1,)).samples[0]["_specopd_request_id"] == "r"
             with pytest.raises(RuntimeError, match="no matching"):
                 transport.take_training_group(w, 5, 0, (1,))
 
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("fault", [None, "missing", "duplicate", "digest"])
+@pytest.mark.parametrize("fault", [None, "missing", "duplicate", "digest", "groups"])
 def test_driver_never_dispatches_training_before_all_16_readiness_acks(
     monkeypatch, fault
 ):
@@ -129,7 +133,7 @@ def test_driver_never_dispatches_training_before_all_16_readiness_acks(
                     revision=revision,
                     features=features,
                     identity=refs[0]["identity"],
-                    schedule="same-plan",
+                    groups=(1,),
                     samples=1,
                     sp=2,
                     dp=8,
@@ -142,6 +146,8 @@ def test_driver_never_dispatches_training_before_all_16_readiness_acks(
                 status[-1]["rank"] = 0
             if fault == "digest":
                 status[-1]["identity"] = "wrong"
+            if fault == "groups":
+                status[-1]["groups"] = (2,)
             return status
 
         def train_specopd_group(self, step, revision, features):
@@ -157,12 +163,11 @@ def test_driver_never_dispatches_training_before_all_16_readiness_acks(
     t = NS(_require_speco_worker_group=lambda: g, _ray_get_if_needed=lambda x: x)
     if fault:
         with pytest.raises(RuntimeError):
-            transport.dispatch_prepared_group(t, [sample(32)], 5, 0, (1,), {})
+            transport.dispatch_prepared_group(t, [sample(32)], 5, 0, (1,), {}, SpecOPDConfig())
         assert events == ["put-once", "all-data-loaded", "release"]
     else:
-        normal = JointScoringRequest("normal", (1, 2, 3), 1)
         assert (
-            len(transport.dispatch_prepared_group(t, [(normal, None), sample(32)], 5, 0, (1,), {}))
+            len(transport.dispatch_prepared_group(t, [sample(32)], 5, 0, (1,), {}, SpecOPDConfig()))
             == 16
         )
         assert events == [
@@ -204,8 +209,11 @@ def test_preflight_uses_same_dp_group_as_loss_reduction(monkeypatch):
 
 
 def test_cpu_schedule_signature_covers_optimizer_policy():
-    trainer, options = _collective_inputs()
-    options["payload_identity"] = "shared-data"
-    before = module.training_schedule_digest(trainer, **options)
-    options["spec"] = replace(options["spec"], optimizer_updates_per_collection=2)
-    assert module.training_schedule_digest(trainer, **options) != before
+    samples = [sample(32)]
+    spec = SpecOPDConfig(enable=True)
+    before, _ = transport.encode_training_payload(samples, spec)
+    after, _ = transport.encode_training_payload(samples, replace(spec, optimizer_updates_per_collection=2))
+    assert before["identity"] != after["identity"]
+    before["spec"] = after["spec"]
+    with pytest.raises(ValueError, match="identity"):
+        transport.decode_training_payload(before)

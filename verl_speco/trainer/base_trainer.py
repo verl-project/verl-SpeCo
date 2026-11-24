@@ -7323,37 +7323,20 @@ class DrafterBaseTrainer:
             self._active_training_target_version = previous_target_version
             self._last_prepared_training_items = previous_prepared_items
 
-    async def training_specopd_group(self, samples, step, spec, feature_indices):
-        """Train one collected group for its configured updates, then publish once."""
+    async def training_specopd_group(self, group):
+        """Consume exactly the CPU plan acknowledged by every training rank."""
         from verl_speco.backends.specopd_forward import (
             prepare_specopd_training_batches,
             partition_specopd_samples,
-            plan_specopd_training_groups,
         )
-
-        selected = [
-            (request, scores) for request, scores in samples if request.branches
-        ]
-        # Establish every loss-reduction communicator while peers are still at
-        # the same entry boundary, rather than after rank-local preparation.
         from verl_speco.integration.specopd_collectives import (
             warm_specopd_training_collectives,
         )
 
-        dp_size = self._get_dp_world_size()
-        group_sizes = plan_specopd_training_groups(
-            selected,
-            dp_size,
-            spec.training_microbatch_trajectories,
-            spec.training_microbatch_token_budget,
-        )
+        step, _, feature_indices = group.key
+        spec, group_sizes = group.spec, group.group_sizes
         warm_specopd_training_collectives(self, step=step)
-        positions = sum(
-            len(branch.token_ids)
-            for request, _ in selected
-            for branch in request.branches
-        )
-        if positions < spec.min_scored_positions_per_update:
+        if group.positions < spec.min_scored_positions_per_update:
             return False
         self._specopd_group_metrics = {}
         activation_started = time.perf_counter()
@@ -7374,12 +7357,13 @@ class DrafterBaseTrainer:
             )
         prepare_started = time.perf_counter()
         dp_rank = self._get_dp_local_rank()
-        selected, real_slots = partition_specopd_samples(selected, dp_rank, dp_size)
+        dp_size = self._get_dp_world_size()
+        selected, real_slots = partition_specopd_samples(
+            group.samples, dp_rank, dp_size
+        )
         batches, cache_bytes = prepare_specopd_training_batches(
             selected,
             self.runtime_device,
-            spec,
-            feature_indices,
             cache_bytes=spec.training_input_cache_mib * 1024**2,
             group_sizes=group_sizes,
             real_slots=real_slots,
@@ -7395,6 +7379,7 @@ class DrafterBaseTrainer:
         )
         optimizer_before = self.optimizer_steps_total
         train_started = time.perf_counter()
+        batch_options = spec.batch_options
         for _ in range(spec.optimizer_updates_per_collection):
             for index, prepared in enumerate(batches):
                 batch = {
@@ -7403,6 +7388,7 @@ class DrafterBaseTrainer:
                     else value
                     for key, value in prepared.items()
                 }
+                batch.update(batch_options)
                 with torch.enable_grad():
                     ok = await self._training_step_on_batch(
                         batch,

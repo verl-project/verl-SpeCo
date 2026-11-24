@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 """Stage immutable CPU features on all ranks before admitting device work."""
 
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 import logging
@@ -14,107 +15,88 @@ from verl_speco.integration.tensor_wire import (
     decode_cpu_tensors,
     tensor_payload_bytes,
 )
-from verl_speco.joint_scoring import BranchScores, JointScores
 
 logger = logging.getLogger(__name__)
 
 
-def _training_payload_identity(samples, tensors):
-    def signature(name):
-        tensor = tensors[name]
-        return tuple(tensor.shape), str(tensor.dtype)
+@dataclass(frozen=True)
+class PreparedTrainingGroup:
+    key: tuple
+    samples: tuple
+    group_sizes: tuple
+    spec: object
+    payload: dict  # Retain the object-store owner through all optimizer updates.
 
-    identity = [
+    @property
+    def positions(self):
+        return sum(b["_speco_position_count"] for b in self.samples)
+
+
+def _training_payload_identity(samples, tensors, spec):
+    # Include the small conditioning tensors, never the large hidden features.
+    identity = (
+        samples,
+        asdict(spec),
         [
-            r.sample_id,
-            r.trunk_ids,
-            r.response_start,
-            [
-                (
-                    b.branch_id,
-                    b.anchor,
-                    b.token_ids,
-                    b.source,
-                    b.accepted_count,
-                    b.verified_count,
-                )
-                for b in r.branches
-            ],
-            [(i, signature(name)) for i, name in sorted(features.items())],
-            [(bid, signature(name)) for bid, name in branches],
-        ]
-        for r, features, branches in samples
-    ]
+            (
+                name,
+                tuple(value.shape),
+                str(value.dtype),
+                None
+                if name.endswith(("/hidden_states", "/target_last_hidden_states"))
+                else value.tolist(),
+            )
+            for name, value in sorted(tensors.items())
+        ],
+    )
     return hashlib.sha256(
         json.dumps(identity, separators=(",", ":")).encode()
     ).hexdigest()
 
 
-def encode_training_payload(samples):
-    """No torch.Tensor is pickled by value; bf16 travels as lossless NumPy bytes."""
+def encode_training_payload(samples, spec):
     tensors, metadata = {}, []
-
-    def store(name, tensor):
-        if tensor.device.type != "cpu":
-            raise ValueError(
-                "SpecOPD training transport requires independent CPU scores"
-            )
-        tensors[name] = tensor.detach().contiguous()
-        return name
-
-    for index, (request, scores) in enumerate(samples):
-        if scores.sample_id != request.sample_id:
-            raise ValueError("SpecOPD training transport sample identity mismatch")
-        end = max(b.anchor for b in request.branches) + 1
-        features = {
-            i: store(f"{index}/f/{i}", value[:end])
-            for i, value in scores.trunk_features.items()
-        }
-        branches = [
-            (b.branch_id, store(f"{index}/b/{j}/h", b.target_hidden))
-            for j, b in enumerate(scores.branches)
-        ]
-        metadata.append((request, features, branches))
+    for index, batch in enumerate(samples):
+        metadata.append(
+            {key: value for key, value in batch.items() if not torch.is_tensor(value)}
+        )
+        tensors.update(
+            {
+                f"{index}/{key}": value.detach().contiguous()
+                for key, value in batch.items()
+                if torch.is_tensor(value)
+            }
+        )
     wire = encode_cpu_tensors(tensors)
     if wire is None:
         raise ValueError("SpecOPD training tensors cannot use the CPU wire format")
-    payload = {
-        "samples": metadata,
-        "tensors": wire,
-        "identity": _training_payload_identity(metadata, tensors),
-    }
-    return payload, tensor_payload_bytes(tensors)
+    return dict(
+        samples=metadata,
+        tensors=wire,
+        spec=spec,
+        identity=_training_payload_identity(metadata, tensors, spec),
+    ), tensor_payload_bytes(tensors)
 
 
 def decode_training_payload(payload):
     tensors = decode_cpu_tensors(payload["tensors"])
-    samples = payload["samples"]
-    if _training_payload_identity(samples, tensors) != payload["identity"]:
+    if (
+        _training_payload_identity(payload["samples"], tensors, payload["spec"])
+        != payload["identity"]
+    ):
         raise ValueError("SpecOPD staged training payload identity mismatch")
-    return tuple(
-        (
-            request,
-            JointScores(
-                request.sample_id,
-                torch.empty(0),
-                tuple(
-                    BranchScores(bid, None, None, tensors[name])
-                    for bid, name in branches
-                ),
-                {i: tensors[name] for i, name in features.items()},
-            ),
-        )
-        for request, features, branches in samples
-    )
+    samples = [dict(fields) for fields in payload["samples"]]
+    for name, value in tensors.items():
+        index, key = name.split("/", 1)
+        samples[int(index)][key] = value
+    return tuple(samples)
 
 
 def preparation_key(step, revision, feature_indices):
     return int(step), int(revision), tuple(feature_indices)
 
 
-async def stage_training_group(
-    worker, payload_refs, step, revision, feature_indices, *, spec=None
-):
+async def stage_training_group(worker, payload_refs, step, revision, feature_indices):
     """CPU-only readiness RPC: never enter HCCL while peers deserialize data."""
     key = preparation_key(step, revision, feature_indices)
     if key in getattr(worker, "_specopd_cancelled_prepares", set()):
@@ -128,37 +110,23 @@ async def stage_training_group(
     reference = payload_refs[0]
     payload = reference if isinstance(reference, dict) else await reference
     samples = decode_training_payload(payload)
-    from verl_speco.specopd_config import SpecOPDConfig
     from verl_speco.backends.specopd_forward import plan_specopd_training_groups
-    from verl_speco.integration.specopd_collectives import training_schedule_digest
 
-    spec = spec or SpecOPDConfig()
-    policy = (
-        spec.optimizer_updates_per_collection,
-        spec.min_scored_positions_per_update,
-        spec.training_microbatch_trajectories,
-        spec.training_microbatch_token_budget,
-    )
-    if tuple(payload.get("policy", policy)) != policy:
-        raise RuntimeError("SpecOPD preparation policy differs from the driver")
-    selected = [(r, s) for r, s in samples if r.branches]
+    spec = payload["spec"]
+    if not spec.enable:
+        raise RuntimeError("SpecOPD preparation contains a disabled training policy")
+    spec.validate()
     groups = plan_specopd_training_groups(
-        selected,
+        samples,
         worker.trainer._get_dp_world_size(),
         spec.training_microbatch_trajectories,
         spec.training_microbatch_token_budget,
     )
-    schedule = training_schedule_digest(
-        worker.trainer,
-        step=step,
-        payload_identity=payload["identity"],
-        spec=spec,
-        feature_indices=feature_indices,
-        group_sizes=groups,
-    )
     if key in getattr(worker, "_specopd_cancelled_prepares", set()):
         raise RuntimeError("SpecOPD preparation was cancelled during data transfer")
-    worker._specopd_prepared_group = (key, samples, payload)
+    worker._specopd_prepared_group = PreparedTrainingGroup(
+        key, samples, tuple(groups), spec, payload
+    )
     sp, dp = worker.trainer._get_sp_world_size(), worker.trainer._get_dp_world_size()
     elapsed = time.perf_counter() - started
     logger.warning(
@@ -174,7 +142,7 @@ async def stage_training_group(
         "revision": int(revision),
         "features": tuple(feature_indices),
         "identity": payload["identity"],
-        "schedule": schedule,
+        "groups": tuple(groups),
         "samples": len(samples),
         "sp": sp,
         "dp": dp,
@@ -184,10 +152,10 @@ async def stage_training_group(
 
 def take_training_group(worker, step, revision, feature_indices):
     staged = getattr(worker, "_specopd_prepared_group", None)
-    if staged is None or staged[0] != preparation_key(step, revision, feature_indices):
+    if staged is None or staged.key != preparation_key(step, revision, feature_indices):
         raise RuntimeError("SpecOPD training has no matching prepared input group")
     worker._specopd_prepared_group = None
-    return staged[1]
+    return staged
 
 
 def discard_training_group(worker, step, revision, feature_indices):
@@ -200,7 +168,7 @@ def discard_training_group(worker, step, revision, feature_indices):
     if len(cancelled) > 16:
         cancelled.remove(min(cancelled))
     staged = getattr(worker, "_specopd_prepared_group", None)
-    if staged is not None and staged[0] == key:
+    if staged is not None and staged.key == key:
         worker._specopd_prepared_group = None
     return True
 
@@ -214,37 +182,32 @@ def validate_prepared_group(
     expected = active[0]["sp"] * active[0]["dp"]
     if len(active) != expected or len({s["rank"] for s in active}) != expected:
         raise RuntimeError("SpecOPD not all training ranks prepared their inputs")
-    for s in active:
-        if (
-            s["step"] != step
-            or s["revision"] != revision
-            or tuple(s["features"]) != tuple(feature_indices)
-            or s["identity"] != identity
-            or s["schedule"] != active[0]["schedule"]
-            or s["samples"] != samples
-            or s["sp"] != active[0]["sp"]
-            or s["dp"] != active[0]["dp"]
-        ):
-            raise RuntimeError("SpecOPD ranks prepared inconsistent input plans")
+    expected_plan = dict(
+        step=step,
+        revision=revision,
+        identity=identity,
+        samples=samples,
+        groups=active[0]["groups"],
+        sp=active[0]["sp"],
+        dp=active[0]["dp"],
+    )
+    if any(
+        tuple(s["features"]) != tuple(feature_indices)
+        or any(s[key] != value for key, value in expected_plan.items())
+        for s in active
+    ):
+        raise RuntimeError("SpecOPD ranks prepared inconsistent input plans")
     return active
 
 
 def dispatch_prepared_group(
-    trainer, samples, step, revision, feature_indices, metrics, spec=None
+    trainer, samples, step, revision, feature_indices, metrics, spec
 ):
     import ray
 
-    samples = tuple((r, s) for r, s in samples if r.branches)
     group = trainer._require_speco_worker_group()
     started = time.perf_counter()
-    payload, size = encode_training_payload(samples)
-    if spec is not None:
-        payload["policy"] = (
-            spec.optimizer_updates_per_collection,
-            spec.min_scored_positions_per_update,
-            spec.training_microbatch_trajectories,
-            spec.training_microbatch_token_budget,
-        )
+    payload, size = encode_training_payload(samples, spec)
     reference = ray.put(payload)
     metrics["timing_s/specopd_transport_encode"] = time.perf_counter() - started
     metrics["specopd/transport_tensor_bytes"] = size

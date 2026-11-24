@@ -19,7 +19,6 @@ worker result, so async scheduler placeholders never become training tokens.
 """
 
 from functools import wraps
-import time
 
 from verl_speco.integration.specopd_protocol import (
     PLAN_KEY,
@@ -29,10 +28,7 @@ from verl_speco.integration.specopd_protocol import (
     token_digest,
     record_dict,
     encode_bundle,
-    decode_bundle,
 )
-
-_COMPLETED: dict[str, tuple[str, float]] = {}
 
 
 def patch_draft_token_request_tracking(runner):
@@ -81,21 +77,6 @@ def install_specopd_draft_token_transport_patch():
 
     patch_draft_token_request_tracking(GPUModelRunner)
     return patch_result_transport(GPUModelRunner)
-
-
-def stage_completed(request_id, wire):
-    now = time.monotonic()
-    for key, (_, timestamp) in list(_COMPLETED.items()):
-        if now - timestamp > 300:
-            _COMPLETED.pop(key, None)
-    if len(_COMPLETED) >= 4096:
-        raise RuntimeError("SpecOPD completed request transport is not being drained")
-    _COMPLETED[str(request_id)] = (wire, now)
-
-
-def pop_completed(request_id):
-    item = _COMPLETED.pop(str(request_id), None)
-    return item[0] if item else None
 
 
 def _plan(request):
@@ -222,14 +203,14 @@ def capture_scheduler_round(scheduler_output, model_output, snapshots):
 def install_specopd_vllm_patch():
     """Install idempotent wrappers; disabled requests keep upstream behavior."""
     from vllm.v1.core.sched.scheduler import Scheduler
-    from vllm.v1.engine.output_processor import OutputProcessor, RequestState
+    from verl_speco.integration.vllm_runtime import patch_vllm_request_acceptance_stats
 
     if getattr(Scheduler, "_specopd_capture_installed", False):
         return True
+    if not patch_vllm_request_acceptance_stats():
+        raise RuntimeError("SpecOPD requires the request-output metadata transport")
     schedule = Scheduler.schedule
     update = Scheduler.update_from_output
-    process = OutputProcessor.process_outputs
-    make_output = RequestState.make_request_output
 
     @wraps(schedule)
     def scheduled(self, *args, **kwargs):
@@ -300,25 +281,6 @@ def install_specopd_vllm_patch():
                     output.trace_headers = headers
         return results
 
-    @wraps(process)
-    def processed(self, engine_core_outputs, *args, **kwargs):
-        for output in engine_core_outputs:
-            wire = (getattr(output, "trace_headers", None) or {}).get(TRACE_KEY)
-            state = getattr(self, "request_states", {}).get(output.request_id)
-            if wire is not None and state is not None:
-                state._specopd_wire = (decode_bundle(wire)["request_id"], wire)
-        return process(self, engine_core_outputs, *args, **kwargs)
-
-    @wraps(make_output)
-    def made(self, *args, **kwargs):
-        output = make_output(self, *args, **kwargs)
-        completed = getattr(self, "_specopd_wire", None)
-        if output is not None and completed is not None:
-            stage_completed(*completed)
-            del self._specopd_wire
-        return output
-
     Scheduler.schedule, Scheduler.update_from_output = scheduled, updated
-    OutputProcessor.process_outputs, RequestState.make_request_output = processed, made
     Scheduler._specopd_capture_installed = True
     return True

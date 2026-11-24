@@ -95,7 +95,6 @@ def test_v1_native_trunk_scores_disjoint_keys(monkeypatch, branch_indices, calcu
 
     from verl_speco.integration import specopd_driver
     from verl_speco.joint_scoring import DraftBranch, JointScores, JointScoringRequest
-    from verl_speco.trainer.scheduler import SpecOPDCycle
 
     monkeypatch.setenv("VERL_SPECO_V1_NATIVE_TRUNK_OLD_LOGPROB", "1")
     keys = ["a", "b", "c", "d"]
@@ -191,7 +190,7 @@ def test_v1_native_trunk_scores_disjoint_keys(monkeypatch, branch_indices, calcu
         for req in reversed(batch):
             i = keys.index(req.sample_id)
             entries.append(JointScores(req.sample_id, log_probs[i], (), {}, entropies[i] if calculate_entropy else None))
-        return entries, dict(model_forward_calls=1, logical_rows=16, independent_rows=16)
+        return [(entries, dict(model_forward_calls=1, logical_rows=16, independent_rows=16))]
 
     trainer = SimpleNamespace(
         _speco_v1_batch_data=lambda batch: (Fields(response_mask=masks), padded),
@@ -210,14 +209,16 @@ def test_v1_native_trunk_scores_disjoint_keys(monkeypatch, branch_indices, calcu
         )),
     )
     value = object.__new__(specopd_driver.SpecOPDDriver)
-    value.trainer, value.metrics, value.cycle = trainer, {}, SpecOPDCycle()
+    value.trainer, value.metrics = trainer, {}
+    value.actor_revision = value.drafter_revision = 0
     value._acknowledged_actor_revision, value._bound_actor_revision = 7, False
     value.scoring_sp_size = 1
     value.spec = SimpleNamespace(
         scoring_token_budget=64, max_dense_mask_elements=1024, microbatch_trajectories=4,
         temperature=0.6, score_target_logz=False,
     )
-    value.cycle.begin(5)
+    value.state, value.step, value.pending = "collecting", 5, None
+    monkeypatch.setattr(specopd_driver, "build_specopd_training_batch", lambda req, *args: {"_specopd_request_id": req.sample_id})
     monkeypatch.setattr(specopd_adapter, "driver", lambda trainer: value)
 
     metrics = {}
@@ -230,7 +231,8 @@ def test_v1_native_trunk_scores_disjoint_keys(monkeypatch, branch_indices, calcu
         dict(keys=["temporary-pad"], partition_id="train") if len(trunk_keys) % 2 else None
     )
     assert batch.keys == keys and batch.extra_info == {"temperature": 0.6}
-    assert [req.sample_id for req, _ in value.cycle.begin_update()] == branch_keys
+    assert value.state == "scored"
+    assert [b["_specopd_request_id"] for b in value.pending] == branch_keys
     for actual, expected in zip(calls["put"]["old_log_probs"], log_probs, strict=True):
         torch.testing.assert_close(actual, expected)
     masked_entropy = sum((entropy * mask).sum().item() for entropy, mask in zip(entropies, masks, strict=True))
