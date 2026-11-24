@@ -258,6 +258,13 @@ def validate_specopd_config(config):
         return spec
     if (training.get("drafter_opd") or {}).get("enable", False):
         raise ValueError("Enable only one of SpecOPD and Draft-OPD")
+    if (
+        str(training.get("dspark_per_position_loss_weight", "")).strip().lower()
+        == "vat"
+    ):
+        raise ValueError(
+            "SpecOPD cannot be combined with VAT; choose only one training objective"
+        )
     # Reject unsupported features before initializing model workers.
     for path in (
         "actor_rollout_ref.rollout.drafter.training.target_lm_head_row_restricted_sync",

@@ -137,6 +137,17 @@ def test_v1_sync_config_requires_one_publication_per_group():
         validate_specopd_config(cfg)
 
 
+@pytest.mark.parametrize("weight", ["vat", " VAT "])
+def test_specopd_rejects_vat_without_restricting_baseline(weight):
+    cfg = config()
+    training = cfg["actor_rollout_ref"]["rollout"]["drafter"]["training"]
+    training["dspark_per_position_loss_weight"] = weight
+    with pytest.raises(ValueError, match="SpecOPD.*VAT"):
+        validate_specopd_config(cfg)
+    training["specopd"]["enable"] = False
+    assert not validate_specopd_config(cfg).enable
+
+
 def capture(raw=(11, 12, 13, 14, 15, 16, 17), generated=(11, 20), offset=0, verified=2):
     plan = make_window(SpecOPDConfig(), "r", 2, 3, 3, 1000)
     request = SimpleNamespace(

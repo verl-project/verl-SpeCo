@@ -32,6 +32,7 @@ from verl_speco.integration.specopd_protocol import PLAN_KEY, decode_bundle
 @pytest.mark.parametrize("async_scheduling", [False, True])
 @pytest.mark.parametrize("collect", [False, True])
 def test_vllm_scheduler_to_final_output_channel(monkeypatch, async_scheduling, collect):
+    monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV, "{}")
     plan = make_window(SpecOPDConfig(proposal_width=3), "external", 0, 0, 3, 20)
     if not collect:
         plan["max_branches"] = 0
