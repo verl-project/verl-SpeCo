@@ -197,7 +197,6 @@ actor_rollout_ref:
           max_proposal_tokens_per_request: null # Defaults to max_branches_per_request * proposal_width.
           max_collect_samples_per_step: null
           scoring_token_budget: 9216
-          score_target_logz: false
           max_dense_mask_elements: 84934656
           max_wire_bytes: 1048576
           min_scored_positions_per_update: 1

@@ -48,6 +48,7 @@ def test_vllm_scheduler_to_final_output_channel(monkeypatch, async_scheduling, c
         def __init__(self):
             self.requests = {"internal": request}
             self.scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
+            self.use_v2_model_runner = async_scheduling
 
         def schedule(self):
             request.spec_token_ids = []
@@ -115,6 +116,44 @@ def test_vllm_scheduler_to_final_output_channel(monkeypatch, async_scheduling, c
         assert bundle["records"][0]["proposal_ids"] == [11, 12, 13]
     assert not vllm_runtime._pop_vllm_request_stats_for_rollout_output("external")[0]
     assert not getattr(scheduler, "_specopd_schedules", {})
+
+
+@pytest.mark.parametrize("enabled,async_scheduling,v2", [
+    (True, True, False), (True, True, True), (True, False, False), (False, True, False),
+])
+def test_startup_checks_effective_runner_before_scheduling(monkeypatch, enabled, async_scheduling, v2):
+    monkeypatch.setenv(vllm_runtime.SPECO_DRAFTER_CONFIG_ENV,
+                       '{"training":{"specopd":{"enable":' + str(enabled).lower() + '}}}')
+    calls = []
+
+    class Scheduler:
+        def __init__(self):
+            self.scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
+            self.use_v2_model_runner = v2
+            self.requests = {}
+
+        def schedule(self):
+            calls.append("schedule")
+
+        def update_from_output(self, *args):
+            return {}
+
+    module = ModuleType("vllm.v1.core.sched.scheduler")
+    module.Scheduler = Scheduler
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(vllm_runtime, "patch_vllm_request_acceptance_stats", lambda: True)
+    # An importable/installed MRV2 hook does not select the engine's runner.
+    monkeypatch.setattr(specopd_vllm, "install_specopd_draft_token_transport_patch", lambda: True)
+    assert specopd_vllm.install_specopd_draft_token_transport_patch()
+    assert specopd_vllm.install_specopd_vllm_patch()
+    assert specopd_vllm.install_specopd_vllm_patch()  # idempotent
+    if enabled and async_scheduling and not v2:
+        with pytest.raises(RuntimeError, match="active MRV2"):
+            Scheduler()
+        assert not calls
+    else:
+        Scheduler().schedule()
+        assert calls == ["schedule"]
 
 
 def configuration():

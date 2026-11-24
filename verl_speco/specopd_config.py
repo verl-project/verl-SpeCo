@@ -28,7 +28,6 @@ class SpecOPDConfig:
     max_proposal_tokens_per_request: int = 56
     max_collect_samples_per_step: int | None = None
     scoring_token_budget: int = 9216
-    score_target_logz: bool = False
     max_dense_mask_elements: int = 84934656
     max_wire_bytes: int = 1048576
     min_scored_positions_per_update: int = 1
@@ -208,8 +207,6 @@ class SpecOPDConfig:
             raise ValueError(
                 "SpecOPD training_input_cache_mib must be a nonnegative integer"
             )
-        if type(self.score_target_logz) is not bool:
-            raise ValueError("SpecOPD score_target_logz must be a boolean")
         if not math.isfinite(self.temperature) or self.temperature <= 0:
             raise ValueError("SpecOPD temperature must be finite and positive")
         if self.objective not in {"e2e_tv", "tv", "l1"}:

@@ -209,8 +209,25 @@ def install_specopd_vllm_patch():
         return True
     if not patch_vllm_request_acceptance_stats():
         raise RuntimeError("SpecOPD requires the request-output metadata transport")
+    initialize = Scheduler.__init__
     schedule = Scheduler.schedule
     update = Scheduler.update_from_output
+
+    @wraps(initialize)
+    def initialized(self, *args, **kwargs):
+        initialize(self, *args, **kwargs)
+        from verl_speco.specopd_config import spec_opd_enabled
+        from verl_speco.integration.vllm_runtime import _load_env_drafter_config
+
+        if (
+            getattr(self.scheduler_config, "async_scheduling", False)
+            and not getattr(self, "use_v2_model_runner", False)
+            and spec_opd_enabled(_load_env_drafter_config().get("training", {}))
+        ):
+            raise RuntimeError(
+                "SpecOPD async scheduling requires the active MRV2 model runner; "
+                "enable VLLM_USE_V2_MODEL_RUNNER=1 or disable async scheduling"
+            )
 
     @wraps(schedule)
     def scheduled(self, *args, **kwargs):
@@ -281,6 +298,7 @@ def install_specopd_vllm_patch():
                     output.trace_headers = headers
         return results
 
+    Scheduler.__init__ = initialized
     Scheduler.schedule, Scheduler.update_from_output = scheduled, updated
     Scheduler._specopd_capture_installed = True
     return True

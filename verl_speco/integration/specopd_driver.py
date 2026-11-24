@@ -311,7 +311,7 @@ class SpecOPDDriver:
                 hidden_state_indices=self.feature_indices,
                 calculate_entropy=calculate_entropy,
                 return_target_logits=False,
-                return_target_logz=self.spec.score_target_logz,
+                return_target_logz=False,
                 capture_empty_trunk_features=False,
                 trunk_feature_prefix_only=True,
                 max_packed_tokens=self.spec.scoring_token_budget,

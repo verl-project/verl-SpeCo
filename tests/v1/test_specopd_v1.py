@@ -185,6 +185,7 @@ def test_v1_native_trunk_scores_disjoint_keys(monkeypatch, branch_indices, calcu
 
     def score_joint(batch, **options):
         assert options["actor_temperature"] == 0.6 and options["calculate_entropy"] == calculate_entropy
+        assert options["return_target_logz"] is False
         calls["joint"] = [req.sample_id for req in batch]
         entries = []
         for req in reversed(batch):
@@ -215,7 +216,7 @@ def test_v1_native_trunk_scores_disjoint_keys(monkeypatch, branch_indices, calcu
     value.scoring_sp_size = 1
     value.spec = SimpleNamespace(
         scoring_token_budget=64, max_dense_mask_elements=1024, microbatch_trajectories=4,
-        temperature=0.6, score_target_logz=False,
+        temperature=0.6,
     )
     value.state, value.step, value.pending = "collecting", 5, None
     monkeypatch.setattr(specopd_driver, "build_specopd_training_batch", lambda req, *args: {"_specopd_request_id": req.sample_id})
