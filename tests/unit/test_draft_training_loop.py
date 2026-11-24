@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from standalone_test_utils import collect_gloo_workers, gloo_process_group
 
 torch = pytest.importorskip("torch")
 
@@ -655,12 +656,8 @@ def test_owned_node_dispatch_preserves_reference_until_training_finishes(monkeyp
 
 
 def _retention_settings_gloo_worker(rank, port, mode, results):
-    from datetime import timedelta
-    import torch.distributed as dist
     from verl_speco.trainer.draft_training_loop import _validate_checkpoint_retention_across_ranks
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2,
-                            timeout=timedelta(seconds=20))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=20):
         settings = (2, bool(rank) if mode == "mismatch" else True,
                     False if mode == "invalid" and rank == 1 else True)
         try:
@@ -668,37 +665,14 @@ def _retention_settings_gloo_worker(rank, port, mode, results):
             results.put((rank, "ok"))
         except ValueError as exc:
             results.put((rank, str(exc)))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 @pytest.mark.parametrize("mode", ["same", "mismatch", "invalid"])
 def test_retention_settings_agree_on_all_ranks(mode):
-    import multiprocessing
-    import socket
-    ctx = multiprocessing.get_context("spawn")
-    results = ctx.Queue()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    processes = [ctx.Process(target=_retention_settings_gloo_worker, args=(rank, port, mode, results))
-                 for rank in range(2)]
-    for process in processes:
-        process.start()
-    try:
-        rows = [results.get(timeout=30) for _ in processes]
-        assert {rank for rank, _ in rows} == {0, 1}
-        assert all((result == "ok") if mode == "same" else ("must agree" in result) for _, result in rows)
-        for process in processes:
-            process.join(timeout=10)
-        assert all(process.exitcode == 0 for process in processes)
-    finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
-        results.close()
+    rows = collect_gloo_workers(_retention_settings_gloo_worker,
+        lambda rank, port, results: (rank, port, mode, results), timeout=30)
+    assert all((result == "ok") if mode == "same" else ("must agree" in result) for _, result in rows)
 
 
 def test_token_metrics_window_aggregates_steps_and_preserves_selected_metrics(monkeypatch):
@@ -2088,60 +2062,31 @@ def test_reference_step_stages_once_and_preserves_backend_hidden_source():
 
 def _device_budget_gloo_worker(rank, port, oversized, results):
     import asyncio
-    import datetime
     import torch
-    import torch.distributed as dist
     from types import SimpleNamespace
     from verl_speco.trainer.draft_training_loop import _reference_training_step_across_ranks
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2,
-                            timeout=datetime.timedelta(seconds=25))
-    calls = []
-    async def train(batch, step, **kwargs):
-        calls.append("train")
-        return True
-    trainer = SimpleNamespace(_stage_standalone_cpu_batch=lambda batch: (calls.append("stage") or dict(batch)),
-                              training_step_from_batch=train)
-    batch = {"hidden_source": "standalone_vllm_reference",
-             "hidden_states": torch.zeros(64 if oversized and rank == 1 else 4)}
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=25):
+        calls = []
+        async def train(batch, step, **kwargs):
+            calls.append("train")
+            return True
+        trainer = SimpleNamespace(_stage_standalone_cpu_batch=lambda batch: (calls.append("stage") or dict(batch)),
+                                  training_step_from_batch=train)
+        batch = {"hidden_source": "standalone_vllm_reference",
+                 "hidden_states": torch.zeros(64 if oversized and rank == 1 else 4)}
         try:
             asyncio.run(_reference_training_step_across_ranks(
                 trainer, batch, 0, device=torch.device("cpu"), max_device_bytes=128))
             results.put((rank, "ok", calls))
         except RuntimeError as exc:
             results.put((rank, str(exc), calls))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("oversized", [False, True])
 def test_reference_device_budget_two_gloo_ranks(oversized):
-    import multiprocessing
-    import socket
-    import torch.distributed as dist
-    if not dist.is_gloo_available():
-        pytest.skip("Gloo is unavailable")
-    ctx = multiprocessing.get_context("spawn")
-    results = ctx.Queue()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    processes = [ctx.Process(target=_device_budget_gloo_worker, args=(rank, port, oversized, results))
-                 for rank in range(2)]
-    for process in processes:
-        process.start()
-    try:
-        rows = [results.get(timeout=60) for _ in processes]
-        for process in processes:
-            process.join(timeout=20)
-        assert all(process.exitcode == 0 for process in processes)
-        assert {row[0] for row in rows} == {0, 1}
-        if oversized:
-            assert all("device byte budget" in row[1] and not row[2] for row in rows)
-        else:
-            assert all(row[1] == "ok" and row[2] == ["stage", "train"] for row in rows)
-    finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
+    rows = collect_gloo_workers(_device_budget_gloo_worker,
+        lambda rank, port, results: (rank, port, oversized, results), timeout=60, join_timeout=20)
+    if oversized:
+        assert all("device byte budget" in row[1] and not row[2] for row in rows)
+    else:
+        assert all(row[1] == "ok" and row[2] == ["stage", "train"] for row in rows)

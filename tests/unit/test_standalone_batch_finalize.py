@@ -7,37 +7,14 @@ from queue import Queue
 from threading import Event, Thread, get_ident
 from types import SimpleNamespace
 
+from standalone_test_utils import (
+    collect_gloo_workers, dspark_reference_backend, gloo_process_group, gloo_workers, join_workers, make_cpu_trainer,
+)
+
 import pytest
 import torch
 
 from verl_speco.trainer.standalone_batch_finalize import AsyncBatchFinalizer
-
-
-def _collect_gloo_workers(target, arguments, *, timeout=45):
-    import multiprocessing
-    import socket
-    context = multiprocessing.get_context("spawn")
-    results = context.Queue()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    processes = [context.Process(target=target, args=arguments(rank, port, results)) for rank in range(2)]
-    started = []
-    try:
-        for process in processes:
-            process.start()
-            started.append(process)
-        rows = [results.get(timeout=timeout) for _ in processes]
-        for process in processes:
-            process.join(timeout=10)
-        assert all(process.exitcode == 0 for process in processes)
-        return rows
-    finally:
-        for process in started:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
-        results.close()
 
 
 def _complete_function():
@@ -426,13 +403,8 @@ def test_multinode_cleanup_refuses_uninitialized_group():
 
 def _gloo_cleanup_worker(rank, port, proceed, ready, cleaned):
     import torch.distributed as dist
-    from datetime import timedelta
 
-    dist.init_process_group(
-        "gloo", init_method=f"tcp://127.0.0.1:{port}",
-        rank=rank, world_size=2, timeout=timedelta(seconds=20),
-    )
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=20):
         complete = _complete_function()
         complete.__globals__["dist"] = dist
         loader = SimpleNamespace(clear_completed_batch=lambda keys: cleaned.set())
@@ -462,50 +434,34 @@ def _gloo_cleanup_worker(rank, port, proceed, ready, cleaned):
         ready.put((rank, run["tokens/run_source"], run["perf/run_checkpoint_blocking_time"],
                    run["tokens/run_source_per_second"], run["tokens/run_window_train_input_positions"],
                    run["tokens/run_window_statistics_input_positions"]))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 def test_real_two_process_group_waits_before_reference_cleanup():
     import multiprocessing
-    import socket
 
     context = multiprocessing.get_context("spawn")
     proceed, cleaned, ready = context.Event(), context.Event(), context.Queue()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    processes = [context.Process(target=_gloo_cleanup_worker,
-                                 args=(rank, port, proceed, ready, cleaned))
-                 for rank in range(2)]
-    for process in processes:
-        process.start()
     try:
-        assert {ready.get(timeout=20), ready.get(timeout=20)} == {0, 1}
-        assert not cleaned.wait(0.5)
-        proceed.set()
-        for process in processes:
-            process.join(timeout=20)
-        assert all(process.exitcode == 0 for process in processes)
-        assert cleaned.is_set()
-        metrics = [ready.get(timeout=5), ready.get(timeout=5)]
-        assert {row[:3] for row in metrics} == {(0, 30.0, 4.0), (1, 30.0, 4.0)}
-        assert metrics[0][3:] == metrics[1][3:]
-        assert 14.0 < metrics[0][3] <= 15.0
-        assert 19.0 < metrics[0][4] <= 20.0
-        assert metrics[0][5] == 0.5
-        assert metrics[0][6:] == (25.0, 7.0)
-        run_metrics = [ready.get(timeout=5), ready.get(timeout=5)]
-        assert {row[:3] for row in run_metrics} == {(0, 30.0, 1.0), (1, 30.0, 1.0)}
-        assert run_metrics[0][3] == run_metrics[1][3]
-        assert run_metrics[0][4:] == run_metrics[1][4:] == (25.0, 7.0)
+        with gloo_workers(context, _gloo_cleanup_worker,
+                          lambda rank, port: (rank, port, proceed, ready, cleaned), release=proceed) as processes:
+            assert {ready.get(timeout=20), ready.get(timeout=20)} == {0, 1}
+            assert not cleaned.wait(0.5)
+            proceed.set()
+            join_workers(processes, 20)
+            assert cleaned.is_set()
+            metrics = [ready.get(timeout=5), ready.get(timeout=5)]
+            assert {row[:3] for row in metrics} == {(0, 30.0, 4.0), (1, 30.0, 4.0)}
+            assert metrics[0][3:] == metrics[1][3:]
+            assert 14.0 < metrics[0][3] <= 15.0
+            assert 19.0 < metrics[0][4] <= 20.0
+            assert metrics[0][5] == 0.5
+            assert metrics[0][6:] == (25.0, 7.0)
+            run_metrics = [ready.get(timeout=5), ready.get(timeout=5)]
+            assert {row[:3] for row in run_metrics} == {(0, 30.0, 1.0), (1, 30.0, 1.0)}
+            assert run_metrics[0][3] == run_metrics[1][3]
+            assert run_metrics[0][4:] == run_metrics[1][4:] == (25.0, 7.0)
     finally:
-        proceed.set()
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
         ready.close()
 
 
@@ -533,38 +489,16 @@ def test_file_ack_retries_transport_without_repeating_metadata_release():
 
 def _gloo_uneven_training_worker(rank, port, results, empty_rank, combine):
     import asyncio
-    from contextlib import nullcontext
-    from datetime import timedelta
-    import torch.distributed as dist
     import verl_speco.trainer.base_trainer as trainer_module
-    from verl_speco.trainer.base_trainer import DrafterBaseTrainer
 
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         trainer_module.device_name = "cpu"
         model = torch.nn.Linear(1, 1, bias=False)
         with torch.no_grad():
             model.weight.zero_()
         model = torch.nn.parallel.DistributedDataParallel(model)
-        trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
-        trainer.model = model
-        trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-        trainer.lr_scheduler = None
-        trainer.optimizer_steps_total = 0
-        trainer.training_steps = 0
-        trainer._standalone_validate_grad_graph = True
+        trainer = make_cpu_trainer(model, lr=0.1, distributed=True)
         trainer.combine_standalone_metrics = combine
-        trainer._training_metric_sums, trainer._training_metric_steps = {}, 0
-        trainer.record_training_timing = lambda *args: None
-        trainer._ulysses_group_context = nullcontext
-        trainer._record_dflash_training_metrics = lambda losses: {}
-        trainer._clip_training_grad_norm = lambda: torch.tensor(0.0)
-        trainer._is_checkpoint_leader = lambda: False
-        def reduce_statistics(values):
-            dist.all_reduce(values)
-            return values, 2
-        trainer._reduce_loss_statistics = reduce_statistics
         def compute_loss(model, batch, pad):
             prediction = model(batch["x"])
             loss = ((prediction.float() - batch["y"]) ** 2).sum()
@@ -587,15 +521,13 @@ def _gloo_uneven_training_worker(rank, port, results, empty_rank, combine):
             results.put((rank, "no graph"))
         else:
             results.put((rank, float(model.module.weight.item())))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 @pytest.mark.parametrize("empty_rank", [False, True])
 @pytest.mark.parametrize("combine", [False, True])
 def test_uneven_rank_tail_uses_global_token_weighted_gradient(empty_rank, combine):
-    values = dict(_collect_gloo_workers(_gloo_uneven_training_worker,
+    values = dict(collect_gloo_workers(_gloo_uneven_training_worker,
         lambda rank, port, results: (rank, port, results, empty_rank, combine), timeout=40))
     if empty_rank:
         assert values == {0: "no graph", 1: "no graph"}
@@ -606,36 +538,14 @@ def test_uneven_rank_tail_uses_global_token_weighted_gradient(empty_rank, combin
 
 def _gloo_reference_parts_worker(rank, port, results, mode):
     import asyncio
-    from contextlib import nullcontext
-    from datetime import timedelta
-    import torch.distributed as dist
     import verl_speco.trainer.base_trainer as trainer_module
-    from verl_speco.trainer.base_trainer import DrafterBaseTrainer
     from verl_speco.trainer.draft_training_loop import _reference_training_parts_across_ranks
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2,
-                            timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         trainer_module.device_name = "cpu"
         model = torch.nn.Linear(1, 1, bias=False)
         with torch.no_grad(): model.weight.zero_()
         model = torch.nn.parallel.DistributedDataParallel(model)
-        trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
-        trainer.model, trainer.runtime_device = model, torch.device("cpu")
-        trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-        trainer.lr_scheduler = None
-        trainer.optimizer_steps_total = trainer.training_steps = 0
-        trainer._standalone_validate_grad_graph = True
-        trainer.combine_standalone_metrics = False
-        trainer._training_metric_sums, trainer._training_metric_steps = {}, 0
-        trainer.record_training_timing = lambda *args: None
-        trainer._ulysses_group_context = nullcontext
-        trainer._record_dflash_training_metrics = lambda losses: {}
-        trainer._clip_training_grad_norm = lambda: torch.tensor(0.0)
-        trainer._is_checkpoint_leader = lambda: False
-        def reduce_statistics(values):
-            dist.all_reduce(values)
-            return values, 2
-        trainer._reduce_loss_statistics = reduce_statistics
+        trainer = make_cpu_trainer(model, lr=0.1, distributed=True)
         def compute_loss(module, batch, pad):
             loss = (((module(batch["x"]).float() - batch["y"]) ** 2) * batch["mask"]).sum()
             if mode == "zero_missing_graph" and rank == 1:
@@ -678,15 +588,13 @@ def _gloo_reference_parts_worker(rank, port, results, mode):
             result = str(exc)
         results.put((rank, result, trainer.optimizer_steps_total, float(model.module.weight.item()),
                      all(parameter.grad is None for parameter in model.parameters())))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 @pytest.mark.parametrize("mode", ["ok", "weighted", "small_weight", "failure", "unequal", "unsupported", "prepass_mismatch",
                                   "zero_first", "zero_last", "all_zero", "zero_missing_graph"])
 def test_reference_parts_one_optimizer_step_and_failure_agreement(mode):
-    rows = _collect_gloo_workers(_gloo_reference_parts_worker,
+    rows = collect_gloo_workers(_gloo_reference_parts_worker,
         lambda rank, port, results: (rank, port, results, mode))
     assert {row[0] for row in rows} == {0, 1}
     for _, result, steps, weight, gradients_cleared in rows:
@@ -705,16 +613,12 @@ def _gloo_real_reference_parts_worker(rank, port, results, mode, strategy):
     import asyncio
     from contextlib import nullcontext
     from copy import deepcopy
-    from datetime import timedelta
     import torch.distributed as dist
     import verl_speco.trainer.base_trainer as trainer_module
-    from verl_speco.trainer.base_trainer import DrafterBaseTrainer
     from verl_speco.trainer.draft_training_loop import _reference_training_parts_across_ranks
-    from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend, DSparkTrainingModel
+    from verl_speco.backends.dspark_trainer_backend import DSparkTrainingModel
     from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2,
-                            timeout=timedelta(seconds=45))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=45):
         torch.manual_seed(912)
         trainer_module.device_name = "cpu"
         if mode.startswith("dpace_zero"):
@@ -775,12 +679,7 @@ def _gloo_real_reference_parts_worker(rank, port, results, mode, strategy):
             if mode.startswith("sampled_parts"):
                 batch["preselected_restricted_vocab"] = sampled_vocab
             return batch
-        backend = DSparkTrainerBackend.__new__(DSparkTrainerBackend)
-        backend.target_lm_head = SimpleNamespace(fc=SimpleNamespace(weight=head))
-        backend.config = SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(training={
-            "mode": "offline", "feature_store": {"type": "ray_reference"},
-            "transfer_queue": {"expected_feature": {"payload_kind": "vllm_reference"}},
-        })))
+        backend = dspark_reference_backend(head)
         selected = ([3, 9] if rank == 0 else [6]) if adaptive else [3, 6, 9]
         original = make_batch(0, 12, selected, [True] * len(selected))
         original.pop("preselected_restricted_vocab", None)
@@ -810,23 +709,7 @@ def _gloo_real_reference_parts_worker(rank, port, results, mode, strategy):
             fully_shard(model, mesh=init_device_mesh("cpu", (2,)))
         else:
             model = torch.nn.parallel.DistributedDataParallel(raw, find_unused_parameters=True)
-        trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
-        trainer.model, trainer.runtime_device = model, torch.device("cpu")
-        trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-        trainer.lr_scheduler = None
-        trainer.optimizer_steps_total = trainer.training_steps = 0
-        trainer._standalone_validate_grad_graph = True
-        trainer.combine_standalone_metrics = False
-        trainer._training_metric_sums, trainer._training_metric_steps = {}, 0
-        trainer.record_training_timing = lambda *args: None
-        trainer._ulysses_group_context = nullcontext
-        trainer._record_dflash_training_metrics = lambda losses: {}
-        trainer._clip_training_grad_norm = lambda: torch.tensor(0.0)
-        trainer._is_checkpoint_leader = lambda: False
-        def reduce_statistics(values):
-            dist.all_reduce(values)
-            return values, 2
-        trainer._reduce_loss_statistics = reduce_statistics
+        trainer = make_cpu_trainer(model, lr=0.1, distributed=True)
         trainer.backend = backend
         if adaptive:
             trainer._stage_standalone_cpu_batch = lambda batch: batch
@@ -867,8 +750,6 @@ def _gloo_real_reference_parts_worker(rank, port, results, mode, strategy):
                 value = a.detach().full_tensor() if hasattr(a, "full_tensor") else a.detach()
                 differences.append(float((value - b.detach()).abs().max()))
         results.put((rank, trainer.optimizer_steps_total, max(differences)))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
@@ -888,7 +769,7 @@ def _gloo_real_reference_parts_worker(rank, port, results, mode, strategy):
                                            ("fsdp2", "sampled_parts_aux"), ("ddp", "dpace_zero"),
                                            ("fsdp1", "dpace_zero_aux"), ("fsdp2", "dpace_zero_aux")])
 def test_real_reference_parts_match_full_batch_optimizer_step(mode, strategy):
-    rows = _collect_gloo_workers(_gloo_real_reference_parts_worker,
+    rows = collect_gloo_workers(_gloo_real_reference_parts_worker,
         lambda rank, port, results: (rank, port, results, mode, strategy), timeout=60)
     assert {rank for rank, _, _ in rows} == {0, 1}
     if mode in {"valid", "adaptive", "confidence", "dpace", "dpace_aux", "restricted", "restricted_aux",
@@ -899,13 +780,10 @@ def test_real_reference_parts_match_full_batch_optimizer_step(mode, strategy):
 
 
 def _gloo_fsdp_gradient_clip_worker(rank, port, results, strategy):
-    from datetime import timedelta
     import torch.distributed as dist
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
     from verl_speco.trainer.base_trainer import DrafterBaseTrainer
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2,
-                            timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         if strategy == "fsdp1":
             model = FSDP(torch.nn.Linear(4, 1, bias=False), use_orig_params=True, device_id=torch.device("cpu"))
         else:
@@ -931,14 +809,12 @@ def _gloo_fsdp_gradient_clip_worker(rank, port, results, strategy):
         reported = float(clipped_norm)
         after = global_grad_norm()
         results.put((rank, before, reported, after))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 @pytest.mark.parametrize("strategy", ["fsdp1", "fsdp2"])
 def test_standalone_fsdp_gradient_clipping_uses_global_norm(strategy):
-    rows = _collect_gloo_workers(_gloo_fsdp_gradient_clip_worker,
+    rows = collect_gloo_workers(_gloo_fsdp_gradient_clip_worker,
         lambda rank, port, results: (rank, port, results, strategy))
     assert {rank for rank, _, _, _ in rows} == {0, 1}
     for _, before, reported, after in rows:
@@ -948,14 +824,10 @@ def test_standalone_fsdp_gradient_clipping_uses_global_norm(strategy):
 
 
 def _gloo_reference_agreement_worker(rank, port, mode, results):
-    from datetime import timedelta
-    import torch.distributed as dist
     from verl_speco.trainer.draft_training_loop import _next_batch_across_ranks
     from verl_speco.trainer.tq_sample_source import TQLocalBatch
 
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         token = f"dispatch-{rank}" if mode == "identity" else "dispatch"
         batch = TQLocalBatch([], [], [], prepared_batch={"input_ids": torch.ones(1)},
                              plan_id=1, receipt_token=token)
@@ -965,15 +837,13 @@ def _gloo_reference_agreement_worker(rank, port, mode, results):
             results.put((rank, "ok"))
         except RuntimeError as exc:
             results.put((rank, str(exc)))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 @pytest.mark.parametrize("mode,expected", [("match", "ok"), ("identity", "dispatch identity differs"),
                                            ("exhaust", "exhausted inconsistently")])
 def test_real_two_rank_reference_readiness_agreement(mode, expected):
-    outputs = _collect_gloo_workers(_gloo_reference_agreement_worker,
+    outputs = collect_gloo_workers(_gloo_reference_agreement_worker,
         lambda rank, port, results: (rank, port, mode, results), timeout=40)
     assert {rank for rank, _ in outputs} == {0, 1}
     assert all(expected in message for _, message in outputs)
@@ -981,14 +851,10 @@ def test_real_two_rank_reference_readiness_agreement(mode, expected):
 
 def _gloo_checkpoint_publish_worker(rank, port, marker, entered, proceed, results, fail_rank, wait):
     from concurrent.futures import Future
-    from datetime import timedelta
     import json
-    import torch.distributed as dist
     import verl_speco.trainer.draft_training_loop as loop
 
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         class Trainer:
             _pending_full_checkpoint_future = None
             _standalone_export_error = None
@@ -1013,8 +879,6 @@ def _gloo_checkpoint_publish_worker(rank, port, marker, entered, proceed, result
             results.put((rank, "ok"))
         except RuntimeError as exc:
             results.put((rank, str(exc)))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
@@ -1022,45 +886,29 @@ def _gloo_checkpoint_publish_worker(rank, port, marker, entered, proceed, result
 def test_real_two_rank_checkpoint_publication_waits_for_all(tmp_path, fail_rank, wait):
     import json
     import multiprocessing
-    import socket
 
     context = multiprocessing.get_context("spawn")
     marker = str(tmp_path / "metadata.json")
     entered, proceed, results = context.Event(), context.Event(), context.Queue()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    processes = [context.Process(target=_gloo_checkpoint_publish_worker,
-        args=(rank, port, marker, entered, proceed, results, fail_rank, wait)) for rank in range(2)]
-    for process in processes:
-        process.start()
     try:
-        assert entered.wait(30)
-        assert json.loads(Path(marker).read_text(encoding="utf-8"))["complete"] is False
-        proceed.set()
-        outcomes = [results.get(timeout=30) for _ in processes]
-        assert {rank for rank, _ in outcomes} == {0, 1}
-        assert all(("save failed" in value) if fail_rank else value == "ok" for _, value in outcomes)
-        assert json.loads(Path(marker).read_text(encoding="utf-8"))["complete"] is (not fail_rank)
-        for process in processes:
-            process.join(timeout=10)
-        assert all(process.exitcode == 0 for process in processes)
+        with gloo_workers(context, _gloo_checkpoint_publish_worker,
+                          lambda rank, port: (rank, port, marker, entered, proceed, results, fail_rank, wait), release=proceed) as processes:
+            assert entered.wait(30)
+            assert json.loads(Path(marker).read_text(encoding="utf-8"))["complete"] is False
+            proceed.set()
+            outcomes = [results.get(timeout=30) for _ in processes]
+            assert {rank for rank, _ in outcomes} == {0, 1}
+            assert all(("save failed" in value) if fail_rank else value == "ok" for _, value in outcomes)
+            assert json.loads(Path(marker).read_text(encoding="utf-8"))["complete"] is (not fail_rank)
+            join_workers(processes, 10)
     finally:
-        proceed.set()
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
         results.close()
 
 
 def _gloo_directory_lease_worker(rank, port, directory, mode, results):
-    from datetime import timedelta
     import torch.distributed as dist
     from verl_speco.trainer.draft_training_loop import _acquire_checkpoint_directory_across_ranks
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         path = directory if mode != "not_shared" or rank == 0 else directory + "-missing"
         try:
             lease = _acquire_checkpoint_directory_across_ranks(
@@ -1075,14 +923,12 @@ def _gloo_directory_lease_worker(rank, port, directory, mode, results):
         except (RuntimeError, ValueError):
             assert mode != "shared"
             results.put((rank, "rejected"))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 @pytest.mark.parametrize("mode", ["shared", "not_shared", "different_setting"])
 def test_checkpoint_directory_ownership_agrees_across_ranks(tmp_path, mode):
-    outputs = _collect_gloo_workers(_gloo_directory_lease_worker,
+    outputs = collect_gloo_workers(_gloo_directory_lease_worker,
         lambda rank, port, results: (rank, port, str(tmp_path), mode, results))
     assert set(outputs) == {(0, "ok" if mode == "shared" else "rejected"),
                             (1, "ok" if mode == "shared" else "rejected")}
@@ -1090,12 +936,8 @@ def test_checkpoint_directory_ownership_agrees_across_ranks(tmp_path, mode):
 
 
 def _gloo_input_binding_worker(rank, port, source, results):
-    from datetime import timedelta
-    import torch.distributed as dist
     import verl_speco.trainer.draft_training_loop as loop
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         identity = loop._input_identity_across_ranks(source if rank == 0 else source + ".missing", 2)
         assert loop._input_identity_across_ranks(source + ".missing", 2) is None
         if rank == 0:
@@ -1120,27 +962,21 @@ def _gloo_input_binding_worker(rank, port, source, results):
             loop._next_batch_across_ranks(iter([batch]), rank=rank, device=torch.device("cpu"),
                                          require_prepared=True, expected_input_identity=identity)
         results.put((rank, identity))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 def test_input_identity_and_failure_are_broadcast_to_all_ranks(tmp_path):
     source = tmp_path / "input.jsonl"
     source.write_bytes(b"input\n")
-    gathered = _collect_gloo_workers(_gloo_input_binding_worker,
+    gathered = collect_gloo_workers(_gloo_input_binding_worker,
         lambda rank, port, results: (rank, port, str(source), results))
     assert {rank for rank, _ in gathered} == {0, 1}
     assert gathered[0][1] == gathered[1][1] and gathered[0][1]["kind"] == "file"
 
 
 def _gloo_nonzero_checkpoint_writer_worker(rank, port, results):
-    from datetime import timedelta
-    import torch.distributed as dist
     import verl_speco.trainer.draft_training_loop as loop
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         finalized = []
         class Trainer:
             _standalone_export_error = None
@@ -1176,13 +1012,11 @@ def _gloo_nonzero_checkpoint_writer_worker(rank, port, results):
         finally:
             loop.torch.empty = original_empty
         results.put((rank, finalized))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 def test_nonzero_checkpoint_writer_receives_rank_zero_progress():
-    outputs = _collect_gloo_workers(_gloo_nonzero_checkpoint_writer_worker,
+    outputs = collect_gloo_workers(_gloo_nonzero_checkpoint_writer_worker,
         lambda rank, port, results: (rank, port, results))
     assert dict(outputs) == {0: [], 1: [0, 65539]}
 
@@ -1252,7 +1086,6 @@ def _gloo_real_checkpoint_worker(rank, port, directory, source, release, publica
 def test_real_dcp_checkpoint_publication_and_recovery(tmp_path, fail_rank):
     import json
     import multiprocessing
-    import socket
     from verl_speco.trainer.checkpoint import is_pretrained_drafter_checkpoint, verify_standalone_checkpoint_integrity
     from verl_speco.trainer.standalone_resume import load_standalone_resume
 
@@ -1261,51 +1094,35 @@ def test_real_dcp_checkpoint_publication_and_recovery(tmp_path, fail_rank):
     checkpoint = tmp_path / "draft_step_1"
     context = multiprocessing.get_context("spawn")
     publication, release, results = context.Queue(), context.Event(), context.Queue()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    processes = [context.Process(target=_gloo_real_checkpoint_worker,
-        args=(rank, port, str(tmp_path), str(source), release, publication, results, fail_rank)) for rank in range(2)]
-    for process in processes:
-        process.start()
     try:
-        error = publication.get(timeout=40)
-        assert error is None, error
-        assert json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))["complete"] is False
-        release.set()
-        outputs = [results.get(timeout=40) for _ in processes]
-        assert {rank for rank, _ in outputs} == {0, 1}
-        if fail_rank:
-            assert all("save failed" in value for _, value in outputs)
-            assert not is_pretrained_drafter_checkpoint(checkpoint)
-            assert not (checkpoint / "standalone_resume.json").exists()
-        else:
-            assert {value for _, value in outputs} == {7}
-            assert is_pretrained_drafter_checkpoint(checkpoint)
-            assert verify_standalone_checkpoint_integrity(checkpoint, require_optimizer_layout=True)
-            assert load_standalone_resume(checkpoint, input_path=source)[0] == {0, 2}
-        for process in processes:
-            process.join(timeout=10)
-        assert all(process.exitcode == 0 for process in processes)
+        with gloo_workers(context, _gloo_real_checkpoint_worker,
+                          lambda rank, port: (rank, port, str(tmp_path), str(source), release, publication, results, fail_rank), release=release) as processes:
+            error = publication.get(timeout=40)
+            assert error is None, error
+            assert json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))["complete"] is False
+            release.set()
+            outputs = [results.get(timeout=40) for _ in processes]
+            assert {rank for rank, _ in outputs} == {0, 1}
+            if fail_rank:
+                assert all("save failed" in value for _, value in outputs)
+                assert not is_pretrained_drafter_checkpoint(checkpoint)
+                assert not (checkpoint / "standalone_resume.json").exists()
+            else:
+                assert {value for _, value in outputs} == {7}
+                assert is_pretrained_drafter_checkpoint(checkpoint)
+                assert verify_standalone_checkpoint_integrity(checkpoint, require_optimizer_layout=True)
+                assert load_standalone_resume(checkpoint, input_path=source)[0] == {0, 2}
+            join_workers(processes, 10)
     finally:
-        release.set()
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
         publication.close()
         results.close()
 
 
 def _gloo_materialization_ack_worker(rank, port, fail_send, events, results):
-    from datetime import timedelta
-    import torch.distributed as dist
     from verl_speco.trainer.draft_training_loop import _ack_reference_materialization_across_ranks, _next_batch_across_ranks
     from verl_speco.trainer.tq_sample_source import TQLocalBatch
 
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         class Events:
             def put(self, event):
                 if fail_send:
@@ -1320,29 +1137,19 @@ def _gloo_materialization_ack_worker(rank, port, fail_send, events, results):
             results.put((rank, "ready for training"))
         except RuntimeError as exc:
             results.put((rank, str(exc)))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 @pytest.mark.parametrize("fail_send", [False, True])
 def test_real_two_rank_materialization_acknowledgement(fail_send):
     import multiprocessing
-    import socket
     from queue import Empty
 
     context = multiprocessing.get_context("spawn")
-    events, results = context.Queue(), context.Queue()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    processes = [context.Process(target=_gloo_materialization_ack_worker,
-        args=(rank, port, fail_send, events, results)) for rank in range(2)]
-    for process in processes:
-        process.start()
+    events = context.Queue()
     try:
-        outputs = [results.get(timeout=40) for _ in processes]
-        assert {rank for rank, _ in outputs} == {0, 1}
+        outputs = collect_gloo_workers(_gloo_materialization_ack_worker,
+            lambda rank, port, results: (rank, port, fail_send, events, results), timeout=40, join_timeout=10)
         if fail_send:
             assert all("acknowledgement failed" in value for _, value in outputs)
             with pytest.raises(Empty):
@@ -1351,27 +1158,15 @@ def test_real_two_rank_materialization_acknowledgement(fail_send):
             assert all(value == "ready for training" for _, value in outputs)
             assert events.get(timeout=5) == {"kind": "training_materialized", "plan_id": 2,
                                               "receipt_token": "dispatch"}
-        for process in processes:
-            process.join(timeout=10)
-        assert all(process.exitcode == 0 for process in processes)
     finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
         events.close()
-        results.close()
 
 
 def _gloo_reference_step_worker(rank, port, source, failure, results):
     import asyncio
-    from datetime import timedelta
-    import torch.distributed as dist
     from verl_speco.trainer.draft_training_loop import _reference_training_step_across_ranks
 
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         model = torch.nn.parallel.DistributedDataParallel(torch.nn.Linear(1, 1, bias=False))
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         class Trainer:
@@ -1394,8 +1189,6 @@ def _gloo_reference_step_worker(rank, port, source, failure, results):
             results.put((rank, "committed"))
         except RuntimeError as exc:
             results.put((rank, str(exc)))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
@@ -1403,7 +1196,7 @@ def _gloo_reference_step_worker(rank, port, source, failure, results):
 def test_real_two_rank_reference_step_gates_release(tmp_path, failure):
     source = tmp_path / "reference"
     source.write_bytes(b"payload")
-    outputs = _collect_gloo_workers(_gloo_reference_step_worker,
+    outputs = collect_gloo_workers(_gloo_reference_step_worker,
         lambda rank, port, results: (rank, port, str(source), failure, results), timeout=40)
     assert {rank for rank, _ in outputs} == {0, 1}
     if failure == "none":
@@ -1416,42 +1209,38 @@ def test_real_two_rank_reference_step_gates_release(tmp_path, failure):
 
 
 def _gloo_commit_gate_worker(rank, port, failure, results):
-    from datetime import timedelta
-    import torch.distributed as dist
     from verl_speco.trainer.draft_training_loop import _drain_batch_finalizer_across_ranks
 
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    finalizer = AsyncBatchFinalizer(1) if rank == 0 else None
-    release = Event()
-    try:
-        if finalizer is not None:
-            def finish_previous():
-                if failure == "timeout":
-                    assert release.wait(10)
-                elif failure:
-                    raise OSError("injected finalization failure")
-            finalizer.submit(finish_previous)
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
+        finalizer = AsyncBatchFinalizer(1) if rank == 0 else None
+        release = Event()
         try:
-            _drain_batch_finalizer_across_ranks(finalizer, torch.device("cpu"),
-                                                timeout=0.1 if failure == "timeout" else 5)
-            results.put((rank, "next step allowed"))
-        except RuntimeError as exc:
-            results.put((rank, str(exc)))
-    finally:
-        if finalizer is not None:
-            release.set()
+            if finalizer is not None:
+                def finish_previous():
+                    if failure == "timeout":
+                        assert release.wait(10)
+                    elif failure:
+                        raise OSError("injected finalization failure")
+                finalizer.submit(finish_previous)
             try:
-                finalizer.close()
-            except OSError:
-                pass
-        dist.destroy_process_group()
+                _drain_batch_finalizer_across_ranks(finalizer, torch.device("cpu"),
+                                                    timeout=0.1 if failure == "timeout" else 5)
+                results.put((rank, "next step allowed"))
+            except RuntimeError as exc:
+                results.put((rank, str(exc)))
+        finally:
+            if finalizer is not None:
+                release.set()
+                try:
+                    finalizer.close()
+                except OSError:
+                    pass
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 @pytest.mark.parametrize("failure", [False, True, "timeout"])
 def test_real_two_rank_previous_finalization_gates_next_step(failure):
-    outputs = _collect_gloo_workers(_gloo_commit_gate_worker,
+    outputs = collect_gloo_workers(_gloo_commit_gate_worker,
         lambda rank, port, results: (rank, port, failure, results), timeout=40)
     assert {rank for rank, _ in outputs} == {0, 1}
     if failure:
@@ -1461,26 +1250,20 @@ def test_real_two_rank_previous_finalization_gates_next_step(failure):
 
 
 def _gloo_checkpoint_timeout_worker(rank, port, results):
-    from datetime import timedelta
-    import torch.distributed as dist
     from verl_speco.trainer.draft_training_loop import _sync_standalone_export_error
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    trainer = SimpleNamespace(_standalone_finalization_event=Event() if rank == 0 else None,
-                              _standalone_checkpoint_timeout=0.1)
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
+        trainer = SimpleNamespace(_standalone_finalization_event=Event() if rank == 0 else None,
+                                  _standalone_checkpoint_timeout=0.1)
         try:
             _sync_standalone_export_error(trainer, torch.device("cpu"))
             results.put((rank, "unexpected success"))
         except RuntimeError as exc:
             results.put((rank, str(exc)))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 def test_checkpoint_finalization_timeout_stops_both_gloo_ranks():
-    outputs = _collect_gloo_workers(_gloo_checkpoint_timeout_worker,
+    outputs = collect_gloo_workers(_gloo_checkpoint_timeout_worker,
                                      lambda rank, port, results: (rank, port, results), timeout=40)
     assert {rank for rank, _ in outputs} == {0, 1}
     assert all("checkpoint export failed" in value.lower() for _, value in outputs)
@@ -1488,35 +1271,29 @@ def test_checkpoint_finalization_timeout_stops_both_gloo_ranks():
 
 def _gloo_checkpoint_save_timeout_worker(rank, port, results):
     from concurrent.futures import Future
-    from datetime import timedelta
-    import torch.distributed as dist
     from verl_speco.trainer.draft_training_loop import _save_standalone_checkpoint_across_ranks
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    class Trainer:
-        checkpoint_dir = "unused"
-        _pending_full_checkpoint_future = None
-        _standalone_checkpoint_timeout = 0.1
-        def _save_checkpoint_async(self, step):
-            self._pending_full_checkpoint_future = Future()
-            if rank:
-                self._pending_full_checkpoint_future.set_result(None)
-            return self._pending_full_checkpoint_future
-    trainer = Trainer()
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
+        class Trainer:
+            checkpoint_dir = "unused"
+            _pending_full_checkpoint_future = None
+            _standalone_checkpoint_timeout = 0.1
+            def _save_checkpoint_async(self, step):
+                self._pending_full_checkpoint_future = Future()
+                if rank:
+                    self._pending_full_checkpoint_future.set_result(None)
+                return self._pending_full_checkpoint_future
+        trainer = Trainer()
         try:
             _save_standalone_checkpoint_across_ranks(trainer, 1, device=torch.device("cpu"), wait=True)
             results.put((rank, "unexpected success", False))
         except RuntimeError as exc:
             pending = trainer._pending_full_checkpoint_future
             results.put((rank, str(exc), pending is not None and not pending.done()))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 def test_checkpoint_save_timeout_stops_both_gloo_ranks():
-    outputs = _collect_gloo_workers(_gloo_checkpoint_save_timeout_worker,
+    outputs = collect_gloo_workers(_gloo_checkpoint_save_timeout_worker,
                                      lambda rank, port, results: (rank, port, results), timeout=40)
     assert {rank for rank, _, _ in outputs} == {0, 1}
     assert all("save failed on at least one rank" in value for _, value, _ in outputs)

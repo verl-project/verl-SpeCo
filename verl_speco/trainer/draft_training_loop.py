@@ -42,7 +42,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from verl.utils.device import get_device_name, get_torch_device
 
 from verl_speco.backends.factory import build_trainer_backend
-from verl_speco.config import config_int, prefetch_depth
+from verl_speco.config import config_int, prefetch_depth, validate_timeout
 from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.standalone_ray_runtime import put_queue
 from verl_speco.trainer.base_trainer import (
@@ -106,6 +106,20 @@ def _is_out_of_memory_error(error: BaseException) -> bool:
     return error.__class__.__name__ in {"OutOfMemoryError", "CudaOutOfMemoryError"}
 
 
+def _gather_rank_records(local, world_size):
+    if not dist.is_initialized() or world_size <= 1:
+        return [local]
+    records = [None] * world_size
+    dist.all_gather_object(records, local)
+    return records
+
+
+def _require_matching_rank_records(local, world_size, message):
+    records = _gather_rank_records(local, world_size)
+    if any(record.get("error") or record != records[0] for record in records):
+        raise ValueError(f"{message}: {records}")
+
+
 def _verify_rollback_checkpoint_across_ranks(
     training_cfg, model_path, world_size: int
 ) -> None:
@@ -127,11 +141,7 @@ def _verify_rollback_checkpoint_across_ranks(
         local: tuple[str | None, str | None] = (identity, None)
     except Exception as exc:  # noqa: BLE001 - every rank must enter the collective
         local = (None, f"{type(exc).__name__}: {exc}")
-    gathered: list[Any] = [None] * world_size
-    if dist.is_initialized() and world_size > 1:
-        dist.all_gather_object(gathered, local)
-    else:
-        gathered = [local]
+    gathered = _gather_rank_records(local, world_size)
     if (
         any(item[1] is not None for item in gathered)
         or len({item[0] for item in gathered}) != 1
@@ -241,17 +251,7 @@ def _retention_resume_identity_across_ranks(
         local = {"identity": identity}
     except Exception as exc:
         local = {"error": f"{type(exc).__name__}: {exc}"}
-    if dist.is_initialized() and world_size > 1:
-        gathered = [None] * world_size
-        dist.all_gather_object(gathered, local)
-    else:
-        gathered = [local]
-    if any(item.get("error") for item in gathered) or any(
-        item != gathered[0] for item in gathered
-    ):
-        raise ValueError(
-            f"Checkpoint retention inheritance failed across ranks: {gathered}"
-        )
+    _require_matching_rank_records(local, world_size, "Checkpoint retention inheritance failed across ranks")
     return local["identity"]
 
 
@@ -561,17 +561,7 @@ def _standalone_recipe_across_ranks(training_cfg, target_model_path, world_size)
         "snapshot_max_bytes": snapshot_max_bytes if error is None else None,
         "snapshot_init": snapshot_init if error is None else None,
     }
-    if dist.is_initialized() and world_size > 1:
-        gathered = [None] * world_size
-        dist.all_gather_object(gathered, local)
-    else:
-        gathered = [local]
-    if any(item["error"] for item in gathered) or any(
-        item != gathered[0] for item in gathered
-    ):
-        raise ValueError(
-            f"Standalone recipe differs or failed across ranks: {gathered}"
-        )
+    _require_matching_rank_records(local, world_size, "Standalone recipe differs or failed across ranks")
     return recipe
 
 
@@ -641,17 +631,7 @@ def _load_resume_across_ranks(
         }
     except Exception as exc:  # noqa: BLE001 - all ranks must enter the collective
         local = {"error": f"{type(exc).__name__}: {exc}"}
-    gathered = [None] * world_size
-    if dist.is_initialized() and world_size > 1:
-        dist.all_gather_object(gathered, local)
-    else:
-        gathered = [local]
-    if any(item.get("error") for item in gathered) or any(
-        item != gathered[0] for item in gathered
-    ):
-        raise ValueError(
-            f"Standalone resume differs or failed across ranks: {gathered}"
-        )
+    _require_matching_rank_records(local, world_size, "Standalone resume differs or failed across ranks")
     return consumed, metadata
 
 
@@ -992,25 +972,11 @@ async def _run_standalone_draft_training_async(
         )
     scheduler_cfg = config.speco.draft_training.get("scheduler") or {}
     commit_gate_timeout = scheduler_cfg.get("commit_gate_timeout_seconds", 180)
-    if (
-        isinstance(commit_gate_timeout, bool)
-        or not isinstance(commit_gate_timeout, (int, float))
-        or not math.isfinite(commit_gate_timeout)
-        or commit_gate_timeout <= 0
-    ):
-        raise ValueError("commit_gate_timeout_seconds must be a positive finite number")
+    validate_timeout(commit_gate_timeout, "commit_gate_timeout_seconds")
     checkpoint_timeout = scheduler_cfg.get(
         "checkpoint_finalization_timeout_seconds", 1800
     )
-    if (
-        isinstance(checkpoint_timeout, bool)
-        or not isinstance(checkpoint_timeout, (int, float))
-        or not math.isfinite(checkpoint_timeout)
-        or checkpoint_timeout <= 0
-    ):
-        raise ValueError(
-            "checkpoint_finalization_timeout_seconds must be a positive finite number"
-        )
+    validate_timeout(checkpoint_timeout, "checkpoint_finalization_timeout_seconds")
     producer_options = (
         config.speco.get("standalone_tq_producer")
         if hasattr(config.speco, "get")
@@ -2302,6 +2268,16 @@ def _trainable_snapshot_parameters(model):
     return parameters
 
 
+def _validate_snapshot_byte_limit(max_bytes):
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ValueError("Trainable snapshot max_bytes must be a non-negative integer")
+
+
+def _check_snapshot_size(tensors, max_bytes):
+    if max_bytes and sum(tensor.numel() * tensor.element_size() for tensor in tensors.values()) > max_bytes:
+        raise ValueError("Trainable snapshot exceeds its logical tensor byte limit")
+
+
 def _save_trainable_snapshot_across_ranks(trainer, step, *, device, max_bytes=0):
     """Collect trainable parameters after a committed step and publish on rank zero."""
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -2319,19 +2295,9 @@ def _save_trainable_snapshot_across_ranks(trainer, step, *, device, max_bytes=0)
     try:
         with context:
             try:
-                if type(max_bytes) is not int or max_bytes < 0:
-                    raise ValueError(
-                        "Trainable snapshot max_bytes must be a non-negative integer"
-                    )
+                _validate_snapshot_byte_limit(max_bytes)
                 parameters = _trainable_snapshot_parameters(model)
-                logical_bytes = sum(
-                    parameter.numel() * parameter.element_size()
-                    for parameter in parameters.values()
-                )
-                if max_bytes and logical_bytes > max_bytes:
-                    raise ValueError(
-                        "Trainable snapshot exceeds its logical tensor byte limit"
-                    )
+                _check_snapshot_size(parameters, max_bytes)
             except Exception as exc:  # noqa: BLE001
                 error = exc
             if not _all_ranks_true(error is None, device):
@@ -2343,8 +2309,7 @@ def _save_trainable_snapshot_across_ranks(trainer, step, *, device, max_bytes=0)
                 for name, parameter in sorted(parameters.items())
             ]
             if distributed:
-                schemas = [None] * dist.get_world_size()
-                dist.all_gather_object(schemas, (schema, max_bytes))
+                schemas = _gather_rank_records((schema, max_bytes), dist.get_world_size())
                 if any(item != schemas[0] for item in schemas):
                     raise ValueError(
                         "Trainable snapshot parameter schemas differ across ranks"
@@ -2415,24 +2380,11 @@ def _load_trainable_snapshot_across_ranks(trainer, path, *, device, max_bytes=0)
     try:
         with context:
             try:
-                if type(max_bytes) is not int or max_bytes < 0:
-                    raise ValueError(
-                        "Trainable snapshot max_bytes must be a non-negative integer"
-                    )
+                _validate_snapshot_byte_limit(max_bytes)
                 weights, manifest = read_standalone_trainable_snapshot(
                     path, expected_training_plan=trainer._standalone_training_plan
                 )
-                if (
-                    max_bytes
-                    and sum(
-                        tensor.numel() * tensor.element_size()
-                        for tensor in weights.values()
-                    )
-                    > max_bytes
-                ):
-                    raise ValueError(
-                        "Trainable snapshot exceeds its logical tensor byte limit"
-                    )
+                _check_snapshot_size(weights, max_bytes)
                 parameters = _trainable_snapshot_parameters(model)
                 if set(weights) != set(parameters):
                     raise ValueError("Trainable snapshot parameter names differ")
@@ -2484,11 +2436,8 @@ def _load_trainable_snapshot_across_ranks(trainer, path, *, device, max_bytes=0)
                     "Trainable snapshot validation failed on a rank"
                 ) from error
             if distributed:
-                identities = [None] * dist.get_world_size()
-                dist.all_gather_object(
-                    identities,
-                    (manifest["weights_sha256"], manifest["optimizer_step"], max_bytes),
-                )
+                identity = (manifest["weights_sha256"], manifest["optimizer_step"], max_bytes)
+                identities = _gather_rank_records(identity, dist.get_world_size())
                 if any(item != identities[0] for item in identities):
                     raise ValueError("Trainable snapshot differs across ranks")
             try:

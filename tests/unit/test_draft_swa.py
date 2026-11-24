@@ -16,6 +16,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from standalone_test_utils import collect_gloo_workers, gloo_process_group
 
 torch = pytest.importorskip("torch")
 
@@ -1300,14 +1301,11 @@ def test_zero_supervision_row_has_finite_zero_gradient(algorithm, markov, confid
                              and torch.count_nonzero(gradient) == 0 for gradient in gradients)
 
 
-def _zero_supervision_ddp_worker(rank, rendezvous, algorithm, confidence, strategy, results):
+def _zero_supervision_ddp_worker(rank, port, algorithm, confidence, strategy, results):
     from copy import deepcopy
-    from datetime import timedelta
     import torch.distributed as dist
     torch.set_num_threads(1)
-    dist.init_process_group("gloo", init_method=rendezvous,
-                            rank=rank, world_size=2, timeout=timedelta(seconds=45))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=45):
         torch.manual_seed(17)
         common = dict(hidden_size=8, intermediate_size=16, num_hidden_layers=1,
                       num_attention_heads=2, num_key_value_heads=1, head_dim=4,
@@ -1361,35 +1359,19 @@ def _zero_supervision_ddp_worker(rank, rendezvous, algorithm, confidence, strate
             gradient = parameter.grad.full_tensor() if strategy == "fsdp2" else parameter.grad
             if rank == 0:
                 diffs.append((gradient - ref_parameter.grad).abs().max().item())
-        if rank == 0:
-            results.put(max(diffs, default=0.0))
-    finally:
-        dist.destroy_process_group()
+        results.put((rank, max(diffs, default=0.0)))
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
 @pytest.mark.parametrize("algorithm,confidence", [("dspark", False), ("dspark", True), ("dflash", False)])
 @pytest.mark.parametrize("strategy", ["ddp", "fsdp2"])
-def test_zero_supervision_rank_matches_real_model_reference(tmp_path, algorithm, confidence, strategy):
-    import multiprocessing
-    context = multiprocessing.get_context("spawn")
-    results = context.Queue()
-    rendezvous = (tmp_path / "gloo-rendezvous").as_uri()
-    processes = [context.Process(target=_zero_supervision_ddp_worker,
-                                 args=(rank, rendezvous, algorithm, confidence, strategy, results)) for rank in range(2)]
-    for process in processes:
-        process.start()
-    try:
-        for process in processes:
-            process.join(timeout=60)
-        assert all(process.exitcode == 0 for process in processes)
-        assert results.get(timeout=5) < 1e-5
-    finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
-        results.close()
+def test_zero_supervision_rank_matches_real_model_reference(algorithm, confidence, strategy):
+    rows = collect_gloo_workers(
+        _zero_supervision_ddp_worker,
+        lambda rank, port, results: (rank, port, algorithm, confidence, strategy, results),
+        timeout=60,
+    )
+    assert max(difference for _, difference in rows) < 1e-5
 
 
 def test_dspark_rnn_empty_supervision_preserves_zero_loss():

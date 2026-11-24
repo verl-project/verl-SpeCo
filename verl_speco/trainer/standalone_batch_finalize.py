@@ -9,22 +9,18 @@ never distributed collectives. Failed tasks remain observable until shutdown.
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-import math
 import threading
 import time
+
+from verl_speco.config import validate_timeout
 
 
 class AsyncBatchFinalizer:
     def __init__(self, capacity: int, *, timeout: float | None = None):
         if capacity < 1:
             raise ValueError("Finalization capacity must be positive")
-        if timeout is not None and (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, (int, float))
-            or not math.isfinite(timeout)
-            or timeout <= 0
-        ):
-            raise ValueError("Finalization timeout must be a positive finite number")
+        if timeout is not None:
+            validate_timeout(timeout, "Finalization timeout")
         self.capacity = capacity
         self.timeout = timeout
         self._pending: deque[Future] = deque()
@@ -71,13 +67,8 @@ class AsyncBatchFinalizer:
         self._pending.append(self._executor.submit(self._run, operation))
 
     def drain(self, *, timeout: float | None = None) -> None:
-        if timeout is not None and (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, (int, float))
-            or not math.isfinite(timeout)
-            or timeout <= 0
-        ):
-            raise ValueError("Finalization timeout must be a positive finite number")
+        if timeout is not None:
+            validate_timeout(timeout, "Finalization timeout")
         deadline = None if timeout is None else time.monotonic() + timeout
         while self._pending:
             remaining = (
