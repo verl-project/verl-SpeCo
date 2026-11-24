@@ -623,6 +623,11 @@ def test_preflight_accepts_verl_prompt_parquet(monkeypatch, tmp_path) -> None:
     _preflight_input_file(str(input_path))
 
 
+def test_online_preflight_rejects_input_directory(tmp_path):
+    with pytest.raises(ValueError, match="Training input must be a regular file"):
+        _preflight_input_file(str(tmp_path))
+
+
 def test_preflight_respects_jsonl_line_limit(tmp_path: Path) -> None:
     path = tmp_path / "train.jsonl"
     path.write_text('{"prompt":"question","response":"answer"}\n', encoding="utf-8")
@@ -1373,8 +1378,12 @@ def test_local_cache_command_preserves_logical_model_identity(tmp_path):
     assert commands.local_model_cache == (original.as_posix(), cache.as_posix())
     assert commands.vllm[2:5] == [cache.as_posix(), "--served-model-name", original.as_posix()]
     assert f"speco.standalone_tq_producer.vllm_model={original.as_posix()}" in commands.producer_overrides
-    assert any(item.endswith(json.dumps(original.as_posix())) and "expected_feature.target_model_path=" in item
-               for item in commands.consumer_overrides)
+    target_paths = [
+        json.loads(item.split("=", 1)[1])
+        for item in commands.consumer_overrides
+        if "expected_feature.target_model_path=" in item
+    ]
+    assert target_paths == [original.as_posix()]
 
 
 @pytest.mark.parametrize("endpoint_alive", [False, True])

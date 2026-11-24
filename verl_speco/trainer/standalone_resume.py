@@ -187,22 +187,15 @@ def _write_compressed_sequences(values: torch.Tensor, path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_compressed_sequences(path: Path, metadata: dict[str, Any]) -> set[int]:
-    """Validate checksums, decoded length and strictly increasing int64 values."""
-    import numpy as np
-
+def _validate_compressed_progress(path: Path, metadata: dict[str, Any]) -> int:
     count = metadata.get("consumed_count")
     decoded_bytes = metadata.get("consumed_sequence_decoded_bytes")
-    decoded_sha = metadata.get("consumed_sequence_decoded_sha256")
     if (
         type(count) is not int
         or count < 0
         or count > _MAX_COMPRESSED_ENTRIES
         or type(decoded_bytes) is not int
         or decoded_bytes != count * 8
-        or not isinstance(decoded_sha, str)
-        or len(decoded_sha) != 64
-        or any(character not in "0123456789abcdef" for character in decoded_sha)
     ):
         raise ValueError("Invalid compressed resume progress descriptor")
     if path.is_symlink() or not path.is_file():
@@ -210,6 +203,20 @@ def _read_compressed_sequences(path: Path, metadata: dict[str, Any]) -> set[int]
     encoded_limit = min(_MAX_ENCODED_BYTES, max(4096, decoded_bytes * 2 + 4096))
     if path.stat().st_size > encoded_limit:
         raise ValueError("Compressed resume progress exceeds the encoded byte limit")
+    return count
+
+
+def _read_compressed_sequences(path: Path, metadata: dict[str, Any]) -> set[int]:
+    """Validate checksums, decoded length and strictly increasing int64 values."""
+    import numpy as np
+
+    decoded_sha = metadata.get("consumed_sequence_decoded_sha256")
+    if (
+        not isinstance(decoded_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", decoded_sha) is None
+    ):
+        raise ValueError("Invalid compressed resume progress descriptor")
+    count = _validate_compressed_progress(path, metadata)
     digest = hashlib.sha256()
     consumed: set[int] = set()
     previous = 0
@@ -251,28 +258,20 @@ def build_input_fingerprint(
     include_content_hash: bool = False,
 ) -> dict[str, Any]:
     input_path = Path(path).resolve()
-    if input_path.is_dir() and (input_path / "metadata.json").is_file():
-        fingerprints = {}
-        for name in ("metadata.json", "manifest.jsonl"):
-            digest = hashlib.sha256()
-            with (input_path / name).open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            fingerprints[name] = digest.hexdigest()
+    if input_path.is_dir():
+        if not (input_path / "metadata.json").is_file():
+            raise ValueError(
+                f"Standalone resume input must be a file or a saved_hidden dataset: {input_path}"
+            )
         return {
             "path": str(input_path),
             "format": "standalone_raw_hidden",
             "sampler_version": 1,
-            "files": fingerprints,
+            "files": {
+                name: _file_sha256(input_path / name)
+                for name in ("metadata.json", "manifest.jsonl")
+            },
         }
-    if input_path.is_dir():
-        from verl_speco.producer.sequence_replay import SequenceReplayReader
-
-        reader = SequenceReplayReader(input_path)
-        try:
-            return {"path": str(input_path), "manifest_sha256": reader.manifest_sha256}
-        finally:
-            reader.close()
     stat = input_path.stat()
     fingerprint = {
         "path": str(input_path),
@@ -302,7 +301,6 @@ def input_content_identity(fingerprint: Mapping[str, Any]) -> dict[str, Any]:
     """Return a path-independent identity backed by a complete content digest."""
     if not isinstance(fingerprint, Mapping):
         raise ValueError("Standalone input fingerprint is missing")
-    digest = fingerprint.get("manifest_sha256")
     if fingerprint.get("format") == "standalone_raw_hidden":
         files = fingerprint.get("files")
         if (
@@ -321,8 +319,6 @@ def input_content_identity(fingerprint: Mapping[str, Any]) -> dict[str, Any]:
             json.dumps(dict(files), sort_keys=True).encode()
         ).hexdigest()
         identity: dict[str, Any] = {"kind": "raw_hidden", "sha256": digest}
-    elif digest is not None:
-        identity = {"kind": "replay_manifest", "sha256": digest}
     else:
         digest = fingerprint.get("sha256")
         size = fingerprint.get("size_bytes")
@@ -346,8 +342,6 @@ def validate_input_identity(identity: Any) -> dict[str, Any]:
         reconstructed = input_content_identity(
             {"sha256": identity["sha256"], "size_bytes": identity["size_bytes"]}
         )
-    elif kind == "replay_manifest" and set(identity) == {"kind", "sha256"}:
-        reconstructed = input_content_identity({"manifest_sha256": identity["sha256"]})
     elif kind == "raw_hidden" and set(identity) == {"kind", "sha256"}:
         digest = identity["sha256"]
         if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
@@ -691,24 +685,7 @@ def load_standalone_resume(
         raise ValueError(f"Unsupported compressed resume codec in {metadata_path}")
     tensor_path = checkpoint_dir / tensor_name
     if compressed:
-        count = metadata.get("consumed_count")
-        decoded_bytes = metadata.get("consumed_sequence_decoded_bytes")
-        if (
-            type(count) is not int
-            or count < 0
-            or count > _MAX_COMPRESSED_ENTRIES
-            or type(decoded_bytes) is not int
-            or decoded_bytes != count * 8
-        ):
-            raise ValueError("Invalid compressed resume progress descriptor")
-        if tensor_path.is_symlink() or not tensor_path.is_file():
-            raise ValueError("Compressed resume progress must be a regular file")
-        if tensor_path.stat().st_size > min(
-            _MAX_ENCODED_BYTES, max(4096, decoded_bytes * 2 + 4096)
-        ):
-            raise ValueError(
-                "Compressed resume progress exceeds the encoded byte limit"
-            )
+        _validate_compressed_progress(tensor_path, metadata)
     expected_sha256 = metadata.get("consumed_sequence_sha256")
     if expected_sha256 is not None or version in {
         _COMPRESSED_SCHEMA_VERSION,

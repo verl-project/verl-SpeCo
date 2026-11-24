@@ -1920,14 +1920,8 @@ def _preflight_input_file(
     input_path: str, *, max_jsonl_line_bytes: int | None = None
 ) -> None:
     path = Path(input_path)
-    if path.is_dir():
-        from verl_speco.producer.sequence_replay import SequenceReplayReader
-
-        if not len(SequenceReplayReader(path)):
-            raise ValueError(f"Sequence replay contains no samples: {input_path}")
-        return
     if not path.is_file():
-        raise ValueError(f"Training file does not exist: {input_path}")
+        raise ValueError(f"Training input must be a regular file: {input_path}")
     from verl_speco.producer.input_reader import iter_input_records
 
     try:

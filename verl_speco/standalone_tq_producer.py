@@ -428,10 +428,8 @@ def validate_producer_config(config: Any, *, allow_native: bool = False) -> str:
         raise ValueError(
             "source_proportional_field must be a nonempty field name or null"
         )
-    if source_field is not None and os.path.isdir(
-        str(producer_cfg.get("input_path") or "")
-    ):
-        raise ValueError("source-proportional ordering requires a JSONL input file")
+    if os.path.isdir(str(producer_cfg["input_path"])):
+        raise ValueError("Online standalone training requires an input file")
     if bool(producer_cfg.get("shuffle", False)) or source_field is not None:
         input_path = str(producer_cfg.get("input_path") or "")
         if input_path.lower().endswith((".parquet", ".pq")):
@@ -1052,8 +1050,7 @@ async def run_producer(
             None if resume_metadata is None else resume_metadata.get("optimizer_step"),
         )
 
-        replay_input = os.path.isdir(str(producer_cfg["input_path"]))
-        if tokenizer is None and not replay_input:
+        if tokenizer is None:
             logger.info(
                 "Standalone Producer loading tokenizer path=%s",
                 producer_cfg["tokenizer_path"],
@@ -1275,26 +1272,8 @@ async def run_producer(
             shuffle = bool(producer_cfg.get("shuffle", False))
             shuffle_seed = int(producer_cfg.get("shuffle_seed", 42))
             source_field = producer_cfg.get("source_proportional_field")
-            replay_reader = None
-            if replay_input:
-                from verl_speco.producer.sequence_replay import SequenceReplayReader
-
-                replay_reader = SequenceReplayReader(str(producer_cfg["input_path"]))
-                # Row validation uses compact per-position digests; the temporary
-                # duplicate index is no longer needed during training.
-                replay_reader.close()
-                identity = replay_reader.manifest["identity"]
-                expected = {
-                    "model": str(producer_cfg["target_model_id"]),
-                    "model_revision": str(producer_cfg["target_model_revision"]),
-                    "tokenizer_fingerprint": str(producer_cfg["tokenizer_fingerprint"]),
-                }
-                if any(identity.get(key) != value for key, value in expected.items()):
-                    raise ValueError(
-                        "Sequence replay target or tokenizer identity differs"
-                    )
             shuffled_reader: ShuffledJsonlReader | None = None
-            if (shuffle or source_field is not None) and replay_reader is None:
+            if shuffle or source_field is not None:
                 # Parquet+shuffle is rejected up front in
                 # validate_producer_config; ShuffledInputUnsupportedError here
                 # only fires for Parquet content behind a non-Parquet name.
@@ -1328,10 +1307,7 @@ async def run_producer(
             source_sequence_no = 0
             render_boundary_cfg = producer_cfg.get("render_boundary", {}) or {}
             render_fn = None
-            if (
-                bool(render_boundary_cfg.get("enabled", False))
-                and replay_reader is None
-            ):
+            if bool(render_boundary_cfg.get("enabled", False)):
                 endpoints = list(producer_cfg.get("vllm_endpoints") or [])
                 if not endpoints:
                     raise ValueError(
@@ -1349,25 +1325,7 @@ async def run_producer(
                 scanned_count = 0
                 considered_count = 0
                 produced_count = 0
-                if replay_reader is not None:
-                    from verl_speco.producer.sequence_replay import _sha256
-
-                    if (
-                        _sha256(replay_reader.directory / "manifest.json")
-                        != replay_reader.manifest_sha256
-                    ):
-                        raise ValueError(
-                            "Sequence replay manifest changed during training"
-                        )
-                    order = (
-                        np.random.default_rng(shuffle_seed + epoch).permutation(
-                            len(replay_reader)
-                        )
-                        if shuffle
-                        else None
-                    )
-                    record_iter = replay_reader.iter_rows(order)
-                elif shuffled_reader is not None:
+                if shuffled_reader is not None:
                     # Deterministic per-epoch permutation (seed + epoch), so a
                     # resumed run replays the same order and the consumed
                     # sequence set stays aligned across restarts. Uses the
@@ -1410,26 +1368,9 @@ async def run_producer(
                     # iter_input_records restarts sequence_no at zero on every
                     # pass. TQ keys require a run-global sequence number so a
                     # repeated sample never overwrites an earlier pending copy.
-                    record = (
-                        source_record
-                        if replay_reader is not None
-                        else replace(source_record, sequence_no=sequence_no)
-                    )
-                    sample_id = (
-                        record["sample_id"]
-                        if replay_reader is not None
-                        else record.sample_id
-                    )
+                    record = replace(source_record, sequence_no=sequence_no)
                     try:
-                        if replay_reader is not None:
-                            from verl_speco.producer.sequence_replay import (
-                                prepare_replay_request,
-                            )
-
-                            request = prepare_replay_request(
-                                record, sequence_no=sequence_no, config=producer_cfg
-                            )
-                        elif record.response is None:
+                        if record.response is None:
                             if on_missing_response == "skip":
                                 raise SampleFilteredError(
                                     f"Producer sample {record.sample_id!r} has no "
@@ -1464,7 +1405,7 @@ async def run_producer(
                             "Standalone Producer filtered sample "
                             "sequence_no=%s sample_id=%s filtered=%s reason=%s",
                             sequence_no,
-                            sample_id,
+                            record.sample_id,
                             stats.filtered_count,
                             exc,
                         )
@@ -1500,7 +1441,7 @@ async def run_producer(
 
         requests = iter(iter_requests())
         if producer_cfg.get("source_route_wave_samples", 0):
-            from verl_speco.producer.sequence_replay import iter_source_route_waves
+            from verl_speco.producer.source_routing import iter_source_route_waves
 
             requests = iter_source_route_waves(
                 requests,

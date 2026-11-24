@@ -23,10 +23,11 @@ from typing import Any
 
 import numpy as np
 import pytest
+from standalone_test_utils import NativeCopyTestEngine
 
 torch = pytest.importorskip("torch")
 
-from verl_speco.producer.vllm_feature_client import RawVllmFeature
+from verl_speco.producer.vllm_feature_client import RawVllmFeature, VllmResponse
 from verl_speco.standalone_tq_producer import (
     _drain_pending_samples,
     run_producer,
@@ -414,7 +415,6 @@ def test_run_producer_publishes_samples_then_eos(
 
 
 def test_native_reference_producer_dispatch_and_read_with_injected_source(tmp_path, monkeypatch):
-    import ctypes
     import json
     from queue import Queue
     from types import SimpleNamespace
@@ -423,18 +423,11 @@ def test_native_reference_producer_dispatch_and_read_with_injected_source(tmp_pa
     from verl_speco.standalone_ray_runtime import StandaloneProducerActor
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport
 
-    class Engine:
-        def initialize(self, *args): return 0
-        def register_memory(self, *args): return 0
-        def unregister_memory(self, *args): return 0
-        def transfer_sync_read(self, segment, local, remote, size):
-            ctypes.memmove(local, remote, size)
-            return 0
 
     def make_transport():
         return NativeFeatureTransport(run_id="run-a", generation=1, endpoint="localhost:1234",
                                       metadata_server="metadata", device="cpu", max_bytes=8 * 1024**2,
-                                      max_slots=2, chunk_bytes=2 * 1024**2, engine_factory=Engine)
+                                      max_slots=2, chunk_bytes=2 * 1024**2, engine_factory=NativeCopyTestEngine)
     source, receiver = make_transport(), make_transport()
     input_path = tmp_path / "input.jsonl"
     _write_input(input_path)
@@ -1032,147 +1025,6 @@ def test_run_producer_shuffle_resume_replays_epoch_order(tmp_path: Path, storage
     records = ["sample-1", "sample-2"]
     epoch1 = np.random.default_rng(43).permutation(2)
     assert [tag["sample_id"] for tag in sample_tags] == [records[i] for i in epoch1]
-
-
-def test_producer_trains_from_committed_replay_without_regeneration(tmp_path, target_final_norm, monkeypatch):
-    from verl_speco.producer.sequence_replay import SequenceReplayWriter
-
-    replay_path = tmp_path / "replay"
-    writer = SequenceReplayWriter(
-        replay_path, identity={"model": "/target", "model_revision": "rev-a",
-                               "tokenizer_fingerprint": "sha256:tokenizer"}, segment_rows=1,
-    )
-    for index in range(2):
-        writer.append({"sequence_no": index, "sample_id": f"replay-{index}",
-                       "input_ids": [1, 2, 11, 12, 13], "loss_mask": [0, 0, 1, 1, 1],
-                       "source_metadata": {}})
-    writer.close()
-    config = _config(replay_path)
-    config["speco"]["standalone_tq_producer"]["shuffle"] = True
-    config["speco"]["standalone_tq_producer"]["max_samples"] = 4
-    transport, pool = _Transport(), _Pool(tmp_path)
-    monkeypatch.setattr("verl_speco.standalone_tq_producer._load_tokenizer",
-                        lambda *_: pytest.fail("replay should not tokenize again"))
-    stats = asyncio.run(run_producer(config, transport=transport, client_pool=pool))
-    tags = sorted((tag for tag in transport.records.values() if tag.get("record_type") == "sample"),
-                  key=lambda tag: tag["sequence_no"])
-    assert stats.published_count == 4 and pool.generate_calls == 0
-    assert [tag["sequence_no"] for tag in tags] == [0, 1, 2, 3]
-    assert {tag["sample_id"] for tag in tags[:2]} == {"replay-0", "replay-1"}
-    assert {tag["sample_id"] for tag in tags[2:]} == {"replay-0", "replay-1"}
-
-
-def test_producer_rejects_replay_from_different_target(tmp_path, target_final_norm):
-    from verl_speco.producer.sequence_replay import SequenceReplayWriter
-
-    replay_path = tmp_path / "replay"
-    writer = SequenceReplayWriter(replay_path, identity={"model": "other"}, segment_rows=1)
-    writer.append({"sequence_no": 0, "sample_id": "x", "input_ids": [1, 2, 3, 4, 5],
-                   "loss_mask": [0, 0, 1, 1, 1], "source_metadata": {}})
-    writer.close()
-    with pytest.raises(ValueError, match="target or tokenizer identity differs"):
-        asyncio.run(run_producer(_config(replay_path), transport=_Transport(), client_pool=_Pool(tmp_path)))
-
-
-def test_generate_replay_then_resume_training_without_regeneration(tmp_path, target_final_norm):
-    from verl_speco.producer.sequence_replay import SequenceReplayWriter, generate_sequences
-
-    source = tmp_path / "prompts.jsonl"
-    source.write_text('''{"sample_id":"s1","prompt":"Q1: "}\n{"sample_id":"s2","prompt":"Q2: "}\n''', encoding="utf-8")
-    directory = tmp_path / "replay"
-    identity = {"model": "/target", "model_revision": "rev-a", "tokenizer_fingerprint": "sha256:tokenizer"}
-    writer = SequenceReplayWriter(directory, identity=identity, segment_rows=1)
-    calls = []
-    async def generate(request):
-        calls.append(request.sample_id)
-        return [11, 12, 13]
-    settings = {"generation_max_tokens": 4, "max_sequence_length": 16}
-    assert asyncio.run(generate_sequences(source, writer=writer, tokenizer=_Tokenizer(), generate=generate, config=settings)) == 2
-    writer.close()
-    writer = SequenceReplayWriter(directory, identity=identity)
-    assert asyncio.run(generate_sequences(source, writer=writer, tokenizer=_Tokenizer(), generate=generate, config=settings)) == 0
-    writer.close()
-    assert calls == ["s1", "s2"]
-    checkpoint = tmp_path / "checkpoint"
-    save_standalone_resume(checkpoint, [0, 1], optimizer_step=1, input_path=directory,
-                           producer_shuffle={"shuffle": True, "shuffle_seed": 42})
-    config = _config(directory)
-    producer = config["speco"]["standalone_tq_producer"]
-    producer.update(resume_checkpoint_path=str(checkpoint), shuffle=True, shuffle_seed=42, max_samples=2)
-    transport, pool = _Transport(), _Pool(tmp_path)
-    stats = asyncio.run(run_producer(config, transport=transport, client_pool=pool))
-    tags = sorted((tag for tag in transport.records.values() if tag.get("record_type") == "sample"),
-                  key=lambda tag: tag["sequence_no"])
-    assert stats.published_count == 2 and pool.generate_calls == 0
-    assert [tag["sequence_no"] for tag in tags] == [2, 3]
-    assert {tag["sample_id"] for tag in tags} == {"s1", "s2"}
-
-
-def test_sequence_only_cli_generates_and_reopens_committed_corpus(tmp_path, monkeypatch):
-    import httpx
-    from transformers import AutoTokenizer
-    from verl_speco.producer.sequence_replay import SequenceReplayReader, main
-
-    source = tmp_path / "prompts.jsonl"
-    source.write_text('{"sample_id":"s1","prompt":"Q1: "}\n', encoding="utf-8")
-    directory = tmp_path / "replay"
-    calls = []
-    class Response:
-        def raise_for_status(self):
-            pass
-        def json(self):
-            return {"choices": [{"prompt_token_ids": [1, 2], "token_ids": [11, 12, 13]}]}
-    class Client:
-        def __init__(self, **kwargs):
-            pass
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            pass
-        async def post(self, path, *, json, timeout):
-            calls.append((path, json, timeout))
-            return Response()
-    monkeypatch.setattr(httpx, "AsyncClient", Client)
-    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *a, **k: _Tokenizer())
-    args = ["--input", str(source), "--output", str(directory), "--model", "/target",
-            "--tokenizer", "/target", "--endpoint", "http://localhost:8000/v1",
-            "--temperature", "0.7", "--max-tokens", "4"]
-    assert main(args) == 0
-    row = next(SequenceReplayReader(directory).iter_rows())
-    assert row["input_ids"] == [1, 2, 11, 12, 13] and row["loss_mask"] == [0, 0, 1, 1, 1]
-    assert calls[0][1]["temperature"] == 0.7 and calls[0][1]["return_token_ids"] is True
-    assert main(args) == 0 and len(calls) == 1
-
-
-def test_sequence_generation_rejects_invalid_response_without_publishing(tmp_path):
-    from verl_speco.producer.sequence_replay import SequenceReplayWriter, generate_sequences
-
-    source = tmp_path / "prompt.jsonl"
-    source.write_text('{"sample_id":"s1","prompt":"Q1: "}\n', encoding="utf-8")
-    directory = tmp_path / "replay"
-    writer = SequenceReplayWriter(directory, identity={"model": "v1"}, segment_rows=1)
-    async def invalid(request):
-        return [1] * (request.max_tokens + 1)
-    with pytest.raises(ValueError, match="invalid token IDs"):
-        asyncio.run(generate_sequences(source, writer=writer, tokenizer=_Tokenizer(), generate=invalid,
-                                       config={"generation_max_tokens": 4, "max_sequence_length": 16}))
-    writer.close(commit=False)
-    assert not (directory / "manifest.json").exists()
-
-
-def test_sequence_generation_preserves_existing_response_prefill_boundary(tmp_path):
-    from verl_speco.producer.sequence_replay import SequenceReplayReader, SequenceReplayWriter, generate_sequences
-
-    source = tmp_path / "input.jsonl"
-    source.write_text('{"sample_id":"s1","prompt":"Q1: ","response":"A1"}\n', encoding="utf-8")
-    writer = SequenceReplayWriter(tmp_path / "replay", identity={"model": "v1"}, segment_rows=1)
-    async def unexpected(_):
-        pytest.fail("a row with a response must not call generation")
-    assert asyncio.run(generate_sequences(source, writer=writer, tokenizer=_Tokenizer(),
-                                           generate=unexpected, config={"max_feature_length": 0})) == 1
-    writer.close()
-    row = next(SequenceReplayReader(tmp_path / "replay").iter_rows())
-    assert row["input_ids"] == [1, 2, 3, 4] and row["prefill_excludes_last"] is False
 
 
 def test_run_producer_shuffle_resume_with_filtered_rows_stays_aligned(
@@ -2335,16 +2187,49 @@ def test_eagle3_filters_short_reference_and_fills_batch_budget(tmp_path, monkeyp
     assert batch["input_ids"].shape == (1, 6)
 
 
-def test_ordered_reference_publication_preserves_input_order_with_bounded_window(tmp_path, monkeypatch):
-    import verl_speco.standalone_tq_producer as producer
-    from verl_speco.producer.vllm_feature_client import VllmResponse
+@pytest.fixture
+def reference_config(monkeypatch):
+    monkeypatch.setattr("verl_speco.standalone_tq_producer._load_target_depth", lambda *args: 32)
+
+    def build(source):
+        config = _config(source)
+        transfer_queue = config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["transfer_queue"]
+        transfer_queue["expected_feature"] = {"payload_kind": "vllm_reference"}
+        return config
+
+    return build
+
+
+def _reference_actor(queue=None, *, batch_size, **limits):
+    from verl_speco.standalone_ray_runtime import StandaloneProducerActor
+
+    return StandaloneProducerActor(
+        {"speco": {"standalone_tq_producer": limits}}, queue, reference_batch_size=batch_size
+    )
+
+
+def _run_slotted_reference_producer(config, actor, tokenizer, pool, *, batch_size):
+    return run_producer(
+        config, tokenizer=tokenizer, client_pool=pool, reference_batch_size=batch_size,
+        on_references=actor._on_references,
+        acquire_reference_slot=actor._acquire_reference_slot,
+        release_unpublished_slot=actor._release_unpublished_slot,
+        transfer_unpublished_slot=actor._transfer_unpublished_slot,
+    )
+
+
+async def _release_reference_batch(actor, batch, plan_id, receipt_token):
+    keys = [entry["key"] for entry in batch["entries"]]
+    await actor.register_dispatch(actor._incarnation, plan_id, receipt_token, keys)
+    await actor.release_references(actor._incarnation, plan_id, receipt_token, keys)
+
+
+def test_ordered_reference_publication_preserves_input_order_with_bounded_window(tmp_path, reference_config):
     source = tmp_path / "input.jsonl"
     _write_input(source)
-    config = _config(source)
+    config = reference_config(source)
     options = config["speco"]["standalone_tq_producer"]
     options.update(deterministic_publication=True, max_ordered_inflight=2, max_samples=4)
-    config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["transfer_queue"]["expected_feature"] = {"payload_kind": "vllm_reference"}
-    monkeypatch.setattr(producer, "_load_target_depth", lambda *args: 32)
     completed, published = [], []
     class Pool(_Pool):
         async def prefill_reference(self, request):
@@ -2376,22 +2261,19 @@ def test_ordered_reference_publication_preserves_input_order_with_bounded_window
 
 
 @pytest.mark.parametrize("published_limit", [0, 2])
-def test_reference_execution_slots_bound_prefill_until_completed_release(tmp_path, monkeypatch, published_limit):
+def test_reference_execution_slots_bound_prefill_until_completed_release(tmp_path, reference_config, published_limit):
     from queue import Queue
-    import verl_speco.standalone_tq_producer as producer
-    from verl_speco.producer.vllm_feature_client import VllmResponse
-    from verl_speco.standalone_ray_runtime import StandaloneProducerActor
     source = tmp_path / "input.jsonl"
     _write_input(source)
-    config = _config(source)
+    config = reference_config(source)
     options = config["speco"]["standalone_tq_producer"]
     options.update(deterministic_publication=True, max_ordered_inflight=2, max_samples=4)
-    config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["transfer_queue"]["expected_feature"] = {"payload_kind": "vllm_reference"}
-    monkeypatch.setattr(producer, "_load_target_depth", lambda *args: 32)
     queue = Queue()
-    actor = StandaloneProducerActor({"speco": {"standalone_tq_producer": {
-        "max_reference_execution_slots": 2, "max_published_references": published_limit}}},
-        queue, reference_batch_size=2)
+    actor = _reference_actor(
+        queue, batch_size=2,
+        max_reference_execution_slots=2,
+        max_published_references=published_limit,
+    )
     requested = []
     class Pool(_Pool):
         async def prefill_reference(self, request):
@@ -2401,45 +2283,39 @@ def test_reference_execution_slots_bound_prefill_until_completed_release(tmp_pat
             path.write_bytes(b"reference")
             return VllmResponse(str(path), "http://vllm:8000/v1")
     async def run():
-        task = asyncio.create_task(run_producer(config, tokenizer=_Tokenizer(), client_pool=Pool(tmp_path),
-            on_references=actor._on_references, reference_batch_size=2,
-            acquire_reference_slot=actor._acquire_reference_slot,
-            release_unpublished_slot=actor._release_unpublished_slot,
-            transfer_unpublished_slot=actor._transfer_unpublished_slot))
+        task = asyncio.create_task(
+            _run_slotted_reference_producer(config, actor, _Tokenizer(), Pool(tmp_path), batch_size=2)
+        )
         first = await asyncio.wait_for(asyncio.to_thread(queue.get, True, 5), 6)
         assert [entry["tag"]["sequence_no"] for entry in first["entries"]] == [0, 1]
         await asyncio.sleep(0.05)
         assert sorted(requested) == [0, 1] and not task.done()
-        await actor.register_dispatch(actor._incarnation, 0, "first", [entry["key"] for entry in first["entries"]])
-        await actor.release_references(actor._incarnation, 0, "first", [entry["key"] for entry in first["entries"]])
+        await _release_reference_batch(actor, first, 0, "first")
         second = await asyncio.wait_for(asyncio.to_thread(queue.get, True, 5), 6)
         assert [entry["tag"]["sequence_no"] for entry in second["entries"]] == [2, 3]
-        await actor.register_dispatch(actor._incarnation, 1, "second", [entry["key"] for entry in second["entries"]])
-        await actor.release_references(actor._incarnation, 1, "second", [entry["key"] for entry in second["entries"]])
+        await _release_reference_batch(actor, second, 1, "second")
         result = await asyncio.wait_for(task, 5)
         assert result.published_count == 4
         assert not actor._execution_pending and not actor._active_references
     asyncio.run(run())
 
 
-def test_reference_file_byte_reservation_covers_prefill_until_completion(tmp_path, monkeypatch):
+def test_reference_file_byte_reservation_covers_prefill_until_completion(tmp_path, reference_config):
     from queue import Queue
     from safetensors.torch import save_file
     import torch
-    import verl_speco.standalone_tq_producer as producer
-    from verl_speco.producer.vllm_feature_client import VllmResponse
-    from verl_speco.standalone_ray_runtime import StandaloneProducerActor
     source = tmp_path / "input.jsonl"
     _write_input(source)
-    config = _config(source)
+    config = reference_config(source)
     config["speco"]["standalone_tq_producer"].update(
         deterministic_publication=True, max_ordered_inflight=2, max_samples=4)
-    config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["transfer_queue"]["expected_feature"] = {"payload_kind": "vllm_reference"}
-    monkeypatch.setattr(producer, "_load_target_depth", lambda *args: 32)
     queue = Queue()
-    actor = StandaloneProducerActor({"speco": {"standalone_tq_producer": {
-        "max_published_file_tensor_bytes": 32, "max_single_file_tensor_bytes": 16,
-        "max_reserved_file_tensor_bytes": 32}}}, queue, reference_batch_size=2)
+    actor = _reference_actor(
+        queue, batch_size=2,
+        max_published_file_tensor_bytes=32,
+        max_single_file_tensor_bytes=16,
+        max_reserved_file_tensor_bytes=32,
+    )
     requested = []
     class Pool(_Pool):
         async def prefill_reference(self, request):
@@ -2448,43 +2324,32 @@ def test_reference_file_byte_reservation_covers_prefill_until_completion(tmp_pat
             save_file({"x": torch.arange(4, dtype=torch.float32)}, str(path))
             return VllmResponse(str(path), "http://vllm:8000/v1")
     async def run():
-        task = asyncio.create_task(run_producer(config, tokenizer=_Tokenizer(), client_pool=Pool(tmp_path),
-            on_references=actor._on_references, reference_batch_size=2,
-            acquire_reference_slot=actor._acquire_reference_slot,
-            release_unpublished_slot=actor._release_unpublished_slot,
-            transfer_unpublished_slot=actor._transfer_unpublished_slot))
+        task = asyncio.create_task(
+            _run_slotted_reference_producer(config, actor, _Tokenizer(), Pool(tmp_path), batch_size=2)
+        )
         first = await asyncio.wait_for(asyncio.to_thread(queue.get, True, 5), 6)
         assert sorted(requested) == [0, 1] and actor._published_file_bytes == 32
         assert not task.done()
-        keys = [entry["key"] for entry in first["entries"]]
-        await actor.register_dispatch(actor._incarnation, 0, "first", keys)
-        await actor.release_references(actor._incarnation, 0, "first", keys)
+        await _release_reference_batch(actor, first, 0, "first")
         second = await asyncio.wait_for(asyncio.to_thread(queue.get, True, 5), 6)
-        keys = [entry["key"] for entry in second["entries"]]
-        await actor.register_dispatch(actor._incarnation, 1, "second", keys)
-        await actor.release_references(actor._incarnation, 1, "second", keys)
+        await _release_reference_batch(actor, second, 1, "second")
         assert (await asyncio.wait_for(task, 5)).published_count == 4
         assert not actor._execution_pending and actor._published_file_bytes == 0
     asyncio.run(run())
 
 
-def test_generation_cleanup_failure_does_not_reuse_execution_slot(tmp_path, monkeypatch):
+def test_generation_cleanup_failure_does_not_reuse_execution_slot(tmp_path, monkeypatch, reference_config):
     from queue import Queue
     import verl_speco.standalone_tq_producer as producer
-    from verl_speco.producer.vllm_feature_client import VllmResponse
-    from verl_speco.standalone_ray_runtime import StandaloneProducerActor
     source = tmp_path / "prompts.jsonl"
     source.write_text(json.dumps({"prompt": [{"role": "user", "content": "Q3"}]}) + "\n", encoding="utf-8")
-    config = _config(source)
+    config = reference_config(source)
     config["speco"]["standalone_tq_producer"].update(max_inflight_requests=1, max_samples=1,
         on_missing_response="generate", min_supervised_tokens=2)
-    config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["transfer_queue"]["expected_feature"] = {"payload_kind": "vllm_reference"}
-    monkeypatch.setattr(producer, "_load_target_depth", lambda *args: 32)
     def fail_cleanup(_):
         raise OSError("generation cleanup failed")
     monkeypatch.setattr(producer, "delete_temporary_result", fail_cleanup)
-    actor = StandaloneProducerActor({"speco": {"standalone_tq_producer": {
-        "max_reference_execution_slots": 1}}}, Queue(), reference_batch_size=1)
+    actor = _reference_actor(Queue(), batch_size=1, max_reference_execution_slots=1)
     prefilled = []
     class Pool(_Pool):
         async def generate_reference(self, request):
@@ -2496,41 +2361,36 @@ def test_generation_cleanup_failure_does_not_reuse_execution_slot(tmp_path, monk
             raise AssertionError("prefill must not run")
     async def run():
         with pytest.raises(OSError, match="generation cleanup failed"):
-            await asyncio.wait_for(run_producer(config, tokenizer=_ChatTokenizer(), client_pool=Pool(tmp_path),
-                on_references=actor._on_references, reference_batch_size=1,
-                acquire_reference_slot=actor._acquire_reference_slot,
-                release_unpublished_slot=actor._release_unpublished_slot,
-                transfer_unpublished_slot=actor._transfer_unpublished_slot), 10)
+            await asyncio.wait_for(_run_slotted_reference_producer(config, actor, _ChatTokenizer(), Pool(tmp_path), batch_size=1), 10)
         assert not prefilled and actor._execution_pending == {0}
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("cleanup_fails", [False, True])
-@pytest.mark.parametrize("ordered", [False, True])
-@pytest.mark.parametrize("execution_slots", [False, True])
+@pytest.mark.parametrize("cleanup_fails,ordered,execution_slots", [
+    (False, False, False), (False, False, True), (False, True, False), (False, True, True),
+    (True, False, True), (True, True, False), (True, True, True),
+])
 @pytest.mark.parametrize("ordered_window", [1, 2])
-def test_filtered_generation_transfers_slot_without_blocking_queued_input(tmp_path, monkeypatch, cleanup_fails, ordered, execution_slots, ordered_window):
-    if cleanup_fails and not execution_slots and not ordered:
-        pytest.skip("Legacy unordered cleanup remains best effort")
+def test_filtered_generation_transfers_slot_without_blocking_queued_input(
+    tmp_path, monkeypatch, reference_config, cleanup_fails, ordered, execution_slots, ordered_window,
+):
     from queue import Queue
     import verl_speco.standalone_tq_producer as producer
-    from verl_speco.producer.vllm_feature_client import VllmResponse
-    from verl_speco.standalone_ray_runtime import StandaloneProducerActor
     source = tmp_path / "prompts.jsonl"
     source.write_text(json.dumps({"prompt": [{"role": "user", "content": "Q3"}]}) + "\n", encoding="utf-8")
-    config = _config(source)
+    config = reference_config(source)
     config["speco"]["standalone_tq_producer"].update(
         max_inflight_requests=1, max_samples=2, on_missing_response="generate", min_supervised_tokens=2,
         deterministic_publication=ordered, max_ordered_inflight=ordered_window)
-    config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["transfer_queue"]["expected_feature"] = {"payload_kind": "vllm_reference"}
-    monkeypatch.setattr(producer, "_load_target_depth", lambda *args: 32)
     if cleanup_fails:
         def fail_cleanup(result):
             raise OSError("injected cleanup failure")
         monkeypatch.setattr(producer, "delete_temporary_result", fail_cleanup)
     queue = Queue()
-    actor = StandaloneProducerActor({"speco": {"standalone_tq_producer": {
-        "max_reference_execution_slots": 2 if execution_slots else 0}}}, queue, reference_batch_size=2)
+    actor = _reference_actor(
+        queue, batch_size=2,
+        max_reference_execution_slots=2 if execution_slots else 0,
+    )
     transfers = []
     class Pool(_Pool):
         async def generate_reference(self, request):
@@ -2572,22 +2432,16 @@ def test_filtered_generation_transfers_slot_without_blocking_queued_input(tmp_pa
     asyncio.run(run())
 
 
-def test_ordered_filter_keeps_order_when_later_request_finishes_first(tmp_path, monkeypatch):
+def test_ordered_filter_keeps_order_when_later_request_finishes_first(tmp_path, reference_config):
     from queue import Queue
-    import verl_speco.standalone_tq_producer as producer
-    from verl_speco.producer.vllm_feature_client import VllmResponse
-    from verl_speco.standalone_ray_runtime import StandaloneProducerActor
     source = tmp_path / "prompt.jsonl"
     source.write_text(json.dumps({"prompt": [{"role": "user", "content": "Q3"}]}) + "\n", encoding="utf-8")
-    config = _config(source)
+    config = reference_config(source)
     config["speco"]["standalone_tq_producer"].update(
         max_inflight_requests=2, max_samples=2, on_missing_response="generate", min_supervised_tokens=2,
         deterministic_publication=True, max_ordered_inflight=2)
-    config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["transfer_queue"]["expected_feature"] = {"payload_kind": "vllm_reference"}
-    monkeypatch.setattr(producer, "_load_target_depth", lambda *args: 32)
     queue = Queue()
-    actor = StandaloneProducerActor({"speco": {"standalone_tq_producer": {
-        "max_reference_execution_slots": 2}}}, queue, reference_batch_size=2)
+    actor = _reference_actor(queue, batch_size=2, max_reference_execution_slots=2)
     completed = []
     class Pool(_Pool):
         async def generate_reference(self, request):
@@ -2603,11 +2457,9 @@ def test_ordered_filter_keeps_order_when_later_request_finishes_first(tmp_path, 
             path.write_bytes(b"reference")
             return VllmResponse(str(path), "http://vllm:8000/v1")
     async def run():
-        result = await asyncio.wait_for(run_producer(config, tokenizer=_ChatTokenizer(), client_pool=Pool(tmp_path),
-            on_references=actor._on_references, reference_batch_size=2,
-            acquire_reference_slot=actor._acquire_reference_slot,
-            release_unpublished_slot=actor._release_unpublished_slot,
-            transfer_unpublished_slot=actor._transfer_unpublished_slot), 10)
+        result = await asyncio.wait_for(
+            _run_slotted_reference_producer(config, actor, _ChatTokenizer(), Pool(tmp_path), batch_size=2), 10
+        )
         entries = queue.get_nowait()["entries"]
         assert result.filtered_count == 1 and result.published_count == 2
         assert completed.index(1) < completed.index(0)
@@ -2617,65 +2469,48 @@ def test_ordered_filter_keeps_order_when_later_request_finishes_first(tmp_path, 
             producer_shuffle={"shuffle": False, "shuffle_seed": 42, "deterministic_publication": True})
         config["speco"]["standalone_tq_producer"].update(resume_checkpoint_path=str(checkpoint), max_samples=1)
         resumed_queue = Queue()
-        resumed = StandaloneProducerActor({"speco": {"standalone_tq_producer": {
-            "max_reference_execution_slots": 2}}}, resumed_queue, reference_batch_size=1)
-        again = await asyncio.wait_for(run_producer(config, tokenizer=_ChatTokenizer(), client_pool=Pool(tmp_path),
-            on_references=resumed._on_references, reference_batch_size=1,
-            acquire_reference_slot=resumed._acquire_reference_slot,
-            release_unpublished_slot=resumed._release_unpublished_slot,
-            transfer_unpublished_slot=resumed._transfer_unpublished_slot), 10)
+        resumed = _reference_actor(resumed_queue, batch_size=1, max_reference_execution_slots=2)
+        again = await asyncio.wait_for(
+            _run_slotted_reference_producer(config, resumed, _ChatTokenizer(), Pool(tmp_path), batch_size=1), 10
+        )
         assert again.published_count == 1 and again.filtered_count == 1
         assert [entry["tag"]["sequence_no"] for entry in resumed_queue.get_nowait()["entries"]] == [2]
     asyncio.run(run())
 
 
-def test_ordered_filtered_input_releases_slot_at_end_of_stream(tmp_path, monkeypatch):
+def test_ordered_filtered_input_releases_slot_at_end_of_stream(tmp_path, reference_config):
     from queue import Queue
-    import verl_speco.standalone_tq_producer as producer
-    from verl_speco.producer.vllm_feature_client import VllmResponse
-    from verl_speco.standalone_ray_runtime import StandaloneProducerActor
     source = tmp_path / "prompt.jsonl"
     source.write_text(json.dumps({"prompt": [{"role": "user", "content": "Q3"}]}) + "\n", encoding="utf-8")
-    config = _config(source)
+    config = reference_config(source)
     config["speco"]["standalone_tq_producer"].update(
         max_inflight_requests=1, max_samples=0, on_missing_response="generate", min_supervised_tokens=2,
         deterministic_publication=True, max_ordered_inflight=1)
-    config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["transfer_queue"]["expected_feature"] = {"payload_kind": "vllm_reference"}
-    monkeypatch.setattr(producer, "_load_target_depth", lambda *args: 32)
-    actor = StandaloneProducerActor({"speco": {"standalone_tq_producer": {
-        "max_reference_execution_slots": 1}}}, Queue(), reference_batch_size=1)
+    actor = _reference_actor(Queue(), batch_size=1, max_reference_execution_slots=1)
     class Pool(_Pool):
         async def generate_reference(self, request):
             path = self.root / "filtered-generated"
             path.write_bytes(b"temporary")
             return VllmResponse(str(path), "http://vllm:8000/v1", generated_token_ids=(11,))
     async def run():
-        result = await asyncio.wait_for(run_producer(config, tokenizer=_ChatTokenizer(), client_pool=Pool(tmp_path),
-            on_references=actor._on_references, reference_batch_size=1,
-            acquire_reference_slot=actor._acquire_reference_slot,
-            release_unpublished_slot=actor._release_unpublished_slot,
-            transfer_unpublished_slot=actor._transfer_unpublished_slot), 10)
+        result = await asyncio.wait_for(
+            _run_slotted_reference_producer(config, actor, _ChatTokenizer(), Pool(tmp_path), batch_size=1), 10
+        )
         assert result.filtered_count == 1 and result.published_count == 0
         assert not actor._execution_pending and not actor._active_references
         assert not (tmp_path / "filtered-generated").exists()
     asyncio.run(run())
 
 
-def test_ordered_generated_filter_preserves_replacement_circuit_breaker(tmp_path, monkeypatch):
+def test_ordered_generated_filter_preserves_replacement_circuit_breaker(tmp_path, reference_config):
     from queue import Queue
-    import verl_speco.standalone_tq_producer as producer
-    from verl_speco.producer.vllm_feature_client import VllmResponse
-    from verl_speco.standalone_ray_runtime import StandaloneProducerActor
     source = tmp_path / "prompt.jsonl"
     source.write_text(json.dumps({"prompt": [{"role": "user", "content": "Q3"}]}) + "\n", encoding="utf-8")
-    config = _config(source)
+    config = reference_config(source)
     config["speco"]["standalone_tq_producer"].update(
         max_inflight_requests=1, max_samples=2, on_missing_response="generate", min_supervised_tokens=2,
         deterministic_publication=True, max_ordered_inflight=2, max_consecutive_feature_drops=2)
-    config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["transfer_queue"]["expected_feature"] = {"payload_kind": "vllm_reference"}
-    monkeypatch.setattr(producer, "_load_target_depth", lambda *args: 32)
-    actor = StandaloneProducerActor({"speco": {"standalone_tq_producer": {
-        "max_reference_execution_slots": 2}}}, Queue(), reference_batch_size=2)
+    actor = _reference_actor(Queue(), batch_size=2, max_reference_execution_slots=2)
     class Pool(_Pool):
         async def generate_reference(self, request):
             path = self.root / f"filtered-{request.sequence_no}"
@@ -2683,11 +2518,7 @@ def test_ordered_generated_filter_preserves_replacement_circuit_breaker(tmp_path
             return VllmResponse(str(path), "http://vllm:8000/v1", generated_token_ids=(11,))
     async def run():
         with pytest.raises(RuntimeError, match="max_consecutive_feature_drops=2"):
-            await asyncio.wait_for(run_producer(config, tokenizer=_ChatTokenizer(), client_pool=Pool(tmp_path),
-                on_references=actor._on_references, reference_batch_size=2,
-                acquire_reference_slot=actor._acquire_reference_slot,
-                release_unpublished_slot=actor._release_unpublished_slot,
-                transfer_unpublished_slot=actor._transfer_unpublished_slot), 10)
+            await asyncio.wait_for(_run_slotted_reference_producer(config, actor, _ChatTokenizer(), Pool(tmp_path), batch_size=2), 10)
     asyncio.run(run())
     assert not list(tmp_path.glob("filtered-*"))
 
@@ -2707,17 +2538,12 @@ def test_producer_rejects_input_change_after_start_handshake(tmp_path):
     assert pool.closed
 
 
-def test_reference_execution_failure_retains_slot_and_stops_replacement(tmp_path, monkeypatch):
-    import verl_speco.standalone_tq_producer as producer
-    from verl_speco.standalone_ray_runtime import StandaloneProducerActor
+def test_reference_execution_failure_retains_slot_and_stops_replacement(tmp_path, reference_config):
     source = tmp_path / "input.jsonl"
     _write_input(source)
-    config = _config(source)
+    config = reference_config(source)
     config["speco"]["standalone_tq_producer"].update(max_inflight_requests=1, max_samples=2)
-    config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["transfer_queue"]["expected_feature"] = {"payload_kind": "vllm_reference"}
-    monkeypatch.setattr(producer, "_load_target_depth", lambda *args: 32)
-    actor = StandaloneProducerActor({"speco": {"standalone_tq_producer": {
-        "max_reference_execution_slots": 2}}}, reference_batch_size=2)
+    actor = _reference_actor(batch_size=2, max_reference_execution_slots=2)
     class Failed(_Pool):
         async def prefill_reference(self, request):
             raise TimeoutError("uncertain request")
@@ -2733,18 +2559,14 @@ def test_reference_execution_failure_retains_slot_and_stops_replacement(tmp_path
     asyncio.run(run())
 
 
-def test_ordered_reference_publication_aborts_instead_of_replacing_failed_input(tmp_path, monkeypatch):
-    import verl_speco.standalone_tq_producer as producer
+def test_ordered_reference_publication_aborts_instead_of_replacing_failed_input(tmp_path, reference_config):
     source = tmp_path / "input.jsonl"
     _write_input(source)
-    config = _config(source)
+    config = reference_config(source)
     options = config["speco"]["standalone_tq_producer"]
     options.update(deterministic_publication=True, max_ordered_inflight=2, max_samples=2)
-    config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["transfer_queue"]["expected_feature"] = {"payload_kind": "vllm_reference"}
-    monkeypatch.setattr(producer, "_load_target_depth", lambda *args: 32)
     class Pool(_Pool):
         async def prefill_reference(self, request):
-            from verl_speco.producer.vllm_feature_client import VllmResponse
             if request.sequence_no == 0:
                 await asyncio.sleep(0.08)
                 raise RuntimeError("injected failure")

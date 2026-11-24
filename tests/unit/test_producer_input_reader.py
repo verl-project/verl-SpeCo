@@ -26,7 +26,7 @@ from verl_speco.producer import input_reader
 
 
 def test_source_route_waves_keep_resume_routes_and_bind_endpoint_order():
-    from verl_speco.producer.sequence_replay import iter_source_route_waves
+    from verl_speco.producer.source_routing import iter_source_route_waves
 
     requests = [input_reader.GenerationRequest(i, str(i), tuple(range(length)), 1, {})
                 for i, length in enumerate([2, 8, 3, 7, 4])]
@@ -49,7 +49,7 @@ def test_source_route_waves_keep_resume_routes_and_bind_endpoint_order():
 
 
 def test_source_route_plan_preserves_order_and_enforces_wave_capacity():
-    from verl_speco.producer.sequence_replay import plan_source_routes
+    from verl_speco.producer.source_routing import plan_source_routes
 
     limits = dict(source_count=3, max_samples=2, max_tokens=12, max_sequence_tokens=10)
     lengths = [2, 10, 3, 9]
@@ -599,196 +599,6 @@ def test_minimum_feature_rows_applies_after_window_selection(feature_rows):
     else:
         request = input_reader._build_tokenized_request(**kwargs)
         assert request.feature_positions.numel() == feature_rows
-
-
-def _replay_row(index):
-    return {"sequence_no": index, "sample_id": f"id-{index}",
-            "input_ids": [1, 2, index + 3], "loss_mask": [0, 0, 1],
-            "source_metadata": {"source": "test"}}
-
-
-def test_sequence_replay_commits_segments_and_resumes_idempotently(tmp_path):
-    from verl_speco.producer.sequence_replay import SequenceReplayReader, SequenceReplayWriter
-
-    identity = {"target_revision": "model-sha", "tokenizer": "tokenizer-sha"}
-    writer = SequenceReplayWriter(tmp_path, identity=identity, segment_rows=2)
-    assert writer.append(_replay_row(0))
-    assert not (tmp_path / "manifest.json").exists()
-    assert writer.append(_replay_row(1))
-    reader = SequenceReplayReader(tmp_path, identity=identity, allow_incomplete=True)
-    assert [row["sample_id"] for row in reader.iter_rows([1, 0])] == ["id-1", "id-0"]
-    writer.append(_replay_row(2))
-    writer.close(commit=False)
-    with pytest.raises(ValueError, match="has not completed"):
-        SequenceReplayReader(tmp_path)
-    assert len(SequenceReplayReader(tmp_path, allow_incomplete=True)) == 2
-    writer = SequenceReplayWriter(tmp_path, identity=identity, segment_rows=2)
-    assert writer.has_record(0, "id-0") and not writer.append(_replay_row(0))
-    assert writer.append(_replay_row(2))
-    writer.close()
-    assert len(SequenceReplayReader(tmp_path)) == 3
-    with pytest.raises(ValueError, match="identity differs"):
-        SequenceReplayWriter(tmp_path, identity={"target_revision": "other"})
-
-
-def test_sequence_replay_manifest_failure_keeps_old_committed_snapshot(tmp_path, monkeypatch):
-    from verl_speco.producer import sequence_replay
-
-    writer = sequence_replay.SequenceReplayWriter(tmp_path, identity={"target": "v1"}, segment_rows=1)
-    writer.append(_replay_row(0))
-    original_write = sequence_replay._atomic_write
-    def interrupted(path, data):
-        if path.name == "manifest.json":
-            raise OSError("injected manifest failure")
-        return original_write(path, data)
-    monkeypatch.setattr(sequence_replay, "_atomic_write", interrupted)
-    with pytest.raises(OSError, match="injected"):
-        writer.append(_replay_row(1))
-    writer.close(commit=False)
-    assert [row["sequence_no"] for row in sequence_replay.SequenceReplayReader(tmp_path, allow_incomplete=True).iter_rows()] == [0]
-
-
-def test_sequence_replay_rejects_concurrent_writer_and_corrupted_segment(tmp_path):
-    from verl_speco.producer.sequence_replay import SequenceReplayReader, SequenceReplayWriter
-
-    writer = SequenceReplayWriter(tmp_path, identity={"target": "v1"}, segment_rows=1)
-    with pytest.raises(OSError):
-        SequenceReplayWriter(tmp_path, identity={"target": "v1"})
-    writer.append(_replay_row(0))
-    writer.close()
-    segment = next(tmp_path.glob("segment-*.jsonl"))
-    segment.write_bytes(segment.read_bytes().replace(b'id-0', b'id-x'))
-    with pytest.raises(ValueError, match="checksum mismatch"):
-        SequenceReplayReader(tmp_path)
-
-
-def test_sequence_replay_detects_equal_length_row_swap_after_indexing(tmp_path):
-    from verl_speco.producer.sequence_replay import SequenceReplayReader, SequenceReplayWriter
-    writer = SequenceReplayWriter(tmp_path, identity={"target": "v1"}, segment_rows=2)
-    writer.append(_replay_row(0))
-    writer.append(_replay_row(1))
-    writer.close()
-    reader = SequenceReplayReader(tmp_path)
-    assert len(reader.row_hashes) == 64 and not isinstance(reader.seen, dict)
-    segment = next(tmp_path.glob("segment-*.jsonl"))
-    lines = segment.read_bytes().splitlines(keepends=True)
-    assert len(lines[0]) == len(lines[1])
-    segment.write_bytes(lines[1] + lines[0])
-    with pytest.raises(ValueError, match="row changed after indexing"):
-        list(reader.iter_rows())
-
-
-def test_sequence_replay_index_preserves_large_sequence_numbers(tmp_path):
-    from verl_speco.producer.sequence_replay import SequenceReplayReader, SequenceReplayWriter
-    sequence = 10**30
-    row = _replay_row(0)
-    row["sequence_no"] = sequence
-    writer = SequenceReplayWriter(tmp_path, identity={"target": "v1"})
-    writer.append(row)
-    writer.close()
-    writer = SequenceReplayWriter(tmp_path, identity={"target": "v1"})
-    assert writer.has_record(sequence, row["sample_id"])
-    writer.close()
-    assert next(SequenceReplayReader(tmp_path).iter_rows())["sequence_no"] == sequence
-
-
-def test_sequence_replay_temporary_index_is_closed_and_rebuildable(tmp_path, monkeypatch):
-    from verl_speco.producer import sequence_replay
-    index_root = tmp_path / "indices"
-    index_root.mkdir()
-    original = sequence_replay.tempfile.TemporaryDirectory
-    paths = []
-    def temporary(*args, **kwargs):
-        kwargs["dir"] = index_root
-        directory = original(*args, **kwargs)
-        paths.append(Path(directory.name))
-        return directory
-    monkeypatch.setattr(sequence_replay.tempfile, "TemporaryDirectory", temporary)
-    data = tmp_path / "data"
-    writer = sequence_replay.SequenceReplayWriter(data, identity={"target": "v1"}, segment_rows=1)
-    assert paths[-1].exists()
-    writer.append(_replay_row(0))
-    index = writer.seen
-    original_add = index.add
-    def fail(sequence, sample, digest):
-        if sequence == 1:
-            raise OSError("injected temporary index failure")
-        return original_add(sequence, sample, digest)
-    monkeypatch.setattr(index, "add", fail)
-    with pytest.raises(OSError, match="temporary index failure"):
-        writer.append(_replay_row(1))
-    with pytest.raises(RuntimeError, match="closed or failed"):
-        writer.append(_replay_row(2))
-    writer.close(commit=False)
-    assert not paths[-1].exists()
-    recovered = sequence_replay.SequenceReplayWriter(data, identity={"target": "v1"})
-    assert recovered.has_record(0, "id-0") and recovered.has_record(1, "id-1")
-    recovered.close()
-    reader = sequence_replay.SequenceReplayReader(data)
-    assert paths[-1].exists() and reader.seen[1][0] == "id-1" and 0 in reader.seen
-    reader.close()
-    assert not paths[-1].exists()
-    assert [row["sequence_no"] for row in reader.iter_rows()] == [0, 1]
-    segment = next(data.glob("segment-*.jsonl"))
-    segment.write_bytes(segment.read_bytes().replace(b"id-", b"zz-"))
-    with pytest.raises(ValueError, match="checksum mismatch"):
-        sequence_replay.SequenceReplayReader(data)
-    assert not paths[-1].exists()
-
-
-def test_sequence_replay_index_rejects_duplicate_across_segments(tmp_path):
-    import hashlib
-    from verl_speco.producer import sequence_replay
-    writer = sequence_replay.SequenceReplayWriter(tmp_path, identity={"target": "v1"}, segment_rows=1)
-    writer.append(_replay_row(0))
-    writer.append(_replay_row(1))
-    writer.close()
-    manifest_path = tmp_path / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    descriptor = manifest["segments"][1]
-    segment = tmp_path / descriptor["file"]
-    row = json.loads(segment.read_text(encoding="utf-8"))
-    row["sequence_no"] = 0
-    payload = sequence_replay._encoded(row) + b"\n"
-    segment.write_bytes(payload)
-    descriptor["sha256"] = hashlib.sha256(payload).hexdigest()
-    manifest_path.write_bytes(sequence_replay._encoded(manifest) + b"\n")
-    with pytest.raises(ValueError, match="Duplicate sequence number"):
-        sequence_replay.SequenceReplayReader(tmp_path)
-
-
-def test_sequence_replay_training_request_preserves_full_labels_and_metadata():
-    from verl_speco.producer.sequence_replay import prepare_replay_request
-
-    row = {"sequence_no": 3, "sample_id": "s", "input_ids": [1, 2, 3, 4, 5],
-           "loss_mask": [0, 0, 1, 1, 1], "source_metadata": {"replay_sequence_no": "original"}}
-    request = prepare_replay_request(row, sequence_no=9, config={"max_sequence_length": 10})
-    assert request.sequence_no == 9
-    assert request.input_ids.tolist() == [1, 2, 3, 4, 5]
-    assert request.prompt_token_ids == [1, 2, 3, 4]
-    assert request.loss_mask.tolist() == [0, 0, 1, 1, 1]
-    assert request.source_metadata == row["source_metadata"]
-    row["prefill_excludes_last"] = False
-    response_request = prepare_replay_request(row, sequence_no=9, config={"max_sequence_length": 10})
-    assert response_request.prompt_token_ids == [1, 2, 3, 4, 5]
-
-
-def test_sequence_replay_limits_buffer_by_bytes_not_only_rows(tmp_path, monkeypatch):
-    from verl_speco.producer import sequence_replay
-
-    monkeypatch.setattr(sequence_replay, "_MAX_ROW_BYTES", 256)
-    writer = sequence_replay.SequenceReplayWriter(
-        tmp_path, identity={"model": "v1"}, segment_rows=100, segment_bytes=256,
-    )
-    for index in range(3):
-        row = _replay_row(index)
-        row["source_metadata"]["description"] = "x" * 80
-        writer.append(row)
-        assert writer.pending_bytes <= 256
-    writer.close()
-    reader = sequence_replay.SequenceReplayReader(tmp_path)
-    assert len(reader.manifest["segments"]) > 1
-    assert [row["sequence_no"] for row in reader.iter_rows()] == [0, 1, 2]
 
 
 def test_source_proportional_order_preserves_rows_and_stable_fallback_identity(tmp_path):

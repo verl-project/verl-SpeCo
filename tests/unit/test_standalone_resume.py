@@ -15,6 +15,8 @@
 from pathlib import Path
 import json
 
+from standalone_test_utils import collect_gloo_workers, gloo_process_group
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -294,45 +296,6 @@ def test_legacy_resume_fingerprint_without_content_hash_still_loads(tmp_path):
     del metadata["input_fingerprint"]["sha256"]
     path.write_text(json.dumps(metadata), encoding="utf-8")
     assert load_standalone_resume(checkpoint, input_path=source)[0] == {1}
-
-
-def test_resume_binds_replay_manifest_snapshot(tmp_path):
-    from verl_speco.producer.sequence_replay import SequenceReplayWriter
-
-    source = tmp_path / "replay"
-    writer = SequenceReplayWriter(source, identity={"model": "v1"}, segment_rows=1)
-    writer.append({"sequence_no": 0, "sample_id": "x", "input_ids": [1, 2],
-                   "loss_mask": [0, 1], "source_metadata": {}})
-    writer.close()
-    checkpoint = tmp_path / "checkpoint"
-    save_standalone_resume(checkpoint, [0], optimizer_step=1, input_path=source)
-    assert load_standalone_resume(checkpoint, input_path=source)[0] == {0}
-    manifest_path = source / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["identity"]["model"] = "v2"
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(ValueError, match="input file changed"):
-        load_standalone_resume(checkpoint, input_path=source)
-
-
-def test_bound_replay_identity_allows_equivalent_mount_and_rejects_changed_segment(tmp_path):
-    import shutil
-    from verl_speco.producer.sequence_replay import SequenceReplayWriter
-    from verl_speco.trainer.standalone_resume import build_input_fingerprint, input_content_identity
-    source, copy = tmp_path / "first", tmp_path / "second"
-    writer = SequenceReplayWriter(source, identity={"model": "v1"}, segment_rows=1)
-    writer.append({"sequence_no": 0, "sample_id": "x", "input_ids": [1, 2],
-                   "loss_mask": [0, 1], "source_metadata": {}})
-    writer.close()
-    shutil.copytree(source, copy)
-    identity = input_content_identity(build_input_fingerprint(source, include_content_hash=True))
-    checkpoint = tmp_path / "checkpoint"
-    save_standalone_resume(checkpoint, [0], optimizer_step=1, input_path=source, expected_input_identity=identity)
-    assert load_standalone_resume(checkpoint, input_path=copy)[0] == {0}
-    segment = next(copy.glob("segment-*.jsonl"))
-    segment.write_bytes(segment.read_bytes() + b" ")
-    with pytest.raises(ValueError):
-        load_standalone_resume(checkpoint, input_path=copy)
 
 
 def _sealed_checkpoint(root, step, run_id, *, input_path=None, input_identity=None):
@@ -994,45 +957,15 @@ def test_verified_model_cache_rejects_invalid_configuration(config, path):
 
 
 def _run_two_rank(worker, *args):
-    """Run Gloo workers with bounded cleanup even when a child fails."""
-    import multiprocessing
-    import socket
-    import torch.distributed as dist
-
-    if not dist.is_gloo_available():
-        pytest.skip("Gloo is unavailable")
-    context = multiprocessing.get_context("spawn")
-    results = context.Queue()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    processes = [context.Process(target=worker, args=(rank, port, *args, results)) for rank in range(2)]
-    for process in processes:
-        process.start()
-    try:
-        output = [results.get(timeout=55) for _ in processes]
-        assert {item[0] for item in output} == {0, 1}
-        for process in processes:
-            process.join(timeout=10)
-        assert all(process.exitcode == 0 for process in processes)
-        return output
-    finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
-        results.close()
+    return collect_gloo_workers(worker, lambda rank, port, results: (rank, port, *args, results), timeout=55)
 
 
 def _step_rng_resume_worker(rank, port, directory, results):
     import random
-    from datetime import timedelta
     import numpy as np
     import torch.distributed as dist
     from verl_speco.trainer.draft_training_loop import _seed_standalone_step
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
-                            world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         torch.manual_seed(123)
         model = torch.nn.Linear(4, 1)
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
@@ -1062,8 +995,6 @@ def _step_rng_resume_worker(rank, port, directory, results):
         for index in range(2, 4):
             step(resumed, resumed_optimizer, index)
         results.put((rank, all(torch.equal(actual, wanted) for actual, wanted in zip(resumed.parameters(), expected, strict=True))))
-    finally:
-        dist.destroy_process_group()
 
 
 def test_two_rank_step_rng_matches_training_after_checkpoint_resume(tmp_path):
@@ -1071,13 +1002,9 @@ def test_two_rank_step_rng_matches_training_after_checkpoint_resume(tmp_path):
 
 
 def _model_cache_recipe_worker(rank, port, paths, mode, results):
-    from datetime import timedelta
-    import torch.distributed as dist
     from verl_speco.trainer.draft_training_loop import _standalone_recipe_across_ranks
 
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
-                            world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         try:
             recipe = _standalone_recipe_across_ranks(
                 {"target_model_cache_content_identity": True, "target_model_logical_id": "target@rev",
@@ -1087,8 +1014,6 @@ def _model_cache_recipe_worker(rank, port, paths, mode, results):
             results.put((rank, recipe["sha256"]))
         except ValueError as exc:
             results.put((rank, str(exc)))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("case", ["matching", "mismatch", "missing", "interval", "budget"])
@@ -1182,15 +1107,11 @@ def test_trainable_snapshot_byte_limit_applies_before_gather_and_copy(tmp_path):
 
 
 def _trainable_snapshot_initialize_worker(rank, port, paths, mismatch, results):
-    from datetime import timedelta
     from types import SimpleNamespace
     import torch
-    import torch.distributed as dist
     from verl_speco.trainer.draft_training_loop import _load_trainable_snapshot_across_ranks
 
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
-                            world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         torch.manual_seed(7)
         model = torch.nn.parallel.DistributedDataParallel(torch.nn.Linear(2, 1))
         if rank == 1 and mismatch:
@@ -1203,8 +1124,6 @@ def _trainable_snapshot_initialize_worker(rank, port, paths, mismatch, results):
         except RuntimeError as exc:
             unchanged = all(torch.equal(before[name], parameter) for name, parameter in model.module.named_parameters())
             results.put((rank, str(exc), unchanged, None))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("case", ["valid", "mismatch", "different_payload"])
@@ -1227,15 +1146,11 @@ def test_trainable_snapshot_initialization_validates_all_ranks_before_copy(tmp_p
 
 
 def _trainable_snapshot_worker(rank, port, directory, mismatch, results):
-    from datetime import timedelta
     from types import SimpleNamespace
     import torch
-    import torch.distributed as dist
     from verl_speco.trainer.draft_training_loop import _save_trainable_snapshot_across_ranks
 
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
-                            world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         torch.manual_seed(123)
         model = torch.nn.parallel.DistributedDataParallel(torch.nn.Linear(2, 1))
         if rank == 1 and mismatch:
@@ -1247,8 +1162,6 @@ def _trainable_snapshot_worker(rank, port, directory, mismatch, results):
             results.put((rank, result))
         except RuntimeError as exc:
             results.put((rank, str(exc)))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("case", ["valid", "mismatch", "write_failure"])
@@ -1273,19 +1186,15 @@ def test_trainable_snapshot_gloo_writer_and_schema_agreement(tmp_path, case):
 
 
 def _trainable_dtensor_worker(rank, port, directory, shard_dim, rows, results):
-    from datetime import timedelta
     from types import SimpleNamespace
     import torch
-    import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor import Replicate, Shard, distribute_tensor
     from verl_speco.trainer.draft_training_loop import (
         _load_trainable_snapshot_across_ranks, _save_trainable_snapshot_across_ranks,
     )
 
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
-                            world_size=2, timeout=timedelta(seconds=35))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=35):
         mesh = init_device_mesh("cpu", (2,))
         class Model(torch.nn.Module):
             def __init__(self):
@@ -1308,8 +1217,6 @@ def _trainable_dtensor_worker(rank, port, directory, shard_dim, rows, results):
         except RuntimeError as exc:
             unchanged = all(not torch.count_nonzero(value.to_local()).item() for value in model.parameters())
             results.put((rank, str(exc), unchanged, path))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("shard_dim,rows", [(0, 5), (0, 1), (1, 5)])
@@ -1327,51 +1234,46 @@ def test_trainable_snapshot_real_cpu_dtensor_shards(tmp_path, shard_dim, rows):
 
 
 def _trainable_fsdp_worker(rank, port, directory, version, results):
-    from datetime import timedelta
     from types import SimpleNamespace
     import torch
-    import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, fully_shard
     from verl_speco.trainer.draft_training_loop import (
         _load_trainable_snapshot_across_ranks, _save_trainable_snapshot_across_ranks,
     )
 
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
-                            world_size=2, timeout=timedelta(seconds=35))
-    try:
-        torch.manual_seed(11)
-        base = torch.nn.Linear(2, 3)
-        base.bias.requires_grad_(False)
-        if version == 1:
-            expected_weight, expected_bias = base.weight.detach().clone(), base.bias.detach().clone()
-            model = FSDP(base, device_id=torch.device("cpu"), use_orig_params=True)
-        else:
-            model = base
-            fully_shard(model, mesh=init_device_mesh("cpu", (2,)))
-            expected_weight = model.weight.to_local().detach().clone()
-            expected_bias = model.bias.to_local().detach().clone()
-        trainer = SimpleNamespace(model=model, checkpoint_dir=directory,
-                                  _standalone_training_plan={"world_size": 2, "recipe": "same"})
-        path = _save_trainable_snapshot_across_ranks(trainer, 2, device=torch.device("cpu"), max_bytes=24)
-        if version == 1:
-            with FSDP.summon_full_params(model, recurse=True, writeback=True, rank0_only=False):
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=35):
+        try:
+            torch.manual_seed(11)
+            base = torch.nn.Linear(2, 3)
+            base.bias.requires_grad_(False)
+            if version == 1:
+                expected_weight, expected_bias = base.weight.detach().clone(), base.bias.detach().clone()
+                model = FSDP(base, device_id=torch.device("cpu"), use_orig_params=True)
+            else:
+                model = base
+                fully_shard(model, mesh=init_device_mesh("cpu", (2,)))
+                expected_weight = model.weight.to_local().detach().clone()
+                expected_bias = model.bias.to_local().detach().clone()
+            trainer = SimpleNamespace(model=model, checkpoint_dir=directory,
+                                      _standalone_training_plan={"world_size": 2, "recipe": "same"})
+            path = _save_trainable_snapshot_across_ranks(trainer, 2, device=torch.device("cpu"), max_bytes=24)
+            if version == 1:
+                with FSDP.summon_full_params(model, recurse=True, writeback=True, rank0_only=False):
+                    with torch.no_grad():
+                        model.module.weight.zero_()
+            else:
                 with torch.no_grad():
-                    model.module.weight.zero_()
-        else:
-            with torch.no_grad():
-                model.weight.to_local().zero_()
-        _load_trainable_snapshot_across_ranks(trainer, path, device=torch.device("cpu"), max_bytes=24)
-        if version == 1:
-            with FSDP.summon_full_params(model, recurse=True, writeback=False, rank0_only=False):
-                good = torch.equal(model.module.weight, expected_weight) and torch.equal(model.module.bias, expected_bias)
-        else:
-            good = torch.equal(model.weight.to_local(), expected_weight) and torch.equal(model.bias.to_local(), expected_bias)
-        results.put((rank, good, path))
-    except Exception as exc:
-        results.put((rank, f"{type(exc).__name__}: {exc}", None))
-    finally:
-        dist.destroy_process_group()
+                    model.weight.to_local().zero_()
+            _load_trainable_snapshot_across_ranks(trainer, path, device=torch.device("cpu"), max_bytes=24)
+            if version == 1:
+                with FSDP.summon_full_params(model, recurse=True, writeback=False, rank0_only=False):
+                    good = torch.equal(model.module.weight, expected_weight) and torch.equal(model.module.bias, expected_bias)
+            else:
+                good = torch.equal(model.weight.to_local(), expected_weight) and torch.equal(model.bias.to_local(), expected_bias)
+            results.put((rank, good, path))
+        except Exception as exc:
+            results.put((rank, f"{type(exc).__name__}: {exc}", None))
 
 
 @pytest.mark.parametrize("version", [1, 2])
@@ -1386,13 +1288,9 @@ def test_trainable_snapshot_real_cpu_fsdp(tmp_path, version):
 
 
 def _gloo_recipe_resume_worker(rank, port, checkpoint, source, mismatch, results):
-    from datetime import timedelta
-    import torch.distributed as dist
     from verl_speco.trainer.draft_training_loop import _load_resume_across_ranks, _standalone_recipe
 
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         config = {"lr": 0.02 if mismatch and rank == 1 else 0.01,
                   "packing": {"enable": True}, "dspark_num_anchors": 16}
         plan = {"world_size": 2, "recipe": _standalone_recipe(config, None)}
@@ -1401,38 +1299,26 @@ def _gloo_recipe_resume_worker(rank, port, checkpoint, source, mismatch, results
             results.put((rank, sorted(consumed)))
         except ValueError as exc:
             results.put((rank, str(exc)))
-    finally:
-        dist.destroy_process_group()
 
 
 def _gloo_retention_resume_worker(rank, port, root, checkpoint, mismatch, results):
-    from datetime import timedelta
-    import torch.distributed as dist
     from verl_speco.trainer.draft_training_loop import _retention_resume_identity_across_ranks
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         metadata = None if mismatch and rank == 1 else {"optimizer_step": 2}
         try:
             results.put((rank, _retention_resume_identity_across_ranks(root, checkpoint, 2, metadata, 2)))
         except ValueError as exc:
             results.put((rank, str(exc)))
-    finally:
-        dist.destroy_process_group()
 
 
 def _gloo_shared_file_probe_worker(rank, port, root, other_root, mode, results):
     import asyncio
     import sys
-    from datetime import timedelta
     from types import SimpleNamespace
-    import torch.distributed as dist
     from verl_speco.producer.hidden_states_store import FileHiddenStatesStore
     from verl_speco.standalone_ray_runtime import StandaloneProducerActor
     from verl_speco.trainer.draft_training_loop import _verify_shared_file_root_across_ranks
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=30):
         selected_root = other_root if mode == "root_mismatch" and rank == 1 else root
         hidden = FileHiddenStatesStore(selected_root)
         if mode == "not_visible" and rank == 1:
@@ -1452,8 +1338,6 @@ def _gloo_shared_file_probe_worker(rank, port, root, other_root, mode, results):
             results.put((rank, "ok"))
         except RuntimeError as exc:
             results.put((rank, str(exc)))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("mode", ["shared", "not_visible", "root_mismatch"])
