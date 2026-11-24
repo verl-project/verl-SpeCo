@@ -367,3 +367,112 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
         "DRAFTER_PATH=${DRAFTER_PATH:-/path/to/vllm-compatible-dspark-drafter}"
         in mrv2_source
     )
+
+
+@pytest.fixture
+def two_node_controller(monkeypatch):
+    import importlib.util
+    import sys
+    import types
+
+    # The controller logic under test does not open an SSH connection.
+    monkeypatch.setitem(sys.modules, "paramiko", types.ModuleType("paramiko"))
+    path = ROOT / "examples" / "dspark_two_node" / "run.py"
+    spec = importlib.util.spec_from_file_location("two_node_controller", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize("failure", [None, "start", "execute"])
+def test_two_node_phase_stops_readers_before_source(
+    two_node_controller, monkeypatch, resume, failure
+):
+    from types import SimpleNamespace
+
+    controller = two_node_controller
+    stopped = []
+    monkeypatch.setattr(controller, "prepare", lambda host, args, role, *rest: role)
+    monkeypatch.setattr(
+        controller, "stop", lambda host, directory: stopped.append(host)
+    )
+    monkeypatch.setattr(controller, "wait_service", lambda *args: None)
+
+    def operation(name):
+        def run(*args, **kwargs):
+            if name == failure:
+                raise RuntimeError("injected phase failure")
+
+        return run
+
+    monkeypatch.setattr(controller, "start", operation("start"))
+    monkeypatch.setattr(controller, "execute", operation("execute"))
+    args = SimpleNamespace(consumer="10.0.0.1", producer="10.0.0.2", data="/data")
+    if failure:
+        with pytest.raises(RuntimeError, match="injected phase failure"):
+            controller.phase(args, ("reader", "source"), "job", "/checkpoint", resume)
+    else:
+        controller.phase(args, ("reader", "source"), "job", "/checkpoint", resume)
+    assert stopped == ["reader", "source"]
+
+
+def test_two_node_failed_reader_shutdown_preserves_source(
+    two_node_controller, monkeypatch
+):
+    stopped = []
+
+    def stop(host, directory):
+        stopped.append(host)
+        if host == "reader":
+            raise OSError("reader unreachable")
+
+    monkeypatch.setattr(two_node_controller, "stop", stop)
+    with pytest.raises(RuntimeError, match="preserving Producer resources") as error:
+        two_node_controller.stop_phase("reader", "/consumer", "source", "/producer")
+    assert isinstance(error.value.__cause__, OSError)
+    assert stopped == ["reader"]
+
+
+def test_two_node_native_budget_covers_long_samples(two_node_controller, monkeypatch):
+    import io
+    import shlex
+    from contextlib import contextmanager, nullcontext
+    from types import SimpleNamespace
+
+    staged = {}
+
+    @contextmanager
+    def write_remote(path, mode):
+        stream = io.BytesIO()
+        yield stream
+        staged[Path(path).name] = stream.getvalue().decode()
+
+    client = SimpleNamespace(
+        open_sftp=lambda: nullcontext(SimpleNamespace(open=write_remote))
+    )
+    monkeypatch.setattr(two_node_controller, "execute", lambda *args: None)
+    args = SimpleNamespace(
+        root="/jobs",
+        repo="/repo",
+        model="/model",
+        consumer="10.0.0.1",
+        producer="10.0.0.2",
+        consumer_npu=0,
+        producer_npu=0,
+        consumer_env=None,
+    )
+    two_node_controller.prepare(client, args, "consumer", "test", "token", 0)
+    env = dict(
+        shlex.split(line.removeprefix("export "))[0].split("=", 1)
+        for line in staged["job.env"].splitlines()
+        if line.startswith("export ")
+    )
+    # Full 8k Qwen3-8B capture (five auxiliary layers + final layer), token IDs,
+    # and conservative space for both aligned payload and validity registrations.
+    payload_bytes = 8192 * 4096 * 6 * 2 + 8192 * 8
+    registered_bytes = payload_bytes + 4 * 1024**2
+    assert int(env["SPECO_NATIVE_READER_MAX_BYTES"]) >= registered_bytes
+    assert int(env["SPECO_NATIVE_SOURCE_MAX_BYTES"]) >= (
+        int(env["SPECO_NATIVE_SOURCE_MAX_SLOTS"]) * registered_bytes
+    )

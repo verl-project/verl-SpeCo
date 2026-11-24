@@ -135,6 +135,19 @@ PY""",
     )
 
 
+def stop_phase(consumer, consumer_dir, producer, producer_dir):
+    # A lost reader can still access registered source memory. Never release the
+    # source unless every task-owned Consumer process is confirmed stopped.
+    try:
+        stop(consumer, consumer_dir)
+    except Exception as error:
+        raise RuntimeError(
+            f"Consumer shutdown was not confirmed; preserving Producer resources at {producer_dir}. "
+            "Fence all readers before stopping the Producer."
+        ) from error
+    stop(producer, producer_dir)
+
+
 def setup_script(args, role):
     path = getattr(args, role + "_env")
     return "source " + shlex.quote(path) + "\n" if path else ""
@@ -164,6 +177,7 @@ def check(client, args, role):
 def prepare(client, args, role, name, token, generation):
     directory = f"{args.root}/{name}-{role}"
     execute(client, f"umask 077; mkdir {shlex.quote(directory)}")
+    source_slots, reader_bytes = 4, 512 << 20
     variables = {
         "ROLE": role,
         "RUN_DIR": directory,
@@ -184,9 +198,11 @@ def prepare(client, args, role, name, token, generation):
         "SPECO_NATIVE_SOURCE_ENDPOINT": f"{args.producer}:25502",
         "SPECO_NATIVE_READER_ENDPOINTS": json.dumps([f"{args.consumer}:25503"]),
         "SPECO_NATIVE_METADATA_SERVER": f"http://{args.consumer}:25501/metadata",
-        "SPECO_NATIVE_SOURCE_MAX_SLOTS": "4",
-        "SPECO_NATIVE_SOURCE_MAX_BYTES": str(512 << 20),
-        "SPECO_NATIVE_READER_MAX_BYTES": str(256 << 20),
+        "SPECO_NATIVE_SOURCE_MAX_SLOTS": str(source_slots),
+        # 8192 tokens x 4096 hidden width x 6 BF16 layers need 384 MiB,
+        # before token IDs, descriptors and registration alignment.
+        "SPECO_NATIVE_SOURCE_MAX_BYTES": str(source_slots * reader_bytes),
+        "SPECO_NATIVE_READER_MAX_BYTES": str(reader_bytes),
         "SPECO_NATIVE_CHUNK_BYTES": str(128 << 20),
         "SPECO_NATIVE_MAX_RECORDS": "128",
         "MC_LEGACY_RPC_PORT_BINDING": "1",
@@ -222,8 +238,7 @@ def phase(args, hosts, name, checkpoint, resume):
     action = "resume" if resume else "train"
     print(f"{action}: {args.producer}:{p}/{action}.log", flush=True)
     with ExitStack() as cleanup:
-        cleanup.callback(stop, consumer, c)
-        cleanup.callback(stop, producer, p)
+        cleanup.callback(stop_phase, consumer, c, producer, p)
         start(consumer, c, "ray")
         start(consumer, c, "metadata")
         start(producer, p, "vllm")
