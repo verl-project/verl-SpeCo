@@ -10,6 +10,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from standalone_test_utils import collect_gloo_workers, gloo_process_group
 
 from verl_speco.standalone_ray_runtime import (
     StandaloneProducerActor,
@@ -336,9 +337,7 @@ def test_parent_commit_publication_rejects_invalid_settings(setting, batch, limi
 
 
 def test_parent_commit_publication_rejects_transfer_queue_mode(monkeypatch):
-    from copy import deepcopy
-
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     config.speco.standalone_tq_producer.publication_after_parent_commit = True
     monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
     trainer = StandaloneRayTrainer(_commands(), ray_module=_FakeRay(_ProducerHandle()),
@@ -751,26 +750,38 @@ def test_reference_capacity_rejects_non_reference_runtime():
         asyncio.run(actor._run_producer())
 
 
-def test_file_reservation_returns_unused_bytes_after_publication(tmp_path):
+def _file_credit_fixture(tmp_path, prefix, values):
     from queue import Queue
+
     import torch
     from safetensors.torch import save_file
-    actor = StandaloneProducerActor({"speco": {"standalone_tq_producer": {
-        "max_published_file_tensor_bytes": 32, "max_single_file_tensor_bytes": 16,
-        "max_reserved_file_tensor_bytes": 32}}}, Queue(), reference_batch_size=2)
-    paths = []
-    for index in range(2):
-        path = tmp_path / f"small-{index}.safetensors"
-        save_file({"x": torch.tensor([index], dtype=torch.float32)}, str(path))
-        paths.append(path)
+
+    actor = StandaloneProducerActor(
+        {"speco": {"standalone_tq_producer": {
+            "max_published_file_tensor_bytes": 32, "max_single_file_tensor_bytes": 16,
+            "max_reserved_file_tensor_bytes": 32,
+        }}},
+        Queue(), reference_batch_size=2,
+    )
+    entries = []
+    for index, value in enumerate(values):
+        path = tmp_path / f"{prefix}-{index}.safetensors"
+        save_file({"x": torch.tensor([value], dtype=torch.float32)}, path)
+        entries.append({"key": str(index), "tag": {
+            "sequence_no": index, "backend": "file", "hidden_states_path": str(path),
+        }})
+    return actor, entries
+
+
+def test_file_reservation_returns_unused_bytes_after_publication(tmp_path):
+    actor, entries = _file_credit_fixture(tmp_path, "small", range(2))
+
     async def run():
         await actor._acquire_reference_slot(SimpleNamespace(sequence_no=0))
         await actor._acquire_reference_slot(SimpleNamespace(sequence_no=1))
         waiting = asyncio.create_task(actor._acquire_reference_slot(SimpleNamespace(sequence_no=2)))
         await asyncio.sleep(0)
         assert not waiting.done()
-        entries = [{"key": str(i), "tag": {"sequence_no": i, "backend": "file",
-                   "hidden_states_path": str(path)}} for i, path in enumerate(paths)]
         await actor._on_references(entries)
         await asyncio.wait_for(waiting, 2)
         assert actor._published_file_bytes == 8 and actor._execution_pending == {2}
@@ -782,16 +793,7 @@ def test_file_reservation_returns_unused_bytes_after_publication(tmp_path):
 
 
 def test_reference_credit_metrics_follow_publication_and_release(tmp_path):
-    from queue import Queue
-    import torch
-    from safetensors.torch import save_file
-
-    actor = StandaloneProducerActor({"speco": {"standalone_tq_producer": {
-        "max_published_file_tensor_bytes": 32, "max_single_file_tensor_bytes": 16,
-        "max_reserved_file_tensor_bytes": 32}}}, Queue(), reference_batch_size=2)
-    paths = [tmp_path / f"metric-{i}.safetensors" for i in range(2)]
-    for path in paths:
-        save_file({"x": torch.tensor([1], dtype=torch.float32)}, str(path))
+    actor, entries = _file_credit_fixture(tmp_path, "metric", (1, 1))
 
     async def run():
         for i in range(2):
@@ -801,8 +803,6 @@ def test_reference_credit_metrics_follow_publication_and_release(tmp_path):
         assert pending["producer/reference_execution_pending"] == 2
         assert pending["producer/reference_file_tensor_bytes"] == 0
         assert pending["producer/reference_reserved_file_tensor_bytes"] == 32
-        entries = [{"key": str(i), "tag": {"sequence_no": i, "backend": "file",
-                   "hidden_states_path": str(path)}} for i, path in enumerate(paths)]
         await actor._on_references(entries)
         await actor.register_dispatch(actor._incarnation, 0, "token", ["0", "1"])
         original = {"producer/samples_per_second": 3.0}
@@ -1265,12 +1265,11 @@ def test_native_ray_pipeline_rejects_unidentified_existing_local_service():
 
 
 def test_producer_restart_rechecks_credits_after_fingerprinting(tmp_path, monkeypatch):
-    from copy import deepcopy
     from threading import Event
     import verl_speco.standalone_ray_runtime as runtime
     source = tmp_path / "input.jsonl"
     source.write_bytes(b"row\n")
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     config.speco.standalone_tq_producer.input_path = str(source)
     config.speco.standalone_tq_producer.max_published_references = 1
     config.actor_rollout_ref.rollout.drafter.training.feature_store = SimpleNamespace(type="ray_reference")
@@ -1299,12 +1298,11 @@ def test_producer_restart_rechecks_credits_after_fingerprinting(tmp_path, monkey
 
 
 def test_producer_start_and_stop_serialize_input_fingerprinting(tmp_path, monkeypatch):
-    from copy import deepcopy
     from threading import Event
     import verl_speco.standalone_ray_runtime as runtime
     source = tmp_path / "input.jsonl"
     source.write_bytes(b"row\n")
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     config.speco.standalone_tq_producer.input_path = str(source)
     config.actor_rollout_ref.rollout.drafter.training.feature_store = SimpleNamespace(type="ray_reference")
     started, release = Event(), Event()
@@ -1642,15 +1640,12 @@ def test_worker_group_uses_the_pinned_placement_groups(monkeypatch, driver_devic
 
 @pytest.mark.parametrize("mode", ["rank_ack", "shared_root"])
 def test_producer_handle_is_passed_for_ack_or_shared_witness(monkeypatch, tmp_path, mode):
-    from copy import deepcopy
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     config.speco.draft_training.scheduler = {"per_rank_reference_ack": mode == "rank_ack"}
-    config.speco.draft_training.get = lambda key, default=None: getattr(config.speco.draft_training, key, default)
     config.speco.standalone_tq_producer.max_published_references = 4
     if mode == "shared_root":
         config.speco.standalone_tq_producer.hidden_states_store = {"file_root": str(tmp_path)}
     training = config.actor_rollout_ref.rollout.drafter.training
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.feature_store = SimpleNamespace(type="ray_reference")
     monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
     source, observed = _ProducerHandle(), {}
@@ -1675,10 +1670,8 @@ def test_producer_handle_is_passed_for_ack_or_shared_witness(monkeypatch, tmp_pa
 
 
 def test_rank_ack_requires_a_producer_credit_limit(monkeypatch):
-    from copy import deepcopy
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     config.speco.draft_training.scheduler = {"per_rank_reference_ack": True}
-    config.speco.draft_training.get = lambda key, default=None: getattr(config.speco.draft_training, key, default)
     config.actor_rollout_ref.rollout.drafter.training.feature_store = SimpleNamespace(type="ray_reference")
     monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
     trainer = StandaloneRayTrainer(_commands(), ray_module=SimpleNamespace())
@@ -1691,14 +1684,11 @@ def test_rank_ack_requires_a_producer_credit_limit(monkeypatch):
     ("native", "native", False, True), ("native", "native", True, False),
 ])
 def test_native_scheduler_rejects_unsafe_configuration(monkeypatch, source, target, directory, ack):
-    from copy import deepcopy
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     config.speco.draft_training.scheduler = {"per_rank_reference_ack": ack}
-    config.speco.draft_training.get = lambda key, default=None: getattr(config.speco.draft_training, key, default)
     config.speco.standalone_tq_producer.max_published_references = 4
     config.speco.standalone_tq_producer.hidden_states_store = {"backend": source}
     training = config.actor_rollout_ref.rollout.drafter.training
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.feature_store = SimpleNamespace(type="ray_reference")
     training.target_feature_replay = {"hidden_states_store": {"backend": target}}
     monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
@@ -1709,12 +1699,9 @@ def test_native_scheduler_rejects_unsafe_configuration(monkeypatch, source, targ
 
 
 def test_shared_file_root_must_match_between_roles_before_worker_creation(monkeypatch, tmp_path):
-    from copy import deepcopy
-    config = deepcopy(_runtime_config())
-    config.speco.draft_training.get = lambda key, default=None: getattr(config.speco.draft_training, key, default)
+    config = _runtime_config()
     config.speco.standalone_tq_producer.hidden_states_store = {"file_root": str(tmp_path / "producer")}
     training = config.actor_rollout_ref.rollout.drafter.training
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.feature_store = SimpleNamespace(type="ray_reference")
     training.target_feature_replay = {"hidden_states_store": {"file_root": str(tmp_path / "consumer")}}
     monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
@@ -1791,7 +1778,7 @@ class _RemoteProducerClass:
         return self
 
     def remote(self, config, events, *args):
-        assert config is _runtime_config()
+        self.handle.config = config
         return self.handle
 
 
@@ -1908,12 +1895,9 @@ def test_driver_stops_on_background_finalization_failure(monkeypatch):
 
 
 def test_file_driver_kills_group_when_one_rank_reports_training_failure(monkeypatch):
-    from copy import deepcopy
-
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     training = config.actor_rollout_ref.rollout.drafter.training
     training.feature_store = SimpleNamespace(type="ray_reference")
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.transfer_queue = {"consumer_prefetch_batches": 2}
     monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
     queues = iter((_RecordingQueue(), _RecordingQueue(events=[
@@ -1941,13 +1925,10 @@ def test_file_driver_kills_group_when_one_rank_reports_training_failure(monkeypa
 @pytest.mark.parametrize("reference", [False, True])
 @pytest.mark.parametrize("stuck", ["consumer", "producer"])
 def test_shutdown_timeout_is_bounded_for_each_store(monkeypatch, reference, stuck):
-    from copy import deepcopy
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     config.speco.draft_training.scheduler = {"consumer_shutdown_timeout_seconds": 0.01,
                                              "producer_stop_timeout_seconds": 0.01}
-    config.speco.draft_training.get = lambda key, default=None: getattr(config.speco.draft_training, key, default)
     training = config.actor_rollout_ref.rollout.drafter.training
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.feature_store = SimpleNamespace(type="ray_reference" if reference else "tq")
     training.transfer_queue = {"consumer_prefetch_batches": 1}
     training.max_steps = 1
@@ -1981,35 +1962,22 @@ def test_shutdown_timeout_is_bounded_for_each_store(monkeypatch, reference, stuc
     assert not cleaned
 
 
+@pytest.mark.parametrize("key", [
+    "commit_gate_timeout_seconds", "producer_start_timeout_seconds",
+    "consumer_shutdown_timeout_seconds", "producer_stop_timeout_seconds",
+])
 @pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), True, "5"])
-def test_commit_gate_timeout_is_validated_before_workers(value):
-    from copy import deepcopy
-    config = deepcopy(_runtime_config())
-    config.speco.draft_training.scheduler = {"commit_gate_timeout_seconds": value}
-    config.speco.draft_training.get = lambda key, default=None: getattr(config.speco.draft_training, key, default)
+def test_scheduler_timeout_is_validated_before_workers(key, value):
     trainer = StandaloneRayTrainer.__new__(StandaloneRayTrainer)
-    trainer.consumer_config = config
-    with pytest.raises(ValueError, match="commit_gate_timeout_seconds"):
-        trainer.run()
-
-
-@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), True, "5"])
-def test_producer_start_timeout_is_validated_before_workers(value):
-    from copy import deepcopy
-    config = deepcopy(_runtime_config())
-    config.speco.draft_training.scheduler = {"producer_start_timeout_seconds": value}
-    config.speco.draft_training.get = lambda key, default=None: getattr(config.speco.draft_training, key, default)
-    trainer = StandaloneRayTrainer.__new__(StandaloneRayTrainer)
-    trainer.consumer_config = config
-    with pytest.raises(ValueError, match="producer_start_timeout_seconds"):
+    trainer.consumer_config = _runtime_config()
+    trainer.consumer_config.speco.draft_training.scheduler = {key: value}
+    with pytest.raises(ValueError, match=key):
         trainer.run()
 
 
 def test_producer_start_timeout_stops_actor_without_starting_consumers(monkeypatch):
-    from copy import deepcopy
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     config.speco.draft_training.scheduler = {"producer_start_timeout_seconds": 0.01}
-    config.speco.draft_training.get = lambda key, default=None: getattr(config.speco.draft_training, key, default)
     monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
     class Ray(_FakeRay):
         def get(self, ref, timeout=None):
@@ -2030,30 +1998,15 @@ def test_producer_start_timeout_stops_actor_without_starting_consumers(monkeypat
     assert ray.producer.stopped
 
 
-@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), True, "5"])
-def test_consumer_shutdown_timeout_is_validated_before_workers(value):
-    from copy import deepcopy
-    config = deepcopy(_runtime_config())
-    config.speco.draft_training.scheduler = {"consumer_shutdown_timeout_seconds": value}
-    config.speco.draft_training.get = lambda key, default=None: getattr(config.speco.draft_training, key, default)
-    trainer = StandaloneRayTrainer.__new__(StandaloneRayTrainer)
-    trainer.consumer_config = config
-    with pytest.raises(ValueError, match="consumer_shutdown_timeout_seconds"):
-        trainer.run()
-
-
 @pytest.mark.parametrize("nodes", [1, 2])
 @pytest.mark.parametrize("credits", [False, True])
 def test_failure_preserves_unfenced_references(monkeypatch, nodes, credits):
-    from copy import deepcopy
-
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     config.speco.draft_training.nnodes = nodes
     if credits:
         config.speco.standalone_tq_producer.max_published_references = 4 * nodes
     training = config.actor_rollout_ref.rollout.drafter.training
     training.feature_store = SimpleNamespace(type="ray_reference")
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.transfer_queue = {"consumer_prefetch_batches": 2}
     monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
     cleaned = []
@@ -2086,12 +2039,10 @@ def test_failure_preserves_unfenced_references(monkeypatch, nodes, credits):
 
 @pytest.mark.parametrize("start_failure", ["invalid_receipt", "lost_reply"])
 def test_invalid_producer_start_receipt_stops_started_actor(monkeypatch, start_failure):
-    from copy import deepcopy
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     config.speco.standalone_tq_producer.max_reference_execution_slots = 4
     training = config.actor_rollout_ref.rollout.drafter.training
     training.feature_store = SimpleNamespace(type="ray_reference")
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.transfer_queue = {"consumer_prefetch_batches": 1}
     monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
     ray = _FlowRay(_ProducerHandle())
@@ -2140,6 +2091,7 @@ def test_scheduler_executes_one_complete_standalone_batch(monkeypatch) -> None:
     )
 
     assert trainer.run() == 0
+    assert trainer.ray.producer.config is trainer.producer_config
     assert commands.items[0]["kind"] == "batch"
     assert commands.items[0]["global_keys"] == [
         f"sample-{index}" for index in range(4)
@@ -2149,14 +2101,8 @@ def test_scheduler_executes_one_complete_standalone_batch(monkeypatch) -> None:
 
 @pytest.mark.parametrize("depth", [0, 1, 2])
 def test_scheduler_prefills_capacity_and_uses_cached_keys(monkeypatch, depth):
-    import copy
-
-    config = copy.deepcopy(_runtime_config())
-    monkeypatch.setattr(sys.modules[__name__], "_CONFIG", config)
+    config = _runtime_config()
     config.actor_rollout_ref.rollout.drafter.training.transfer_queue = {"consumer_prefetch_batches": depth}
-    # deepcopy preserves the fixture's get closure, so bind it to this object.
-    training = config.actor_rollout_ref.rollout.drafter.training
-    training.get = lambda key, default=None: getattr(training, key, default)
     store = _ReadyStore()
     store.ready = [SimpleNamespace(key=f"sample-{i}", tag={"sequence_no": i}) for i in range(12)]
     list_calls = []
@@ -2204,14 +2150,10 @@ def test_scheduler_prefills_capacity_and_uses_cached_keys(monkeypatch, depth):
 @pytest.mark.parametrize("initial_step", [8, 9])
 @pytest.mark.parametrize("depth", [0, 1, 2])
 def test_scheduler_respects_restored_remaining_budget(monkeypatch, initial_step, depth):
-    import copy
-
-    config = copy.deepcopy(_runtime_config())
-    monkeypatch.setattr(sys.modules[__name__], "_CONFIG", config)
+    config = _runtime_config()
     training = config.actor_rollout_ref.rollout.drafter.training
     training.transfer_queue = {"consumer_prefetch_batches": depth}
     training.max_steps = 9
-    training.get = lambda key, default=None: getattr(training, key, default)
     store = _ReadyStore()
     commands = _RecordingQueue()
     event_items = [{"kind": "consumer_ready", "initial_optimizer_step": initial_step}]
@@ -2240,13 +2182,9 @@ def test_scheduler_respects_restored_remaining_budget(monkeypatch, initial_step,
 
 
 def test_fast_producer_watermarks_and_duplicate_events_do_not_block_training(monkeypatch):
-    import copy
-
-    config = copy.deepcopy(_runtime_config())
-    monkeypatch.setattr(sys.modules[__name__], "_CONFIG", config)
+    config = _runtime_config()
     training = config.actor_rollout_ref.rollout.drafter.training
     training.transfer_queue = {"consumer_prefetch_batches": 1}
-    training.get = lambda key, default=None: getattr(training, key, default)
     store = _ReadyStore()
     store.ready.clear()
     calls = []
@@ -2377,34 +2315,20 @@ def test_pipeline_throughput_uses_driver_duration_and_validated_checkpoint_wait(
         {"tokens/run_source": 120, "perf/run_checkpoint_blocking_time": 12}, 10)
 
 
-_CONFIG = None
+class _Config(SimpleNamespace):
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 
 def _runtime_config():
-    global _CONFIG
-    if _CONFIG is None:
-        training = SimpleNamespace(batch_size_per_gpu=4, transfer_queue={})
-        training.get = lambda key, default=None: getattr(training, key, default)
-        draft_training = SimpleNamespace(
-            nproc_per_node=1,
-            nnodes=1,
-            scheduler={},
-        )
-        draft_training.get = lambda key, default=None: getattr(
-            draft_training, key, default
-        )
-        _CONFIG = SimpleNamespace(
-            speco=SimpleNamespace(
-                draft_training=draft_training,
-                standalone_tq_producer=SimpleNamespace(max_pending_samples=20),
-            ),
-            actor_rollout_ref=SimpleNamespace(
-                rollout=SimpleNamespace(
-                    drafter=SimpleNamespace(training=training)
-                )
-            ),
-        )
-    return _CONFIG
+    training = _Config(batch_size_per_gpu=4, transfer_queue={})
+    return SimpleNamespace(
+        speco=SimpleNamespace(
+            draft_training=_Config(nproc_per_node=1, nnodes=1, scheduler={}),
+            standalone_tq_producer=SimpleNamespace(max_pending_samples=20),
+        ),
+        actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(training=training))),
+    )
 
 
 def test_queue_config_defaults_low_watermark_to_half_producer_capacity(
@@ -2531,13 +2455,9 @@ def test_trainer_rejects_unexpected_early_consumer_exit(monkeypatch) -> None:
 
 
 def test_step_budget_survives_consumer_exit_before_completion_event(monkeypatch):
-    import copy
-
-    config = copy.deepcopy(_runtime_config())
-    monkeypatch.setattr(sys.modules[__name__], "_CONFIG", config)
+    config = _runtime_config()
     training = config.actor_rollout_ref.rollout.drafter.training
     training.step = 1
-    training.get = lambda key, default=None: getattr(training, key, default)
     events = _RecordingQueue(events=[
         {"kind": "consumer_ready", "initial_optimizer_step": 0},
         {"kind": "training_completed", "plan_id": 0,
@@ -2593,32 +2513,26 @@ def test_trainer_propagates_consumer_error_and_stops_producer(monkeypatch) -> No
 
 
 @pytest.mark.parametrize("producer_node", ["driver-node", "other-node", None])
-@pytest.mark.parametrize("end", ["eos", "max_steps"])
-@pytest.mark.parametrize("shutdown_conflict", ["none", "metadata", "incarnation", "stop_failure", "stop_timeout", "discard_failure"])
-@pytest.mark.parametrize("release_fails", [False, True])
+@pytest.mark.parametrize("end,shutdown_conflict,release_fails", [
+    ("eos", "none", False), ("eos", "none", True), ("eos", "discard_failure", False),
+    ("max_steps", "none", False), ("max_steps", "none", True),
+    ("max_steps", "metadata", False), ("max_steps", "incarnation", False),
+    ("max_steps", "stop_failure", False), ("max_steps", "stop_timeout", False),
+])
 def test_mooncake_driver_cleans_tail_and_late_shutdown_references(monkeypatch, end, producer_node, shutdown_conflict, release_fails):
-    if release_fails and shutdown_conflict != "none":
-        pytest.skip("Cleanup failure and identity conflict are tested separately")
-    if shutdown_conflict not in {"none", "discard_failure"} and end == "eos":
-        pytest.skip("Only max_steps has a late shutdown event")
-    if shutdown_conflict == "discard_failure" and end != "eos":
-        pytest.skip("Discard failure is covered by the end-of-stream tail")
-    from copy import deepcopy
     from verl_speco.producer import hidden_states_store
     from verl_speco.trainer.tq_feature_store import ReferenceFeatureStore
     from verl_speco.transport.drafter_sample_protocol import (
         PROTOCOL_SCHEMA_VERSION, SampleMetadata, make_reference_tag, make_sample_key,
     )
 
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     use_credits = end == "eos" and shutdown_conflict in {"none", "discard_failure"}
     if shutdown_conflict == "incarnation" or use_credits:
         config.speco.standalone_tq_producer.max_published_references = 2
     if shutdown_conflict == "stop_timeout":
         config.speco.draft_training.scheduler = {"producer_stop_timeout_seconds": 0.01}
-        config.speco.draft_training.get = lambda key, default=None: getattr(config.speco.draft_training, key, default)
     training = config.actor_rollout_ref.rollout.drafter.training
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.feature_store = SimpleNamespace(type="ray_reference")
     training.batch_size_per_gpu = 2 if end == "eos" else 1
     training.max_steps = 0 if end == "eos" else 1
@@ -2748,24 +2662,10 @@ def test_mooncake_driver_cleans_tail_and_late_shutdown_references(monkeypatch, e
             assert "metadata_event_age_time" not in command["delivery_times"]
 
 
-@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), True, "5"])
-def test_producer_stop_timeout_is_validated_before_workers(value):
-    from copy import deepcopy
-    config = deepcopy(_runtime_config())
-    config.speco.draft_training.scheduler = {"producer_stop_timeout_seconds": value}
-    config.speco.draft_training.get = lambda key, default=None: getattr(config.speco.draft_training, key, default)
-    trainer = StandaloneRayTrainer.__new__(StandaloneRayTrainer)
-    trainer.consumer_config = config
-    with pytest.raises(ValueError, match="producer_stop_timeout_seconds"):
-        trainer.run()
-
-
 def test_rank_token_balance_validates_configuration_before_workers(monkeypatch):
-    from copy import deepcopy
     from verl_speco.standalone_ray_runtime import _balance_assignments_by_tokens
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     # The lightweight test namespace binds get methods to its original instance.
-    config.speco.draft_training.get = lambda key, default=None: getattr(config.speco.draft_training, key, default)
     config.speco.draft_training.scheduler = {"balance_by_tokens": True}
     with pytest.raises(ValueError, match="requires ray_reference"):
         _balance_assignments_by_tokens(config)
@@ -2776,21 +2676,26 @@ def test_rank_token_balance_validates_configuration_before_workers(monkeypatch):
         _balance_assignments_by_tokens(config)
 
 
+def _dspark_mooncake_entry(index):
+    from verl_speco.transport.drafter_sample_protocol import (
+        PROTOCOL_SCHEMA_VERSION, SampleMetadata, make_reference_tag, make_sample_key,
+    )
+
+    meta = SampleMetadata(PROTOCOL_SCHEMA_VERSION, "run", str(index), index)
+    tag = make_reference_tag(
+        meta, backend="mooncake", handle=f"h{index}",
+        request={"input_ids": [1], "loss_mask": [1], "position_ids": [0],
+                 "feature_positions": [0], "draft_position_ids": [0],
+                 "vllm_prompt_token_ids": [1], "source_metadata": {}},
+        feature_contract={"algorithm": "DSPARK"},
+    )
+    return {"key": make_sample_key(meta), "tag": tag}
+
+
 def test_disk_reference_identity_ledger_rejects_conflicts_and_enforces_capacity():
     from copy import deepcopy
     from verl_speco.producer.reference_ledger import _ReferenceIdentityLedger
     from verl_speco.standalone_ray_runtime import _accept_reference_entries, _release_reference_entries
-    from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION, SampleMetadata, make_reference_tag, make_sample_key
-    def entry(index):
-        meta = SampleMetadata(PROTOCOL_SCHEMA_VERSION, "run", str(index), index)
-        tag = make_reference_tag(
-            meta, backend="mooncake", handle=f"h{index}",
-            request={"input_ids": [1], "loss_mask": [1], "position_ids": [0],
-                     "feature_positions": [0], "draft_position_ids": [0],
-                     "vllm_prompt_token_ids": [1], "source_metadata": {}},
-            feature_contract={"algorithm": "DSPARK"},
-        )
-        return {"key": make_sample_key(meta), "tag": tag}
     ledger = _ReferenceIdentityLedger(max_entries=2)
     from pathlib import Path
     directory = Path(ledger.directory.name)
@@ -2798,7 +2703,7 @@ def test_disk_reference_identity_ledger_rejects_conflicts_and_enforces_capacity(
     try:
         assert (directory / "identities.sqlite").is_file()
         assert ledger.db.execute("PRAGMA cache_size").fetchone()[0] == -2048
-        first = entry(0)
+        first = _dspark_mooncake_entry(0)
         accepted = _accept_reference_entries([first], run_id="run", seen_keys=ledger, seen_references=references)
         _release_reference_entries(accepted, references)
         assert not _accept_reference_entries([deepcopy(first)], run_id="run", seen_keys=ledger, seen_references=references)
@@ -2807,9 +2712,9 @@ def test_disk_reference_identity_ledger_rejects_conflicts_and_enforces_capacity(
         with pytest.raises(ValueError, match="conflicting"):
             _accept_reference_entries([altered], run_id="run", seen_keys=ledger, seen_references=references)
         with pytest.raises(ValueError, match="entry limit"):
-            _accept_reference_entries([entry(1), entry(2)], run_id="run", seen_keys=ledger, seen_references=references)
+            _accept_reference_entries([_dspark_mooncake_entry(1), _dspark_mooncake_entry(2)], run_id="run", seen_keys=ledger, seen_references=references)
         assert ledger.count == 1 and not references
-        assert _accept_reference_entries([entry(1)], run_id="run", seen_keys=ledger, seen_references=references)
+        assert _accept_reference_entries([_dspark_mooncake_entry(1)], run_id="run", seen_keys=ledger, seen_references=references)
         assert ledger.count == 2
         with pytest.raises(ValueError, match="must not be empty"):
             ledger.record_batch(2, [])
@@ -2817,7 +2722,7 @@ def test_disk_reference_identity_ledger_rejects_conflicts_and_enforces_capacity(
         assert not ledger.record_batch(0, [deepcopy(first)])
         with pytest.raises(ValueError, match="conflicting contents"):
             ledger.record_batch(0, [altered])
-        assert ledger.record_batch(1, [entry(1)])
+        assert ledger.record_batch(1, [_dspark_mooncake_entry(1)])
     finally:
         ledger.close()
     assert not directory.exists()
@@ -2829,9 +2734,8 @@ def test_driver_validates_retried_metadata_batch_identity(monkeypatch, conflict)
     from pathlib import Path
     import verl_speco.standalone_ray_runtime as runtime
     from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION, SampleMetadata, make_reference_tag, make_sample_key
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     training = config.actor_rollout_ref.rollout.drafter.training
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.feature_store = SimpleNamespace(type="ray_reference")
     training.transfer_queue = {"consumer_prefetch_batches": 2}
     monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
@@ -2876,29 +2780,17 @@ def test_driver_validates_retried_metadata_batch_identity(monkeypatch, conflict)
     (1, "DSPARK", "missing_applied"), (1, "DSPARK", "stale_applied"),
 ])
 def test_driver_partial_tail_trains_each_sample_or_preserves_too_small_tail(monkeypatch, tail_count, algorithm, ack_mode):
-    from copy import deepcopy
-    from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION, SampleMetadata, make_reference_tag, make_sample_key
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     runtime = config.speco.draft_training
     runtime.nnodes = 2
     runtime.scheduler = {"tail_policy": "partial"}
-    runtime.get = lambda key, default=None: getattr(runtime, key, default)
     training = config.actor_rollout_ref.rollout.drafter.training
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.feature_store = SimpleNamespace(type="ray_reference")
     config.actor_rollout_ref.rollout.drafter.speculative_algorithm = algorithm
     training.batch_size_per_gpu = 2
     training.transfer_queue = {"consumer_prefetch_batches": 1}
     monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
-    def entry(index):
-        meta = SampleMetadata(PROTOCOL_SCHEMA_VERSION, "run", str(index), index)
-        tag = make_reference_tag(meta, backend="mooncake", handle=f"h{index}",
-            request={"input_ids": [1], "loss_mask": [1], "position_ids": [0],
-                     "feature_positions": [0], "draft_position_ids": [0],
-                     "vllm_prompt_token_ids": [1], "source_metadata": {}},
-            feature_contract={"algorithm": "DSPARK"})
-        return {"key": make_sample_key(meta), "tag": tag}
-    entries = [entry(i) for i in range(tail_count)]
+    entries = [_dspark_mooncake_entry(i) for i in range(tail_count)]
     events = _RecordingQueue(events=[
         {"kind": "consumer_ready", "initial_optimizer_step": 0},
         *[{"kind": "samples_ready", "batch_id": index, "entries": [entry]}
@@ -2957,9 +2849,7 @@ def test_driver_partial_tail_trains_each_sample_or_preserves_too_small_tail(monk
                                                for early in (False, True)] + [("unsafe_copy", True), ("cleanup_failure", True)])
 @pytest.mark.parametrize("parent_commit", [False, True])
 def test_driver_verifies_direct_rank_receipts_before_credit_release(monkeypatch, mode, parent_commit, early_release):
-    from copy import deepcopy
-    from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION, SampleMetadata, make_reference_tag, make_sample_key
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     runtime = config.speco.draft_training
     runtime.nproc_per_node = 2
     runtime.scheduler = {"per_rank_reference_ack": True, "release_payload_on_materialization": early_release}
@@ -2971,27 +2861,17 @@ def test_driver_verifies_direct_rank_receipts_before_credit_release(monkeypatch,
     if early_release:
         monkeypatch.setattr("verl_speco.standalone_ray_runtime.cleanup_standalone_samples",
                             lambda *a, **k: ["unreleased"] if mode == "cleanup_failure" and k.get("reason") == "materialized" else [])
-    runtime.get = lambda key, default=None: getattr(runtime, key, default)
     config.speco.standalone_tq_producer.max_published_references = 0 if parent_commit else 2
     config.speco.standalone_tq_producer.publication_after_parent_commit = parent_commit
     training = config.actor_rollout_ref.rollout.drafter.training
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.feature_store = SimpleNamespace(type="ray_reference")
     training.batch_size_per_gpu = 1
     training.max_steps = 1
     training.transfer_queue = {"consumer_prefetch_batches": 1}
     monkeypatch.setattr("verl_speco.standalone_ray_runtime.compose_runtime_config", lambda _: config)
-    def entry(index):
-        meta = SampleMetadata(PROTOCOL_SCHEMA_VERSION, "run", str(index), index)
-        tag = make_reference_tag(meta, backend="mooncake", handle=f"h{index}",
-            request={"input_ids": [1], "loss_mask": [1], "position_ids": [0],
-                     "feature_positions": [0], "draft_position_ids": [0],
-                     "vllm_prompt_token_ids": [1], "source_metadata": {}},
-            feature_contract={"algorithm": "DSPARK"})
-        return {"key": make_sample_key(meta), "tag": tag}
     events = _RecordingQueue(events=[
         {"kind": "consumer_ready", "initial_optimizer_step": 0},
-        {"kind": "samples_ready", "batch_id": 0, "entries": [entry(0), entry(1)],
+        {"kind": "samples_ready", "batch_id": 0, "entries": [_dspark_mooncake_entry(0), _dspark_mooncake_entry(1)],
          "producer_incarnation": "f" * 32},
         {"kind": "producer_done", "producer_incarnation": "f" * 32},
     ], on_event=lambda event: observed.append(event["kind"]))
@@ -3062,12 +2942,7 @@ def test_driver_verifies_direct_rank_receipts_before_credit_release(monkeypatch,
 
 @pytest.mark.parametrize("successful", [False, None, "true"])
 def test_driver_rejects_untrusted_training_completion(monkeypatch, successful):
-    import copy
-
-    config = copy.deepcopy(_runtime_config())
-    monkeypatch.setattr(sys.modules[__name__], "_CONFIG", config)
-    training = config.actor_rollout_ref.rollout.drafter.training
-    training.get = lambda key, default=None: getattr(training, key, default)
+    config = _runtime_config()
     commands = _RecordingQueue()
     events = _RecordingQueue(events=[
         {"kind": "consumer_ready", "initial_optimizer_step": 0},
@@ -3132,14 +3007,10 @@ def test_oversized_reference_entry_fails_before_any_event():
 
 
 def test_driver_accepts_next_materialization_before_previous_completion(monkeypatch):
-    from copy import deepcopy
     from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION, SampleMetadata, make_reference_tag, make_sample_key
 
-    config = deepcopy(_runtime_config())
-    runtime = config.speco.draft_training
-    runtime.get = lambda key, default=None: getattr(runtime, key, default)
+    config = _runtime_config()
     training = config.actor_rollout_ref.rollout.drafter.training
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.feature_store = SimpleNamespace(type="ray_reference")
     training.batch_size_per_gpu = 1
     training.max_steps = 2
@@ -3192,68 +3063,40 @@ def test_driver_accepts_next_materialization_before_previous_completion(monkeypa
 
 
 def _live_topology_gloo_worker(rank, port, bad, result_queue):
-    import datetime
     import ray
-    import torch.distributed as dist
     import verl_speco.trainer.draft_training_loop as loop
     from types import SimpleNamespace
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=datetime.timedelta(seconds=25))
-    def node_id():
-        if bad == "lookup" and rank == 1:
-            raise RuntimeError("injected Ray context failure")
-        if bad == "owner_same":
-            return "node-shared"
-        return f"node-{rank}"
-    ray.get_runtime_context = lambda: SimpleNamespace(
-        get_node_id=node_id, get_accelerator_ids=lambda: {"GPU": ["0"]})
-    ray.util.get_node_ip_address = lambda: f"10.0.0.{1 if bad == 'placement' else rank + 1}"
-    loop.get_device_name = lambda: "cuda"
-    changed = bad == "config" and rank == 1
-    single_node = changed or bad in {"owner_same", "owner_split"}
-    config = SimpleNamespace(speco=SimpleNamespace(draft_training=SimpleNamespace(
-        nnodes=1 if single_node else 2, nproc_per_node=2 if single_node else 1,
-        trainer_node_ips=None if single_node else ["10.0.0.1", "10.0.0.2"])),
-        actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(
-            training={"transfer_queue": {"consumer_device_batch_bytes": 1 if bad == "budget" and rank == 1 else 0,
-                                         "consumer_node_reference_owner": bad in {"owner_same", "owner_split"}}}))))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=25):
+        def node_id():
+            if bad == "lookup" and rank == 1:
+                raise RuntimeError("injected Ray context failure")
+            if bad == "owner_same":
+                return "node-shared"
+            return f"node-{rank}"
+        ray.get_runtime_context = lambda: SimpleNamespace(
+            get_node_id=node_id, get_accelerator_ids=lambda: {"GPU": ["0"]})
+        ray.util.get_node_ip_address = lambda: f"10.0.0.{1 if bad == 'placement' else rank + 1}"
+        loop.get_device_name = lambda: "cuda"
+        changed = bad == "config" and rank == 1
+        single_node = changed or bad in {"owner_same", "owner_split"}
+        config = SimpleNamespace(speco=SimpleNamespace(draft_training=SimpleNamespace(
+            nnodes=1 if single_node else 2, nproc_per_node=2 if single_node else 1,
+            trainer_node_ips=None if single_node else ["10.0.0.1", "10.0.0.2"])),
+            actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(
+                training={"transfer_queue": {"consumer_device_batch_bytes": 1 if bad == "budget" and rank == 1 else 0,
+                                             "consumer_node_reference_owner": bad in {"owner_same", "owner_split"}}}))))
         try:
             loop._verify_live_trainer_topology(config, rank=rank, world_size=2, scheduled=True)
             result_queue.put((rank, "ok"))
         except ValueError as exc:
             result_queue.put((rank, str(exc)))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("bad", ["none", "placement", "config", "lookup", "budget", "owner_same", "owner_split"])
 def test_live_trainer_topology_gloo_agrees_before_model_loading(bad):
-    import multiprocessing
-    import socket
-    import torch.distributed as dist
-    if not dist.is_gloo_available():
-        pytest.skip("Gloo is unavailable")
-    context = multiprocessing.get_context("spawn")
-    queue = context.Queue()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    processes = [context.Process(target=_live_topology_gloo_worker, args=(rank, port, bad, queue)) for rank in range(2)]
-    for process in processes:
-        process.start()
-    try:
-        results = [queue.get(timeout=60) for _ in processes]
-        for process in processes:
-            process.join(timeout=20)
-        assert all(process.exitcode == 0 for process in processes)
-        assert {item[0] for item in results} == {0, 1}
-        expected = {"placement": "differs from the plan", "config": "disagree on the configured topology",
-                    "lookup": "Cannot verify live trainer placement", "budget": "disagree on the configured topology",
-                    "owner_split": "must share one verified Ray node"}.get(bad, "ok")
-        assert all(expected in item[1] for item in results)
-    finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
+    results = collect_gloo_workers(_live_topology_gloo_worker,
+        lambda rank, port, queue: (rank, port, bad, queue), timeout=60, join_timeout=20)
+    expected = {"placement": "differs from the plan", "config": "disagree on the configured topology",
+                "lookup": "Cannot verify live trainer placement", "budget": "disagree on the configured topology",
+                "owner_split": "must share one verified Ray node"}.get(bad, "ok")
+    assert all(expected in item[1] for item in results)

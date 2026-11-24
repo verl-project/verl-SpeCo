@@ -5,6 +5,7 @@ from functools import partial
 from queue import Queue
 
 import pytest
+from standalone_test_utils import gloo_workers, join_workers, gloo_process_group
 import torch
 from safetensors.torch import save_file
 
@@ -521,13 +522,11 @@ def test_ray_reference_adapter_prepares_and_cleans_without_any_tq_calls(tmp_path
     store.close()
 
 
-@pytest.mark.parametrize("credit_limit", [0, 1, 2, 3])
-@pytest.mark.parametrize("incarnation_conflict", ["none", "sample", "done"])
-@pytest.mark.parametrize("training_fails,stale_receipt,fragmented", [
-    (False, False, False), (True, False, False), (False, True, False), (False, False, True),
+@pytest.mark.parametrize("credit_limit,incarnation_conflict,scenario", [
+    *((limit, "none", scenario) for limit in range(4) for scenario in ("ok", "training_fails", "stale_receipt", "fragmented")),
+    *((limit, conflict, "ok") for limit in (1, 2, 3) for conflict in ("sample", "done")),
 ])
-def test_driver_receives_metadata_once_before_producer_completion(tmp_path, monkeypatch, training_fails, stale_receipt, fragmented, credit_limit, incarnation_conflict):
-    from copy import deepcopy
+def test_driver_receives_metadata_once_before_producer_completion(tmp_path, monkeypatch, credit_limit, incarnation_conflict, scenario):
     from types import SimpleNamespace
 
     from test_standalone_ray_runtime import (
@@ -535,19 +534,17 @@ def test_driver_receives_metadata_once_before_producer_completion(tmp_path, monk
     )
     from verl_speco.standalone_ray_runtime import StandaloneRayTrainer
 
-    if incarnation_conflict != "none" and (not credit_limit or training_fails or stale_receipt or fragmented):
-        pytest.skip("Incarnation conflict needs one successful credit-enabled case")
-    config = deepcopy(_runtime_config())
+    training_fails = scenario == "training_fails"
+    stale_receipt = scenario == "stale_receipt"
+    fragmented = scenario == "fragmented"
+    config = _runtime_config()
     config.speco.standalone_tq_producer.max_published_references = int(credit_limit == 1)
     config.speco.standalone_tq_producer.max_reference_execution_slots = int(credit_limit == 2)
     config.speco.standalone_tq_producer.max_published_file_tensor_bytes = int(credit_limit == 3)
     runtime = config.speco.draft_training
     if fragmented:
         runtime.scheduler = {"reference_command_frame_bytes": 1024}
-        runtime.get = lambda key, default=None: getattr(runtime, key, default)
     training = config.actor_rollout_ref.rollout.drafter.training
-    # The fixture's get closures refer to the original; replace with local access.
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.feature_store = SimpleNamespace(type="ray_reference")
     training.batch_size_per_gpu = 1
     training.transfer_queue = {"consumer_prefetch_batches": 1}
@@ -689,14 +686,12 @@ def test_driver_receives_metadata_once_before_producer_completion(tmp_path, monk
 
 @pytest.mark.parametrize("matching", [False, True, None])
 def test_driver_waits_for_matching_input_identity_before_dispatch(tmp_path, monkeypatch, matching):
-    from copy import deepcopy
     from types import SimpleNamespace
     from test_standalone_ray_runtime import _commands, _runtime_config, _FakeRay, _ProducerHandle, _RecordingQueue, _WorkerGroup
     from verl_speco.standalone_ray_runtime import StandaloneRayTrainer
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     config.speco.standalone_tq_producer.input_path = "bound-input"
     training = config.actor_rollout_ref.rollout.drafter.training
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.feature_store = SimpleNamespace(type="ray_reference")
     training.batch_size_per_gpu = 1
     training.transfer_queue = {"consumer_prefetch_batches": 0}
@@ -940,7 +935,6 @@ def test_node_owner_receives_local_assignments_including_padding_template(tmp_pa
 def _gloo_padding_pipeline_worker(rank, port, command, proceed, ready, invalid_mask, algorithm):
     import asyncio
     from contextlib import nullcontext
-    from datetime import timedelta
     from types import SimpleNamespace
     import torch.distributed as dist
     import verl_speco.trainer.base_trainer as trainer_module
@@ -959,9 +953,7 @@ def _gloo_padding_pipeline_worker(rank, port, command, proceed, ready, invalid_m
     )
 
     torch.set_num_threads(1)
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=timedelta(seconds=45))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=45):
         trainer_module.device_name = "cpu"
         torch.manual_seed(21)
         common = dict(hidden_size=2, intermediate_size=4, num_hidden_layers=1,
@@ -1070,8 +1062,6 @@ def _gloo_padding_pipeline_worker(rank, port, command, proceed, ready, invalid_m
             assert events.get_nowait()["kind"] == "training_applied"
             assert events.get_nowait()["kind"] == "training_completed"
         ready.put((rank, "cleared"))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
@@ -1079,7 +1069,6 @@ def _gloo_padding_pipeline_worker(rank, port, command, proceed, ready, invalid_m
 @pytest.mark.parametrize("algorithm", ["DSPARK", "DFLASH", "EAGLE3"])
 def test_padding_tail_real_two_rank_loader_training_and_release(tmp_path, invalid_mask, algorithm, monkeypatch):
     import multiprocessing
-    import socket
     entry, path = _entry(tmp_path)
     entry.tag["feature_contract"]["algorithm"] = algorithm
     if algorithm == "EAGLE3":
@@ -1098,34 +1087,22 @@ def test_padding_tail_real_two_rank_loader_training_and_release(tmp_path, invali
         assert len(command) > 1
     context = multiprocessing.get_context("spawn")
     ready, proceed = context.Queue(), context.Event()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    processes = [context.Process(target=_gloo_padding_pipeline_worker,
-                                 args=(rank, port, command, proceed, ready, invalid_mask, algorithm)) for rank in range(2)]
-    for process in processes:
-        process.start()
     try:
-        rows = {ready.get(timeout=45), ready.get(timeout=45)}
-        if invalid_mask:
-            assert rows == {(0, "fetch_error"), (1, "fetch_error")}
-            assert path.exists()
-        else:
-            assert rows == {(0, False, 2 if algorithm == "EAGLE3" else 3), (1, True, 0)}
-            assert path.exists()  # The other rank has not entered the release barrier.
-            proceed.set()
-        for process in processes:
-            process.join(timeout=40)
-        assert all(process.exitcode == 0 for process in processes)
-        if not invalid_mask:
-            assert {ready.get(timeout=5), ready.get(timeout=5)} == {(0, "cleared"), (1, "cleared")}
-            assert not path.exists()
+        with gloo_workers(context, _gloo_padding_pipeline_worker,
+                          lambda rank, port: (rank, port, command, proceed, ready, invalid_mask, algorithm), release=proceed) as processes:
+            rows = {ready.get(timeout=45), ready.get(timeout=45)}
+            if invalid_mask:
+                assert rows == {(0, "fetch_error"), (1, "fetch_error")}
+                assert path.exists()
+            else:
+                assert rows == {(0, False, 2 if algorithm == "EAGLE3" else 3), (1, True, 0)}
+                assert path.exists()  # The other rank has not entered the release barrier.
+                proceed.set()
+            join_workers(processes, 40)
+            if not invalid_mask:
+                assert {ready.get(timeout=5), ready.get(timeout=5)} == {(0, "cleared"), (1, "cleared")}
+                assert not path.exists()
     finally:
-        proceed.set()
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
         ready.close()
 
 
@@ -1156,20 +1133,17 @@ def test_padding_command_rejects_unsafe_reference_and_cleanup(tmp_path, fault):
 
 @pytest.mark.parametrize("oversized", ["event", "command"])
 def test_reference_control_limit_rejects_large_metadata_without_deleting(tmp_path, monkeypatch, oversized):
-    from copy import deepcopy
     from types import SimpleNamespace
     from test_standalone_ray_runtime import (
         _commands, _runtime_config, _FakeRay, _ProducerHandle, _RecordingQueue, _WorkerGroup,
     )
     from verl_speco.standalone_ray_runtime import StandaloneRayTrainer
 
-    config = deepcopy(_runtime_config())
+    config = _runtime_config()
     runtime = config.speco.draft_training
     runtime.scheduler = {"reference_command_max_bytes": 1024 if oversized == "command" else 268435456}
-    runtime.get = lambda key, default=None: getattr(runtime, key, default)
     config.speco.standalone_tq_producer.reference_event_max_bytes = 1024 if oversized == "event" else 16777216
     training = config.actor_rollout_ref.rollout.drafter.training
-    training.get = lambda key, default=None: getattr(training, key, default)
     training.feature_store = SimpleNamespace(type="ray_reference")
     training.batch_size_per_gpu = 1
     training.transfer_queue = {"consumer_prefetch_batches": 1}

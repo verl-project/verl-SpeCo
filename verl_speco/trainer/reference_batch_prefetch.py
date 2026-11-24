@@ -357,18 +357,7 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
         )
 
     def close(self, *, timeout=None):
-        timeout = self.close_timeout if timeout is None else timeout
-        if (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, (int, float))
-            or not math.isfinite(timeout)
-            or timeout <= 0
-        ):
-            raise ValueError("Prefetch close timeout must be a positive finite number")
-        deadline = time.monotonic() + timeout
-        self.stop.set()
-        with self._condition:
-            self._condition.notify_all()
+        deadline = self._begin_close(timeout)
         self._collector.join(timeout=max(0.0, deadline - time.monotonic()))
         error = None
         try:

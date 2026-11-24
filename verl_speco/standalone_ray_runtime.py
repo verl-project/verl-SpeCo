@@ -23,7 +23,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, cast
 
-from verl_speco.config import prefetch_depth
+from verl_speco.config import prefetch_depth, validate_timeout
 from verl_speco.producer.metrics import current_ray_node_id
 from verl_speco.producer.reference_ledger import (
     _ReferenceIdentityLedger,
@@ -1079,6 +1079,31 @@ class StandaloneProducerActor:
             await self._fail_native_transition()
             raise
 
+    def _validate_reference_accounting(self, keys: list[str]) -> None:
+        if (
+            self._slot_tracking
+            and not set(keys) <= self._active_reference_sequences.keys()
+        ):
+            raise RuntimeError(
+                "Reference execution slot accounting is inconsistent"
+            )
+        if self._file_bytes_limit and (
+            not set(keys) <= self._active_file_bytes.keys()
+            or sum(self._active_file_bytes[key] for key in keys)
+            > self._published_file_bytes
+        ):
+            raise RuntimeError("File tensor byte accounting is inconsistent")
+
+    def _retire_reference_accounting(self, keys: list[str]) -> None:
+        self._journal_payloads(retired=keys)
+        for key in keys:
+            self._native_references.pop(key, None)
+            if self._slot_tracking:
+                del self._active_reference_sequences[key]
+            if self._file_bytes_limit:
+                self._published_file_bytes -= self._active_file_bytes.pop(key)
+        self._active_references.difference_update(keys)
+
     async def discard_unassigned_references(
         self, incarnation: str, token: str, keys: list[str]
     ) -> None:
@@ -1119,28 +1144,9 @@ class StandaloneProducerActor:
                 raise ValueError(
                     "Reference discard requires unassigned active references"
                 )
-            if (
-                self._slot_tracking
-                and not set(keys) <= self._active_reference_sequences.keys()
-            ):
-                raise RuntimeError(
-                    "Reference execution slot accounting is inconsistent"
-                )
-            if self._file_bytes_limit and (
-                not set(keys) <= self._active_file_bytes.keys()
-                or sum(self._active_file_bytes[key] for key in keys)
-                > self._published_file_bytes
-            ):
-                raise RuntimeError("File tensor byte accounting is inconsistent")
+            self._validate_reference_accounting(keys)
             await self._native_transition(keys, "discard_unbound")
-            self._journal_payloads(retired=keys)
-            for key in keys:
-                self._native_references.pop(key, None)
-                if self._slot_tracking:
-                    del self._active_reference_sequences[key]
-                if self._file_bytes_limit:
-                    self._published_file_bytes -= self._active_file_bytes.pop(key)
-            self._active_references.difference_update(keys)
+            self._retire_reference_accounting(keys)
             self._discarded_reference_batches[token] = identity
             self._close_drained_lease_journal()
             if len(self._discarded_reference_batches) > 4096:
@@ -1352,38 +1358,16 @@ class StandaloneProducerActor:
                 raise ValueError(
                     "Reference credit release requires every rank acknowledgement"
                 )
-            if (
-                self._slot_tracking
-                and not set(keys) <= self._active_reference_sequences.keys()
-            ):
-                raise RuntimeError(
-                    "Reference execution slot accounting is inconsistent"
-                )
-            if self._file_bytes_limit and (
-                not set(keys) <= self._active_file_bytes.keys()
-                or sum(self._active_file_bytes[key] for key in keys)
-                > self._published_file_bytes
-            ):
-                raise RuntimeError("File tensor byte accounting is inconsistent")
+            self._validate_reference_accounting(keys)
             self._journal_lease(plan_id, "RELEASE_INTENT", identity)
             await self._native_transition(
                 keys, "release", plan_id=plan_id, receipt_token=receipt_token
             )
             self._journal_lease(plan_id, "RELEASED", identity)
-            self._journal_payloads(retired=keys)
-            for key in keys:
-                self._native_references.pop(key, None)
+            self._retire_reference_accounting(keys)
             del self._registered_reference_plans[plan_id]
             del self._rank_acknowledgements[plan_id]
             self._assigned_references.difference_update(keys)
-            self._active_references.difference_update(keys)
-            if self._file_bytes_limit:
-                self._published_file_bytes -= sum(
-                    self._active_file_bytes.pop(key) for key in keys
-                )
-            if self._slot_tracking:
-                for key in keys:
-                    del self._active_reference_sequences[key]
             self._released_reference_plans[plan_id] = identity
             self._last_released_reference_plan = plan_id
             self._close_drained_lease_journal()
@@ -1411,15 +1395,7 @@ class StandaloneProducerActor:
         training = _config_member(speco, "draft_training", {})
         scheduler = _config_member(training, "scheduler", {}) or {}
         timeout = _config_member(scheduler, "producer_stop_timeout_seconds", 180)
-        if (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, (int, float))
-            or not math.isfinite(timeout)
-            or timeout <= 0
-        ):
-            raise ValueError(
-                "producer_stop_timeout_seconds must be a positive finite number"
-            )
+        validate_timeout(timeout, "producer_stop_timeout_seconds")
         try:
             # Timeout does not cancel a queue RPC already running in a thread.
             await asyncio.wait_for(
@@ -1717,6 +1693,46 @@ def _ray_controller_types():
     return RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 
 
+def _validate_trainer_placement(processes_per_node, timeout):
+    if (
+        type(processes_per_node) is not int
+        or processes_per_node < 1
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError(
+            "trainer placement requires positive process count and timeout"
+        )
+
+
+def _reserve_trainer_groups(
+    ray_module, node_ips, processes_per_node, resource, name, timeout, placement_api,
+):
+    if placement_api is None:
+        from ray.util.placement_group import placement_group, remove_placement_group
+    else:
+        placement_group, remove_placement_group = placement_api
+    groups = []
+    try:
+        for index, ip in enumerate(node_ips if node_ips is not None else (None,)):
+            bundles = [{"CPU": 1, resource: 1} for _ in range(processes_per_node)]
+            group_name = name
+            if ip is not None:
+                bundles[0][f"node:{ip}"] = 0.001
+                group_name = f"{name}_{index}"
+            groups.append(placement_group(bundles, strategy="STRICT_PACK", name=group_name))
+        ready = [group.ready() for group in groups]
+        ray_module.get(ready[0] if node_ips is None else ready, timeout=timeout)
+        return groups
+    except BaseException:
+        for group in groups:
+            try:
+                remove_placement_group(group)
+            except Exception:
+                logger.exception("Failed to remove partially allocated trainer group")
+        raise
+
+
 def _create_pinned_trainer_groups(
     ray_module,
     *,
@@ -1747,15 +1763,7 @@ def _create_pinned_trainer_groups(
     if len(set(node_ips)) != len(node_ips):
         raise ValueError("trainer_node_ips must list distinct Ray node addresses")
     node_ips.sort()  # Match verl's deterministic placement-group rank order.
-    if (
-        type(processes_per_node) is not int
-        or processes_per_node < 1
-        or not math.isfinite(timeout)
-        or timeout <= 0
-    ):
-        raise ValueError(
-            "trainer placement requires positive process count and timeout"
-        )
+    _validate_trainer_placement(processes_per_node, timeout)
     resource = RAY_ACCELERATOR_RESOURCES.get(device_name)
     if resource is None:
         raise ValueError(f"Unsupported distributed trainer device: {device_name}")
@@ -1777,27 +1785,9 @@ def _create_pinned_trainer_groups(
             raise ValueError(
                 f"Ray node {ip!r} lacks required {resource}/CPU capacity or node resource"
             )
-    if placement_api is None:
-        from ray.util.placement_group import placement_group, remove_placement_group
-    else:
-        placement_group, remove_placement_group = placement_api
-    groups = []
-    try:
-        for index, ip in enumerate(node_ips):
-            bundles = [{"CPU": 1, resource: 1} for _ in range(processes_per_node)]
-            bundles[0][f"node:{ip}"] = 0.001
-            groups.append(
-                placement_group(bundles, strategy="STRICT_PACK", name=f"{name}_{index}")
-            )
-        ray_module.get([group.ready() for group in groups], timeout=timeout)
-        return groups
-    except BaseException:
-        for group in groups:
-            try:
-                remove_placement_group(group)
-            except Exception:
-                logger.exception("Failed to remove partially allocated trainer group")
-        raise
+    return _reserve_trainer_groups(
+        ray_module, node_ips, processes_per_node, resource, name, timeout, placement_api
+    )
 
 
 def _create_unpinned_trainer_group(
@@ -1806,36 +1796,13 @@ def _create_unpinned_trainer_group(
     """Reserve the single-node group with a bounded, cleanup-safe wait."""
     from verl_speco.trainer.gpu_transfer import RAY_ACCELERATOR_RESOURCES
 
-    if (
-        type(processes_per_node) is not int
-        or processes_per_node < 1
-        or not math.isfinite(timeout)
-        or timeout <= 0
-    ):
-        raise ValueError(
-            "trainer placement requires positive process count and timeout"
-        )
+    _validate_trainer_placement(processes_per_node, timeout)
     resource = RAY_ACCELERATOR_RESOURCES.get(device_name, device_name)
     if not isinstance(resource, str) or not resource:
         raise ValueError("Unsupported trainer device")
-    if placement_api is None:
-        from ray.util.placement_group import placement_group, remove_placement_group
-    else:
-        placement_group, remove_placement_group = placement_api
-    group = placement_group(
-        [{"CPU": 1, resource: 1} for _ in range(processes_per_node)],
-        strategy="STRICT_PACK",
-        name=name,
+    return _reserve_trainer_groups(
+        ray_module, None, processes_per_node, resource, name, timeout, placement_api
     )
-    try:
-        ray_module.get(group.ready(), timeout=timeout)
-        return [group]
-    except BaseException:
-        try:
-            remove_placement_group(group)
-        except Exception:
-            logger.exception("Failed to remove partially allocated trainer group")
-        raise
 
 
 def build_consumer_worker_group(
@@ -2189,45 +2156,13 @@ class StandaloneRayTrainer:
         balance_by_tokens = _balance_assignments_by_tokens(self.consumer_config)
         scheduler_cfg = self.consumer_config.speco.draft_training.get("scheduler") or {}
         start_timeout = scheduler_cfg.get("producer_start_timeout_seconds", 1800)
-        if (
-            isinstance(start_timeout, bool)
-            or not isinstance(start_timeout, (int, float))
-            or not math.isfinite(start_timeout)
-            or start_timeout <= 0
-        ):
-            raise ValueError(
-                "scheduler.producer_start_timeout_seconds must be a positive finite number"
-            )
+        validate_timeout(start_timeout, "scheduler.producer_start_timeout_seconds")
         stop_timeout = scheduler_cfg.get("producer_stop_timeout_seconds", 180)
-        if (
-            isinstance(stop_timeout, bool)
-            or not isinstance(stop_timeout, (int, float))
-            or not math.isfinite(stop_timeout)
-            or stop_timeout <= 0
-        ):
-            raise ValueError(
-                "scheduler.producer_stop_timeout_seconds must be a positive finite number"
-            )
+        validate_timeout(stop_timeout, "scheduler.producer_stop_timeout_seconds")
         consumer_timeout = scheduler_cfg.get("consumer_shutdown_timeout_seconds", 1800)
-        if (
-            isinstance(consumer_timeout, bool)
-            or not isinstance(consumer_timeout, (int, float))
-            or not math.isfinite(consumer_timeout)
-            or consumer_timeout <= 0
-        ):
-            raise ValueError(
-                "scheduler.consumer_shutdown_timeout_seconds must be a positive finite number"
-            )
+        validate_timeout(consumer_timeout, "scheduler.consumer_shutdown_timeout_seconds")
         commit_gate_timeout = scheduler_cfg.get("commit_gate_timeout_seconds", 180)
-        if (
-            isinstance(commit_gate_timeout, bool)
-            or not isinstance(commit_gate_timeout, (int, float))
-            or not math.isfinite(commit_gate_timeout)
-            or commit_gate_timeout <= 0
-        ):
-            raise ValueError(
-                "scheduler.commit_gate_timeout_seconds must be a positive finite number"
-            )
+        validate_timeout(commit_gate_timeout, "scheduler.commit_gate_timeout_seconds")
         per_rank_ack = scheduler_cfg.get("per_rank_reference_ack", False)
         if type(per_rank_ack) is not bool:
             raise ValueError("scheduler.per_rank_reference_ack must be a boolean")
@@ -2698,6 +2633,22 @@ class StandaloneRayTrainer:
                 ),
             )
 
+        def release_payload(pending, name):
+            retry_io(
+                lambda: self.ray.get(
+                    producer.release_references.remote(
+                        producer_incarnation,
+                        pending.plan_id,
+                        pending.receipt_token,
+                        list(pending.keys),
+                    ),
+                    timeout=float(tq_cfg.get("io_timeout_seconds", 30)),
+                ),
+                name=name,
+                attempts=io_attempts,
+            )
+            plans.mark_payload_released(pending)
+
         def release_materialized_payloads():
             # Keep source release FIFO even if prefetch receipts arrive early.
             # This does not remove a training plan or advance optimizer credit.
@@ -2716,20 +2667,7 @@ class StandaloneRayTrainer:
                     raise RuntimeError(
                         "Materialized source payload cleanup failed; source credits retained"
                     )
-                retry_io(
-                    lambda pending=pending: self.ray.get(
-                        producer.release_references.remote(
-                            producer_incarnation,
-                            pending.plan_id,
-                            pending.receipt_token,
-                            list(pending.keys),
-                        ),
-                        timeout=float(tq_cfg.get("io_timeout_seconds", 30)),
-                    ),
-                    name="Materialized source payload release",
-                    attempts=io_attempts,
-                )
-                plans.mark_payload_released(pending)
+                release_payload(pending, "Materialized source payload release")
 
         def reconcile_and_schedule(trigger: str) -> bool:
             nonlocal producer_paused, consumer_stop_requested
@@ -3138,20 +3076,7 @@ class StandaloneRayTrainer:
                         and reference_credits_enabled
                         and not pending.payload_released
                     ):
-                        retry_io(
-                            lambda pending=pending: self.ray.get(
-                                producer.release_references.remote(
-                                    producer_incarnation,
-                                    pending.plan_id,
-                                    pending.receipt_token,
-                                    list(pending.keys),
-                                ),
-                                timeout=float(tq_cfg.get("io_timeout_seconds", 30)),
-                            ),
-                            name="Producer reference credit release",
-                            attempts=io_attempts,
-                        )
-                        plans.mark_payload_released(pending)
+                        release_payload(pending, "Producer reference credit release")
                     training_outcome = scheduler.complete_standalone_training(
                         runtime_state=pending.runtime,
                         completed_keys=event.get("keys", ()),

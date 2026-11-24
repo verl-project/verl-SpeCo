@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import math
 import threading
 import time
 from collections import deque
@@ -16,6 +15,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from verl_speco.config import validate_timeout
 from verl_speco.trainer.standalone_data import StandaloneLocalBatch
 
 
@@ -111,13 +111,7 @@ class StandalonePrefetchIterator:
             raise ValueError("prefetch depth must be positive")
         if prepare_workers < 0:
             raise ValueError("prepare_workers must be non-negative")
-        if (
-            isinstance(close_timeout, bool)
-            or not isinstance(close_timeout, (int, float))
-            or not math.isfinite(close_timeout)
-            or close_timeout <= 0
-        ):
-            raise ValueError("Prefetch close timeout must be a positive finite number")
+        validate_timeout(close_timeout, "Prefetch close timeout")
         if pin_memory and getattr(loader, "prepare_batch", None) is None:
             raise ValueError("Independent pinning requires file batch preparation")
         self.loader = loader
@@ -345,19 +339,17 @@ class StandalonePrefetchIterator:
     def has_running_work(self) -> bool:
         return self._thread_work_running()
 
-    def close(self, *, timeout: float | None = None) -> None:
+    def _begin_close(self, timeout: float | None) -> float:
         timeout = self.close_timeout if timeout is None else timeout
-        if (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, (int, float))
-            or not math.isfinite(timeout)
-            or timeout <= 0
-        ):
-            raise ValueError("Prefetch close timeout must be a positive finite number")
+        validate_timeout(timeout, "Prefetch close timeout")
         deadline = time.monotonic() + timeout
         self.stop.set()
         with self._condition:
             self._condition.notify_all()
+        return deadline
+
+    def close(self, *, timeout: float | None = None) -> None:
+        deadline = self._begin_close(timeout)
         self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if self._pin_thread is not None:
             self._pin_thread.join(timeout=max(0.0, deadline - time.monotonic()))

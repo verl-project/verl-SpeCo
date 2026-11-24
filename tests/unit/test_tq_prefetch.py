@@ -7,6 +7,7 @@ from queue import Queue
 from types import SimpleNamespace
 
 import pytest
+from standalone_test_utils import collect_gloo_workers, gloo_process_group
 
 from verl_speco.trainer.scheduler import StandaloneQueueState
 from verl_speco.config import prefetch_depth
@@ -900,98 +901,69 @@ def test_reference_queue_metrics_follow_all_three_stages():
 
 
 def _host_budget_gloo_worker(rank, port, result_queue, init_failure):
-    import datetime
     import torch
     import torch.distributed as dist
     from types import SimpleNamespace
     from verl_speco.trainer.tq_sample_source import TQPrefetchIterator
 
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}",
-                            rank=rank, world_size=2, timeout=datetime.timedelta(seconds=25))
-    torch.Tensor.pin_memory = lambda tensor: tensor
-    class Loader:
-        world_size = 2
-        process_group = dist.group.WORLD
-        cleanup_after_load = False
-        prepare_batch = staticmethod(lambda *args, **kwargs: None)
-        def __init__(self):
-            self.rank = rank
-        def __iter__(self):
-            if init_failure and rank == 1:
-                raise ValueError("source initialization failed")
-            return iter([SimpleNamespace(prepared_batch={"x": torch.zeros(4 if rank == 0 else 64)}, delivery_times={})])
-    source = TQPrefetchIterator(Loader(), 2, pin_memory=True, prepare_workers=0,
-                                max_host_bytes=128, max_batch_host_bytes=128, close_timeout=10)
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=25):
+        torch.Tensor.pin_memory = lambda tensor: tensor
+        class Loader:
+            world_size = 2
+            process_group = dist.group.WORLD
+            cleanup_after_load = False
+            prepare_batch = staticmethod(lambda *args, **kwargs: None)
+            def __init__(self):
+                self.rank = rank
+            def __iter__(self):
+                if init_failure and rank == 1:
+                    raise ValueError("source initialization failed")
+                return iter([SimpleNamespace(prepared_batch={"x": torch.zeros(4 if rank == 0 else 64)}, delivery_times={})])
+        source = TQPrefetchIterator(Loader(), 2, pin_memory=True, prepare_workers=0,
+                                    max_host_bytes=128, max_batch_host_bytes=128, close_timeout=10)
         try:
-            next(source)
-            result_queue.put((rank, "unexpected_batch"))
-        except RuntimeError as exc:
-            result_queue.put((rank, str(exc), type(exc.__cause__).__name__))
-    finally:
-        source.close()
-        dist.destroy_process_group()
+            try:
+                next(source)
+                result_queue.put((rank, "unexpected_batch"))
+            except RuntimeError as exc:
+                result_queue.put((rank, str(exc), type(exc.__cause__).__name__))
+        finally:
+            source.close()
 
 
 @pytest.mark.parametrize("init_failure", [False, True])
 def test_host_budget_failure_stops_both_gloo_ranks(init_failure):
-    import multiprocessing
-    import socket
-    import torch.distributed as dist
-    if not dist.is_gloo_available():
-        pytest.skip("Gloo is unavailable")
-    context = multiprocessing.get_context("spawn")
-    queue = context.Queue()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    processes = [context.Process(target=_host_budget_gloo_worker, args=(rank, port, queue, init_failure)) for rank in range(2)]
-    for process in processes:
-        process.start()
-    try:
-        results = [queue.get(timeout=45) for _ in processes]
-        for process in processes:
-            process.join(timeout=20)
-        assert all(process.exitcode == 0 for process in processes)
-        assert {item[0] for item in results} == {0, 1}
-        message = "source initialization failed" if init_failure else "Consumer prefetch failed"
-        assert all(message in item[1] for item in results)
-        assert next(item for item in results if item[0] == 1)[2] == "ValueError"
-    finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
+    results = collect_gloo_workers(_host_budget_gloo_worker,
+        lambda rank, port, queue: (rank, port, queue, init_failure), timeout=45, join_timeout=20)
+    message = "source initialization failed" if init_failure else "Consumer prefetch failed"
+    assert all(message in item[1] for item in results)
+    assert next(item for item in results if item[0] == 1)[2] == "ValueError"
 
 
 def _rank_materialization_gloo_worker(rank, port, fail_rank, events, results):
-    import datetime
     import torch
-    import torch.distributed as dist
     import ray
     from types import SimpleNamespace
     from verl_speco.trainer.draft_training_loop import _ack_reference_materialization_across_ranks
     from verl_speco.trainer.tq_sample_source import TQLocalBatch
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2,
-                            timeout=datetime.timedelta(seconds=25))
-    acknowledged = []
-    def acknowledge(incarnation, plan_id, token, owner_rank):
-        assert (incarnation, plan_id, token, owner_rank) == ("f" * 32, 0, "token", rank)
-        if fail_rank == "source" and rank == 1:
-            raise RuntimeError("injected Producer acknowledgement failure")
-        acknowledged.append(owner_rank)
-        return "ack"
-    ray.get = lambda ref, timeout=None: ref
-    producer = SimpleNamespace(acknowledge_reference_rank=SimpleNamespace(remote=acknowledge))
-    class EventQueue:
-        def put(self, event):
-            if fail_rank == "event" and rank == 1:
-                raise OSError("injected rank event failure")
-            assert acknowledged == [rank]
-            events.put(event)
-    batch = TQLocalBatch(local_keys=[], local_samples=[], global_keys=None, plan_id=0, receipt_token="token",
-                         producer_incarnation="f" * 32)
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=25):
+        acknowledged = []
+        def acknowledge(incarnation, plan_id, token, owner_rank):
+            assert (incarnation, plan_id, token, owner_rank) == ("f" * 32, 0, "token", rank)
+            if fail_rank == "source" and rank == 1:
+                raise RuntimeError("injected Producer acknowledgement failure")
+            acknowledged.append(owner_rank)
+            return "ack"
+        ray.get = lambda ref, timeout=None: ref
+        producer = SimpleNamespace(acknowledge_reference_rank=SimpleNamespace(remote=acknowledge))
+        class EventQueue:
+            def put(self, event):
+                if fail_rank == "event" and rank == 1:
+                    raise OSError("injected rank event failure")
+                assert acknowledged == [rank]
+                events.put(event)
+        batch = TQLocalBatch(local_keys=[], local_samples=[], global_keys=None, plan_id=0, receipt_token="token",
+                             producer_incarnation="f" * 32)
         try:
             _ack_reference_materialization_across_ranks(batch, rank=rank, device=torch.device("cpu"),
                                                         events=EventQueue(), config={"io_retry_max_attempts": 1}, per_rank=True,
@@ -999,31 +971,16 @@ def _rank_materialization_gloo_worker(rank, port, fail_rank, events, results):
             results.put((rank, "ok"))
         except RuntimeError as exc:
             results.put((rank, str(exc)))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("fail_rank", ["none", "event", "source"])
 def test_per_rank_materialization_gloo_confirmation_and_failure(fail_rank):
     import multiprocessing
-    import socket
-    import torch.distributed as dist
-    if not dist.is_gloo_available():
-        pytest.skip("Gloo is unavailable")
     ctx = multiprocessing.get_context("spawn")
-    events, results = ctx.Queue(), ctx.Queue()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    processes = [ctx.Process(target=_rank_materialization_gloo_worker,
-                             args=(rank, port, fail_rank, events, results)) for rank in range(2)]
-    for process in processes:
-        process.start()
+    events = ctx.Queue()
     try:
-        rows = [results.get(timeout=60) for _ in processes]
-        for process in processes:
-            process.join(timeout=20)
-        assert all(process.exitcode == 0 for process in processes)
+        rows = collect_gloo_workers(_rank_materialization_gloo_worker,
+            lambda rank, port, results: (rank, port, fail_rank, events, results), timeout=60, join_timeout=20)
         if fail_rank != "none":
             assert all("acknowledgement failed" in row[1] for row in rows)
             received = [events.get(timeout=5)]
@@ -1034,10 +991,7 @@ def test_per_rank_materialization_gloo_confirmation_and_failure(fail_rank):
             assert {event["rank"] for event in received if event["kind"] == "reference_rank_materialized"} == {0, 1}
             assert sum(event["kind"] == "training_materialized" for event in received) == 1
     finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
+        events.close()
 
 
 def _fake_device_backend():
@@ -1212,68 +1166,42 @@ def test_device_prefetch_rejects_oversize_before_copy():
 
 
 def _device_prefetch_gloo_worker(rank, port, fail_copy, results):
-    import datetime
     import torch
-    import torch.distributed as dist
     from contextlib import contextmanager
     from verl_speco.trainer.reference_batch_prefetch import ReferenceDevicePrefetchIterator
     from verl_speco.trainer.draft_training_loop import _next_batch_across_ranks
     from verl_speco.trainer.tq_sample_source import TQLocalBatch
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2,
-                            timeout=datetime.timedelta(seconds=25))
-    @contextmanager
-    def stream_context(stream):
-        if fail_copy and rank == 1:
-            raise RuntimeError("injected device transfer failure")
-        yield
-    class Stream:
-        def synchronize(self): pass
-    backend = SimpleNamespace(set_device=lambda index: None, Stream=Stream, stream=stream_context)
-    class Source:
-        def __init__(self):
-            self.rows = iter([TQLocalBatch([], [], None, plan_id=0, receipt_token="same", prepared_batch={"x": torch.tensor([rank])})])
-        def __next__(self): return next(self.rows)
-        def close(self): pass
-    prefetch = ReferenceDevicePrefetchIterator(Source(), device=torch.device("cpu"), backend=backend,
-                                               max_batch_bytes=64, close_timeout=10)
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=25):
+        @contextmanager
+        def stream_context(stream):
+            if fail_copy and rank == 1:
+                raise RuntimeError("injected device transfer failure")
+            yield
+        class Stream:
+            def synchronize(self): pass
+        backend = SimpleNamespace(set_device=lambda index: None, Stream=Stream, stream=stream_context)
+        class Source:
+            def __init__(self):
+                self.rows = iter([TQLocalBatch([], [], None, plan_id=0, receipt_token="same", prepared_batch={"x": torch.tensor([rank])})])
+            def __next__(self): return next(self.rows)
+            def close(self): pass
+        prefetch = ReferenceDevicePrefetchIterator(Source(), device=torch.device("cpu"), backend=backend,
+                                                   max_batch_bytes=64, close_timeout=10)
         try:
-            batch = _next_batch_across_ranks(prefetch, rank=rank, device=torch.device("cpu"), require_prepared=True)
-            results.put((rank, "ok", batch.prepared_batch["x"].item()))
-        except RuntimeError as exc:
-            results.put((rank, str(exc), None))
-    finally:
-        prefetch.close()
-        dist.destroy_process_group()
+            try:
+                batch = _next_batch_across_ranks(prefetch, rank=rank, device=torch.device("cpu"), require_prepared=True)
+                results.put((rank, "ok", batch.prepared_batch["x"].item()))
+            except RuntimeError as exc:
+                results.put((rank, str(exc), None))
+        finally:
+            prefetch.close()
 
 
 @pytest.mark.parametrize("fail_copy", [False, True])
 def test_device_prefetch_failure_is_synchronized_across_gloo_ranks(fail_copy):
-    import multiprocessing
-    import socket
-    import torch.distributed as dist
-    if not dist.is_gloo_available():
-        pytest.skip("Gloo is unavailable")
-    ctx = multiprocessing.get_context("spawn")
-    results = ctx.Queue()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    processes = [ctx.Process(target=_device_prefetch_gloo_worker, args=(rank, port, fail_copy, results))
-                 for rank in range(2)]
-    for process in processes:
-        process.start()
-    try:
-        rows = [results.get(timeout=60) for _ in processes]
-        for process in processes:
-            process.join(timeout=20)
-        assert all(process.exitcode == 0 for process in processes)
-        if fail_copy:
-            assert all("producer failed" in row[1] for row in rows)
-        else:
-            assert {(row[0], row[1], row[2]) for row in rows} == {(0, "ok", 0), (1, "ok", 1)}
-    finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
+    rows = collect_gloo_workers(_device_prefetch_gloo_worker,
+        lambda rank, port, queue: (rank, port, fail_copy, queue), timeout=60, join_timeout=20)
+    if fail_copy:
+        assert all("producer failed" in row[1] for row in rows)
+    else:
+        assert {(row[0], row[1], row[2]) for row in rows} == {(0, "ok", 0), (1, "ok", 1)}
