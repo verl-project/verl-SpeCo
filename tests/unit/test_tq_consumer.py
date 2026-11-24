@@ -17,14 +17,18 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from standalone_test_utils import NativeTestEngine
 
 torch = pytest.importorskip("torch")
 
 
-class _NativeTestEngine:
-    def initialize(self, *args): return 0
-    def register_memory(self, *args): return 0
-    def unregister_memory(self, *args): return 0
+_TEST_DISPATCH = {"plan_id": 0, "receipt_token": "receipt"}
+
+
+def _publish_dispatched(source, fields, *, lease_id, readers=(0,)):
+    descriptor = source.publish(fields, lease_id=lease_id)
+    source.bind_readers(descriptor, readers=readers, **_TEST_DISPATCH)
+    return descriptor
 
 
 @pytest.mark.parametrize("fault", [None, "transfer", "stale", "payload"])
@@ -36,8 +40,7 @@ def test_native_transport_leases_and_copy_lifecycle(fault, monkeypatch):
 
     monkeypatch.setattr(native, "_REGISTERED_OWNERS", set())
     registrations, reads = {}, []
-    class Engine:
-        def initialize(self, *args): return 0
+    class Engine(NativeTestEngine):
         def register_memory(self, address, size):
             registrations[address] = size
             return 0
@@ -62,17 +65,17 @@ def test_native_transport_leases_and_copy_lifecycle(fault, monkeypatch):
                                       max_slots=2, chunk_bytes=2 * 1024**2, engine_factory=Engine)
     source, receiver = make(), make()
     values = {"hidden": torch.arange(12).reshape(3, 4).bfloat16(), "scalar": torch.tensor(3.0)}
-    descriptor = source.publish(values, lease_id="lease", readers=[0, 1])
+    descriptor = _publish_dispatched(source, values, lease_id="lease", readers=(0, 1))
     with pytest.raises(ValueError, match="already active"):
-        source.publish(values, lease_id="lease", readers=[0])
+        source.publish(values, lease_id="lease")
     with pytest.raises(ValueError, match="slot or byte budget"):
-        source.publish(values, lease_id="second", readers=[0])
+        source.publish(values, lease_id="second")
     with pytest.raises(RuntimeError, match="unacknowledged"):
-        source.release(descriptor)
+        source.release(descriptor, **_TEST_DISPATCH)
     with pytest.raises(RuntimeError, match="active source leases"):
         source.close()
     with pytest.raises(ValueError, match="reader differs"):
-        source.acknowledge(descriptor, reader=2)
+        source.acknowledge(descriptor, reader=2, **_TEST_DISPATCH)
     changed = deepcopy(descriptor)
     changed["generation"] += 1
     with pytest.raises(ValueError, match="descriptor or scope"):
@@ -94,7 +97,7 @@ def test_native_transport_leases_and_copy_lifecycle(fault, monkeypatch):
     assert len(registrations) == (2 if fault == "transfer" else 1)
     if fault:
         with pytest.raises(RuntimeError, match="unacknowledged"):
-            source.release(descriptor)
+            source.release(descriptor, **_TEST_DISPATCH)
         with pytest.raises(RuntimeError, match="active source leases"):
             source.close()
         if fault == "transfer":
@@ -103,18 +106,18 @@ def test_native_transport_leases_and_copy_lifecycle(fault, monkeypatch):
         else:
             receiver.close()
         return
-    source.acknowledge(descriptor, reader=0)
-    source.acknowledge(descriptor, reader=0)  # Idempotent until release.
+    source.acknowledge(descriptor, reader=0, **_TEST_DISPATCH)
+    source.acknowledge(descriptor, reader=0, **_TEST_DISPATCH)  # Idempotent until release.
     with pytest.raises(RuntimeError, match="unacknowledged"):
-        source.release(descriptor)
-    source.acknowledge(descriptor, reader=1)
-    source.release(descriptor)
-    source.acknowledge(descriptor, reader=0)
-    source.release(descriptor)
+        source.release(descriptor, **_TEST_DISPATCH)
+    source.acknowledge(descriptor, reader=1, **_TEST_DISPATCH)
+    source.release(descriptor, **_TEST_DISPATCH)
+    source.acknowledge(descriptor, reader=0, **_TEST_DISPATCH)
+    source.release(descriptor, **_TEST_DISPATCH)
     with pytest.raises(ValueError, match="acknowledgement identity"):
-        source.acknowledge(descriptor, reader=2)
+        source.acknowledge(descriptor, reader=2, **_TEST_DISPATCH)
     with pytest.raises(ValueError, match="already completed"):
-        source.publish(values, lease_id="lease", readers=[0])
+        source.publish(values, lease_id="lease")
     assert not registrations
     assert all(torch.equal(result[name], value) for name, value in values.items())
     source.close()
@@ -151,7 +154,7 @@ def test_native_source_freeze_and_seal_blocks_late_publications():
 
     source = NativeFeatureTransport(run_id="run", generation=1, endpoint="source", metadata_server="metadata",
                                     device="cpu", max_bytes=4 * 1024**2, max_slots=1,
-                                    chunk_bytes=2 * 1024**2, engine_factory=_NativeTestEngine)
+                                    chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
     options = {"request_queue": Queue(), "response_queue": Queue(), "channel_id": "a" * 32, "timeout": 1.0}
     directory = NativeSourceDirectory(run_id="run", generation=1, max_sources=1, max_records=2)
     service = NativeSourceControlService(source, **options)
@@ -257,7 +260,7 @@ def test_native_directory_mutation_failure_retains_active_fence(phase):
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport, NativeSourceDirectory
     source = NativeFeatureTransport(run_id="run", generation=1, endpoint="source", metadata_server="metadata",
                                     device="cpu", max_bytes=4 * 1024**2, max_slots=1,
-                                    chunk_bytes=2 * 1024**2, engine_factory=_NativeTestEngine)
+                                    chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
     descriptor = source.publish({"ids": torch.arange(2)}, lease_id="sample")
     directory = NativeSourceDirectory(run_id="run", generation=1, max_sources=1, max_records=2)
     options = {"request_queue": Queue(), "response_queue": Queue(), "channel_id": "a" * 32, "timeout": 1.0}
@@ -286,7 +289,7 @@ def test_native_source_seal_with_live_memory_fails_closed():
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport
     source = NativeFeatureTransport(run_id="run", generation=1, endpoint="source", metadata_server="metadata",
                                     device="cpu", max_bytes=4 * 1024**2, max_slots=1,
-                                    chunk_bytes=2 * 1024**2, engine_factory=_NativeTestEngine)
+                                    chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
     descriptor = source.publish({"ids": torch.arange(2)}, lease_id="first")
     with pytest.raises(RuntimeError, match="registered memory"):
         source.seal_if_empty()
@@ -303,7 +306,7 @@ def test_native_source_directory_binds_and_retires_handles():
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport, NativeSourceDirectory
     source = NativeFeatureTransport(run_id="run", generation=1, endpoint="source", metadata_server="metadata",
                                     device="cpu", max_bytes=8 * 1024**2, max_slots=2,
-                                    chunk_bytes=2 * 1024**2, engine_factory=_NativeTestEngine)
+                                    chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
     first = source.publish({"ids": torch.arange(2)}, lease_id="first")
     second = source.publish({"ids": torch.arange(2)}, lease_id="second")
     directory = NativeSourceDirectory(run_id="run", generation=1, max_sources=1, max_records=1)
@@ -360,7 +363,7 @@ def test_native_source_control_routes_and_timeout():
         endpoint = f"source-{index}"
         source = NativeFeatureTransport(run_id="run", generation=1, endpoint=endpoint, metadata_server="metadata",
                                         device="cpu", max_bytes=4 * 1024**2, max_slots=1,
-                                        chunk_bytes=2 * 1024**2, engine_factory=_NativeTestEngine)
+                                        chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
         options = {"request_queue": Queue(maxsize=1), "response_queue": Queue(maxsize=1),
                    "channel_id": f"{index:032x}", "timeout": 2.0}
         routes[endpoint] = options
@@ -401,7 +404,7 @@ def test_native_unbound_discard_never_releases_dispatched_source():
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport
     source = NativeFeatureTransport(run_id="run", generation=1, endpoint="localhost:1234",
                                     metadata_server="metadata", device="cpu", max_bytes=8 * 1024**2,
-                                    max_slots=2, chunk_bytes=2 * 1024**2, engine_factory=_NativeTestEngine)
+                                    max_slots=2, chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
     tail = source.publish({"ids": torch.arange(2)}, lease_id="tail")
     assigned = source.publish({"ids": torch.arange(2)}, lease_id="assigned")
     source.bind_readers(assigned, readers=[0], plan_id=0, receipt_token="receipt")
@@ -422,18 +425,18 @@ def test_native_source_supports_more_than_sixteen_bounded_slots(slot_limit):
     slot_bytes = 4 * 1024**2 - 1
     source = NativeFeatureTransport(run_id="run", generation=1, endpoint="localhost:1234",
                                     metadata_server="metadata", device="cpu", max_bytes=17 * slot_bytes,
-                                    max_slots=slot_limit, chunk_bytes=2 * 1024**2, engine_factory=_NativeTestEngine)
-    descriptors = [source.publish({"ids": torch.tensor([i])}, lease_id=str(i), readers=[0]) for i in range(17)]
+                                    max_slots=slot_limit, chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
+    descriptors = [_publish_dispatched(source, {"ids": torch.tensor([i])}, lease_id=str(i)) for i in range(17)]
     assert source._registered_bytes == 17 * slot_bytes
     with pytest.raises(ValueError, match="slot limit|slot or byte budget"):
-        source.publish({"ids": torch.tensor([18])}, lease_id="overflow", readers=[0])
-    source.acknowledge(descriptors[0], reader=0)
-    source.release(descriptors[0])
+        source.publish({"ids": torch.tensor([18])}, lease_id="overflow")
+    source.acknowledge(descriptors[0], reader=0, **_TEST_DISPATCH)
+    source.release(descriptors[0], **_TEST_DISPATCH)
     assert source._registered_bytes == 16 * slot_bytes
-    replacement = source.publish({"ids": torch.tensor([18])}, lease_id="replacement", readers=[0])
+    replacement = _publish_dispatched(source, {"ids": torch.tensor([18])}, lease_id="replacement")
     for descriptor in [*descriptors[1:], replacement]:
-        source.acknowledge(descriptor, reader=0)
-        source.release(descriptor)
+        source.acknowledge(descriptor, reader=0, **_TEST_DISPATCH)
+        source.release(descriptor, **_TEST_DISPATCH)
     assert source._registered_bytes == 0
     source.close()
 
@@ -443,24 +446,22 @@ def test_native_transport_quarantines_uncertain_lease_invalidation(monkeypatch):
 
     monkeypatch.setattr(native, "_REGISTERED_OWNERS", set())
     unregistered = []
-    class Engine:
-        def initialize(self, *args): return 0
-        def register_memory(self, *args): return 0
+    class Engine(NativeTestEngine):
         def unregister_memory(self, *args): unregistered.append(args); return 0
 
     source = native.NativeFeatureTransport(run_id="run", generation=1, endpoint="localhost:1234",
                                            metadata_server="metadata", device="cpu", max_bytes=4 * 1024**2,
                                            max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=Engine)
-    descriptor = source.publish({"ids": torch.arange(2)}, lease_id="lease", readers=[0])
-    source.acknowledge(descriptor, reader=0)
+    descriptor = _publish_dispatched(source, {"ids": torch.arange(2)}, lease_id="lease")
+    source.acknowledge(descriptor, reader=0, **_TEST_DISPATCH)
     def fail_zero(_):
         raise RuntimeError("device submission failed")
     monkeypatch.setattr(torch.Tensor, "zero_", fail_zero)
     with pytest.raises(RuntimeError, match="device submission failed"):
-        source.release(descriptor)
+        source.release(descriptor, **_TEST_DISPATCH)
     assert "lease" in source._slots and source in native._REGISTERED_OWNERS and not unregistered
     with pytest.raises(RuntimeError, match="quarantined"):
-        source.release(descriptor)
+        source.release(descriptor, **_TEST_DISPATCH)
     with pytest.raises(RuntimeError, match="process fencing"):
         source.close()
 
@@ -473,8 +474,7 @@ def test_native_transport_quarantines_ambiguous_registration(failure, monkeypatc
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport
     monkeypatch.setattr(native, "_REGISTERED_OWNERS", set())
     registrations = {}
-    class Engine:
-        def initialize(self, *args): return 0
+    class Engine(NativeTestEngine):
         def register_memory(self, address, size):
             registrations[address] = size
             return int(failure == "register")
@@ -488,12 +488,12 @@ def test_native_transport_quarantines_ambiguous_registration(failure, monkeypatc
                                         max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=Engine)
     if failure == "register":
         with pytest.raises(RuntimeError, match="register_memory"):
-            transport.publish({"ids": torch.arange(2)}, lease_id="lease", readers=[0])
+            transport.publish({"ids": torch.arange(2)}, lease_id="lease")
     else:
-        descriptor = transport.publish({"ids": torch.arange(2)}, lease_id="lease", readers=[0])
-        transport.acknowledge(descriptor, reader=0)
+        descriptor = _publish_dispatched(transport, {"ids": torch.arange(2)}, lease_id="lease")
+        transport.acknowledge(descriptor, reader=0, **_TEST_DISPATCH)
         with pytest.raises(RuntimeError, match="unregister_memory"):
-            transport.release(descriptor)
+            transport.release(descriptor, **_TEST_DISPATCH)
     assert len(registrations) == len(transport._registered) == 1
     assert transport._registered_bytes == 4 * 1024**2 - 1
     with pytest.raises(RuntimeError, match="process fencing"):
@@ -507,15 +507,12 @@ def test_native_transport_quarantines_ambiguous_registration(failure, monkeypatc
 def test_native_transport_rejects_invalid_layout_before_read():
     from copy import deepcopy
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport, _fingerprint
-    class Engine:
-        def initialize(self, *args): return 0
-        def register_memory(self, address, size): return 0
-        def unregister_memory(self, address): return 0
+    class Engine(NativeTestEngine):
         def transfer_sync_read(self, *args): pytest.fail("invalid descriptor triggered native read")
     transport = NativeFeatureTransport(run_id="run", generation=1, endpoint="localhost:1234",
                                         metadata_server="metadata", device="cpu", max_bytes=4 * 1024**2,
                                         max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=Engine)
-    original = transport.publish({"ids": torch.arange(2)}, lease_id="lease", readers=[0])
+    original = _publish_dispatched(transport, {"ids": torch.arange(2)}, lease_id="lease")
     with pytest.raises(ValueError, match="slot or byte budget"):
         transport.read(original)
     for mutate in (lambda d: d["fields"][0].update(offset=0),
@@ -528,8 +525,8 @@ def test_native_transport_rejects_invalid_layout_before_read():
         descriptor["sha256"] = _fingerprint({key: value for key, value in descriptor.items() if key != "sha256"})
         with pytest.raises(ValueError, match="descriptor|layout"):
             transport.read(descriptor)
-    transport.acknowledge(original, reader=0)
-    transport.release(original)
+    transport.acknowledge(original, reader=0, **_TEST_DISPATCH)
+    transport.release(original, **_TEST_DISPATCH)
     transport.close()
 
 
@@ -540,15 +537,15 @@ def test_native_registered_owner_survives_until_successful_release(monkeypatch):
     monkeypatch.setattr(native, "_REGISTERED_OWNERS", set())
     transport = native.NativeFeatureTransport(run_id="run", generation=1, endpoint="localhost:1234",
                                                metadata_server="metadata", device="cpu", max_bytes=4 * 1024**2,
-                                               max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=_NativeTestEngine)
-    descriptor = transport.publish({"ids": torch.arange(2)}, lease_id="lease", readers=[0])
+                                               max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
+    descriptor = _publish_dispatched(transport, {"ids": torch.arange(2)}, lease_id="lease")
     reference = weakref.ref(transport)
     del transport
     gc.collect()
     assert reference() is not None
     owner = reference()
-    owner.acknowledge(descriptor, reader=0)
-    owner.release(descriptor)
+    owner.acknowledge(descriptor, reader=0, **_TEST_DISPATCH)
+    owner.release(descriptor, **_TEST_DISPATCH)
     owner.close()
     del owner
     gc.collect()
@@ -561,16 +558,16 @@ def test_native_transport_rejects_inherited_process_handles(monkeypatch):
     monkeypatch.setattr(native, "os", SimpleNamespace(getpid=lambda: pid[0]))
     transport = native.NativeFeatureTransport(run_id="run", generation=1, endpoint="localhost:1234",
                                                metadata_server="metadata", device="cpu", max_bytes=4 * 1024**2,
-                                               max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=_NativeTestEngine)
-    descriptor = transport.publish({"ids": torch.arange(2)}, lease_id="lease", readers=[0])
+                                               max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
+    descriptor = _publish_dispatched(transport, {"ids": torch.arange(2)}, lease_id="lease")
     pid[0] = 2
     with pytest.raises(RuntimeError, match="different process"):
-        transport.acknowledge(descriptor, reader=0)
+        transport.acknowledge(descriptor, reader=0, **_TEST_DISPATCH)
     with pytest.raises(RuntimeError, match="different process"):
         transport.close()
     pid[0] = 1
-    transport.acknowledge(descriptor, reader=0)
-    transport.release(descriptor)
+    transport.acknowledge(descriptor, reader=0, **_TEST_DISPATCH)
+    transport.release(descriptor, **_TEST_DISPATCH)
     transport.close()
 
 
@@ -578,13 +575,15 @@ def test_native_lease_binds_scheduler_dispatch_before_acknowledgement():
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport
     source = NativeFeatureTransport(run_id="run", generation=1, endpoint="localhost:1234",
                                     metadata_server="metadata", device="cpu", max_bytes=4 * 1024**2,
-                                    max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=_NativeTestEngine)
+                                    max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
     descriptor = source.publish({"ids": torch.arange(2)}, lease_id="lease")
-    with pytest.raises(RuntimeError, match="not been bound"):
-        source.release(descriptor)
-    with pytest.raises(RuntimeError, match="not been bound"):
-        source.acknowledge(descriptor, reader=0)
     binding = {"plan_id": 7, "receipt_token": "dispatch"}
+    with pytest.raises(RuntimeError, match="not been bound"):
+        source.release(descriptor, **binding)
+    with pytest.raises(RuntimeError, match="not been bound"):
+        source.acknowledge(descriptor, reader=0, **binding)
+    with pytest.raises(ValueError, match="Invalid native dispatch identity"):
+        source.acknowledge(descriptor, reader=0, plan_id=None, receipt_token=None)
     source.bind_readers(descriptor, readers=[1, 0], **binding)
     source.bind_readers(descriptor, readers=[0, 1], **binding)
     with pytest.raises(ValueError, match="another dispatch"):
@@ -604,32 +603,6 @@ def test_native_lease_binds_scheduler_dispatch_before_acknowledgement():
     source.close()
 
 
-def test_native_preselected_readers_bind_dispatch_without_rewriting_acknowledgements():
-    from verl_speco.transport.native_feature_transport import NativeFeatureTransport
-    source = NativeFeatureTransport(run_id="run", generation=1, endpoint="localhost:1234",
-                                    metadata_server="metadata", device="cpu", max_bytes=4 * 1024**2,
-                                    max_slots=2, chunk_bytes=2 * 1024**2, engine_factory=_NativeTestEngine)
-    descriptor = source.publish({"ids": torch.arange(2)}, lease_id="lease", readers=[0, 1])
-    binding = {"plan_id": 7, "receipt_token": "dispatch"}
-    with pytest.raises(ValueError, match="another dispatch"):
-        source.bind_readers(descriptor, readers=[0], **binding)
-    source.bind_readers(descriptor, readers=[1, 0], **binding)
-    source.bind_readers(descriptor, readers=[0, 1], **binding)
-    with pytest.raises(ValueError, match="identity"):
-        source.acknowledge(descriptor, reader=0)
-    source.acknowledge(descriptor, reader=0, **binding)
-    source.acknowledge(descriptor, reader=1, **binding)
-    source.release(descriptor, **binding)
-
-    legacy = source.publish({"ids": torch.arange(2)}, lease_id="legacy", readers=[0, 1])
-    source.acknowledge(legacy, reader=0)
-    with pytest.raises(ValueError, match="another dispatch"):
-        source.bind_readers(legacy, readers=[0, 1], **binding)
-    source.acknowledge(legacy, reader=1)
-    source.release(legacy)
-    source.close()
-
-
 def test_native_payload_checksum_handles_multiple_bounded_chunks(monkeypatch):
     import hashlib
     from verl_speco.transport import native_feature_transport as native
@@ -643,8 +616,7 @@ def test_native_slow_reader_keeps_source_lease_until_completion():
     import threading
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport
     registered, entered, resume, results = {}, threading.Event(), threading.Event(), []
-    class Engine:
-        def initialize(self, *args): return 0
+    class Engine(NativeTestEngine):
         def register_memory(self, address, size): registered[address] = size; return 0
         def unregister_memory(self, address): del registered[address]; return 0
         def transfer_sync_read(self, segment, local, remote, size):
@@ -691,10 +663,7 @@ def test_native_read_snapshots_descriptor_before_native_transfer():
     from copy import deepcopy
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport
     mutable, reads = {}, []
-    class Engine:
-        def initialize(self, *args): return 0
-        def register_memory(self, address, size): return 0
-        def unregister_memory(self, address): return 0
+    class Engine(NativeTestEngine):
         def transfer_sync_read(self, segment, local, remote, size):
             if not reads:
                 mutable["address"] = 1
@@ -706,12 +675,12 @@ def test_native_read_snapshots_descriptor_before_native_transfer():
                                       metadata_server="metadata", device="cpu", max_bytes=4 * 1024**2,
                                       max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=Engine)
     source, receiver = make(), make()
-    mutable.update(source.publish({"ids": torch.arange(4)}, lease_id="lease", readers=[0]))
+    mutable.update(_publish_dispatched(source, {"ids": torch.arange(4)}, lease_id="lease"))
     original = deepcopy(mutable)
     assert torch.equal(receiver.read(mutable)["ids"], torch.arange(4))
     assert mutable["address"] == 1 and len(reads) == 2
-    source.acknowledge(original, reader=0)
-    source.release(original)
+    source.acknowledge(original, reader=0, **_TEST_DISPATCH)
+    source.release(original, **_TEST_DISPATCH)
     source.close()
     receiver.close()
 

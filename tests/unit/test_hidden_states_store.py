@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import pytest
+from standalone_test_utils import NativeCopyTestEngine, NativeTestEngine
 import torch
 
 from verl_speco.producer.hidden_states_store import (
@@ -60,31 +61,25 @@ def test_build_store_selects_mooncake() -> None:
 
 
 def test_managed_native_reader_keeps_source_until_scheduler_release():
-    import ctypes
     import json
     from verl_speco.producer.hidden_states_store import build_managed_native_reader
     from verl_speco.trainer.feature_store import build_feature_store_from_config
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport
 
-    class Engine:
-        def initialize(self, *args): return 0
-        def register_memory(self, *args): return 0
-        def unregister_memory(self, *args): return 0
-        def transfer_sync_read(self, segment, local, remote, size):
-            ctypes.memmove(local, remote, size)
-            return 0
 
     settings = {"endpoints": ["localhost:1001", "localhost:1002"], "generation": 1,
                 "metadata_server": "metadata", "max_bytes": 4 * 1024**2, "chunk_bytes": 2 * 1024**2}
     for bad in ({**settings, "endpoints": ["same", "same"]}, {**settings, "endpoints": ["only-one"]},
                 {**settings, "unexpected": 1}):
         with pytest.raises(ValueError, match="Native reader"):
-            build_managed_native_reader(bad, run_id="run", rank=0, world_size=2, device="cpu", engine_factory=Engine)
-    reader = build_managed_native_reader(settings, run_id="run", rank=1, world_size=2, device="cpu", engine_factory=Engine)
+            build_managed_native_reader(bad, run_id="run", rank=0, world_size=2, device="cpu", engine_factory=NativeCopyTestEngine)
+    reader = build_managed_native_reader(settings, run_id="run", rank=1, world_size=2, device="cpu", engine_factory=NativeCopyTestEngine)
     source = NativeFeatureTransport(run_id="run", generation=1, endpoint="source", metadata_server="metadata",
                                     device="cpu", max_bytes=4 * 1024**2, max_slots=1,
-                                    chunk_bytes=2 * 1024**2, engine_factory=Engine)
-    descriptor = source.publish({"ids": torch.arange(4)}, lease_id="sample", readers=[1])
+                                    chunk_bytes=2 * 1024**2, engine_factory=NativeCopyTestEngine)
+    descriptor = source.publish({"ids": torch.arange(4)}, lease_id="sample")
+    binding = {"plan_id": 0, "receipt_token": "receipt"}
+    source.bind_readers(descriptor, readers=[1], **binding)
     handle = json.dumps(descriptor)
     assert torch.equal(reader.load(handle)[0]["ids"], torch.arange(4))
     reader.release(handle)
@@ -96,8 +91,8 @@ def test_managed_native_reader_keeps_source_until_scheduler_release():
                                             hidden_states_store=reader)
     assert store.hidden_states_store is reader
     store.close_local()
-    source.acknowledge(descriptor, reader=1)
-    source.release(descriptor)
+    source.acknowledge(descriptor, reader=1, **binding)
+    source.release(descriptor, **binding)
     source.close()
 
 
@@ -221,10 +216,6 @@ def test_native_connector_captures_device_payload_and_preserves_ambiguous_source
     from types import SimpleNamespace
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport
     events, published = [], []
-    class Engine:
-        def initialize(self, *args): return 0
-        def register_memory(self, *args): return 0
-        def unregister_memory(self, *args): return 0
     class Stream:
         def wait_event(self, value): events.append(("wait", value))
         def synchronize(self): events.append(("synchronize", None))
@@ -238,7 +229,7 @@ def test_native_connector_captures_device_payload_and_preserves_ambiguous_source
     connector._copy_stream, connector._block_size = Stream(), 4
     connector._native_source = NativeFeatureTransport(run_id="run", generation=1, endpoint="source",
         metadata_server="metadata", device="cpu", max_bytes=4 * 1024**2, max_slots=1,
-        chunk_bytes=2 * 1024**2, engine_factory=Engine)
+        chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
     def publish(handle, descriptor):
         published.append((handle, descriptor))
         if publish_fails:

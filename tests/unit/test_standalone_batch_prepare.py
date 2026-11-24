@@ -8,6 +8,14 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
+from standalone_test_utils import (
+    NativeTestEngine,
+    collect_gloo_workers,
+    dspark_reference_backend,
+    gloo_process_group,
+    make_cpu_trainer,
+)
+
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -21,31 +29,50 @@ from verl_speco.transport.drafter_sample_protocol import (
 )
 
 
-def test_local_frame_codec_binds_rank_and_tensor_metadata():
+@pytest.fixture
+def read_local_frame(monkeypatch):
+    from safetensors.torch import load
+    from verl_speco.trainer import reference_shared_frame as frame
+
+    def read(payload, descriptor, *, binding, max_bytes):
+        # Emulate FD reads and the mapping syscall so these checks also run on Windows.
+        fake_os = SimpleNamespace(
+            fstat=lambda fd: SimpleNamespace(st_size=len(payload)),
+            pread=lambda fd, size, offset: payload[offset : offset + size],
+        )
+        with monkeypatch.context() as patch:
+            patch.setattr(frame, "os", fake_os)
+            patch.setattr(frame, "_map_tensors", lambda path: load(payload))
+            return frame._read_mapped_frame(0, descriptor, binding=binding, max_bytes=max_bytes)
+
+    return read
+
+
+def test_local_frame_codec_binds_rank_and_tensor_metadata(read_local_frame):
     import json
-    from verl_speco.trainer.reference_shared_frame import encode_local_frame, decode_local_frame
+    from verl_speco.trainer.reference_shared_frame import encode_local_frame
     binding = {"run_id": "run", "generation": 1, "batch_id": 3, "rank": 2, "receipt_token": "receipt"}
     tensors = {"ids": torch.arange(6).reshape(2, 3), "hidden": torch.ones(2, 3, dtype=torch.bfloat16),
                "hidden_source": "standalone_vllm_reference", "_speco_pad_size": 0,
                "_speco_token_counts": {"source_tokens": 6, "supervised_tokens": 4}}
     payload, descriptor = encode_local_frame(tensors, binding=binding, max_bytes=4096)
-    restored = decode_local_frame(payload, descriptor, binding=binding, max_bytes=4096)
+    restored = read_local_frame(payload, descriptor, binding=binding, max_bytes=4096)
     assert all(torch.equal(restored[name], value) if isinstance(value, torch.Tensor) else restored[name] == value
                for name, value in tensors.items())
     with pytest.raises(ValueError, match="identity"):
-        decode_local_frame(payload, descriptor, binding={**binding, "rank": 1}, max_bytes=4096)
+        read_local_frame(payload, descriptor, binding={**binding, "rank": 1}, max_bytes=4096)
     with pytest.raises(ValueError, match="identity"):
-        decode_local_frame(payload, descriptor, binding={**binding, "receipt_token": "old"}, max_bytes=4096)
+        read_local_frame(payload, descriptor, binding={**binding, "receipt_token": "old"}, max_bytes=4096)
     with pytest.raises(ValueError, match="checksum"):
-        decode_local_frame(payload[:-1] + bytes([payload[-1] ^ 1]), descriptor, binding=binding, max_bytes=4096)
+        read_local_frame(payload[:-1] + bytes([payload[-1] ^ 1]), descriptor, binding=binding, max_bytes=4096)
     manifest = json.loads(descriptor)
     manifest["tensors"]["ids"]["shape"] = [6]
     with pytest.raises(ValueError, match="checksum"):
-        decode_local_frame(payload, json.dumps(manifest).encode(), binding=binding, max_bytes=4096)
+        read_local_frame(payload, json.dumps(manifest).encode(), binding=binding, max_bytes=4096)
     manifest = json.loads(descriptor)
     manifest["metadata"]["_speco_token_counts"]["source_tokens"] = 99
     with pytest.raises(ValueError, match="checksum"):
-        decode_local_frame(payload, json.dumps(manifest).encode(), binding=binding, max_bytes=4096)
+        read_local_frame(payload, json.dumps(manifest).encode(), binding=binding, max_bytes=4096)
     with pytest.raises(ValueError, match="byte limit"):
         encode_local_frame(tensors, binding=binding, max_bytes=4)
     with pytest.raises(ValueError, match="metadata"):
@@ -194,7 +221,7 @@ def _node_owner_test_worker(binding, results):
 
 
 @pytest.mark.parametrize("fault", [None, "duplicate", "foreign", "prepare", "send", "slow_prepare", "slow_create", "slow_send", "slow_owner"])
-def test_node_owner_routes_and_stops_on_failure_without_releasing_inputs(monkeypatch, fault):
+def test_node_owner_routes_and_stops_on_failure_without_releasing_inputs(monkeypatch, read_local_frame, fault):
     import json
     from verl_speco.trainer import reference_shared_frame as frame
     binding = {"run_id": "run", "generation": 0, "batch_id": 2, "rank": 0, "receipt_token": "receipt"}
@@ -229,7 +256,7 @@ def test_node_owner_routes_and_stops_on_failure_without_releasing_inputs(monkeyp
     def send(connection, fd, descriptor):
         if fault == "send" and connection.rank == 1:
             raise RuntimeError("injected send failure")
-        transmitted[connection.rank] = frame.decode_local_frame(
+        transmitted[connection.rank] = read_local_frame(
             payloads[fd], descriptor, binding={**binding, "rank": connection.rank}, max_bytes=4096)["ids"].tolist()
         if fault == "slow_send" and connection.rank == 1:
             now[0] = 11.0
@@ -344,8 +371,8 @@ def _sample(tmp_path, contract, *, length=5, index=0, positions=None, hidden_off
 
 @pytest.mark.parametrize("algorithm,packing", [("DSPARK", False), ("DSPARK", True),
                                                  ("DFLASH", False), ("DFLASH", True), ("EAGLE3", False)])
-def test_node_frame_roundtrips_real_prepared_batches(tmp_path, algorithm, packing):
-    from verl_speco.trainer.reference_shared_frame import encode_local_frame, decode_local_frame
+def test_node_frame_roundtrips_real_prepared_batches(tmp_path, read_local_frame, algorithm, packing):
+    from verl_speco.trainer.reference_shared_frame import encode_local_frame
     contract = _contract(algorithm)
     tags = [_sample(tmp_path, contract, length=length, index=index)[0]
             for index, length in enumerate((5, 3))]
@@ -353,7 +380,7 @@ def test_node_frame_roundtrips_real_prepared_batches(tmp_path, algorithm, packin
                                          packing=packing, block_size=4)
     binding = {"run_id": "run", "generation": 0, "batch_id": 2, "rank": 1, "receipt_token": "token"}
     payload, descriptor = encode_local_frame(batch, binding=binding, max_bytes=1024 * 1024)
-    result = decode_local_frame(payload, descriptor, binding=binding, max_bytes=1024 * 1024)
+    result = read_local_frame(payload, descriptor, binding=binding, max_bytes=1024 * 1024)
     assert set(result) == set(batch)
     for key, value in batch.items():
         if isinstance(value, torch.Tensor):
@@ -425,10 +452,21 @@ def test_owned_reference_window_respects_cropped_source(tmp_path):
                                     block_size=2, windows=[3], source_window=(5, 10))
 
 
+def tiny_window_config(**kwargs):
+    from verl_speco.models.dspark import DSparkConfig
+
+    return DSparkConfig(hidden_size=2, intermediate_size=8, num_hidden_layers=1,
+                        num_attention_heads=1, num_key_value_heads=1, head_dim=2,
+                        vocab_size=32, num_target_layers=4, num_context_layers=2,
+                        target_hidden_size=2, target_num_hidden_layers=4, target_layer_ids=[0, 1],
+                        mask_token_id=31, markov_rank=2, markov_head_type="vanilla",
+                        sliding_window=3, use_sliding_window=True, layer_types=["sliding_attention"], **kwargs)
+
+
 def test_owned_reference_window_matches_training_loss_and_gradient(tmp_path):
     from copy import deepcopy
-    from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend, DSparkTrainingModel
-    from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
+    from verl_speco.backends.dspark_trainer_backend import DSparkTrainingModel
+    from verl_speco.models.dspark import DSparkDraftModel
     from verl_speco.trainer.standalone_batch_prepare import prepare_owned_anchor_window
     torch.manual_seed(19)
     contract = _contract("DSPARK")
@@ -436,12 +474,7 @@ def test_owned_reference_window_matches_training_loss_and_gradient(tmp_path):
     full = prepare_standalone_cpu_batch([tag], contract, pin_memory=False)
     part = prepare_owned_anchor_window(tag, contract, start=3, end=9, anchor=6,
                                        block_size=2, windows=[3])
-    config = DSparkConfig(hidden_size=2, intermediate_size=8, num_hidden_layers=1,
-                          num_attention_heads=1, num_key_value_heads=1, head_dim=2,
-                          vocab_size=32, num_target_layers=4, num_context_layers=2,
-                          target_hidden_size=2, target_num_hidden_layers=4, target_layer_ids=[0, 1],
-                          mask_token_id=31, markov_rank=2, markov_head_type="vanilla",
-                          sliding_window=3, use_sliding_window=True, layer_types=["sliding_attention"])
+    config = tiny_window_config()
     model = DSparkTrainingModel(draft_model=DSparkDraftModel(config), block_size=2,
                                 num_anchors=3, l1_loss_alpha=0.0,
                                 verifier_norm=torch.nn.LayerNorm(2)).eval()
@@ -467,12 +500,7 @@ def test_owned_reference_window_matches_training_loss_and_gradient(tmp_path):
 
     model.zero_grad(set_to_none=True)
     local.zero_grad(set_to_none=True)
-    backend = DSparkTrainerBackend.__new__(DSparkTrainerBackend)
-    backend.target_lm_head = SimpleNamespace(fc=SimpleNamespace(weight=head))
-    backend.config = SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(training={
-        "mode": "offline", "feature_store": {"type": "ray_reference"},
-        "transfer_queue": {"expected_feature": {"payload_kind": "vllm_reference"}},
-    })))
+    backend = dspark_reference_backend(head)
     full["document_ids"] = torch.zeros_like(full["input_ids"])
     full["preselected_anchor_positions"] = torch.tensor([[6]])
     full["preselected_anchor_keep_mask"] = torch.tensor([[True]])
@@ -627,30 +655,20 @@ def test_owned_anchor_sampling_matches_packed_rows(tmp_path, max_packed_len, pac
 
 def test_sampled_owned_windows_match_padded_batch_gradients(tmp_path):
     from copy import deepcopy
-    from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend, DSparkTrainingModel
-    from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
+    from verl_speco.backends.dspark_trainer_backend import DSparkTrainingModel
+    from verl_speco.models.dspark import DSparkDraftModel
     from verl_speco.trainer.standalone_batch_prepare import sample_owned_anchor_windows, prepare_owned_anchor_window
     contract = _contract("DSPARK")
     tags = [_sample(tmp_path, contract, length=length, index=index)[0]
             for index, length in enumerate((12, 8))]
     full = prepare_standalone_cpu_batch(tags, contract, pin_memory=False, streaming=True)
-    config = DSparkConfig(hidden_size=2, intermediate_size=8, num_hidden_layers=1,
-                          num_attention_heads=1, num_key_value_heads=1, head_dim=2,
-                          vocab_size=32, num_target_layers=4, num_context_layers=2,
-                          target_hidden_size=2, target_num_hidden_layers=4, target_layer_ids=[0, 1],
-                          mask_token_id=31, markov_rank=2, markov_head_type="vanilla",
-                          sliding_window=3, use_sliding_window=True, layer_types=["sliding_attention"])
+    config = tiny_window_config()
     torch.manual_seed(17)
     model = DSparkTrainingModel(draft_model=DSparkDraftModel(config), block_size=2,
                                 num_anchors=3, l1_loss_alpha=0.0,
                                 verifier_norm=torch.nn.LayerNorm(2)).eval()
     local = deepcopy(model)
-    backend = DSparkTrainerBackend.__new__(DSparkTrainerBackend)
-    backend.target_lm_head = SimpleNamespace(fc=SimpleNamespace(weight=torch.randn(32, 2)))
-    backend.config = SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(training={
-        "mode": "offline", "feature_store": {"type": "ray_reference"},
-        "transfer_queue": {"expected_feature": {"payload_kind": "vllm_reference"}},
-    })))
+    backend = dspark_reference_backend(torch.randn(32, 2))
     torch.manual_seed(29)
     anchors, keep, plans = sample_owned_anchor_windows(tags, contract, model, device=torch.device("cpu"), windows=[3])
     full["preselected_anchor_positions"], full["preselected_anchor_keep_mask"] = anchors, keep
@@ -751,12 +769,10 @@ def test_owned_file_training_matches_full_batch_optimizer(tmp_path, monkeypatch,
                                                      position_weight="fixed_exp_decay", loss_mode="full_vocab", negatives=9,
                                                      dpace_alpha=0.5, extreme_dpace=False):
     import asyncio
-    from contextlib import nullcontext
     from copy import deepcopy
     import verl_speco.trainer.base_trainer as trainer_module
-    from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend, DSparkTrainingModel
-    from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
-    from verl_speco.trainer.base_trainer import DrafterBaseTrainer
+    from verl_speco.backends.dspark_trainer_backend import DSparkTrainingModel
+    from verl_speco.models.dspark import DSparkDraftModel
     from queue import Queue
     from verl_speco.trainer.draft_training_loop import (_execute_owned_reference_batch,
         _reference_training_parts_across_ranks, _reference_training_step_across_ranks)
@@ -789,13 +805,7 @@ def test_owned_file_training_matches_full_batch_optimizer(tmp_path, monkeypatch,
         payload["hidden_states"][3, 2, 0] = float("nan")
     save_file(payload, tags[0]["hidden_states_path"])
     full = prepare_standalone_cpu_batch(tags, contract, pin_memory=False, streaming=True, packing=packing, block_size=2)
-    model_config = DSparkConfig(hidden_size=2, intermediate_size=8, num_hidden_layers=1,
-                                num_attention_heads=1, num_key_value_heads=1, head_dim=2,
-                                vocab_size=32, num_target_layers=4, num_context_layers=2,
-                                target_hidden_size=2, target_num_hidden_layers=4, target_layer_ids=[0, 1],
-                                mask_token_id=31, markov_rank=2, markov_head_type="vanilla",
-                                enable_confidence_head=confidence_alpha > 0, confidence_head_with_markov=True,
-                                sliding_window=3, use_sliding_window=True, layer_types=["sliding_attention"])
+    model_config = tiny_window_config(enable_confidence_head=confidence_alpha > 0, confidence_head_with_markov=True)
     torch.manual_seed(55)
     model = DSparkTrainingModel(draft_model=DSparkDraftModel(model_config), block_size=2,
                                 num_anchors=3, l1_loss_alpha=l1_alpha, lk_loss_alpha=lk_alpha, ce_target_source=ce_target_source,
@@ -808,12 +818,7 @@ def test_owned_file_training_matches_full_batch_optimizer(tmp_path, monkeypatch,
                                 l1_chunk_size=2 if l1_alpha and ce_target_source == "labels" else 0,
                                 verifier_norm=torch.nn.LayerNorm(2))
     local = deepcopy(model)
-    backend = DSparkTrainerBackend.__new__(DSparkTrainerBackend)
-    backend.target_lm_head = SimpleNamespace(fc=SimpleNamespace(weight=torch.randn(32, 2)))
-    backend.config = SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(training={
-        "mode": "offline", "feature_store": {"type": "ray_reference"},
-        "transfer_queue": {"expected_feature": {"payload_kind": "vllm_reference"}},
-    })))
+    backend = dspark_reference_backend(torch.randn(32, 2))
     observed_denominators = []
     if extreme_dpace:
         compute = backend.compute_loss
@@ -826,21 +831,8 @@ def test_owned_file_training_matches_full_batch_optimizer(tmp_path, monkeypatch,
             return result
         backend.compute_loss = observe
     def make_trainer(current):
-        trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
-        trainer.model, trainer.backend, trainer.config = current, backend, backend.config
-        trainer.runtime_device, trainer.rank = torch.device("cpu"), 0
-        trainer.optimizer = torch.optim.SGD(current.parameters(), lr=0.01)
-        trainer.lr_scheduler = None
-        trainer.optimizer_steps_total = trainer.training_steps = 0
-        trainer._standalone_validate_grad_graph = True
-        trainer.combine_standalone_metrics = False
-        trainer._training_metric_sums, trainer._training_metric_steps = {}, 0
-        trainer.record_training_timing = lambda *args: None
-        trainer._ulysses_group_context = nullcontext
-        trainer._record_dflash_training_metrics = lambda losses: {}
-        trainer._clip_training_grad_norm = lambda: torch.tensor(0.0)
-        trainer._is_checkpoint_leader = lambda: False
-        trainer._reduce_loss_statistics = lambda values: (values, 1)
+        trainer = make_cpu_trainer(current, lr=0.01, distributed=False)
+        trainer.backend, trainer.config, trainer.rank = backend, backend.config, 0
         return trainer
     baseline, owned = make_trainer(model), make_trainer(local)
     if confidence_alpha and confidence_mode in {"probabilistic", "all_invalid"}:
@@ -927,29 +919,18 @@ def test_owned_dpace_tiny_total_ce_weight_matches_full_batch_numerator(tmp_path,
 
 
 @pytest.mark.parametrize("packing", [False, True])
+@pytest.mark.parametrize("loss_mode", ["restricted_ce", "sampled_ce"])
 @pytest.mark.parametrize("position_weight,l1,lk,lk_type,confidence,mode", [
     ("fixed_exp_decay", 0.0, 0.0, "alpha", 0.0, "greedy"),
     ("fixed_exp_decay", 0.9, 0.3, "adaptive_hybrid", 0.4, "probabilistic"),
     ("dpace", 0.9, 0.3, "adaptive_hybrid", 0.4, "probabilistic"),
 ])
-def test_owned_restricted_ce_matches_full_batch_optimizer(tmp_path, monkeypatch, packing, position_weight,
-                                                           l1, lk, lk_type, confidence, mode):
+def test_owned_vocabulary_loss_matches_full_batch_optimizer(
+    tmp_path, monkeypatch, packing, position_weight, l1, lk, lk_type, confidence, mode, loss_mode,
+):
     test_owned_file_training_matches_full_batch_optimizer(
         tmp_path, monkeypatch, "labels", l1, lk, lk_type, confidence, mode, packing,
-        position_weight=position_weight, loss_mode="restricted_ce")
-
-
-@pytest.mark.parametrize("packing", [False, True])
-@pytest.mark.parametrize("position_weight,l1,lk,lk_type,confidence,mode", [
-    ("fixed_exp_decay", 0.0, 0.0, "alpha", 0.0, "greedy"),
-    ("fixed_exp_decay", 0.9, 0.3, "adaptive_hybrid", 0.4, "probabilistic"),
-    ("dpace", 0.9, 0.3, "adaptive_hybrid", 0.4, "probabilistic"),
-])
-def test_owned_sampled_ce_matches_full_batch_optimizer(tmp_path, monkeypatch, packing, position_weight,
-                                                        l1, lk, lk_type, confidence, mode):
-    test_owned_file_training_matches_full_batch_optimizer(
-        tmp_path, monkeypatch, "labels", l1, lk, lk_type, confidence, mode, packing,
-        position_weight=position_weight, loss_mode="sampled_ce")
+        position_weight=position_weight, loss_mode=loss_mode)
 
 
 def test_owned_sampled_ce_with_no_negatives_preserves_rng(tmp_path, monkeypatch):
@@ -960,19 +941,14 @@ def test_owned_sampled_ce_with_no_negatives_preserves_rng(tmp_path, monkeypatch)
 
 def _owned_file_step_gloo_worker(rank, port, directory, fail, output):
     import asyncio
-    import datetime
-    from contextlib import nullcontext
     from copy import deepcopy
     import torch.distributed as dist
     import verl_speco.trainer.base_trainer as trainer_module
-    from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend, DSparkTrainingModel
-    from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
-    from verl_speco.trainer.base_trainer import DrafterBaseTrainer
+    from verl_speco.backends.dspark_trainer_backend import DSparkTrainingModel
+    from verl_speco.models.dspark import DSparkDraftModel
     from verl_speco.trainer.draft_training_loop import (_owned_reference_training_step,
         _reference_training_step_across_ranks, _zero_standalone_padding_batch)
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2,
-                            timeout=datetime.timedelta(seconds=45))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=45):
         if fail == "node_dpace_zero":
             import torch.nn.functional as functional
             original_nll = functional.nll_loss
@@ -996,12 +972,7 @@ def _owned_file_step_gloo_worker(rank, port, directory, fail, output):
                                              packing=fail in {"packed", "node_packed"}, block_size=2)
         if rank == 1 and fail != "sampled_invalid":
             full = _zero_standalone_padding_batch(full)
-        config = DSparkConfig(hidden_size=2, intermediate_size=8, num_hidden_layers=1,
-                              num_attention_heads=1, num_key_value_heads=1, head_dim=2,
-                              vocab_size=32, num_target_layers=4, num_context_layers=2,
-                              target_hidden_size=2, target_num_hidden_layers=4, target_layer_ids=[0, 1],
-                              mask_token_id=31, markov_rank=2, markov_head_type="vanilla",
-                              sliding_window=3, use_sliding_window=True, layer_types=["sliding_attention"])
+        config = tiny_window_config()
         torch.manual_seed(731)
         model = DSparkTrainingModel(draft_model=DSparkDraftModel(config), block_size=2,
                                     num_anchors=3, l1_loss_alpha=0.9 if fail in {"l1", "packed", "adaptive", "sampled_aux", "node_aux", "node_sampled_aux", "node_dpace_zero"} else 0.0,
@@ -1013,33 +984,12 @@ def _owned_file_step_gloo_worker(rank, port, directory, fail, output):
                                     sampled_ce_negatives=0 if fail == "sampled_mismatch" and rank == 1 else 9,
                                     verifier_norm=torch.nn.LayerNorm(2))
         baseline = deepcopy(model)
-        backend = DSparkTrainerBackend.__new__(DSparkTrainerBackend)
-        backend.target_lm_head = SimpleNamespace(fc=SimpleNamespace(weight=torch.randn(32, 2)))
-        backend.config = SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(training={
-            "mode": "offline", "feature_store": {"type": "ray_reference"},
-            "transfer_queue": {"expected_feature": {"payload_kind": "vllm_reference"}},
-        })))
+        backend = dspark_reference_backend(torch.randn(32, 2))
         trainer_module.device_name = "cpu"
         def make_trainer(raw):
-            trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
-            trainer.model = torch.nn.parallel.DistributedDataParallel(raw, find_unused_parameters=True)
-            trainer.backend, trainer.config = backend, backend.config
-            trainer.runtime_device, trainer.rank = torch.device("cpu"), rank
-            trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.01)
-            trainer.lr_scheduler = None
-            trainer.optimizer_steps_total = trainer.training_steps = 0
-            trainer._standalone_validate_grad_graph = True
-            trainer.combine_standalone_metrics = False
-            trainer._training_metric_sums, trainer._training_metric_steps = {}, 0
-            trainer.record_training_timing = lambda *args: None
-            trainer._ulysses_group_context = nullcontext
-            trainer._record_dflash_training_metrics = lambda losses: {}
-            trainer._clip_training_grad_norm = lambda: torch.tensor(0.0)
-            trainer._is_checkpoint_leader = lambda: False
-            def reduce_statistics(values):
-                dist.all_reduce(values)
-                return values, 2
-            trainer._reduce_loss_statistics = reduce_statistics
+            wrapped = torch.nn.parallel.DistributedDataParallel(raw, find_unused_parameters=True)
+            trainer = make_cpu_trainer(wrapped, lr=0.01, distributed=True)
+            trainer.backend, trainer.config, trainer.rank = backend, backend.config, rank
             return trainer
         trainer, reference = make_trainer(model), make_trainer(baseline)
         node_context = None
@@ -1128,42 +1078,11 @@ def _owned_file_step_gloo_worker(rank, port, directory, fail, output):
             output.put((rank, "ok", seen, Path(tag["hidden_states_path"]).exists(), trainer.optimizer_steps_total, difference))
         except RuntimeError as exc:
             output.put((rank, str(exc), seen, Path(tag["hidden_states_path"]).exists(), trainer.optimizer_steps_total, None))
-    finally:
-        dist.destroy_process_group()
-
-
-def _collect_gloo_workers(target, arguments, *, count, timeout, join_timeout):
-    import multiprocessing
-    import socket
-    if not torch.distributed.is_gloo_available():
-        pytest.skip("Gloo is unavailable")
-    ctx = multiprocessing.get_context("spawn")
-    output = ctx.Queue()
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    processes = [ctx.Process(target=target, args=arguments(rank, port, output)) for rank in range(count)]
-    started = []
-    try:
-        for process in processes:
-            process.start()
-            started.append(process)
-        rows = sorted(output.get(timeout=timeout) for _ in processes)
-        for process in processes:
-            process.join(timeout=join_timeout)
-        assert all(process.exitcode == 0 for process in processes)
-        return rows
-    finally:
-        for process in started:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
-        output.close()
 
 
 @pytest.mark.parametrize("fail", [None, "l1", "packed", "adaptive", "scan", "materialize", "sampled", "sampled_aux", "sampled_changed", "sampled_invalid", "sampled_mismatch", "node_basic", "node_packed", "node_sampled", "node_failure", "node_invalid_assignment", "node_aux", "node_restricted", "node_sampled_aux", "node_bad_identity", "node_dpace_zero"])
 def test_owned_file_step_two_gloo_ranks(tmp_path, fail):
-    rows = _collect_gloo_workers(_owned_file_step_gloo_worker,
+    rows = collect_gloo_workers(_owned_file_step_gloo_worker,
         lambda rank, port, output: (rank, port, str(tmp_path), fail, output), count=2, timeout=90, join_timeout=20)
     if fail in {"scan", "materialize", "sampled_changed", "sampled_mismatch", "node_failure", "node_invalid_assignment", "node_bad_identity"}:
         expected_error = ("planning failed" if fail == "scan" else "Node-owned window plan is invalid"
@@ -1181,14 +1100,11 @@ def test_owned_file_step_two_gloo_ranks(tmp_path, fail):
 
 
 def _node_window_four_rank_worker(rank, port, output):
-    import datetime
     import torch.distributed as dist
     import verl_speco.trainer.reference_shared_frame as shared
     import verl_speco.trainer.standalone_batch_prepare as prepare
     from verl_speco.trainer.draft_training_loop import _node_owned_window_parts
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=4,
-                            timeout=datetime.timedelta(seconds=35))
-    try:
+    with gloo_process_group(rank, f"tcp://127.0.0.1:{port}", timeout=35, world_size=4):
         owner = rank // 2 * 2
         entries = ({peer: [SimpleNamespace(tag={"rank": peer})] for peer in range(owner, owner + 2)}
                    if rank == owner else None)
@@ -1218,12 +1134,10 @@ def _node_window_four_rank_worker(rank, port, output):
             values.append(parts[index]())
             dist.barrier()
         output.put((rank, values, sent))
-    finally:
-        dist.destroy_process_group()
 
 
 def test_node_window_routing_isolated_across_two_node_groups():
-    rows = _collect_gloo_workers(_node_window_four_rank_worker,
+    rows = collect_gloo_workers(_node_window_four_rank_worker,
         lambda rank, port, output: (rank, port, output), count=4, timeout=60, join_timeout=10)
     for rank, values, sent in rows:
         expected = [rank + 1, rank + 10 if rank % 2 == 0 else -1] * 2
@@ -1241,13 +1155,9 @@ def test_native_producer_uses_source_owned_control_service(tmp_path, monkeypatch
     from verl_speco.transport.drafter_sample_protocol import make_sample_key
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport, NativeSourceControlService
 
-    class Engine:
-        def initialize(self, *args): return 0
-        def register_memory(self, *args): return 0
-        def unregister_memory(self, *args): return 0
     source = NativeFeatureTransport(run_id="run", generation=1, endpoint="source", metadata_server="metadata",
                                     device="cpu", max_bytes=4 * 1024**2, max_slots=1,
-                                    chunk_bytes=2 * 1024**2, engine_factory=Engine)
+                                    chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
     descriptor = source.publish({"ids": torch.arange(2)}, lease_id="sample")
     file_tag, _ = _sample(tmp_path, _contract("DSPARK"), length=8)
     tag = make_reference_tag(SampleMetadata.from_dict(file_tag), backend="native",
@@ -1307,17 +1217,13 @@ def test_native_source_follows_producer_dispatch_and_rank_ack(tmp_path, monkeypa
     from verl_speco.transport.drafter_sample_protocol import make_sample_key
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport
 
-    class Engine:
-        def initialize(self, *args): return 0
-        def register_memory(self, *args): return 0
-        def unregister_memory(self, *args): return 0
 
     source = NativeFeatureTransport(run_id="run", generation=1, endpoint="localhost:1234",
                                     metadata_server="metadata", device="cpu", max_bytes=4 * 1024**2,
-                                    max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=Engine)
+                                    max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
     other_source = NativeFeatureTransport(run_id="run", generation=1, endpoint="localhost:1234",
                                           metadata_server="metadata", device="cpu", max_bytes=4 * 1024**2,
-                                          max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=Engine)
+                                          max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
     contract = _contract("DSPARK")
     file_tag, _ = _sample(tmp_path, contract, length=8)
     descriptor = source.publish({"hidden": torch.ones(2, 2)}, lease_id="sample")
@@ -1434,8 +1340,7 @@ def test_native_reference_prepares_batch_and_preserves_source_until_ack(tmp_path
     from verl_speco.transport.drafter_sample_protocol import make_sample_key
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport
     registrations = {}
-    class Engine:
-        def initialize(self, *args): return 0
+    class Engine(NativeTestEngine):
         def register_memory(self, address, size): registrations[address] = size; return 0
         def unregister_memory(self, address): del registrations[address]; return 0
         def transfer_sync_read(self, segment, local, remote, size):

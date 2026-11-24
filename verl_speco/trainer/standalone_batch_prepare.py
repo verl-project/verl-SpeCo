@@ -14,6 +14,7 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
+from verl_speco.config import validate_timeout
 from verl_speco.producer.hidden_states_store import (
     FileHiddenStatesStore,
     HiddenStatesStore,
@@ -58,13 +59,7 @@ def prepare_standalone_cpu_batch(
         raise ValueError("streaming must be a boolean")
     if type(max_output_bytes) is not int or max_output_bytes < 0:
         raise ValueError("max_output_bytes must be a non-negative integer")
-    if (
-        isinstance(read_timeout, bool)
-        or not isinstance(read_timeout, (int, float))
-        or not math.isfinite(read_timeout)
-        or read_timeout <= 0
-    ):
-        raise ValueError("read_timeout must be a positive finite number")
+    validate_timeout(read_timeout, "read_timeout")
     read_deadline = time.monotonic() + read_timeout
     if not tags or (max_window is not None and max_window < 0):
         raise ValueError("A non-empty batch and non-negative max_window are required")

@@ -83,8 +83,6 @@ def _readers(value):
 
 
 def _dispatch(plan_id, receipt_token):
-    if plan_id is None and receipt_token is None:
-        return None
     if (
         type(plan_id) is not int
         or plan_id < 0
@@ -989,7 +987,7 @@ class NativeFeatureTransport:
             if self._registered:
                 raise RuntimeError("Native source still owns registered memory")
 
-    def publish(self, fields, *, lease_id, readers=None):
+    def publish(self, fields, *, lease_id):
         with self._lock, self._device_scope():
             self._require_open()
             if self._sealed:
@@ -1006,8 +1004,7 @@ class NativeFeatureTransport:
                     for name in fields
                 )
             ):
-                raise ValueError("Invalid native lease, readers, fields or slot limit")
-            expected = None if readers is None else _readers(readers)
+                raise ValueError("Invalid native lease, fields or slot limit")
             if lease_id in self._slots:
                 raise ValueError("Native lease is already active")
             if lease_id in self._completed:
@@ -1077,10 +1074,9 @@ class NativeFeatureTransport:
             self._slots[lease_id] = {
                 "buffer": buffer,
                 "descriptor": descriptor,
-                "expected": expected,
-                "pending": None if expected is None else set(expected),
+                "expected": None,
+                "pending": None,
                 "dispatch": None,
-                "acknowledged": set(),
             }
             return json.loads(json.dumps(descriptor))
 
@@ -1295,8 +1291,6 @@ class NativeFeatureTransport:
             self._require_open()
             descriptor = self._validate(descriptor)
             expected, dispatch = _readers(readers), _dispatch(plan_id, receipt_token)
-            if dispatch is None:
-                raise ValueError("Native source binding requires dispatch identity")
             slot = self._slots.get(descriptor["lease_id"])
             if slot is None:
                 completed = self._completed.get(descriptor["lease_id"])
@@ -1309,18 +1303,8 @@ class NativeFeatureTransport:
                 raise ValueError("Native source binding identity differs")
             if slot["descriptor"] != descriptor:
                 raise ValueError("Native source binding identity differs")
-            if slot["expected"] is not None:
+            if slot["dispatch"] is not None:
                 if slot["expected"] == expected and slot["dispatch"] == dispatch:
-                    return
-                # A producer may know the intended ranks before the scheduler
-                # assigns a plan. Bind that plan only before any legacy ACK so
-                # a receipt can never be moved between dispatch identities.
-                if (
-                    slot["expected"] == expected
-                    and slot["dispatch"] is None
-                    and not slot["acknowledged"]
-                ):
-                    slot["dispatch"] = dispatch
                     return
                 raise ValueError("Native source is already bound to another dispatch")
             slot["expected"], slot["pending"], slot["dispatch"] = (
@@ -1329,7 +1313,7 @@ class NativeFeatureTransport:
                 dispatch,
             )
 
-    def acknowledge(self, descriptor, *, reader, plan_id=None, receipt_token=None):
+    def acknowledge(self, descriptor, *, reader, plan_id, receipt_token):
         with self._lock, self._device_scope():
             self._require_open()
             descriptor = self._validate(descriptor)
@@ -1349,19 +1333,16 @@ class NativeFeatureTransport:
             if (
                 slot["descriptor"] != descriptor
                 or type(reader) is not int
-                or slot["dispatch"] != dispatch
+                or slot["dispatch"] not in (None, dispatch)
             ):
                 raise ValueError("Native lease acknowledgement identity differs")
             if slot["pending"] is None:
                 raise RuntimeError("Native source lease has not been bound to readers")
-            if reader in slot["acknowledged"]:
-                return
-            if reader not in slot["pending"]:
+            if reader not in slot["expected"]:
                 raise ValueError("Native lease acknowledgement reader differs")
-            slot["pending"].remove(reader)
-            slot["acknowledged"].add(reader)
+            slot["pending"].discard(reader)
 
-    def release(self, descriptor, *, plan_id=None, receipt_token=None):
+    def release(self, descriptor, *, plan_id, receipt_token):
         with self._lock, self._device_scope():
             self._require_open()
             descriptor = self._validate(descriptor)
@@ -1376,7 +1357,10 @@ class NativeFeatureTransport:
                 ):
                     return
                 raise ValueError("Native source lease identity differs")
-            if slot["descriptor"] != descriptor or slot["dispatch"] != dispatch:
+            if (
+                slot["descriptor"] != descriptor
+                or slot["dispatch"] not in (None, dispatch)
+            ):
                 raise ValueError("Native source lease identity differs")
             if slot["pending"] is None:
                 raise RuntimeError("Native source lease has not been bound to readers")
@@ -1384,7 +1368,7 @@ class NativeFeatureTransport:
                 raise RuntimeError(
                     "Native source lease still has unacknowledged readers"
                 )
-            self._retire_slot(descriptor, slot, dispatch)
+            self._retire_slot(descriptor, slot)
 
     def discard_unbound(self, descriptor):
         """Discard an unpublished-to-readers source after the scheduler fences dispatch."""
@@ -1397,15 +1381,11 @@ class NativeFeatureTransport:
                 if completed == (descriptor["sha256"], frozenset(), None):
                     return
                 raise ValueError("Native source discard identity differs")
-            if (
-                slot["descriptor"] != descriptor
-                or slot["dispatch"] is not None
-                or slot["acknowledged"]
-            ):
+            if slot["descriptor"] != descriptor or slot["dispatch"] is not None:
                 raise ValueError("Native source has already been dispatched or read")
-            self._retire_slot(descriptor, slot, None)
+            self._retire_slot(descriptor, slot)
 
-    def _retire_slot(self, descriptor, slot, dispatch):
+    def _retire_slot(self, descriptor, slot):
         try:
             slot["buffer"][:64].zero_()
             self._synchronize()
@@ -1415,11 +1395,11 @@ class NativeFeatureTransport:
             self._failed = True
             raise
         self._unregister(slot["buffer"])
-        readers = frozenset(slot["acknowledged"])
+        readers = slot["expected"] or frozenset()
         self._completed[descriptor["lease_id"]] = (
             descriptor["sha256"],
             readers,
-            dispatch,
+            slot["dispatch"],
         )
         self._completed_readers += len(readers)
         while len(self._completed) > 4096 or self._completed_readers > 8192:

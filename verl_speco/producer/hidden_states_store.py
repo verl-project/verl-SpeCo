@@ -247,6 +247,21 @@ def file_reference_tensor_bytes(reference: str) -> int:
         return payload_bytes
 
 
+def _validate_file_payload_fields(data) -> None:
+    if not {"token_ids", "hidden_states"}.issubset(data.keys()):
+        raise ValueError("vLLM hidden-states payload must contain token_ids and hidden_states")
+
+
+def _consecutive_row_runs(rows) -> list[list[int]]:
+    runs: list[list[int]] = []
+    for row in rows:
+        if runs and row == runs[-1][1]:
+            runs[-1][1] += 1
+        else:
+            runs.append([row, row + 1])
+    return runs
+
+
 class FileHiddenStatesStore(HiddenStatesStore):
     """Legacy safetensors file backend (``hidden_states_path``)."""
 
@@ -346,10 +361,7 @@ class FileHiddenStatesStore(HiddenStatesStore):
         if self.wait_for_writer:
             _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
         with safe_open(str(path), framework="pt", device="cpu") as data:
-            if "token_ids" not in data.keys() or "hidden_states" not in data.keys():
-                raise ValueError(
-                    "vLLM hidden-states payload must contain token_ids and hidden_states"
-                )
+            _validate_file_payload_fields(data)
             if data.get_tensor("token_ids").long().tolist() != list(prompt_ids):
                 raise HiddenStateAlignmentError(
                     "vLLM hidden-states token_ids do not match replay input"
@@ -388,12 +400,7 @@ class FileHiddenStatesStore(HiddenStatesStore):
                     )
                     values = block.index_select(0, indices)
                 else:
-                    runs: list[list[int]] = []
-                    for row in rows:
-                        if runs and row == runs[-1][1]:
-                            runs[-1][1] += 1
-                        else:
-                            runs.append([row, row + 1])
+                    runs = _consecutive_row_runs(rows)
                     chunks = [
                         hidden[first:last][:, :auxiliary_layers, :]
                         for first, last in runs
@@ -469,10 +476,7 @@ class FileHiddenStatesStore(HiddenStatesStore):
         if not path.is_file():
             raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
         with safe_open(str(path), framework="pt", device="cpu") as data:
-            if "token_ids" not in data.keys() or "hidden_states" not in data.keys():
-                raise ValueError(
-                    "vLLM hidden-states payload must contain token_ids and hidden_states"
-                )
+            _validate_file_payload_fields(data)
             hidden = data.get_slice("hidden_states")
             shape = hidden.get_shape()
             if len(shape) != 3:
@@ -499,13 +503,7 @@ class FileHiddenStatesStore(HiddenStatesStore):
             first = min(selected_positions) - original_offset
             last = max(selected_positions) - original_offset + 1
             if compact and last - first > 2 * len(selected_positions):
-                runs: list[list[int]] = []
-                for position in selected_positions:
-                    row = position - original_offset
-                    if runs and row == runs[-1][1]:
-                        runs[-1][1] += 1
-                    else:
-                        runs.append([row, row + 1])
+                runs = _consecutive_row_runs(position - original_offset for position in selected_positions)
                 # Bound metadata and read operations for extremely fragmented input.
                 if len(runs) <= 1024:
                     chunks = [hidden[start:end] for start, end in runs]

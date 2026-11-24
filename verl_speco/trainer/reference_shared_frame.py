@@ -16,7 +16,7 @@ import time
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import load, save
+from safetensors.torch import save
 
 _CONTROL_LIMIT = 64 * 1024
 
@@ -169,19 +169,6 @@ def _validate_tensors(manifest, metadata, tensors):
     if not tensors or actual != manifest["tensors"] or set(metadata) & set(tensors):
         raise ValueError("Local frame tensor metadata differs")
     return {**tensors, **metadata}
-
-
-def decode_local_frame(payload, descriptor, *, binding, max_bytes):
-    if not isinstance(payload, bytes):
-        raise ValueError("Invalid local frame payload")
-    manifest, metadata = _parse_manifest(
-        descriptor, binding=binding, max_bytes=max_bytes, size=len(payload)
-    )
-    if manifest["sha256"] != _checksum(
-        {k: v for k, v in manifest.items() if k != "sha256"}, payload
-    ):
-        raise ValueError("Local frame checksum differs")
-    return _validate_tensors(manifest, metadata, load(payload))
 
 
 def _read_mapped_frame(fd, descriptor, *, binding, max_bytes, deadline=None):
