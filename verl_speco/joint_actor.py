@@ -24,6 +24,8 @@ from verl_speco.joint_scoring import (
     JointScoringRequest,
     validate_joint_batch,
     score_joint_batch,
+    validate_joint_model,
+    parallel_microbatch_sizes,
 )
 
 
@@ -40,39 +42,9 @@ def partition_joint_requests(requests, rank, world_size):
     return (dummy,), True
 
 
-def parallel_microbatch_sizes(requests, sizes, dp_size, sp_size, options):
-    """Apply token/mask limits per DP rank, keeping each tree in one forward."""
-    if dp_size == 1:
-        return sizes
-    token_budget = options.get("max_packed_tokens", 8192)
-    mask_budget = options.get("max_mask_elements", 16777216)
-    local_limit = max(sizes)
-    groups, count = [], 0
-    totals, widths, counts = [0] * dp_size, [0] * dp_size, [0] * dp_size
-    for request in requests:
-        length, width = request.packed_size(sp_size)
-        if length > token_budget or width * width > mask_budget:
-            raise ValueError("joint trajectory exceeds its per-rank token/mask budget")
-        rank = count % dp_size
-        if (
-            totals[rank] + length > token_budget
-            or (counts[rank] + 1) * max(widths[rank], width) ** 2 > mask_budget
-            or counts[rank] + 1 > local_limit
-        ):
-            groups.append(count)
-            count = 0
-            totals, widths, counts = [0] * dp_size, [0] * dp_size, [0] * dp_size
-            rank = 0
-        totals[rank] += length
-        widths[rank] = max(widths[rank], width)
-        counts[rank] += 1
-        count += 1
-    if count:
-        groups.append(count)
-    return tuple(groups)
-
-
-def score_actor_joint(worker, requests, *, microbatch_sizes=None, **options):
+def score_actor_joint(
+    worker, requests, *, microbatch_sizes=None, microbatch_trajectories=None, **options
+):
     """Validate all scheduled rounds before entering the resident FSDP actor."""
     sizes = tuple(microbatch_sizes) if microbatch_sizes is not None else None
     engine = getattr(getattr(worker, "actor", None), "engine", None)
@@ -86,7 +58,13 @@ def score_actor_joint(worker, requests, *, microbatch_sizes=None, **options):
         for name in ULYSSES_ENV_FLAGS:
             options[name] = resolve_ulysses_flag(name, options.get(name))
     if distributed:
-        signature = (requests, sizes, sp_size, sorted(options.items()))
+        signature = (
+            requests,
+            sizes,
+            microbatch_trajectories,
+            sp_size,
+            sorted(options.items()),
+        )
         digest = hashlib.sha256(repr(signature).encode()).hexdigest()
         schedules = [None] * world
         torch.distributed.all_gather_object(schedules, digest)
@@ -109,7 +87,24 @@ def score_actor_joint(worker, requests, *, microbatch_sizes=None, **options):
         )
         dp_size, dp_rank = world // sp_size, rank // sp_size
         nonleader = sp_size > 1 and torch.distributed.get_rank(sp_group) != 0
-        if sizes is None:
+        if microbatch_trajectories is not None:
+            if (
+                sizes is not None
+                or type(microbatch_trajectories) is not int
+                or microbatch_trajectories < 1
+            ):
+                raise ValueError(
+                    "joint scoring requires one positive microbatch trajectory limit"
+                )
+            requests, sizes, ordered_indices = _plan_actor_batches(
+                requests,
+                (microbatch_trajectories,),
+                dp_size,
+                sp_size,
+                options,
+                auto=True,
+            )
+        elif sizes is None:
             sizes = (len(requests),)
         else:
             if (
@@ -129,8 +124,14 @@ def score_actor_joint(worker, requests, *, microbatch_sizes=None, **options):
             if len({request.sample_id for request in batch}) != len(batch):
                 raise ValueError("sample IDs must be nonempty and unique")
             local_requests, dummy = partition_joint_requests(batch, dp_rank, dp_size)
-            _validate_local_batch(
-                local_requests, engine.module.config, sp_size, options
+            validate_joint_batch(
+                local_requests,
+                dtype=torch.float32,
+                vocab_size=engine.module.config.vocab_size,
+                max_position_embeddings=engine.module.config.max_position_embeddings,
+                max_packed_tokens=options.get("max_packed_tokens", 8192),
+                max_mask_elements=options.get("max_mask_elements", 16777216),
+                sequence_multiple=sp_size,
             )
             indices = (
                 ordered_indices[offset + dp_rank : offset + length : dp_size]
@@ -184,7 +185,7 @@ def score_actor_joint(worker, requests, *, microbatch_sizes=None, **options):
     return tuple(results), totals
 
 
-def _plan_actor_batches(requests, sizes, dp_size, sp_size, options):
+def _plan_actor_batches(requests, sizes, dp_size, sp_size, options, *, auto=False):
     ordered_indices = None
     if sp_size > 1 and dp_size > 1 and options.get("use_causal_fast_path"):
         trunk_indices = []
@@ -202,7 +203,9 @@ def _plan_actor_batches(requests, sizes, dp_size, sp_size, options):
             requests = tuple(requests[i] for i in ordered_indices)
     return (
         requests,
-        parallel_microbatch_sizes(requests, sizes, dp_size, sp_size, options),
+        sizes
+        if dp_size == 1 and not auto
+        else parallel_microbatch_sizes(requests, sizes, dp_size, sp_size, options),
         ordered_indices,
     )
 
@@ -248,47 +251,13 @@ def _validate_actor_engine(
         model_config, "lora_adapter_path", None
     ):
         raise NotImplementedError("joint scoring has not validated LoRA actor wrappers")
-    config = engine.module.config
-    if config.model_type not in {"qwen2", "qwen3", "llama"} or getattr(
-        config, "_attn_implementation", None
-    ) not in (
-        {"eager", "sdpa", "flash_attention_2"} if sp_size > 1 else {"eager", "sdpa"}
-    ):
-        raise ValueError(
-            "joint actor requires a supported full-attention eager/SDPA model"
-        )
-    if getattr(config, "sliding_window", None) is not None or any(
-        layer != "full_attention"
-        for layer in (getattr(config, "layer_types", None) or ())
-    ):
-        raise ValueError("joint actor does not support sliding/hybrid attention")
+    validate_joint_model(
+        engine.module.config, options.get("hidden_state_indices", ()), sp_size
+    )
     if sp_size > 1:
         from verl_speco.joint_ulysses import validate_ulysses_model
 
         validate_ulysses_model(engine.module, sp_size)
-    for i in options.get("hidden_state_indices", ()):
-        if type(i) is not int or not 0 <= i <= config.num_hidden_layers:
-            raise ValueError("joint actor auxiliary hidden-state index is invalid")
-
-
-def _validate_local_batch(requests, config, sp_size, options):
-    validate_joint_batch(
-        requests,
-        dtype=torch.float32,
-        vocab_size=config.vocab_size,
-        max_packed_tokens=options.get("max_packed_tokens", 8192),
-        max_mask_elements=options.get("max_mask_elements", 16777216),
-        sequence_multiple=sp_size,
-    )
-    max_position = max(
-        max(
-            len(r.trunk_ids) - 1,
-            max((b.anchor + len(b.token_ids) - 1 for b in r.branches), default=0),
-        )
-        for r in requests
-    )
-    if max_position >= config.max_position_embeddings:
-        raise ValueError("joint actor exceeds max_position_embeddings")
 
 
 def _score_local_joint_batch(

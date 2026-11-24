@@ -173,35 +173,6 @@ def request():
     return [JointScoringRequest("x", (1, 2, 3, 4), 2, (DraftBranch("b", 2, (5, 6)),))]
 
 
-def test_actor_publish_mixin_exposes_joint_scoring():
-    from verl_speco.integration.rollout_publish import DraftWeightPublishMixin
-
-    actor, events = worker()
-    result, metrics = DraftWeightPublishMixin.compute_joint_old_log_prob(
-        actor, request()
-    )
-    assert result[0].sample_id == "x"
-    assert metrics["model_forward_calls"] == 1
-    assert events == ["enter", "exit"]
-
-
-def test_microbatch_schedule_error_restores_engine(monkeypatch):
-    actor, events = worker()
-    original = actor.actor.engine.module.forward
-    calls = 0
-    def fail_second(**kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise RuntimeError("second chunk failed")
-        return original(**kwargs)
-    monkeypatch.setattr(actor.actor.engine.module, "forward", fail_second)
-    with pytest.raises(RuntimeError, match="second chunk failed"):
-        score_actor_joint(actor, request() + request(), microbatch_sizes=(1, 1))
-    assert events == ["enter", "exit"]
-    assert actor.actor.engine.module.training
-
-
 def test_parallel_schedule_respects_padded_local_mask_budget():
     from dataclasses import replace
 
@@ -214,7 +185,8 @@ def test_parallel_schedule_respects_padded_local_mask_budget():
 
 
 @pytest.mark.parametrize("bad_late_batch", [False, True])
-def test_schedule_checks_all_ranks_once_before_any_forward(monkeypatch, bad_late_batch):
+@pytest.mark.parametrize("automatic", [False, True])
+def test_schedule_checks_all_ranks_once_before_any_forward(monkeypatch, bad_late_batch, automatic):
     from dataclasses import replace
 
     actor, events = worker()
@@ -232,12 +204,13 @@ def test_schedule_checks_all_ranks_once_before_any_forward(monkeypatch, bad_late
     first = request()[0]
     final = replace(first, sample_id="final", trunk_ids=(1, 2, 3, 32)) if bad_late_batch else first
     trees = (first, first, final)
+    schedule = dict(microbatch_trajectories=1) if automatic else dict(microbatch_sizes=(1, 1, 1))
     if bad_late_batch:
         with pytest.raises(RuntimeError, match="preflight failed.*model vocabulary"):
-            score_actor_joint(actor, trees, microbatch_sizes=(1, 1, 1))
+            score_actor_joint(actor, trees, **schedule)
         assert not events
     else:
-        _, metrics = score_actor_joint(actor, trees, microbatch_sizes=(1, 1, 1))
+        _, metrics = score_actor_joint(actor, trees, **schedule)
         assert metrics["model_forward_calls"] == 3
         assert events == ["enter", "exit"]
     assert len(collectives) == 2

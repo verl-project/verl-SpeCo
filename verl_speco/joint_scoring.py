@@ -22,6 +22,7 @@ rejection sampling takes place here.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 import math
 from typing import Sequence
 
@@ -96,6 +97,7 @@ def validate_joint_batch(
     max_packed_tokens=8192,
     max_mask_elements=16_777_216,
     sequence_multiple=1,
+    max_position_embeddings=None,
 ):
     """Check a local packed tree layout without allocating quadratic masks."""
     if not requests:
@@ -168,6 +170,16 @@ def validate_joint_batch(
             independent_rows += branch.anchor + len(branch.token_ids)
         if any(not _integer(token) or not 0 <= token < vocab_size for token in ids):
             raise ValueError("token IDs must be integers inside the model vocabulary")
+        max_position = max(
+            [n - 1] + [b.anchor + len(b.token_ids) - 1 for b in request.branches]
+        )
+        if (
+            max_position_embeddings is not None
+            and max_position >= max_position_embeddings
+        ):
+            raise ValueError(
+                "joint actor exceeds max_position_embeddings; prefixes must not be truncated"
+            )
         lengths.append(length)
     if not _integer(sequence_multiple) or sequence_multiple < 1:
         raise ValueError("sequence_multiple must be a positive integer")
@@ -193,6 +205,7 @@ def pack_joint_batch(
     sequence_multiple: int = 1,
     omit_trunk_only_masks: bool = False,
     build_attention_mask: bool = True,
+    max_position_embeddings: int | None = None,
 ) -> PackedJointBatch:
     """Compile ancestry, semantic RoPE positions and predecessor readouts.
 
@@ -211,6 +224,7 @@ def pack_joint_batch(
         max_packed_tokens=max_packed_tokens,
         max_mask_elements=max_mask_elements,
         sequence_multiple=sequence_multiple,
+        max_position_embeddings=max_position_embeddings,
     )
 
     input_ids = torch.zeros((len(requests), width), dtype=torch.long, device=device)
@@ -297,6 +311,73 @@ def response_scores(logits, labels, temperature, calculate_entropy):
     return log_probs, entropy
 
 
+def parallel_microbatch_sizes(requests, sizes, dp_size, sp_size, options):
+    """Apply token/mask limits per DP rank, keeping each tree in one forward."""
+    token_budget = options.get("max_packed_tokens", 8192)
+    mask_budget = options.get("max_mask_elements", 16777216)
+    local_limit = max(sizes)
+    groups, count = [], 0
+    totals, widths, counts = [0] * dp_size, [0] * dp_size, [0] * dp_size
+    for request in requests:
+        length, width = request.packed_size(sp_size)
+        if length > token_budget or width * width > mask_budget:
+            raise ValueError(
+                "complete trajectory exceeds its per-rank token/mask budget"
+            )
+        rank = count % dp_size
+        if (
+            totals[rank] + length > token_budget
+            or (counts[rank] + 1) * max(widths[rank], width) ** 2 > mask_budget
+            or counts[rank] + 1 > local_limit
+        ):
+            groups.append(count)
+            count = 0
+            totals, widths, counts = [0] * dp_size, [0] * dp_size, [0] * dp_size
+            rank = 0
+        totals[rank] += length
+        widths[rank] = max(widths[rank], width)
+        counts[rank] += 1
+        count += 1
+    if count:
+        groups.append(count)
+    return tuple(groups)
+
+
+def validate_joint_model(config, indices, sp_size=1):
+    """Share model restrictions between collective preflight and execution."""
+    if config.model_type not in {"qwen2", "qwen3", "llama"}:
+        raise ValueError(
+            "joint scoring currently supports full-attention Qwen2/Qwen3/Llama only"
+        )
+    if getattr(config, "_attn_implementation", None) not in (
+        {"eager", "sdpa", "flash_attention_2"} if sp_size > 1 else {"eager", "sdpa"}
+    ):
+        raise ValueError(
+            "joint scoring requires eager or SDPA with an explicit 4D mask"
+        )
+    if getattr(config, "sliding_window", None) is not None or any(
+        layer != "full_attention"
+        for layer in (getattr(config, "layer_types", None) or ())
+    ):
+        raise ValueError("sliding-window and hybrid/recurrent models are not supported")
+    if any(not _integer(i) or not 0 <= i <= config.num_hidden_layers for i in indices):
+        raise ValueError(
+            "hidden-state indices must use the HF embedding/layer tuple convention"
+        )
+
+
+def _gather_rows(local, rows, start=0, group=None):
+    """Gather readout rows only; the unsharded path is an independent snapshot."""
+    rows = torch.as_tensor(rows, dtype=torch.long, device=local.device)
+    if group is None:
+        return local.index_select(0, rows)
+    owned = (rows >= start) & (rows < start + len(local))
+    output = local.new_zeros((len(rows), *local.shape[1:]))
+    output[owned] = local.index_select(0, rows[owned] - start)
+    torch.distributed.all_reduce(output, group=group)
+    return output
+
+
 @torch.no_grad()
 def score_joint_batch(
     model,
@@ -313,102 +394,131 @@ def score_joint_batch(
     max_packed_tokens: int = 8192,
     max_mask_elements: int = 16_777_216,
     sequence_multiple: int = 1,
+    _sp_group=None,
+    **sp_options,
 ) -> tuple[tuple[JointScores, ...], dict[str, int]]:
-    """Evaluate all trunks and branches in ONE model call, without gradients.
-
-    Call on an unpatched HF full-attention causal LM (eager or SDPA). This
-    explicit reference API does not accept verl unpadded/fused model forwards,
-    sharded/offloaded workers, linear attention, sliding windows, or KV caches.
-    Old logprobs have response-token order, with no prompt/branch/padding rows.
-    """
+    """Score trunks and branches in one forward, using HF or Ulysses attention."""
     for temperature in (actor_temperature, target_temperature):
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("scoring temperatures must be finite and positive")
-    config = model.config
-    if config.model_type not in {"qwen2", "qwen3", "llama"}:
-        raise ValueError(
-            "joint scoring currently supports full-attention Qwen2/Qwen3/Llama only"
-        )
-    if getattr(config, "_attn_implementation", None) not in {"eager", "sdpa"}:
-        raise ValueError(
-            "joint scoring requires eager or SDPA with an explicit 4D mask"
-        )
-    if getattr(config, "sliding_window", None) is not None or any(
-        layer != "full_attention"
-        for layer in (getattr(config, "layer_types", None) or ())
-    ):
-        raise ValueError("sliding-window and hybrid/recurrent models are not supported")
     indices = tuple(hidden_state_indices)
-    if any(not _integer(i) or not 0 <= i <= config.num_hidden_layers for i in indices):
-        raise ValueError(
-            "hidden-state indices must use the HF embedding/layer tuple convention"
-        )
+    group = _sp_group
+    size = torch.distributed.get_world_size(group) if group is not None else 1
+    rank = torch.distributed.get_rank(group) if group is not None else 0
+    validate_joint_model(model.config, indices, size)
     parameter = next(model.parameters())
-    packed = pack_joint_batch(
-        requests,
+    pack_options = dict(
         device=parameter.device,
         dtype=parameter.dtype,
-        vocab_size=config.vocab_size,
+        vocab_size=model.config.vocab_size,
+        max_position_embeddings=model.config.max_position_embeddings,
         max_packed_tokens=max_packed_tokens,
         max_mask_elements=max_mask_elements,
-        sequence_multiple=sequence_multiple,
     )
-    mask = packed.attention_mask
-    assert mask is not None
-    if int(packed.position_ids.max()) >= config.max_position_embeddings:
-        raise ValueError(
-            "a branch exceeds max_position_embeddings; prefixes must not be truncated"
+    if group is None:
+        if sp_options:
+            raise TypeError(f"unexpected joint scoring options: {sorted(sp_options)}")
+        packed = pack_joint_batch(
+            requests, sequence_multiple=sequence_multiple, **pack_options
         )
-    training_states = [(module, module.training) for module in model.modules()]
+        attention, capture_hidden = nullcontext(), True
+        assert packed.attention_mask is not None
+        metrics = {"mask_elements": packed.attention_mask.numel()}
+    else:
+        from verl_speco.joint_ulysses import prepare_ulysses_batch
+
+        packed, attention, capture_hidden, metrics = prepare_ulysses_batch(
+            model,
+            requests,
+            group,
+            pack_options,
+            bool(
+                any(r.branches for r in requests)
+                or (capture_empty_trunk_features and indices)
+            ),
+            **sp_options,
+        )
+    width = packed.input_ids.shape[1] // size
+    start = rank * width
+    states = [(module, module.training) for module in model.modules()]
     try:
         model.eval()
-        output = model(
-            input_ids=packed.input_ids,
-            position_ids=packed.position_ids,
-            attention_mask=mask,
-            use_cache=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        with attention:
+            output = model(
+                input_ids=packed.input_ids[:, start : start + width],
+                position_ids=packed.position_ids[:, start : start + width],
+                attention_mask=packed.attention_mask if group is None else None,
+                use_cache=False,
+                output_hidden_states=capture_hidden,
+                return_dict=True,
+            )
     finally:
-        # Restore mixed child states, including models whose dropout was already
-        # in eval while their parent was in train. No recursive train() reset.
-        for module, training in training_states:
+        # Preserve mixed child states without recursively resetting dropout.
+        for module, training in states:
             module.training = training
 
     results = []
-    for batch_index, request in enumerate(packed.requests):
+    for i, request in enumerate(packed.requests):
         n = len(request.trunk_ids)
-        rows = output.logits[batch_index, request.response_start - 1 : n - 1]
+        rows = torch.arange(request.response_start - 1, n - 1, device=parameter.device)
+        owned = (rows >= start) & (rows < start + width)
         labels = torch.tensor(
             request.trunk_ids[request.response_start :],
-            device=rows.device,
+            device=parameter.device,
             dtype=torch.long,
         )
-        log_probs, entropy = response_scores(
-            rows, labels, actor_temperature, calculate_entropy
+        local_probs, local_entropy = response_scores(
+            output.logits[i].index_select(0, rows[owned] - start),
+            labels[owned],
+            actor_temperature,
+            calculate_entropy,
         )
+        responses = [local_probs, local_entropy]
+        if group is not None:
+            for index, local in enumerate(responses):
+                if local is not None:
+                    values = local.new_zeros(len(rows))
+                    values[owned] = local
+                    if len(rows):
+                        torch.distributed.all_reduce(values, group=group)
+                    responses[index] = values
+        readouts = packed.branch_rows[i]
+        flat_rows = [row for readout in readouts for row in readout]
         branches = []
-        for branch, readout in zip(
-            request.branches, packed.branch_rows[batch_index], strict=True
-        ):
-            row_indices = torch.tensor(readout, device=rows.device)
-            logits = (
-                output.logits[batch_index].index_select(0, row_indices)
-                if return_target_logits or return_target_logz
+        if flat_rows:
+            flat_logz = None
+            if return_target_logz:
+                row_ids = torch.tensor(flat_rows, device=parameter.device)
+                owned_readouts = (row_ids >= start) & (row_ids < start + width)
+                flat_logz = output.logits.new_zeros(len(flat_rows), dtype=torch.float32)
+                flat_logz[owned_readouts] = (
+                    output.logits[i]
+                    .index_select(0, row_ids[owned_readouts] - start)
+                    .float()
+                    / target_temperature
+                ).logsumexp(-1)
+                if group is not None:
+                    torch.distributed.all_reduce(flat_logz, group=group)
+            flat_hidden = _gather_rows(
+                output.hidden_states[-1][i], flat_rows, start, group
+            )
+            flat_logits = (
+                _gather_rows(output.logits[i], flat_rows, start, group)
+                if return_target_logits
                 else None
             )
-            hidden = output.hidden_states[-1][batch_index].index_select(0, row_indices)
-            branches.append(
-                BranchScores(
-                    branch.branch_id,
-                    logits if return_target_logits else None,
-                    (logits.float() / target_temperature).logsumexp(-1)
-                    if return_target_logz and logits is not None
-                    else None,
-                    hidden,
+            offset = 0
+            for branch, readout in zip(request.branches, readouts, strict=True):
+                end = offset + len(readout)
+                branches.append(
+                    BranchScores(
+                        branch.branch_id,
+                        flat_logits[offset:end] if flat_logits is not None else None,
+                        flat_logz[offset:end] if flat_logz is not None else None,
+                        flat_hidden[offset:end],
+                    )
                 )
-            )
+                offset = end
         feature_rows = (
             max(b.anchor for b in request.branches) + 1
             if trunk_feature_prefix_only and request.branches
@@ -416,15 +526,17 @@ def score_joint_batch(
         )
         features = (
             {
-                i: output.hidden_states[i][batch_index, :feature_rows].clone()
-                for i in indices
+                index: _gather_rows(
+                    output.hidden_states[index][i], range(feature_rows), start, group
+                )
+                for index in indices
             }
             if request.branches or capture_empty_trunk_features
             else {}
         )
         results.append(
             JointScores(
-                request.sample_id, log_probs, tuple(branches), features, entropy
+                request.sample_id, responses[0], tuple(branches), features, responses[1]
             )
         )
     return tuple(results), {
@@ -432,5 +544,5 @@ def score_joint_batch(
         "logical_rows": packed.logical_rows,
         "independent_rows": packed.independent_rows,
         "padded_rows": packed.input_ids.numel(),
-        "mask_elements": mask.numel(),
+        **metrics,
     }

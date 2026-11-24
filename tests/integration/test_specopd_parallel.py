@@ -101,7 +101,7 @@ def _run(rank, size, init_file):
             ulysses_parallel_group=groups[rank // 2],
         )
         worker = SimpleNamespace(_is_actor=True, actor=SimpleNamespace(engine=engine))
-        exported, metrics = score_actor_joint(worker, tree, microbatch_sizes=(1,), **options)
+        exported, metrics = score_actor_joint(worker, tree, microbatch_trajectories=1, **options)
         if rank == 0:
             _assert_scores(exported, expected[:1])
             assert metrics["model_forward_calls"] == 1

@@ -17,10 +17,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from verl_speco.joint_scoring import (
-    BranchScores,
-    JointScores,
     pack_joint_batch,
-    response_scores,
+    score_joint_batch,
 )
 
 
@@ -351,212 +349,71 @@ def tree_attention(
                 del layer.forward
 
 
-def _gather_rows(local, rows, start, group):
-    """Gather selected rows only, without gathering the full vocabulary output."""
-    output = local.new_zeros((len(rows), *local.shape[1:]))
-    rows = torch.as_tensor(rows, dtype=torch.long, device=local.device)
-    owned = (rows >= start) & (rows < start + len(local))
-    output[owned] = local.index_select(0, rows[owned] - start)
-    dist.all_reduce(output, group=group)
-    return output
-
-
-@torch.no_grad()
-def score_ulysses_joint_batch(
-    model,
-    requests,
-    group,
-    *,
-    actor_temperature=1.0,
-    target_temperature=1.0,
-    hidden_state_indices=(),
-    calculate_entropy=False,
-    return_target_logits=True,
-    return_target_logz=True,
-    capture_empty_trunk_features=True,
-    trunk_feature_prefix_only=False,
-    max_packed_tokens=8192,
-    max_mask_elements=16777216,
-    use_causal_fast_path=None,
-    use_packed_qkv=None,
-    use_segmented_attention=None,
-    use_segmented_dense_prefix=None,
-    use_preserve_pv=None,
+def prepare_ulysses_batch(
+    model, requests, group, pack_options, needs_features, **options
 ):
-    for t in (actor_temperature, target_temperature):
-        if not math.isfinite(t) or t <= 0:
-            raise ValueError("scoring temperatures must be finite and positive")
-    size, rank = dist.get_world_size(group), dist.get_rank(group)
-    cfg = model.config
+    """Prepare only the SP-specific layout and scoped attention override."""
+    unknown = options.keys() - ULYSSES_ENV_FLAGS.keys()
+    if unknown:
+        raise TypeError(f"unexpected Ulysses scoring options: {sorted(unknown)}")
+    flags = {
+        name: resolve_ulysses_flag(name, options.get(name))
+        for name in ULYSSES_ENV_FLAGS
+    }
+    size = dist.get_world_size(group)
     validate_ulysses_model(model, size)
-    parameter = next(model.parameters())
-    use_causal_fast_path = resolve_ulysses_flag(
-        "use_causal_fast_path", use_causal_fast_path
-    )
-    use_packed_qkv = resolve_ulysses_flag("use_packed_qkv", use_packed_qkv)
-    use_segmented_attention = resolve_ulysses_flag(
-        "use_segmented_attention", use_segmented_attention
-    )
-    use_segmented_dense_prefix = resolve_ulysses_flag(
-        "use_segmented_dense_prefix", use_segmented_dense_prefix
-    )
-    use_preserve_pv = resolve_ulysses_flag("use_preserve_pv", use_preserve_pv)
-    if use_preserve_pv and len(requests) != 1:
+    if flags["use_preserve_pv"] and len(requests) != 1:
         # Only one local row has been validated with the original PV geometry.
-        use_preserve_pv = use_causal_fast_path = use_segmented_attention = (
-            use_segmented_dense_prefix
-        ) = False
-    elif use_preserve_pv:
-        use_preserve_pv = bool(requests[0].branches)
-    dense_prefix = use_segmented_dense_prefix or use_preserve_pv
-    segmented = use_segmented_attention or dense_prefix
+        for name in (
+            "use_preserve_pv",
+            "use_causal_fast_path",
+            "use_segmented_attention",
+            "use_segmented_dense_prefix",
+        ):
+            flags[name] = False
+    elif flags["use_preserve_pv"]:
+        flags["use_preserve_pv"] = bool(requests[0].branches)
+    dense_prefix = flags["use_segmented_dense_prefix"] or flags["use_preserve_pv"]
+    segmented = flags["use_segmented_attention"] or dense_prefix
     tree_rows = tuple(i for i, request in enumerate(requests) if request.branches)
     causal_rows = (
         tuple(i for i, request in enumerate(requests) if not request.branches)
-        if use_causal_fast_path and not segmented
+        if flags["use_causal_fast_path"] and not segmented
         else ()
     )
-    # Valid trunk queries cannot see right padding, and padded outputs are never returned.
     packed = pack_joint_batch(
         requests,
-        device=parameter.device,
-        dtype=parameter.dtype,
-        vocab_size=cfg.vocab_size,
-        max_packed_tokens=max_packed_tokens,
-        max_mask_elements=max_mask_elements,
         sequence_multiple=size,
         omit_trunk_only_masks=bool(causal_rows),
         build_attention_mask=not segmented,
+        **pack_options,
     )
     segments = (
-        _segment_masks(packed, parameter.dtype, dense_prefix=dense_prefix)
+        _segment_masks(packed, pack_options["dtype"], dense_prefix=dense_prefix)
         if segmented
         else None
     )
-    width = packed.input_ids.shape[1] // size
-    start = rank * width
-    states = [(m, m.training) for m in model.modules()]
-    try:
-        model.eval()
-        with tree_attention(
-            model,
-            packed.attention_mask,
-            group,
-            causal_rows=causal_rows,
-            tree_rows=tree_rows,
-            pack_qkv=use_packed_qkv,
-            segments=segments,
-            dense_prefix=dense_prefix,
-            preserve_pv=use_preserve_pv,
-        ):
-            output = model(
-                input_ids=packed.input_ids[:, start : start + width],
-                position_ids=packed.position_ids[:, start : start + width],
-                attention_mask=None,
-                use_cache=False,
-                return_dict=True,
-                output_hidden_states=(
-                    not (use_causal_fast_path or segmented)
-                    or bool(
-                        tree_rows
-                        or (capture_empty_trunk_features and hidden_state_indices)
-                    )
-                ),
-            )
-    finally:
-        for module, training in states:
-            module.training = training
-    results = []
-    for i, request in enumerate(requests):
-        n = len(request.trunk_ids)
-        rows = torch.arange(request.response_start - 1, n - 1, device=parameter.device)
-        owned = (rows >= start) & (rows < start + width)
-        local_logits = output.logits[i].index_select(0, rows[owned] - start)
-        labels = torch.tensor(
-            request.trunk_ids[request.response_start :],
-            device=parameter.device,
-            dtype=torch.long,
-        )[owned]
-        local_log_probs, local_entropy = response_scores(
-            local_logits, labels, actor_temperature, calculate_entropy
-        )
-        log_probs = local_log_probs.new_zeros(len(rows))
-        log_probs[owned] = local_log_probs
-        if len(rows):
-            dist.all_reduce(log_probs, group=group)
-        entropy = None
-        if local_entropy is not None:
-            entropy = local_entropy.new_zeros(len(rows))
-            entropy[owned] = local_entropy
-            if len(rows):
-                dist.all_reduce(entropy, group=group)
-        branches = []
-        readouts = packed.branch_rows[i]
-        flat_rows = [row for readout in readouts for row in readout]
-        if flat_rows:
-            flat_logz = None
-            if return_target_logz:
-                # Only normalize branch rows owned by this SP rank.
-                row_ids = torch.tensor(flat_rows, device=parameter.device)
-                owned_readouts = (row_ids >= start) & (row_ids < start + width)
-                flat_logz = output.logits.new_zeros(len(flat_rows), dtype=torch.float32)
-                flat_logz[owned_readouts] = (
-                    output.logits[i]
-                    .index_select(0, row_ids[owned_readouts] - start)
-                    .float()
-                    / target_temperature
-                ).logsumexp(-1)
-                dist.all_reduce(flat_logz, group=group)
-            flat_hidden = _gather_rows(
-                output.hidden_states[-1][i], flat_rows, start, group
-            )
-            flat_logits = (
-                _gather_rows(output.logits[i], flat_rows, start, group)
-                if return_target_logits
-                else None
-            )
-            offset = 0
-            for branch, readout in zip(request.branches, readouts, strict=True):
-                end = offset + len(readout)
-                branches.append(
-                    BranchScores(
-                        branch.branch_id,
-                        flat_logits[offset:end] if flat_logits is not None else None,
-                        flat_logz[offset:end] if flat_logz is not None else None,
-                        flat_hidden[offset:end],
-                    )
-                )
-                offset = end
-        feature_rows = (
-            max(b.anchor for b in request.branches) + 1
-            if trunk_feature_prefix_only and request.branches
-            else n
-        )
-        features = (
-            {
-                index: _gather_rows(
-                    output.hidden_states[index][i], range(feature_rows), start, group
-                )
-                for index in hidden_state_indices
-            }
-            if request.branches or capture_empty_trunk_features
-            else {}
-        )
-        results.append(
-            JointScores(
-                request.sample_id, log_probs, tuple(branches), features, entropy
-            )
-        )
-    mask_elements = (
-        packed.attention_mask.numel() if packed.attention_mask is not None else 0
+    attention = tree_attention(
+        model,
+        packed.attention_mask,
+        group,
+        causal_rows=causal_rows,
+        tree_rows=tree_rows,
+        pack_qkv=flags["use_packed_qkv"],
+        segments=segments,
+        dense_prefix=dense_prefix,
+        preserve_pv=flags["use_preserve_pv"],
     )
+    elements = packed.attention_mask.numel() if packed.attention_mask is not None else 0
     if segments is not None:
-        mask_elements = sum(mask.numel() for _, _, mask in segments if mask is not None)
-    return tuple(results), {
-        "model_forward_calls": 1,
-        "logical_rows": packed.logical_rows,
-        "independent_rows": packed.independent_rows,
-        "padded_rows": packed.input_ids.numel(),
-        "mask_elements": mask_elements,
-        "sp_size": size,
-    }
+        elements = sum(mask.numel() for _, _, mask in segments if mask is not None)
+    return (
+        packed,
+        attention,
+        not (flags["use_causal_fast_path"] or segmented) or needs_features,
+        {"mask_elements": elements, "sp_size": size},
+    )
+
+
+def score_ulysses_joint_batch(model, requests, group, **options):
+    return score_joint_batch(model, requests, _sp_group=group, **options)
