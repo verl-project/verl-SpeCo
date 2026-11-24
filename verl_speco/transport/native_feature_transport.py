@@ -1357,9 +1357,9 @@ class NativeFeatureTransport:
                 ):
                     return
                 raise ValueError("Native source lease identity differs")
-            if (
-                slot["descriptor"] != descriptor
-                or slot["dispatch"] not in (None, dispatch)
+            if slot["descriptor"] != descriptor or slot["dispatch"] not in (
+                None,
+                dispatch,
             ):
                 raise ValueError("Native source lease identity differs")
             if slot["pending"] is None:

@@ -249,7 +249,9 @@ def file_reference_tensor_bytes(reference: str) -> int:
 
 def _validate_file_payload_fields(data) -> None:
     if not {"token_ids", "hidden_states"}.issubset(data.keys()):
-        raise ValueError("vLLM hidden-states payload must contain token_ids and hidden_states")
+        raise ValueError(
+            "vLLM hidden-states payload must contain token_ids and hidden_states"
+        )
 
 
 def _consecutive_row_runs(rows) -> list[list[int]]:
@@ -503,7 +505,9 @@ class FileHiddenStatesStore(HiddenStatesStore):
             first = min(selected_positions) - original_offset
             last = max(selected_positions) - original_offset + 1
             if compact and last - first > 2 * len(selected_positions):
-                runs = _consecutive_row_runs(position - original_offset for position in selected_positions)
+                runs = _consecutive_row_runs(
+                    position - original_offset for position in selected_positions
+                )
                 # Bound metadata and read operations for extremely fragmented input.
                 if len(runs) <= 1024:
                     chunks = [hidden[start:end] for start, end in runs]

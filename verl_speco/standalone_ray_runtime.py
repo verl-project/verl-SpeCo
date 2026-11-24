@@ -1084,9 +1084,7 @@ class StandaloneProducerActor:
             self._slot_tracking
             and not set(keys) <= self._active_reference_sequences.keys()
         ):
-            raise RuntimeError(
-                "Reference execution slot accounting is inconsistent"
-            )
+            raise RuntimeError("Reference execution slot accounting is inconsistent")
         if self._file_bytes_limit and (
             not set(keys) <= self._active_file_bytes.keys()
             or sum(self._active_file_bytes[key] for key in keys)
@@ -1706,7 +1704,13 @@ def _validate_trainer_placement(processes_per_node, timeout):
 
 
 def _reserve_trainer_groups(
-    ray_module, node_ips, processes_per_node, resource, name, timeout, placement_api,
+    ray_module,
+    node_ips,
+    processes_per_node,
+    resource,
+    name,
+    timeout,
+    placement_api,
 ):
     if placement_api is None:
         from ray.util.placement_group import placement_group, remove_placement_group
@@ -1720,7 +1724,9 @@ def _reserve_trainer_groups(
             if ip is not None:
                 bundles[0][f"node:{ip}"] = 0.001
                 group_name = f"{name}_{index}"
-            groups.append(placement_group(bundles, strategy="STRICT_PACK", name=group_name))
+            groups.append(
+                placement_group(bundles, strategy="STRICT_PACK", name=group_name)
+            )
         ready = [group.ready() for group in groups]
         ray_module.get(ready[0] if node_ips is None else ready, timeout=timeout)
         return groups
@@ -2160,7 +2166,9 @@ class StandaloneRayTrainer:
         stop_timeout = scheduler_cfg.get("producer_stop_timeout_seconds", 180)
         validate_timeout(stop_timeout, "scheduler.producer_stop_timeout_seconds")
         consumer_timeout = scheduler_cfg.get("consumer_shutdown_timeout_seconds", 1800)
-        validate_timeout(consumer_timeout, "scheduler.consumer_shutdown_timeout_seconds")
+        validate_timeout(
+            consumer_timeout, "scheduler.consumer_shutdown_timeout_seconds"
+        )
         commit_gate_timeout = scheduler_cfg.get("commit_gate_timeout_seconds", 180)
         validate_timeout(commit_gate_timeout, "scheduler.commit_gate_timeout_seconds")
         per_rank_ack = scheduler_cfg.get("per_rank_reference_ack", False)

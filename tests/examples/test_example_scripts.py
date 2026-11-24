@@ -384,6 +384,55 @@ def two_node_controller(monkeypatch):
     return module
 
 
+@pytest.mark.parametrize(
+    "device, selected_busy, expected_error",
+    [(2, False, None), (2, True, "Logical NPU 2 is busy"), (3, False, "Cannot map logical NPU 3")],
+)
+def test_two_node_preflight_checks_only_selected_npu(
+    two_node_controller, monkeypatch, tmp_path, device, selected_busy, expected_error
+):
+    from types import SimpleNamespace
+
+    controller = two_node_controller
+    bash = _require_working_bash()
+    launcher = tmp_path / "examples/run_qwen3-8b_drafter_dspark_separate_training.sh"
+    launcher.parent.mkdir()
+    for path in (launcher, tmp_path / "config.json", tmp_path / "data.jsonl"):
+        path.touch()
+
+    busy_result = "123 vllm 59000" if selected_busy else "No process in device."
+    npu_stub = f"""
+npu-smi() {{
+    case "$*" in
+        'info -m') printf '%s\n' '0 0 0 0 Ascend910' '7 0 2 14 Ascend910' ;;
+        'info -t proc-mem -i 0 -c 0') echo '123 vllm 59000' ;;
+        'info -t proc-mem -i 7 -c 0') echo '{busy_result}' ;;
+        'info -t health -i 7 -c 0') echo 'Health Status : OK' ;;
+        *) return 1 ;;
+    esac
+}}
+ss() {{ :; }}
+"""
+    monkeypatch.setattr(controller, "setup_script", lambda *_: npu_stub)
+
+    results = []
+
+    def capture(_host, script):
+        results.append(
+            subprocess.run([bash, "-ec", script], cwd=tmp_path, text=True, capture_output=True)
+        )
+
+    monkeypatch.setattr(controller, "execute", capture)
+    args = SimpleNamespace(root=".", repo=".", model=".", data="data.jsonl", producer_npu=device)
+    controller.check(None, args, "producer")
+    (result,) = results
+    if expected_error is None:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        assert expected_error in result.stdout
+
+
 @pytest.mark.parametrize("resume", [False, True])
 @pytest.mark.parametrize("failure", [None, "start", "execute"])
 def test_two_node_phase_stops_readers_before_source(

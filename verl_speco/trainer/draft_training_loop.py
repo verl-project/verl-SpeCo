@@ -251,7 +251,9 @@ def _retention_resume_identity_across_ranks(
         local = {"identity": identity}
     except Exception as exc:
         local = {"error": f"{type(exc).__name__}: {exc}"}
-    _require_matching_rank_records(local, world_size, "Checkpoint retention inheritance failed across ranks")
+    _require_matching_rank_records(
+        local, world_size, "Checkpoint retention inheritance failed across ranks"
+    )
     return local["identity"]
 
 
@@ -561,7 +563,9 @@ def _standalone_recipe_across_ranks(training_cfg, target_model_path, world_size)
         "snapshot_max_bytes": snapshot_max_bytes if error is None else None,
         "snapshot_init": snapshot_init if error is None else None,
     }
-    _require_matching_rank_records(local, world_size, "Standalone recipe differs or failed across ranks")
+    _require_matching_rank_records(
+        local, world_size, "Standalone recipe differs or failed across ranks"
+    )
     return recipe
 
 
@@ -631,7 +635,9 @@ def _load_resume_across_ranks(
         }
     except Exception as exc:  # noqa: BLE001 - all ranks must enter the collective
         local = {"error": f"{type(exc).__name__}: {exc}"}
-    _require_matching_rank_records(local, world_size, "Standalone resume differs or failed across ranks")
+    _require_matching_rank_records(
+        local, world_size, "Standalone resume differs or failed across ranks"
+    )
     return consumed, metadata
 
 
@@ -2274,7 +2280,11 @@ def _validate_snapshot_byte_limit(max_bytes):
 
 
 def _check_snapshot_size(tensors, max_bytes):
-    if max_bytes and sum(tensor.numel() * tensor.element_size() for tensor in tensors.values()) > max_bytes:
+    if (
+        max_bytes
+        and sum(tensor.numel() * tensor.element_size() for tensor in tensors.values())
+        > max_bytes
+    ):
         raise ValueError("Trainable snapshot exceeds its logical tensor byte limit")
 
 
@@ -2309,7 +2319,9 @@ def _save_trainable_snapshot_across_ranks(trainer, step, *, device, max_bytes=0)
                 for name, parameter in sorted(parameters.items())
             ]
             if distributed:
-                schemas = _gather_rank_records((schema, max_bytes), dist.get_world_size())
+                schemas = _gather_rank_records(
+                    (schema, max_bytes), dist.get_world_size()
+                )
                 if any(item != schemas[0] for item in schemas):
                     raise ValueError(
                         "Trainable snapshot parameter schemas differ across ranks"
@@ -2436,7 +2448,11 @@ def _load_trainable_snapshot_across_ranks(trainer, path, *, device, max_bytes=0)
                     "Trainable snapshot validation failed on a rank"
                 ) from error
             if distributed:
-                identity = (manifest["weights_sha256"], manifest["optimizer_step"], max_bytes)
+                identity = (
+                    manifest["weights_sha256"],
+                    manifest["optimizer_step"],
+                    max_bytes,
+                )
                 identities = _gather_rank_records(identity, dist.get_world_size())
                 if any(item != identities[0] for item in identities):
                     raise ValueError("Trainable snapshot differs across ranks")

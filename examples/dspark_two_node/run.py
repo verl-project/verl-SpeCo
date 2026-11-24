@@ -154,6 +154,7 @@ def setup_script(args, role):
 
 
 def check(client, args, role):
+    device = getattr(args, role + "_npu")
     execute(
         client,
         setup_script(args, role)
@@ -161,10 +162,23 @@ def check(client, args, role):
         test -d {shlex.quote(args.root)}
         test -r {shlex.quote(args.repo + "/examples/run_qwen3-8b_drafter_dspark_separate_training.sh")}
         test -r {shlex.quote(args.model + "/config.json")} && test -r {shlex.quote(args.data)}
-        usage=$(npu-smi info)
-        if ! grep -q 'No running processes found' <<< "$usage" ||
-            grep -Eq '\\| +[0-9]+ +[0-9]+ +\\| +[0-9]+ +\\|' <<< "$usage"; then
-            echo "NPU busy or status unavailable"; exit 1
+        mapping=$(npu-smi info -m)
+        if ! chip=$(awk -v device={device} '
+            $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $3 == device {{
+                card = $1; chip_id = $2; matches++
+            }}
+            END {{ if (matches == 1) print card, chip_id; else exit 1 }}
+        ' <<< "$mapping"); then
+            echo "Cannot map logical NPU {device} to a unique chip"; exit 1
+        fi
+        read -r card chip_id <<< "$chip"
+        if ! usage=$(npu-smi info -t proc-mem -i "$card" -c "$chip_id") ||
+            ! grep -Eq '^[[:space:]]*No process in device[.][[:space:]]*$' <<< "$usage"; then
+            echo "Logical NPU {device} is busy or its process status is unavailable"; exit 1
+        fi
+        if ! health=$(npu-smi info -t health -i "$card" -c "$chip_id") ||
+            ! grep -Eq 'Health Status[[:space:]]*:[[:space:]]*OK[[:space:]]*$' <<< "$health"; then
+            echo "Logical NPU {device} is unhealthy or its health status is unavailable"; exit 1
         fi
         ports=$(ss -H -ltn | awk '{{print $4}}')
         if grep -Eq ':(2549[0-7]|2550[1-4]|255[23][0-9]|2554[0-5])$' <<< "$ports"; then
@@ -320,7 +334,9 @@ def main():
             f"--{role}-env",
             help="optional host-local shell file for CANN and Python environment",
         )
-    parser.add_argument("--user", default=getuser(), help="SSH user on both hosts")
+    parser.add_argument(
+        "--user", help="SSH user on both hosts (defaults to the local user)"
+    )
     parser.add_argument(
         "--known-hosts", help="additional trusted OpenSSH known_hosts file"
     )
@@ -346,6 +362,11 @@ def main():
     )
     parser.add_argument("--check", action="store_true", help="preflight only")
     args = parser.parse_args()
+    if args.user is None:
+        try:
+            args.user = getuser()
+        except (OSError, ImportError):
+            parser.error("--user is required when the local username is unavailable")
     if args.consumer == args.producer:
         parser.error("Producer and Consumer must use distinct hosts")
     if not all(

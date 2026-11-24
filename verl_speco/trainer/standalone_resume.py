@@ -301,6 +301,7 @@ def input_content_identity(fingerprint: Mapping[str, Any]) -> dict[str, Any]:
     """Return a path-independent identity backed by a complete content digest."""
     if not isinstance(fingerprint, Mapping):
         raise ValueError("Standalone input fingerprint is missing")
+    digest: object
     if fingerprint.get("format") == "standalone_raw_hidden":
         files = fingerprint.get("files")
         if (
