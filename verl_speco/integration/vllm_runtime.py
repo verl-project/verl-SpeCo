@@ -2116,6 +2116,24 @@ def _enforce_mrv2_dspark_runtime_contract(
             )
 
 
+def _enforce_specopd_proposal_width(drafter_cfg, rollout_cfg, final_speculative_config):
+    if not spec_opd_enabled(drafter_cfg.get("training", {})):
+        return
+    from verl_speco.specopd_config import SpecOPDConfig
+
+    spec = SpecOPDConfig.from_drafter(
+        drafter_cfg, rollout_temperature=_get_nested(rollout_cfg, ("temperature",), 1.0)
+    )
+    actual = final_speculative_config.get("num_speculative_tokens")
+    if actual != spec.proposal_width:
+        raise ValueError(
+            "SpecOPD final num_speculative_tokens must match resolved "
+            f"proposal_width={spec.proposal_width}; got {actual!r}. "
+            "Change the SpeCo drafter configuration instead of "
+            "engine_kwargs.vllm.speculative_config."
+        )
+
+
 def _int_or_zero(value: Any) -> int:
     try:
         return int(value)
@@ -3873,6 +3891,7 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
             )
         ),
     )
+    _enforce_specopd_proposal_width(drafter_cfg, rollout_cfg, merged_speculative_config)
     _enforce_mrv2_dspark_runtime_contract(speculative_config, merged_speculative_config)
     _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
     if bool(merged_speculative_config.get("enforce_eager")):
@@ -5190,6 +5209,7 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
             )
         ),
     )
+    _enforce_specopd_proposal_width(drafter_cfg, rollout_cfg, merged_speculative_config)
     _enforce_mrv2_dspark_runtime_contract(speculative_config, merged_speculative_config)
     _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
     if bool(drafter_cfg.get("enable")):

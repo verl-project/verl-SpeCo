@@ -35,6 +35,21 @@ def sample(length=8192):
     return build_specopd_training_batch(request, score, "cpu", SpecOPDConfig(), (1,))
 
 
+@pytest.mark.parametrize("lengths,dp,expected", [
+    ([4096], 1, [1]), ([2048, 2048], 1, [2]), ([2049, 2048], 1, [1, 1]),
+    ([4097], 1, None), ([10, 4097], 1, None), ([10, 4097], 2, None),
+])
+def test_training_plan_enforces_single_trajectory_token_budget(lengths, dp, expected):
+    from verl_speco.backends.specopd_forward import plan_specopd_training_groups
+
+    samples = [{"input_ids": torch.empty(1, length)} for length in lengths]
+    if expected is None:
+        with pytest.raises(ValueError, match="context length 4097.*training_microbatch_token_budget=4096"):
+            plan_specopd_training_groups(samples, dp, 10, 4096)
+    else:
+        assert plan_specopd_training_groups(samples, dp, 10, 4096) == expected
+
+
 def test_numpy_wire_crops_storage_and_preserves_bf16_exactly():
     expected = sample()
     payload, size = transport.encode_training_payload([expected], SpecOPDConfig())

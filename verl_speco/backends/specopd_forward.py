@@ -209,6 +209,11 @@ def plan_specopd_training_groups(selected, dp_size, max_trajectories, token_budg
     ]
     sizes, current, longest = [], 0, 0
     for length in lengths:
+        if length > token_budget:
+            raise ValueError(
+                f"SpecOPD trajectory context length {length} exceeds "
+                f"training_microbatch_token_budget={token_budget}"
+            )
         if current and (
             current == max_trajectories
             or (current + 1) * max(longest, length) > token_budget

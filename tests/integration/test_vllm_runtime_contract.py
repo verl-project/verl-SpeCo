@@ -2294,6 +2294,35 @@ def test_vllm_mrv2_rejects_final_engine_speculative_override(
         configure_vllm_runtime_from_config(config)
 
 
+@pytest.mark.parametrize("entry", ["driver", "server"])
+@pytest.mark.parametrize("enabled,width", [(True, 3), (True, 7), (False, 3)])
+def test_specopd_checks_final_proposal_width_on_all_runtime_paths(monkeypatch, tmp_path, entry, enabled, width):
+    monkeypatch.setattr(vllm_runtime, "_is_vllm_ascend_runtime_hint", lambda: False)
+    monkeypatch.setattr(vllm_runtime, "install_upstream_vllm_runtime_bridge", lambda: True)
+    model = tmp_path / "drafter"
+    model.mkdir()
+    (model / "config.json").write_text(
+        '{"architectures":["Qwen3DSparkModel"],"markov_head_type":"vanilla"}', encoding="utf-8")
+    drafter = _drafter(speculative_algorithm="DSPARK", model_path=str(model),
+        rollout={"spec_verify_tokens": 7}, training={"specopd": {"enable": enabled}})
+    rollout = dict(name="vllm", drafter=drafter,
+        engine_kwargs={"vllm": {"speculative_config": {"num_speculative_tokens": width}}})
+    monkeypatch.setattr(vllm_runtime, "_load_env_drafter_config", lambda: drafter)
+
+    def configure():
+        if entry == "driver":
+            configure_vllm_runtime_from_config({"actor_rollout_ref": {"rollout": rollout}})
+        else:
+            vllm_runtime._ensure_vllm_drafter_speculative_config_from_env(rollout)
+
+    if enabled and width != 7:
+        with pytest.raises(ValueError, match="SpecOPD.*num_speculative_tokens.*7.*3"):
+            configure()
+    else:
+        configure()
+        assert rollout["engine_kwargs"]["vllm"]["speculative_config"]["num_speculative_tokens"] == width
+
+
 def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None:
     transformers_module = types.ModuleType("transformers")
     configuration_utils_module = types.ModuleType("transformers.configuration_utils")
