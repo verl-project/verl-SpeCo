@@ -31,6 +31,61 @@ def _publish_dispatched(source, fields, *, lease_id, readers=(0,)):
     return descriptor
 
 
+def test_native_buffers_are_reused_until_leases_are_drained(monkeypatch):
+    import ctypes
+    from verl_speco.transport.native_feature_transport import NativeFeatureTransport
+
+    monkeypatch.setenv("SPECO_NATIVE_REUSE_BUFFER_BYTES", str(2 * 1024**2))
+    calls = []
+
+    class Engine(NativeTestEngine):
+        def register_memory(self, address, size):
+            calls.append(("register", address))
+            return 0
+
+        def unregister_memory(self, address):
+            calls.append(("unregister", address))
+            return 0
+
+        def transfer_sync_read(self, segment, local, remote, size):
+            ctypes.memmove(local, remote, size)
+            return 0
+
+    def make():
+        return NativeFeatureTransport(
+            run_id="run", generation=1, endpoint="localhost:1234",
+            metadata_server="metadata", device="cpu", max_bytes=4 * 1024**2,
+            max_slots=1, chunk_bytes=2 * 1024**2, engine_factory=Engine,
+        )
+
+    with torch.inference_mode():
+        source, reader = make(), make()
+    try:
+        assert [action for action, _ in calls] == ["register", "register"]
+        first = _publish_dispatched(source, {"hidden": torch.tensor([1])}, lease_id="first")
+        copy = reader.read(first)["hidden"]
+        with pytest.raises(RuntimeError, match="registered memory"):
+            source.seal_if_empty()
+        source.acknowledge(first, reader=0, **_TEST_DISPATCH)
+        source.release(first, **_TEST_DISPATCH)
+        # seal_if_empty also fences new publication. Open a fresh source for the
+        # next two leases, since a failed seal must stay fail closed.
+        source.close()
+        source = make()
+        for idx in (2, 3):
+            desc = _publish_dispatched(source, {"hidden": torch.tensor([idx])}, lease_id=str(idx))
+            assert reader.read(desc)["hidden"].item() == idx
+            source.acknowledge(desc, reader=0, **_TEST_DISPATCH)
+            source.release(desc, **_TEST_DISPATCH)
+        source.seal_if_empty()
+        assert copy.item() == 1
+        assert [action for action, _ in calls] == ["register", "register", "unregister", "register"]
+    finally:
+        source.close()
+        reader.close()
+    assert sum(action == "unregister" for action, _ in calls) == 3
+
+
 @pytest.mark.parametrize("fault", [None, "transfer", "stale", "payload"])
 def test_native_transport_leases_and_copy_lifecycle(fault, monkeypatch):
     import ctypes

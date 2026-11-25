@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+from os import getenv
 import threading
 import time
 import uuid
@@ -813,7 +814,13 @@ class NativeRetiredReferenceStore:
 
 
 class NativeFeatureTransport:
-    """Own registered ranges until all bound readers acknowledge completion."""
+    """Own registered ranges until all bound readers acknowledge completion.
+
+    Set SPECO_NATIVE_REUSE_BUFFER_BYTES on both source and reader processes to
+    pre-register fixed-size slots before HIXL can connect. The slot size must
+    fit the largest payload and be a multiple of 2 MiB. The slot and byte caps
+    bound the total device memory allocated during initialization.
+    """
 
     def __init__(
         self,
@@ -873,6 +880,16 @@ class NativeFeatureTransport:
             False,
         )
         self._registered_bytes = 0
+        # CANN can disconnect peers while deregistering a range. A bounded,
+        # fixed-size cache avoids that disconnect in the transfer hot path.
+        self._reusable_bytes = int(getenv("SPECO_NATIVE_REUSE_BUFFER_BYTES", "0"))
+        if self._reusable_bytes and (
+            self._reusable_bytes < _ALIGN
+            or self._reusable_bytes % _ALIGN
+            or self._reusable_bytes + _ALIGN - 1 > self.max_bytes
+        ):
+            raise ValueError("Invalid native reusable buffer size")
+        self._idle_buffers: list[torch.Tensor] = []
         self._completed = OrderedDict()
         self._completed_readers = 0
         self._failed, self._sealed = False, False
@@ -894,6 +911,25 @@ class NativeFeatureTransport:
             if not separator or not host or not 0 < port <= 65535:
                 raise RuntimeError("Cannot determine the native Mooncake RPC endpoint")
             self.endpoint = f"{host}:{port}"
+
+        if self._reusable_bytes:
+            try:
+                self._initialize_buffer_pool()
+            except Exception:
+                # No descriptor was issued. Known allocation failures can
+                # release prior slots; ambiguous native failures stay fenced.
+                if not self._failed:
+                    self.close()
+                raise
+
+    def _initialize_buffer_pool(self):
+        # HIXL snapshots remote buffers during connection setup. Register the
+        # full bounded pool before publishing any address to a reader.
+        allocation_bytes = self._reusable_bytes + _ALIGN - 1
+        slots = min(self.max_slots, self.max_bytes // allocation_bytes)
+        with torch.inference_mode(False), self._device_scope():
+            for _ in range(slots):
+                self._idle_buffers.append(self._register(self._reusable_bytes))
 
     @staticmethod
     def _require_zero(operation, result):
@@ -971,6 +1007,21 @@ class NativeFeatureTransport:
         if not self._registered:
             _REGISTERED_OWNERS.discard(self)
 
+    def _borrow_buffer(self, size):
+        if not self._reusable_bytes:
+            return self._register(size)
+        if size > self._reusable_bytes:
+            raise ValueError("Native payload exceeds reusable buffer size")
+        if not self._idle_buffers:
+            raise ValueError("Native reusable buffer pool is exhausted")
+        return self._idle_buffers.pop()
+
+    def _return_buffer(self, buffer):
+        if self._reusable_bytes:
+            self._idle_buffers.append(buffer)
+        else:
+            self._unregister(buffer)
+
     def stop_publication(self):
         """Forbid new source allocations while preserving every active lease."""
         with self._lock:
@@ -980,12 +1031,14 @@ class NativeFeatureTransport:
             self._sealed = True
 
     def seal_if_empty(self):
-        """Forbid new publications and confirm no registered source memory remains."""
+        """Forbid new publications and confirm no source lease is outstanding."""
         with self._lock:
             self._require_open()
             self._sealed = True
-            if self._registered:
-                raise RuntimeError("Native source still owns registered memory")
+            if self._slots or len(self._registered) != len(self._idle_buffers):
+                raise RuntimeError(
+                    "Native source still owns registered memory for an active lease"
+                )
 
     def publish(self, fields, *, lease_id):
         with self._lock, self._device_scope():
@@ -1035,7 +1088,7 @@ class NativeFeatureTransport:
                     }
                 )
                 offset += nbytes
-            buffer = self._register(offset)
+            buffer = self._borrow_buffer(offset)
             try:
                 for item in layout:
                     buffer[item["offset"] : item["offset"] + item["nbytes"]].copy_(
@@ -1069,7 +1122,7 @@ class NativeFeatureTransport:
             except BaseException:
                 self._synchronize()
                 if not self._failed:
-                    self._unregister(buffer)
+                    self._return_buffer(buffer)
                 raise
             self._slots[lease_id] = {
                 "buffer": buffer,
@@ -1189,7 +1242,7 @@ class NativeFeatureTransport:
                     "Native transport output must use CPU or the local transport device"
                 )
             started = time.monotonic()
-            buffer = self._register(descriptor["nbytes"])
+            buffer = self._borrow_buffer(descriptor["nbytes"])
             registered = time.monotonic()
             transfer_failed = False
             try:
@@ -1249,7 +1302,7 @@ class NativeFeatureTransport:
             finally:
                 self._synchronize()
                 if not transfer_failed and not self._failed:
-                    self._unregister(buffer)
+                    self._return_buffer(buffer)
             finished = time.monotonic()
             values = {
                 "reads_total": 1,
@@ -1394,7 +1447,7 @@ class NativeFeatureTransport:
             # Keep the registration and prohibit reuse until fenced.
             self._failed = True
             raise
-        self._unregister(slot["buffer"])
+        self._return_buffer(slot["buffer"])
         readers = slot["expected"] or frozenset()
         self._completed[descriptor["lease_id"]] = (
             descriptor["sha256"],
@@ -1426,5 +1479,6 @@ class NativeFeatureTransport:
             self._synchronize()
             for buffer in list(self._registered.values()):
                 self._unregister(buffer)
+            self._idle_buffers.clear()
             self._closed = True
             self._engine = None
