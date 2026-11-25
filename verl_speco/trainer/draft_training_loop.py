@@ -107,6 +107,9 @@ async def _run_standalone_draft_training_async(
     draft_config = config.actor_rollout_ref
     drafter_cfg = draft_config.rollout.drafter
     training_cfg = drafter_cfg.training
+    max_steps = int(training_cfg.get("max_steps", training_cfg.get("step", 1000)) or 0)
+    with open_dict(training_cfg):
+        training_cfg["_standalone_max_steps"] = max_steps
     feature_store_cfg = training_cfg.feature_store
     feature_store_type = (
         str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
@@ -158,7 +161,6 @@ async def _run_standalone_draft_training_async(
     # declares another layer-ID convention. The export path repeats this check
     # while rewriting the runtime config, but only on the writer thread.
     _assert_standalone_layer_migration(trainer, getattr(backend, "model_type", None))
-    max_steps = int(training_cfg.get("max_steps", training_cfg.get("step", 1000)) or 0)
     save_interval = int(training_cfg.get("save_interval_steps", 0) or 0)
     successful_steps = 0
     initial_optimizer_step = 0

@@ -151,12 +151,20 @@ def build_drafter_lr_scheduler(optimizer: Optimizer, train_cfg: Any) -> LRSchedu
             last_epoch=last_epoch,
         )
     if scheduler_type == "cosine":
+        standalone = "_standalone_max_steps" in train_cfg
+        total_steps = int(train_cfg.get("_standalone_max_steps" if standalone else "step", 0) or 0)
+        if not 0 <= warmup_steps < total_steps:
+            budget_key = "max_steps" if standalone else "step"
+            raise ValueError(
+                f"cosine requires 0 <= lr_warmup_steps < training.{budget_key}, "
+                f"got warmup={warmup_steps}, total={total_steps}"
+            )
         min_lr_ratio = train_cfg.get("min_lr_ratio", 0.0)
         num_cycles = train_cfg.get("num_cycles", 0.5)
         return get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=warmup_steps,
-            num_training_steps=int(train_cfg.get("step", 0) or 0),
+            num_training_steps=total_steps,
             min_lr_ratio=float(min_lr_ratio or 0.0),
             num_cycles=float(0.5 if num_cycles is None else num_cycles),
             last_epoch=last_epoch,

@@ -58,6 +58,49 @@ def test_clamped_global_cosine_uses_global_steps_and_holds_floor() -> None:
     assert scheduler.last_epoch == 125
 
 
+@pytest.mark.parametrize("standalone", [True, False], ids=["standalone", "online"])
+def test_cosine_scheduler_follows_optimizer_step_budget(standalone) -> None:
+    config = {
+        "lr_scheduler_type": "cosine",
+        "step": 10,
+        "max_steps": 1000,
+        "lr_warmup_steps": 100 if standalone else 2,
+        "min_lr_ratio": 0.1,
+    }
+    if standalone:
+        config["_standalone_max_steps"] = config["max_steps"]
+
+    total = config["max_steps"] if standalone else config["step"]
+    warmup = config["lr_warmup_steps"]
+    optimizer = _optimizer(lr=1.0)
+    scheduler = build_drafter_lr_scheduler(optimizer, config)
+    for step in range(total + 1):
+        if step < warmup:
+            expected = step / warmup
+        else:
+            progress = (step - warmup) / (total - warmup)
+            expected = 0.1 + 0.45 * (1 + math.cos(math.pi * progress))
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(expected)
+        if step < total:
+            _step(optimizer, scheduler, 1)
+
+
+@pytest.mark.parametrize(
+    ("total", "warmup"), [(0, 0), (-1, 0), (10, -1), (10, 10), (10, 11)]
+)
+def test_cosine_scheduler_rejects_invalid_step_budget(total, warmup) -> None:
+    with pytest.raises(ValueError, match="training.max_steps"):
+        build_drafter_lr_scheduler(
+            _optimizer(),
+            {
+                "lr_scheduler_type": "cosine",
+                "_standalone_max_steps": total,
+                "step": 100,
+                "lr_warmup_steps": warmup,
+            },
+        )
+
+
 def test_scheduler_builder_allows_legacy_constant_override() -> None:
     optimizer = _optimizer()
     scheduler = build_drafter_lr_scheduler(
