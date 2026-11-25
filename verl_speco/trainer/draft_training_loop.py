@@ -57,6 +57,7 @@ from verl_speco.trainer.standalone_data import (
 )
 from verl_speco.trainer.standalone_prefetch import StandalonePrefetchIterator
 from verl_speco.trainer.standalone_resume import (
+    build_input_fingerprint,
     load_standalone_resume,
     save_standalone_resume,
     validate_standalone_loader_config,
@@ -219,6 +220,11 @@ async def _run_standalone_draft_training_async(
         resume_input_path = _standalone_resume_input_path(
             config, feature_store_type, feature_store_cfg
         )
+        resume_input_fingerprint = (
+            build_input_fingerprint(resume_input_path)
+            if resume_input_path is not None
+            else None
+        )
         file_loader_config = (
             _standalone_loader_config(
                 training_cfg,
@@ -229,11 +235,13 @@ async def _run_standalone_draft_training_async(
             if feature_store_type not in {"tq", "ray_reference"}
             else None
         )
+        resume_enabled = _standalone_resume_enabled(training_cfg)
         file_data_progress = None
-        if resume_input_path is not None:
+        if resume_enabled and resume_input_path is not None:
             consumed_sequence_nos, resume_metadata = load_standalone_resume(
                 drafter_cfg.get("model_path"),
                 input_path=resume_input_path,
+                current_fingerprint=resume_input_fingerprint,
             )
             if initial_optimizer_step > 0 and resume_metadata is None:
                 if feature_store_type in {"tq", "ray_reference"}:
@@ -279,6 +287,13 @@ async def _run_standalone_draft_training_async(
                 initial_optimizer_step,
                 len(consumed_sequence_nos),
                 file_data_progress,
+            )
+        elif resume_input_path is not None:
+            logger.info(
+                "[standalone rank=%s] resume_trainer_state_from_checkpoint=false; "
+                "ignoring the standalone resume sidecar under %s and starting fresh",
+                rank,
+                drafter_cfg.get("model_path"),
             )
         current_stage = "open_feature_store"
         stage_started = time.perf_counter()
@@ -719,6 +734,7 @@ async def _run_standalone_draft_training_async(
                     ),
                     data_progress=data_progress,
                     loader_config=file_loader_config,
+                    input_fingerprint=resume_input_fingerprint,
                 )
                 if rank == 0:
                     logger.info(
@@ -764,6 +780,7 @@ async def _run_standalone_draft_training_async(
                 ),
                 data_progress=data_progress,
                 loader_config=file_loader_config,
+                input_fingerprint=resume_input_fingerprint,
             )
             if rank == 0:
                 logger.info(
@@ -887,6 +904,7 @@ def _save_standalone_checkpoint(
     producer_shuffle: dict[str, Any] | None = None,
     data_progress: dict[str, Any] | None = None,
     loader_config: dict[str, Any] | None = None,
+    input_fingerprint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     consumed_snapshot = torch.tensor(
         sorted(consumed_sequence_nos or ()), dtype=torch.int64
@@ -907,6 +925,7 @@ def _save_standalone_checkpoint(
                     producer_shuffle=producer_shuffle,
                     data_progress=data_progress,
                     loader_config=loader_config,
+                    input_fingerprint=input_fingerprint,
                 )
             else:
                 future = getattr(trainer, "_pending_full_checkpoint_future", None)
@@ -922,6 +941,7 @@ def _save_standalone_checkpoint(
                             producer_shuffle=producer_shuffle,
                             data_progress=data_progress,
                             loader_config=loader_config,
+                            input_fingerprint=input_fingerprint,
                         )
                     )
         return result
@@ -960,6 +980,7 @@ def _save_standalone_checkpoint(
             producer_shuffle=producer_shuffle,
             data_progress=data_progress,
             loader_config=loader_config,
+            input_fingerprint=input_fingerprint,
         )
     elif future is not None:
         future.add_done_callback(
@@ -973,6 +994,7 @@ def _save_standalone_checkpoint(
                 producer_shuffle=producer_shuffle,
                 data_progress=data_progress,
                 loader_config=loader_config,
+                input_fingerprint=input_fingerprint,
             )
         )
     return {
@@ -1015,6 +1037,7 @@ def _finalize_standalone_checkpoint(
     producer_shuffle: dict[str, Any] | None = None,
     data_progress: dict[str, Any] | None = None,
     loader_config: dict[str, Any] | None = None,
+    input_fingerprint: dict[str, Any] | None = None,
 ) -> None:
     try:
         completed_future.result()
@@ -1049,6 +1072,7 @@ def _finalize_standalone_checkpoint(
             producer_shuffle=producer_shuffle,
             data_progress=data_progress,
             loader_config=loader_config,
+            input_fingerprint=input_fingerprint,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception(
@@ -1070,6 +1094,7 @@ def _finalize_standalone_checkpoint_files(
     producer_shuffle: dict[str, Any] | None = None,
     data_progress: dict[str, Any] | None = None,
     loader_config: dict[str, Any] | None = None,
+    input_fingerprint: dict[str, Any] | None = None,
 ) -> None:
     """Commit standalone-only files before publishing a managed checkpoint.
 
@@ -1088,6 +1113,7 @@ def _finalize_standalone_checkpoint_files(
         producer_shuffle=producer_shuffle,
         data_progress=data_progress,
         loader_config=loader_config,
+        input_fingerprint=input_fingerprint,
     )
     _set_standalone_checkpoint_complete(checkpoint_path, complete=True)
 
@@ -1125,6 +1151,7 @@ def _save_resume_sidecar(
     producer_shuffle: dict[str, Any] | None = None,
     data_progress: dict[str, Any] | None = None,
     loader_config: dict[str, Any] | None = None,
+    input_fingerprint: dict[str, Any] | None = None,
 ) -> None:
     if consumed_snapshot is None or step is None or input_path is None:
         return
@@ -1136,6 +1163,7 @@ def _save_resume_sidecar(
         producer_shuffle=producer_shuffle,
         data_progress=data_progress,
         loader_config=loader_config,
+        input_fingerprint=input_fingerprint,
     )
 
 
@@ -1149,6 +1177,22 @@ def _standalone_input_path(config: Any) -> str | None:
     if train_files is not None and len(train_files) == 1:
         return str(train_files[0])
     return None
+
+
+def _standalone_resume_enabled(training_cfg: Any) -> bool:
+    """Match the trainer's resume setting for standalone sidecar state.
+
+    ``base_trainer`` and ``speco_ray_trainer`` use
+    ``resume_trainer_state_from_checkpoint`` (falling back to
+    ``resume_lr_scheduler_from_checkpoint``) to decide whether optimizer state
+    is restored. Standalone data progress must follow the same setting: a
+    weights-only initialization must not skip batches from the saved cursor.
+    """
+
+    resume_setting = training_cfg.get("resume_trainer_state_from_checkpoint", None)
+    if resume_setting is None:
+        resume_setting = training_cfg.get("resume_lr_scheduler_from_checkpoint", True)
+    return bool(resume_setting)
 
 
 def _standalone_resume_input_path(
@@ -1182,9 +1226,12 @@ def _standalone_loader_config(
     the same dict is persisted beside the cursor and validated on resume.
     ``rank`` is intentionally absent: it is a per-process view of the same
     global order, while ``world_size`` changes the sharding and must match.
-    Stores that rewrite rows (JSONL token replay) also expose length/window and
-    tokenizer settings that change sequence lengths and therefore filtering and
-    length-based ordering.
+    Rank-to-shard placement is assumed stable for an exact resume. Stores that
+    rewrite rows (JSONL token replay) also expose length/window and tokenizer
+    settings that change sequence lengths and therefore filtering and
+    length-based ordering. Only ``tokenizer_path`` is validated today; a
+    tokenizer content fingerprint can be added later (for example, reusing the
+    launcher's ``_saved_hidden_tokenizer_fingerprint``).
     """
 
     config: dict[str, Any] = {
@@ -1219,6 +1266,9 @@ def _standalone_loader_config(
                 "window_mode": str(
                     feature_store_cfg.get("window_mode", "loss") or "loss"
                 ),
+                # Path-only validation: a tokenizer updated in place at the
+                # same path is not detected until a content fingerprint is
+                # added (reuse _saved_hidden_tokenizer_fingerprint if needed).
                 "tokenizer_path": (
                     os.fspath(tokenizer_path) if tokenizer_path else None
                 ),
@@ -1285,10 +1335,9 @@ def _standalone_data_progress(
         return None
     progress = loader.progress()
     read_errors = int(getattr(loader, "epoch_read_errors", lambda: 0)())
+    read_errors = _max_across_ranks_int(read_errors, trainer.runtime_device)
     progress["read_errors"] = read_errors
-    progress["read_errors_exact"] = _all_ranks_true(
-        read_errors == 0, trainer.runtime_device
-    )
+    progress["read_errors_exact"] = read_errors == 0
     return progress
 
 
@@ -2009,6 +2058,16 @@ def _optional_int(value: object) -> int | None:
 def _barrier() -> None:
     if dist.is_initialized():
         dist.barrier()
+
+
+def _max_across_ranks_int(value: int, device: torch.device) -> int:
+    """Return the cluster-wide maximum for a small integer counter."""
+
+    if not dist.is_initialized() or dist.get_world_size() <= 1:
+        return int(value)
+    maximum = torch.tensor(int(value), dtype=torch.int32, device=device)
+    dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+    return int(maximum.item())
 
 
 def _all_ranks_true(value: bool, device: torch.device) -> bool:

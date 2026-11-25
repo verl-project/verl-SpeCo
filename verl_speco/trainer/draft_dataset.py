@@ -282,6 +282,56 @@ class DraftFeatureDataLoader:
         dist.all_reduce(count, op=dist.ReduceOp.MIN)
         return samples[: int(count.item())]
 
+    def _synchronize_read_errors(self) -> None:
+        """Share the epoch read-error count before any rank aborts.
+
+        On resume, an unreadable sample must fail on every rank. Raising only on
+        the affected rank would leave the healthy ranks in a different
+        collective (the next batch-status sync or the next epoch's length sync)
+        and can hang the job instead of failing cleanly.
+        """
+
+        if int(self.config.world_size) <= 1:
+            return
+        try:
+            import torch.distributed as dist
+        except ImportError:  # pragma: no cover - torch always ships distributed
+            return
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        count = torch.tensor(
+            [int(self._epoch_read_errors)],
+            dtype=torch.int32,
+            device=_collective_device(),
+        )
+        dist.all_reduce(count, op=dist.ReduceOp.MAX)
+        self._epoch_read_errors = int(count.item())
+
+    def _synchronize_failure(self, failed: bool) -> bool:
+        """Share a read/filter failure before any rank raises.
+
+        ``_read_filtered`` can raise locally (``on_error='raise'`` or too many
+        consecutive errors). Without a shared flag the healthy ranks would
+        enter ``_synchronize_length`` or the next epoch's collectives while the
+        failing rank leaves the iterator, which can hang the job.
+        """
+
+        if int(self.config.world_size) <= 1:
+            return failed
+        try:
+            import torch.distributed as dist
+        except ImportError:  # pragma: no cover - torch always ships distributed
+            return failed
+        if not (dist.is_available() and dist.is_initialized()):
+            return failed
+        flag = torch.tensor(
+            [1 if failed else 0],
+            dtype=torch.int32,
+            device=_collective_device(),
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return bool(flag.item())
+
     def _sample_in_step_window(self, sample: DraftStoredSample) -> bool:
         if self.config.min_sample_step is None and self.config.max_sample_step is None:
             return True
@@ -361,49 +411,64 @@ class DraftFeatureDataLoader:
         while True:
             read_errors_start = int(self.filter_stats["read_errors"])
             self._epoch_read_errors = 0
-            keys = list(
-                self.store.iter_keys(
-                    shuffle=bool(self.config.shuffle),
-                    seed=int(self.config.seed) + epoch,
-                )
-            )
-            if not keys:
-                return
             rank = int(self.config.rank)
             world_size = int(self.config.world_size)
-            if self._uses_step_window:
-                # NOTE: this path intentionally filters BEFORE distributed
-                # slicing (see test_draft_feature_dataloader_filters_before_
-                # distributed_slicing): every rank must see every matching
-                # sample so the stride yields a balanced, interleaved split.
-                # A restrictive window can match only a contiguous shard range,
-                # so per-rank contiguous slices (the main path's shard-level DP)
-                # would empty some ranks. The cost is full read amplification;
-                # removing it needs shard-level step metadata from the producer.
-                samples = [
-                    sample
-                    for sample in self._read_filtered(keys)
-                    if self._sample_in_step_window(sample)
-                ]
-                if not samples:
-                    return
-                rank_samples = samples[rank::world_size]
-                if world_size > 1:
-                    rank_samples = rank_samples[: len(samples) // world_size]
-            else:
-                # Shard-level data parallelism: hand each rank a CONTIGUOUS slice
-                # of the shard-major key list so it owns whole shards. Striding
-                # (keys[rank::world_size]) would touch every multi-GB shard while
-                # using only a few samples per shard, causing ~world_size read
-                # amplification under whole-shard reads. Each rank takes exactly
-                # ``len(keys) // world_size`` keys; the remainder is not read here
-                # (distributed runs truncate to the global minimum in
-                # ``_synchronize_length`` anyway, so it would be dropped regardless).
-                per = len(keys) // world_size if world_size > 1 else len(keys)
-                rank_keys = keys[rank * per : (rank + 1) * per]
-                rank_samples = self._read_filtered(rank_keys)
+            local_error: Exception | None = None
+            keys: list[str] = []
+            rank_samples: list[DraftStoredSample] = []
+            global_samples_empty = False
+            try:
+                keys = list(
+                    self.store.iter_keys(
+                        shuffle=bool(self.config.shuffle),
+                        seed=int(self.config.seed) + epoch,
+                    )
+                )
+                if keys:
+                    if self._uses_step_window:
+                        # NOTE: this path intentionally filters BEFORE distributed
+                        # slicing (see test_draft_feature_dataloader_filters_before_
+                        # distributed_slicing): every rank must see every matching
+                        # sample so the stride yields a balanced, interleaved split.
+                        # A restrictive window can match only a contiguous shard range,
+                        # so per-rank contiguous slices (the main path's shard-level DP)
+                        # would empty some ranks. The cost is full read amplification;
+                        # removing it needs shard-level step metadata from the producer.
+                        samples = [
+                            sample
+                            for sample in self._read_filtered(keys)
+                            if self._sample_in_step_window(sample)
+                        ]
+                        global_samples_empty = not samples
+                        if samples:
+                            rank_samples = samples[rank::world_size]
+                            if world_size > 1:
+                                rank_samples = rank_samples[
+                                    : len(samples) // world_size
+                                ]
+                    else:
+                        # Shard-level data parallelism: hand each rank a CONTIGUOUS slice
+                        # of the shard-major key list so it owns whole shards. Striding
+                        # (keys[rank::world_size]) would touch every multi-GB shard while
+                        # using only a few samples per shard, causing ~world_size read
+                        # amplification under whole-shard reads. Each rank takes exactly
+                        # ``len(keys) // world_size`` keys; the remainder is not read here
+                        # (distributed runs truncate to the global minimum in
+                        # ``_synchronize_length`` anyway, so it would be dropped regardless).
+                        per = len(keys) // world_size if world_size > 1 else len(keys)
+                        rank_keys = keys[rank * per : (rank + 1) * per]
+                        rank_samples = self._read_filtered(rank_keys)
+            except Exception as exc:  # noqa: BLE001 - synchronized below
+                local_error = exc
+                rank_samples = []
             rank_samples = self._synchronize_length(rank_samples)
-            rank_samples = self._maybe_group_by_length(rank_samples)
+            if self._synchronize_failure(local_error is not None):
+                if local_error is not None:
+                    raise local_error
+                raise RuntimeError(
+                    "DraftFeatureDataLoader failed on another rank while reading "
+                    f"or filtering; rank={rank} is stopping"
+                )
             self._epoch_read_errors = (
                 int(self.filter_stats["read_errors"]) - read_errors_start
             )
@@ -412,15 +477,28 @@ class DraftFeatureDataLoader:
                 if epoch == int(self.config.start_epoch)
                 else 0
             )
+            if epoch == int(self.config.start_epoch):
+                self._synchronize_read_errors()
             if skip_batches > 0 and self._epoch_read_errors > 0:
                 raise ValueError(
                     "DraftFeatureDataLoader cannot resume at "
                     f"epoch={epoch} batch_index={skip_batches}: "
-                    f"{self._epoch_read_errors} feature samples were unreadable "
-                    "while rebuilding the epoch, so skipping the saved number of "
-                    "batches would land on a different boundary and could repeat "
-                    "or skip samples. Fix the store or start a fresh run."
+                    f"{self._epoch_read_errors} feature sample(s) were "
+                    "unreadable on at least one rank while rebuilding the "
+                    "epoch, so skipping the saved number of batches would "
+                    "land on a different boundary and could repeat or skip "
+                    "samples. Fix the store or start a fresh run."
                 )
+            if not keys or global_samples_empty:
+                if skip_batches > 0:
+                    raise ValueError(
+                        "DraftFeatureDataLoader resume cursor "
+                        f"epoch={epoch} batch_index={skip_batches} exceeds the "
+                        "0 batches available in this epoch; the checkpoint and "
+                        "feature store are inconsistent."
+                    )
+                return
+            rank_samples = self._maybe_group_by_length(rank_samples)
             if not rank_samples:
                 raise RuntimeError(
                     f"DraftFeatureDataLoader epoch={epoch} rank={rank} produced no "

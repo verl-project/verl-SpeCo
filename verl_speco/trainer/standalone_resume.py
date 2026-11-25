@@ -26,11 +26,36 @@ import torch
 RESUME_METADATA_NAME = "standalone_resume.json"
 CONSUMED_SEQUENCE_NAME = "consumed_sequence_nos.pt"
 RESUME_SCHEMA_VERSION = 1
+# Full content hashing is cheap enough for ordinary JSONL shards; very large
+# shards are sampled deterministically so a multi-node resume does not depend
+# on node-local mtimes or on reading terabytes at every checkpoint.
+_HASH_FULL_LIMIT_BYTES = 64 * 1024 * 1024
+_HASH_CHUNK_BYTES = 64 * 1024
+_HASH_SAMPLE_COUNT = 6
 
 
-def _file_stat_fingerprint(file_path: Path) -> dict[str, int]:
-    stat = file_path.stat()
-    return {"size_bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+def _file_content_fingerprint(file_path: Path) -> dict[str, Any]:
+    size = int(file_path.stat().st_size)
+    digest = hashlib.sha256()
+    digest.update(str(size).encode())
+    with file_path.open("rb") as stream:
+        if size <= _HASH_FULL_LIMIT_BYTES:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        else:
+            offsets = {0, max(size - _HASH_CHUNK_BYTES, 0)}
+            for index in range(1, _HASH_SAMPLE_COUNT):
+                offsets.add((size * index) // _HASH_SAMPLE_COUNT)
+            for offset in sorted(offsets):
+                stream.seek(offset)
+                digest.update(stream.read(_HASH_CHUNK_BYTES))
+    return {"size_bytes": size, "sha256": digest.hexdigest()}
+
+
+def _fingerprint_identity(fingerprint: dict[str, Any]) -> dict[str, Any]:
+    """Fields that must match on resume; the mount path is informational only."""
+
+    return {key: value for key, value in fingerprint.items() if key != "path"}
 
 
 def build_input_fingerprint(path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -61,7 +86,7 @@ def build_input_fingerprint(path: str | os.PathLike[str]) -> dict[str, Any]:
                 "path": str(input_path),
                 "format": "jsonl_token_replay",
                 "files": {
-                    file_path.name: _file_stat_fingerprint(file_path)
+                    file_path.name: _file_content_fingerprint(file_path)
                     for file_path in jsonl_files
                 },
             }
@@ -72,7 +97,7 @@ def build_input_fingerprint(path: str | os.PathLike[str]) -> dict[str, Any]:
             "path": str(input_path),
             "format": "directory",
             "files": {
-                file_path.relative_to(input_path).as_posix(): _file_stat_fingerprint(
+                file_path.relative_to(input_path).as_posix(): _file_content_fingerprint(
                     file_path
                 )
                 for file_path in directory_files
@@ -80,7 +105,7 @@ def build_input_fingerprint(path: str | os.PathLike[str]) -> dict[str, Any]:
         }
     return {
         "path": str(input_path),
-        **_file_stat_fingerprint(input_path),
+        **_file_content_fingerprint(input_path),
     }
 
 
@@ -93,6 +118,7 @@ def save_standalone_resume(
     producer_shuffle: dict[str, Any] | None = None,
     data_progress: dict[str, Any] | None = None,
     loader_config: dict[str, Any] | None = None,
+    input_fingerprint: dict[str, Any] | None = None,
 ) -> None:
     checkpoint_dir = Path(checkpoint_path)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -117,7 +143,11 @@ def save_standalone_resume(
         "optimizer_step": int(optimizer_step),
         "consumed_count": int(values.numel()),
         "consumed_sequence_file": CONSUMED_SEQUENCE_NAME,
-        "input_fingerprint": build_input_fingerprint(input_path),
+        "input_fingerprint": (
+            input_fingerprint
+            if input_fingerprint is not None
+            else build_input_fingerprint(input_path)
+        ),
     }
     if producer_shuffle is not None:
         # Consumed sequence numbers are position-based, so their meaning
@@ -168,6 +198,7 @@ def load_standalone_resume(
     checkpoint_path: str | os.PathLike[str] | None,
     *,
     input_path: str | os.PathLike[str] | None = None,
+    current_fingerprint: dict[str, Any] | None = None,
 ) -> tuple[set[int], dict[str, Any] | None]:
     if not checkpoint_path:
         return set(), None
@@ -194,10 +225,15 @@ def load_standalone_resume(
     consumed = {int(value) for value in values.tolist()}
     if len(consumed) != int(metadata.get("consumed_count", -1)):
         raise ValueError(f"Consumed sequence count mismatch in {checkpoint_dir}")
-    if input_path is not None:
+    if input_path is not None or current_fingerprint is not None:
         saved_fingerprint = metadata.get("input_fingerprint")
-        current_fingerprint = build_input_fingerprint(input_path)
-        if saved_fingerprint != current_fingerprint:
+        if current_fingerprint is None:
+            if input_path is None:
+                raise ValueError("load_standalone_resume requires input_path")
+            current_fingerprint = build_input_fingerprint(input_path)
+        if not isinstance(saved_fingerprint, dict) or _fingerprint_identity(
+            saved_fingerprint
+        ) != _fingerprint_identity(current_fingerprint):
             raise ValueError(
                 "Standalone resume input file changed since the checkpoint was saved: "
                 f"saved={saved_fingerprint!r}, current={current_fingerprint!r}"

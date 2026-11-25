@@ -36,12 +36,14 @@ from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _finish_standalone_tracking,
     _is_out_of_memory_error,
     _log_standalone_tracking_metrics,
+    _max_across_ranks_int,
     _next_batch_across_ranks,
     _raise_standalone_export_error,
     _rewrite_standalone_block_runtime_config,
     _save_standalone_checkpoint,
     _select_standalone_tracking_metrics,
     _standalone_loader_config,
+    _standalone_resume_enabled,
     _should_log_batch_progress,
     _sync_standalone_export_error,
 )
@@ -1346,3 +1348,45 @@ def test_file_data_loader_rejects_unknown_loader_config_key() -> None:
             rank=0,
             data_progress=None,
         )
+
+
+def test_standalone_resume_enabled_matches_trainer_setting() -> None:
+    assert _standalone_resume_enabled({}) is True
+    assert (
+        _standalone_resume_enabled({"resume_lr_scheduler_from_checkpoint": False})
+        is False
+    )
+    assert (
+        _standalone_resume_enabled({"resume_trainer_state_from_checkpoint": False})
+        is False
+    )
+    assert (
+        _standalone_resume_enabled(
+            {
+                "resume_trainer_state_from_checkpoint": True,
+                "resume_lr_scheduler_from_checkpoint": False,
+            }
+        )
+        is True
+    )
+
+
+def test_file_data_loader_weights_only_starts_at_first_batch() -> None:
+    loader_config = _standalone_loader_config(
+        {"batch_size_per_gpu": 4, "seed": 7},
+        {"type": "torch_shard"},
+        world_size=1,
+        feature_store_type="torch_shard",
+    )
+    loader = _build_file_feature_data_loader(
+        SimpleNamespace(),
+        loader_config,
+        rank=0,
+        data_progress=None,
+    )
+    assert loader.config.start_epoch == 0
+    assert loader.config.skip_batches == 0
+
+
+def test_max_across_ranks_int_returns_local_without_dist() -> None:
+    assert _max_across_ranks_int(3, torch.device("cpu")) == 3

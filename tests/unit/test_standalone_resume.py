@@ -188,6 +188,8 @@ def test_build_input_fingerprint_handles_plain_jsonl_directory(tmp_path: Path) -
     fingerprint = build_input_fingerprint(data_dir)
     assert fingerprint["format"] == "jsonl_token_replay"
     assert set(fingerprint["files"]) == {"a.jsonl", "b.jsonl"}
+    assert "sha256" in fingerprint["files"]["a.jsonl"]
+    assert "mtime_ns" not in fingerprint["files"]["a.jsonl"]
 
     checkpoint_path = tmp_path / "draft_step_1"
     save_standalone_resume(
@@ -213,3 +215,101 @@ def test_build_input_fingerprint_handles_generic_directory(tmp_path: Path) -> No
     fingerprint = build_input_fingerprint(data_dir)
     assert fingerprint["format"] == "directory"
     assert set(fingerprint["files"]) == {"shard.bin", "nested/index.json"}
+    assert "sha256" in fingerprint["files"]["shard.bin"]
+
+
+def test_input_fingerprint_comparison_ignores_mount_path(tmp_path: Path) -> None:
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    (dir_a / "data.jsonl").write_text('{"input_ids": [1]}\n', encoding="utf-8")
+    (dir_b / "data.jsonl").write_text('{"input_ids": [1]}\n', encoding="utf-8")
+    checkpoint_path = tmp_path / "draft_step_1"
+
+    save_standalone_resume(
+        checkpoint_path,
+        [],
+        optimizer_step=1,
+        input_path=dir_a,
+    )
+    _, metadata = load_standalone_resume(checkpoint_path, input_path=dir_b)
+    assert metadata is not None
+
+    (dir_b / "data.jsonl").write_text('{"input_ids": [2]}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="input file changed"):
+        load_standalone_resume(checkpoint_path, input_path=dir_b)
+
+
+def test_save_standalone_resume_accepts_precomputed_fingerprint(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "manifest.jsonl"
+    input_path.write_text('{"num_samples": 1}\n', encoding="utf-8")
+    checkpoint_path = tmp_path / "draft_step_1"
+    fingerprint = {"path": "/node/a", "format": "test", "files": {}}
+
+    save_standalone_resume(
+        checkpoint_path,
+        [],
+        optimizer_step=1,
+        input_path=input_path,
+        input_fingerprint=fingerprint,
+    )
+    _, metadata = load_standalone_resume(
+        checkpoint_path, current_fingerprint=fingerprint
+    )
+    assert metadata is not None
+    assert metadata["input_fingerprint"] == fingerprint
+
+    with pytest.raises(ValueError, match="input file changed"):
+        load_standalone_resume(
+            checkpoint_path,
+            current_fingerprint={**fingerprint, "format": "other"},
+        )
+
+
+def test_load_standalone_resume_accepts_precomputed_current_fingerprint(
+    monkeypatch, tmp_path: Path
+) -> None:
+    input_path = tmp_path / "manifest.jsonl"
+    input_path.write_text('{"num_samples": 1}\n', encoding="utf-8")
+    checkpoint_path = tmp_path / "draft_step_1"
+    save_standalone_resume(
+        checkpoint_path,
+        [],
+        optimizer_step=1,
+        input_path=input_path,
+    )
+    fingerprint = build_input_fingerprint(input_path)
+
+    def fail_recompute(*args, **kwargs):
+        raise AssertionError("build_input_fingerprint should not be called")
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.standalone_resume.build_input_fingerprint",
+        fail_recompute,
+    )
+    _, metadata = load_standalone_resume(
+        checkpoint_path, current_fingerprint=fingerprint
+    )
+    assert metadata is not None
+
+
+def test_large_file_fingerprint_detects_head_and_tail_changes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import verl_speco.trainer.standalone_resume as resume
+
+    monkeypatch.setattr(resume, "_HASH_FULL_LIMIT_BYTES", 16)
+    monkeypatch.setattr(resume, "_HASH_CHUNK_BYTES", 4)
+    monkeypatch.setattr(resume, "_HASH_SAMPLE_COUNT", 3)
+    path = tmp_path / "big.jsonl"
+    path.write_bytes(b"0123456789abcdefghij")
+    original = build_input_fingerprint(path)
+
+    path.write_bytes(b"X123456789abcdefghij")
+    assert build_input_fingerprint(path) != original
+
+    path.write_bytes(b"0123456789abcdefghiX")
+    assert build_input_fingerprint(path) != original

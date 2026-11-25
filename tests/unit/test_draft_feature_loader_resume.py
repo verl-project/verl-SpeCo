@@ -15,7 +15,13 @@
 
 from __future__ import annotations
 
+import os
 import random
+import subprocess
+import sys
+import textwrap
+import time
+from pathlib import Path
 
 import pytest
 
@@ -131,3 +137,215 @@ def test_loader_reports_epoch_read_errors() -> None:
     assert loader.epoch_read_errors() == 0
     list(loader)
     assert loader.epoch_read_errors() == 0
+
+
+def test_loader_resume_synchronizes_read_errors_with_other_ranks(
+    monkeypatch,
+) -> None:
+    import torch.distributed as dist
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_dataset._collective_device",
+        lambda: torch.device("cpu"),
+    )
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+
+    max_calls = 0
+
+    def fake_all_reduce(tensor, op=None):
+        nonlocal max_calls
+        # Length sync uses MIN and must keep the local count. MAX is used first
+        # for the read/filter failure flag, then for the read-error count; make
+        # only the latter look like another rank had unreadable samples.
+        if op == dist.ReduceOp.MAX:
+            max_calls += 1
+            if max_calls == 2:
+                tensor.fill_(3)
+
+    monkeypatch.setattr(dist, "all_reduce", fake_all_reduce)
+
+    loader = DraftFeatureDataLoader(
+        _Store(10),
+        _config(world_size=2, rank=0, start_epoch=0, skip_batches=2),
+    )
+    with pytest.raises(ValueError, match="unreadable on at least one rank"):
+        next(iter(loader))
+
+
+def test_loader_synchronizes_rank_failures_before_raising(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_dataset._collective_device",
+        lambda: torch.device("cpu"),
+    )
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+
+    def fake_all_reduce(tensor, op=None):
+        # The first MAX is the read/filter failure flag; simulate another rank
+        # having failed so this healthy rank must stop before batching.
+        if op == dist.ReduceOp.MAX:
+            tensor.fill_(1)
+
+    monkeypatch.setattr(dist, "all_reduce", fake_all_reduce)
+
+    loader = DraftFeatureDataLoader(
+        _Store(10),
+        _config(world_size=2, rank=0, start_epoch=0, skip_batches=2),
+    )
+    with pytest.raises(RuntimeError, match="failed on another rank"):
+        next(iter(loader))
+
+
+_GLOO_RESUME_DRIVER = r'''
+import sys
+from datetime import timedelta
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+
+from verl_speco.trainer.draft_dataset import (
+    DraftFeatureDataLoader,
+    DraftFeatureDataLoaderConfig,
+)
+from verl_speco.trainer.feature_store import DraftFeatureSample
+
+
+class Store:
+    def __init__(self, fail_key=None):
+        self.keys = [f"k{i}" for i in range(8)]
+        self.fail_key = fail_key
+
+    def iter_keys(self, *, shuffle=False, seed=0):
+        return iter(list(self.keys))
+
+    def read(self, key):
+        if key == self.fail_key:
+            raise OSError("injected read failure")
+        index = int(key[1:])
+        return DraftFeatureSample(
+            input_ids=torch.arange(index, index + 4, dtype=torch.long),
+            loss_mask=torch.ones(4, dtype=torch.float32),
+            hidden_states=torch.zeros(4, 8, dtype=torch.float32),
+        )
+
+
+rank = int(sys.argv[1])
+world_size = int(sys.argv[2])
+init_file = sys.argv[3]
+result_path = Path(sys.argv[4])
+mode = sys.argv[5]
+result = "init_failed"
+try:
+    dist.init_process_group(
+        backend="gloo",
+        init_method="file://" + init_file,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    # k4 falls in rank 1's contiguous shard, so only rank 1 hits the failure.
+    loader = DraftFeatureDataLoader(
+        Store(fail_key="k4" if rank == 1 else None),
+        DraftFeatureDataLoaderConfig(
+            batch_size=2,
+            rank=rank,
+            world_size=world_size,
+            shuffle=False,
+            repeat=False,
+            start_epoch=0,
+            skip_batches=2,
+            on_error=mode,
+        ),
+    )
+    try:
+        next(iter(loader))
+    except Exception as exc:
+        result = f"error:{type(exc).__name__}:{exc}"
+    else:
+        result = "no_error"
+except Exception as exc:
+    result = f"error:{type(exc).__name__}:{exc}"
+finally:
+    result_path.write_text(result)
+    try:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception:
+        pass
+'''
+
+
+def _run_gloo_resume_case(tmp_path: Path, mode: str) -> dict[str, str]:
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_gloo_available()):
+        pytest.skip("gloo backend is required")
+
+    script = tmp_path / "gloo_resume_driver.py"
+    script.write_text(textwrap.dedent(_GLOO_RESUME_DRIVER).lstrip(), encoding="utf-8")
+    init_file = tmp_path / "gloo_init"
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(repo_root), env.get("PYTHONPATH", "")]
+    ).strip(os.pathsep)
+
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(script),
+                str(rank),
+                "2",
+                str(init_file),
+                str(result_dir / f"rank{rank}.txt"),
+                mode,
+            ],
+            env=env,
+        )
+        for rank in range(2)
+    ]
+    deadline = time.monotonic() + 60
+    timed_out = []
+    for process in processes:
+        try:
+            process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            timed_out.append(process)
+    for process in timed_out:
+        process.kill()
+        process.wait(timeout=5)
+    assert not timed_out, f"gloo resume workers hung in mode={mode!r}"
+
+    results = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in sorted(result_dir.glob("rank*.txt"))
+    }
+    assert set(results) == {"rank0.txt", "rank1.txt"}, results
+    assert all(value.startswith("error:") for value in results.values()), results
+    return results
+
+
+def test_gloo_two_rank_resume_read_error_syncs(tmp_path: Path) -> None:
+    results = _run_gloo_resume_case(tmp_path, "skip")
+    assert "ValueError" in results["rank0.txt"]
+    assert "ValueError" in results["rank1.txt"]
+    assert "unreadable on at least one rank" in results["rank0.txt"]
+    assert "unreadable on at least one rank" in results["rank1.txt"]
+
+
+def test_gloo_two_rank_resume_failure_syncs(tmp_path: Path) -> None:
+    results = _run_gloo_resume_case(tmp_path, "raise")
+    assert "RuntimeError" in results["rank0.txt"]
+    assert "RuntimeError" in results["rank1.txt"]
+    assert "Failed to read feature sample" in results["rank1.txt"]
+    assert (
+        "failed on another rank" in results["rank0.txt"]
+        or "failed on another rank" in results["rank1.txt"]
+    )
