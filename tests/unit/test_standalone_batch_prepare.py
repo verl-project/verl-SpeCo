@@ -1050,14 +1050,14 @@ def _owned_file_step_gloo_worker(rank, port, directory, fail, output):
                 assignment = _next_batch_across_ranks(iter([assignment]), rank=rank, device=torch.device("cpu"),
                                                       require_reference_metadata=True, node_ranks_per_host=2)
                 node_context["entries"] = assignment.node_file_entries
-            def serve(groups, *, binding, prepare, max_bytes, timeout):
+            def serve(groups, *, binding, prepare, max_bytes, timeout, peer_processes=None):
                 if fail == "node_failure":
                     dist.send_object_list([{"injected_error": True}], dst=1, group=node_group)
                     raise OSError("injected owner read failure")
                 remote, _ = prepare(groups[1])
                 dist.send_object_list([remote], dst=1, group=node_group)
                 return prepare(groups[0])
-            def receive(*, binding, owner_rank, max_bytes, timeout):
+            def receive(*, binding, owner_rank, max_bytes, timeout, peer_processes=None):
                 value = [None]
                 dist.recv_object_list(value, src=owner_rank, group=node_group)
                 if value[0].get("injected_error"):
