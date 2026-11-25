@@ -4359,7 +4359,9 @@ def _node_owned_window_parts(
             "ranks_per_host": local_size,
         }
         encoded = json.dumps(
-            {"common": common, "plans": plans}, separators=(",", ":"), allow_nan=False
+            {"common": common, "plans": plans, "pid": os.getpid()},
+            separators=(",", ":"),
+            allow_nan=False,
         )
         if len(encoded.encode()) > 1024 * 1024:
             raise ValueError("Node-owned window plan exceeds its metadata limit")
@@ -4414,6 +4416,11 @@ def _node_owned_window_parts(
 
     counter = [0]
     timeout = max(30.0, float(read_timeout) * (local_size + 1))
+    peer_processes = {
+        peer: (records[peer]["pid"],)
+        for peer in range(owner, owner + local_size)
+        if peer != rank
+    }
 
     def materialize(index):
         serial = counter[0]
@@ -4434,6 +4441,7 @@ def _node_owned_window_parts(
                 owner_rank=owner,
                 max_bytes=max_host_bytes,
                 timeout=timeout,
+                peer_processes=peer_processes,
             )[0]
 
         requests = {
@@ -4473,6 +4481,7 @@ def _node_owned_window_parts(
             prepare=prepare,
             max_bytes=max_host_bytes,
             timeout=timeout,
+            peer_processes=peer_processes,
         )[0]
 
     return [partial(materialize, index) for index in range(count)]

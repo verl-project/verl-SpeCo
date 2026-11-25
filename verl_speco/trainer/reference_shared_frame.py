@@ -9,11 +9,13 @@ import hashlib
 import json
 import math
 import os
+import select
 import socket
 import stat
 import struct
 import time
-from contextlib import suppress
+from contextlib import ExitStack, contextmanager, suppress
+from pathlib import Path
 
 import torch
 from safetensors import safe_open
@@ -237,11 +239,12 @@ def _verify_local_socket(connection):
         raise ValueError("Local frames require a message-oriented Unix socket")
     if not hasattr(socket, "SO_PEERCRED") or not hasattr(os, "geteuid"):
         raise RuntimeError("Local shared frames require Linux peer credentials")
-    _, peer_uid, _ = struct.unpack(
+    peer_pid, peer_uid, _ = struct.unpack(
         "3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
     )
     if peer_uid != os.geteuid():
         raise ValueError("Local frame peer has a different user identity")
+    return peer_pid
 
 
 def send_local_frame(connection, fd, descriptor):
@@ -319,7 +322,73 @@ def _remaining_time(deadline):
     return remaining
 
 
-def serve_node_batches(groups, *, binding, prepare, max_bytes, timeout):
+class _NodePeerExited(RuntimeError):
+    def __init__(self, rank):
+        super().__init__(f"Node reference peer rank={rank} exited")
+        self.rank = rank
+
+
+@contextmanager
+def _node_process_watch(processes):
+    """Monitor local process lifetimes while waiting for a Unix socket."""
+    with ExitStack() as stack:
+        watches = {}
+        for rank, pids in (processes or {}).items():
+            for pid in pids:
+                if type(pid) is not int or pid <= 0:
+                    raise ValueError("Invalid node peer process ID")
+                try:
+                    fd = os.pidfd_open(pid) if hasattr(os, "pidfd_open") else None
+                except ProcessLookupError:
+                    fd = -1
+                except OSError:
+                    fd = None  # Older kernels can still expose process state in procfs.
+                if fd is not None and fd >= 0:
+                    stack.callback(os.close, fd)
+                watches[(rank, pid)] = fd
+
+        def wait(connection, deadline, ranks):
+            if not watches:
+                return _remaining_time(deadline)
+            while True:
+                fds = {}
+                for (rank, pid), fd in watches.items():
+                    if rank not in ranks:
+                        continue
+                    if fd == -1:
+                        raise _NodePeerExited(rank)
+                    if fd is None:
+                        try:
+                            state = (
+                                Path(f"/proc/{pid}/stat")
+                                .read_text()
+                                .rpartition(") ")[2]
+                                .split()[0]
+                            )
+                        except (OSError, IndexError):
+                            raise _NodePeerExited(rank) from None
+                        if state in {"Z", "X"}:
+                            raise _NodePeerExited(rank)
+                    else:
+                        fds[fd] = rank
+                ready, _, _ = select.select(
+                    ([connection] if connection is not None else []) + list(fds),
+                    [],
+                    [],
+                    min(0.1, _remaining_time(deadline)),
+                )
+                for fd in fds:
+                    if fd in ready:
+                        raise _NodePeerExited(fds[fd])
+                if connection is None or connection in ready:
+                    return _remaining_time(deadline)
+
+        yield wait
+
+
+def serve_node_batches(
+    groups, *, binding, prepare, max_bytes, timeout, peer_processes=None
+):
     """One owner prepares each local assignment and sends only its rank's frame."""
     identity = _binding(binding)
     owner = identity["rank"]
@@ -346,16 +415,45 @@ def serve_node_batches(groups, *, binding, prepare, max_bytes, timeout):
     remaining = set(groups) - {owner}
     deadline = time.monotonic() + timeout
     failure = None
-    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
+    with (
+        _node_process_watch(peer_processes) as wait,
+        socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener,
+    ):
         listener.bind(_node_address(identity, owner))
         listener.listen(max(1, len(remaining)))
         while remaining:
+            try:
+                wait(listener, deadline, remaining)
+            except _NodePeerExited as exc:
+                failure = failure or exc
+                remaining.remove(exc.rank)
+                continue
             listener.settimeout(_remaining_time(deadline))
             connection, _ = listener.accept()
             with connection:
                 connection.settimeout(_remaining_time(deadline))
-                _verify_local_socket(connection)
+                peer_pid = _verify_local_socket(connection)
+                connected_rank = next(
+                    (
+                        rank
+                        for rank, pids in (peer_processes or {}).items()
+                        if peer_pid in pids
+                    ),
+                    None,
+                )
+                try:
+                    wait(connection, deadline, {connected_rank})
+                except _NodePeerExited as exc:
+                    failure = failure or exc
+                    remaining.remove(exc.rank)
+                    with suppress(OSError):
+                        connection.send(_NODE_BATCH_ERROR)
+                    continue
                 request = connection.recv(_CONTROL_LIMIT + 1)
+                if not request and connected_rank in remaining:
+                    remaining.remove(connected_rank)
+                    failure = failure or _NodePeerExited(connected_rank)
+                    continue
                 if len(request) > _CONTROL_LIMIT:
                     raise ValueError("Node reference request is too large")
                 requested = _binding(json.loads(request))
@@ -396,7 +494,7 @@ def serve_node_batches(groups, *, binding, prepare, max_bytes, timeout):
         return batch, time.perf_counter() - started
 
 
-def receive_node_batch(*, binding, owner_rank, max_bytes, timeout):
+def receive_node_batch(*, binding, owner_rank, max_bytes, timeout, peer_processes=None):
     identity = _binding(binding)
     if (
         type(owner_rank) is not int
@@ -414,6 +512,14 @@ def receive_node_batch(*, binding, owner_rank, max_bytes, timeout):
         raise RuntimeError("Node reference batches require Linux shared frames")
     deadline = time.monotonic() + timeout
     address = _node_address(identity, owner_rank)
+    # Keep the watcher open through connection establishment and frame receipt.
+    with _node_process_watch(peer_processes) as wait:
+        return _receive_node_batch(
+            identity, owner_rank, max_bytes, deadline, address, wait
+        )
+
+
+def _receive_node_batch(identity, owner_rank, max_bytes, deadline, address, wait):
     while True:
         remaining = _remaining_time(deadline)
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -423,6 +529,7 @@ def receive_node_batch(*, binding, owner_rank, max_bytes, timeout):
             break
         except (ConnectionRefusedError, FileNotFoundError):
             connection.close()
+            wait(None, deadline, {owner_rank})
             time.sleep(min(0.05, _remaining_time(deadline)))
         except BaseException:
             connection.close()
@@ -434,6 +541,7 @@ def receive_node_batch(*, binding, owner_rank, max_bytes, timeout):
             raise RuntimeError("Incomplete node reference request")
         started = time.perf_counter()
         connection.settimeout(_remaining_time(deadline))
+        wait(connection, deadline, {owner_rank})
         batch = receive_local_frame(
             connection, binding=identity, max_bytes=max_bytes, deadline=deadline
         )

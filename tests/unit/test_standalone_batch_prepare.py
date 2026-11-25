@@ -209,6 +209,33 @@ def test_node_owner_materializes_only_each_requested_rank():
         results.close()
 
 
+@pytest.mark.skipif(not hasattr(__import__("os"), "memfd_create"), reason="Linux local process watching")
+@pytest.mark.parametrize("role", ["owner", "peer"])
+def test_node_rendezvous_detects_process_exit_before_connection(role):
+    import subprocess
+    import sys
+    import time
+    import uuid
+    from verl_speco.trainer.reference_shared_frame import serve_node_batches, receive_node_batch
+
+    binding = {"run_id": "exit-test", "generation": 0, "batch_id": 0, "rank": 0,
+               "receipt_token": uuid.uuid4().hex}
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.2)"])
+    started = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="peer rank=1 exited"):
+            if role == "owner":
+                serve_node_batches({0: [0], 1: [1]}, binding=binding,
+                    prepare=lambda entries: ({"ids": torch.tensor(entries)}, 0),
+                    max_bytes=4096, timeout=30, peer_processes={1: (child.pid,)})
+            else:
+                receive_node_batch(binding=binding, owner_rank=1, max_bytes=4096,
+                                   timeout=30, peer_processes={1: (child.pid,)})
+        assert time.monotonic() - started < 5
+    finally:
+        child.wait(timeout=5)
+
+
 def _node_owner_test_worker(binding, results):
     from verl_speco.trainer.reference_shared_frame import serve_node_batches
     calls = []
@@ -1122,13 +1149,13 @@ def _node_window_four_rank_worker(rank, port, output):
         prepare.prepare_owned_anchor_window = lambda tag, contract, **kw: {"rank": tag["rank"], "anchor": kw["anchor"]}
         prepare.prepare_empty_owned_window = lambda tag, contract, **kw: {"rank": tag["rank"], "anchor": -1}
         sent = []
-        def serve(groups, *, binding, prepare, max_bytes, timeout):
+        def serve(groups, *, binding, prepare, max_bytes, timeout, peer_processes=None):
             peer = rank + 1
             sent.append(binding["receipt_token"])
             value, _ = prepare(groups[peer])
             dist.send_object_list([({**binding, "rank": peer}, value)], dst=peer)
             return prepare(groups[rank])
-        def receive(*, binding, owner_rank, max_bytes, timeout):
+        def receive(*, binding, owner_rank, max_bytes, timeout, peer_processes=None):
             value = [None]
             dist.recv_object_list(value, src=owner_rank)
             assert value[0][0] == binding

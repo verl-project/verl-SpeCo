@@ -972,6 +972,10 @@ class NativeFeatureTransport:
             chunk_bytes,
         )
         self._lock = threading.RLock()
+        self._read_condition = threading.Condition(self._lock)
+        self._engine_lock = threading.RLock()
+        self._active_reads = 0
+        self._finished_read_buffers: list[torch.Tensor] = []
         self._slots: dict[str, dict[str, Any]] = {}
         self._registered: dict[int, torch.Tensor] = {}
         self._closed = False
@@ -1084,9 +1088,11 @@ class NativeFeatureTransport:
         self._registered_bytes += allocation.untyped_storage().nbytes()
         _REGISTERED_OWNERS.add(self)
         try:
-            self._require_zero(
-                "register_memory", self._engine.register_memory(buffer.data_ptr(), size)
-            )
+            with self._engine_lock:
+                self._require_zero(
+                    "register_memory",
+                    self._engine.register_memory(buffer.data_ptr(), size),
+                )
         except BaseException:
             # An error may be ambiguous; never free a possibly registered range.
             self._failed = True
@@ -1096,9 +1102,10 @@ class NativeFeatureTransport:
     def _unregister(self, buffer):
         address = buffer.data_ptr()
         try:
-            self._require_zero(
-                "unregister_memory", self._engine.unregister_memory(address)
-            )
+            with self._engine_lock:
+                self._require_zero(
+                    "unregister_memory", self._engine.unregister_memory(address)
+                )
         except BaseException:
             self._failed = True
             raise
@@ -1331,33 +1338,51 @@ class NativeFeatureTransport:
 
     def read(self, descriptor, *, output_device=None):
         """Synchronously copy into independent tensors and verify the lease twice."""
-        with self._lock, self._device_scope():
-            self._require_open()
-            descriptor = self._validate(descriptor)
-            destination = (
-                self.device if output_device is None else torch.device(output_device)
-            )
-            if destination.type != "cpu" and destination != self.device:
-                raise ValueError(
-                    "Native transport output must use CPU or the local transport device"
-                )
+        with self._device_scope():
             started = time.monotonic()
-            buffer = self._borrow_buffer(descriptor["nbytes"])
+            with self._read_condition:
+                self._require_open()
+                descriptor = self._validate(descriptor)
+                destination = (
+                    self.device
+                    if output_device is None
+                    else torch.device(output_device)
+                )
+                if destination.type != "cpu" and destination != self.device:
+                    raise ValueError(
+                        "Native transport output must use CPU or the local transport device"
+                    )
+                while self._active_reads and (
+                    not self._idle_buffers
+                    if self._reusable_bytes
+                    else len(self._registered) >= self.max_slots
+                    or self._registered_bytes
+                    + native_buffer_allocation_bytes(
+                        _aligned(descriptor["nbytes"], _ALIGN)
+                    )
+                    > self.max_bytes
+                ):
+                    self._read_condition.wait()
+                    self._require_open()
+                buffer = self._borrow_buffer(descriptor["nbytes"])
+                self._active_reads += 1
             registered = time.monotonic()
             transfer_failed = False
             try:
                 for offset in range(0, descriptor["nbytes"], self.chunk_bytes):
                     count = min(self.chunk_bytes, descriptor["nbytes"] - offset)
                     try:
-                        self._require_zero(
-                            "transfer_sync_read",
-                            self._engine.transfer_sync_read(
-                                descriptor["segment"],
-                                buffer.data_ptr() + offset,
-                                descriptor["address"] + offset,
-                                count,
-                            ),
-                        )
+                        with self._engine_lock:
+                            self._require_open()
+                            self._require_zero(
+                                "transfer_sync_read",
+                                self._engine.transfer_sync_read(
+                                    descriptor["segment"],
+                                    buffer.data_ptr() + offset,
+                                    descriptor["address"] + offset,
+                                    count,
+                                ),
+                            )
                     except BaseException:
                         transfer_failed = self._failed = True
                         raise
@@ -1383,15 +1408,17 @@ class NativeFeatureTransport:
                 self._synchronize()
                 materialized = time.monotonic()
                 try:
-                    self._require_zero(
-                        "transfer_sync_read",
-                        self._engine.transfer_sync_read(
-                            descriptor["segment"],
-                            buffer.data_ptr(),
-                            descriptor["address"],
-                            64,
-                        ),
-                    )
+                    with self._engine_lock:
+                        self._require_open()
+                        self._require_zero(
+                            "transfer_sync_read",
+                            self._engine.transfer_sync_read(
+                                descriptor["segment"],
+                                buffer.data_ptr(),
+                                descriptor["address"],
+                                64,
+                            ),
+                        )
                 except BaseException:
                     transfer_failed = self._failed = True
                     raise
@@ -1400,9 +1427,25 @@ class NativeFeatureTransport:
                     raise RuntimeError("Native source lease changed during transfer")
                 verified = time.monotonic()
             finally:
-                self._synchronize()
-                if not transfer_failed and not self._failed:
-                    self._return_buffer(buffer)
+                try:
+                    self._synchronize()
+                finally:
+                    with self._read_condition:
+                        self._active_reads -= 1
+                        try:
+                            if not transfer_failed and not self._failed:
+                                if self._reusable_bytes:
+                                    self._return_buffer(buffer)
+                                else:
+                                    self._finished_read_buffers.append(buffer)
+                                    if not self._active_reads:
+                                        for (
+                                            finished_buffer
+                                        ) in self._finished_read_buffers:
+                                            self._unregister(finished_buffer)
+                                        self._finished_read_buffers.clear()
+                        finally:
+                            self._read_condition.notify_all()
             finished = time.monotonic()
             values = {
                 "reads_total": 1,
@@ -1572,9 +1615,9 @@ class NativeFeatureTransport:
                 raise RuntimeError(
                     "Cannot close a quarantined native transport without process fencing"
                 )
-            if self._slots:
+            if self._slots or self._active_reads:
                 raise RuntimeError(
-                    "Cannot close native transport with active source leases"
+                    "Cannot close native transport with active source leases or reads"
                 )
             self._synchronize()
             for buffer in list(self._registered.values()):

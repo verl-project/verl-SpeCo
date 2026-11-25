@@ -83,7 +83,9 @@ def _prepare_batch(entries):
     return batch, time.perf_counter() - started
 
 
-def _node_frame_batch(groups, *, binding, owner_rank, max_bytes, timeout):
+def _node_frame_batch(
+    groups, *, binding, owner_rank, max_bytes, timeout, peer_processes=None
+):
     from verl_speco.trainer.reference_shared_frame import (
         serve_node_batches,
         receive_node_batch,
@@ -102,9 +104,14 @@ def _node_frame_batch(groups, *, binding, owner_rank, max_bytes, timeout):
             prepare=_prepare_batch,
             max_bytes=max_bytes,
             timeout=timeout,
+            peer_processes=peer_processes,
         )
     batch, seconds = receive_node_batch(
-        binding=binding, owner_rank=owner_rank, max_bytes=max_bytes, timeout=timeout
+        binding=binding,
+        owner_rank=owner_rank,
+        max_bytes=max_bytes,
+        timeout=timeout,
+        peer_processes=peer_processes,
     )
     # The collector measures IPC from its own local worker's completion.
     batch["_speco_worker_finished_at"] = time.monotonic()
@@ -209,6 +216,25 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
         source = None
         try:
             source = self._open_source(self.loader.iter_assignments)
+            node_processes = {}
+            if self.node_ranks_per_host:
+                # Node-owner mode has exactly one CPU worker per training rank.
+                pids = [0] * (2 * self.loader.world_size)
+                pids[2 * self.loader.rank : 2 * self.loader.rank + 2] = [
+                    os.getpid(),
+                    self._pool._pool[0].pid,
+                ]
+                pids = self._sync(pids)
+                owner = (
+                    self.loader.rank
+                    // self.node_ranks_per_host
+                    * self.node_ranks_per_host
+                )
+                node_processes = {
+                    rank: tuple(pids[2 * rank : 2 * rank + 2])
+                    for rank in range(owner, owner + self.node_ranks_per_host)
+                    if rank != self.loader.rank
+                }
             while True:
                 with self._condition:
                     self._condition.wait_for(
@@ -245,6 +271,7 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
                                 "owner_rank": owner_rank,
                                 "max_bytes": self.node_frame_bytes,
                                 "timeout": self.close_timeout,
+                                "peer_processes": node_processes,
                             },
                         )
                     else:

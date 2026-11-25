@@ -717,6 +717,42 @@ def test_native_slow_reader_keeps_source_lease_until_completion():
     assert not registered
 
 
+@pytest.mark.parametrize("reuse", [False, True])
+def test_native_reads_overlap_checksum_and_keep_inflight_buffers(monkeypatch, reuse):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Event
+    from standalone_test_utils import NativeCopyTestEngine
+    from verl_speco.transport import native_feature_transport as native
+
+    options = dict(run_id="run", generation=1, endpoint="source", metadata_server="metadata",
+                   device="cpu", max_bytes=8 * 1024**2, max_slots=2, chunk_bytes=2 * 1024**2,
+                   reusable_buffer_bytes=2 * 1024**2 if reuse else 0, engine_factory=NativeCopyTestEngine)
+    source, reader = native.NativeFeatureTransport(**options), native.NativeFeatureTransport(**options)
+    descriptor = source.publish({"ids": torch.arange(8)}, lease_id="sample")
+    entered, release = Barrier(3), Event()
+    original = native._content_hash
+    def checksum(data):
+        entered.wait(timeout=5)
+        assert release.wait(timeout=5)
+        return original(data)
+    monkeypatch.setattr(native, "_content_hash", checksum)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        reads = [workers.submit(reader.read, descriptor) for _ in range(2)]
+        try:
+            entered.wait(timeout=5)
+            assert reader._active_reads == 2 and len(reader._registered) == 2
+            with pytest.raises(RuntimeError, match="active source leases or reads"):
+                reader.close()
+        finally:
+            release.set()
+        assert all(torch.equal(result.result(timeout=5)["ids"], torch.arange(8)) for result in reads)
+    assert reader._active_reads == 0
+    assert len(reader._registered) == (2 if reuse else 0)
+    source.discard_unbound(descriptor)
+    source.close()
+    reader.close()
+
+
 def test_native_read_snapshots_descriptor_before_native_transfer():
     import ctypes
     from copy import deepcopy
