@@ -325,10 +325,10 @@ class SpecoNativeHiddenStatesConnector(SpecoMooncakeHiddenStatesConnector):
                     "max_bytes": int(os.environ["SPECO_NATIVE_SOURCE_MAX_BYTES"]),
                     "max_slots": int(os.environ["SPECO_NATIVE_SOURCE_MAX_SLOTS"]),
                     "chunk_bytes": int(os.environ["SPECO_NATIVE_CHUNK_BYTES"]),
-                    "reusable_buffer_bytes": int(
-                        os.environ.get("SPECO_NATIVE_REUSE_BUFFER_BYTES", "0")
-                    ),
                 }
+                reusable_buffer_bytes = int(
+                    os.environ.get("SPECO_NATIVE_REUSE_BUFFER_BYTES", "0")
+                )
                 requests, responses = Queue(maxsize=1), Queue(maxsize=1)
                 # The control thread polls with a short deadline. Cold actor startup
                 # belongs to initialization, before the first lease RPC can be issued.
@@ -346,6 +346,7 @@ class SpecoNativeHiddenStatesConnector(SpecoMooncakeHiddenStatesConnector):
                     generation=generation,
                     endpoint=endpoint,
                     device=self._kv_cache.device,
+                    reusable_buffer_bytes=reusable_buffer_bytes,
                     **source_settings,
                 )
                 options = {
@@ -365,7 +366,13 @@ class SpecoNativeHiddenStatesConnector(SpecoMooncakeHiddenStatesConnector):
                 self._native_control_timeout = timeout
                 ray.get(
                     directory.register_source.remote(
-                        source.endpoint, uuid.uuid4().hex, options, source_settings
+                        source.endpoint,
+                        uuid.uuid4().hex,
+                        options,
+                        {
+                            **source_settings,
+                            "reusable_buffer_bytes": reusable_buffer_bytes,
+                        },
                     ),
                     timeout=timeout,
                 )

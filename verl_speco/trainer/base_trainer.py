@@ -636,6 +636,7 @@ class DrafterBaseTrainer:
     _standalone_checkpoint_timeout: float
     _standalone_checkpoint_directory_lease: "StandaloneCheckpointDirectoryLease"
     _standalone_input_identity: dict[str, Any] | None
+    _standalone_input_fingerprint_provider: Callable[[], dict[str, Any]]
 
     def __init__(
         self,

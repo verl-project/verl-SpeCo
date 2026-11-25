@@ -563,8 +563,8 @@ def save_standalone_resume(
         else:
             torch.save(values, temporary)
         encoded_sha = _file_sha256(temporary)
-        with temporary.open("rb+") as stream:
-            os.fsync(stream.fileno())
+        with temporary.open("rb+") as data_stream:
+            os.fsync(data_stream.fileno())
         os.replace(temporary, data_path)
     finally:
         temporary.unlink(missing_ok=True)

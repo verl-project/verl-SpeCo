@@ -653,7 +653,7 @@ def test_checkpoint_retention_never_follows_symlinks(tmp_path):
 def test_ray_reference_checkpoint_preserves_upstream_shuffle_resume_settings(tmp_path):
     """Both checkpoint call sites must retain main's shuffle metadata for ray_reference."""
     import ast
-    from typing import Any
+    from typing import Any, Callable
 
     import torch
 
@@ -664,7 +664,7 @@ def test_ray_reference_checkpoint_preserves_upstream_shuffle_resume_settings(tmp
     selected = [node for node in tree.body if isinstance(node, ast.FunctionDef)
                 and node.name in {"_standalone_producer_shuffle", "_save_resume_sidecar"}]
     from verl_speco.trainer.standalone_resume import producer_data_recipe
-    namespace = {"Any": Any, "torch": torch, "save_standalone_resume": save_standalone_resume,
+    namespace = {"Any": Any, "Callable": Callable, "torch": torch, "save_standalone_resume": save_standalone_resume,
                  "producer_data_recipe": producer_data_recipe}
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(source), "exec"), namespace)
     settings = namespace["_standalone_producer_shuffle"]({

@@ -33,7 +33,7 @@ from dataclasses import replace
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import torch
 import torch.distributed as dist
@@ -2999,7 +2999,7 @@ def _save_resume_sidecar(
     training_plan: dict[str, Any] | None = None,
     storage_format: str = "tensor",
     expected_input_identity: dict[str, Any] | None = None,
-    input_fingerprint_provider=None,
+    input_fingerprint_provider: Callable[[], dict[str, Any]] | None = None,
     lease_snapshot_sha256: str | None = None,
 ) -> None:
     if consumed_snapshot is None or step is None or input_path is None:
@@ -3017,16 +3017,8 @@ def _save_resume_sidecar(
         training_plan=training_plan,
         storage_format=storage_format,
         expected_input_identity=expected_input_identity,
-        **(
-            {"input_fingerprint_provider": input_fingerprint_provider}
-            if input_fingerprint_provider is not None
-            else {}
-        ),
-        **(
-            {"lease_snapshot_sha256": lease_snapshot_sha256}
-            if lease_snapshot_sha256 is not None
-            else {}
-        ),
+        input_fingerprint_provider=input_fingerprint_provider,
+        lease_snapshot_sha256=lease_snapshot_sha256,
     )
 
 

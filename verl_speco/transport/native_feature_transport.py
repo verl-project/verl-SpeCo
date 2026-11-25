@@ -22,6 +22,7 @@ from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from queue import Empty, Full
+from typing import Any
 
 import torch
 
@@ -946,12 +947,10 @@ class NativeFeatureTransport:
             max_slots,
             chunk_bytes,
         )
-        self._lock, self._slots, self._registered, self._closed = (
-            threading.RLock(),
-            {},
-            {},
-            False,
-        )
+        self._lock = threading.RLock()
+        self._slots: dict[str, dict[str, Any]] = {}
+        self._registered: dict[int, torch.Tensor] = {}
+        self._closed = False
         self._registered_bytes = 0
         # CANN can disconnect peers while deregistering a range. A bounded,
         # fixed-size cache avoids that disconnect in the transfer hot path.
@@ -967,10 +966,12 @@ class NativeFeatureTransport:
             if not pool_slots:
                 raise ValueError("Native reusable buffer does not fit the byte budget")
         self._idle_buffers: list[torch.Tensor] = []
-        self._completed = OrderedDict()
+        self._completed: OrderedDict[
+            str, tuple[str, frozenset[int], tuple[int, str] | None]
+        ] = OrderedDict()
         self._completed_readers = 0
         self._failed, self._sealed = False, False
-        self._read_metrics = {}
+        self._read_metrics: dict[str, float] = {}
         self._metrics_lock = threading.Lock()
         self._engine = engine_factory()
         self._require_zero(
