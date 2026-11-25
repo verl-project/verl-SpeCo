@@ -433,7 +433,8 @@ def _iter_payloads(
 
 
 def _is_json_array(input_path: Path) -> bool:
-    if input_path.suffix.lower() == ".jsonl":
+    # Preserve legacy line-by-line parsing unless array format is opted into.
+    if input_path.suffix.lower() != ".json":
         return False
     with input_path.open("rb") as input_file:
         token = input_file.read(1)

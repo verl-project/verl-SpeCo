@@ -13,12 +13,14 @@
 # limitations under the License.
 """Server-side differential render boundaries and the Producer wiring.
 
-Pure logic plus an injectable vLLM ``/render`` client. No network in tests.
+Pure logic plus an injectable vLLM ``/render`` client. The live-server check
+requires SPECO_TEST_VLLM_RENDER_ENDPOINT; other tests do not use the network.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from io import BytesIO
 
 import pytest
@@ -74,14 +76,19 @@ def test_render_conversation_client_returns_token_ids(monkeypatch) -> None:
     assert captured["url"].endswith("/v1/chat/completions/render")
     assert captured["body"]["add_generation_prompt"] is True
     assert captured["body"]["tools"] == [{"type": "function"}]
-    assert captured["body"]["tool_choice"] == "none"
+    assert "tool_choice" in captured["body"]
+    assert captured["body"]["tool_choice"] is None
     assert captured["body"]["truncate_prompt_tokens"] == 16
     assert captured["body"]["truncation_side"] == "right"
 
 
 @pytest.mark.parametrize("add_generation_prompt", [True, False])
-@pytest.mark.parametrize("tools", [None, [{"type": "function", "function": {"name": "lookup"}}]])
-def test_render_conversation_serialized_tool_choice(monkeypatch, add_generation_prompt, tools):
+@pytest.mark.parametrize(
+    "tools", [None, [{"type": "function", "function": {"name": "lookup"}}]]
+)
+def test_render_conversation_serialized_tool_choice(
+    monkeypatch, add_generation_prompt, tools
+):
     def fake_urlopen(request, timeout):
         body = json.loads(request.data)
         assert body["add_generation_prompt"] is add_generation_prompt
@@ -90,7 +97,8 @@ def test_render_conversation_serialized_tool_choice(monkeypatch, add_generation_
             assert "tool_choice" not in body
         else:
             assert body["tools"] == tools
-            assert body["tool_choice"] == "none"
+            assert "tool_choice" in body  # Omission would default to "auto".
+            assert body["tool_choice"] is None
         return BytesIO(b'{"token_ids": [1, 2, 3]}')
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
@@ -167,6 +175,65 @@ def test_producer_uses_render_boundary_for_loss_mask() -> None:
     assert request.loss_mask.tolist() == [0, 0, 0, 0, 1, 1]
 
 
+def test_live_vllm_render_preserves_tool_schema_and_boundary() -> None:
+    """Run against servers without auto tools, with exclusion both off and on."""
+    endpoint = os.environ.get("SPECO_TEST_VLLM_RENDER_ENDPOINT")
+    if not endpoint:
+        pytest.skip("Set SPECO_TEST_VLLM_RENDER_ENDPOINT to test a running vLLM server")
+
+    from verl_speco.data.render_boundary import _post_json, _render_url
+
+    marker = "speco_schema_marker_7d3261"
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "speco_lookup",
+                "description": marker,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    renders = []
+
+    def render(messages, *, add_generation_prompt, tools=None, max_length=None):
+        ids = render_conversation(
+            endpoint,
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+        )
+        base = _render_url(endpoint).rsplit("/v1/", 1)[0]
+        text = _post_json(f"{base}/detokenize", {"tokens": ids}, 10)["prompt"]
+        assert marker in text
+        assert "speco_lookup" in text
+        renders.append((add_generation_prompt, ids))
+        return ids
+
+    record = InputRecord(
+        sequence_no=0,
+        sample_id="tools",
+        prompt=({"role": "user", "content": "Say done."},),
+        response="done",
+        source_metadata={},
+        tools=tools,
+    )
+    request = tokenize_record_with_render_boundary(
+        record,
+        object(),
+        {"max_feature_length": 0, "max_sequence_length": 0},
+        render,
+    )
+    assert [entry[0] for entry in renders[:2]] == [True, False]
+    history_ids = renders[2][1] if len(renders) == 3 else None
+    boundary = boundary_from_renders(renders[0][1], renders[1][1], history_ids)
+    assert request.input_ids.tolist() == renders[1][1]
+    assert 0 < boundary < len(request.input_ids)
+    assert request.loss_mask.tolist() == [0] * boundary + [1] * (
+        len(request.input_ids) - boundary
+    )
+
+
 def test_producer_render_boundary_renders_history_only_when_needed() -> None:
     record = InputRecord(
         sequence_no=0,
@@ -190,7 +257,9 @@ def test_producer_render_boundary_renders_history_only_when_needed() -> None:
 
     fallback_calls: list[int] = []
 
-    def fallback_render(messages, *, add_generation_prompt, tools=None, max_length=None):
+    def fallback_render(
+        messages, *, add_generation_prompt, tools=None, max_length=None
+    ):
         fallback_calls.append(len(messages))
         if add_generation_prompt:
             return [1, 7, 8, 2]
