@@ -147,6 +147,8 @@ def test_native_launcher_builds_bounded_reader_and_scheduler_settings():
     assert list(training.target_feature_replay.hidden_states_store.native.endpoints) == ["10.0.0.2:1234"]
     assert training.target_feature_replay.hidden_states_store.native.reusable_buffer_bytes == 2 * 1024**2
     assert commands.native_settings["run_id"] == config.run_id
+    assert commands.native_settings["source_max_slots"] == 4
+    assert commands.native_settings["source_max_bytes"] == 4 * (4 * 1024**2 - 1)
     transfer = json.loads(commands.vllm[commands.vllm.index("--kv-transfer-config") + 1])
     assert transfer["kv_connector"] == "SpecoNativeHiddenStatesConnector"
 

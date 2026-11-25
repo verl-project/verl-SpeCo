@@ -438,6 +438,12 @@ class Source:
         options = self.connector._native_control_options
         options["response_queue"].put(
             {"channel_id": options["channel_id"], "request_id": "0" * 32, "ok": True}, timeout=5)
+    def validate_concurrent_clients(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from verl_speco.transport.native_feature_transport import NativeSourceControlClient
+        clients = [NativeSourceControlClient(**self.connector._native_control_options) for _ in range(2)]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda client: client.validate_published(self.descriptor_value()), clients))
     def publish_extra(self): self._publish("filtered")
     def active(self): return len(self.connector._native_source._slots)
     def close(self):
@@ -475,6 +481,7 @@ try:
     source = Source.remote(directory_name)
     descriptor = ray.get(source.descriptor_value.remote(), timeout=20)
     ray.get(source.queue_stale_reply.remote(), timeout=10)
+    ray.get(source.validate_concurrent_clients.remote(), timeout=30)
     assert ray.get(directory.status.remote(1), timeout=10)["active_sample"][0]["handle"] == "sample"
     handle = NativeProducerReferenceStore(NativeSourceDirectoryRouter(directory, timeout=10)).resolve_reference("sample")
     assert json.loads(handle) == descriptor
@@ -1345,13 +1352,20 @@ def test_producer_restart_rechecks_credits_after_fingerprinting(tmp_path, monkey
     asyncio.run(run())
 
 
-def test_producer_start_and_stop_serialize_input_fingerprinting(tmp_path, monkeypatch):
+@pytest.mark.parametrize("resume", [False, True])
+def test_producer_start_and_stop_serialize_input_fingerprinting(tmp_path, monkeypatch, resume):
     from threading import Event
     import verl_speco.standalone_ray_runtime as runtime
     source = tmp_path / "input.jsonl"
     source.write_bytes(b"row\n")
+    from verl_speco.trainer.standalone_resume import save_standalone_resume, load_standalone_resume
+    checkpoint = tmp_path / "consumer-checkpoint"
+    save_standalone_resume(checkpoint, [0], optimizer_step=1, input_path=source)
+    state = load_standalone_resume(checkpoint)
     config = _runtime_config()
     config.speco.standalone_tq_producer.input_path = str(source)
+    if resume:
+        config.speco.standalone_tq_producer.resume_checkpoint_path = str(tmp_path / "unmounted-checkpoint")
     config.actor_rollout_ref.rollout.drafter.training.feature_store = SimpleNamespace(type="ray_reference")
     started, release = Event(), Event()
     original = runtime.build_input_fingerprint
@@ -1365,13 +1379,14 @@ def test_producer_start_and_stop_serialize_input_fingerprinting(tmp_path, monkey
         await asyncio.Event().wait()
     actor._run_producer = producer
     async def run():
-        start_task = asyncio.create_task(actor.start())
+        start_task = asyncio.create_task(actor.start(state) if resume else actor.start())
         assert await asyncio.to_thread(started.wait, 5)
         stop_task = asyncio.create_task(actor.stop())
         await asyncio.sleep(0)
         assert not stop_task.done()
         release.set()
         started_result = await start_task
+        assert actor._resume_state == (state if resume else None)
         assert started_result["input_identity"]["kind"] == "file"
         assert await stop_task == {"stopped": True}
     try:

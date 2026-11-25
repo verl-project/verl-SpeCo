@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
 from os import getenv
@@ -229,6 +230,9 @@ class NativeSourceControlService:
             except BaseException as exc:
                 self._fail(exc)
                 return
+            responses = None
+            if isinstance(request, tuple) and len(request) == 2:
+                request, responses = request
             try:
                 request = _control_message(request)
                 method, arguments = request.get("method"), request.get("arguments")
@@ -273,32 +277,39 @@ class NativeSourceControlService:
                                 "request_id": request["request_id"],
                                 "ok": False,
                             },
+                            responses,
                         )
                     except BaseException:
                         pass
                 return  # Do not accept another command after an ambiguous failure.
             try:
-                self._reply(response)
+                self._reply(response, responses)
             except BaseException as exc:
+                if responses is not None:
+                    # A timed-out client can destroy its private reply actor.
+                    # The operation already completed; retain its lease outcome.
+                    logging.getLogger(__name__).warning(
+                        "Native client reply channel closed: %r", exc
+                    )
+                    continue
                 self._fail(exc)
                 return
 
-    def _reply(self, response):
+    def _reply(self, response, responses=None):
+        responses = self.responses if responses is None else responses
         try:
             _control_queue(
-                self.responses, "put", response, timeout=0, rpc_timeout=self.timeout
+                responses, "put", response, timeout=0, rpc_timeout=self.timeout
             )
         except Full:
             # A bounded channel may still hold the acknowledgement of a
             # timed-out request. Keep the newest response available.
             try:
-                _control_queue(
-                    self.responses, "get", timeout=0, rpc_timeout=self.timeout
-                )
+                _control_queue(responses, "get", timeout=0, rpc_timeout=self.timeout)
             except Empty:
                 pass  # A waiting client already removed the stale reply.
             _control_queue(
-                self.responses, "put", response, timeout=0, rpc_timeout=self.timeout
+                responses, "put", response, timeout=0, rpc_timeout=self.timeout
             )
 
     def close(self):
@@ -357,6 +368,7 @@ class NativeSourceControlClient(_NativeControlOperations):
             float(timeout),
         )
         self._lock, self._failed = threading.Lock(), False
+        self._private_responses: Any = None
 
     def _call(self, method, descriptor, **arguments):
         with self._lock:
@@ -374,14 +386,26 @@ class NativeSourceControlClient(_NativeControlOperations):
             )
             deadline = time.monotonic() + self.timeout
             try:
-                _control_queue(self.requests, "put", request, timeout=self.timeout)
+                responses = self.responses
+                if getattr(self.requests, "actor", None) is not None:
+                    from ray.util.queue import Queue
+
+                    if self._private_responses is None:
+                        self._private_responses = Queue(maxsize=1)
+                    responses = self._private_responses
+                envelope = (
+                    (request, responses)
+                    if self._private_responses is not None
+                    else request
+                )
+                _control_queue(self.requests, "put", envelope, timeout=self.timeout)
                 while True:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("Native source control deadline exceeded")
                     try:
                         response = _control_message(
-                            _control_queue(self.responses, "get", timeout=remaining)
+                            _control_queue(responses, "get", timeout=remaining)
                         )
                     except Empty as exc:
                         raise TimeoutError(

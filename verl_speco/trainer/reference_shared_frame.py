@@ -371,6 +371,7 @@ def serve_node_batches(groups, *, binding, prepare, max_bytes, timeout):
                         continue
                     batch, _ = prepare(groups[rank])
                     _remaining_time(deadline)
+                    batch.pop("_speco_worker_finished_at", None)
                     payload, descriptor = encode_local_frame(
                         batch, binding=requested, max_bytes=max_bytes
                     )

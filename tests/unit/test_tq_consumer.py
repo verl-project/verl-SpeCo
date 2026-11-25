@@ -430,6 +430,9 @@ def test_native_source_control_routes_and_timeout():
     with pytest.raises(ValueError, match="no configured"):
         router.validate_published({"segment": "other"})
     for descriptor in descriptors:
+        routes[descriptor["segment"]]["response_queue"].put(
+            {"channel_id": routes[descriptor["segment"]]["channel_id"],
+             "request_id": "f" * 32, "ok": True})
         router.validate_published(descriptor)
         router.bind_readers(descriptor, readers=[0], plan_id=0, receipt_token="receipt")
         router.acknowledge(descriptor, reader=0, plan_id=0, receipt_token="receipt")

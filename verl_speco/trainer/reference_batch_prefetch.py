@@ -106,6 +106,8 @@ def _node_frame_batch(groups, *, binding, owner_rank, max_bytes, timeout):
     batch, seconds = receive_node_batch(
         binding=binding, owner_rank=owner_rank, max_bytes=max_bytes, timeout=timeout
     )
+    # The collector measures IPC from its own local worker's completion.
+    batch["_speco_worker_finished_at"] = time.monotonic()
     if _MAX_BATCH_HOST_BYTES and _prepared_host_bytes(batch) > _MAX_BATCH_HOST_BYTES:
         raise ValueError(
             "Received node reference batch exceeds consumer_prefetch_batch_bytes"

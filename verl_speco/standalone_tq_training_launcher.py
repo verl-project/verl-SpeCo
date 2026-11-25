@@ -1227,7 +1227,19 @@ def _native_launch_settings(
     if len(directory) > 256 or not config.run_id or len(config.run_id) > 256:
         raise ValueError("Invalid native directory name or run identity")
     align = 2 * 1024**2
-    source_slots = integer("SPECO_NATIVE_SOURCE_MAX_SLOTS", max(batch, 16), batch, 4096)
+    execution_override = _find_override(
+        training_args,
+        f"{_PRODUCER_PREFIX}.max_reference_execution_slots",
+        normalize_key=True,
+    )
+    execution_slots = (
+        int(_strip_quotes(execution_override))
+        if execution_override is not None
+        else batch
+    )
+    source_slots = integer(
+        "SPECO_NATIVE_SOURCE_MAX_SLOTS", max(batch, execution_slots), batch, 4096
+    )
     reader_bytes = integer(
         "SPECO_NATIVE_READER_MAX_BYTES", 2 * 1024**3, 2 * align - 1, 2**63 - 1
     )
@@ -1245,6 +1257,12 @@ def _native_launch_settings(
         )
 
         slot_bytes = native_buffer_allocation_bytes(reusable_buffer_bytes)
+        if not _env(env, "SPECO_NATIVE_SOURCE_MAX_BYTES"):
+            source_bytes = source_slots * slot_bytes
+        if source_slots * slot_bytes > source_bytes:
+            raise ValueError(
+                "SPECO_NATIVE_SOURCE_MAX_BYTES must cover every pre-registered source slot"
+            )
         if reader_bytes < slot_bytes:
             raise ValueError(
                 "SPECO_NATIVE_READER_MAX_BYTES must cover the reusable buffer and alignment"

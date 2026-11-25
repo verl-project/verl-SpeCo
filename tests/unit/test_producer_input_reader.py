@@ -47,6 +47,18 @@ def test_source_route_waves_keep_resume_routes_and_bind_endpoint_order():
     with pytest.raises(ValueError, match="token limits"):
         list(iter_source_route_waves(oversized(), **settings))
 
+    # Total tokens fit, but three four-token requests cannot fit two six-token sources.
+    split_requests = [input_reader.GenerationRequest(i, str(i), (1, 2, 3, 4), 0, {}) for i in range(3)]
+    split_settings = dict(settings, max_tokens=6)
+    routed = list(iter_source_route_waves(split_requests, **split_settings))
+    assert [item.sequence_no for item in routed] == [0, 1, 2]
+    assert len({item.source_plan_sha256 for item in routed}) == 2
+    assert list(iter_source_route_waves(split_requests, consumed=[0], **split_settings)) == routed[1:]
+    for digest in {item.source_plan_sha256 for item in routed}:
+        for route in range(2):
+            assigned = [item for item in routed if item.source_plan_sha256 == digest and item.source_route == route]
+            assert sum(len(item.prompt_token_ids) for item in assigned) <= 6
+
 
 def test_source_route_plan_preserves_order_and_enforces_wave_capacity():
     from verl_speco.producer.source_routing import plan_source_routes

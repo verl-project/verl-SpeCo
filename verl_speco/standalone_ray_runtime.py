@@ -68,6 +68,7 @@ from verl_speco.trainer.standalone_resume import (
     input_content_identity,
     load_standalone_resume,
     validate_input_identity,
+    validate_resume_input_fingerprint,
 )
 
 from verl_speco.transport.reference_dispatch import (
@@ -346,6 +347,7 @@ class StandaloneProducerActor:
         self._stopping = False
         self._start_lock = asyncio.Lock()
         self._input_identity: dict[str, Any] | None = None
+        self._resume_state: tuple[set[int], dict[str, Any]] | None = None
         self._run_gate = asyncio.Event()
         self._run_gate.set()
         self._events = events
@@ -1508,6 +1510,8 @@ class StandaloneProducerActor:
             }
             if self._input_identity is not None:
                 file_options["expected_input_identity"] = self._input_identity
+            if self._resume_state is not None:
+                file_options["resume_state"] = self._resume_state
             if self._slot_tracking:
                 file_options["acquire_reference_slot"] = self._acquire_reference_slot
                 file_options["release_unpublished_slot"] = (
@@ -1573,7 +1577,7 @@ class StandaloneProducerActor:
             )
         return result
 
-    async def start(self) -> dict[str, Any]:
+    async def start(self, resume_state=None) -> dict[str, Any]:
         async with self._start_lock:
             if self._reference_aborted:
                 raise RuntimeError("Cannot restart an aborted Producer actor")
@@ -1619,7 +1623,16 @@ class StandaloneProducerActor:
                 resume_checkpoint = _config_member(
                     producer_cfg, "resume_checkpoint_path", None
                 )
-                if resume_checkpoint:
+                if resume_state is not None:
+                    consumed, metadata = resume_state
+                    if not isinstance(consumed, set) or not isinstance(metadata, dict):
+                        raise ValueError("Invalid Producer resume state")
+                    if len(consumed) != metadata.get("consumed_count") or any(
+                        type(value) is not int or value < 0 for value in consumed
+                    ):
+                        raise ValueError("Invalid Producer resume progress")
+                    validate_resume_input_fingerprint(metadata, fingerprint)
+                elif resume_checkpoint:
                     await asyncio.to_thread(
                         load_standalone_resume,
                         resume_checkpoint,
@@ -1640,6 +1653,7 @@ class StandaloneProducerActor:
                         "Cannot restart producer with outstanding reference credits"
                     )
                 self._input_identity = input_identity
+                self._resume_state = resume_state
                 self._released_reference_plans.clear()
                 self._discarded_reference_batches.clear()
                 self._rank_ack_counts.clear()
@@ -2904,7 +2918,24 @@ class StandaloneRayTrainer:
                 )
             producer_start_attempted = True
             try:
-                started = self.ray.get(producer.start.remote(), timeout=start_timeout)
+                # The Driver shares the Consumer checkpoint view. Send verified
+                # progress to the Producer, whose dataset can live on another host.
+                checkpoint_path = _config_member(
+                    self.consumer_config.actor_rollout_ref.rollout.drafter,
+                    "model_path",
+                    None,
+                )
+                resume_state = (
+                    load_standalone_resume(checkpoint_path)
+                    if checkpoint_path and hidden_references
+                    else (set(), None)
+                )
+                start_ref = (
+                    producer.start.remote(resume_state)
+                    if resume_state[1] is not None
+                    else producer.start.remote()
+                )
+                started = self.ray.get(start_ref, timeout=start_timeout)
             except TimeoutError as error:
                 raise TimeoutError(
                     "Standalone Producer start timed out; shutdown will be attempted"

@@ -930,6 +930,7 @@ async def run_producer(
     on_metrics: Any | None = None,
     get_runtime_state: Any | None = None,
     is_graceful_stop: Any | None = None,
+    resume_state: tuple[set[int], dict[str, Any]] | None = None,
 ) -> ProducerStats:
     """Publish references from online vLLM or a persistent raw-hidden dataset."""
 
@@ -1059,9 +1060,13 @@ async def run_producer(
             )
             logger.info("Standalone Producer observed owner_ready run_id=%s", run_id)
 
-        consumed_sequence_nos, resume_metadata = load_standalone_resume(
-            producer_cfg.get("resume_checkpoint_path"),
-            input_path=str(producer_cfg["input_path"]),
+        consumed_sequence_nos, resume_metadata = (
+            resume_state
+            if resume_state is not None
+            else load_standalone_resume(
+                producer_cfg.get("resume_checkpoint_path"),
+                input_path=str(producer_cfg["input_path"]),
+            )
         )
         _assert_resume_shuffle_alignment(
             resume_metadata,

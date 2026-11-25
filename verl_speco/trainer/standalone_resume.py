@@ -734,19 +734,31 @@ def load_standalone_resume(
             if input_path is not None
             else dict(input_fingerprint or {})
         )
-        if not include_content_hash:
-            current_fingerprint.pop("sha256", None)
-        differs = (
-            input_content_identity(current_fingerprint) != saved_identity
-            if saved_identity is not None
-            else saved_fingerprint != current_fingerprint
-        )
-        if differs:
-            raise ValueError(
-                "Standalone resume input file changed since the checkpoint was saved: "
-                f"saved={saved_fingerprint!r}, current={current_fingerprint!r}"
-            )
+        validate_resume_input_fingerprint(metadata, current_fingerprint)
     return consumed, metadata
+
+
+def validate_resume_input_fingerprint(metadata, fingerprint):
+    """Validate a remotely supplied input against already verified resume metadata."""
+    saved = metadata.get("input_fingerprint")
+    identity = metadata.get("input_content_identity")
+    current = dict(fingerprint)
+    if identity is not None:
+        identity = validate_input_identity(identity)
+        if input_content_identity(saved) != identity:
+            raise ValueError(
+                "Standalone saved input identity conflicts with its fingerprint"
+            )
+        differs = input_content_identity(current) != identity
+    else:
+        if isinstance(saved, dict) and "sha256" not in saved:
+            current.pop("sha256", None)
+        differs = saved != current
+    if differs:
+        raise ValueError(
+            "Standalone resume input file changed since the checkpoint was saved: "
+            f"saved={saved!r}, current={current!r}"
+        )
 
 
 __all__ = [
