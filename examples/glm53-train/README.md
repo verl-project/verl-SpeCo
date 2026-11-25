@@ -157,6 +157,12 @@ Additional final layer: 78
 
 These values follow the current service configuration. Recheck the final layer index for a different model configuration. The wrapper does not override the mask token ID or FFN width. For a newly initialized drafter, the code defaults to target `vocab_size - 1` as the mask ID and target `intermediate_size` as the FFN width, falling back to `hidden_size * 4` if absent. This does not identify a mask token from the tokenizer, and the target FFN width may not suit a small drafter.
 
+### MLA draft backbone
+
+GLM-5.3 uses DeepSeek-style dense MLA, so the wrapper sets `DSPARK_DRAFT_ATTN=mla`. The drafter then replaces the Qwen3-style GQA projections with latent Q/KV projections (`q_a_proj`/`q_b_proj`, `kv_a_proj_with_mqa`/`kv_b_proj`), applies interleaved rotary to the rope channels only, and follows the target's `rope_parameters` (including YaRN attention scaling). The MLA topology (`q_lora_rank`, `kv_lora_rank`, `qk_nope_head_dim`, `qk_rope_head_dim`, `v_head_dim`, `rope_interleave`) is derived from the target config; missing fields fail fast.
+
+Because the draft inherits the target FFN width, GLM-5.3 produces a larger drafter than the Qwen3 example. Override `DSPARK_INTERMEDIATE_SIZE` in the wrapper if memory is tight. The exported checkpoint is written with `model_type=glm5_dspark` and `architectures=["DSparkDraftModel"]`, matching the GLM-5 MLA draft serving contract. MLA does not support sliding-window attention.
+
 Run:
 
 ```bash

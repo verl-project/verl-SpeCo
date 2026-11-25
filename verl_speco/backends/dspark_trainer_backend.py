@@ -37,6 +37,7 @@ from verl_speco.backends.lk_loss import (
 )
 from verl_speco.backends.target_hidden import gather_aligned_target_hidden
 from verl_speco.models.dflash import resolve_rope_theta
+from verl_speco.models.dflash.configuration_dflash import DEFAULT_ROPE_THETA
 from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
 from verl_speco.ops.dspark_fused_loss import (
     fused_label_cross_entropy,
@@ -1597,6 +1598,64 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             )
         return drafter_config
 
+    @staticmethod
+    def _mla_kwargs_from_target(target_text_config) -> dict[str, Any]:
+        """Derive GLM-5/DeepSeek MLA topology from the verifier config."""
+        q_lora_rank = getattr(target_text_config, "q_lora_rank", None)
+        kv_lora_rank = getattr(target_text_config, "kv_lora_rank", None)
+        qk_nope_head_dim = getattr(target_text_config, "qk_nope_head_dim", None)
+        qk_rope_head_dim = getattr(target_text_config, "qk_rope_head_dim", None)
+        qk_head_dim = getattr(target_text_config, "qk_head_dim", None)
+        v_head_dim = getattr(target_text_config, "v_head_dim", None)
+        if (
+            qk_rope_head_dim is None
+            and qk_head_dim is not None
+            and qk_nope_head_dim is not None
+        ):
+            qk_rope_head_dim = int(qk_head_dim) - int(qk_nope_head_dim)
+        required = {
+            "kv_lora_rank": kv_lora_rank,
+            "qk_nope_head_dim": qk_nope_head_dim,
+            "qk_rope_head_dim": qk_rope_head_dim,
+            "v_head_dim": v_head_dim,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise ValueError(
+                "dspark_draft_attn='mla' requires the target config to define "
+                + ", ".join(missing)
+                + "; the configured target does not look like a GLM-5/DeepSeek "
+                "MLA model"
+            )
+        rope_parameters = getattr(target_text_config, "rope_parameters", None)
+        if rope_parameters is None:
+            rope_scaling = getattr(target_text_config, "rope_scaling", None)
+            if isinstance(rope_scaling, dict):
+                rope_parameters = dict(rope_scaling)
+                rope_parameters.setdefault(
+                    "rope_type", rope_parameters.pop("type", "default")
+                )
+        rope_parameters = (
+            dict(rope_parameters) if isinstance(rope_parameters, dict) else None
+        )
+        rope_theta = rope_parameters.get("rope_theta") if rope_parameters else None
+        if rope_theta is None:
+            rope_theta = getattr(target_text_config, "rope_theta", None)
+        return {
+            "q_lora_rank": (int(q_lora_rank) if q_lora_rank not in (None, 0) else None),
+            "kv_lora_rank": int(kv_lora_rank),
+            "qk_nope_head_dim": int(qk_nope_head_dim),
+            "qk_rope_head_dim": int(qk_rope_head_dim),
+            "v_head_dim": int(v_head_dim),
+            "rope_interleave": bool(
+                getattr(target_text_config, "rope_interleave", True)
+            ),
+            "_rope_theta": (
+                float(rope_theta) if rope_theta is not None else DEFAULT_ROPE_THETA
+            ),
+            "_rope_parameters": rope_parameters,
+        }
+
     def _build_fallback_config(self, target_hf_config):
         training_cfg = self.config.rollout.drafter.training
         target_text_config = getattr(target_hf_config, "text_config", target_hf_config)
@@ -1660,25 +1719,46 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         sliding_window = self._training_value(
             training_cfg, "dspark_sliding_window", "dflash_sliding_window", None
         )
+        draft_attn = str(training_cfg.get("dspark_draft_attn", "gqa") or "gqa").lower()
+        num_attention_heads = int(target_text_config.num_attention_heads)
+        mla_kwargs = {}
+        if draft_attn == "mla":
+            mla_kwargs = self._mla_kwargs_from_target(target_text_config)
+            head_dim = mla_kwargs["qk_rope_head_dim"]
+            num_key_value_heads = num_attention_heads
+            rope_theta = mla_kwargs.pop("_rope_theta")
+            rope_parameters = mla_kwargs.pop("_rope_parameters")
+        elif draft_attn == "gqa":
+            head_dim = int(target_head_dim) if target_head_dim is not None else None
+            num_key_value_heads = int(
+                getattr(
+                    target_text_config,
+                    "num_key_value_heads",
+                    num_attention_heads,
+                )
+            )
+            rope_theta = resolve_rope_theta(target_text_config)
+            rope_parameters = None
+        else:
+            raise ValueError(
+                f"dspark_draft_attn must be 'gqa' or 'mla', got {draft_attn!r}"
+            )
         return DSparkConfig(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_hidden_layers=num_hidden_layers,
-            num_attention_heads=int(getattr(target_text_config, "num_attention_heads")),
-            num_key_value_heads=int(
-                getattr(
-                    target_text_config,
-                    "num_key_value_heads",
-                    getattr(target_text_config, "num_attention_heads"),
-                )
-            ),
-            head_dim=int(target_head_dim) if target_head_dim is not None else None,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+            head_dim=head_dim,
             vocab_size=int(target_text_config.vocab_size),
             rms_norm_eps=float(getattr(target_text_config, "rms_norm_eps", 1e-6)),
             max_position_embeddings=int(
                 getattr(target_text_config, "max_position_embeddings", 32768)
             ),
-            rope_theta=resolve_rope_theta(target_text_config),
+            rope_theta=rope_theta,
+            rope_parameters=rope_parameters,
+            draft_attn=draft_attn,
+            **mla_kwargs,
             num_target_layers=target_num_hidden_layers,
             num_context_layers=num_context_layers,
             target_hidden_size=int(target_text_config.hidden_size),

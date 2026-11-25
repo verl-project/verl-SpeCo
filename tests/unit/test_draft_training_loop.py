@@ -670,6 +670,35 @@ def test_standalone_dspark_checkpoint_rewrites_generic_qwen3_architecture(tmp_pa
     assert runtime_config["speco_training_model_type"] == "dspark"
 
 
+def test_standalone_dspark_mla_checkpoint_rewrites_glm5_architecture(tmp_path):
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "dspark",
+                "architectures": ["DSparkDraftModel"],
+                "markov_head_type": "vanilla",
+                # MLA snapshots carry the latent KV topology; the exporter
+                # infers the GLM-5 dispatch identity from these fields.
+                "kv_lora_rank": 512,
+                "qk_rope_head_dim": 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    trainer = _export_trainer("dspark", None)
+
+    _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    runtime_config = json.loads(
+        (checkpoint_dir / "config.json").read_text(encoding="utf-8")
+    )
+    assert runtime_config["model_type"] == "glm5_dspark"
+    assert runtime_config["architectures"] == ["DSparkDraftModel"]
+    assert runtime_config["speco_training_model_type"] == "dspark"
+
+
 def test_standalone_domino_checkpoint_exports_dflash_projector_config(tmp_path):
     checkpoint_dir = tmp_path / "draft_step_5"
     checkpoint_dir.mkdir()
