@@ -810,6 +810,24 @@ def _validate_runtime_backend_topology(
                 )
 
 
+def _producer_only_input(training_args: Sequence[str], env: Mapping[str, str]) -> bool:
+    def setting(key, default=""):
+        return _strip_quotes(
+            _find_override(training_args, key, normalize_key=True) or default
+        )
+
+    return bool(
+        _external_ray_address(env)
+        and setting("speco.draft_training.producer_node_ip", "null")
+        not in {"null", "None", "none", ""}
+        and setting(_DATA_SOURCE_KEY, "online") == "online"
+        and setting(_DATA_TRANSPORT_KEY, "ray_reference") == "ray_reference"
+        and not Path(
+            _single_train_file(_find_override(training_args, _TRAIN_FILES_KEY))
+        ).exists()
+    )
+
+
 def _trainer_node_ips(training_args: Sequence[str], nnodes: int) -> list[str]:
     raw = _find_override(
         training_args, "speco.draft_training.trainer_node_ips", normalize_key=True
@@ -1210,15 +1228,27 @@ def _native_launch_settings(
         raise ValueError("Invalid native directory name or run identity")
     align = 2 * 1024**2
     source_slots = integer("SPECO_NATIVE_SOURCE_MAX_SLOTS", max(batch, 16), batch, 4096)
-    source_bytes = integer(
-        "SPECO_NATIVE_SOURCE_MAX_BYTES",
-        source_slots * (2 * align - 1),
-        batch * (2 * align - 1),
-        2**63 - 1,
-    )
     reader_bytes = integer(
         "SPECO_NATIVE_READER_MAX_BYTES", 2 * 1024**3, 2 * align - 1, 2**63 - 1
     )
+    source_bytes = integer(
+        "SPECO_NATIVE_SOURCE_MAX_BYTES",
+        min(source_slots * reader_bytes, 2**63 - 1),
+        batch * (2 * align - 1),
+        2**63 - 1,
+    )
+    reusable_buffer_bytes = integer("SPECO_NATIVE_REUSE_BUFFER_BYTES", 0, 0, 2**63 - 1)
+    slot_bytes = 2 * align - 1
+    if reusable_buffer_bytes:
+        from verl_speco.transport.native_feature_transport import (
+            native_buffer_allocation_bytes,
+        )
+
+        slot_bytes = native_buffer_allocation_bytes(reusable_buffer_bytes)
+        if reader_bytes < slot_bytes:
+            raise ValueError(
+                "SPECO_NATIVE_READER_MAX_BYTES must cover the reusable buffer and alignment"
+            )
     chunk = integer("SPECO_NATIVE_CHUNK_BYTES", align, align, 2**63 - 1)
     if chunk % align:
         raise ValueError("SPECO_NATIVE_CHUNK_BYTES must be a multiple of 2 MiB")
@@ -1250,6 +1280,7 @@ def _native_launch_settings(
         "reader_endpoints": endpoints,
         "source_max_bytes": source_bytes,
         "source_max_slots": source_slots,
+        "reusable_buffer_bytes": reusable_buffer_bytes,
         "chunk_bytes": chunk,
         "timeout": timeout,
     }
@@ -1266,11 +1297,10 @@ def _native_launch_settings(
             raise ValueError(
                 f"{full} must cover one batch and execution slots must fit the source"
             )
-        if key == "max_reference_execution_slots" and source_bytes < value * (
-            2 * align - 1
-        ):
+        if key == "max_reference_execution_slots" and source_bytes < value * slot_bytes:
             raise ValueError(
-                "SPECO_NATIVE_SOURCE_MAX_BYTES must cover the minimum allocation for each execution slot"
+                "SPECO_NATIVE_SOURCE_MAX_BYTES must cover every execution slot, "
+                "including reusable buffer size and alignment when enabled"
             )
         if raw is None:
             source_overrides.append(f"{full}={value}")
@@ -1299,6 +1329,7 @@ def _native_launch_settings(
             f"{prefix}.generation={settings['generation']}",
             f"{prefix}.max_bytes={reader_bytes}",
             f"{prefix}.chunk_bytes={chunk}",
+            f"{prefix}.reusable_buffer_bytes={reusable_buffer_bytes}",
         ]
     )
     return settings, source_overrides, consumer_overrides
@@ -1430,7 +1461,9 @@ def build_pipeline_commands(
     drafter_path = _strip_quotes(_find_override(training_args, _DRAFTER_PATH_KEY) or "")
     _, resume_metadata = load_standalone_resume(
         drafter_path or None,
-        input_path=config.input_path,
+        input_path=None
+        if _producer_only_input(training_args, backend_env)
+        else config.input_path,
     )
     resumed_optimizer_step = (
         int(resume_metadata.get("optimizer_step", 0))
@@ -1593,6 +1626,21 @@ def build_pipeline_commands(
     if config.data_source == "saved_hidden" and data_transport != "ray_reference":
         raise ValueError("saved_hidden requires data_transport=ray_reference")
     hidden_references = data_transport == "ray_reference"
+    owned_windows_key = (
+        "actor_rollout_ref.rollout.drafter.training.reference_owned_windows"
+    )
+    if (
+        _strip_quotes(
+            _find_override(training_args, owned_windows_key, normalize_key=True)
+            or "false"
+        ).lower()
+        == "true"
+    ):
+        workers_key = f"{_TQ_PREFIX}.consumer_batch_workers"
+        workers = _find_override(training_args, workers_key, normalize_key=True)
+        if workers is not None and int(_strip_quotes(workers)) != 0:
+            raise ValueError("Owned windows require consumer_batch_workers=0")
+        consumer_internal.append(f"{workers_key}=0")
     consumer_internal.append(f"{_DATA_SOURCE_KEY}={config.data_source}")
     consumer_internal.append(f"{_DATA_TRANSPORT_KEY}={data_transport}")
     producer_overrides.append(f"{_DATA_TRANSPORT_KEY}={data_transport}")
@@ -2036,7 +2084,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             ).hexdigest()
             print(json.dumps(plan, sort_keys=True))
             return 0
-        training_args = _resolve_checkpoint_rollback(training_args)
+        remote_input = _producer_only_input(training_args, os.environ)
+        training_args = _resolve_checkpoint_rollback(
+            training_args, require_input=not remote_input
+        )
         config = resolve_pipeline_config(training_args)
         _validate_runtime_backend_topology(runtime_backend, training_args)
         if args.dry_run:
@@ -2092,7 +2143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("consumer: Ray WorkerGroup (StandaloneDrafterWorker)")
             print("consumer overrides: " + _format_command(commands.consumer_overrides))
             return 0
-        if config.data_source == "online":
+        if config.data_source == "online" and not remote_input:
             line_limit = _find_override(
                 training_args,
                 "speco.standalone_tq_producer.max_jsonl_line_bytes",

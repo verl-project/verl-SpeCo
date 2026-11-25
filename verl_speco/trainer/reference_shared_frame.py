@@ -13,12 +13,14 @@ import socket
 import stat
 import struct
 import time
+from contextlib import suppress
 
 import torch
 from safetensors import safe_open
 from safetensors.torch import save
 
 _CONTROL_LIMIT = 64 * 1024
+_NODE_BATCH_ERROR = b"speco-node-batch-owner-error"
 
 
 def _checksum(manifest, payload):
@@ -270,6 +272,8 @@ def receive_local_frame(connection, *, binding, max_bytes, deadline=None):
                     values[: len(values) - len(values) % handles.itemsize]
                 )
                 received.extend(handles)
+        if data == _NODE_BATCH_ERROR and not received:
+            raise RuntimeError("Node reference owner could not prepare a peer batch")
         if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or len(received) != 1:
             raise ValueError("Local frame must carry exactly one complete descriptor")
         fd = received[0]
@@ -341,6 +345,7 @@ def serve_node_batches(groups, *, binding, prepare, max_bytes, timeout):
     started = time.perf_counter()
     remaining = set(groups) - {owner}
     deadline = time.monotonic() + timeout
+    failure = None
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
         listener.bind(_node_address(identity, owner))
         listener.listen(max(1, len(remaining)))
@@ -359,21 +364,31 @@ def serve_node_batches(groups, *, binding, prepare, max_bytes, timeout):
                     raise ValueError(
                         "Node reference request does not match a pending rank"
                     )
-                batch, _ = prepare(groups[rank])
-                _remaining_time(deadline)
-                payload, descriptor = encode_local_frame(
-                    batch, binding=requested, max_bytes=max_bytes
-                )
-                _remaining_time(deadline)
-                fd = create_local_frame(payload, max_bytes=max_bytes)
-                try:
-                    connection.settimeout(_remaining_time(deadline))
-                    send_local_frame(connection, fd, descriptor)
-                    _remaining_time(deadline)
-                finally:
-                    os.close(fd)
-                del batch, payload
                 remaining.remove(rank)
+                try:
+                    if failure is not None:
+                        connection.send(_NODE_BATCH_ERROR)
+                        continue
+                    batch, _ = prepare(groups[rank])
+                    _remaining_time(deadline)
+                    payload, descriptor = encode_local_frame(
+                        batch, binding=requested, max_bytes=max_bytes
+                    )
+                    _remaining_time(deadline)
+                    fd = create_local_frame(payload, max_bytes=max_bytes)
+                    try:
+                        connection.settimeout(_remaining_time(deadline))
+                        send_local_frame(connection, fd, descriptor)
+                    finally:
+                        os.close(fd)
+                    del batch, payload
+                except Exception as exc:
+                    if failure is None:
+                        failure = exc
+                    with suppress(OSError):
+                        connection.send(_NODE_BATCH_ERROR)
+        if failure is not None:
+            raise failure
         _remaining_time(deadline)
         batch, _ = prepare(groups[owner])
         _remaining_time(deadline)

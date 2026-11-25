@@ -26,8 +26,7 @@ def reference_command_frames(command, *, max_bytes, frame_bytes):
     """Serialize large commands into ordered, independently retryable frames."""
     size = bounded_metadata_size(command, max_bytes)
     if size <= frame_bytes:
-        yield command
-        return
+        return iter((command,))
     encoded = json.dumps(
         command,
         ensure_ascii=True,
@@ -39,17 +38,20 @@ def reference_command_frames(command, *, max_bytes, frame_bytes):
         raise RuntimeError("Reference command encoding size changed")
     digest = hashlib.sha256(encoded).hexdigest()
     count = (size + frame_bytes - 1) // frame_bytes
-    for index in range(count):
-        yield {
+    plan_id, receipt_token = command["plan_id"], command["receipt_token"]
+    return (
+        {
             "kind": "batch_fragment",
-            "plan_id": command["plan_id"],
-            "receipt_token": command["receipt_token"],
+            "plan_id": plan_id,
+            "receipt_token": receipt_token,
             "index": index,
             "count": count,
             "nbytes": size,
             "sha256": digest,
             "data": encoded[index * frame_bytes : (index + 1) * frame_bytes],
         }
+        for index in range(count)
+    )
 
 
 def command_fingerprint(command: dict[str, Any]) -> bytes:

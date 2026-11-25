@@ -21,9 +21,11 @@ import uuid
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
-from queue import Empty
+from queue import Empty, Full
 
 import torch
+
+from verl_speco.trainer.standalone_retry import retry_io
 
 _ALIGN = 2 * 1024 * 1024
 _FIELD_ALIGN = 256
@@ -58,6 +60,15 @@ def _fingerprint(value):
 
 def _aligned(value, alignment):
     return ((value + alignment - 1) // alignment) * alignment
+
+
+def native_buffer_allocation_bytes(size: int) -> int:
+    """Include the padding needed to align a registered device slice."""
+    if type(size) is not int or size < _ALIGN or size % _ALIGN:
+        raise ValueError(
+            "Native reusable buffer size must be a positive multiple of 2 MiB"
+        )
+    return size + _ALIGN - 1
 
 
 def _content_hash(data):
@@ -105,7 +116,7 @@ _CONTROL_ARGUMENTS = {
 }
 
 
-def _control_queue(queue, operation, value=None, *, timeout):
+def _control_queue(queue, operation, value=None, *, timeout, rpc_timeout=None):
     actor = getattr(queue, "actor", None)
     if actor is None:
         return (
@@ -115,13 +126,22 @@ def _control_queue(queue, operation, value=None, *, timeout):
         )
     import ray
 
-    ref = (
-        actor.put.remote(value, timeout)
-        if operation == "put"
-        else actor.get.remote(timeout)
-    )
+    if operation == "put":
+        ref = (
+            actor.put_nowait.remote(value)
+            if timeout == 0
+            else actor.put.remote(value, timeout)
+        )
+    else:
+        ref = actor.get_nowait.remote() if timeout == 0 else actor.get.remote(timeout)
     try:
-        return ray.get(ref, timeout=timeout + 1)
+        return ray.get(
+            ref, timeout=(timeout if rpc_timeout is None else rpc_timeout) + 1
+        )
+    except asyncio.QueueEmpty as exc:
+        raise Empty from exc
+    except asyncio.QueueFull as exc:
+        raise Full from exc
     except ray.exceptions.GetTimeoutError:
         ray.cancel(ref, force=False)
         raise TimeoutError("Native source control queue RPC timed out") from None
@@ -246,24 +266,39 @@ class NativeSourceControlService:
                     and len(request["request_id"]) == 32
                 ):
                     try:
-                        _control_queue(
-                            self.responses,
-                            "put",
+                        self._reply(
                             {
                                 "channel_id": self.channel_id,
                                 "request_id": request["request_id"],
                                 "ok": False,
                             },
-                            timeout=self.timeout,
                         )
                     except BaseException:
                         pass
                 return  # Do not accept another command after an ambiguous failure.
             try:
-                _control_queue(self.responses, "put", response, timeout=self.timeout)
+                self._reply(response)
             except BaseException as exc:
                 self._fail(exc)
                 return
+
+    def _reply(self, response):
+        try:
+            _control_queue(
+                self.responses, "put", response, timeout=0, rpc_timeout=self.timeout
+            )
+        except Full:
+            # A bounded channel may still hold the acknowledgement of a
+            # timed-out request. Keep the newest response available.
+            try:
+                _control_queue(
+                    self.responses, "get", timeout=0, rpc_timeout=self.timeout
+                )
+            except Empty:
+                pass  # A waiting client already removed the stale reply.
+            _control_queue(
+                self.responses, "put", response, timeout=0, rpc_timeout=self.timeout
+            )
 
     def close(self):
         self._stopping.set()
@@ -339,34 +374,39 @@ class NativeSourceControlClient(_NativeControlOperations):
             deadline = time.monotonic() + self.timeout
             try:
                 _control_queue(self.requests, "put", request, timeout=self.timeout)
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("Native source control deadline exceeded")
-                try:
-                    response = _control_message(
-                        _control_queue(self.responses, "get", timeout=remaining)
-                    )
-                except Empty as exc:
-                    raise TimeoutError(
-                        "Native source control deadline exceeded"
-                    ) from exc
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("Native source control deadline exceeded")
-                if response == {
-                    "channel_id": self.channel_id,
-                    "request_id": request_id,
-                    "ok": False,
-                }:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Native source control deadline exceeded")
+                    try:
+                        response = _control_message(
+                            _control_queue(self.responses, "get", timeout=remaining)
+                        )
+                    except Empty as exc:
+                        raise TimeoutError(
+                            "Native source control deadline exceeded"
+                        ) from exc
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Native source control deadline exceeded")
+                    if (
+                        not isinstance(response, dict)
+                        or set(response) != {"channel_id", "request_id", "ok"}
+                        or response["channel_id"] != self.channel_id
+                        or type(response["ok"]) is not bool
+                        or not isinstance(response["request_id"], str)
+                        or len(response["request_id"]) != 32
+                        or any(
+                            c not in "0123456789abcdef" for c in response["request_id"]
+                        )
+                    ):
+                        raise ValueError(
+                            "Native source control acknowledgement identity differs"
+                        )
+                    if response["request_id"] == request_id:
+                        break
+                if not response["ok"]:
                     raise RuntimeError(
                         "Native source control operation failed; retain source buffers"
-                    )
-                if response != {
-                    "channel_id": self.channel_id,
-                    "request_id": request_id,
-                    "ok": True,
-                }:
-                    raise ValueError(
-                        "Native source control acknowledgement identity differs"
                     )
             except BaseException:
                 self._failed = True
@@ -435,10 +475,16 @@ class NativeSourceDirectory:
         self.max_sources, self.max_records = max_sources, max_records
         self.max_descriptor_bytes, self._descriptor_bytes = max_descriptor_bytes, 0
         if source_requirements is not None:
+            if isinstance(source_requirements, dict):
+                source_requirements = {
+                    "reusable_buffer_bytes": 0,
+                    **source_requirements,
+                }
             required = {
                 "max_bytes",
                 "max_slots",
                 "chunk_bytes",
+                "reusable_buffer_bytes",
                 "metadata_server",
                 "reader_endpoints",
             }
@@ -450,6 +496,8 @@ class NativeSourceDirectory:
                     or source_requirements[key] <= 0
                     for key in ("max_bytes", "max_slots", "chunk_bytes")
                 )
+                or type(source_requirements["reusable_buffer_bytes"]) is not int
+                or source_requirements["reusable_buffer_bytes"] < 0
                 or not isinstance(source_requirements["metadata_server"], str)
                 or not source_requirements["metadata_server"]
                 or not isinstance(source_requirements["reader_endpoints"], list)
@@ -480,10 +528,18 @@ class NativeSourceDirectory:
         NativeSourceControlClient(**options)
         if self._source_requirements is not None:
             required = self._source_requirements
+            if isinstance(source_settings, dict):
+                source_settings = {"reusable_buffer_bytes": 0, **source_settings}
             if (
                 not isinstance(source_settings, dict)
                 or set(source_settings)
-                != {"max_bytes", "max_slots", "chunk_bytes", "metadata_server"}
+                != {
+                    "max_bytes",
+                    "max_slots",
+                    "chunk_bytes",
+                    "reusable_buffer_bytes",
+                    "metadata_server",
+                }
                 or any(
                     type(source_settings[key]) is not int
                     or source_settings[key] < required[key]
@@ -491,6 +547,9 @@ class NativeSourceDirectory:
                 )
                 or type(source_settings["chunk_bytes"]) is not int
                 or source_settings["chunk_bytes"] != required["chunk_bytes"]
+                or type(source_settings["reusable_buffer_bytes"]) is not int
+                or source_settings["reusable_buffer_bytes"]
+                != required["reusable_buffer_bytes"]
                 or source_settings["metadata_server"] != required["metadata_server"]
                 or endpoint in required["reader_endpoints"]
             ):
@@ -571,6 +630,8 @@ class NativeSourceDirectory:
                 raise ValueError(
                     "Native source directory descriptor byte limit exceeded"
                 )
+            # Keep the active fence if indexing fails after the source has
+            # already registered this lease.
             self._active_handles.add(handle)
             self._records[handle] = (descriptor["sha256"], descriptor)
             self._descriptor_bytes += len(encoded)
@@ -624,7 +685,11 @@ class NativeSourceDirectory:
             for handle in self._active_handles:
                 if len(active) >= limit:
                     break
-                fingerprint, descriptor = self._records[handle]
+                record = self._records.get(handle)
+                if record is None or record[1] is None:
+                    active.append({"handle": handle, "unresolved": True})
+                    continue
+                fingerprint, descriptor = record
                 active.append(
                     {
                         "handle": handle,
@@ -710,7 +775,14 @@ class NativeSourceDirectoryRouter(_NativeControlOperations):
     def _call(self, method, descriptor, **arguments):
         getattr(self._client(descriptor), method)(descriptor, **arguments)
         if method in {"release", "discard_unbound"}:
-            self._directory_call("retire", descriptor["lease_id"], descriptor["sha256"])
+            # Retirement is idempotent even when a reply is lost. Retry only
+            # that RPC so a transient directory error cannot strand a freed lease.
+            retry_io(
+                lambda: self._directory_call(
+                    "retire", descriptor["lease_id"], descriptor["sha256"]
+                ),
+                name="Native directory retirement",
+            )
 
     def freeze_and_seal(self):
         for endpoint in self._directory_call("freeze"):
@@ -816,8 +888,8 @@ class NativeRetiredReferenceStore:
 class NativeFeatureTransport:
     """Own registered ranges until all bound readers acknowledge completion.
 
-    Set SPECO_NATIVE_REUSE_BUFFER_BYTES on both source and reader processes to
-    pre-register fixed-size slots before HIXL can connect. The slot size must
+    A positive reusable_buffer_bytes pre-registers fixed-size slots before
+    HIXL can connect. The slot size must
     fit the largest payload and be a multiple of 2 MiB. The slot and byte caps
     bound the total device memory allocated during initialization.
     """
@@ -834,6 +906,7 @@ class NativeFeatureTransport:
         max_slots,
         chunk_bytes,
         engine_factory=None,
+        reusable_buffer_bytes: int | None = None,
     ):
         if (
             not isinstance(run_id, str)
@@ -882,13 +955,17 @@ class NativeFeatureTransport:
         self._registered_bytes = 0
         # CANN can disconnect peers while deregistering a range. A bounded,
         # fixed-size cache avoids that disconnect in the transfer hot path.
-        self._reusable_bytes = int(getenv("SPECO_NATIVE_REUSE_BUFFER_BYTES", "0"))
-        if self._reusable_bytes and (
-            self._reusable_bytes < _ALIGN
-            or self._reusable_bytes % _ALIGN
-            or self._reusable_bytes + _ALIGN - 1 > self.max_bytes
-        ):
+        if reusable_buffer_bytes is None:
+            reusable_buffer_bytes = int(getenv("SPECO_NATIVE_REUSE_BUFFER_BYTES", "0"))
+        if type(reusable_buffer_bytes) is not int or reusable_buffer_bytes < 0:
             raise ValueError("Invalid native reusable buffer size")
+        self._reusable_bytes = reusable_buffer_bytes
+        pool_slots = 0
+        if reusable_buffer_bytes:
+            allocation_bytes = native_buffer_allocation_bytes(reusable_buffer_bytes)
+            pool_slots = min(max_slots, max_bytes // allocation_bytes)
+            if not pool_slots:
+                raise ValueError("Native reusable buffer does not fit the byte budget")
         self._idle_buffers: list[torch.Tensor] = []
         self._completed = OrderedDict()
         self._completed_readers = 0
@@ -912,9 +989,9 @@ class NativeFeatureTransport:
                 raise RuntimeError("Cannot determine the native Mooncake RPC endpoint")
             self.endpoint = f"{host}:{port}"
 
-        if self._reusable_bytes:
+        if pool_slots:
             try:
-                self._initialize_buffer_pool()
+                self._initialize_buffer_pool(pool_slots)
             except Exception:
                 # No descriptor was issued. Known allocation failures can
                 # release prior slots; ambiguous native failures stay fenced.
@@ -922,11 +999,9 @@ class NativeFeatureTransport:
                     self.close()
                 raise
 
-    def _initialize_buffer_pool(self):
+    def _initialize_buffer_pool(self, slots):
         # HIXL snapshots remote buffers during connection setup. Register the
         # full bounded pool before publishing any address to a reader.
-        allocation_bytes = self._reusable_bytes + _ALIGN - 1
-        slots = min(self.max_slots, self.max_bytes // allocation_bytes)
         with torch.inference_mode(False), self._device_scope():
             for _ in range(slots):
                 self._idle_buffers.append(self._register(self._reusable_bytes))
@@ -969,7 +1044,7 @@ class NativeFeatureTransport:
 
     def _register(self, size):
         size = _aligned(size, _ALIGN)
-        allocation_bytes = size + _ALIGN - 1
+        allocation_bytes = native_buffer_allocation_bytes(size)
         if (
             len(self._registered) >= self.max_slots
             or self._registered_bytes + allocation_bytes > self.max_bytes

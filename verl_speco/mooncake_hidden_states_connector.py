@@ -277,11 +277,37 @@ class SpecoNativeHiddenStatesConnector(SpecoMooncakeHiddenStatesConnector):
                 namespace = os.environ.get(
                     "SPECO_NATIVE_RAY_NAMESPACE", "transfer_queue"
                 )
+                ray_address = os.environ["SPECO_NATIVE_RAY_ADDRESS"]
                 if not ray.is_initialized():
                     ray.init(
-                        address=os.environ["SPECO_NATIVE_RAY_ADDRESS"],
+                        address=ray_address,
                         namespace=namespace,
                     )
+                else:
+                    current_address = ray.get_runtime_context().gcs_address
+                    if current_address != ray_address:
+                        from socket import SOCK_STREAM, getaddrinfo
+                        from urllib.parse import urlsplit
+
+                        expected = urlsplit("//" + ray_address)
+                        current = urlsplit("//" + current_address)
+                        endpoints = [
+                            {
+                                entry[4][0]
+                                for entry in getaddrinfo(
+                                    address.hostname, address.port, type=SOCK_STREAM
+                                )
+                            }
+                            for address in (expected, current)
+                        ]
+                        if (
+                            expected.port != current.port
+                            or not endpoints[0] & endpoints[1]
+                        ):
+                            raise ValueError(
+                                "Native vLLM already uses a different Ray cluster"
+                            )
+                # The explicit lookup namespace is independent of the caller's namespace.
                 directory = ray.get_actor(
                     os.environ["SPECO_NATIVE_DIRECTORY"], namespace=namespace
                 )
@@ -299,6 +325,9 @@ class SpecoNativeHiddenStatesConnector(SpecoMooncakeHiddenStatesConnector):
                     "max_bytes": int(os.environ["SPECO_NATIVE_SOURCE_MAX_BYTES"]),
                     "max_slots": int(os.environ["SPECO_NATIVE_SOURCE_MAX_SLOTS"]),
                     "chunk_bytes": int(os.environ["SPECO_NATIVE_CHUNK_BYTES"]),
+                    "reusable_buffer_bytes": int(
+                        os.environ.get("SPECO_NATIVE_REUSE_BUFFER_BYTES", "0")
+                    ),
                 }
                 requests, responses = Queue(maxsize=1), Queue(maxsize=1)
                 # The control thread polls with a short deadline. Cold actor startup

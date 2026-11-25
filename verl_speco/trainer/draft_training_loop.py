@@ -1221,17 +1221,38 @@ async def _run_standalone_draft_training_async(
         last_saved_step = optimizer_step
         snapshot_init = training_cfg.get("trainable_snapshot_initialization_path")
         if feature_store_type in {"tq", "ray_reference"}:
-            consumed_sequence_nos, resume_metadata = _load_resume_across_ranks(
-                drafter_cfg.get("model_path"),
-                standalone_input_path,
-                initial_optimizer_step,
-                trainer._standalone_training_plan,
-                world_size,
-            )
+            resume_input_path = standalone_input_path
             if feature_store_type == "ray_reference":
                 trainer._standalone_input_identity = _input_identity_across_ranks(
                     standalone_input_path, world_size
                 )
+                if standalone_input_path and trainer._standalone_input_identity is None:
+                    if producer_handle is None:
+                        raise ValueError(
+                            "Producer-only input requires a scheduled Producer handle"
+                        )
+                    resume_input_path = (
+                        None  # The Producer validated replay before trainer activation.
+                    )
+
+                    def input_fingerprint_provider():
+                        import ray
+
+                        return ray.get(
+                            producer_handle.checkpoint_input_fingerprint.remote(),
+                            timeout=checkpoint_timeout,
+                        )
+
+                    trainer._standalone_input_fingerprint_provider = (
+                        input_fingerprint_provider
+                    )
+            consumed_sequence_nos, resume_metadata = _load_resume_across_ranks(
+                drafter_cfg.get("model_path"),
+                resume_input_path,
+                initial_optimizer_step,
+                trainer._standalone_training_plan,
+                world_size,
+            )
             logger.info(
                 "[standalone rank=%s] resume progress optimizer_step=%s consumed=%s",
                 rank,
@@ -1553,6 +1574,12 @@ async def _run_standalone_draft_training_async(
         ):
             raise ValueError("Prefetch host byte limits require ray_reference prefetch")
         if owned_windows:
+            if rank == 0:
+                logger.info(
+                    "Owned windows use synchronous preparation within each rank; "
+                    "consumer_prefetch_batches=%s bounds scheduled batches only",
+                    depth,
+                )
             sample_source = loader.iter_assignments()
         elif feature_store_type in {"tq", "ray_reference"} and depth:
             batch_workers = int(tq_cfg.get("consumer_batch_workers", 2))
@@ -2879,6 +2906,9 @@ def _finalize_standalone_checkpoint_files(
         training_plan=getattr(trainer, "_standalone_training_plan", None),
         storage_format=getattr(trainer, "_standalone_resume_format", "tensor"),
         expected_input_identity=getattr(trainer, "_standalone_input_identity", None),
+        input_fingerprint_provider=getattr(
+            trainer, "_standalone_input_fingerprint_provider", None
+        ),
         **(
             {"lease_snapshot_sha256": lease_snapshot["sha256"]}
             if lease_snapshot is not None
@@ -2969,6 +2999,7 @@ def _save_resume_sidecar(
     training_plan: dict[str, Any] | None = None,
     storage_format: str = "tensor",
     expected_input_identity: dict[str, Any] | None = None,
+    input_fingerprint_provider=None,
     lease_snapshot_sha256: str | None = None,
 ) -> None:
     if consumed_snapshot is None or step is None or input_path is None:
@@ -2986,6 +3017,11 @@ def _save_resume_sidecar(
         training_plan=training_plan,
         storage_format=storage_format,
         expected_input_identity=expected_input_identity,
+        **(
+            {"input_fingerprint_provider": input_fingerprint_provider}
+            if input_fingerprint_provider is not None
+            else {}
+        ),
         **(
             {"lease_snapshot_sha256": lease_snapshot_sha256}
             if lease_snapshot_sha256 is not None
@@ -3819,6 +3855,13 @@ async def _reference_training_step_across_ranks(
         if batch.get("hidden_source") == "standalone_vllm_reference":
             staged = trainer._stage_standalone_cpu_batch(batch)
             staged["_speco_reference_staged"] = True
+            if "_speco_token_counts" in batch:
+                batch["_speco_token_counts"] = {
+                    **batch["_speco_token_counts"],
+                    "supervised_tokens": int(
+                        torch.count_nonzero(staged["loss_mask"]).item()
+                    ),
+                }
     except Exception as exc:
         error = exc
     if not _all_ranks_true(error is None, device):

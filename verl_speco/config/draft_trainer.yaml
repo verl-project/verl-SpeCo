@@ -154,6 +154,7 @@ actor_rollout_ref:
               generation: 0
               max_bytes: 0
               chunk_bytes: 2097152
+              reusable_buffer_bytes: null
             mooncake:
               local_hostname: ""
               metadata_server: P2PHANDSHAKE

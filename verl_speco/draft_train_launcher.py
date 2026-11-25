@@ -104,7 +104,14 @@ def _find_override(overrides: Iterable[str], keys: Iterable[str]) -> str | None:
 def _parse_bool(value: str | None, *, default: bool) -> bool:
     if value is None:
         return default
-    normalized = str(value).strip().lower()
+    normalized = str(value).strip()
+    if (
+        len(normalized) >= 2
+        and normalized[0] == normalized[-1]
+        and normalized[0] in "'\""
+    ):
+        normalized = normalized[1:-1].strip()
+    normalized = normalized.lower()
     if normalized in {"1", "true", "yes", "on", "y"}:
         return True
     if normalized in {"0", "false", "no", "off", "n"}:

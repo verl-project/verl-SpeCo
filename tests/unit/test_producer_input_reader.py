@@ -70,6 +70,10 @@ def test_source_route_plan_preserves_order_and_enforces_wave_capacity():
         plan_source_routes([8] * 4, **limits)
     changed = plan_source_routes(lengths, **dict(limits, max_tokens=13))
     assert changed["sha256"] != plan["sha256"]
+    packed = plan_source_routes(
+        [3, 3, 2, 2, 2], source_count=2, max_samples=3, max_tokens=6, max_sequence_tokens=6
+    )
+    assert packed["routes"] == [0, 0, 1, 1, 1]
 
 
 @pytest.mark.parametrize("response_budget", [0, 2, 3])

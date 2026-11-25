@@ -22,6 +22,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from verl_speco.trainer.standalone_resume import (
+    build_input_fingerprint,
+    input_content_identity,
     load_standalone_resume,
     save_standalone_resume,
 )
@@ -86,21 +88,30 @@ def test_resume_binds_persistent_lease_snapshot_without_granting_training_credit
         load_standalone_resume(checkpoint)
 
 
-def test_standalone_resume_round_trip_and_input_validation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("producer_only", [False, True])
+def test_standalone_resume_round_trip_and_input_validation(tmp_path: Path, producer_only: bool) -> None:
     input_path = tmp_path / "train.jsonl"
     input_path.write_text('{"prompt":"q","response":"a"}\n', encoding="utf-8")
     checkpoint_path = tmp_path / "draft_step_7"
+
+    def fingerprint():
+        return build_input_fingerprint(input_path, include_content_hash=True)
+
+    def resume():
+        if producer_only:
+            return load_standalone_resume(checkpoint_path, input_fingerprint=fingerprint())
+        return load_standalone_resume(checkpoint_path, input_path=input_path)
 
     save_standalone_resume(
         checkpoint_path,
         [5, 1, 5, 3],
         optimizer_step=7,
-        input_path=input_path,
+        input_path=tmp_path / "unmounted.jsonl" if producer_only else input_path,
+        input_fingerprint_provider=fingerprint if producer_only else None,
+        expected_input_identity=input_content_identity(fingerprint()) if producer_only else None,
     )
 
-    consumed, metadata = load_standalone_resume(
-        checkpoint_path, input_path=input_path
-    )
+    consumed, metadata = resume()
     assert consumed == {1, 3, 5}
     assert metadata is not None
     assert metadata["optimizer_step"] == 7
@@ -108,7 +119,7 @@ def test_standalone_resume_round_trip_and_input_validation(tmp_path: Path) -> No
 
     input_path.write_text('{"prompt":"changed","response":"a"}\n', encoding="utf-8")
     with pytest.raises(ValueError, match="input file changed"):
-        load_standalone_resume(checkpoint_path, input_path=input_path)
+        resume()
 
 
 def test_missing_standalone_resume_is_not_a_resume_checkpoint(

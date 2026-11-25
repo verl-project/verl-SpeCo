@@ -285,6 +285,7 @@ def test_native_connector_registers_source_and_retains_ambiguous_setup(monkeypat
     ray = types.ModuleType("ray")
     ray.__path__ = []
     ray.is_initialized = lambda: True
+    ray.get_runtime_context = lambda: SimpleNamespace(gcs_address="ray:6379")
     ray.get_actor = lambda name, namespace: directory
     ray.get = ray_get
     ray_util, ray_queue = types.ModuleType("ray.util"), types.ModuleType("ray.util.queue")
@@ -299,6 +300,7 @@ def test_native_connector_registers_source_and_retains_ambiguous_setup(monkeypat
                         "SPECO_NATIVE_METADATA_SERVER": "metadata", "SPECO_NATIVE_SOURCE_MAX_BYTES": "4194304",
                         "SPECO_NATIVE_SOURCE_MAX_SLOTS": "1", "SPECO_NATIVE_CHUNK_BYTES": "2097152"}.items():
         monkeypatch.setenv(name, value)
+    monkeypatch.setenv("SPECO_NATIVE_RAY_ADDRESS", "ray:6379")
     connector = _native_connector_for_test(None, None)()
     connector._kv_cache = torch.zeros(1)
     def initialize(done=None):

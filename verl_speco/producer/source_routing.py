@@ -11,13 +11,38 @@ from dataclasses import replace
 _MAX_RECORDS = 5_000_000
 
 
+class _SourceWavePackingError(ValueError):
+    """The wave could not be placed with the bounded routing heuristics."""
+
+
+def _assign_routes(sizes, order, *, source_count, max_samples, max_tokens, load_sign):
+    loads, counts = [0] * source_count, [0] * source_count
+    routes = [0] * len(sizes)
+    for index in order:
+        eligible = [
+            source
+            for source in range(source_count)
+            if counts[source] < max_samples
+            and loads[source] + sizes[index] <= max_tokens
+        ]
+        if not eligible:
+            return None
+        source = min(
+            eligible,
+            key=lambda source: (load_sign * loads[source], counts[source], source),
+        )
+        routes[index] = source
+        loads[source] += sizes[index]
+        counts[source] += 1
+    return routes
+
+
 def plan_source_routes(
     lengths, *, source_count, max_samples, max_tokens, max_sequence_tokens
 ):
     """Plan one bounded capture wave without changing logical sample order.
 
-    Returned routes are indexed by logical position. Empty sources are valid;
-    a wave that cannot fit is rejected rather than dropping or copying samples.
+    Returned routes are indexed by logical position. Empty sources are valid.
     """
     for name, value in (
         ("source_count", source_count),
@@ -40,23 +65,24 @@ def plan_source_routes(
                 "Sequence exceeds source token limits or has invalid length"
             )
         sizes.append(length)
-    loads, counts = [0] * source_count, [0] * source_count
-    routes = [0] * len(sizes)
-    for index in sorted(range(len(sizes)), key=lambda i: (-sizes[i], i)):
-        eligible = [
-            source
-            for source in range(source_count)
-            if counts[source] < max_samples
-            and loads[source] + sizes[index] <= max_tokens
-        ]
-        if not eligible:
-            raise ValueError("Capture wave cannot fit source token and sample limits")
-        source = min(
-            eligible, key=lambda source: (loads[source], counts[source], source)
+    order = sorted(range(len(sizes)), key=lambda i: (-sizes[i], i))
+    # Keep existing balanced placements and their hashes. On failure, try
+    # filling the most loaded eligible source before moving to another one.
+    for load_sign in (1, -1):
+        routes = _assign_routes(
+            sizes,
+            order,
+            source_count=source_count,
+            max_samples=max_samples,
+            max_tokens=max_tokens,
+            load_sign=load_sign,
         )
-        routes[index] = source
-        loads[source] += sizes[index]
-        counts[source] += 1
+        if routes is not None:
+            break
+    else:
+        raise _SourceWavePackingError(
+            "Capture wave cannot fit source token and sample limits"
+        )
     plan = {
         "version": 1,
         "lengths": sizes,
@@ -104,13 +130,23 @@ def iter_source_route_waves(
             len(request.prompt_token_ids) + max(0, getattr(request, "max_tokens", 0))
             for request in wave
         ]
-        plan = plan_source_routes(
-            costs,
-            source_count=len(endpoints),
-            max_samples=max_samples,
-            max_tokens=max_tokens,
-            max_sequence_tokens=max_sequence_tokens,
-        )
+        try:
+            plan = plan_source_routes(
+                costs,
+                source_count=len(endpoints),
+                max_samples=max_samples,
+                max_tokens=max_tokens,
+                max_sequence_tokens=max_sequence_tokens,
+            )
+        except _SourceWavePackingError:
+            if len(wave) == 1:
+                raise
+            # Split at a stable occurrence boundary before dropping consumed
+            # records, so resuming yields the same routes and digests.
+            middle = len(wave) // 2
+            yield from emit(wave[:middle])
+            yield from emit(wave[middle:])
+            return
         identity = {
             "plan": plan,
             "endpoints": endpoints,

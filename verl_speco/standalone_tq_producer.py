@@ -178,6 +178,27 @@ async def _delete_result_best_effort(result: RawVllmFeature | VllmResponse) -> N
         )
 
 
+async def _finish_reference_io(operation, *, discard=None, should_drain=None):
+    """Resolve in-flight reference I/O before propagating a task cancellation."""
+    task = asyncio.ensure_future(operation)
+    cancelled = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if not task.done() and should_drain is not None and not should_drain():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            cancelled = error
+    result = task.result()
+    if cancelled is not None:
+        if discard is not None:
+            await _finish_reference_io(discard(result))
+        raise cancelled
+    return result
+
+
 async def publish_one(
     result: PreparedFeature,
     transport: Any,
@@ -908,6 +929,7 @@ async def run_producer(
     reference_batch_size: int = 1,
     on_metrics: Any | None = None,
     get_runtime_state: Any | None = None,
+    is_graceful_stop: Any | None = None,
 ) -> ProducerStats:
     """Publish references from online vLLM or a persistent raw-hidden dataset."""
 
@@ -917,11 +939,18 @@ async def run_producer(
         .get("draft_training", {})
         .get("data_source", "online")
     )
+    should_drain = is_graceful_stop or (lambda: False)
     if source == "saved_hidden":
+
+        async def publish_saved(entries):
+            return await _finish_reference_io(
+                on_references(entries), should_drain=should_drain
+            )
+
         return await _publish_saved_hidden(
             config,
             before_publish=before_request,
-            on_references=on_references,
+            on_references=publish_saved if on_references is not None else None,
             reference_batch_size=reference_batch_size,
             on_metrics=on_metrics,
         )
@@ -1186,6 +1215,15 @@ async def run_producer(
         stages: dict[str, tuple[str, float, str]] = {}
         sample_timings: dict[int, dict[str, float]] = {}
         unsubmitted_references: dict[str, VllmResponse] = {}
+
+        async def discard_reference(raw):
+            await asyncio.to_thread(
+                retry_io,
+                partial(delete_temporary_result, raw),
+                name="Unsubmitted hidden reference cleanup",
+                retry_if=lambda exc: True,
+            )
+
         perf_rows: list[dict[str, Any]] = []
         diagnostics = getattr(pool, "diagnostics", None) or ProducerDiagnostics()
         diagnostics.snapshot()  # Exclude model/client initialization from occupancy.
@@ -1674,7 +1712,11 @@ async def run_producer(
                     generate_started = time.monotonic()
                     try:
                         generated = await (
-                            pool.generate_reference(request)
+                            _finish_reference_io(
+                                pool.generate_reference(request),
+                                discard=discard_reference,
+                                should_drain=should_drain,
+                            )
                             if hidden_references
                             else pool.generate(request)
                         )
@@ -1748,11 +1790,9 @@ async def run_producer(
                             if acquire_reference_slot is not None:
                                 # Reusing a slot while its generation payload remains
                                 # allocated would invalidate the admission bound.
-                                await asyncio.to_thread(
-                                    retry_io,
-                                    partial(delete_temporary_result, generated),
-                                    name="Generated reference cleanup before prefill",
-                                    retry_if=lambda error: True,
+                                await _finish_reference_io(
+                                    discard_reference(generated),
+                                    should_drain=should_drain,
                                 )
                             else:
                                 await _delete_result_best_effort(generated)
@@ -1760,7 +1800,11 @@ async def run_producer(
                 prefill_started = time.monotonic()
                 try:
                     raw = await (
-                        pool.prefill_reference(request)
+                        _finish_reference_io(
+                            pool.prefill_reference(request),
+                            discard=discard_reference,
+                            should_drain=should_drain,
+                        )
                         if hidden_references
                         else pool.prefill(request)
                     )
@@ -2080,16 +2124,30 @@ async def run_producer(
                     mark_stage(worker, "metadata_submit", first.request.sample_id)
                     publish_inflight += 1
                     peak_publish_inflight = max(peak_publish_inflight, publish_inflight)
-                    # Once an RPC is issued its delivery may be ambiguous even
-                    # after cancellation or a timeout. A remote reader may already
-                    # own these references, so never release them in Producer
-                    # cleanup unless a separate fencing protocol proves safety.
-                    for item in buffered:
-                        unsubmitted_references.pop(
-                            _as_vllm_reference(item.raw).reference, None
-                        )
+
+                    async def submit_references():
+                        unpublished = set()
+                        try:
+                            result = await on_references(entries)
+                            unpublished.update(
+                                (result or {}).get("unsubmitted_keys", ())
+                            )
+                            return result
+                        finally:
+                            # Unknown delivery belongs to the Driver. Keep only
+                            # explicitly rejected payloads for local cleanup.
+                            for item, entry in zip(buffered, entries, strict=True):
+                                if entry["key"] not in unpublished:
+                                    unsubmitted_references.pop(
+                                        _as_vllm_reference(item.raw).reference, None
+                                    )
+
                     try:
-                        publication = await on_references(entries)
+                        publication = await _finish_reference_io(
+                            submit_references(), should_drain=should_drain
+                        )
+                        if publication and publication.get("unsubmitted_keys"):
+                            return
                         for item in buffered:
                             if order_slots is not None:
                                 del order_by_sequence[int(item.request.sequence_no)]
@@ -2312,16 +2370,18 @@ async def run_producer(
             for task in [*tasks, *request_tasks]:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(*tasks, *request_tasks, return_exceptions=True)
+            outcomes = await asyncio.gather(
+                *tasks, *request_tasks, return_exceptions=True
+            )
+            cleanup_error = next(
+                (item for item in outcomes if isinstance(item, Exception)), None
+            )
             for raw in unsubmitted_references.values():
                 try:
-                    await asyncio.to_thread(
-                        retry_io,
-                        partial(delete_temporary_result, raw),
-                        name="Unsubmitted hidden reference cleanup",
-                        retry_if=lambda exc: True,
-                    )
-                except Exception:
+                    await discard_reference(raw)
+                except Exception as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
                     logger.exception(
                         "Failed to release unsubmitted hidden reference %s",
                         raw.reference,
@@ -2333,6 +2393,8 @@ async def run_producer(
             heartbeat.cancel()
             loop_monitor.cancel()
             await asyncio.gather(heartbeat, loop_monitor, return_exceptions=True)
+            if cleanup_error is not None and acquire_reference_slot is not None:
+                raise cleanup_error
 
         if stats.published_count == 0:
             logger.error(

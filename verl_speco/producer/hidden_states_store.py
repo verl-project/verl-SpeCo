@@ -694,7 +694,7 @@ def build_managed_native_reader(
         "max_bytes",
         "chunk_bytes",
     }
-    if set(settings) != expected:
+    if settings.keys() - {"reusable_buffer_bytes"} != expected:
         raise ValueError(
             "Native reader settings require endpoints, metadata_server, generation, max_bytes and chunk_bytes"
         )
@@ -721,6 +721,7 @@ def build_managed_native_reader(
         max_slots=1,
         chunk_bytes=settings["chunk_bytes"],
         engine_factory=engine_factory,
+        reusable_buffer_bytes=settings.get("reusable_buffer_bytes"),
     )
     # Only the producer can free the source after its dispatch-wide ACKs. Local
     # cleanup must not independently release a buffer another rank may read.

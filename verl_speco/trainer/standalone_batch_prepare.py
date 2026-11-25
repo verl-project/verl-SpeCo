@@ -60,7 +60,7 @@ def prepare_standalone_cpu_batch(
     if type(max_output_bytes) is not int or max_output_bytes < 0:
         raise ValueError("max_output_bytes must be a non-negative integer")
     validate_timeout(read_timeout, "read_timeout")
-    read_deadline = time.monotonic() + read_timeout
+    read_deadline = None if store.backend == "file" else time.monotonic() + read_timeout
     if not tags or (max_window is not None and max_window < 0):
         raise ValueError("A non-empty batch and non-negative max_window are required")
     if block_size <= 0 or max_packed_len < 0:
@@ -75,6 +75,7 @@ def prepare_standalone_cpu_batch(
         max_window=max_window,
         store=store,
         read_deadline=read_deadline,
+        read_timeout=read_timeout,
         partial_file_reads=streaming,
     )
     if streaming:
@@ -87,11 +88,8 @@ def prepare_standalone_cpu_batch(
             max_window=max_window,
         )
         if max_output_bytes and type(store) is FileHiddenStatesStore:
-            remaining = read_deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Reference batch read deadline exceeded")
             _, _, width = store.hidden_shape(
-                tags[0]["hidden_states_path"], timeout=remaining
+                tags[0]["hidden_states_path"], timeout=read_timeout
             )
             # Count the final CPU tensors and one pinning copy, matching the
             # existing post-materialization _prepared_host_bytes budget.
@@ -418,6 +416,7 @@ def prepare_owned_anchor_window(
         max_window=None,
         store=store,
         read_deadline=deadline,
+        read_timeout=read_timeout,
         partial_file_reads=True,
         owned_window=(start, end),
     )
@@ -501,9 +500,7 @@ def scan_owned_anchor_inputs(
         "label_mask": loss_mask.clone(),
         "attention_mask": (~invalid).long().unsqueeze(0),
         "feature_window": (start, end),
-        "supervised_tokens": int(
-            torch.count_nonzero(original_mask[start:end] > 0).item()
-        ),
+        "supervised_tokens": int(torch.count_nonzero(loss_mask).item()),
     }
 
 
@@ -733,6 +730,7 @@ def _prepare_chunk(
     max_window,
     store,
     read_deadline,
+    read_timeout,
     partial_file_reads=False,
     owned_window=None,
 ):
@@ -750,7 +748,9 @@ def _prepare_chunk(
     row_offset = None
     row_positions = None
     positions = request["feature_positions"]
-    remaining = read_deadline - time.monotonic()
+    remaining = (
+        read_timeout if read_deadline is None else read_deadline - time.monotonic()
+    )
     if remaining <= 0:
         raise TimeoutError("Reference batch read deadline exceeded")
     if partial_file_reads and type(store) is FileHiddenStatesStore:

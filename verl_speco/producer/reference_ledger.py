@@ -169,11 +169,16 @@ class _ReferenceLeaseJournal:
         }
         size = 1024
         for name, query in (
-            ("leases", "SELECT plan, phase, identity FROM leases ORDER BY plan"),
+            (
+                "leases",
+                "SELECT plan, phase, identity FROM leases WHERE phase != 'RELEASED' ORDER BY plan",
+            ),
             ("payloads", "SELECT key, identity FROM payloads ORDER BY key"),
             (
                 "acknowledgements",
-                "SELECT plan, rank FROM acknowledgements ORDER BY plan, rank",
+                "SELECT a.plan, a.rank FROM acknowledgements a "
+                "JOIN leases l ON l.plan = a.plan WHERE l.phase != 'RELEASED' "
+                "ORDER BY a.plan, a.rank",
             ),
         ):
             for row in self.db.execute(query):

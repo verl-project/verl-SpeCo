@@ -383,7 +383,7 @@ def test_real_ray_unassigned_discard_and_blocked_publication():
 import ray
 import json
 from ray.util.queue import Queue
-from verl_speco.standalone_ray_runtime import StandaloneProducerActor
+from verl_speco.standalone_ray_runtime import StandaloneProducerActor, get_queue
 from verl_speco.transport.native_feature_transport import NativeSourceDirectory, NativeSourceDirectoryRouter, NativeProducerReferenceStore
 from verl_speco.transport.drafter_sample_protocol import SampleMetadata, PROTOCOL_SCHEMA_VERSION, make_reference_tag, make_sample_key
 @ray.remote(max_concurrency=4)
@@ -410,6 +410,7 @@ class Source:
         original = native.NativeFeatureTransport
         native.NativeFeatureTransport = lambda **kwargs: original(**kwargs, engine_factory=Engine)
         for name, value in {"SPECO_NATIVE_DIRECTORY": directory_name, "SPECO_NATIVE_RAY_NAMESPACE": "native-test",
+            "SPECO_NATIVE_RAY_ADDRESS": ray.get_runtime_context().gcs_address,
             "SPECO_NATIVE_RUN_ID": "run", "SPECO_NATIVE_GENERATION": "1", "SPECO_NATIVE_SOURCE_ENDPOINT": "source",
             "SPECO_NATIVE_METADATA_SERVER": "metadata", "SPECO_NATIVE_SOURCE_MAX_BYTES": "4194304",
             "SPECO_NATIVE_SOURCE_MAX_SLOTS": "1", "SPECO_NATIVE_CHUNK_BYTES": "2097152"}.items():
@@ -433,6 +434,10 @@ class Source:
         from types import SimpleNamespace
         self.connector._publish_sample(SimpleNamespace(block_ids=[0], token_ids=torch.tensor([1, 2]), mooncake_key=handle), None)
     def descriptor_value(self): return self.connector._native_source._slots["sample"]["descriptor"]
+    def queue_stale_reply(self):
+        options = self.connector._native_control_options
+        options["response_queue"].put(
+            {"channel_id": options["channel_id"], "request_id": "0" * 32, "ok": True}, timeout=5)
     def publish_extra(self): self._publish("filtered")
     def active(self): return len(self.connector._native_source._slots)
     def close(self):
@@ -446,6 +451,7 @@ try:
     actor = Actor.remote({"speco": {"standalone_tq_producer": {"max_published_references": 2}}}, queue, 1)
     incarnation = ray.get(actor.publish.remote("a"), timeout=20)
     ray.get(actor.publish.remote("b"), timeout=20)
+    assert get_queue(queue, timeout=0)["entries"][0]["key"] == "a"
     ray.get(actor.register_dispatch.remote(incarnation, 0, "receipt", ["a"], 1), timeout=10)
     blocked = actor.publish.remote("c")
     assert not ray.wait([blocked], timeout=0.5)[0]
@@ -468,6 +474,7 @@ try:
                              "metadata_server": "metadata", "reader_endpoints": ["reader"]})
     source = Source.remote(directory_name)
     descriptor = ray.get(source.descriptor_value.remote(), timeout=20)
+    ray.get(source.queue_stale_reply.remote(), timeout=10)
     assert ray.get(directory.status.remote(1), timeout=10)["active_sample"][0]["handle"] == "sample"
     handle = NativeProducerReferenceStore(NativeSourceDirectoryRouter(directory, timeout=10)).resolve_reference("sample")
     assert json.loads(handle) == descriptor
@@ -1099,11 +1106,52 @@ def test_persistent_lease_journal_requires_all_acknowledgements_and_clean_handof
     with pytest.raises(RuntimeError, match="unresolved"):
         journal.close(drained=True)
     journal.retire(["sample"])
+    snapshot = journal.snapshot(max_bytes=1200)
+    assert snapshot["leases"] == snapshot["acknowledgements"] == []
     journal.close(drained=True)
     successor = _ReferenceLeaseJournal(path, "run", "second")
     successor.close()
     with pytest.raises(RuntimeError, match="already has an owner"):
         _ReferenceLeaseJournal(path, "run", "third")
+
+
+def test_normal_stop_discards_inflight_reference_result(monkeypatch):
+    from verl_speco import standalone_tq_producer as producer
+
+    config = _runtime_config()
+    config.actor_rollout_ref.rollout.drafter.training.feature_store = _Config(type="ray_reference")
+    config.speco.standalone_tq_producer.max_reference_execution_slots = 1
+    actor = StandaloneProducerActor(config, reference_batch_size=1)
+
+    async def run():
+        entered, finish = asyncio.Event(), asyncio.Event()
+        discarded = []
+
+        async def request():
+            entered.set()
+            await finish.wait()
+            return "sample"
+
+        async def discard(value):
+            discarded.append(value)
+
+        async def run_producer(config, *, acquire_reference_slot, is_graceful_stop, **kwargs):
+            await acquire_reference_slot(SimpleNamespace(sequence_no=0))
+            await producer._finish_reference_io(
+                request(), discard=discard, should_drain=is_graceful_stop
+            )
+
+        monkeypatch.setattr(producer, "run_producer", run_producer)
+        await actor.start()
+        await asyncio.wait_for(entered.wait(), timeout=3)
+        stopped = asyncio.create_task(actor.stop())
+        await asyncio.sleep(0)
+        assert actor._reference_closed and not stopped.done()
+        finish.set()
+        await asyncio.wait_for(stopped, timeout=3)
+        assert discarded == ["sample"] and not actor._execution_pending
+
+    asyncio.run(run())
 
 
 def test_native_abort_freezes_sources_without_returning_active_credits(monkeypatch):
@@ -1177,7 +1225,7 @@ def test_ray_reference_pipeline_never_starts_tq_and_preserves_untrained_files(tm
     untrained.write_bytes(b"untrained")
     commands = _commands()
     commands = PipelineCommands(
-        **{**commands.__dict__, "consumer_overrides": ("training.feature_store.type=ray_reference",)}
+        **{**commands.__dict__, "consumer_overrides": ("training.feature_store.type='ray_reference'",)}
     )
     original_mkdtemp = runtime.tempfile.mkdtemp
 

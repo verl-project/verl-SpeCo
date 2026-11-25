@@ -33,6 +33,9 @@ from verl_speco.producer.hidden_states_store import file_reference_tensor_bytes
 from verl_speco.standalone_tq_training_launcher import (
     _VLLM_HIDDEN_STATES_DIR,
     PipelineCommands,
+    _find_override,
+    _preflight_input_file,
+    _strip_quotes,
     _stop_process,
     _start_process,
     _cleanup_hidden_states_directory,
@@ -63,6 +66,7 @@ from verl_speco.trainer.standalone_tracking import (
 from verl_speco.trainer.standalone_resume import (
     build_input_fingerprint,
     input_content_identity,
+    load_standalone_resume,
     validate_input_identity,
 )
 
@@ -238,9 +242,13 @@ def get_queue(queue: Any, *, timeout: float = 0.5, rpc_timeout: float = 30.0) ->
         return queue.get(block=True, timeout=timeout)
     import ray
 
-    ref = actor.get.remote(timeout)
+    ref = actor.get_nowait.remote() if timeout == 0 else actor.get.remote(timeout)
     try:
         return ray.get(ref, timeout=rpc_timeout + 5)
+    except asyncio.QueueEmpty as exc:
+        from queue import Empty
+
+        raise Empty from exc
     except ray.exceptions.GetTimeoutError:
         ray.cancel(ref, force=False)
         # A timed-out get may already have removed an item. Do not issue a new
@@ -797,7 +805,7 @@ class StandaloneProducerActor:
             self._execution_pending.remove(sequence)
             self._reference_condition.notify_all()
 
-    async def _on_references(self, entries: list[dict[str, Any]]) -> dict[str, float]:
+    async def _on_references(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
         # Batch IDs and partial sends must stay ordered even if callers overlap.
         async with self._reference_publication_lock:
             try:
@@ -814,7 +822,7 @@ class StandaloneProducerActor:
 
     async def _publish_references(
         self, entries: list[dict[str, Any]]
-    ) -> dict[str, float]:
+    ) -> dict[str, Any]:
         if self._events is None:
             raise RuntimeError("Ray file publication requires the Driver event queue")
         entries = [
@@ -895,7 +903,12 @@ class StandaloneProducerActor:
                         "File reference exceeds max_single_file_tensor_bytes"
                     )
                 file_sizes[entry["key"]] = size
-        metrics = {"attempts": 0.0, "transport_seconds": 0.0, "retry_wait_seconds": 0.0}
+        metrics: dict[str, Any] = {
+            "attempts": 0.0,
+            "transport_seconds": 0.0,
+            "retry_wait_seconds": 0.0,
+        }
+        submitted_keys: set[str] = set()
         for group in groups:
             while group:
                 async with self._reference_condition:
@@ -927,9 +940,16 @@ class StandaloneProducerActor:
                             "Reference publication stopped after pipeline failure"
                         )
                     if self._reference_closed:
-                        raise RuntimeError(
-                            "Reference publication stopped after Producer closure"
-                        )
+                        if not self._stopping:
+                            raise RuntimeError(
+                                "Reference publication stopped after Producer closure"
+                            )
+                        metrics["unsubmitted_keys"] = [
+                            item["key"]
+                            for item in entries
+                            if item["key"] not in submitted_keys
+                        ]
+                        return metrics
                     self._ensure_lease_journal()
                     self._reference_publication_started = True
                     count = (
@@ -1022,6 +1042,7 @@ class StandaloneProducerActor:
                 await asyncio.to_thread(
                     retry_io, submit, name="Producer file metadata batch"
                 )
+                submitted_keys.update(raw_keys)
                 self._reference_batch_id += 1
         return metrics
 
@@ -1481,6 +1502,9 @@ class StandaloneProducerActor:
             file_options = {
                 "on_references": self._on_references,
                 "reference_batch_size": self._notification_batch_size,
+                "is_graceful_stop": lambda: (
+                    self._stopping and not self._reference_aborted
+                ),
             }
             if self._input_identity is not None:
                 file_options["expected_input_identity"] = self._input_identity
@@ -1576,10 +1600,31 @@ class StandaloneProducerActor:
             input_path = _config_member(producer_cfg, "input_path", None)
             input_identity = None
             if _uses_ray_reference(self.config) and input_path:
+                training = _config_member(speco, "draft_training", {})
+                if (
+                    _config_member(training, "producer_node_ip", None)
+                    and _config_member(training, "data_source", "online") == "online"
+                ):
+                    await asyncio.to_thread(
+                        _preflight_input_file,
+                        input_path,
+                        max_jsonl_line_bytes=_config_member(
+                            producer_cfg, "max_jsonl_line_bytes", 0
+                        ),
+                    )
                 fingerprint = await asyncio.to_thread(
                     build_input_fingerprint, input_path, include_content_hash=True
                 )
                 input_identity = input_content_identity(fingerprint)
+                resume_checkpoint = _config_member(
+                    producer_cfg, "resume_checkpoint_path", None
+                )
+                if resume_checkpoint:
+                    await asyncio.to_thread(
+                        load_standalone_resume,
+                        resume_checkpoint,
+                        input_fingerprint=fingerprint,
+                    )
             async with self._reference_condition:
                 if self._reference_aborted:
                     raise RuntimeError("Cannot restart an aborted Producer actor")
@@ -1634,6 +1679,20 @@ class StandaloneProducerActor:
             raise RuntimeError("Producer has not been started")
         return asdict(await self._task)
 
+    async def checkpoint_input_fingerprint(self) -> dict[str, Any]:
+        speco = _config_member(self.config, "speco", {})
+        producer_config = _config_member(speco, "standalone_tq_producer", {})
+        path = _config_member(producer_config, "input_path", None)
+        identity = self._input_identity
+        if path is None or identity is None:
+            raise RuntimeError("Producer input was not bound to this standalone run")
+        fingerprint = await asyncio.to_thread(
+            build_input_fingerprint, path, include_content_hash=True
+        )
+        if input_content_identity(fingerprint) != identity:
+            raise ValueError("Standalone Producer input changed since training began")
+        return fingerprint
+
     async def stop(self) -> dict[str, bool]:
         # Wait for an in-progress start handshake before deciding there is no task.
         async with self._start_lock:
@@ -1642,12 +1701,19 @@ class StandaloneProducerActor:
                 await self._close_reference_admission()
                 return {"stopped": False}
             self._stopping = True
+            # Wake a publisher waiting for credits. An in-flight send is
+            # shielded by the Producer and reports which references it owns.
+            await self._close_reference_admission()
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
-            await self._close_reference_admission()
+            async with self._reference_condition:
+                # All request tasks and unsubmitted references have drained.
+                self._execution_pending.clear()
+                self._reference_condition.notify_all()
+                self._close_drained_lease_journal()
             return {"stopped": True}
 
     async def pause(self) -> dict[str, bool]:
@@ -2065,6 +2131,14 @@ class StandaloneRayTrainer:
             )
             if (
                 scheduler_cfg.get("per_rank_reference_ack", False)
+                or (
+                    _uses_ray_reference(self.consumer_config)
+                    and _config_member(
+                        self.producer_config.speco.standalone_tq_producer,
+                        "input_path",
+                        None,
+                    )
+                )
                 or _config_member(source_store, "file_root", None) is not None
                 or _config_member(
                     self.producer_config.speco.standalone_tq_producer,
@@ -2498,7 +2572,12 @@ class StandaloneRayTrainer:
                 )
             ).upper()
         )
-        supports_empty_ranks = algorithm in {"DSPARK", "DFLASH", "EAGLE3"}
+        supports_empty_ranks = algorithm in {
+            "DSPARK",
+            "DSV4_DSPARK",
+            "DFLASH",
+            "EAGLE3",
+        }
 
         def submit_training_command(plan, selected_entries):
             assignments = build_assignments(
@@ -3204,7 +3283,7 @@ class StandaloneRayTrainer:
                     ) from shutdown_stop_error
                 while True:
                     try:
-                        event = self.events_queue.get(block=False)
+                        event = get_queue(self.events_queue, timeout=0.0)
                     except Empty:
                         break
                     handle_shutdown_event(event)
@@ -3300,9 +3379,21 @@ def run_ray_pipeline(
     # Mirror the subprocess path: fail fast when the selected TQ transport or
     # handle-based store points at an unreachable Mooncake master. This is the
     # default runtime mode.
-    hidden_references = any(
-        item.endswith("feature_store.type=ray_reference")
-        for item in commands.consumer_overrides
+    hidden_references = (
+        _strip_quotes(
+            _find_override(
+                commands.consumer_overrides,
+                "actor_rollout_ref.rollout.drafter.training.feature_store.type",
+                normalize_key=True,
+            )
+            or _find_override(
+                commands.consumer_overrides,
+                "training.feature_store.type",
+                normalize_key=True,
+            )
+            or ""
+        )
+        == "ray_reference"
     )
     if not hidden_references:
         validate_tq_backend(base_env)
@@ -3314,6 +3405,12 @@ def run_ray_pipeline(
     native_drained = False
     native_unavailable = None
     if native is not None:
+        if not native["reusable_buffer_bytes"]:
+            logger.warning(
+                "Native HCCS uses dynamic buffer registration. Set "
+                "SPECO_NATIVE_REUSE_BUFFER_BYTES on the launcher and all external vLLM sources "
+                "to avoid deregistration during transfers."
+            )
         native_unavailable = [
             endpoint
             for endpoint in commands.vllm_endpoints
@@ -3355,6 +3452,7 @@ def run_ray_pipeline(
                         "chunk_bytes": native["chunk_bytes"],
                         "metadata_server": native["metadata_server"],
                         "reader_endpoints": native["reader_endpoints"],
+                        "reusable_buffer_bytes": native["reusable_buffer_bytes"],
                     },
                 )
             )
@@ -3378,6 +3476,9 @@ def run_ray_pipeline(
                     "SPECO_NATIVE_SOURCE_MAX_BYTES": str(native["source_max_bytes"]),
                     "SPECO_NATIVE_SOURCE_MAX_SLOTS": str(native["source_max_slots"]),
                     "SPECO_NATIVE_CHUNK_BYTES": str(native["chunk_bytes"]),
+                    "SPECO_NATIVE_REUSE_BUFFER_BYTES": str(
+                        native["reusable_buffer_bytes"]
+                    ),
                     "SPECO_NATIVE_CONTROL_TIMEOUT": str(native["timeout"]),
                 }
             )

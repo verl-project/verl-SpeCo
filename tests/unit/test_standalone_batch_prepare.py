@@ -225,8 +225,8 @@ def test_node_owner_routes_and_stops_on_failure_without_releasing_inputs(monkeyp
     import json
     from verl_speco.trainer import reference_shared_frame as frame
     binding = {"run_id": "run", "generation": 0, "batch_id": 2, "rank": 0, "receipt_token": "receipt"}
-    ranks = [2, 2 if fault == "duplicate" else 1]
-    prepared, transmitted, closed, payloads = [], {}, [], {}
+    ranks = [1, 2] if fault == "prepare" else [2, 2 if fault == "duplicate" else 1]
+    prepared, transmitted, closed, payloads, notified = [], {}, [], {}, []
     now = [0.0]
     monkeypatch.setattr(frame, "time", SimpleNamespace(monotonic=lambda: now[0], perf_counter=lambda: now[0]))
     class Connection:
@@ -234,6 +234,9 @@ def test_node_owner_routes_and_stops_on_failure_without_releasing_inputs(monkeyp
         def __enter__(self): return self
         def __exit__(self, *args): pass
         def settimeout(self, value): pass
+        def send(self, data):
+            notified.append((self.rank, data))
+            return len(data)
         def recv(self, size):
             token = "foreign" if fault == "foreign" and self.rank == 1 else "receipt"
             return json.dumps({**binding, "rank": self.rank, "receipt_token": token}).encode()
@@ -277,7 +280,10 @@ def test_node_owner_routes_and_stops_on_failure_without_releasing_inputs(monkeyp
     else:
         with pytest.raises((RuntimeError, ValueError, TimeoutError)):
             frame.serve_node_batches(groups, binding=binding, prepare=prepare, max_bytes=4096, timeout=10)
-        if fault == "slow_owner":
+        if fault == "prepare":
+            assert prepared == [1] and not transmitted
+            assert notified == [(1, frame._NODE_BATCH_ERROR), (2, frame._NODE_BATCH_ERROR)]
+        elif fault == "slow_owner":
             assert prepared == [2, 1, 0] and transmitted == {2: [2], 1: [1]}
         elif fault == "slow_send":
             assert prepared == [2, 1] and transmitted == {2: [2], 1: [1]}
@@ -557,6 +563,7 @@ def test_owned_anchor_scan_matches_baseline_sanitized_mask(tmp_path, dtype, max_
     scanned = scan_owned_anchor_inputs(tag, contract, max_window=max_window, clip_value=1000.0, chunk_rows=2)
     for key in ("input_ids", "loss_mask", "label_mask", "attention_mask"):
         assert torch.equal(scanned[key], staged[key])
+    assert scanned["supervised_tokens"] == torch.count_nonzero(staged["loss_mask"]).item()
     start, end = scanned["feature_window"]
     assert scanned["input_ids"].tolist() == [[positions[i] for i in range(start, end)]]
     assert Path(tag["hidden_states_path"]).exists()
@@ -1825,7 +1832,7 @@ def test_dsv4_dspark_shares_dspark_layouts(tmp_path):
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_file_batch_reads_share_one_timeout_budget(tmp_path, monkeypatch, streaming):
+def test_file_batch_reads_get_independent_lock_timeouts(tmp_path, monkeypatch, streaming):
     import verl_speco.trainer.standalone_batch_prepare as prepare
     from verl_speco.producer.hidden_states_store import FileHiddenStatesStore
 
@@ -1843,12 +1850,8 @@ def test_file_batch_reads_share_one_timeout_budget(tmp_path, monkeypatch, stream
     monkeypatch.setattr(prepare, "time", SimpleNamespace(monotonic=lambda: now[0]))
     monkeypatch.setattr(FileHiddenStatesStore, method, load)
     options = dict(streaming=streaming, max_window=3, pin_memory=False)
-    prepare.prepare_standalone_cpu_batch(tags, contract, read_timeout=10, **options)
-    assert timeouts == [10, 6]
-    now[0], timeouts[:] = 100, []
-    with pytest.raises(TimeoutError, match="batch read deadline"):
-        prepare.prepare_standalone_cpu_batch(tags, contract, read_timeout=3, **options)
-    assert timeouts == [3]
+    prepare.prepare_standalone_cpu_batch(tags, contract, read_timeout=3, **options)
+    assert timeouts == [3, 3]
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), True, "5"])
@@ -1860,7 +1863,7 @@ def test_reference_batch_read_timeout_must_be_positive_and_finite(tmp_path, time
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_file_lock_wait_obeys_batch_deadline(tmp_path, streaming):
+def test_file_lock_wait_obeys_single_read_timeout(tmp_path, streaming):
     import os
     import time
     from pathlib import Path

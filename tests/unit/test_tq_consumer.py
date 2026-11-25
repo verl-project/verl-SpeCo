@@ -333,6 +333,7 @@ def test_native_directory_mutation_failure_retains_active_fence(phase):
                 await directory.retire("sample", descriptor["sha256"])
         with pytest.raises(RuntimeError, match="active references"):
             await directory.freeze()
+        assert (await directory.status(1))["active_sample"][0]["handle"] == "sample"
     try:
         asyncio.run(run())
     finally:
@@ -447,7 +448,7 @@ def test_native_source_control_routes_and_timeout():
         stalled.validate_published({"segment": "source"})
     assert requests.get_nowait()["method"] == "validate_published"
     replies = Queue(maxsize=1)
-    replies.put({"channel_id": "a" * 32, "request_id": "0" * 32, "ok": True})
+    replies.put({"channel_id": "b" * 32, "request_id": "0" * 32, "ok": True})
     mismatch = NativeSourceControlClient(Queue(maxsize=1), replies, channel_id="a" * 32, timeout=1.0)
     with pytest.raises(ValueError, match="acknowledgement identity"):
         mismatch.validate_published({"segment": "source"})

@@ -133,7 +133,8 @@ def test_native_launcher_builds_bounded_reader_and_scheduler_settings():
     from verl_speco.standalone_ray_runtime import compose_runtime_config
     env = {"SPECO_VLLM_HIDDEN_STATES_STORE": "native",
            "SPECO_NATIVE_SOURCE_ENDPOINT": "10.0.0.1:1234",
-           "SPECO_NATIVE_READER_ENDPOINTS": '["10.0.0.2:1234"]'}
+           "SPECO_NATIVE_READER_ENDPOINTS": '["10.0.0.2:1234"]',
+           "SPECO_NATIVE_REUSE_BUFFER_BYTES": "2097152"}
     config = resolve_pipeline_config(_training_args(), environ=env)
     commands = build_pipeline_commands(config, _training_args(), ray_address="10.0.0.1:6379", env=env)
     producer = compose_runtime_config(commands.producer_overrides)
@@ -144,6 +145,7 @@ def test_native_launcher_builds_bounded_reader_and_scheduler_settings():
     training = consumer.actor_rollout_ref.rollout.drafter.training
     assert training.transfer_queue.consumer_batch_workers == 0
     assert list(training.target_feature_replay.hidden_states_store.native.endpoints) == ["10.0.0.2:1234"]
+    assert training.target_feature_replay.hidden_states_store.native.reusable_buffer_bytes == 2 * 1024**2
     assert commands.native_settings["run_id"] == config.run_id
     transfer = json.loads(commands.vllm[commands.vllm.index("--kv-transfer-config") + 1])
     assert transfer["kv_connector"] == "SpecoNativeHiddenStatesConnector"

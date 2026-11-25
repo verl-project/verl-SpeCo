@@ -110,22 +110,39 @@ def stop(client, directory):
     execute(
         client,
         f"""python3 - {shlex.quote(directory)} <<'PY'
-import os, signal, sys, time
+import errno, os, signal, sys, time
 from pathlib import Path
 tag = b'DSPARK_TWO_NODE_JOB=' + os.fsencode(sys.argv[1])
+def belongs_to_job(pid):
+    try:
+        return tag in Path('/proc', str(pid), 'environ').read_bytes().split(b'\\0')
+    except (ProcessLookupError, FileNotFoundError, PermissionError):
+        return False
 def running():
     for path in Path('/proc').glob('[0-9]*/environ'):
-        try:
-            if tag in path.read_bytes().split(b'\\0'):
-                yield int(path.parent.name)
-        except (ProcessLookupError, FileNotFoundError, PermissionError):
-            continue
+        pid = int(path.parent.name)
+        if belongs_to_job(pid):
+            yield pid
 for sig in (signal.SIGTERM, signal.SIGKILL):
     for pid in running():
+        pidfd = None
         try:
-            os.kill(pid, sig)
+            if hasattr(os, 'pidfd_open') and hasattr(signal, 'pidfd_send_signal'):
+                try:
+                    pidfd = os.pidfd_open(pid)
+                except OSError as exc:
+                    if exc.errno not in (errno.ENOSYS, errno.EINVAL):
+                        raise
+            if belongs_to_job(pid):
+                if pidfd is None:
+                    os.kill(pid, sig)
+                else:
+                    signal.pidfd_send_signal(pidfd, sig)
         except ProcessLookupError:
             pass
+        finally:
+            if pidfd is not None:
+                os.close(pidfd)
     for _ in range(25):
         if not any(running()):
             sys.exit(0)
@@ -217,6 +234,7 @@ def prepare(client, args, role, name, token, generation):
         # before token IDs, descriptors and registration alignment.
         "SPECO_NATIVE_SOURCE_MAX_BYTES": str(source_slots * reader_bytes),
         "SPECO_NATIVE_READER_MAX_BYTES": str(reader_bytes),
+        "SPECO_NATIVE_REUSE_BUFFER_BYTES": str(448 << 20),
         "SPECO_NATIVE_CHUNK_BYTES": str(128 << 20),
         "SPECO_NATIVE_MAX_RECORDS": "128",
         "MC_LEGACY_RPC_PORT_BINDING": "1",
@@ -239,6 +257,7 @@ def prepare(client, args, role, name, token, generation):
             )
             with sftp.open(f"{directory}/{filename}", "wb") as dest:
                 dest.write(contents.encode())
+    execute(client, f"chmod 600 -- {shlex.quote(directory + '/job.env')}")
     return directory
 
 

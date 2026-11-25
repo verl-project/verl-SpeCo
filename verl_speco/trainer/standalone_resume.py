@@ -23,7 +23,7 @@ import re
 import uuid
 import zlib
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import torch
 
@@ -510,17 +510,34 @@ def save_standalone_resume(
     training_plan: dict[str, Any] | None = None,
     storage_format: str = "tensor",
     expected_input_identity: Mapping[str, Any] | None = None,
+    input_fingerprint_provider: Callable[[], dict[str, Any]] | None = None,
     lease_snapshot_sha256: str | None = None,
 ) -> None:
     if not isinstance(storage_format, str) or storage_format not in {"tensor", "gzip"}:
         raise ValueError("Standalone resume storage_format must be tensor or gzip")
-    if expected_input_identity is not None:
-        expected_input_identity = validate_input_identity(expected_input_identity)
-        initial = build_input_fingerprint(input_path, include_content_hash=True)
-        if input_content_identity(initial) != expected_input_identity:
+    if input_fingerprint_provider is not None and expected_input_identity is None:
+        raise ValueError(
+            "A remote input fingerprint requires a bound Producer identity"
+        )
+
+    def checked_input_fingerprint():
+        fingerprint = (
+            input_fingerprint_provider()
+            if input_fingerprint_provider is not None
+            else build_input_fingerprint(input_path, include_content_hash=True)
+        )
+        if (
+            expected_input_identity is not None
+            and input_content_identity(fingerprint) != expected_input_identity
+        ):
             raise ValueError(
                 "Standalone input changed since training began; checkpoint cannot be published"
             )
+        return fingerprint
+
+    if expected_input_identity is not None:
+        expected_input_identity = validate_input_identity(expected_input_identity)
+        checked_input_fingerprint()
     checkpoint_dir = Path(checkpoint_path)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     if lease_snapshot_sha256 is not None:
@@ -554,14 +571,7 @@ def save_standalone_resume(
 
     publish_attempted = False
     try:
-        fingerprint = build_input_fingerprint(input_path, include_content_hash=True)
-        if (
-            expected_input_identity is not None
-            and input_content_identity(fingerprint) != expected_input_identity
-        ):
-            raise ValueError(
-                "Standalone input changed since training began; checkpoint cannot be published"
-            )
+        fingerprint = checked_input_fingerprint()
         metadata = {
             "schema_version": _IMMUTABLE_SCHEMA_VERSION,
             "storage_format": storage_format,
@@ -636,6 +646,7 @@ def load_standalone_resume(
     checkpoint_path: str | os.PathLike[str] | None,
     *,
     input_path: str | os.PathLike[str] | None = None,
+    input_fingerprint: Mapping[str, Any] | None = None,
 ) -> tuple[set[int], dict[str, Any] | None]:
     if not checkpoint_path:
         return set(), None
@@ -712,12 +723,19 @@ def load_standalone_resume(
         consumed = {int(value) for value in values.tolist()}
         if len(consumed) != int(metadata.get("consumed_count", -1)):
             raise ValueError(f"Consumed sequence count mismatch in {checkpoint_dir}")
-    if input_path is not None:
-        current_fingerprint = build_input_fingerprint(
-            input_path,
-            include_content_hash=saved_identity is not None
-            or (isinstance(saved_fingerprint, dict) and "sha256" in saved_fingerprint),
+    if input_path is not None or input_fingerprint is not None:
+        include_content_hash = saved_identity is not None or (
+            isinstance(saved_fingerprint, dict) and "sha256" in saved_fingerprint
         )
+        current_fingerprint = (
+            build_input_fingerprint(
+                input_path, include_content_hash=include_content_hash
+            )
+            if input_path is not None
+            else dict(input_fingerprint or {})
+        )
+        if not include_content_hash:
+            current_fingerprint.pop("sha256", None)
         differs = (
             input_content_identity(current_fingerprint) != saved_identity
             if saved_identity is not None
