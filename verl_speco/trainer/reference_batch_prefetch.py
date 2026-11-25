@@ -186,6 +186,9 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
                 max_batch_host_bytes,
             ),
         )
+        self._node_worker_pid = (
+            int(self._pool._pool[0].pid) if node_ranks_per_host else 0
+        )
         try:
             super().__init__(
                 loader,
@@ -222,7 +225,7 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
                 pids = [0] * (2 * self.loader.world_size)
                 pids[2 * self.loader.rank : 2 * self.loader.rank + 2] = [
                     os.getpid(),
-                    self._pool._pool[0].pid,
+                    self._node_worker_pid,
                 ]
                 pids = self._sync(pids)
                 owner = (
@@ -329,6 +332,13 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
                         prepared, seconds = result.get(timeout=0.1)
                         break
                     except PoolTimeout:
+                        if self.node_ranks_per_host and (
+                            self._pool._pool[0].pid != self._node_worker_pid
+                            or self._pool._pool[0].exitcode is not None
+                        ):
+                            raise RuntimeError(
+                                "Node reference batch worker exited"
+                            ) from None
                         if time.monotonic() >= deadline:
                             raise TimeoutError(
                                 "Reference batch worker exceeded preparation deadline"
