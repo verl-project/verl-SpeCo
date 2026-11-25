@@ -22,6 +22,9 @@ SEARCH_WHITELIST = [
     # SpeCo subclasses and patches verl's Ray PPO trainer, whose public
     # contract still uses DataProto. Keep that dependency contained here.
     "verl_speco/trainer/speco_ray_trainer.py",
+    # Replaces the legacy trainer's old-logprob call and must return its
+    # DataProto contract; tree scoring and drafter batches stay independent.
+    "verl_speco/integration/specopd_driver.py",
     # The V1 mixin bridges V1 TensorDict batches back to the upstream trainer's
     # legacy checkpoint and rollout interfaces at the compatibility boundary.
     "verl_speco/trainer/v1/speco_mixin.py",

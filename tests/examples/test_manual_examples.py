@@ -48,9 +48,19 @@ def test_manual_workflow_covers_every_example_and_routes_hardware():
         manifest["examples/run_qwen3.6-35b-a3b_drafter_dspark_separate_training.sh"]
         == "npu"
     )
+    npu = workflow["jobs"]["npu"]
+    release = npu["env"]["SPECO_EXAMPLE_VERL_REF"]
+    assert "run_qwen3-8b-specopd_drafter_dspark_vllm_npu.sh" in release
+    assert "'release/v0.9.0' || inputs.verl_ref" in release
+    assert npu["steps"][1]["with"]["ref"] == "${{ env.SPECO_EXAMPLE_VERL_REF }}"
 
 
-def test_manual_online_paths_and_strict_result(tmp_path):
+
+@pytest.mark.parametrize("example", [
+    "examples/run_qwen3-8b_drafter_eagle3_vllm.sh",
+    "examples/run_qwen3-8b-specopd_drafter_dspark_vllm_npu.sh",
+])
+def test_manual_online_paths_and_strict_result(tmp_path, example):
     settings = {
         "MODEL_PATH": "/models/target",
         "TRAIN_FILE": "/data/train",
@@ -58,7 +68,7 @@ def test_manual_online_paths_and_strict_result(tmp_path):
         "DRAFTER_PATH": "/models/draft",
     }
     env, args, online = prepare(
-        "examples/run_qwen3-8b_drafter_eagle3_vllm.sh",
+        example,
         settings,
         "trainer.total_training_steps=2\n",
         tmp_path,
@@ -68,6 +78,8 @@ def test_manual_online_paths_and_strict_result(tmp_path):
     assert env["SPECO_CI_RESULT_PATH"] == str(tmp_path / "result.json")
     assert env["CKPTS_DIR"] == str(tmp_path / "ckpts_dir")
     assert env["MODEL_PATH"] == "/models/target"
+    if "specopd" in example:
+        assert env["SPECO_ACCELERATOR_COUNT"] == "8"
 
 
 @pytest.mark.parametrize("settings", [[], {"MAX_STEPS": 3}, {"invalid name": "x"}])

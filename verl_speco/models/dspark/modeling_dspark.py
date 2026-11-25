@@ -76,8 +76,7 @@ class DSparkVanillaMarkovHead(nn.Module):
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        del hidden_states
-        return base_logits + self.compute_step_bias(token_ids)
+        return base_logits + self.compute_step_bias(token_ids, hidden_states)
 
 
 class DSparkGatedMarkovHead(DSparkVanillaMarkovHead):
