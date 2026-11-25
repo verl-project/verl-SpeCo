@@ -117,6 +117,9 @@ ENV/
 # vscode
 .vscode
 
+# Trae local workspace artifacts
+.trae/
+
 # Mac
 .DS_Store
 
