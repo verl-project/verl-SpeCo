@@ -433,6 +433,8 @@ def _iter_payloads(
 
 
 def _is_json_array(input_path: Path) -> bool:
+    if input_path.suffix.lower() == ".jsonl":
+        return False
     with input_path.open("rb") as input_file:
         token = input_file.read(1)
         while token and token in b" \t\r\n":

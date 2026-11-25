@@ -106,6 +106,8 @@ def render_conversation(
     }
     if tools is not None:
         body["tools"] = tools
+        # Rendering recorded conversations does not need automatic tool selection.
+        body["tool_choice"] = "none"
     if truncate_prompt_tokens is not None:
         body["truncate_prompt_tokens"] = truncate_prompt_tokens
     if truncation_side is not None:

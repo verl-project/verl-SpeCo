@@ -107,6 +107,23 @@ def test_prompt_only_tools_reach_generation_template():
     assert request.prompt_token_ids == (1, 2, 3)
 
 
+@pytest.mark.parametrize("suffix", [".jsonl", ".JSONL"])
+@pytest.mark.parametrize("order", [None, [0, 1], [1, 0]])
+def test_jsonl_array_first_line_respects_skip_policy(tmp_path, suffix, order):
+    path = tmp_path / f"input{suffix}"
+    path.write_text(
+        '[]\n{"sample_id":"valid","prompt":"hello","response":"world"}\n',
+        encoding="utf-8",
+    )
+    if order is None:
+        records = input_reader.iter_input_records(path, on_error="skip")
+    else:
+        reader = input_reader.ShuffledJsonlReader(path, on_error="skip")
+        assert reader.record_count == 2
+        records = reader.iter_records(order)
+    assert [record.sample_id for record in records] == ["valid"]
+
+
 def test_json_array_skips_invalid_tool_rows_in_both_readers(tmp_path):
     path = tmp_path / "input.json"
     bad = {**_tool_row("bad"), "tools": "invalid"}

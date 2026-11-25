@@ -18,6 +18,9 @@ Pure logic plus an injectable vLLM ``/render`` client. No network in tests.
 
 from __future__ import annotations
 
+import json
+from io import BytesIO
+
 import pytest
 
 from verl_speco.data.render_boundary import (
@@ -71,8 +74,32 @@ def test_render_conversation_client_returns_token_ids(monkeypatch) -> None:
     assert captured["url"].endswith("/v1/chat/completions/render")
     assert captured["body"]["add_generation_prompt"] is True
     assert captured["body"]["tools"] == [{"type": "function"}]
+    assert captured["body"]["tool_choice"] == "none"
     assert captured["body"]["truncate_prompt_tokens"] == 16
     assert captured["body"]["truncation_side"] == "right"
+
+
+@pytest.mark.parametrize("add_generation_prompt", [True, False])
+@pytest.mark.parametrize("tools", [None, [{"type": "function", "function": {"name": "lookup"}}]])
+def test_render_conversation_serialized_tool_choice(monkeypatch, add_generation_prompt, tools):
+    def fake_urlopen(request, timeout):
+        body = json.loads(request.data)
+        assert body["add_generation_prompt"] is add_generation_prompt
+        if tools is None:
+            assert "tools" not in body
+            assert "tool_choice" not in body
+        else:
+            assert body["tools"] == tools
+            assert body["tool_choice"] == "none"
+        return BytesIO(b'{"token_ids": [1, 2, 3]}')
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    assert render_conversation(
+        "http://localhost:8000/v1",
+        [{"role": "user", "content": "hi"}],
+        add_generation_prompt=add_generation_prompt,
+        tools=tools,
+    ) == [1, 2, 3]
 
 
 def test_render_conversation_normalizes_v1_endpoint(monkeypatch) -> None:
