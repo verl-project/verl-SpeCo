@@ -25,6 +25,97 @@ pytest.importorskip("torch")
 from verl_speco.producer import input_reader
 
 
+def _tool_row(sample_id="tool-a"):
+    return {
+        "sample_id": sample_id,
+        "tools": [{"type": "function", "function": {"name": "remove_member", "parameters": {"type": "object"}}}],
+        "conversations": [
+            {"from": "system", "value": "Choose a tool."},
+            {"from": "human", "value": "Remove a member."},
+            {"from": "assistant", "value": "<tool_call>\n<function=remove_member>张三</function>\n</tool_call>"},
+        ],
+    }
+
+
+@pytest.mark.parametrize("array_format", [False, True])
+def test_tool_rows_parse_and_shuffle(tmp_path, array_format):
+    rows = [_tool_row(), _tool_row("tool-b")]
+    path = tmp_path / ("input.json" if array_format else "input.jsonl")
+    text = json.dumps(rows, ensure_ascii=False, indent=2) if array_format else "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
+    path.write_text(text, encoding="utf-8")
+    sequential = list(input_reader.iter_input_records(path, on_error="raise"))
+    shuffled = list(input_reader.ShuffledJsonlReader(path, on_error="raise").iter_records([1, 0]))
+    assert [row.sample_id for row in sequential] == ["tool-a", "tool-b"]
+    assert [row.sample_id for row in shuffled] == ["tool-b", "tool-a"]
+    assert [row.sequence_no for row in shuffled] == [0, 1]
+    for record in [*sequential, *shuffled]:
+        assert record.tools == rows[0]["tools"]
+        assert record.response == rows[0]["conversations"][-1]["value"]
+        assert [message["role"] for message in record.prompt] == ["system", "user"]
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_tools_reach_all_local_template_calls(fallback):
+    row = _tool_row()
+    record = input_reader._record_from_payload(row, "test", 0, False)
+    calls = []
+
+    class Tokenizer:
+        def __call__(self, text, **kwargs):
+            return list(text.encode("utf-8"))
+
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, tools):
+            calls.append(tools)
+            text = json.dumps(tools) + "".join(f"[{m['role']}]{m['content']}" for m in messages)
+            if add_generation_prompt:
+                text += "[assistant]" + ("<think>" if fallback else "")
+            return list(text.encode("utf-8")) if tokenize else text
+
+    request = input_reader.tokenize_record(record, Tokenizer(), {"max_feature_length": 0})
+    assert calls == [row["tools"]] * (3 if fallback else 2)
+    supervised = request.input_ids[request.loss_mask.bool()].tolist()
+    assert bytes(supervised).decode("utf-8") == record.response
+
+
+def test_tools_reach_render_boundary_fallback():
+    row = _tool_row()
+    record = input_reader._record_from_payload(row, "test", 0, False)
+    calls = []
+
+    def render(messages, *, add_generation_prompt, max_length, tools):
+        calls.append(tools)
+        if add_generation_prompt:
+            return [1, 2, 9]
+        return [1, 2, 3, 4] if messages[-1]["role"] == "assistant" else [1, 2]
+
+    request = input_reader.tokenize_record_with_render_boundary(record, None, {"max_feature_length": 0}, render)
+    assert calls == [row["tools"]] * 3
+    assert request.loss_mask.tolist() == [0, 0, 1, 1]
+
+
+def test_prompt_only_tools_reach_generation_template():
+    row = _tool_row()
+    row["conversations"].pop()
+    record = input_reader._record_from_payload(row, "test", 0, False)
+
+    class Tokenizer:
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, tools):
+            assert tools == row["tools"]
+            return [1, 2, 3]
+
+    request = input_reader.prepare_generation_request(record, Tokenizer(), {"generation_max_tokens": 4})
+    assert request.prompt_token_ids == (1, 2, 3)
+
+
+def test_json_array_skips_invalid_tool_rows_in_both_readers(tmp_path):
+    path = tmp_path / "input.json"
+    bad = {**_tool_row("bad"), "tools": "invalid"}
+    path.write_text(json.dumps([_tool_row(), bad, _tool_row("tool-b")]), encoding="utf-8")
+    readers = [input_reader.iter_input_records(path), input_reader.ShuffledJsonlReader(path).iter_records([0, 1, 2])]
+    for reader in readers:
+        assert [record.sample_id for record in reader] == ["tool-a", "tool-b"]
+
+
 @pytest.mark.parametrize("response_budget", [0, 2, 3])
 def test_prompt_context_does_not_consume_response_feature_budget(response_budget):
     request = input_reader._build_tokenized_request(
